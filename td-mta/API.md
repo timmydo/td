@@ -4519,6 +4519,26 @@ Meter/HeaderBudget plus End. Partial output remains caller-reserved and is
 not wiped after refusal. The fixed source/framer pair is neither Copy nor
 Clone; this helper composes no part tree, null property or whole response.
 
+### 1.103 Shared string-array framing
+
+M06cx atomically moves MessageIds and URLs array punctuation and nested
+string framing into std-only td_json::string_array. The mail coordinator
+still validates the whole field before emitting array bytes, selects the
+existing field mode, maps whole-field malformed values to null, and owns
+original Meter/HeaderBudget handoff. The shared frame retains no values or
+allowances. Array and String callback roles preserve existing typed error
+contexts for punctuation and nested scalar/escaping work.
+
+Balanced Begin/Scalar*/End events delimit each string; Complete ends the
+array. Short drains retain already-paid bytes. Empty output freshly admits
+without advancing input; cached completion is inert. Any protocol/source
+or admission failure retires all provisional output. Fresh consuming mail
+handoff requires complete drained array/null framing and the original
+converter outcome. Public forms, literal output, diagnostics and existing
+resource ceilings remain unchanged. This primitive introduces no field,
+source, locator or publication authority; Content-Language JSON remains a
+separate binding.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -1579,6 +1579,19 @@ retains its eight-byte charge ceiling. Allocation intervals cover long URLs,
 null/NO, short drains and late refusal. Combined worker/native/RSS
 qualification remains open.
 
+M06cx replaces mail's inline array punctuation/string loop with shared
+std-only td-json framing. Each existing MessageIds/URLs coordinator still
+fits its 1024-byte parser ceiling with original owners, one pending event,
+fixed null literal and the shared array frame. The shared frame owns at most
+one six-byte string pending buffer and fixed phase/error state; it invokes
+one source poll, one bounded string turn or copies one punctuation byte per
+call. Existing source/step/record/output ceilings above remain unchanged.
+Whole-field validation precedes array output; malformed null mapping adds no
+fresh allowance. Existing measured allocation intervals exercise the shared
+array implementation without a retained list or arena. Standalone frame
+size depends on the caller's inline error type; no universal error-size
+bound or native/worker/RSS qualification follows.
+
 The budgeted address/group parser (M06bd) fits 800 bytes in the existing
 16 KiB parser reservation, replacing standalone list state. Original budgets
 and private credit cover boundary/CFWS/phrase/mailbox/route parsing and raw

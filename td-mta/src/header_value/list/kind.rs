@@ -5,14 +5,7 @@ use crate::{
     admission::work::Meter, header_message_ids as ids, header_urls as urls, json_string,
     nfc::HeaderBudget, ports::Tick,
 };
-#[derive(Clone, Copy)]
-pub(in crate::header_value) enum Event {
-    Yield,
-    Begin,
-    Scalar(char),
-    End,
-    Complete,
-}
+pub(in crate::header_value) use td_json::string_array::Event;
 pub(in crate::header_value) trait Kind {
     type Cursor<'a, 'w>;
     type Mode: Copy;

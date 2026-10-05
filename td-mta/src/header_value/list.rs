@@ -1,8 +1,8 @@
 use super::{projection::Projection, Error, Form};
 use crate::{
     admission::work::{Charge, Meter},
-    json_string::{self, Frame, Progress, ScalarSource, Status},
-    nfc::{self, HeaderBudget},
+    json_string::{Frame, Progress, Status},
+    nfc::HeaderBudget,
     ports::Tick,
 };
 mod kind;
@@ -46,9 +46,8 @@ impl<'a, 'w, K: Kind> Projection<'a, 'w> for ListMode<K> {
             owner: Owner::Convert(K::start(bytes, mode, work, budget)),
             mode,
             phase: Phase::First,
-            next: Phase::First,
-            bytes: [0; 4],
-            used: 0,
+            array: td_json::string_array::Frame::new(),
+            pending: None,
             position: 0,
             failure: None,
         }
@@ -60,6 +59,9 @@ impl<'a, 'w, K: Kind> Projection<'a, 'w> for ListMode<K> {
             return Err(error);
         }
         if !matches!(source.phase, Phase::Done) {
+            return Err(Error::InvalidState);
+        }
+        if matches!(source.owner, Owner::Convert(_)) && !source.array.is_complete() {
             return Err(Error::InvalidState);
         }
         let (work, budget) = match source.owner {
@@ -74,11 +76,11 @@ impl<'a, 'w, K: Kind> Projection<'a, 'w> for ListMode<K> {
     }
     fn poll(
         source: &mut Self::Source,
-        frame: &mut Frame,
+        _frame: &mut Frame,
         now: Tick,
         output: &mut [u8],
     ) -> Result<Progress, Error> {
-        source.poll(frame, now, output)
+        source.poll(now, output)
     }
     fn is_encoding_problem(source: &Self::Source) -> bool {
         match &source.owner {
@@ -95,34 +97,53 @@ enum Owner<'a, 'w, K: Kind> {
 #[derive(Clone, Copy)]
 enum Phase {
     First,
-    ItemStart,
-    Item,
-    Between,
-    Drain,
+    Array,
+    NullDrain,
     Done,
 }
 pub(super) struct Source<'a, 'w, K: Kind> {
     owner: Owner<'a, 'w, K>,
     mode: K::Mode,
     phase: Phase,
-    next: Phase,
-    bytes: [u8; 4],
-    used: usize,
+    array: td_json::string_array::Frame<Error>,
+    pending: Option<Event>,
     position: usize,
     failure: Option<Error>,
 }
-struct Item<'c, 'a, 'w, K: Kind>(&'c mut K::Cursor<'a, 'w>);
-impl<K: Kind> ScalarSource for Item<'_, '_, '_, K> {
-    fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), json_string::Error> {
-        K::charge_output(self.0, now, bytes).map_err(Into::<json_string::Error>::into)
+struct ArraySource<'c, 'a, 'w, K: Kind> {
+    cursor: &'c mut K::Cursor<'a, 'w>,
+    pending: &'c mut Option<Event>,
+}
+fn contextual<K: Kind>(error: K::Failure, role: td_json::string_array::Role) -> Error {
+    match role {
+        td_json::string_array::Role::Array => error.into(),
+        td_json::string_array::Role::String => Error::Json(error.into()),
     }
-    fn poll(&mut self, now: Tick) -> Result<nfc::Status, json_string::Error> {
-        match K::poll(self.0, now).map_err(Into::<json_string::Error>::into)? {
-            Event::Yield => Ok(nfc::Status::Yield),
-            Event::Scalar(value) => Ok(nfc::Status::Scalar(value)),
-            Event::End => Ok(nfc::Status::Complete),
-            Event::Begin | Event::Complete => Err(json_string::Error::InvalidState),
+}
+fn array_error(error: td_json::string_array::Error<Error>) -> Error {
+    use td_json::string_array::{Error as Shared, Role};
+    match error {
+        Shared::Source(error) => error,
+        Shared::InvalidState(Role::Array) => Error::InvalidState,
+        Shared::InvalidState(Role::String) => Error::Json(crate::json_string::Error::InvalidState),
+    }
+}
+impl<K: Kind> td_json::string_array::Source for ArraySource<'_, '_, '_, K> {
+    type Context = Tick;
+    type Error = Error;
+    fn charge_output(
+        &mut self,
+        now: Tick,
+        bytes: u64,
+        role: td_json::string_array::Role,
+    ) -> Result<(), Error> {
+        K::charge_output(self.cursor, now, bytes).map_err(|error| contextual::<K>(error, role))
+    }
+    fn poll(&mut self, now: Tick, role: td_json::string_array::Role) -> Result<Event, Error> {
+        if let Some(event) = self.pending.take() {
+            return Ok(event);
         }
+        K::poll(self.cursor, now).map_err(|error| contextual::<K>(error, role))
     }
 }
 impl<K: Kind> Source<'_, '_, K> {
@@ -163,22 +184,13 @@ impl<K: Kind> Source<'_, '_, K> {
         }
         result
     }
-    fn stage(&mut self, now: Tick, bytes: &[u8], next: Phase) -> Result<(), Error> {
-        if bytes.is_empty() || bytes.len() > self.bytes.len() {
-            return Err(Error::InvalidState);
-        }
-        self.charge_output(now, bytes.len() as u64)?;
-        self.bytes
-            .get_mut(..bytes.len())
-            .ok_or(Error::InvalidState)?
-            .copy_from_slice(bytes);
-        self.used = bytes.len();
+    fn stage_null(&mut self, now: Tick) -> Result<(), Error> {
+        self.charge_output(now, 4)?;
         self.position = 0;
-        self.next = next;
-        self.phase = Phase::Drain;
+        self.phase = Phase::NullDrain;
         Ok(())
     }
-    fn poll(&mut self, frame: &mut Frame, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
+    fn poll(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -188,44 +200,34 @@ impl<K: Kind> Source<'_, '_, K> {
                 status: Status::Complete,
             });
         }
-        let result = self.step(frame, now, output);
+        let result = self.step(now, output);
         if let Err(error) = result {
             self.failure = Some(error);
         }
         result
     }
-    fn step(&mut self, frame: &mut Frame, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
-        self.charge_output(now, 0)?;
-        if output.is_empty() {
+    fn step(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
+        if !matches!(self.phase, Phase::Array) {
+            self.charge_output(now, 0)?;
+        }
+        if output.is_empty() && !matches!(self.phase, Phase::Array) {
             return Ok(Progress {
                 written: 0,
                 status: Status::NeedOutput,
             });
         }
         match self.phase {
-            Phase::First | Phase::Between => {
+            Phase::First => {
                 let Owner::Convert(cursor) = &mut self.owner else {
                     return Err(Error::InvalidState);
                 };
                 match K::poll(cursor, now) {
                     Ok(Event::Yield) => {}
-                    Ok(Event::Begin) => {
-                        let bytes = if matches!(self.phase, Phase::First) {
-                            b"["
-                        } else {
-                            b","
-                        };
-                        self.stage(now, bytes, Phase::ItemStart)?;
+                    Ok(event @ (Event::Begin | Event::Complete)) => {
+                        self.pending = Some(event);
+                        self.phase = Phase::Array;
                     }
-                    Ok(Event::Complete) => {
-                        let bytes: &[u8] = if matches!(self.phase, Phase::First) {
-                            b"[]"
-                        } else {
-                            b"]"
-                        };
-                        self.stage(now, bytes, Phase::Done)?;
-                    }
-                    Err(error) if error == K::MALFORMED && matches!(self.phase, Phase::First) => {
+                    Err(error) if error == K::MALFORMED => {
                         let Owner::Convert(cursor) =
                             std::mem::replace(&mut self.owner, Owner::Retired)
                         else {
@@ -234,34 +236,34 @@ impl<K: Kind> Source<'_, '_, K> {
                         let (work, budget) =
                             K::finish_malformed(cursor).map_err(Into::<Error>::into)?;
                         self.owner = Owner::Budgets(work, budget);
-                        self.stage(now, b"null", Phase::Done)?;
+                        self.stage_null(now)?;
                     }
                     Err(error) => return Err(error.into()),
                     Ok(Event::Scalar(_) | Event::End) => return Err(Error::InvalidState),
                 }
             }
-            Phase::ItemStart => {
-                *frame = Frame::new();
-                self.phase = Phase::Item;
-            }
-            Phase::Item => {
+            Phase::Array => {
                 let Owner::Convert(cursor) = &mut self.owner else {
                     return Err(Error::InvalidState);
                 };
-                let progress = frame
-                    .poll(&mut Item::<K>(cursor), now, output)
-                    .map_err(Error::Json)?;
+                let progress = self
+                    .array
+                    .poll(
+                        &mut ArraySource::<K> {
+                            cursor,
+                            pending: &mut self.pending,
+                        },
+                        now,
+                        output,
+                    )
+                    .map_err(array_error)?;
                 if progress.status == Status::Complete {
-                    self.phase = Phase::Between;
+                    self.phase = Phase::Done;
                 }
-                return Ok(Progress {
-                    written: progress.written,
-                    status: Status::Yield,
-                });
+                return Ok(progress);
             }
-            Phase::Drain => {
-                let count = self
-                    .used
+            Phase::NullDrain => {
+                let count = 4usize
                     .checked_sub(self.position)
                     .ok_or(Error::InvalidState)?
                     .min(output.len());
@@ -272,14 +274,10 @@ impl<K: Kind> Source<'_, '_, K> {
                 output
                     .get_mut(..count)
                     .ok_or(Error::InvalidState)?
-                    .copy_from_slice(
-                        self.bytes
-                            .get(self.position..end)
-                            .ok_or(Error::InvalidState)?,
-                    );
+                    .copy_from_slice(b"null".get(self.position..end).ok_or(Error::InvalidState)?);
                 self.position = end;
-                if end == self.used {
-                    self.phase = self.next;
+                if end == 4 {
+                    self.phase = Phase::Done;
                 }
                 return Ok(Progress {
                     written: count,
@@ -323,39 +321,109 @@ mod tests {
         )
     }
     #[test]
-    fn source_handoff_requires_complete_drained_value() {
-        for (bytes, target) in [
-            (b"<a@b>".as_slice(), Phase::First),
-            (b"<a@b>", Phase::Drain),
-            (b"<a@b>", Phase::Item),
-            (b"<a@b>", Phase::Between),
-            (b"bad", Phase::Drain),
-        ] {
-            let mut work = work();
-            let mut budget = HeaderBudget::new();
-            let mut source = IdsMode::start(bytes, &mut work, &mut budget, Mode::Strict);
-            let mut frame = Frame::new();
-            let mut reached = false;
-            for _ in 0..1000 {
-                if std::mem::discriminant(&source.phase) == std::mem::discriminant(&target) {
-                    reached = true;
-                    break;
-                }
-                IdsMode::poll(&mut source, &mut frame, Tick(1), &mut [0; 1]).unwrap();
-            }
-            assert!(reached);
-            if bytes == b"bad" {
-                assert!(matches!(source.owner, Owner::Budgets(_, _)));
+    fn shared_roles_preserve_mail_error_contexts() {
+        use crate::{admission::work::Stop, header_urls};
+        use td_json::string_array::{Error as Shared, Role};
+        let ids = ids::Error::Work(Stop::OutputBytes);
+        let urls = header_urls::Error::Work(Stop::OutputBytes);
+        assert_eq!(contextual::<Ids>(ids, Role::Array), Error::MessageIds(ids));
+        assert_eq!(
+            contextual::<Ids>(ids, Role::String),
+            Error::Json(ids.into())
+        );
+        assert_eq!(contextual::<Urls>(urls, Role::Array), Error::URLs(urls));
+        assert_eq!(
+            contextual::<Urls>(urls, Role::String),
+            Error::Json(urls.into())
+        );
+        fn charged<K: Kind>(bytes: &[u8], mode: K::Mode, expected: [Error; 2]) {
+            for (role, expected) in [Role::Array, Role::String].into_iter().zip(expected) {
+                let mut work = work();
+                let remaining = work.remaining();
+                work = Meter::new(
+                    Deadline::after(Tick(0), 100).unwrap(),
+                    Charge {
+                        output_bytes: 0,
+                        ..remaining
+                    },
+                );
+                let mut budget = HeaderBudget::new();
+                let mut cursor = K::start(bytes, mode, &mut work, &mut budget);
+                let mut pending = None;
+                let mut source = ArraySource::<K> {
+                    cursor: &mut cursor,
+                    pending: &mut pending,
+                };
                 assert_eq!(
-                    IdsMode::poll(&mut source, &mut frame, Tick(1), &mut [0; 1])
-                        .unwrap()
-                        .written,
-                    1
+                    td_json::string_array::Source::charge_output(&mut source, Tick(1), 1, role),
+                    Err(expected)
                 );
             }
-            assert!(matches!(IdsMode::finish(source), Err(Error::InvalidState)));
+        }
+        charged::<Ids>(
+            b"<a@b>",
+            Mode::Strict,
+            [Error::MessageIds(ids), Error::Json(ids.into())],
+        );
+        charged::<Urls>(
+            b"<x:a>",
+            header_urls::Mode::URLs,
+            [Error::URLs(urls), Error::Json(urls.into())],
+        );
+        assert_eq!(
+            array_error(Shared::InvalidState(Role::Array)),
+            Error::InvalidState
+        );
+        assert_eq!(
+            array_error(Shared::InvalidState(Role::String)),
+            Error::Json(crate::json_string::Error::InvalidState)
+        );
+    }
+    #[test]
+    fn source_handoff_requires_complete_drained_value() {
+        for (bytes, mode) in [
+            (b"<a@b>".as_slice(), Mode::Strict),
+            (b"<a@b><c@d>", Mode::Strict),
+            (b"", Mode::Strict),
+            (b"bad", Mode::Strict),
+            (b"<a@b><c@d>", Mode::ObsoletePhrases),
+        ] {
+            let mut baseline_work = work();
+            let mut baseline_budget = HeaderBudget::new();
+            let mut source = IdsMode::start(bytes, &mut baseline_work, &mut baseline_budget, mode);
+            let mut frame = Frame::new();
+            let turns = (1..1000)
+                .find(|_| {
+                    IdsMode::poll(&mut source, &mut frame, Tick(1), &mut [0; 1])
+                        .unwrap()
+                        .status
+                        == Status::Complete
+                })
+                .unwrap();
+            IdsMode::finish(source).unwrap();
+            for cut in 0..=turns {
+                let mut work = work();
+                let mut budget = HeaderBudget::new();
+                let identity = (std::ptr::from_ref(&work), std::ptr::from_ref(&budget));
+                let mut source = IdsMode::start(bytes, &mut work, &mut budget, mode);
+                let mut frame = Frame::new();
+                for _ in 0..cut {
+                    IdsMode::poll(&mut source, &mut frame, Tick(1), &mut [0; 1]).unwrap();
+                }
+                if cut < turns {
+                    assert!(matches!(IdsMode::finish(source), Err(Error::InvalidState)));
+                } else {
+                    let (work, budget, returned_mode) = IdsMode::finish(source).unwrap();
+                    assert_eq!(
+                        (std::ptr::from_ref(&*work), std::ptr::from_ref(&*budget)),
+                        identity
+                    );
+                    assert_eq!(returned_mode, mode);
+                }
+            }
         }
     }
+
     #[test]
     fn converter_handoff_separates_malformed_from_partial_failed_and_complete() {
         let mut work = work();
@@ -453,7 +521,7 @@ mod tests {
         let mut frame = Frame::new();
         for _ in 0..1000 {
             UrlsMode::poll(&mut source, &mut frame, Tick(1), &mut [0; 1]).unwrap();
-            if matches!(source.phase, Phase::Drain) {
+            if matches!(source.phase, Phase::NullDrain) {
                 break;
             }
         }

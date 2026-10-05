@@ -497,6 +497,13 @@ sequence. Premature JSON finish and child source-state refusal retain their
 distinct outer/source error contexts. Future metadata composition must adapt
 those contexts explicitly rather than silently flattening them.
 
+M06cx extracts generic string-array framing into std-only td-json and
+atomically replaces the mail MessageIds/URLs framing mechanism. Mail retains
+whole-field validation before array output, mode/null policy, original
+admission owners and contextual errors. Shared punctuation and string
+escaping retain fixed paid progress without retaining values or granting
+source/publication authority. Content-Language binding remains separate.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

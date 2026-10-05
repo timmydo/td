@@ -41,6 +41,7 @@
 )]
 
 pub mod string;
+pub mod string_array;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};

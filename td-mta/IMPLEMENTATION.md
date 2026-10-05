@@ -1983,6 +1983,14 @@ Initial independently landable increments:
   mapping, location, part/response composition and worker/native/RSS remain
   open.
 
+- **M06cx — shared bounded string arrays:** extract array punctuation and
+  nested string framing into std-only td-json, atomically migrating existing
+  MessageIds/URLs property coordinators. Keep complete grammar validation,
+  modes, null mapping, original budgets, diagnostics and typed error contexts
+  in mail. Qualify short drains, protocol/source/admission refusal, original
+  consuming handoff and existing allocation/resource ceilings. Language JSON
+  and MIME metadata/response publication remain subsequent work.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

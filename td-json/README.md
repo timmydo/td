@@ -43,6 +43,45 @@ source yields, empty output, exact charges, partial output allowances,
 independent error latching and final admission. td-mta separately qualifies
 its budget adapters, fixed memory ceilings and allocation-free composed paths.
 
+## Incremental string arrays
+
+`string_array::Frame<E>` composes the same string framer with bounded array
+punctuation. Its `Source` emits `Begin`, zero or more `Scalar(char)` events,
+then `End` for each string, and `Complete` for the whole array. `Yield` may
+occur between events. Empty arrays and empty strings are supported. The frame
+rejects scalars/end outside a string, nested begin, and whole-array completion
+inside an unfinished string, retiring the complete result.
+
+Array punctuation and per-string work carry an explicit `Role` into source
+callbacks, so consumers can preserve contextual error policy while sharing
+one original source and admission owner. A role is no new allowance or source.
+
+One poll advances at most one source poll, one shared string turn, or one
+punctuation byte. Quotes, commas and brackets spend exact serialized-length
+output admission before copying; short drains do not repay them. Empty output
+performs fresh admission without advancing input. Cached `Complete` is inert;
+`check_admission` performs the final live check and can retire completion.
+`is_complete` is false after every refusal. Later polls/checks return the
+same sticky error without consulting the source. Source and admission errors
+retain their original typed cause; protocol errors use `InvalidState(Role)` to preserve their context.
+
+Keep one logical source and policy attached across all strings and final
+admission. The frame owns one optional fixed string frame, phase, first-item
+flag and sticky error; it allocates no value/list storage. Size depends on
+error/target layout. A small-error fixture pins the frame within 96 bytes;
+that is not a bound on arbitrary caller error types. Per-string frames restart
+only after a balanced end and complete serialization of that string. All
+array bytes remain provisional through whole-array completion and final live
+admission; source bounds, source identity, retention and atomic publication
+remain caller responsibilities. No normalization or character filtering is
+added to ordinary JSON escaping.
+
+Fixtures check literal arrays, empty/multiple strings, selected Unicode and
+control escapes, short/empty drains, exact charges, malformed event sequences,
+every output/source/admission cut, mid-string yields, callback roles and
+fresh retirement at every progress cut.
+They reuse the shared scalar escaper rather than adding another serializer.
+
 ## Build policy
 
 The mail portable build pins this crate's manifest and lock in
