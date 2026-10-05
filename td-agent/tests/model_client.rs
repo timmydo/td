@@ -1856,6 +1856,78 @@ fn a_checkout_done_while_idle_wakes_its_conversation() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A call into a worktree that could not be prepared is refused with
+/// its state before any card is asked: here a command with no directory,
+/// which runs in the first worktree (DESIGN.md §7).
+#[test]
+fn a_call_into_a_worktree_not_prepared_is_told_so_without_a_card() {
+    let base = std::env::temp_dir().join(format!(
+        "td-agent-model-unready-{}-{}",
+        std::process::id(),
+        td_agent::store::random_hex(4).unwrap()
+    ));
+    let template = td_agent::config::Template {
+        name: "td".into(),
+        repos: vec![td_agent::config::Repo {
+            remote: "https://example.org/a/td".into(),
+            base: "main".into(),
+            branch: "agent".into(),
+            sparse: None,
+        }],
+        shared: None,
+    };
+    let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
+    let made = td_agent::workspace::repositories(
+        &template,
+        &Id::random().unwrap(),
+        &base.join("data"),
+        &base.join("trees"),
+        &admitted,
+        0,
+    )
+    .unwrap();
+    let checkout = made.entries[0].checkout.display().to_string();
+    let argument = td_agent::workspace::Workspace::Repositories(made).argument();
+    let mut h = Harness::new_in(
+        "unready",
+        Role::Conversation,
+        Some(argument.to_str().unwrap()),
+        false,
+        vec![
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    while !matches!(h.next(), Up::Fetch { .. }) {}
+    h.setup(Client::default());
+    h.down(&Down::Fetched {
+        remote: "https://example.org/a/td".into(),
+        result: Err("the remote is not admitted".into()),
+    });
+    h.say("Tidy the notes.");
+    // Any card would stop the turn here, unanswered.
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let results = results(&events);
+    assert_eq!(results.len(), 2, "{results:?}");
+    let shell = &results[1];
+    assert!(
+        shell.2
+            && shell.1 == format!(
+                "error: {checkout} could not be prepared; td-agent tries again when this conversation is next opened"
+            ),
+        "{results:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, Kind::Approval { .. })),
+        "{events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A command the person allows runs in the conversation's jail, in its
 /// scratch workspace, and a search runs there without asking.
 #[test]

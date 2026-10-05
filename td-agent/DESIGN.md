@@ -1959,6 +1959,25 @@ window shows too (§3, Notifications). A jail instance binds a worktree
 only once it is ready; the long-lived file-tool instance is replaced
 whenever the set of ready worktrees changes.
 
+**As built (increment 11, a call told a worktree's state).** Before
+any card is asked, a workspace tool's call is refused when an
+absolute path it names, or the working directory it runs in when it
+names none (`shell` without `workdir`, `glob` and `grep` without
+`path`), is in a worktree not prepared: `<checkout> is still being
+checked out; td-agent tells you when it is ready` while the process
+is waiting for its store or checking it out, else `<checkout> could
+not be prepared; td-agent tries again when this conversation is next
+opened`, which is when its process next starts (a conversation left
+while its process works on keeps it). A path is judged as written,
+`.` and `..` taken lexically, against each worktree's checkout by
+whole components; a relative path is left to the tool host, which
+refuses every one (§8). The jail refuses such a call anyway; this
+says why, and asks the person nothing about a call that cannot run.
+What a command reaches by itself, outside its working directory, is
+still the jail's to refuse. A checkout that ends during a step's calls
+is taken up before the next request, so a later call in that step is
+still told it is checking out.
+
 **Keeping current.** The git worker fetches each store remote in the
 background every `fetch_interval` (default ten minutes) and on demand
 (`git_fetch` from a workspace's conversation, §9). It then updates each
@@ -2153,14 +2172,16 @@ worktree not yet ready is refused as outside the tool host's roots,
 and one that names no directory while the first worktree is not ready
 is refused (the tool host is told its working directory,
 `--directory`, rather than taking its first root), never run in
-another root. The prefix names every worktree with its remote, branch,
+another root; the conversation says so first, naming the worktree's
+state (As built (increment 11, a call told a worktree's state)). The prefix names every worktree with its remote, branch,
 base and paths whether or not it is ready, so it holds while they
 prepare. The first turn waits for each store's answer, which carries
 the project instructions (§13, As built (increment 11, project
 instructions)); the checkout then runs on a thread of its own, and its
 news wakes an idle conversation (As built (increment 11, asynchronous
-preparation)). Rules from the base, and a tool call into a worktree
-still checking out told so, are later steps (the background fetch,
+preparation)), and a call into a worktree not ready is told its state
+(As built (increment 11, a call told a worktree's state)). Rules from
+the base are a later step (the background fetch,
 the remote-tracking refs and the notifications are As built
 (increment 11, background fetch), (increment 11, remote-tracking
 refs) and (increment 11, notifications)). Deleting the conversation removes its
@@ -4527,6 +4548,15 @@ thread answering a refresh for the window with its bases;
 remotes only, each once with its bases once, none whose fetch is
 pending, and a base moving only from a commit known before; the store
 thread's queue a preparation before queued background fetches.
+For a call told a worktree's state, `src/conversation.rs` covers a
+read into a worktree still checking out, a command in a ready first
+worktree and a path outside every worktree passing, a path climbing
+through `..` into a worktree not ready, a relative path left to the
+tool host, a command with no directory while the first could not be
+prepared, a `sed` naming one such path among others, and every
+worktree ready;
+`tests/model_client.rs` a command with no directory refused so, with
+no card, in a turn.
 For the asynchronous preparation, `tests/model_client.rs` covers a
 checkout's news, idle, waking nothing before the person has written;
 then a refused store's news and a checkout's each waking a turn of its

@@ -1785,6 +1785,24 @@ impl Session {
         if self.conversation.meta().removed {
             return failed(WORKSPACE_GONE.into());
         }
+        // Before any card: the person is not asked about a call that
+        // cannot run yet.
+        if let Some(Workspace::Repositories(repositories)) = &self.conversation.meta().workspace {
+            let pending: Vec<&str> = self
+                .checking
+                .iter()
+                .chain(&self.awaiting)
+                .map(String::as_str)
+                .collect();
+            if let Some(why) = unready(
+                repositories,
+                &self.conversation.meta().prepared,
+                &pending,
+                &call,
+            ) {
+                return failed(why);
+            }
+        }
         if acts {
             let (title, details) = tools::card(&call);
             match self.decide(started, title, details)? {
@@ -2671,6 +2689,66 @@ fn post(
     )
 }
 
+/// Why `call` cannot run yet: it names a path in a worktree not ready,
+/// or, by naming no directory, runs in the first worktree while that is
+/// not, said with that worktree's state, one whose remote is `pending`
+/// still checking out and any other not prepared (DESIGN.md §7). The
+/// jail refuses such a call anyway; this says why. A relative path is
+/// the tool host's to refuse, as it does every one (§8), and what a
+/// command reaches by itself the jail's.
+fn unready(
+    repositories: &crate::workspace::Repositories,
+    prepared: &[PathBuf],
+    pending: &[&str],
+    call: &host::Call,
+) -> Option<String> {
+    let first = repositories.entries.first()?;
+    let named: Vec<Option<&str>> = match call {
+        host::Call::Read { path, .. }
+        | host::Call::Write { path, .. }
+        | host::Call::Edit { path, .. } => vec![Some(path.as_str())],
+        host::Call::Glob { path, .. } | host::Call::Grep { path, .. } => vec![path.as_deref()],
+        host::Call::Shell { workdir, .. } => vec![workdir.as_deref()],
+        host::Call::Sed { paths, .. } => paths.iter().map(|path| Some(path.as_str())).collect(),
+    };
+    named.into_iter().find_map(|path| {
+        let at = match path.map(Path::new) {
+            Some(path) if path.is_absolute() => lexical(path),
+            Some(_) => return None,
+            None => first.checkout.clone(),
+        };
+        let entry = repositories
+            .entries
+            .iter()
+            .find(|entry| at.starts_with(&entry.checkout))?;
+        if prepared.contains(&entry.repository) {
+            return None;
+        }
+        let state = if pending.contains(&entry.remote.as_str()) {
+            "is still being checked out; td-agent tells you when it is ready"
+        } else {
+            "could not be prepared; td-agent tries again when this conversation is next opened"
+        };
+        Some(format!("{} {state}", entry.checkout.display()))
+    })
+}
+
+/// `path` with each `.` dropped and each `..` taking the name before it,
+/// as written, without asking the file system.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// A repository's checkout, run on a thread of its own: owned, so it holds
 /// nothing of the conversation's (DESIGN.md §7).
 struct Checkout {
@@ -2808,6 +2886,100 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
     use crate::store::tests::Scratch;
+
+    /// A call into a worktree not ready is refused with its state; one
+    /// ready, or outside every worktree, is the jail's to judge.
+    #[test]
+    fn a_call_into_a_worktree_not_ready_is_told_its_state() {
+        let template = crate::config::Template {
+            name: "td".into(),
+            repos: vec![
+                crate::config::Repo {
+                    remote: "https://example.org/a/td".into(),
+                    base: "main".into(),
+                    branch: "agent".into(),
+                    sparse: None,
+                },
+                crate::config::Repo {
+                    remote: "https://example.org/a/docs".into(),
+                    base: "main".into(),
+                    branch: "agent".into(),
+                    sparse: None,
+                },
+            ],
+            shared: None,
+        };
+        let admitted = [crate::git::Admission::parse("example.org").unwrap()];
+        let made = crate::workspace::repositories(
+            &template,
+            &Id::random().unwrap(),
+            Path::new("/data"),
+            Path::new("/trees"),
+            &admitted,
+            0,
+        )
+        .unwrap();
+        let (td, docs) = (made.entries.first().unwrap(), made.entries.get(1).unwrap());
+        let read = |path: &str| host::Call::Read {
+            path: path.into(),
+            offset: None,
+            limit: None,
+        };
+        let shell = |workdir: Option<&str>| host::Call::Shell {
+            command: "make".into(),
+            timeout_ms: None,
+            workdir: workdir.map(String::from),
+        };
+        let docs_file = docs.checkout.join("a").display().to_string();
+        let none: [&str; 0] = [];
+        // td ready, docs still checking out.
+        let prepared = [td.repository.clone()];
+        let pending = ["https://example.org/a/docs"];
+        let said = unready(&made, &prepared, &pending, &read(&docs_file)).unwrap();
+        assert!(
+            said.starts_with(&docs.checkout.display().to_string()),
+            "{said}"
+        );
+        assert!(said.contains("is still being checked out"), "{said}");
+        assert_eq!(unready(&made, &prepared, &pending, &shell(None)), None);
+        assert_eq!(
+            unready(&made, &prepared, &pending, &read("src/main.rs")),
+            None
+        );
+        assert_eq!(
+            unready(&made, &prepared, &pending, &read("/elsewhere/x")),
+            None
+        );
+        // A path climbing out of the first into docs.
+        let climbing = format!(
+            "{}/../{}/a",
+            td.checkout.display(),
+            docs.checkout.file_name().unwrap().to_str().unwrap()
+        );
+        assert!(unready(&made, &prepared, &pending, &read(&climbing)).is_some());
+        // A relative path is the tool host's to refuse, whatever is ready.
+        assert_eq!(unready(&made, &[], &none, &read("src/main.rs")), None);
+        // Neither ready, nothing pending: the first named for a call with
+        // no directory, as failed.
+        let said = unready(&made, &[], &none, &shell(None)).unwrap();
+        assert!(
+            said.starts_with(&td.checkout.display().to_string()),
+            "{said}"
+        );
+        assert!(said.contains("could not be prepared"), "{said}");
+        let sed = host::Call::Sed {
+            script: "p".into(),
+            paths: vec!["/elsewhere/x".into(), docs_file.clone()],
+            extended: false,
+        };
+        assert!(unready(&made, &prepared, &none, &sed)
+            .unwrap()
+            .contains("could not be prepared"));
+        // Both ready: nothing to say.
+        let both = [td.repository.clone(), docs.repository.clone()];
+        assert_eq!(unready(&made, &both, &none, &read(&docs_file)), None);
+        assert_eq!(lexical(Path::new("/a/./b/../c")), PathBuf::from("/a/c"));
+    }
 
     #[test]
     fn a_reason_is_quoted_on_one_bounded_line() {
