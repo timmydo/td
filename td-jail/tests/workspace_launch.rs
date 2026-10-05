@@ -59,7 +59,7 @@ fn prepare_with(name: &str, entry: Option<&Path>) -> Result<(PathBuf, PathBuf), 
     fs::write(
         &spec,
         format!(
-            "format=1\nentry={}\nhome={}\nworktree={}\nread={}\n",
+            "format=1\nentry={}\npath=/usr\nhome={}\nworktree={}\nread={}\n",
             entry.display(),
             base.join("home").display(),
             base.join("tree").display(),
@@ -97,6 +97,8 @@ fn a_workspace_launch_is_confined_and_speaks_on_its_channel() -> Result<(), Box<
         format!("cwd={}", base.join("tree").display()),
         "worktree=writable".into(),
         "home=writable".into(),
+        // The spec's path directory first, then the fixed list.
+        "path=/usr:/usr/local/bin:/usr/bin:/bin:".into(),
         "shared=read-only".into(),
         "usr=read-only".into(),
         "tmp=ran".into(),

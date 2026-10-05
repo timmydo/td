@@ -44,6 +44,51 @@ pub struct Programs {
     pub txt: PathBuf,
 }
 
+/// The host trees td-jail binds into every instance (APPLICATIONS.md §C,
+/// the `workspace` kind), which a `PATH` directory must resolve into.
+const SYSTEM_TREES: &[&str] = &[
+    "/bin", "/gnu", "/lib", "/lib32", "/lib64", "/libx32", "/nix", "/sbin", "/usr",
+];
+
+/// The most `PATH` directories named to td-jail, which refuses more.
+const MAX_PATH_DIRECTORIES: usize = 16;
+
+/// This process's `PATH` as `system_path` keeps it, resolved at each
+/// launch, so a profile changed or collected since is followed.
+fn host_path() -> Vec<PathBuf> {
+    system_path(std::env::var_os("PATH").as_deref())
+}
+
+/// `path`'s directories as they resolve, those inside a tree every
+/// instance binds, each once, in order, at most `MAX_PATH_DIRECTORIES`:
+/// so a host whose tools are in a profile under the home, as Guix's and
+/// Nix's are, finds them in the instance by name, where they lie in its
+/// store. Nothing is bound for them; they are bound already.
+pub fn system_path(path: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    for directory in path.map(std::env::split_paths).into_iter().flatten() {
+        if found.len() == MAX_PATH_DIRECTORIES {
+            break;
+        }
+        let Ok(resolved) = fs::canonicalize(&directory) else {
+            continue;
+        };
+        let inside = SYSTEM_TREES.iter().any(|tree| resolved.starts_with(tree));
+        let named = resolved
+            .to_str()
+            .is_some_and(|name| !name.contains([':', '\n', '\r']));
+        if directory.is_absolute()
+            && inside
+            && named
+            && resolved.is_dir()
+            && !found.contains(&resolved)
+        {
+            found.push(resolved);
+        }
+    }
+    found
+}
+
 impl Programs {
     /// From `./agent`'s variables, with this program as the entry.
     pub fn from_env() -> Result<Self, String> {
@@ -149,8 +194,9 @@ impl Policy {
     }
 }
 
-/// The spec's text: td-jail's exact, ordered keyfile.
-pub fn spec_text(programs: &Programs, policy: &Policy) -> Result<String, String> {
+/// The spec's text: td-jail's exact, ordered keyfile, with `path` the
+/// directories put first on the instance's `PATH`.
+pub fn spec_text(programs: &Programs, policy: &Policy, path: &[PathBuf]) -> Result<String, String> {
     let mut text = String::from("format=1\n");
     let mut line = |key: &str, path: &Path| -> Result<(), String> {
         let value = path
@@ -165,6 +211,9 @@ pub fn spec_text(programs: &Programs, policy: &Policy) -> Result<String, String>
     };
     line("entry", &programs.agent)?;
     line("program", &programs.txt)?;
+    for directory in path {
+        line("path", directory)?;
+    }
     line("home", &policy.home)?;
     for tree in &policy.worktrees {
         line("worktree", tree)?;
@@ -219,7 +268,7 @@ pub fn launch(programs: &Programs, policy: &Policy, spec_dir: &Path) -> Result<C
         home: private_dir(&policy.home)?,
         ..policy.clone()
     };
-    let spec = write_spec(spec_dir, &spec_text(programs, &policy)?)?;
+    let spec = write_spec(spec_dir, &spec_text(programs, &policy, &host_path())?)?;
     let launched = start(programs, &policy, &spec);
     if launched.is_err() {
         let _ = fs::remove_file(&spec);
@@ -285,7 +334,7 @@ pub fn maintain(
         home: private_dir(&policy.home)?,
         ..policy.clone()
     };
-    let spec = write_spec(spec_dir, &spec_text(programs, &policy)?)?;
+    let spec = write_spec(spec_dir, &spec_text(programs, &policy, &host_path())?)?;
     let answered = run_maintenance(programs, &spec, task, time);
     let _ = fs::remove_file(&spec);
     answered
@@ -467,9 +516,9 @@ mod tests {
             write: vec!["/e".into()],
         };
         assert_eq!(
-            spec_text(&programs(), &policy).unwrap(),
+            spec_text(&programs(), &policy, &["/gnu/store/x-profile/bin".into()]).unwrap(),
             "format=1\nentry=/w/target/td-agent\nprogram=/w/target/td-txt\n\
-             home=/s/jail/a/home\nworktree=/w/a\nworktree=/w/b\ncheckout=/t/r\n\
+             path=/gnu/store/x-profile/bin\nhome=/s/jail/a/home\nworktree=/w/a\nworktree=/w/b\ncheckout=/t/r\n\
              repository=/ws/r.git\nread=/store/r.git/objects\nread=/d\nwrite=/e\n"
         );
         // Neither a repository nor the store is the tool host's to act in.
@@ -489,8 +538,35 @@ mod tests {
                 worktrees: vec![bad.into()],
                 ..Policy::default()
             };
-            assert!(spec_text(&programs(), &policy).is_err(), "{bad:?}");
+            assert!(spec_text(&programs(), &policy, &[]).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_path_named_is_the_hosts_as_it_resolves_into_a_bound_tree() {
+        let scratch = crate::store::tests::Scratch::new("system-path");
+        let link = scratch.0.join("profile-bin");
+        std::os::unix::fs::symlink("/usr", &link).unwrap();
+        let file = scratch.0.join("file");
+        fs::write(&file, "").unwrap();
+        let path = std::env::join_paths([
+            link.as_path(),
+            scratch.0.as_path(),
+            Path::new("/usr"),
+            Path::new("usr"),
+            Path::new("/usr/no-such-directory-here"),
+            file.as_path(),
+        ])
+        .unwrap();
+        // The link as it resolves, once; a directory outside the bound
+        // trees, a relative one, one missing and a file left out.
+        assert_eq!(system_path(Some(&path)), [PathBuf::from("/usr")]);
+        assert!(system_path(None).is_empty());
+        let many = std::env::join_paths(
+            std::iter::repeat_n(link.as_path(), 2).chain(std::iter::once(Path::new("/usr"))),
+        )
+        .unwrap();
+        assert_eq!(system_path(Some(&many)).len(), 1);
     }
 
     #[test]

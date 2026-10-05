@@ -14,6 +14,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -25,10 +26,10 @@ use crate::authority::{
 pub(crate) const WORKSPACE_ARG: &str = "--workspace";
 /// Where the spec's programs are bound, each under its own file name.
 pub(crate) const PROGRAM_DIR: &str = "/opt/workspace/bin";
-/// The entry's `PATH`, `TMPDIR` and `LANG`; `HOME` is the spec's home.
-/// The system profiles of store-based hosts (Guix, NixOS) follow the
-/// ordinary directories; on another host they are absent and cost a
-/// lookup.
+/// The entry's `PATH`, after the spec's own directories, and its
+/// `TMPDIR` and `LANG`; `HOME` is the spec's home. The system profiles
+/// of store-based hosts (Guix, NixOS) follow the ordinary directories;
+/// on another host they are absent and cost a lookup.
 pub(crate) const PATH: &str =
     "/usr/local/bin:/usr/bin:/bin:/run/current-system/profile/bin:/run/current-system/sw/bin";
 pub(crate) const TMPDIR: &str = "/tmp";
@@ -86,6 +87,8 @@ const UNIX_CONNECTED: &str = "03";
 const MAX_SPEC_BYTES: u64 = 64 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 pub(crate) const MAX_PROGRAMS: usize = 4;
+/// The most `path` directories a spec names.
+pub(crate) const MAX_PATH_DIRECTORIES: usize = 16;
 pub(crate) const MAX_TREES: usize = 32;
 /// The most mounts the git chains add, past the directories: a
 /// repository takes 11 and 4 for each of at most `MAX_TREES` linked
@@ -152,6 +155,9 @@ pub(crate) struct WorkspacePlan {
     pub(crate) gid: u32,
     /// The first program, which is the entry.
     pub(crate) programs: Vec<Program>,
+    /// Directories of the bound system trees put first on the entry's
+    /// `PATH`, in order.
+    pub(crate) path: Vec<PathBuf>,
     /// Read-write, not executable.
     pub(crate) home: FilesystemGrant,
     /// Read-write and executable: what the tools build and run. A
@@ -177,15 +183,32 @@ impl WorkspacePlan {
     }
 }
 
-/// The entry's whole environment.
-pub(crate) fn environment(home: &Path) -> Vec<(OsString, OsString)> {
+/// The entry's whole environment: `path` first on its `PATH`.
+pub(crate) fn environment(home: &Path, path: &[PathBuf]) -> Vec<(OsString, OsString)> {
+    let mut search = OsString::new();
+    for directory in path {
+        search.push(directory.as_os_str());
+        search.push(":");
+    }
+    search.push(PATH);
     vec![
         ("HOME".into(), home.as_os_str().to_os_string()),
         ("LANG".into(), LANG.into()),
-        ("PATH".into(), PATH.into()),
+        ("PATH".into(), search),
         ("TERM".into(), TERM.into()),
         ("TMPDIR".into(), TMPDIR.into()),
     ]
+}
+
+/// Whether `path` may be one of the entry's `PATH` directories, by its
+/// name: absolute and canonical in spelling, inside one of the system
+/// trees every instance binds, and holding no `:`, which would split it.
+pub(crate) fn path_directory_named(path: &Path) -> bool {
+    authority::validate_filesystem_target(path).is_ok()
+        && !path.as_os_str().as_bytes().contains(&b':')
+        && SYSTEM_TREES
+            .iter()
+            .any(|tree| path_is_same_or_child(path, &Path::new("/").join(tree)))
 }
 
 pub(crate) fn is_workspace_argument(argument: &OsStr) -> bool {
@@ -196,6 +219,7 @@ pub(crate) fn is_workspace_argument(argument: &OsStr) -> bool {
 #[derive(Debug, Default, Eq, PartialEq)]
 struct Spec {
     programs: Vec<PathBuf>,
+    path: Vec<PathBuf>,
     home: PathBuf,
     worktrees: Vec<PathBuf>,
     checkouts: Vec<PathBuf>,
@@ -204,9 +228,9 @@ struct Spec {
     write: Vec<PathBuf>,
 }
 
-/// The exact, ordered keyfile: `format=1`, one `entry`, any `program`s,
-/// one `home`, then any `worktree`, `checkout`, `repository`, `read` and
-/// `write` lines, each group in that order.
+/// The exact, ordered keyfile: `format=1`, one `entry`, any `program`s
+/// and `path` directories, one `home`, then any `worktree`, `checkout`,
+/// `repository`, `read` and `write` lines, each group in that order.
 fn parse_spec(text: &str) -> io::Result<Spec> {
     let mut lines = text.lines();
     if lines.next() != Some(FORMAT_LINE) {
@@ -215,6 +239,7 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
     const ORDER: &[&str] = &[
         "entry",
         "program",
+        "path",
         "home",
         "worktree",
         "checkout",
@@ -249,6 +274,7 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
             }
             "program" if entry => spec.programs.push(path),
             "program" => return Err(invalid("workspace spec names a program before its entry")),
+            "path" => spec.path.push(path),
             "home" => home = Some(path),
             "worktree" => spec.worktrees.push(path),
             "checkout" => spec.checkouts.push(path),
@@ -261,6 +287,11 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
         return Err(invalid("workspace spec names no entry"));
     }
     spec.home = home.ok_or_else(|| invalid("workspace spec names no home"))?;
+    if spec.path.len() > MAX_PATH_DIRECTORIES {
+        return Err(invalid(format!(
+            "workspace spec names more than {MAX_PATH_DIRECTORIES} path directories"
+        )));
+    }
     if spec.programs.len() > MAX_PROGRAMS {
         return Err(invalid(format!(
             "workspace spec names more than {MAX_PROGRAMS} programs"
@@ -372,6 +403,17 @@ fn admit(
         }
         programs.push(program);
     }
+    let mut path: Vec<PathBuf> = Vec::new();
+    for directory in spec.path {
+        admit_path_directory(&directory)?;
+        if path.contains(&directory) {
+            return Err(invalid(format!(
+                "workspace path directory {} is named twice",
+                directory.display()
+            )));
+        }
+        path.push(directory);
+    }
     let home = admit_directory(&spec.home, false)?;
     let home_metadata = fs::symlink_metadata(&spec.home)?;
     if home_metadata.uid() != uid || home_metadata.permissions().mode() & 0o777 != 0o700 {
@@ -425,6 +467,7 @@ fn admit(
     }
     check_plan_bytes(
         std::iter::once(&spec.home)
+            .chain(&path)
             .chain(&spec.worktrees)
             .chain(&spec.checkouts)
             .chain(&spec.repositories)
@@ -541,6 +584,7 @@ fn admit(
         uid,
         gid,
         programs,
+        path,
         home,
         worktrees,
         repositories,
@@ -548,6 +592,31 @@ fn admit(
         shared,
         arguments,
     })
+}
+
+/// A `path` directory: named as one may be, and a directory there as it
+/// resolves, so what the entry searches is a bound tree's own, not a link
+/// out of it.
+fn admit_path_directory(directory: &Path) -> io::Result<()> {
+    if !path_directory_named(directory) {
+        return Err(invalid(format!(
+            "workspace path directory {} is not in a bound system tree",
+            directory.display()
+        )));
+    }
+    let resolved = fs::canonicalize(directory).map_err(|error| {
+        invalid(format!(
+            "workspace path directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+    if resolved != directory || !fs::metadata(directory)?.is_dir() {
+        return Err(invalid(format!(
+            "workspace path directory {} is not a directory as it resolves",
+            directory.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Refuses paths that would take more than `most` bytes of argv.
@@ -845,7 +914,22 @@ mod tests {
         .unwrap();
         assert_eq!(spec.checkouts, [PathBuf::from("/w/b")]);
         assert_eq!(spec.repositories, [PathBuf::from("/g/b.git")]);
+        let spec = parse_spec(
+            "format=1\nentry=/a\nprogram=/b\npath=/gnu/store/x/bin\npath=/usr/bin\nhome=/h\n",
+        )
+        .unwrap();
+        assert_eq!(
+            spec.path,
+            [PathBuf::from("/gnu/store/x/bin"), PathBuf::from("/usr/bin")]
+        );
+        let many: String = (0..=MAX_PATH_DIRECTORIES)
+            .map(|n| format!("path=/usr/{n}\n"))
+            .collect();
+        assert!(parse_spec(&format!("format=1\nentry=/a\n{many}home=/h\n")).is_err());
         for bad in [
+            "format=1\nentry=/a\nhome=/h\npath=/usr/bin\n",
+            "format=1\npath=/usr/bin\nentry=/a\nhome=/h\n",
+            "format=1\nentry=/a\npath=usr/bin\nhome=/h\n",
             "format=1\nentry=/a\nhome=/h\nrepository=/r\ncheckout=/c\n",
             "format=1\nentry=/a\nhome=/h\nread=/d\nrepository=/r\n",
             "format=1\nentry=/a\nhome=/h\ncheckout=/c\nworktree=/w\n",
@@ -932,6 +1016,7 @@ mod tests {
         let real_home = &[PathBuf::from("/nonexistent-td-jail-home")];
         let spec = |programs: &[&Path], home: &Path, worktrees: &[&Path], read: &[&Path]| Spec {
             programs: programs.iter().map(|path| path.to_path_buf()).collect(),
+            path: Vec::new(),
             home: home.to_path_buf(),
             worktrees: worktrees.iter().map(|path| path.to_path_buf()).collect(),
             checkouts: Vec::new(),
@@ -960,6 +1045,19 @@ mod tests {
         assert_eq!(plan.working_directory(), tree);
         assert!(plan.shared[0].read_only && !plan.home.read_only);
 
+        // Path directories, a bound system tree's own, in order, each once.
+        let mut searched = spec(&[&entry], &home, &[&tree], &[]);
+        searched.path = vec!["/usr".into()];
+        assert_eq!(admit_spec(searched).unwrap().path, [PathBuf::from("/usr")]);
+        for path in [
+            vec![PathBuf::from("/usr"), "/usr".into()],
+            vec![tree.clone()],
+            vec!["/usr/no-such-directory-here".into()],
+        ] {
+            let mut searched = spec(&[&entry], &home, &[&tree], &[]);
+            searched.path = path;
+            assert!(admit_spec(searched).is_err());
+        }
         // A home that others can enter.
         assert!(admit_spec(spec(&[&entry], &loose, &[&tree], &[])).is_err());
         // A program that cannot run, or is a directory.
@@ -1261,10 +1359,57 @@ mod tests {
     }
 
     #[test]
-    fn the_environment_is_fixed_but_for_home() {
-        let environment = environment(Path::new("/s/home"));
-        let keys: Vec<_> = environment.iter().map(|(key, _)| key.clone()).collect();
+    fn the_environment_is_fixed_but_for_home_and_path() {
+        let fixed = environment(Path::new("/s/home"), &[]);
+        let keys: Vec<_> = fixed.iter().map(|(key, _)| key.clone()).collect();
         assert_eq!(keys, ["HOME", "LANG", "PATH", "TERM", "TMPDIR"]);
-        assert_eq!(environment[0].1, "/s/home");
+        assert_eq!(fixed[0].1, "/s/home");
+        assert_eq!(fixed[2].1, PATH);
+        let searched = environment(
+            Path::new("/s/home"),
+            &["/gnu/store/x-profile/bin".into(), "/usr/local/sbin".into()],
+        );
+        assert_eq!(
+            searched[2].1,
+            OsString::from(format!("/gnu/store/x-profile/bin:/usr/local/sbin:{PATH}"))
+        );
+    }
+
+    #[test]
+    fn a_path_directory_is_a_bound_system_trees_own() {
+        for good in [
+            "/gnu/store/x-profile/bin",
+            "/nix/store/y/bin",
+            "/usr/bin",
+            "/usr",
+        ] {
+            assert!(path_directory_named(Path::new(good)), "{good}");
+        }
+        for bad in [
+            "/home/u/.guix-home/profile/bin",
+            "/run/current-system/profile/bin",
+            "/opt/bin",
+            "/usr/../home/bin",
+            "/usr//bin",
+            "usr/bin",
+            "/usr/a:b",
+            "/usrx/bin",
+        ] {
+            assert!(!path_directory_named(Path::new(bad)), "{bad}");
+        }
+        // As it resolves: a directory there, not a link or a file.
+        assert!(admit_path_directory(Path::new("/usr")).is_ok());
+        assert!(admit_path_directory(Path::new("/usr/no-such-directory-here")).is_err());
+        // A file or a link there, whichever the host has: `/usr` is bound
+        // by every instance, and `/usr/bin` holds `env` on every host.
+        let other = ["/usr/bin", "/bin"]
+            .into_iter()
+            .filter_map(|dir| fs::read_dir(dir).ok())
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_dir()))
+            .unwrap();
+        assert!(admit_path_directory(&other).is_err(), "{}", other.display());
     }
 }

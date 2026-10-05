@@ -101,6 +101,19 @@ fn the_jailed_tool_host_works_inside_its_policy() {
     std::fs::write(scratch.0.join("shared/given.txt"), "from the human\n").unwrap();
     let mut client = jail::launch(&programs(), &scratch.policy(), &scratch.0.join("jail")).unwrap();
     let tree = scratch.0.join("tree");
+    // The host's git, where a bound tree holds it, is found by name, as
+    // the model's shell asks for it.
+    if let Some(git) = bound_git() {
+        let found = shell(&mut client, "command -v git");
+        assert_eq!(
+            found
+                .lines()
+                .last()
+                .and_then(|line| std::fs::canonicalize(line).ok()),
+            Some(git),
+            "{found}"
+        );
+    }
 
     let file = tree.join("a.rs").display().to_string();
     done(

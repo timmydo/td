@@ -52,6 +52,7 @@ const STAGE2_RESOURCES_ARG: &str = "--resources";
 const STAGE2_ARGUMENTS_ARG: &str = "--arguments";
 const STAGE2_WORKSPACE_ARG: &str = "--workspace";
 const STAGE2_PROGRAMS_ARG: &str = "--programs";
+const STAGE2_PATH_ARG: &str = "--path";
 const STAGE2_HOME_ARG: &str = "--home";
 const STAGE2_WORKTREES_ARG: &str = "--worktrees";
 const STAGE2_REPOSITORIES_ARG: &str = "--repositories";
@@ -419,10 +420,11 @@ pub enum Stage2Action {
 
 /// What stage 2 of a `workspace` launch was told: the plan it reads back
 /// and the entry it starts. The environment is not carried; it follows
-/// from `home` (`workspace::environment`).
+/// from `home` and `path` (`workspace::environment`).
 #[derive(Debug, Eq, PartialEq)]
 pub struct Stage2Workspace {
     programs: Vec<String>,
+    path: Vec<PathBuf>,
     home: PathBuf,
     worktrees: Vec<PathBuf>,
     repositories: Vec<PathBuf>,
@@ -6559,6 +6561,13 @@ fn stage2_workspace_arguments(
             .iter()
             .map(|program| OsString::from(&program.name)),
     );
+    stage2.push(OsString::from(STAGE2_PATH_ARG));
+    stage2.push(OsString::from(plan.path.len().to_string()));
+    stage2.extend(
+        plan.path
+            .iter()
+            .map(|directory| directory.as_os_str().to_os_string()),
+    );
     stage2.push(OsString::from(STAGE2_HOME_ARG));
     stage2.push(plan.home.target.as_os_str().to_os_string());
     stage2.push(OsString::from(STAGE2_WORKTREES_ARG));
@@ -6633,6 +6642,19 @@ where
             return Err(usage_error());
         }
         programs.push(name);
+    }
+    expect(STAGE2_PATH_ARG, args)?;
+    let count = parse_count(args.next(), "path count")?;
+    if count > workspace::MAX_PATH_DIRECTORIES {
+        return Err(usage_error());
+    }
+    let mut path: Vec<PathBuf> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let directory = PathBuf::from(args.next().ok_or_else(usage_error)?);
+        if !workspace::path_directory_named(&directory) || path.contains(&directory) {
+            return Err(usage_error());
+        }
+        path.push(directory);
     }
     expect(STAGE2_HOME_ARG, args)?;
     let home = tree(args.next())?;
@@ -6723,6 +6745,7 @@ where
     expect(STAGE2_ARGUMENTS_ARG, args)?;
     let plan = Stage2Workspace {
         programs,
+        path,
         home,
         worktrees,
         repositories,
@@ -7443,7 +7466,7 @@ fn run_stage2_workspace(
     command
         .args(&plan.arguments)
         .env_clear()
-        .envs(workspace::environment(&plan.home))
+        .envs(workspace::environment(&plan.home, &plan.path))
         .stdin(Stdio::from(channel.as_fd().try_clone_to_owned()?))
         .stdout(Stdio::from(channel.as_fd().try_clone_to_owned()?))
         .stderr(Stdio::from(
@@ -7472,6 +7495,7 @@ mod tests {
         };
         let plan = Stage2Workspace {
             programs: vec!["a".into()],
+            path: Vec::new(),
             home: "/h".into(),
             worktrees: Vec::new(),
             repositories: vec!["/r".into()],
@@ -7534,6 +7558,7 @@ mod tests {
                     inode: 4,
                 },
             ],
+            path: vec!["/gnu/store/x-profile/bin".into()],
             home: grant("/s/home", false),
             worktrees: vec![grant("/w/a", false)],
             repositories: vec![grant("/g/r.git", false)],
@@ -7566,6 +7591,7 @@ mod tests {
         let mut rest = arguments.into_iter().skip(7);
         let parsed = parse_stage2_workspace(&mut rest).unwrap();
         assert_eq!(parsed.programs, ["td-agent", "td-txt"]);
+        assert_eq!(parsed.path, [PathBuf::from("/gnu/store/x-profile/bin")]);
         assert_eq!(
             parsed.entry().unwrap(),
             Path::new("/opt/workspace/bin/td-agent")
@@ -7608,35 +7634,42 @@ mod tests {
         const NONE: &str = "--repositories 0 --git-chain 0";
         for bad in [
             // A working directory that is not the first worktree.
-            format!("--programs 1 a --home /h --worktrees 1 /w {NONE} --shared 0 --working-directory /h --arguments"),
+            format!("--programs 1 a --path 0 --home /h --worktrees 1 /w {NONE} --shared 0 --working-directory /h --arguments"),
             // Overlapping trees.
-            format!("--programs 1 a --home /h --worktrees 1 /h/w {NONE} --shared 0 --working-directory /h/w --arguments"),
-            format!("--programs 1 a --home /h --worktrees 0 {NONE} --shared 2 /d ro /d/e rw --working-directory /h --arguments"),
-            "--programs 1 a --home /h --worktrees 0 --repositories 1 /h/r --git-chain 0 --shared 0 --working-directory /h --arguments".into(),
+            format!("--programs 1 a --path 0 --home /h --worktrees 1 /h/w {NONE} --shared 0 --working-directory /h/w --arguments"),
+            format!("--programs 1 a --path 0 --home /h --worktrees 0 {NONE} --shared 2 /d ro /d/e rw --working-directory /h --arguments"),
+            "--programs 1 a --path 0 --home /h --worktrees 0 --repositories 1 /h/r --git-chain 0 --shared 0 --working-directory /h --arguments".into(),
             // A chain link outside every repository and worktree, at a
             // top, twice, or a writable file; in a worktree, anything
             // but its `.git` file, read-only.
-            "--programs 1 a --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /h/x ro dir --shared 0 --working-directory /h --arguments".into(),
-            "--programs 1 a --home /h --worktrees 1 /w --repositories 0 --git-chain 1 /w/x ro file --shared 0 --working-directory /w --arguments".into(),
-            "--programs 1 a --home /h --worktrees 1 /w --repositories 0 --git-chain 1 /w/.git ro dir --shared 0 --working-directory /w --arguments".into(),
-            "--programs 1 a --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /r ro dir --shared 0 --working-directory /h --arguments".into(),
-            "--programs 1 a --home /h --worktrees 0 --repositories 1 /r --git-chain 2 /r/x ro dir /r/x ro dir --shared 0 --working-directory /h --arguments".into(),
-            "--programs 1 a --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /r/x rw file --shared 0 --working-directory /h --arguments".into(),
+            "--programs 1 a --path 0 --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /h/x ro dir --shared 0 --working-directory /h --arguments".into(),
+            "--programs 1 a --path 0 --home /h --worktrees 1 /w --repositories 0 --git-chain 1 /w/x ro file --shared 0 --working-directory /w --arguments".into(),
+            "--programs 1 a --path 0 --home /h --worktrees 1 /w --repositories 0 --git-chain 1 /w/.git ro dir --shared 0 --working-directory /w --arguments".into(),
+            "--programs 1 a --path 0 --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /r ro dir --shared 0 --working-directory /h --arguments".into(),
+            "--programs 1 a --path 0 --home /h --worktrees 0 --repositories 1 /r --git-chain 2 /r/x ro dir /r/x ro dir --shared 0 --working-directory /h --arguments".into(),
+            "--programs 1 a --path 0 --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /r/x rw file --shared 0 --working-directory /h --arguments".into(),
             // A program name that is a path.
-            format!("--programs 1 ../a --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
-            format!("--programs 0 --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
-            format!("--programs 1 a --home /h --worktrees 0 {NONE} --shared 1 /d rx --working-directory /h --arguments"),
-            format!("--programs 1 a --home h --worktrees 0 {NONE} --shared 0 --working-directory h --arguments"),
-            format!("--programs 1 a --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h"),
+            format!("--programs 1 ../a --path 0 --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
+            format!("--programs 0 --path 0 --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
+            format!("--programs 1 a --path 0 --home /h --worktrees 0 {NONE} --shared 1 /d rx --working-directory /h --arguments"),
+            format!("--programs 1 a --path 0 --home h --worktrees 0 {NONE} --shared 0 --working-directory h --arguments"),
+            format!("--programs 1 a --path 0 --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h"),
+            // A path directory outside the bound trees, of a bad name or
+            // twice; and the shape before `--path`.
+            format!("--programs 1 a --path 1 /home/u/bin --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
+            format!("--programs 1 a --path 1 /usr/a:b --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
+            format!("--programs 1 a --path 2 /usr/bin /usr/bin --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
+            format!("--programs 1 a --path 17 {} --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments", (0..17).map(|n| format!("/usr/{n}")).collect::<Vec<_>>().join(" ")),
+            format!("--programs 1 a --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
             // The old shape, without repositories or a chain.
-            "--programs 1 a --home /h --worktrees 0 --shared 0 --working-directory /h --arguments".into(),
+            "--programs 1 a --path 0 --home /h --worktrees 0 --shared 0 --working-directory /h --arguments".into(),
         ] {
             assert!(
                 parse_stage2_workspace(&mut words(&bad).into_iter()).is_err(),
                 "{bad}"
             );
         }
-        let good = "--programs 1 a --home /h --worktrees 0 --repositories 0 --git-chain 0 --shared 0 --working-directory /h --arguments";
+        let good = "--programs 1 a --path 0 --home /h --worktrees 0 --repositories 0 --git-chain 0 --shared 0 --working-directory /h --arguments";
         assert!(parse_stage2_workspace(&mut words(good).into_iter()).is_ok());
     }
     use crate::authority::{

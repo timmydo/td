@@ -1244,12 +1244,13 @@ mod confinement {
             .contains("install_standard_seccomp_filter(firefox_seccomp_probe).map_err(|error|"));
         assert!(TRANSITION.contains("probe_pid1_lifecycle()?;"));
         // The workspace kind's stage 2 and entry add two; its entry's
-        // environment is the fixed `workspace::environment`.
+        // environment is the fixed `workspace::environment`, the spec's
+        // path directories first on its `PATH`.
         assert_eq!(TRANSITION.matches(".env_clear()").count(), 6);
         assert_eq!(TRANSITION.matches(".envs(").count(), 2);
         assert_eq!(
             TRANSITION
-                .matches(".envs(workspace::environment(&plan.home))")
+                .matches(".envs(workspace::environment(&plan.home, &plan.path))")
                 .count(),
             1
         );

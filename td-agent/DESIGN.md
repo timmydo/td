@@ -2442,7 +2442,14 @@ Every instance has:
 - **Inheritance:** no descriptor but the instance's pipe, no runtime
   directory, and an environment scrubbed to `PATH`, `HOME`, `TMPDIR`,
   `LANG`, `TERM=dumb` and, when the policy is not `off`, the proxy
-  variables of §10.
+  variables of §10. `PATH` begins with the host's own `PATH`
+  directories as they resolve, those inside a system tree the instance
+  binds, each once and at most 16 (`jail::system_path`, td-jail's
+  `path` spec key); the rest is td-jail's fixed list. A store-based
+  host's tools, in a profile under the home that no instance binds but
+  resolving into its store, are so found by name: the model's `git
+  commit` and `cargo build`. They are resolved at each launch, so a
+  profile changed or collected since is followed.
 
 **The git mount chain.** Commits happen inside the jail, so a workspace
 repository's objects, refs, index and logs are writable there, and

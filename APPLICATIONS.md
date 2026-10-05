@@ -3532,6 +3532,7 @@ no one else can write, at most 64 KiB, and an exact, ordered keyfile:
 format=1
 entry=/absolute/td-agent
 program=/absolute/td-txt
+path=/gnu/store/...-profile/bin
 home=/absolute/private/home
 worktree=/absolute/worktree
 checkout=/absolute/linked/worktree
@@ -3540,9 +3541,10 @@ read=/absolute/shared/read-only
 write=/absolute/shared/read-write
 ```
 
-`entry` and `home` appear once; `program` (with `entry`, at most four),
-`worktree`, `checkout`, `repository`, `read` and `write` repeat, at most
-32 directories in all; keys appear in that order. Admission is §C's filesystem-grant source checks
+`entry` and `home` appear once; `program` (with `entry`, at most four)
+and `path` (at most 16) repeat, as do `worktree`, `checkout`,
+`repository`, `read` and `write`, at most 32 of these in all; keys
+appear in that order. Admission is §C's filesystem-grant source checks
 with the kind's own departures:
 
 - **Programs**, the entry first, are direct executable regular files,
@@ -3550,6 +3552,15 @@ with the kind's own departures:
   their device and inode checked before and after the bind. The entry
   runs as the first of them. No package, manifest or permission file is
   involved, so nothing of §B's identity reaches the instance.
+- **Path directories** name where the entry searches for programs
+  first, as the host's own `PATH` does: each canonical, no link, a
+  directory, holding no `:`, named once, and inside one of the system
+  trees every instance binds (below), so naming one binds nothing and
+  reaches nothing an instance could not already run by its full path.
+  A store-based host keeps its tools in profiles under the home, which
+  no instance binds, but those resolve into its store, which every
+  instance does; without these an agent there finds no `git` or
+  `cargo` by name. Stage 2 is told them and checks each again by name.
 - **Directories** are canonical, links refused, and bound at their own
   real paths rather than below `/home/td`. Any two of them overlapping by
   path or by mount identity is refused, as is any overlap with the
@@ -3652,8 +3663,9 @@ as its
 stdout and checks it is a socket and that no terminal controls it, and
 the entry receives two clones as its standard input and output, with the
 null device as standard error. Its environment is exactly `HOME` (the
-spec's home), `LANG=C.UTF-8`, `PATH` (the ordinary directories, then a
-store-based host's system profile), `TERM=dumb` and `TMPDIR=/tmp`; it
+spec's home), `LANG=C.UTF-8`, `PATH` (the spec's path directories, in
+order, then the ordinary directories, then a store-based host's system
+profile), `TERM=dumb` and `TMPDIR=/tmp`; it
 starts in the first worktree, else in the home. No cgroup is created and
 no data limit set: an instance keeps its launcher's cgroup and whatever
 limit it inherits, and says so with one named diagnostic,
@@ -10842,7 +10854,9 @@ two-configuration rule requires:
   system trees; a coding agent's tools on a host are the host's: its
   compiler, git and shell. The `workspace` kind binds the host's system
   trees read-only and an allowlisted selective `/etc`, for that kind
-  alone.
+  alone, and its launcher may name directories of those trees first on
+  the entry's `PATH` (td-agent names its own `PATH`'s, as they
+  resolve), which binds nothing more.
 - **(c) The caller's own identity.** §X.1 maps the caller to uid 1000;
   the `workspace` kind maps it to itself, because its directories sit at
   their real paths and keep their owner.
