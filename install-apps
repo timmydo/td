@@ -1,12 +1,12 @@
 #!/bin/sh
-# ./install-apps — build the checkout's desktop programs (td-agent, td-editor,
-# td-mail, td-news, td-pass, td-photo, td-review, td-taskmgr, td-term) in
-# release mode with the host's cargo and install them to run from
-# ~/.local/bin, td-news, td-mail and td-agent as links to td-net's launcher in
-# ~/.local/lib/td (td-builder install-apps, builder/src/install_apps.rs). Not
-# ./start's preflight: that provisions the seed toolchain, musl target
-# included, for control-plane artifacts that enter builds; nothing here does,
-# so the host's own cargo is enough.
+# ./install-apps — build the checkout's desktop programs (td-agent, td-dua,
+# td-editor, td-mail, td-news, td-pass, td-photo, td-pinentry, td-review,
+# td-taskmgr, td-term) in release mode with the host's cargo and install
+# them to run from ~/.local/bin, td-news, td-mail and td-agent as links to
+# td-net's launcher in ~/.local/lib/td (td-builder install-apps,
+# builder/src/install_apps.rs). Not ./start's preflight: that provisions
+# the seed toolchain, musl target included, for control-plane artifacts
+# that enter builds; nothing here does, so the host's own cargo is enough.
 set -eu
 unset CDPATH
 

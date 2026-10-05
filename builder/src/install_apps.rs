@@ -2,15 +2,15 @@
 //! release mode with the host's cargo and installed for this host's user.
 //! The repository-root `./install-apps` entry script execs this.
 //!
-//! td-editor, td-pass, td-photo, td-pinentry, td-review, td-taskmgr and
-//! td-term are installed in `~/.local/bin`. td-news, td-mail and td-agent
-//! fetch only through td's fetch service, which a host session does not
-//! run, so they are installed with td-net in `~/.local/lib/td`, and their
-//! names in `~/.local/bin` are links to td-net, whose `launch` applet
-//! serves a fetch service of their own and runs the program of the link's
-//! name beside it (net/src/launch.rs), as `./news`, `./mail` and `./agent`
-//! do from the checkout. td-net names those programs itself (`td-net
-//! launch --names`).
+//! td-dua, td-editor, td-pass, td-photo, td-pinentry, td-review,
+//! td-taskmgr and td-term are installed in `~/.local/bin`. td-news,
+//! td-mail and td-agent fetch only through td's fetch service, which a host
+//! session does not run, so they are installed with td-net in
+//! `~/.local/lib/td`, and their names in `~/.local/bin` are links to
+//! td-net, whose `launch` applet serves a fetch service of their own and
+//! runs the program of the link's name beside it (net/src/launch.rs), as
+//! `./news`, `./mail` and `./agent` do from the checkout. td-net names
+//! those programs itself (`td-net launch --names`).
 //!
 //! A development fixture, as `host-run` is: every program is built before
 //! any is installed, so a failed build leaves the installed set as it was;
@@ -29,6 +29,7 @@ use std::process::{Command, ExitCode, Stdio};
 /// name.
 const APPS: &[&str] = &[
     "td-agent",
+    "td-dua",
     "td-editor",
     "td-mail",
     "td-news",
