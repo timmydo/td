@@ -19,7 +19,8 @@
 //! The open conversation's todo list (DESIGN.md §12), when it has one, is
 //! drawn above the composer, collapsed to the item in progress; `C-t`
 //! shows the whole list and `C-S-t` clears it. `C-S-p` pauses or resumes
-//! the open conversation (§3).
+//! the open conversation (§3). `C-z` undoes its latest step that changed
+//! files, `C-S-z` redoes the latest undone (§12).
 //!
 //! A menu bar holds the File, Conversation and Help menus (`menu`), which
 //! a press on a header opens, `F10` opening File. File → Set OpenRouter
@@ -246,6 +247,10 @@ pub enum Request {
     Pause(bool),
     /// Clear the open conversation's todo list.
     ClearTodo,
+    /// Undo the open conversation's step snapshotted at this place.
+    Undo(u64),
+    /// Redo it.
+    Redo(u64),
     /// Save the split's preferred share.
     SaveShare(u32, u32),
     /// Store the OpenRouter key from the key dialog, replacing a stored
@@ -530,6 +535,8 @@ pub struct App {
     /// The open conversation's todo list, and whether it is shown whole.
     todo: Vec<TodoItem>,
     todo_open: bool,
+    /// The open conversation's steps to undo and redo, from its log.
+    steps: crate::store::Steps,
     /// Each user message's sequence number and its index in the
     /// transcript, and each started turn's and its user message's.
     messages: Vec<(u64, usize)>,
@@ -682,6 +689,7 @@ impl App {
             show_archived: false,
             todo: Vec::new(),
             todo_open: false,
+            steps: crate::store::Steps::default(),
             messages: Vec::new(),
             turns: Vec::new(),
             last_seq: 0,
@@ -1367,6 +1375,7 @@ impl App {
         self.system_shown = false;
         self.streaming = None;
         self.undrawn = None;
+        self.steps = crate::store::Steps::default();
         if !self.todo.is_empty() {
             self.todo.clear();
             self.place();
@@ -1531,7 +1540,8 @@ impl App {
                 | Up::Query { .. }
                 | Up::Fetch { .. }
                 | Up::Heads { .. }
-                | Up::Prepared { .. },
+                | Up::Prepared { .. }
+                | Up::Restored,
             )
             | Update::Undeliverable { .. } => {}
             Update::Up(Up::Delta {
@@ -1568,6 +1578,7 @@ impl App {
             return;
         }
         self.last_seq = event.seq;
+        self.steps.apply(&event);
         // From the end: a turn's records follow its message closely, so a
         // replay finds each at once rather than scanning the whole log.
         let message_of = |messages: &[(u64, usize)], turns: &[(u64, u64)], started: u64| {
@@ -1837,8 +1848,15 @@ impl App {
                     .iter()
                     .map(crate::history::snapshot_line)
                     .collect();
-                self.notice_message(&format!("this step changed {}", lines.join("; ")));
+                self.notice_message(&format!(
+                    "this step changed {}; C-z undoes it",
+                    lines.join("; ")
+                ));
             }
+            Kind::Restore { step, undo } => self.notice_message(&format!(
+                "you {} the step snapshotted at #{step}",
+                if undo { "undid" } else { "redid" }
+            )),
             Kind::Todo { items, cleared } => {
                 if cleared {
                     self.notice_message("you cleared the todo list");
@@ -2450,6 +2468,28 @@ impl App {
         if self.active.as_ref() != Some(&id) || self.active_failed() {
             self.set_active(id.clone());
             self.requests.push(Request::Open(id));
+        }
+    }
+
+    /// Asks the open conversation to undo its latest step, or redo the
+    /// latest undone, naming it, between turns (DESIGN.md §12).
+    fn restore_step(&mut self, undo: bool) {
+        if self.active.is_none() {
+            return;
+        }
+        if self.running() {
+            return self.note("a step is undone or redone between turns");
+        }
+        let step = if undo {
+            self.steps.undo()
+        } else {
+            self.steps.redo()
+        };
+        match step {
+            Some(step) if undo => self.requests.push(Request::Undo(step)),
+            Some(step) => self.requests.push(Request::Redo(step)),
+            None if undo => self.note("no step to undo"),
+            None => self.note("no step to redo"),
         }
     }
 
@@ -3661,6 +3701,7 @@ impl App {
                 }
                 return;
             }
+            "C-z" | "C-S-z" if !repeat => return self.restore_step(chord == "C-z"),
             "C-S-p" if !repeat => {
                 let paused = self
                     .active
@@ -5137,6 +5178,80 @@ pub mod tests {
         // Nothing to clear asks nothing.
         key(&mut app, "C-S-t");
         assert!(app.take_requests().is_empty());
+    }
+
+    #[test]
+    fn c_z_undoes_the_latest_step_and_c_s_z_redoes_it_between_turns() {
+        let mut app = app();
+        key(&mut app, "C-z");
+        assert!(app.take_requests().is_empty());
+        assert!(app.notice().unwrap().contains("no step to undo"));
+        let snapshot = |seq: u64| {
+            at(
+                seq,
+                Kind::Snapshot {
+                    reply: seq - 1,
+                    worktrees: vec![crate::store::Snapped {
+                        checkout: "/w/td".into(),
+                        before: "a".repeat(40),
+                        after: "b".repeat(40),
+                        changed: vec!["src/x\u{1b}.rs".into()],
+                        more: 2,
+                    }],
+                },
+            )
+        };
+        app.update(snapshot(3), 0);
+        app.update(snapshot(5), 0);
+        assert!(text(&app).contains("this step changed /w/td"));
+        assert!(text(&app).contains("C-z undoes it"));
+        key(&mut app, "C-z");
+        assert_eq!(app.take_requests(), [Request::Undo(5)]);
+        // Only between turns.
+        app.update(
+            at(
+                6,
+                Kind::Started {
+                    effect: crate::store::Effect::Turn,
+                    of: 1,
+                },
+            ),
+            0,
+        );
+        key(&mut app, "C-z");
+        assert!(app.take_requests().is_empty());
+        assert!(app.notice().unwrap().contains("between turns"));
+        app.update(
+            at(
+                7,
+                Kind::Finished {
+                    started: 6,
+                    outcome: "replied".into(),
+                    retry: false,
+                },
+            ),
+            0,
+        );
+        app.update(
+            at(
+                8,
+                Kind::Restore {
+                    step: 5,
+                    undo: true,
+                },
+            ),
+            0,
+        );
+        assert!(text(&app).contains("you undid the step snapshotted at #5"));
+        key(&mut app, "C-z");
+        assert_eq!(app.take_requests(), [Request::Undo(3)]);
+        key(&mut app, "C-S-z");
+        assert_eq!(app.take_requests(), [Request::Redo(5)]);
+        // A new step leaves nothing to redo.
+        app.update(snapshot(9), 0);
+        key(&mut app, "C-S-z");
+        assert!(app.take_requests().is_empty());
+        assert!(app.notice().unwrap().contains("no step to redo"));
     }
 
     #[test]

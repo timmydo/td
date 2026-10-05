@@ -279,6 +279,12 @@ impl Session {
                         self.app.note(e);
                     }
                 }
+                Request::Undo(step) | Request::Redo(step) => {
+                    let undo = matches!(request, Request::Undo(_));
+                    if let Err(e) = self.supervisor.tell(&Down::Restore { step, undo }) {
+                        self.app.note(e);
+                    }
+                }
                 Request::Choose { model, effort } => {
                     if let Err(e) = self.supervisor.tell(&Down::Choose { model, effort }) {
                         self.app.note(e);

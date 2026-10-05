@@ -637,7 +637,9 @@ fn a_repository_conversation_prepares_its_workspace() {
     // A step snapshot in the conversation's own kind of instance: the
     // worktree kept as a tree on its snapshot ref, and a change named
     // (DESIGN.md §12).
-    let snap = |before: &[String]| {
+    let checkouts = vec![entry.checkout.display().to_string()];
+    let git_path = td_agent::repo::host_git().unwrap().display().to_string();
+    let host = |call: td_agent::host::Call| {
         let workspace = td_agent::workspace::Workspace::Repositories(made.clone());
         let (policy, specs) = td_agent::workspace::policy(
             &workspace,
@@ -648,14 +650,7 @@ fn a_repository_conversation_prepares_its_workspace() {
         )
         .unwrap();
         let mut client = jail::launch(&programs().unwrap(), &policy, &specs).unwrap();
-        let checkouts = vec![entry.checkout.display().to_string()];
-        client
-            .call(td_agent::host::Call::Snapshot {
-                git: td_agent::repo::host_git().unwrap().display().to_string(),
-                checkouts: checkouts.clone(),
-                before: before.to_vec(),
-            })
-            .unwrap();
+        client.call(call).unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             assert!(Instant::now() < deadline, "no snapshot came");
@@ -666,6 +661,21 @@ fn a_repository_conversation_prepares_its_workspace() {
                 }
             }
         }
+    };
+    let snap = |before: &[String]| {
+        host(td_agent::host::Call::Snapshot {
+            git: git_path.clone(),
+            checkouts: checkouts.clone(),
+            before: before.to_vec(),
+        })
+    };
+    let restore = |from: &str, to: &str| {
+        host(td_agent::host::Call::Restore {
+            git: git_path.clone(),
+            checkouts: checkouts.clone(),
+            from: vec![from.to_string()],
+            to: vec![to.to_string()],
+        })
     };
     let first = snap(&[]);
     let kept = format!("refs/td-agent/snapshots/{}", entry.id);
@@ -688,7 +698,17 @@ fn a_repository_conversation_prepares_its_workspace() {
         .trim(),
         second[0].tree
     );
-    std::fs::remove_file(entry.checkout.join("a/new")).unwrap();
+    // Undone and redone there too.
+    let undone = restore(&second[0].tree, &first[0].tree);
+    assert_eq!(undone[0].changed, ["a/new"]);
+    assert!(!entry.checkout.join("a/new").exists());
+    restore(&first[0].tree, &second[0].tree);
+    assert_eq!(
+        std::fs::read_to_string(entry.checkout.join("a/new")).unwrap(),
+        "made in a step\n"
+    );
+    restore(&second[0].tree, &first[0].tree);
+    assert!(!entry.checkout.join("a/new").exists());
     let asked = || td_agent::removal::survey(&state, &id, &made, programs());
     let found = asked();
     assert_eq!(found.len(), 1);

@@ -95,6 +95,9 @@ struct Running {
     /// The remotes it asked the window for and has not said prepared:
     /// a repository workspace being made ready, kept until it is.
     preparing: Vec<String>,
+    /// Undos and redos asked of it and not yet heard done: its files may
+    /// be half written, so it is kept until they are.
+    restoring: u32,
 }
 
 impl Running {
@@ -106,6 +109,7 @@ impl Running {
         self.busy.is_some()
             || self.resuming
             || !self.preparing.is_empty()
+            || self.restoring > 0
             || !self.pending.is_empty()
             || !self.deliveries.is_empty()
     }
@@ -207,6 +211,7 @@ impl Supervisor {
             failed: false,
             busy: None,
             preparing: Vec::new(),
+            restoring: 0,
             resuming: false,
         });
         Ok(())
@@ -244,6 +249,9 @@ impl Supervisor {
         }
         if matches!(down, Down::Pause { paused: false }) {
             running.resuming = true;
+        }
+        if matches!(down, Down::Restore { .. }) {
+            running.restoring = running.restoring.saturating_add(1);
         }
         Ok(())
     }
@@ -362,6 +370,7 @@ impl Supervisor {
             failed: false,
             busy: None,
             preparing: Vec::new(),
+            restoring: 0,
             resuming: false,
         });
         self.open = Some(id);
@@ -573,6 +582,9 @@ impl Supervisor {
             let _ = running.child.kill();
             let _ = running.child.wait();
             running.busy = None;
+            // Its process gone, nothing is half written by it any more,
+            // and the new one is not asked again.
+            running.restoring = 0;
             if running.restarts >= MAX_RESTARTS {
                 running.failed = true;
                 return Update::Failed { reason };
@@ -700,6 +712,7 @@ fn drain(running: &mut Running, updates: &mut Vec<(Id, Update)>) -> Option<Strin
                             }
                         }
                         Up::Prepared { remote } => running.preparing.retain(|r| r != remote),
+                        Up::Restored => running.restoring = running.restoring.saturating_sub(1),
                         Up::Event(event) => match event.kind {
                             // Logged after any turn it starts, whose start
                             // has marked the child busy.

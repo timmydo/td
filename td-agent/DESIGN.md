@@ -3413,8 +3413,8 @@ A directory or scratch workspace without git records pre-images of
 makes the whole of what `sed` can write.
 
 **As built (increment 11, step snapshots).** A repository workspace's
-step snapshots are recorded; undo and redo are the next step, and a
-directory or scratch workspace's pre-images later. A step whose reply
+step snapshots are recorded, and undone and redone (below); a
+directory or scratch workspace's pre-images come later. A step whose reply
 calls a tool that acts (`write_file`, `edit_file`, `sed`, `shell`) is
 snapshotted before its first call and after its last, however its
 calls end, each time in a fresh tool instance by td-agent's own call,
@@ -3458,6 +3458,57 @@ that step is not recorded, and no other is tried in the turn, so a
 slow or failing one costs a turn once; a record with no room left in
 the log, or that cannot be written, is the same. The removal survey
 does not count a snapshot's commits as work.
+
+**As built (increment 11, undo and redo).** `C-z` (the driven action
+`undo`) undoes the open conversation's latest recorded step and
+`C-S-z` (`redo`) redoes the latest undone, naming it by its
+`snapshot` event's place; the window refuses either while a turn
+runs, and both sides count the steps from the log alike
+(`store::Steps`): each `snapshot` is done, an undo moves the latest
+done to the undone, a redo the latest undone back, and a new
+`snapshot` leaves nothing to redo. The conversation refuses, saying
+why in a notice, a step that is not the latest to undo or redo, as a
+request that waited out a turn may be, one whose worktrees are not
+all ready, a removed workspace, no settings from the window, and a
+log without room for the record and the notification at their most,
+checked before a file is written. It asks a fresh tool instance, by
+its own call `restore` (`host::Call::Restore`, `snapshot::restore`),
+to bring each worktree the step changed from one tree to the other:
+after for before to undo, the reverse to redo. The tool host first,
+before writing any, checks each worktree: at the tree it is to leave,
+written as a snapshot is, so nothing changed since, by a later step,
+the human or a process, is overwritten, or at the tree it brings
+already, an earlier try's, which it then leaves; no submodule among
+what differs (`diff-tree --raw`, mode 160000), since git writes
+none; and nothing a tree cannot hold, an ignored file, where it
+writes: at a path the tree it brings adds, unless a file of the very
+bytes it writes there (`hash-object --no-filters`) or a directory
+holding only files it removes, nor on the way to one, unless a
+directory or a file it removes. A tree comparison cannot see ignored
+files, which `checkout-index -f` would otherwise write over or delete
+in a directory in its way. Then, in each, it removes the files the
+tree it brings lacks, through no link and never a directory, and the
+directories that leaves empty; writes the rest that differ with `git
+checkout-index -f` from a private index of that tree, attributes
+from the empty tree; checks the worktree is now that tree; and moves
+the snapshot ref to it. Each file written is its blob's bytes and
+mode, since the repository's `config` and `info/`, which could name
+a filter or attributes, are td-agent's, bound read-only in the jail
+(§9). A path git names must be plain: no `..`, `.`, empty or `.git`
+name. The worktree's own index, its commits and the ignored files
+the checks allow are left as they are: an undo restores files, not a
+commit the step made. A failure names its worktree and those
+restored before it, and a retry passes over those. The window keeps
+the conversation's process, though left, from asking until the
+conversation says it is done (`Up::Restored`), after its record, a
+count of those asked; a process that fails meanwhile is restarted
+unasked, so its count ends. Why one failed is quoted, as a
+notification quotes it. Done,
+the conversation logs an `undo` or `redo` event naming the step and
+tells the model in a notification, which wakes no turn: the person
+undid, or redid, its step, and the files it changed, made visible
+and at most 1000 characters. Background processes do not exist yet,
+so the refusal while one runs (above) is not built.
 
 **Background processes.** A `shell` call with `background: true` keeps
 its instance running after the call returns, for a build, a watcher or a
@@ -3689,9 +3740,10 @@ head and tail beside it as the result's `kept`, never sent back, and
 drops `kept` before the result when the line would be too long. The
 window does not yet show a command's output as it comes. `write_file`,
 `edit_file`, `sed` and `shell` are decided by the human before they run
-(§11, `ask` mode); the rest run. There are no step snapshots or undo
-yet: a change the human allowed in a directory workspace stays, and
-td-agent cannot take it back.
+(§11, `ask` mode); the rest run. A repository workspace's steps are
+snapshotted and can be undone (above); a change the human allowed in a
+directory or scratch workspace stays, and td-agent cannot take it
+back.
 
 ## 13. Prompting
 
@@ -4616,8 +4668,28 @@ commit not counted as work;
 snapshotted, one that runs a command snapshotted first and, with no
 jail, said once before its first call, and no `snapshot` event; and
 the live `tests/jail.rs` preparation test a snapshot in the
-conversation's own kind of instance, its ref holding its tree, and a
-file made between two named.
+conversation's own kind of instance, its ref holding its tree, a
+file made between two named, and that step undone, redone and undone
+there. For undo and redo, `src/snapshot.rs` covers an edit, a
+deletion emptying a directory, an addition in a new one, a mode and a
+link turned file each restored and redone, an ignored file left, a
+file restored as its bytes under `.gitattributes`, the ref moved, a
+worktree changed since refused with nothing written, mismatched or
+non-id trees and other worktrees refused, paths that are not plain
+refused, no removal through a link or of a directory, and emptied
+directories pruned; `src/store.rs` the steps counted from the log;
+`src/ui.rs` `C-z` and `C-S-z` naming the latest step, refused while a
+turn runs, and nothing to redo after a new step;
+`tests/model_client.rs` a step not the latest and one whose worktree
+is not ready refused, and one past those checks failing short of a
+jail with no `undo` logged; and `tests/processes.rs` a conversation
+asked to undo kept, though left, until it says it is done, and one
+restarted meanwhile not kept for it. Against
+what no snapshot holds, `src/snapshot.rs` covers an ignored file in a
+directory to become a file, one where a directory must be, and a file
+ignored after the step and edited since each refused with nothing
+written, that file as it was allowed, a submodule refused, and a
+retry of a restore done already changing nothing.
 For a call told a worktree's state, `src/conversation.rs` covers a
 read into a worktree still checking out, a command in a ready first
 worktree and a path outside every worktree passing, a path climbing

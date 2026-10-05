@@ -605,6 +605,7 @@ impl Session {
                 Down::Retry => self.retry()?,
                 Down::Pause { paused } => self.pause(paused)?,
                 Down::ClearTodo => self.clear_todo()?,
+                Down::Restore { step, undo } => self.restore(step, undo)?,
                 Down::Choose { model, effort } => self.choose(model, effort)?,
                 Down::Fetched { remote, result } => self.stored(remote, result)?,
                 Down::Heads { remote, bases, ids } => self.heads(&remote, &bases, &ids)?,
@@ -1364,6 +1365,133 @@ impl Session {
             self.unsnapped(why);
         }
         Ok(())
+    }
+
+    /// The step snapshotted at `step` undone, or redone, as the window
+    /// asked naming it (DESIGN.md §12): the model is told, or why not is
+    /// said.
+    fn restore(&mut self, step: u64, undo: bool) -> Result<(), String> {
+        match self.restoring(step, undo) {
+            Ok(text) => {
+                self.log(Kind::Restore { step, undo })?;
+                self.log(Kind::Notification { text })?;
+            }
+            Err(why) => {
+                let text = format!(
+                    "the step could not be {}: {}",
+                    if undo { "undone" } else { "redone" },
+                    quoted(&why)
+                );
+                self.log(Kind::Notice { text })?;
+            }
+        }
+        self.sync()?;
+        // Done, either way, and recorded: the window kept this process
+        // until now.
+        self.send(&Up::Restored);
+        Ok(())
+    }
+
+    /// Restores the step at `step`, only the latest to undo, or the latest
+    /// undone, between turns, with every worktree it changed still ready
+    /// and, as the tool host checks, as it was left; what to tell the
+    /// model, or why not.
+    fn restoring(&mut self, step: u64, undo: bool) -> Result<String, String> {
+        let steps = store::Steps::of(self.conversation.events());
+        let latest = if undo { steps.undo() } else { steps.redo() };
+        if latest != Some(step) {
+            return Err(format!(
+                "it is not the latest step to {}",
+                if undo { "undo" } else { "redo" }
+            ));
+        }
+        let meta = self.conversation.meta().clone();
+        let Some(workspace @ Workspace::Repositories(repositories)) = &meta.workspace else {
+            return Err("this conversation has no repositories".into());
+        };
+        if meta.removed {
+            return Err("its workspace is removed".into());
+        }
+        let Some((reply, worktrees)) =
+            self.conversation
+                .events()
+                .iter()
+                .find_map(|event| match &event.kind {
+                    Kind::Snapshot { reply, worktrees } if event.seq == step => {
+                        Some((*reply, worktrees.clone()))
+                    }
+                    _ => None,
+                })
+        else {
+            return Err("its snapshot is not in the log".into());
+        };
+        for one in &worktrees {
+            let ready = repositories.entries.iter().any(|entry| {
+                entry.checkout.display().to_string() == one.checkout
+                    && meta.prepared.contains(&entry.repository)
+            });
+            if !ready {
+                return Err(format!("{} is not ready", one.checkout));
+            }
+        }
+        let checkouts: Vec<String> = worktrees.iter().map(|one| one.checkout.clone()).collect();
+        let (from, to): (Vec<String>, Vec<String>) = worktrees
+            .iter()
+            .map(|one| {
+                if undo {
+                    (one.after.clone(), one.before.clone())
+                } else {
+                    (one.before.clone(), one.after.clone())
+                }
+            })
+            .unzip();
+        // Room for its record and its notification, at their most, before
+        // a file is written.
+        let most = (MAX_WHY * 4 + 512) as u64;
+        if !self.conversation.has_room_for(most.saturating_mul(6)) {
+            return Err("the conversation's log has no room for its record".into());
+        }
+        let Some((_, client)) = self.setup.clone() else {
+            return Err(NO_SETTINGS.into());
+        };
+        let state = StateDir::at(self.state.clone());
+        self.bench.prepare(
+            workspace,
+            &state,
+            &meta.id,
+            client.shared_for(workspace),
+            &meta.prepared,
+        )?;
+        let git = crate::repo::host_git()?.display().to_string();
+        let call = host::Call::Restore {
+            git,
+            checkouts: checkouts.clone(),
+            from,
+            to: to.clone(),
+        };
+        let taken = self
+            .internal(call, SNAPSHOT_TIME)
+            .and_then(|text| snapshot::decode(&text, &checkouts))?;
+        if taken.iter().zip(&to).any(|(taken, to)| taken.tree != *to) {
+            return Err("a worktree did not come back to that step's tree".into());
+        }
+        let lines: Vec<String> = taken
+            .into_iter()
+            .map(|taken| {
+                let mut names = taken.changed;
+                if taken.more > 0 {
+                    names.push(format!("and {} more", taken.more));
+                }
+                format!("{}: {}", taken.checkout, names.join(", "))
+            })
+            .collect();
+        let text = format!(
+            "the person {} your step of #{reply}; its files are now as they were {} it: {}",
+            if undo { "undid" } else { "redid" },
+            if undo { "before" } else { "after" },
+            quoted(&lines.join("; "))
+        );
+        Ok(text)
     }
 
     /// Runs td-agent's own `call` in the jail, not a model's, for at most
@@ -2857,7 +2985,7 @@ fn unready(
         host::Call::Shell { workdir, .. } => vec![workdir.as_deref()],
         host::Call::Sed { paths, .. } => paths.iter().map(|path| Some(path.as_str())).collect(),
         // td-agent's own, over the ready worktrees alone.
-        host::Call::Snapshot { .. } => Vec::new(),
+        host::Call::Snapshot { .. } | host::Call::Restore { .. } => Vec::new(),
     };
     named.into_iter().find_map(|path| {
         let at = match path.map(Path::new) {

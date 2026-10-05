@@ -490,6 +490,25 @@ fn act(
             kept: None,
             digest: None,
         }),
+        Call::Restore {
+            git,
+            checkouts,
+            from,
+            to,
+        } => Ok(Done {
+            text: crate::snapshot::encode(&crate::snapshot::restore(
+                &crate::snapshot::Git {
+                    path: PathBuf::from(git),
+                    env: shell::environment(),
+                },
+                checkouts,
+                from,
+                to,
+                &config.roots,
+            )?),
+            kept: None,
+            digest: None,
+        }),
     }
 }
 

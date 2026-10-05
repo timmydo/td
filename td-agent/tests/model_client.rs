@@ -467,6 +467,7 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Kind::ToolResult { .. } => "tool_result",
             Kind::Todo { .. } => "todo",
             Kind::Snapshot { .. } => "snapshot",
+            Kind::Restore { .. } => "restore",
             Kind::Pause { .. } => "pause",
             Kind::Choice { .. } => "choice",
             Kind::Approval { .. } => "approval",
@@ -2025,11 +2026,121 @@ fn a_step_that_may_change_files_is_snapshotted_or_says_why_not_once() {
     let mut heard = std::mem::take(&mut h.heard);
     heard.extend(events);
     assert_eq!(unsnapped(&heard), 0, "{heard:?}");
-    let (conversation, _h) = h.close();
+    // An undo is of the latest step only, and why not is said; a reopened
+    // process replays its log first, up to `after`.
+    let notice = |h: &mut Harness, after: u64| loop {
+        if let Up::Event(Event {
+            seq,
+            kind: Kind::Notice { text },
+            ..
+        }) = h.next()
+        {
+            if seq > after {
+                break text;
+            }
+        }
+    };
+    h.down(&Down::Restore {
+        step: 1,
+        undo: true,
+    });
+    assert_eq!(
+        notice(&mut h, 0),
+        "the step could not be undone: it is not the latest step to undo"
+    );
+    let (mut conversation, mut h) = h.close();
     assert!(!conversation
         .events()
         .iter()
         .any(|e| matches!(e.kind, Kind::Snapshot { .. })),);
+    // Steps as if snapshotted: one in a worktree not this workspace's,
+    // then one in its own, which with no jail is not restored.
+    let snapped = |checkout: &str| Kind::Snapshot {
+        reply: 1,
+        worktrees: vec![td_agent::store::Snapped {
+            checkout: checkout.into(),
+            before: "a".repeat(40),
+            after: "b".repeat(40),
+            changed: vec!["notes".into()],
+            more: 0,
+        }],
+    };
+    let elsewhere = conversation.append(snapped("/elsewhere")).unwrap().seq;
+    let checkout = conversation
+        .meta()
+        .workspace
+        .clone()
+        .map(|workspace| match workspace {
+            td_agent::workspace::Workspace::Repositories(made) => {
+                made.entries[0].checkout.display().to_string()
+            }
+            other => panic!("{other:?}"),
+        });
+    let own = conversation
+        .append(snapped(&checkout.unwrap()))
+        .unwrap()
+        .seq;
+    conversation.sync().unwrap();
+    let after = own;
+    drop(conversation);
+    h.reopen();
+    h.setup(Client::default());
+    h.down(&Down::Restore {
+        step: elsewhere,
+        undo: true,
+    });
+    assert_eq!(
+        notice(&mut h, after),
+        "the step could not be undone: it is not the latest step to undo"
+    );
+    h.down(&Down::Restore {
+        step: own,
+        undo: false,
+    });
+    assert_eq!(
+        notice(&mut h, after),
+        "the step could not be redone: it is not the latest step to redo"
+    );
+    h.down(&Down::Restore {
+        step: own,
+        undo: true,
+    });
+    // Past the step's checks, git or the jail is what is missing here.
+    let refused = notice(&mut h, after);
+    assert!(
+        refused.starts_with("the step could not be undone: ")
+            && !refused.contains("latest")
+            && !refused.contains("not ready"),
+        "{refused}"
+    );
+    let (mut conversation, mut h) = h.close();
+    // Undone as if it had been, the one before is next, and not ready.
+    let after = conversation
+        .append(Kind::Restore {
+            step: own,
+            undo: true,
+        })
+        .unwrap()
+        .seq;
+    conversation.sync().unwrap();
+    drop(conversation);
+    h.reopen();
+    h.setup(Client::default());
+    h.down(&Down::Restore {
+        step: elsewhere,
+        undo: true,
+    });
+    assert_eq!(
+        notice(&mut h, after),
+        "the step could not be undone: /elsewhere is not ready"
+    );
+    let (conversation, _h) = h.close();
+    let restored = conversation
+        .events()
+        .iter()
+        .filter(|e| matches!(e.kind, Kind::Restore { .. }))
+        .count();
+    assert_eq!(restored, 1, "only the one appended here");
     let _ = std::fs::remove_dir_all(&base);
 }
 

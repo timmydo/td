@@ -108,6 +108,18 @@ pub const BINDINGS: &[Binding] = &[
         help: "Clear the open conversation's todo list.",
     },
     Binding {
+        name: "undo",
+        chord: Some("C-z"),
+        arguments: "",
+        help: "Undo the open conversation's latest step that changed files, between turns.",
+    },
+    Binding {
+        name: "redo",
+        chord: Some("C-S-z"),
+        arguments: "",
+        help: "Redo the open conversation's latest undone step.",
+    },
+    Binding {
         name: "focus-next",
         chord: Some("F6"),
         arguments: "",

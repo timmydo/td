@@ -1091,6 +1091,55 @@ impl Status {
     }
 }
 
+/// The steps a conversation's log can undo and redo (DESIGN.md §12),
+/// by their snapshots' places: a snapshot is done, an undo moves the
+/// latest done to the undone, a redo the latest undone back, and a new
+/// snapshot leaves nothing to redo.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Steps {
+    done: Vec<u64>,
+    undone: Vec<u64>,
+}
+
+impl Steps {
+    pub fn of(events: &[Event]) -> Self {
+        let mut steps = Self::default();
+        for event in events {
+            steps.apply(event);
+        }
+        steps
+    }
+
+    /// `event`, the next in the log, counted.
+    pub fn apply(&mut self, event: &Event) {
+        match event.kind {
+            Kind::Snapshot { .. } => {
+                self.done.push(event.seq);
+                self.undone.clear();
+            }
+            Kind::Restore { step, undo: true } if self.done.last() == Some(&step) => {
+                self.done.pop();
+                self.undone.push(step);
+            }
+            Kind::Restore { step, undo: false } if self.undone.last() == Some(&step) => {
+                self.undone.pop();
+                self.done.push(step);
+            }
+            _ => {}
+        }
+    }
+
+    /// The step an undo would undo, its snapshot's place.
+    pub fn undo(&self) -> Option<u64> {
+        self.done.last().copied()
+    }
+
+    /// The step a redo would redo.
+    pub fn redo(&self) -> Option<u64> {
+        self.undone.last().copied()
+    }
+}
+
 /// A worktree a step changed (DESIGN.md §12): its checkout, its trees
 /// before and after, and the files changed, as many as
 /// `snapshot::MAX_CHANGED`, and how many more. The trees and the names
@@ -1254,6 +1303,10 @@ pub enum Kind {
     /// The worktrees the step of the reply at `reply` changed, each as a
     /// git tree before and after it (DESIGN.md §12).
     Snapshot { reply: u64, worktrees: Vec<Snapped> },
+    /// The human undid the step whose snapshot is at `step`, its
+    /// worktrees brought back to their trees before it, or, not `undo`,
+    /// redid it (DESIGN.md §12).
+    Restore { step: u64, undo: bool },
     /// The human paused or resumed the conversation (DESIGN.md §3).
     Pause { paused: bool },
     /// The human chose the conversation's model and reasoning effort
@@ -1482,6 +1535,13 @@ impl Event {
                     .collect();
                 put("worktrees", Json::Arr(worktrees));
             }
+            Kind::Restore { step, undo } => {
+                put(
+                    "kind",
+                    Json::Str(if *undo { "undo" } else { "redo" }.into()),
+                );
+                put("step", Json::from(*step));
+            }
             Kind::Pause { paused } => {
                 put("kind", Json::Str("pause".into()));
                 put("paused", Json::Bool(*paused));
@@ -1672,6 +1732,10 @@ impl Event {
                     })
                     .collect::<Result<_, String>>()?,
                 cleared: flag("cleared")?,
+            },
+            Some(undo @ ("undo" | "redo")) => Kind::Restore {
+                step: number("step")?,
+                undo: undo == "undo",
             },
             Some("snapshot") => Kind::Snapshot {
                 reply: number("reply")?,
@@ -2672,6 +2736,53 @@ pub mod tests {
     }
 
     #[test]
+    fn steps_are_undone_latest_first_and_a_new_one_ends_redo() {
+        let at = |seq: u64, kind: Kind| Event { seq, time: 0, kind };
+        let snap = |seq: u64| {
+            at(
+                seq,
+                Kind::Snapshot {
+                    reply: seq,
+                    worktrees: Vec::new(),
+                },
+            )
+        };
+        let restore = |seq: u64, step: u64, undo: bool| at(seq, Kind::Restore { step, undo });
+        let mut events = vec![snap(1), snap(2)];
+        assert_eq!(
+            (Steps::of(&events).undo(), Steps::of(&events).redo()),
+            (Some(2), None)
+        );
+        events.push(restore(3, 2, true));
+        assert_eq!(
+            (Steps::of(&events).undo(), Steps::of(&events).redo()),
+            (Some(1), Some(2))
+        );
+        events.push(restore(4, 1, true));
+        assert_eq!(
+            (Steps::of(&events).undo(), Steps::of(&events).redo()),
+            (None, Some(1))
+        );
+        // A restore of any other step counts for nothing.
+        events.push(restore(5, 2, false));
+        assert_eq!(
+            (Steps::of(&events).undo(), Steps::of(&events).redo()),
+            (None, Some(1))
+        );
+        events.push(restore(6, 1, false));
+        assert_eq!(
+            (Steps::of(&events).undo(), Steps::of(&events).redo()),
+            (Some(1), Some(2))
+        );
+        // A new step leaves nothing to redo.
+        events.push(snap(7));
+        assert_eq!(
+            (Steps::of(&events).undo(), Steps::of(&events).redo()),
+            (Some(7), None)
+        );
+    }
+
+    #[test]
     fn a_snapshot_with_a_tree_that_is_no_id_is_refused() {
         let event = Event {
             seq: 1,
@@ -2782,6 +2893,14 @@ pub mod tests {
                 by: "a rule".into(),
                 probabilities: None,
                 reason: Some("read-only".into()),
+            },
+            Kind::Restore {
+                step: 9,
+                undo: true,
+            },
+            Kind::Restore {
+                step: 9,
+                undo: false,
             },
             Kind::Snapshot {
                 reply: 3,

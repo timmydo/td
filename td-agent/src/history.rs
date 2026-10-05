@@ -127,6 +127,8 @@ fn kind(event: &Event) -> &'static str {
         Kind::ToolResult { .. } => "tool_result",
         Kind::Todo { .. } => "todo",
         Kind::Snapshot { .. } => "snapshot",
+        Kind::Restore { undo: true, .. } => "undo",
+        Kind::Restore { undo: false, .. } => "redo",
         Kind::Pause { .. } => "pause",
         Kind::Choice { .. } => "choice",
         Kind::Approval { .. } => "approval",
@@ -242,6 +244,12 @@ pub fn render(event: &Event) -> String {
                 out.push_str(&format!("\n{}", snapshot_line(one)));
             }
             out
+        }
+        Kind::Restore { step, undo: true } => {
+            format!("the person undid the step snapshotted at #{step}")
+        }
+        Kind::Restore { step, undo: false } => {
+            format!("the person redid the step snapshotted at #{step}")
         }
         Kind::Pause { paused: true } => "the person paused this conversation".into(),
         Kind::Pause { paused: false } => "the person resumed this conversation".into(),

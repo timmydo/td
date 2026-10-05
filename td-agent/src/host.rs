@@ -84,6 +84,15 @@ pub enum Call {
         checkouts: Vec<String>,
         before: Vec<String>,
     },
+    /// td-agent's own, never a model's: each of `checkouts` brought from
+    /// tree `from` to tree `to` with `git`, refused unless each is at its
+    /// `from` now; a step undone or redone (DESIGN.md §12).
+    Restore {
+        git: String,
+        checkouts: Vec<String>,
+        from: Vec<String>,
+        to: Vec<String>,
+    },
 }
 
 /// From a conversation to its tool host.
@@ -145,6 +154,7 @@ impl Call {
             Self::Grep { .. } => "grep",
             Self::Sed { .. } => "sed",
             Self::Snapshot { .. } => "snapshot",
+            Self::Restore { .. } => "restore",
         }
     }
 
@@ -240,6 +250,23 @@ impl Call {
                     "before",
                     Json::Arr(before.iter().cloned().map(Json::Str).collect()),
                 ),
+            ]),
+            Self::Restore {
+                git,
+                checkouts,
+                from,
+                to,
+            } => member(vec![
+                ("git", Json::Str(git.clone())),
+                (
+                    "checkouts",
+                    Json::Arr(checkouts.iter().cloned().map(Json::Str).collect()),
+                ),
+                (
+                    "from",
+                    Json::Arr(from.iter().cloned().map(Json::Str).collect()),
+                ),
+                ("to", Json::Arr(to.iter().cloned().map(Json::Str).collect())),
             ]),
         }
     }
@@ -337,6 +364,12 @@ impl Call {
                 git: text("git")?,
                 checkouts: texts("checkouts")?,
                 before: texts("before")?,
+            },
+            "restore" => Self::Restore {
+                git: text("git")?,
+                checkouts: texts("checkouts")?,
+                from: texts("from")?,
+                to: texts("to")?,
             },
             other => return Err(format!("no tool {other:?}")),
         })
@@ -675,6 +708,12 @@ mod tests {
                 git: "/usr/bin/git".into(),
                 checkouts: vec!["/w/a".into(), "/w/b".into()],
                 before: vec!["a".repeat(40), "b".repeat(40)],
+            },
+            Call::Restore {
+                git: "/usr/bin/git".into(),
+                checkouts: vec!["/w/a".into()],
+                from: vec!["a".repeat(40)],
+                to: vec!["b".repeat(40)],
             },
         ];
         for (n, call) in calls.into_iter().enumerate() {

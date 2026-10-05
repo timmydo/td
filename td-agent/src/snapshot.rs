@@ -120,6 +120,350 @@ fn one(
     before: Option<&str>,
     budget: &mut usize,
 ) -> Result<Taken, String> {
+    let (id, gitdir) = linked(git, checkout)?;
+    let tree = current(git, checkout, &gitdir)?;
+    keep(git, checkout, &id, &tree)?;
+    let (changed, more) = match before {
+        Some(before) if before != tree => changed(git, checkout, before, &tree, budget)?,
+        _ => (Vec::new(), 0),
+    };
+    Ok(Taken {
+        checkout: checkout.display().to_string(),
+        tree,
+        changed,
+        more,
+    })
+}
+
+/// Each of `checkouts` brought from tree `from` to tree `to`, in their
+/// order (DESIGN.md §12, undo and redo). Before any is written, each
+/// must be at its `from`, so nothing changed since is overwritten, or at
+/// its `to` already, done by an earlier try; no submodule may differ;
+/// and nothing a tree cannot hold, an ignored file, may be in the way of
+/// what is written. Then in each the files `to` lacks are removed and the
+/// rest that differ written from it, the result checked to be `to` and
+/// kept on its ref. What changed is answered as a snapshot's; a failure
+/// names its worktree and those restored before it.
+pub fn restore(
+    git: &Git,
+    checkouts: &[String],
+    from: &[String],
+    to: &[String],
+    roots: &[PathBuf],
+) -> Result<Vec<Taken>, String> {
+    if !git.path.is_absolute() {
+        return Err(format!("{} is not an absolute path", git.path.display()));
+    }
+    if from.len() != checkouts.len() || to.len() != checkouts.len() {
+        return Err("a restore's trees do not match its worktrees".into());
+    }
+    if !from
+        .iter()
+        .chain(to)
+        .all(|tree| crate::git::object_id(tree))
+    {
+        return Err("a restore's tree is no object id".into());
+    }
+    let mut found = Vec::new();
+    for ((checkout, from), to) in checkouts.iter().zip(from).zip(to) {
+        let path = Path::new(checkout);
+        if !roots.iter().any(|root| root == path) {
+            return Err(format!("{checkout} is not a worktree here"));
+        }
+        let checked = |why: String| format!("{checkout}: {why}");
+        let (id, gitdir) = linked(git, path).map_err(checked)?;
+        let now = current(git, path, &gitdir).map_err(checked)?;
+        let plan = if now == *to {
+            None
+        } else if now == *from {
+            let plan = plan(git, path, from, to).map_err(checked)?;
+            clear(git, path, &plan).map_err(checked)?;
+            Some(plan)
+        } else {
+            return Err(format!("{checkout} has changed since that step"));
+        };
+        found.push((path, id, gitdir, plan));
+    }
+    let mut budget = MAX_NAMED_ALL;
+    let mut restored: Vec<String> = Vec::new();
+    let mut taken = Vec::new();
+    for ((checkout, id, gitdir, plan), (from, to)) in found.into_iter().zip(from.iter().zip(to)) {
+        let mut one = || -> Result<Taken, String> {
+            if let Some(plan) = &plan {
+                apply(git, checkout, to, plan)?;
+                if current(git, checkout, &gitdir)? != *to {
+                    return Err("it did not come back to that step's tree".into());
+                }
+            }
+            keep(git, checkout, &id, to)?;
+            let (changed, more) = if from == to {
+                (Vec::new(), 0)
+            } else {
+                changed(git, checkout, from, to, &mut budget)?
+            };
+            Ok(Taken {
+                checkout: checkout.display().to_string(),
+                tree: to.clone(),
+                changed,
+                more,
+            })
+        };
+        match one() {
+            Ok(one) => {
+                restored.push(one.checkout.clone());
+                taken.push(one);
+            }
+            Err(why) => {
+                let before = if restored.is_empty() {
+                    String::new()
+                } else {
+                    format!("; restored already: {}", restored.join(", "))
+                };
+                return Err(format!("{}: {why}{before}", checkout.display()));
+            }
+        }
+    }
+    Ok(taken)
+}
+
+/// What bringing a worktree from one tree to another does: the paths
+/// removed, and those written, each ended by a NUL, which include the
+/// ones added, each with the object it is to be.
+struct Plan {
+    gone: Vec<PathBuf>,
+    added: Vec<(PathBuf, String)>,
+    wanted: Vec<u8>,
+}
+
+/// The files that differ between trees `from` and `to`, as a plan; a
+/// submodule among them is refused, since git writes none.
+fn plan(git: &Git, checkout: &Path, from: &str, to: &str) -> Result<Plan, String> {
+    let listed =
+        ran(git
+            .at(checkout)
+            .args(["diff-tree", "-r", "-z", "--no-renames", "--raw", from, to]))?;
+    let mut fields = listed.split(|&b| b == 0).filter(|field| !field.is_empty());
+    let mut plan = Plan {
+        gone: Vec::new(),
+        added: Vec::new(),
+        wanted: Vec::new(),
+    };
+    while let Some(meta) = fields.next() {
+        let path = fields.next().ok_or("git: a change without its path")?;
+        let relative = relative(path)?;
+        // `:<mode> <mode> <id> <id> <status>`
+        let meta: Vec<&[u8]> = meta
+            .strip_prefix(b":")
+            .ok_or("git: a change it did not describe")?
+            .split(|&b| b == b' ')
+            .collect();
+        if meta.iter().take(2).any(|mode| *mode == b"160000") {
+            return Err(format!(
+                "{} is a submodule, which td-agent does not restore",
+                relative.display()
+            ));
+        }
+        match meta.get(4).and_then(|status| status.first()) {
+            Some(b'D') => plan.gone.push(relative),
+            Some(b'A') => {
+                let id = meta
+                    .get(3)
+                    .map(|id| String::from_utf8_lossy(id).into_owned())
+                    .filter(|id| crate::git::object_id(id))
+                    .ok_or("git: an addition of no object")?;
+                plan.added.push((relative, id));
+                plan.wanted.extend(path.iter().copied().chain([0]));
+            }
+            Some(b'M' | b'T') => plan.wanted.extend(path.iter().copied().chain([0])),
+            _ => return Err("git: a change of no kind it should give".into()),
+        }
+    }
+    Ok(plan)
+}
+
+/// Refused if anything no tree holds, an ignored file, is where `plan`
+/// writes: at a path it adds, unless a file of the very bytes it writes
+/// there or a directory holding only what it removes, or on the way to
+/// one, unless a directory or what it removes.
+fn clear(git: &Git, checkout: &Path, plan: &Plan) -> Result<(), String> {
+    let gone: std::collections::HashSet<&Path> = plan.gone.iter().map(PathBuf::as_path).collect();
+    let in_the_way = |path: &Path| format!("{} is in the way and in no snapshot", path.display());
+    for (added, id) in &plan.added {
+        let mut at = PathBuf::new();
+        let mut reached = true;
+        if let Some(parent) = added.parent() {
+            for name in parent.components() {
+                at.push(name);
+                match std::fs::symlink_metadata(checkout.join(&at)) {
+                    Ok(meta) if meta.is_dir() => {}
+                    Ok(_) if gone.contains(at.as_path()) => {
+                        reached = false;
+                        break;
+                    }
+                    Ok(_) => return Err(in_the_way(&at)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        reached = false;
+                        break;
+                    }
+                    Err(e) => return Err(format!("{}: {e}", at.display())),
+                }
+            }
+        }
+        if !reached {
+            continue;
+        }
+        match std::fs::symlink_metadata(checkout.join(added)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(meta) if meta.is_dir() => only_gone(checkout, added, &gone)?,
+            Ok(meta) if meta.is_file() => {
+                let held = said(
+                    git.at(checkout)
+                        .args(["hash-object", "--no-filters", "--"])
+                        .arg(added),
+                )?;
+                if held != *id {
+                    return Err(in_the_way(added));
+                }
+            }
+            Ok(_) => return Err(in_the_way(added)),
+            Err(e) => return Err(format!("{}: {e}", added.display())),
+        }
+    }
+    Ok(())
+}
+
+/// Refused unless directory `dir` of `checkout` holds, at any depth, no
+/// file but those in `gone`; links are not followed.
+fn only_gone(
+    checkout: &Path,
+    dir: &Path,
+    gone: &std::collections::HashSet<&Path>,
+) -> Result<(), String> {
+    let mut left = vec![dir.to_path_buf()];
+    while let Some(dir) = left.pop() {
+        let entries = std::fs::read_dir(checkout.join(&dir))
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+            let path = dir.join(entry.file_name());
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            if kind.is_dir() {
+                left.push(path);
+            } else if !gone.contains(path.as_path()) {
+                return Err(format!(
+                    "{} is in the way and in no snapshot",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `plan` carried out in `checkout`: the files it removes removed, through
+/// no link, and the directories they leave empty; those it writes
+/// written from tree `to` by git.
+fn apply(git: &Git, checkout: &Path, to: &str, plan: &Plan) -> Result<(), String> {
+    for path in &plan.gone {
+        remove(checkout, path)?;
+    }
+    for path in &plan.gone {
+        prune(checkout, path);
+    }
+    if plan.wanted.is_empty() {
+        return Ok(());
+    }
+    let index = private_index()?;
+    let list = index.with_extension("wanted");
+    let written = write_out(git, checkout, to, &index, &list, &plan.wanted);
+    let _ = std::fs::remove_file(&index);
+    let _ = std::fs::remove_file(&list);
+    written
+}
+
+/// `wanted`, paths each ended by a NUL, written into `checkout` from tree
+/// `to` through `index`, a private one, as their blobs' bytes.
+fn write_out(
+    git: &Git,
+    checkout: &Path,
+    to: &str,
+    index: &Path,
+    list: &Path,
+    wanted: &[u8],
+) -> Result<(), String> {
+    let empty = empty_tree(git, checkout)?;
+    ran(git
+        .at(checkout)
+        .env("GIT_INDEX_FILE", index)
+        .args(["read-tree", to]))?;
+    std::fs::write(list, wanted).map_err(|e| format!("{}: {e}", list.display()))?;
+    let input = std::fs::File::open(list).map_err(|e| format!("{}: {e}", list.display()))?;
+    ran(git
+        .at(checkout)
+        .env("GIT_INDEX_FILE", index)
+        .env("GIT_ATTR_SOURCE", &empty)
+        .stdin(input)
+        .args(["checkout-index", "-f", "-z", "--stdin"]))?;
+    Ok(())
+}
+
+/// `path`, a tree's, as a relative path of plain names: none empty,
+/// `.`, `..` or `.git`.
+fn relative(path: &[u8]) -> Result<PathBuf, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let plain = !path.is_empty()
+        && path.split(|&b| b == b'/').all(|name| {
+            !name.is_empty() && name != b"." && name != b".." && !name.eq_ignore_ascii_case(b".git")
+        });
+    if !plain {
+        return Err(format!(
+            "git named a path {:?}",
+            crate::tools::visible(&String::from_utf8_lossy(path))
+        ));
+    }
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+}
+
+/// `path` in `checkout` removed, a file or a link, never followed: each
+/// directory on the way must be one, not a link to one.
+fn remove(checkout: &Path, path: &Path) -> Result<(), String> {
+    let mut at = checkout.to_path_buf();
+    if let Some(parent) = path.parent() {
+        for name in parent.components() {
+            at.push(name);
+            match std::fs::symlink_metadata(&at) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => return Err(format!("{} is not a directory", at.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(format!("{}: {e}", at.display())),
+            }
+        }
+    }
+    let at = checkout.join(path);
+    match std::fs::symlink_metadata(&at) {
+        Ok(meta) if meta.is_dir() => Err(format!("{} is a directory", at.display())),
+        Ok(_) => std::fs::remove_file(&at).map_err(|e| format!("{}: {e}", at.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", at.display())),
+    }
+}
+
+/// The directories above `path` in `checkout` it left empty, removed.
+fn prune(checkout: &Path, path: &Path) {
+    let mut at = path.parent();
+    while let Some(dir) = at.filter(|dir| !dir.as_os_str().is_empty()) {
+        if std::fs::remove_dir(checkout.join(dir)).is_err() {
+            return;
+        }
+        at = dir.parent();
+    }
+}
+
+/// `checkout`'s id among its repository's worktrees, and its git
+/// directory; refused for any but a linked worktree.
+fn linked(git: &Git, checkout: &Path) -> Result<(String, PathBuf), String> {
     let gitdir = PathBuf::from(said(
         git.at(checkout).args(["rev-parse", "--absolute-git-dir"]),
     )?);
@@ -133,26 +477,33 @@ fn one(
         })
         .ok_or_else(|| format!("{} is not a linked worktree", checkout.display()))?
         .to_string();
-    // A private index, so the worktree's own, and what is staged in it,
-    // are left as they are.
-    let index = std::env::temp_dir().join(format!(
+    Ok((id, gitdir))
+}
+
+/// `checkout`'s tree as it is now, written with a private index, so the
+/// worktree's own, and what is staged in it, are left as they are.
+fn current(git: &Git, checkout: &Path, gitdir: &Path) -> Result<String, String> {
+    let index = private_index()?;
+    let made = make_tree(git, checkout, gitdir, &index);
+    let _ = std::fs::remove_file(&index);
+    made
+}
+
+/// A fresh name for a private index in the instance's temporary
+/// directory.
+fn private_index() -> Result<PathBuf, String> {
+    Ok(std::env::temp_dir().join(format!(
         "td-agent-snapshot-{}.index",
         crate::store::random_hex(8).map_err(|e| format!("an index name: {e}"))?
-    ));
-    let made = make_tree(git, checkout, &gitdir, &index);
-    let _ = std::fs::remove_file(&index);
-    let tree = made?;
-    keep(git, checkout, &id, &tree)?;
-    let (changed, more) = match before {
-        Some(before) if before != tree => changed(git, checkout, before, &tree, budget)?,
-        _ => (Vec::new(), 0),
-    };
-    Ok(Taken {
-        checkout: checkout.display().to_string(),
-        tree,
-        changed,
-        more,
-    })
+    )))
+}
+
+/// The empty tree's id in `checkout`'s repository, whatever its hash.
+fn empty_tree(git: &Git, checkout: &Path) -> Result<String, String> {
+    said(
+        git.at(checkout)
+            .args(["hash-object", "-t", "tree", "/dev/null"]),
+    )
 }
 
 fn make_tree(git: &Git, checkout: &Path, gitdir: &Path, index: &Path) -> Result<String, String> {
@@ -173,10 +524,7 @@ fn make_tree(git: &Git, checkout: &Path, gitdir: &Path, index: &Path) -> Result<
     }
     // Attributes from no tree, an empty one, so each blob is its file's
     // bytes, whatever a `.gitattributes` there says.
-    let empty = said(
-        git.at(checkout)
-            .args(["hash-object", "-t", "tree", "/dev/null"]),
-    )?;
+    let empty = empty_tree(git, checkout)?;
     let staged = |command: &mut Command| {
         command
             .env("GIT_INDEX_FILE", index)
@@ -815,5 +1163,271 @@ mod tests {
         let mut budget = MAX_NAMED_ALL;
         let (kept, more) = named(std::iter::repeat_n(b"a".as_slice(), 50), &mut budget);
         assert_eq!((kept.len(), more), (MAX_CHANGED, 10));
+    }
+
+    #[test]
+    fn a_step_is_undone_and_redone_and_nothing_changed_since_is_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        if !crate::git::tests::have_git() {
+            return;
+        }
+        let scratch = Scratch::new("snapshot-restore");
+        let (checkout, name) = worktree(
+            &scratch,
+            &[
+                ("a", "one\n"),
+                ("d/x", "x\n"),
+                ("run", "#!/bin/sh\n"),
+                (".gitignore", "target/\n"),
+            ],
+        );
+        std::os::unix::fs::symlink("a", checkout.join("link")).unwrap();
+        std::fs::create_dir(checkout.join("target")).unwrap();
+        std::fs::write(checkout.join("target/kept"), "built\n").unwrap();
+        // Attributes that would write a file other than its bytes.
+        std::fs::write(checkout.join(".gitattributes"), "lf text eol=crlf\n").unwrap();
+        std::fs::write(checkout.join("lf"), "x\n").unwrap();
+        let git = git();
+        let roots = [checkout.clone()];
+        let names = [name.clone()];
+        let before = take(&git, &names, &[], &roots).unwrap()[0].tree.clone();
+        // The step: an edit, a deletion emptying a directory, an addition
+        // in a new one, a mode, a link turned into a file.
+        std::fs::write(checkout.join("a"), "two\n").unwrap();
+        std::fs::remove_file(checkout.join("d/x")).unwrap();
+        std::fs::remove_dir(checkout.join("d")).unwrap();
+        std::fs::create_dir(checkout.join("new")).unwrap();
+        std::fs::write(checkout.join("new/n"), "n\n").unwrap();
+        std::fs::set_permissions(checkout.join("run"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::remove_file(checkout.join("link")).unwrap();
+        std::fs::write(checkout.join("link"), "plain\n").unwrap();
+        std::fs::remove_file(checkout.join("lf")).unwrap();
+        let after = take(&git, &names, std::slice::from_ref(&before), &roots).unwrap()[0]
+            .tree
+            .clone();
+        let back = |from: &str, to: &str| {
+            restore(&git, &names, &[from.to_string()], &[to.to_string()], &roots)
+        };
+        // Undone: each file as it was, the new directory gone.
+        let undone = back(&after, &before).unwrap();
+        assert_eq!(undone[0].tree, before);
+        // Asked again, it is done already, and nothing changes.
+        assert_eq!(back(&after, &before).unwrap()[0].tree, before);
+        let mut changed = undone[0].changed.clone();
+        changed.sort();
+        assert_eq!(changed, ["a", "d/x", "lf", "link", "new/n", "run"]);
+        assert_eq!(std::fs::read(checkout.join("lf")).unwrap(), b"x\n");
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("a")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("d/x")).unwrap(),
+            "x\n"
+        );
+        assert!(!checkout.join("new").exists());
+        assert_eq!(
+            std::fs::read_link(checkout.join("link")).unwrap(),
+            Path::new("a")
+        );
+        let mode = std::fs::metadata(checkout.join("run"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0);
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("target/kept")).unwrap(),
+            "built\n"
+        );
+        let main = scratch.0.join("main");
+        assert_eq!(
+            run(&main, &["rev-parse", &format!("{REF}tree^{{tree}}")]),
+            before
+        );
+        // Redone: the step's again.
+        assert_eq!(back(&before, &after).unwrap()[0].tree, after);
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("a")).unwrap(),
+            "two\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("new/n")).unwrap(),
+            "n\n"
+        );
+        assert!(!checkout.join("d").exists());
+        // A worktree changed since is refused, and nothing written.
+        std::fs::write(checkout.join("later"), "mine\n").unwrap();
+        let refused = back(&after, &before).unwrap_err();
+        assert!(refused.contains("has changed since"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("a")).unwrap(),
+            "two\n"
+        );
+        assert!(checkout.join("later").exists());
+        // Bad requests.
+        assert!(restore(&git, &names, std::slice::from_ref(&after), &[], &roots).is_err());
+        assert!(restore(
+            &git,
+            &names,
+            &["HEAD".into()],
+            std::slice::from_ref(&before),
+            &roots
+        )
+        .is_err());
+        assert!(restore(
+            &git,
+            &names,
+            std::slice::from_ref(&after),
+            std::slice::from_ref(&before),
+            &[]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_restore_names_only_plain_paths_and_removes_through_no_link() {
+        for bad in [
+            &b""[..],
+            b"/abs",
+            b"../x",
+            b"a/../b",
+            b"a//b",
+            b"./a",
+            b".git/config",
+            b"a/.GIT/x",
+        ] {
+            assert!(relative(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(relative(b"a/b.git/c").unwrap(), Path::new("a/b.git/c"));
+        let scratch = Scratch::new("snapshot-remove");
+        let checkout = scratch.0.join("tree");
+        let outside = scratch.0.join("outside");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("f"), "kept\n").unwrap();
+        std::os::unix::fs::symlink(&outside, checkout.join("l")).unwrap();
+        assert!(remove(&checkout, Path::new("l/f")).is_err());
+        assert!(outside.join("f").exists());
+        // A link itself is removed, not what it names.
+        std::os::unix::fs::symlink(outside.join("f"), checkout.join("g")).unwrap();
+        remove(&checkout, Path::new("g")).unwrap();
+        assert!(outside.join("f").exists());
+        // What is gone already is no failure; a directory is.
+        remove(&checkout, Path::new("none/x")).unwrap();
+        std::fs::create_dir(checkout.join("dir")).unwrap();
+        assert!(remove(&checkout, Path::new("dir")).is_err());
+        // Emptied directories go, up to the first that is not.
+        std::fs::create_dir_all(checkout.join("p/q/r")).unwrap();
+        std::fs::write(checkout.join("p/keep"), "k\n").unwrap();
+        prune(&checkout, Path::new("p/q/r/file"));
+        assert!(!checkout.join("p/q").exists());
+        assert!(checkout.join("p/keep").exists());
+    }
+
+    #[test]
+    fn what_no_snapshot_holds_is_never_written_over() {
+        if !crate::git::tests::have_git() {
+            return;
+        }
+        let scratch = Scratch::new("snapshot-in-the-way");
+        let (checkout, name) = worktree(
+            &scratch,
+            &[("out", "one\n"), ("p/q", "q\n"), (".gitignore", "*.o\n")],
+        );
+        std::fs::write(checkout.join("notes"), "mine\n").unwrap();
+        let git = git();
+        let roots = [checkout.clone()];
+        let names = [name.clone()];
+        let before = take(&git, &names, &[], &roots).unwrap()[0].tree.clone();
+        // The step: a file turned directory, a directory gone, and a file
+        // newly ignored.
+        std::fs::remove_file(checkout.join("out")).unwrap();
+        std::fs::create_dir(checkout.join("out")).unwrap();
+        std::fs::write(checkout.join("out/x"), "x\n").unwrap();
+        std::fs::remove_file(checkout.join("p/q")).unwrap();
+        std::fs::remove_dir(checkout.join("p")).unwrap();
+        std::fs::write(checkout.join(".gitignore"), "*.o\nnotes\np\n").unwrap();
+        let after = take(&git, &names, std::slice::from_ref(&before), &roots).unwrap()[0]
+            .tree
+            .clone();
+        let undo = || {
+            restore(
+                &git,
+                &names,
+                std::slice::from_ref(&after),
+                std::slice::from_ref(&before),
+                &roots,
+            )
+        };
+        // An ignored build output in the directory to become a file.
+        std::fs::write(checkout.join("out/build.o"), "built\n").unwrap();
+        let refused = undo().unwrap_err();
+        assert!(refused.contains("out/build.o is in the way"), "{refused}");
+        assert!(refused.starts_with(&name), "{refused}");
+        assert!(checkout.join("out/x").exists(), "nothing written");
+        std::fs::remove_file(checkout.join("out/build.o")).unwrap();
+        // An ignored file where a directory must be.
+        std::fs::write(checkout.join("p"), "ignored\n").unwrap();
+        let refused = undo().unwrap_err();
+        assert!(refused.contains("p is in the way"), "{refused}");
+        std::fs::remove_file(checkout.join("p")).unwrap();
+        // The newly ignored file, edited since, is the human's; as it was,
+        // it is the very bytes written.
+        std::fs::write(checkout.join("notes"), "edited\n").unwrap();
+        let refused = undo().unwrap_err();
+        assert!(refused.contains("notes is in the way"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("notes")).unwrap(),
+            "edited\n"
+        );
+        std::fs::write(checkout.join("notes"), "mine\n").unwrap();
+        // Out of the way, the directory holding only what goes is undone.
+        assert_eq!(undo().unwrap()[0].tree, before);
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("out")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("p/q")).unwrap(),
+            "q\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("notes")).unwrap(),
+            "mine\n"
+        );
+    }
+
+    #[test]
+    fn a_submodule_is_not_restored() {
+        if !crate::git::tests::have_git() {
+            return;
+        }
+        let scratch = Scratch::new("snapshot-submodule");
+        let (checkout, name) = worktree(&scratch, &[("a", "a\n")]);
+        let git = git();
+        let roots = [checkout.clone()];
+        let names = [name.clone()];
+        let before = take(&git, &names, &[], &roots).unwrap()[0].tree.clone();
+        let sub = checkout.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        run(&sub, &["init", "-q"]);
+        std::fs::write(sub.join("s"), "s\n").unwrap();
+        run(&sub, &["add", "s"]);
+        run(&sub, &["commit", "-q", "-m", "s"]);
+        std::fs::write(checkout.join("a"), "b\n").unwrap();
+        let after = take(&git, &names, std::slice::from_ref(&before), &roots).unwrap()[0]
+            .tree
+            .clone();
+        let refused = restore(
+            &git,
+            &names,
+            std::slice::from_ref(&after),
+            std::slice::from_ref(&before),
+            &roots,
+        )
+        .unwrap_err();
+        assert!(refused.contains("sub is a submodule"), "{refused}");
+        assert_eq!(std::fs::read_to_string(checkout.join("a")).unwrap(), "b\n");
     }
 }

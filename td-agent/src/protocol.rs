@@ -51,6 +51,8 @@ pub enum Down {
     Pause { paused: bool },
     /// The human cleared the todo list.
     ClearTodo,
+    /// Undo, or redo, the step snapshotted at `step` (DESIGN.md §12).
+    Restore { step: u64, undo: bool },
     /// The human chose the conversation's model and reasoning effort,
     /// whole; none is the configuration's.
     Choose {
@@ -166,6 +168,10 @@ pub enum Up {
         remote: String,
         bases: Vec<String>,
     },
+    /// The conversation is done with an undo or a redo the window asked
+    /// for, done or not: until then the window keeps its process
+    /// (DESIGN.md §12).
+    Restored,
     /// The conversation is done preparing `remote`'s repository, ready or
     /// not: until then the window keeps its process (DESIGN.md §7).
     Prepared {
@@ -381,6 +387,13 @@ impl Down {
             ),
             Self::Pause { paused } => typed("pause", vec![("paused".into(), Json::Bool(*paused))]),
             Self::ClearTodo => typed("clear_todo", Vec::new()),
+            Self::Restore { step, undo } => typed(
+                "restore",
+                vec![
+                    ("step".into(), Json::from(*step)),
+                    ("undo".into(), Json::Bool(*undo)),
+                ],
+            ),
             Self::Choose { model, effort } => typed(
                 "choose",
                 vec![
@@ -496,6 +509,16 @@ impl Down {
                     .ok_or("no paused")?,
             }),
             Some("clear_todo") => Ok(Self::ClearTodo),
+            Some("restore") => Ok(Self::Restore {
+                step: value
+                    .get("step")
+                    .and_then(Json::as_u64)
+                    .ok_or("a restore with no step")?,
+                undo: value
+                    .get("undo")
+                    .and_then(Json::as_bool)
+                    .ok_or("a restore with no undo")?,
+            }),
             Some("choose") => {
                 let model = maybe(&value, "model")?;
                 let effort = maybe(&value, "effort")?;
@@ -630,6 +653,7 @@ impl Up {
                 ],
             ),
             Self::Query { id } => typed("query", vec![("id".into(), Json::from(*id))]),
+            Self::Restored => typed("restored", Vec::new()),
             Self::Prepared { remote } => typed(
                 "prepared",
                 vec![("remote".into(), Json::Str(remote.clone()))],
@@ -752,6 +776,7 @@ impl Up {
                 remote: string(&value, "remote")?,
                 bases: strings(&value, "bases")?,
             },
+            Some("restored") => Self::Restored,
             Some("prepared") => Self::Prepared {
                 remote: string(&value, "remote")?,
             },
@@ -873,6 +898,7 @@ mod tests {
             Up::Prepared {
                 remote: "https://github.com/timmydo/td".into(),
             },
+            Up::Restored,
             Up::Heads {
                 remote: "https://github.com/timmydo/td".into(),
                 bases: vec!["main".into()],
@@ -957,6 +983,14 @@ mod tests {
             },
             Down::Pause { paused: true },
             Down::ClearTodo,
+            Down::Restore {
+                step: 7,
+                undo: true,
+            },
+            Down::Restore {
+                step: 9,
+                undo: false,
+            },
             Down::Decision {
                 call: 7,
                 allow: true,

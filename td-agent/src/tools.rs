@@ -1126,6 +1126,12 @@ pub fn card(call: &Call) -> (String, Vec<String>) {
             }
             "Snapshot the worktrees"
         }
+        Call::Restore { checkouts, .. } => {
+            for checkout in checkouts {
+                card.line(visible(checkout));
+            }
+            "Restore the worktrees"
+        }
     };
     (title.to_string(), card.done())
 }
