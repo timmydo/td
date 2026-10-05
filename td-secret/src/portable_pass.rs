@@ -149,6 +149,12 @@ impl Cancel {
     pub fn cancel(&self) {
         self.0.cancel();
     }
+
+    /// Whether it has been cancelled, so a caller's own long step, such as
+    /// reading what an import brings, ends with the operation.
+    pub fn cancelled(&self) -> bool {
+        self.0.cancelled()
+    }
 }
 
 fn cancelled() -> Error {
@@ -641,6 +647,43 @@ impl Host {
             })
             .map_err(Failure)
     }
+
+    /// Saves `changes` as one save under the unlock that opened `vault`,
+    /// each against the entries the ones before it left: every change
+    /// commits, or, refused or cancelled before publication, none does;
+    /// an uncertain failure is uncertain for them all. No token is
+    /// presented; memory is rechecked first, and a `cancel` before
+    /// publication publishes nothing.
+    pub fn apply_all(
+        &mut self,
+        vault: &mut Vault,
+        changes: Vec<Change>,
+        cancel: &Cancel,
+    ) -> Result<Vec<Committed>, Failure> {
+        self.protected
+            .recheck()
+            .map_err(|reason| Failure(Error::Refused(reason.into())))?;
+        let revoked = || cancel.0.cancelled();
+        let changes = changes.into_iter().map(notebook::Change::from).collect();
+        vault
+            .0
+            .apply_all(
+                &self.directory,
+                changes,
+                &revoked,
+                &mut Random(&mut self.random),
+            )
+            .map(|committed| {
+                committed
+                    .into_iter()
+                    .map(|committed| Committed {
+                        id: committed.id,
+                        revision: committed.revision,
+                    })
+                    .collect()
+            })
+            .map_err(Failure)
+    }
 }
 
 /// Runs `operation` over the production token adapter: each presentation
@@ -940,6 +983,16 @@ mod tests {
             text(Error::State("no portable vault exists")),
             "no portable vault exists"
         );
+    }
+
+    #[test]
+    fn a_cancel_says_it_was_cancelled_through_every_clone() {
+        let cancel = Cancel::new();
+        let held = cancel.clone();
+        assert!(!held.cancelled());
+        cancel.cancel();
+        assert!(held.cancelled() && cancel.cancelled());
+        assert!(!Cancel::new().cancelled());
     }
 
     #[test]

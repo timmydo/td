@@ -1,5 +1,6 @@
-//! Entry operations over an unlocked session. Each change is one
-//! revision-checked save of the whole notebook under the session's unlock.
+//! Entry operations over an unlocked session. Each change, or each batch
+//! of changes, is one revision-checked save of the whole notebook under
+//! the session's unlock.
 
 use super::lifecycle::{Directory, Error, Session};
 use super::{Entry, Notebook, MAX_BODY, MAX_ENTRIES, MAX_PLAIN, MAX_TITLE};
@@ -127,6 +128,28 @@ impl Session {
         revoked: &dyn Fn() -> bool,
         random: &mut impl Read,
     ) -> Result<Committed, Error> {
+        self.apply_all(directory, vec![change], revoked, random)?
+            .pop()
+            .ok_or_else(|| Error::Refused("portable change committed nothing".into()))
+    }
+
+    /// Builds the next notebook from `changes`, each against the entries
+    /// the ones before it left, then saves it once under the session's
+    /// unlock: one vault revision, or nothing when any change or the save
+    /// is refused, or `revoked` comes, before publication; a save
+    /// uncertain after it began is uncertain for the whole batch. An
+    /// entry changed twice reports the first change's revision, never
+    /// published alone. No changes save nothing.
+    pub fn apply_all(
+        &mut self,
+        directory: &Directory,
+        changes: Vec<Change>,
+        revoked: &dyn Fn() -> bool,
+        random: &mut impl Read,
+    ) -> Result<Vec<Committed>, Error> {
+        if changes.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut entries: Vec<Entry> = self
             .notebook()
             .entries
@@ -140,93 +163,105 @@ impl Session {
                 )
             })
             .collect();
-        let find = |entries: &[Entry], id: &EntryId, base: u64| {
-            let index = entries
-                .iter()
-                .position(|entry| &entry.id == id)
-                .ok_or(Error::Entry(EntryError::Missing))?;
-            if entries.get(index).map(|entry| entry.revision) != Some(base) {
-                return Err(Error::Entry(EntryError::Stale));
-            }
-            Ok(index)
-        };
-        let committed = match change {
-            Change::Create { title, body } => {
-                if entries.len() >= MAX_ENTRIES {
-                    return Err(Error::Entry(EntryError::Full));
-                }
-                if let Some(error) = title_error(&entries, None, title.as_str()) {
-                    return Err(Error::Entry(error));
-                }
-                if body.as_str().len() > MAX_BODY {
-                    return Err(Error::Entry(EntryError::Body));
-                }
-                let mut id = [0; 16];
-                random
-                    .read_exact(&mut id)
-                    .map_err(|_| Error::Refused("portable entropy unavailable".into()))?;
-                if entries.iter().any(|entry| entry.id == id) {
-                    return Err(Error::Refused("portable entry identity collided".into()));
-                }
-                entries.push(Entry::new(id, 1, title.take(), body.take().into_bytes()));
-                Committed {
-                    id,
-                    revision: Some(1),
-                }
-            }
-            Change::Edit {
-                id,
-                base,
-                title,
-                body,
-            } => {
-                let index = find(&entries, &id, base)?;
-                if let Some(error) = title_error(&entries, Some(index), title.as_str()) {
-                    return Err(Error::Entry(error));
-                }
-                if body.as_str().len() > MAX_BODY {
-                    return Err(Error::Entry(EntryError::Body));
-                }
-                let revision = next(base)?;
-                let entry = entries
-                    .get_mut(index)
-                    .ok_or(Error::Entry(EntryError::Missing))?;
-                entry.replace_text(title.take(), body.take().into_bytes());
-                entry.revision = revision;
-                Committed {
-                    id,
-                    revision: Some(revision),
-                }
-            }
-            Change::Rename { id, base, title } => {
-                let index = find(&entries, &id, base)?;
-                if let Some(error) = title_error(&entries, Some(index), title.as_str()) {
-                    return Err(Error::Entry(error));
-                }
-                let revision = next(base)?;
-                let entry = entries
-                    .get_mut(index)
-                    .ok_or(Error::Entry(EntryError::Missing))?;
-                let body = entry.body().to_vec();
-                entry.replace_text(title.take(), body);
-                entry.revision = revision;
-                Committed {
-                    id,
-                    revision: Some(revision),
-                }
-            }
-            Change::Delete { id, base } => {
-                let index = find(&entries, &id, base)?;
-                entries.remove(index);
-                Committed { id, revision: None }
-            }
-        };
+        let mut committed = Vec::with_capacity(changes.len());
+        for change in changes {
+            committed.push(apply_one(&mut entries, change, random)?);
+        }
         if plaintext_size(&entries).is_none_or(|size| size > MAX_PLAIN) {
             return Err(Error::Entry(EntryError::Full));
         }
         self.save(directory, &Notebook { entries }, revoked, random)?;
         Ok(committed)
     }
+}
+
+/// Applies one change to the next notebook's `entries`.
+fn apply_one(
+    entries: &mut Vec<Entry>,
+    change: Change,
+    random: &mut impl Read,
+) -> Result<Committed, Error> {
+    let find = |entries: &[Entry], id: &EntryId, base: u64| {
+        let index = entries
+            .iter()
+            .position(|entry| &entry.id == id)
+            .ok_or(Error::Entry(EntryError::Missing))?;
+        if entries.get(index).map(|entry| entry.revision) != Some(base) {
+            return Err(Error::Entry(EntryError::Stale));
+        }
+        Ok(index)
+    };
+    Ok(match change {
+        Change::Create { title, body } => {
+            if entries.len() >= MAX_ENTRIES {
+                return Err(Error::Entry(EntryError::Full));
+            }
+            if let Some(error) = title_error(entries, None, title.as_str()) {
+                return Err(Error::Entry(error));
+            }
+            if body.as_str().len() > MAX_BODY {
+                return Err(Error::Entry(EntryError::Body));
+            }
+            let mut id = [0; 16];
+            random
+                .read_exact(&mut id)
+                .map_err(|_| Error::Refused("portable entropy unavailable".into()))?;
+            if entries.iter().any(|entry| entry.id == id) {
+                return Err(Error::Refused("portable entry identity collided".into()));
+            }
+            entries.push(Entry::new(id, 1, title.take(), body.take().into_bytes()));
+            Committed {
+                id,
+                revision: Some(1),
+            }
+        }
+        Change::Edit {
+            id,
+            base,
+            title,
+            body,
+        } => {
+            let index = find(entries, &id, base)?;
+            if let Some(error) = title_error(entries, Some(index), title.as_str()) {
+                return Err(Error::Entry(error));
+            }
+            if body.as_str().len() > MAX_BODY {
+                return Err(Error::Entry(EntryError::Body));
+            }
+            let revision = next(base)?;
+            let entry = entries
+                .get_mut(index)
+                .ok_or(Error::Entry(EntryError::Missing))?;
+            entry.replace_text(title.take(), body.take().into_bytes());
+            entry.revision = revision;
+            Committed {
+                id,
+                revision: Some(revision),
+            }
+        }
+        Change::Rename { id, base, title } => {
+            let index = find(entries, &id, base)?;
+            if let Some(error) = title_error(entries, Some(index), title.as_str()) {
+                return Err(Error::Entry(error));
+            }
+            let revision = next(base)?;
+            let entry = entries
+                .get_mut(index)
+                .ok_or(Error::Entry(EntryError::Missing))?;
+            let body = entry.body().to_vec();
+            entry.replace_text(title.take(), body);
+            entry.revision = revision;
+            Committed {
+                id,
+                revision: Some(revision),
+            }
+        }
+        Change::Delete { id, base } => {
+            let index = find(entries, &id, base)?;
+            entries.remove(index);
+            Committed { id, revision: None }
+        }
+    })
 }
 
 fn next(base: u64) -> Result<u64, Error> {
@@ -396,6 +431,151 @@ mod tests {
                 title: "Mail".into(),
             })
             .unwrap();
+    }
+
+    #[test]
+    fn a_batch_commits_as_one_revision_that_every_key_reads() {
+        let mut fixture = Fixture::new();
+        let mail = fixture.create("Mail", "old");
+        let bank = fixture.create("Bank", "pin");
+        let revision = fixture.session.revision();
+        let calls = fixture.bench.calls.len();
+        let committed = fixture
+            .session
+            .apply_all(
+                &fixture.place.1,
+                vec![
+                    Change::Create {
+                        title: "Shop".into(),
+                        body: "cart".into(),
+                    },
+                    Change::Edit {
+                        id: mail.id,
+                        base: 1,
+                        title: "Mail".into(),
+                        body: "new".into(),
+                    },
+                    Change::Delete {
+                        id: bank.id,
+                        base: 1,
+                    },
+                    // Bank's title is free once the delete before it ran.
+                    Change::Create {
+                        title: "Bank".into(),
+                        body: "".into(),
+                    },
+                ],
+                &|| false,
+                &mut fixture.random,
+            )
+            .unwrap();
+        assert_eq!(fixture.bench.calls.len(), calls);
+        assert_eq!(fixture.session.revision(), revision + 1);
+        let revisions: Vec<_> = committed.iter().map(|c| c.revision).collect();
+        assert_eq!(revisions, [Some(1), Some(2), None, Some(1)]);
+        assert_eq!(committed[1].id, mail.id);
+        let Fixture {
+            place,
+            mut bench,
+            session,
+            ..
+        } = fixture;
+        drop(session);
+        let other = unlocked(&place, &mut bench, 0);
+        let listed: Vec<_> = other
+            .entries()
+            .map(|entry| entry.title.to_owned())
+            .collect();
+        assert_eq!(listed, ["Mail", "Shop", "Bank"]);
+        assert_eq!(other.entry(&mail.id).unwrap().body(), b"new");
+        assert!(other.entry(&bank.id).is_none());
+    }
+
+    #[test]
+    fn edits_in_a_batch_build_on_the_ones_before_them() {
+        let mut fixture = Fixture::new();
+        let mail = fixture.create("Mail", "one");
+        let edit = |base, body: &str| Change::Edit {
+            id: mail.id,
+            base,
+            title: "Mail".into(),
+            body: Text::new(body.to_owned()),
+        };
+        let before = fixture.place.bytes();
+        // A second edit against the session's revision is stale.
+        let stale = fixture.session.apply_all(
+            &fixture.place.1,
+            vec![edit(1, "two"), edit(1, "three")],
+            &|| false,
+            &mut fixture.random,
+        );
+        assert_eq!(stale.err(), Some(Error::Entry(EntryError::Stale)));
+        assert_eq!(fixture.place.bytes(), before);
+        let committed = fixture
+            .session
+            .apply_all(
+                &fixture.place.1,
+                vec![edit(1, "two"), edit(2, "three")],
+                &|| false,
+                &mut fixture.random,
+            )
+            .unwrap();
+        let revisions: Vec<_> = committed.iter().map(|c| c.revision).collect();
+        assert_eq!(revisions, [Some(2), Some(3)]);
+        let entry = fixture.session.entry(&mail.id).unwrap();
+        assert_eq!((entry.revision, entry.body()), (3, b"three".as_slice()));
+    }
+
+    #[test]
+    fn a_batch_with_one_refused_change_publishes_nothing() {
+        let mut fixture = Fixture::new();
+        let mail = fixture.create("Mail", "old");
+        let before = fixture.place.bytes();
+        let revision = fixture.session.revision();
+        let batch = || {
+            vec![
+                Change::Edit {
+                    id: mail.id,
+                    base: 1,
+                    title: "Mail".into(),
+                    body: "new".into(),
+                },
+                Change::Create {
+                    title: "Shop".into(),
+                    body: "".into(),
+                },
+            ]
+        };
+        let mut refused = batch();
+        // Two creations of one title: the second sees the first.
+        refused.push(Change::Create {
+            title: "Shop".into(),
+            body: "".into(),
+        });
+        let result =
+            fixture
+                .session
+                .apply_all(&fixture.place.1, refused, &|| false, &mut fixture.random);
+        assert_eq!(result.err(), Some(Error::Entry(EntryError::Duplicate)));
+        // A lock before publication refuses the whole batch too.
+        let locked =
+            fixture
+                .session
+                .apply_all(&fixture.place.1, batch(), &|| true, &mut fixture.random);
+        assert!(matches!(locked, Err(Error::Token(_))));
+        assert_eq!(fixture.place.bytes(), before);
+        assert_eq!(fixture.session.revision(), revision);
+        let entry = fixture.session.entry(&mail.id).unwrap();
+        assert_eq!((entry.revision, entry.body()), (1, b"old".as_slice()));
+        assert_eq!(fixture.session.entries().count(), 1);
+        // No changes save nothing.
+        let none = fixture
+            .session
+            .apply_all(&fixture.place.1, Vec::new(), &|| false, &mut fixture.random)
+            .unwrap();
+        assert!(none.is_empty());
+        assert_eq!(fixture.place.bytes(), before);
+        assert_eq!(fixture.session.revision(), revision);
     }
 
     #[test]

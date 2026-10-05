@@ -996,11 +996,21 @@ Create draws a fresh random 16-byte ID and starts at entry revision one.
 Edit and rename advance the revision by exactly one; rename keeps the body.
 Delete removes the entry. Each accepted change builds the complete next
 notebook and runs one save under the session's unlock, presenting no
-token. A refused or failed save leaves the session's entry at its base
-revision with its old contents. Committed changes report the entry ID
-and its new revision, or none after deletion. The API never
-writes plaintext outside the session; body bytes are UTF-8 and stored
-exactly.
+token. A batch of changes, as an import into the open notebook brings,
+applies each in order against the entries the ones before it left, so
+a creation sees an earlier one's title and an edit's base is the
+revision the batch reached, then runs the same one save: one vault
+revision for the whole batch, or nothing when any change or the save
+is refused, or the lock comes, before publication. A save that fails
+after publication began is uncertain for the whole batch as for one
+change: the store may hold all of it, and export is refused until lock
+and unlock, as below. A batch that changes one entry twice reports the
+first change's revision, which is never published alone. An empty
+batch saves nothing. A refused or failed save leaves the session's
+entry at its base revision with its old contents. Committed changes
+report the entry ID and its new revision, or none after deletion. The
+API never writes plaintext outside the session; body bytes are UTF-8
+and stored exactly.
 
 Export is the session's authenticated baseline ciphertext, unchanged. After
 an uncertain publication the store may already hold a newer revision, so
@@ -1022,7 +1032,14 @@ Tests cover each entry operation and read the final notebook through the
 other key after unlock. They cover every typed refusal for each change kind
 before any token, that no change presents one, a save refused by a lock
 keeping the base entry, and both notebook bounds, reached by creation,
-edit and rename. Export is refused after an uncertain publication.
+edit and rename. A batch of a creation, an edit, a delete and a
+creation of the deleted title commits one vault revision the other key
+reads; two edits of one entry in a batch commit its next two revisions,
+and a second edit against the session's revision is refused as stale;
+a batch whose last change repeats an earlier one's title, or one
+refused by a lock, publishes nothing and keeps the session's entries,
+and an empty batch saves nothing. Export is refused after an uncertain
+publication.
 Import tests refuse an unenrolled key and an undecodable copy before
 any token, and refuse a tampered body or a
 tampered slot salt, and a wrongly presented token, without writing. A
@@ -1151,7 +1168,9 @@ both.
   title and the stored body bytes), names its revision, its keys and the
   key that unlocked it, which authorizes adding a key, and exports its
   authenticated ciphertext. Dropping it is the lock. `Host::apply` saves
-  a change under that unlock and takes no `Prompt`.
+  a change under that unlock and takes no `Prompt`; `Host::apply_all`
+  saves a batch of changes as one save, every change committing or,
+  before publication, none.
 - **Changes.** `Change` carries owned text and clears it on drop,
   whether it is applied, refused or never sent; applying moves the text
   into the entry API's clearing owners.
@@ -1181,7 +1200,9 @@ both.
   or startup the cancel
   interrupts reports cancellation, whatever startup then failed with. A
   `Cancel` stays cancelled, so each cancellable operation takes a fresh
-  one.
+  one. `cancelled` tells the caller, through any clone, so a step of its
+  own within the operation, such as reading what an import brings, ends
+  with it.
 - **Failures.** A `Failure` names the stale-entry, uncertain-publication
   and cancelled cases and displays a reason. Neither its text nor its
   `Debug` carries a PIN, entry content or a token's protocol detail.
