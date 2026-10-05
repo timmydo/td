@@ -177,9 +177,7 @@ impl Session {
                 )
                 .map(|data| (0, data))
             }
-            wire::WORKSPACE_TERMINAL | wire::WORKSPACE_CODEX | wire::WORKSPACE_CLAUDE
-                if request.revision == 0 =>
-            {
+            wire::WORKSPACE_TERMINAL | wire::WORKSPACE_CLAUDE if request.revision == 0 => {
                 self.lease = None;
                 let plan = wire::workspace::Plan::parse(&request.data)?;
                 let uid = fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid();
@@ -222,7 +220,6 @@ fn launch_task_terminal(
     wire::workspace::parse_ready(status, plan)?;
     let terminal = match verb {
         wire::WORKSPACE_TERMINAL => crate::authority::Program::Task,
-        wire::WORKSPACE_CODEX => crate::authority::Program::Codex,
         wire::WORKSPACE_CLAUDE => crate::authority::Program::Claude,
         _ => return Err("invalid task launch selection".into()),
     };
@@ -667,63 +664,61 @@ mod tests {
     #[test]
     fn ready_agent_launch_selects_the_exact_authority_kind() {
         let plan = wire::workspace::example();
-        for verb in [wire::WORKSPACE_CODEX, wire::WORKSPACE_CLAUDE] {
-            let mut selections = Vec::new();
-            let mut launch = |terminal| {
-                selections.push(match terminal {
-                    crate::authority::Program::Codex => wire::WORKSPACE_CODEX,
-                    crate::authority::Program::Claude => wire::WORKSPACE_CLAUDE,
-                    _ => "wrong terminal",
-                });
-                Ok(())
-            };
-            for status in [
-                wire::workspace::pending(&plan),
-                wire::workspace::failure(&plan, "failed"),
-                wire::workspace::ready(&wire::workspace::Plan {
-                    branch: "other".into(),
-                    ..plan.clone()
-                }),
-            ] {
-                assert!(launch_task_terminal(&status, &plan, verb, &mut launch).is_err());
-            }
-            launch_task_terminal(&wire::workspace::ready(&plan), &plan, verb, &mut launch).unwrap();
-            assert_eq!(selections, [verb]);
-            assert!(
-                launch_task_terminal(&wire::workspace::ready(&plan), &plan, verb, &mut |_| Err(
-                    "authority unavailable".into()
-                ))
-                .is_err()
-            );
+        let verb = wire::WORKSPACE_CLAUDE;
+        let mut selections = Vec::new();
+        let mut launch = |terminal| {
+            selections.push(match terminal {
+                crate::authority::Program::Claude => wire::WORKSPACE_CLAUDE,
+                _ => "wrong terminal",
+            });
+            Ok(())
+        };
+        for status in [
+            wire::workspace::pending(&plan),
+            wire::workspace::failure(&plan, "failed"),
+            wire::workspace::ready(&wire::workspace::Plan {
+                branch: "other".into(),
+                ..plan.clone()
+            }),
+        ] {
+            assert!(launch_task_terminal(&status, &plan, verb, &mut launch).is_err());
         }
-        assert!(launch_task_terminal(
-            &wire::workspace::ready(&plan),
-            &plan,
-            "unknown",
-            &mut |_| panic!("unknown selection reached authority")
-        )
-        .is_err());
+        launch_task_terminal(&wire::workspace::ready(&plan), &plan, verb, &mut launch).unwrap();
+        assert_eq!(selections, [verb]);
+        assert!(
+            launch_task_terminal(&wire::workspace::ready(&plan), &plan, verb, &mut |_| Err(
+                "authority unavailable".into()
+            ))
+            .is_err()
+        );
+        for unknown in ["unknown", "workspace-codex"] {
+            assert!(launch_task_terminal(
+                &wire::workspace::ready(&plan),
+                &plan,
+                unknown,
+                &mut |_| panic!("unknown selection reached authority")
+            )
+            .is_err());
+        }
     }
 
     #[test]
     fn agent_requests_refuse_bad_plans_and_revisions_before_launching() {
         let fixture = Fixture::new();
         let mut session = Session::default();
-        for verb in [wire::WORKSPACE_CODEX, wire::WORKSPACE_CLAUDE] {
-            for (revision, data) in [(1, wire::workspace::example().encode()), (0, vec![])] {
-                let mut launched = false;
-                let reply = session.handle(
-                    wire::Message::new(1, verb, revision, data),
-                    &fixture.runtime,
-                    &fixture.dir.join("feed"),
-                    &mut |_| {
-                        launched = true;
-                        Ok(())
-                    },
-                );
-                assert_eq!(reply.verb, wire::ERROR);
-                assert!(!launched);
-            }
+        for (revision, data) in [(1, wire::workspace::example().encode()), (0, vec![])] {
+            let mut launched = false;
+            let reply = session.handle(
+                wire::Message::new(1, wire::WORKSPACE_CLAUDE, revision, data),
+                &fixture.runtime,
+                &fixture.dir.join("feed"),
+                &mut |_| {
+                    launched = true;
+                    Ok(())
+                },
+            );
+            assert_eq!(reply.verb, wire::ERROR);
+            assert!(!launched);
         }
     }
 

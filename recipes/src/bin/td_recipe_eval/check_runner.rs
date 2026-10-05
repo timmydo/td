@@ -4717,7 +4717,6 @@ impl RecipeCheckRunner {
                     h,
                     match check.runner {
                         Some(CheckRunner::BuildOnly) => b"build-only".as_slice(),
-                        Some(CheckRunner::Codex) => b"codex".as_slice(),
                         Some(CheckRunner::RustToolchain) => b"rust-toolchain".as_slice(),
                         Some(CheckRunner::Tzdata) => b"tzdata".as_slice(),
                         None => b"none".as_slice(),
@@ -11529,7 +11528,7 @@ chmod 755 '{}'
         // alias (`m as`, or `checks::m` / `super::m` as anything but a
         // call), or by any mention inside a `use` item, which rustfmt may
         // wrap over lines up to its `;`. `checks::run(` is mod.rs's dispatch
-        // function and `codex::run(` a runner's, not the module. The font
+        // function and `tzdata::run(` a runner's, not the module. The font
         // mounts at the crate root are the screen oracles' alone. Each
         // non-comment line comes back with what it names.
         let named_lines = |text: &str| -> Vec<(String, BTreeSet<&'static str>)> {

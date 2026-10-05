@@ -370,7 +370,7 @@ mod tests {
             LAUNCH
                 .matches(r#""--command", "/bin/cttyhack", "--stdin", "#)
                 .count(),
-            2
+            1
         );
         assert!(CTTYHACK.contains(r#"const STDIN_FLAG: &str = "--stdin";"#));
         // And that the applet still advertises it, so `cttyhack` alone tells an

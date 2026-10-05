@@ -700,14 +700,12 @@ mod tests {
         // uutils, ripgrep, and fd userland `.crate` sources) + btrfs-progs 7.0
         // and util-linux 2.42.2 (the persistent-volume writer and its minimal
         // libraries) + the ripgrep 15.2.0 static application seed + curl's
-        // dated Mozilla CA extract + OpenAI Codex 0.148.0, its five exact Cargo
-        // Git commit archives, libcap 2.78, Protobuf 31.1 with its exact Abseil
-        // 20250127.0 source dependency, OpenSSH Portable 10.5p1, the
+        // dated Mozilla CA extract + OpenSSH Portable 10.5p1, the
         // Claude Code 2.1.260 native Linux x86-64 binary, IANA timezone
         // data 2026d, and the Nerd Fonts v3.5.1 JetBrains Mono release with
         // nine licence notices + cryptsetup 2.8.8 with json-c 0.18, popt 1.19
         // and LVM2 2.03.43 (the LUKS2 userspace and its static libraries).
-        assert_eq!(pins.len(), 87);
+        assert_eq!(pins.len(), 78);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "ca-certificates-source"));
         assert!(pins.iter().any(|pin| pin.key == "tzdata-source"));
@@ -715,20 +713,7 @@ mod tests {
             .iter()
             .any(|pin| pin.key == "jetbrains-mono-nerd-font-source"));
         assert!(pins.iter().any(|pin| pin.key == "cmake-x86-64-source"));
-        assert!(pins.iter().any(|pin| pin.key == "codex-source"));
         assert!(pins.iter().any(|pin| pin.key == "claude-code-source"));
-        assert!(pins.iter().any(|pin| pin.key == "abseil-cpp-x86-64-source"));
-        assert!(pins.iter().any(|pin| pin.key == "protobuf-x86-64-source"));
-        for key in [
-            "codex-cargo-crossterm-source",
-            "codex-cargo-nucleo-source",
-            "codex-cargo-rules-rust-source",
-            "codex-cargo-tokio-tungstenite-source",
-            "codex-cargo-tungstenite-source",
-        ] {
-            assert!(pins.iter().any(|pin| pin.key == key), "missing {key}");
-        }
-        assert!(pins.iter().any(|pin| pin.key == "libcap-x86-64-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-stage0-rustc-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-stage0-std-source"));

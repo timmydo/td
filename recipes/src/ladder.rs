@@ -738,11 +738,10 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// profiler evidence is serialized ahead of that workload so its bounded capture
 /// stays deterministic. The host must outlast the serial identity/root checks, the
 /// slower of that 915-second service and the 700-second network service, then the
-/// clamped 760-second health loop and the diagnostic margin. The tenth Codex block
-/// restored the former 70-second host margin at that revision. Even after the
-/// profiler predecessor grew from 315 to 915 seconds, this path totals 2155 seconds
-/// and retains 620 seconds below the value here; the longer Firefox path below still
-/// governs the final host ceiling.
+/// clamped 700-second health loop and the diagnostic margin. Even after the
+/// profiler predecessor grew from 315 to 915 seconds, this path totals 2095 seconds
+/// and retains 680 seconds below the 2775-second pre-Firefox ceiling; the longer
+/// Firefox path below still governs the final host ceiling.
 ///
 /// The Firefox download proof adds a 40-second one-shot browser boundary and a
 /// separate 20-second asynchronous file-observation window. The real Firefox
@@ -762,15 +761,6 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// at the greeter's cap rather than sooner.
 pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 2974;
 pub const QEMU_GUEST_WAIT_MARGIN_SECS: u64 = 30;
-
-/// The source release identities and exact `--version` output shared by the
-/// package checks and the deployed health probe. Keeping these beside the boot
-/// contract prevents a package update from leaving a stale image assertion.
-pub const CODEX_RECIPE_VERSION: &str = "0.148.0";
-pub const CODEX_VERSION_OUTPUT: &str = "codex-cli 0.148.0";
-pub const CODEX_BWRAP_UPSTREAM_VERSION: &str = "0.11.2";
-pub const CODEX_BWRAP_RECIPE_VERSION: &str = "0.11.2-codex-0.148.0";
-pub const CODEX_BWRAP_VERSION_OUTPUT: &str = "bubblewrap 0.11.2";
 
 /// Printed after the running system installs and activates a verified candidate
 /// deployment through td-boot's fsync + atomic-rename transaction.
@@ -817,13 +807,6 @@ pub const RIPGREP_FD_RUNTIME_MARKER: &str = "TD-RG-FD-RUN-OK";
 /// bundle at the image's conventional path. Verified use of that bundle and Git's
 /// compiled HTTPS helper is the operator-only `GIT_HTTPS_RUNTIME_MARKER` below.
 pub const GIT_RUNTIME_MARKER: &str = "TD-GIT-RUN-OK";
-
-/// Printed by the root-owned health target only after the unprivileged user can
-/// execute the installed source-built Codex CLI and its source-built Bubblewrap
-/// helper by their `/bin` names, both report their exact pinned versions, and a
-/// Codex read-only sandbox enters a distinct network namespace while refusing a
-/// fixture write without changing or hiding the fixture.
-pub const CODEX_RUNTIME_MARKER: &str = "TD-CODEX-BWRAP-RUN-OK";
 
 /// Printed by the root-owned health target only after the unprivileged OpenSSH client
 /// authenticates to the running OpenSSH daemon on loopback with an ephemeral Ed25519 key
@@ -1706,29 +1689,6 @@ mod tests {
         ] {
             assert!(command.contains(required), "regression omits {required}");
         }
-    }
-
-    #[test]
-    fn codex_release_strings_are_one_consistent_pin() {
-        assert_eq!(
-            super::CODEX_VERSION_OUTPUT,
-            format!("codex-cli {}", super::CODEX_RECIPE_VERSION)
-        );
-        assert_eq!(
-            super::CODEX_BWRAP_VERSION_OUTPUT,
-            format!("bubblewrap {}", super::CODEX_BWRAP_UPSTREAM_VERSION)
-        );
-        assert_eq!(
-            super::CODEX_BWRAP_RECIPE_VERSION,
-            format!(
-                "{}-codex-{}",
-                super::CODEX_BWRAP_UPSTREAM_VERSION,
-                super::CODEX_RECIPE_VERSION
-            )
-        );
-        let exception = td_engine::target_profile::line_attribution_exception("codex")
-            .expect("Codex line-attribution exception");
-        assert!(exception.reason.contains(super::CODEX_RECIPE_VERSION));
     }
 
     #[test]

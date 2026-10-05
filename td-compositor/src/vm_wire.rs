@@ -19,7 +19,6 @@ pub const KEY: &str = "git-key";
 pub const WORKSPACE: &str = "workspace";
 pub const WORKSPACE_ENSURE: &str = "workspace-ensure";
 pub const WORKSPACE_TERMINAL: &str = "workspace-terminal";
-pub const WORKSPACE_CODEX: &str = "workspace-codex";
 pub const WORKSPACE_CLAUDE: &str = "workspace-claude";
 pub const POWEROFF: &str = "poweroff";
 #[allow(dead_code)] // Shared with the root guest power worker.
@@ -119,7 +118,6 @@ fn valid_verb(verb: &str) -> bool {
             | WORKSPACE
             | WORKSPACE_ENSURE
             | WORKSPACE_TERMINAL
-            | WORKSPACE_CODEX
             | WORKSPACE_CLAUDE
             | POWEROFF
             | OK
@@ -322,6 +320,7 @@ mod tests {
             "TDVM1 0 get 0 0 \n",
             "TDVM1 01 get 0 0 \n",
             "TDVM1 1 exec 0 0 \n",
+            "TDVM1 1 workspace-codex 0 0 \n",
             "TDVM1 1 get 0 1 a\n",
             "TDVM1 1 get 0 1 gg\n",
             "TDVM1 1 get 18446744073709551616 0 \n",

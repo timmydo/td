@@ -11,7 +11,6 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 enum Source {
     Local,
     Crate { name: String, version: String },
-    Archive { file: String, checksum: String },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -72,19 +71,6 @@ fn parse_jobs(text: &str) -> Result<Vec<Job>, String> {
                     source: Source::Crate {
                         name: (*name).into(),
                         version: (*version).into(),
-                    },
-                }
-            }
-            ["warm", "crate-source", file, checksum, lock, dest, repeated]
-                if lock == repeated
-                    && valid_crate_source_coordinates(file, checksum, lock, dest) =>
-            {
-                Job {
-                    dest: (*dest).into(),
-                    lock: (*lock).into(),
-                    source: Source::Archive {
-                        file: (*file).into(),
-                        checksum: (*checksum).into(),
                     },
                 }
             }
@@ -203,18 +189,15 @@ fn recipe_jobs(root: &Path, target: Option<&str>) -> Result<Vec<Job>, String> {
 }
 
 fn source_pin<'a>(job: &Job, pins: &'a [SourcePin]) -> Result<Option<&'a SourcePin>, String> {
-    let (file, checksum) = match &job.source {
+    let file = match &job.source {
         Source::Local => return Ok(None),
-        Source::Crate { name, version } => (format!("{name}-{version}.crate"), None),
-        Source::Archive { file, checksum } => (file.clone(), Some(checksum.as_str())),
+        Source::Crate { name, version } => format!("{name}-{version}.crate"),
     };
     let mut matches = pins.iter().filter(|pin| pin.file == file);
     let pin = matches
         .next()
         .ok_or_else(|| format!("{} has no declared source pin for {file}", job.dest))?;
-    if matches.any(|other| other.sha256 != pin.sha256)
-        || checksum.is_some_and(|want| want != pin.sha256)
-    {
+    if matches.any(|other| other.sha256 != pin.sha256) {
         return Err(format!(
             "{} source pin is ambiguous or mismatched for {file}",
             job.dest
@@ -361,14 +344,6 @@ fn consume_job(
                 let src = stage.join("src").join(&package);
                 prepare_package_metadata(&work.join(&pin.file), &pin.sha256, &package, &src)?
             }
-            Source::Archive { .. } => {
-                consume_source_pins(
-                    std::slice::from_ref(pin.ok_or("archive job has no source pin")?),
-                    source_cache,
-                    base,
-                )?;
-                real_relative_file(root, &job.lock, "committed Cargo.lock")?
-            }
             Source::Local => real_relative_file(root, &job.lock, "local Cargo.lock")?,
         };
         let (sources, digest) = read_locked_cargo_sources(&lock_path)?;
@@ -436,9 +411,7 @@ pub(super) fn run(root: &Path, target: Option<&str>, consume: bool) -> Result<()
                 let _lock = lock_job(root, &job.dest)?;
                 if let Some(pin) = pin {
                     let cache = sources_dir();
-                    let source_cache = if matches!(job.source, Source::Crate { .. })
-                        && !cache.join(&pin.file).is_file()
-                    {
+                    let source_cache = if !cache.join(&pin.file).is_file() {
                         root.join(".td-build-cache/crate-vendor")
                             .join(&job.dest)
                             .join("work")
@@ -520,16 +493,18 @@ mod tests {
     #[test]
     fn recipe_rows_are_typed_and_cannot_choose_commands_or_escape_destinations() {
         let valid = "warm\tcrate-local\tnet\ttd-net\tnet/Cargo.lock\n\
-                     warm\tcrate\tcoreutils\t0.9.0\tuutils\t.td-build-cache/crate-vendor/uutils/src/coreutils-0.9.0/Cargo.lock\n\
-                     warm\tcrate-source\tsource.tar.gz\tCHECKSUM\trecipes/locks/codex/Cargo.lock\tcodex\trecipes/locks/codex/Cargo.lock\n".replace("CHECKSUM", &"a".repeat(64));
-        assert_eq!(parse_jobs(&valid).unwrap().len(), 3);
+                     warm\tcrate\tcoreutils\t0.9.0\tuutils\t.td-build-cache/crate-vendor/uutils/src/coreutils-0.9.0/Cargo.lock\n";
+        assert_eq!(parse_jobs(valid).unwrap().len(), 2);
         for text in [
             valid.replace("crate-local", "shell"),
             valid.replace("td-net", "../td-net"),
             valid.replace("net/Cargo.lock", "/tmp/Cargo.lock"),
             valid.replace("0.9.0", "../0.9.0"),
-            valid.replace("source.tar.gz", "../source.tar.gz"),
             format!("{valid}{valid}"),
+            format!(
+                "{valid}warm\tcrate-source\tsource.tar.gz\t{}\trecipes/locks/uutils/Cargo.lock\tuutils2\trecipes/locks/uutils/Cargo.lock\n",
+                "a".repeat(64)
+            ),
         ] {
             assert!(parse_jobs(&text).is_err(), "{text}");
         }

@@ -82,7 +82,7 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm workspace enroll NAME         enroll its Git key, branch and starting commit
   td-vm workspace clone NAME          provision its private guest clone and worktree
   td-vm workspace terminal NAME       open a terminal in its prepared task worktree
-  td-vm workspace agent NAME AGENT    open codex or claude in its task worktree
+  td-vm workspace agent NAME claude   open Claude in its task worktree
 
 TD_VM_HOME defaults to ~/.local/share/td-vm. Requires host QEMU, qemu-img and qemu-io.
 Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
@@ -93,9 +93,8 @@ Stop requests guest poweroff; --force explicitly cuts power.";
 
 fn agent_verb(agent: &str) -> Result<&'static str> {
     match agent {
-        "codex" => Ok(vm_wire::WORKSPACE_CODEX),
         "claude" => Ok(vm_wire::WORKSPACE_CLAUDE),
-        _ => Err("task agent must be codex or claude".into()),
+        _ => Err("task agent must be claude".into()),
     }
 }
 
@@ -763,7 +762,6 @@ impl Manager {
             ));
         }
         let agent = match verb {
-            vm_wire::WORKSPACE_CODEX => "Codex",
             vm_wire::WORKSPACE_CLAUDE => "Claude",
             _ => return Err("invalid task agent launch selection".into()),
         };
@@ -1977,7 +1975,7 @@ fn tui(manager: &Manager) -> Result<()> {
             "td-vm  Enter open · n new · i import · t templates · S stop · D delete · X cut power",
             term::Style::bar(term::CYAN),
         );
-        frame.push_text("a agent · T terminal · h status · R resume · w workspace · W prepare · E enroll · C clone · l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
+        frame.push_text("a Claude · T terminal · h status · R resume · w workspace · W prepare · E enroll · C clone · l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
         frame.push_text(TABLE_HEADER, term::Style::bold());
         let page = height.saturating_sub(8).max(1);
         let offset = selected.saturating_sub(page - 1);
@@ -2118,16 +2116,10 @@ fn tui(manager: &Manager) -> Result<()> {
                     break;
                 }
                 term::Key::Char('a') if current.is_some() => {
-                    let Some(agent) = prompt(
-                        &mut terminal,
-                        "Task agent: codex or claude (login not configured)",
-                    )?
-                    else {
-                        break;
-                    };
-                    status = match agent_verb(&agent).and_then(|verb| {
-                        manager.workspace_launch(current.ok_or("no instance selected")?, verb)
-                    }) {
+                    status = match manager.workspace_launch(
+                        current.ok_or("no instance selected")?,
+                        vm_wire::WORKSPACE_CLAUDE,
+                    ) {
                         Ok(message) => message,
                         Err(error) => error,
                     };
@@ -2303,9 +2295,15 @@ mod tests {
 
     #[test]
     fn task_agent_selection_is_closed_and_literal() {
-        assert_eq!(agent_verb("codex").unwrap(), vm_wire::WORKSPACE_CODEX);
         assert_eq!(agent_verb("claude").unwrap(), vm_wire::WORKSPACE_CLAUDE);
-        for value in ["", "Codex", "/bin/codex", "codex --help", "claude; sh"] {
+        for value in [
+            "",
+            "codex",
+            "Claude",
+            "/bin/claude",
+            "claude --help",
+            "claude; sh",
+        ] {
             assert!(agent_verb(value).is_err());
         }
     }

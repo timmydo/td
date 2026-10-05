@@ -1175,11 +1175,11 @@ fn heavy_warms(root: &Path) {
 /// things drove them: the explicit `td-recipe-eval warm`, and
 /// `warm_operator_inputs`, which is gated on an INTERACTIVE stdin
 /// (`check_runner.rs`). `td-builder check` is neither, so under `check` nothing
-/// vendored codex's closure: `provision_auto_vendor` requires
+/// vendored a rung's closure: `provision_auto_vendor` requires
 /// `crate-vendor/<stem>/vendor` whenever the committed lock has any registry
-/// package (`stage_verified_vendor`'s `allow_missing` is `registry == 0`), and
-/// codex's lock has 1189 -- so `recipe-check codex#1` failed on every fresh
-/// worktree, on unmodified main, for a reason no diff introduced.
+/// package (`stage_verified_vendor`'s `allow_missing` is `registry == 0`), so
+/// such a rung's recipe check failed on every fresh worktree, on unmodified
+/// main, for a reason no diff introduced.
 ///
 /// The job list is ASKED FOR, not restated here: the pin, its hash, the
 /// committed lock and the stem are recipe data, and a second copy in the
@@ -1238,8 +1238,8 @@ fn warm_vendor_closures(
         .filter(|c| c.code.is_some_and(|code| code != 0 && code != 124))
         .map(|c| c.job.clone())
         .collect();
-    // A stale newstore td-feed predates the `crate-source` verb and rejects it,
-    // exiting non-zero without writing a vendor dir. Same shape as the
+    // A stale newstore td-feed may predate a warm verb and reject it, exiting
+    // non-zero without writing a vendor dir. Same shape as the
     // kernel-headers seed (issue #546): build the source `feed/` once and retry
     // only what is still absent. A source build already IS this tree, so a
     // non-newstore pick has nothing better to retry with.
@@ -1762,28 +1762,16 @@ mod tests {
     /// lock — and the exit statuses collected from the spawned argv are keyed
     /// by dest. Reading the dest back off the SPAWNED argv (which no longer has
     /// the lock) silently names the wrong field, leaves every status
-    /// unfindable, and quietly disables the source-built-td-feed retry that
-    /// exists for exactly the rung this whole area is about.
+    /// unfindable, and quietly disables the source-built-td-feed retry.
     #[test]
     fn a_vendor_line_splits_into_an_argv_a_dest_and_a_lock() {
-        let line: Vec<String> = [
-            "warm",
-            "crate-source",
-            "codex-rust-v0.148.0.tar.gz",
-            "abc123",
-            "recipes/locks/codex/Cargo.lock",
-            "codex",
-            "recipes/locks/codex/Cargo.lock",
-        ]
-        .iter()
-        .map(|f| f.to_string())
-        .collect();
+        let line: Vec<String> = ["warm", "crate-local", "net", "td-net", "net/Cargo.lock"]
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
 
-        assert_eq!(super::vendor_dest(&line), "codex");
-        assert_eq!(
-            super::vendor_lock(&line),
-            Some("recipes/locks/codex/Cargo.lock")
-        );
+        assert_eq!(super::vendor_dest(&line), "td-net");
+        assert_eq!(super::vendor_lock(&line), Some("net/Cargo.lock"));
         let argv = super::vendor_argv(&line);
         assert_eq!(
             argv.len(),
@@ -1792,7 +1780,7 @@ mod tests {
         );
         assert_eq!(
             argv.last().map(String::as_str),
-            Some("codex"),
+            Some("td-net"),
             "the spawned argv ends at the dest"
         );
 

@@ -12,15 +12,10 @@ const SETTINGS_LIMIT: u64 = 64 * 1024;
 // Linux x86-64 O_NOFOLLOW | O_NONBLOCK; inspect opened objects before use.
 const OPEN_READ_FLAGS: i32 = 0x20000 | 0x800;
 const FILE: &str = "settings-profile";
+const HEADER: &str = "TDVM-SETTINGS-PROFILE-2";
 const FIELDS: &[&str] = &[
-    "default-agent",
     "workspace",
     "path",
-    "codex-home",
-    "codex",
-    "codex-sha256",
-    "codex-version",
-    "codex-config-sha256",
     "claude-home",
     "claude",
     "claude-sha256",
@@ -169,10 +164,13 @@ fn trusted_program(value: &str, boundary: Option<&Path>) -> Result<PathBuf> {
 impl Profile {
     pub fn parse(text: &str) -> Result<Self> {
         let mut lines = text.lines();
-        if text.len() as u64 > PROFILE_LIMIT
-            || !text.ends_with('\n')
-            || lines.next() != Some("TDVM-SETTINGS-PROFILE-1")
-        {
+        let header = lines.next();
+        if header == Some("TDVM-SETTINGS-PROFILE-1") {
+            return Err(format!(
+                "settings profile version 1 names the removed Codex agent; write a {HEADER} profile without default-agent or codex fields and set it again"
+            ));
+        }
+        if text.len() as u64 > PROFILE_LIMIT || !text.ends_with('\n') || header != Some(HEADER) {
             return Err("invalid settings profile header, size or final newline".into());
         }
         let mut fields = BTreeMap::new();
@@ -192,10 +190,7 @@ impl Profile {
             return Err("settings profile is missing required fields".into());
         }
         let profile = Self { fields };
-        if !matches!(profile.get("default-agent")?, "codex" | "claude") {
-            return Err("default-agent must be codex or claude".into());
-        }
-        for field in ["workspace", "codex-home", "codex", "claude-home", "claude"] {
+        for field in ["workspace", "claude-home", "claude"] {
             absolute(profile.get(field)?)?;
         }
         let path = profile.get("path")?;
@@ -207,18 +202,11 @@ impl Profile {
                 "settings profile PATH must contain only absolute canonical-shaped entries".into(),
             );
         }
-        for field in ["codex-version", "claude-version"] {
-            let value = profile.get(field)?;
-            if value.len() > 256 || value.trim() != value {
-                return Err("settings profile versions must be one bounded line".into());
-            }
+        let version = profile.get("claude-version")?;
+        if version.len() > 256 || version.trim() != version {
+            return Err("settings profile claude-version must be one bounded line".into());
         }
-        for field in [
-            "codex-sha256",
-            "codex-config-sha256",
-            "claude-sha256",
-            "claude-settings-sha256",
-        ] {
+        for field in ["claude-sha256", "claude-settings-sha256"] {
             digest(profile.get(field)?)?;
         }
         Ok(profile)
@@ -232,7 +220,7 @@ impl Profile {
     }
 
     pub fn encode(&self) -> String {
-        let mut text = String::from("TDVM-SETTINGS-PROFILE-1\n");
+        let mut text = format!("{HEADER}\n");
         for (name, value) in &self.fields {
             text.push_str(&format!("{name}={value}\n"));
         }
@@ -245,15 +233,9 @@ impl Profile {
 
     pub fn summary(&self) -> Result<String> {
         Ok(format!(
-            "Default agent: {}\nHost workspace: {}\nHost PATH: {}\nCodex: {}\n  executable: {} ({})\n  home: {}\n  settings: {}\nClaude: {}\n  executable: {} ({})\n  home: {}\n  settings: {}\nSettings profile: {}",
-            self.get("default-agent")?,
+            "Host workspace: {}\nHost PATH: {}\nClaude: {}\n  executable: {} ({})\n  home: {}\n  settings: {}\nSettings profile: {}",
             self.get("workspace")?,
             self.get("path")?,
-            self.get("codex-version")?,
-            self.get("codex")?,
-            self.get("codex-sha256")?,
-            self.get("codex-home")?,
-            self.get("codex-config-sha256")?,
             self.get("claude-version")?,
             self.get("claude")?,
             self.get("claude-sha256")?,
@@ -286,28 +268,13 @@ impl Profile {
 
     fn check_with_boundary(&self, boundary: Option<&Path>) -> Result<String> {
         trusted_directory(self.get("workspace")?, "host workspace", boundary)?;
-        let codex_home = trusted_directory(self.get("codex-home")?, "Codex home", boundary)?;
         let claude_home = trusted_directory(self.get("claude-home")?, "Claude home", boundary)?;
         path_list(self.get("path")?, boundary)?;
-        let codex_program = trusted_program(self.get("codex")?, boundary)?;
         let claude_program = trusted_program(self.get("claude")?, boundary)?;
-        let codex = settings(&codex_home.join("config.toml"), "Codex config.toml")?;
         let claude = settings(&claude_home.join("settings.json"), "Claude settings.json")?;
-        if sha256::hex_digest(&codex) != self.get("codex-config-sha256")? {
-            return Err(
-                "Codex settings changed; review them and replace the settings profile".into(),
-            );
-        }
         if sha256::hex_digest(&claude) != self.get("claude-settings-sha256")? {
             return Err(
                 "Claude settings changed; review them and replace the settings profile".into(),
-            );
-        }
-        if executable_fingerprint(&codex_program, "Codex executable")?
-            != self.get("codex-sha256")?
-        {
-            return Err(
-                "Codex executable changed; review it and replace the settings profile".into(),
             );
         }
         if executable_fingerprint(&claude_program, "Claude executable")?
@@ -317,9 +284,6 @@ impl Profile {
                 "Claude executable changed; review it and replace the settings profile".into(),
             );
         }
-        if self.version(&codex_program, "codex-home", "CODEX_HOME")? != self.get("codex-version")? {
-            return Err("Codex version changed; review it and replace the settings profile".into());
-        }
         if self.version(&claude_program, "claude-home", "CLAUDE_CONFIG_DIR")?
             != self.get("claude-version")?
         {
@@ -328,7 +292,7 @@ impl Profile {
             );
         }
         Ok(format!(
-            "Settings source profile {} is unchanged and both configured CLIs match. Guest schema translation, synchronization, and login reuse remain pending.",
+            "Settings source profile {} is unchanged and the configured CLI matches. Guest schema translation, synchronization, and login reuse remain pending.",
             self.fingerprint()
         ))
     }
@@ -426,10 +390,8 @@ mod tests {
 
     fn example() -> String {
         format!(
-            "TDVM-SETTINGS-PROFILE-1\ndefault-agent=codex\nworkspace=/home/test/src/td\npath=/usr/bin\ncodex-home=/home/test/.codex\ncodex=/usr/bin/codex\ncodex-sha256={}\ncodex-version=codex-cli 0.148.0\ncodex-config-sha256={}\nclaude-home=/home/test/.claude\nclaude=/usr/bin/claude\nclaude-sha256={}\nclaude-version=2.1.260 (Claude Code)\nclaude-settings-sha256={}\n",
-            "c".repeat(64),
+            "TDVM-SETTINGS-PROFILE-2\nworkspace=/home/test/src/td\npath=/usr/bin\nclaude-home=/home/test/.claude\nclaude=/usr/bin/claude\nclaude-sha256={}\nclaude-version=2.1.260 (Claude Code)\nclaude-settings-sha256={}\n",
             "a".repeat(64),
-            "d".repeat(64),
             "b".repeat(64)
         )
     }
@@ -441,7 +403,9 @@ mod tests {
         assert_eq!(Profile::parse(&profile.encode()).unwrap(), profile);
         assert_eq!(profile.fingerprint().len(), 64);
         for bad in [
-            text.replace("default-agent=codex", "default-agent=other"),
+            text.replace("TDVM-SETTINGS-PROFILE-2", "TDVM-SETTINGS-PROFILE-3"),
+            format!("{text}default-agent=claude\n"),
+            format!("{text}codex=/usr/bin/codex\n"),
             text.replace("workspace=/home/test/src/td", "workspace=../td"),
             text.replace("path=/usr/bin", "path=/usr/bin::/bin"),
             text.replace(&"a".repeat(64), "A234"),
@@ -451,6 +415,10 @@ mod tests {
         ] {
             assert!(Profile::parse(&bad).is_err(), "{bad}");
         }
+        let retired = text.replace("TDVM-SETTINGS-PROFILE-2", "TDVM-SETTINGS-PROFILE-1");
+        assert!(Profile::parse(&retired)
+            .unwrap_err()
+            .contains("removed Codex agent"));
         assert!(!profile.encode().contains("auth.json"));
         assert!(!profile.encode().contains("credentials.json"));
     }
@@ -465,31 +433,22 @@ mod tests {
         for path in [
             root.clone(),
             root.join("workspace"),
-            root.join("codex"),
             root.join("claude"),
             root.join("bin"),
         ] {
             fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
         }
-        let codex_config = root.join("codex/config.toml");
         let claude_settings = root.join("claude/settings.json");
-        fs::write(&codex_config, b"model = \"fixture\"\n").unwrap();
         fs::write(&claude_settings, b"{}\n").unwrap();
-        for name in ["codex-tool", "claude-tool"] {
-            let path = root.join("bin").join(name);
-            fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{name}-1'\n")).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        let claude_tool = root.join("bin/claude-tool");
+        fs::write(&claude_tool, b"#!/bin/sh\nprintf '%s\\n' 'claude-tool-1'\n").unwrap();
+        fs::set_permissions(&claude_tool, fs::Permissions::from_mode(0o700)).unwrap();
         let text = format!(
-            "TDVM-SETTINGS-PROFILE-1\ndefault-agent=codex\nworkspace={}\npath={}\ncodex-home={}\ncodex={}\ncodex-sha256={}\ncodex-version=codex-tool-1\ncodex-config-sha256={}\nclaude-home={}\nclaude={}\nclaude-sha256={}\nclaude-version=claude-tool-1\nclaude-settings-sha256={}\n",
+            "TDVM-SETTINGS-PROFILE-2\nworkspace={}\npath={}\nclaude-home={}\nclaude={}\nclaude-sha256={}\nclaude-version=claude-tool-1\nclaude-settings-sha256={}\n",
             root.join("workspace").display(),
             root.join("bin").display(),
-            root.join("codex").display(),
-            root.join("bin/codex-tool").display(),
-            sha256::hex_digest(b"#!/bin/sh\nprintf '%s\\n' 'codex-tool-1'\n"),
-            sha256::hex_digest(b"model = \"fixture\"\n"),
             root.join("claude").display(),
-            root.join("bin/claude-tool").display(),
+            claude_tool.display(),
             sha256::hex_digest(b"#!/bin/sh\nprintf '%s\\n' 'claude-tool-1'\n"),
             sha256::hex_digest(b"{}\n"),
         );
@@ -498,23 +457,22 @@ mod tests {
             .check_beneath(&root)
             .unwrap()
             .contains("login reuse remain pending"));
-        fs::write(&codex_config, b"model = \"changed\"\n").unwrap();
+        fs::write(&claude_settings, b"{\"changed\":true}\n").unwrap();
         assert!(profile
             .check_beneath(&root)
             .unwrap_err()
             .contains("settings changed"));
-        fs::write(&codex_config, b"model = \"fixture\"\n").unwrap();
-        let codex_tool = root.join("bin/codex-tool");
+        fs::write(&claude_settings, b"{}\n").unwrap();
         fs::write(
-            &codex_tool,
-            b"#!/bin/sh\n# changed\nprintf '%s\\n' 'codex-tool-1'\n",
+            &claude_tool,
+            b"#!/bin/sh\n# changed\nprintf '%s\\n' 'claude-tool-1'\n",
         )
         .unwrap();
         assert!(profile
             .check_beneath(&root)
             .unwrap_err()
-            .contains("Codex executable changed"));
-        fs::write(&codex_tool, b"#!/bin/sh\nprintf '%s\\n' 'codex-tool-1'\n").unwrap();
+            .contains("Claude executable changed"));
+        fs::write(&claude_tool, b"#!/bin/sh\nprintf '%s\\n' 'claude-tool-1'\n").unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(profile
             .check_beneath(&root)

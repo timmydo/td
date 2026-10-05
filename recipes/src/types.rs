@@ -942,96 +942,6 @@ pub struct Phase {
     pub body: Option<Vec<Stmt>>,
 }
 
-/// One package selected from a fixed-output archive of a Cargo Git source.
-/// `path` is relative to the archive's single top-level directory; `.` names
-/// that directory itself. The lock gate binds the declared name and version to
-/// the exact Git source entry; Cargo then validates the copied manifest.
-#[derive(Clone)]
-pub struct CargoGitPackage {
-    pub name: String,
-    pub version: String,
-    pub path: String,
-}
-
-impl CargoGitPackage {
-    pub fn new(name: &str, version: &str, path: &str) -> CargoGitPackage {
-        CargoGitPackage {
-            name: name.into(),
-            version: version.into(),
-            path: path.into(),
-        }
-    }
-
-    fn to_json(&self) -> Json {
-        Json::Obj(vec![
-            ("name".into(), Json::Str(self.name.clone())),
-            ("version".into(), Json::Str(self.version.clone())),
-            ("path".into(), Json::Str(self.path.clone())),
-        ])
-    }
-}
-
-/// A Cargo `git+` source represented as an ordinary td fixed-output input.
-/// `source` is the exact Cargo.lock source id, including its full commit;
-/// `input` names a source pin whose URL and SHA-256 authenticate the commit
-/// archive. No Git client or network access enters the target build.
-#[derive(Clone)]
-pub struct CargoGitSource {
-    pub source: String,
-    pub input: String,
-    pub packages: Vec<CargoGitPackage>,
-}
-
-impl CargoGitSource {
-    pub fn new(source: &str, input: &str, packages: Vec<CargoGitPackage>) -> CargoGitSource {
-        CargoGitSource {
-            source: source.into(),
-            input: input.into(),
-            packages,
-        }
-    }
-
-    fn to_json(&self) -> Json {
-        Json::Obj(vec![
-            ("source".into(), Json::Str(self.source.clone())),
-            ("input".into(), Json::Str(self.input.clone())),
-            (
-                "packages".into(),
-                Json::Arr(self.packages.iter().map(CargoGitPackage::to_json).collect()),
-            ),
-        ])
-    }
-}
-
-/// A literal, count-checked patch to one Cargo.toml or Rust source file below the
-/// selected Rust workspace. This is narrower than a generic build phase, and
-/// the Rust runner applies the edits before enforcing the exact reviewed
-/// Cargo.lock and invoking frozen Cargo.
-#[derive(Clone)]
-pub struct CargoSourcePatch {
-    pub file: String,
-    pub edits: Vec<TextEdit>,
-}
-
-impl CargoSourcePatch {
-    pub fn new(file: &str, edits: Vec<TextEdit>) -> CargoSourcePatch {
-        CargoSourcePatch {
-            file: file.into(),
-            edits,
-        }
-    }
-
-    fn to_json(&self) -> Json {
-        Json::Obj(vec![
-            ("file".into(), Json::Str(self.file.clone())),
-            (
-                "edits".into(),
-                Json::Arr(self.edits.iter().map(TextEdit::to_json).collect()),
-            ),
-        ])
-    }
-}
-
 impl Phase {
     pub fn new(position: &str, anchor: &str, name: &str) -> Phase {
         Phase {
@@ -1153,10 +1063,6 @@ pub struct Recipe {
     /// because Cargo could select that ancestor's lock. Absent means the source root
     /// itself, preserving existing recipes.
     pub cargo_subdir: Option<String>,
-    /// Cargo package selected from the workspace. Absent builds the workspace's
-    /// normal default target set, preserving existing recipes. When set, every
-    /// `bins` entry must name a binary target owned by this package.
-    pub cargo_package: Option<String>,
     pub no_default_features: Option<bool>,
     pub features: Option<Vec<String>>,
     /// Package-owned behavioral/reproducibility checks. The gate runner consumes
@@ -1176,27 +1082,12 @@ pub struct Recipe {
     /// committed-checksum ingress that lets a rust node build in the graph without
     /// reopening the #469 crate-provenance gate.
     pub cargo_lock: Option<String>,
-    /// Replace the materialized source workspace's existing regular Cargo.lock with
-    /// the exact committed `cargo_lock` before the frozen build. Absent verifies byte
-    /// equality instead. This is an explicit escape hatch for reviewed normalized
-    /// workspace locks; ordinary recipes must use the upstream source's embedded lock
-    /// verbatim. It does not generate a lock for source that omits one.
-    pub replace_cargo_lock: Option<bool>,
     /// Link the named binaries as fully static executables: no program
     /// interpreter, no `DT_NEEDED`, no run-path, which is what an application
     /// package's static validator requires of a td-built entry. The runner
     /// then pins Cargo's explicit `--target` so `+crt-static` reaches only
     /// target artifacts, never a proc macro or a build script.
     pub static_link: Option<bool>,
-    /// Exact Cargo Git sources admitted by explicit review. Each declaration binds
-    /// lock source id + commit to a fixed-output archive input and the packages td
-    /// may expose from it. The input is also added to the ordinary source/tool graph;
-    /// the Rust runner consumes it as source data and never invokes Git.
-    pub cargo_git_sources: Option<Vec<CargoGitSource>>,
-    /// Reviewed, literal edits to Cargo manifests or build scripts in the
-    /// selected workspace. Each edit pins its expected occurrence count so
-    /// upstream drift fails before Cargo runs.
-    pub cargo_source_patches: Option<Vec<CargoSourcePatch>>,
     /// Repo-relative path to an IN-TREE source directory this recipe builds from
     /// (#469 local-source provenance). Set via `local_source`, which also points
     /// `source_input` at this recipe's own `<name>-source` key. The runner
@@ -1223,7 +1114,6 @@ pub struct RecipeCheck {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CheckRunner {
     BuildOnly,
-    Codex,
     RustToolchain,
     Tzdata,
 }
@@ -1238,7 +1128,7 @@ impl CheckRunner {
             // The product proof `td shell`-builds the Rust userland with the
             // toolchain it just made (checks/rust_toolchain.rs).
             CheckRunner::RustToolchain => &["ripgrep", "fd", "uutils"],
-            CheckRunner::BuildOnly | CheckRunner::Codex | CheckRunner::Tzdata => &[],
+            CheckRunner::BuildOnly | CheckRunner::Tzdata => &[],
         }
     }
 }
@@ -1279,17 +1169,13 @@ impl Recipe {
             tests: None,
             bins: None,
             cargo_subdir: None,
-            cargo_package: None,
             no_default_features: None,
             features: None,
             checks: None,
             source_pins: None,
             ostree_pins: None,
             cargo_lock: None,
-            replace_cargo_lock: None,
             static_link: None,
-            cargo_git_sources: None,
-            cargo_source_patches: None,
             local_source: None,
             local_source_trees: None,
         }
@@ -1373,15 +1259,7 @@ impl Recipe {
         self
     }
     pub fn inputs(mut self, xs: &[&str]) -> Recipe {
-        let mut inputs = vs(xs);
-        if let Some(sources) = &self.cargo_git_sources {
-            for source in sources {
-                if !inputs.contains(&source.input) {
-                    inputs.push(source.input.clone());
-                }
-            }
-        }
-        self.inputs = Some(inputs);
+        self.inputs = Some(vs(xs));
         self.add_source_pins_for_keys(xs.iter().copied());
         self.add_ostree_pins_for_keys(xs.iter().copied());
         self
@@ -1391,15 +1269,7 @@ impl Recipe {
     pub fn inputs_owned(mut self, xs: Vec<String>) -> Recipe {
         self.add_source_pins_for_keys(xs.iter().map(String::as_str));
         self.add_ostree_pins_for_keys(xs.iter().map(String::as_str));
-        let mut inputs = xs;
-        if let Some(sources) = &self.cargo_git_sources {
-            for source in sources {
-                if !inputs.contains(&source.input) {
-                    inputs.push(source.input.clone());
-                }
-            }
-        }
-        self.inputs = Some(inputs);
+        self.inputs = Some(xs);
         self
     }
     pub fn configure_flags(mut self, xs: &[&str]) -> Recipe {
@@ -1430,10 +1300,6 @@ impl Recipe {
         self.cargo_subdir = Some(path.into());
         self
     }
-    pub fn cargo_package(mut self, package: &str) -> Recipe {
-        self.cargo_package = Some(package.into());
-        self
-    }
     pub fn no_default_features(mut self) -> Recipe {
         self.no_default_features = Some(true);
         self
@@ -1456,34 +1322,9 @@ impl Recipe {
         self.cargo_lock = Some(path.into());
         self
     }
-    /// Make the exact committed Cargo.lock authoritative for the materialized
-    /// workspace. The default is stricter: require the source's lock to match it.
-    pub fn replace_cargo_lock(mut self) -> Recipe {
-        self.replace_cargo_lock = Some(true);
-        self
-    }
     /// Link the named binaries fully static; see the `static_link` field.
     pub fn static_link(mut self) -> Recipe {
         self.static_link = Some(true);
-        self
-    }
-    /// Admit explicitly reviewed Cargo Git dependencies through fixed-output
-    /// commit archives. The archive inputs join `inputs` whichever order these
-    /// setters are called; downstream seed provenance still authenticates the
-    /// resolved bytes before they may be staged.
-    pub fn cargo_git_sources(mut self, sources: Vec<CargoGitSource>) -> Recipe {
-        for source in &sources {
-            let inputs = self.inputs.get_or_insert_with(Vec::new);
-            if !inputs.contains(&source.input) {
-                inputs.push(source.input.clone());
-            }
-            self.add_source_pin_for_key(&source.input);
-        }
-        self.cargo_git_sources = Some(sources);
-        self
-    }
-    pub fn cargo_source_patches(mut self, patches: Vec<CargoSourcePatch>) -> Recipe {
-        self.cargo_source_patches = Some(patches);
         self
     }
     /// Build this recipe from an IN-TREE source directory (repo-relative `path`),
@@ -1690,9 +1531,6 @@ impl Recipe {
         if let Some(path) = &self.cargo_subdir {
             o.push(("cargoSubdir".into(), Json::Str(path.clone())));
         }
-        if let Some(package) = &self.cargo_package {
-            o.push(("cargoPackage".into(), Json::Str(package.clone())));
-        }
         if let Some(b) = self.no_default_features {
             o.push(("noDefaultFeatures".into(), Json::Bool(b)));
         }
@@ -1702,23 +1540,8 @@ impl Recipe {
         if let Some(l) = &self.cargo_lock {
             o.push(("cargoLock".into(), Json::Str(l.clone())));
         }
-        if let Some(replace) = self.replace_cargo_lock {
-            o.push(("replaceCargoLock".into(), Json::Bool(replace)));
-        }
         if let Some(static_link) = self.static_link {
             o.push(("staticLink".into(), Json::Bool(static_link)));
-        }
-        if let Some(sources) = &self.cargo_git_sources {
-            o.push((
-                "cargoGitSources".into(),
-                Json::Arr(sources.iter().map(CargoGitSource::to_json).collect()),
-            ));
-        }
-        if let Some(patches) = &self.cargo_source_patches {
-            o.push((
-                "cargoSourcePatches".into(),
-                Json::Arr(patches.iter().map(CargoSourcePatch::to_json).collect()),
-            ));
         }
         Json::Obj(o)
     }
@@ -1751,7 +1574,7 @@ mod tests {
     }
 
     #[test]
-    fn cargo_lock_replacement_is_explicit_recipe_data() {
+    fn cargo_lock_and_static_link_are_explicit_recipe_data() {
         let plain = Recipe::rust("tool", "1.0")
             .bins(&["tool"])
             .cargo_lock("recipes/locks/tool/Cargo.lock");
@@ -1760,59 +1583,19 @@ mod tests {
             r#"{"bins":["tool"],"buildSystem":"rust","cargoLock":"recipes/locks/tool/Cargo.lock","name":"tool","version":"1.0"}"#
         );
         assert_eq!(
-            plain.clone().replace_cargo_lock().to_json().to_canonical(),
-            r#"{"bins":["tool"],"buildSystem":"rust","cargoLock":"recipes/locks/tool/Cargo.lock","name":"tool","replaceCargoLock":true,"version":"1.0"}"#
-        );
-        assert_eq!(
             plain.static_link().to_json().to_canonical(),
             r#"{"bins":["tool"],"buildSystem":"rust","cargoLock":"recipes/locks/tool/Cargo.lock","name":"tool","staticLink":true,"version":"1.0"}"#
         );
     }
 
     #[test]
-    fn cargo_git_sources_are_typed_and_attach_their_fixed_output_inputs() {
-        let source = CargoGitSource::new(
-            "git+https://example.invalid/tool?rev=0123456789abcdef0123456789abcdef01234567#0123456789abcdef0123456789abcdef01234567",
-            "tool-git-source",
-            vec![CargoGitPackage::new("tool", "1.2.3", ".")],
-        );
-        let recipe = Recipe::rust("consumer", "1")
-            .cargo_git_sources(vec![source.clone()])
-            .inputs(&["rust-toolchain"]);
-        assert_eq!(
-            recipe.to_json().to_canonical(),
-            r#"{"buildSystem":"rust","cargoGitSources":[{"input":"tool-git-source","packages":[{"name":"tool","path":".","version":"1.2.3"}],"source":"git+https://example.invalid/tool?rev=0123456789abcdef0123456789abcdef01234567#0123456789abcdef0123456789abcdef01234567"}],"inputs":["rust-toolchain","tool-git-source"],"name":"consumer","version":"1"}"#
-        );
-        let owned = Recipe::rust("consumer", "1")
-            .cargo_git_sources(vec![source])
-            .inputs_owned(vec!["rust-toolchain".into()]);
-        assert_eq!(
-            owned.inputs,
-            Some(vec!["rust-toolchain".into(), "tool-git-source".into()])
-        );
-    }
-
-    #[test]
     fn rust_workspace_selection_is_explicit_recipe_data() {
-        let r = Recipe::rust("codex", "0.149.1")
-            .bins(&["codex"])
-            .cargo_subdir("codex-rs")
-            .cargo_package("codex-cli");
+        let r = Recipe::rust("tool", "1.0")
+            .bins(&["tool"])
+            .cargo_subdir("nested");
         assert_eq!(
             r.to_json().to_canonical(),
-            r#"{"bins":["codex"],"buildSystem":"rust","cargoPackage":"codex-cli","cargoSubdir":"codex-rs","name":"codex","version":"0.149.1"}"#
-        );
-    }
-
-    #[test]
-    fn cargo_source_patches_are_literal_count_checked_recipe_data() {
-        let r = Recipe::rust("tool", "1").cargo_source_patches(vec![CargoSourcePatch::new(
-            "nested/Cargo.toml",
-            vec![TextEdit::new("native-tls", "rustls", 1)],
-        )]);
-        assert_eq!(
-            r.to_json().to_canonical(),
-            r#"{"buildSystem":"rust","cargoSourcePatches":[{"edits":[{"expect":"1","from":"native-tls","to":"rustls"}],"file":"nested/Cargo.toml"}],"name":"tool","version":"1"}"#
+            r#"{"bins":["tool"],"buildSystem":"rust","cargoSubdir":"nested","name":"tool","version":"1.0"}"#
         );
     }
 

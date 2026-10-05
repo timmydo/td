@@ -577,7 +577,7 @@ Subsequent payloads are exact byte records:
 | `02` plus that u64 handle | `82 00` running, `82 01` successful exit, or `82 02` failed exit |
 | `03` | `83` heartbeat |
 | `04` | `81` plus a process handle for a terminal in the fixed task worktree |
-| `05` | `81` plus a process handle for Codex in the fixed task worktree |
+| `05` | retired (formerly the Codex agent); refused like any unknown request and never reassigned |
 | `06` | `81` plus a process handle for Claude in the fixed task worktree |
 | `07` | `81` plus a process handle for the human task manager |
 | `08` | `81` plus a process handle for the human text editor |
@@ -606,8 +606,8 @@ request or heartbeat within each five-second receive deadline.
 
 The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
 terminal-exec UID GENERATION HANDLE
-[task|codex|claude|taskmgr|editor|photo|review]` in a new process group.
-The optional literal selects requests `04` through `0a`; it is not a
+[task|claude|taskmgr|editor|photo|review]` in a new process group.
+The optional literal selects requests `04` and `06` through `0a`; it is not a
 pathname.
 td-login checks
 the human account policy and drops and verifies credentials. Its exact
@@ -681,13 +681,12 @@ authorization. Opening one's ordinary terminal is session behavior and opens
 an ordinary shell with the human account's existing authority; it grants
 neither store access nor an elevated shell.
 
-Both agent variants enter the same fixed task directory and append exactly
-`--command /bin/cttyhack --stdin /bin/codex` or its `/bin/claude` counterpart.
-The wrapper claims the human terminal so interactive signals work. Codex uses
-its installed source-built entry point without sandbox overrides. Claude's
-human entry point invokes the application client described below: that service
-creates a separate fresh slave for the private-UID jail. The human terminal
-is never passed into the jail, and the wrapper does not bypass confinement.
+The agent variant enters the same fixed task directory and appends exactly
+`--command /bin/cttyhack --stdin /bin/claude`. The wrapper claims the human
+terminal so interactive signals work. Claude's human entry point invokes the
+application client described below: that service creates a separate fresh
+slave for the private-UID jail. The human terminal is never passed into the
+jail, and the wrapper does not bypass confinement.
 Launch is not authentication, settings synchronization, or build readiness.
 
 The compositor-owned runtime directory permits human traversal and socket

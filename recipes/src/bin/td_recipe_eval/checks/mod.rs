@@ -8,7 +8,6 @@ mod basic;
 // redistributable demo VM, which needs host qemu-img and a writable destination.
 // Exposed as `td-recipe-eval bundle` (check_runner::bundle_cli).
 pub(crate) mod bundle;
-mod codex;
 pub(crate) mod release_source;
 // qemu_boot is NOT a CheckRunner variant: booting the kernel needs HOST qemu,
 // which the gate's host-free sandbox hides, so it can't run as a sandboxed
@@ -27,7 +26,6 @@ pub(crate) fn run(
 ) -> Result<(), String> {
     match check_runner {
         CheckRunner::BuildOnly => basic::run_build_only(runner, stem),
-        CheckRunner::Codex => codex::run(runner),
         CheckRunner::RustToolchain => rust_toolchain::run(runner),
         CheckRunner::Tzdata => tzdata::run(runner),
     }

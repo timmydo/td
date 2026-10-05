@@ -10,12 +10,12 @@ use ssh_policy::SSHD_AUTHORIZED_KEYS;
 
 use crate::ladder::{
     entry_program, post_bootstrap_path, AUTOTEST_CMDLINE_TOKEN, BOOT_FAIL_TARGET_CMDLINE_TOKEN,
-    BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, CODEX_BWRAP_VERSION_OUTPUT, CODEX_RUNTIME_MARKER,
-    CODEX_VERSION_OUTPUT, DEPLOY_INSTALL_CMDLINE_TOKEN, FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN,
-    FIREFOX_AUDIT_CMDLINE_TOKEN, FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN,
-    FIREFOX_INPUT_CMDLINE_TOKEN, FIREFOX_NETWORK_RUNTIME_MARKER, GIT_HTTPS_RUNTIME_MARKER,
-    GIT_HTTPS_TEST_URL, GIT_RUNTIME_MARKER, GREETER_MARKER, KERNEL_AUDIT_CMDLINE_TOKEN,
-    NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
+    BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, DEPLOY_INSTALL_CMDLINE_TOKEN,
+    FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN, FIREFOX_AUDIT_CMDLINE_TOKEN,
+    FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN, FIREFOX_INPUT_CMDLINE_TOKEN,
+    FIREFOX_NETWORK_RUNTIME_MARKER, GIT_HTTPS_RUNTIME_MARKER, GIT_HTTPS_TEST_URL,
+    GIT_RUNTIME_MARKER, GREETER_MARKER, KERNEL_AUDIT_CMDLINE_TOKEN, NETTEST_CMDLINE_TOKEN,
+    NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
     PERSIST_WRITE_CMDLINE_TOKEN, POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER,
     SETUP_INPUT_CMDLINE_TOKEN, SSHD_MARKER, SYSTEM_BOOT_SUCCESS_MARKER,
     SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_DEPLOY_ROLLBACK_MARKER, SYSTEM_ETC_MUTABLE_MARKER,
@@ -61,7 +61,7 @@ const BOOT_SUCCESS_RETRY_SECS: u8 = 3;
 /// instead of withholding it.
 const BUS_MARKER_GRACE_SWEEPS: u8 = 2;
 const BOOT_SUCCESS_RETRY_MAX_SECS: u8 = 10;
-/// What ONE iteration of the boot-success loop may cost on a slow TCG guest: ten
+/// What ONE iteration of the boot-success loop may cost on a slow TCG guest: nine
 /// `su` probe blocks, four `td-boot update` passes and a `rollback`. Exactly ONE of
 /// those copies an image; what the rest add is deployment-sized READS, and the
 /// distinction is worth the words because the QEMU volume budget turns on it
@@ -80,11 +80,9 @@ const BOOT_SUCCESS_RETRY_MAX_SECS: u8 = 10;
 /// local init/clone/commit/push/reclone/fsck and shell-porcelain workflow. Its local
 /// transport forks both service programs and performs pack/object work, so reserve
 /// 18 seconds on TCG rather than only the two-second spawn share. A budget that
-/// covered only the healthy path would not be a backstop. The tenth starts the large
-/// Codex CLI and then drives a read-only command through its Bubblewrap backend;
-/// reserve six seconds for those dynamic starts and the namespace transition on TCG.
+/// covered only the healthy path would not be a backstop.
 #[cfg(test)]
-const BOOT_SUCCESS_ITERATION_BUDGET_SECS: u32 = 76;
+const BOOT_SUCCESS_ITERATION_BUDGET_SECS: u32 = 70;
 const BOOT_FAIL_PARK_WAIT_SECS: u8 = 30;
 const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 
@@ -110,8 +108,8 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 // reviewed symlink per mutable file out to writable state (the `MUTABLE_ETC` table
 // below) rather than an overlay — so the read-only-`/etc` assertion survives while
 // per-machine identity still persists; `/home` and `/root` are root-image symlinks
-// into `/var`. The real root is store-native: uutils, ripgrep, fd, Git, Codex and
-// Bubblewrap at their /td/store paths, a /bin symlink farm, and generated /etc. The
+// into `/var`. The real root is store-native: uutils, ripgrep, fd and Git at
+// their /td/store paths, a /bin symlink farm, and generated /etc. The
 // typed PackErofs step invokes
 // the dependency-free control-plane image writer directly; no recipe process can
 // execute td-builder through PATH or argv. Strict manifests separately hash the
@@ -1379,7 +1377,7 @@ mod svc_timeouts {
     /// One control-channel request: a line in, and a line or a short report out.
     pub const APPLICATION_PLACE: u32 = 30;
     /// The script's own retry loop is clamped to BOOT_SUCCESS_RETRY_MAX_SECS iterations,
-    /// but each runs a large probe farm (ten `su` blocks) and can run four
+    /// but each runs a large probe farm (nine `su` blocks) and can run four
     /// transactional `td-boot update` passes plus a `rollback`, so an iteration is worth
     /// seconds on a slow disk, not one. Two of the four are cheap by construction — a
     /// refusal and an idle tick each read a bounded manifest and stop.
@@ -1397,8 +1395,8 @@ mod svc_timeouts {
     /// the fallback being the deployment that is running, since this fixture has two
     /// deployments and not three.
     ///
-    /// Raised again for the ninth, Git-heavy `su` block and the tenth Codex/Bubblewrap
-    /// block, and by the rule rather than by a measurement: this backstop must clear
+    /// Raised again for the ninth, Git-heavy `su` block, and by the rule rather than
+    /// by a measurement: this backstop must clear
     /// the guest loop's own worst case TWICE. What the number bounds is a HANG — the
     /// loop exits as soon as it is healthy — so the cost of the increase is only how
     /// long a wedged health target takes to be called one.
@@ -3185,7 +3183,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          n=0\n\
          bg={BUS_MARKER_GRACE_SWEEPS}\n\
          [ \"$bg\" -ge \"$wait\" ] && bg=$((wait-1))\n\
-         mu=0; mrf=0; mg=0; mc=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0; mtb=0; btb=0\n\
+         mu=0; mrf=0; mg=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0; mtb=0; btb=0\n\
          msk=0; mtj=0; mtk=0; mts=1\n\
          if /bin/su -s /bin/sh \"$health_user\" -c \
          '{sandbox_kernel_probes}[ \"$k\" = 1 ]'; then \
@@ -3305,48 +3303,6 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          {{ echo \"git: the installed CA bundle has no PEM certificate\"; exit 1; }}'; then \
          [ \"$mg\" = 1 ] || {{ echo {GIT_RUNTIME_MARKER}; mg=1; }}; else healthy=0; fi; \
          if /bin/su -s /bin/sh \"$health_user\" -c \
-         'c=$(/bin/codex --version 2>&1) || \
-         {{ echo \"codex: /bin/codex --version failed: $c\"; exit 1; }}; \
-         [ \"$c\" = \"{codex_version}\" ] || \
-         {{ echo \"codex: unexpected installed version: $c\"; exit 1; }}; \
-         b=$(/bin/bwrap --version 2>&1) || \
-         {{ echo \"bwrap: /bin/bwrap --version failed: $b\"; exit 1; }}; \
-         [ \"$b\" = \"{bwrap_version}\" ] || \
-         {{ echo \"bwrap: unexpected installed version: $b\"; exit 1; }}; \
-         /bin/rm -rf {codex_probe_root} || \
-         {{ echo \"codex: could not clear the sandbox probe\"; exit 1; }}; \
-         /bin/mkdir -p {codex_probe_root}/home/.codex \
-         {codex_probe_root}/work || \
-         {{ echo \"codex: could not prepare the sandbox probe\"; exit 1; }}; \
-         /bin/printf \"%s\\n\" outside > {codex_probe_root}/work/fixture || \
-         {{ echo \"codex: could not write the outer sandbox fixture\"; exit 1; }}; \
-         /bin/readlink /proc/self/ns/net > {codex_probe_root}/work/outer-net || \
-         {{ echo \"codex: could not record the outer network namespace\"; exit 1; }}; \
-         s=$(HOME={codex_probe_root}/home \
-         CODEX_HOME={codex_probe_root}/home/.codex PATH=/bin \
-         /bin/codex sandbox -P :read-only -C {codex_probe_root}/work \
-         /bin/sh -c '\\''if {{ /bin/printf sandboxed >> fixture; }} 2>/dev/null; then \
-         echo write-was-not-confined; exit 1; fi; \
-         v=$(/bin/cat fixture) || \
-         {{ /bin/echo sandbox-fixture-unreadable; exit 1; }}; \
-         [ \"$v\" = outside ] || \
-         {{ /bin/echo sandbox-fixture-changed: \"$v\"; exit 1; }}; \
-         outer_net=$(/bin/cat outer-net) || \
-         {{ /bin/echo sandbox-outer-network-namespace-unreadable; exit 1; }}; \
-         inner_net=$(/bin/readlink /proc/self/ns/net) || \
-         {{ /bin/echo sandbox-inner-network-namespace-unreadable; exit 1; }}; \
-         [ \"$inner_net\" != \"$outer_net\" ] || \
-         {{ /bin/echo sandbox-network-namespace-unchanged: \"$inner_net\"; exit 1; }}; \
-         /bin/echo TD-CODEX-SANDBOX-OK'\\'' 2>&1) || \
-         {{ echo \"codex: read-only Bubblewrap transition failed: $s\"; exit 1; }}; \
-         /bin/printf \"%s\\n\" \"$s\" | \
-         /bin/grep -q -x -F TD-CODEX-SANDBOX-OK || \
-         {{ echo \"codex: sandbox transition omitted its success evidence: $s\"; \
-         exit 1; }}; \
-         /bin/rm -rf {codex_probe_root} || \
-         {{ echo \"codex: could not clean the sandbox probe\"; exit 1; }}'; then \
-         [ \"$mc\" = 1 ] || {{ echo {CODEX_RUNTIME_MARKER}; mc=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh \"$health_user\" -c \
          'o=$(/bin/ssh -F /dev/null -i /run/td-ssh-selftest \
          -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
          -o UserKnownHostsFile=/run/td-ssh-known-hosts \
@@ -3437,9 +3393,6 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          n=$((n+1)); /bin/td-util sleep 1; \
          done\n\
          fail\n",
-        codex_probe_root = format!("/run/user/{UI_UID}/td-codex-sandbox-probe"),
-        codex_version = CODEX_VERSION_OUTPUT,
-        bwrap_version = CODEX_BWRAP_VERSION_OUTPUT,
     )
 }
 
@@ -4520,12 +4473,6 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         from: "{in:td-portal}".into(),
         dest: "{root}/real-root{in:td-portal}".into(),
     });
-    // Codex's exact Bubblewrap helper is static, so preserve its canonical package
-    // directly instead of treating source-provenance strings as runtime edges.
-    steps.push(Step::CopyTree {
-        from: "{in:codex-bwrap}".into(),
-        dest: "{root}/real-root{in:codex-bwrap}".into(),
-    });
     // The CA extract is immutable data, not an executable runtime closure. Copy
     // the package at its canonical store path so IMMUTABLE_ETC can expose the
     // conventional filename without duplicating the bundle in /etc.
@@ -4591,7 +4538,7 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         });
     }
     // Stage the dynamically linked userland and every transitively referenced store item
-    // at its canonical absolute path. uutils, ripgrep, fd, OpenSSH, and Codex pull their
+    // at its canonical absolute path. uutils, ripgrep, fd and OpenSSH pull their
     // td glibc closures. The engine admits only direct recipe inputs, so a Rust bootstrap
     // or other build-only reference fails closed rather than entering the EROFS image.
     let mut runtime_roots = vec![
@@ -4600,7 +4547,6 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         "{in:fd}".into(),
         "{in:openssh-x86-64}".into(),
         "{in:git-x86-64}".into(),
-        "{in:codex}".into(),
         "{in:rust-toolchain}".into(),
         "{in:gcc-x86-64-self}".into(),
         "{in:binutils-x86-64-self}".into(),
@@ -4663,8 +4609,6 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         ),
         ("git-upload-pack", "{in:git-x86-64}/bin/git-upload-pack"),
         ("openssl", "{in:libressl-x86-64}/bin/openssl"),
-        ("codex", "{in:codex}/bin/codex"),
-        ("bwrap", "{in:codex-bwrap}/bin/bwrap"),
     ] {
         steps.push(Step::Symlink {
             target: target.into(),
@@ -5083,9 +5027,10 @@ fn shape_check() -> String {
      tdp=\"{root}/real-root{in:td-profiler}/bin/td-profiler\"; { [ -f \"$tdp\" ] && [ -x \"$tdp\" ]; } || { echo 'root tree: td-profiler is not packed and executable' >&2; exit 1; }; \
      pindex=\"$root@PROFILER_OBJECT_INDEX@\"; [ -s \"$pindex\" ] || { echo 'root tree: deployment profiler object index is absent or empty' >&2; exit 1; }; \
      [ \"$(head -n 1 \"$pindex\")\" = td-profiler-objects-v1 ] || { echo 'root tree: deployment profiler object index has the wrong header' >&2; exit 1; }; \
-     codexrow=$(grep -F \"{in:codex}/bin/codex\" \"$pindex\") || { echo 'root tree: deployment profiler object index omits Codex' >&2; exit 1; }; \
-     case \"$codexrow\" in *';assembly-boundary=1'*) : ;; *) echo 'root tree: deployment profiler object index omits the Codex assembly boundary' >&2; exit 1;; esac; \
-     case \"$codexrow\" in *';line-attribution-boundary=1'*) : ;; *) echo 'root tree: deployment profiler object index omits the Codex line-attribution boundary' >&2; exit 1;; esac; \
+     netrow=$(grep -F \"{in:td-net}/bin/td-net\" \"$pindex\") || { echo 'root tree: deployment profiler object index omits td-net' >&2; exit 1; }; \
+     case \"$netrow\" in *';assembly-boundary=1'*) : ;; *) echo 'root tree: deployment profiler object index omits the td-net assembly boundary' >&2; exit 1;; esac; \
+     driverrow=$(grep -F \"{in:rust-toolchain}/lib/librustc_driver-\" \"$pindex\") || { echo 'root tree: deployment profiler object index omits librustc_driver' >&2; exit 1; }; \
+     case \"$driverrow\" in *';line-attribution-boundary=1'*) : ;; *) echo 'root tree: deployment profiler object index omits the librustc_driver line-attribution boundary' >&2; exit 1;; esac; \
      [ \"$(readlink \"$root/bin/td-jail\" 2>/dev/null)\" = \"{in:td-jail}/bin/td-jail\" ] || { echo 'root tree: /bin/td-jail is not a symlink to the staged confinement boundary' >&2; exit 1; }; \
      tdj=\"{root}/real-root{in:td-jail}/bin/td-jail\"; { [ -f \"$tdj\" ] && [ -x \"$tdj\" ]; } || { echo 'root tree: td-jail is not packed and executable, so the running-kernel transition oracle cannot run' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-seatd\" 2>/dev/null)\" = \"{in:td-seatd}/bin/td-seatd\" ] || { echo 'root tree: /bin/td-seatd is not a symlink to the staged single-user seat assigner' >&2; exit 1; }; \
@@ -5162,17 +5107,6 @@ fn shape_check() -> String {
          { [ -f \"$githelper\" ] && [ -x \"$githelper\" ]; } || { echo \"root tree: $a is not packed/executable at real-root{in:git-x86-64}/bin/$a - /bin/$a would dangle\" >&2; exit 1; }; \
          [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"{in:git-x86-64}/bin/$a\" ] || { echo \"root tree: /bin/$a is not a symlink to staged Git\" >&2; exit 1; }; \
      done; \
-     codex=\"{root}/real-root{in:codex}/bin/codex\"; codextgt=\"{in:codex}/bin/codex\"; \
-     { [ -f \"$codex\" ] && [ -x \"$codex\" ]; } || { echo 'root tree: Codex is not packed/executable at real-root{in:codex}/bin/codex - /bin/codex would dangle and StageRuntimeClosure did not stage it' >&2; exit 1; }; \
-     [ \"$(readlink \"$root/bin/codex\" 2>/dev/null)\" = \"$codextgt\" ] || { echo 'root tree: /bin/codex is not a symlink to staged Codex' >&2; exit 1; }; \
-     [ -f \"{root}/real-root{in:codex}/lib/debug/bin/codex.debug\" ] || { echo 'root tree: the staged Codex package lacks its debug companion' >&2; exit 1; }; \
-     [ -f \"{root}/real-root{in:codex}/lib/debug/.td-assembly-exception\" ] || { echo 'root tree: the staged Codex package lacks its assembly-boundary marker' >&2; exit 1; }; \
-     codexline=\"{root}/real-root{in:codex}/lib/debug/.td-line-attribution-exception\"; \
-     [ -f \"$codexline\" ] && grep -q -x -F 'output=codex' \"$codexline\" && grep -q -x -F 'runtime=bin/codex' \"$codexline\" || { echo 'root tree: the staged Codex package lacks its bound line-attribution marker' >&2; exit 1; }; \
-     bwrap=\"{root}/real-root{in:codex-bwrap}/bin/bwrap\"; bwraptgt=\"{in:codex-bwrap}/bin/bwrap\"; \
-     { [ -f \"$bwrap\" ] && [ -x \"$bwrap\" ]; } || { echo 'root tree: Codex Bubblewrap is not packed/executable at real-root{in:codex-bwrap}/bin/bwrap - /bin/bwrap would dangle' >&2; exit 1; }; \
-     [ \"$(readlink \"$root/bin/bwrap\" 2>/dev/null)\" = \"$bwraptgt\" ] || { echo 'root tree: /bin/bwrap is not a symlink to the source-built Codex helper' >&2; exit 1; }; \
-     [ -f \"{root}/real-root{in:codex-bwrap}/lib/debug/bin/bwrap.debug\" ] || { echo 'root tree: the staged Codex Bubblewrap package lacks its debug companion' >&2; exit 1; }; \
      [ -s \"{root}/real-root{in:ca-certificates}/share/ca-certificates/ca-bundle.crt\" ] || { echo 'root tree: the pinned CA bundle is missing or empty' >&2; exit 1; }; \
      [ \"$(readlink \"$root/etc/ssl/certs/ca-certificates.crt\" 2>/dev/null)\" = \"{in:ca-certificates}/share/ca-certificates/ca-bundle.crt\" ] || { echo 'root tree: Git curl CA path does not resolve to the pinned bundle' >&2; exit 1; }; \
      openssl=\"{root}/real-root{in:libressl-x86-64}/bin/openssl\"; openssltgt=\"{in:libressl-x86-64}/bin/openssl\"; \
@@ -5506,7 +5440,6 @@ pub fn recipe() -> Recipe {
         //   userland (#547).
         // ripgrep/fd: dynamically linked Rust search tools exposed as /bin/rg and /bin/fd.
         // Git: the source-built local and HTTP(S) client plus its executable helpers.
-        // Codex: the source-built dynamic CLI plus its source-built static Bubblewrap helper.
         // ca-certificates: immutable Mozilla trust data at curl's conventional path.
         // tzdata: immutable compiled zones and geographic tables at /etc/zoneinfo.
         // jetbrains-mono-nerd-font: the pinned outline face at
@@ -5552,8 +5485,6 @@ pub fn recipe() -> Recipe {
             "ripgrep",
             "fd",
             "git-x86-64",
-            "codex",
-            "codex-bwrap",
             "ca-certificates",
             "tzdata",
             "jetbrains-mono-nerd-font",
@@ -7590,7 +7521,7 @@ mod tests {
                 // The loop is clamped to this many iterations; budget a slow one each.
                 (BOOT_SUCCESS_RETRY_MAX_SECS as u32)
                     .saturating_mul(BOOT_SUCCESS_ITERATION_BUDGET_SECS),
-                "clamped iterations of ten su probe blocks, four td-boot updates and \
+                "clamped iterations of nine su probe blocks, four td-boot updates and \
                  a rollback",
             ),
             (
@@ -8766,7 +8697,6 @@ mod tests {
             "{in:fd}".to_string(),
             "{in:openssh-x86-64}".to_string(),
             "{in:git-x86-64}".to_string(),
-            "{in:codex}".to_string(),
             "{in:rust-toolchain}".to_string(),
             "{in:gcc-x86-64-self}".to_string(),
             "{in:binutils-x86-64-self}".to_string(),
@@ -8784,8 +8714,6 @@ mod tests {
             "the shipped programs and application packages are explicit runtime roots"
         );
         assert_eq!(dest.as_str(), "{root}/real-root");
-        // Keep the closing `}` in the prefix: the separately reviewed
-        // codex-bwrap static helper legitimately uses CopyTree.
         assert!(
             steps.iter().all(|step| !matches!(
                 step,
@@ -8794,23 +8722,9 @@ mod tests {
                         || from.contains("ripgrep")
                         || from.starts_with("{in:fd}")
                         || from.contains("git-x86-64")
-                        || from.starts_with("{in:codex}")
                         || from.contains("glibc-x86-64")
             )),
             "runtime store items must not bypass StageRuntimeClosure"
-        );
-        assert_eq!(
-            steps
-                .iter()
-                .filter(|step| matches!(
-                    step,
-                    Step::CopyTree { from, dest }
-                        if from == "{in:codex-bwrap}"
-                            && dest == "{root}/real-root{in:codex-bwrap}"
-                ))
-                .count(),
-            1,
-            "the static Codex Bubblewrap helper must be copied once at its canonical path"
         );
         let libressl_copies: Vec<(&str, &str)> = steps
             .iter()
@@ -8845,8 +8759,6 @@ mod tests {
                 "{in:git-x86-64}/bin/git-upload-archive",
             ),
             ("git-upload-pack", "{in:git-x86-64}/bin/git-upload-pack"),
-            ("codex", "{in:codex}/bin/codex"),
-            ("bwrap", "{in:codex-bwrap}/bin/bwrap"),
             ("openssl", "{in:libressl-x86-64}/bin/openssl"),
             ("rustc", "{in:rust-toolchain}/bin/rustc"),
             ("rustdoc", "{in:rust-toolchain}/bin/rustdoc"),
@@ -8888,8 +8800,6 @@ mod tests {
 
         let native_inputs = recipe().native_inputs.expect("system native inputs");
         for required in [
-            "codex",
-            "codex-bwrap",
             "libressl-x86-64",
             "rust-toolchain",
             "gcc-x86-64-self",
@@ -11567,8 +11477,8 @@ mod tests {
         let su = "/bin/su -s /bin/sh \"$health_user\" -c";
         assert_eq!(script.matches(setup).count(), 1);
         assert!(script.find(setup).unwrap() < script.find(su).unwrap());
-        assert_eq!(script.matches(su).count(), 14);
-        assert_eq!(script.matches("/bin/su ").count(), 14);
+        assert_eq!(script.matches(su).count(), 13);
+        assert_eq!(script.matches("/bin/su ").count(), 13);
         assert!(script.contains(
             "/bin/td-login exec-as \"$health_user\" -- /bin/td-login verify-credentials"
         ));
@@ -11741,22 +11651,6 @@ mod tests {
                 && bootsuccess.contains("git: receive-pack push failed")
                 && bootsuccess.contains("/etc/ssl/certs/ca-certificates.crt")
                 && bootsuccess.contains(GIT_RUNTIME_MARKER)
-                && bootsuccess.contains("/bin/codex --version")
-                && bootsuccess.contains(CODEX_VERSION_OUTPUT)
-                && bootsuccess.contains("/bin/bwrap --version")
-                && bootsuccess.contains(CODEX_BWRAP_VERSION_OUTPUT)
-                && bootsuccess.contains("/bin/codex sandbox -P :read-only")
-                && bootsuccess
-                    .contains("/run/user/1000/td-codex-sandbox-probe/home/.codex")
-                && bootsuccess.contains("/bin/printf \"%s\\n\" outside >")
-                && bootsuccess.contains("/bin/readlink /proc/self/ns/net >")
-                && bootsuccess.contains(
-                    "/bin/sh -c '\\''if { /bin/printf sandboxed >> fixture; }"
-                )
-                && bootsuccess.contains("sandbox-network-namespace-unchanged")
-                && bootsuccess.contains("codex: could not clean the sandbox probe")
-                && bootsuccess.contains("TD-CODEX-SANDBOX-OK")
-                && bootsuccess.contains(CODEX_RUNTIME_MARKER)
                 && bootsuccess.contains("TD-OPENSSH-ROUNDTRIP")
                 && bootsuccess.contains(SSHD_MARKER)
                 && bootsuccess.contains("/bin/td-util --list")
@@ -11911,14 +11805,6 @@ mod tests {
                     < bootsuccess
                         .find("&& /bin/td-boot on-volume success")
                         .unwrap()
-                && bootsuccess.find("/bin/codex --version").unwrap()
-                    < bootsuccess
-                        .find("&& /bin/td-boot on-volume success")
-                        .unwrap()
-                && bootsuccess.find("/bin/bwrap --version").unwrap()
-                    < bootsuccess
-                        .find("&& /bin/td-boot on-volume success")
-                        .unwrap()
                 && bootsuccess.find("TD-OPENSSH-ROUNDTRIP").unwrap()
                     < bootsuccess
                         .find("&& /bin/td-boot on-volume success")
@@ -11941,18 +11827,6 @@ mod tests {
                  else healthy=0; fi"
             )),
             "ripgrep and fd must both return exact results before their shared marker is emitted"
-        );
-        assert!(
-            bootsuccess.contains(&format!(
-                "/bin/grep -q -x -F TD-CODEX-SANDBOX-OK || \
-                 {{ echo \"codex: sandbox transition omitted its success evidence: $s\"; \
-                 exit 1; }}; \
-                 /bin/rm -rf /run/user/{UI_UID}/td-codex-sandbox-probe || \
-                 {{ echo \"codex: could not clean the sandbox probe\"; exit 1; }}'; then \
-                 [ \"$mc\" = 1 ] || {{ echo {CODEX_RUNTIME_MARKER}; mc=1; }}; \
-                 else healthy=0; fi"
-            )),
-            "Codex must drive a confined command through Bubblewrap before their shared marker"
         );
         let configured = SystemDef {
             hostname: "configured.host",

@@ -130,7 +130,6 @@ fn malformed_primary_configuration_never_reads_the_account_database() {
 fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
     assert_eq!(request(&[1]).unwrap(), Request::Start(Program::Home));
     assert_eq!(request(&[4]).unwrap(), Request::Start(Program::Task));
-    assert_eq!(request(&[5]).unwrap(), Request::Start(Program::Codex));
     assert_eq!(request(&[6]).unwrap(), Request::Start(Program::Claude));
     assert_eq!(request(&[7]).unwrap(), Request::Start(Program::TaskManager));
     assert_eq!(request(&[8]).unwrap(), Request::Start(Program::Editor));
@@ -146,6 +145,7 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         vec![1, 0],
         vec![3, 0],
         vec![4, 0],
+        vec![5],
         vec![5, 0],
         vec![6, 0],
         vec![7, 0],
@@ -234,37 +234,32 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
 }
 
 #[test]
-fn task_agents_use_fixed_human_entry_points_and_a_controlling_terminal() {
-    for (terminal, selection, program) in [
-        (Program::Codex, "codex", "/bin/codex"),
-        (Program::Claude, "claude", "/bin/claude"),
-    ] {
-        let helper = config().terminal("000102030405060708090a0b0c0d0e0f", 1, terminal);
-        assert_eq!(
-            helper.get_args().last(),
-            Some(std::ffi::OsStr::new(selection))
-        );
-        let command = terminal_command(
-            1000,
-            "000102030405060708090a0b0c0d0e0f",
-            1,
-            terminal,
-            || Ok(primary("tester")),
-        )
-        .unwrap();
-        assert_eq!(command.get_program(), "/bin/td-term");
-        assert_eq!(
-            command.get_args().skip(5).collect::<Vec<_>>(),
-            [
-                "--working-directory",
-                "/home/tester/src/td-vm/work",
-                "--command",
-                "/bin/cttyhack",
-                "--stdin",
-                program,
-            ]
-        );
-    }
+fn the_task_agent_uses_its_fixed_human_entry_point_and_a_controlling_terminal() {
+    let helper = config().terminal("000102030405060708090a0b0c0d0e0f", 1, Program::Claude);
+    assert_eq!(
+        helper.get_args().last(),
+        Some(std::ffi::OsStr::new("claude"))
+    );
+    let command = terminal_command(
+        1000,
+        "000102030405060708090a0b0c0d0e0f",
+        1,
+        Program::Claude,
+        || Ok(primary("tester")),
+    )
+    .unwrap();
+    assert_eq!(command.get_program(), "/bin/td-term");
+    assert_eq!(
+        command.get_args().skip(5).collect::<Vec<_>>(),
+        [
+            "--working-directory",
+            "/home/tester/src/td-vm/work",
+            "--command",
+            "/bin/cttyhack",
+            "--stdin",
+            "/bin/claude",
+        ]
+    );
 }
 
 fn probe_command() -> Command {
@@ -592,7 +587,6 @@ fn task_manager_has_fixed_unprivileged_exec_and_display_only() {
 fn every_selection_literal_names_its_program_back() {
     for program in [
         Program::Task,
-        Program::Codex,
         Program::Claude,
         Program::TaskManager,
         Program::Editor,
@@ -603,7 +597,7 @@ fn every_selection_literal_names_its_program_back() {
         assert_eq!(Program::from_selection(literal), Some(program), "{literal}");
     }
     assert_eq!(Program::Home.selection(), None);
-    for literal in ["", "home", "Review", "/bin/td-review", "review "] {
+    for literal in ["", "home", "codex", "Review", "/bin/td-review", "review "] {
         assert_eq!(Program::from_selection(literal), None, "{literal:?}");
     }
 }
@@ -652,7 +646,7 @@ fn desktop_programs_exec_fixed_binaries_from_the_validated_home() {
 #[test]
 fn task_and_agent_directories_follow_the_validated_primary_account() {
     for name in ["alice", "bob"] {
-        for program in [Program::Task, Program::Codex, Program::Claude] {
+        for program in [Program::Task, Program::Claude] {
             let command =
                 terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 1, program, || {
                     Ok(primary(name))
@@ -679,7 +673,6 @@ fn only_launches_placed_in_the_account_require_the_primary_account() {
         Program::Home,
         Program::TaskManager,
         Program::Task,
-        Program::Codex,
         Program::Claude,
         Program::Editor,
         Program::Photo,

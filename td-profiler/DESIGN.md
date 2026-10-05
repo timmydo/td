@@ -65,22 +65,20 @@ are already stable inputs, not varying build paths to remap. Timestamps,
 archive ordering, and other build identity inputs remain pinned by the normal
 recipe reproducibility contract.
 
-Codex 0.148.0 is one of two named source-line attribution exceptions. Its
-shipped ThinLTO CLI contains 18,612,350 numeric line rows and a
-134,994,982-byte `.debug_line`; expanding that program would exceed the
-dependency-free reader's one-million-row and 128-MiB object ceilings. The
-exception is bound to `bin/codex`; any other ELF in that recipe remains under
-the ordinary policy.
+A named source-line attribution exception admits one exact runtime ELF whose
+line program exceeds the dependency-free reader's 32-MiB `.debug_line` or
+one-million-range ceilings. The exception is bound to that runtime path; any
+other ELF in the recipe remains under the ordinary policy.
 The producer still structurally validates and retains the uncompressed line
-program under a literal 160-MiB section ceiling, retains ordinary function
-symbols, and records
+program under the exception's literal section ceiling, retains ordinary
+function symbols, and records
 `lib/debug/.td-line-attribution-exception`. It removes `.debug_info`,
 `.debug_abbrev`, `.debug_aranges`, `.debug_ranges`, `.debug_rnglists`,
 `.debug_frame`, `.debug_loc`, `.debug_loclists`, and `.debug_str` to bound the
 exception rather than retain full variable, type, range, and string payload.
 `.debug_line_str` remains. This policy does not claim that an external reader
-can resolve every retained line row: the producer check does not inspect each
-line-table string form. The resulting companion has a 256-MiB file ceiling.
+can resolve every retained line row unless the exception says so below. The
+resulting companion has the exception's literal file ceiling.
 The marker is exactly these seven LF-terminated rows, in this order, with no
 trailing section or content:
 
@@ -103,7 +101,7 @@ td-profiler deliberately refuses that oversized line program, preserves
 function attribution, and emits its existing explicit line-resolution
 diagnostic.
 
-Rust 1.96.0's `lib/librustc_driver-277b25caa34f5853.so` is the second named
+Rust 1.96.0's `lib/librustc_driver-277b25caa34f5853.so` is the one named
 exception. Its 102,210,217-byte `.debug_line` exceeds the ordinary reader
 ceiling; after the same non-line DWARF pruning, its companion is 165,003,688
 bytes. The producer admits only that exact runtime under a 128-MiB line-section
@@ -111,10 +109,9 @@ ceiling and a 192-MiB companion ceiling. This producer ceiling happens to
 equal the reader's separate 128-MiB whole-object budget; it does not relax or
 derive from that budget. Every other Rust-toolchain ELF remains ordinary. The
 driver's retained line program is structurally checked to require no pruned
-`.debug_str`; Codex makes no such string-dependency claim. Neither exception
-claims that the runtime reader accepts its oversized line program. An update
-to either pinned producer must remeasure the section and companion, then
-re-review or remove its exception.
+`.debug_str`. The exception does not claim that the runtime reader accepts its
+oversized line program. An update to the pinned producer must remeasure the
+section and companion, then re-review or remove the exception.
 
 A recipe links each user-mode ELF with a deterministic GNU build ID, using the
 linker's SHA-1 build-id form. This is a pair check over linked bytes, not object
@@ -166,8 +163,7 @@ debugging information. The producer removes `.debug_info`, `.debug_abbrev`,
 line-table unit is DWARF 2 through 4, whose path tables are inline, or when a
 structural scan of every DWARF-5 directory and file format finds no
 `DW_FORM_strp`. A declared `DW_FORM_strp` keeps `.debug_str` and subjects it to
-the ordinary reader ceiling. The Codex oversized-line exception removes
-`.debug_str` without making a string-dependency claim. The Rust-driver
+the ordinary reader ceiling. The Rust-driver
 exception removes it and then structurally rejects a retained line program
 which declares `DW_FORM_strp`. The image recipe records the companions' total
 bytes and enforces a literal compiled ceiling kept outside the measuring code.
@@ -476,8 +472,8 @@ callchain.
 
 One ordinary object accepts at most 32 MiB of `.debug_line`, 32 MiB for either
 external line-string section, one million retained line ranges, and 4,096 bytes
-in one reported source path. The named Codex and Rust-driver producer
-exceptions are not accepted by this reader: function symbols remain available
+in one reported source path. The named Rust-driver producer
+exception is not accepted by this reader: function symbols remain available
 and source-line attribution fails explicitly at the 32-MiB check. One unit may
 declare at most 200,000 combined transient file/directory entries. The
 producer's pre-prune dependency scan applies that same per-unit ceiling and

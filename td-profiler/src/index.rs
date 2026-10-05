@@ -1057,24 +1057,29 @@ mod tests {
 
     #[test]
     fn line_attribution_marker_is_canonical_and_runtime_bound() {
-        let marker = "format=1\noutput=codex\nruntime=bin/codex\nreader_ceiling_bytes=33554432\nadmitted_ceiling_bytes=167772160\ncompanion_ceiling_bytes=268435456\nreason=bounded reader exception\n";
+        let runtime = "lib/librustc_driver-277b25caa34f5853.so";
+        let marker = format!("format=1\noutput=rust-toolchain\nruntime={runtime}\nreader_ceiling_bytes=33554432\nadmitted_ceiling_bytes=134217728\ncompanion_ceiling_bytes=201326592\nreason=bounded reader exception\n");
+        let item = "hash-rust-toolchain-1.96.0";
         assert_eq!(
-            validate_line_attribution_marker(marker, "hash-codex-0.148.0").unwrap(),
-            PathBuf::from("bin/codex")
+            validate_line_attribution_marker(&marker, item).unwrap(),
+            PathBuf::from(runtime)
         );
         for invalid in [
-            marker.replace("runtime=bin/codex", "runtime=../bin/codex"),
             marker.replace(
-                "admitted_ceiling_bytes=167772160",
+                &format!("runtime={runtime}"),
+                &format!("runtime=../{runtime}"),
+            ),
+            marker.replace(
+                "admitted_ceiling_bytes=134217728",
                 "admitted_ceiling_bytes=16",
             ),
             marker.replace("reader_ceiling_bytes=33554432", "reader_ceiling_bytes=1"),
-            marker.replace("output=codex", "output=other"),
+            marker.replace("output=rust-toolchain", "output=other"),
             format!("{marker}trailing=value\n"),
             format!("{marker}\n[trailing]\nvalue=1\n"),
         ] {
             assert!(
-                validate_line_attribution_marker(&invalid, "hash-codex-0.148.0").is_err(),
+                validate_line_attribution_marker(&invalid, item).is_err(),
                 "accepted non-canonical marker: {invalid:?}"
             );
         }

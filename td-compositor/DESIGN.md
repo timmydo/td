@@ -5859,12 +5859,14 @@ does not retry an unconfirmed launch. Clipboard sharing and focus do not gate
 the operation.
 
 
-The revision-zero `workspace-codex` and `workspace-claude` operations apply
-the identical complete-plan readiness gate and queue acknowledgement. They
-select only fixed authority requests `05` and `06`, respectively. The authority
-chooses the executable and worktree; no host argument vector crosses the bridge.
-These explicit launches do not establish settings or login readiness. An older
-image refuses the unknown operation rather than falling back to a shell.
+The revision-zero `workspace-claude` operation applies the identical
+complete-plan readiness gate and queue acknowledgement. It selects only fixed
+authority request `06`. The authority chooses the executable and worktree; no
+host argument vector crosses the bridge. This explicit launch does not
+establish settings or login readiness. An older image refuses the unknown
+operation rather than falling back to a shell. The former `workspace-codex`
+operation and its authority request `05` are retired: the codec refuses the
+verb and neither is reassigned.
 
 The empty revision-zero `poweroff` carrier operation cancels clipboard leases
 and atomically replaces `vm-poweroff` with the fixed `TDVM-POWEROFF-1\n`

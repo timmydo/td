@@ -107,7 +107,7 @@ fn extract_vendor(root: &Path, destination: &str, lock_path: &str) -> Result<Nat
     let prepared = NativeVendor(scratch);
     let lock = std::fs::read_to_string(root.join(lock_path))
         .map_err(|e| format!("read {lock_path}: {e}"))?;
-    crate::build::validate_cargo_lock_sources(&lock, &[])?;
+    crate::build::validate_cargo_lock_sources(&lock)?;
     let archives = prepared.0.join("archives");
     // td-feed publishes archives. Verify private copies before extraction.
     crate::stage_verified_vendor(

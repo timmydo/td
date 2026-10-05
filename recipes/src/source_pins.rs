@@ -15,16 +15,6 @@ struct PinDef {
 
 const PINS: &[PinDef] = &[
     PinDef {
-        key: "abseil-cpp-x86-64-source",
-        aliases: &[],
-        // Protobuf 31.1's build declares this exact Abseil release. It is
-        // staged as source data and consumed through CMake's local
-        // FetchContent override; the build never invokes a network transport.
-        url: "https://github.com/abseil/abseil-cpp/releases/download/20250127.0/abseil-cpp-20250127.0.tar.gz",
-        sha256: "16242f394245627e508ec6bb296b433c90f8d914f73b9c026fddb905e27276e8",
-        file: "abseil-cpp-20250127.0.tar.gz",
-    },
-    PinDef {
         key: "bash-mesboot-source",
         aliases: &[],
         // GNU bash 2.05b — the from-source bootstrap shell (re #469). Same
@@ -96,8 +86,8 @@ const PINS: &[PinDef] = &[
         // is this SHA-256. It is a marked sandboxed-application payload
         // (APPLICATIONS.md §B.8): its own recipe consumes it as typed data,
         // and it is never a tool, compilation input, or execution input to a
-        // source-built output. The vendor ships no source, so unlike Codex it
-        // is a prebuilt payload whose supported run path is td-jail.
+        // source-built output. The vendor ships no source, so it is a
+        // prebuilt payload whose supported run path is td-jail.
         url: "https://downloads.claude.ai/claude-code-releases/2.1.260/linux-x64/claude",
         sha256: "7a2fdc74b6836ea3d183f665b869f0ee3baebc9713cbebffe5838da4ea7bd82e",
         file: "claude-2.1.260-linux-x64",
@@ -111,56 +101,6 @@ const PINS: &[PinDef] = &[
         url: "https://cmake.org/files/v3.31/cmake-3.31.12.tar.gz",
         sha256: "5f3fd5a54dfa65602bdbed64f981a72673cc19f2d304cc2955cf0dfa0cfd8272",
         file: "cmake-3.31.12.tar.gz",
-    },
-    PinDef {
-        key: "codex-cargo-crossterm-source",
-        aliases: &[],
-        // Cargo pins this fork by its full commit. The fixed-output archive is
-        // source data only: td's Rust runner vendors it without invoking Git.
-        url: "https://github.com/openai-oss-forks/crossterm/archive/45fecb9508105988f42fe6ff0441783ed3717f92.tar.gz",
-        sha256: "408decc2710285f01e6a154e2605891e1af297961fd4e6517dcbfb9491eb6c6f",
-        file: "codex-crossterm-45fecb9508105988f42fe6ff0441783ed3717f92.tar.gz",
-    },
-    PinDef {
-        key: "codex-cargo-nucleo-source",
-        aliases: &[],
-        url: "https://github.com/helix-editor/nucleo/archive/4253de9faabb4e5c6d81d946a5e35a90f87347ee.tar.gz",
-        sha256: "d1676ac33a82c5903ffede68ce73c9d924666aa8a102bb649a8fb926a7a61ce1",
-        file: "codex-nucleo-4253de9faabb4e5c6d81d946a5e35a90f87347ee.tar.gz",
-    },
-    PinDef {
-        key: "codex-cargo-rules-rust-source",
-        aliases: &[],
-        url: "https://github.com/dzbarsky/rules_rust/archive/b56cbaa8465e74127f1ea216f813cd377295ad81.tar.gz",
-        sha256: "ddbdf40db8df685df67c3260dfe59cf7ffa4b193a9324e10b359bbe8981db9e0",
-        file: "codex-rules-rust-b56cbaa8465e74127f1ea216f813cd377295ad81.tar.gz",
-    },
-    PinDef {
-        key: "codex-cargo-tokio-tungstenite-source",
-        aliases: &[],
-        url: "https://github.com/openai-oss-forks/tokio-tungstenite/archive/0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186.tar.gz",
-        sha256: "a1d8bfedf41ea59d5ed375ebc280dad7099d0c3398e91406c51d485270196a3d",
-        file: "codex-tokio-tungstenite-0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186.tar.gz",
-    },
-    PinDef {
-        key: "codex-cargo-tungstenite-source",
-        aliases: &[],
-        url: "https://github.com/openai-oss-forks/tungstenite-rs/archive/4fffad30fe373adbdcffab9545e9e9bf4f2fc19f.tar.gz",
-        sha256: "d85393467dd5843688059bb204a61b7450dce1166a2c8aab3c87478955ffce48",
-        file: "codex-tungstenite-4fffad30fe373adbdcffab9545e9e9bf4f2fc19f.tar.gz",
-    },
-    PinDef {
-        key: "codex-source",
-        aliases: &[],
-        // OpenAI Codex 0.148.0 is the source-built daily-driver coding agent.
-        // The same reviewed archive supplies its vendored Bubblewrap 0.11.2
-        // sources; the helper is compiled separately against td-built libcap.
-        // Upstream publishes binaries but no source release asset for this tag;
-        // GitHub's tag archive is its only upstream-hosted source archive, so
-        // this exact SHA pin deliberately accepts that availability tradeoff.
-        url: "https://github.com/openai/codex/archive/refs/tags/rust-v0.148.0.tar.gz",
-        sha256: "a45e90403eb36b7d6093b167fe1c7dba9b36063bef6d39359eed52c47a21f94a",
-        file: "codex-rust-v0.148.0.tar.gz",
     },
     PinDef {
         key: "coreutils-mesboot0-source",
@@ -477,16 +417,6 @@ const PINS: &[PinDef] = &[
         file: "json-c-0.18.tar.gz",
     },
     PinDef {
-        key: "libcap-x86-64-source",
-        aliases: &[],
-        // libcap 2.78 is the small static capability-name library required by
-        // Codex's vendored Bubblewrap. Only libcap.a and its public headers
-        // leave the recipe; no administrative tools or shared objects ship.
-        url: "https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-2.78.tar.xz",
-        sha256: "0d621e562fd932ccf67b9660fb018e468a683d7b827541df27813228c996bb11",
-        file: "libcap-2.78.tar.xz",
-    },
-    PinDef {
         key: "libdevmapper-x86-64-source",
         aliases: &[],
         // LVM2, of which only libdevmapper.a is built for cryptsetup; the
@@ -645,16 +575,6 @@ const PINS: &[PinDef] = &[
         url: "http://ftp.rpm.org/popt/releases/popt-1.x/popt-1.19.tar.gz",
         sha256: "c25a4838fc8e4c1c8aacb8bd620edb3084a3d63bf8987fdad3ca2758c63240f9",
         file: "popt-1.19.tar.gz",
-    },
-    PinDef {
-        key: "protobuf-x86-64-source",
-        aliases: &[],
-        // Codex's code-mode build script needs protoc 31.1. Build it from the
-        // official Protobuf source instead of executing protoc-bin-vendored's
-        // target prebuilt payload during the source bootstrap.
-        url: "https://github.com/protocolbuffers/protobuf/releases/download/v31.1/protobuf-31.1.tar.gz",
-        sha256: "12bfd76d27b9ac3d65c00966901609e020481b9474ef75c7ff4601ac06fa0b82",
-        file: "protobuf-31.1.tar.gz",
     },
     PinDef {
         key: "ripgrep-seed-source",
@@ -884,11 +804,8 @@ mod tests {
         // btrfs-progs 7.0 and util-linux 2.42.2 (the persistent-volume writer
         // and its minimal libuuid/libblkid build closure) + the first reviewed
         // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.3.2,
-        // curl 8.21.0 (the static HTTPS foundation for Git), Git 2.55.0, and
-        // curl's dated Mozilla CA extract, OpenSSH Portable 10.5p1, OpenAI Codex
-        // 0.148.0 (including its
-        // vendored Bubblewrap and five Cargo Git commit archives), libcap 2.78,
-        // Protobuf 31.1 with its exact Abseil 20250127.0 source dependency, and
+        // curl 8.21.0 (the static HTTPS foundation for Git), Git 2.55.0,
+        // curl's dated Mozilla CA extract, OpenSSH Portable 10.5p1, and
         // the second reviewed foreign application seed, the Claude Code
         // 2.1.260 native release. The terminal applications are td's own
         // trees (APPLICATIONS.md §W.8) and pin nothing here.
@@ -896,7 +813,7 @@ mod tests {
         // Fonts v3.5.1 JetBrains Mono release ten pinned upstream data pins:
         // the archive and nine licence notices. cryptsetup 2.8.8 with json-c
         // 0.18, popt 1.19 and LVM2 2.03.43 add the LUKS2 userspace closure.
-        assert_eq!(all().len(), 87);
+        assert_eq!(all().len(), 78);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

@@ -122,7 +122,7 @@ Escape sequences in names, guest messages, and logs are rendered as text.
 
 | Action | Behavior |
 | --- | --- |
-| New | Choose name and Codex, Claude, or a development shell; use the configured repository, template, and resource defaults. |
+| New | Choose name and Claude or a development shell; use the configured repository, template, and resource defaults. |
 | Open / Enter | Boot a stopped instance in its own QEMU graphics window. For a running instance, identify its existing window and focus it where the host permits; never launch a second QEMU on its disk. |
 | Stop | Request an orderly guest shutdown and report completion. |
 | Restart | Request an orderly guest reboot within the same QEMU process. |
@@ -141,7 +141,7 @@ flowchart LR
     Supervisor --> QEMU[QEMU graphics window]
     QEMU --> Compositor[td-compositor]
     Compositor --> Terminal[td-term]
-    Terminal --> Agent[Codex / Claude / shell]
+    Terminal --> Agent[Claude / shell]
     Host[Host settings and account adapter] --> Bridge[Private VM bridge]
     Bridge --> Guest[td guest provisioning helper]
     Guest --> Agent
@@ -242,12 +242,15 @@ for the initial stock-desktop lifecycle increment. The image producer owns:
 - td-compositor, td-term, matching terminfo, and an ordinary development-user
   session. The provisioner creates state through its fixed service operation;
   the UI must not depend on the current root/su escape hatch.
-- Source-built Codex and the reviewed Claude application payload and runtime,
-  with their working directories, configuration, credentials, and child tools
-  reachable through their proper launch paths. Host CLI executables and host
-  plugin binaries are not copied into the image.
+- The reviewed Claude application payload and runtime, with its working
+  directories, configuration, credentials, and child tools reachable through
+  its proper launch path. Claude is the only guest agent until td-agent
+  lands. Host CLI executables and host plugin binaries are not copied into the
+  image.
 - The tools required by DEVELOPMENT.md's review roster as well as its build
-  gate. An unavailable reviewer remains an explicit missing capability; the
+  gate. The Codex CLI cross-model reviewer is not among them now that the
+  guest carries no Codex payload, so a guest agent cannot fill that slot.
+  An unavailable reviewer remains an explicit missing capability; the
   design does not make reviewer waivers or host-side execution of guest builds
   the default workflow.
 
@@ -492,8 +495,8 @@ vendors [TARGET]` on the host and `td-feed consume vendors [TARGET]` in the
 guest. The default target is `system-x86-64`. Both use the checkout's existing
 `td-recipe-eval vendor-warm-args` roster; an unplannable declared vendor fails
 the roster instead of silently dropping that recipe. The same builder/evaluator
-prerequisite as source-pin resolution applies. The current system closure
-selects five jobs: uutils, ripgrep, fd, Codex, and td-net.
+prerequisite as source-pin resolution applies. The current system closure's
+jobs include uutils, ripgrep, fd, and td-net.
 
 Export publishes the jobs' root source archives as well as their locked
 registry archives. Source archives come from the existing source cache; a
@@ -603,7 +606,7 @@ sharing mutable build databases or compiling everything anew for every VM.
 Link each selected host CLI profile once. Honor its configured home/location
 and credential backend rather than assuming every installation uses defaults.
 Settings transfer is an explicit schema/version adapter, not a recursive mount
-of `~/.codex`, `~/.claude`, or the host home.
+of `~/.claude` or the host home.
 
 Copy portable preferences, instructions, skills, and supported source-based
 extensions into an instance-local configuration generation. Map the chosen host
@@ -635,28 +638,32 @@ state root. Configure it with `td-vm settings-profile set FILE`, inspect it with
 profile: it establishes exactly which host material a later schema adapter may
 read; it does not yet translate or send that material to a guest.
 
-The canonical `TDVM-SETTINGS-PROFILE-1` input has exactly these fields:
-`default-agent`, `workspace`, `path`, `codex-home`, `codex`, `codex-version`,
-`codex-sha256`, `codex-config-sha256`, `claude-home`, `claude`,
-`claude-sha256`, `claude-version`, and `claude-settings-sha256`. Paths are
-bounded canonical-shaped absolute paths.
-The selected default is exactly `codex` or `claude`; versions are bounded
-single lines; settings fingerprints are lowercase SHA-256. The private stored
-copy is mode 0600 and replaced by a synced rename under a stable profile lock.
+The canonical `TDVM-SETTINGS-PROFILE-2` input has exactly these fields:
+`workspace`, `path`, `claude-home`, `claude`, `claude-sha256`,
+`claude-version`, and `claude-settings-sha256`. Paths are bounded
+canonical-shaped absolute paths. The version is a bounded single line;
+settings fingerprints are lowercase SHA-256. The private stored copy is mode
+0600 and replaced by a synced rename under a stable profile lock.
 
-`check` resolves and validates the workspace, both CLI homes, every configured
-`PATH` entry, their ancestors, and both executables under caller-or-root
-ownership without group/other writes. It opens `config.toml`, `settings.json`,
-and both executable entry files without following their final links, compares
-their exact fingerprints, bounds each settings file at 64 KiB, and runs each
-exact executable's `--version` with a cleared environment plus scoped `HOME`,
-only its `CODEX_HOME` or `CLAUDE_CONFIG_DIR`, and the configured PATH.
+Claude is the only profiled agent, so there is no `default-agent` selector.
+A version-1 input or stored profile, which carried that selector and Codex
+fields, is refused with an error naming the removed agent; the operator sets a
+version-2 profile. A later agent such as td-agent adds its fields and any
+selector in a new profile version.
+
+`check` resolves and validates the workspace, the Claude home, every configured
+`PATH` entry, their ancestors, and the executable under caller-or-root
+ownership without group/other writes. It opens `settings.json` and the
+executable entry file without following their final links, compares their
+exact fingerprints, bounds the settings file at 64 KiB, and runs the exact
+executable's `--version` with a cleared environment plus scoped `HOME`,
+`CLAUDE_CONFIG_DIR`, and the configured PATH.
 A settings or executable change requires an explicit reviewed profile
 replacement instead of silently changing later guests.
 
-The profile deliberately has no field for Codex `auth.json`, Claude
-`.credentials.json`, keyring contents, session databases, caches, transcripts,
-or project trust databases. A settings fingerprint is public configuration
+The profile deliberately has no field for Claude `.credentials.json`,
+keyring contents, session databases, caches, transcripts, or project trust
+databases. A settings fingerprint is public configuration
 identity, not a credential. The next increment owns schema classification,
 host-path remapping, an instance-local generation and explicit conflict-aware
 guest synchronization. Until then `check` says those capabilities and login
@@ -669,14 +676,10 @@ new VM. Credential linking is host-level setup, not image setup. An expired or
 unsupported login produces one actionable host status with a supported renewal
 flow; asking every guest to start its own browser login is not the solution.
 
-**Do not clone refresh-token caches into concurrently running VMs.** Codex
-supports a file cache under CODEX_HOME or an OS credential store, and documents
-copying a cache to a remote machine. Its concurrent-use constraint matters:
-the automation guidance restricts a refreshable cache to one machine or
-serialized stream and warns that another consumer's rotation can invalidate
-it. Copying the bytes into separate files does not remove that upstream race.
-See [Codex authentication](https://developers.openai.com/codex/auth/) and
-[refresh ownership](https://developers.openai.com/codex/auth/ci-cd-auth/).
+**Do not clone refresh-token caches into concurrently running VMs.** A
+refreshable cache shared by several consumers lets one consumer's rotation
+invalidate the others. Copying the bytes into separate files does not remove
+that upstream race.
 
 The design therefore uses a host account adapter as the single refresh owner
 and delivers only the provider material each guest actually needs. Guest
@@ -692,13 +695,10 @@ Provider integration has separate obligations:
 
 | Provider/mode | Design and required proof |
 | --- | --- |
-| Codex subscription | Keep refresh ownership on the host; deliver account-bound access credentials to guest Codex through a supported external-auth path. Codex app-server documents an experimental external-token mode, but that does not establish support in the shipped interactive CLI. Prove that CLI path, or add a reviewed source-built adapter, before claiming this mode works. |
 | Claude subscription | Prefer a reusable host-managed credential that the pinned CLI officially accepts. A `claude setup-token` credential is a candidate for one-time host linking; an ordinary cached access token is not equivalent to it. Prove expiry, restart/resume, account restrictions, and the guest launch interface. |
 | Existing API-key profile | Deliver the selected existing key through the provider adapter, retaining the configured endpoint and billing mode. Never select this mode just because subscription forwarding is unfinished. |
 | OS keyring or external helper | Use a reviewed host adapter for that backend. Never copy the keyring database, request all stored secrets, or assume a nonexportable credential can be extracted. |
 
-Codex's [external-auth documentation](https://developers.openai.com/codex/app-server/)
-is an integration lead, not evidence that a transparent CLI bridge exists.
 Claude documents Linux credentials in its configured `.credentials.json` and
 a separately generated setup token. Its environment-token mode retains the
 token for the running session and requires replacement/restart on expiry;
@@ -850,8 +850,8 @@ recursively change repository ownership. Check that files written through
 SSH as `test` remain accessible to the integrator under the existing group/ACL
 and umask policy. `timmy`'s local manager permissions and a VM's SSH permission
 to act as `test` are different grants.
-Codex/Claude settings and login reuse still come from `timmy`'s selected host
-profiles. Selecting `test` for Git does not select `test`'s AI accounts.
+Claude settings and login reuse still come from `timmy`'s selected host
+profile. Selecting `test` for Git does not select `test`'s AI accounts.
 
 `test`'s existing authorized-key files, normally
 `/home/test/.ssh/authorized_keys`, retain their human and automation entries.
@@ -1399,30 +1399,30 @@ retain their existing workflow semantics.
 The host integrator may keep its local-path origin. Another development or
 review machine can use an SSH URL reaching the same bare repository, with its
 own enrolled key and role. An integrator using SSH needs a separately authorized
-integrator key; a VM-restricted key cannot publish main. Codex/Claude account
+integrator key; a VM-restricted key cannot publish main. Claude account
 credentials remain separate from these Git SSH keys.
 
 ## Working through td-term and td-compositor
 
-`td-vm workspace agent NAME codex|claude` (TUI `a`, then the agent name)
-explicitly queues the selected CLI
-in the prepared task worktree. Like `workspace terminal`, it requires the
-exact retained clone plan and guest-ready record. It uses typed private bridge
+`td-vm workspace agent NAME claude` (TUI `a`) explicitly queues Claude in
+the prepared task worktree. The CLI keeps the literal agent argument as a
+closed selection so a later agent joins without a new command shape; the TUI
+has no choice to make. Like `workspace terminal`, it requires the exact
+retained clone plan and guest-ready record. It uses typed private bridge
 operations and the paired authority's fixed human-session launch commands.
-Claude enters its existing application-UID shell launcher and jail; Codex uses
-its installed source-built entry point without weakening its sandbox. Queue
+Claude enters its existing application-UID shell launcher and jail. Queue
 admission is not successful exec or authentication. Open still queues a shell;
 automatic agent selection, settings delivery and login reuse remain pending.
 
-Use the compositor's supported launcher/control path to open each agent in a
-fresh td-term PTY. Claude retains its foreign-application marking and confinement;
-make the development checkout, declared build tools, and selected credentials
-available through that policy. Do not launch it outside td-jail to make the
-first demo work. Codex keeps its source-built provenance and supported sandbox.
-Claude's foreign runtime, including its shell, must not become a tool or
-execution input to a source-built recipe. Prove that development commands
-enter the td-built control plane and its declared build sandbox with the
-correct tools; exposing the checkout alone does not establish that boundary.
+Use the compositor's supported launcher/control path to open the agent in a
+fresh td-term PTY. Claude retains its foreign-application marking and
+confinement; make the development checkout, declared build tools, and selected
+credentials available through that policy. Do not launch it outside td-jail to
+make the first demo work. Claude's foreign runtime, including its shell, must
+not become a tool or execution input to a source-built recipe. Prove that
+development commands enter the td-built control plane and its declared build
+sandbox with the correct tools; exposing the checkout alone does not establish
+that boundary.
 
 This directly exercises the terminal's native rendering, input, resize,
 scrollback, terminfo, and compositor focus behavior. Fix missing terminal
@@ -1448,7 +1448,7 @@ implementation landings; this proposal does not relax them.
    fixed guest provisioner/power bridge. Enroll per-VM Git keys for host `test`,
    clone automatically, build/check in both guests, push distinct branches over
    SSH, review/land with host td-review, and fetch the resulting main back.
-   Bring both CLI launch paths through their proper application confinement;
+   Bring the agent launch path through its proper application confinement;
    authentication can remain explicitly unconfigured at this stage.
 4. **Add settings and login reuse.** Prove the account adapters with real pinned
    CLIs, including concurrent subscription use and refresh ownership. Record

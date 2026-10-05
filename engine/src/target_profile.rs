@@ -64,10 +64,6 @@ pub fn direct_rustc_args(build_root: &str, source_root: &str) -> [String; 6] {
 /// still use the global policy; samples entering one of these ranges are an
 /// explicit coverage boundary rather than silently trusted unwinds.
 pub const ASSEMBLY_EXCEPTIONS: &[(&str, &str)] = &[
-    (
-        "codex",
-        "aws-lc-sys 0.39.0, ring 0.17.14, and zstd-sys 2.0.16+zstd.1.5.7 x86_64 assembly",
-    ),
     ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
     (
         "gcc-x86-64-stage1",
@@ -94,7 +90,6 @@ pub const ASSEMBLY_EXCEPTIONS: &[(&str, &str)] = &[
 /// this roster adds Rust/LLVM and is pinned against both Cargo and direct-rustc
 /// recipes by the catalog tests.
 pub const RUST_PROFILED_RECIPES: &[&str] = &[
-    "codex",
     "fd",
     "ripgrep",
     "rust-toolchain",
@@ -154,7 +149,7 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
                     && !matches!(recipe, "glibc-x86-64" | "binutils-x86-64-self"))
                 || (*source == "rust-toolchain" && RUST_PROFILED_RECIPES.contains(&recipe))
                 // A package's own crate assembly reaches that package alone.
-                || (*source == recipe && matches!(recipe, "codex" | "td-net"))
+                || (*source == recipe && recipe == "td-net")
         })
         .collect()
 }
@@ -180,17 +175,6 @@ pub struct LineAttributionException {
 }
 
 pub const LINE_ATTRIBUTION_EXCEPTIONS: &[(&str, LineAttributionException)] = &[
-    (
-        "codex",
-        LineAttributionException {
-            runtime_relative_path: "bin/codex",
-            max_line_section_bytes: 160 * 1024 * 1024,
-            max_companion_bytes: 256 * 1024 * 1024,
-            require_complete_line_strings: false,
-            reason:
-                "Codex 0.148.0's ThinLTO line program is beyond td-profiler's bounded per-object reader",
-        },
-    ),
     (
         "rust-toolchain",
         LineAttributionException {
@@ -330,10 +314,6 @@ mod tests {
         assert_eq!(
             ASSEMBLY_EXCEPTIONS,
             [
-                (
-                    "codex",
-                    "aws-lc-sys 0.39.0, ring 0.17.14, and zstd-sys 2.0.16+zstd.1.5.7 x86_64 assembly",
-                ),
                 ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
                 (
                     "gcc-x86-64-stage1",
@@ -365,18 +345,15 @@ mod tests {
             ]
         );
         assert_eq!(
-            output_assembly_exceptions("codex"),
+            output_assembly_exceptions("td-net"),
             vec![
-                (
-                    "codex",
-                    "aws-lc-sys 0.39.0, ring 0.17.14, and zstd-sys 2.0.16+zstd.1.5.7 x86_64 assembly",
-                ),
                 ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
                 ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
                 (
                     "rust-toolchain",
                     "upstream LLVM and Rust compiler-runtime assembly"
                 ),
+                ("td-net", "ring 0.17.14 x86_64 assembly"),
             ]
         );
         // The terminal applications are std alone: only the boundaries every
@@ -397,11 +374,7 @@ mod tests {
         }
         assert!(!output_assembly_exceptions("ripgrep")
             .iter()
-            .any(|(source, _)| matches!(*source, "td-net" | "codex")));
-        // The `*source == recipe` arm still hands td-net its own entry; the
-        // applications losing theirs took no code path with them.
-        assert!(output_assembly_exceptions("td-net")
-            .contains(&("td-net", "ring 0.17.14 x86_64 assembly")));
+            .any(|(source, _)| *source == "td-net"));
         assert_eq!(
             output_assembly_exceptions("glibc-x86-64"),
             vec![
@@ -439,16 +412,7 @@ mod tests {
     fn oversized_line_attribution_boundaries_are_exactly_named() {
         assert_eq!(DEFAULT_PROFILE_LINE_SECTION_BYTES, 32 * 1024 * 1024);
         assert_eq!(DEBUG_COMPANION_POLICY, "line-tables-v2");
-        assert_eq!(LINE_ATTRIBUTION_EXCEPTIONS.len(), 2);
-        let codex = line_attribution_exception("codex").unwrap();
-        assert_eq!(codex.runtime_relative_path, "bin/codex");
-        assert_eq!(codex.max_line_section_bytes, 160 * 1024 * 1024);
-        assert_eq!(codex.max_companion_bytes, 256 * 1024 * 1024);
-        assert!(!codex.require_complete_line_strings);
-        assert_eq!(
-            codex.reason,
-            "Codex 0.148.0's ThinLTO line program is beyond td-profiler's bounded per-object reader"
-        );
+        assert_eq!(LINE_ATTRIBUTION_EXCEPTIONS.len(), 1);
         let rust = line_attribution_exception("rust-toolchain").unwrap();
         assert_eq!(
             rust.runtime_relative_path,

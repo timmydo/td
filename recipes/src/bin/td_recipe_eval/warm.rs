@@ -407,15 +407,14 @@ fn vendor_is_warm(root: &Path, dest: &str, lock: &Path) -> bool {
 /// The argv AND the lock td-feed will hash into the completion marker for it.
 ///
 /// Derived together, deliberately. Each `warm` form pins its closure with a
-/// DIFFERENT lock — `crate-local` with the in-tree directory's, `crate-source`
-/// with the committed one the recipe names, and `crate` with the lock SHIPPED
-/// inside the fetched package — and a preflight that guessed differently would
-/// compute a digest td-feed never wrote. It would then ask for a repair on
-/// every run while td-feed reported `already warm` and skipped: a standoff that
-/// resolves only when someone deletes the vendor dir by hand. Today all three
-/// crates.io rungs happen to ship a lock byte-identical to their committed
-/// copy, which is exactly the sort of coincidence that stops being true
-/// quietly (review finding).
+/// DIFFERENT lock — `crate-local` with the in-tree directory's and `crate` with
+/// the lock SHIPPED inside the fetched package — and a preflight that guessed
+/// differently would compute a digest td-feed never wrote. It would then ask
+/// for a repair on every run while td-feed reported `already warm` and skipped:
+/// a standoff that resolves only when someone deletes the vendor dir by hand.
+/// Today all three crates.io rungs happen to ship a lock byte-identical to
+/// their committed copy, which is exactly the sort of coincidence that stops
+/// being true quietly (review finding).
 fn vendor_warm_plan(recipe: &Recipe, dest: &str) -> Result<(Vec<String>, PathBuf), String> {
     if let Some(rel) = &recipe.local_source {
         return Ok((
@@ -448,28 +447,10 @@ fn vendor_warm_plan(recipe: &Recipe, dest: &str) -> Result<(Vec<String>, PathBuf
             shipped,
         ));
     }
-    // Fixed-output archives are materialized from their top-level source root;
-    // fail during warming if the later build has not selected its Cargo workspace.
-    recipe.cargo_subdir.as_deref().ok_or_else(|| {
-        format!(
-            "fixed-output source archive `{}` needs an explicit cargoSubdir",
-            pin.file
-        )
-    })?;
-    let lock = recipe
-        .cargo_lock
-        .as_deref()
-        .ok_or_else(|| format!("`{dest}' declares no committed Cargo.lock"))?;
-    Ok((
-        vec![
-            s("warm"),
-            s("crate-source"),
-            pin.file,
-            pin.sha256,
-            lock.to_string(),
-            dest.to_string(),
-        ],
-        PathBuf::from(lock),
+    Err(format!(
+        "`{dest}' pins `{}', which is neither a crates.io `.crate' nor a local source; \
+         no vendor warm covers it",
+        pin.file
     ))
 }
 
@@ -905,7 +886,7 @@ mod tests {
     }
 
     /// The default target's graph derives a vendor warm for every rung that
-    /// declares a committed lock -- codex included.
+    /// declares a committed lock.
     ///
     /// This is the property `td-builder check`'s prelude now depends on: it asks
     /// for this list rather than restating it, so a rung that falls out of the
@@ -920,8 +901,8 @@ mod tests {
             .map(|node| node.stem.as_str())
             .collect();
         assert!(
-            locked.contains(&"codex"),
-            "codex declares a committed lock but is not in the default graph: {locked:?}"
+            locked.contains(&"uutils"),
+            "uutils declares a committed lock but is not in the default graph: {locked:?}"
         );
         let lines = vendor_warm_lines(&graph).unwrap();
         assert!(
@@ -979,8 +960,8 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("\tcodex\t") && line.ends_with("Cargo.lock")),
-            "the default target derives no codex warm: {lines:?}"
+                .any(|line| line == "warm\tcrate-local\tnet\ttd-net\tnet/Cargo.lock"),
+            "the default target derives no td-net warm: {lines:?}"
         );
         assert!(vendor_warm_args_for("no-such-recipe-stem").is_err());
         let two = [s("system-x86-64"), s("extra")];
@@ -1089,32 +1070,22 @@ mod tests {
             "a crates.io rung is pinned by the lock its package ships"
         );
 
-        let codex = td_recipe::catalog::lookup("codex").unwrap();
-        let (args, lock) = vendor_warm_plan(&codex, "codex").unwrap();
-        assert_eq!(args.get(1).map(String::as_str), Some("crate-source"));
+        let net = td_recipe::catalog::lookup("td-net").unwrap();
+        let (args, lock) = vendor_warm_plan(&net, "td-net").unwrap();
+        assert_eq!(args.get(1).map(String::as_str), Some("crate-local"));
         assert_eq!(
             lock,
-            PathBuf::from("recipes/locks/codex/Cargo.lock"),
-            "an archive rung is pinned by its committed lock"
+            PathBuf::from("net/Cargo.lock"),
+            "an in-tree rung is pinned by its own directory's lock"
         );
-        // The argv td-feed receives names that same lock, so the two cannot be
-        // about different files.
-        assert_eq!(args.get(4).map(String::as_str), lock.to_str());
     }
 
     #[test]
-    fn fixed_output_workspace_archives_warm_from_the_committed_lock() {
-        let codex = td_recipe::catalog::lookup("codex").unwrap();
-        assert_eq!(
-            vendor_warm_plan(&codex, "codex").unwrap().0,
-            vec![
-                "warm",
-                "crate-source",
-                "codex-rust-v0.148.0.tar.gz",
-                "a45e90403eb36b7d6093b167fe1c7dba9b36063bef6d39359eed52c47a21f94a",
-                "recipes/locks/codex/Cargo.lock",
-                "codex",
-            ]
-        );
+    fn an_archive_pinned_rust_rung_has_no_vendor_warm() {
+        let archive = Recipe::rust("fixture", "1")
+            .source_input("git-x86-64-source")
+            .cargo_lock("recipes/locks/fixture/Cargo.lock");
+        let error = vendor_warm_plan(&archive, "fixture").unwrap_err();
+        assert!(error.contains("neither a crates.io"), "{error}");
     }
 }

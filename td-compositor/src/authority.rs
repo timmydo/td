@@ -100,7 +100,6 @@ impl Launcher {
 pub(crate) enum Program {
     Home,
     Task,
-    Codex,
     Claude,
     TaskManager,
     Editor,
@@ -241,7 +240,6 @@ impl Processes {
         let request = match terminal {
             Program::Home => [1],
             Program::Task => [4],
-            Program::Codex => [5],
             Program::Claude => [6],
             Program::TaskManager => [7],
             Program::Editor => [8],
@@ -439,7 +437,6 @@ mod tests {
     #[test]
     fn selected_programs_send_only_their_fixed_authority_request() {
         for (terminal, expected) in [
-            (Program::Codex, 5),
             (Program::Claude, 6),
             (Program::TaskManager, 7),
             (Program::Editor, 8),

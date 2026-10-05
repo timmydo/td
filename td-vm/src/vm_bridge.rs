@@ -45,7 +45,7 @@ fn reply(
                         && wire::workspace::Plan::parse(&request.data)
                             .is_ok_and(|plan| wire::workspace::progress(&reply.data, &plan).is_ok())
                 }
-                wire::WORKSPACE_TERMINAL | wire::WORKSPACE_CODEX | wire::WORKSPACE_CLAUDE => {
+                wire::WORKSPACE_TERMINAL | wire::WORKSPACE_CLAUDE => {
                     reply.revision == 0
                         && reply.data == wire::TASK_TERMINAL_QUEUED
                         && wire::workspace::Plan::parse(&request.data).is_ok()
@@ -277,7 +277,6 @@ fn forward(dir: &Path, request: wire::Message, deadline: Instant) -> Result<wire
         wire::WORKSPACE
         | wire::WORKSPACE_ENSURE
         | wire::WORKSPACE_TERMINAL
-        | wire::WORKSPACE_CODEX
         | wire::WORKSPACE_CLAUDE => {
             wire::workspace::Plan::parse(&request.data)?;
         }
@@ -370,11 +369,7 @@ mod tests {
 
     #[test]
     fn task_terminal_crosses_both_relays_with_its_exact_plan_and_reply() {
-        for verb in [
-            wire::WORKSPACE_TERMINAL,
-            wire::WORKSPACE_CODEX,
-            wire::WORKSPACE_CLAUDE,
-        ] {
+        for verb in [wire::WORKSPACE_TERMINAL, wire::WORKSPACE_CLAUDE] {
             let temp = Temp::new();
             sharing(&temp.0, "off").unwrap();
             let listener = UnixListener::bind(temp.0.join("guest")).unwrap();

@@ -9,7 +9,6 @@
 # (warm source cache required) when a pin, seed patch, or the stage0
 # source changes. Hand-editing a row is self-defeating: the runner
 # re-derives from the pins every run and reds on disagreement.
-abseil-cpp-x86-64-source gkyfdgg2aczgzl3v0x2kbm1yrfvppygi-abseil-cpp-x86-64-source
 bash-mesboot-source 0w2mkw1b4ll6wfq48nsmp9l13b3za98g-bash-mesboot-source
 binutils-244-source 8xzd2kk7j2pj9fhkmab3ajhgpmccgidj-binutils-244-source
 binutils-mesboot-source 455cqqkkwpx94h5km91l46wldq80dgyl-binutils-mesboot-source
@@ -19,12 +18,6 @@ busybox-x86-64-source 3lfjnlqhk05h0hbqd3ks4jbh4pvw7c01-busybox-x86-64-source
 ca-certificates-source 1nh4w1q566ga153y3h427ai268h934nx-ca-certificates-source
 claude-code-source 38p8258xch0p61w26g2k7h6in56jzyh9-claude-code-source
 cmake-x86-64-source arcs0qgnqjhfljjd69mpgnjnanpcrlid-cmake-x86-64-source
-codex-cargo-crossterm-source dfz77cl236snh28p9nfc2zvxvr0hgd1f-codex-cargo-crossterm-source
-codex-cargo-nucleo-source f4zayri9kd3iafnq7w5zfjz8sz0ikm06-codex-cargo-nucleo-source
-codex-cargo-rules-rust-source xwczvrbjyxnsnjvph44hys8l8imafvx1-codex-cargo-rules-rust-source
-codex-cargo-tokio-tungstenite-source 7wxk1mcdbbigmmlrl17v1a2kj18d3slm-codex-cargo-tokio-tungstenite-source
-codex-cargo-tungstenite-source mxhgq411phj88hcvazjvimzli4gsf0jz-codex-cargo-tungstenite-source
-codex-source 468dyzi341i0b80fp9rl64q634inclbn-codex-source
 coreutils-mesboot0-source 7dkw301jma5vnzc6x5i09nmh2dn7ak0q-coreutils-mesboot0-source
 cryptsetup-x86-64-source v3g69yip0g4zybh9yw2hlp3zzcfy98fc-cryptsetup-x86-64-source
 curl-x86-64-source 985mgjp6q4y958wwzqs984nkh399jnac-curl-x86-64-source
@@ -52,7 +45,6 @@ grep-mesboot0-source 664n3hm5dz2hyn5py2frds5cc3r4nid4-grep-mesboot0-source
 hello-source r2gr5vy54san8vw8ry4mmjm93ivybbpv-hello-source
 jetbrains-mono-nerd-font-source 632myin1d84lnr23d9ma4f4iwgs13bk2-jetbrains-mono-nerd-font-source
 json-c-x86-64-source csb78c2cixywmxii4vxp4ab11q5273p5-json-c-x86-64-source
-libcap-x86-64-source 14mkpjichrq0gzqyz5nrg4l0yq9hd3dw-libcap-x86-64-source
 libdevmapper-x86-64-source 14i35fjwswmcjr5jp6p00vhh8b2m99d4-libdevmapper-x86-64-source
 libressl-x86-64-source vmx5274krlcs393la52x3iggv4kparn4-libressl-x86-64-source
 linux-headers hg590f1sggdwv8z3yvs4yz90cr0vnvfd-linux-headers
@@ -88,7 +80,6 @@ patch-glibc-bootstrap-system-2.16.0 nggbvl93zgr74xf9x50331yfgsw4hh0r-patch-glibc
 patch-glibc-bootstrap-system-2.2.5 wjhcnyy2wspd9bf312ql84gfmvivixs2-patch-glibc-bootstrap-system-2.2.5
 patch-mesboot-source r3w1jmlradg89l3av29y1ifp7y312pk9-patch-mesboot-source
 popt-x86-64-source i2hswa2a3s6kzvqrzl9hz4gvgavsx4yh-popt-x86-64-source
-protobuf-x86-64-source khzifk156vrqqnbdk3a009m6syccq6vm-protobuf-x86-64-source
 python-mesboot-source 460ch0an5nlsgs5i9ppdk6b890fnvw1y-python-mesboot-source
 ripgrep-seed-source vg4gdaxl18mqlbhybnn2pq7lpwm3wm2q-ripgrep-seed-source
 ripgrep-source ma4kmnnyn1hlimj2rw6hq7p07h8g2p3x-ripgrep-source

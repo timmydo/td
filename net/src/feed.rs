@@ -1634,12 +1634,11 @@ struct LockedRegistryPackage {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct LockedCargoSources {
     registry: Vec<LockedRegistryPackage>,
-    git_packages: usize,
 }
 
 /// Parse only Cargo.lock's generated package records. Path/workspace packages
 /// need no fetch; registry packages must carry their exact SHA-256; Git
-/// packages are counted but deliberately never handed to a transport here.
+/// packages are unsupported and refused.
 fn parse_locked_cargo_sources(text: &str) -> Result<LockedCargoSources, String> {
     let mut result = LockedCargoSources::default();
     let mut seen_registry = std::collections::BTreeSet::new();
@@ -1735,13 +1734,6 @@ fn account_locked_cargo_source(
         return Err(format!(
             "Cargo.lock external package from `{source}' has no name or version"
         ));
-    }
-    if source.starts_with("git+") {
-        result.git_packages = result
-            .git_packages
-            .checked_add(1)
-            .ok_or("Cargo.lock Git package count overflow")?;
-        return Ok(());
     }
     if !source.starts_with("registry+") {
         return Err(format!(
@@ -1907,8 +1899,8 @@ fn transfer_registry_sources(
         }
     }
     eprintln!(
-        ">> td-feed {action} cargo: {} registry archive(s) selected; {} Git package(s) require separate recipe-pinned source archives; no Git transport",
-        sources.registry.len(), sources.git_packages,
+        ">> td-feed {action} cargo: {} registry archive(s) selected",
+        sources.registry.len(),
     );
     if failures.is_empty() {
         Ok(())
@@ -1926,8 +1918,7 @@ fn transfer_registry_sources(
 }
 
 /// Fetch only the registry members of the committed lock through td's
-/// verifying sparse-index/static-crate egress. Git members are represented by
-/// separately pinned source archives and are intentionally never contacted.
+/// verifying sparse-index/static-crate egress.
 /// Returns the locked sources AND the sha256 of the bytes they were parsed
 /// from. The digest travels with the parse deliberately: the completion marker
 /// records which lock a vendor set was published from, and re-reading the path
@@ -2047,8 +2038,7 @@ fn detach_from_workspace(manifest: &Path) -> Result<(), String> {
 
 /// warm crate CRATE VERSION [DEST] — provision a crates.io package's metadata + its FULL
 /// locked registry closure through td's verifying egress (each `.crate` sha256 must equal
-/// both the Cargo.lock checksum and crates.io sparse-index cksum). Git entries are counted
-/// but never fetched; their recipe-owned fixed-output archives use `warm sources`. Leaves, for the
+/// both the Cargo.lock checksum and crates.io sparse-index cksum). Leaves, for the
 /// offline gate to intern + build via TD_VENDOR_DIR:
 ///   .td-build-cache/crate-vendor/<dest>/src/<crate>-<ver>/  Cargo metadata only
 ///   .td-build-cache/crate-vendor/<dest>/work/<crate>-<ver>.crate  original source
@@ -2130,8 +2120,7 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
     }
 
     // 3) Fetch only the registry members of the source's OWN Cargo.lock through
-    //    td's verifying egress. Git members never reach Cargo or a Git transport;
-    //    their separately pinned archives are warmed by `warm sources`.
+    //    td's verifying egress.
     let _ = std::fs::remove_dir_all(proxy_store.join("crates"));
     let _ = std::fs::remove_dir_all(proxy_store.join("index"));
     let (sources, digest) = match fetch_locked_registry(&srcdir.join("Cargo.lock"), &proxy_store) {
@@ -2174,30 +2163,10 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
     }
     mark_warm_complete(&vendor, n, &digest);
     eprintln!(
-        "td-feed warm crate: {krate}-{ver} — source + {n} registry crates and {} Git package pin(s) provisioned guix-free \
-         (Cargo.lock-pinned, registry sha==index cksum; no Git transport) in {}",
-        sources.git_packages,
+        "td-feed warm crate: {krate}-{ver} — source + {n} registry crates provisioned guix-free \
+         (Cargo.lock-pinned, registry sha==index cksum) in {}",
         cv.display()
     );
-}
-
-/// warm crate-source FILE SHA256 LOCK DEST — provision the registry closure for
-/// an already-warmed fixed-output source archive from the recipe's exact
-/// committed lock. The archive is re-hashed to bind this warm job to its source
-/// pin, but dependency selection needs neither its manifest nor an extracted
-/// scratch source tree: the committed lock is the build gate's exact oracle.
-fn valid_crate_source_coordinates(file: &str, sha256: &str, lock: &str, dest: &str) -> bool {
-    let file_is_plain = Path::new(file).file_name() == Some(std::ffi::OsStr::new(file));
-    let lock_is_plain = Path::new(lock).file_name() == Some(std::ffi::OsStr::new("Cargo.lock"))
-        && Path::new(lock)
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)));
-    let dest_is_plain = Path::new(dest).file_name() == Some(std::ffi::OsStr::new(dest));
-    let sha_is_hex = sha256.len() == 64
-        && sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
-    file_is_plain && lock_is_plain && dest_is_plain && sha_is_hex
 }
 
 fn real_relative_file(root: &Path, relative: &str, label: &str) -> Result<PathBuf, String> {
@@ -2227,31 +2196,6 @@ fn real_relative_file(root: &Path, relative: &str, label: &str) -> Result<PathBu
         }
     }
     Ok(current)
-}
-
-fn warm_crate_source(root: &Path, file: &str, sha256: &str, lock: &str, dest: &str) {
-    if !valid_crate_source_coordinates(file, sha256, lock, dest) {
-        eprintln!(
-            "td-feed warm crate-source: FILE, SHA256, LOCK, or DEST is malformed — skipping {dest}"
-        );
-        return;
-    }
-    let committed_lock = match real_relative_file(root, lock, "committed Cargo.lock") {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("td-feed warm crate-source: {error} — skipping {dest}");
-            return;
-        }
-    };
-    let archive = sources_dir().join(file);
-    if file_sha256(&archive).ok().as_deref() != Some(sha256) {
-        eprintln!(
-            "td-feed warm crate-source: {} is absent or does not match the declared SHA-256 — skipping {dest}",
-            archive.display()
-        );
-        return;
-    }
-    warm_crate_lock(root, &committed_lock, dest, "crate-source");
 }
 
 /// warm crate-local SRCDIR DEST — provision a LOCAL (in-tree) crate's locked registry
@@ -2329,9 +2273,8 @@ fn warm_crate_lock(root: &Path, lock: &Path, dest: &str, action: &str) {
     }
     mark_warm_complete(&vendor, n, &digest);
     eprintln!(
-        "td-feed warm {action}: {dest} — {n} registry crates and {} Git package pin(s) provisioned guix-free \
-         (lock {}, registry sha==index cksum; no Git transport) in {}",
-        sources.git_packages,
+        "td-feed warm {action}: {dest} — {n} registry crates provisioned guix-free \
+         (lock {}, registry sha==index cksum) in {}",
         lock.display(),
         vendor.display()
     );
@@ -3127,24 +3070,33 @@ fn warm_selftest() {
         die("warm-selftest: the in-process proxy SERVED a crate whose bytes mismatch its index cksum — verify-on-fetch is not load-bearing".into());
     }
 
-    // 5) Lock-driven warming fetches the registry package and only counts the
-    // Git member. The deliberately unreachable Git URL must never be contacted.
+    // 5) Lock-driven warming fetches the registry package; a Git member is
+    // refused before any fetch.
     let lock = store.join("Cargo.lock");
-    let git_commit = "0123456789abcdef0123456789abcdef01234567";
     let lock_text = format!(
         "version = 4\n\n\
          [[package]]\nname = \"warmcrate\"\nversion = \"0.1.0\"\n\
          source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
-         checksum = \"{cksum}\"\n\n\
-         [[package]]\nname = \"gitdep\"\nversion = \"1.0.0\"\n\
-         source = \"git+https://example.invalid/never-contact?rev={git_commit}#{git_commit}\"\n"
+         checksum = \"{cksum}\"\n"
     );
-    std::fs::write(&lock, lock_text)
+    std::fs::write(&lock, &lock_text)
         .unwrap_or_else(|e| die(format!("warm-selftest: write Cargo.lock: {e}")));
     let (locked, _) = fetch_locked_registry(&lock, &store)
         .unwrap_or_else(|e| die(format!("warm-selftest: lock-driven registry fetch: {e}")));
-    if locked.registry.len() != 1 || locked.git_packages != 1 {
-        die("warm-selftest: lock-driven fetch did not separate registry and Git packages".into());
+    if locked.registry.len() != 1 {
+        die("warm-selftest: lock-driven fetch did not select the registry package".into());
+    }
+    let git_commit = "0123456789abcdef0123456789abcdef01234567";
+    std::fs::write(
+        &lock,
+        format!(
+            "{lock_text}\n[[package]]\nname = \"gitdep\"\nversion = \"1.0.0\"\n\
+             source = \"git+https://example.invalid/never-contact?rev={git_commit}#{git_commit}\"\n"
+        ),
+    )
+    .unwrap_or_else(|e| die(format!("warm-selftest: write Cargo.lock: {e}")));
+    if fetch_locked_registry(&lock, &store).is_ok() {
+        die("warm-selftest: lock-driven fetch accepted a Git package".into());
     }
     let _ = std::fs::remove_dir_all(&store);
 
@@ -3152,8 +3104,8 @@ fn warm_selftest() {
         "td-feed: warm selftest OK — parse_source_pins (+malformed reject), kernel source filename, \
          cargo_config (sparse source replacement), and the IN-PROCESS cargo-proxy \
          round-trip a verifying source-crate GET over loopback (mock upstream 127.0.0.1:{uport}); a crate whose \
-         bytes mismatch its index cksum is refused; lock-driven warming fetched its registry crate while never \
-         contacting the counted Git source (the verifying egress and no-Git boundary are load-bearing)"
+         bytes mismatch its index cksum is refused; lock-driven warming fetched its registry crate and refused \
+         a Git source (the verifying egress and no-Git boundary are load-bearing)"
     );
 }
 
@@ -3161,7 +3113,6 @@ fn warm_usage() -> ! {
     eprintln!(
         "usage:\n  td-feed warm index INDEX STORE        (also: td-feed warm INDEX STORE)\n  \
          td-feed warm crate CRATE VERSION [DEST]\n  td-feed warm crate-local SRCDIR DEST\n  \
-         td-feed warm crate-source FILE SHA256 LOCK DEST\n  \
          td-feed warm sources\n  td-feed warm kernel-headers ARCH\n  \
          td-feed warm ostree REPOSITORY REF COMMIT CONTENT DEST"
     );
@@ -3449,9 +3400,6 @@ pub fn run(a: &[String]) {
                 Some("crate") if a.len() == 5 => warm_crate(&root, &a[3], &a[4], &a[3]),
                 Some("crate") if a.len() == 6 => warm_crate(&root, &a[3], &a[4], &a[5]),
                 Some("crate-local") if a.len() == 5 => warm_crate_local(&root, &a[3], &a[4]),
-                Some("crate-source") if a.len() == 7 => {
-                    warm_crate_source(&root, &a[3], &a[4], &a[5], &a[6])
-                }
                 Some("sources") if a.len() == 3 => {
                     if let Err(e) = warm_sources(&root) {
                         die(format!("warm sources: {e}"));
@@ -3473,7 +3421,6 @@ pub fn run(a: &[String]) {
                             "index"
                                 | "crate"
                                 | "crate-local"
-                                | "crate-source"
                                 | "sources"
                                 | "kernel-headers"
                                 | "ostree"
@@ -3517,7 +3464,6 @@ pub fn run(a: &[String]) {
             eprintln!(
                 "usage:\n  td-feed warm INDEX STORE   (low-level; also: warm index INDEX STORE)\n  \
                  td-feed warm crate CRATE VERSION [DEST]\n  td-feed warm crate-local SRCDIR DEST\n  \
-                 td-feed warm crate-source FILE SHA256 LOCK DEST\n  \
                  td-feed warm sources\n  td-feed warm kernel-headers ARCH\n  \
                  td-feed warm ostree REPOSITORY REF COMMIT CONTENT DEST\n  \
                  td-feed serve STORE ADDR\n  \
@@ -3536,8 +3482,8 @@ pub(crate) mod tests {
         feed_daemon_policy, file_sha256_before, index_path, is_warm_complete, mark_warm_complete,
         mount_is_memory_backed, parse_locked_cargo_sources, parse_serve_addr, read_digest_sidecar,
         real_relative_file, resolve_feed_dir, snapshot_for_serve, snapshot_for_serve_before,
-        sweep_download_temps, sweep_kernel_header_temps, valid_crate_source_coordinates,
-        write_before, FeedDaemonPolicy, ResponseGuard, RESPONSE_DEADLINE,
+        sweep_download_temps, sweep_kernel_header_temps, write_before, FeedDaemonPolicy,
+        ResponseGuard, RESPONSE_DEADLINE,
     };
     use std::io::Read;
     use std::path::PathBuf;
@@ -3665,7 +3611,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cargo_lock_warming_separates_registry_from_git_without_transport() {
+    fn cargo_lock_warming_selects_registry_and_refuses_git() {
         let checksum = "a".repeat(64);
         let commit = "0123456789abcdef0123456789abcdef01234567";
         let lock = format!(
@@ -3673,14 +3619,16 @@ pub(crate) mod tests {
              [[package]]\nname = \"root\"\nversion = \"0.1.0\"\n\n\
              [[package]]\nname = \"registry-dep\"\nversion = \"1.2.3\"\n\
              source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
-             checksum = \"{checksum}\"\n\n\
-             [[package]]\nname = \"git-dep\"\nversion = \"2.0.0\"\n\
-             source = \"git+https://example.invalid/never?rev={commit}#{commit}\"\n"
+             checksum = \"{checksum}\"\n"
         );
         let parsed = parse_locked_cargo_sources(&lock).unwrap();
         assert_eq!(parsed.registry.len(), 1);
         assert_eq!(parsed.registry[0].name, "registry-dep");
-        assert_eq!(parsed.git_packages, 1);
+        let with_git = format!(
+            "{lock}\n[[package]]\nname = \"git-dep\"\nversion = \"2.0.0\"\n\
+             source = \"git+https://example.invalid/never?rev={commit}#{commit}\"\n"
+        );
+        assert!(parse_locked_cargo_sources(&with_git).is_err());
         assert!(parse_locked_cargo_sources(&lock.replace(&checksum, &"A".repeat(64))).is_err());
         assert!(parse_locked_cargo_sources(
             "version = 4\n\n[[package]]\nname = \"dep\"\nversion = \"1\"\nsource = \"path+file:///tmp/dep\"\n"
@@ -4132,15 +4080,11 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    fn cargo_transfer_lock(
-        dir: &std::path::Path,
-        bytes: &[u8],
-        git_url: &str,
-    ) -> std::path::PathBuf {
+    fn cargo_transfer_lock(dir: &std::path::Path, bytes: &[u8]) -> std::path::PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let lock = dir.join("Cargo.lock");
         std::fs::write(&lock, format!(
-            "version = 4\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\nsource = \"registry+https://example.invalid/index\"\nchecksum = \"{}\"\n[[package]]\nname = \"git-dep\"\nversion = \"1.0.0\"\nsource = \"git+{git_url}#123456\"\n",
+            "version = 4\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\nsource = \"registry+https://example.invalid/index\"\nchecksum = \"{}\"\n",
             super::hex_sha256(bytes),
         )).unwrap();
         lock
@@ -4160,7 +4104,6 @@ pub(crate) mod tests {
         .unwrap();
         let (sources, _) = super::read_locked_cargo_sources(&lock).unwrap();
         assert!(sources.registry.is_empty());
-        assert_eq!(sources.git_packages, 0);
         super::transfer_locked_registry(&lock, &dir.join("unused"), &dir.join("store"), None)
             .unwrap();
         let symlink = dir.join("link.lock");
@@ -4203,7 +4146,7 @@ pub(crate) mod tests {
         let dir = unique_tmp_dir("cargo-transfer");
         let origin = ConsumerServer::start(dir.join("upstream"), None);
         let bytes = b"locked crate bytes";
-        let lock = cargo_transfer_lock(&dir, bytes, &origin.base);
+        let lock = cargo_transfer_lock(&dir, bytes);
         let archives = dir.join("archives");
         let store = dir.join("store");
         std::fs::create_dir_all(&archives).unwrap();
@@ -4245,8 +4188,8 @@ pub(crate) mod tests {
         use super::transfer_locked_registry as transfer;
         let dir = unique_tmp_dir("cargo-transfer-refusal");
         let origin = ConsumerServer::start(dir.join("upstream"), None);
-        let first = cargo_transfer_lock(&dir.join("first"), b"first", &origin.base);
-        let second = cargo_transfer_lock(&dir.join("second"), b"second", &origin.base);
+        let first = cargo_transfer_lock(&dir.join("first"), b"first");
+        let second = cargo_transfer_lock(&dir.join("second"), b"second");
         let store = dir.join("store");
         for (lock, bytes) in [
             (&first, b"first".as_slice()),
@@ -4289,7 +4232,7 @@ pub(crate) mod tests {
     fn cargo_transfer_rejects_unbounded_special_and_unsafe_locks() {
         use super::read_locked_cargo_sources as read_lock;
         let dir = unique_tmp_dir("cargo-transfer-lock");
-        let lock = cargo_transfer_lock(&dir, b"bytes", "https://example.invalid/git");
+        let lock = cargo_transfer_lock(&dir, b"bytes");
         let original = std::fs::read_to_string(&lock).unwrap();
         for replacement in ["../escape", "a/b", "a\\b"] {
             std::fs::write(
@@ -4693,40 +4636,6 @@ pub(crate) mod tests {
         assert_eq!(parse_serve_addr("on http://127.0.0.1/"), None); // no port
         assert_eq!(parse_serve_addr("on http://:8080/"), None); // no host
         assert_eq!(parse_serve_addr("on http://host:port/"), None); // non-numeric port
-    }
-
-    #[test]
-    fn fixed_output_workspace_warm_coordinates_cannot_traverse() {
-        let sha = "a".repeat(64);
-        assert!(valid_crate_source_coordinates(
-            "source.tar.gz",
-            &sha,
-            "recipes/locks/codex/Cargo.lock",
-            "codex"
-        ));
-        for (file, digest, lock, dest) in [
-            (
-                "../source.tar.gz",
-                sha.as_str(),
-                "recipes/locks/codex/Cargo.lock",
-                "codex",
-            ),
-            (
-                "source.tar.gz",
-                "A",
-                "recipes/locks/codex/Cargo.lock",
-                "codex",
-            ),
-            ("source.tar.gz", sha.as_str(), "../Cargo.lock", "codex"),
-            (
-                "source.tar.gz",
-                sha.as_str(),
-                "recipes/locks/codex/Cargo.lock",
-                "../codex",
-            ),
-        ] {
-            assert!(!valid_crate_source_coordinates(file, digest, lock, dest));
-        }
     }
 
     #[test]
