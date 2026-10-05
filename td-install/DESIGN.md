@@ -2896,7 +2896,7 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
      No gate would have caught it — not because nothing boots a VM, since
      `qemu-boot-system` does, but because that check ran only in a full image
      build and no gate ran one; it now runs in the `td-builder check
-     integration` tier, on main and on a boot-path branch. The obvious
+     integration` tier, on main after each landing. The obvious
      alternative,
      "deepest covering entry", is wrong in the other direction: a read-only
      mount at `/vol/sub` hidden by a later writable one at `/vol` is still in

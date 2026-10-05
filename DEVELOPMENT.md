@@ -385,16 +385,15 @@ never in the gate sandbox: it warms the system image's inputs, then runs
 with a banner saying what it proves, its outcome and wall time, recorded
 in the check history as `integration:STEP` (`td-recipe-eval
 check-history integration`). On its own it runs only those steps; beside
-gate goals, as `affected-checks` selects it (`td-builder check check
-recipe-checks integration`), it runs after the gates pass and says so
-when they do not. Every boot uses KVM when this user can open `/dev/kvm`
+gate goals (`td-builder check check integration`), it runs after the
+gates pass and says so when they do not. Every boot uses KVM when this user can open `/dev/kvm`
 (membership in the `kvm` group, from a login started after joining it),
 with TCG behind it, and says which; `TD_QEMU_ACCEL=tcg` pins software
 emulation, several times slower. It needs the host's qemu, and OVMF for
 the last two (found beside qemu or in /usr/share/OVMF, or named by
 `TD_QEMU_EFI_CODE` and `TD_QEMU_EFI_VARS`). An oracle the host cannot
 run is an unprovisioned skip; when none could run the tier exits 69,
-which `ready` does not take for a pass. An oracle that passed before
+which is not a pass. An oracle that passed before
 with every input it boots unchanged (the same components as a recipe
 check's key over its recipes, beside its name, its accelerator list and
 `TD_QEMU_BOOT_TIMEOUT_SECS`) answers from its memo and boots nothing,
@@ -408,13 +407,16 @@ key is read when asked and again when a pass is recorded, not between.
 
 It belongs to main: after a landing, an agent on a provisioned host runs
 `td-builder check integration` on main, and a red one is healed as any
-red gate on main is (`ci/revert-suspect.sh`). A branch runs it only when
-it changes the boot path: the code, manifest, lock or build script of
-td-boot, td-firstboot, td-init, td-install, td-install-qemu-test,
-td-kexec, td-login, td-sh or td-svc, or the recipe of the same name; the
+red gate on main is (`ci/revert-suspect.sh`). No branch's `ready` runs
+it, so an hour of qemu never holds a landing: the selection prints that
+the tier is deferred to main, and names in its notes a change to the
+boot path — the code, manifest, lock or build script of td-boot,
+td-firstboot, td-init, td-install, td-install-qemu-test, td-kexec,
+td-login, td-sh or td-svc, or the recipe of the same name; the
 linux-x86-64 or system-x86-64 recipe; the oracles' code; or the tier's
-runner. Otherwise the selection prints that the tier is deferred to
-main. Run it on a branch by hand with `td-builder check integration`.
+runner. The cost is that a boot-breaking change is found on main, after
+it lands. A branch that expects to touch the boot can run the tier by
+hand with `td-builder check integration` before pushing.
 
 When `ready` passes, push the branch:
 

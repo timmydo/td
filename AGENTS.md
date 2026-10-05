@@ -265,8 +265,8 @@ cargo run --release --manifest-path builder/Cargo.toml -- check
 ```
 
 The system-level qemu oracles are the separate `td-builder check
-integration` tier, which main runs and a branch runs only when it changes
-the boot path; `DEVELOPMENT.md` says when.
+integration` tier, which main runs after a landing and no branch's
+`ready` runs; `DEVELOPMENT.md` says how.
 
 Build the builder with:
 

@@ -1349,7 +1349,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // `system-x86-64` owns no gated check (it is absent from `check-list`), so its
     // `shape_check` probes of the packed shell and the boot oracle behind
     // `qemu-boot-system` run only in the integration tier (`td-builder check
-    // integration`), which a td-sh change selects through `boot_path`. In the
+    // integration`), which main runs after a landing. In the
     // gates, the host-side recipe TESTS are what stand in, and they are
     // cargo-test's.
     //
@@ -1952,7 +1952,7 @@ fn format_output(
     }
     // What a selection that runs the gates leaves to main, said where
     // `ready` shows it.
-    if !sel.targets.is_empty() && !sel.targets.iter().any(|t| t == crate::integration::GOAL) {
+    if !sel.targets.is_empty() {
         o.push_str(&format!("  {}\n", crate::integration::deferred_note()));
     }
 
@@ -2023,10 +2023,10 @@ fn compute_selection(root: &Path, changed: &[String]) -> Selection {
         if !p.is_empty() {
             map_path(root, &roster, p, &mut sel);
             if boot_path(p) {
-                sel.add_target(crate::integration::GOAL);
                 sel.add_note(&format!(
-                    "{p} is on the boot path: the system-level qemu oracles run \
-                     too (td-builder check {}), after the gates",
+                    "{p} is on the boot path: the system-level qemu oracles \
+                     run on main after it lands; `td-builder check {}` runs \
+                     them here by hand",
                     crate::integration::GOAL
                 ));
             }
@@ -2041,8 +2041,10 @@ fn compute_selection(root: &Path, changed: &[String]) -> Selection {
 /// td-fs, which td-boot and the installer compile in, is left out by
 /// decision: its changes run the gates on a branch and the oracles on main.
 /// A change to one's code, manifest, lock or build script, or to its recipe
-/// file of the same name, opts a branch into the integration tier, which
-/// otherwise runs on main alone. Its tests, docs and ignore files do not.
+/// file of the same name, is named in the selection's notes as on the boot
+/// path. The integration tier still runs on main alone: a branch's `ready`
+/// never waits on the qemu oracles. Its tests, docs and ignore files are not
+/// named.
 const BOOT_CRATES: &[&str] = &[
     "td-boot",
     "td-firstboot",
@@ -6271,12 +6273,13 @@ mod tests {
         }
     }
 
-    /// A boot-path change opts a branch into the integration tier, with a
-    /// note; anything else leaves it to main and says so where the gates
-    /// run. A boot crate's tests, docs and ignore file do not boot, nor
-    /// does a crate whose name only starts like one.
+    /// No branch change selects the integration tier: main runs it after a
+    /// landing. A boot-path change is named in a note and still says the
+    /// tier is deferred where the gates run. A boot crate's tests, docs and
+    /// ignore file are not named, nor is a crate whose name only starts
+    /// like one.
     #[test]
-    fn a_boot_path_change_runs_the_integration_tier() {
+    fn a_boot_path_change_leaves_the_integration_tier_to_main() {
         let root = repo_root();
         let goal = crate::integration::GOAL;
         for path in [
@@ -6299,16 +6302,12 @@ mod tests {
         ] {
             let sel = compute_selection(&root, &[path.to_string()]);
             assert!(
-                sel.targets.iter().any(|t| t == goal),
+                !sel.targets.iter().any(|t| t == goal),
                 "{path}: {:?}",
                 sel.targets
             );
             assert!(
                 sel.notes.iter().any(|n| n.contains("on the boot path")),
-                "{path}"
-            );
-            assert!(
-                !path_output(&root, path).contains("deferred to main"),
                 "{path}"
             );
         }
@@ -6331,8 +6330,13 @@ mod tests {
                 "{path}: {:?}",
                 sel.targets
             );
+            assert!(
+                !sel.notes.iter().any(|n| n.contains("on the boot path")),
+                "{path}"
+            );
         }
         assert!(path_output(&root, "recipes/src/recipes/uutils.rs").contains("deferred to main"));
+        assert!(path_output(&root, "td-init/src/main.rs").contains("deferred to main"));
         assert!(!default_check_covers_target(&root, goal));
     }
 
@@ -6447,7 +6451,7 @@ mod tests {
         );
         let out = path_output(&root, "td-sh/src/lib.rs");
         assert!(
-            out.contains("  td-builder check check recipe-checks integration\n  recipe-checks scope: td-sh/src/lib.rs (TD_CHECK_SCOPE on the command above)\n"),
+            out.contains("  td-builder check check recipe-checks\n  recipe-checks scope: td-sh/src/lib.rs (TD_CHECK_SCOPE on the command above)\n"),
             "{out}"
         );
         assert!(!path_output(&root, "check.sh").contains("recipe-checks scope"));

@@ -1,9 +1,9 @@
 //! `td-builder check integration`: the system-level qemu oracles, which
 //! boot the system image in a VM with the host's qemu and firmware. They
 //! run on the host after the sandboxed gates pass, never inside the gate
-//! sandbox, and are not part of `check`: main runs them, and a branch runs
-//! them only when it changes the boot path (`affected::boot_path`), which
-//! `ready` says when it defers them.
+//! sandbox, and are not part of `check`: main runs them after a landing,
+//! and a branch's `ready` never does, saying so when it defers them; a
+//! boot-path change (`affected::boot_path`) is named in its notes.
 
 use std::path::Path;
 use std::process::Command;
@@ -52,8 +52,8 @@ pub(crate) fn deferred_note() -> String {
         .map(|s| s.name)
         .collect();
     format!(
-        "deferred to main: the system-level qemu oracles ({}), run by \
-         `td-builder check {GOAL}`; no boot-path file changed",
+        "deferred to main: the system-level qemu oracles ({}), which main \
+         runs after a landing; `td-builder check {GOAL}` runs them by hand",
         names.join(", ")
     )
 }
