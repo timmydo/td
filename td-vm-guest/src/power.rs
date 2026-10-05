@@ -139,7 +139,7 @@ pub fn serve() -> Result<()> {
     }
     directory(Path::new("/run"), 0, false)?;
     let state = Path::new("/run/td-vm-power");
-    create_directory(state, 0)?;
+    create_directory(state)?;
     let lease: File = io(
         OpenOptions::new()
             .read(true)

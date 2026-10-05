@@ -8,6 +8,12 @@ mod power;
     path = "../../td-authd/src/primary_account.rs"
 )]
 mod primary_account;
+#[cfg_attr(feature = "target-recipe", path = "td_fs.rs")]
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../td-fs/src/private_dir.rs"
+)]
+mod td_fs;
 #[allow(dead_code)] // Shared compositor codec also carries clipboard and feed operations.
 #[cfg_attr(feature = "target-recipe", path = "vm_wire.rs")]
 #[cfg_attr(
@@ -69,13 +75,8 @@ fn directory(path: &Path, uid: u32, private: bool) -> Result<()> {
     Ok(())
 }
 
-fn create_directory(path: &Path, uid: u32) -> Result<()> {
-    match DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(format!("create private VM key directory: {e}")),
-    }
-    directory(path, uid, true)
+fn create_directory(path: &Path) -> Result<()> {
+    td_fs::private_dir(path).map_err(|e| format!("private VM key directory: {e}"))
 }
 
 fn write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
@@ -197,7 +198,7 @@ fn verify_secret(dir: &Path, uid: u32, keygen: &Path, key: &str) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("inspect key proof: {e}")),
     }
-    create_directory(&proof, uid)?;
+    create_directory(&proof)?;
     let result = (|| {
         let challenge = proof.join("challenge");
         write(&challenge, b"td-vm private key self-test\n", 0o600)?;
@@ -269,7 +270,7 @@ fn ensure_key(state: &Path, id: &str, uid: u32, keygen: &Path) -> Result<String>
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("inspect guest key staging: {e}")),
     }
-    create_directory(&temporary, uid)?;
+    create_directory(&temporary)?;
     let result = (|| {
         write(&temporary.join("instance"), id.as_bytes(), 0o600)?;
         keygen_run(
@@ -454,7 +455,7 @@ fn serve() -> Result<()> {
         directory(&state, uid, false)?;
     }
     state.push("td-vm");
-    create_directory(&state, uid)?;
+    create_directory(&state)?;
     let lock = io(
         OpenOptions::new()
             .create(true)
@@ -603,7 +604,7 @@ mod tests {
                 .find(|p| p.is_file())
                 .expect("ssh-keygen test prerequisite");
             for dir in ["state", "request", "response"] {
-                create_directory(&root.join(dir), uid).unwrap();
+                create_directory(&root.join(dir)).unwrap();
             }
             Self { root, uid, keygen }
         }
@@ -777,7 +778,7 @@ FnRkLXFlbXUtYWRtaW4tc2VsZnRlc3QBAgMEBQYH
     #[ignore = "requires host ssh-keygen; run by the host preflight"]
     fn interrupted_staging_recovers_but_published_damage_never_regenerates() {
         let f = Fixture::new();
-        create_directory(&f.state().join("git.tmp"), f.uid).unwrap();
+        create_directory(&f.state().join("git.tmp")).unwrap();
         fs::write(f.state().join("git.tmp/incomplete"), b"interrupted").unwrap();
         f.key(ID).unwrap();
         assert!(!f.state().join("git.tmp").exists());

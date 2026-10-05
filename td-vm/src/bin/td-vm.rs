@@ -347,24 +347,11 @@ fn path_text(path: &Path) -> Result<&str> {
 }
 
 fn private_dir(path: &Path) -> Result<()> {
-    match DirBuilder::new().recursive(true).mode(0o700).create(path) {
-        Ok(()) => (),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
-        Err(e) => return Err(format!("create {}: {e}", path.display())),
-    }
-    check_private_dir(path)
+    td_fs::private_dir(path).map_err(|e| e.to_string())
 }
 
 fn check_private_dir(path: &Path) -> Result<()> {
-    let meta = io(fs::symlink_metadata(path), "inspect VM directory")?;
-    let uid = io(fs::metadata("/proc/self"), "inspect current uid")?.uid();
-    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
-        return Err(format!(
-            "{} must be a private, caller-owned directory (0700), not a symlink",
-            path.display()
-        ));
-    }
-    Ok(())
+    td_fs::check_private_dir(path).map_err(|e| e.to_string())
 }
 
 fn command(command: &mut Command) -> Result<()> {

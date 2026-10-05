@@ -13,6 +13,8 @@ mod protocol;
 #[path = "../../engine/src/sha256.rs"]
 #[allow(dead_code, reason = "shared streaming SHA-256 implementation")]
 mod sha256;
+#[path = "../../td-fs/src/private_dir.rs"]
+mod td_fs;
 mod upstream;
 
 type Result<T> = std::result::Result<T, String>;
@@ -35,23 +37,10 @@ fn present(path: &Path) -> Result<bool> {
     }
 }
 
-fn private_directory(path: &Path, uid: u32) -> Result<()> {
-    match DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(format!("create {}: {e}", path.display())),
-    }
-    let metadata = io(fs::symlink_metadata(path), "inspect source state directory")?;
-    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
-        return Err("source state must be a private directory owned by this user".into());
-    }
-    Ok(())
-}
-
 fn source_lock(home: &Path) -> Result<File> {
     let uid = io(fs::metadata("/proc/self"), "read current UID")?.uid();
     let state = home.join(".td-update");
-    private_directory(&state, uid)?;
+    td_fs::private_dir(&state).map_err(|e| format!("source state: {e}"))?;
     let file = io(
         OpenOptions::new()
             .read(true)

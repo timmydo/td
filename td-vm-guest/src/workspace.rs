@@ -200,7 +200,7 @@ fn configuration(plan: &Plan, state: &Path, uid: u32) -> Result<()> {
     }
     let staging = state.join("ssh.tmp");
     remove_staging(&staging, uid)?;
-    create_directory(&staging, uid)?;
+    create_directory(&staging)?;
     write(&staging.join("plan"), &plan.encode(), 0o600)?;
     write(
         &staging.join("config"),
@@ -299,7 +299,7 @@ pub fn prepare(
         }
     }
     let empty = state.join("empty-template");
-    create_directory(&empty, uid)?;
+    create_directory(&empty)?;
     if io(fs::read_dir(&empty), "inspect empty Git template")?
         .next()
         .is_some()
@@ -331,7 +331,7 @@ pub fn prepare(
     }
     let staging = src.join(".td-vm.tmp");
     remove_staging(&staging, uid)?;
-    create_directory(&staging, uid)?;
+    create_directory(&staging)?;
     write(&staging.join("plan"), &plan.encode(), 0o600)?;
     let repo = staging.join("repo");
     let work = staging.join("work");
@@ -615,9 +615,9 @@ mod tests {
         let git_bin = program("git");
         let ssh = program("ssh");
         let home = f.root.join("home");
-        create_directory(&home, uid).unwrap();
+        create_directory(&home).unwrap();
         let state = home.join("state");
-        create_directory(&state, uid).unwrap();
+        create_directory(&state).unwrap();
         let key = ensure_key(&state, ID, uid, &keygen).unwrap();
         let host_key = f.root.join("host-key");
         invoke(
@@ -833,7 +833,7 @@ fn main() {{
         );
         // An interrupted private staging tree is discarded; no published work exists.
         fs::create_dir(home.join("src")).unwrap();
-        create_directory(&home.join("src/.td-vm.tmp"), uid).unwrap();
+        create_directory(&home.join("src/.td-vm.tmp")).unwrap();
         fs::write(home.join("src/.td-vm.tmp/partial"), "interrupted").unwrap();
         fs::write(f.root.join("provision-plan"), plan.encode()).unwrap();
         fs::write(&hold, "delay Git upload").unwrap();

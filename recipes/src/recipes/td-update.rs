@@ -5,6 +5,7 @@ const APPLY_RS: &str = include_str!("../../../td-update/src/apply.rs");
 const UPSTREAM_RS: &str = include_str!("../../../td-update/src/upstream.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
+const PRIVATE_DIR_RS: &str = include_str!("../../../td-fs/src/private_dir.rs");
 
 const MAIN_RS: &str = include_str!("../../../td-update/src/main.rs");
 
@@ -49,6 +50,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-boot/src/protocol.rs".into(),
             content: PROTOCOL_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-fs/src/private_dir.rs".into(),
+            content: PRIVATE_DIR_RS.into(),
             exec: false,
         },
         Step::MkDir {
