@@ -2233,11 +2233,33 @@ fn align_up(sectors: u64, align: u64) -> Option<u64> {
     sectors.checked_add(align - remainder)
 }
 
+/// Where the volume partition ends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VolumeEnd {
+    /// At the last usable LBA: an unencrypted volume, Btrfs over the whole
+    /// partition.
+    LastUsable,
+    /// At the last usable LBA that leaves the partition whole 4 KiB
+    /// encryption sectors: a device-bound volume, whose LUKS2 segment is
+    /// the rest of the partition, which dm-crypt maps only in whole
+    /// sectors (DESIGN.md "Device-bound formatting").
+    EncryptionSectors,
+}
+
+impl VolumeEnd {
+    fn of(storage: installation_plan::Storage) -> Self {
+        match storage {
+            installation_plan::Storage::Unencrypted => Self::LastUsable,
+            installation_plan::Storage::DeviceBound => Self::EncryptionSectors,
+        }
+    }
+}
+
 /// Compute the layout, or say why the disk cannot hold one.
 ///
 /// Every partition boundary is INCLUSIVE, because that is how GPT stores it and
 /// an exclusive end written into that field is an off-by-one no reader detects.
-fn plan(sector_size: u64, disk_bytes: u64) -> Result<Plan, String> {
+fn plan(sector_size: u64, disk_bytes: u64, end: VolumeEnd) -> Result<Plan, String> {
     if sector_size == 0 {
         return Err("the destination reports a sector size of 0".to_string());
     }
@@ -2287,10 +2309,34 @@ fn plan(sector_size: u64, disk_bytes: u64) -> Result<Plan, String> {
              {esp_end} and the last usable LBA is {last_usable}"
         ));
     }
-    let volume_sectors = last_usable
+    let mut volume_sectors = last_usable
         .checked_sub(volume_start)
         .and_then(|s| s.checked_add(1))
         .unwrap_or(0);
+    if end == VolumeEnd::EncryptionSectors {
+        // The start is already 1 MiB-aligned; only the end moves, and never
+        // past the last usable LBA.
+        let granule = device_bound::SECTOR_BYTES / sector_size;
+        if granule == 0 || !device_bound::SECTOR_BYTES.is_multiple_of(sector_size) {
+            return Err(format!(
+                "a {sector_size}-byte sector does not divide a {}-byte encryption sector",
+                device_bound::SECTOR_BYTES
+            ));
+        }
+        let start = volume_start.saturating_mul(sector_size);
+        if !start.is_multiple_of(device_bound::SECTOR_BYTES) {
+            return Err(format!(
+                "the volume would start at byte {start}, not on a {}-byte \
+                 encryption sector",
+                device_bound::SECTOR_BYTES
+            ));
+        }
+        volume_sectors -= volume_sectors % granule;
+    }
+    let volume_end = volume_start
+        .checked_add(volume_sectors)
+        .and_then(|end| end.checked_sub(1))
+        .ok_or_else(|| "the destination holds no volume".to_string())?;
     let volume_bytes = volume_sectors.saturating_mul(sector_size);
     if volume_bytes < protocol::MIN_VOLUME_BYTES {
         return Err(format!(
@@ -2307,7 +2353,7 @@ fn plan(sector_size: u64, disk_bytes: u64) -> Result<Plan, String> {
         esp_start,
         esp_end,
         volume_start,
-        volume_end: last_usable,
+        volume_end,
     })
 }
 
@@ -2318,7 +2364,7 @@ fn layout_preview(sector_bytes: u64, capacity_bytes: u64, out: &mut dyn Write) -
             "layout preview supports 512-byte and 4096-byte logical sectors".into(),
         ));
     }
-    let layout = plan(sector_bytes, capacity_bytes)
+    let layout = plan(sector_bytes, capacity_bytes, VolumeEnd::LastUsable)
         .map_err(|error| invalid(format!("layout preview: {error}")))?;
     let byte_range = |start: u64, end: u64| -> io::Result<(u64, u64)> {
         let offset = start
@@ -2714,11 +2760,13 @@ fn format_layout(
     boot: Option<&BootFiles>,
     out: &mut dyn Write,
 ) -> io::Result<()> {
-    prepare_layout(destination, boot, None)?.write_to(destination, out)
+    prepare_layout(destination, boot, None, VolumeEnd::LastUsable)?.write_to(destination, out)
 }
 
 struct PreparedLayout {
     plan: Plan,
+    /// The rule the volume's end was planned by, which a recheck repeats.
+    end: VolumeEnd,
     table: gpt::Image,
     esp: fat::Image<'static>,
     metadata: u64,
@@ -2731,11 +2779,12 @@ fn prepare_layout(
     destination: &mut FormatDestination,
     boot: Option<&BootFiles>,
     digests: Option<&[[u8; 32]; 2]>,
+    end: VolumeEnd,
 ) -> io::Result<PreparedLayout> {
     let file = &mut destination.file;
     let disk_bytes = destination_bytes(file)?;
     let sector_size = logical_sector_size(file)?;
-    let plan = plan(sector_size, disk_bytes).map_err(invalid)?;
+    let plan = plan(sector_size, disk_bytes, end).map_err(invalid)?;
 
     // Pin and size both sources before any destructive write. The caller owns
     // their content and must keep it stable throughout the operation.
@@ -2866,6 +2915,7 @@ fn prepare_layout(
 
     Ok(PreparedLayout {
         plan,
+        end,
         table,
         esp,
         metadata,
@@ -2916,7 +2966,7 @@ impl PreparedLayout {
     fn check_unchanged(&self, destination: &mut File) -> io::Result<()> {
         let disk_bytes = destination_bytes(destination)?;
         let sector_size = logical_sector_size(destination)?;
-        if plan(sector_size, disk_bytes).map_err(invalid)? != self.plan {
+        if plan(sector_size, disk_bytes, self.end).map_err(invalid)? != self.plan {
             return Err(invalid(
                 "destination geometry changed during format preparation".into(),
             ));
@@ -3593,8 +3643,10 @@ fn held_layout(
     destination: &mut FormatDestination,
     boot: &BootFiles,
     digests: Option<&[[u8; 32]; 2]>,
+    end: VolumeEnd,
 ) -> Result<HeldLayout, HeldFailure> {
-    let layout = prepare_layout(destination, Some(boot), digests).map_err(HeldFailure::Layout)?;
+    let layout =
+        prepare_layout(destination, Some(boot), digests, end).map_err(HeldFailure::Layout)?;
     let len = layout
         .plan
         .volume_bytes()
@@ -3633,7 +3685,7 @@ fn format_held(
         boot: boot_extents,
         metadata,
         table,
-    } = held_layout(destination, boot, digests)?;
+    } = held_layout(destination, boot, digests, VolumeEnd::LastUsable)?;
     let len = volume.1;
     let seed = prepared.seed;
     let image = prepare_volume_image(prepared, destination, len).map_err(HeldFailure::Staging)?;
@@ -3890,7 +3942,8 @@ fn format_held_device_bound(
         boot: boot_extents,
         metadata,
         table,
-    } = held_layout(destination, boot, digests)?;
+    } = held_layout(destination, boot, digests, VolumeEnd::EncryptionSectors)?;
+    let volume = encryption_extent(volume).map_err(HeldFailure::Layout)?;
     let PreparedVolume {
         settings,
         uuid,
@@ -3961,10 +4014,27 @@ fn format_held_device_bound(
     }
 }
 
+/// The held volume's `(offset, len)`, refused before the first write unless
+/// it is whole encryption sectors. Never shrunk instead: the table places
+/// the whole partition and stock cryptsetup maps the whole partition, so a
+/// format shorter than the partition would be a volume no mapping of the
+/// partition opens.
+fn encryption_extent((offset, len): (u64, u64)) -> io::Result<(u64, u64)> {
+    if offset.is_multiple_of(device_bound::SECTOR_BYTES)
+        && len.is_multiple_of(device_bound::SECTOR_BYTES)
+    {
+        Ok((offset, len))
+    } else {
+        Err(invalid(format!(
+            "the {len}-byte volume at {offset} is not whole {}-byte encryption sectors",
+            device_bound::SECTOR_BYTES
+        )))
+    }
+}
+
 /// Binds the loop over the layout's `(offset, len)` volume, which no table
-/// on the disk places yet, its length rounded down to whole encryption
-/// sectors, and formats and publishes on it. The loop is released and the
-/// destination synced before success.
+/// on the disk places yet, and formats and publishes on it. The loop is
+/// released and the destination synced before success.
 fn publish_device_bound(
     destination: &mut FormatDestination,
     (offset, len): (u64, u64),
@@ -3973,9 +4043,8 @@ fn publish_device_bound(
 ) -> Result<(Vec<u8>, td_protector::recovery::RecoveryKey), HeldFailure> {
     let written = HeldFailure::Written;
     let sector_size = logical_sector_size(&destination.file).map_err(written)?;
-    let extent = len - len % device_bound::SECTOR_BYTES;
     let device =
-        loop_device::attach(&destination.file, offset, extent, sector_size).map_err(|error| {
+        loop_device::attach(&destination.file, offset, len, sector_size).map_err(|error| {
             written(io::Error::new(
                 error.kind(),
                 format!(
@@ -3984,18 +4053,13 @@ fn publish_device_bound(
                 ),
             ))
         })?;
-    let formatted = device_bound::format(
-        volume,
-        device.path(),
-        extent,
-        &destination.file,
-        offset,
-        step,
-    )
-    .map_err(|stopped| match stopped {
-        device_bound::Stopped::Write(error) => HeldFailure::Written(error),
-        device_bound::Stopped::Verify(error) => HeldFailure::Verify(error),
-    })?;
+    let formatted =
+        device_bound::format(volume, device.path(), len, &destination.file, offset, step).map_err(
+            |stopped| match stopped {
+                device_bound::Stopped::Write(error) => HeldFailure::Written(error),
+                device_bound::Stopped::Verify(error) => HeldFailure::Verify(error),
+            },
+        )?;
     device.release().map_err(written)?;
     destination.file.sync_all().map_err(written)?;
     Ok(formatted)
@@ -4524,15 +4588,14 @@ fn volume_fit(
     storage: installation_plan::Storage,
 ) -> Result<(), String> {
     const GIB: u64 = 1 << 30;
-    let volume = plan(sector_size, capacity)?
+    let volume = plan(sector_size, capacity, VolumeEnd::of(storage))?
         .volume_bytes()
         .ok_or("the system volume's length overflowed")?;
     let volume = match storage {
         installation_plan::Storage::Unencrypted => volume,
         installation_plan::Storage::DeviceBound => {
-            let inside = volume
-                .saturating_sub(volume % device_bound::SECTOR_BYTES)
-                .saturating_sub(device_bound::HEADER_BYTES);
+            // The plan already ends it on whole encryption sectors.
+            let inside = volume.saturating_sub(device_bound::HEADER_BYTES);
             if inside < protocol::MIN_VOLUME_BYTES {
                 return Err(format!(
                     "the encrypted volume would hold {inside} bytes after its \
@@ -4557,7 +4620,7 @@ fn volume_fit(
 
 /// The ESP's FAT, built from lengths alone, holds the kernel and selector.
 fn esp_fit(sector_size: u64, capacity: u64, kernel: u64, selector: u64) -> Result<(), String> {
-    let layout = plan(sector_size, capacity)?;
+    let layout = plan(sector_size, capacity, VolumeEnd::LastUsable)?;
     let esp = esp_volume(sector_size, &layout, 0, Some((kernel, selector)))
         .map_err(|error| error.to_string())?;
     fat::build(&esp)
@@ -6666,7 +6729,7 @@ mod tests {
     fn the_volume_region_is_the_partition_the_table_describes() {
         let scratch = Scratch::disk(DISK);
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
-        let plan = plan(512, DISK).unwrap();
+        let plan = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         let mut file = File::open(&scratch.path).unwrap();
         let (offset, len) = volume_region(&mut file, 512, DISK / 512).unwrap();
         assert_eq!(offset, plan.volume_start * 512);
@@ -6737,7 +6800,7 @@ mod tests {
         .unwrap();
         let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
         let words: Vec<&str> = argv.lines().collect();
-        let plan = plan(512, DISK).unwrap();
+        let plan = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         let expected = (plan.volume_end - plan.volume_start + 1) * 512;
         let after = |flag: &str| {
             words
@@ -7000,7 +7063,7 @@ mod tests {
             3,
             "the line is <off> <len> <written>: {text:?}"
         );
-        let plan = plan(512, DISK).unwrap();
+        let plan = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         assert_eq!(
             fields.first().map(|f| f.parse::<u64>().unwrap()),
             Some(plan.volume_start * 512)
@@ -9811,7 +9874,7 @@ mod tests {
         let disk = Scratch::disk(DISK);
         run_layout(&disk.path, &mut Vec::new()).unwrap();
         let mut file = OpenOptions::new().write(true).open(&disk.path).unwrap();
-        let offset = plan(512, DISK).unwrap().volume_start * 512;
+        let offset = plan(512, DISK, VolumeEnd::LastUsable).unwrap().volume_start * 512;
         for at in [MIB, offset, DISK - 2 * MIB] {
             write_at(&mut file, at, &[0xa5; 4096]).unwrap();
         }
@@ -10149,7 +10212,10 @@ mod tests {
             sha256::hex_digest(b"retained initrd"),
         ]
         .map(|hex| digest_bytes(&hex).unwrap());
-        let esp = plan(512, DISK).unwrap().esp_offset().unwrap();
+        let esp = plan(512, DISK, VolumeEnd::LastUsable)
+            .unwrap()
+            .esp_offset()
+            .unwrap();
         let snapshot = |disk: &Scratch| {
             let mut file = File::open(&disk.path).unwrap();
             let mut regions = volume_write_snapshot(disk);
@@ -10159,22 +10225,60 @@ mod tests {
         };
         let before = snapshot(&disk);
         let mut destination = FormatDestination::open(&disk.path).unwrap();
-        prepare_layout(&mut destination, Some(&boot), Some(&digests)).unwrap();
+        prepare_layout(
+            &mut destination,
+            Some(&boot),
+            Some(&digests),
+            VolumeEnd::LastUsable,
+        )
+        .unwrap();
         let [kernel, initramfs] = digests;
         for wrong in [[initramfs, initramfs], [kernel, kernel]] {
-            let error = prepare_layout(&mut destination, Some(&boot), Some(&wrong))
-                .err()
-                .unwrap();
+            let error = prepare_layout(
+                &mut destination,
+                Some(&boot),
+                Some(&wrong),
+                VolumeEnd::LastUsable,
+            )
+            .err()
+            .unwrap();
             assert!(error.to_string().contains("is not the"), "{error}");
         }
         assert!(snapshot(&disk) == before);
+    }
+
+    /// On a 512-byte disk whose usable range ends off an encryption sector,
+    /// the device-bound layout's table entry and the held extent are whole
+    /// 4 KiB sectors, and an extent that is not is refused as a layout
+    /// failure, before anything is written.
+    #[test]
+    fn the_device_bound_layout_places_whole_encryption_sectors() {
+        let (disk, _dir, boot) = combined_fixture(RECORDING_MKFS);
+        let unencrypted = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
+        assert_ne!(unencrypted.volume_bytes().unwrap() % 4096, 0);
+        let mut destination = FormatDestination::open(&disk.path).unwrap();
+        let held = held_layout(&mut destination, &boot, None, VolumeEnd::EncryptionSectors)
+            .ok()
+            .unwrap();
+        let (offset, len) = held.volume;
+        assert_eq!((offset % 4096, len % 4096), (0, 0));
+        assert_eq!(encryption_extent(held.volume).unwrap(), held.volume);
+        let table = gpt::parse(&held.table.primary, &held.table.backup, 512).unwrap();
+        let entry = &table.partitions[1];
+        assert_eq!(entry.start_lba * 512, offset);
+        assert_eq!((entry.end_lba + 1) * 512, offset + len);
+        assert!(entry.end_lba < unencrypted.volume_end);
+        for misaligned in [(offset, len - 512), (offset + 512, len - 4096)] {
+            assert!(encryption_extent(misaligned).is_err());
+        }
     }
 
     #[test]
     fn prepared_layout_refuses_changed_geometry_without_writes() {
         let (disk, _dir, boot) = combined_fixture(RECORDING_MKFS);
         let mut destination = FormatDestination::open(&disk.path).unwrap();
-        let layout = prepare_layout(&mut destination, Some(&boot), None).unwrap();
+        let layout =
+            prepare_layout(&mut destination, Some(&boot), None, VolumeEnd::LastUsable).unwrap();
         destination.file.set_len(DISK + MIB).unwrap();
         let before = volume_write_snapshot(&disk);
         let error = layout
@@ -10193,7 +10297,8 @@ mod tests {
         for commit in [true, false] {
             let (disk, _dir, boot) = combined_fixture(RECORDING_MKFS);
             let mut destination = FormatDestination::open(&disk.path).unwrap();
-            let layout = prepare_layout(&mut destination, Some(&boot), None).unwrap();
+            let layout =
+                prepare_layout(&mut destination, Some(&boot), None, VolumeEnd::LastUsable).unwrap();
             destination.file.set_len(DISK + MIB).unwrap();
             let before = volume_write_snapshot(&disk);
             let failure = layout.write_held(&mut destination, commit).unwrap_err();
@@ -10343,7 +10448,7 @@ mod tests {
     }
 
     fn volume_write_snapshot(disk: &Scratch) -> Vec<Vec<u8>> {
-        let plan = plan(512, DISK).unwrap();
+        let plan = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         let offset = plan.volume_start * 512;
         let len = (plan.volume_end - plan.volume_start + 1) * 512;
         [
@@ -10368,7 +10473,7 @@ mod tests {
     ) {
         let disk = Scratch::disk(DISK);
         let mut destination = FormatDestination::open(&disk.path).unwrap();
-        let plan = plan(512, DISK).unwrap();
+        let plan = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         let offset = plan.volume_start * 512;
         let volume_len = (plan.volume_end - plan.volume_start + 1) * 512;
         for (at, count) in [
@@ -10401,7 +10506,7 @@ mod tests {
 
     #[test]
     fn staged_volume_before_layout_copies_the_held_image_after_path_replacement() {
-        let plan = plan(512, DISK).unwrap();
+        let plan = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         let len = (plan.volume_end - plan.volume_start + 1) * 512;
         let (disk, dir, mut destination, image) = unlaid_volume_image(len);
         let image_path = dir.0.join("td-volume.img");
@@ -10437,7 +10542,7 @@ mod tests {
 
     #[test]
     fn staged_volume_refuses_its_own_inode_as_the_copy_destination() {
-        let plan = plan(512, DISK).unwrap();
+        let plan = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         let len = (plan.volume_end - plan.volume_start + 1) * 512;
         let (disk, dir, _destination, image) = unlaid_volume_image(len);
         let mut alias = FormatDestination::open(&dir.0.join("td-volume.img")).unwrap();
@@ -10458,7 +10563,7 @@ mod tests {
 
     #[test]
     fn staged_volume_refuses_a_different_destination_extent_before_writes() {
-        let plan = plan(512, DISK).unwrap();
+        let plan = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         let len = (plan.volume_end - plan.volume_start + 1) * 512;
         for prepared_len in [len - 512, len + 512] {
             let (disk, _dir, mut destination, image) = unlaid_volume_image(prepared_len);
@@ -10482,7 +10587,7 @@ mod tests {
 
     #[test]
     fn staged_volume_refuses_a_resized_source_before_writes() {
-        let plan = plan(512, DISK).unwrap();
+        let plan = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         let len = (plan.volume_end - plan.volume_start + 1) * 512;
         for changed_len in [len - 512, len + 512] {
             let (disk, dir, mut destination, image) = unlaid_volume_image(len);
@@ -10526,7 +10631,7 @@ mod tests {
     fn refused_prepared_image_preserves_destination(fault: PreparedImageFault) {
         let disk = Scratch::disk(DISK);
         run_layout(&disk.path, &mut Vec::new()).unwrap();
-        let plan = plan(512, DISK).unwrap();
+        let plan = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         let offset = plan.volume_start * 512;
         let len = (plan.volume_end - plan.volume_start + 1) * 512;
         let ranges = [
@@ -10721,7 +10826,7 @@ mod tests {
 
     #[test]
     fn a_plan_puts_both_partitions_where_gpt_allows_and_alignment_requires() {
-        let p = plan(512, DISK).unwrap();
+        let p = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         let align = protocol::PARTITION_ALIGN_BYTES / 512;
 
         assert_eq!(p.esp_start % align, 0, "ESP start is 1 MiB aligned");
@@ -10753,7 +10858,7 @@ mod tests {
     /// next partition.
     #[test]
     fn partition_ends_are_inclusive() {
-        let p = plan(512, DISK).unwrap();
+        let p = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         // The ESP spans esp_end - esp_start + 1 sectors, so its declared size
         // is only exact if the end is the LAST sector rather than one past it.
         assert_eq!(p.esp_sectors().unwrap(), protocol::ESP_BYTES / 512);
@@ -10769,26 +10874,26 @@ mod tests {
 
     #[test]
     fn a_disk_too_small_for_retention_and_an_update_is_refused_by_name() {
-        let error = plan(512, protocol::ESP_BYTES + 64 * MIB).unwrap_err();
+        let error = plan(512, protocol::ESP_BYTES + 64 * MIB, VolumeEnd::LastUsable).unwrap_err();
         assert!(error.contains("td volume"), "{error}");
         // Smaller than the ESP itself: the volume never starts.
-        let error = plan(512, 16 * MIB).unwrap_err();
+        let error = plan(512, 16 * MIB, VolumeEnd::LastUsable).unwrap_err();
         assert!(error.contains("too small"), "{error}");
         // Smaller than a GPT, which is refused before any partition is placed.
-        let error = plan(512, 8 * 512).unwrap_err();
+        let error = plan(512, 8 * 512, VolumeEnd::LastUsable).unwrap_err();
         assert!(error.contains("GPT alone"), "{error}");
     }
 
     #[test]
     fn a_size_that_is_not_whole_sectors_is_refused() {
-        let error = plan(512, 8 * GIB + 1).unwrap_err();
+        let error = plan(512, 8 * GIB + 1, VolumeEnd::LastUsable).unwrap_err();
         assert!(error.contains("whole number"), "{error}");
     }
 
     /// 4Kn disks are laid out in their OWN sectors, not in 512-byte ones.
     #[test]
     fn a_4kn_disk_plans_in_its_own_sectors() {
-        let p = plan(4096, DISK).unwrap();
+        let p = plan(4096, DISK, VolumeEnd::LastUsable).unwrap();
         assert_eq!(p.sector_size, 4096);
         assert_eq!(p.disk_sectors, DISK / 4096);
         assert_eq!((p.esp_end - p.esp_start + 1) * 4096, protocol::ESP_BYTES);
@@ -10811,7 +10916,7 @@ mod tests {
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let table = scratch.table(DISK);
 
-        let p = plan(512, DISK).unwrap();
+        let p = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         assert_eq!(table.partitions.len(), 2);
         let esp = table.partitions.first().unwrap();
         let volume = table.partitions.get(1).unwrap();
@@ -10838,7 +10943,7 @@ mod tests {
     fn the_esp_is_a_fat32_volume_of_the_partitions_size() {
         let scratch = Scratch::disk(DISK);
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
-        let p = plan(512, DISK).unwrap();
+        let p = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
 
         let boot = scratch.read_at(p.esp_offset().unwrap(), 512);
         assert_eq!(boot.get(510..512).unwrap(), &[0x55, 0xaa], "boot signature");
@@ -10864,7 +10969,7 @@ mod tests {
     #[test]
     fn a_destination_with_a_stale_filesystem_is_zeroed_before_it_is_formatted() {
         let scratch = Scratch::disk(DISK);
-        let p = plan(512, DISK).unwrap();
+        let p = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         let at = p.esp_offset().unwrap();
         {
             let mut file = OpenOptions::new().write(true).open(&scratch.path).unwrap();
@@ -10945,7 +11050,7 @@ mod tests {
 
         {
             let mut file = OpenOptions::new().write(true).open(&scratch.path).unwrap();
-            let p = plan(512, DISK).unwrap();
+            let p = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
             let image = gpt::build(&gpt::Layout {
                 sector_size: 512,
                 disk_sectors: p.disk_sectors,
@@ -11065,7 +11170,7 @@ mod tests {
     /// by one FAT leaves the second copy holding whatever was there.
     #[test]
     fn the_metadata_region_covers_both_fats_and_the_root_cluster() {
-        let p = plan(512, DISK).unwrap();
+        let p = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
         let esp = fat::build(&fat::Volume {
             bytes_per_sector: 512,
             total_sectors: p.esp_sectors().unwrap(),
@@ -11431,7 +11536,7 @@ mod tests {
             reviewed.settings().clone(),
         )
         .unwrap();
-        let layout = plan(512, DISK).unwrap();
+        let layout = plan(512, DISK, VolumeEnd::EncryptionSectors).unwrap();
         let offset = layout.volume_start * 512;
         let header = device_bound::HEADER_BYTES;
         {
@@ -11675,11 +11780,81 @@ mod tests {
         assert_eq!(fit(&mut host), Err(Refusal::SourceUnavailable));
     }
 
+    /// A device-bound volume partition starts and ends on whole 4 KiB
+    /// encryption sectors, so stock cryptsetup's dynamic segment maps the
+    /// whole partition; it ends at most one encryption sector short of the
+    /// last usable LBA. The unencrypted plan still ends at the last usable
+    /// LBA and differs from it in nothing else.
+    #[test]
+    fn a_device_bound_volume_is_whole_encryption_sectors_and_unencrypted_is_unchanged() {
+        const GIB: u64 = 1 << 30;
+        let mut misaligned = 0;
+        for sector in [512u64, 4096] {
+            for disk in [
+                DISK,
+                8 * GIB,
+                8 * GIB + 512,
+                8 * GIB + 7 * 512,
+                8 * GIB + 4096 + 3 * 512,
+                6 * GIB + 1024 * 1024 - 512,
+                (8 * GIB + 3 * 4096) | 512,
+                64 * GIB + 5 * 512,
+            ] {
+                if !disk.is_multiple_of(sector) {
+                    continue;
+                }
+                let last = gpt::last_usable_lba(sector, disk / sector).unwrap();
+                let open = plan(sector, disk, VolumeEnd::LastUsable).unwrap();
+                if !open.volume_bytes().unwrap().is_multiple_of(4096) {
+                    misaligned += 1;
+                }
+                assert_eq!(open.volume_end, last, "{sector} {disk}");
+                let bound = plan(sector, disk, VolumeEnd::EncryptionSectors).unwrap();
+                let start = bound.volume_start * sector;
+                let len = bound.volume_bytes().unwrap();
+                assert_eq!(start % 4096, 0, "{sector} {disk}");
+                assert_eq!(len % 4096, 0, "{sector} {disk}");
+                assert!(bound.volume_end <= last);
+                assert!((last - bound.volume_end) * sector < 4096, "{sector} {disk}");
+                if sector == 4096 {
+                    assert_eq!(bound, open);
+                }
+                assert_eq!(
+                    Plan {
+                        volume_end: last,
+                        ..bound
+                    },
+                    open
+                );
+            }
+        }
+        // Some disks above end their usable range off an encryption sector.
+        assert!(misaligned > 0);
+        // The fit counts the partition's own length less the header.
+        let bound = plan(512, DISK, VolumeEnd::EncryptionSectors).unwrap();
+        let inside = bound.volume_bytes().unwrap() - device_bound::HEADER_BYTES;
+        let payloads = inside - GIB;
+        assert_eq!(
+            volume_fit(512, DISK, payloads, installation_plan::Storage::DeviceBound),
+            Ok(())
+        );
+        assert!(volume_fit(
+            512,
+            DISK,
+            payloads + 1,
+            installation_plan::Storage::DeviceBound
+        )
+        .is_err());
+    }
+
     /// The fit's arithmetic at its edges: the volume needs exactly one copy
     /// and a GiB, and the selector's length is the one prepared.
     #[test]
     fn the_fit_is_one_copy_and_a_gib_and_the_prepared_selector() {
-        let volume = plan(512, DISK).unwrap().volume_bytes().unwrap();
+        let volume = plan(512, DISK, VolumeEnd::LastUsable)
+            .unwrap()
+            .volume_bytes()
+            .unwrap();
         let most = volume - GIB;
         use installation_plan::Storage::{DeviceBound, Unencrypted};
         assert_eq!(volume_fit(512, DISK, most, Unencrypted), Ok(()));
@@ -11696,7 +11871,7 @@ mod tests {
         // header takes it below.
         let smallest = (1..)
             .map(|mib| mib << 20)
-            .find(|capacity| plan(512, *capacity).is_ok());
+            .find(|capacity| plan(512, *capacity, VolumeEnd::LastUsable).is_ok());
         let smallest = smallest.unwrap();
         assert_eq!(volume_fit(512, smallest, 0, Unencrypted), Ok(()));
         let error = volume_fit(512, smallest, 0, DeviceBound).unwrap_err();

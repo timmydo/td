@@ -1695,7 +1695,10 @@ takes two unsigned decimal byte counts, each at most twenty ASCII digits
 and within u64. Leading zero padding is allowed within that length
 bound; output numbers have no padding. It computes the same GPT
 partition layout that `layout` writes, for v1's supported 512-byte or
-4096-byte logical sectors. Invalid geometry, unaligned capacity or
+4096-byte logical sectors. That is the unencrypted layout: a
+device-bound installation ends the system volume on whole 4 KiB
+encryption sectors, up to 3.5 KiB earlier on a 512-byte disk (DESIGN.md
+"Disk layout"). Invalid geometry, unaligned capacity or
 insufficient space for the fixed ESP and minimum system volume refuses
 before output. It opens no files or devices, reads no sysfs attributes,
 generates no identities and starts no child process.

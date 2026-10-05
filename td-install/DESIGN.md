@@ -483,6 +483,15 @@ block on flash media. At 512 bytes that is LBA 2048 and at 4096 it is LBA
 4Kn disk laid out in 512-byte sectors has every LBA off by a factor of eight
 and firmware reads that as no table at all.
 
+Partition 2 ends at the last usable LBA, except on a device-bound plan:
+there it ends on the last usable LBA that leaves its length whole 4 KiB
+encryption sectors, at most 3.5 KiB short of the last usable LBA on a
+512-byte disk and nowhere short on a 4Kn one. The LUKS2 data segment is
+the rest of the partition, and dm-crypt maps a 4 KiB-sector segment only
+in whole sectors, so stock cryptsetup opening the partition from any
+medium must find it whole. Its 1 MiB-aligned start is already a whole
+encryption sector. The unencrypted layout is unchanged by this rule.
+
 **The ESP is at least 33 MiB.** This is not a round number chosen for
 comfort: `engine/src/fat.rs` refuses to format a volume below **66599
 sectors — 32.52 MiB**, because FAT32 is *defined* as at least 65525 clusters
@@ -890,11 +899,12 @@ unencrypted path, but neither copy of the new table is written until the
 recovery key is confirmed (below). A refusal by the layout's recheck
 before its first write leaves the disk untouched. The formatter then binds
 the loop over the layout's volume extent, which no table on the disk yet
-places, as "Publishing through a loop over the claim" does, its length
-rounded down to whole 4 KiB encryption sectors: cryptsetup refuses a
-device that is not, and the layout ends the volume at the last usable
-sector, which on a 512-byte disk need not be 4 KiB aligned. The at most
-3.5 KiB left past the loop stays unused. Then, on that loop:
+places, as "Publishing through a loop over the claim" does. The loop
+covers the whole partition, which the layout ends on whole 4 KiB
+encryption sectors ("Disk layout"); an extent that is not whole sectors
+is refused before the first write rather than shortened, because a
+format shorter than the partition would be a volume no mapping of the
+partition opens. Then, on that loop:
 
 1. draws the recovery key and the first-boot protector secret from
    `/dev/random` through td-protector;
@@ -1031,11 +1041,11 @@ untouched. Past that point the payloads td-boot publishes are bound only
 by their digests; a source that changes size afterwards meets ENOSPC
 during publication.
 
-A device-bound plan first rounds the volume down to whole 4 KiB
-encryption sectors and subtracts the 16 MiB LUKS2 header and keyslots
-area (ENCRYPTION.md "Device-bound formatting"), for this fit and for the
-layout's minimum volume size, which the volume inside the header must
-still hold.
+A device-bound plan subtracts from its partition, which the layout
+already ends on whole 4 KiB encryption sectors, the 16 MiB LUKS2 header
+and keyslots area (ENCRYPTION.md "Device-bound formatting"), for this
+fit and for the layout's minimum volume size, which the volume inside
+the header must still hold.
 
 Scratch is not sized here. The execution's workspace under `/run` holds
 the kernel copy, the selector and a sparse volume image whose blocks are

@@ -236,8 +236,11 @@ cryptsetup luksFormat --batch-mode --type luks2 --cipher aes-xts-plain64
 Each LUKS2 header copy is 16 KiB and the keyslots area fills the rest of
 the first 16 MiB, where the data segment starts (`--offset` counts
 512-byte sectors): cryptsetup's default layout, stated so that no version
-change moves it. Volume fit and the minimum volume size subtract those
-16 MiB. The protected-tier upgrade re-encrypts online with checksum
+change moves it. The segment's size is dynamic, the rest of the
+partition, which the layout ends on whole 4 KiB sectors (DESIGN.md "Disk
+layout") so that stock cryptsetup opens the partition itself. Volume fit
+and the minimum volume size subtract those 16 MiB from the partition's
+length. The protected-tier upgrade re-encrypts online with checksum
 resilience, whose hotzone lives in the keyslots area, so the layout keeps
 no data-shift reserve. The LUKS2 UUID is the plan's volume UUID, which the
 Btrfs filesystem inside and the prepared selector also carry, and the

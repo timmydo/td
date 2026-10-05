@@ -349,7 +349,12 @@ fn candidate(device: &Device, devices: &[Device]) -> bool {
     supported_disk_name(&device.name)
         && !device.read_only
         && matches!(disk.logical_sector_bytes, 512 | 4096)
-        && crate::plan(disk.logical_sector_bytes, device.bytes).is_ok()
+        && crate::plan(
+            disk.logical_sector_bytes,
+            device.bytes,
+            crate::VolumeEnd::LastUsable,
+        )
+        .is_ok()
         && devices
             .iter()
             .filter(|peer| {
