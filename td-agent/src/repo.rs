@@ -16,7 +16,7 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::git::{self, Failure};
 
@@ -24,9 +24,16 @@ use crate::git::{self, Failure};
 const MAX_ID: usize = 128;
 /// The most linked worktrees a repository has: td-jail binds no more.
 const MAX_WORKTREES: usize = 32;
-/// The most a maintenance git may say, and how long a checkout may take.
+/// The most a maintenance git may say, how long a checkout's git may
+/// take in all, and how long its cleanup after a failure.
 const MAX_SAID: u64 = 64 * 1024;
 const CHECKOUT_TIME: Duration = Duration::from_secs(600);
+const CLEANUP_TIME: Duration = Duration::from_secs(30);
+/// How long the instance running one checkout may take: its git, its
+/// cleanup and the jail's start and end, so the instance is never killed
+/// before the task has cleaned up.
+pub(crate) const TASK_TIME: Duration =
+    CHECKOUT_TIME.saturating_add(CLEANUP_TIME.saturating_add(Duration::from_secs(60)));
 /// The word a maintenance instance's entry is started with.
 pub const MAINTAIN: &str = "maintain";
 
@@ -397,8 +404,10 @@ pub fn add_worktree(repository: &Path, worktree: &Worktree) -> Result<PathBuf, S
 /// instance's entry, `td-agent maintain`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Task {
-    /// Makes the worktree's branch at `base`, refusing one that exists,
-    /// and checks the worktree out as its sparse patterns select.
+    /// Makes the worktree's branch at `base`, keeping one an earlier run
+    /// made, and checks the worktree out as its sparse patterns select.
+    /// Run only before its repository is recorded prepared, when nothing
+    /// else writes it.
     Checkout {
         /// The git the instance runs, by the path it has there.
         git: PathBuf,
@@ -471,7 +480,12 @@ impl Task {
                 base,
             } => {
                 let jailed = || jailed(git, repository, id, checkout);
-                let run = |args: &[&str]| git::run(jailed().args(args), MAX_SAID, CHECKOUT_TIME);
+                let now = Instant::now();
+                let deadline = now.checked_add(CHECKOUT_TIME).unwrap_or(now);
+                let run = |args: &[&str]| {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    git::run(jailed().args(args), MAX_SAID, left)
+                };
                 // `worktrees/<id>/` is the jail's to write once renamed into
                 // place: an index there was not made by this task.
                 let index = repository.join("worktrees").join(id).join("index");
@@ -482,23 +496,60 @@ impl Task {
                     ));
                 }
                 let reference = format!("refs/heads/{branch}");
-                // An empty old value: made, never moved.
-                run(&["update-ref", "--no-deref", &reference, base, ""])
-                    .map_err(|e| said("making the branch", &e))?;
+                // Until the repository is recorded prepared nothing but
+                // these tasks writes it (DESIGN.md §7), so a lock is one a
+                // run killed mid-step left, and would refuse every retry.
+                let linked = repository.join("worktrees").join(id);
+                for lock in [
+                    linked.join("index.lock"),
+                    linked.join("HEAD.lock"),
+                    repository.join(format!("{reference}.lock")),
+                    repository.join("packed-refs.lock"),
+                ] {
+                    match fs::remove_file(&lock) {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                            return Err(format!("{}: {e}", lock.display()));
+                        }
+                        _ => {}
+                    }
+                }
+                // An empty old value: made here, at the base. A branch
+                // already there was made by a run of this task a crash cut
+                // short, at the base resolved then, which is kept: a
+                // retry never moves a branch.
+                let at = match run(&["update-ref", "--no-deref", &reference, base, ""]) {
+                    Ok(_) => base.clone(),
+                    Err(made) => run(&[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        "--end-of-options",
+                        &format!("{reference}^{{commit}}"),
+                    ])
+                    .ok()
+                    .and_then(|said| String::from_utf8(said).ok())
+                    .map(|said| said.trim().to_string())
+                    .filter(|said| git::object_id(said))
+                    .ok_or_else(|| said("making the branch", &made))?,
+                };
                 // `HEAD` set here and the tree read by its id, not through
                 // a `HEAD` the jail could have written.
                 let checked = run(&["symbolic-ref", "HEAD", &reference])
                     // `--reset`: what an earlier, broken run wrote is
                     // overwritten, and the index check above leaves no
                     // tracked change to lose.
-                    .and_then(|_| run(&["read-tree", "--reset", "-u", base]));
+                    .and_then(|_| run(&["read-tree", "--reset", "-u", &at]));
                 if let Err(e) = checked {
-                    // Removed while it is still at the base, so a retry can
-                    // make it again.
-                    let _ = run(&["update-ref", "-d", &reference, base]);
+                    // Removed while it is still where it was made, so a
+                    // retry makes it again at the base it then resolves.
+                    let _ = git::run(
+                        jailed().args(["update-ref", "-d", &reference, &at]),
+                        MAX_SAID,
+                        CLEANUP_TIME,
+                    );
                     return Err(said("checking out", &e));
                 }
-                Ok(format!("{branch} checked out at {base}"))
+                Ok(format!("{branch} checked out at {at}"))
             }
         }
     }
@@ -543,6 +594,19 @@ fn jailed(git: &Path, repository: &Path, id: &str, checkout: &Path) -> Command {
         command.arg("-c").arg(setting);
     }
     command
+}
+
+/// The host's git, as a maintenance instance runs it: the first `git` on
+/// `PATH`, by the path it resolves to, which the jail's system trees must
+/// bind.
+pub fn host_git() -> Result<PathBuf, String> {
+    let path = std::env::var_os("PATH").ok_or("there is no PATH to find git on")?;
+    let found = std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())
+        .ok_or("there is no git on PATH")?;
+    fs::canonicalize(&found).map_err(|e| format!("{}: {e}", found.display()))
 }
 
 /// A maintenance entry's answer, its standard output's one line.
@@ -867,8 +931,9 @@ pub(crate) mod tests {
     }
 
     /// The task run as a maintenance instance runs it, here outside one:
-    /// the layout is git's to read, the branch is made and never moved,
-    /// and the checkout is the sparse cone's.
+    /// the layout is git's to read, the branch is made at the base, the
+    /// checkout is the sparse cone's, and a run a crash cut short is
+    /// taken up again, its branch kept where it was made.
     #[test]
     fn a_checkout_task_checks_the_cone_out_on_a_new_branch() {
         if !git::tests::have_git() {
@@ -901,15 +966,19 @@ pub(crate) mod tests {
             base: base.clone(),
         };
         // A checkout that fails removes the branch it made, so it can be
-        // asked again, over what it wrote: here an index it cannot lock,
-        // which stops root as anyone, and a file it left.
-        let lock = repository.join("worktrees/r/index.lock");
-        fs::write(&lock, "").unwrap();
+        // asked again, over what it wrote: here a file whose blob is
+        // missing from the store, which stops root as anyone, and a file
+        // it left.
+        let blob = plain(&store, &["rev-parse", &format!("{base}:top")]);
+        let (fan, rest) = blob.trim().split_at(2);
+        let object = store.join("objects").join(fan).join(rest);
+        let aside = store.join("objects/aside");
+        fs::rename(&object, &aside).unwrap();
         fs::write(checkout.join("top"), "left by a broken run\n").unwrap();
         let e = task.run().unwrap_err();
         assert!(e.starts_with("checking out"), "{e}");
         assert!(!repository.join("refs/heads/agent/one").exists());
-        fs::remove_file(&lock).unwrap();
+        fs::rename(&aside, &object).unwrap();
         // `HEAD` is set by the task, whatever the jail wrote there.
         let head = repository.join("worktrees/r/HEAD");
         fs::write(&head, "ref: refs/heads/elsewhere\n").unwrap();
@@ -942,26 +1011,6 @@ pub(crate) mod tests {
         // Checked out once: the index it made refuses a second run.
         let e = task.run().unwrap_err();
         assert!(e.contains("is not checked out again"), "{e}");
-        // Made, never moved: another worktree on the branch is refused.
-        let mut second = worktree(&scratch.0.join("tree/w/r2"), None);
-        second.id = "r2".into();
-        let checkout_two = add_worktree(&repository, &second).unwrap();
-        let task_two = Task::Checkout {
-            git: task_git(&task),
-            repository: repository.clone(),
-            id: "r2".into(),
-            checkout: checkout_two,
-            branch: "agent/one".into(),
-            base: base.clone(),
-        };
-        let e = task_two.run().unwrap_err();
-        assert!(e.starts_with("making the branch"), "{e}");
-        assert_eq!(
-            fs::read_to_string(repository.join("refs/heads/agent/one"))
-                .unwrap()
-                .trim(),
-            base
-        );
         // A commit there carries the repository's identity; no object is
         // copied from the store but the new ones.
         let mut commit = jailed(&task_git(&task), &repository, "r", &checkout);
@@ -980,6 +1029,48 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(String::from_utf8(said).unwrap(), "Human two\nt one\n");
+        // A run a crash cut short after making its branch, the base
+        // resolved again since and moved on: the branch is kept where it
+        // was made, and the locks the killed git left are cleared.
+        let mut third = worktree(&scratch.0.join("tree/w/r3"), None);
+        third.id = "r3".into();
+        third.branch = "agent/three".into();
+        let checkout_three = add_worktree(&repository, &third).unwrap();
+        let earlier = fs::read_to_string(repository.join("refs/heads/agent/one")).unwrap();
+        assert_ne!(earlier.trim(), base);
+        fs::write(repository.join("refs/heads/agent/three"), &earlier).unwrap();
+        let locks = [
+            "refs/heads/agent/three.lock",
+            "packed-refs.lock",
+            "worktrees/r3/index.lock",
+            "worktrees/r3/HEAD.lock",
+        ];
+        for lock in locks {
+            fs::write(repository.join(lock), "").unwrap();
+        }
+        let task_three = Task::Checkout {
+            git: task_git(&task),
+            repository: repository.clone(),
+            id: "r3".into(),
+            checkout: checkout_three.clone(),
+            branch: "agent/three".into(),
+            base: base.clone(),
+        };
+        assert_eq!(
+            task_three.run().unwrap(),
+            format!("agent/three checked out at {}", earlier.trim())
+        );
+        assert_eq!(
+            fs::read_to_string(checkout_three.join("top")).unwrap(),
+            "changed\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repository.join("refs/heads/agent/three")).unwrap(),
+            earlier
+        );
+        for lock in locks {
+            assert!(!repository.join(lock).exists(), "{lock}");
+        }
         assert!(!repository
             .join("objects/pack")
             .read_dir()

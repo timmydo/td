@@ -18,17 +18,23 @@ use crate::host::{Call, Done, Down, Up, MAX_CALLS, OUTPUT_CHUNK};
 use crate::shell::{self, Grep, Sed};
 
 /// What a tool host serves: the worktrees, the first being where a call
-/// names no directory, and td-txt for `grep` and `sed`.
+/// names no directory unless `directory` names it, and td-txt for `grep`
+/// and `sed`.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     pub roots: Vec<PathBuf>,
     pub txt: Option<PathBuf>,
+    /// Where a call that names no directory works, when that is not
+    /// the first root: a repository workspace's first worktree, which
+    /// may not be bound yet.
+    pub directory: Option<PathBuf>,
 }
 
 impl Config {
-    /// `--root DIR` (repeated) and `--txt PATH`, each absolute.
+    /// `--root DIR` (repeated), `--txt PATH` and `--directory DIR`, each
+    /// absolute.
     pub fn parse(args: &[String]) -> Result<Self, String> {
-        let usage = "usage: td-agent tool-host [--txt ABSOLUTE-PATH] [--root ABSOLUTE-DIR]...";
+        let usage = "usage: td-agent tool-host [--txt ABSOLUTE-PATH] [--directory ABSOLUTE-DIR] [--root ABSOLUTE-DIR]...";
         let mut config = Self::default();
         let mut rest = args.iter();
         while let Some(flag) = rest.next() {
@@ -39,14 +45,29 @@ impl Config {
             match flag.as_str() {
                 "--root" => config.roots.push(value),
                 "--txt" => config.txt = Some(value),
+                "--directory" => config.directory = Some(value),
                 _ => return Err(usage.into()),
             }
         }
         Ok(config)
     }
 
-    /// Where a call that names no directory works: the first worktree.
+    /// Where a call that names no directory works: the first worktree,
+    /// refused while it is not bound rather than another root in its
+    /// place.
     fn first(&self, what: &str) -> Result<PathBuf, String> {
+        if let Some(directory) = &self.directory {
+            return self
+                .roots
+                .contains(directory)
+                .then(|| directory.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "the working directory, {}, is not checked out yet; give `{what}` as an absolute path in a worktree that is",
+                        directory.display()
+                    )
+                });
+        }
         self.roots.first().cloned().ok_or_else(|| {
             format!("this workspace has no worktree; give `{what}` as an absolute path")
         })
@@ -474,9 +495,16 @@ mod tests {
 
     /// A tool host on a thread, served over a socketpair.
     fn host(roots: Vec<PathBuf>) -> Client {
+        hosted(Config {
+            roots,
+            ..Config::default()
+        })
+    }
+
+    fn hosted(config: Config) -> Client {
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
         let reader = theirs.try_clone().unwrap();
-        std::thread::spawn(move || serve(reader, theirs, Config { roots, txt: None }));
+        std::thread::spawn(move || serve(reader, theirs, config));
         Client::over(ours.try_clone().unwrap(), ours)
     }
 
@@ -748,6 +776,53 @@ mod tests {
             panic!("{up:?}")
         };
         assert!(why.contains("past the 1048576-byte frame"), "{why}");
+    }
+
+    /// A working directory not yet bound refuses a call that names no
+    /// directory, rather than another root taking its place.
+    #[test]
+    fn a_working_directory_not_bound_refuses_and_names_none_in_its_place() {
+        let other = std::env::temp_dir();
+        let mut client = hosted(Config {
+            roots: vec![other.clone()],
+            txt: None,
+            directory: Some("/w/not-yet".into()),
+        });
+        let id = client
+            .call(Call::Shell {
+                command: "true".into(),
+                timeout_ms: None,
+                workdir: None,
+            })
+            .unwrap();
+        let e = done(&mut client, id).unwrap_err();
+        assert!(e.contains("/w/not-yet, is not checked out yet"), "{e}");
+        let id = client
+            .call(Call::Shell {
+                command: "true".into(),
+                timeout_ms: None,
+                workdir: Some(other.display().to_string()),
+            })
+            .unwrap();
+        assert!(done(&mut client, id).is_ok());
+        let mut client = hosted(Config {
+            roots: vec![other.clone(), "/w/ready".into()],
+            txt: None,
+            directory: Some("/w/ready".into()),
+        });
+        let config = Config::parse(&["--directory".into(), "/w/ready".into()]).unwrap();
+        assert_eq!(config.directory, Some(PathBuf::from("/w/ready")));
+        assert!(Config::parse(&["--directory".into(), "w".into()]).is_err());
+        let id = client
+            .call(Call::Shell {
+                command: "true".into(),
+                timeout_ms: None,
+                workdir: None,
+            })
+            .unwrap();
+        // The bound working directory is chosen: it does not exist here.
+        let e = done(&mut client, id).unwrap_err();
+        assert!(e.contains("/w/ready"), "{e}");
     }
 
     #[test]

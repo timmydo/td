@@ -390,6 +390,124 @@ fn a_maintenance_instance_checks_out_and_a_jailed_git_commits() {
     );
 }
 
+/// A repository conversation prepares its workspace as the window
+/// answers its ask (DESIGN.md §7): the repository laid out, its worktree
+/// checked out in a maintenance instance, then recorded prepared and its
+/// tools bound to it.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL, TD_AGENT_TXT and a host git"]
+fn a_repository_conversation_prepares_its_workspace() {
+    use td_agent::protocol::{Down, Fetched, Up};
+    use td_agent::store::{Conversation, Id, Kind, Role, StateDir};
+    use td_agent::supervisor::{Supervisor, Update};
+    assert!(
+        bound_git().is_some(),
+        "no git on PATH in a tree the jail binds"
+    );
+    let scratch = Scratch::new("prepare");
+    let up = scratch.0.join("up");
+    for path in ["a/x", "top"] {
+        let file = up.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, format!("{path}\n")).unwrap();
+    }
+    plain(&up, &["init", "--quiet"]);
+    plain(&up, &["add", "."]);
+    plain(&up, &["commit", "--quiet", "-m", "one"]);
+    let id = Id::random().unwrap();
+    let template = td_agent::config::Template {
+        name: "td".into(),
+        repos: vec![td_agent::config::Repo {
+            remote: "https://example.org/a/td".into(),
+            base: "main".into(),
+            branch: "agent".into(),
+            sparse: Some(vec!["a".into()]),
+        }],
+        shared: None,
+    };
+    let made = td_agent::workspace::repositories(
+        &template,
+        &id,
+        &scratch.0.join("data"),
+        &scratch.0.join("trees"),
+        &[td_agent::git::Admission::parse("example.org").unwrap()],
+        0,
+    )
+    .unwrap();
+    let entry = made.entries.first().unwrap().clone();
+    // The store as the window's worker leaves it.
+    std::fs::create_dir_all(&entry.store).unwrap();
+    plain(&entry.store, &["init", "--quiet", "--bare"]);
+    let from = up.display().to_string();
+    plain(
+        &entry.store,
+        &["fetch", "--quiet", &from, "+refs/heads/*:refs/heads/*"],
+    );
+    let base = plain(&entry.store, &["rev-parse", "main"])
+        .trim()
+        .to_string();
+    let state = StateDir::at(scratch.0.join("state"));
+    state.ensure().unwrap();
+    let keyless = Down::Setup {
+        key: Err("no API key".into()),
+        client: td_agent::config::Client::default(),
+    };
+    let named = |var: &str| std::env::var_os(var).unwrap_or_else(|| panic!("{var}"));
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless)
+        .env(jail::JAIL_VAR, named(jail::JAIL_VAR))
+        .env(jail::TXT_VAR, named(jail::TXT_VAR));
+    supervisor
+        .create(
+            id.clone(),
+            Role::Conversation,
+            td_agent::workspace::Workspace::Repositories(made),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut asked = false;
+    let mut ready = None;
+    while ready.is_none() {
+        assert!(Instant::now() < deadline, "no notice came");
+        for (_, update) in supervisor.poll() {
+            match update {
+                Update::Up(Up::Fetch { remote, bases }) if !asked => {
+                    assert_eq!(bases, ["main"]);
+                    asked = true;
+                    supervisor.answer(
+                        &id,
+                        &Down::Fetched {
+                            remote,
+                            result: Ok(Fetched {
+                                identity: Identity {
+                                    name: Some("Human".into()),
+                                    email: Some("h@example.org".into()),
+                                },
+                                ids: vec![base.clone()],
+                            }),
+                        },
+                    );
+                }
+                Update::Up(Up::Event(event)) => {
+                    if let Kind::Notice { text } = event.kind {
+                        ready = Some(text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let said = ready.unwrap();
+    assert!(said.contains("is checked out and ready"), "{said}");
+    assert!(entry.checkout.join("a/x").is_file() && entry.checkout.join("top").is_file());
+    drop(supervisor);
+    let (conversation, _) = Conversation::open(&state, &id, None, Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        conversation.meta().prepared,
+        std::slice::from_ref(&entry.repository)
+    );
+}
+
 /// The instance dies with the process that launched it, killed with
 /// `SIGKILL` and so with no chance to clean up (§8).
 #[test]

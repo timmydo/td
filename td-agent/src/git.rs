@@ -787,6 +787,105 @@ pub(crate) enum Failure {
     TimedOut(Duration),
 }
 
+/// The window's store fetches (DESIGN.md §7, §9): one thread, which runs
+/// the git worker outside any jail on the stores alone, one fetch at a
+/// time, so two workspaces never fetch one store at once.
+pub struct Service {
+    jobs: mpsc::Sender<Job>,
+    done: mpsc::Receiver<Done>,
+}
+
+/// A conversation's ask: fetch `remote`'s store and resolve `bases`.
+struct Job {
+    conversation: crate::store::Id,
+    remote: Remote,
+    bases: Vec<String>,
+}
+
+/// A fetch's answer, for `conversation`.
+pub struct Done {
+    pub conversation: crate::store::Id,
+    pub remote: String,
+    pub result: Result<crate::protocol::Fetched, String>,
+}
+
+impl Service {
+    /// Starts the thread, whose worker keeps its files in `worker` and
+    /// its stores in `stores`; a worker that cannot be made answers every
+    /// ask with why.
+    pub fn start(worker: PathBuf, stores: PathBuf, env: Vec<(String, OsString)>) -> Self {
+        let (jobs, asked) = mpsc::channel::<Job>();
+        let (tell, done) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("td-agent-stores".into())
+            .spawn(move || {
+                let made = Worker::new(&worker, &env);
+                for job in asked {
+                    let result = match &made {
+                        Ok(made) => made.prepare(&stores, &job.remote, &job.bases),
+                        Err(why) => Err(format!("the git worker: {why}")),
+                    };
+                    let answer = Done {
+                        conversation: job.conversation,
+                        remote: job.remote.url(),
+                        result,
+                    };
+                    if tell.send(answer).is_err() {
+                        break;
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            eprintln!("td-agent: the store thread did not start: {e}");
+        }
+        Self { jobs, done }
+    }
+
+    /// Asks for `remote`'s store fetched and `bases` resolved there, for
+    /// `conversation`; the answer comes from `answers`.
+    pub fn ask(
+        &self,
+        conversation: crate::store::Id,
+        remote: Remote,
+        bases: Vec<String>,
+    ) -> Result<(), String> {
+        self.jobs
+            .send(Job {
+                conversation,
+                remote,
+                bases,
+            })
+            .map_err(|_| "the store thread has ended".to_string())
+    }
+
+    /// The answers that have come.
+    pub fn answers(&self) -> Vec<Done> {
+        self.done.try_iter().collect()
+    }
+}
+
+impl Worker {
+    /// The store for `remote` under `stores`, made if need be and
+    /// fetched, with `bases` resolved there and the human's identity.
+    fn prepare(
+        &self,
+        stores: &Path,
+        remote: &Remote,
+        bases: &[String],
+    ) -> Result<crate::protocol::Fetched, String> {
+        let store = self.store(stores, remote)?;
+        self.fetch(&store, remote)?;
+        let ids = bases
+            .iter()
+            .map(|base| self.resolve(&store, base))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::protocol::Fetched {
+            identity: self.identity()?,
+            ids,
+        })
+    }
+}
+
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1216,6 +1315,33 @@ pub(crate) mod tests {
             .store(&stores, &remote)
             .unwrap_err()
             .contains("another remote"));
+    }
+
+    #[test]
+    fn the_store_service_answers_each_ask_for_its_conversation() {
+        // A worker that cannot be made answers every ask with why.
+        let service = Service::start("relative".into(), "/nowhere".into(), Vec::new());
+        let id = crate::store::Id::random().unwrap();
+        let remote = Remote::parse("https://example.org/a/td").unwrap();
+        service
+            .ask(id.clone(), remote.clone(), vec!["main".into()])
+            .unwrap();
+        service
+            .ask(id.clone(), remote, vec!["next".into()])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut answers = Vec::new();
+        while answers.len() < 2 {
+            assert!(Instant::now() < deadline, "no answer came");
+            answers.extend(service.answers());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for done in answers {
+            assert_eq!(done.conversation, id);
+            assert_eq!(done.remote, "https://example.org/a/td");
+            let why = done.result.unwrap_err();
+            assert!(why.starts_with("the git worker"), "{why}");
+        }
     }
 
     #[test]

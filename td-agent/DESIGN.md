@@ -1772,9 +1772,8 @@ and `Escape` creates nothing.
 
 Choosing is the decision: no card follows it but a remote's admission
 (below). A template's repositories are prepared by increment 11's git
-worker (below); until it lands, a template that names any is refused at
-creation, saying that repository workspaces come with increment 11, and
-nothing is made. The conversation starts on the human's first message,
+worker (below; As built (increment 11, preparation)). The conversation
+starts on the human's first message,
 which can be sent at once. Two workspaces made from one template work
 on branches of the same name, each in a repository of its own (below),
 and a push names the remote branch it writes (§9).
@@ -1809,9 +1808,9 @@ Workspace column and the `conversations` tool name the workspace
 `template NAME`, and the
 question before a deletion says, by the workspace's kind and not its
 name, that a template's scratch directory goes with the conversation.
-A template naming repositories is listed, the finder's note saying it
-is refused until increment 11, and choosing it makes nothing and says
-why. Choosing Directory… goes straight to the folder chooser: a card
+A template naming repositories was listed then, the finder's note
+saying it was refused until increment 11, and choosing it made nothing;
+increment 11 prepares it (As built (increment 11, preparation)). Choosing Directory… goes straight to the folder chooser: a card
 that waited behind the template chooser waits behind it too.
 Without `./agent`'s jail no workspace can be made and there is nothing
 to choose: `C-n` starts a conversation with none at once, the reason on
@@ -1902,6 +1901,67 @@ maintenance instance, so a workspace sees new upstream commits without
 any network in its jail, and notifies each workspace conversation whose
 base advanced, which the window shows too. Rebasing is the
 conversation's own work.
+
+**As built (increment 11, preparation).** Choosing a template that
+names repositories makes its workspace's record at once, in the
+window: every remote admitted by `remotes` (one that is not refuses
+the template, saying to list it; the admission card is a later step),
+every base and branch a branch name td-agent passes to git, no branch
+named twice for one remote, at most 32 entries, no more directories
+bound than td-jail binds (32: its worktrees, repositories, stores and
+shared directories together), and a record of at most 16 KiB. The
+workspace is named from its template and the conversation's id,
+`<template>-<8 hex>`, and reserved by making `ws/<name>` in the data
+directory, which only one making can do: a name another workspace
+holds, there or as a tree under the workspace root, is passed over for
+a new id. Entries naming one remote share its repository,
+`ws/<name>/<repo>.git` in the data directory, each with a worktree of
+its own, `<repo>` for the first and `<repo>-<branch>` for the rest,
+under `<workspace_root>/<name>/`; and every path is fixed in `meta`'s
+`{"kind": "repositories", …}`, so an edited template moves nothing.
+The data directory is `$XDG_DATA_HOME/td-agent`, else
+`~/.local/share/td-agent`: a directory and no link, made the caller's
+alone (0700, an older one narrowed) and named as it resolves;
+td-agent's part of every data home is refused to directory workspaces
+and shared directories (§8). The conversation's process, at its start
+and after any restart, asks the window for each remote whose
+repository it has not recorded prepared (`Fetch`, with its bases). The
+window checks the remote against `remotes` again and hands it to its
+store thread, which runs the git worker on the stores outside any
+jail, one fetch at a time (`fetch_concurrency` and `fetch_interval`
+are not read yet), and answers with the human's identity and each
+base's commit, or why not. The process then lays the repository out
+and checks each worktree out in a maintenance instance (§8, As built
+(increment 11, the layout)), with the host's git by the path it
+resolves to, records the repository in `meta`'s `prepared`, and says
+in a notice in its log that it is ready, or why it is not, which the
+window shows; one that fails is asked for again when a process for the
+conversation next starts, as on opening it again. From its ask until
+it says it is done (`Prepared`) the window keeps its process when the
+conversation is left, as it keeps one with a turn under way. Its
+instances bind a repository, with its checkouts and its store's
+objects, only once it is recorded prepared: until then no instance but
+maintenance binds it, so what a run cut short left is td-agent's own,
+and the next run uses a whole repository or worktree id again, removes
+a checkout without its id, takes an index as a finished checkout,
+clears the git locks a killed run left (the worktree's `index.lock`
+and `HEAD.lock`, the branch's), and keeps a branch an earlier run made
+where it made it, at the base resolved then, so a retry never moves a
+branch. A checkout's git has ten minutes in all, and its instance
+longer, so a failure cleans up before the instance ends. A call into a
+worktree not yet ready is refused as outside the tool host's roots,
+and one that names no directory while the first worktree is not ready
+is refused (the tool host is told its working directory,
+`--directory`, rather than taking its first root), never run in
+another root. The prefix names every worktree with its remote, branch,
+base and paths whether or not it is ready, so it holds while they
+prepare. In this step the checkout runs on the conversation process's
+main thread, so a turn waits behind it, and the model is told nothing
+of it; the admission card, the workspace
+card, project instructions and rules from the base, background fetches
+and the model's notification are later steps, as is the cleanup:
+deleting the conversation leaves its repository workspace in place,
+which the deletion question says.
 
 **Empty and directory workspaces.** The Empty template makes a scratch
 workspace under the jail directory, for a general-assistant conversation
@@ -2416,12 +2476,19 @@ attributes and excludes files, submodules, every protocol and auto gc
 off on its command line. Its one task so far, `checkout`, trusts
 nothing in the id directory, which is the jail's to write once it is
 in place: it refuses one holding an `index`, makes the branch at the
-base with `update-ref` and an empty old value, so an existing branch is
-refused rather than moved, sets `HEAD` to it, and reads the base's tree
-by its id with `read-tree --reset -u`, which the sparse patterns
-select and which overwrites what a broken run left; a
-checkout that fails after making the branch removes it while it is
-still at the base, so the task can be asked again. A workspace
+base with `update-ref` and an empty old value, sets `HEAD` to it, and
+reads the branch's tree by its id with `read-tree --reset -u`, which
+the sparse patterns select and which overwrites what a broken run left;
+a checkout that fails after making the branch removes it while it is
+still where it was made, so the task can be asked again. It is run only
+before its repository is recorded prepared (§7, As built (increment
+11, preparation)), when nothing but these tasks writes the repository,
+which it cannot itself check: so it clears the locks a killed git left
+(the worktree's `index.lock` and `HEAD.lock`, the branch's and
+`packed-refs.lock`) and keeps a branch already there, which only an
+earlier run of it, cut short, made, checking that out instead of the
+base; that one worktree's branch is no other's is the workspace
+record's to hold, which refuses a branch named twice for one remote. A workspace
 repository is never fetched into: its remote-tracking refs will be set
 with `update-ref` from the ids the git worker reads in the trusted
 store, whose objects the alternates already reach, so its empty
@@ -3495,14 +3562,15 @@ default, except `jev_threshold` until it is calibrated (§11):
   - `repos`: the git repositories to check out, an array of tables each
     with a `remote`, a `base` (the ref the worktree starts from), a
     `branch` (the one it works on) and an optional `sparse`, the
-    cone-mode paths to check out, absent for the whole tree; until
-    increment 11 a template with any is refused at creation (§7);
+    cone-mode paths to check out, absent for the whole tree (§7);
   - `shared`: as the top-level `shared`, in place of it for this
     template's workspaces; absent, the top-level list;
   - `network` (later, with increment 15): `off`, `allowlist` or `open`
     for this template's workspaces; absent, the top-level `network`
-- `remotes`: the admitted git remotes (§7); default empty, so the first
-  workspace on a remote asks
+- `remotes`: the admitted git remotes (§7), each a remote's URL or a
+  host with a path prefix; default empty, so the first workspace on a
+  remote asks (until the admission card lands, a template whose remote
+  is not listed is refused, saying to list it)
 - `network`: the default policy, `off` or `allowlist`; default `allowlist`
 - `network_allowlist`: the default allowlist of §10, hosts with ports
 - `protected_branches`; default `["main", "master"]`
@@ -4019,6 +4087,35 @@ identity. `src/jail.rs` covers the spec's `checkout`, `repository` and
 store `read` lines in td-jail's order and that neither a repository nor
 the store is a root. The ignored live test is As built (increment 11,
 the layout)'s.
+
+For repository workspaces' preparation, `src/workspace.rs` covers a
+template's record (its name, a shared repository for one remote's
+entries and a worktree each, another remote of the same name a
+repository of its own, the paths under the data directory and the
+workspace root, its round trip through `meta` and the process's
+argument; refused: an unadmitted remote, a branch twice for one
+remote, a branch git would misread, a transport other than https and
+ssh, no repositories) and that its policy binds only what is prepared,
+a repository's checkouts its roots; `src/store.rs` that `prepared` is
+kept once, through the window's archiving, absent in a meta written
+before and refused relative; `src/protocol.rs` the round trips of
+`Fetch`, `Fetched` and `Prepared`, and a `Fetch` past 32 bases refused;
+`src/git.rs` that the store service answers each ask for its
+conversation; `src/config.rs` `remotes`; `src/prompt.rs` the worktrees
+in the environment block; `src/repo.rs` a checkout resumed after a
+crash, its branch kept where it was made though the base moved and its
+stale locks cleared, and a failed checkout (a blob missing from the
+store) removing its branch; `src/workspace.rs` too a name reserved
+once, the bound on directories and on the record, the policy's
+working directory and its bound, and the data directory narrowed and
+refused as a link; and `src/toolhost.rs` a call naming no directory
+refused while the working directory is not bound. `tests/processes.rs`
+has a new repository conversation ask once for its store, with its
+bases, be kept while it prepares though left and retired once done,
+and say a refusal in its log, recording nothing; the ignored
+live test in `tests/jail.rs` answers a conversation's ask with a real
+store and finds its worktree checked out, its notice said and its
+repository recorded prepared.
 
 For row menus and archiving, `src/menu.rs` covers the row menu's items
 for a live and an archived conversation, each activating its action,

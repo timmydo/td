@@ -54,7 +54,7 @@ use crate::history;
 use crate::host;
 use crate::key::Secret;
 use crate::models::{Model, Models};
-use crate::protocol::{Down, Up, MAX_TEXT};
+use crate::protocol::{Down, Fetched as Stored, Up, MAX_TEXT};
 use crate::sse::{self, Fault};
 use crate::store::{
     self, Basis, Call, Conversation, Effect, Event, Held, Id, Kind, Purpose, Role, StateDir,
@@ -62,7 +62,7 @@ use crate::store::{
 };
 use crate::tools::{self, Args, Listed, Op, Reach};
 use crate::wake;
-use crate::workspace::Workspace;
+use crate::workspace::{Entry, Workspace};
 
 /// What a turn ends with when there is no window settings to make a
 /// request with: the window sends them first, so only a harness that
@@ -278,6 +278,7 @@ pub fn serve_in(
     for event in session.conversation.events().to_vec() {
         session.send(&Up::Event(event));
     }
+    session.ask_stores();
     session.serve()
 }
 
@@ -514,6 +515,7 @@ impl Session {
                 Down::Pause { paused } => self.pause(paused)?,
                 Down::ClearTodo => self.clear_todo()?,
                 Down::Choose { model, effort } => self.choose(model, effort)?,
+                Down::Fetched { remote, result } => self.stored(remote, result)?,
                 // A reservation granted after its request gave up waiting:
                 // nothing was sent, so the window's hold is released.
                 Down::Reservation { id, refusal: None } => self.spent(id, 0),
@@ -1187,6 +1189,150 @@ impl Session {
         Ok(())
     }
 
+    /// A repository workspace's stores, asked of the window for each
+    /// repository not yet prepared (DESIGN.md §7); each answer prepares
+    /// its repository (`stored`). A process started again asks again.
+    fn ask_stores(&mut self) {
+        let meta = self.conversation.meta();
+        let Some(Workspace::Repositories(repositories)) = &meta.workspace else {
+            return;
+        };
+        let mut asks: Vec<(String, Vec<String>)> = Vec::new();
+        for entry in &repositories.entries {
+            if meta.prepared.contains(&entry.repository) {
+                continue;
+            }
+            match asks.iter_mut().find(|(remote, _)| *remote == entry.remote) {
+                Some((_, bases)) => bases.push(entry.base.clone()),
+                None => asks.push((entry.remote.clone(), vec![entry.base.clone()])),
+            }
+        }
+        for (remote, bases) in asks {
+            self.send(&Up::Fetch { remote, bases });
+        }
+    }
+
+    /// The window's answer for `remote`'s store (`prepare`), then the
+    /// window told this process is done with it, so it may retire it.
+    fn stored(&mut self, remote: String, result: Result<Stored, String>) -> Result<(), String> {
+        let prepared = self.prepare(&remote, result);
+        self.send(&Up::Prepared { remote });
+        prepared
+    }
+
+    /// `remote`'s repository laid out and each of its worktrees checked
+    /// out in a maintenance instance, then recorded prepared, which its
+    /// instances bind from the next call; said in the log either way.
+    /// One that fails is asked for again only when a process for this
+    /// conversation next starts.
+    fn prepare(&mut self, remote: &str, result: Result<Stored, String>) -> Result<(), String> {
+        let meta = self.conversation.meta().clone();
+        let Some(Workspace::Repositories(repositories)) = &meta.workspace else {
+            return Ok(());
+        };
+        let entries: Vec<&Entry> = repositories
+            .entries
+            .iter()
+            .filter(|entry| entry.remote == remote)
+            .collect();
+        let Some(first) = entries.first() else {
+            return Ok(());
+        };
+        let repository = first.repository.clone();
+        if meta.prepared.contains(&repository) {
+            return Ok(());
+        }
+        let text = match result.and_then(|fetched| self.check_out(&meta.id, &entries, &fetched)) {
+            Ok(()) => {
+                self.conversation.set_prepared(&repository)?;
+                let ready: Vec<String> = entries
+                    .iter()
+                    .map(|entry| entry.checkout.display().to_string())
+                    .collect();
+                format!("{remote} is checked out and ready: {}", ready.join(", "))
+            }
+            Err(why) => format!("{remote} could not be prepared: {why}"),
+        };
+        self.log(Kind::Notice { text })?;
+        self.sync()
+    }
+
+    /// Lays out `entries`' repository, one remote's, and checks each
+    /// worktree out in a maintenance instance, at the bases `fetched`
+    /// resolved. Until it is recorded prepared no instance but these binds
+    /// the repository, so what a run cut short left is td-agent's own: a
+    /// whole repository or worktree id is used again, a checkout without
+    /// its id removed and made again, and an index is a checkout that
+    /// ended before it was recorded.
+    fn check_out(&self, id: &Id, entries: &[&Entry], fetched: &Stored) -> Result<(), String> {
+        if fetched.ids.len() != entries.len() {
+            return Err("the window resolved another number of bases".into());
+        }
+        let first = entries.first().ok_or("no worktree to check out")?;
+        let repository = &first.repository;
+        let programs = crate::jail::Programs::from_env()?;
+        let git = crate::repo::host_git()?;
+        if std::fs::symlink_metadata(repository).is_err() {
+            crate::repo::create(repository, &first.store, &fetched.identity)?;
+        }
+        for entry in entries {
+            let linked = repository.join("worktrees").join(&entry.id);
+            if std::fs::symlink_metadata(&linked).is_ok() {
+                continue;
+            }
+            if std::fs::symlink_metadata(&entry.checkout).is_ok() {
+                std::fs::remove_dir_all(&entry.checkout)
+                    .map_err(|e| format!("{}: {e}", entry.checkout.display()))?;
+            }
+            crate::repo::add_worktree(
+                repository,
+                &crate::repo::Worktree {
+                    id: entry.id.clone(),
+                    checkout: entry.checkout.clone(),
+                    branch: entry.branch.clone(),
+                    sparse: entry.sparse.clone(),
+                },
+            )?;
+        }
+        let dir = crate::workspace::jail_dir(&StateDir::at(self.state.clone()), id);
+        let policy = crate::jail::Policy {
+            home: dir.join("maintenance"),
+            checkouts: entries.iter().map(|entry| entry.checkout.clone()).collect(),
+            repositories: vec![repository.clone()],
+            objects: vec![first.store.join("objects")],
+            ..crate::jail::Policy::default()
+        };
+        for (entry, base) in entries.iter().zip(&fetched.ids) {
+            let index = repository.join("worktrees").join(&entry.id).join("index");
+            if std::fs::symlink_metadata(&index).is_ok() {
+                continue;
+            }
+            let task = crate::repo::Task::Checkout {
+                git: git.clone(),
+                repository: repository.clone(),
+                id: entry.id.clone(),
+                checkout: entry.checkout.clone(),
+                branch: entry.branch.clone(),
+                base: base.clone(),
+            };
+            crate::jail::maintain(
+                &programs,
+                &policy,
+                &dir.join("specs"),
+                &task,
+                crate::repo::TASK_TIME,
+            )
+            .map_err(|why| {
+                format!(
+                    "checking {} out with {}: {why}",
+                    entry.checkout.display(),
+                    git.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     /// The prefix this conversation's requests begin with: for one in a
     /// workspace, the workspace prepared for `client`'s shared directories
     /// and named, with its tools.
@@ -1198,17 +1344,30 @@ impl Session {
         let state = StateDir::at(self.state.clone());
         let policy = self
             .bench
-            .prepare(workspace, &state, &meta.id, client.shared_for(workspace))
+            .prepare(
+                workspace,
+                &state,
+                &meta.id,
+                client.shared_for(workspace),
+                &meta.prepared,
+            )
             .map_err(|e| format!("the workspace could not be prepared: {e}"))?;
-        let directory = policy
-            .worktrees
-            .first()
-            .ok_or("the workspace has no directory")?;
+        // Named whether or not they are ready, so the prefix holds.
+        let repositories = match workspace {
+            Workspace::Repositories(repositories) => Some(repositories),
+            _ => None,
+        };
+        let directory = match repositories {
+            Some(repositories) => repositories.entries.first().map(|entry| &entry.checkout),
+            None => policy.worktrees.first(),
+        }
+        .ok_or("the workspace has no directory")?;
         let place = crate::prompt::Place {
             scratch: workspace.scratch(),
             directory,
             read: &policy.read,
             write: &policy.write,
+            repositories,
         };
         Ok(crate::prompt::prefix_in(meta.created, Some(&place)))
     }

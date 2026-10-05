@@ -1382,7 +1382,12 @@ impl App {
             }
             // The window's ledger and post answer these; nothing shows.
             Update::Up(
-                Up::Reserve { .. } | Up::Spent { .. } | Up::Send { .. } | Up::Query { .. },
+                Up::Reserve { .. }
+                | Up::Spent { .. }
+                | Up::Send { .. }
+                | Up::Query { .. }
+                | Up::Fetch { .. }
+                | Up::Prepared { .. },
             )
             | Update::Undeliverable { .. } => {}
             Update::Up(Up::Delta {
@@ -2771,7 +2776,7 @@ impl App {
             (name.clone(), meta.to_string())
         }));
         let note = if self.templates.iter().any(|(_, repos)| *repos) {
-            "a template naming repositories is refused until increment 11 prepares them"
+            "a repository template's worktrees are checked out in the background; its remotes must be in `remotes`"
         } else {
             "Empty is a private scratch directory; Directory\u{2026} is a folder of yours"
         };
@@ -5594,7 +5599,7 @@ pub mod tests {
         app.set_no_workspaces(None);
         app.set_templates(vec![("notes".into(), false), ("td".into(), true)]);
         // The built-ins, then the templates in the order written, Empty
-        // selected; the note says a repository template waits.
+        // selected; the note says how a repository template prepares.
         key(&mut app, "C-n");
         assert_eq!(app.picking(), "template");
         let picker = app.picker().unwrap();
@@ -5607,7 +5612,7 @@ pub mod tests {
         assert_eq!(listed, ["Empty", "Directory\u{2026}", "notes", "td"]);
         assert_eq!(picker.selected(), Some("Empty"));
         assert!(
-            text(&app).contains("refused until increment 11"),
+            text(&app).contains("checked out in the background"),
             "{}",
             text(&app)
         );

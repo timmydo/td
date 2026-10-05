@@ -69,6 +69,14 @@ fn worked(workspace: Option<&Workspace>) -> String {
             "The directory it works in, {}, is yours and stays.",
             directory.display()
         ),
+        // Its cleanup is a later step of increment 11 (DESIGN.md §7).
+        Some(Workspace::Repositories(repositories)) => format!(
+            "Its repository workspace, made from template {}, stays for now: its worktrees in {} and its repositories are not yet removed with it.",
+            repositories.template,
+            repositories
+                .tree()
+                .map_or_else(|| "the workspace root".to_string(), |tree| tree.display().to_string())
+        ),
         None => String::new(),
     }
 }

@@ -60,6 +60,21 @@ pub enum Down {
     /// The human's decision on the card the conversation asked for call
     /// `call` (its `ToolCall`'s sequence number).
     Decision { call: u64, allow: bool },
+    /// The answer to a `Fetch` of `remote`: the store fetched and each
+    /// base resolved, or why not.
+    Fetched {
+        remote: String,
+        result: Result<Fetched, String>,
+    },
+}
+
+/// A fetched store, for a repository workspace's preparation (DESIGN.md
+/// §7): the human's identity its commits carry, and each base asked for
+/// resolved to its commit, in the order asked.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Fetched {
+    pub identity: crate::repo::Identity,
+    pub ids: Vec<String>,
 }
 
 /// From a conversation to the window.
@@ -135,6 +150,17 @@ pub enum Up {
     Withdraw {
         call: u64,
     },
+    /// A repository workspace's store for `remote` is wanted: the window
+    /// fetches it and resolves `bases` there, and answers with `Fetched`.
+    Fetch {
+        remote: String,
+        bases: Vec<String>,
+    },
+    /// The conversation is done preparing `remote`'s repository, ready or
+    /// not: until then the window keeps its process (DESIGN.md §7).
+    Prepared {
+        remote: String,
+    },
 }
 
 fn typed(kind: &str, mut pairs: Vec<(String, Json)>) -> Vec<u8> {
@@ -171,6 +197,30 @@ fn maybe(value: &Json, name: &str) -> Result<Option<String>, String> {
         _ => Err(format!("no {name}")),
     }
 }
+
+/// A member that is a list of texts.
+fn strings(value: &Json, name: &str) -> Result<Vec<String>, String> {
+    let strings: Vec<String> = value
+        .get(name)
+        .and_then(Json::as_arr)
+        .ok_or_else(|| format!("no {name}"))?
+        .iter()
+        .take(MAX_STRINGS + 1)
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("{name} holds something other than text"))
+        })
+        .collect::<Result<_, _>>()?;
+    if strings.len() > MAX_STRINGS {
+        return Err(format!("{name} holds more than {MAX_STRINGS} items"));
+    }
+    Ok(strings)
+}
+
+/// The most bases a `Fetch` asks and commits a `Fetched` answers, as
+/// many as a repository workspace has worktrees.
+const MAX_STRINGS: usize = crate::workspace::MAX_ENTRIES;
 
 fn number(value: &Json, name: &str) -> Result<u64, String> {
     value
@@ -267,6 +317,22 @@ impl Down {
                     ("allow".into(), Json::Bool(*allow)),
                 ],
             ),
+            Self::Fetched { remote, result } => {
+                let mut pairs = vec![("remote".into(), Json::Str(remote.clone()))];
+                match result {
+                    Ok(fetched) => pairs.extend([
+                        ("error".into(), Json::Null),
+                        ("name".into(), optional(&fetched.identity.name)),
+                        ("email".into(), optional(&fetched.identity.email)),
+                        (
+                            "ids".into(),
+                            Json::Arr(fetched.ids.iter().cloned().map(Json::Str).collect()),
+                        ),
+                    ]),
+                    Err(why) => pairs.push(("error".into(), Json::Str(why.clone()))),
+                }
+                typed("fetched", pairs)
+            }
         }
     }
 
@@ -365,6 +431,19 @@ impl Down {
                     .and_then(Json::as_bool)
                     .ok_or("no allow")?,
             }),
+            Some("fetched") => Ok(Self::Fetched {
+                remote: string(&value, "remote")?,
+                result: match maybe(&value, "error")? {
+                    Some(why) => Err(why),
+                    None => Ok(Fetched {
+                        identity: crate::repo::Identity {
+                            name: maybe(&value, "name")?,
+                            email: maybe(&value, "email")?,
+                        },
+                        ids: strings(&value, "ids")?,
+                    }),
+                },
+            }),
             other => Err(format!("unknown message {other:?}")),
         }
     }
@@ -445,6 +524,20 @@ impl Up {
                 ],
             ),
             Self::Query { id } => typed("query", vec![("id".into(), Json::from(*id))]),
+            Self::Prepared { remote } => typed(
+                "prepared",
+                vec![("remote".into(), Json::Str(remote.clone()))],
+            ),
+            Self::Fetch { remote, bases } => typed(
+                "fetch",
+                vec![
+                    ("remote".into(), Json::Str(remote.clone())),
+                    (
+                        "bases".into(),
+                        Json::Arr(bases.iter().cloned().map(Json::Str).collect()),
+                    ),
+                ],
+            ),
             Self::Ask {
                 call,
                 title,
@@ -539,6 +632,13 @@ impl Up {
             Some("withdraw") => Self::Withdraw {
                 call: number(&value, "call")?,
             },
+            Some("fetch") => Self::Fetch {
+                remote: string(&value, "remote")?,
+                bases: strings(&value, "bases")?,
+            },
+            Some("prepared") => Self::Prepared {
+                remote: string(&value, "remote")?,
+            },
             other => return Err(format!("unknown message {other:?}")),
         })
     }
@@ -552,6 +652,18 @@ mod tests {
 
     fn delivery_text() -> String {
         "0123456789abcdef0123456789abcdef".into()
+    }
+
+    #[test]
+    fn a_fetch_asks_at_most_as_many_bases_as_a_workspace_has_worktrees() {
+        let fetch = |n: usize| Up::Fetch {
+            remote: "https://github.com/timmydo/td".into(),
+            bases: vec!["main".into(); n],
+        };
+        let most = fetch(MAX_STRINGS);
+        assert_eq!(Up::decode(&most.encode()).unwrap(), most);
+        let e = Up::decode(&fetch(MAX_STRINGS + 1).encode()).unwrap_err();
+        assert!(e.contains("more than 32"), "{e}");
     }
 
     #[test]
@@ -590,6 +702,13 @@ mod tests {
                 text: "hi".into(),
             },
             Up::Query { id: 6 },
+            Up::Fetch {
+                remote: "https://github.com/timmydo/td".into(),
+                bases: vec!["main".into(), "next".into()],
+            },
+            Up::Prepared {
+                remote: "https://github.com/timmydo/td".into(),
+            },
             Up::Ask {
                 call: 9,
                 title: "Run a command?".into(),
@@ -710,6 +829,20 @@ mod tests {
             },
             Down::Retry,
             Down::Interrupt,
+            Down::Fetched {
+                remote: "https://github.com/timmydo/td".into(),
+                result: Ok(Fetched {
+                    identity: crate::repo::Identity {
+                        name: Some("Human".into()),
+                        email: None,
+                    },
+                    ids: vec!["a".repeat(40)],
+                }),
+            },
+            Down::Fetched {
+                remote: "https://github.com/timmydo/td".into(),
+                result: Err("the remote has no branch \"main\"".into()),
+            },
         ] {
             assert_eq!(Down::decode(&down.encode()).unwrap(), down);
         }

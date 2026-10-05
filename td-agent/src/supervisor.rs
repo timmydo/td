@@ -92,6 +92,9 @@ struct Running {
     /// Told to resume and not yet heard resuming: a turn for what it
     /// held may be about to start, so it is kept.
     resuming: bool,
+    /// The remotes it asked the window for and has not said prepared:
+    /// a repository workspace being made ready, kept until it is.
+    preparing: Vec<String>,
 }
 
 impl Running {
@@ -102,6 +105,7 @@ impl Running {
     fn working(&self) -> bool {
         self.busy.is_some()
             || self.resuming
+            || !self.preparing.is_empty()
             || !self.pending.is_empty()
             || !self.deliveries.is_empty()
     }
@@ -193,6 +197,7 @@ impl Supervisor {
             restarts: 0,
             failed: false,
             busy: None,
+            preparing: Vec::new(),
             resuming: false,
         });
         Ok(())
@@ -347,6 +352,7 @@ impl Supervisor {
             restarts: 0,
             failed: false,
             busy: None,
+            preparing: Vec::new(),
             resuming: false,
         });
         self.open = Some(id);
@@ -676,7 +682,15 @@ fn drain(running: &mut Running, updates: &mut Vec<(Id, Update)>) -> Option<Strin
                         Up::Hello { .. } => {
                             running.busy = None;
                             running.resuming = false;
+                            // A process started again asks again.
+                            running.preparing.clear();
                         }
+                        Up::Fetch { remote, .. } => {
+                            if !running.preparing.contains(remote) {
+                                running.preparing.push(remote.clone());
+                            }
+                        }
+                        Up::Prepared { remote } => running.preparing.retain(|r| r != remote),
                         Up::Event(event) => match event.kind {
                             // Logged after any turn it starts, whose start
                             // has marked the child busy.

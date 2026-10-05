@@ -113,17 +113,20 @@ impl Client {
     /// and none when its template is no longer configured, so removing or
     /// renaming one never widens what its conversations reach.
     pub fn shared_for(&self, workspace: &Workspace) -> &[Shared] {
-        match workspace {
-            Workspace::Template(name) => {
-                match self.template_shared.iter().find(|t| &t.name == name) {
-                    Some(TemplateShared {
-                        shared: Some(own), ..
-                    }) => own,
-                    Some(TemplateShared { shared: None, .. }) => &self.shared,
-                    None => &[],
-                }
-            }
-            Workspace::Scratch | Workspace::Directory(_) => &self.shared,
+        let template = match workspace {
+            Workspace::Template(name) => Some(name),
+            Workspace::Repositories(repositories) => Some(&repositories.template),
+            Workspace::Scratch | Workspace::Directory(_) => None,
+        };
+        match template {
+            Some(name) => match self.template_shared.iter().find(|t| &t.name == name) {
+                Some(TemplateShared {
+                    shared: Some(own), ..
+                }) => own,
+                Some(TemplateShared { shared: None, .. }) => &self.shared,
+                None => &[],
+            },
+            None => &self.shared,
         }
     }
 
@@ -352,7 +355,7 @@ const KEYS: &[(&str, Use)] = &[
     ("workspace_root", Use::Read),
     ("shared", Use::Read),
     ("template", Use::Read),
-    ("remotes", Use::Later(11)),
+    ("remotes", Use::Read),
     ("network", Use::Later(15)),
     ("network_allowlist", Use::Later(15)),
     ("protected_branches", Use::Later(14)),
@@ -398,6 +401,9 @@ pub struct Config {
     pub shared: Option<Vec<Shared>>,
     /// `[[template]]` in the order written (DESIGN.md §7).
     pub templates: Vec<Template>,
+    /// `remotes`: the git remotes the human admitted, each a remote or a
+    /// host with a path prefix (DESIGN.md §7, Admitted remotes).
+    pub remotes: Vec<crate::git::Admission>,
 }
 
 /// A workspace template (DESIGN.md §7, §15).
@@ -747,6 +753,18 @@ pub fn parse(text: &str) -> Result<Config, String> {
     if let Some(value) = table.get("template") {
         config.templates = templates(value, &mut config.notes)?;
     }
+    if let Some(value) = table.get("remotes") {
+        let wrong = "`remotes` is a list of remotes, each a URL or a host with a path prefix";
+        config.remotes = value
+            .as_arr()
+            .ok_or(wrong)?
+            .iter()
+            .map(|item| {
+                let text = item.as_str().ok_or(wrong)?;
+                crate::git::Admission::parse(text).map_err(|e| format!("`remotes`: {e}"))
+            })
+            .collect::<Result<_, String>>()?;
+    }
     let client = &mut config.client;
     for (key, slot) in [
         ("max_cost_per_turn", &mut client.limits.turn),
@@ -868,6 +886,32 @@ mod tests {
             ..Client::default()
         };
         assert_eq!(Client::from_json(&client.to_json()).unwrap(), client);
+    }
+
+    #[test]
+    fn remotes_are_read_as_admissions() {
+        let config = parse("remotes = [\"github.com/timmydo\", \"git@example.org:a/b\"]").unwrap();
+        let remote = |text| crate::git::Remote::parse(text).unwrap();
+        assert_eq!(config.remotes.len(), 2);
+        assert!(config
+            .remotes
+            .first()
+            .unwrap()
+            .admits(&remote("https://github.com/timmydo/td")));
+        assert!(config
+            .remotes
+            .get(1)
+            .unwrap()
+            .admits(&remote("git@example.org:a/b.git")));
+        for (text, why) in [
+            ("remotes = \"github.com\"", "a list"),
+            ("remotes = [1]", "a list"),
+            ("remotes = [\"http://github.com/a\"]", "`remotes`"),
+        ] {
+            let e = parse(text).unwrap_err();
+            assert!(e.contains(why), "{text}: {e}");
+        }
+        assert!(parse("").unwrap().remotes.is_empty());
     }
 
     #[test]

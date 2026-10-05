@@ -24,9 +24,9 @@ use crate::workspace::{self, Shared, Workspace};
 pub struct Bench {
     /// The jail's programs, found once; why there are none otherwise.
     programs: Option<Result<Programs, String>>,
-    /// The policy and specs directory, for the shared directories they
-    /// were worked out with.
-    policy: Option<(Vec<Shared>, Policy, PathBuf)>,
+    /// The policy and specs directory, for the shared directories and
+    /// prepared repositories they were worked out with.
+    policy: Option<(Vec<Shared>, Vec<PathBuf>, Policy, PathBuf)>,
     /// The file tools' instance, between calls.
     files: Option<Client>,
     digests: BTreeMap<String, String>,
@@ -42,31 +42,32 @@ pub fn fresh(call: &Call) -> bool {
 }
 
 impl Bench {
-    /// Works out the policy for `workspace` with `shared`, unless it is
-    /// worked out for them already; a new one retires the file tools'
-    /// instance, which binds the old.
+    /// Works out the policy for `workspace` with `shared` and the
+    /// repositories `prepared`, unless it is worked out for them already;
+    /// a new one retires the file tools' instance, which binds the old
+    /// (DESIGN.md §7: it is replaced when the ready worktrees change).
     pub fn prepare(
         &mut self,
         workspace: &Workspace,
         state: &StateDir,
         id: &Id,
         shared: &[Shared],
+        prepared: &[PathBuf],
     ) -> Result<&Policy, String> {
         if self.programs.is_none() {
             self.programs = Some(Programs::from_env());
         }
-        let current = self
-            .policy
-            .as_ref()
-            .is_some_and(|(with, _, _)| with.as_slice() == shared);
+        let current = self.policy.as_ref().is_some_and(|(with, ready, _, _)| {
+            with.as_slice() == shared && ready.as_slice() == prepared
+        });
         if !current {
-            let (policy, specs) = workspace::policy(workspace, state, id, shared)?;
+            let (policy, specs) = workspace::policy(workspace, state, id, shared, prepared)?;
             self.files = None;
-            self.policy = Some((shared.to_vec(), policy, specs));
+            self.policy = Some((shared.to_vec(), prepared.to_vec(), policy, specs));
         }
         self.policy
             .as_ref()
-            .map(|(_, policy, _)| policy)
+            .map(|(_, _, policy, _)| policy)
             .ok_or_else(|| "no workspace policy".to_string())
     }
 
@@ -113,7 +114,7 @@ impl Bench {
             Some(Err(why)) => return Err(why.clone()),
             None => return Err("the workspace is not prepared".into()),
         };
-        let (_, policy, specs) = self
+        let (_, _, policy, specs) = self
             .policy
             .as_ref()
             .ok_or("the workspace is not prepared")?;

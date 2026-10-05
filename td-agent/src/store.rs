@@ -542,6 +542,11 @@ pub struct Meta {
     /// process for it and routes no message to it until unarchived. Only
     /// the window writes it; absent and false in a meta written before.
     pub archived: bool,
+    /// A repository workspace's repositories its process has checked
+    /// out, which its instances then bind (DESIGN.md §7); only that
+    /// process writes it, never from what a jail could have written.
+    /// Absent and empty in a meta written before.
+    pub prepared: Vec<PathBuf>,
 }
 
 impl Meta {
@@ -564,6 +569,15 @@ impl Meta {
             ("paused".into(), Json::Bool(self.paused)),
             ("effort".into(), or_null(&self.effort)),
             ("archived".into(), Json::Bool(self.archived)),
+            (
+                "prepared".into(),
+                Json::Arr(
+                    self.prepared
+                        .iter()
+                        .map(|path| Json::Str(path.display().to_string()))
+                        .collect(),
+                ),
+            ),
         ])
     }
 
@@ -599,6 +613,20 @@ impl Meta {
                 Some(archived) => archived
                     .as_bool()
                     .ok_or("meta's archived is not a boolean")?,
+            },
+            prepared: match value.get("prepared") {
+                None => Vec::new(),
+                Some(prepared) => prepared
+                    .as_arr()
+                    .ok_or("meta's prepared is not a list")?
+                    .iter()
+                    .map(|path| {
+                        path.as_str()
+                            .map(PathBuf::from)
+                            .filter(|path| path.is_absolute())
+                            .ok_or("meta's prepared names a path that is not absolute")
+                    })
+                    .collect::<Result<_, _>>()?,
             },
         })
     }
@@ -1420,6 +1448,7 @@ impl Conversation {
                     effort: None,
                     workspace,
                     archived: false,
+                    prepared: Vec::new(),
                 };
                 // The request prefix (§13) is written once and never
                 // rewritten; a later prefix is a log event.
@@ -1629,6 +1658,18 @@ impl Conversation {
             }
         }
         open
+    }
+
+    /// Records repository `repository` checked out in `meta`, once.
+    pub fn set_prepared(&mut self, repository: &Path) -> Result<(), String> {
+        if self.meta.prepared.iter().any(|done| done == repository) {
+            return Ok(());
+        }
+        let mut meta = self.meta.clone();
+        meta.prepared.push(repository.to_path_buf());
+        replace(&self.dir, "meta", meta.to_json().to_string().as_bytes())?;
+        self.meta = meta;
+        Ok(())
     }
 
     /// Marks the conversation paused or resumed in its `meta`, the list's
@@ -2308,6 +2349,35 @@ pub mod tests {
         let other = Id::random().unwrap();
         assert!(state.set_archived(&other, true, LOCK_WAIT).is_err());
         assert!(!state.conversation(&other).exists());
+    }
+
+    #[test]
+    fn prepared_repositories_are_kept_in_meta_once() {
+        let scratch = Scratch::new("prepared");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let (mut conversation, _) =
+            Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
+        assert!(conversation.meta().prepared.is_empty());
+        let repository = Path::new("/d/ws/td-1/td.git");
+        conversation.set_prepared(repository).unwrap();
+        conversation.set_prepared(repository).unwrap();
+        drop(conversation);
+        // Kept by the window's archiving, and read back whole.
+        state.set_archived(&id, true, LOCK_WAIT).unwrap();
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert_eq!(conversation.meta().prepared, [repository.to_path_buf()]);
+        assert!(conversation.meta().archived);
+        // A meta written before has none; a relative path is refused.
+        let mut value = conversation.meta().to_json();
+        if let Json::Obj(pairs) = &mut value {
+            pairs.retain(|(key, _)| key != "prepared");
+        }
+        assert!(Meta::from_json(&value).unwrap().prepared.is_empty());
+        if let Json::Obj(pairs) = &mut value {
+            pairs.push(("prepared".into(), Json::Arr(vec![Json::Str("rel".into())])));
+        }
+        assert!(Meta::from_json(&value).is_err());
     }
 
     #[test]

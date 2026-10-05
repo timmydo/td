@@ -209,6 +209,99 @@ fn a_workspace_reaches_the_conversation_and_stale_specs_are_cleared() {
     }
 }
 
+/// A repository workspace's record, as the window makes it.
+fn repositories(id: &Id, base: &Path) -> Workspace {
+    let template = td_agent::config::Template {
+        name: "td".into(),
+        repos: vec![td_agent::config::Repo {
+            remote: "https://example.org/a/td".into(),
+            base: "main".into(),
+            branch: "agent".into(),
+            sparse: None,
+        }],
+        shared: None,
+    };
+    let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
+    let made = td_agent::workspace::repositories(
+        &template,
+        id,
+        &base.join("data"),
+        &base.join("trees"),
+        &admitted,
+        0,
+    )
+    .unwrap();
+    Workspace::Repositories(made)
+}
+
+/// A new repository conversation asks the window for its store, once per
+/// remote and with its bases, is kept while it prepares though left, and
+/// says in its log when the answer is a refusal; nothing is recorded
+/// prepared (DESIGN.md §7).
+#[test]
+fn a_repository_conversation_asks_for_its_store_and_says_a_refusal() {
+    let scratch = Scratch::new("repositories");
+    let state = scratch.state();
+    let id = Id::random().unwrap();
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless());
+    let workspace = repositories(&id, &scratch.0);
+    supervisor
+        .create(id.clone(), Role::Conversation, workspace.clone())
+        .unwrap();
+    let mut heard = Vec::new();
+    until(&mut supervisor, &mut heard, |heard| {
+        heard
+            .iter()
+            .any(|u| matches!(u, Update::Up(Up::Fetch { .. })))
+    });
+    let asked: Vec<&Update> = heard
+        .iter()
+        .filter(|u| matches!(u, Update::Up(Up::Fetch { .. })))
+        .collect();
+    assert_eq!(
+        asked,
+        [&Update::Up(Up::Fetch {
+            remote: "https://example.org/a/td".into(),
+            bases: vec!["main".into()],
+        })]
+    );
+    // Switched away from while it prepares: its process is kept.
+    let other = Id::random().unwrap();
+    supervisor
+        .create(other.clone(), Role::Conversation, Workspace::Scratch)
+        .unwrap();
+    let kept = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < kept {
+        heard.extend(supervisor.poll().into_iter().map(|(_, update)| update));
+        assert!(supervisor.running(&id), "retired while preparing");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    supervisor.answer(
+        &id,
+        &Down::Fetched {
+            remote: "https://example.org/a/td".into(),
+            result: Err("the remote is not admitted".into()),
+        },
+    );
+    until(&mut supervisor, &mut heard, |heard| {
+        heard.iter().any(|u| {
+            matches!(u, Update::Up(Up::Event(e)) if matches!(&e.kind,
+                Kind::Notice { text } if text.contains("could not be prepared: the remote is not admitted")))
+        })
+    });
+    // Done preparing, it is retired as any left conversation is.
+    let deadline = Instant::now() + TIMEOUT;
+    while supervisor.running(&id) {
+        assert!(Instant::now() < deadline, "kept once prepared");
+        supervisor.poll();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(supervisor);
+    let (conversation, _) = Conversation::open(&state, &id, None, Duration::from_secs(5)).unwrap();
+    assert_eq!(conversation.meta().workspace, Some(workspace));
+    assert!(conversation.meta().prepared.is_empty());
+}
+
 #[test]
 fn a_conversation_that_keeps_failing_is_left_failed() {
     let scratch = Scratch::new("failing");

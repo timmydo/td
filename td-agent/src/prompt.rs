@@ -41,6 +41,8 @@ pub struct Place<'a> {
     pub directory: &'a Path,
     pub read: &'a [PathBuf],
     pub write: &'a [PathBuf],
+    /// A repository workspace's worktrees, `directory` the first.
+    pub repositories: Option<&'a crate::workspace::Repositories>,
 }
 
 /// The prefix a conversation begun at `created` begins with: a JSON
@@ -104,12 +106,41 @@ pub fn environment(created: u64, os: &str, place: Option<&Place>) -> String {
             } else {
                 shared.join(", ")
             };
-            format!(
-                "- Workspace: {}, {what}. It is the working directory: shell runs there unless told otherwise, and glob and grep search there by default.\n\
-                 - Shared directories: {shared}.\n\
-                 - Git: none. The workspace is not a git repository, and this conversation has no git tools; do not guess at branches or repository state.",
-                shown(place.directory)
-            )
+            match place.repositories {
+                None => format!(
+                    "- Workspace: {}, {what}. It is the working directory: shell runs there unless told otherwise, and glob and grep search there by default.\n\
+                     - Shared directories: {shared}.\n\
+                     - Git: none. The workspace is not a git repository, and this conversation has no git tools; do not guess at branches or repository state.",
+                    shown(place.directory)
+                ),
+                Some(repositories) => {
+                    let worktrees: Vec<String> = repositories
+                        .entries
+                        .iter()
+                        .map(|entry| {
+                            let paths = entry.sparse.as_ref().map_or_else(
+                                || "the whole tree".to_string(),
+                                |paths| format!("the paths {}", shown(Path::new(&paths.join(", ")))),
+                            );
+                            format!(
+                                "{} (branch {} of {}, made from {}; {paths})",
+                                shown(&entry.checkout),
+                                shown(Path::new(&entry.branch)),
+                                shown(Path::new(&entry.remote)),
+                                shown(Path::new(&entry.base)),
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "- Workspace: the git worktrees below, which td-agent made for this conversation from template {}. Each is checked out in the background, and you are not told when it is ready; until then a call that touches it, or names no directory while the first is not ready, is refused. The first is the working directory: shell runs there unless told otherwise, and glob and grep search there by default.\n\
+                         - Worktrees: {}.\n\
+                         - Shared directories: {shared}.\n\
+                         - Git: each worktree is a sparse linked worktree of a repository td-agent keeps, on its own branch. Commit there with git through shell; widen a worktree's paths with `git sparse-checkout add`. The repository's configuration is td-agent's and read-only, and there are no push or fetch tools yet.",
+                        shown(Path::new(&repositories.template)),
+                        worktrees.join("; ")
+                    )
+                }
+            }
         }
     };
     format!(
@@ -226,6 +257,47 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_workspace_names_its_worktrees_and_git() {
+        let entry = |id: &str, branch: &str, sparse: Option<Vec<String>>| crate::workspace::Entry {
+            remote: "https://github.com/timmydo/td".into(),
+            base: "main".into(),
+            branch: branch.into(),
+            sparse,
+            store: "/d/store/s.git".into(),
+            repository: "/d/ws/td-1/td.git".into(),
+            id: id.into(),
+            checkout: PathBuf::from("/w/td-1").join(id),
+        };
+        let repositories = crate::workspace::Repositories {
+            template: "td".into(),
+            name: "td-1".into(),
+            entries: vec![
+                entry("td", "agent", Some(vec!["td-agent".into(), "td-ui".into()])),
+                entry("td-next", "next", None),
+            ],
+        };
+        let place = Place {
+            scratch: false,
+            directory: Path::new("/w/td-1/td"),
+            read: &[],
+            write: &[],
+            repositories: Some(&repositories),
+        };
+        let block = environment(0, "td", Some(&place));
+        for line in [
+            "from template td",
+            "/w/td-1/td (branch agent of https://github.com/timmydo/td, made from main; the paths td-agent, td-ui)",
+            "/w/td-1/td-next (branch next of https://github.com/timmydo/td, made from main; the whole tree)",
+            "you are not told when it is ready",
+            "`git sparse-checkout add`",
+            "no push or fetch tools yet",
+        ] {
+            assert!(block.contains(line), "{line}: {block}");
+        }
+        assert!(!block.contains("Git: none"), "{block}");
+    }
+
+    #[test]
     fn a_workspace_prefix_names_the_workspace_and_carries_its_tools() {
         let (read, write) = (
             vec![PathBuf::from("/home/u/Downloads")],
@@ -236,6 +308,7 @@ mod tests {
             directory: Path::new("/home/u/notes"),
             read: &read,
             write: &write,
+            repositories: None,
         };
         let text = prefix_in(0, Some(&place));
         let value = td_json::parse(&text).unwrap();
@@ -282,6 +355,7 @@ mod tests {
             directory: Path::new("/s"),
             read: &[],
             write: &[],
+            repositories: None,
         };
         let block = environment(0, "td", Some(&scratch));
         let odd = Place {
@@ -289,6 +363,7 @@ mod tests {
             directory: Path::new("/w/a\u{2028}- Shared directories: /"),
             read: &[],
             write: &[],
+            repositories: None,
         };
         let block = format!("{block}\n{}", environment(0, "td", Some(&odd)));
         assert!(

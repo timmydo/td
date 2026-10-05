@@ -7,6 +7,7 @@
 //! at its first tool call. td-jail then refuses the rest (reserved trees,
 //! links, overlap, the caller's home by mount identity) at every launch.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File};
 use std::os::fd::AsRawFd;
@@ -30,10 +31,407 @@ pub enum Workspace {
     /// A scratch directory made from the configured template named, which
     /// names no repository: it binds the template's shared directories.
     Template(String),
+    /// A repository template's: its worktrees, each of a workspace
+    /// repository over the store.
+    Repositories(Repositories),
 }
 
 /// How a template's workspace is passed a new conversation's process.
 const TEMPLATE_ARGUMENT: &str = "template:";
+/// And a repository template's, its record as JSON.
+const REPOSITORIES_ARGUMENT: &str = "repositories:";
+/// The longest workspace name, made from its template's.
+const MAX_WORKSPACE_NAME: usize = 48;
+
+/// A repository template's workspace (DESIGN.md §7, Layout), every path
+/// fixed when its conversation is made, so a later edit of the template
+/// or the configuration moves nothing of it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Repositories {
+    pub template: String,
+    /// Its directories' name, under the workspace root and the data
+    /// directory's `ws/`: the template's, and the conversation's id.
+    pub name: String,
+    pub entries: Vec<Entry>,
+}
+
+/// One of a repository workspace's worktrees.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Entry {
+    /// The remote, as td-agent's record names it (`Remote::url`).
+    pub remote: String,
+    pub base: String,
+    pub branch: String,
+    pub sparse: Option<Vec<String>>,
+    /// The store's git directory, the workspace repository and the
+    /// worktree's id there and checkout in the workspace tree.
+    pub store: PathBuf,
+    pub repository: PathBuf,
+    pub id: String,
+    pub checkout: PathBuf,
+}
+
+impl Entry {
+    fn to_json(&self) -> Json {
+        let path = |path: &Path| Json::Str(path.display().to_string());
+        Json::Obj(vec![
+            ("remote".into(), Json::Str(self.remote.clone())),
+            ("base".into(), Json::Str(self.base.clone())),
+            ("branch".into(), Json::Str(self.branch.clone())),
+            (
+                "sparse".into(),
+                self.sparse.as_ref().map_or(Json::Null, |paths| {
+                    Json::Arr(paths.iter().cloned().map(Json::Str).collect())
+                }),
+            ),
+            ("store".into(), path(&self.store)),
+            ("repository".into(), path(&self.repository)),
+            ("id".into(), Json::Str(self.id.clone())),
+            ("checkout".into(), path(&self.checkout)),
+        ])
+    }
+
+    fn from_json(value: &Json) -> Result<Self, String> {
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(Json::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| format!("a repository entry has no `{key}`"))
+        };
+        let path = |key: &str| {
+            text(key).map(PathBuf::from).and_then(|path| {
+                path.is_absolute()
+                    .then_some(path)
+                    .ok_or_else(|| format!("a repository entry's `{key}` is not absolute"))
+            })
+        };
+        let sparse = match value.get("sparse") {
+            None | Some(Json::Null) => None,
+            Some(paths) => Some(
+                paths
+                    .as_arr()
+                    .ok_or("a repository entry's `sparse` is not a list")?
+                    .iter()
+                    .map(|path| {
+                        path.as_str()
+                            .map(str::to_string)
+                            .ok_or("a sparse path is not text")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        };
+        let remote = text("remote")?;
+        crate::git::Remote::parse(&remote)?;
+        let base = text("base")?;
+        crate::git::branch_name(&base)?;
+        let branch = text("branch")?;
+        crate::git::branch_name(&branch)?;
+        crate::repo::cone(sparse.as_deref())?;
+        let id = text("id")?;
+        crate::repo::worktree_id(&id)?;
+        Ok(Self {
+            remote,
+            base,
+            branch,
+            sparse,
+            store: path("store")?,
+            repository: path("repository")?,
+            id,
+            checkout: path("checkout")?,
+        })
+    }
+}
+
+impl Repositories {
+    fn to_json(&self) -> Json {
+        Json::Obj(vec![
+            ("kind".into(), Json::Str("repositories".into())),
+            ("template".into(), Json::Str(self.template.clone())),
+            ("name".into(), Json::Str(self.name.clone())),
+            (
+                "entries".into(),
+                Json::Arr(self.entries.iter().map(Entry::to_json).collect()),
+            ),
+        ])
+    }
+
+    fn from_json(value: &Json) -> Result<Self, String> {
+        let template = value
+            .get("template")
+            .and_then(Json::as_str)
+            .ok_or("a repository workspace has no template")
+            .map_err(String::from)
+            .and_then(crate::config::template_name)?;
+        let name = value
+            .get("name")
+            .and_then(Json::as_str)
+            .filter(|name| workspace_name(name))
+            .ok_or("a repository workspace has no name td-agent makes")?
+            .to_string();
+        let entries = value
+            .get("entries")
+            .and_then(Json::as_arr)
+            .ok_or("a repository workspace has no entries")?
+            .iter()
+            .map(Entry::from_json)
+            .collect::<Result<Vec<_>, _>>()?;
+        if entries.is_empty() || entries.len() > MAX_ENTRIES {
+            return Err(format!(
+                "a repository workspace has 1 to {MAX_ENTRIES} entries"
+            ));
+        }
+        Ok(Self {
+            template,
+            name,
+            entries,
+        })
+    }
+
+    /// Its repositories, each once, in the order their entries come.
+    pub fn repositories(&self) -> Vec<&Path> {
+        let mut seen: Vec<&Path> = Vec::new();
+        for entry in &self.entries {
+            if !seen.contains(&entry.repository.as_path()) {
+                seen.push(&entry.repository);
+            }
+        }
+        seen
+    }
+
+    /// The workspace tree, the directory its checkouts are made in.
+    pub fn tree(&self) -> Option<&Path> {
+        self.entries
+            .first()
+            .and_then(|entry| entry.checkout.parent())
+    }
+}
+
+/// td-agent's data directory (DESIGN.md §7, Layout), which holds the
+/// stores and workspace repositories: `$XDG_DATA_HOME/td-agent`, else
+/// `~/.local/share/td-agent`, a directory and no link, since the places
+/// refused to grants name it so, made the caller's alone and named as it
+/// resolves, since td-jail binds real paths.
+pub fn data_dir() -> Result<PathBuf, String> {
+    let absolute = |var: &str| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    let base = absolute("XDG_DATA_HOME")
+        .or_else(|| absolute("HOME").map(|home| home.join(".local/share")))
+        .ok_or(
+            "neither XDG_DATA_HOME nor HOME is an absolute path, so there is no data directory",
+        )?;
+    data_in(&base)
+}
+
+/// `data_dir` in the data home `base`.
+fn data_in(base: &Path) -> Result<PathBuf, String> {
+    let dir = base.join("td-agent");
+    let failed = |e: std::io::Error| format!("{}: {e}", dir.display());
+    DirBuilder::new()
+        .recursive(true)
+        .create(base)
+        .map_err(|e| format!("{}: {e}", base.display()))?;
+    match DirBuilder::new().mode(0o700).create(&dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(failed(e)),
+        _ => {}
+    }
+    if !fs::symlink_metadata(&dir).map_err(failed)?.is_dir() {
+        return Err(format!("{} is not a directory", dir.display()));
+    }
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(failed)?;
+    fs::canonicalize(&dir).map_err(failed)
+}
+
+/// Reserves `repositories`' name (DESIGN.md §7), its directory in the
+/// data directory `data` made by this call alone, so no two workspaces,
+/// whose names are short, share a repository or a checkout: false when
+/// another has it, or its tree under the workspace root is there.
+pub fn reserve(repositories: &Repositories, data: &Path) -> Result<bool, String> {
+    let tree = repositories.tree().ok_or("a workspace with no worktrees")?;
+    if fs::symlink_metadata(tree).is_ok() {
+        return Ok(false);
+    }
+    let all = data.join("ws");
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&all)
+        .map_err(|e| format!("{}: {e}", all.display()))?;
+    let own = all.join(&repositories.name);
+    match DirBuilder::new().mode(0o700).create(&own) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(format!("{}: {e}", own.display())),
+    }
+}
+
+/// The most worktrees a repository workspace has: td-jail binds at most
+/// 32 linked worktrees of one repository, and a workspace's entries are
+/// held to that in all.
+pub(crate) const MAX_ENTRIES: usize = 32;
+/// The most directories td-jail binds for one instance: worktrees,
+/// checkouts, repositories, the stores' objects and shared directories.
+const MAX_TREES: usize = 32;
+/// The most bytes a repository workspace's record takes as JSON: it is
+/// held whole in `meta`, with the repositories prepared, and in the
+/// argument a conversation's process starts with.
+const MAX_RECORD: usize = 16 * 1024;
+
+/// A workspace name td-agent makes: lower-case letters, digits and `-`,
+/// not starting or ending with `-`.
+fn workspace_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_WORKSPACE_NAME
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// `text` as a name segment: ASCII letters and digits kept, lower case,
+/// every run of anything else one `-`, at most `max` bytes.
+fn slug(text: &str, max: usize) -> String {
+    let mut slug = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    let mut slug: String = slug.chars().take(max).collect();
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
+}
+
+/// The workspace `template` makes for conversation `id`: every remote
+/// admitted by `admitted`, every branch and base a name td-agent passes
+/// to git, and every path named, under `data` (td-agent's data
+/// directory) and `root` (the workspace root). Entries naming one remote
+/// share its repository; each has a worktree of its own. With its
+/// `shared` shared directories it binds no more than td-jail does.
+pub fn repositories(
+    template: &crate::config::Template,
+    id: &Id,
+    data: &Path,
+    root: &Path,
+    admitted: &[crate::git::Admission],
+    shared: usize,
+) -> Result<Repositories, String> {
+    if template.repos.is_empty() || template.repos.len() > MAX_ENTRIES {
+        return Err(format!(
+            "template {:?} names 1 to {MAX_ENTRIES} repositories",
+            template.name
+        ));
+    }
+    let prefix = match slug(&template.name, MAX_WORKSPACE_NAME - 9) {
+        empty if empty.is_empty() => "workspace".to_string(),
+        named => named,
+    };
+    let short: String = id.to_string().chars().take(8).collect();
+    let name = format!("{prefix}-{}", slug(&short, 8));
+    let mut entries: Vec<Entry> = Vec::new();
+    for repo in &template.repos {
+        let remote = crate::git::Remote::parse(&repo.remote)?;
+        let url = remote.url();
+        if !admitted.iter().any(|admission| admission.admits(&remote)) {
+            return Err(format!(
+                "the remote {url} is not admitted: add it, or a prefix of it, to `remotes` in the configuration"
+            ));
+        }
+        crate::git::branch_name(&repo.base)?;
+        crate::git::branch_name(&repo.branch)?;
+        crate::repo::cone(repo.sparse.as_deref())?;
+        let stem = remote
+            .segments
+            .last()
+            .map(|last| last.strip_suffix(".git").unwrap_or(last))
+            .map(|last| slug(last, 32))
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or_else(|| "repo".to_string());
+        let repository = match entries.iter().find(|entry| entry.remote == url) {
+            Some(entry) => entry.repository.clone(),
+            None => {
+                let mut dir = stem.clone();
+                let mut n = 2;
+                while entries
+                    .iter()
+                    .any(|entry| entry.repository.file_stem() == Some(dir.as_ref()))
+                {
+                    dir = format!("{stem}-{n}");
+                    n += 1;
+                }
+                data.join("ws").join(&name).join(format!("{dir}.git"))
+            }
+        };
+        // Two worktrees on one branch would move each other's.
+        if entries
+            .iter()
+            .any(|entry| entry.remote == url && entry.branch == repo.branch)
+        {
+            return Err(format!(
+                "template {:?} names branch {} of {url} twice",
+                template.name, repo.branch
+            ));
+        }
+        let first = entries.iter().all(|entry| entry.remote != url);
+        let wanted = if first {
+            stem.clone()
+        } else {
+            format!("{stem}-{}", slug(&repo.branch, 32))
+        };
+        let mut worktree = wanted.clone();
+        let mut n = 2;
+        while entries.iter().any(|entry| entry.id == worktree) {
+            worktree = format!("{wanted}-{n}");
+            n += 1;
+        }
+        crate::repo::worktree_id(&worktree)?;
+        entries.push(Entry {
+            store: data
+                .join("store")
+                .join(format!("{}.git", remote.store_name())),
+            checkout: root.join(&name).join(&worktree),
+            remote: url,
+            base: repo.base.clone(),
+            branch: repo.branch.clone(),
+            sparse: repo.sparse.clone(),
+            repository,
+            id: worktree,
+        });
+    }
+    let made = Repositories {
+        template: template.name.clone(),
+        name,
+        entries,
+    };
+    let stores: BTreeSet<&Path> = made.entries.iter().map(|e| e.store.as_path()).collect();
+    let trees = made.entries.len() + made.repositories().len() + stores.len() + shared;
+    if trees > MAX_TREES {
+        return Err(format!(
+            "template {:?} binds {trees} directories, its worktrees, repositories, stores and shared directories, and td-jail binds at most {MAX_TREES}",
+            template.name
+        ));
+    }
+    if Workspace::Repositories(made.clone())
+        .to_json()
+        .to_string()
+        .len()
+        > MAX_RECORD
+    {
+        return Err(format!(
+            "template {:?} is past {MAX_RECORD} bytes as td-agent records it: name fewer sparse paths",
+            template.name
+        ));
+    }
+    Ok(made)
+}
 
 impl Workspace {
     pub fn to_json(&self) -> Json {
@@ -47,6 +445,7 @@ impl Workspace {
                 ("kind".into(), Json::Str("template".into())),
                 ("name".into(), Json::Str(name.clone())),
             ]),
+            Self::Repositories(repositories) => repositories.to_json(),
         }
     }
 
@@ -66,7 +465,10 @@ impl Workspace {
                 .ok_or_else(|| "a template workspace has no name".to_string())
                 .and_then(crate::config::template_name)
                 .map(Self::Template),
-            _ => Err("a workspace is a scratch, a directory or a template one".into()),
+            Some("repositories") => Repositories::from_json(value).map(Self::Repositories),
+            _ => {
+                Err("a workspace is a scratch, a directory, a template or a repository one".into())
+            }
         }
     }
 
@@ -76,6 +478,9 @@ impl Workspace {
             Self::Scratch => "scratch".into(),
             Self::Directory(path) => path.as_os_str().to_os_string(),
             Self::Template(name) => format!("{TEMPLATE_ARGUMENT}{name}").into(),
+            Self::Repositories(repositories) => {
+                format!("{REPOSITORIES_ARGUMENT}{}", repositories.to_json()).into()
+            }
         }
     }
 
@@ -85,6 +490,14 @@ impl Workspace {
         }
         if let Some(name) = word.strip_prefix(TEMPLATE_ARGUMENT) {
             return crate::config::template_name(name).map(Self::Template);
+        }
+        if let Some(record) = word.strip_prefix(REPOSITORIES_ARGUMENT) {
+            let value =
+                td_json::parse(record).map_err(|e| format!("a repository workspace: {e}"))?;
+            return match Self::from_json(&value)? {
+                repositories @ Self::Repositories(_) => Ok(repositories),
+                _ => Err("a repository workspace's record names another kind".into()),
+            };
         }
         let path = PathBuf::from(word);
         if !path.is_absolute() {
@@ -101,6 +514,7 @@ impl Workspace {
             Self::Scratch => "scratch".into(),
             Self::Directory(path) => path.display().to_string(),
             Self::Template(name) => format!("template {name}"),
+            Self::Repositories(repositories) => format!("template {}", repositories.template),
         }
     }
 
@@ -181,8 +595,9 @@ const CONFIG_SENSITIVE: &[&str] = &[
     "td-agent",
     "vivaldi",
 ];
-/// Below each data home: keyrings, td-pass's vault, desktop entries.
-const DATA_SENSITIVE: &[&str] = &["applications", "keyrings", "td-pass"];
+/// Below each data home: keyrings, td-pass's vault, desktop entries,
+/// and td-agent's own stores and workspace repositories.
+const DATA_SENSITIVE: &[&str] = &["applications", "keyrings", "td-agent", "td-pass"];
 /// Below the home: where the human's own programs are put, refused to a
 /// tree the model can write, as `PATH`'s directories are.
 const EXECUTED: &[&str] = &[".cargo/bin", ".local/bin", "bin"];
@@ -715,12 +1130,16 @@ fn open_directory(path: &Path) -> std::io::Result<File> {
 }
 
 /// The instance policy for `workspace`, its directories made where they
-/// are td-agent's, and the directory specs go in, outside every grant.
+/// are td-agent's, and the directory specs go in, outside every grant. A
+/// repository workspace binds the repositories in `prepared` alone, each
+/// with its checkouts and its stores' objects, and none of the rest
+/// until it is (DESIGN.md §7).
 pub fn policy(
     workspace: &Workspace,
     state: &StateDir,
     id: &Id,
     shared: &[Shared],
+    prepared: &[PathBuf],
 ) -> Result<(Policy, PathBuf), String> {
     let dir = jail_dir(state, id);
     let made = |name: &str| -> Result<PathBuf, String> {
@@ -732,16 +1151,47 @@ pub fn policy(
             .map_err(|e| format!("{}: {e}", path.display()))?;
         fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))
     };
-    let tree = match workspace {
-        Workspace::Scratch | Workspace::Template(_) => made("scratch")?,
-        Workspace::Directory(path) => path.clone(),
+    let (worktrees, checkouts, repositories, objects) = match workspace {
+        Workspace::Scratch | Workspace::Template(_) => {
+            (vec![made("scratch")?], Vec::new(), Vec::new(), Vec::new())
+        }
+        Workspace::Directory(path) => (vec![path.clone()], Vec::new(), Vec::new(), Vec::new()),
+        Workspace::Repositories(repositories) => {
+            let ready: Vec<&Entry> = repositories
+                .entries
+                .iter()
+                .filter(|entry| prepared.contains(&entry.repository))
+                .collect();
+            let mut repositories: Vec<PathBuf> = Vec::new();
+            let mut objects: Vec<PathBuf> = Vec::new();
+            for entry in &ready {
+                if !repositories.contains(&entry.repository) {
+                    repositories.push(entry.repository.clone());
+                }
+                let store = entry.store.join("objects");
+                if !objects.contains(&store) {
+                    objects.push(store);
+                }
+            }
+            let checkouts = ready.iter().map(|entry| entry.checkout.clone()).collect();
+            (Vec::new(), checkouts, repositories, objects)
+        }
+    };
+    // A repository workspace's working directory is its first worktree,
+    // not bound until it is prepared.
+    let directory = match workspace {
+        Workspace::Repositories(repositories) => {
+            repositories.entries.first().map(|e| e.checkout.clone())
+        }
+        _ => None,
     };
     let policy = Policy {
         home: made("home")?,
-        worktrees: vec![tree],
-        checkouts: Vec::new(),
-        repositories: Vec::new(),
-        objects: Vec::new(),
+        worktrees,
+        checkouts,
+        repositories,
+        objects,
+        directory,
         read: shared
             .iter()
             .filter(|shared| !shared.write)
@@ -753,6 +1203,12 @@ pub fn policy(
             .map(|shared| shared.path.clone())
             .collect(),
     };
+    let trees = policy.roots().len() + policy.repositories.len() + policy.objects.len();
+    if trees > MAX_TREES {
+        return Err(format!(
+            "this workspace binds {trees} directories, and td-jail binds at most {MAX_TREES}"
+        ));
+    }
     Ok((policy, made("specs")?))
 }
 
@@ -773,6 +1229,220 @@ mod tests {
             programs: vec![home.join("src/td/target/release/td-jail")],
             path: vec![home.join("tools/bin")],
         }
+    }
+
+    fn template(repos: &[(&str, &str, &str)]) -> crate::config::Template {
+        crate::config::Template {
+            name: "td agent!".into(),
+            repos: repos
+                .iter()
+                .map(|(remote, base, branch)| crate::config::Repo {
+                    remote: remote.to_string(),
+                    base: base.to_string(),
+                    branch: branch.to_string(),
+                    sparse: None,
+                })
+                .collect(),
+            shared: None,
+        }
+    }
+
+    #[test]
+    fn a_repository_template_makes_its_workspace_record() {
+        let id = Id::parse("0123456789abcdef0123456789abcdef").unwrap();
+        let admitted = [crate::git::Admission::parse("github.com/timmydo").unwrap()];
+        let (data, root) = (Path::new("/d/td-agent"), Path::new("/h/td-agent"));
+        let made = repositories(
+            &template(&[
+                ("https://github.com/timmydo/td", "main", "agent"),
+                ("HTTPS://GitHub.com/timmydo/td/", "main", "next"),
+                ("git@github.com:timmydo/td", "main", "agent"),
+            ]),
+            &id,
+            data,
+            root,
+            &admitted,
+            0,
+        )
+        .unwrap();
+        assert_eq!(made.name, "td-agent-01234567");
+        assert_eq!(made.template, "td agent!");
+        let names: Vec<(&str, &Path, &Path)> = made
+            .entries
+            .iter()
+            .map(|e| (e.id.as_str(), e.repository.as_path(), e.checkout.as_path()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (
+                    "td",
+                    Path::new("/d/td-agent/ws/td-agent-01234567/td.git"),
+                    Path::new("/h/td-agent/td-agent-01234567/td")
+                ),
+                // The same remote: its repository, a worktree of its own.
+                (
+                    "td-next",
+                    Path::new("/d/td-agent/ws/td-agent-01234567/td.git"),
+                    Path::new("/h/td-agent/td-agent-01234567/td-next")
+                ),
+                // Another remote of the same name: a repository of its own.
+                (
+                    "td-2",
+                    Path::new("/d/td-agent/ws/td-agent-01234567/td-2.git"),
+                    Path::new("/h/td-agent/td-agent-01234567/td-2")
+                ),
+            ]
+        );
+        let first = made.entries.first().unwrap();
+        assert_eq!(first.remote, "https://github.com/timmydo/td");
+        assert!(first.store.starts_with("/d/td-agent/store"), "{first:?}");
+        assert_ne!(first.store, made.entries.get(2).unwrap().store);
+        assert_eq!(made.repositories().len(), 2);
+        assert_eq!(
+            made.tree(),
+            Some(Path::new("/h/td-agent/td-agent-01234567"))
+        );
+        // Its record round-trips, as meta and as the process's argument.
+        let workspace = Workspace::Repositories(made.clone());
+        assert_eq!(
+            Workspace::from_json(&workspace.to_json()).unwrap(),
+            workspace
+        );
+        let word = workspace.argument().into_string().unwrap();
+        assert_eq!(Workspace::parse_argument(&word).unwrap(), workspace);
+        assert_eq!(workspace.label(), "template td agent!");
+        assert!(!workspace.scratch());
+        // Refused: an unadmitted remote, a branch named twice for one
+        // remote, a branch git would misread.
+        for (repos, why) in [
+            (
+                vec![("https://gitlab.com/a/b", "main", "x")],
+                "not admitted",
+            ),
+            (
+                vec![
+                    ("https://github.com/timmydo/td", "main", "x"),
+                    ("https://github.com/timmydo/td", "next", "x"),
+                ],
+                "twice",
+            ),
+            (
+                vec![("https://github.com/timmydo/td", "main", "-x")],
+                "branch",
+            ),
+            (
+                vec![("http://github.com/timmydo/td", "main", "x")],
+                "https or ssh",
+            ),
+        ] {
+            let e = repositories(&template(&repos), &id, data, root, &admitted, 0).unwrap_err();
+            assert!(e.contains(why), "{repos:?}: {e}");
+        }
+        assert!(repositories(&template(&[]), &id, data, root, &admitted, 0).is_err());
+        // With its shared directories it binds no more than td-jail: one
+        // worktree, its repository and its store leave 29.
+        let one = template(&[("https://github.com/timmydo/td", "main", "x")]);
+        assert!(repositories(&one, &id, data, root, &admitted, 29).is_ok());
+        let e = repositories(&one, &id, data, root, &admitted, 30).unwrap_err();
+        assert!(e.contains("td-jail binds at most 32"), "{e}");
+        // Its record fits `meta` and an argument.
+        let mut long = one.clone();
+        if let Some(repo) = long.repos.first_mut() {
+            repo.sparse = Some((0..800).map(|n| format!("some/long/path/{n:08}")).collect());
+        }
+        let e = repositories(&long, &id, data, root, &admitted, 0).unwrap_err();
+        assert!(e.contains("16384 bytes"), "{e}");
+    }
+
+    #[test]
+    fn a_repository_workspace_binds_only_what_is_prepared() {
+        let scratch = crate::store::tests::Scratch::new("ws-repositories");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let admitted = [crate::git::Admission::parse("github.com").unwrap()];
+        let made = repositories(
+            &template(&[
+                ("https://github.com/a/one", "main", "x"),
+                ("https://github.com/a/two", "main", "x"),
+            ]),
+            &id,
+            Path::new("/d"),
+            Path::new("/h"),
+            &admitted,
+            0,
+        )
+        .unwrap();
+        let workspace = Workspace::Repositories(made.clone());
+        let (none, _) = policy(&workspace, &state, &id, &[], &[]).unwrap();
+        assert!(
+            none.checkouts.is_empty() && none.repositories.is_empty() && none.objects.is_empty()
+        );
+        assert!(none.worktrees.is_empty());
+        // Its working directory is its first worktree, bound or not.
+        let first = made.entries.first().map(|e| e.checkout.clone());
+        assert_eq!(none.directory, first);
+        let one = made.entries.first().unwrap();
+        let ready = std::slice::from_ref(&one.repository);
+        let (bound, _) = policy(&workspace, &state, &id, &[], ready).unwrap();
+        assert_eq!(bound.checkouts, std::slice::from_ref(&one.checkout));
+        assert_eq!(bound.repositories, ready);
+        assert_eq!(bound.objects, [one.store.join("objects")]);
+        assert_eq!(bound.roots(), std::slice::from_ref(&one.checkout));
+        assert_eq!(bound.directory, first);
+        // No policy binds more than td-jail does.
+        let many: Vec<Shared> = (0..32)
+            .map(|n| Shared {
+                path: PathBuf::from(format!("/s/{n}")),
+                write: false,
+            })
+            .collect();
+        let e = policy(&workspace, &state, &id, &many, ready).unwrap_err();
+        assert!(e.contains("td-jail binds at most 32"), "{e}");
+        let (scratch_policy, _) = policy(&Workspace::Scratch, &state, &id, &[], &[]).unwrap();
+        assert_eq!(scratch_policy.directory, None);
+    }
+
+    #[test]
+    fn a_workspace_name_is_reserved_once() {
+        let scratch = crate::store::tests::Scratch::new("ws-reserve");
+        let data = scratch.0.join("data");
+        let id = Id::parse("0123456789abcdef0123456789abcdef").unwrap();
+        let admitted = [crate::git::Admission::parse("github.com").unwrap()];
+        let one = template(&[("https://github.com/a/one", "main", "x")]);
+        let made = repositories(&one, &id, &data, &scratch.0.join("trees"), &admitted, 0).unwrap();
+        assert!(reserve(&made, &data).unwrap());
+        assert!(data.join("ws").join(&made.name).is_dir());
+        // Another id with the same first eight: the name is held.
+        let again = Id::parse("01234567ffffffffffffffffffffffff").unwrap();
+        let other =
+            repositories(&one, &again, &data, &scratch.0.join("trees"), &admitted, 0).unwrap();
+        assert_eq!(other.name, made.name);
+        assert!(!reserve(&other, &data).unwrap());
+        // A tree under the workspace root holds it too.
+        let elsewhere = scratch.0.join("data-2");
+        fs::create_dir_all(made.tree().unwrap()).unwrap();
+        assert!(!reserve(&made, &elsewhere).unwrap());
+    }
+
+    #[test]
+    fn the_data_directory_is_made_the_callers_and_no_link() {
+        let scratch = crate::store::tests::Scratch::new("ws-data");
+        let base = scratch.0.join("share");
+        let dir = data_in(&base).unwrap();
+        assert_eq!(dir, fs::canonicalize(base.join("td-agent")).unwrap());
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        // One made wider before is narrowed.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(data_in(&base).unwrap(), dir);
+        assert_eq!(mode(&dir), 0o700);
+        // A link there is refused: the places refused to grants name it.
+        let linked = scratch.0.join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&dir, linked.join("td-agent")).unwrap();
+        let e = data_in(&linked).unwrap_err();
+        assert!(e.contains("is not a directory"), "{e}");
     }
 
     #[test]
@@ -830,6 +1500,8 @@ mod tests {
             "/home/u/.config/autostart",
             "/home/u/.local/share/keyrings",
             "/data/td-pass",
+            "/home/u/.local/share/td-agent/ws",
+            "/data/td-agent",
             "/home/u/.var/app/org.example",
         ] {
             assert!(
@@ -992,7 +1664,7 @@ mod tests {
                 write: true,
             },
         ];
-        let (policy, specs) = policy(&Workspace::Scratch, &state, &id, &shared).unwrap();
+        let (policy, specs) = policy(&Workspace::Scratch, &state, &id, &shared, &[]).unwrap();
         let jail = root.join("jail").join(id.as_str());
         assert_eq!(policy.worktrees, [jail.join("scratch")]);
         assert_eq!(policy.home, jail.join("home"));
@@ -1133,6 +1805,6 @@ mod tests {
     }
 
     fn policy_of_directory(state: &StateDir, id: &Id) -> (Policy, PathBuf) {
-        policy(&Workspace::Directory("/w/a".into()), state, id, &[]).unwrap()
+        policy(&Workspace::Directory("/w/a".into()), state, id, &[], &[]).unwrap()
     }
 }

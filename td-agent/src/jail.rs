@@ -129,6 +129,9 @@ pub struct Policy {
     pub objects: Vec<PathBuf>,
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
+    /// The tool host's working directory when it is not the first root
+    /// (`toolhost::Config::directory`).
+    pub directory: Option<PathBuf>,
 }
 
 impl Policy {
@@ -240,6 +243,9 @@ fn start(programs: &Programs, policy: &Policy, spec: &Path) -> Result<Client, St
         .arg("tool-host")
         .arg("--txt")
         .arg(Programs::inside(&programs.txt)?);
+    if let Some(directory) = &policy.directory {
+        command.arg("--directory").arg(directory);
+    }
     for root in policy.roots() {
         command.arg("--root").arg(root);
     }
@@ -456,6 +462,7 @@ mod tests {
             checkouts: vec!["/t/r".into()],
             repositories: vec!["/ws/r.git".into()],
             objects: vec!["/store/r.git/objects".into()],
+            directory: None,
             read: vec!["/d".into()],
             write: vec!["/e".into()],
         };

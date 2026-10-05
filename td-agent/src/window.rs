@@ -40,6 +40,9 @@ use crate::workspace::{self, Places, Workspace};
 
 /// The longest a turn waits before polling the conversation again.
 const POLL_MS: u64 = 50;
+/// The ids a repository workspace is named from before its making gives
+/// up: another holds a name rarely.
+const NAME_TRIES: usize = 8;
 /// Control requests answered per turn, so a busy client cannot starve
 /// the window's own inputs.
 const CONTROL_PER_TURN: usize = 4;
@@ -191,6 +194,12 @@ pub struct Session {
     places: Result<Places, String>,
     /// The configured workspace templates (DESIGN.md §7).
     templates: Vec<Template>,
+    /// The remotes the configuration admits (DESIGN.md §7).
+    remotes: Vec<crate::git::Admission>,
+    /// td-agent's data directory, or why there is none, and the store
+    /// fetches done there for repository workspaces.
+    data: Result<PathBuf, String>,
+    stores: Option<crate::git::Service>,
 }
 
 impl Session {
@@ -346,27 +355,57 @@ impl Session {
     }
 
     /// A new conversation from the configured template `name`
-    /// (DESIGN.md §7): one naming repositories is refused until increment
-    /// 11 prepares them, and nothing is made.
+    /// (DESIGN.md §7). One naming repositories makes their workspace's
+    /// record, every remote admitted, which its conversation's process
+    /// then prepares; refused, nothing is made.
     fn start_from(&mut self, name: &str) {
-        if let Err(why) = &self.places {
-            return self.app.note(why.clone());
+        let root = match &self.places {
+            Ok(places) => places.root.clone(),
+            Err(why) => return self.app.note(why.clone()),
+        };
+        let Some(template) = self.templates.iter().find(|t| t.name == name).cloned() else {
+            return self.app.note(format!("no template is named {name:?}"));
+        };
+        if template.repos.is_empty() {
+            return self.start(Some(Workspace::Template(name.to_string())));
         }
-        match from_template(&self.templates, name) {
-            Ok(workspace) => self.start(Some(workspace)),
-            Err(why) => self.app.note(why),
+        let shared = self
+            .client
+            .shared_for(&Workspace::Template(name.to_string()))
+            .len();
+        // A workspace's name is short: one another workspace holds is
+        // passed over for a new id.
+        let made = self.data.clone().and_then(|data| {
+            for _ in 0..NAME_TRIES {
+                let id = Id::random()?;
+                let repositories =
+                    workspace::repositories(&template, &id, &data, &root, &self.remotes, shared)?;
+                if workspace::reserve(&repositories, &data)? {
+                    return Ok((id, repositories));
+                }
+            }
+            Err(format!("no free workspace name in {NAME_TRIES} tries"))
+        });
+        match made {
+            Ok((id, repositories)) => {
+                self.start_as(id, Some(Workspace::Repositories(repositories)))
+            }
+            Err(why) => self
+                .app
+                .note(format!("no conversation from template {name:?}: {why}")),
         }
     }
 
     /// A new conversation, created by its own process and opened.
     fn start(&mut self, workspace: Option<Workspace>) {
-        let id = match Id::random() {
-            Ok(id) => id,
-            Err(e) => {
-                self.app.note(format!("a new conversation: {e}"));
-                return;
-            }
-        };
+        match Id::random() {
+            Ok(id) => self.start_as(id, workspace),
+            Err(e) => self.app.note(format!("a new conversation: {e}")),
+        }
+    }
+
+    /// `start`, with the conversation's id given.
+    fn start_as(&mut self, id: Id, workspace: Option<Workspace>) {
         self.app.add_row(Row {
             id: id.clone(),
             title: Role::Conversation.first_title().to_string(),
@@ -432,6 +471,17 @@ impl Session {
                             refusal,
                         },
                     );
+                }
+                Update::Up(Up::Fetch { remote, bases }) => {
+                    if let Err(why) = self.fetch(&id, remote, bases) {
+                        self.supervisor.answer(
+                            &id,
+                            &Down::Fetched {
+                                remote: remote.clone(),
+                                result: Err(why),
+                            },
+                        );
+                    }
                 }
                 Update::Up(Up::Spent {
                     id: request,
@@ -519,6 +569,40 @@ impl Session {
             "the default model is {}: new conversations, and those with no model of their own, use it from their next turn",
             self.client.model
         ));
+    }
+
+    /// A conversation's ask for `remote`'s store (DESIGN.md §7, §9),
+    /// handed to the store thread when the configuration admits the
+    /// remote; why not, otherwise, which it is answered with.
+    fn fetch(&mut self, id: &Id, remote: &str, bases: &[String]) -> Result<(), String> {
+        let parsed = crate::git::Remote::parse(remote)?;
+        if !self.remotes.iter().any(|admitted| admitted.admits(&parsed)) {
+            return Err(format!(
+                "the remote {remote} is not admitted: add it, or a prefix of it, to `remotes` in the configuration"
+            ));
+        }
+        let stores = self.stores.as_ref().ok_or_else(|| match &self.data {
+            Err(why) => why.clone(),
+            Ok(_) => "no store thread".to_string(),
+        })?;
+        stores.ask(id.clone(), parsed, bases.to_vec())
+    }
+
+    /// The store thread's answers, each to the conversation that asked;
+    /// one whose process has gone asks again when it starts.
+    fn stored(&mut self) {
+        let Some(stores) = &self.stores else {
+            return;
+        };
+        for done in stores.answers() {
+            self.supervisor.answer(
+                &done.conversation,
+                &Down::Fetched {
+                    remote: done.remote,
+                    result: done.result,
+                },
+            );
+        }
     }
 
     /// Deletes conversation `id` for good (DESIGN.md §4): its process
@@ -832,6 +916,7 @@ impl Handler for Session {
     fn poll(&mut self, now: u64) -> Flow {
         self.app.tick(now);
         self.hear();
+        self.stored();
         self.control();
         self.serve();
         self.flow()
@@ -899,20 +984,6 @@ fn places(config: &Config, state: &StateDir) -> Result<Places, String> {
 /// The most a setup frame's client may take of `frame::MAX_FRAME`, the
 /// key and the framing having the rest.
 const SETUP_CLIENT_BYTES: usize = crate::frame::MAX_FRAME / 2;
-
-/// The workspace template `name` makes, or why it makes none.
-fn from_template(templates: &[Template], name: &str) -> Result<Workspace, String> {
-    let template = templates
-        .iter()
-        .find(|t| t.name == name)
-        .ok_or_else(|| format!("no template is named {name:?}"))?;
-    if !template.repos.is_empty() {
-        return Err(format!(
-            "no conversation from template {name:?}: it names repositories, and repository workspaces come with increment 11"
-        ));
-    }
-    Ok(Workspace::Template(name.to_string()))
-}
 
 /// The conversations the store holds, as the list shows them, closed.
 fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
@@ -1094,6 +1165,10 @@ pub fn run(
     if let Some(problem) = problems.last() {
         app.note(format!("the outbox: {problem}"));
     }
+    // The stores and workspace repositories live in the data directory;
+    // the git worker's own files in the state directory.
+    let data = workspace::data_dir();
+    let git_dir = state.root().join("git");
     let mut session = Session {
         app,
         supervisor,
@@ -1111,6 +1186,11 @@ pub fn run(
         show_keys: false,
         places,
         templates: config.templates.clone(),
+        remotes: config.remotes.clone(),
+        stores: data.as_ref().ok().map(|data| {
+            crate::git::Service::start(git_dir, data.join("store"), crate::git::kept_env())
+        }),
+        data,
     };
     // A cached list serves until the provider's comes.
     match Models::load(session.state.root()) {
@@ -1137,32 +1217,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::{default_model, from_template};
-    use crate::config::{Repo, Template};
-    use crate::workspace::Workspace;
-
-    #[test]
-    fn a_template_naming_repositories_is_refused_until_increment_11() {
-        let template = |name: &str, repos: Vec<Repo>| Template {
-            name: name.into(),
-            repos,
-            shared: None,
-        };
-        let repo = Repo {
-            remote: "r".into(),
-            base: "main".into(),
-            branch: "b".into(),
-            sparse: None,
-        };
-        let templates = [template("notes", Vec::new()), template("td", vec![repo])];
-        assert_eq!(
-            from_template(&templates, "notes"),
-            Ok(Workspace::Template("notes".into()))
-        );
-        let refused = from_template(&templates, "td").unwrap_err();
-        assert!(refused.contains("come with increment 11"), "{refused}");
-        assert!(from_template(&templates, "gone").is_err());
-    }
+    use super::default_model;
 
     #[test]
     fn the_saved_default_holds_until_the_configuration_changes_model() {
