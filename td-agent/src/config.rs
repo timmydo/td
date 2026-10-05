@@ -44,6 +44,8 @@ pub struct Client {
     /// Every configured template, with the shared directories of its
     /// own its workspaces bind in place of `shared`, admitted as it is.
     pub template_shared: Vec<TemplateShared>,
+    /// The most background processes a conversation runs at once.
+    pub max_background: u32,
 }
 
 /// A configured template and its own shared directories, admitted; none
@@ -65,6 +67,7 @@ impl Default for Client {
             limits: Limits::default(),
             shared: Vec::new(),
             template_shared: Vec::new(),
+            max_background: DEFAULT_MAX_BACKGROUND,
         }
     }
 }
@@ -158,6 +161,10 @@ impl Client {
                 limit(self.limits.conversation),
             ),
             ("max_cost_per_day".into(), limit(self.limits.day)),
+            (
+                "max_background".into(),
+                Json::from(u64::from(self.max_background)),
+            ),
             ("shared".into(), shared_json(&self.shared)),
             (
                 "template_shared".into(),
@@ -202,6 +209,14 @@ impl Client {
                 turn: limit("max_cost_per_turn")?,
                 conversation: limit("max_cost_per_conversation")?,
                 day: limit("max_cost_per_day")?,
+            },
+            max_background: match value.get("max_background") {
+                None => DEFAULT_MAX_BACKGROUND,
+                Some(n) => n
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|n| MAX_BACKGROUND.contains(n))
+                    .ok_or("max_background is out of range")?,
             },
             shared: match value.get("shared") {
                 None => Vec::new(),
@@ -361,7 +376,7 @@ const KEYS: &[(&str, Use)] = &[
     ("protected_branches", Use::Later(14)),
     ("fetch_interval", Use::Read),
     ("fetch_concurrency", Use::Later(11)),
-    ("max_background", Use::Later(12)),
+    ("max_background", Use::Read),
     ("background_output_bytes", Use::Later(12)),
     ("auto_compact", Use::Later(16)),
     ("compact_at", Use::Later(16)),
@@ -408,6 +423,11 @@ pub struct Config {
     /// `DEFAULT_FETCH_INTERVAL`.
     pub fetch_interval: Option<u64>,
 }
+
+/// The most background processes a conversation runs at once
+/// (DESIGN.md §12, §15), by default and as a file may set it.
+pub const DEFAULT_MAX_BACKGROUND: u32 = 4;
+const MAX_BACKGROUND: std::ops::RangeInclusive<u32> = 1..=16;
 
 /// How often, in seconds, the stores are fetched in the background
 /// (DESIGN.md §7, Keeping current), and the bounds a file may set.
@@ -785,6 +805,20 @@ pub fn parse(text: &str) -> Result<Config, String> {
             })?,
         );
     }
+    if let Some(value) = table.get("max_background") {
+        config.client.max_background = match value {
+            Toml::Int(n) => u32::try_from(*n).ok(),
+            _ => None,
+        }
+        .filter(|n| MAX_BACKGROUND.contains(n))
+        .ok_or_else(|| {
+            format!(
+                "`max_background` is a whole number from {} to {}, not {value:?}",
+                MAX_BACKGROUND.start(),
+                MAX_BACKGROUND.end()
+            )
+        })?;
+    }
     let client = &mut config.client;
     for (key, slot) in [
         ("max_cost_per_turn", &mut client.limits.turn),
@@ -1007,6 +1041,31 @@ mod tests {
             let refused = parse(&format!("fetch_interval = {text}")).unwrap_err();
             assert!(refused.contains("whole number of seconds"), "{refused}");
         }
+    }
+
+    #[test]
+    fn max_background_is_a_count_within_its_bounds_and_crosses_whole() {
+        assert_eq!(Config::default().client.max_background, 4);
+        for (text, most) in [("1", 1), ("16", 16)] {
+            let config = parse(&format!("max_background = {text}")).unwrap();
+            assert_eq!(config.client.max_background, most);
+            assert!(config.notes.is_empty(), "{:?}", config.notes);
+            let client = &config.client;
+            assert_eq!(&Client::from_json(&client.to_json()).unwrap(), client);
+        }
+        for text in ["0", "17", "-1", "2.5", "\"4\""] {
+            let refused = parse(&format!("max_background = {text}")).unwrap_err();
+            assert!(refused.contains("`max_background`"), "{refused}");
+        }
+        let mut value = Client::default().to_json();
+        if let Json::Obj(pairs) = &mut value {
+            for (name, n) in pairs.iter_mut() {
+                if name == "max_background" {
+                    *n = Json::from(17u64);
+                }
+            }
+        }
+        assert!(Client::from_json(&value).is_err());
     }
 
     #[test]

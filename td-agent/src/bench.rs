@@ -38,6 +38,7 @@ pub fn fresh(call: &Call) -> bool {
     matches!(
         call,
         Call::Shell { .. }
+            | Call::Background { .. }
             | Call::Grep { .. }
             | Call::Sed { .. }
             | Call::Snapshot { .. }
@@ -197,6 +198,9 @@ pub fn limit(call: &Call) -> Duration {
             timeout_ms: Some(ms),
             ..
         } => Duration::from_millis(*ms),
+        Call::Background { timeout_ms, .. } => timeout_ms
+            .map_or(shell::MAX_BACKGROUND_TIMEOUT, Duration::from_millis)
+            .min(shell::MAX_BACKGROUND_TIMEOUT),
         _ => shell::DEFAULT_TIMEOUT,
     };
     own.saturating_add(LIMIT_GRACE)
@@ -251,6 +255,20 @@ mod tests {
             Duration::from_secs(16)
         );
         assert_eq!(limit(&read), shell::DEFAULT_TIMEOUT + LIMIT_GRACE);
+        let background = |timeout_ms| Call::Background {
+            command: "x".into(),
+            timeout_ms,
+            workdir: None,
+        };
+        assert!(fresh(&background(None)));
+        assert_eq!(
+            limit(&background(None)),
+            shell::MAX_BACKGROUND_TIMEOUT + LIMIT_GRACE
+        );
+        assert_eq!(
+            limit(&background(Some(u64::MAX))),
+            shell::MAX_BACKGROUND_TIMEOUT + LIMIT_GRACE
+        );
     }
 
     #[test]

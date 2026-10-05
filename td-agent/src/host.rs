@@ -61,6 +61,13 @@ pub enum Call {
         timeout_ms: Option<u64>,
         workdir: Option<String>,
     },
+    /// A `shell` call with `background`: its instance outlives the call
+    /// that started it, answered when the command ends (DESIGN.md §12).
+    Background {
+        command: String,
+        timeout_ms: Option<u64>,
+        workdir: Option<String>,
+    },
     Grep {
         pattern: String,
         path: Option<String>,
@@ -143,7 +150,8 @@ fn opt_num(value: Option<u64>) -> Json {
 }
 
 impl Call {
-    /// The tool's name, as the model calls it.
+    /// The call's name on the wire: the tool's, as the model calls it,
+    /// but for td-agent's own and a background `shell`.
     pub fn tool(&self) -> &'static str {
         match self {
             Self::Read { .. } => "read_file",
@@ -151,6 +159,7 @@ impl Call {
             Self::Edit { .. } => "edit_file",
             Self::Glob { .. } => "glob",
             Self::Shell { .. } => "shell",
+            Self::Background { .. } => "background",
             Self::Grep { .. } => "grep",
             Self::Sed { .. } => "sed",
             Self::Snapshot { .. } => "snapshot",
@@ -199,6 +208,11 @@ impl Call {
                 ("path", opt_str(path.as_deref())),
             ]),
             Self::Shell {
+                command,
+                timeout_ms,
+                workdir,
+            }
+            | Self::Background {
                 command,
                 timeout_ms,
                 workdir,
@@ -332,6 +346,11 @@ impl Call {
                 path: maybe("path")?,
             },
             "shell" => Self::Shell {
+                command: text("command")?,
+                timeout_ms: number("timeout_ms")?,
+                workdir: maybe("workdir")?,
+            },
+            "background" => Self::Background {
                 command: text("command")?,
                 timeout_ms: number("timeout_ms")?,
                 workdir: maybe("workdir")?,
@@ -688,6 +707,11 @@ mod tests {
             Call::Shell {
                 command: "ls".into(),
                 timeout_ms: Some(5),
+                workdir: Some("/w".into()),
+            },
+            Call::Background {
+                command: "make".into(),
+                timeout_ms: None,
                 workdir: Some("/w".into()),
             },
             Call::Grep {

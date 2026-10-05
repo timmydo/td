@@ -1,0 +1,24 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"toolu_bg_01","type":"function","function":{"name":"shell","arguments":""}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"sleep 60\",\"background\":true}"}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":1,"id":"toolu_bg_02","type":"function","function":{"name":"shell","arguments":""}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":1,"function":{"arguments":"{\"command\":\"sleep 2; exit 3\",\"background\":true}"}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":2,"id":"toolu_bg_03","type":"function","function":{"name":"shell","arguments":""}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":2,"function":{"arguments":"{\"command\":\"true\",\"background\":true}"}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":3,"id":"toolu_list_01","type":"function","function":{"name":"process_list","arguments":""}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":3,"function":{"arguments":"{}"}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null},"finish_reason":"tool_calls","native_finish_reason":"tool_use","logprobs":null}]}
+
+data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null,"native_finish_reason":null,"logprobs":null}],"usage":{"prompt_tokens":1500,"completion_tokens":60,"total_tokens":1560,"cost":0.002,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0,"audio_tokens":0},"cost_details":{"upstream_inference_cost":null},"completion_tokens_details":{"reasoning_tokens":0,"image_tokens":0}}}
+
+data: [DONE]
+

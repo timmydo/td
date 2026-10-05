@@ -98,6 +98,9 @@ struct Running {
     /// Undos and redos asked of it and not yet heard done: its files may
     /// be half written, so it is kept until they are.
     restoring: u32,
+    /// Its background processes running, by its log: none survives it,
+    /// so it is kept while any runs (DESIGN.md §12).
+    background: u32,
 }
 
 impl Running {
@@ -110,8 +113,19 @@ impl Running {
             || self.resuming
             || !self.preparing.is_empty()
             || self.restoring > 0
+            || self.background > 0
             || !self.pending.is_empty()
             || !self.deliveries.is_empty()
+    }
+}
+
+/// A count of background processes running, after its log's `kind`:
+/// one more for a start, one fewer for an end (DESIGN.md §12).
+fn background(running: u32, kind: &Kind) -> u32 {
+    match kind {
+        Kind::Process { .. } => running.saturating_add(1),
+        Kind::Ended { .. } => running.saturating_sub(1),
+        _ => running,
     }
 }
 
@@ -212,6 +226,7 @@ impl Supervisor {
             busy: None,
             preparing: Vec::new(),
             restoring: 0,
+            background: 0,
             resuming: false,
         });
         Ok(())
@@ -371,6 +386,7 @@ impl Supervisor {
             busy: None,
             preparing: Vec::new(),
             restoring: 0,
+            background: 0,
             resuming: false,
         });
         self.open = Some(id);
@@ -583,8 +599,10 @@ impl Supervisor {
             let _ = running.child.wait();
             running.busy = None;
             // Its process gone, nothing is half written by it any more,
-            // and the new one is not asked again.
+            // and the new one is not asked again; its background
+            // processes went with it.
             running.restoring = 0;
+            running.background = 0;
             if running.restarts >= MAX_RESTARTS {
                 running.failed = true;
                 return Update::Failed { reason };
@@ -703,6 +721,8 @@ fn drain(running: &mut Running, updates: &mut Vec<(Id, Update)>) -> Option<Strin
                         Up::Hello { .. } => {
                             running.busy = None;
                             running.resuming = false;
+                            // Its log, replayed next, counts them again.
+                            running.background = 0;
                             // A process started again asks again.
                             running.preparing.clear();
                         }
@@ -725,6 +745,9 @@ fn drain(running: &mut Running, updates: &mut Vec<(Id, Update)>) -> Option<Strin
                                 if running.busy == Some(started) =>
                             {
                                 running.busy = None
+                            }
+                            Kind::Process { .. } | Kind::Ended { .. } => {
+                                running.background = background(running.background, &event.kind)
                             }
                             _ => {}
                         },
@@ -836,5 +859,28 @@ fn exit_reason(child: &mut Child) -> String {
             Ok(None) => return "its process closed the socketpair".into(),
             Err(e) => return format!("its process: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+
+    #[test]
+    fn a_start_counts_one_more_and_an_end_one_fewer() {
+        let start = Kind::Process {
+            number: 1,
+            call: 2,
+            command: "make".into(),
+        };
+        let end = Kind::Ended {
+            number: 1,
+            how: "killed".into(),
+        };
+        assert_eq!(background(0, &start), 1);
+        assert_eq!(background(1, &end), 0);
+        // A replayed end after a restart reset the count stays at none.
+        assert_eq!(background(0, &end), 0);
+        assert_eq!(background(3, &Kind::Pause { paused: true }), 3);
     }
 }

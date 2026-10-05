@@ -468,6 +468,8 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Kind::Todo { .. } => "todo",
             Kind::Snapshot { .. } => "snapshot",
             Kind::Restore { .. } => "restore",
+            Kind::Process { .. } => "process",
+            Kind::Ended { .. } => "ended",
             Kind::Pause { .. } => "pause",
             Kind::Choice { .. } => "choice",
             Kind::Approval { .. } => "approval",
@@ -2233,6 +2235,208 @@ fn a_tool_host_that_does_not_answer_is_torn_down_at_the_deadline() {
         "{results:?}"
     );
     assert!(asked.elapsed() < Duration::from_secs(25));
+}
+
+/// The end of background process `number` this process logs, waiting
+/// for it.
+fn until_ended(h: &mut Harness, number: u64) -> String {
+    loop {
+        let up = h.next();
+        if h.hear(&up) {
+            continue;
+        }
+        if let Up::Event(Event {
+            kind: Kind::Ended { number: n, how },
+            ..
+        }) = up
+        {
+            if n == number {
+                return how;
+            }
+        }
+    }
+}
+
+/// `process_list` shows the latest processes, each command cut, so its
+/// result fits however many ran; `process_kill` of one that ended says
+/// how (DESIGN.md §12).
+#[test]
+fn the_process_list_is_the_latest_and_bounded() {
+    let h = Harness::new_in(
+        "plist",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-process-list.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    let (mut conversation, mut h) = h.close();
+    let long = format!("{}tail", "\t".repeat(300));
+    for number in 1..=52u64 {
+        let command = if number == 52 {
+            long.clone()
+        } else {
+            format!("job {number}")
+        };
+        conversation
+            .append(Kind::Process {
+                number,
+                call: 0,
+                command,
+            })
+            .unwrap();
+        conversation
+            .append(Kind::Ended {
+                number,
+                how: "exit status 0".into(),
+            })
+            .unwrap();
+    }
+    conversation.sync().unwrap();
+    drop(conversation);
+    h.reopen();
+    h.setup(Client::default());
+    h.say("List them.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let said = results(&events);
+    let list = &said[0].1;
+    assert!(
+        list.starts_with("2 earlier not shown\np3 | exit status 0 | started "),
+        "{list}"
+    );
+    assert!(!list.contains("| job 2\n"), "{list}");
+    assert!(
+        list.contains("| job 51\np52 | exit status 0 | started "),
+        "{list}"
+    );
+    assert!(
+        list.ends_with(&format!("{}...", "<U+0009>".repeat(200))),
+        "{list}"
+    );
+    assert_eq!(said[1].1, "error: p52 is not running: exit status 0");
+}
+
+/// A background command runs on in its own jail after its call returns,
+/// numbered from the log; at most `max_background` run at once; one is
+/// listed while it runs, and its end, by itself or killed, is logged;
+/// no undo runs meanwhile; and one still running when its conversation's
+/// process ends is lost (DESIGN.md §12).
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn a_background_command_runs_on_until_it_ends_or_is_killed() {
+    let mut h = Harness::new_in(
+        "background",
+        Role::Conversation,
+        Some("scratch"),
+        true,
+        vec![
+            Reply::sse("stream-tool-background.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client {
+        max_background: 2,
+        ..Client::default()
+    });
+    h.say("Build in the background.");
+    for command in ["sleep 60", "sleep 2; exit 3"] {
+        let (call, title, details) = h.until_ask();
+        assert_eq!(title, "Run a command in the background");
+        assert_eq!(details[1], command);
+        h.down(&Down::Decision { call, allow: true });
+    }
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let said = results(&events);
+    assert!(said[0].1.starts_with("started p1 "), "{said:?}");
+    assert!(said[1].1.starts_with("started p2 "), "{said:?}");
+    // The third is refused before any card: two run.
+    assert_eq!(
+        said[2].1,
+        "error: 2 background processes are running (p1, p2), the most at once; wait for one to end or kill one"
+    );
+    assert!(said[3].1.contains("p1 | running | started "), "{said:?}");
+    assert!(said[3].1.contains("| sleep 60"), "{said:?}");
+    // Logged inside the turn, or after it.
+    let ended = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Kind::Ended { number: 2, how } => Some(how.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| until_ended(&mut h, 2));
+    assert_eq!(ended, "exit status 3");
+    // While one runs, nothing is restored, whichever step.
+    h.down(&Down::Restore {
+        step: 1,
+        undo: true,
+    });
+    loop {
+        if let Up::Event(Event {
+            kind: Kind::Notice { text },
+            ..
+        }) = h.next()
+        {
+            assert_eq!(
+                text,
+                "the step could not be undone: background processes are running (p1); kill them first"
+            );
+            break;
+        }
+    }
+
+    h.mock.then(vec![
+        Reply::sse("stream-tool-background-kill.sse"),
+        Reply::sse("stream-sonnet.sse"),
+    ]);
+    h.say("Stop it.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let said = results(&events);
+    assert_eq!(said[0].1, "p1 is being killed");
+    assert_eq!(said[1].1, "error: p2 is not running: exit status 3");
+    assert_eq!(said[2].1, "error: there is no p9");
+    // Logged between the turn's steps, or after it.
+    let killed = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Kind::Ended { number: 1, how } => Some(how.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| until_ended(&mut h, 1));
+    assert_eq!(killed, "killed");
+
+    // Numbered on from the log; gone with the process that ran it.
+    h.mock.then(vec![
+        Reply::sse("stream-tool-background.sse"),
+        Reply::sse("stream-sonnet.sse"),
+    ]);
+    h.say("Again.");
+    for _ in 0..2 {
+        let (call, _, _) = h.until_ask();
+        h.down(&Down::Decision { call, allow: true });
+    }
+    let (events, _, _) = h.turn();
+    assert!(results(&events)[0].1.starts_with("started p3 "));
+    let (conversation, mut h) = h.close();
+    drop(conversation);
+    h.reopen();
+    let (conversation, _h) = h.close();
+    let ended = conversation.events().iter().find_map(|e| match &e.kind {
+        Kind::Ended { number: 3, how } => Some(how.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        ended.as_deref(),
+        Some(td_agent::store::PROCESS_LOST),
+        "{:?}",
+        conversation.events()
+    );
 }
 
 // --- the conversation tools (DESIGN.md §3, §5, §12) ---------------------

@@ -1857,6 +1857,11 @@ impl App {
                 "you {} the step snapshotted at #{step}",
                 if undo { "undid" } else { "redid" }
             )),
+            // The `shell` call's result says it started.
+            Kind::Process { .. } => {}
+            Kind::Ended { number, how } => {
+                self.notice_message(&format!("background process p{number} ended: {how}"))
+            }
             Kind::Todo { items, cleared } => {
                 if cleared {
                     self.notice_message("you cleared the todo list");
@@ -5243,12 +5248,38 @@ pub mod tests {
             0,
         );
         assert!(text(&app).contains("you undid the step snapshotted at #5"));
+        // A background process's start is its call's result; its end is
+        // a notice.
+        let shown = text(&app);
+        app.update(
+            at(
+                9,
+                Kind::Process {
+                    number: 1,
+                    call: 2,
+                    command: "make".into(),
+                },
+            ),
+            0,
+        );
+        assert_eq!(text(&app), shown);
+        app.update(
+            at(
+                10,
+                Kind::Ended {
+                    number: 1,
+                    how: "exit status 2".into(),
+                },
+            ),
+            0,
+        );
+        assert!(text(&app).contains("background process p1 ended: exit status 2"));
         key(&mut app, "C-z");
         assert_eq!(app.take_requests(), [Request::Undo(3)]);
         key(&mut app, "C-S-z");
         assert_eq!(app.take_requests(), [Request::Redo(5)]);
         // A new step leaves nothing to redo.
-        app.update(snapshot(9), 0);
+        app.update(snapshot(11), 0);
         key(&mut app, "C-S-z");
         assert!(app.take_requests().is_empty());
         assert!(app.notice().unwrap().contains("no step to redo"));

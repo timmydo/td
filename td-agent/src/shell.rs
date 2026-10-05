@@ -20,6 +20,9 @@ use std::time::{Duration, Instant};
 /// name.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(600);
+/// The longest a background process runs, and how long it runs when its
+/// call names no timeout (DESIGN.md §12).
+pub const MAX_BACKGROUND_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 /// What is kept of a call's output, standard error interleaved: its first
 /// and its last this many bytes, the rest counted (the log's record).
 pub const KEPT_HEAD: usize = 64 * 1024;
@@ -345,6 +348,22 @@ pub fn timeout(ms: Option<u64>) -> Result<Duration, String> {
     Ok(asked)
 }
 
+/// A background process's timeout: the longest when none is given,
+/// refused past it.
+pub fn background_timeout(ms: Option<u64>) -> Result<Duration, String> {
+    let Some(ms) = ms else {
+        return Ok(MAX_BACKGROUND_TIMEOUT);
+    };
+    let asked = Duration::from_millis(ms);
+    if ms == 0 || asked > MAX_BACKGROUND_TIMEOUT {
+        return Err(format!(
+            "`timeout_ms` is {ms}; in the background it is from 1 to {}",
+            MAX_BACKGROUND_TIMEOUT.as_millis()
+        ));
+    }
+    Ok(asked)
+}
+
 /// A `grep` call's arguments (§12).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Grep {
@@ -610,6 +629,16 @@ mod tests {
         assert_eq!(timeout(Some(5000)).unwrap(), Duration::from_secs(5));
         assert!(timeout(Some(0)).unwrap_err().contains("from 1 to 600000"));
         assert!(timeout(Some(600_001)).is_err());
+        // In the background, a day, and a day at most.
+        assert_eq!(background_timeout(None).unwrap(), MAX_BACKGROUND_TIMEOUT);
+        assert_eq!(
+            background_timeout(Some(86_400_000)).unwrap(),
+            MAX_BACKGROUND_TIMEOUT
+        );
+        assert!(background_timeout(Some(0)).is_err());
+        assert!(background_timeout(Some(86_400_001))
+            .unwrap_err()
+            .contains("in the background"));
     }
 
     #[test]

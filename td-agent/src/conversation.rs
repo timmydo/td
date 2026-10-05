@@ -33,7 +33,7 @@
 //! its own into the same channel, so an interrupt from the window is heard
 //! between any two of its frames.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
@@ -83,6 +83,11 @@ const MAX_WHY: usize = 1000;
 fn quoted(why: &str) -> String {
     crate::tools::visible(why).chars().take(MAX_WHY).collect()
 }
+
+/// The most background processes `process_list` shows, the latest, and
+/// how much of each command.
+const MAX_PROCESSES_LISTED: usize = 50;
+const MAX_LISTED_COMMAND: usize = 200;
 
 /// A commit as a notice names it.
 fn short(id: &str) -> &str {
@@ -172,6 +177,12 @@ enum Inbound {
         remote: String,
         result: Set,
     },
+    /// Background process `number`, watched on its own thread (`watch`),
+    /// ended, `how` as `process_list` says it.
+    Ended {
+        number: u64,
+        how: String,
+    },
 }
 
 /// What a checkout set: the bases and the commits their remote-tracking
@@ -183,6 +194,7 @@ type Set = Result<Vec<(String, String)>, String>;
 enum Work {
     Down(Down),
     Checked(String, Set),
+    Ended(u64, String),
 }
 
 /// One step of a streamed request, as its thread read it.
@@ -311,6 +323,8 @@ pub fn serve_in(
         unsnapped: false,
         snapless: false,
         checked: VecDeque::new(),
+        processes: BTreeMap::new(),
+        exited: VecDeque::new(),
     };
     // What this conversation read or wrote before, so a replacement of an
     // unchanged file needs no read again.
@@ -327,6 +341,33 @@ pub fn serve_in(
     }
     session.ask_stores();
     session.serve()
+}
+
+/// Watches background call `call` on `client` until it ends, `killed`
+/// says to kill it or is dropped, or `limit` passes: how it ended, as
+/// `process_list` says it. Its instance ends with `client`.
+fn watch(mut client: host::Client, call: u64, limit: Duration, killed: &Receiver<()>) -> String {
+    let deadline = Instant::now().checked_add(limit);
+    loop {
+        match killed.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => return "killed".into(),
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if deadline.is_some_and(|at| Instant::now() >= at) {
+            return "timed out".into();
+        }
+        match client.next_reply(HOST_POLL) {
+            None | Some(Ok(host::Up::Output { .. })) => {}
+            Some(Ok(host::Up::Done { id, outcome })) if id == call => {
+                return match outcome {
+                    Ok(done) => done.text,
+                    Err(why) => format!("failed: {why}"),
+                }
+            }
+            Some(Ok(host::Up::Done { .. })) => {}
+            Some(Err(why)) => return format!("failed: {why}"),
+        }
+    }
 }
 
 /// The prefix a hello carries: none past `MAX_TEXT`, which keeps the
@@ -498,6 +539,12 @@ struct Session {
     /// Checkouts done, with what each set or why not, kept until a turn's
     /// next step or the turn's end (`between`, `woken`).
     checked: VecDeque<(String, Set)>,
+    /// The background processes running, by number, each with what tells
+    /// its watcher to kill it (DESIGN.md §12); dropped, it does.
+    processes: BTreeMap<u64, mpsc::Sender<()>>,
+    /// Background processes that ended, by number with how, kept until a
+    /// turn's next step or the turn's end (`between`).
+    exited: VecDeque<(u64, String)>,
 }
 
 /// A remote whose remote-tracking refs could not be set to `tried`, and
@@ -547,6 +594,7 @@ impl Session {
                 Ok(Inbound::Down(down)) => self.queue.push_back(down),
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
+                Ok(Inbound::Ended { number, how }) => self.exit(number, how),
                 Ok(Inbound::Closed) => self.ended = Some(Ok(())),
                 Ok(Inbound::Broken(e)) => self.ended = Some(Err(e)),
                 Err(_) => break,
@@ -560,6 +608,9 @@ impl Session {
         if let Some((remote, result)) = self.checked.pop_front() {
             return Ok(Some(Work::Checked(remote, result)));
         }
+        if let Some((number, how)) = self.exited.pop_front() {
+            return Ok(Some(Work::Ended(number, how)));
+        }
         match self.ended.take() {
             Some(Ok(())) => return Ok(None),
             Some(Err(e)) => return Err(format!("the window: {e}")),
@@ -571,6 +622,7 @@ impl Session {
                 Ok(Inbound::Checked { remote, result }) => {
                     return Ok(Some(Work::Checked(remote, result)))
                 }
+                Ok(Inbound::Ended { number, how }) => return Ok(Some(Work::Ended(number, how))),
                 Ok(Inbound::Closed) | Err(_) => return Ok(None),
                 Ok(Inbound::Broken(e)) => return Err(format!("the window: {e}")),
                 // A stream given up on, still reading to its next frame.
@@ -585,6 +637,15 @@ impl Session {
                 None => return Ok(()),
                 Some(Work::Checked(remote, result)) => {
                     self.woken(remote, result)?;
+                    if !self.gone {
+                        let _ = self.writer.flush();
+                    }
+                    continue;
+                }
+                Some(Work::Ended(number, how)) => {
+                    self.ended(number, how)?;
+                    // Durable, or the next open says it was lost.
+                    self.sync()?;
                     if !self.gone {
                         let _ = self.writer.flush();
                     }
@@ -879,6 +940,7 @@ impl Session {
                 Ok(Inbound::Down(down)) => self.queue.push_back(down),
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
+                Ok(Inbound::Ended { number, how }) => self.exit(number, how),
                 Ok(Inbound::Closed | Inbound::Broken(_)) | Err(RecvTimeoutError::Disconnected) => {
                     self.gone = true;
                     return Err("the window has closed".into());
@@ -903,6 +965,7 @@ impl Session {
                 Inbound::Down(down) => self.queue.push_back(down),
                 Inbound::Fetch { .. } => {}
                 Inbound::Checked { remote, result } => self.checked.push_back((remote, result)),
+                Inbound::Ended { number, how } => self.exit(number, how),
                 Inbound::Closed | Inbound::Broken(_) => self.gone = true,
             }
         }
@@ -1397,6 +1460,18 @@ impl Session {
     /// and, as the tool host checks, as it was left; what to tell the
     /// model, or why not.
     fn restoring(&mut self, step: u64, undo: bool) -> Result<String, String> {
+        // What one writes a restore could overwrite, or be overwritten by,
+        // whichever step it is; one that has ended is not running.
+        self.hear();
+        while let Some((number, how)) = self.exited.pop_front() {
+            self.ended(number, how)?;
+        }
+        if !self.processes.is_empty() {
+            return Err(format!(
+                "background processes are running ({}); kill them first",
+                self.process_names()
+            ));
+        }
         let steps = store::Steps::of(self.conversation.events());
         let latest = if undo { steps.undo() } else { steps.redo() };
         if latest != Some(step) {
@@ -1790,6 +1865,9 @@ impl Session {
     /// request reads it (DESIGN.md §7); whether there was one.
     fn between(&mut self) -> Result<bool, String> {
         self.hear();
+        while let Some((number, how)) = self.exited.pop_front() {
+            self.ended(number, how)?;
+        }
         let any = !self.checked.is_empty();
         while let Some((remote, result)) = self.checked.pop_front() {
             let said = self.checked_out(&remote, result);
@@ -1993,6 +2071,7 @@ impl Session {
                 Ok(Inbound::Down(down)) => self.queue.push_back(down),
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
+                Ok(Inbound::Ended { number, how }) => self.exit(number, how),
                 Ok(Inbound::Closed | Inbound::Broken(_)) | Err(_) => {
                     self.gone = true;
                     return Err("the window has closed".into());
@@ -2077,6 +2156,22 @@ impl Session {
                 return failed(why);
             }
         }
+        if let host::Call::Background { .. } = &call {
+            // One that has ended runs no more.
+            self.hear();
+            let most = self
+                .setup
+                .as_ref()
+                .map_or(crate::config::DEFAULT_MAX_BACKGROUND, |(_, client)| {
+                    client.max_background
+                });
+            if self.processes.len() >= most as usize {
+                return failed(format!(
+                    "{most} background processes are running ({}), the most at once; wait for one to end or kill one",
+                    self.process_names()
+                ));
+            }
+        }
         if acts {
             let (title, details) = tools::card(&call);
             match self.decide(started, title, details)? {
@@ -2100,6 +2195,13 @@ impl Session {
             Ok(id) => id,
             Err(why) => return failed(why),
         };
+        if let host::Call::Background { command, .. } = &call {
+            let limit = crate::bench::limit(&call);
+            return Ok((
+                self.background(started, command, client, id, limit),
+                Beside::default(),
+            ));
+        }
         // What runs in the jail may stop or replace the tool host, so the
         // call's time is kept here too, past which its jail is torn down.
         let mut deadline = Instant::now() + crate::bench::limit(&call);
@@ -2140,6 +2242,158 @@ impl Session {
         }
     }
 
+    /// Background process `call` started on `client`, whose `started`
+    /// `ToolCall` it is, given its own number and a thread that watches
+    /// it until it ends, is killed or passes `limit` (DESIGN.md §12).
+    fn background(
+        &mut self,
+        started: u64,
+        command: &str,
+        client: host::Client,
+        call: u64,
+        limit: Duration,
+    ) -> Result<String, String> {
+        let number = store::backgrounds(self.conversation.events())
+            .iter()
+            .map(|one| one.number)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        // Logged before it is watched, so its end is never logged first;
+        // a process whose start cannot be logged is ended with `client`.
+        self.log(Kind::Process {
+            number,
+            call: started,
+            command: command.to_string(),
+        })?;
+        let (kill, killed) = mpsc::channel();
+        let inbox = self.sender.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("p{number}"))
+            .spawn(move || {
+                let how = watch(client, call, limit, &killed);
+                let _ = inbox.send(Inbound::Ended { number, how });
+            });
+        if let Err(e) = spawned {
+            self.ended(number, format!("failed: a thread to watch it: {e}"))?;
+            return Err(format!("a thread to watch p{number}: {e}"));
+        }
+        self.processes.insert(number, kill);
+        Ok(format!(
+            "started p{number} in the background; process_list shows it, process_kill ends it"
+        ))
+    }
+
+    /// Background process `number` ended `how`: logged, once.
+    fn ended(&mut self, number: u64, how: String) -> Result<(), String> {
+        self.processes.remove(&number);
+        let running = store::backgrounds(self.conversation.events())
+            .iter()
+            .any(|one| one.number == number && one.ended.is_none());
+        if running {
+            // What the jail said, its tool host maybe replaced: one
+            // bounded line.
+            self.log(Kind::Ended {
+                number,
+                how: quoted(&how),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Background process `number` ended `how`, heard: it runs no more,
+    /// and its end is logged at the next step or while idle (`ended`).
+    fn exit(&mut self, number: u64, how: String) {
+        self.processes.remove(&number);
+        self.exited.push_back((number, how));
+    }
+
+    /// How background process `number` ended, as heard and not yet
+    /// logged.
+    fn heard_end(&self, number: u64) -> Option<String> {
+        self.exited
+            .iter()
+            .find(|(n, _)| *n == number)
+            .map(|(_, how)| quoted(how))
+    }
+
+    /// The running background processes' ids, for a refusal.
+    fn process_names(&self) -> String {
+        self.processes
+            .keys()
+            .map(|number| format!("p{number}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// `process_list`: the log's background processes, the running ones
+    /// as this process has them.
+    fn process_list(&mut self) -> String {
+        self.hear();
+        let all = store::backgrounds(self.conversation.events());
+        if all.is_empty() {
+            return "no background processes".into();
+        }
+        // The latest, each command cut, so the list fits a log line.
+        let earlier = all.len().saturating_sub(MAX_PROCESSES_LISTED);
+        let mut out = String::new();
+        if earlier > 0 {
+            out.push_str(&format!("{earlier} earlier not shown"));
+        }
+        for one in all.iter().skip(earlier) {
+            let state = match &one.ended {
+                Some(how) => how.clone(),
+                None if self.processes.contains_key(&one.number) => "running".into(),
+                // Its end heard and not yet logged; "ending" only when
+                // logging an end failed.
+                None => self
+                    .heard_end(one.number)
+                    .unwrap_or_else(|| "ending".into()),
+            };
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            let command: String = one.command.chars().take(MAX_LISTED_COMMAND).collect();
+            out.push_str(&format!(
+                "p{} | {state} | started {} | {}{}",
+                one.number,
+                history::utc(one.started),
+                tools::visible(&command),
+                if command.len() < one.command.len() {
+                    "..."
+                } else {
+                    ""
+                }
+            ));
+        }
+        out
+    }
+
+    /// `process_kill`: background process `number` told to end; its end
+    /// is logged when its watcher says it ended.
+    fn kill(&mut self, number: u64) -> Result<String, String> {
+        self.hear();
+        if let Some(how) = self.heard_end(number) {
+            return Err(format!("p{number} is not running: {how}"));
+        }
+        match self.processes.get(&number) {
+            Some(kill) => {
+                let _ = kill.send(());
+                Ok(format!("p{number} is being killed"))
+            }
+            None => match store::backgrounds(self.conversation.events())
+                .into_iter()
+                .find(|one| one.number == number)
+            {
+                Some(one) => Err(format!(
+                    "p{number} is not running: {}",
+                    one.ended.as_deref().unwrap_or("it has ended")
+                )),
+                None => Err(format!("there is no p{number}")),
+            },
+        }
+    }
+
     /// Asks the human whether the call `started` may run, on a card the
     /// window draws (DESIGN.md §11) with `title` and `details`, and waits
     /// for the answer however long it takes, hearing the window
@@ -2172,6 +2426,7 @@ impl Session {
                 Ok(Inbound::Down(down)) => self.queue.push_back(down),
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
+                Ok(Inbound::Ended { number, how }) => self.exit(number, how),
                 Ok(Inbound::Broken(why)) => {
                     eprintln!("td-agent: the window: {why}");
                     self.gone = true;
@@ -2244,6 +2499,8 @@ impl Session {
                 }
             }
             Args::Conversations => self.conversations(),
+            Args::Processes => Ok(self.process_list()),
+            Args::Kill(number) => self.kill(number),
             Args::Send { to, text } => {
                 match self.cross(started, Some(&to), Op::Message, Reach::Message(&text))? {
                     Ok(_) => self.post(to, text),
@@ -2594,6 +2851,7 @@ impl Session {
                 Ok(Inbound::Down(down)) => self.queue.push_back(down),
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
+                Ok(Inbound::Ended { number, how }) => self.exit(number, how),
                 Ok(Inbound::Closed | Inbound::Broken(_)) => {
                     self.gone = true;
                     return true;
@@ -2644,6 +2902,7 @@ impl Session {
                 }
                 Inbound::Fetch { .. } => {}
                 Inbound::Checked { remote, result } => self.checked.push_back((remote, result)),
+                Inbound::Ended { number, how } => self.exit(number, how),
                 Inbound::Down(Down::Interrupt) => {
                     break Streamed::Failed {
                         failure: Failure::Interrupted {
@@ -2982,7 +3241,9 @@ fn unready(
         | host::Call::Write { path, .. }
         | host::Call::Edit { path, .. } => vec![Some(path.as_str())],
         host::Call::Glob { path, .. } | host::Call::Grep { path, .. } => vec![path.as_deref()],
-        host::Call::Shell { workdir, .. } => vec![workdir.as_deref()],
+        host::Call::Shell { workdir, .. } | host::Call::Background { workdir, .. } => {
+            vec![workdir.as_deref()]
+        }
         host::Call::Sed { paths, .. } => paths.iter().map(|path| Some(path.as_str())).collect(),
         // td-agent's own, over the ready worktrees alone.
         host::Call::Snapshot { .. } | host::Call::Restore { .. } => Vec::new(),

@@ -3514,8 +3514,9 @@ notification quotes it. Done,
 the conversation logs an `undo` or `redo` event naming the step and
 tells the model in a notification, which wakes no turn: the person
 undid, or redid, its step, and the files it changed, made visible
-and at most 1000 characters. Background processes do not exist yet,
-so the refusal while one runs (above) is not built.
+and at most 1000 characters. While a background process runs, an
+undo or a redo is refused before any other check (As built
+(increment 12, lifetime)).
 
 **Background processes.** A `shell` call with `background: true` keeps
 its instance running after the call returns, for a build, a watcher or a
@@ -3560,6 +3561,44 @@ a step snapshot may include its changes, and the step's diff says that
 background processes were running. Undo and redo are refused while any
 background process of the workspace runs, since a restore could
 overwrite what one wrote or be overwritten by it.
+
+**As built (increment 12, lifetime).** `shell` takes `background`; with
+it the call is `host::Call::Background`, its `timeout_ms` from 1 ms to
+24 hours and 24 hours when left out, decided on a card of its own ("Run
+a command in the background"). It is refused before any card when
+`max_background` processes run (§15: 1 to 16, 4 by default, carried to
+the conversation in its `Setup`). Otherwise the conversation launches
+its instance as for any `shell`, from its main thread, logs a `process`
+event with its number, the next after the log's highest, its
+`ToolCall` and its command, and hands the instance to a thread of its
+own, which watches it until its answer, its kill or its time with the
+grace a call has (`bench::limit`). The call's result is its id. The
+tool host runs it as a `shell`, but answers with how it ended alone.
+How it ended comes back through the inbox: heard, the process runs no
+more for the cap, `process_list` and `process_kill`, and it is logged
+as an `ended` event between a turn's steps, before an undo or a redo,
+or while idle (then synced), as one bounded line with every control
+named, since a replaced tool host could say anything: its exit status
+as a call's says it (`timed out after ...` when the tool host's own
+timeout ended it), `killed`, `timed out` (the conversation's
+deadline), or `failed:` with why. `process_list` shows the latest 50
+of the log's processes, saying how many earlier it leaves out, each
+with its state, start time and command cut to 200 characters; and
+`process_kill` tells its watcher to drop the instance, which ends
+everything in it; both are the conversation's own tools, with no card.
+A conversation's process that ends drops its watchers, and with them
+its instances; the next one to open the log records each process still
+running there as `lost` (`store::PROCESS_LOST`), as it records an
+interrupted call. The window counts a conversation's running processes
+from those events (a restart, or a hello, zeroes the count before the
+log replays) and keeps its process while any runs. An undo or a redo
+is refused before any other check while one runs, whichever step it
+names. Not built yet: the output store, `process_output`,
+`process_wait` and the list's output size (the instance's output is
+read and dropped meanwhile); the exit notice to the model, which sees
+an end only through `process_list`; the window's process list and the
+status row's count; `conversations`, which still says `background 0`;
+and the step diff's note.
 
 **Todo list.** `todo_write` replaces the conversation's whole list with
 items of `pending`, `in_progress`, `done` or `cancelled`, at most one in
@@ -4054,8 +4093,8 @@ default, except `jev_threshold` until it is calibrated (§11):
 - `protected_branches`; default `["main", "master"]`
 - `fetch_interval`, a whole number of seconds from 60 to 86,400, and
   `fetch_concurrency`; defaults 600 (ten minutes) and 4
-- `max_background` and `background_output_bytes`; defaults 4 and 16 MiB
-  (§12)
+- `max_background`, a whole number from 1 to 16, and
+  `background_output_bytes`; defaults 4 and 16 MiB (§12)
 - `auto_compact`, `compact_at`, `compact_keep_tokens` and
   `compact_model`; defaults `true`, 80%, 20,000 and the conversation's
   model (§14)

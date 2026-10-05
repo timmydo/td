@@ -1190,6 +1190,49 @@ pub const CALL_INTERRUPTED: &str = "interrupted: td-agent restarted while this c
 /// What a tool call that never ran is answered with, so that every call
 /// a reply asked for has its one result.
 pub const CALL_NOT_RUN: &str = "not run: the turn ended before this call ran";
+/// How a background process still running when its conversation's
+/// process stopped ended, as far as the log knows (DESIGN.md §12).
+pub const PROCESS_LOST: &str = "lost: td-agent stopped while it ran";
+
+/// A background process as the log records it (DESIGN.md §12).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Background {
+    /// `p1` is 1.
+    pub number: u64,
+    pub command: String,
+    /// When it started, as the log's time.
+    pub started: u64,
+    /// How it ended, if it has.
+    pub ended: Option<String>,
+}
+
+/// The background processes `events` record, in the order they started.
+pub fn backgrounds(events: &[Event]) -> Vec<Background> {
+    let mut out: Vec<Background> = Vec::new();
+    for event in events {
+        match &event.kind {
+            Kind::Process {
+                number, command, ..
+            } => out.push(Background {
+                number: *number,
+                command: command.clone(),
+                started: event.time,
+                ended: None,
+            }),
+            Kind::Ended { number, how } => {
+                if let Some(one) = out
+                    .iter_mut()
+                    .rev()
+                    .find(|one| one.number == *number && one.ended.is_none())
+                {
+                    one.ended = Some(how.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
 
 /// One log event's content.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1307,6 +1350,16 @@ pub enum Kind {
     /// worktrees brought back to their trees before it, or, not `undo`,
     /// redid it (DESIGN.md §12).
     Restore { step: u64, undo: bool },
+    /// Background process `number` (`p1` is 1) started, by the `ToolCall`
+    /// at `call`, running `command` (DESIGN.md §12).
+    Process {
+        number: u64,
+        call: u64,
+        command: String,
+    },
+    /// Background process `number` ended: `how`, as `process_list` says
+    /// it, an exit status, killed, timed out, failed or lost.
+    Ended { number: u64, how: String },
     /// The human paused or resumed the conversation (DESIGN.md §3).
     Pause { paused: bool },
     /// The human chose the conversation's model and reasoning effort
@@ -1542,6 +1595,21 @@ impl Event {
                 );
                 put("step", Json::from(*step));
             }
+            Kind::Process {
+                number,
+                call,
+                command,
+            } => {
+                put("kind", Json::Str("process".into()));
+                put("number", Json::from(*number));
+                put("call", Json::from(*call));
+                put("command", Json::Str(command.clone()));
+            }
+            Kind::Ended { number, how } => {
+                put("kind", Json::Str("ended".into()));
+                put("number", Json::from(*number));
+                put("how", Json::Str(how.clone()));
+            }
             Kind::Pause { paused } => {
                 put("kind", Json::Str("pause".into()));
                 put("paused", Json::Bool(*paused));
@@ -1732,6 +1800,15 @@ impl Event {
                     })
                     .collect::<Result<_, String>>()?,
                 cleared: flag("cleared")?,
+            },
+            Some("process") => Kind::Process {
+                number: number("number")?,
+                call: number("call")?,
+                command: string("command")?,
+            },
+            Some("ended") => Kind::Ended {
+                number: number("number")?,
+                how: string("how")?,
             },
             Some(undo @ ("undo" | "redo")) => Kind::Restore {
                 step: number("step")?,
@@ -1994,6 +2071,19 @@ impl Conversation {
         for started in conversation.unfinished() {
             conversation.append(Kind::Interrupted { started })?;
             load.interrupted.push(started);
+        }
+        // No background process outlives the process that ran it.
+        let running: Vec<u64> = backgrounds(&conversation.events)
+            .into_iter()
+            .filter(|one| one.ended.is_none())
+            .map(|one| one.number)
+            .collect();
+        for number in running {
+            conversation.append(Kind::Ended {
+                number,
+                how: PROCESS_LOST.into(),
+            })?;
+            repaired = true;
         }
         if repaired || load.torn.is_some() || !load.interrupted.is_empty() {
             conversation.sync()?;
@@ -2735,6 +2825,68 @@ pub mod tests {
         assert_eq!(conversation.events().len(), 3);
     }
 
+    /// No background process outlives its conversation's process: one
+    /// the log has running when it opens is recorded lost, once.
+    #[test]
+    fn a_background_process_still_running_at_open_is_lost() {
+        let scratch = Scratch::new("lost");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        {
+            let (mut conversation, _) =
+                Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
+            for (number, command) in [(1, "make"), (2, "watch"), (3, "serve")] {
+                conversation
+                    .append(Kind::Process {
+                        number,
+                        call: 0,
+                        command: command.into(),
+                    })
+                    .unwrap();
+            }
+            conversation
+                .append(Kind::Ended {
+                    number: 2,
+                    how: "killed".into(),
+                })
+                .unwrap();
+            // A number the log holds twice, as only a hand could write
+            // it: an end is the latest unended one's.
+            conversation
+                .append(Kind::Process {
+                    number: 2,
+                    call: 0,
+                    command: "again".into(),
+                })
+                .unwrap();
+            conversation.sync().unwrap();
+        }
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        let all = backgrounds(conversation.events());
+        let ended: Vec<(u64, Option<&str>)> = all
+            .iter()
+            .map(|one| (one.number, one.ended.as_deref()))
+            .collect();
+        assert_eq!(
+            ended,
+            [
+                (1, Some(PROCESS_LOST)),
+                (2, Some("killed")),
+                (3, Some(PROCESS_LOST)),
+                (2, Some(PROCESS_LOST))
+            ]
+        );
+        let first = all.first().unwrap();
+        assert_eq!(first.command, "make");
+        assert_eq!(
+            Some(first.started),
+            conversation.events().first().map(|e| e.time)
+        );
+        drop(conversation);
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert_eq!(conversation.events().len(), 8, "recorded once");
+    }
+
     #[test]
     fn steps_are_undone_latest_first_and_a_new_one_ends_redo() {
         let at = |seq: u64, kind: Kind| Event { seq, time: 0, kind };
@@ -2901,6 +3053,15 @@ pub mod tests {
             Kind::Restore {
                 step: 9,
                 undo: false,
+            },
+            Kind::Process {
+                number: 1,
+                call: 4,
+                command: "make \"all\"\n".into(),
+            },
+            Kind::Ended {
+                number: 1,
+                how: "exit status 2".into(),
             },
             Kind::Snapshot {
                 reply: 3,

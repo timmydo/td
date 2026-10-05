@@ -129,6 +129,8 @@ fn kind(event: &Event) -> &'static str {
         Kind::Snapshot { .. } => "snapshot",
         Kind::Restore { undo: true, .. } => "undo",
         Kind::Restore { undo: false, .. } => "redo",
+        Kind::Process { .. } => "process",
+        Kind::Ended { .. } => "ended",
         Kind::Pause { .. } => "pause",
         Kind::Choice { .. } => "choice",
         Kind::Approval { .. } => "approval",
@@ -248,6 +250,12 @@ pub fn render(event: &Event) -> String {
         Kind::Restore { step, undo: true } => {
             format!("the person undid the step snapshotted at #{step}")
         }
+        Kind::Process {
+            number,
+            call,
+            command,
+        } => format!("background process p{number} started by #{call}: {command}"),
+        Kind::Ended { number, how } => format!("background process p{number} ended: {how}"),
         Kind::Restore { step, undo: false } => {
             format!("the person redid the step snapshotted at #{step}")
         }

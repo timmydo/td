@@ -61,6 +61,8 @@ pub enum Tool {
     Grep,
     Sed,
     Shell,
+    ProcessList,
+    ProcessKill,
 }
 
 /// The tools every conversation has, in the order the prefix defines
@@ -83,6 +85,8 @@ const WORKSPACE: &[Tool] = &[
     Tool::Grep,
     Tool::Sed,
     Tool::Shell,
+    Tool::ProcessList,
+    Tool::ProcessKill,
 ];
 
 impl Tool {
@@ -100,6 +104,8 @@ impl Tool {
             Self::Grep => "grep",
             Self::Sed => "sed",
             Self::Shell => "shell",
+            Self::ProcessList => "process_list",
+            Self::ProcessKill => "process_kill",
         }
     }
 
@@ -345,14 +351,26 @@ fn definition(tool: Tool) -> Json {
             ),
         ),
         Tool::Shell => (
-            format!("Run a command with sh -c in the workspace, in a fresh jail of its own: the working directory and shared directories are there, the network and the rest of this machine are not, and nothing it starts outlives the call. The working directory is the workspace's unless `workdir` names another directory in it, and does not persist between calls. Returns the exit status and the output, its middle cut when long. Default timeout {} s, at most {} s. The person approves each command before it runs, and may refuse it.", shell::DEFAULT_TIMEOUT.as_secs(), shell::MAX_TIMEOUT.as_secs()),
+            format!("Run a command with sh -c in the workspace, in a fresh jail of its own: the working directory and shared directories are there, the network and the rest of this machine are not, and nothing it starts outlives the call. The working directory is the workspace's unless `workdir` names another directory in it, and does not persist between calls. Returns the exit status and the output, its middle cut when long. Default timeout {} s, at most {} s. With `background`, it returns at once with the process's id (p1, p2, ...) and runs on, for a build or a watcher, until it ends, is killed with process_kill, or reaches `timeout_ms` ({} s when left out, and at most that); at most {} run at once unless td-agent is configured otherwise. A later call runs in a jail of its own, so it cannot reach a server a background process starts. The person approves each command before it runs, and may refuse it.", shell::DEFAULT_TIMEOUT.as_secs(), shell::MAX_TIMEOUT.as_secs(), shell::MAX_BACKGROUND_TIMEOUT.as_secs(), crate::config::DEFAULT_MAX_BACKGROUND),
             schema(
                 vec![
                     ("command", property("string", "The command, as sh -c takes it.")),
-                    ("timeout_ms", integer("How long it may run, in milliseconds.", 1, Some(shell::MAX_TIMEOUT.as_millis() as u64))),
+                    ("timeout_ms", integer(&format!("How long it may run, in milliseconds: at most {}, or {} in the background.", shell::MAX_TIMEOUT.as_millis(), shell::MAX_BACKGROUND_TIMEOUT.as_millis()), 1, Some(shell::MAX_BACKGROUND_TIMEOUT.as_millis() as u64))),
                     ("workdir", property("string", "The absolute directory to run in.")),
+                    ("background", property("boolean", "Run it in the background; false when left out.")),
                 ],
                 &["command"],
+            ),
+        ),
+        Tool::ProcessList => (
+            "List this conversation's background processes: each one's id, state (running, or how it ended: its exit status, killed, timed out, failed, or lost when td-agent stopped while it ran), start time and command.".to_string(),
+            schema(Vec::new(), &[]),
+        ),
+        Tool::ProcessKill => (
+            "Kill a background process, by its id from shell or process_list, and everything it started.".to_string(),
+            schema(
+                vec![("id", property("string", "The process's id, such as p1."))],
+                &["id"],
             ),
         ),
     };
@@ -428,6 +446,10 @@ pub enum Args {
         to: Id,
         text: String,
     },
+    /// `process_list`.
+    Processes,
+    /// `process_kill`, of the background process numbered so.
+    Kill(u64),
     /// A workspace tool's, for the tool host; `acts` when the human
     /// decides it first. A write's or an edit's expected digest is the
     /// conversation's to fill.
@@ -537,15 +559,32 @@ fn host_call(tool: Tool, value: &Json) -> Result<Call, String> {
             }
         }
         Tool::Shell => {
-            let m = members(name, value, &["command", "timeout_ms", "workdir"])?;
+            let m = members(
+                name,
+                value,
+                &["command", "timeout_ms", "workdir", "background"],
+            )?;
             let command = required(m, "command")?;
             if command.trim().is_empty() {
                 return Err("`command` is empty".into());
             }
-            Call::Shell {
-                command: command.to_string(),
-                timeout_ms: number(m, "timeout_ms", 1, shell::MAX_TIMEOUT.as_millis() as u64)?,
-                workdir: owned(m, "workdir")?,
+            if flag(m, "background")? {
+                Call::Background {
+                    command: command.to_string(),
+                    timeout_ms: number(
+                        m,
+                        "timeout_ms",
+                        1,
+                        shell::MAX_BACKGROUND_TIMEOUT.as_millis() as u64,
+                    )?,
+                    workdir: owned(m, "workdir")?,
+                }
+            } else {
+                Call::Shell {
+                    command: command.to_string(),
+                    timeout_ms: number(m, "timeout_ms", 1, shell::MAX_TIMEOUT.as_millis() as u64)?,
+                    workdir: owned(m, "workdir")?,
+                }
             }
         }
         _ => return Err(format!("{name} is not run by the tool host")),
@@ -615,6 +654,16 @@ fn number(
         return Err(format!("`{name}` is {number}, outside {least} to {most}"));
     }
     Ok(Some(number))
+}
+
+/// A background process's number from its id, `p1` being 1.
+fn process_id(id: &str) -> Result<u64, String> {
+    id.trim()
+        .strip_prefix('p')
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .filter(|number| *number > 0)
+        .ok_or_else(|| format!("`id` is a process id such as p1, not {:?}", visible(id)))
 }
 
 /// The log a history tool reads: another conversation's, or, when the
@@ -791,6 +840,14 @@ pub fn parse_in(workspace: bool, name: &str, arguments: &str) -> Result<Args, St
         Tool::Conversations => {
             members(tool_name, &value, &[])?;
             Args::Conversations
+        }
+        Tool::ProcessList => {
+            members(tool_name, &value, &[])?;
+            Args::Processes
+        }
+        Tool::ProcessKill => {
+            let m = members(tool_name, &value, &["id"])?;
+            Args::Kill(process_id(required(m, "id")?)?)
         }
         Tool::SendMessage => {
             let m = members(tool_name, &value, &["to", "text"])?;
@@ -1064,6 +1121,23 @@ pub fn card(call: &Call) -> (String, Vec<String>) {
             card.text("", command, PART_LINES * 2);
             "Run a command"
         }
+        Call::Background {
+            command,
+            timeout_ms,
+            workdir,
+        } => {
+            let timeout = timeout_ms.map_or(shell::MAX_BACKGROUND_TIMEOUT.as_secs(), |ms| {
+                ms.div_ceil(1000)
+            });
+            card.line(format!(
+                "In {}, in the background, for at most {timeout} s, in a jail of its own:",
+                workdir
+                    .as_deref()
+                    .map_or("the workspace".to_string(), visible)
+            ));
+            card.text("", command, PART_LINES * 2);
+            "Run a command in the background"
+        }
         Call::Write { path, content, .. } => {
             card.line(format!(
                 "{}, made or replaced whole with {} bytes in {} lines:",
@@ -1237,7 +1311,7 @@ mod tests {
     fn a_workspace_adds_its_tools_and_their_calls_go_to_the_host() {
         let names: Vec<&str> = Tool::all(true).iter().map(|t| t.name()).collect();
         assert_eq!(
-            names[names.len() - 7..],
+            names[names.len() - 9..],
             [
                 "read_file",
                 "write_file",
@@ -1245,7 +1319,9 @@ mod tests {
                 "glob",
                 "grep",
                 "sed",
-                "shell"
+                "shell",
+                "process_list",
+                "process_kill"
             ]
         );
         // The tool host's tools are offered only in a workspace.
@@ -1266,6 +1342,41 @@ mod tests {
                 acts: true
             }
         );
+        // In the background, a day at most; the process tools are the
+        // conversation's own.
+        assert_eq!(
+            call(
+                "shell",
+                r#"{"command":"make","background":true,"timeout_ms":86400000}"#
+            )
+            .unwrap(),
+            Args::Host {
+                call: Call::Background {
+                    command: "make".into(),
+                    timeout_ms: Some(86_400_000),
+                    workdir: None
+                },
+                acts: true
+            }
+        );
+        assert_eq!(
+            call("shell", r#"{"command":"ls","background":false}"#).unwrap(),
+            Args::Host {
+                call: Call::Shell {
+                    command: "ls".into(),
+                    timeout_ms: None,
+                    workdir: None
+                },
+                acts: true
+            }
+        );
+        assert_eq!(call("process_list", "{}").unwrap(), Args::Processes);
+        assert_eq!(
+            call("process_kill", r#"{"id":" p12 "}"#).unwrap(),
+            Args::Kill(12)
+        );
+        assert!(!Tool::acting("process_kill"));
+        assert!(parse("process_list", "{}").is_err());
         assert_eq!(
             call("read_file", r#"{"path":"/w/a","offset":3}"#).unwrap(),
             Args::Host {
@@ -1318,6 +1429,20 @@ mod tests {
                 r#"{"command":"x","timeout_ms":600001}"#,
                 "timeout_ms",
             ),
+            (
+                "shell",
+                r#"{"command":"x","background":true,"timeout_ms":86400001}"#,
+                "timeout_ms",
+            ),
+            (
+                "shell",
+                r#"{"command":"x","background":1}"#,
+                "true or false",
+            ),
+            ("process_kill", r#"{"id":"1"}"#, "process id"),
+            ("process_kill", r#"{"id":"p0"}"#, "process id"),
+            ("process_kill", r#"{"id":"p+1"}"#, "process id"),
+            ("process_kill", r#"{}"#, "`id` is missing"),
             ("sed", r#"{"script":"p","paths":[]}"#, "`paths` is empty"),
             ("sed", r#"{"script":"p","paths":[1]}"#, "not a string"),
             ("grep", r#"{"pattern":"x","context":21}"#, "context"),

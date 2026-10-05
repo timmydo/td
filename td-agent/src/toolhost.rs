@@ -392,6 +392,27 @@ fn act(
                 digest: None,
             })
         }
+        // Its output went up as it came; the answer is how it ended.
+        Call::Background {
+            command,
+            timeout_ms,
+            workdir,
+        } => {
+            let timeout = shell::background_timeout(*timeout_ms)?;
+            let dir = match workdir {
+                Some(dir) => config.path(dir, "workdir")?,
+                None => config.first("workdir")?,
+            };
+            if !dir.is_dir() {
+                return Err(format!("`workdir` {} is not a directory", dir.display()));
+            }
+            let exit = shell::run(shell::shell(command, &dir), timeout, cancel, sink)?;
+            Ok(Done {
+                text: exit.status(),
+                kept: None,
+                digest: None,
+            })
+        }
         Call::Grep {
             pattern,
             path,
