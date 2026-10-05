@@ -305,11 +305,10 @@ pub fn pool_directory(runtime: Option<&OsStr>, uid: Option<u32>, temporary: Path
 /// the directory holding it. Each directory below is made, or found, private
 /// and no link, so no other account can choose where the entry or the
 /// directory ncurses searches goes. The entry is written to a new file
-/// beside it and renamed over, so terminals starting together each leave a
-/// whole one.
+/// beside it, synced and renamed over (`td_fs::replace`), so terminals
+/// starting together each leave a whole one.
 pub fn install_runtime_terminfo(runtime: &Path, uid: u32, entry: &[u8]) -> Result<PathBuf, String> {
-    use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::unix::fs::DirBuilderExt;
     if !runtime.is_absolute() {
         return Err(format!(
             "XDG_RUNTIME_DIR '{}' is not absolute",
@@ -334,28 +333,8 @@ pub fn install_runtime_terminfo(runtime: &Path, uid: u32, entry: &[u8]) -> Resul
             _ => private_directory(&made, uid, false)?,
         }
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.subsec_nanos());
-    let staging = parent.join(format!(".td-term.{}.{nanos}", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o644)
-        .open(&staging)
-        .map_err(|e| format!("create {}: {e}", staging.display()))?;
-    // Only a file this call made is removed: a name another writer holds
-    // failed the open above and is left to it.
-    let written = file
-        .write_all(entry)
-        .map_err(|e| format!("write {}: {e}", staging.display()))
-        .and_then(|()| {
-            std::fs::rename(&staging, &path).map_err(|e| format!("rename {}: {e}", path.display()))
-        });
-    if written.is_err() {
-        let _ = std::fs::remove_file(&staging);
-    }
-    written.map(|()| directory)
+    td_fs::replace(&path, entry, 0o644).map_err(|e| e.to_string())?;
+    Ok(directory)
 }
 
 /// The packaged binary's own check of the session policy. It reads no file,

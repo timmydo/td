@@ -2,9 +2,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 //! Source-level contracts the compiler cannot express: the crate's file
-//! inventory, that it forbids `unsafe` and declares the toolkit as its one
-//! dependency, that the device and raw layers are td-ui's, and the words
-//! td's boot oracle and units read, by value.
+//! inventory, that it forbids `unsafe` and declares the toolkit and td-fs
+//! as its two dependencies, that the device and raw layers are td-ui's,
+//! and the words td's boot oracle and units read, by value.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -101,14 +101,16 @@ fn the_words_units_and_the_boot_oracle_read_are_pinned() {
 }
 
 #[test]
-fn the_manifest_declares_the_toolkit_alone_and_joins_the_gate() {
+fn the_manifest_declares_the_toolkit_and_td_fs_and_joins_the_gate() {
     let manifest = read("Cargo.toml");
     assert!(manifest.contains("[workspace]\n"), "own workspace root");
     assert!(
-        manifest.contains("\n[dependencies]\ntd-ui = { path = \"../td-ui\" }\n"),
-        "the toolkit by path"
+        manifest.contains(
+            "\n[dependencies]\ntd-fs = { path = \"../td-fs\" }\ntd-ui = { path = \"../td-ui\" }\n"
+        ),
+        "td-fs and the toolkit by path"
     );
-    assert_eq!(manifest.matches("path =").count(), 1, "one dependency");
+    assert_eq!(manifest.matches("path =").count(), 2, "two dependencies");
     for table in [
         "[dev-dependencies]",
         "[build-dependencies]",
@@ -131,7 +133,8 @@ fn the_manifest_declares_the_toolkit_alone_and_joins_the_gate() {
         assert!(manifest.contains(&format!("{lint} = \"deny\"")), "{lint}");
     }
     let lock = read("Cargo.lock");
-    assert_eq!(lock.matches("[[package]]").count(), 2);
+    assert_eq!(lock.matches("[[package]]").count(), 3);
+    assert!(lock.contains("name = \"td-fs\""));
     assert!(lock.contains("name = \"td-term\""));
     assert!(lock.contains("name = \"td-ui\""));
     assert!(!lock.contains("source ="), "no registry or git source");

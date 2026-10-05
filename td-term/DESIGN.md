@@ -21,12 +21,14 @@ framework. It is not a foot reimplementation and does not inherit foot's
 implementation or compatibility claims.
 
 td-term is its own crate, `td-term/`, and its own static binary. Its manifest
-declares one dependency, `td-ui = { path = "../td-ui" }`, and its lock lists
-exactly td-term and td-ui. It is a td-ui client like td-editor or td-portal's
-chooser: the Wayland wire codec, the connection and its SCM_RIGHTS transport,
-the object table, the seat, keymap compilation, key repeat, pointer decoding,
-the data device, and the clipboard's transfer owners are the toolkit's,
-shared with every td-owned graphical program rather than copied. td-term was
+declares two dependencies, `td-fs = { path = "../td-fs" }`, whose atomic
+replace installs the runtime terminfo entry, and `td-ui = { path =
+"../td-ui" }`, and its lock lists exactly td-term, td-fs and td-ui. It is a
+td-ui client like td-editor or td-portal's chooser: the Wayland wire codec,
+the connection and its SCM_RIGHTS transport, the object table, the seat,
+keymap compilation, key repeat, pointer decoding, the data device, and the
+clipboard's transfer owners are the toolkit's, shared with every td-owned
+graphical program rather than copied. td-term was
 once an argv[0] personality of the compositor multicall; it left so that the
 compositor carries no terminal and so that the terminal can run under a
 Wayland compositor other than td's (§7). The two now share only the sources
@@ -1642,9 +1644,9 @@ terminal, and td-term's prove the program:
   dead one is, and a silent, dripping, or over-long answer fails the probe
   within its deadline (`ready.rs`);
 - td-term's confinement tests pin its closed source inventory, that it
-  forbids `unsafe` and reaches no raw layer, that its manifest declares td-ui
-  alone and joins the gate, and, by value, the words td's units and boot
-  oracle read: the fallback title, the app id the authority probe reads,
+  forbids `unsafe` and reaches no raw layer, that its manifest declares
+  td-fs and td-ui alone and joins the gate, and, by value, the words td's
+  units and boot oracle read: the fallback title, the app id the authority probe reads,
   the proof token, every marker, the last-screen prefix and the exit
   report;
 - the shipped artifact is static, and its target selftest runs without host
@@ -1665,9 +1667,9 @@ terminal, and td-term's prove the program:
 ## 7. Running outside td
 
 td-term builds on any host with the pinned Rust toolchain, with no
-dependency but its sibling td-ui, and runs under any Wayland compositor that
-offers `wl_seat` version 5 or later, `wl_shm` and `xdg_shell` -- sway, for
-one, in place of foot:
+dependency but its siblings td-fs and td-ui, and runs under any Wayland
+compositor that offers `wl_seat` version 5 or later, `wl_shm` and
+`xdg_shell` -- sway, for one, in place of foot:
 
 ```text
 cargo build --release --manifest-path td-term/Cargo.toml

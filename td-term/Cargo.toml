@@ -6,12 +6,14 @@ description = "td's terminal: a Wayland window over a PTY, running td-ui's termi
 license = "MIT"
 
 # Own workspace root, so cargo behaves the same from the main checkout as from
-# a worktree nested under it (see the root Cargo.toml). The toolkit is the one
-# dependency, a sibling path in the one spelling the lock guard admits
-# (AGENTS.md 'Rust code').
+# a worktree nested under it (see the root Cargo.toml). The toolkit and td-fs,
+# whose atomic replace installs the terminfo entry, are the two dependencies,
+# sibling paths in the one spelling the lock guard admits (AGENTS.md 'Rust
+# code').
 [workspace]
 
 [dependencies]
+td-fs = { path = "../td-fs" }
 td-ui = { path = "../td-ui" }
 
 [package.metadata.td-gate]

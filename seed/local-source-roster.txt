@@ -22,4 +22,4 @@ td-portal-source td-portal td-secret,td-busd,td-compositor,engine,td-ui,td-tpm
 td-review-source td-review td-fs,td-ui,td-compositor
 td-setup-source td-setup td-install,td-ui,td-compositor
 td-taskmgr-source td-taskmgr td-ui,td-compositor
-td-term-source td-term td-ui,td-compositor
+td-term-source td-term td-fs,td-ui,td-compositor
