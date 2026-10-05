@@ -3,6 +3,17 @@
 
 #![cfg_attr(clippy, deny(warnings))]
 
+/// Conservative wire capacity for a UTF-8 string with this scalar escaper.
+/// Each input byte needs at most six serialized bytes, plus two quotes.
+/// A transforming source must separately justify any bound on its output;
+/// this arithmetic grants no validity, source, storage or output allowance.
+pub const fn capacity_bound(utf8_bytes: usize) -> Option<usize> {
+    match utf8_bytes.checked_mul(6) {
+        Some(bytes) => bytes.checked_add(2),
+        None => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error<E> {
     Source(E),
@@ -251,6 +262,26 @@ pub(crate) fn encode(value: char, output: &mut [u8; 6]) -> Option<usize> {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    #[test]
+    fn capacity_bound_covers_escaping_and_checked_extremes() {
+        assert_eq!(capacity_bound(0), Some(2));
+        assert_eq!(capacity_bound(1), Some(8));
+        let maximum = usize::MAX / 6;
+        assert_eq!(
+            capacity_bound(maximum),
+            maximum
+                .checked_mul(6)
+                .and_then(|bytes| bytes.checked_add(2))
+        );
+        assert_eq!(capacity_bound(maximum + 1), None);
+        assert_eq!(capacity_bound(usize::MAX), None);
+        for text in ["", "\0\u{1f}\n\t", "\"\\", "é例🐈", "e\u{301}"] {
+            assert!(
+                crate::Json::Str(text.to_owned()).to_string().len()
+                    <= capacity_bound(text.len()).unwrap()
+            );
+        }
+    }
     #[test]
     fn scalar_encoding_covers_all_unicode_without_surrogates_or_unescaped_controls() {
         let mut output = [0; 6];

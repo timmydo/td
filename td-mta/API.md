@@ -4759,6 +4759,42 @@ null selection, retained output windows, response ownership and publication
 remain enclosing obligations. A malformed field can follow a provisional
 opening quote; it never publishes a successful JSON string.
 
+### 1.110 Retained optional selected location JSON
+
+M06de adds mime_location_field::retained::Cursor over an optional complete
+caller-authorized selected field and one distinct caller-reserved backing
+window. Missing input remains absent; a present empty reference retains the
+empty JSON string. Field discovery, first-valid duplicate choice, null
+mapping, URL/label matching and publication remain external. capacity_bound
+uses the shared checked string sizing helper: URI conversion and escaping
+need at most six serialized bytes per original field octet, plus two quotes.
+The helper grants no source, storage reservation or output allowance.
+
+The cursor keeps one bound JSON child and shared td-json::retain::Window.
+Every retained turn performs fresh original admission and at most one child
+poll. Construction and consuming handoff add no charge or renewed credit;
+all source, interpretation, scalar and serialized output costs remain those
+of the independent public JSON child. A child completing its closing drain
+is freshly consumed in that turn to restore the same original owners.
+Capacity and projection failures retire the whole value and hide its View;
+provisional backing bytes are not wiped. Empty/full backing never triggers
+a renewed window or output quota. Missing input needs no backing or output.
+
+view() returns passive Retained { value, end } only after whole healthy
+completion; field provenance/form/repair and JSON bytes become visible
+together. Every later refusal hides the view. Cached Complete is inert;
+check_deadline and consuming finish(now) freshly admit even Complete before
+premature-state refusal. Healthy finish returns Retained borrowing the same
+reserved backing and the pointer-identical reusable Meter/HeaderBudget.
+The cursor is neither Copy nor Clone and supports relocation between polls.
+A view remains provisional through whole-job final publication admission.
+
+CID/language pair retention migrates atomically to the same shared window
+primitive, retaining its public Backing/Values/Retained APIs, error contexts,
+first-valid selected sources, exclusive children and original cost contracts.
+The shared window tracks only fixed backing and checked reported prefixes;
+it grants no source identity, JSON validity, completion or publication.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

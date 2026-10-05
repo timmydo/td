@@ -2045,6 +2045,15 @@ Initial independently landable increments:
   typed source/framing faults and long/escape/refusal allocation. First-valid
   location discovery/retention and traversal/response integration remain next.
 
+- **M06de — shared retained JSON windows and optional location retention:**
+  extract fixed backing/prefix bookkeeping into std-only td-json and migrate
+  paired-label retention atomically. Retain selected location JSON under the
+  same original owner/cost contracts, keeping absence and empty presence
+  distinct. Qualify exact backing, all original cuts, source/owner identity,
+  whole visibility, relocation, fresh retirement and measured long/fault
+  allocation. First-valid Content-Location discovery/source-bound retention
+  and existing traversal/response metadata integration remain next.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

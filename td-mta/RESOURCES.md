@@ -1792,6 +1792,38 @@ malformed tails, zero records/output and late scalar/closing refusal. Inputs
 are allocated before counting; worker/native/RSS and retained response
 buffers remain separate qualifications.
 
+M06de's selected location retention cursor plus HeaderBudget fits a compiled
+1024-byte ceiling in the existing parser region. The shared window owns one
+fixed reserved backing and checked prefix/failure state within four machine
+words; retention buffers remain separate caller-reserved response storage.
+CID/language retention uses two such windows without increasing its existing
+1024-byte cursor ceiling or the composed part-header 6 KiB ceiling. The two
+windows add two inline refusal slots: the paired cursor grows from 352 to
+368 bytes on the 64-bit host. The composed cursor remains 5872 bytes
+(5896 including HeaderBudget), because its larger header owner dominates.
+Existing owner ceilings still compile. No growing storage, source-sized scratch or second parser/header arena is introduced.
+
+A location turn performs fresh original admission and at most one JSON child
+poll; a completing poll freshly consumes/restores original owners in that
+turn without added resource charges or credit. Child visit/step/record and
+ten-output-byte ceilings remain inherited. Window prefix bookkeeping copies
+no bytes and grants no output. Missing input consumes no window or output;
+capacity/projection/deadline failures retire the entire result. Shared checked
+string sizing retains the existing CID 6N+2 bound and supplies the location
+bound; transforming-source policies justify both raw-octet bounds separately.
+
+Units compare retained values, diagnostics, backing and original-owner
+identity with independent public JSON projection and exact original costs.
+Every backing capacity and every original resource cut/exact grant, every
+prefix deadline/premature finish, absence versus empty presence, malformed
+fields and relocation between every turn qualify whole visibility. Existing
+paired-label resource/allocation oracles qualify the window migration.
+Warm/measured Rust intervals cover long literal/word values, exact backing,
+short escapes, repair/absence/fallback, syntax/zero/late output refusal,
+empty/full capacity, original public reuse and fresh completed retirement.
+Input/backing allocation precedes counting; native, worker/RSS and enclosing
+response retention reservations remain separate qualifications.
+
 M06cq's selected literal URI reader plus HeaderBudget fits 320 bytes in the
 existing parser region. It retains shared fixed validator/unfolder state
 and source borrows, with no source-sized scratch or second header arena.

@@ -82,6 +82,29 @@ every output/source/admission cut, mid-string yields, callback roles and
 fresh retirement at every progress cut.
 They reuse the shared scalar escaper rather than adding another serializer.
 
+## Caller-reserved fragment retention
+
+`retain::Window` owns one caller-reserved mutable backing and a checked
+prefix length. `tail` supplies only the remaining storage; `advance` records
+the producer's actually written bytes. Empty/full storage refuses further
+turns with `Capacity`, and oversized/overflow reports latch `InvalidState`.
+Writing capacity/progress refusals are sticky. `provisional` hides the prefix after refusal;
+`into_slice` consumes the same backing identity and returns the retained
+prefix without allocating. The type is neither Copy nor Clone and keeps
+within four machine words. It supplies no writer, JSON validation, source,
+work allowance, presence/null policy or completion/publication authority.
+Bind it to one producer throughout; the enclosing owner must prove whole
+producer completion and fresh final admission before retaining a result.
+Provisional bytes are not wiped on refusal.
+
+`string::capacity_bound` computes at most six wire bytes per UTF-8 source
+byte plus two quotes, with checked overflow. A transforming source must
+independently prove any bound it uses for its projected output. The sizing
+helper grants neither backing allocation nor serialized output allowance.
+Fixtures pin fragmented backing identity/prefixes, untouched tail bytes,
+empty/exact-full retention, oversized/overflow sticky refusal, capacity
+extremes and escaping bounds.
+
 ## Build policy
 
 The mail portable build pins this crate's manifest and lock in

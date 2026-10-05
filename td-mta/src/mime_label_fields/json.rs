@@ -18,10 +18,7 @@ pub struct Backing<'w> {
 /// Conservative serialized CID capacity from the complete raw value length.
 /// Sizing grants no source, validity or output allowance.
 pub const fn content_id_capacity_bound(raw_bytes: usize) -> Option<usize> {
-    match raw_bytes.checked_mul(6) {
-        Some(bytes) => bytes.checked_add(2),
-        None => None,
-    }
+    td_json::string::capacity_bound(raw_bytes)
 }
 /// Conservative serialized language-array capacity from raw value length.
 pub const fn content_language_capacity_bound(raw_bytes: usize) -> Option<usize> {
@@ -43,6 +40,12 @@ pub enum Error {
     Admission(nfc::Error),
     OutputCapacity,
     InvalidState,
+}
+fn window_error(error: td_json::retain::Error) -> Error {
+    match error {
+        td_json::retain::Error::Capacity => Error::OutputCapacity,
+        td_json::retain::Error::InvalidState => Error::InvalidState,
+    }
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -89,11 +92,10 @@ enum Owner<'a, 'w> {
 /// ```
 pub struct Cursor<'a, 'w> {
     values: Values<'a>,
-    backing: Backing<'w>,
+    id_window: td_json::retain::Window<'w>,
+    language_window: td_json::retain::Window<'w>,
     owner: Owner<'a, 'w>,
     phase: Phase,
-    id_used: usize,
-    language_used: usize,
     id_end: Option<cid::End>,
     language_complete: bool,
     failure: Option<Error>,
@@ -107,11 +109,10 @@ impl<'a, 'w> Cursor<'a, 'w> {
     ) -> Self {
         Self {
             values,
-            backing,
+            id_window: td_json::retain::Window::new(backing.content_id),
+            language_window: td_json::retain::Window::new(backing.content_language),
             owner: Owner::Budgets(work, budget),
             phase: Phase::StartId,
-            id_used: 0,
-            language_used: 0,
             id_end: None,
             language_complete: false,
             failure: None,
@@ -176,22 +177,11 @@ impl<'a, 'w> Cursor<'a, 'w> {
                 let Owner::Id(cursor) = &mut self.owner else {
                     return Err(Error::InvalidState);
                 };
-                let output = self
-                    .backing
-                    .content_id
-                    .get_mut(self.id_used..)
-                    .ok_or(Error::InvalidState)?;
-                if output.is_empty() {
-                    return Err(Error::OutputCapacity);
-                }
+                let output = self.id_window.tail().map_err(window_error)?;
                 let progress = cursor.poll(now, output).map_err(Error::ContentId)?;
-                self.id_used = self
-                    .id_used
-                    .checked_add(progress.written)
-                    .ok_or(Error::InvalidState)?;
-                if self.id_used > self.backing.content_id.len() {
-                    return Err(Error::InvalidState);
-                }
+                self.id_window
+                    .advance(progress.written)
+                    .map_err(window_error)?;
                 if progress.status == cid::Status::Complete {
                     let Owner::Id(cursor) = std::mem::replace(&mut self.owner, Owner::Retired)
                     else {
@@ -219,22 +209,11 @@ impl<'a, 'w> Cursor<'a, 'w> {
                 let Owner::Language(cursor) = &mut self.owner else {
                     return Err(Error::InvalidState);
                 };
-                let output = self
-                    .backing
-                    .content_language
-                    .get_mut(self.language_used..)
-                    .ok_or(Error::InvalidState)?;
-                if output.is_empty() {
-                    return Err(Error::OutputCapacity);
-                }
+                let output = self.language_window.tail().map_err(window_error)?;
                 let progress = cursor.poll(now, output).map_err(Error::ContentLanguage)?;
-                self.language_used = self
-                    .language_used
-                    .checked_add(progress.written)
-                    .ok_or(Error::InvalidState)?;
-                if self.language_used > self.backing.content_language.len() {
-                    return Err(Error::InvalidState);
-                }
+                self.language_window
+                    .advance(progress.written)
+                    .map_err(window_error)?;
                 if progress.status == language::Status::Complete {
                     let Owner::Language(cursor) =
                         std::mem::replace(&mut self.owner, Owner::Retired)
@@ -261,21 +240,17 @@ impl<'a, 'w> Cursor<'a, 'w> {
             return Err(Error::InvalidState);
         }
         let (work, budget) = self.budgets()?;
-        let id_backing: &'w [u8] = self.backing.content_id;
-        let language_backing: &'w [u8] = self.backing.content_language;
         let content_id = match self.values.content_id {
             Some(_) if self.id_end.is_some() => {
-                Some(id_backing.get(..self.id_used).ok_or(Error::InvalidState)?)
+                Some(self.id_window.into_slice().map_err(window_error)?)
             }
             Some(_) => return Err(Error::InvalidState),
             None => None,
         };
         let content_language = match self.values.content_language {
-            Some(_) if self.language_complete => Some(
-                language_backing
-                    .get(..self.language_used)
-                    .ok_or(Error::InvalidState)?,
-            ),
+            Some(_) if self.language_complete => {
+                Some(self.language_window.into_slice().map_err(window_error)?)
+            }
             Some(_) => return Err(Error::InvalidState),
             None => None,
         };
@@ -457,7 +432,7 @@ mod tests {
                 assert_eq!(drain(&mut cursor), Err(Error::OutputCapacity));
                 if kind == 1 {
                     assert!(cursor.id_end.is_some());
-                    assert_eq!(cursor.backing.content_id, b"\"A@B\"");
+                    assert_eq!(cursor.id_window.provisional(), Some(b"\"A@B\"".as_slice()));
                 }
                 assert!(!cursor.is_complete());
                 assert_eq!(cursor.poll(Tick(1)), Err(Error::OutputCapacity));

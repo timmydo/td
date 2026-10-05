@@ -461,6 +461,17 @@ Any refusal retires source/frame and hides metadata, with bytes provisional
 through fresh consuming finish. Null selection, retained buffers and response
 publication remain separate obligations.
 
+M06de retains an optional caller-selected complete location JSON fragment in
+one fixed caller-reserved window. Absence and a present empty reference stay
+distinct. Share checked backing identity/prefix bookkeeping in std-only
+td-json and migrate CID/language pair retention to it in the same landing.
+The shared primitive supplies no source or completion authority. Enclosing
+cursors keep original exclusive admission owners, freshly consume completing
+children without added charge and hide all fragment metadata on any refusal.
+Whole retained views remain provisional through fresh final admission and
+whole-job publication; first-valid location discovery and traversal response
+integration remain later composition.
+
 M06cq composes shared URI unfolding and reference validation into a selected
 literal spelling reader. It validates the complete spelling before replaying
 literal ASCII octets and slice-relative provenance under original job/header

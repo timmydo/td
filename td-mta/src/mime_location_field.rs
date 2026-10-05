@@ -9,6 +9,7 @@ use crate::{
 };
 pub use selection::Spelling;
 pub mod json;
+pub mod retained;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Selection(selection::Error),

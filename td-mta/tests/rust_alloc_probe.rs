@@ -2168,6 +2168,296 @@ fn uri_word_runs() {
     assert_eq!(before, after, "URI encoded-word run allocated");
 }
 
+fn uri_location_retention() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_location_field::{
+            self as field, json,
+            retained::{Cursor, Error, Status},
+        },
+        mime_location_literal as literal, mime_location_selection as selection,
+        mime_location_word as word,
+        nfc::{self, HeaderBudget},
+        ports::{Deadline, Tick},
+    };
+    let long_literal = format!("../{}", "a%2F/".repeat(8192));
+    let long_words = "=?utf-8?Q?e=CC=81?= \r\n ".repeat(1024);
+    let mut bad_literal = long_literal.clone();
+    bad_literal.push('%');
+    let mut backing = vec![
+        0xa5;
+        td_mta::mime_location_field::retained::capacity_bound(
+            bad_literal.len().max(long_words.len())
+        )
+        .unwrap()
+    ];
+    let mut next_backing = [0; 64];
+    let before = COUNTERS.snapshot();
+    for (source, size, wanted, encoded, problem, fault, output, records) in [
+        (
+            Some(long_literal.as_bytes()),
+            long_literal.len() + 2,
+            long_literal.len() + 2,
+            false,
+            false,
+            None,
+            100_000,
+            2_000_000,
+        ),
+        (
+            Some(long_words.as_bytes()),
+            3074,
+            3074,
+            true,
+            false,
+            None,
+            100_000,
+            2_000_000,
+        ),
+        (
+            Some(b"=?ascii?Q?=00=22=5C=0A?=".as_slice()),
+            6,
+            6,
+            true,
+            false,
+            None,
+            100_000,
+            2_000_000,
+        ),
+        (
+            Some(b"(x) =?utf-8?Q?=FF?= =?ascii?Q?ok?= (tail)"),
+            7,
+            7,
+            true,
+            true,
+            None,
+            100_000,
+            2_000_000,
+        ),
+        (None, 0, 0, false, false, None, 0, 0),
+        (Some(b""), 2, 2, false, false, None, 100_000, 2_000_000),
+        (
+            Some(b"=?unknown?Q?a?="),
+            b"=?unknown?Q?a?=".len() + 2,
+            b"=?unknown?Q?a?=".len() + 2,
+            false,
+            false,
+            None,
+            100_000,
+            2_000_000,
+        ),
+        (
+            Some(bad_literal.as_bytes()),
+            bad_literal.len() + 2,
+            0,
+            false,
+            false,
+            Some(Error::Projection(json::Error::Source(
+                field::Error::Literal(literal::Error::MalformedUri),
+            ))),
+            100_000,
+            2_000_000,
+        ),
+        (
+            Some(b"../a\r\nX"),
+            64,
+            0,
+            false,
+            false,
+            Some(Error::Projection(json::Error::Source(field::Error::Words(
+                word::Error::MalformedFold,
+            )))),
+            100_000,
+            2_000_000,
+        ),
+        (
+            Some(b"(broken"),
+            64,
+            0,
+            false,
+            false,
+            Some(Error::Projection(json::Error::Source(
+                field::Error::Selection(selection::Error::Malformed),
+            ))),
+            100_000,
+            2_000_000,
+        ),
+        (
+            Some(b"../a"),
+            0,
+            0,
+            false,
+            false,
+            Some(Error::OutputCapacity),
+            100_000,
+            2_000_000,
+        ),
+        (
+            Some(b"../a"),
+            1,
+            0,
+            false,
+            false,
+            Some(Error::OutputCapacity),
+            100_000,
+            2_000_000,
+        ),
+        (
+            Some(b"../a"),
+            64,
+            0,
+            false,
+            false,
+            Some(Error::Projection(json::Error::Source(
+                field::Error::Selection(selection::Error::Work(Stop::Records)),
+            ))),
+            100_000,
+            0,
+        ),
+        (
+            Some(b"../a"),
+            64,
+            0,
+            false,
+            false,
+            Some(Error::Projection(json::Error::Source(
+                field::Error::Selection(selection::Error::Work(Stop::OutputBytes)),
+            ))),
+            0,
+            2_000_000,
+        ),
+        (
+            Some(b""),
+            2,
+            0,
+            false,
+            false,
+            Some(Error::Projection(json::Error::Source(
+                field::Error::Admission(nfc::Error::Work(Stop::OutputBytes)),
+            ))),
+            1,
+            2_000_000,
+        ),
+        (
+            Some(b"=?ascii?Q?=22?="),
+            16,
+            0,
+            true,
+            false,
+            Some(Error::Projection(json::Error::Source(field::Error::Words(
+                word::Error::Work(Stop::OutputBytes),
+            )))),
+            2,
+            2_000_000,
+        ),
+        (
+            Some(b"../a"),
+            6,
+            0,
+            false,
+            false,
+            Some(Error::Projection(json::Error::Source(
+                field::Error::Literal(literal::Error::Work(Stop::OutputBytes)),
+            ))),
+            2,
+            2_000_000,
+        ),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 10_000_000,
+                records,
+                output_bytes: output,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let pointers = (std::ptr::from_ref(&work), std::ptr::from_ref(&budget));
+        let mut cursor = Cursor::new(
+            source,
+            backing.get_mut(..size).unwrap(),
+            &mut work,
+            &mut budget,
+        );
+        let mut error = None;
+        let mut complete = false;
+        for _ in 0..2_000_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => assert!(cursor.view().is_none()),
+                Ok(Status::Complete) => {
+                    complete = true;
+                    break;
+                }
+                Err(failure) => {
+                    error = Some(failure);
+                    break;
+                }
+            }
+        }
+        assert_eq!(error, fault);
+        if let Some(error) = fault {
+            assert!(cursor.view().is_none());
+            assert_eq!(cursor.poll(Tick(100)), Err(error));
+            assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+            assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+        } else {
+            assert!(complete);
+            let view = cursor.view().unwrap();
+            assert_eq!(view.value.map_or(0, <[u8]>::len), wanted);
+            if let Some(end) = view.end {
+                assert_eq!(
+                    (end.encoded_words, end.encoding_problem),
+                    (encoded, problem)
+                );
+                assert!(source
+                    .unwrap()
+                    .get(end.spelling.start..end.spelling.end)
+                    .is_some());
+            } else {
+                assert!(source.is_none());
+            }
+            assert_eq!(view.value.is_some(), source.is_some());
+            black_box(view.value);
+            assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+            let (_, work, budget) = cursor.finish(Tick(1)).unwrap();
+            assert_eq!(
+                (std::ptr::from_ref(&*work), std::ptr::from_ref(&*budget)),
+                pointers
+            );
+            let mut next = Cursor::new(
+                if source.is_some() {
+                    Some(b"../x")
+                } else {
+                    None
+                },
+                &mut next_backing,
+                work,
+                budget,
+            );
+            let mut complete = false;
+            for _ in 0..1000 {
+                if next.poll(Tick(1)).unwrap() == Status::Complete {
+                    complete = true;
+                    break;
+                }
+                assert!(next.view().is_none());
+            }
+            assert!(complete);
+            assert_eq!(next.poll(Tick(100)), Ok(Status::Complete));
+            let deadline = Error::Admission(nfc::Error::Work(Stop::Deadline));
+            assert_eq!(next.check_deadline(Tick(100)), Err(deadline));
+            assert!(next.view().is_none());
+            assert_eq!(next.finish(Tick(1)).err(), Some(deadline));
+        }
+    }
+    assert_eq!(
+        COUNTERS.snapshot(),
+        before,
+        "Rust allocation in retained location JSON"
+    );
+}
+
 fn uri_location_json() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -10435,6 +10725,7 @@ fn main() {
         uri_word_runs();
         uri_location_fields();
         uri_location_json();
+        uri_location_retention();
         uri_unfold_values();
         uri_reference_values();
         content_id_values();
@@ -10607,6 +10898,7 @@ fn main() {
     uri_word_runs();
     uri_location_fields();
     uri_location_json();
+    uri_location_retention();
     uri_unfold_values();
     uri_reference_values();
     content_id_values();
