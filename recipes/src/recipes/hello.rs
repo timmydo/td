@@ -1,12 +1,16 @@
-use crate::ladder::{mesboot0_inputs, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH};
 use crate::types::{Recipe, Step};
 
 // GNU Hello 2.10 — the first ordinary package built by the complete native
 // x86_64 recipe graph (#424). Its build userland is explicit: make-x86-64
-// drives the upstream configure/make/install flow, while every ordinary tool
-// name resolves to the declared BusyBox output through the ToolFarm below.
-// bash-mesboot remains the declared configure interpreter; no host /bin, /usr,
-// ambient PATH, or host store path is available to a recipe step.
+// drives the upstream configure/make/install flow, and every ordinary tool
+// comes from the pinned root's mesboot userland that the rungs below the cut
+// use: coreutils, sed, grep, gawk and diffutils. hello sits on the bootstrap
+// side, so nothing built after rust-toolchain may serve it. Of the names that
+// userland lacks, configure probes uname and mktemp and falls back; nothing
+// on the configure, make or install path uses comm, date, env or which. bash-mesboot remains the declared configure interpreter; no
+// host /bin, /usr, ambient PATH, or host store path is available to a recipe
+// step.
 //
 // The installed hello is deliberately dynamic. Its interpreter and RUNPATH
 // name td's source-built glibc input, proving that the native GCC/binutils/libc
@@ -16,24 +20,12 @@ pub fn recipe() -> Recipe {
     let ngcc = "{in:gcc-x86-64-native}/stage/td/store/gcc-14.3.0-x86_64-native/bin/gcc";
     let nbin = "{in:binutils-x86-64-native}/bin";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
-    let path = format!("{{tools}}:{nbin}");
+    let path = format!("{}:{nbin}", mesboot0_path());
     let mut steps = unpack_into("hello-source", "{src}");
 
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
     steps.push(Step::ToolFarm {
-        links: [
-            "awk", "basename", "cat", "chmod", "cmp", "comm", "cp", "cut", "date", "diff",
-            "dirname", "echo", "env", "expr", "false", "grep", "head", "install", "ln", "ls",
-            "mkdir", "mktemp", "mv", "printf", "pwd", "rm", "sed", "sleep", "sort", "tail", "tee",
-            "touch", "tr", "true", "uname", "wc", "which", "yes",
-        ]
-        .iter()
-        .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))
-        .chain(std::iter::once((
-            "make".into(),
-            "{in:make-x86-64}/bin/make".into(),
-        )))
-        .collect(),
+        links: vec![("make".into(), "{in:make-x86-64}/bin/make".into())],
     });
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
@@ -109,7 +101,6 @@ pub fn recipe() -> Recipe {
             "binutils-x86-64-native",
             "glibc-x86-64",
             "make-x86-64",
-            "busybox-x86-64",
         ])
         .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
