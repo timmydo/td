@@ -1672,6 +1672,190 @@ fn a_workspace_gone_with_its_archive_refuses_its_tools() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A repository's checkout runs on a thread of its own, so a turn goes
+/// on without it; done while the conversation is idle, its news wakes a
+/// turn that reads it, though not before the person has written, not
+/// while the conversation is paused, and not when it says what the last
+/// news of its remote said (DESIGN.md §3, §7). With no jail here the
+/// checkout fails, which is news as well, as is a store refused before
+/// any checkout starts; each process's news differs from the last but
+/// where it is meant to be the same.
+#[test]
+fn a_checkout_done_while_idle_wakes_its_conversation() {
+    let base = std::env::temp_dir().join(format!(
+        "td-agent-model-woken-{}-{}",
+        std::process::id(),
+        td_agent::store::random_hex(4).unwrap()
+    ));
+    let template = td_agent::config::Template {
+        name: "td".into(),
+        repos: vec![td_agent::config::Repo {
+            remote: "https://example.org/a/td".into(),
+            base: "main".into(),
+            branch: "agent".into(),
+            sparse: None,
+        }],
+        shared: None,
+    };
+    let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
+    let made = td_agent::workspace::repositories(
+        &template,
+        &Id::random().unwrap(),
+        &base.join("data"),
+        &base.join("trees"),
+        &admitted,
+        0,
+    )
+    .unwrap();
+    let argument = td_agent::workspace::Workspace::Repositories(made).argument();
+    let mut h = Harness::new_in(
+        "woken",
+        Role::Conversation,
+        Some(argument.to_str().unwrap()),
+        false,
+        vec![
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    let remote = "https://example.org/a/td".to_string();
+    let fetched = Down::Fetched {
+        remote: remote.clone(),
+        result: Ok(td_agent::protocol::Fetched {
+            identity: td_agent::repo::Identity::default(),
+            ids: vec!["a".repeat(40)],
+            instructions: vec![td_agent::repo::Instructions::Absent],
+        }),
+    };
+    let refused = Down::Fetched {
+        remote: remote.clone(),
+        result: Err("the remote is not admitted".into()),
+    };
+    let asked = |h: &mut Harness| while !matches!(h.next(), Up::Fetch { .. }) {};
+    let done = |h: &mut Harness| while !matches!(h.next(), Up::Prepared { .. }) {};
+    // No turn was started of the last notification logged.
+    let slept = |conversation: &Conversation| {
+        let events = conversation.events();
+        let last = events
+            .iter()
+            .rposition(|e| matches!(e.kind, Kind::Notification { .. }))
+            .unwrap();
+        assert!(
+            !events[last..]
+                .iter()
+                .any(|e| matches!(e.kind, Kind::Started { .. })),
+            "{events:?}"
+        );
+    };
+    // Before the person has written, the news wakes nothing.
+    asked(&mut h);
+    h.setup(Client::default());
+    h.down(&fetched);
+    done(&mut h);
+    h.say("Tidy the notes.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let turns = events
+        .iter()
+        .filter(|e| matches!(e.kind, Kind::Started { .. }))
+        .count();
+    assert_eq!(turns, 1, "{events:?}");
+    let (conversation, mut h) = h.close();
+    let logged = conversation.events();
+    let news = logged
+        .iter()
+        .find(|e| matches!(e.kind, Kind::Notification { .. }))
+        .map(|e| e.seq)
+        .unwrap();
+    assert!(
+        !logged
+            .iter()
+            .any(|e| matches!(e.kind, Kind::Started { of, .. } if of == news)),
+        "{logged:?}"
+    );
+    drop(conversation);
+    // Started again, idle: a refused store's news, then the checkout's,
+    // each other than the last, wakes a turn of its own, which reads it.
+    h.reopen();
+    asked(&mut h);
+    h.setup(Client::default());
+    let woke = |h: &mut Harness, what: &str| {
+        // The turn is announced before the window is told the process is
+        // done with the store, so it keeps the process for the turn.
+        loop {
+            let up = h.next();
+            if h.hear(&up) {
+                continue;
+            }
+            match up {
+                Up::Prepared { .. } => panic!("done with before the turn: {:?}", h.heard),
+                Up::Event(event) => {
+                    let started = matches!(event.kind, Kind::Started { .. });
+                    h.heard.push(event);
+                    if started {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (events, outcome, _) = h.turn();
+        assert_eq!(outcome, "replied", "{}", h.said());
+        let news = events
+            .iter()
+            .rfind(|e| matches!(&e.kind, Kind::Notification { text } if text.contains(what)))
+            .unwrap_or_else(|| panic!("{events:?}"));
+        assert!(
+            events.iter().any(|e| e.kind
+                == Kind::Started {
+                    effect: td_agent::store::Effect::Turn,
+                    of: news.seq
+                }),
+            "{events:?}"
+        );
+    };
+    h.down(&refused);
+    woke(&mut h, "the remote is not admitted");
+    h.down(&fetched);
+    woke(&mut h, "could not be prepared");
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 4, "the person's turn, its title, two woken");
+    assert!(
+        requests[3]
+            .text()
+            .contains("td-agent's news of this workspace"),
+        "{}",
+        requests[3].text()
+    );
+    let (conversation, mut h) = h.close();
+    drop(conversation);
+    // Paused, the news is logged and wakes nothing.
+    h.reopen();
+    asked(&mut h);
+    h.down(&Down::Pause { paused: true });
+    h.setup(Client::default());
+    h.down(&refused);
+    done(&mut h);
+    h.down(&fetched);
+    done(&mut h);
+    let (conversation, mut h) = h.close();
+    slept(&conversation);
+    drop(conversation);
+    // Resumed, the same failure as the last news wakes nothing.
+    h.reopen();
+    asked(&mut h);
+    h.down(&Down::Pause { paused: false });
+    h.setup(Client::default());
+    h.down(&fetched);
+    done(&mut h);
+    let (conversation, h) = h.close();
+    slept(&conversation);
+    assert_eq!(h.mock.requests().len(), 4, "nothing more was sent");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A command the person allows runs in the conversation's jail, in its
 /// scratch workspace, and a search runs there without asking.
 #[test]

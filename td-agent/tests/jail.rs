@@ -466,8 +466,11 @@ fn a_repository_conversation_prepares_its_workspace() {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut asked = false;
     let mut ready = None;
-    while ready.is_none() {
-        assert!(Instant::now() < deadline, "no notice came");
+    // Ready, it asks where its bases are now, so a move while it
+    // checked out is not missed.
+    let mut followed = false;
+    while ready.is_none() || !followed {
+        assert!(Instant::now() < deadline, "no notice came, or no Heads");
         for (_, update) in supervisor.poll() {
             match update {
                 Update::Up(Up::Fetch { remote, bases }) if !asked => {
@@ -495,6 +498,15 @@ fn a_repository_conversation_prepares_its_workspace() {
                     if let Kind::Notification { text } = event.kind {
                         ready = Some(text);
                     }
+                }
+                Update::Up(Up::Heads { bases, .. }) => {
+                    assert!(ready.is_some(), "asked before it was ready");
+                    assert_eq!(bases, ["main"]);
+                    followed = true;
+                }
+                // The window keeps the process until the checkout is done.
+                Update::Up(Up::Prepared { .. }) => {
+                    assert!(ready.is_some(), "done with before it was ready");
                 }
                 _ => {}
             }

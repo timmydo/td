@@ -2045,11 +2045,59 @@ answer. A failure's reason is quoted on one line, every control named,
 and cut to 1,000 characters. The sentence every conversation's prefix
 has about the received line is left as it was, so no other
 conversation's cache is lost; `history_search` takes `notification`
-as a name for `notice`, its schema unchanged. One
-logged between turns is read at the next turn; nothing wakes the
-conversation for it yet, and a preparation's still runs on the
-process's main thread during the first turn, before its request, so
-the model reads that first turn's news with it.
+as a name for `notice`, its schema unchanged. When a notification is
+logged, and whether it wakes the conversation, is As built (increment
+11, asynchronous preparation).
+
+**As built (increment 11, asynchronous preparation).** The first turn
+waits for each store's answer, whose project instructions are
+recorded on the conversation process's main thread; the checkout then
+runs on a thread of its own (`Checkout`), holding nothing of the
+conversation's, so that turn and any later one go on meanwhile. The
+thread runs each worktree's checkout and then sets the remote-tracking
+refs, each in a maintenance instance as before, and hands back the
+commits set or why not. td-jail ties an instance to the thread that
+starts it; a maintenance instance runs within its call, the call
+waiting for it to end and killing it at its deadline, so the thread
+outlives its instance and the instance still ends with the process.
+Tool instances, the file tools' long-lived one among them, are still
+started from the main thread. What the thread hands back is taken up
+where its news can be read in order: during a turn, before each
+request (`between`), and before a request rate-limited is asked
+again, its worktrees then bound for that step's calls, so the
+notification falls after every result of the step before, never
+between a tool call and its result, and the next request reads it in
+the same turn; between turns, at once. The
+repository is then recorded prepared, which binds it from the next
+call, its commits recorded, the notification logged, and the window
+told the process is done with the store (`Prepared`), which it keeps
+the process for until then; a second answer for a store whose
+preparation's end is not yet taken up, a checkout running or a
+failure before one, waits for the same `Prepared`. Ready, the process asks where its bases
+are now (`Heads`), so a move while it checked out is not missed. A
+notification taken up between turns wakes the conversation, a turn
+started of it (`Started`'s `of` names the notification) that reads
+it: only when the person has written to the conversation, so a
+conversation opened and never asked anything spends nothing; when it
+is not paused, its news then read by the next turn, which resuming
+alone does not start; when there is a key to ask with; while the
+window is there; when nothing the window sent is about to start a
+turn that would read it anyway; and when it does not say what the
+last news of its remote said, so a failure each process start meets
+again, which the model has read, buys no turn. Such a turn is not
+counted against the wake budget, which counts turns started of a
+message (§3), and its `Started` is sent before `Prepared`, so the
+window, seeing the turn, keeps the process for it. A preparation that
+fails before its checkout starts, a store refused, instructions that
+do not fit or a thread that cannot start, is kept as a checkout's end
+is and said, and wakes, alike. A thread that panics hands back that it
+ended. A process that ends while a checkout runs takes its instance
+with it, and the next process asks again, the checkout taking up what
+the last one left. Two remotes' checkouts, and a checkout and a
+prepared repository's `track`, may now run at once, each its own
+repository; their maintenance instances share the conversation's
+maintenance home, which their git, its `HOME` `/nonexistent`, does
+not use, and each spec has a name of its own.
 
 **As built (increment 11, preparation).** Choosing a template that
 names repositories makes its workspace's record at once, in the
@@ -2109,14 +2157,13 @@ another root. The prefix names every worktree with its remote, branch,
 base and paths whether or not it is ready, so it holds while they
 prepare. The first turn waits for each store's answer, which carries
 the project instructions (§13, As built (increment 11, project
-instructions)); in this step the checkout then runs on the
-conversation process's main thread, so that turn, and any during a
-later preparation, waits behind it too; rules from the base, and a
-checkout off the main thread whose news wakes an idle conversation,
-are later steps (the background fetch, the remote-tracking refs and
-the notifications are As built (increment 11, background fetch),
-(increment 11, remote-tracking refs) and (increment 11,
-notifications)). Deleting the conversation removes its
+instructions)); the checkout then runs on a thread of its own, and its
+news wakes an idle conversation (As built (increment 11, asynchronous
+preparation)). Rules from the base, and a tool call into a worktree
+still checking out told so, are later steps (the background fetch,
+the remote-tracking refs and the notifications are As built
+(increment 11, background fetch), (increment 11, remote-tracking
+refs) and (increment 11, notifications)). Deleting the conversation removes its
 repository workspace (As built (increment 11, removal on deletion)),
 and archiving it does too (As built (increment 11, removal on
 archiving)).
@@ -3558,8 +3605,11 @@ shared directories (§8). It runs `read_file`, `write_file`, `edit_file`
 and `glob` in one long-lived instance, started at the first such call
 and again after one fails or the shared directories change, and each
 `shell`, `grep` and `sed` in a fresh instance of its own, so nothing a
-command leaves outlives its call. Every instance is started from the
-conversation process's main thread, which td-jail ties it to. An
+command leaves outlives its call. Every tool instance is started from
+the conversation process's main thread, which td-jail ties it to; a
+maintenance instance may start on a checkout's thread, which waits
+for it to end (§7, As built (increment 11, asynchronous
+preparation)). An
 interrupt cancels the call under way; a window gone does not, so the
 call ends whole in the log. Since what runs in the jail can stop or
 replace its tool host, the conversation keeps each call's time too: its
@@ -4477,6 +4527,17 @@ thread answering a refresh for the window with its bases;
 remotes only, each once with its bases once, none whose fetch is
 pending, and a base moving only from a commit known before; the store
 thread's queue a preparation before queued background fetches.
+For the asynchronous preparation, `tests/model_client.rs` covers a
+checkout's news, idle, waking nothing before the person has written;
+then a refused store's news and a checkout's each waking a turn of its
+own that reads it, announced before `Prepared`; nothing woken while
+paused; and a failure the same as the last news waking nothing. The
+live `tests/jail.rs` preparation test covers `Prepared` only after
+the ready notification and `Heads` asked once ready. Not pinned, as a
+test cannot time them without a hook: a checkout done during a turn
+taken up before the next request or a retry rather than after the
+turn; a second answer while checking out; a closing window waking
+nothing; and a panicking thread.
 For the notifications, `src/client.rs` covers one given to the model
 labelled, with and without the received line, and a notice not, its
 history rendering, and `notification` searching as `notice`;

@@ -37,7 +37,7 @@ use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -160,6 +160,24 @@ enum Inbound {
         request: u64,
         item: Fetched,
     },
+    /// `remote`'s checkout, run on its own thread (`Checkout`), done: the
+    /// bases and the commits their remote-tracking refs were set to, or
+    /// why not.
+    Checked {
+        remote: String,
+        result: Set,
+    },
+}
+
+/// What a checkout set: the bases and the commits their remote-tracking
+/// refs were set to, or why not.
+type Set = Result<Vec<(String, String)>, String>;
+
+/// What an idle conversation does next: what the window sent, or a
+/// checkout done.
+enum Work {
+    Down(Down),
+    Checked(String, Set),
 }
 
 /// One step of a streamed request, as its thread read it.
@@ -284,6 +302,8 @@ pub fn serve_in(
         bench: Bench::default(),
         awaiting: Vec::new(),
         untracked: Vec::new(),
+        checking: Vec::new(),
+        checked: VecDeque::new(),
     };
     // What this conversation read or wrote before, so a replacement of an
     // unchanged file needs no read again.
@@ -460,6 +480,12 @@ struct Session {
     /// tried again until they change or the process starts again, and a
     /// failure is logged once until it says something else.
     untracked: Vec<Untracked>,
+    /// The remotes whose preparation began and whose end is not yet
+    /// taken up (`prepare`, `done_with`): a second answer waits for it.
+    checking: Vec<String>,
+    /// Checkouts done, with what each set or why not, kept until a turn's
+    /// next step or the turn's end (`between`, `woken`).
+    checked: VecDeque<(String, Set)>,
 }
 
 /// A remote whose remote-tracking refs could not be set to `tried`, and
@@ -499,7 +525,7 @@ impl Session {
         self.conversation.sync()
     }
 
-    fn next(&mut self) -> Result<Option<Down>, String> {
+    fn next(&mut self) -> Result<Option<Work>, String> {
         // What came meanwhile joins the queue first, so that `take` can
         // choose: a setup first, then a pause sent after messages from
         // other conversations, while a turn ran, before them, holding
@@ -508,13 +534,19 @@ impl Session {
             match self.inbox.try_recv() {
                 Ok(Inbound::Down(down)) => self.queue.push_back(down),
                 Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Closed) => self.ended = Some(Ok(())),
                 Ok(Inbound::Broken(e)) => self.ended = Some(Err(e)),
                 Err(_) => break,
             }
         }
+        // What the window sent first: a turn it starts reads a checkout
+        // done meanwhile between its steps.
         if let Some(down) = take(&mut self.queue) {
-            return Ok(Some(down));
+            return Ok(Some(Work::Down(down)));
+        }
+        if let Some((remote, result)) = self.checked.pop_front() {
+            return Ok(Some(Work::Checked(remote, result)));
         }
         match self.ended.take() {
             Some(Ok(())) => return Ok(None),
@@ -523,7 +555,10 @@ impl Session {
         }
         loop {
             match self.inbox.recv() {
-                Ok(Inbound::Down(down)) => return Ok(Some(down)),
+                Ok(Inbound::Down(down)) => return Ok(Some(Work::Down(down))),
+                Ok(Inbound::Checked { remote, result }) => {
+                    return Ok(Some(Work::Checked(remote, result)))
+                }
                 Ok(Inbound::Closed) | Err(_) => return Ok(None),
                 Ok(Inbound::Broken(e)) => return Err(format!("the window: {e}")),
                 // A stream given up on, still reading to its next frame.
@@ -534,8 +569,16 @@ impl Session {
 
     fn serve(&mut self) -> Result<(), String> {
         while !self.gone {
-            let Some(down) = self.next()? else {
-                return Ok(());
+            let down = match self.next()? {
+                None => return Ok(()),
+                Some(Work::Checked(remote, result)) => {
+                    self.woken(remote, result)?;
+                    if !self.gone {
+                        let _ = self.writer.flush();
+                    }
+                    continue;
+                }
+                Some(Work::Down(down)) => down,
             };
             match down {
                 Down::Setup { key, client } => self.setup = Some((key, client)),
@@ -686,6 +729,7 @@ impl Session {
         }
         let mut replied = false;
         for _ in 0..MAX_STEPS {
+            self.between()?;
             let outcome = self.exchange(turn)?;
             let Some(reply) = outcome.calls else {
                 return Ok(Outcome {
@@ -820,6 +864,7 @@ impl Session {
                 Ok(Inbound::Down(Down::Interrupt)) => self.interrupt = true,
                 Ok(Inbound::Down(down)) => self.queue.push_back(down),
                 Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Closed | Inbound::Broken(_)) | Err(RecvTimeoutError::Disconnected) => {
                     self.gone = true;
                     return Err("the window has closed".into());
@@ -843,6 +888,7 @@ impl Session {
                 Inbound::Down(Down::Reservation { id, refusal: None }) => self.spent(id, 0),
                 Inbound::Down(down) => self.queue.push_back(down),
                 Inbound::Fetch { .. } => {}
+                Inbound::Checked { remote, result } => self.checked.push_back((remote, result)),
                 Inbound::Closed | Inbound::Broken(_) => self.gone = true,
             }
         }
@@ -928,6 +974,14 @@ impl Session {
         }
         let mut attempt = 0u32;
         loop {
+            // A checkout done while a request waited to be asked again is
+            // taken up before it is, its worktrees bound for this step's
+            // calls; the prefix does not depend on them.
+            if attempt > 0 && self.between()? {
+                if let Err(why) = self.expected_prefix(&client) {
+                    return Ok(Outcome::stop(why));
+                }
+            }
             let events = self.conversation.events();
             let (prefix, prefix_text) =
                 client::current_prefix(events, self.conversation.prefix_file());
@@ -1324,7 +1378,7 @@ impl Session {
         {
             return Ok(());
         }
-        let said = match self.track(&meta.id, &entries, &heads, false) {
+        let said = match track(&self.state, &meta.id, &entries, &heads, false) {
             Ok(()) => {
                 self.conversation.set_tracked(remote, &heads)?;
                 self.untracked.retain(|failed| failed.remote != remote);
@@ -1366,62 +1420,34 @@ impl Session {
         Ok(())
     }
 
-    /// Sets `heads`' remote-tracking refs in the repository of `entries`,
-    /// one remote's, in a maintenance instance, `preparing` it.
-    fn track(
-        &self,
-        id: &Id,
-        entries: &[&Entry],
-        heads: &[(String, String)],
-        preparing: bool,
-    ) -> Result<(), String> {
-        let first = entries.first().ok_or("no worktree to track in")?;
-        let programs = crate::jail::Programs::from_env()?;
-        let git = crate::repo::host_git()?;
-        let dir = crate::workspace::jail_dir(&StateDir::at(self.state.clone()), id);
-        let policy =
-            crate::workspace::maintenance(&dir, entries).ok_or("no worktree to track in")?;
-        let task = crate::repo::Task::Track {
-            git,
-            repository: first.repository.clone(),
-            id: first.id.clone(),
-            checkout: first.checkout.clone(),
-            heads: heads.to_vec(),
-            preparing,
-        };
-        crate::jail::maintain(
-            &programs,
-            &policy,
-            &dir.join("specs"),
-            &task,
-            crate::repo::TRACK_TIME,
-        )
-        .map(drop)
-        .map_err(|why| format!("setting its remote-tracking refs: {why}"))
-    }
-
     /// The window's answer for `remote`'s store (`prepare`), then the
-    /// window told this process is done with it, so it may retire it.
+    /// window told this process is done with it, so it may retire it:
+    /// now, or when the checkout it began is done (`finished`).
     fn stored(&mut self, remote: String, result: Result<Stored, String>) -> Result<(), String> {
         self.awaiting.retain(|asked| *asked != remote);
-        let prepared = self.prepare(&remote, result);
-        self.send(&Up::Prepared { remote });
-        prepared
+        let checking = self.prepare(&remote, result);
+        if !matches!(checking, Ok(true)) {
+            self.send(&Up::Prepared { remote });
+        }
+        checking.map(drop)
     }
 
-    /// `remote`'s repository laid out and each of its worktrees checked
-    /// out in a maintenance instance, then recorded prepared, which its
-    /// instances bind from the next call; said in the log either way.
-    /// One that fails is asked for again only when a process for this
-    /// conversation next starts.
-    fn prepare(&mut self, remote: &str, result: Result<Stored, String>) -> Result<(), String> {
+    /// `remote`'s project instructions recorded, then its repository laid
+    /// out and each of its worktrees checked out on a thread of its own
+    /// (`Checkout`), so a turn goes on meanwhile; whether the window is
+    /// to be told it is done later. A failure before the checkout starts
+    /// is kept as the thread's would be (`checked`), and said, as every
+    /// checkout's end is, between a turn's steps or as an idle
+    /// conversation's news (`between`, `woken`). One that fails is asked
+    /// for again only when a process for this conversation next starts.
+    fn prepare(&mut self, remote: &str, result: Result<Stored, String>) -> Result<bool, String> {
         let meta = self.conversation.meta().clone();
         let Some(Workspace::Repositories(repositories)) = &meta.workspace else {
-            return Ok(());
+            return Ok(false);
         };
         // Gone with its archive: an answer asked for before is let go.
         if meta.removed {
-            return Ok(());
+            return Ok(false);
         }
         let entries: Vec<&Entry> = repositories
             .entries
@@ -1429,46 +1455,197 @@ impl Session {
             .filter(|entry| entry.remote == remote)
             .collect();
         let Some(first) = entries.first() else {
-            return Ok(());
+            return Ok(false);
         };
-        let repository = first.repository.clone();
-        if meta.prepared.contains(&repository) {
+        if meta.prepared.contains(&first.repository) {
+            return Ok(false);
+        }
+        // One already checking out says it is done when it is.
+        if self.checking.iter().any(|checking| checking == remote) {
+            return Ok(true);
+        }
+        // Held until its end is taken up, however it ends (`done_with`).
+        self.checking.push(remote.to_string());
+        // The instructions first, here: the turn waiting for them goes on
+        // whether or not the checkout does.
+        let fetched = match result.and_then(|fetched| {
+            self.instructed(&entries, &fetched)?;
+            Ok(fetched)
+        }) {
+            Ok(fetched) => fetched,
+            // Said as a checkout's failure is, so it wakes alike.
+            Err(why) => {
+                self.checked.push_back((remote.to_string(), Err(why)));
+                return Ok(true);
+            }
+        };
+        let checkout = Checkout {
+            state: self.state.clone(),
+            id: meta.id.clone(),
+            entries: entries.iter().map(|entry| (*entry).clone()).collect(),
+            fetched,
+        };
+        let (send, named) = (self.sender.clone(), remote.to_string());
+        let spawned = std::thread::Builder::new()
+            .name("td-agent-checkout".into())
+            .spawn(move || {
+                // Handed back however the thread ends, so the window is
+                // always told the process is done with the store.
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| checkout.run()))
+                        .unwrap_or_else(|_| Err("the checkout's thread ended".into()));
+                let _ = send.send(Inbound::Checked {
+                    remote: named,
+                    result,
+                });
+            });
+        match spawned {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                self.checked.push_back((
+                    remote.to_string(),
+                    Err(format!("its checkout's thread: {e}")),
+                ));
+                Ok(true)
+            }
+        }
+    }
+
+    /// Each checkout done meanwhile, said between a turn's steps, where
+    /// its news falls after every result of the step before and the next
+    /// request reads it (DESIGN.md §7); whether there was one.
+    fn between(&mut self) -> Result<bool, String> {
+        self.hear();
+        let any = !self.checked.is_empty();
+        while let Some((remote, result)) = self.checked.pop_front() {
+            let said = self.checked_out(&remote, result);
+            self.done_with(&remote);
+            said?;
+        }
+        Ok(any)
+    }
+
+    /// A checkout done while no turn runs: said, and its news wakes the
+    /// conversation (DESIGN.md §3) when the person has written to it, it
+    /// is not paused, there is a key to ask with, the window is still
+    /// there, nothing it sent is about to start a turn that would read
+    /// the news anyway, and the news is not what the last of `remote`'s
+    /// said. Such a turn is not counted against the wake budget.
+    fn woken(&mut self, remote: String, result: Set) -> Result<(), String> {
+        let said = match self.checked_out(&remote, result) {
+            Ok(Some(said)) => said,
+            other => {
+                self.done_with(&remote);
+                return other.map(drop);
+            }
+        };
+        let wakes = !self.conversation.meta().paused
+            && self.setup.as_ref().is_some_and(|(key, _)| key.is_ok())
+            && !self.gone
+            && self.ended.is_none()
+            && self
+                .conversation
+                .events()
+                .iter()
+                .any(|event| matches!(event.kind, Kind::User { .. }))
+            && !self
+                .queue
+                .iter()
+                .any(|down| matches!(down, Down::User { .. } | Down::Message { .. } | Down::Retry))
+            && !self.repeated(&remote, &said);
+        if !wakes {
+            self.done_with(&remote);
             return Ok(());
         }
-        // The instructions first: the turn waiting for them goes on
-        // whether or not the checkout does.
-        let checked = result.and_then(|fetched| {
-            self.instructed(&entries, &fetched)?;
-            self.check_out(&meta.id, &entries, &fetched)?;
-            // Each base's remote-tracking ref at the commit its worktree
-            // starts from, so nothing has moved yet.
-            let heads: Vec<(String, String)> = entries
-                .iter()
-                .map(|entry| entry.base.clone())
-                .zip(fetched.ids.iter().cloned())
-                .fold(Vec::new(), |mut heads, (base, id)| {
-                    if !heads.iter().any(|(b, _)| *b == base) {
-                        heads.push((base, id));
-                    }
-                    heads
-                });
-            self.track(&meta.id, &entries, &heads, true)?;
-            Ok(heads)
+        // The turn first, so the window, told it is done with the store,
+        // still keeps the process for the turn.
+        let started = self.log(Kind::Started {
+            effect: Effect::Turn,
+            of: said.seq,
         });
-        let text = match checked {
+        self.done_with(&remote);
+        let started = started?;
+        self.sync()?;
+        self.turn(started.seq)
+    }
+
+    /// Whether `said` says what the last news of `remote` before it said:
+    /// a failure each process start meets again, which wakes nothing.
+    fn repeated(&self, remote: &str, said: &Event) -> bool {
+        let Kind::Notification { text } = &said.kind else {
+            return false;
+        };
+        let about = format!("{remote} ");
+        self.conversation
+            .events()
+            .iter()
+            .rev()
+            .filter(|event| event.seq < said.seq)
+            .find_map(|event| match &event.kind {
+                Kind::Notification { text } if text.starts_with(&about) => Some(text),
+                _ => None,
+            })
+            .is_some_and(|last| last == text)
+    }
+
+    /// The window told this process is done with `remote`'s store, which
+    /// it kept the process for.
+    fn done_with(&mut self, remote: &str) {
+        self.checking.retain(|checking| checking != remote);
+        self.send(&Up::Prepared {
+            remote: remote.to_string(),
+        });
+    }
+
+    /// `remote`'s repository recorded prepared, which its instances bind
+    /// from the next call, with the commits its remote-tracking refs were
+    /// set to, or not; said in a notification either way, which is
+    /// returned. A prepared one's bases are asked where the window found
+    /// them last, so a move while it checked out is not missed (`heads`).
+    fn checked_out(&mut self, remote: &str, result: Set) -> Result<Option<Event>, String> {
+        let meta = self.conversation.meta().clone();
+        let Some(Workspace::Repositories(repositories)) = &meta.workspace else {
+            return Ok(None);
+        };
+        if meta.removed {
+            return Ok(None);
+        }
+        let entries: Vec<&Entry> = repositories
+            .entries
+            .iter()
+            .filter(|entry| entry.remote == remote)
+            .collect();
+        let Some(first) = entries.first() else {
+            return Ok(None);
+        };
+        let (text, ready) = match result {
             Ok(heads) => {
-                self.conversation.set_prepared(&repository)?;
+                self.conversation.set_prepared(&first.repository)?;
                 self.conversation.set_tracked(remote, &heads)?;
                 let ready: Vec<String> = entries
                     .iter()
                     .map(|entry| entry.checkout.display().to_string())
                     .collect();
-                format!("{remote} is checked out and ready: {}", ready.join(", "))
+                let bases = heads.into_iter().map(|(base, _)| base).collect();
+                (
+                    format!("{remote} is checked out and ready: {}", ready.join(", ")),
+                    Some(bases),
+                )
             }
-            Err(why) => format!("{remote} could not be prepared: {}", quoted(&why)),
+            Err(why) => (
+                format!("{remote} could not be prepared: {}", quoted(&why)),
+                None,
+            ),
         };
-        self.log(Kind::Notification { text })?;
-        self.sync()
+        let said = self.log(Kind::Notification { text })?;
+        self.sync()?;
+        if let Some(bases) = ready {
+            self.send(&Up::Heads {
+                remote: remote.to_string(),
+                bases,
+            });
+        }
+        Ok(Some(said))
     }
 
     /// Records the project instructions `fetched` read at each of
@@ -1541,6 +1718,7 @@ impl Session {
                 Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
                 Ok(Inbound::Down(down)) => self.queue.push_back(down),
                 Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Closed | Inbound::Broken(_)) | Err(_) => {
                     self.gone = true;
                     return Err("the window has closed".into());
@@ -1548,74 +1726,6 @@ impl Session {
             }
         }
         Ok(None)
-    }
-
-    /// Lays out `entries`' repository, one remote's, and checks each
-    /// worktree out in a maintenance instance, at the bases `fetched`
-    /// resolved. Until it is recorded prepared no instance but these binds
-    /// the repository, so what a run cut short left is td-agent's own: a
-    /// whole repository or worktree id is used again, a checkout without
-    /// its id removed and made again, and an index is a checkout that
-    /// ended before it was recorded.
-    fn check_out(&self, id: &Id, entries: &[&Entry], fetched: &Stored) -> Result<(), String> {
-        let first = entries.first().ok_or("no worktree to check out")?;
-        let repository = &first.repository;
-        let programs = crate::jail::Programs::from_env()?;
-        let git = crate::repo::host_git()?;
-        if std::fs::symlink_metadata(repository).is_err() {
-            crate::repo::create(repository, &first.store, &fetched.identity)?;
-        }
-        for entry in entries {
-            let linked = repository.join("worktrees").join(&entry.id);
-            if std::fs::symlink_metadata(&linked).is_ok() {
-                continue;
-            }
-            if std::fs::symlink_metadata(&entry.checkout).is_ok() {
-                std::fs::remove_dir_all(&entry.checkout)
-                    .map_err(|e| format!("{}: {e}", entry.checkout.display()))?;
-            }
-            crate::repo::add_worktree(
-                repository,
-                &crate::repo::Worktree {
-                    id: entry.id.clone(),
-                    checkout: entry.checkout.clone(),
-                    branch: entry.branch.clone(),
-                    sparse: entry.sparse.clone(),
-                },
-            )?;
-        }
-        let dir = crate::workspace::jail_dir(&StateDir::at(self.state.clone()), id);
-        let policy =
-            crate::workspace::maintenance(&dir, entries).ok_or("no worktree to check out")?;
-        for (entry, base) in entries.iter().zip(&fetched.ids) {
-            let index = repository.join("worktrees").join(&entry.id).join("index");
-            if std::fs::symlink_metadata(&index).is_ok() {
-                continue;
-            }
-            let task = crate::repo::Task::Checkout {
-                git: git.clone(),
-                repository: repository.clone(),
-                id: entry.id.clone(),
-                checkout: entry.checkout.clone(),
-                branch: entry.branch.clone(),
-                base: base.clone(),
-            };
-            crate::jail::maintain(
-                &programs,
-                &policy,
-                &dir.join("specs"),
-                &task,
-                crate::repo::TASK_TIME,
-            )
-            .map_err(|why| {
-                format!(
-                    "checking {} out with {}: {why}",
-                    entry.checkout.display(),
-                    git.display()
-                )
-            })?;
-        }
-        Ok(())
     }
 
     /// The prefix this conversation's requests begin with: for one in a
@@ -1769,6 +1879,7 @@ impl Session {
                 Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
                 Ok(Inbound::Down(down)) => self.queue.push_back(down),
                 Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Broken(why)) => {
                     eprintln!("td-agent: the window: {why}");
                     self.gone = true;
@@ -2190,6 +2301,7 @@ impl Session {
                 Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
                 Ok(Inbound::Down(down)) => self.queue.push_back(down),
                 Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Closed | Inbound::Broken(_)) => {
                     self.gone = true;
                     return true;
@@ -2239,6 +2351,7 @@ impl Session {
                     }
                 }
                 Inbound::Fetch { .. } => {}
+                Inbound::Checked { remote, result } => self.checked.push_back((remote, result)),
                 Inbound::Down(Down::Interrupt) => {
                     break Streamed::Failed {
                         failure: Failure::Interrupted {
@@ -2556,6 +2669,138 @@ fn post(
         body.as_bytes(),
         Some(client::MAX_REPLY),
     )
+}
+
+/// A repository's checkout, run on a thread of its own: owned, so it holds
+/// nothing of the conversation's (DESIGN.md §7).
+struct Checkout {
+    state: PathBuf,
+    id: Id,
+    entries: Vec<Entry>,
+    fetched: Stored,
+}
+
+impl Checkout {
+    /// Each worktree checked out, then each base's remote-tracking ref set
+    /// at the commit its worktree starts from, so nothing has moved yet:
+    /// those bases and commits.
+    fn run(&self) -> Set {
+        let entries: Vec<&Entry> = self.entries.iter().collect();
+        check_out(&self.state, &self.id, &entries, &self.fetched)?;
+        let heads: Vec<(String, String)> = self
+            .entries
+            .iter()
+            .map(|entry| entry.base.clone())
+            .zip(self.fetched.ids.iter().cloned())
+            .fold(Vec::new(), |mut heads, (base, id)| {
+                if !heads.iter().any(|(b, _)| *b == base) {
+                    heads.push((base, id));
+                }
+                heads
+            });
+        track(&self.state, &self.id, &entries, &heads, true)?;
+        Ok(heads)
+    }
+}
+
+/// Lays out `entries`' repository, one remote's, and checks each
+/// worktree out in a maintenance instance, at the bases `fetched`
+/// resolved. Until it is recorded prepared no instance but these binds
+/// the repository, so what a run cut short left is td-agent's own: a
+/// whole repository or worktree id is used again, a checkout without
+/// its id removed and made again, and an index is a checkout that
+/// ended before it was recorded.
+fn check_out(state: &Path, id: &Id, entries: &[&Entry], fetched: &Stored) -> Result<(), String> {
+    let first = entries.first().ok_or("no worktree to check out")?;
+    let repository = &first.repository;
+    let programs = crate::jail::Programs::from_env()?;
+    let git = crate::repo::host_git()?;
+    if std::fs::symlink_metadata(repository).is_err() {
+        crate::repo::create(repository, &first.store, &fetched.identity)?;
+    }
+    for entry in entries {
+        let linked = repository.join("worktrees").join(&entry.id);
+        if std::fs::symlink_metadata(&linked).is_ok() {
+            continue;
+        }
+        if std::fs::symlink_metadata(&entry.checkout).is_ok() {
+            std::fs::remove_dir_all(&entry.checkout)
+                .map_err(|e| format!("{}: {e}", entry.checkout.display()))?;
+        }
+        crate::repo::add_worktree(
+            repository,
+            &crate::repo::Worktree {
+                id: entry.id.clone(),
+                checkout: entry.checkout.clone(),
+                branch: entry.branch.clone(),
+                sparse: entry.sparse.clone(),
+            },
+        )?;
+    }
+    let dir = crate::workspace::jail_dir(&StateDir::at(state.to_path_buf()), id);
+    let policy = crate::workspace::maintenance(&dir, entries).ok_or("no worktree to check out")?;
+    for (entry, base) in entries.iter().zip(&fetched.ids) {
+        let index = repository.join("worktrees").join(&entry.id).join("index");
+        if std::fs::symlink_metadata(&index).is_ok() {
+            continue;
+        }
+        let task = crate::repo::Task::Checkout {
+            git: git.clone(),
+            repository: repository.clone(),
+            id: entry.id.clone(),
+            checkout: entry.checkout.clone(),
+            branch: entry.branch.clone(),
+            base: base.clone(),
+        };
+        crate::jail::maintain(
+            &programs,
+            &policy,
+            &dir.join("specs"),
+            &task,
+            crate::repo::TASK_TIME,
+        )
+        .map_err(|why| {
+            format!(
+                "checking {} out with {}: {why}",
+                entry.checkout.display(),
+                git.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Sets `heads`' remote-tracking refs in the repository of `entries`,
+/// one remote's, in a maintenance instance, `preparing` it.
+fn track(
+    state: &Path,
+    id: &Id,
+    entries: &[&Entry],
+    heads: &[(String, String)],
+    preparing: bool,
+) -> Result<(), String> {
+    let first = entries.first().ok_or("no worktree to track in")?;
+    let programs = crate::jail::Programs::from_env()?;
+    let git = crate::repo::host_git()?;
+    let dir = crate::workspace::jail_dir(&StateDir::at(state.to_path_buf()), id);
+    let policy = crate::workspace::maintenance(&dir, entries).ok_or("no worktree to track in")?;
+    let task = crate::repo::Task::Track {
+        git,
+        repository: first.repository.clone(),
+        id: first.id.clone(),
+        checkout: first.checkout.clone(),
+        heads: heads.to_vec(),
+        preparing,
+    };
+    crate::jail::maintain(
+        &programs,
+        &policy,
+        &dir.join("specs"),
+        &task,
+        crate::repo::TRACK_TIME,
+    )
+    .map(drop)
+    .map_err(|why| format!("setting its remote-tracking refs: {why}"))
 }
 
 #[cfg(test)]
