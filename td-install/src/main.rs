@@ -1183,27 +1183,38 @@ impl installation_service::Host for LiveHost {
         Ok(plan_identity(bytes))
     }
 
-    fn restart(&mut self) -> Result<(), installation_protocol::Refusal> {
+    fn end(
+        &mut self,
+        ending: installation_protocol::Ending,
+    ) -> Result<(), installation_protocol::Refusal> {
         let supervisor = self.root.join("bin/td-svc");
-        request_reboot(&supervisor, RESTART_TIMEOUT)
-            .map_err(|error| refuse(installation_protocol::Refusal::RestartUnavailable, error))
+        request_power(&supervisor, power_verb(ending), POWER_TIMEOUT)
+            .map_err(|error| refuse(installation_protocol::Refusal::PowerUnavailable, error))
     }
 }
 
-/// How long td-svc's client may take to have the reboot accepted; the
-/// supervisor answers before it stops anything.
-const RESTART_TIMEOUT: Duration = Duration::from_secs(10);
+/// td-svc's control verb for an ending.
+fn power_verb(ending: installation_protocol::Ending) -> &'static str {
+    match ending {
+        installation_protocol::Ending::Restart => "reboot",
+        installation_protocol::Ending::PowerOff => "poweroff",
+    }
+}
 
-/// Asks the supervisor at `supervisor` for its orderly reboot (td-svc/DESIGN.md
-/// section 8): its client, with nothing of the service's, and only its two
-/// acceptances count.
-fn request_reboot(supervisor: &Path, timeout: Duration) -> io::Result<()> {
+/// How long td-svc's client may take to have the reboot or power-off
+/// accepted; the supervisor answers before it stops anything.
+const POWER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Asks the supervisor at `supervisor` for its orderly `verb`, reboot or
+/// poweroff (td-svc/DESIGN.md section 8): its client, with nothing of the
+/// service's, and only its two acceptances of that verb count.
+fn request_power(supervisor: &Path, verb: &str, timeout: Duration) -> io::Result<()> {
     // A socket rather than a pipe, so the read is nonblocking and the one
     // deadline bounds it, whatever holds the other end.
     let (mut reply, output) = std::os::unix::net::UnixStream::pair()?;
     reply.set_nonblocking(true)?;
     let mut child = std::process::Command::new(supervisor)
-        .arg("reboot")
+        .arg(verb)
         .env_clear()
         .current_dir("/")
         .stdin(std::process::Stdio::null())
@@ -1218,7 +1229,7 @@ fn request_reboot(supervisor: &Path, timeout: Duration) -> io::Result<()> {
                 format!("start {}: {error}", supervisor.display()),
             )
         })?;
-    let result = settle_reboot(&mut child, &mut reply, timeout);
+    let result = settle_power(&mut child, &mut reply, verb, timeout);
     if result.is_err() {
         // Only the child this call started.
         let _ = child.kill();
@@ -1227,14 +1238,15 @@ fn request_reboot(supervisor: &Path, timeout: Duration) -> io::Result<()> {
     result
 }
 
-fn settle_reboot(
+fn settle_power(
     child: &mut std::process::Child,
     output: &mut std::os::unix::net::UnixStream,
+    verb: &str,
     timeout: Duration,
 ) -> io::Result<()> {
     let deadline = std::time::Instant::now()
         .checked_add(timeout)
-        .ok_or_else(|| invalid("restart deadline overflow".into()))?;
+        .ok_or_else(|| invalid(format!("{verb} deadline overflow")))?;
     let mut reply = Vec::new();
     let mut buffer = [0; 128];
     let mut ended = false;
@@ -1264,19 +1276,19 @@ fn settle_reboot(
             break status;
         }
         if std::time::Instant::now() >= deadline {
-            return Err(invalid("the supervisor did not answer the restart".into()));
+            return Err(invalid(format!("the supervisor did not answer the {verb}")));
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    match reply.as_slice() {
-        b"reboot requested\n" | b"shutdown already in progress (reboot)\n" if status.success() => {
-            Ok(())
-        }
-        _ => Err(invalid(format!(
-            "the supervisor did not accept the restart ({status}): {}",
-            String::from_utf8_lossy(&reply).trim_end()
-        ))),
+    let requested = format!("{verb} requested\n");
+    let again = format!("shutdown already in progress ({verb})\n");
+    if status.success() && (reply == requested.as_bytes() || reply == again.as_bytes()) {
+        return Ok(());
     }
+    Err(invalid(format!(
+        "the supervisor did not accept the {verb} ({status}): {}",
+        String::from_utf8_lossy(&reply).trim_end()
+    )))
 }
 
 /// A consented installation onto the held disk (DESIGN.md "Executing a
@@ -4287,11 +4299,12 @@ mod tests {
         }
     }
 
-    /// The restart runs the supervisor's client with nothing of the
-    /// service's and counts only td-svc's two acceptances; a client that
-    /// says anything else, fails, or does not answer in time refuses.
+    /// A restart or power-off runs the supervisor's client with nothing of
+    /// the service's and counts only td-svc's two acceptances of that verb;
+    /// a client that says anything else, fails, or does not answer in time
+    /// refuses.
     #[test]
-    fn a_restart_counts_only_the_supervisors_acceptance() {
+    fn an_ending_counts_only_the_supervisors_acceptance() {
         let dir = ScratchDirectory(scratch::path("restart"));
         std::fs::create_dir(&dir.0).unwrap();
         let client = |name: &str, body: &str| {
@@ -4303,8 +4316,8 @@ mod tests {
         };
         // A script just written may be busy while another test's child is
         // between fork and exec: ask again only then.
-        let request_reboot = |path: &std::path::Path, timeout| loop {
-            match request_reboot(path, timeout) {
+        let request_power = |path: &std::path::Path, verb, timeout| loop {
+            match request_power(path, verb, timeout) {
                 Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy => {
                     std::thread::sleep(Duration::from_millis(10))
                 }
@@ -4312,23 +4325,36 @@ mod tests {
             }
         };
         let timeout = Duration::from_secs(5);
-        for (name, body, accepted) in [
-            (
-                "requested",
-                "[ \"$*\" = reboot ] && [ -z \"$HOME\" ] && echo 'reboot requested'",
-                true,
-            ),
-            (
-                "again",
-                "echo 'shutdown already in progress (reboot)'",
-                true,
-            ),
-            ("poweroff", "echo 'poweroff requested'", false),
-            ("failed", "echo 'reboot requested'; exit 1", false),
-            ("silent", "exit 0", false),
-        ] {
-            let result = request_reboot(&client(name, body), timeout);
-            assert_eq!(result.is_ok(), accepted, "{name}: {result:?}");
+        assert_eq!(power_verb(installation_protocol::Ending::Restart), "reboot");
+        assert_eq!(
+            power_verb(installation_protocol::Ending::PowerOff),
+            "poweroff"
+        );
+        for (verb, other) in [("reboot", "poweroff"), ("poweroff", "reboot")] {
+            for (name, body, accepted) in [
+                (
+                    "requested",
+                    format!("[ \"$*\" = {verb} ] && [ -z \"$HOME\" ] && echo '{verb} requested'"),
+                    true,
+                ),
+                (
+                    "again",
+                    format!("echo 'shutdown already in progress ({verb})'"),
+                    true,
+                ),
+                ("other", format!("echo '{other} requested'"), false),
+                (
+                    "other-again",
+                    format!("echo 'shutdown already in progress ({other})'"),
+                    false,
+                ),
+                ("failed", format!("echo '{verb} requested'; exit 1"), false),
+                ("silent", "exit 0".to_string(), false),
+            ] {
+                let name = format!("{verb}-{name}");
+                let result = request_power(&client(&name, &body), verb, timeout);
+                assert_eq!(result.is_ok(), accepted, "{name}: {result:?}");
+            }
         }
         // A descendant that keeps the output open cannot hold the service
         // past the deadline either.
@@ -4337,16 +4363,17 @@ mod tests {
             "(i=0; while [ $i -lt 1000000 ]; do i=$((i + 1)); done) & echo 'reboot requested'",
         );
         let started = std::time::Instant::now();
-        assert!(request_reboot(&held, Duration::from_millis(50)).is_err());
+        assert!(request_power(&held, "reboot", Duration::from_millis(50)).is_err());
         assert!(started.elapsed() < Duration::from_secs(10));
         let started = std::time::Instant::now();
-        let hung = request_reboot(
+        let hung = request_power(
             &client("hung", "while :; do :; done"),
+            "poweroff",
             Duration::from_millis(200),
         );
         assert!(hung.unwrap_err().to_string().contains("did not answer"));
         assert!(started.elapsed() < Duration::from_secs(10));
-        assert!(request_reboot(&dir.0.join("absent"), timeout).is_err());
+        assert!(request_power(&dir.0.join("absent"), "reboot", timeout).is_err());
     }
 
     /// Under serve, standard input is the installer's channel and standard

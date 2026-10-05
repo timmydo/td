@@ -10,7 +10,7 @@ use td_install::installation_plan::{
     MAX_CANDIDATE_BYTES, MAX_ZONES,
 };
 use td_install::installation_protocol::{
-    check_greeting, frame, payload_len, Abandon, Failure, Phase, Refusal, Reply, Request,
+    check_greeting, frame, payload_len, Abandon, Ending, Failure, Phase, Refusal, Reply, Request,
     ReviewNonce, State, GREETING, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
 };
 
@@ -74,7 +74,8 @@ fn requests() -> Vec<Request> {
         Request::Status,
         Request::Withdraw(nonce()),
         Request::Timezones,
-        Request::Restart(nonce()),
+        Request::End(Ending::Restart, nonce()),
+        Request::End(Ending::PowerOff, nonce()),
     ]
 }
 
@@ -104,7 +105,7 @@ fn replies() -> Vec<Reply> {
 
 #[test]
 fn wire_bytes_are_independently_specified() {
-    assert_eq!(GREETING, b"TDINS03\n");
+    assert_eq!(GREETING, b"TDINS04\n");
     let mut propose = vec![0x02];
     propose.extend(DESTINATION);
     propose.extend(SETTINGS);
@@ -114,7 +115,9 @@ fn wire_bytes_are_independently_specified() {
     withdraw.extend([7; 32]);
     let mut restart = vec![0x07];
     restart.extend([7; 32]);
-    let expected: [&[u8]; 7] = [
+    let mut power_off = vec![0x08];
+    power_off.extend([7; 32]);
+    let expected: [&[u8]; 8] = [
         &[0x01],
         &propose,
         &execute,
@@ -122,6 +125,7 @@ fn wire_bytes_are_independently_specified() {
         &withdraw,
         &[0x06],
         &restart,
+        &power_off,
     ];
     for (request, bytes) in requests().iter().zip(expected) {
         assert_eq!(request.encode(), bytes, "{request:?}");
@@ -186,7 +190,7 @@ fn wire_bytes_are_independently_specified() {
             Reply::Refused(Refusal::TimezonesUnavailable),
             vec![0x84, 14],
         ),
-        (Reply::Refused(Refusal::RestartUnavailable), vec![0x84, 15]),
+        (Reply::Refused(Refusal::PowerUnavailable), vec![0x84, 15]),
         (
             Reply::Timezones(zones()),
             b"\x85TDZONE01\0\x02\0\x13America/Los_Angeles\0\x07Etc/UTC".to_vec(),
@@ -352,7 +356,7 @@ fn every_truncation_and_extension_refuses() {
 #[test]
 fn unknown_tags_codes_and_zero_nonces_refuse() {
     for tag in 0..=255u8 {
-        let known_request = (0x01..=0x07).contains(&tag);
+        let known_request = (0x01..=0x08).contains(&tag);
         let known_reply = (0x81..=0x85).contains(&tag);
         if !known_request {
             assert_eq!(
@@ -406,10 +410,13 @@ fn unknown_tags_codes_and_zero_nonces_refuse() {
     zero_withdraw.extend([0; 32]);
     let mut zero_restart = vec![0x07];
     zero_restart.extend([0; 32]);
+    let mut zero_power_off = vec![0x08];
+    zero_power_off.extend([0; 32]);
     for error in [
         Reply::decode(&zero_status).unwrap_err(),
         Request::decode(&zero_withdraw).unwrap_err(),
         Request::decode(&zero_restart).unwrap_err(),
+        Request::decode(&zero_power_off).unwrap_err(),
     ] {
         assert_eq!(error, "installation review nonce cannot be zero");
     }
@@ -428,8 +435,8 @@ fn directions_are_disjoint() {
 
 #[test]
 fn only_this_version_is_admitted() {
-    assert!(check_greeting(b"TDINS03\n").is_ok());
-    for other in [b"TDINS02\n", b"TDAT001\n", b"TDUPD01\n", b"TDINS03\0"] {
+    assert!(check_greeting(b"TDINS04\n").is_ok());
+    for other in [b"TDINS03\n", b"TDAT001\n", b"TDUPD01\n", b"TDINS04\0"] {
         assert_eq!(
             check_greeting(other).unwrap_err(),
             "unsupported installation protocol greeting"
@@ -546,9 +553,7 @@ fn replies_pair_only_with_their_requests() {
         (_, Reply::Refused(_)) => true,
         (Request::Destinations, Reply::Destinations(_)) => true,
         (Request::Propose { .. }, Reply::Reviewed(_)) => true,
-        (Request::Execute(_) | Request::Withdraw(_) | Request::Restart(_), Reply::Status(_)) => {
-            true
-        }
+        (Request::Execute(_) | Request::Withdraw(_) | Request::End(..), Reply::Status(_)) => true,
         (Request::Timezones, Reply::Timezones(_)) => true,
         _ => false,
     };

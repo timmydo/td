@@ -125,7 +125,7 @@ fn a_misplaced_serve_exits_without_a_byte() -> Res<()> {
     assert!(!output.status.success(), "{output:?}");
     if root {
         // Admitted: it greets, then ends when the installer closes unanswered.
-        assert_eq!(sent, b"TDINS03\n");
+        assert_eq!(sent, b"TDINS04\n");
     } else {
         assert!(sent.is_empty(), "{sent:?}");
         assert!(String::from_utf8_lossy(&output.stderr)

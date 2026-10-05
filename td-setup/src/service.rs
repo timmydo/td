@@ -21,6 +21,31 @@ use td_install::installation_protocol::{
 
 use crate::outcome;
 
+/// How a complete installation's live session ends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ending {
+    Restart,
+    PowerOff,
+}
+
+impl Ending {
+    pub const ALL: &[Self] = &[Self::Restart, Self::PowerOff];
+
+    fn wire(self) -> protocol::Ending {
+        match self {
+            Self::Restart => protocol::Ending::Restart,
+            Self::PowerOff => protocol::Ending::PowerOff,
+        }
+    }
+
+    fn from_wire(ending: protocol::Ending) -> Self {
+        match ending {
+            protocol::Ending::Restart => Self::Restart,
+            protocol::Ending::PowerOff => Self::PowerOff,
+        }
+    }
+}
+
 /// td-authd's setup intake; it starts one service per connection.
 pub const SOCKET: &str = "/run/td-authd/1000/setup";
 /// A service that stops reading for this long, or does not greet within it,
@@ -50,8 +75,9 @@ pub enum Answer {
     Stale(&'static str),
     /// A refusal, as text for the person.
     Refused(&'static str),
-    /// The supervisor accepted the restart of the completed installation.
-    Restarting,
+    /// The supervisor accepted the restart or power-off of the completed
+    /// installation.
+    Ending(Ending),
 }
 
 /// The service's state, as the installer shows it.
@@ -153,10 +179,10 @@ impl Service {
         self.send(Request::Timezones)
     }
 
-    /// Asks the service to restart the computer into the complete
-    /// installation `nonce` names.
-    pub fn restart(&mut self, nonce: [u8; 32]) -> Result<(), String> {
-        self.send(Request::Restart(ReviewNonce::new(nonce)?))
+    /// Asks the service to restart or power off the computer; it admits
+    /// this only while the installation `nonce` names is complete.
+    pub fn end(&mut self, nonce: [u8; 32], ending: Ending) -> Result<(), String> {
+        self.send(Request::End(ending.wire(), ReviewNonce::new(nonce)?))
     }
 
     /// Whether a request awaits its answer.
@@ -306,13 +332,13 @@ fn exchange(stream: &mut UnixStream, request: &Request) -> Result<Answer, String
             Ok(Answer::Withdrawn)
         }
         (Request::Withdraw(_), _) => Err("the installer service did not release the review".into()),
-        (Request::Restart(nonce), Reply::Status(State::Complete(complete)))
+        (Request::End(ending, nonce), Reply::Status(State::Complete(complete)))
             if complete == *nonce =>
         {
-            Ok(Answer::Restarting)
+            Ok(Answer::Ending(Ending::from_wire(*ending)))
         }
-        (Request::Restart(_), Reply::Status(_)) => {
-            Err("the installer service did not restart the installation".into())
+        (Request::End(..), Reply::Status(_)) => {
+            Err("the installer service did not end the installation's session".into())
         }
         (
             Request::Propose {
@@ -408,7 +434,7 @@ fn refusal_text(refusal: Refusal) -> &'static str {
         Refusal::NoReview => "there is no review",
         Refusal::ConsentUnavailable => "trusted consent is unavailable",
         Refusal::TimezonesUnavailable => "the time zones could not be read",
-        Refusal::RestartUnavailable => "the computer could not be restarted",
+        Refusal::PowerUnavailable => "the computer could not be restarted or powered off",
     }
 }
 
@@ -478,7 +504,7 @@ pub(crate) mod tests {
                 ReviewNonce::new(*plan.nonce()).unwrap(),
             ))),
             Request::Status => framed(&Reply::Status(State::Idle)),
-            Request::Restart(nonce) => framed(&Reply::Status(State::Complete(*nonce))),
+            Request::End(_, nonce) => framed(&Reply::Status(State::Complete(*nonce))),
         }
     }
 

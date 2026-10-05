@@ -25,7 +25,7 @@ use crate::destination::DestinationPage;
 use crate::evidence::{self, field, Proof};
 use crate::outcome::{CompletionPage, Progress, ProgressPage};
 use crate::review::ReviewPage;
-use crate::service::{Answer, Service, Stage, Standing, SOCKET};
+use crate::service::{Answer, Ending, Service, Stage, Standing, SOCKET};
 use crate::settings::{Draft, TIME_ZONE};
 use crate::welcome::Welcome;
 use std::io::Write;
@@ -93,25 +93,26 @@ enum Asked {
     Withdraw,
     Execute,
     Status,
-    Restart,
+    End,
 }
 
-/// Where the completion page's restart stands.
+/// Where the completion page's restart or power-off stands; each asked
+/// variant names the ending asked for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Restart {
+enum Power {
     Offered,
     /// Return was pressed; the request is not yet sent.
-    Wanted,
-    Sent,
+    Wanted(Ending),
+    Sent(Ending),
     /// The supervisor accepted it; the session is ending.
-    Accepted,
+    Accepted(Ending),
     Refused(&'static str),
     /// The connection is gone, and only welcome connects: nothing here can
     /// ask any more.
     Unavailable,
-    /// The connection ended with the restart asked for and unanswered: the
+    /// The connection ended with the ending asked for and unanswered: the
     /// supervisor may have accepted it, its teardown ending the connection.
-    Unknown,
+    Unknown(Ending),
 }
 
 /// What the wizard knows of the service's time zone catalog.
@@ -164,20 +165,49 @@ const REVIEW_KEYS: &[(&str, &str)] = &[
 ];
 const CONSENT_KEYS: &[(&str, &str)] =
     &[("Escape", "withdraw the review and go back to the settings")];
-const COMPLETE_KEYS: &[(&str, &str)] = &[(
-    "Return",
-    "restart the computer; remove the installation media once it has restarted",
-)];
+const COMPLETE_KEYS: &[(&str, &str)] = &[
+    ("Left/Up", "choose restart"),
+    ("Right/Down", "choose power off"),
+    ("Tab/S-Tab", "move to the other button"),
+    (
+        "Return",
+        "do it; remove the installation media once it has restarted or powered off",
+    ),
+];
 
-/// Shown on completion while the restart is asked for.
-const ASKING_RESTART: &str = "Asking the installer service to restart the computer\u{2026}";
-/// Shown on completion once the supervisor accepted the restart.
-const RESTARTING: &str = "Restarting\u{2026}";
-/// Shown on completion once nothing can ask for the restart.
-const RESTART_UNAVAILABLE: &str = "The installer service has ended; restart the computer yourself.";
-/// Shown on completion once an asked restart's answer cannot come.
-const RESTART_UNKNOWN: &str =
-    "The computer may be restarting; if it does not, restart it yourself.";
+/// Shown on completion while an ending is asked for.
+fn asking(ending: Ending) -> &'static str {
+    match ending {
+        Ending::Restart => "Asking the installer service to restart the computer\u{2026}",
+        Ending::PowerOff => "Asking the installer service to power off the computer\u{2026}",
+    }
+}
+/// Shown on completion once the supervisor accepted an ending.
+fn ending_notice(ending: Ending) -> &'static str {
+    match ending {
+        Ending::Restart => "Restarting\u{2026}",
+        Ending::PowerOff => "Powering off\u{2026}",
+    }
+}
+/// Shown on completion once an asked ending's answer cannot come.
+fn unknown_notice(ending: Ending) -> &'static str {
+    match ending {
+        Ending::Restart => "The computer may be restarting; if it does not, restart it yourself.",
+        Ending::PowerOff => {
+            "The computer may be powering off; if it does not, power it off yourself."
+        }
+    }
+}
+/// An ending's name in the page state.
+fn ending_name(ending: Ending) -> &'static str {
+    match ending {
+        Ending::Restart => "restart",
+        Ending::PowerOff => "poweroff",
+    }
+}
+/// Shown on completion once nothing can ask for an ending.
+const POWER_UNAVAILABLE: &str =
+    "The installer service has ended; restart or power off the computer yourself.";
 
 /// Shown on settings while a proposal is with the service.
 const REVIEWING: &str = "Asking the installer service for a review\u{2026}";
@@ -226,9 +256,11 @@ struct Wizard {
     poll_due: bool,
     /// The review the withdraw last sent names.
     withdrawing: Option<[u8; 32]>,
-    /// The complete installation's review, which a restart names.
+    /// The complete installation's review, which an ending names.
     completed: Option<[u8; 32]>,
-    restart: Restart,
+    /// The completion page's selected button.
+    choice: Ending,
+    power: Power,
 }
 
 impl Wizard {
@@ -254,7 +286,8 @@ impl Wizard {
             poll_due: false,
             withdrawing: None,
             completed: None,
-            restart: Restart::Offered,
+            choice: Ending::Restart,
+            power: Power::Offered,
         }
     }
 
@@ -312,10 +345,20 @@ impl Wizard {
                 self.review_page = 0;
                 self.page = Page::Settings;
             }
-            // Only a complete installation's own review restarts, once
-            // asked, or again after a refusal.
-            (Page::Complete, "Return") if self.restartable() => {
-                self.restart = Restart::Wanted;
+            // Only a complete installation's own review ends the session,
+            // once asked, or again after a refusal.
+            // The buttons sit Restart then Power off: arrows choose one,
+            // Tab and S-Tab move to the other.
+            (Page::Complete, "Up" | "Left") if self.endable() => self.choice = Ending::Restart,
+            (Page::Complete, "Down" | "Right") if self.endable() => self.choice = Ending::PowerOff,
+            (Page::Complete, "Tab" | "S-Tab") if self.endable() => {
+                self.choice = match self.choice {
+                    Ending::Restart => Ending::PowerOff,
+                    Ending::PowerOff => Ending::Restart,
+                };
+            }
+            (Page::Complete, "Return") if self.endable() => {
+                self.power = Power::Wanted(self.choice);
             }
             // Nothing here undoes an installation or hides its outcome.
             (Page::Progress(_) | Page::Complete, _) => {}
@@ -372,7 +415,7 @@ impl Wizard {
             Page::Settings => &[2],
             Page::Review => &[4],
             Page::Progress(Progress::Consent) => &[5],
-            Page::Complete if self.restartable() => &[6],
+            Page::Complete if self.endable() => &[6],
             Page::Complete => &[],
             // These take no key.
             Page::Progress(_) => &[],
@@ -437,7 +480,7 @@ impl Wizard {
             (Page::Settings, Catalog::Unasked) => Some(Asked::Zones),
             (Page::Settings, _) if self.proposal.is_some() => Some(Asked::Review),
             (Page::Review, _) if self.execute.is_some() => Some(Asked::Execute),
-            (Page::Complete, _) if self.restart == Restart::Wanted => Some(Asked::Restart),
+            (Page::Complete, _) if matches!(self.power, Power::Wanted(_)) => Some(Asked::End),
             _ if self.poll_due && self.executing.is_some() && self.following() => {
                 Some(Asked::Status)
             }
@@ -545,9 +588,9 @@ impl Wizard {
                     Stage::Reviewed | Stage::AwaitingConsent | Stage::Running(_) => {}
                 }
             }
-            (Some(Asked::Restart), Ok(Answer::Restarting)) => self.restart = Restart::Accepted,
-            (Some(Asked::Restart), Ok(Answer::Refused(reason))) => {
-                self.restart = Restart::Refused(reason);
+            (Some(Asked::End), Ok(Answer::Ending(ending))) => self.power = Power::Accepted(ending),
+            (Some(Asked::End), Ok(Answer::Refused(reason))) => {
+                self.power = Power::Refused(reason);
             }
             (Some(Asked::Withdraw), Ok(Answer::Withdrawn)) => {
                 let released = self.withdrawing.take();
@@ -571,10 +614,10 @@ impl Wizard {
         }
     }
 
-    /// Whether Return on completion may ask for the restart: once, or
-    /// again after a refusal, while the connection lasts.
-    fn restartable(&self) -> bool {
-        self.completed.is_some() && matches!(self.restart, Restart::Offered | Restart::Refused(_))
+    /// Whether completion may ask for an ending: once, or again after a
+    /// refusal, while the connection lasts.
+    fn endable(&self) -> bool {
+        self.completed.is_some() && matches!(self.power, Power::Offered | Power::Refused(_))
     }
 
     /// Whether the shown page follows an installation's state.
@@ -597,7 +640,8 @@ impl Wizard {
         };
         if stage == Stage::Complete {
             self.completed = review;
-            self.restart = Restart::Offered;
+            self.choice = Ending::Restart;
+            self.power = Power::Offered;
         }
         let page = match stage {
             Stage::AwaitingConsent => Page::Progress(Progress::Consent),
@@ -649,14 +693,14 @@ impl Wizard {
             self.page,
             Page::Complete | Page::Progress(Progress::Failed(_))
         );
-        // Completion can no longer ask for a restart; one asked for may
+        // Completion can no longer ask for an ending; one asked for may
         // still be under way.
         if self.page == Page::Complete {
-            self.restart = match self.restart {
-                Restart::Accepted => Restart::Accepted,
-                Restart::Sent | Restart::Unknown => Restart::Unknown,
-                Restart::Offered | Restart::Wanted | Restart::Refused(_) | Restart::Unavailable => {
-                    Restart::Unavailable
+            self.power = match self.power {
+                Power::Accepted(ending) => Power::Accepted(ending),
+                Power::Sent(ending) | Power::Unknown(ending) => Power::Unknown(ending),
+                Power::Offered | Power::Wanted(_) | Power::Refused(_) | Power::Unavailable => {
+                    Power::Unavailable
                 }
             };
         }
@@ -729,15 +773,18 @@ impl Wizard {
             Page::Progress(Progress::Unknown) => state.push_str("unknown"),
             Page::Complete => {
                 state.push_str("complete");
-                let restart = match self.restart {
-                    Restart::Offered => "offered",
-                    Restart::Wanted | Restart::Sent => "asked",
-                    Restart::Accepted => "accepted",
-                    Restart::Refused(_) => "refused",
-                    Restart::Unavailable => "unavailable",
-                    Restart::Unknown => "unknown",
+                field(&mut state, "choice", ending_name(self.choice));
+                let end = match self.power {
+                    Power::Offered => "offered".to_string(),
+                    Power::Wanted(ending) | Power::Sent(ending) => {
+                        format!("asked-{}", ending_name(ending))
+                    }
+                    Power::Accepted(ending) => format!("accepted-{}", ending_name(ending)),
+                    Power::Refused(_) => "refused".to_string(),
+                    Power::Unavailable => "unavailable".to_string(),
+                    Power::Unknown(ending) => format!("unknown-{}", ending_name(ending)),
                 };
-                field(&mut state, "restart", restart);
+                field(&mut state, "end", &end);
             }
         }
         state
@@ -835,9 +882,9 @@ impl Front {
                 None => return,
             },
             Asked::Status => service.status(),
-            Asked::Restart => match self.wizard.completed {
-                Some(nonce) => service.restart(nonce),
-                None => return,
+            Asked::End => match (self.wizard.completed, self.wizard.power) {
+                (Some(nonce), Power::Wanted(ending)) => service.end(nonce, ending),
+                _ => return,
             },
         };
         match sent {
@@ -846,7 +893,11 @@ impl Front {
                     Asked::Execute => self.wizard.executing = names,
                     Asked::Withdraw => self.wizard.withdrawing = names,
                     Asked::Status => self.next_poll = self.now.saturating_add(POLL),
-                    Asked::Restart => self.wizard.restart = Restart::Sent,
+                    Asked::End => {
+                        if let Power::Wanted(ending) = self.wizard.power {
+                            self.wizard.power = Power::Sent(ending);
+                        }
+                    }
                     _ => {}
                 }
                 self.wizard.sent(asked);
@@ -1100,18 +1151,18 @@ impl Window {
                     .map(|view| Box::new(view) as Box<dyn Composition>),
             ),
             Page::Complete => {
-                let notice = match wizard.restart {
-                    Restart::Offered => None,
-                    Restart::Wanted | Restart::Sent => Some(ASKING_RESTART),
-                    Restart::Accepted => Some(RESTARTING),
-                    Restart::Refused(reason) => Some(reason),
-                    Restart::Unavailable => Some(RESTART_UNAVAILABLE),
-                    Restart::Unknown => Some(RESTART_UNKNOWN),
+                let notice = match wizard.power {
+                    Power::Offered => None,
+                    Power::Wanted(ending) | Power::Sent(ending) => Some(asking(ending)),
+                    Power::Accepted(ending) => Some(ending_notice(ending)),
+                    Power::Refused(reason) => Some(reason),
+                    Power::Unavailable => Some(POWER_UNAVAILABLE),
+                    Power::Unknown(ending) => Some(unknown_notice(ending)),
                 };
-                Some(
-                    CompletionPage::new(surface)
-                        .map(|view| Box::new(view.with_notice(notice)) as Box<dyn Composition>),
-                )
+                let choice = wizard.endable().then_some(wizard.choice);
+                Some(CompletionPage::new(surface).map(|view| {
+                    Box::new(view.with_notice(notice).with_choice(choice)) as Box<dyn Composition>
+                }))
             }
             _ => None,
         };
@@ -1496,7 +1547,7 @@ mod tests {
         for (page, state) in [
             (Page::Progress(Progress::Consent), "page=consent"),
             (Page::Progress(Progress::Unknown), "page=unknown"),
-            (Page::Complete, "page=complete restart=offered"),
+            (Page::Complete, "page=complete choice=restart end=offered"),
             (Page::Unavailable, "page=unavailable"),
             (Page::Refused("busy"), "page=refused"),
         ] {
@@ -1733,18 +1784,18 @@ mod tests {
         assert_eq!(wizard.page, Page::Complete);
     }
 
-    /// Return on completion asks, once, for the restart of the review
-    /// that completed; a refusal or a lost connection is shown and Return
-    /// asks again, and an accepted restart takes no more keys.
+    /// Return on completion asks, once, for the chosen ending of the
+    /// review that completed, restart by default; a refusal is shown and
+    /// Return asks again, and an accepted ending takes no more keys.
     #[test]
-    fn a_complete_installation_restarts_on_return() {
+    fn a_complete_installation_restarts_or_powers_off_on_return() {
         let mut wizard = on_review();
         wizard.key("Return");
         let nonce = send_execute(&mut wizard);
         wizard.answered(Ok(state(nonce, Stage::Complete)));
         assert_eq!(wizard.page, Page::Complete);
         assert_eq!(wizard.completed, Some(nonce));
-        assert_eq!(wizard.state(), "page=complete restart=offered");
+        assert_eq!(wizard.state(), "page=complete choice=restart end=offered");
         assert_eq!(
             wizard.key_sections().first().map(|s| s.title),
             Some("Complete")
@@ -1753,44 +1804,96 @@ mod tests {
             wizard.key(chord);
         }
         assert_eq!(wizard.wanted(), None);
+        // Arrows choose a button, the same one again stays put, and Tab
+        // and S-Tab move to the other.
+        for (chord, choice) in [
+            ("Up", "restart"),
+            ("Left", "restart"),
+            ("Down", "poweroff"),
+            ("Right", "poweroff"),
+            ("Down", "poweroff"),
+            ("Tab", "restart"),
+            ("S-Tab", "poweroff"),
+            ("Left", "restart"),
+            ("Right", "poweroff"),
+        ] {
+            wizard.key(chord);
+            assert_eq!(
+                wizard.state(),
+                format!("page=complete choice={choice} end=offered")
+            );
+        }
         wizard.key("Return");
-        assert_eq!(wizard.wanted(), Some(Asked::Restart));
-        wizard.restart = Restart::Sent;
-        wizard.sent(Asked::Restart);
-        assert_eq!(wizard.state(), "page=complete restart=asked");
-        wizard.key("Return");
-        assert_eq!(wizard.wanted(), None);
-        wizard.answered(Ok(Answer::Refused("the computer could not be restarted")));
+        assert_eq!(wizard.wanted(), Some(Asked::End));
+        assert_eq!(wizard.power, Power::Wanted(Ending::PowerOff));
+        wizard.power = Power::Sent(Ending::PowerOff);
+        wizard.sent(Asked::End);
         assert_eq!(
-            wizard.restart,
-            Restart::Refused("the computer could not be restarted")
+            wizard.state(),
+            "page=complete choice=poweroff end=asked-poweroff"
         );
-        assert_eq!(wizard.state(), "page=complete restart=refused");
-        wizard.key("Return");
-        assert_eq!(wizard.wanted(), Some(Asked::Restart));
-        wizard.restart = Restart::Sent;
-        wizard.sent(Asked::Restart);
-        wizard.answered(Ok(Answer::Restarting));
-        assert_eq!(wizard.state(), "page=complete restart=accepted");
-        wizard.key("Return");
+        // A request in flight takes no other key.
+        for chord in ["Return", "Up"] {
+            wizard.key(chord);
+        }
         assert_eq!(wizard.wanted(), None);
+        assert_eq!(wizard.power, Power::Sent(Ending::PowerOff));
+        let refused = "the computer could not be restarted or powered off";
+        wizard.answered(Ok(Answer::Refused(refused)));
+        assert_eq!(wizard.power, Power::Refused(refused));
+        assert_eq!(wizard.state(), "page=complete choice=poweroff end=refused");
+        // After a refusal the other ending may be chosen.
+        wizard.key("Left");
+        wizard.key("Return");
+        assert_eq!(wizard.power, Power::Wanted(Ending::Restart));
+        wizard.power = Power::Sent(Ending::Restart);
+        wizard.sent(Asked::End);
+        wizard.answered(Ok(Answer::Ending(Ending::Restart)));
+        assert_eq!(
+            wizard.state(),
+            "page=complete choice=restart end=accepted-restart"
+        );
+        for chord in ["Return", "Down"] {
+            wizard.key(chord);
+        }
+        assert_eq!(wizard.wanted(), None);
+        assert_eq!(wizard.choice, Ending::Restart);
         assert!(wizard.key_sections().first().map(|s| s.title) != Some("Complete"));
         // The session ends with the connection; the page stands.
         wizard.lost();
         assert_eq!(wizard.page, Page::Complete);
-        assert_eq!(wizard.restart, Restart::Accepted);
+        assert_eq!(wizard.power, Power::Accepted(Ending::Restart));
         // A connection lost before the answer, or before Return, leaves
-        // nothing to ask: the page says to restart by other means.
-        for (before, after, state) in [
-            (Restart::Offered, Restart::Unavailable, "unavailable"),
-            (Restart::Refused("no"), Restart::Unavailable, "unavailable"),
-            (Restart::Sent, Restart::Unknown, "unknown"),
+        // nothing to ask: the page says to end the session by other means.
+        for (choice, before, after, end) in [
+            (
+                Ending::Restart,
+                Power::Offered,
+                Power::Unavailable,
+                "unavailable",
+            ),
+            (
+                Ending::PowerOff,
+                Power::Refused("no"),
+                Power::Unavailable,
+                "unavailable",
+            ),
+            (
+                Ending::PowerOff,
+                Power::Sent(Ending::PowerOff),
+                Power::Unknown(Ending::PowerOff),
+                "unknown-poweroff",
+            ),
         ] {
-            wizard.restart = before;
+            wizard.choice = choice;
+            wizard.power = before;
             wizard.lost();
             assert_eq!(wizard.page, Page::Complete);
-            assert_eq!(wizard.restart, after);
-            assert_eq!(wizard.state(), format!("page=complete restart={state}"));
+            assert_eq!(wizard.power, after);
+            assert_eq!(
+                wizard.state(),
+                format!("page=complete choice={} end={end}", ending_name(choice))
+            );
             wizard.key("Return");
             assert_eq!(wizard.wanted(), None);
         }
@@ -2196,8 +2299,8 @@ mod tests {
         // connection.
         front.key("Return", &intake);
         let deadline = Instant::now() + Duration::from_secs(20);
-        while front.wizard.restart != Restart::Accepted {
-            assert!(Instant::now() < deadline, "{:?}", front.wizard.restart);
+        while front.wizard.power != Power::Accepted(Ending::Restart) {
+            assert!(Instant::now() < deadline, "{:?}", front.wizard.power);
             front.receive();
             std::thread::sleep(Duration::from_millis(1));
         }

@@ -43,7 +43,8 @@ review, installation progress, and completion. Back preserves valid input.
 Errors remain visible and explain the failed operation. The review includes
 the exact disk identity and capacity, the selected settings, and an explicit
 confirmation that all data on that disk will be lost. Success offers an
-orderly reboot with an instruction to remove the installation media.
+orderly reboot or power-off with an instruction to remove the installation
+media.
 
 The UI is a td-owned, dependency-free Rust Wayland client. Follow td-editor's
 software rendering, font and input conventions where useful; a general UI
@@ -207,7 +208,7 @@ once the menu's notice says the system is installed. QEMU's own count of
 changes to the target, writes, discards and zone appends alike, must be zero
 when the review is released, when consent is asked and at every Enter on the
 prompt, and must not be by the installed notice. Once td-setup says the
-installation completed, with the restart offered, the drive presses Return;
+installation completed, with Restart selected, the drive presses Return;
 the live phase ends only when the guest's orderly reboot has printed
 `TD-SHUTDOWN-OK` and then the kernel's `reboot: Restarting system`, which a
 power-off does not print, without a kernel panic, and QEMU, under
@@ -216,58 +217,59 @@ the installer's GPT layout, primary and backup whole. A lost or garbled
 evidence line fails the run as soon as a later line shows the gap, and a
 state that does not follow its act within five minutes, or an installed
 notice that does not follow consent within half an hour, fails it then; so
-does td-setup saying the installation failed, saying its restart was refused
+does td-setup saying the installation failed, saying its ending was refused
 or can no longer be asked for, or a guest still up ten minutes after the
-restart was asked for. Under that token the greeter parks rather than reboot
-the live boot when its health transaction settles; no autotest window
-evidence runs on a live boot, so nothing else maps to take the drive's keys.
-With the medium detached, the installed disk then cold-boots through
-firmware twice, alone and then renamed behind a decoy disk: each boot must
-bind the volume UUID read from the image's own superblock and the medium's
-deployment, activate the wizard's account and host (the primary profile and
-hostname reports), acknowledge a healthy deployment and flip the
-compositor's pages, with a machine-id, host key and the account's home under
-`/var/home` that the first boot created and the second found, and with every
-compositor session's clock naming Asia/Tokyo. Once a boot reports success,
-its display is captured through QMP, at most once a second for two minutes
-and before the boot is stopped, until the status bar's clock ends in the
-configured zone's offset, UTC+09:00 for Asia/Tokyo, drawn as the compositor
-draws it from the image's outline face; a boot whose display never shows it
-fails. The name and the offset come from the one clock the compositor loaded
-from `/etc/timezone`. Each boot's serial console is also a socket the oracle
-types into, QEMU waiting for it before the guest starts and logging what the
-guest writes to the console file it reads: once a boot reports success and
-the greeter has logged the account in on ttyS0, its login shell must, within
-two minutes of that success, report `id -un`, the home a bare `cd` from `/`
-reaches through `HOME` with `pwd -P`, and `/etc/timezone` as `dana
-/var/home/dana Asia/Tokyo`; on the first boot it writes a per-run token into
-a file in that home and syncs, and each boot reports the file's contents and
-the home's inode from `ls -di .`, the second boot the same token and inode
-as the first. `./test-iso` boots a medium through firmware by hand, with no
-tokens.
+restart was asked for. The power-off button's path is the same request with
+the other verb, pinned by td-install's and td-setup's tests rather than
+booted. Under that token the greeter parks rather than reboot the live boot
+when its health transaction settles; no autotest window evidence runs on a
+live boot, so nothing else maps to take the drive's keys. With the medium
+detached, the installed disk then cold-boots through firmware twice, alone
+and then renamed behind a decoy disk: each boot must bind the volume UUID
+read from the image's own superblock and the medium's deployment, activate
+the wizard's account and host (the primary profile and hostname reports),
+acknowledge a healthy deployment and flip the compositor's pages, with a
+machine-id, host key and the account's home under `/var/home` that the first
+boot created and the second found, and with every compositor session's clock
+naming Asia/Tokyo. Once a boot reports success, its display is captured
+through QMP, at most once a second for two minutes and before the boot is
+stopped, until the status bar's clock ends in the configured zone's offset,
+UTC+09:00 for Asia/Tokyo, drawn as the compositor draws it from the image's
+outline face; a boot whose display never shows it fails. The name and the
+offset come from the one clock the compositor loaded from `/etc/timezone`.
+Each boot's serial console is also a socket the oracle types into, QEMU
+waiting for it before the guest starts and logging what the guest writes to
+the console file it reads: once a boot reports success and the greeter has
+logged the account in on ttyS0, its login shell must, within two minutes of
+that success, report `id -un`, the home a bare `cd` from `/` reaches through
+`HOME` with `pwd -P`, and `/etc/timezone` as `dana /var/home/dana
+Asia/Tokyo`; on the first boot it writes a per-run token into a file in that
+home and syncs, and each boot reports the file's contents and the home's
+inode from `ls -di .`, the second boot the same token and inode as the
+first. `./test-iso` boots a medium through firmware by hand, with no tokens.
 
 The intake admits only the wizard's identity. The session's own programs,
 its shell and the VM guest helper among them, run as UID 1000: the socket's
 permissions (mode 0600, owned by `tdi1000`) refuse their connect, and
 td-authd's peer check closes any other peer that reaches it unanswered, so
 none can take the one installation service a session generation serves,
-drive a review to the consent prompt or ask for the restart a complete
-installation offers; that restart, which the wizard's identity may ask for,
-only ends the live session through the supervisor's orderly reboot. Nothing
-unprivileged becomes `tdi1000`: it is a service-only account, and td-login,
-never installed setuid, switches credentials only for root. Root is outside
-this boundary and could write a disk without the installer (the stock image
-leaves its password field empty, but nothing in the live session enters it);
-through the installation service, erasure still needs the person's physical
-consent. Programs of the session can still disturb the wizard without
-driving it, among them: the compositor's control socket moves, regroups and
-resizes its window and changes its workspace, a window mapped later, such as
-one a person opens, takes its focus (above), a window with td-setup's app id
-satisfies the unit's diagnostic readiness probe, the session's clients can
-fill the compositor's public client slots or `/tmp` first, and files
-squatting td-ui's predictable buffer names in `/tmp` can leave it unable to
-draw. Synthetic input is refused while trusted attention is enabled, so none
-can type into it.
+drive a review to the consent prompt or ask for the restart or power-off a
+complete installation offers; that ending, which the wizard's identity may
+ask for, only ends the live session through the supervisor's orderly reboot
+or power-off. Nothing unprivileged becomes `tdi1000`: it is a service-only
+account, and td-login, never installed setuid, switches credentials only for
+root. Root is outside this boundary and could write a disk without the
+installer (the stock image leaves its password field empty, but nothing in
+the live session enters it); through the installation service, erasure still
+needs the person's physical consent. Programs of the session can still
+disturb the wizard without driving it, among them: the compositor's control
+socket moves, regroups and resizes its window and changes its workspace, a
+window mapped later, such as one a person opens, takes its focus (above), a
+window with td-setup's app id satisfies the unit's diagnostic readiness
+probe, the session's clients can fill the compositor's public client slots
+or `/tmp` first, and files squatting td-ui's predictable buffer names in
+`/tmp` can leave it unable to draw. Synthetic input is refused while trusted
+attention is enabled, so none can type into it.
 
 The destination page is a pure view over `Destination` values supplied by
 the service. It shows capacity, model, kernel name, device number, sequence,
@@ -346,41 +348,43 @@ The pure progress view renders service-supplied phases and a bounded failure
 reason. It shows an unknown outcome when service status is unavailable,
 never infers success from a queued request, and warns that a failed disk may
 be incomplete and requires a new review before retry. The completion view
-offers the restart: Return asks the service, over the same connection, to
-restart into the installation it reported complete, and the view says to
-keep the installation media in until the computer has restarted and shows
-its startup screen, then remove it. The live system runs from the medium
-until its teardown ends, so a medium pulled when the screen goes dark can
-leave that teardown unable to run its last programs and the machine to be
-switched off by hand (the installation is already durable); and an installed
-disk boots by the removable-media path with no firmware boot entry, so a
-medium left in may start again. Return asks once, showing that it asks; a
-refusal is shown and Return asks again; an accepted restart shows the
-computer restarting and takes no more keys. Once the connection is gone,
-Return cannot ask again (only welcome connects, and td-authd serves no
-second installation), so the view says to restart the computer by other
-means; gone while a restart is asked for, since the teardown may end it
-before the acceptance reaches the window, the view says the computer may be
-restarting and, if it does not, to restart it by other means. The caller may
-show the view only after the service reports durable filesystem and
-deployment publication, verified boot artifacts, and settings publication.
-In the live window, execute answered awaiting consent shows a consent view:
-confirm or decline at the secure prompt, since this window cannot give
-consent. While consent is sought or the installation runs, the window asks
-for status over
-the same connection, at most every half second from each ask, and follows
-only the review it executed: awaiting consent, a running phase, failure and
-completion are shown as reported; a review abandoned before any write
-(declined, expired, unavailable or the disk changed) returns to settings
-with the reason; idle, another review's state, the review still merely
-reviewed, or a lost connection after execute shows the outcome as unknown,
-never success or a mere unavailable service. Escape at the consent view
-withdraws the review; until the release is confirmed a lost connection, or
-leaving the wait for disks on a new attempt, is still an unknown outcome,
-and a state already asked for that reports the review ended settles it:
-abandoned needs no release, and completion or failure is shown. No key
-leaves progress, failure, an unknown outcome or completion; Return on
-completion asks only for the restart. A reported completion or failure
+offers two buttons, Restart (selected first) and Power off: Left or Up
+chooses Restart, Right or Down Power off, Tab and S-Tab the other, and
+Return asks the service, over the same connection, to restart or power
+off. The view says to keep the installation media in until the computer has
+restarted and shows its startup screen, or has powered off, then remove it.
+The live system runs from the medium until its teardown ends, so a medium
+pulled when the screen goes dark can leave that teardown unable to run its
+last programs and the machine to be switched off by hand (the installation
+is already durable); and an installed disk boots by the removable-media path
+with no firmware boot entry, so a medium left in may start again. Powering
+off lets the person take the medium out with the machine at rest. Return
+asks once, showing that it asks; a refusal is shown and either button may be
+asked for again; an accepted ending shows the computer restarting or
+powering off and takes no more keys. Once the connection is gone, nothing
+can ask again (only welcome connects, and td-authd serves no second
+installation), so the view says to restart or power off the computer by
+other means; gone while an ending is asked for, since the teardown may end
+it before the acceptance reaches the window, the view says the computer may
+be restarting or powering off and, if it does not, to do so by other means.
+The caller may show the view only after the service reports durable
+filesystem and deployment publication, verified boot artifacts, and settings
+publication. In the live window, execute answered awaiting consent shows a
+consent view: confirm or decline at the secure prompt, since this window
+cannot give consent. While consent is sought or the installation runs, the
+window asks for status over the same connection, at most every half second
+from each ask, and follows only the review it executed: awaiting consent, a
+running phase, failure and completion are shown as reported; a review
+abandoned before any write (declined, expired, unavailable or the disk
+changed) returns to settings with the reason; idle, another review's state,
+the review still merely reviewed, or a lost connection after execute shows
+the outcome as unknown, never success or a mere unavailable service. Escape
+at the consent view withdraws the review; until the release is confirmed a
+lost connection, or leaving the wait for disks on a new attempt, is still an
+unknown outcome, and a state already asked for that reports the review ended
+settles it: abandoned needs no release, and completion or failure is shown.
+No key leaves progress, failure, an unknown outcome or completion; Return on
+completion asks only for the chosen ending. A reported completion or failure
 stands when the connection ends.
 
 A device-bound installation reaches completion through its recovery-key
@@ -545,12 +549,12 @@ unprivileged installer and the root installation service. It is data and
 codec only, and decoding a message grants no authority. The service core
 below implements it; td-authd's setup intake starts it for td-setup, which
 asks for destinations, time zones and status, proposes, executes, withdraws
-and asks for the restart, and checks that a review carries exactly what it
-proposed and that a withdraw answers abandoned (withdrawn), and a restart
+and asks for an ending, and checks that a review carries exactly what it
+proposed and that a withdraw answers abandoned (withdrawn), and an ending
 complete, for its nonce; any other answer ends its connection, and with it,
 until an installation starts, the review and claim.
 
-Both ends first send and require the eight bytes `TDINS03\n`. Any change to
+Both ends first send and require the eight bytes `TDINS04\n`. Any change to
 a message or its bytes changes this greeting; there is no negotiation. Each
 message then travels in one frame: a big-endian u32 length and that many
 payload bytes. `payload_len` admits a nonzero length within the direction's
@@ -584,9 +588,10 @@ Requests carry no path, executable, mount option, source or consent:
   against that same record, so the installer offers exactly the zones the
   service admits, and an unreadable catalog refuses a proposal as time
   zones unavailable, not as an unsupported zone.
-- `0x07` restart: a 32-byte review nonce. It asks the service to restart
-  the computer into the complete installation the nonce names, through the
-  supervisor's orderly reboot.
+- `0x07` restart and `0x08` power off: a 32-byte review nonce. Each asks
+  the service to end the live session through the supervisor's orderly
+  reboot or power-off, only while the installation the nonce names is
+  complete.
 
 Replies set the high bit, so no request decodes as a reply or the reverse:
 
@@ -614,9 +619,9 @@ unavailable, 3 discovery failed, 4 destination changed, 5 destination busy,
 keyboard, 10 unsupported timezone, 11 stale review, 12 no review, 13 consent
 unavailable (no seat, compositor or trusted consent path can present the
 review, or the consent channel cannot carry it), 14 time zones
-unavailable (the catalog could not be read) and 15 restart unavailable (the
-supervisor did not accept the reboot). Unassigned codes refuse, and a
-duplicated code does not compile.
+unavailable (the catalog could not be read) and 15 power unavailable (the
+supervisor did not accept the reboot or power-off). Unassigned codes
+refuse, and a duplicated code does not compile.
 
 The service holds at most one review. A review is held while reviewed,
 awaiting consent or running, and not after complete, failed or abandoned.
@@ -639,22 +644,25 @@ Where two refusals apply, busy wins. Each state admits:
   answering abandoned (withdrawn) and releasing the claim and any displayed
   consent. Another nonce is a stale review, no held review is no review,
   and running is busy: a started installation cannot be withdrawn.
-- restart: only while complete, for that installation's nonce. The service
-  runs the running root's `/bin/td-svc reboot` with a cleared environment,
-  no input, its output captured and its error discarded, for at most ten
-  seconds, and answers complete once the supervisor has accepted the reboot
-  (`reboot requested`, or a reboot already in progress). The supervisor
-  accepts before it stops anything, but its teardown may end this service,
-  or the installer's connection, before that answer reaches the installer.
-  Any other answer, failure or timeout kills that client and refuses as
-  restart unavailable; a client that timed out may still have started the
-  reboot. Another nonce is a stale review, running is busy, and every other
-  state is no review. It takes no consent: it changes no disk, ends a live
-  session whose writes are lost at power-off anyway, and runs the same
-  teardown every reboot does (td-svc/DESIGN.md section 8).
+- restart and power off: only while complete, for that installation's
+  nonce. The service runs the running root's `/bin/td-svc reboot` or
+  `/bin/td-svc poweroff` with a cleared environment, no input, its output
+  captured and its error discarded, for at most ten seconds, and answers
+  complete once the supervisor has accepted that verb (`reboot requested`
+  or `poweroff requested`, or that one already in progress). The
+  supervisor accepts before it stops anything, but its teardown may end
+  this service, or the installer's connection, before that answer reaches
+  the installer. Any other answer, the other verb's included, failure or
+  timeout kills that client and refuses as power unavailable; a client
+  that timed out may still have started the ending. Another nonce is a
+  stale review, running is busy, and every other state is no review. Neither
+  takes consent: they change no disk, end a live session whose writes are
+  lost at power-off anyway, and run the same teardown every reboot or
+  power-off does (td-svc/DESIGN.md section 8).
 
-Destinations and propose may be refused; execute, withdraw and restart
-answer with status or a refusal; status always answers with status.
+Destinations and propose may be refused; execute, withdraw and the ending
+requests answer with status or a refusal; status always answers with
+status.
 `Reply::answers` checks only this shape: the installer still compares the
 review nonce and the proposed or echoed fields. Complete means durable
 filesystem and deployment publication, verified boot artifacts and settings

@@ -372,7 +372,7 @@ fn script(rows: &[String]) -> Result<Vec<SetupStep>, String> {
     // td-authd ends the attention only once the installation finished, so
     // td-setup's next poll says so; Return then restarts the computer.
     steps.push(SetupStep {
-        shown: "page=complete restart=offered".into(),
+        shown: "page=complete choice=restart end=offered".into(),
         act: Act::Keys(vec!["ret"]),
         untouched: false,
         within: STEP_TIMEOUT,
@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(untouched[1], "page=consent");
         assert!(matches!(&consent.act, Act::Consent(shown) if *shown == rows));
         // Return on the completion page restarts the computer.
-        assert_eq!(last.shown, "page=complete restart=offered");
+        assert_eq!(last.shown, "page=complete choice=restart end=offered");
         assert!(matches!(&last.act, Act::Keys(keys) if keys == &["ret"]));
         assert_eq!(last.within, STEP_TIMEOUT);
         // The same review is asked twice, and consent follows the second.

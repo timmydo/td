@@ -1507,24 +1507,24 @@ connect at all, the socket being mode 0600 and the wizard's. The service is
 empty environment, cwd `/`, the accepted socket as stdin, one end of a new
 socketpair as stdout and authority stderr: td-install/INSTALLER.md
 "Installation service core" says what it admits, including the supervisor's
-orderly reboot once its installation is complete. td-authd keeps the other
-end, nonblocking, and speaks td-install/INSTALLER.md "Installation consent
-channel" on it, compiling the service's own codec, with at most four reads
-and four writes per heartbeat. It sends its greeting, requires the
-service's, and holds at most one open review from its review report to the
-service's ended or finished report, admitting started only after it sent
-consent, finished only after started, and ended only before started. Reports
-read before the channel ends count. A report out of that order or a
-malformed frame breaks the channel, as does a failed write (owed bytes mean
-the service has not started), and td-authd kills the service. The service
-closing the channel, or having exited, once everything it sent before
-exiting is read, retires it unsignalled, so a started installation is not
-interrupted. Either way its open review ends then (a started one fails, its
-outcome unknown), and nonblocking polls reap the retired child; a hung one
-keeps the intake busy until teardown. A finished-complete report marks the
-generation complete and its intake starts no further service. A later
-generation's intake starts afresh: each installation still needs its own
-review and physical consent.
+orderly reboot or power-off while its installation is complete. td-authd
+keeps the other end, nonblocking, and speaks td-install/INSTALLER.md
+"Installation consent channel" on it, compiling the service's own codec,
+with at most four reads and four writes per heartbeat. It sends its
+greeting, requires the service's, and holds at most one open review from its
+review report to the service's ended or finished report, admitting started
+only after it sent consent, finished only after started, and ended only
+before started. Reports read before the channel ends count. A report out of
+that order or a malformed frame breaks the channel, as does a failed write
+(owed bytes mean the service has not started), and td-authd kills the
+service. The service closing the channel, or having exited, once everything
+it sent before exiting is read, retires it unsignalled, so a started
+installation is not interrupted. Either way its open review ends then (a
+started one fails, its outcome unknown), and nonblocking polls reap the
+retired child; a hung one keeps the intake busy until teardown. A
+finished-complete report marks the generation complete and its intake starts
+no further service. A later generation's intake starts afresh: each
+installation still needs its own review and physical consent.
 
 Only private request 19 selects the open review, once; with none, or a busy
 operation slot, it answers 99 00. Selection makes the review's consent

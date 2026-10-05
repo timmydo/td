@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::installation_consent::{self as consent, Answer, Ended, NoConsent, Outcome, Report};
 use crate::installation_plan::{Candidates, Destination, Plan, Settings, Zones};
 use crate::installation_protocol::{
-    check_greeting, frame, payload_len, Abandon, Failure, Phase, Refusal, Reply, Request,
+    check_greeting, frame, payload_len, Abandon, Ending, Failure, Phase, Refusal, Reply, Request,
     ReviewNonce, State, GREETING, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
 };
 
@@ -36,9 +36,9 @@ pub(crate) trait Host {
     fn recheck(&mut self, destination: &Destination, claim: &mut Self::Claim) -> bool;
     /// A proposal nonce and volume UUID. Failure ends the service.
     fn entropy(&mut self) -> io::Result<([u8; 32], [u8; 16])>;
-    /// Asks the supervisor for its orderly reboot; `Ok` once it has
-    /// accepted, before anything is stopped.
-    fn restart(&mut self) -> Result<(), Refusal>;
+    /// Asks the supervisor for its orderly reboot or power-off; `Ok` once
+    /// it has accepted, before anything is stopped.
+    fn end(&mut self, ending: Ending) -> Result<(), Refusal>;
 }
 
 /// Writes a consented installation under its claim, on its own thread.
@@ -158,15 +158,16 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
                 Ok(zones) => Reply::Timezones(zones),
                 Err(refusal) => Reply::Refused(refusal),
             },
-            Request::Restart(nonce) => self.restart(nonce),
+            Request::End(ending, nonce) => self.end(ending, nonce),
         })
     }
 
-    /// Only a complete installation, named by its nonce, restarts the
-    /// computer, and only into the supervisor's orderly reboot.
-    fn restart(&mut self, nonce: ReviewNonce) -> Reply {
+    /// Only a complete installation, named by its nonce, restarts or
+    /// powers off the computer, and only through the supervisor's orderly
+    /// teardown.
+    fn end(&mut self, ending: Ending, nonce: ReviewNonce) -> Reply {
         match self.held {
-            Held::Complete(complete) if complete == nonce => match self.host.restart() {
+            Held::Complete(complete) if complete == nonce => match self.host.end(ending) {
                 Ok(()) => Reply::Status(self.state()),
                 Err(refusal) => Reply::Refused(refusal),
             },
@@ -794,7 +795,7 @@ mod tests {
         zones: Result<(), Refusal>,
         /// Proposals so far; each draws its own nonce.
         drawn: u8,
-        restart: Result<(), Refusal>,
+        end: Result<(), Refusal>,
     }
     impl Fake {
         fn new() -> Self {
@@ -809,7 +810,7 @@ mod tests {
                 entropy: true,
                 zones: Ok(()),
                 drawn: 0,
-                restart: Ok(()),
+                end: Ok(()),
             }
         }
         fn call(&self, name: &'static str) {
@@ -871,9 +872,12 @@ mod tests {
             self.drawn += 1;
             Ok((nonce, uuid))
         }
-        fn restart(&mut self) -> Result<(), Refusal> {
-            self.call("restart");
-            self.restart
+        fn end(&mut self, ending: Ending) -> Result<(), Refusal> {
+            self.call(match ending {
+                Ending::Restart => "restart",
+                Ending::PowerOff => "power off",
+            });
+            self.end
         }
     }
 
@@ -1420,9 +1424,9 @@ mod tests {
                 Reply::Refused(Refusal::NoReview)
             );
         }
-        // A restart names the completed installation; the supervisor
-        // refusing it is the person's to see.
-        let calls = |service: &Service<Fake, _>| {
+        // A restart or power-off names the completed installation; the
+        // supervisor refusing it is the person's to see.
+        let calls = |service: &Service<Fake, _>, name: &str| {
             service
                 .host
                 .log
@@ -1430,34 +1434,40 @@ mod tests {
                 .unwrap()
                 .calls
                 .iter()
-                .filter(|call| **call == "restart")
+                .filter(|call| **call == name)
                 .count()
         };
-        assert_eq!(
-            service
-                .answer(Request::Restart(ReviewNonce::new([4; 32]).unwrap()))
-                .unwrap(),
-            Reply::Refused(Refusal::StaleReview)
-        );
-        assert_eq!(calls(&service), 0);
-        service.host.restart = Err(Refusal::RestartUnavailable);
-        assert_eq!(
-            service.answer(Request::Restart(nonce)).unwrap(),
-            Reply::Refused(Refusal::RestartUnavailable)
-        );
-        service.host.restart = Ok(());
-        assert_eq!(
-            service.answer(Request::Restart(nonce)).unwrap(),
-            Reply::Status(State::Complete(nonce))
-        );
-        assert_eq!(calls(&service), 2);
+        for (ending, name) in [
+            (Ending::Restart, "restart"),
+            (Ending::PowerOff, "power off"),
+        ] {
+            assert_eq!(
+                service
+                    .answer(Request::End(ending, ReviewNonce::new([4; 32]).unwrap()))
+                    .unwrap(),
+                Reply::Refused(Refusal::StaleReview)
+            );
+            assert_eq!(calls(&service, name), 0);
+            service.host.end = Err(Refusal::PowerUnavailable);
+            assert_eq!(
+                service.answer(Request::End(ending, nonce)).unwrap(),
+                Reply::Refused(Refusal::PowerUnavailable)
+            );
+            service.host.end = Ok(());
+            assert_eq!(
+                service.answer(Request::End(ending, nonce)).unwrap(),
+                Reply::Status(State::Complete(nonce))
+            );
+            assert_eq!(calls(&service, name), 2);
+        }
         assert_eq!(service.state(), State::Complete(nonce));
         assert!(service.take_reports().is_empty());
     }
 
-    /// Nothing but a complete installation restarts the computer.
+    /// Nothing but a complete installation restarts or powers off the
+    /// computer.
     #[test]
-    fn only_a_complete_installation_restarts() {
+    fn only_a_complete_installation_ends_the_session() {
         let mut held = Service::new(Fake::new());
         let plan = reviewed(&mut held);
         let mut displayed = Service::new(Fake::new());
@@ -1489,14 +1499,17 @@ mod tests {
         for (refusal, mut service) in services {
             let state = service.state();
             for named in [nonce(), ReviewNonce::from(&plan)] {
-                assert_eq!(
-                    service.answer(Request::Restart(named)).unwrap(),
-                    Reply::Refused(refusal),
-                    "{state:?}"
-                );
+                for ending in Ending::ALL {
+                    assert_eq!(
+                        service.answer(Request::End(*ending, named)).unwrap(),
+                        Reply::Refused(refusal),
+                        "{state:?}"
+                    );
+                }
             }
             assert_eq!(service.state(), state);
-            assert!(!service.host.log.lock().unwrap().calls.contains(&"restart"));
+            let calls = &service.host.log.lock().unwrap().calls;
+            assert!(!calls.contains(&"restart") && !calls.contains(&"power off"));
         }
     }
 

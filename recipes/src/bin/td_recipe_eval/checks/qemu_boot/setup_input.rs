@@ -105,8 +105,8 @@ pub(super) fn restart_progress(
         return Err(lost.clone());
     }
     if let Some((_, state)) = evidence.td_setup_shown.iter().find(|(_, shown)| {
-        matches(shown, "page=complete restart=refused")
-            || matches(shown, "page=complete restart=unavailable")
+        matches(shown, "page=complete end=refused")
+            || matches(shown, "page=complete end=unavailable")
     }) {
         return Err(format!("td-setup showed {state:?}"));
     }
@@ -618,10 +618,10 @@ mod tests {
             let mut evidence = ConsoleEvidence::default();
             evidence
                 .td_setup_shown
-                .push((1, "page=complete restart=offered".into()));
+                .push((1, "page=complete choice=restart end=offered".into()));
             evidence
                 .td_setup_shown
-                .push((2, "page=complete restart=asked".into()));
+                .push((2, "page=complete choice=restart end=asked-restart".into()));
             evidence
                 .td_setup_shown
                 .extend(extra.map(|state| (3, state)));
@@ -633,8 +633,13 @@ mod tests {
         assert!(restart_progress(&evidence, asked, late)
             .unwrap_err()
             .contains("did not restart"));
-        for ended in ["refused", "unavailable"] {
-            let evidence = shown(Some(format!("page=complete restart={ended}")));
+        for (choice, ended) in [
+            ("restart", "refused"),
+            ("poweroff", "refused"),
+            ("restart", "unavailable"),
+            ("poweroff", "unavailable"),
+        ] {
+            let evidence = shown(Some(format!("page=complete choice={choice} end={ended}")));
             assert!(restart_progress(&evidence, asked, asked)
                 .unwrap_err()
                 .contains(ended));
