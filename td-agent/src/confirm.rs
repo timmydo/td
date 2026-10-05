@@ -159,7 +159,9 @@ impl Confirm {
         match self.dialog.focus() {
             confirmations::Focus::Details => "details",
             confirmations::Focus::Cancel => "cancel",
-            confirmations::Focus::Alternate | confirmations::Focus::Confirm => match self.purpose {
+            confirmations::Focus::Alternate
+            | confirmations::Focus::Further
+            | confirmations::Focus::Confirm => match self.purpose {
                 Purpose::Delete(_) => "delete",
                 Purpose::Approve { .. } => "allow",
             },

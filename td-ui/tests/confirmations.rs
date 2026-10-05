@@ -782,6 +782,213 @@ fn an_alternate_label_is_bounded_and_needs_its_own_row() {
     );
 }
 
+fn four_way(scale: u8) -> Controller<u32, u64, u32> {
+    let model = Model::new("Replace it?", "Yes to all", &["entry: mail"], 1, 9)
+        .unwrap()
+        .with_alternate("No", 2)
+        .unwrap()
+        .with_further("Yes", 3)
+        .unwrap();
+    Controller::new(model, surface(scale), rect(scale), Some(42)).unwrap()
+}
+
+const FOUR: [Focus; 4] = [
+    Focus::Cancel,
+    Focus::Alternate,
+    Focus::Further,
+    Focus::Confirm,
+];
+
+#[test]
+fn a_further_action_sits_between_the_alternate_and_confirm() {
+    for scale in 1..=4 {
+        let d = four_way(scale);
+        let rows = FOUR.map(|focus| d.action_rect(focus).unwrap());
+        assert!(
+            rows.windows(2).all(|pair| pair[0].y < pair[1].y),
+            "{rows:?}"
+        );
+        for row in rows {
+            assert_eq!(row.intersection(d.rect()), Some(row));
+        }
+        assert!(d.details_rect().y + i64::from(d.details_rect().height) <= rows[0].y);
+        // Each row chooses its own action by press and release.
+        for (focus, choice) in FOUR.into_iter().zip([
+            Choice::Cancelled,
+            Choice::Confirmed(2),
+            Choice::Confirmed(3),
+            Choice::Confirmed(1),
+        ]) {
+            let mut d = four_way(scale);
+            let at = d.action_rect(focus).unwrap();
+            assert_eq!(event(&mut d, press(at)), Outcome::Changed);
+            assert_eq!(
+                event(&mut d, release(at)),
+                Outcome::Closed {
+                    choice,
+                    restore_focus: Some(42)
+                }
+            );
+        }
+    }
+    // Tab visits every action in row order, BackTab the reverse.
+    let mut d = four_way(1);
+    assert_eq!(d.focus(), Focus::Cancel);
+    for expected in [
+        Focus::Alternate,
+        Focus::Further,
+        Focus::Confirm,
+        Focus::Details,
+        Focus::Cancel,
+    ] {
+        key(&mut d, Key::Tab);
+        assert_eq!(d.focus(), expected);
+    }
+    for expected in [
+        Focus::Details,
+        Focus::Confirm,
+        Focus::Further,
+        Focus::Alternate,
+        Focus::Cancel,
+    ] {
+        key(&mut d, Key::BackTab);
+        assert_eq!(d.focus(), expected);
+    }
+    key(&mut d, Key::Tab);
+    key(&mut d, Key::Tab);
+    assert_eq!(
+        key(&mut d, Key::Activate),
+        Outcome::Closed {
+            choice: Choice::Confirmed(3),
+            restore_focus: Some(42)
+        }
+    );
+    // A three-way dialog has no further row and never focuses one.
+    let mut d = three_way(1);
+    assert_eq!(d.action_rect(Focus::Further), None);
+    for _ in 0..4 {
+        key(&mut d, Key::Tab);
+        assert_ne!(d.focus(), Focus::Further);
+    }
+}
+
+#[test]
+fn a_further_action_without_an_alternate_takes_the_alternates_place() {
+    let model = Model::new("Replace it?", "Yes", &["entry"], 1u32, 9u64)
+        .unwrap()
+        .with_further("Yes to all", 3)
+        .unwrap();
+    let mut d = Controller::new(model, surface(1), rect(1), Some(42u32)).unwrap();
+    assert_eq!(d.action_rect(Focus::Alternate), None);
+    let rows =
+        [Focus::Cancel, Focus::Further, Focus::Confirm].map(|focus| d.action_rect(focus).unwrap());
+    assert!(rows[0].y < rows[1].y && rows[1].y < rows[2].y, "{rows:?}");
+    for expected in [
+        Focus::Further,
+        Focus::Confirm,
+        Focus::Details,
+        Focus::Cancel,
+    ] {
+        key(&mut d, Key::Tab);
+        assert_eq!(d.focus(), expected);
+    }
+    key(&mut d, Key::Tab);
+    assert_eq!(
+        key(&mut d, Key::Activate),
+        Outcome::Closed {
+            choice: Choice::Confirmed(3),
+            restore_focus: Some(42)
+        }
+    );
+}
+
+#[test]
+fn each_of_four_action_rows_paints_its_own_label() {
+    use td_ui::chrome::SELECTED_ROW;
+    use td_ui::raster::Primitive;
+    for scale in 1..=4 {
+        let mut d = four_way(scale);
+        for focused in FOUR {
+            let rows = FOUR.map(|focus| d.action_rect(focus).unwrap());
+            let mut labels = [String::new(), String::new(), String::new(), String::new()];
+            let mut highlighted = Vec::new();
+            d.emit(surface(scale).bounds(), &mut |draw| match draw.primitive {
+                Primitive::Glyph { x, y, scalar, .. } => {
+                    if let Some(at) = rows.iter().position(|row| row.contains(x, y)) {
+                        labels[at].push(scalar);
+                    }
+                }
+                Primitive::Fill { rect, color } if color == SELECTED_ROW => {
+                    highlighted.push(rect);
+                }
+                _ => {}
+            });
+            // Whether a space draws a glyph is the font's; the words are
+            // the labels'.
+            assert_eq!(
+                labels.map(|l| l.replace(' ', "")),
+                ["Cancel", "No", "Yes", "Yestoall"]
+            );
+            let at = FOUR.iter().position(|f| *f == focused).unwrap();
+            assert_eq!(highlighted, [rows[at]], "{focused:?} at scale {scale}");
+            key(&mut d, Key::Tab);
+        }
+    }
+}
+
+#[test]
+fn a_further_label_is_bounded_and_needs_its_own_row() {
+    let model = || {
+        Model::new("Replace it?", "Yes", &["entry"], 1u32, 9u64)
+            .unwrap()
+            .with_alternate("No", 2)
+            .unwrap()
+    };
+    assert_eq!(model().with_further("", 3).unwrap_err(), Error::InvalidText);
+    assert_eq!(
+        model().with_further("Yes\tto all", 3).unwrap_err(),
+        Error::InvalidText
+    );
+    let long = "x".repeat(257);
+    assert_eq!(model().with_further(&long, 3).unwrap_err(), Error::Limit);
+    let three = model().storage_bytes();
+    let four = model().with_further("Yes to all", 3).unwrap();
+    assert!(four.storage_bytes() >= three + "Yes to all".len());
+    // Five rows hold a three-action dialog but not a four-action one.
+    let row = td_ui::chrome::ROW as u32;
+    let short = Rect {
+        height: 5 * row,
+        ..rect(1)
+    };
+    assert!(Controller::new(model(), surface(1), short, Some(42u32)).is_ok());
+    assert_eq!(
+        Controller::new(four, surface(1), short, Some(42u32)).unwrap_err(),
+        Error::NoRoom
+    );
+    // A four-way dialog resized to that height closes unavailable.
+    let mut d = four_way(1);
+    assert_eq!(
+        event(
+            &mut d,
+            Event::Resize {
+                surface: surface(1),
+                rect: short,
+            }
+        ),
+        Outcome::Closed {
+            choice: Choice::Unavailable(Error::NoRoom),
+            restore_focus: Some(42)
+        }
+    );
+    assert!(!d.is_open());
+    let wide = "Y".repeat(200);
+    let model = model().with_further(&wide, 3).unwrap();
+    assert_eq!(
+        Controller::new(model, surface(1), rect(1), Some(42u32)).unwrap_err(),
+        Error::NoRoom
+    );
+}
+
 #[test]
 fn the_default_chords_name_the_keys() {
     for (chord, key) in [

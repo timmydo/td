@@ -2496,13 +2496,17 @@ The consumer owns any authority or descriptors behind the action ID.
 `with_alternate` adds a second action with its own label, validated as the
 confirmation label is, for a three-way choice such as Save, Discard or
 Cancel; either action closes as `Confirmed` with its own ID.
+`with_further` adds one more, validated the same way, for a four-way
+choice such as Cancel, No, Yes or Yes to all; it too closes as
+`Confirmed` with its own ID.
 
 `confirmations::Controller` composes a title panel, a scrolling detail list
 and fixed action rows inside a fully visible rectangle: Cancel, the
-alternate when the model has one, then Confirm. Details
-wrap at scalar boundaries without loss; precomputed offsets into the
-captured strings avoid borrowed self-references and allocation while
-handling ordinary input or painting. Layout reserves at most 65,536
+alternate when the model has one, the further action when it has one,
+then Confirm. Details wrap at scalar boundaries without loss;
+precomputed offsets into the captured strings avoid borrowed
+self-references and allocation while handling ordinary input or
+painting. Layout reserves at most 65,536
 wrapped rows. Insufficient width, height, label space or wrapping capacity
 refuses with `NoRoom`, without omitting an action or part of the request.
 A valid layout shows the complete title and action labels, at least one
@@ -2514,8 +2518,9 @@ then reflows fallibly; a refusal closes with `Unavailable` and never
 leaves an old invisible confirmation target active.
 
 Focus starts on Cancel. Tab/BackTab cycle only through the detail list,
-Cancel, the alternate if any, and Confirm; without an alternate,
-`Focus::Alternate` is never focused and has no row. Up/Down,
+Cancel, the alternate if any, the further action if any, and Confirm;
+without an alternate, `Focus::Alternate` is never focused and has no
+row, and likewise `Focus::Further` without a further action. Up/Down,
 PageUp/PageDown and Home/End navigate details; Activate acts only on the
 focused action. Escape cancels. `Key::from_chord` is the default set:
 Tab and Shift+Tab, Up and Down, Page Up/Down, Home and End, Return or
@@ -2540,9 +2545,9 @@ resize failures are represented by `Closed` with `Unavailable`.
 A close returns that ID only when valid, for the adapter to restore focus.
 The adapter routes input through the modal controller while it is open
 and executes only the typed outcome; td-ui grants no process authority.
-The adapter must not position Confirm, nor an alternate such as Discard,
-beneath the pointer that opened the dialog: a second click in a
-double-click is otherwise a fresh gesture.
+The adapter must not position Confirm, nor an alternate such as
+Discard or a further action, beneath the pointer that opened the
+dialog: a second click in a double-click is otherwise a fresh gesture.
 
 `confirmations::KEYS` is the dialog's keys as a key list shows them, so
 each program with a dialog lists the same rows for it.
@@ -2558,7 +2563,15 @@ Tab and Activate, each painting its own label with only the focused row
 highlighted at scales one through four; its label is bounded and
 validated, counted in storage, and refused with `NoRoom` when too wide
 or when the height holds only two actions, and a resize to such a height
-closes it `Unavailable`. Draw-stream and pixel checks at scales one
+closes it `Unavailable`. A four-way dialog's rows stand in that order,
+each choosing its own action by press and release and the further action
+by Tab and Activate, each painting its own label with only the focused
+row highlighted at scales one through four; a further action without an
+alternate takes the alternate's place, a three-way dialog never focuses
+`Focus::Further`, and the further label is bounded, validated, counted
+in storage and refused with `NoRoom` when too wide or when the height
+holds only three actions, and a resize to such a height closes it
+`Unavailable`. Draw-stream and pixel checks at scales one
 through four keep the controls within the dialog, preserve pixels
 outside it and respect partial damage.
 
