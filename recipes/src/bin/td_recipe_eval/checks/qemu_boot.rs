@@ -4909,17 +4909,18 @@ fn boot_source(
     let accel = crate::checks::accel::headless_from_env()?;
     announce_accel(&accel);
     let mut cmd = Command::new(qemu);
-    let machine = if matches!(
+    let q35 = matches!(
         source,
         BootSource::Firmware { .. } | BootSource::LiveSetup { .. }
-    ) {
-        "q35"
-    } else {
-        "pc"
-    };
-    cmd.args(["-M", machine]);
+    );
+    cmd.args(["-M", if q35 { "q35" } else { "pc" }]);
     for name in accel.names {
-        cmd.args(["-accel", name]);
+        let arg = if q35 {
+            crate::checks::accel::q35_accel_arg(name)
+        } else {
+            name.to_string()
+        };
+        cmd.arg("-accel").arg(arg);
     }
     // A named model under both accelerators, so the guest ISA does not follow
     // the host's CPU; KVM still adds its paravirt leaves (`run.rs`).

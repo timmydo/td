@@ -217,7 +217,9 @@ fn command(
             "virtio-blk-pci,drive=destination,serial=TD-TEST-ISO-TARGET",
         ]);
     for name in accelerator {
-        command.args(["-accel", name]);
+        command
+            .arg("-accel")
+            .arg(crate::checks::accel::q35_accel_arg(name));
     }
     attach_system_audio(&mut command, None);
     if let Some(usb) = media {
@@ -301,6 +303,6 @@ mod tests {
             .filter(|pair| pair.first().is_some_and(|arg| arg == "-accel"))
             .filter_map(|pair| pair.get(1).cloned())
             .collect();
-        assert_eq!(accelerators, ["kvm", "tcg"]);
+        assert_eq!(accelerators, ["kvm,kernel-irqchip=split", "tcg"]);
     }
 }

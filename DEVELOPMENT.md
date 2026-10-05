@@ -389,7 +389,9 @@ gate goals (`td-builder check check integration`), it runs after the
 gates pass and says so when they do not. Every boot runs on KVM alone,
 which needs the run to open `/dev/kvm` (membership in the `kvm` group,
 from a login started after joining it): an oracle never falls back to
-TCG, several times slower, and without KVM it is a host gap.
+TCG, several times slower, and without KVM it is a host gap. A q35
+firmware boot splits the irqchip under KVM (`checks/accel.rs`): with it
+in the host kernel, OVMF hung polling AHCI on QEMU 10.2.1.
 `TD_QEMU_ACCEL=tcg` emulates on purpose, keyed apart. It needs the
 host's qemu, and OVMF for the last two (found beside qemu or in
 /usr/share/OVMF, or named by

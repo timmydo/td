@@ -219,6 +219,21 @@ pub(crate) fn headless_from_env() -> Result<AccelPlan, String> {
     headless_plan(kvm_status, forced_accel(forced.as_deref())?)
 }
 
+/// The `-accel` value for `name` on a q35 firmware boot. Under KVM the
+/// PIC, IOAPIC and PIT move into qemu (`kernel-irqchip=split`): with them in
+/// the host kernel, QEMU 10.2.1 on Linux 7.0 left OVMF polling an AHCI
+/// port's interrupt status for a completion that never came, 11 of 18
+/// installer boots under load, and the hung process faulted on its next
+/// event; split hung 0 of 36. It is the KVM accelerator's property, so a
+/// TCG fallback is untouched.
+pub(crate) fn q35_accel_arg(name: &str) -> String {
+    if name == "kvm" {
+        "kvm,kernel-irqchip=split".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 /// What a check's boot asks qemu for under this environment, without asking
 /// the host: the accelerator a pass is keyed on. A boot gets exactly these or
 /// does not boot, so the probe would add nothing to the key.
@@ -431,6 +446,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A q35 boot splits the irqchip under KVM alone; TCG takes no KVM
+    /// property, and the oracle's q35 boots go through this one helper.
+    #[test]
+    fn a_q35_kvm_boot_splits_the_irqchip() {
+        assert_eq!(q35_accel_arg("kvm"), "kvm,kernel-irqchip=split");
+        assert_eq!(q35_accel_arg("tcg"), "tcg");
+        let boot = include_str!("qemu_boot.rs");
+        assert!(boot.contains("crate::checks::accel::q35_accel_arg(name)"));
     }
 
     #[test]
