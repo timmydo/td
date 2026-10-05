@@ -45,6 +45,8 @@ pub struct Place<'a> {
     pub repositories: Option<&'a crate::workspace::Repositories>,
     /// Their project instructions, as the conversation recorded them.
     pub instructions: &'a [crate::store::Instructed],
+    /// The repository workspace went with the conversation's archive.
+    pub removed: bool,
 }
 
 /// The prefix a conversation begun at `created` begins with: a JSON
@@ -220,6 +222,14 @@ pub fn environment(created: u64, os: &str, place: Option<&Place>) -> String {
                             )
                         })
                         .collect();
+                    if place.removed {
+                        format!(
+                            "- Workspace: none now. The git worktrees below, which td-agent made for this conversation from template {}, were removed when the person archived it, with any work in them; every file, shell and search tool is refused.\n\
+                             - Worktrees (removed): {}.",
+                            shown(Path::new(&repositories.template)),
+                            worktrees.join("; ")
+                        )
+                    } else {
                     format!(
                         "- Workspace: the git worktrees below, which td-agent made for this conversation from template {}. Each is checked out in the background, and you are not told when it is ready; until then a call that touches it, or names no directory while the first is not ready, is refused. The first is the working directory: shell runs there unless told otherwise, and glob and grep search there by default.\n\
                          - Worktrees: {}.\n\
@@ -228,6 +238,7 @@ pub fn environment(created: u64, os: &str, place: Option<&Place>) -> String {
                         shown(Path::new(&repositories.template)),
                         worktrees.join("; ")
                     )
+                    }
                 }
             }
         }
@@ -372,6 +383,7 @@ mod tests {
             write: &[],
             repositories: Some(&repositories),
             instructions: &[],
+            removed: false,
         };
         let block = environment(0, "td", Some(&place));
         for line in [
@@ -441,6 +453,7 @@ mod tests {
             write: &[],
             repositories: Some(&repositories),
             instructions: &instructions,
+            removed: false,
         };
         let block = project(&place).unwrap();
         assert!(block.starts_with("Project instructions:"), "{block}");
@@ -508,6 +521,7 @@ mod tests {
             write: &[],
             repositories: Some(&repositories),
             instructions: &instructions,
+            removed: false,
         };
         let event = crate::store::Event {
             seq: u64::MAX,
@@ -534,6 +548,7 @@ mod tests {
             write: &write,
             repositories: None,
             instructions: &[],
+            removed: false,
         };
         let text = prefix_in(0, Some(&place));
         let value = td_json::parse(&text).unwrap();
@@ -582,6 +597,7 @@ mod tests {
             write: &[],
             repositories: None,
             instructions: &[],
+            removed: false,
         };
         let block = environment(0, "td", Some(&scratch));
         let odd = Place {
@@ -591,6 +607,7 @@ mod tests {
             write: &[],
             repositories: None,
             instructions: &[],
+            removed: false,
         };
         let block = format!("{block}\n{}", environment(0, "td", Some(&odd)));
         assert!(

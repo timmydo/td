@@ -29,13 +29,18 @@ const SHORT: usize = 12;
 const UNKNOWN: &str = "unknown, since the record above could not be read";
 
 /// What the window reads for the card from the conversation's
-/// directory: its recorded project instructions and the workspace
-/// repositories it has prepared.
+/// directory: its recorded project instructions, the workspace
+/// repositories it has prepared, and whether the workspace went with
+/// its archive.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Record {
     pub instructions: Result<Vec<Instructed>, String>,
     pub prepared: Result<Vec<PathBuf>, String>,
+    pub removed: bool,
 }
+
+/// A worktree's state once its workspace went with the archive.
+const REMOVED: &str = "removed with any work in it when the conversation was archived";
 
 /// The card's title row.
 pub fn title(repositories: &Repositories) -> String {
@@ -83,7 +88,14 @@ pub fn entries(repositories: &Repositories, record: &Record) -> Vec<(String, Str
         }
     }
     for (remote, read, entries) in groups {
-        out.push(group(remote, read, known, &entries, prepared));
+        out.push(group(
+            remote,
+            read,
+            known,
+            &entries,
+            prepared,
+            record.removed,
+        ));
     }
     out
 }
@@ -107,14 +119,15 @@ fn alike(one: Option<&Instructed>, other: Option<&Instructed>) -> bool {
 
 /// One entry: the remote, its worktrees and whether each is checked
 /// out, then what the model is given at their commit. `known` says the
-/// instructions' record could be read, and `prepared` is none when
-/// `meta` could not.
+/// instructions' record could be read, `prepared` is none when `meta`
+/// could not, and `removed` that the worktrees went with the archive.
 fn group(
     remote: &str,
     read: Option<&Instructed>,
     known: bool,
     entries: &[&Entry],
     prepared: Option<&Vec<PathBuf>>,
+    removed: bool,
 ) -> (String, String) {
     let name = remote
         .trim_end_matches('/')
@@ -133,6 +146,7 @@ fn group(
     let mut text = format!("{}\n", shown(remote));
     for entry in entries {
         let state = match prepared {
+            _ if removed => REMOVED,
             Some(prepared) if prepared.contains(&entry.repository) => "checked out",
             Some(_) => "not checked out yet: it is being prepared, or is tried again when the conversation next starts",
             None => UNKNOWN,
@@ -258,6 +272,7 @@ mod tests {
                 ),
             ]),
             prepared: Ok(vec!["/r/w/td-1/td".into()]),
+            removed: false,
         };
         let card = entries(&repositories, &record);
         let headers: Vec<&str> = card.iter().map(|(h, _)| h.as_str()).collect();
@@ -291,6 +306,7 @@ mod tests {
         let unreadable = Record {
             instructions: Err("instructions: not a list".into()),
             prepared: Err("meta: gone".into()),
+            removed: false,
         };
         let card = entries(&repositories, &unreadable);
         let all: String = card.iter().map(|(_, t)| t.as_str()).collect();
@@ -298,6 +314,18 @@ mod tests {
         assert!(all.contains("could not be read: meta: gone"));
         // Nothing then says what it cannot know.
         assert!(!all.contains("not read yet") && !all.contains("first turn waits"));
+        // Gone with the archive, no worktree is said checked out or to
+        // come.
+        let gone = Record {
+            removed: true,
+            ..record
+        };
+        let all: String = entries(&repositories, &gone)
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert!(all.contains(REMOVED), "{all}");
+        assert!(!all.contains("checked out"), "{all}");
         assert!(!all.contains("not checked out yet"));
         assert!(card
             .iter()

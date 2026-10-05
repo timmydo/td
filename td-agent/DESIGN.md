@@ -2028,8 +2028,9 @@ conversation process's main thread, so that turn, and any during a
 later preparation, waits behind it too, and the model is told nothing
 of it; rules from the base, background fetches and the model's
 notification are later steps. Deleting the conversation removes its
-repository workspace (As built (increment 11, removal on deletion));
-archiving it keeps it, for now.
+repository workspace (As built (increment 11, removal on deletion)),
+and archiving it does too (As built (increment 11, removal on
+archiving)).
 
 **Empty and directory workspaces.** The Empty template makes a scratch
 workspace under the jail directory, for a general-assistant conversation
@@ -2101,8 +2102,7 @@ saying the workspace went with the archive.
 
 **As built (increment 11, removal on deletion).** Deleting a repository
 workspace's conversation removes the workspace with it; archiving one
-keeps it, until a later step makes a conversation whose workspace went
-with its archive refuse its tools, as above. The deletion question says
+does too, as the next paragraph says. The deletion question says
 what goes, that each worktree is asked first, and that files git
 ignores, such as build output, are not asked about. Once it is
 confirmed, the window stops the conversation's processes, as a
@@ -2155,6 +2155,38 @@ conversation's jail directory, with the instances' home, goes with the
 conversation as before; the store stays. Archiving a conversation being
 deleted is refused.
 
+**As built (increment 11, removal on archiving).** Archiving a
+repository workspace's conversation removes its workspace as deleting
+it does (above): the same survey, the list saying `archiving` while it
+runs and the conversation neither opening nor taking a message, and,
+when anything would be lost or could not be asked, the same loss card
+headed `Archive and lose work`, its action `Archive anyway`. Archive
+acts at once as it did, with no question first, so a clean workspace
+goes without one; the loss card is the question for one that is not.
+Kept, the conversation and its workspace stay as they were. Archived,
+its `meta` gains `removed`, which only the window writes, under the
+conversation's lock while no process of it runs, and which unarchiving
+never clears; a conversation's own process keeps it as it found it.
+The directories are renamed away before `meta` is written, put back if
+that fails, and removed after, as a deletion's are. Unarchived, a
+conversation whose workspace went asks the window for no store, lets
+go an answer to one it asked for before the archive (the window told
+it is done with, nothing laid out), and refuses every workspace tool
+before any card with
+`the workspace went with this conversation's archive`; its environment
+says the worktrees were removed when the person archived it, so its
+prefix changes once, logged as any change is; its workspace card says
+each worktree was removed with the archive. Deleting it later asks
+nothing, there being nothing left to ask, and archiving it again
+removes nothing. A conversation whose record cannot be read is
+archived as one with no workspace, any it had left and said. A crash
+after the renames and before `meta` is written leaves the conversation
+unarchived and not marked, its workspace swept, so its tools fail on
+the missing paths until it is archived or deleted again, as with a
+deletion. The instances' home in the conversation's jail directory
+stays with an archived conversation and goes with its deletion, as
+before.
+
 **As built (archiving).** `meta` holds `archived`, absent and false in
 one written before. Only the window writes it, under the conversation's
 lock, once the conversation's processes, open, in the background or
@@ -2177,8 +2209,9 @@ it, which starts its process in the background as any message does, and
 that process takes the human's messages parked with it; with nothing
 waiting, nothing starts until the human opens it. A conversation's own
 process keeps the mark as it found it when it rewrites `meta`. A scratch
-workspace stays with it; repository workspaces, and so the cleanup
-above, come with increment 11, and there are no schedules yet to stop.
+workspace stays with it; a repository workspace goes with it (As built
+(increment 11, removal on archiving)), and there are no schedules yet
+to stop.
 
 ## 8. The workspace jail
 
@@ -4344,7 +4377,15 @@ sweep taking a leftover but not the human's `.deleting-notes`, with
 the names a sweep knows; `src/ui.rs` a conversation being deleted
 closed, refusing to open, given nothing by the post and named
 `deleting`, and its loss card, Cancel focused, set aside with the
-keyboard and asked again, Cancel keeping and the action deleting. The
+keyboard and asked again, Cancel keeping and the action deleting.
+For removal on archiving, `src/store.rs` covers `removed` read back,
+absent as false, refused when not a boolean, kept by unarchiving and by
+a process's own write; `src/ui.rs` a conversation being archived named
+`archiving` and its card headed for archiving; `tests/processes.rs` an
+unarchived one whose workspace went asking for no store, letting a late
+answer go with nothing laid out or recorded, its prefix saying so;
+`src/card.rs` its worktrees said removed; and `tests/model_client.rs`
+its read and shell calls refused without a card, the turn going on. The
 live test in `tests/jail.rs` surveys the worktree it prepared in a
 real maintenance instance, clean, then with an untracked file, then
 with a commit, and removes the workspace, the store left.

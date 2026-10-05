@@ -32,8 +32,8 @@ pub enum Purpose {
         template: String,
         remotes: Vec<String>,
     },
-    /// Deleting this conversation though its repository workspace
-    /// reports work that would be lost (DESIGN.md §7).
+    /// Deleting, or archiving, this conversation though its repository
+    /// workspace reports work that would be lost (DESIGN.md §7).
     Remove(Id),
 }
 
@@ -60,9 +60,12 @@ pub const ALLOW: &str = "Allow";
 /// The admission card's title and its action's label.
 pub const ADMIT_TITLE: &str = "Admit remotes";
 pub const ADMIT: &str = "Admit";
-/// The loss card's title and its action's label.
+/// The loss card's titles and its action's labels, deleting and
+/// archiving.
 pub const REMOVE_TITLE: &str = "Delete and lose work";
 pub const REMOVE: &str = "Delete anyway";
+pub const ARCHIVE_TITLE: &str = "Archive and lose work";
+pub const ARCHIVE: &str = "Archive anyway";
 
 /// The open question: what it is for and the dialog.
 pub struct Confirm {
@@ -172,17 +175,24 @@ impl Confirm {
     }
 
     /// The card asking whether conversation `id`, titled `title`, is
-    /// deleted though its workspace reports `lost`, a line a worktree.
+    /// deleted, or archived when `archive`, though its workspace reports
+    /// `lost`, a line a worktree.
     pub fn remove(
         surface: Surface,
         body: Rect,
         id: Id,
         title: &str,
         lost: &[String],
+        archive: bool,
         revision: u64,
     ) -> Result<Self, String> {
+        let (doing, card, action) = if archive {
+            ("Archiving", ARCHIVE_TITLE, ARCHIVE)
+        } else {
+            ("Deleting", REMOVE_TITLE, REMOVE)
+        };
         let asked = format!(
-            "Deleting \u{201c}{}\u{201d} ({}) removes its repository workspace, whose worktrees report work that would be lost with it:",
+            "{doing} \u{201c}{}\u{201d} ({}) removes its repository workspace, whose worktrees report work that would be lost with it:",
             crate::tools::visible(title),
             id.as_str()
         );
@@ -192,7 +202,7 @@ impl Confirm {
             "Each worktree's answer comes from git inside the workspace, which the model could have changed: td-agent can know no more than it says.",
         );
         details.push("Cancel keeps the conversation and its workspace as they are.");
-        let model = Model::new(REMOVE_TITLE, REMOVE, &details, Act, revision)
+        let model = Model::new(card, action, &details, Act, revision)
             .map_err(|e| format!("the loss card: {e}"))?;
         let purpose = Purpose::Remove(id);
         let dialog = Controller::new(model, surface, place(surface, body, &purpose), None)

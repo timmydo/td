@@ -370,6 +370,96 @@ fn a_repository_conversations_first_turn_waits_for_its_stores() {
     assert!(conversation.meta().prepared.is_empty());
 }
 
+/// A repository conversation whose workspace went with its archive asks
+/// for no store once unarchived: its turn runs at once, its environment
+/// saying the worktrees were removed and its tools refused (DESIGN.md
+/// §7).
+#[test]
+fn a_conversation_whose_workspace_went_with_its_archive_prepares_nothing() {
+    let scratch = Scratch::new("removed");
+    let state = scratch.state();
+    let id = Id::random().unwrap();
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless());
+    supervisor
+        .create(
+            id.clone(),
+            Role::Conversation,
+            repositories(&id, &scratch.0),
+        )
+        .unwrap();
+    let mut heard = Vec::new();
+    until(&mut supervisor, &mut heard, |heard| {
+        heard
+            .iter()
+            .any(|u| matches!(u, Update::Up(Up::Fetch { .. })))
+    });
+    drop(supervisor);
+    // Archived with its workspace, then brought back: still removed.
+    state
+        .set_archived(&id, true, true, Duration::from_secs(5))
+        .unwrap();
+    state
+        .set_archived(&id, false, false, Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(state.removed(&id), Ok(true));
+    // No limits, so the turn reaches its prefix; it then asks the window
+    // to reserve, which nothing answers, so nothing is sent.
+    let keyed = Down::Setup {
+        key: Ok(td_agent::key::Secret::new("sk-or-v1-test".into())),
+        client: Client {
+            limits: td_agent::cost::Limits {
+                turn: None,
+                conversation: None,
+                day: None,
+            },
+            ..Client::default()
+        },
+    };
+    let nowhere = scratch.0.join("run");
+    std::fs::create_dir(&nowhere).unwrap();
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyed)
+        .env("XDG_RUNTIME_DIR", &nowhere);
+    supervisor.open(id.clone(), None).unwrap();
+    heard.clear();
+    // An answer asked for before the archive, come late, is let go: the
+    // window told it is done with, nothing laid out or recorded.
+    supervisor.answer(
+        &id,
+        &Down::Fetched {
+            remote: "https://example.org/a/td".into(),
+            result: Ok(td_agent::protocol::Fetched {
+                identity: td_agent::repo::Identity::default(),
+                ids: vec!["a".repeat(40)],
+                instructions: vec![td_agent::repo::Instructions::Absent],
+            }),
+        },
+    );
+    until(&mut supervisor, &mut heard, |heard| {
+        heard
+            .iter()
+            .any(|u| matches!(u, Update::Up(Up::Prepared { .. })))
+    });
+    supervisor.send("hello".into()).unwrap();
+    until(&mut supervisor, &mut heard, |heard| {
+        heard.iter().any(|u| {
+            matches!(u, Update::Up(Up::Event(e))
+            if matches!(&e.kind, Kind::Prefix { text }
+                if text.contains("were removed when the person archived it")))
+        })
+    });
+    assert!(
+        !heard
+            .iter()
+            .any(|u| matches!(u, Update::Up(Up::Fetch { .. }))),
+        "asked for a store"
+    );
+    drop(supervisor);
+    let (conversation, _) = Conversation::open(&state, &id, None, Duration::from_secs(5)).unwrap();
+    assert!(conversation.meta().prepared.is_empty());
+    assert!(conversation.instructions().is_empty());
+    assert!(!scratch.0.join("data").join("ws").exists());
+}
+
 /// An interrupt ends a turn waiting for its stores, as one to be asked
 /// again, whether it came with the message or after.
 #[test]

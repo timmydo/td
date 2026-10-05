@@ -69,6 +69,9 @@ use crate::workspace::{Entry, Workspace};
 /// does not sees this.
 pub const NO_SETTINGS: &str = "no settings from the window";
 
+/// What a workspace tool says once its repository workspace went with
+/// the conversation's archive (DESIGN.md §7).
+const WORKSPACE_GONE: &str = "the workspace went with this conversation's archive: its worktrees are removed, so the file, shell and search tools are refused";
 /// Where a refusal says the human chose the conversation's model.
 const CHOSEN: &str = "the conversation's model (Conversation \u{2192} Model\u{2026})";
 /// Where a conversation with no model of its own gets one (DESIGN.md §4).
@@ -1209,6 +1212,10 @@ impl Session {
         let Some(Workspace::Repositories(repositories)) = &meta.workspace else {
             return;
         };
+        // Gone with its archive: nothing is prepared again.
+        if meta.removed {
+            return;
+        }
         let mut asks: Vec<(String, Vec<String>)> = Vec::new();
         for entry in &repositories.entries {
             if meta.prepared.contains(&entry.repository) {
@@ -1244,6 +1251,10 @@ impl Session {
         let Some(Workspace::Repositories(repositories)) = &meta.workspace else {
             return Ok(());
         };
+        // Gone with its archive: an answer asked for before is let go.
+        if meta.removed {
+            return Ok(());
+        }
         let entries: Vec<&Entry> = repositories
             .entries
             .iter()
@@ -1461,6 +1472,7 @@ impl Session {
             write: &policy.write,
             repositories,
             instructions: &instructions,
+            removed: meta.removed,
         };
         Ok(crate::prompt::prefix_in(meta.created, Some(&place)))
     }
@@ -1477,6 +1489,9 @@ impl Session {
         acts: bool,
     ) -> Result<(Result<String, String>, Beside), String> {
         let failed = |why: String| Ok((Err(why), Beside::default()));
+        if self.conversation.meta().removed {
+            return failed(WORKSPACE_GONE.into());
+        }
         if acts {
             let (title, details) = tools::card(&call);
             match self.decide(started, title, details)? {

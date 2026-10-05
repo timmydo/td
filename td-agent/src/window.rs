@@ -226,6 +226,8 @@ pub struct Session {
 /// answers.
 struct Removal {
     id: Id,
+    /// It is archived, not deleted, once its workspace goes.
+    archive: bool,
     title: String,
     repositories: crate::workspace::Repositories,
     held: Vec<(String, String)>,
@@ -283,6 +285,7 @@ impl Session {
                     let record = crate::card::Record {
                         instructions: self.state.instructions(&id),
                         prepared: self.state.prepared(&id),
+                        removed: self.state.removed(&id) == Ok(true),
                     };
                     self.app.show_workspace(&id, &record);
                 }
@@ -687,8 +690,11 @@ impl Session {
     /// the one open.
     fn delete(&mut self, id: &Id) {
         match self.state.workspace(id) {
-            Ok(Some(crate::workspace::Workspace::Repositories(repositories))) => {
-                return self.begin_removal(id, repositories);
+            // One whose workspace went with its archive has none to ask.
+            Ok(Some(crate::workspace::Workspace::Repositories(repositories)))
+                if self.state.removed(id) != Ok(true) =>
+            {
+                return self.begin_removal(id, repositories, false);
             }
             // Its record unread, a workspace it may have is not known.
             Err(e) => self.app.note(format!(
@@ -747,19 +753,28 @@ impl Session {
         true
     }
 
-    /// Starts deleting conversation `id`, whose repository workspace
-    /// goes with it (DESIGN.md §7): its processes are stopped and it
-    /// neither opens nor takes a message while each prepared worktree is
-    /// asked, on a thread, what removing it would lose.
-    fn begin_removal(&mut self, id: &Id, repositories: crate::workspace::Repositories) {
+    /// Starts deleting conversation `id`, or archiving it when `archive`,
+    /// its repository workspace going with it (DESIGN.md §7): its
+    /// processes are stopped and it neither opens nor takes a message
+    /// while each prepared worktree is asked, on a thread, what removing
+    /// it would lose.
+    fn begin_removal(
+        &mut self,
+        id: &Id,
+        repositories: crate::workspace::Repositories,
+        archive: bool,
+    ) {
         if self.removals.iter().any(|removal| &removal.id == id) {
-            return self.app.note("that conversation is already being deleted");
+            return self
+                .app
+                .note("that conversation is already being archived or deleted");
         }
+        let doing = if archive { "archiving" } else { "deleting" };
         let was_open = self.app.active() == Some(id);
         let held = self.supervisor.remove(id);
         self.ledger.forget(id);
         self.app.withdraw(id, None);
-        self.app.set_closing(id, true);
+        self.app.set_closing(id, Some(doing));
         let title = self
             .app
             .rows()
@@ -776,7 +791,7 @@ impl Session {
                 let _ = tell.send(crate::removal::survey(&state, &of, &asked, programs));
             });
         self.app.note(format!(
-            "{title:?}: asking its workspace what removing it would lose, before deleting it"
+            "{title:?}: asking its workspace what removing it would lose, before {doing} it"
         ));
         let survey = match spawned {
             Ok(_) => Some(survey),
@@ -785,12 +800,14 @@ impl Session {
                     id.clone(),
                     title.clone(),
                     vec![format!("its worktrees could not be asked: {e}")],
+                    archive,
                 );
                 None
             }
         };
         self.removals.push(Removal {
             id: id.clone(),
+            archive,
             title,
             repositories,
             held,
@@ -820,29 +837,40 @@ impl Session {
                 Ok(found) => crate::removal::lost(&found),
                 Err(()) => vec!["the survey of its worktrees ended without an answer".into()],
             };
-            answered.push((removal.id.clone(), removal.title.clone(), lost));
+            answered.push((
+                removal.id.clone(),
+                removal.title.clone(),
+                lost,
+                removal.archive,
+            ));
         }
-        for (id, title, lost) in answered {
+        for (id, title, lost, archive) in answered {
             if lost.is_empty() {
                 self.finish_removal(&id, true);
             } else {
-                self.app.ask_removal(id, title, lost);
+                self.app.ask_removal(id, title, lost, archive);
             }
         }
     }
 
-    /// Ends conversation `id`'s removal: deleted with its workspace when
-    /// `remove`, else both kept as they were, its messages held again.
+    /// Ends conversation `id`'s removal: deleted, or archived, with its
+    /// workspace removed when `remove`, else both kept as they were, its
+    /// messages held again.
     fn finish_removal(&mut self, id: &Id, remove: bool) {
         let Some(at) = self.removals.iter().position(|removal| &removal.id == id) else {
             return;
         };
         let removal = self.removals.remove(at);
-        self.app.set_closing(id, false);
+        self.app.set_closing(id, None);
+        let done = if removal.archive {
+            "archived"
+        } else {
+            "deleted"
+        };
         if !remove {
             self.supervisor.park(id.clone(), removal.held);
             return self.app.note(format!(
-                "{:?} is not deleted: it and its workspace stay as they were",
+                "{:?} is not {done}: it and its workspace stay as they were",
                 removal.title
             ));
         }
@@ -851,7 +879,12 @@ impl Session {
         // stays.
         let doomed = crate::removal::doom(&removal.repositories);
         let name = &removal.repositories.name;
-        let said = if self.delete_now(id, false, removal.held) {
+        let ended = if removal.archive {
+            self.archive_now(id, true, true, false, removal.held)
+        } else {
+            self.delete_now(id, false, removal.held)
+        };
+        let said = if ended {
             match doomed.finish() {
                 Ok(()) => format!("its workspace {name} is removed"),
                 Err(e) => format!("its workspace {name} was not all removed: {e}"),
@@ -874,7 +907,7 @@ impl Session {
         if self.removals.iter().any(|removal| &removal.id == id) {
             return self
                 .app
-                .note("that conversation is being deleted, so is not archived");
+                .note("that conversation is being archived or deleted already");
         }
         // One still being made has no `meta` to mark: stopping its
         // process would leave it half made.
@@ -882,6 +915,23 @@ impl Session {
             return self
                 .app
                 .note(format!("the conversation cannot be archived yet: {e}"));
+        }
+        // Its repository workspace goes with it, asked first (DESIGN.md
+        // §7), unless it went with an earlier archive.
+        if archived {
+            match self.state.removed(id).and_then(|removed| {
+                self.state
+                    .workspace(id)
+                    .map(|workspace| workspace.filter(|_| !removed))
+            }) {
+                Ok(Some(crate::workspace::Workspace::Repositories(repositories))) => {
+                    return self.begin_removal(id, repositories, true);
+                }
+                Err(e) => self.app.note(format!(
+                    "the conversation's record could not be read, so a repository workspace it may have is left: {e}"
+                )),
+                Ok(_) => {}
+            }
         }
         let was_open = self.app.active() == Some(id);
         let held = if archived {
@@ -892,23 +942,40 @@ impl Session {
         } else {
             Vec::new()
         };
+        self.archive_now(id, archived, false, was_open, held);
+    }
+
+    /// Archives conversation `id`, or brings it back, its processes
+    /// stopped and `held` the human's messages they had not taken, its
+    /// workspace marked gone with it when `removed`, opening the next
+    /// when `was_open`; whether it is.
+    fn archive_now(
+        &mut self,
+        id: &Id,
+        archived: bool,
+        removed: bool,
+        was_open: bool,
+        held: Vec<(String, String)>,
+    ) -> bool {
         let done = if archived { "archived" } else { "unarchived" };
         let mut trouble = None;
         if let Err(e) = self
             .state
-            .set_archived(id, archived, Duration::from_secs(2))
+            .set_archived(id, archived, removed, Duration::from_secs(2))
         {
             eprintln!("td-agent: {done} {id}: {e}");
             // A failure after the new `meta` was put in place, syncing
             // its directory, still marked it: what is stored decides.
-            if self.state.archived(id) != Ok(archived) {
+            if self.state.archived(id) != Ok(archived)
+                || (removed && self.state.removed(id) != Ok(true))
+            {
                 self.app
                     .note(format!("the conversation was not {done}: {e}"));
                 self.supervisor.park(id.clone(), held);
                 if was_open {
                     self.open(id.clone(), None);
                 }
-                return;
+                return false;
             }
             trouble = Some(e);
         }
@@ -931,6 +998,7 @@ impl Session {
                 self.open(next, None);
             }
         }
+        true
     }
 
     /// Starts the diagnostics export (DESIGN.md §4) on a thread, into

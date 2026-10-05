@@ -394,11 +394,18 @@ impl StateDir {
     /// Marks conversation `id` archived, or not, in its `meta` (DESIGN.md
     /// §7), under its lock, waiting `wait` for it: the window's to write
     /// once the conversation's process has ended, which held it.
-    pub fn set_archived(&self, id: &Id, archived: bool, wait: Duration) -> Result<(), String> {
+    pub fn set_archived(
+        &self,
+        id: &Id,
+        archived: bool,
+        removed: bool,
+        wait: Duration,
+    ) -> Result<(), String> {
         let dir = self.conversation(id);
         let lock = lock_conversation(&dir, wait)?;
         let written = read_meta(&dir).and_then(|mut meta| {
             meta.archived = archived;
+            meta.removed |= removed;
             replace(&dir, "meta", meta.to_json().to_string().as_bytes())
         });
         drop(lock);
@@ -420,6 +427,12 @@ impl StateDir {
     /// prepared.
     pub fn prepared(&self, id: &Id) -> Result<Vec<PathBuf>, String> {
         read_meta(&self.conversation(id)).map(|meta| meta.prepared)
+    }
+
+    /// Whether conversation `id`'s `meta` says its workspace went with its
+    /// archive.
+    pub fn removed(&self, id: &Id) -> Result<bool, String> {
+        read_meta(&self.conversation(id)).map(|meta| meta.removed)
     }
 
     /// Whether conversation `id`'s `meta` says it is archived, as stored.
@@ -747,6 +760,11 @@ pub struct Meta {
     /// process writes it, never from what a jail could have written.
     /// Absent and empty in a meta written before.
     pub prepared: Vec<PathBuf>,
+    /// Its repository workspace went with its archive (DESIGN.md §7): its
+    /// process asks for no store and refuses the workspace tools. Only
+    /// the window writes it, and never clears it; absent and false in a
+    /// meta written before.
+    pub removed: bool,
 }
 
 impl Meta {
@@ -769,6 +787,7 @@ impl Meta {
             ("paused".into(), Json::Bool(self.paused)),
             ("effort".into(), or_null(&self.effort)),
             ("archived".into(), Json::Bool(self.archived)),
+            ("removed".into(), Json::Bool(self.removed)),
             (
                 "prepared".into(),
                 Json::Arr(
@@ -813,6 +832,10 @@ impl Meta {
                 Some(archived) => archived
                     .as_bool()
                     .ok_or("meta's archived is not a boolean")?,
+            },
+            removed: match value.get("removed") {
+                None => false,
+                Some(removed) => removed.as_bool().ok_or("meta's removed is not a boolean")?,
             },
             prepared: match value.get("prepared") {
                 None => Vec::new(),
@@ -1651,6 +1674,7 @@ impl Conversation {
                     workspace,
                     archived: false,
                     prepared: Vec::new(),
+                    removed: false,
                 };
                 // The request prefix (§13) is written once and never
                 // rewritten; a later prefix is a log event.
@@ -2596,11 +2620,11 @@ pub mod tests {
         assert!(!conversation.meta().archived);
         // Its process holds the lock: the window waits, then says so.
         let refused = state
-            .set_archived(&id, true, Duration::from_millis(50))
+            .set_archived(&id, true, false, Duration::from_millis(50))
             .unwrap_err();
         assert!(refused.contains("lock"), "{refused}");
         drop(conversation);
-        state.set_archived(&id, true, LOCK_WAIT).unwrap();
+        state.set_archived(&id, true, false, LOCK_WAIT).unwrap();
         let (metas, _) = state.list();
         assert!(metas.iter().all(|m| m.archived && m.id == id));
         // A process that opens it keeps it, and writes it back with what
@@ -2610,11 +2634,22 @@ pub mod tests {
         conversation.set_paused(true).unwrap();
         drop(conversation);
         assert!(state.list().0.iter().all(|m| m.archived && m.paused));
-        state.set_archived(&id, false, LOCK_WAIT).unwrap();
+        state.set_archived(&id, false, false, LOCK_WAIT).unwrap();
         assert!(state.list().0.iter().all(|m| !m.archived && m.paused));
+        assert_eq!(state.removed(&id), Ok(false));
+        // A workspace gone with an archive stays gone once unarchived,
+        // and a process's own writes keep it so.
+        state.set_archived(&id, true, true, LOCK_WAIT).unwrap();
+        state.set_archived(&id, false, false, LOCK_WAIT).unwrap();
+        assert_eq!(state.removed(&id), Ok(true));
+        let (mut conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert!(conversation.meta().removed);
+        conversation.set_paused(false).unwrap();
+        drop(conversation);
+        assert!(state.list().0.iter().all(|m| m.removed && !m.paused));
         // A conversation the store does not hold is not made.
         let other = Id::random().unwrap();
-        assert!(state.set_archived(&other, true, LOCK_WAIT).is_err());
+        assert!(state.set_archived(&other, true, false, LOCK_WAIT).is_err());
         assert!(!state.conversation(&other).exists());
     }
 
@@ -2799,7 +2834,7 @@ pub mod tests {
         conversation.set_prepared(repository).unwrap();
         drop(conversation);
         // Kept by the window's archiving, and read back whole.
-        state.set_archived(&id, true, LOCK_WAIT).unwrap();
+        state.set_archived(&id, true, false, LOCK_WAIT).unwrap();
         let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
         assert_eq!(conversation.meta().prepared, [repository.to_path_buf()]);
         assert!(conversation.meta().archived);
@@ -2811,6 +2846,16 @@ pub mod tests {
         assert!(Meta::from_json(&value).unwrap().prepared.is_empty());
         if let Json::Obj(pairs) = &mut value {
             pairs.push(("prepared".into(), Json::Arr(vec![Json::Str("rel".into())])));
+        }
+        assert!(Meta::from_json(&value).is_err());
+        // Nor has it `removed`, which must be a boolean.
+        let mut value = conversation.meta().to_json();
+        if let Json::Obj(pairs) = &mut value {
+            pairs.retain(|(key, _)| key != "removed");
+        }
+        assert!(!Meta::from_json(&value).unwrap().removed);
+        if let Json::Obj(pairs) = &mut value {
+            pairs.push(("removed".into(), Json::Str("yes".into())));
         }
         assert!(Meta::from_json(&value).is_err());
     }

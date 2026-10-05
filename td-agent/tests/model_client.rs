@@ -323,6 +323,22 @@ impl Harness {
         std::fs::read_to_string(&self.stderr).unwrap_or_default()
     }
 
+    /// Starts the conversation's process again, as the window opens it.
+    fn reopen(&mut self) {
+        let (child, window) = spawn(
+            &self.state,
+            &self.id,
+            None,
+            None,
+            false,
+            self.mock.runtime(),
+            &self.stderr,
+        );
+        self.child = child;
+        self.window = window;
+        assert!(matches!(self.next(), Up::Hello { .. }));
+    }
+
     /// The conversation as the store holds it, once its process is gone.
     fn close(mut self) -> (Conversation, Self) {
         let _ = self.window.shutdown(std::net::Shutdown::Both);
@@ -1585,6 +1601,74 @@ fn a_card_asked_when_the_window_closes_is_withdrawn() {
             .starts_with("error: not run: the turn was interrupted, or the window closed"),
         "{results:?}"
     );
+}
+
+/// A conversation whose repository workspace went with its archive,
+/// unarchived, asks for no store and refuses its workspace tools without
+/// asking, the turn going on (DESIGN.md §7). A store asked for, or a
+/// card, would hold the turn past the harness's wait.
+#[test]
+fn a_workspace_gone_with_its_archive_refuses_its_tools() {
+    let base = std::env::temp_dir().join(format!(
+        "td-agent-model-removed-{}-{}",
+        std::process::id(),
+        td_agent::store::random_hex(4).unwrap()
+    ));
+    let template = td_agent::config::Template {
+        name: "td".into(),
+        repos: vec![td_agent::config::Repo {
+            remote: "https://example.org/a/td".into(),
+            base: "main".into(),
+            branch: "agent".into(),
+            sparse: None,
+        }],
+        shared: None,
+    };
+    let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
+    let made = td_agent::workspace::repositories(
+        &template,
+        &Id::random().unwrap(),
+        &base.join("data"),
+        &base.join("trees"),
+        &admitted,
+        0,
+    )
+    .unwrap();
+    let argument = td_agent::workspace::Workspace::Repositories(made).argument();
+    let mut h = Harness::new_in(
+        "removed",
+        Role::Conversation,
+        Some(argument.to_str().unwrap()),
+        false,
+        vec![
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    while !matches!(h.next(), Up::Fetch { .. }) {}
+    let (conversation, mut h) = h.close();
+    drop(conversation);
+    // Archived with its workspace by the window, then brought back.
+    h.state
+        .set_archived(&h.id, true, true, Duration::from_secs(3))
+        .unwrap();
+    h.state
+        .set_archived(&h.id, false, false, Duration::from_secs(3))
+        .unwrap();
+    h.reopen();
+    h.setup(Client::default());
+    h.say("Tidy the notes.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let results = results(&events);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(
+        results.iter().all(|(_, content, error)| *error
+            && content.contains("the workspace went with this conversation's archive")),
+        "{results:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A command the person allows runs in the conversation's jail, in its
