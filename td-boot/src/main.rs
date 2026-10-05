@@ -12,6 +12,8 @@ mod cap;
 #[path = "measurement.rs"]
 mod measurement;
 mod protocol;
+#[path = "unlock.rs"]
+mod unlock;
 #[path = "volume.rs"]
 mod volume;
 // The real-regular-bounded file rule, td-fs's, shared with `td-install` for
@@ -65,12 +67,13 @@ use std::os::unix::fs::{
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
-// td-boot reaches no third-party program at all now. `losetup` was the last
-// one: the ability to BOOT rested on busybox existing at an absolute path and
-// parsing `-r <device> <file>` as expected, with nothing tying the two
-// together, so dropping that applet from the image would have stopped every
-// boot at the root loop with no build-time complaint. It is a td-init applet
-// beside mount/umount, under one pinned `LOOP_SET_FD` request.
+// td-boot reaches no third-party program but D6's source-built cryptsetup,
+// which the deployment initramfs's unlock runs (unlock.rs). `losetup` was the
+// last other one: the ability to BOOT rested on busybox existing at an
+// absolute path and parsing `-r <device> <file>` as expected, with nothing
+// tying the two together, so dropping that applet from the image would have
+// stopped every boot at the root loop with no build-time complaint. It is a
+// td-init applet beside mount/umount, under one pinned `LOOP_SET_FD` request.
 const TD_MOUNT: &str = "/bin/mount";
 const TD_UMOUNT: &str = "/bin/umount";
 const TD_LOSETUP: &str = "/bin/losetup";
@@ -3782,6 +3785,14 @@ fn run() -> io::Result<()> {
 }
 
 fn on_volume(mut operation: Mode) -> io::Result<()> {
+    // mount-root takes the selector's handed-off volume key first, removing
+    // it and the kernel's initrd.image copy on every path, a refusal's
+    // included (td-install/ENCRYPTION.md "Boot and authority boundaries").
+    // No other operation reads or removes it.
+    let key = match &operation {
+        Mode::MountVolume { var: false, .. } => unlock::take_key(Path::new("/"), 0)?,
+        _ => None,
+    };
     let uuid = if let Mode::Boot { cmdline, .. } = &mut operation {
         let bytes = read_bounded_real_file(
             &Path::new("/").join(protocol::VOLUME_UUID_PATH),
@@ -3798,26 +3809,114 @@ fn on_volume(mut operation: Mode) -> io::Result<()> {
             MAX_CMDLINE_BYTES as u64,
         )?)?
     };
-    let pinned = bind_volume(&mut operation, volume::Opened::open(&uuid)?)?;
+    let opened = volume::Opened::open(&uuid)?;
+    let binding = bind_volume(&mut operation, opened, key, |partition, key| {
+        unlock::unlock(
+            &mut unlock::System::new(partition, &uuid)?,
+            &partition.path(),
+            key,
+            &mut io::stderr(),
+        )
+    })?;
+    let pinned = match binding {
+        Binding::Bound(pinned) => pinned,
+        Binding::Halt(reason) => halt(&reason),
+    };
     report_volume_binding(&mut io::stderr(), &uuid, &pinned.device)?;
     dispatch(operation)
 }
 
-/// Gives the operation the pinned volume as its device operand. Every
-/// operation refuses an encrypted volume until td-boot unlocks one.
-fn bind_volume(operation: &mut Mode, opened: volume::Opened) -> io::Result<volume::Pinned> {
-    let pinned = opened.unencrypted()?;
-    let device = match operation {
+/// What `bind_volume` decided.
+enum Binding {
+    /// The operation's device, held.
+    Bound(volume::Pinned),
+    /// The post-cap check refused the boot: halt, never exit init.
+    Halt(String),
+}
+
+/// Gives the operation the pinned volume as its device operand. A Btrfs
+/// volume binds as before, and refuses a handed-off key. A td LUKS2
+/// volume binds only for the deployment initramfs: `mount-root` requires
+/// the key and no active mapping, and binds the mapping `unlock` opens;
+/// `mount-var` binds the mapping `mount-root` opened. Every other
+/// operation refuses it.
+fn bind_volume(
+    operation: &mut Mode,
+    opened: volume::Opened,
+    key: Option<unlock::VolumeKey>,
+    unlock: impl FnOnce(&volume::Pinned, unlock::VolumeKey) -> io::Result<unlock::Unlocked>,
+) -> io::Result<Binding> {
+    let (device, mount) = match operation {
+        Mode::MountVolume { device, var, .. } => (device, Some(*var)),
         Mode::Boot { device, .. }
         | Mode::Install { device, .. }
         | Mode::Update { device, .. }
         | Mode::Rollback { device, .. }
-        | Mode::Success { device, .. }
-        | Mode::MountVolume { device, .. } => device,
+        | Mode::Success { device, .. } => (device, None),
         _ => return Err(usage_error()),
     };
+    let pinned = match opened {
+        volume::Opened::Btrfs(pinned) => {
+            if key.is_some() {
+                return Err(invalid(format!(
+                    "a volume key was handed off for {}, which is not encrypted",
+                    pinned.device.display()
+                )));
+            }
+            pinned
+        }
+        volume::Opened::Luks2 { partition, mapping } => match mount {
+            Some(false) => {
+                let Some(key) = key else {
+                    return Err(invalid(format!(
+                        "{} holds a td LUKS2 volume and no volume key was handed off",
+                        partition.device.display()
+                    )));
+                };
+                if let Some(mapping) = mapping {
+                    return Err(invalid(format!(
+                        "{} already has the active mapping {}; the deployment initramfs \
+                         opens the volume itself",
+                        partition.device.display(),
+                        mapping.name()
+                    )));
+                }
+                match unlock(&partition, key)? {
+                    unlock::Unlocked::Mapping(mapping) => {
+                        mapping.into_pinned(partition.device.clone())
+                    }
+                    unlock::Unlocked::Halt(reason) => return Ok(Binding::Halt(reason)),
+                }
+            }
+            Some(true) => match mapping {
+                Some(mapping) if mapping.name() == protocol::VOLUME_MAPPING_NAME => {
+                    mapping.into_pinned(partition.device.clone())
+                }
+                Some(mapping) => {
+                    return Err(invalid(format!(
+                        "{}'s active mapping is {:?}, not the {:?} mount-root opens",
+                        partition.device.display(),
+                        mapping.name(),
+                        protocol::VOLUME_MAPPING_NAME
+                    )))
+                }
+                None => {
+                    return Err(invalid(format!(
+                        "{} holds a td LUKS2 volume with no active mapping; mount-root opens it",
+                        partition.device.display()
+                    )))
+                }
+            },
+            None => {
+                return Err(volume::encrypted_unsupported(
+                    &partition.device,
+                    mapping.as_ref(),
+                ))
+            }
+        },
+    };
     *device = pinned.path();
-    Ok(pinned)
+    Ok(Binding::Bound(pinned))
 }
 
 fn mount_volume(device: &Path, mountpoint: &Path, var: bool) -> io::Result<()> {
@@ -8052,6 +8151,49 @@ mod tests {
         assert!(!body.contains("read_boot_trust_root("));
     }
 
+    /// The deployment initramfs's order: mount-root takes the key before the
+    /// volume is found, so every refusal after it leaves no key; the unlock
+    /// (its post-cap check, then cryptsetup) runs inside the binding, a halt
+    /// halts rather than returning, and nothing is mounted or reported
+    /// before the binding succeeds.
+    #[test]
+    fn mount_root_takes_the_key_before_discovery_and_unlocks_before_mounting() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split_once("\nfn on_volume(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        let position = |needle: &str| {
+            assert_eq!(body.matches(needle).count(), 1, "{needle}");
+            body.find(needle).unwrap()
+        };
+        let taken = position(
+            "Mode::MountVolume { var: false, .. } => unlock::take_key(Path::new(\"/\"), 0)?,",
+        );
+        let order = [
+            taken,
+            position("volume::handoff("),
+            position("volume::Opened::open(&uuid)?"),
+            position("bind_volume(&mut operation, opened, key, |partition, key| {"),
+            position("unlock::unlock("),
+            position("Binding::Halt(reason) => halt(&reason),"),
+            position("report_volume_binding("),
+            position("dispatch(operation)"),
+        ];
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{body}");
+        let unlock = include_str!("unlock.rs");
+        let body = unlock
+            .split_once("\npub(crate) fn unlock<U: Unlocker>(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        let checked = body.find("check_cap(unlocker, out)").unwrap();
+        let opened = body.find("open_by_volume_key_args(").unwrap();
+        let admitted = body.find("unlocker.admit()").unwrap();
+        assert!(checked < opened && opened < admitted);
+    }
+
     /// The cap runs once, after the selector's own provisioning check and
     /// before anything else, the medium's discovery and mount included; a
     /// refusal halts rather than returning, which would exit init.
@@ -8086,13 +8228,14 @@ mod tests {
         ] {
             assert!(capped < position(later), "{later} precedes the cap");
         }
-        // Only run_live_boot caps or halts.
+        // Only run_live_boot caps; it and the deployment initramfs's unlock
+        // (`on_volume`) halt.
         let (production, _) = source.split_once("\n#[cfg(test)]\nmod tests {").unwrap();
         assert_eq!(production.matches("cap::live").count(), 1);
         assert_eq!(
             production.matches("halt(").count(),
-            2,
-            "its definition and the call"
+            3,
+            "its definition and the two calls"
         );
 
         let halt = source

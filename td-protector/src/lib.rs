@@ -101,13 +101,21 @@ impl fmt::Display for ObserveError {
     }
 }
 
-/// PCRs 4 and 9 as they read now, in one PCR_Read.
-fn selector_pcrs<T: Transport>(client: &mut Client<T>) -> Result<([u8; 32], [u8; 32]), String> {
-    let values = client.read_pcrs(selection(&[SELECTOR_IMAGE_PCR, SELECTOR_INITRD_PCR])?)?;
+/// PCRs 4 and 9 as they read now, in one PCR_Read; a TPM without a SHA-256
+/// bank is typed as td-tpm types it.
+fn selector_pcrs_typed<T: Transport>(
+    client: &mut Client<T>,
+) -> Result<([u8; 32], [u8; 32]), PcrReadError> {
+    let values = client.read_pcrs_typed(selection(&[SELECTOR_IMAGE_PCR, SELECTOR_INITRD_PCR])?)?;
     let [image, initrd] = values.as_slice() else {
         return Err("TPM returned the wrong number of PCR values".into());
     };
     Ok((*image, *initrd))
+}
+
+/// `selector_pcrs_typed`, its error as text.
+fn selector_pcrs<T: Transport>(client: &mut Client<T>) -> Result<([u8; 32], [u8; 32]), String> {
+    selector_pcrs_typed(client).map_err(String::from)
 }
 
 /// The device-bound policy over these PCR 4 and PCR 9 values and a
@@ -141,9 +149,10 @@ pub fn observed_policy<T: Transport>(client: &mut Client<T>) -> Result<PcrPolicy
 /// they read now, unmeasured or not, and a literal-zero PCR 12. Whether the
 /// protector was sealed to it is the TPM's to answer, so a changed boot
 /// chain or a closed cap is a policy refusal rather than a local mismatch.
-pub fn release_policy<T: Transport>(client: &mut Client<T>) -> Result<PcrPolicy, String> {
-    let (image, initrd) = selector_pcrs(client)?;
-    device_bound_policy(image, initrd)
+/// A TPM without a SHA-256 bank is `PcrReadError::NoSha256Bank`.
+pub fn release_policy<T: Transport>(client: &mut Client<T>) -> Result<PcrPolicy, PcrReadError> {
+    let (image, initrd) = selector_pcrs_typed(client)?;
+    device_bound_policy(image, initrd).map_err(PcrReadError::Other)
 }
 
 /// A protector secret. It lives in one heap allocation that is zeroed on
@@ -278,6 +287,10 @@ pub enum UnsealError {
     /// a cleared or different TPM, or an owner hierarchy given a password
     /// or disabled since installation.
     LoadRefused(String),
+    /// The release policy's PCR_Read found no SHA-256 bank (td-tpm's
+    /// `PcrReadError::NoSha256Bank`), so nothing was sent to unseal: no
+    /// SHA-256 PolicyPCR can be met without the bank.
+    NoSha256Bank,
     /// A transport error, a reply that does not answer the command, any
     /// other response code, or a payload that is not a protector secret.
     Other(String),
@@ -287,7 +300,18 @@ impl fmt::Display for UnsealError {
         match self {
             Self::PolicyRefused(error) => write!(f, "policy refused: {error}"),
             Self::LoadRefused(error) => write!(f, "load refused: {error}"),
+            Self::NoSha256Bank => {
+                f.write_str("TPM has no SHA-256 PCR bank: no protector policy can be met")
+            }
             Self::Other(error) => f.write_str(error),
+        }
+    }
+}
+impl From<PcrReadError> for UnsealError {
+    fn from(error: PcrReadError) -> Self {
+        match error {
+            PcrReadError::NoSha256Bank => Self::NoSha256Bank,
+            PcrReadError::Other(error) => Self::Other(error),
         }
     }
 }

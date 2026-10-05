@@ -359,14 +359,17 @@ boundaries") are increment 6's target. Only td-kexec's half of the
 handoff exists, a mode nothing invokes yet, td-protector's release
 orchestration, which runs steps 2 to 5 of the release order as a
 library nothing calls yet ([td-protector](../td-protector/DESIGN.md)
-"Release orchestration"), and the live selector's cap (MEDIA.md "Live
-boot"). Today's installed selector neither releases nor caps. td-boot's
-discovery identifies a td LUKS2 volume and admits its active mapping
-(DESIGN.md "Full-system volume consumers"), but every consumer refuses
-an encrypted volume as not yet supported, and the image refuses
-cryptsetup in either initramfs (DESIGN.md D6). td-init's secret-line
-applet exists but no initramfs links it until the recovery flow does
-(UNSAFE.md §3).
+"Release orchestration"), the live selector's cap (MEDIA.md "Live
+boot"), and the deployment initramfs's unlock ("Boot and authority
+boundaries"), with the deployment initramfs carrying cryptsetup
+(DESIGN.md D6). Today's installed selector neither releases nor caps,
+and nothing places a key, so that unlock is reached only by tests.
+td-boot's discovery identifies a td LUKS2 volume and admits its active
+mapping (DESIGN.md "Full-system volume consumers"); every consumer but
+the deployment initramfs's mounts refuses an encrypted volume as not
+yet supported, and the image refuses cryptsetup in the selector
+initramfs. td-init's secret-line applet exists but no initramfs links it
+until the recovery flow does (UNSAFE.md §3).
 
 The installed selector acts on what discovery finds under its configured
 UUID (DESIGN.md "Full-system volume consumers"): a Btrfs volume boots as
@@ -391,8 +394,9 @@ a residual like the memfd's.
 Before activation the default unencrypted boot is behaviour-identical,
 not byte-identical: cryptsetup enters both initramfs and the boot
 binaries change, but an unencrypted volume's boot makes no TPM contact
-and takes the same steps. On a machine with a TPM, the live selector's
-cap is the one change a live boot shows.
+and takes the same steps, beyond `mount-root`'s removal of a key member
+and an `initrd.image` that are not there. On a machine with a TPM, the
+live selector's cap is the one change a live boot shows.
 
 ## Authentication and recovery
 
@@ -475,8 +479,9 @@ the signed manifest and the measured event. Its single member's name and
 the 64-byte key length are td-boot protocol constants and a permanent v1
 contract: td has no selector-update operation, so an installed selector
 hands every later deployment the same format. A deployment from before
-increment 6 on an encrypted volume has no key reader; it fails closed,
-and the selector falls back through its boot attempts.
+increment 6 on an encrypted volume has no key reader; it fails closed.
+A pending deployment's failures then fall back through the selector's
+boot attempts; an acknowledged one's repeat on every boot (below).
 
 The member is `td-volume-key-v1` at the root of the rootfs, a regular
 file of mode 0400 owned by root holding exactly the 64 key bytes; a later
@@ -522,23 +527,64 @@ system. When its kernel could not unpack an initramfs, the
 `CONFIG_BLK_DEV_RAM` fallback writes the whole initrd, archive and key
 included, to `/initrd.image` in that root, so the key reader must remove
 that file too before starting the system; DESIGN.md "Full-system volume
-consumers" owns how it finds the partition and the active mapping. It refuses a key on an unencrypted
-volume and an encrypted volume without a key. Then, as defence in depth,
-it attempts to unseal each td token, since the selector's cap must
-already be closed. Without a TPM device it attempts nothing, so a TPM
-that appears later goes unchecked ("Device-bound default"). A policy
+consumers" owns how it finds the partition and the active mapping.
+`td-boot on-volume mount-root` takes the key first, before it reads the
+command line or looks for the volume: it inspects the member without
+following a link and opens nothing but a regular file, then requires,
+on the open descriptor, the file it inspected, mode 0400, uid 0 and
+exactly 64 bytes, read into a buffer zeroed on drop with end of file
+after them. It then removes the member and `/initrd.image`, each if
+present, whether or not the member was there or passed, so every later
+path, refusal included, finds neither; a member that fails a check, or
+a removal that fails, refuses. No other operation reads or removes
+them. It refuses a key on an unencrypted volume and an encrypted volume
+without a key, and an encrypted volume whose mapping is already active,
+since the selector's does not survive `kexec`. Each refusal is an
+ordinary `on-volume` error: td-boot exits non-zero, the deployment
+`/init` exits under `set -e`, the kernel panics on init's exit and
+`panic=-1` reboots at once; nothing starts the system. As for an
+unencrypted volume that fails to mount, the reboot spends a pending
+deployment's boot attempts, so the selector falls back to `previous`
+once they are gone. An acknowledged deployment has no countdown, so a
+refusal that repeats on every boot, such as a key handed for an
+unencrypted volume, a malformed member or a key cryptsetup rejects
+against the header's digest, reboots without end, each cycle running
+the selector's release again, until the volume or the selector is
+repaired from the live medium.
+
+Then, as defence in depth and before cryptsetup runs, it attempts to
+unseal each td token the selector would try (td-protector's release
+candidates: none naming keyslot 0, at most four), since the selector's
+cap must already be closed. It reads the header after the selector's
+step-5 transitions, so its tokens are the header's tokens now. Without
+a TPM device (`/dev/tpmrm0` absent, with no wait) it attempts nothing,
+so a TPM that appears later goes unchecked ("Device-bound default"). A
+header td's reader refuses gives the check no tokens, so it attempts
+nothing either and the volume opens. A policy
 refusal and a load refusal (td-protector "Unseal outcomes") release
 nothing: the closed cap causes the first, and a cleared or different
 TPM, or an owner hierarchy given a password or disabled since
-installation, the second for tokens a recovery boot kept. Any release,
+installation, the second for tokens a recovery boot kept. Nor does a
+TPM without a SHA-256 PCR bank (`NoSha256Bank`), whose selector reached
+recovery for the same reason: no SHA-256 PolicyPCR can be met, so a
+device-bound token's policy read sends nothing to unseal. Any release,
 or any
-other outcome, a transport error or a command the TPM did not answer
-included, zeroes what it released and halts on the console, as the
-selector's failed cap does; it never exits init. That attempt is the
-installed path's evidence of an unseal after the cap. Neither stage
-writes the key to any block device. Removing the file retires the key from
-the filesystem only: copies remain in the selector's memfd pages, the
-`kexec` segments and the second kernel's freed initrd region, which memory
+other outcome, a transport error, a device that will not open or a
+command the TPM did not answer included, zeroes what it released and
+the key and halts on the console, as the selector's failed cap does; it
+never exits init, and tries no later token. That attempt is the
+installed path's evidence of an unseal after the cap. Only then does
+td-protector's runner run `/bin/cryptsetup open --type luks2
+--volume-key-file /proc/<pid>/fd/K /proc/<pid>/fd/N td-system`: the key
+on a `KeyFile` pipe, nothing on standard input, the partition named by
+its held descriptor. cryptsetup 2.8.8 reads the header's volume-key size
+from that pipe and activates only a key matching the header's digest of
+the data segment. The key is zeroed once it is in the pipe, before
+cryptsetup runs; a mapping left open by a later refusal ends with the
+reboot. Neither stage writes the key to any block device. Removing the
+file retires the key from the filesystem only: copies remain in the
+selector's memfd pages, the `kexec` segments, the second kernel's freed
+initrd region and the key pipe's freed pages, which memory
 extraction, outside Scope, could read. td-kexec's memfd and sealing
 syscalls are recorded in UNSAFE.md §1.
 

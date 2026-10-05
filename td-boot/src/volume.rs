@@ -387,6 +387,11 @@ impl Pinned {
         ))
     }
 
+    /// The held descriptor, which td's LUKS2 header reader reads through.
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(file: File, device: PathBuf) -> Self {
         Self { file, device }
@@ -410,6 +415,20 @@ pub(crate) struct Mapping {
 }
 
 impl Mapping {
+    /// Its device-mapper name, `dm/name`.
+    pub(crate) fn name(&self) -> &str {
+        &self.entry.name
+    }
+
+    /// The held mapping as the operation's device, reported as `device`,
+    /// the partition it maps.
+    pub(crate) fn into_pinned(self, device: PathBuf) -> Pinned {
+        Pinned {
+            file: self.file,
+            device,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(node: &str, name: &str, file: File) -> Self {
         Self {
@@ -465,20 +484,9 @@ impl Opened {
             Kind::Luks2 => Self::Luks2 { partition, mapping },
         })
     }
-
-    /// The pinned Btrfs volume. Every consumer refuses an encrypted volume
-    /// until td-boot unlocks one (td-install/ENCRYPTION.md "Selector release").
-    pub(crate) fn unencrypted(self) -> io::Result<Pinned> {
-        match self {
-            Self::Btrfs(pinned) => Ok(pinned),
-            Self::Luks2 { partition, mapping } => {
-                Err(encrypted_unsupported(&partition.device, mapping.as_ref()))
-            }
-        }
-    }
 }
 
-fn encrypted_unsupported(device: &Path, mapping: Option<&Mapping>) -> io::Error {
+pub(crate) fn encrypted_unsupported(device: &Path, mapping: Option<&Mapping>) -> io::Error {
     let mapping = match mapping {
         Some(mapping) => {
             let number = match mapping.file.metadata() {
@@ -650,7 +658,7 @@ fn hold_mapping(entry: MappingEntry, partition: &str, uuid: &Uuid) -> io::Result
 }
 
 /// The partition's active mapping, held; `None` when none is active.
-fn open_mapping(partition: &str, uuid: &Uuid) -> io::Result<Option<Mapping>> {
+pub(crate) fn open_mapping(partition: &str, uuid: &Uuid) -> io::Result<Option<Mapping>> {
     let started = Instant::now();
     loop {
         match find_mapping(Path::new(SYS_BLOCK), partition, uuid)? {
@@ -1960,11 +1968,7 @@ mod tests {
                 File::open("/dev/null").unwrap(),
             )),
         ] {
-            let opened = Opened::Luks2 {
-                partition: Pinned::for_test(File::open("/dev/null").unwrap(), "/dev/vda2".into()),
-                mapping,
-            };
-            let error = opened.unencrypted().err().unwrap();
+            let error = encrypted_unsupported(Path::new("/dev/vda2"), mapping.as_ref());
             assert_eq!(error.kind(), io::ErrorKind::Unsupported);
             assert!(
                 error.to_string().starts_with(ENCRYPTED_UNSUPPORTED),
@@ -1973,60 +1977,211 @@ mod tests {
         }
     }
 
-    /// The selector's `boot`, the deployment initramfs's mounts and the
-    /// running system's transactions all bind their device through
-    /// `bind_volume`: an encrypted volume refuses each, and a Btrfs one
-    /// binds each to its held descriptor as before.
+    fn mode_device(mode: &crate::Mode) -> Option<PathBuf> {
+        match mode {
+            crate::Mode::Boot { device, .. }
+            | crate::Mode::Install { device, .. }
+            | crate::Mode::Update { device, .. }
+            | crate::Mode::Rollback { device, .. }
+            | crate::Mode::Success { device, .. }
+            | crate::Mode::MountVolume { device, .. } => Some(device.clone()),
+            _ => None,
+        }
+    }
+
+    fn on_volume_operation(words: &[&str]) -> crate::Mode {
+        let args = std::iter::once("on-volume")
+            .chain(words.iter().copied())
+            .map(std::ffi::OsString::from);
+        let crate::Mode::OnVolume { operation } = crate::parse_args(args).unwrap() else {
+            panic!("{words:?} is not an on-volume operation");
+        };
+        *operation
+    }
+
+    fn luks2(mapping: Option<&str>) -> Opened {
+        Opened::Luks2 {
+            partition: Pinned::for_test(File::open("/dev/null").unwrap(), "/dev/vda2".into()),
+            mapping: mapping
+                .map(|name| Mapping::for_test("dm-0", name, File::open("/dev/null").unwrap())),
+        }
+    }
+
+    fn btrfs_opened() -> Opened {
+        Opened::Btrfs(Pinned::for_test(
+            File::open("/dev/null").unwrap(),
+            "/dev/vda2".into(),
+        ))
+    }
+
+    fn no_unlock(_: &Pinned, _: crate::unlock::VolumeKey) -> io::Result<crate::unlock::Unlocked> {
+        panic!("unlock reached")
+    }
+
+    fn handed_key() -> crate::unlock::VolumeKey {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("td-boot-bind-key-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let member = directory.join(protocol::VOLUME_KEY_MEMBER);
+        fs::write(&member, [7; protocol::VOLUME_KEY_BYTES]).unwrap();
+        fs::set_permissions(&member, std::os::unix::fs::PermissionsExt::from_mode(0o400)).unwrap();
+        let uid = fs::metadata(&member).unwrap().uid();
+        let key = crate::unlock::take_key(&directory, uid).unwrap().unwrap();
+        fs::remove_dir_all(&directory).unwrap();
+        key
+    }
+
+    fn bound(binding: io::Result<crate::Binding>) -> Pinned {
+        match binding.unwrap() {
+            crate::Binding::Bound(pinned) => pinned,
+            crate::Binding::Halt(reason) => panic!("halted: {reason}"),
+        }
+    }
+
+    /// The selector's `boot` and the running system's transactions bind
+    /// their device through `bind_volume`: an encrypted volume refuses each,
+    /// with or without a mapping, and a Btrfs one binds each to its held
+    /// descriptor as before.
     #[test]
-    fn each_on_volume_operation_refuses_an_encrypted_volume() {
+    fn each_on_volume_operation_but_the_mounts_refuses_an_encrypted_volume() {
         let id = "a".repeat(64);
         let operations: &[&[&str]] = &[
             &["boot", "/volume", "quiet"],
-            &["mount-root", "/volume"],
-            &["mount-var", "/sysroot/var"],
             &["install", "/update", "/source", "/key"],
             &["update", "/update", "/volume", "/volume/channel", "/key"],
             &["rollback", "/update"],
             &["success", "/update", &id],
         ];
-        let device = |mode: &crate::Mode| -> Option<PathBuf> {
-            match mode {
-                crate::Mode::Boot { device, .. }
-                | crate::Mode::Install { device, .. }
-                | crate::Mode::Update { device, .. }
-                | crate::Mode::Rollback { device, .. }
-                | crate::Mode::Success { device, .. }
-                | crate::Mode::MountVolume { device, .. } => Some(device.clone()),
-                _ => None,
-            }
-        };
         for words in operations {
-            let args = std::iter::once("on-volume")
-                .chain(words.iter().copied())
-                .map(std::ffi::OsString::from);
-            let crate::Mode::OnVolume { operation } = crate::parse_args(args).unwrap() else {
-                panic!("{words:?} is not an on-volume operation");
-            };
-            let mut operation = *operation;
-            let opened = Opened::Luks2 {
-                partition: Pinned::for_test(File::open("/dev/null").unwrap(), "/dev/vda2".into()),
-                mapping: None,
-            };
-            let error = crate::bind_volume(&mut operation, opened).err().unwrap();
-            assert!(
-                error.to_string().starts_with(ENCRYPTED_UNSUPPORTED),
-                "{words:?}: {error}"
-            );
-            assert_eq!(device(&operation).unwrap(), Path::new("/volume-device"));
-            let pinned = crate::bind_volume(
-                &mut operation,
-                Opened::Btrfs(Pinned::for_test(
-                    File::open("/dev/null").unwrap(),
-                    "/dev/vda2".into(),
-                )),
-            )
-            .unwrap();
-            assert_eq!(device(&operation).unwrap(), pinned.path(), "{words:?}");
+            for mapping in [None, Some(crate::protocol::VOLUME_MAPPING_NAME)] {
+                let mut operation = on_volume_operation(words);
+                let error = crate::bind_volume(&mut operation, luks2(mapping), None, no_unlock)
+                    .err()
+                    .unwrap();
+                assert!(
+                    error.to_string().starts_with(ENCRYPTED_UNSUPPORTED),
+                    "{words:?}: {error}"
+                );
+                assert_eq!(
+                    mode_device(&operation).unwrap(),
+                    Path::new("/volume-device")
+                );
+            }
         }
+        for words in operations.iter().copied().chain([
+            ["mount-root", "/volume"].as_slice(),
+            &["mount-var", "/sysroot/var"],
+        ]) {
+            let mut operation = on_volume_operation(words);
+            let pinned = bound(crate::bind_volume(
+                &mut operation,
+                btrfs_opened(),
+                None,
+                no_unlock,
+            ));
+            assert_eq!(mode_device(&operation).unwrap(), pinned.path(), "{words:?}");
+        }
+    }
+
+    /// A key on an unencrypted volume and an encrypted volume without one
+    /// refuse; so does a mapping already active at mount-root, and none, or
+    /// another, at mount-var. None reaches the unlock.
+    #[test]
+    fn the_deployment_mounts_refuse_a_mismatched_key_or_mapping() {
+        let refusals: &[(&[&str], fn() -> Opened, bool, &str)] = &[
+            (
+                &["mount-root", "/volume"],
+                btrfs_opened,
+                true,
+                "not encrypted",
+            ),
+            (
+                &["mount-root", "/volume"],
+                || luks2(None),
+                false,
+                "no volume key",
+            ),
+            (
+                &["mount-root", "/volume"],
+                || luks2(Some("td-system")),
+                true,
+                "already has the active mapping",
+            ),
+            (
+                &["mount-var", "/sysroot/var"],
+                || luks2(None),
+                false,
+                "no active mapping",
+            ),
+            (
+                &["mount-var", "/sysroot/var"],
+                || luks2(Some("td-other")),
+                false,
+                "td-other",
+            ),
+        ];
+        for (words, opened, with_key, message) in refusals {
+            let mut operation = on_volume_operation(words);
+            let key = with_key.then(handed_key);
+            let error = crate::bind_volume(&mut operation, opened(), key, no_unlock)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains(message), "{words:?}: {error}");
+            assert_eq!(
+                mode_device(&operation).unwrap(),
+                Path::new("/volume-device")
+            );
+        }
+    }
+
+    /// mount-root hands the key and the partition to the unlock and binds the
+    /// mapping it returns; mount-var binds the active td-system mapping; a
+    /// halt is returned for the caller to halt on.
+    #[test]
+    fn the_deployment_mounts_bind_the_mapping() {
+        let mut operation = on_volume_operation(&["mount-root", "/volume"]);
+        let mut reached = false;
+        let pinned = bound(crate::bind_volume(
+            &mut operation,
+            luks2(None),
+            Some(handed_key()),
+            |partition, key| {
+                reached = true;
+                assert_eq!(partition.device, Path::new("/dev/vda2"));
+                drop(key);
+                Ok(crate::unlock::Unlocked::Mapping(Mapping::for_test(
+                    "dm-3",
+                    "td-system",
+                    File::open("/dev/null").unwrap(),
+                )))
+            },
+        ));
+        assert!(reached);
+        assert_eq!(pinned.device, Path::new("/dev/vda2"));
+        assert_eq!(mode_device(&operation).unwrap(), pinned.path());
+
+        let mut operation = on_volume_operation(&["mount-var", "/sysroot/var"]);
+        let pinned = bound(crate::bind_volume(
+            &mut operation,
+            luks2(Some("td-system")),
+            None,
+            no_unlock,
+        ));
+        assert_eq!(mode_device(&operation).unwrap(), pinned.path());
+
+        let mut operation = on_volume_operation(&["mount-root", "/volume"]);
+        let binding =
+            crate::bind_volume(&mut operation, luks2(None), Some(handed_key()), |_, _| {
+                Ok(crate::unlock::Unlocked::Halt("released".into()))
+            })
+            .unwrap();
+        assert!(matches!(binding, crate::Binding::Halt(reason) if reason == "released"));
+        assert_eq!(
+            mode_device(&operation).unwrap(),
+            Path::new("/volume-device")
+        );
     }
 }

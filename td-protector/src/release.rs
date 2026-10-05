@@ -68,10 +68,9 @@ pub fn unseal_token<T: Transport>(
     token: &Token,
 ) -> Result<Secret, UnsealError> {
     let policy = match token.role() {
-        Role::FirstBoot => first_boot_policy(),
-        Role::DeviceBound => release_policy(&mut client),
-    }
-    .map_err(UnsealError::Other)?;
+        Role::FirstBoot => first_boot_policy().map_err(UnsealError::Other)?,
+        Role::DeviceBound => release_policy(&mut client)?,
+    };
     unseal(client, &policy, token.sealed())
 }
 
@@ -272,8 +271,9 @@ pub fn release<T: Tpm, C: Runner>(
 }
 
 /// The td tokens to try, device-bound before first-boot and by number,
-/// never one naming keyslot 0, at most `MAX_ATTEMPTS`.
-fn candidates(header: &Header) -> Vec<(u8, &Token)> {
+/// never one naming keyslot 0, at most `MAX_ATTEMPTS`: the selector's
+/// release and the deployment initramfs's post-cap check try the same.
+pub fn candidates(header: &Header) -> Vec<(u8, &Token)> {
     let mut tokens: Vec<(u8, &Token)> = header
         .tokens
         .iter()
@@ -1437,6 +1437,31 @@ mod tests {
         let order: Vec<u8> = candidates(&header).iter().map(|(n, _)| *n).collect();
         assert_eq!(order, [3, 0, 2]);
         assert_eq!(MAX_ATTEMPTS, 4);
+    }
+
+    /// A TPM whose SHA-256 bank was deallocated answers a device-bound
+    /// token's release-policy read as `NoSha256Bank`, typed rather than
+    /// `Other`, and nothing is sent to unseal; a first-boot token reads no
+    /// PCR and is the TPM's to refuse.
+    #[test]
+    fn a_bankless_tpm_types_a_device_bound_unseal_as_no_sha256_bank() {
+        let mut tpm = Scripted::new();
+        let mut disk = Disk::new(&tpm);
+        drop(disk.enroll(&mut tpm, 0, 1, Role::DeviceBound));
+        let header = disk.header();
+        let (_, token) = header.tokens.first().unwrap();
+        tpm.0.borrow_mut().no_sha256_bank = true;
+        tpm.codes();
+        match unseal_token(tpm.client(), token) {
+            Err(error) => assert_eq!(error, UnsealError::NoSha256Bank),
+            Ok(_) => panic!("released without a SHA-256 bank"),
+        }
+        assert_eq!(tpm.codes(), [PCR_READ]);
+        assert!(tpm.idle());
+        assert_eq!(
+            UnsealError::NoSha256Bank.to_string(),
+            "TPM has no SHA-256 PCR bank: no protector policy can be met"
+        );
     }
 
     /// The swtpm oracle over the release order: the first boot's seal,

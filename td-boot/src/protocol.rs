@@ -235,6 +235,11 @@ pub const CRYPTSETUP: &str = "cryptsetup";
 pub const VOLUME_KEY_MEMBER: &str = "td-volume-key-v1";
 #[allow(dead_code)]
 pub const VOLUME_KEY_BYTES: usize = 64;
+// The device-mapper name the deployment initramfs opens a td LUKS2 volume
+// under, so its dm uuid is `CRYPT-LUKS2-<hex UUID>-td-system`. The selector's
+// mapping does not survive kexec, so the two stages never hold it at once.
+#[allow(dead_code)]
+pub const VOLUME_MAPPING_NAME: &str = "td-system";
 // 1 MiB, the alignment every partition start is held to. A start that ignores
 // it reads and writes across a physical block boundary forever, and nothing
 // reports it — `gpt.rs` refuses 0 for the same reason.
@@ -243,14 +248,14 @@ pub const PARTITION_ALIGN_BYTES: u64 = 1024 * 1024;
 // Raising this changes the v1 reader contract; bump or migrate the format with it.
 pub const ATTEMPT_V1_MAX_REMAINING: u8 = 3;
 pub const DEFAULT_BOOT_ATTEMPTS: u8 = ATTEMPT_V1_MAX_REMAINING;
-// The three external programs td-boot runs. All three are td-init applets now,
-// called by their /bin names as every other script on the image does. The
-// recipe-side initramfs check consumes this roster, so an applet nothing on the
-// image provides reds the build rather than stopping a boot at a "not found".
+// The three td-init applets td-boot runs, called by their /bin names as every
+// other script on the image does. The recipe-side initramfs check consumes
+// this roster, so an applet nothing on the image provides reds the build rather than stopping a boot at a "not found".
 //
 // `REQUIRED_BUSYBOX_APPLETS` used to sit beside this holding `losetup`, and
 // deleting it is the point of the landing that added td-init's `LOOP_SET_FD`
-// request: td-boot now reaches no third-party program at all.
+// request: td-boot now reaches no third-party program but `CRYPTSETUP`, D6's
+// source-built cryptsetup, which the image's shape check binds.
 pub const MOUNT_APPLET: &str = "mount";
 pub const UMOUNT_APPLET: &str = "umount";
 pub const LOSETUP_APPLET: &str = "losetup";

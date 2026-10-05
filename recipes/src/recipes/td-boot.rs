@@ -13,6 +13,7 @@ use crate::types::{Recipe, Step};
 // them. td-tpm includes the same engine SHA-256 by `#[path]`.
 const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
 const CAP_RS: &str = include_str!("../../../td-boot/src/cap.rs");
+const UNLOCK_RS: &str = include_str!("../../../td-boot/src/unlock.rs");
 const MEASUREMENT_RS: &str = include_str!("../../../td-boot/src/measurement.rs");
 const VOLUME_RS: &str = include_str!("../../../td-boot/src/volume.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
@@ -80,6 +81,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-boot/src/cap.rs".into(),
             content: CAP_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-boot/src/unlock.rs".into(),
+            content: UNLOCK_RS.into(),
             exec: false,
         },
         Step::WriteFile {

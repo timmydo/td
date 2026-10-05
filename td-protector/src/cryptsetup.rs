@@ -159,6 +159,20 @@ pub fn open_args(device: &Path, name: &str) -> Vec<OsString> {
     args
 }
 
+/// The mapping `name`, opened with the raw volume key cryptsetup reads from
+/// `key`, a `KeyFile`'s descriptor name. cryptsetup 2.8.8's `open` with
+/// `--volume-key-file` reads the header's volume-key size from it
+/// (`tools_read_vk`) and activates only a key that matches the header's
+/// digest of the data segment (`_verify_key`,
+/// `LUKS2_digest_verify_by_segment`); it tries no token or keyslot.
+pub fn open_by_volume_key_args(device: &Path, name: &str, key: &Path) -> Vec<OsString> {
+    let mut args = os(&["open", "--type", "luks2", "--volume-key-file"]);
+    args.push(key.into());
+    args.push(device.into());
+    args.push(name.into());
+    args
+}
+
 pub fn close_args(name: &str) -> Vec<OsString> {
     os(&["close", name])
 }
@@ -455,6 +469,22 @@ mod tests {
                 "--key-file=-",
                 "/dev/loop7",
                 "td-install-07"
+            ]
+        );
+        assert_eq!(
+            words(&open_by_volume_key_args(
+                Path::new("/proc/9/fd/5"),
+                "td-system",
+                Path::new("/proc/9/fd/4")
+            )),
+            [
+                "open",
+                "--type",
+                "luks2",
+                "--volume-key-file",
+                "/proc/9/fd/4",
+                "/proc/9/fd/5",
+                "td-system"
             ]
         );
         assert_eq!(

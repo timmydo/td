@@ -109,6 +109,14 @@ response code of the TPM refusal that ended the unseal, if one did:
     `TPM_RC_HIERARCHY` (0x080 + 0x005) on handle 1, 0x185, the storage
     hierarchy disabled. Either would otherwise make every recovery
     boot's deployment check halt.
+- `NoSha256Bank`: `release_policy`'s PCR_Read of PCRs 4 and 9 found no
+  SHA-256 bank (td-tpm's `PcrReadError::NoSha256Bank`, kept typed
+  through `release_policy` and `unseal_token`), so a device-bound token
+  sends nothing to unseal: no SHA-256 PolicyPCR can be met without the
+  bank, which only a platform-authorized allocation at the next reset
+  restores. The selector's release logs it as any refusal; the
+  deployment initramfs's check proceeds on it, so a machine whose bank
+  was deallocated after installation boots with its recovery key.
 - `Other`: a transport error, a reply that does not answer the command,
   every other response code, and a payload other than 32 bytes.
 
@@ -340,7 +348,12 @@ with the format's PBKDF2 parameters; `token import`, at a given number
 or the lowest free one; `token remove`; `luksKillSlot --batch-mode
 --key-file=-`, whose standard input carries the key of a keyslot that
 remains; `luksDump --dump-json-metadata`; `open`, `close`, `status`;
-and `open --test-passphrase` on one keyslot. Given a key, cryptsetup
+`open --test-passphrase` on one keyslot; and the deployment initramfs's
+`open --volume-key-file KEY-FILE`, the handed-off volume key a `KeyFile`
+with nothing on standard input, which cryptsetup 2.8.8 reads at the
+header's volume-key size and activates only when it matches the header's
+digest of the data segment (`_verify_key`), trying no token or keyslot.
+Given a key, cryptsetup
 2.8.8's `luksKillSlot` destroys a keyslot only once that key opens
 another; given an empty standard input, or one it fails to read, it
 ignores the failed read (`-EPIPE`) and destroys the keyslot unasked. So
@@ -449,8 +462,9 @@ nothing reaches cryptsetup before the cap.
    device-bound tokens first and each role by number, through
    `unseal_token`: the first-boot policy for a first-boot token,
    `release_policy` for a device-bound one. A token naming keyslot 0 is
-   never tried. Every refusal releases nothing; the console names its
-   `UnsealError`.
+   never tried; `release::candidates` is that order and filter, which
+   the deployment initramfs's post-cap check shares. Every refusal
+   releases nothing; the console names its `UnsealError`.
 3. When only first-boot tokens released, it reads PCRs 4 and 9 with
    `observe`, seals a fresh `/dev/random` secret to them and a
    literal-zero PCR 12, and unseals it once, requiring the same secret.

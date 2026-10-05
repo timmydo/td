@@ -86,8 +86,11 @@ and does not: `td-boot` verifies a signature and kexecs through a helper.
 Its PCR 11 measurement and the live selector's PCR 12 cap run over td-tpm
 and td-protector (with td-json), each forbidding unsafe code, the TPM being
 td-tpm's safe file I/O on `/dev/tpmrm0`; a refused cap halts by parking
-the thread through std. `td-install` was the second until it had to
-publish onto a disk it holds (§21). Its partition tables and filesystems are still bytes at offsets, a
+the thread through std. The deployment initramfs's unlock adds none: its
+post-cap unseal is td-protector's over the same client, its key member is
+read with std file I/O, and its one cryptsetup child, with the key on a
+pipe, is td-protector's runner's std process and pipe. `td-install` was
+the second until it had to publish onto a disk it holds (§21). Its partition tables and filesystems are still bytes at offsets, a
 device's size is a `seek`, and its sector size is a file under `/sys`;
 `td-install/DESIGN.md`'s D8 keeps it that way except for that one recorded
 surface.
@@ -471,7 +474,9 @@ but `mount.rs` — plus `switch_root`'s two `MS_MOVE` moves — may name one
 or call the two wrappers. That amendment is what lets both initramfses and
 `/etc/inittab` mount without busybox, and the `LOOP_SET_FD` request above
 is what lets `td-boot` attach the verified root loop without it — so
-nothing td-boot runs is a third-party program any more. Neither
+nothing td-boot runs is a third-party program any more but D6's
+source-built cryptsetup, with which the deployment initramfs opens an
+encrypted volume (`td-install/DESIGN.md` D6). Neither
 initramfs packs the multicall, and since `getty` became an applet here
 neither does the real root: that used to be a claim about the ARCHIVES
 alone, because the greeter unit respawned busybox's `getty` every boot,
