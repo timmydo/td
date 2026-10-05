@@ -3,8 +3,10 @@
 This is the normative target for td's login-key tier. td-authd, td-secret,
 td-compositor and td-login implement it together; this document owns the
 tier's rules, and each component document states the amendments its own
-contract needs. **Nothing below is implemented.** Until the increments at
-the end land, `THREAT-MODEL.md` §3 is the complete current behaviour: the
+contract needs. **Only the record codec is implemented**, inert: no
+caller uses td-secret's private `login_record` module ("The login
+record"). Nothing else below is implemented. Until the increments at the
+end land, `THREAT-MODEL.md` §3 is the complete current behaviour: the
 installed account logs in automatically and the session never locks. No
 document, UI or release note may describe this tier as available before
 its acceptance evidence exists.
@@ -139,9 +141,10 @@ down boot health and the diagnostics that make the state repairable.
 
 The record's presence is the only enrollment state. Present means enrolled
 and automatic login off; there is no second flag, `/etc/autologin` edit or
-shadow change. Its contents, with exact bytes pinned by the codec increment
-against independent literal vectors, are a magic and version, the UID, a
-random 32-byte record ID fixed at first enrollment, and one through eight
+shadow change. Its contents, with exact bytes (below) pinned against
+independent literal vectors (`td-secret/tests/login_record_vectors.py`),
+are a magic and version, the UID, a random 32-byte record ID fixed at
+first enrollment, and one through eight
 slots in canonical credential-ID order. Each slot holds a bounded nonempty
 credential ID, the canonical P-256 public key, a random 32-byte salt and a
 32-byte verifier. Unknown versions, out-of-range counts, duplicate
@@ -149,16 +152,38 @@ credentials and trailing bytes refuse. Keys have no roles and the record
 holds no recovery-policy byte: the slot count is the state, as in
 `PORTABLE.md`. No counter, AAGUID, label or timestamp is stored.
 
+**Bytes.** Integers are unsigned big-endian. Version 1 is:
+
+| Field | Encoding |
+| --- | --- |
+| Magic | Eight bytes `TDLOGREC` |
+| Version | u8, 1 |
+| UID | u32, which must equal the expected UID |
+| Record ID | 32 random bytes |
+| Slot count | u8, one through eight |
+| Slots | Repeated below, strictly increasing by credential bytes |
+
+Each slot is a u16 credential length (1 through 1024, td-secret's CTAP
+credential bound), the credential ID, the public key as its 32-byte x and
+32-byte y coordinates, canonical field elements on P-256, the 32-byte salt
+and the 32-byte verifier. Raw coordinates rather than `PORTABLE.md`'s COSE
+form: the record stores one key type and no algorithm choice. The largest
+record is 46 + 8 * 1154 = 9278 bytes, and a longer file refuses before
+parsing. Every field has exactly one encoding, so re-encoding a decoded
+record reproduces the bytes read.
+
 **Versions.** A deployment that carries the tier lists, in its tier marker
 (Deployments), the record versions it reads. Enrollment and every mutation
-write a version that both retained deployments read, and refuse when there
-is none. Together with td-authd's update-consent rule (Deployments),
-rolling back to `previous` therefore never meets an unreadable record.
+write the lowest version that the writer and both retained deployments
+read, and refuse when there is none. Together with td-authd's
+update-consent rule (Deployments), rolling back to `previous` therefore
+never meets an unreadable record.
 
-The verifier is HKDF-SHA256 with the slot's hmac-secret output as input
-keying material and an info string that starts with `td-login/verifier/v1`
-and a zero byte and binds the record ID and the length-prefixed credential
-ID. A login needs both checks:
+The verifier is one 32-byte block of HKDF-SHA256 with the slot's
+hmac-secret output as input keying material, an empty salt, and an info
+string of `td-login/verifier/v1`, a zero byte, the u32 UID, the record ID
+and the u32-length-prefixed credential ID. It is compared in constant
+time. A login needs both checks:
 
 - the signature over a fresh root-generated challenge proves the key took
   part now, so no recorded assertion verifies twice;
@@ -206,12 +231,13 @@ next.
 
 Every client-data hash is SHA-256 over `td-login/operation/v1`, a zero
 byte, a phase byte, the u32-length-prefixed complete canonical description
-and 32 fresh kernel-random bytes. Authorize phases also include, before
+and 32 fresh kernel-random bytes. The authorize phase also includes, before
 the random bytes, the length-prefixed record ID and the length-prefixed
 SHA-256 digest of the exact record bytes being changed, so the signature
 itself binds an addition or removal to that record; the worker's baseline
-comparison is a second check, not the binding. The identify, authorize,
-create, prove, repeat, probe and unlock phases are distinct.
+comparison is a second check, not the binding. Length prefixes are u32.
+The identify, authorize, create, prove, repeat, probe and unlock phases
+are distinct, with phase bytes 1 through 7 in that order.
 
 - **Identify.** Before any PIN, a silent getAssertion (`up=false`, no PIN
   and no extension) over the enrolled credential IDs, in batches no larger

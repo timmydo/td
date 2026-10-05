@@ -6,6 +6,12 @@ use super::{crypto, fido_hid, tpm};
 pub const RP_ID: &str = "td.invalid";
 pub const MAX_CREDENTIAL_ID: usize = 1024;
 
+/// A credential's public short name: the first four bytes of its SHA-256.
+pub fn fingerprint(credential: &[u8]) -> [u8; 4] {
+    let [a, b, c, d, ..] = crypto::digest(credential);
+    [a, b, c, d]
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Es256PublicKey {
     x: [u8; 32],

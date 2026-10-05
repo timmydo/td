@@ -76,6 +76,10 @@ const MODULES: &[(&str, &str)] = &[
         "fido_transaction",
         include_str!("../../../td-secret/src/fido_transaction.rs"),
     ),
+    (
+        "login_record",
+        include_str!("../../../td-secret/src/login_record.rs"),
+    ),
     ("pin_sys", include_str!("../../../td-secret/src/pin_sys.rs")),
     (
         "pin_terminal",
@@ -187,6 +191,10 @@ pub fn recipe() -> Recipe {
         (
             "{src}/td-authd/src/primary_account.rs",
             include_str!("../../../td-authd/src/primary_account.rs"),
+        ),
+        (
+            "{src}/td-secret/tests/login_record_vectors.txt",
+            include_str!("../../../td-secret/tests/login_record_vectors.txt"),
         ),
         (
             "{src}/td-secret/tests/aes_vectors.txt",

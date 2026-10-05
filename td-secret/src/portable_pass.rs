@@ -48,8 +48,7 @@ pub struct Fingerprint([u8; 4]);
 
 impl Fingerprint {
     fn of(credential: &[u8]) -> Self {
-        let [a, b, c, d, ..] = crate::crypto::digest(credential);
-        Self([a, b, c, d])
+        Self(crate::fido_ctap::fingerprint(credential))
     }
 }
 

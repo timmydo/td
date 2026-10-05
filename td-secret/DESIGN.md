@@ -1746,3 +1746,45 @@ incoming rights and retains only sender pidfds. It adds no raw operations or
 credential access. Consent tag 5 describes a system installation; secret
 workers reject it, and physical Enter for installation cannot substitute for
 a token-bound secret operation.
+
+## Login record codec
+
+`login_record.rs` is the first, inert piece of
+[../td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md)'s root login
+worker. TOKEN-LOGIN.md, "The login record" and "Token profile", owns the
+bytes; this module implements them and nothing calls it yet. It reads no
+file, token or entropy: the worker supplies the record bytes, hmac-secret
+outputs and the 32 random bytes of each client-data hash.
+
+Decoding takes the expected UID and refuses an oversized input, a wrong
+magic, a version outside `READS`, another UID, a count outside one through
+eight, an empty or oversized credential ID, a noncanonical or off-curve
+key (through `fido_p256`'s validating constructor), truncation, trailing
+bytes, and duplicate or unordered credentials. A decoded record keeps
+the SHA-256 of the exact bytes read as `Record::digest`; the encoding is
+unique, so re-encoding hashes the same. `write_version` picks the lowest
+version in `READS` that both retained deployments' read sets list, and
+refuses when there is none.
+
+Only a `Record` builds a slot, so every verifier binds that record's own
+UID and ID: `Record::enroll` takes one through eight proved keys, each a
+credential, public key, salt and borrowed hmac-secret output; both
+consuming methods, `with_key` adding one proved key and `without`
+removing a nonempty set of enrolled keys, keep the UID, ID and untouched
+slots and take the version to write. Each sorts and re-applies the decode rules.
+`with_key` refuses a ninth or an enrolled credential; `without` refuses an
+unknown or repeated credential and the removal of every key, since the
+store layer unlinks the record instead. A login derives the verifier again
+and compares it in constant time. The output stays in the caller's
+clearing owner; the derived verifier is a private, non-Debug, non-Clone
+owner cleared on drop. Stored verifiers, keys, salts and credential IDs
+are public metadata, as TOKEN-LOGIN.md says. Authorize-phase client-data
+hashes take the baseline record and refuse without it; every other phase
+refuses one. Key fingerprints are `fido_ctap::fingerprint`, the first four
+bytes of the credential ID's SHA-256, which td-pass's `Fingerprint` also
+uses, as `PORTABLE.md` requires.
+
+`tests/login_record_vectors.py` independently derives the record bytes,
+verifiers, fingerprints and every phase's client-data hash with Python's
+`hashlib`, `hmac` and its own integer P-256 arithmetic; the committed
+`tests/login_record_vectors.txt` is what the tests read.
