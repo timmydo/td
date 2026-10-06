@@ -2201,6 +2201,17 @@ Initial independently landable increments:
   exclusivity/constructor doctests and eight measured allocation trials.
   Authenticated locators, request selection and publication remain later.
 
+- **M06dt — original provisional direct-leaf locator candidates:** consume
+  whole Retained and map one original ordinal per funded turn into caller
+  slots. Normalize encoded extents to original source base, preserve all
+  transfer tags and multipart nulls, and emit canonical p1 candidate bytes.
+  Pin literal tags/extents, decoded-size distinction, zero bodies/final
+  CRLF, near-u64 coordinates, original owners/backing, every prefix,
+  constructor/refusal ordering and exact quota errors. Add five exclusive/
+  passive-input doctests and eight measured allocation trials. Candidates
+  remain untrusted until exact source identity and live authorized parent
+  access bind original Mapped; nested contexts and publication follow.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

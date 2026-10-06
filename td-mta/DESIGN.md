@@ -739,6 +739,17 @@ that owner. Fresh checks/consumption preserve original allowance identity
 and sticky refusal. These members remain provisional through authenticated
 locators, request property selection and complete job publication.
 
+M06dt consumes original whole retained metadata to derive provisional
+p1 candidates from every original descriptor. Relative encoded extents,
+transfer tags and multipart nulls use the frozen wire contract; no
+passive imported descriptor can enter the owner. Each bounded turn funds
+canonical bytes and its stored-cell record in original allowances.
+Exclusive Mapped preserves original retained completion through fresh
+checks/consumption. Its parent BlobId is untrusted: source-identity and
+live account/lease authorization must bind this proof before issuance,
+download or reuse. This adds no permission, parent pin, body decoding,
+nested locator context or complete response publication.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

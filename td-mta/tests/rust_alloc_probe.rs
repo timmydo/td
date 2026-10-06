@@ -5480,8 +5480,10 @@ fn ordered_mime_classification() {
     let mut retained_output = [0; 256];
     let mut collection_output = [[0; 256]; 3];
     let mut composed_output = [0; 2048];
+    use td_mta::mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::Candidate;
+    let mut locator_output = [Candidate::default(); 3];
     let before = COUNTERS.snapshot();
-    'trial_loop: for trial in 0..57 {
+    'trial_loop: for trial in 0..65 {
         let mut work = Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
             Charge {
@@ -5769,7 +5771,7 @@ fn ordered_mime_classification() {
                 assert_eq!(serialized.value().unwrap().fragments.len(), 3);
                 if trial >= 49 {
                     use td_mta::mime_traversal::bound::ordered::body_lists::response::collected::composed::{Mode, retained::Cursor as WholeRetention};
-                    let mode = if trial == 50 {
+                    let mode = if trial == 50 || trial == 64 {
                         Mode::Lists
                     } else {
                         Mode::Structure
@@ -5824,6 +5826,75 @@ fn ordered_mime_classification() {
                         continue;
                     }
                     let mut retained = cursor.finish(Tick(1)).unwrap();
+                    if trial >= 57 {
+                        use td_mta::{ids::BlobId, mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::Cursor as Mapping};
+                        let parent = BlobId::from_bytes([0x44; 16]);
+                        let deadline = Error::Admission(td_mta::nfc::Error::Work(Stop::Deadline));
+                        if trial == 63 {
+                            assert_eq!(
+                                Mapping::new(retained, parent, &mut locator_output, Tick(100))
+                                    .err(),
+                                Some(deadline)
+                            );
+                            continue;
+                        }
+                        if trial == 62 {
+                            assert_eq!(
+                                Mapping::new(
+                                    retained,
+                                    parent,
+                                    locator_output.get_mut(..2).unwrap(),
+                                    Tick(1)
+                                )
+                                .err(),
+                                Some(Error::ResponseCapacity)
+                            );
+                            continue;
+                        }
+                        let mut mapping =
+                            Mapping::new(retained, parent, &mut locator_output, Tick(1)).unwrap();
+                        if trial == 58 || trial == 60 {
+                            assert_eq!(mapping.poll(Tick(1)), Ok(Status::Yield));
+                            if trial == 58 {
+                                assert_eq!(mapping.finish(Tick(100)).err(), Some(deadline));
+                            } else {
+                                forget(mapping);
+                            }
+                            continue;
+                        }
+                        assert_eq!(mapping.poll(Tick(1)), Ok(Status::Yield));
+                        assert_eq!(mapping.poll(Tick(1)), Ok(Status::Yield));
+                        assert_eq!(mapping.poll(Tick(1)), Ok(Status::Complete));
+                        if trial == 61 {
+                            forget(mapping);
+                            continue;
+                        }
+                        let mut mapped = mapping.finish(Tick(1)).unwrap();
+                        if trial == 59 {
+                            assert_eq!(mapped.check_deadline(Tick(100)), Err(deadline));
+                            assert!(mapped.value().is_none());
+                            assert_eq!(mapped.finish(Tick(1)).err(), Some(deadline));
+                            continue;
+                        }
+                        let ((actual, candidates), ((actual_mode, bytes, view), work, budget)) =
+                            mapped.finish(Tick(1)).unwrap();
+                        assert_eq!(actual, parent);
+                        assert_eq!(actual_mode, mode);
+                        assert!(!bytes.is_empty());
+                        assert_eq!(view.fragments.len(), 3);
+                        assert_eq!(candidates.len(), 3);
+                        assert!(candidates.first().unwrap().wire().is_none());
+                        assert!(candidates
+                            .get(1..)
+                            .unwrap()
+                            .iter()
+                            .all(|c| c.wire().is_some_and(|s| s.len() == 69)));
+                        assert_eq!(
+                            (std::ptr::from_mut(work), std::ptr::from_mut(budget)),
+                            (pointers.0, pointers.1)
+                        );
+                        continue;
+                    }
                     if trial == 52 {
                         assert_eq!(retained.check_deadline(Tick(100)), Err(deadline));
                         assert!(retained.value().is_none());

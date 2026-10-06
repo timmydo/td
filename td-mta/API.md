@@ -5266,6 +5266,48 @@ Eight additional
 measured Rust allocation intervals preserve the earlier 49. Native stack,
 RSS, authenticated locators and complete response publication remain open.
 
+### 1.125 Original provisional direct-leaf locator candidates
+
+M06dt adds retained::locators. Cursor::new consumes only original whole
+Retained and takes a typed, untrusted parent BlobId plus exactly one
+caller candidate slot per original ordinal. Fresh admission precedes
+capacity; too few slots refuse ResponseCapacity, surplus InvalidState.
+Passive member bytes or candidates cannot reconstruct the constructor.
+
+Each poll maps one original descriptor. Multipart candidates have no
+locator or wire ID. A leaf uses body_start minus original source base,
+entity_end minus body_start and original transfer encoding, with checked
+ranges against source length. Canonical p1 bytes identify encoded extents;
+decoded size never substitutes. Unknown transfer encodings retain the
+original identity rule. This adds no body decoding or nested p2 context.
+
+Original work/header owners fund at most 69 interpretation steps, six
+records and 69 newly generated wire bytes per poll, with no source/I/O
+debit. The stored candidate record and complete wire are funded before
+slot replacement. Refusal leaves each uncommitted slot unchanged, including
+stale passive contents in reused backing; that backing is not a completed
+result after refusal. It hides whole values and is
+sticky. Cached Complete is inert; fresh complete finish yields exclusive Mapped.
+Explicit checks and consuming release freshly admit and return original
+retained bytes, evidence, candidate backing and admission owners.
+
+Candidate remains passive and provisional, with read-only ordinal/locator
+getters and consistent stored wire bytes. View remains forgeable. The supplied
+parent ID is not authenticated. Actual issuance/download/reuse must bind
+whole source identity and live authorized parent access as WIRE.md
+requires; in-range coordinates alone grant nothing. Mapped retains the
+original private completion for that subsequent boundary.
+
+Candidate fits 128 bytes; Cursor plus HeaderBudget and one temporary
+Candidate fits 1 KiB; Mapped fits 256 bytes. Caller slots are separately
+admitted, with no heap or additional allowance. Six units cover literal
+IDs for all transfer tags, empty bodies/final CRLF, encoded lengths,
+base normalization, multipart nulls, every prefix, constructor capacity
+and expiry, exact positive quota refusal and no source/I/O debit. Five
+compile-fail guards pin exclusive ownership and reject passive input.
+Eight additional measured Rust allocation trials preserve the earlier
+57. Native-stack/RSS and authenticated response publication remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

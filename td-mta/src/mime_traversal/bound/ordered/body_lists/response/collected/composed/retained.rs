@@ -1,4 +1,5 @@
 //! Fixed whole-member retention bound to a fresh original composer.
+pub mod locators;
 use super::{Composed, Error, Mode, Serialized, View};
 pub use crate::mime_traversal::Status;
 use crate::{admission::work::Meter, nfc::HeaderBudget, ports::Tick};

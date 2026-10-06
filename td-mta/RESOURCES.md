@@ -2314,6 +2314,28 @@ precedes the next funded step; fresh deadline admission precedes both.
 Partial/complete forgetting exercises loss of proof and is equivalent to
 dropping these destructor-free owners; no destructor cleanup is claimed.
 
+M06dt direct-leaf candidate mapping uses one separately admitted fixed
+Candidate slot per original part. Candidate fits 128 bytes, so its
+conservative reservation is 128 times the admitted part count, computed
+with checked arithmetic. Slots overlap all original retained metadata
+until release. Cursor plus HeaderBudget and one temporary Candidate fits
+1 KiB; Mapped fits 256 bytes. No heap, new allowance or body buffer enters.
+
+Each turn maps one ordinal and funds at most 69 steps, six records and
+69 new wire bytes before storage, with no source/I/O debit. Multipart
+turns fund one step and a stored record but emit no locator. Candidate
+wire uses encoded length, not decoded-size storage or an extra replay.
+
+Eight measured Rust allocation intervals preserve the earlier 57:
+healthy tree/list release, partial expiry, completed Mapped expiry,
+partial/complete forgetting, too-few slots and constructor expiry. All
+candidate backing precedes counting. Units pin literal transfer tags,
+encoded extents, source-base normalization and every positive quota cut;
+zero source/I/O allowances still succeed. Five compile-fail guards pin
+exclusive owners and reject passive substitution. Destructor-free
+forgetting tests consuming loss of proof. These checks do not qualify
+native stack, RSS, parent authorization or complete response memory.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no
