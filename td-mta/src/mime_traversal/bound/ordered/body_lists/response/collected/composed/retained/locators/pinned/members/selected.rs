@@ -1,5 +1,7 @@
 //! Pure ten-field selection over original generated metadata and bound locators.
+#[path = "selected/index.rs"]
 mod index;
+#[path = "selected/retained.rs"]
 pub mod retained;
 pub use super::Status;
 use super::{Bound, Error, Progress};
@@ -140,4 +142,5 @@ const _: () = assert!(std::mem::size_of::<Member<'_, '_, '_, '_, '_, '_, '_, '_,
 #[cfg(test)]
 pub use tests::probe as probe_allocations;
 #[cfg(test)]
+#[path = "selected/tests.rs"]
 mod tests;

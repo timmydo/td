@@ -505,7 +505,9 @@ fn none_still_pays_original_ordinal_handoff_and_refuses_its_quotas() {
             let s = &mut bound.original.source.original.source.projected.structure;
             let expected = if kind == 0 {
                 let left = s.budget.steps_remaining();
-                s.budget.charge(s.work, Tick(1), 0, left, &mut 0).unwrap();
+                s.budget
+                    .charge(s.work, Tick(1), 0, left, &mut crate::nfc::Credit::new())
+                    .unwrap();
                 crate::nfc::Error::InterpretationLimit
             } else {
                 let left = s.work.remaining().records;

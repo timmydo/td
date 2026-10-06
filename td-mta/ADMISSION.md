@@ -7,7 +7,8 @@ M04c1 implements checked disk/work configuration in
 already validated ResourcePlan, DiskLimits, WorkLimits and explicit
 ViewMode. It validates capacity relationships without allocating pools or
 inspecting the filesystem. M04c2 supplies pure charged meters and timer
-budgets in `src/admission/work.rs` and `src/admission/timers.rs`. Fixed logical
+budgets in `../td-mime/src/work.rs` (re-exported by `src/admission/work.rs`)
+and `src/admission/timers.rs`. Fixed logical
 leases and linear effect tickets live in `src/admission/logical.rs`, using `src/admission/quota.rs`.
 The scalar writer/checkpoint ledger is in `src/admission/writer.rs`.
 Runtime locking, actual I/O, cleanup proofs and recovery remain M05/M08.

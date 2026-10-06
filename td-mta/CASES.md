@@ -43,7 +43,7 @@ to form fixture bytes. Expected strings are independent literals.
 | H03 | `Subject: x=?UTF-8?Q?Cafe=CC=81?=y\r\n\r\n`: bad placement leaves Text `x=?UTF-8?Q?Cafe=CC=81?=y` | M06/M14 |
 | H04 | Message-ID `<a@example.test> garbage` has MessageIds null; complete `<a@example.test> (x) <b@example.test>` gives `["a@example.test","b@example.test"]`; header:From:asDate is invalidArguments | M06/M14 |
 | H05 | Address/group/quoted-pair/comment fallback, UTF-8/EAI, RFC 2047 placement, Date numeric/obsolete zones and -0000, List URL parse failures; assert every header form and whitelist combination | M06/M14-M15 |
-| H06 | Input scalars U+0065 U+0301 normalize to U+00E9; U+1100 U+1161 U+11A8 normalize to U+AC01; complete UNICODE.md official vectors and replay failures are separate required tests | M06 |
+| H06 | Input scalars U+0065 U+0301 normalize to U+00E9; U+1100 U+1161 U+11A8 normalize to U+AC01; complete ../td-mime/UNICODE.md official vectors and replay failures are separate required tests | M06 |
 | M01 | base64 `TQ==` -> hex 4d, `TWE=` -> 4d61, `TWFu` -> 4d616e, `TQ` -> 4d with problem, `T!Q==Z` -> 4d with problem, `T` -> empty with problem | M06/M14 |
 | M02 | QP `a=20\r\nb \t\r\nc=0A=QZ=` -> bytes `a \r\nb\r\nc\n=QZ` with problem; split every byte and test arbitrarily long literal trailing whitespace | M06/M14 |
 | M03 | Body `\u00e9\r\nx` in UTF-8: downloaded bytes c3a90d0a78, body value `\u00e9\nx`; maxBodyValueBytes 1 -> empty/truncated, 2 -> `\u00e9`/truncated, 0 -> full/not truncated | M06/M14 |

@@ -1684,7 +1684,7 @@ allocations and whole-process RSS unqualified.
 
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also
-fits within UNICODE.md's future 256-byte decoding cursor checkpoint. No
+fits within ../td-mime/UNICODE.md's future 256-byte decoding cursor checkpoint. No
 partition or process allowance grows. One turn inspects at most four source
 bytes and returns at most one scalar, with no owned string or arena. An
 isolated Rust allocation interval covers all four charsets, single-byte

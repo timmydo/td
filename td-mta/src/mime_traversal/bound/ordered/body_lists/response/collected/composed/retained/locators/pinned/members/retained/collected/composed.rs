@@ -1,6 +1,9 @@
 //! Original source-bound whole members share the bounded tree/list frame.
+#[path = "composed/requested.rs"]
 pub mod requested;
+#[path = "composed/retained.rs"]
 pub mod retained;
+#[path = "composed/selected.rs"]
 pub mod selected;
 use super::super::super::super::super::Error as OriginalError;
 use super::{Error, Serialized, View};
@@ -138,7 +141,7 @@ impl Source for Serialized<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_, '_> {
         now: Tick,
         steps: u64,
         output: u64,
-        credit: &mut u8,
+        credit: &mut crate::nfc::Credit,
     ) -> Result<(), OriginalError> {
         let structure = &mut self
             .source
@@ -276,4 +279,5 @@ const _: () =
 #[cfg(test)]
 pub use tests::probe as probe_allocations;
 #[cfg(test)]
+#[path = "composed/tests.rs"]
 mod tests;

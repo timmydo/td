@@ -1,4 +1,5 @@
 //! Fixed whole-member retention bound to a fresh original composer.
+#[path = "retained/locators.rs"]
 pub mod locators;
 use super::{Composed, Error, Mode, Serialized, View};
 pub use crate::mime_traversal::Status;
@@ -141,4 +142,5 @@ const _: () = assert!(
 const _: () = assert!(std::mem::size_of::<Retained<'_, '_, '_, '_, '_, '_>>() <= 256);
 
 #[cfg(test)]
+#[path = "retained/tests.rs"]
 mod tests;

@@ -17,6 +17,7 @@ needs them:
   normative document.
 - For login or credentials, read `td-login/THREAT-MODEL.md`.
 - For mail serving, storage, or submission, read `td-mta/DESIGN.md`.
+- For shared MIME parsing or decoding, read `td-mime/DESIGN.md`.
 - For td-crypto or its consumer boundary, read `td-crypto/DESIGN.md`.
 - For shared header lexical syntax, read `td-header/DESIGN.md`.
 - For shared Unicode normalization, read `td-nfc/DESIGN.md`.
@@ -367,10 +368,10 @@ message.
   exception is `td-crypto`'s private Rustls/AWS-LC closure: exact manifests,
   locks, root Cargo configuration and active features are pinned in `builder/src/crypto_policy.rs`.
   `td-mta` depends directly on local `td-crypto` and std-only `td-header`
-  plus `td-json` and `td-nfc`; its lock includes their closures. All five
+  plus `td-json`, `td-mime` and `td-nfc`; its lock includes their closures. All six
   local manifests and locks are pinned. No other roster crate may depend
   on `td-crypto` or `td-mta`, directly or transitively; `td-header`,
-  `td-json` and `td-nfc` remain
+  `td-json`, `td-mime` and `td-nfc` remain
   ordinary std-only shared crates.
   `td-crypto/DESIGN.md` owns offline preparation and backend confinement.
   Any new external dependency needs principle-2 sign-off.

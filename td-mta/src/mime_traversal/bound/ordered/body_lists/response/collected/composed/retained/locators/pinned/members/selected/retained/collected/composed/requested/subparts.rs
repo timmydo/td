@@ -1,4 +1,5 @@
 //! Explicit subParts selection shares bounded framing and original custody.
+#[path = "subparts/retained.rs"]
 pub mod retained;
 
 use super::super::super::{Serialized, View};
@@ -151,4 +152,5 @@ const _: () =
 #[cfg(test)]
 pub use tests::probe as probe_allocations;
 #[cfg(test)]
+#[path = "subparts/tests.rs"]
 mod tests;

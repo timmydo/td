@@ -231,7 +231,13 @@ fn original_wire_record_step_cutoffs_hide_partial_retention() {
                 let remaining = structure.budget.steps_remaining();
                 structure
                     .budget
-                    .charge(structure.work, Tick(1), 0, remaining, &mut 0)
+                    .charge(
+                        structure.work,
+                        Tick(1),
+                        0,
+                        remaining,
+                        &mut crate::nfc::Credit::new(),
+                    )
                     .unwrap();
             } else {
                 structure

@@ -315,7 +315,13 @@ fn constructor_and_premature_finish_admit_before_local_errors() {
             assert!(classified
                 .structure
                 .budget
-                .charge(classified.structure.work, Tick(1), bytes + 1, 0, &mut 0)
+                .charge(
+                    classified.structure.work,
+                    Tick(1),
+                    bytes + 1,
+                    0,
+                    &mut crate::nfc::Credit::new()
+                )
                 .is_err());
             Error::Admission(crate::nfc::Error::InterpretationLimit)
         } else {

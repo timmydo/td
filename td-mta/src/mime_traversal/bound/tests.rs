@@ -820,7 +820,13 @@ fn classification_spends_all_five_original_resources_and_exact_node_bytes() {
                     (0, 16_000_000 - grant)
                 };
                 budget
-                    .charge(&mut work, Tick(1), bytes, steps, &mut 0)
+                    .charge(
+                        &mut work,
+                        Tick(1),
+                        bytes,
+                        steps,
+                        &mut crate::nfc::Credit::new(),
+                    )
                     .unwrap();
             }
             let mut scratch = Scratch::new();

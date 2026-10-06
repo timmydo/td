@@ -3,7 +3,7 @@
 This freezes the remaining M02 policies for M06, M08 and M13-M16. It does not
 implement a MIME parser or JMAP handler. [CONFORMANCE.md](CONFORMANCE.md) owns
 the complete standard surface, [WIRE.md](WIRE.md) owns stable blob locators,
-[UNICODE.md](UNICODE.md) owns Unicode inputs, and [CASES.md](CASES.md) owns
+[Unicode data](../td-mime/UNICODE.md) owns Unicode inputs, and [CASES.md](CASES.md) owns
 the acceptance case inventory. [RFC
 8621](https://www.rfc-editor.org/rfc/rfc8621.html) defines property
 shapes/defaults; the policies here select implementation choices and recovery
@@ -273,7 +273,7 @@ diagnostic, preserving raw headers and parsed components. No leap component
 is clamped or rolled into another minute. The pin's expiration does not
 erase historical insertions or establish future absence; updates are
 reviewed git changes. The exact input and cold validation contract are in
-leap-seconds/README.md.
+../td-mime/leap-seconds/README.md.
 
 The URLs form parses RFC 2369 lists and returns null for invalid input.
 Validate the complete list; do not apply RFC 2369's SHOULD-ignore-tail
@@ -618,7 +618,7 @@ are substring matches, without stemming. An empty quoted phrase matches every
 string, just like an empty unquoted operand. Outside phrases, backslash is
 literal; a Windows path needing literal backslashes inside a phrase must
 escape them as the RFC requires. Empty text matches the empty token set.
-Compare Unicode scalars after UNICODE.md's simple lowercase mapping. Do not
+Compare Unicode scalars after ../td-mime/UNICODE.md's simple lowercase mapping. Do not
 strip accents or promise sharp-s/ss or canonical-equivalence matching. Compare
 the decoded field representation literally after simple lowercase; query
 operands receive no implicit NFC. Header Text has mandatory NFC while

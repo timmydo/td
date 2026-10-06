@@ -4,8 +4,14 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
 
-pub(crate) const LOCAL_SOURCES: &[&str] =
-    &["td-crypto", "td-header", "td-json", "td-mta", "td-nfc"];
+pub(crate) const LOCAL_SOURCES: &[&str] = &[
+    "td-crypto",
+    "td-header",
+    "td-json",
+    "td-mime",
+    "td-mta",
+    "td-nfc",
+];
 
 pub(crate) const DEPENDENCIES: &[&str] = &[
     "aws-lc-rs = { version = \"=1.18.1\", default-features = false, features = [\"alloc\", \"non-fips\"] }",
@@ -20,10 +26,11 @@ pub(crate) fn admitted(name: &str) -> bool {
 pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-crypto" => "7ca2d70176ddb80083ff07de51465e8194fd01e4e4d435201444f11ed997c308",
-        "td-mta" => "370cb5d6d634a93fb266e57233b7f99ca1d1f4135aa885b5ebc49ba0755aaf1a",
+        "td-mta" => "7a8c3a5233931da73589b804d3a051574f35bd5cc9357a1fe8afc7da7b834481",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
         "td-json" => "2793cd9cd8ffc7bac436069324b42b503f7f3114418fc95f558fb0831060e8b3",
         "td-nfc" => "39d752d381e239345e4ba213ea2ce2fb4efb723a4ea9f16f1d8aa1f1173359cf",
+        "td-mime" => "3f14e32d7ee4f4b11e57845153df490fc4d0480f282477ecebf2349d5347b1d4",
         _ => {
             return Err(format!(
                 "{name} has no external crypto dependency admission"
@@ -36,10 +43,11 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
 pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-crypto" => "499bfd9b6780ca6cc7df5c928a16d7397c43b61bbde1d164d532c494c530514b",
-        "td-mta" => "88cdc20aaa48bd2a562b3fc4b3fc3879c86ca8cba93b211d0e28b87522b9cb58",
+        "td-mta" => "929c0ffbf66b9a6d43883f73b29ea53d46db061a54a2d794ec9c3c6afa046402",
         "td-header" => "2862fd9186d5cdef3d645af0b43dee9f77ba51beee5d98219e5aae30db11eabc",
         "td-json" => "679f89cdafa0f8457884ba0d0f0c197814d2b13e4f6ece4557575c9bdfe3848c",
         "td-nfc" => "6b447fb42d5b4e2aa2a02da0817647db6f178d445f8dc3861c7c9a011cce4695",
+        "td-mime" => "72893a76d9ecfaad70a4bcf8447386fa5a0d2127ec5c4c770c9ac14438c0a7ed",
         _ => {
             return Err(format!(
                 "{name} has no external crypto dependency admission"
@@ -155,7 +163,7 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
     let mut expected: BTreeSet<String> = ACTIVE.lines().map(str::to_owned).collect();
     let mut local = vec!["td-crypto"];
     if name == "td-mta" {
-        local.extend(["td-header", "td-json", "td-mta", "td-nfc"]);
+        local.extend(["td-header", "td-json", "td-mime", "td-mta", "td-nfc"]);
     }
     for package in local {
         let path = root
@@ -296,7 +304,7 @@ mod tests {
     #[test]
     fn std_source_pins_refuse_dependency_changes() {
         let root = root();
-        for name in ["td-header", "td-json", "td-nfc"] {
+        for name in ["td-header", "td-json", "td-mime", "td-nfc"] {
             if !root.join(name).join("Cargo.toml").exists() {
                 continue;
             }
@@ -374,12 +382,14 @@ mod tests {
         let json = root.join("td-json").canonicalize().unwrap();
         let header = root.join("td-header").canonicalize().unwrap();
         let nfc = root.join("td-nfc").canonicalize().unwrap();
+        let mime = root.join("td-mime").canonicalize().unwrap();
         let mailgraph = format!(
-            "{graph}td-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\n",
+            "{graph}td-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\n",
             mail.display(),
             json.display(),
             header.display(),
-            nfc.display()
+            nfc.display(),
+            mime.display()
         );
         assert!(active_graph(
             &root,
@@ -410,6 +420,12 @@ mod tests {
             &root,
             "td-mta",
             &mailgraph.replace(&nfc.display().to_string(), "/wrong/nfc")
+        )
+        .is_err());
+        assert!(active_graph(
+            &root,
+            "td-mta",
+            &mailgraph.replace(&format!("td-mime v0.1.0 ({})|\n", mime.display()), "")
         )
         .is_err());
         assert!(active_graph(&root, "td-mta", &graph).is_err());

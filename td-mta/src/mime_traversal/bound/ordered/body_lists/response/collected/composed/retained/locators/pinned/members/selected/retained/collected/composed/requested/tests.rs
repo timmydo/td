@@ -463,7 +463,13 @@ fn facade_wire_record_and_step_refusals_preserve_exact_sticky_errors() {
                 let steps = structure.budget.steps_remaining();
                 structure
                     .budget
-                    .charge(structure.work, Tick(1), 0, steps - 1, &mut 0)
+                    .charge(
+                        structure.work,
+                        Tick(1),
+                        0,
+                        steps - 1,
+                        &mut crate::nfc::Credit::new(),
+                    )
                     .unwrap();
             } else {
                 structure

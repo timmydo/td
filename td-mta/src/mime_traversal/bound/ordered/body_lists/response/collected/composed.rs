@@ -1,5 +1,7 @@
 //! Private body metadata members; authenticated blob locators and publication follow.
+#[path = "composed/framing.rs"]
 pub(crate) mod framing;
+#[path = "composed/retained.rs"]
 pub mod retained;
 use super::{Error, Serialized, View};
 use crate::{admission::work::Charge, ports::Tick};
@@ -89,7 +91,13 @@ impl<'a, 'w, 'n, 'c, 'o> Cursor<'a, 'w, 'n, 'c, 'o> {
     }
 }
 impl framing::Source for Serialized<'_, '_, '_, '_, '_> {
-    fn charge(&mut self, now: Tick, steps: u64, output: u64, credit: &mut u8) -> Result<(), Error> {
+    fn charge(
+        &mut self,
+        now: Tick,
+        steps: u64,
+        output: u64,
+        credit: &mut crate::nfc::Credit,
+    ) -> Result<(), Error> {
         let structure = &mut self.projected.structure;
         structure
             .budget
@@ -191,4 +199,5 @@ const _: () = assert!(
 const _: () = assert!(std::mem::size_of::<Composed<'_, '_, '_, '_, '_>>() <= 256);
 
 #[cfg(test)]
+#[path = "composed/tests.rs"]
 mod tests;

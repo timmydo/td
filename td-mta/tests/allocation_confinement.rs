@@ -39,11 +39,11 @@ fn scan(root: &Path, path: &Path) {
             continue;
         }
         let relative = path.strip_prefix(root).unwrap().to_str().unwrap();
-        if relative == "tests/allocation_confinement.rs" {
+        if relative == "td-mta/tests/allocation_confinement.rs" {
             continue;
         }
         let source = std::fs::read_to_string(&path).unwrap();
-        if relative == "tests/support/allocation_shim.rs" {
+        if relative == "td-mta/tests/support/allocation_shim.rs" {
             assert_eq!(words(&source, "unsafe"), 9);
             assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 1);
             assert_eq!(source.matches("#[global_allocator]").count(), 1);
@@ -51,7 +51,7 @@ fn scan(root: &Path, path: &Path) {
                 &source,
                 "5e32cd6f5f5c9e32c073ef5cbbed1afe01e939fdc92c9f8e97c8b3566a09bf6b",
             );
-        } else if relative == "tests/support/native_allocator_bridge.rs" {
+        } else if relative == "td-mta/tests/support/native_allocator_bridge.rs" {
             assert_eq!(words(&source, "unsafe"), 20);
             assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 7);
             assert!(!source.contains("global_allocator"));
@@ -59,7 +59,7 @@ fn scan(root: &Path, path: &Path) {
                 &source,
                 "f552000f6717c0eee3a3b3ab8fa6abea2c2f74e7fed9bf7a9dd2b1344509fcd3",
             );
-        } else if relative == "tests/support/native_allocation_controls.rs" {
+        } else if relative == "td-mta/tests/support/native_allocation_controls.rs" {
             assert_eq!(words(&source, "unsafe"), 10);
             assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 2);
             assert!(!source.contains("global_allocator"));
@@ -72,13 +72,13 @@ fn scan(root: &Path, path: &Path) {
             assert!(!source.contains("allow(unsafe_code"), "{relative}");
             assert!(!source.contains("global_allocator"), "{relative}");
         }
-        if relative == "tests/support/allocation_registry.rs" {
+        if relative == "td-mta/tests/support/allocation_registry.rs" {
             fingerprint(
                 &source,
                 "a3fb5de818f0d5240fc32a3a915337412a915a698bae54e34fd86665bc507caf",
             );
         }
-        if relative == "tests/support/allocation_counter.rs" {
+        if relative == "td-mta/tests/support/allocation_counter.rs" {
             fingerprint(
                 &source,
                 "14e2ef08d8dea85709f5d86e2a60e0b2e965903f5c001e9a46fa9bdecfe9e7d1",
@@ -86,9 +86,9 @@ fn scan(root: &Path, path: &Path) {
         }
         if !matches!(
             relative,
-            "tests/native_alloc_probe.rs"
-                | "tests/support/native_allocator_bridge.rs"
-                | "tests/support/native_allocation_controls.rs"
+            "td-mta/tests/native_alloc_probe.rs"
+                | "td-mta/tests/support/native_allocator_bridge.rs"
+                | "td-mta/tests/support/native_allocation_controls.rs"
         ) {
             for forbidden in [
                 "native_alloc_probe",
@@ -101,14 +101,14 @@ fn scan(root: &Path, path: &Path) {
                 assert!(!source.contains(forbidden), "{relative}: {forbidden}");
             }
         }
-        if relative.starts_with("src/") {
+        if relative.starts_with("td-mta/src/") || relative.starts_with("td-mime/src/") {
             assert!(!source.contains("allocation_registry"), "{relative}");
         }
         if !matches!(
             relative,
-            "tests/rust_alloc_probe.rs"
-                | "tests/support/allocation_shim.rs"
-                | "tests/support/allocation_counter.rs"
+            "td-mta/tests/rust_alloc_probe.rs"
+                | "td-mta/tests/support/allocation_shim.rs"
+                | "td-mta/tests/support/allocation_counter.rs"
         ) {
             for forbidden in [
                 "allocation_shim",
@@ -153,8 +153,40 @@ fn allocation_surface_is_separate_and_exact() {
     }
     assert!(include_str!("../Cargo.toml")
         .contains("[[test]]\nname = \"native_alloc_probe\"\nharness = false\n"));
-    scan(root, &root.join("src"));
-    scan(root, &root.join("tests"));
-    scan(root, &root.join("tools"));
-    scan(root, &root.join("examples"));
+    let repository = root.parent().unwrap();
+    scan(repository, &root.join("src"));
+    scan(repository, &root.join("tests"));
+    let shared = repository.join("td-mime");
+    assert_eq!(
+        shared.strip_prefix(repository).unwrap(),
+        Path::new("td-mime")
+    );
+    for directory in ["src", "tests", "tools", "examples"] {
+        scan(repository, &shared.join(directory));
+    }
+}
+
+#[test]
+fn shared_sources_cannot_inherit_mail_allocation_exemptions() {
+    let fixture = std::env::temp_dir().join(format!("td-mime-confinement-{}", std::process::id()));
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(fixture.clone());
+    let shared = fixture.join("td-mime/tests/support");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(
+        shared.join("allocation_shim.rs"),
+        include_str!("support/allocation_shim.rs"),
+    )
+    .unwrap();
+    assert!(std::panic::catch_unwind(|| scan(&fixture, &shared)).is_err());
+    std::fs::remove_file(shared.join("allocation_shim.rs")).unwrap();
+    let source = fixture.join("td-mime/src");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("fixture.rs"), b"// allocation_registry\n").unwrap();
+    assert!(std::panic::catch_unwind(|| scan(&fixture, &source)).is_err());
 }

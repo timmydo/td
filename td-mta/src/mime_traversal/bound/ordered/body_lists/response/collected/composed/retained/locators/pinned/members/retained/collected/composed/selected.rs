@@ -1,4 +1,5 @@
 //! Requested list-property members under original collection and pin custody.
+#[path = "selected/retained.rs"]
 pub mod retained;
 use super::{Error, Progress, Serialized, View};
 use crate::mime_traversal::bound::ordered::body_lists::response::collected::composed::framing;
@@ -135,4 +136,5 @@ const _: () =
 #[cfg(test)]
 pub use tests::probe as probe_allocations;
 #[cfg(test)]
+#[path = "selected/tests.rs"]
 mod tests;

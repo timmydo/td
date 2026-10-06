@@ -51,7 +51,7 @@ fn drain(cursor: &mut Cursor<'_, '_, '_, '_, '_, '_, '_, '_, '_>, width: usize) 
             .selection
             .as_ref()
             .is_some_and(|index| !index.ready());
-        let credit = cursor.inner.credit;
+        let credit = cursor.inner.credit.remaining();
         let steps = if scanning {
             cursor
                 .inner
@@ -422,7 +422,13 @@ fn interpretation_record_and_wire_refusals_precede_selected_copy() {
                 let left = structure.budget.steps_remaining();
                 structure
                     .budget
-                    .charge(structure.work, Tick(1), 0, left, &mut 0)
+                    .charge(
+                        structure.work,
+                        Tick(1),
+                        0,
+                        left,
+                        &mut crate::nfc::Credit::new(),
+                    )
                     .unwrap();
                 crate::nfc::Error::InterpretationLimit
             } else {

@@ -1,0 +1,25 @@
+[package]
+name = "td-mime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded MIME parsing and decoding with caller-owned storage"
+
+[workspace]
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[dependencies]
+td-header = { path = "../td-header" }
+td-json = { path = "../td-json" }
+td-nfc = { path = "../td-nfc" }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

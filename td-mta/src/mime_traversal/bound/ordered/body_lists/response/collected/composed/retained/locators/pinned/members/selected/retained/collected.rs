@@ -1,4 +1,5 @@
 //! Collect every original ordinal with one immutable ten-field selection.
+#[path = "collected/composed.rs"]
 pub mod composed;
 use super::super::super::retained::collected as shared;
 pub use super::Status;
@@ -164,4 +165,5 @@ const _: () =
 #[cfg(test)]
 pub use tests::probe as probe_allocations;
 #[cfg(test)]
+#[path = "collected/tests.rs"]
 mod tests;

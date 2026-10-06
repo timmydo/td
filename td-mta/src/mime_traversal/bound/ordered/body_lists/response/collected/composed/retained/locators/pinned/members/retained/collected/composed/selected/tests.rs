@@ -213,7 +213,9 @@ fn selected_wire_record_and_step_refusals_are_exact_sticky_and_source_io_free() 
             let left = s.work.remaining();
             if kind == 2 {
                 let steps = s.budget.steps_remaining();
-                s.budget.charge(s.work, Tick(1), 0, steps, &mut 0).unwrap();
+                s.budget
+                    .charge(s.work, Tick(1), 0, steps, &mut crate::nfc::Credit::new())
+                    .unwrap();
             } else {
                 s.work
                     .charge(

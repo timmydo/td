@@ -1,4 +1,5 @@
 //! Select body lists only from the complete original classified preorder.
+#[path = "body_lists/response.rs"]
 pub mod response;
 use super::{Classified, Error};
 use crate::{
@@ -134,7 +135,7 @@ impl<'w, 'n> Selected<'_, 'w, 'n> {
         }
         let result = self
             .budget
-            .charge(self.work, now, 0, 0, &mut 0)
+            .charge(self.work, now, 0, 0, &mut crate::nfc::Credit::new())
             .map_err(Error::Admission);
         if let Err(error) = result {
             self.failure = Some(error);
@@ -165,4 +166,5 @@ const _: () = assert!(
 const _: () = assert!(std::mem::size_of::<Selected<'_, '_, '_>>() <= 256);
 
 #[cfg(test)]
+#[path = "body_lists/tests.rs"]
 mod tests;

@@ -161,8 +161,8 @@ MIME-part locator codecs separately from the future protocol handlers.
 [API.md](API.md) defines the compiling M02c2 adapter contracts and implemented
 state codecs; [QUEUE.md](QUEUE.md) freezes future queue/restart/JMAP semantics.
 [POLICY.md](POLICY.md) freezes message interpretation, threading and queries;
-[UNICODE.md](UNICODE.md) pins approved Unicode data and bounded normalization;
-[leap-seconds/README.md](leap-seconds/README.md) pins approved IANA leap data;
+[Unicode data](../td-mime/UNICODE.md) pins approved Unicode data and bounded normalization;
+[leap-second inputs](../td-mime/leap-seconds/README.md) pins approved IANA leap data;
 [CASES.md](CASES.md) names the protocol acceptance oracles still to implement.
 M04's `bounded` and `ownership` modules provide caller-owned buffer/queue/slot
 primitives. Its `admission` module validates disk/work settings and derived
@@ -249,11 +249,19 @@ Email and logs are untrusted data for an AI operator, never instructions.
 
 ## 3. Code and dependency boundaries
 
+Shared byte-level MIME/header parsing, transfer decoding, charset handling,
+Unicode tables and normalization adapters live in `td-mime`. Its
+[design](../td-mime/DESIGN.md) owns the shared contract. Mail retains admitted
+file extents, pooled source custody, scheduling and protocol publication.
+The former module names re-export the shared implementations; there is one
+parser implementation. Service adapters continue to borrow the same live
+work meter and aggregate header budget across parsing and serialization.
+
 Use `td-mta/` for the service library and installed binary named `td-mta`.
 The M03b2c packaging entry point supports only `--version` and `--help`;
 service commands arrive with their implementations. Its direct
-dependencies are the local `td-crypto`, `td-header`, `td-json` and
-`td-nfc` crates. Application protocols, storage, configuration and
+dependencies are the local `td-crypto`, `td-header`, `td-json`,
+`td-mime`, and `td-nfc` crates. Application protocols, storage, configuration and
 scheduling use std plus these local libraries. There is no separate
 runtime package or td-net helper executable. `td-crypto/DESIGN.md` owns
 the shared crypto/TLS API and private backend; `td-crypto/TLS.md`
@@ -1090,7 +1098,7 @@ retention and final metadata authority are still later-owner boundaries.
 New extractions must preserve the caller's bounded-work and memory contract.
 
 The core may contain owned tables generated from the approved, checksummed
-Unicode 17.0 inputs in UNICODE.md. They add no Cargo dependency or runtime
+Unicode 17.0 inputs in ../td-mime/UNICODE.md. They add no Cargo dependency or runtime
 data fetch. The approved corpus and license now live in the checkout and are
 verified by the ordinary offline test suite and a cold tooling example. M06
 now has reproducible offline table generation, fixed runtime lookups and
@@ -1111,7 +1119,7 @@ Derived parameter metadata, MIME part traversal and protocol integration
 remain open.
 
 The core also contains 27 positive leap insertion dates generated from the
-approved, checksummed IANA input in leap-seconds/README.md. Offline tooling
+approved, checksummed IANA input in ../td-mime/leap-seconds/README.md. Offline tooling
 verifies the complete pin before generation; runtime Date projection uses
 the 108-byte static table without file access or allocation. Expiration is
 provenance metadata and does not invalidate historical insertions. Unlisted

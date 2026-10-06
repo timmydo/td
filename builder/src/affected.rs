@@ -1527,8 +1527,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // td-crypto, td-header and td-nfc have no distribution recipe; td-mta reads them.
-    // Reader closure tests the shared crate and its mail consumer. Std crates
+    // These recipe-free shared crates route through their mail reader. Std crates
     // use ordinary Cargo; only td-crypto and td-mta use `crypto-cargo`, which
     // enforces pinned manifests, locks, Cargo config and backend features.
     // The full check added only gate 325's in-sandbox, networkless copy of
@@ -1536,7 +1535,10 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // source replacement), a recipe-checks scope no recipe reads (so every
     // check), and the bootstrap ladder; the portable musl build is its own
     // command.
-    if (p.starts_with("td-crypto/") || p.starts_with("td-header/") || p.starts_with("td-nfc/"))
+    if (p.starts_with("td-crypto/")
+        || p.starts_with("td-header/")
+        || p.starts_with("td-mime/")
+        || p.starts_with("td-nfc/"))
         && !p.contains("..")
     {
         sel.add_preflight("cargo-test");
@@ -5162,7 +5164,7 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// leaves the list in the landing that makes a recipe name it; a crate that
 /// gains a reader is no longer alone after reader closure, so it takes the
 /// whole list without the list changing. td-mta reads td-crypto, td-header,
-/// td-json and td-nfc, its direct dependencies. td-agent reads td-civil,
+/// td-json, td-mime and td-nfc, its direct dependencies. td-agent reads td-civil,
 /// td-fetch-client, td-fs, td-json, td-toml and td-ui, its dependencies, and
 /// td-compositor, the test tool its `native-compositor-tests` opt-in builds
 /// (td-agent/DESIGN.md §17).
@@ -5179,7 +5181,10 @@ const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[
             "td-ui",
         ],
     ),
-    ("td-mta", &["td-crypto", "td-header", "td-json", "td-nfc"]),
+    (
+        "td-mta",
+        &["td-crypto", "td-header", "td-json", "td-mime", "td-nfc"],
+    ),
 ];
 
 /// The subset of the derived command list a diff over `changed` can actually
@@ -9900,7 +9905,7 @@ mod tests {
         ] {
             let output = path_output(&root, path);
             let commands = cargo_test_cmds(&root, &[path.to_string()]).unwrap();
-            for name in ["td-header", "td-mta"] {
+            for name in ["td-header", "td-mime", "td-mta"] {
                 for action in ["test", "clippy"] {
                     assert!(
                         commands.iter().any(|command| {
@@ -9973,6 +9978,36 @@ mod tests {
     }
 
     #[test]
+    fn mime_paths_run_shared_and_mail_consumers_without_distro_checks() {
+        let root = repo_root();
+        if !root.join("td-mime/Cargo.toml").is_file() {
+            return;
+        }
+        for path in [
+            "td-mime/src/lib.rs",
+            "td-mime/Cargo.toml",
+            "td-mime/Cargo.lock",
+        ] {
+            let commands = cargo_test_cmds(&root, &[path.to_string()]).unwrap();
+            for action in ["test", "clippy"] {
+                assert!(commands.iter().any(|command| command.contains(&format!(
+                    "cargo {action} --frozen --manifest-path td-mime/Cargo.toml"
+                ))));
+                assert!(commands.iter().any(|command| command.contains(&format!(
+                    " gate-crates crypto-cargo {action} --manifest-path td-mta/Cargo.toml"
+                ))));
+            }
+            let output = path_output(&root, path);
+            assert!(!output.contains("td-builder check"), "{output}");
+            assert!(!output.contains("recipe-checks scope"), "{output}");
+        }
+        assert!(path_output(&root, "td-mime/DESIGN.md").contains("Selected checks: none"));
+        for path in ["td-mime-extra/src/lib.rs", "td-mime/../td-sh/src/main.rs"] {
+            assert!(path_output(&root, path).contains("td-builder check"));
+        }
+    }
+
+    #[test]
     fn mail_only_changes_run_own_tests_and_lints_without_distro_checks() {
         let root = repo_root();
         let Ok(roster) = discover_gate_crates(&root) else {
@@ -10034,6 +10069,7 @@ mod tests {
             "td-crypto",
             "td-header",
             "td-json",
+            "td-mime",
             "td-nfc",
             "td-authd",
         ] {
@@ -10076,9 +10112,9 @@ mod tests {
                 (path, text)
             })
             .collect();
-        // td-header and td-nfc share the recipe-free routing arm until packaging gains
+        // td-header, td-mime and td-nfc share the recipe-free routing arm until packaging gains
         // a consumer. Any such admission must revisit that arm too.
-        for name in names.into_iter().chain(["td-header", "td-nfc"]) {
+        for name in names.into_iter().chain(["td-header", "td-mime", "td-nfc"]) {
             for (path, text) in &texts {
                 assert!(
                     !text.contains(name),
@@ -10098,7 +10134,7 @@ mod tests {
                     .unwrap_or_default();
                 assert_eq!(
                     consumers,
-                    ["td-mta"],
+                    ["td-mime", "td-mta"],
                     "td-header gained a reader; revisit its affected-check mapping"
                 );
             }
@@ -10115,8 +10151,18 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 consumers,
-                ["td-mta"],
+                ["td-mime", "td-mta"],
                 "td-nfc gained a reader; revisit its affected-check mapping"
+            );
+            let consumers = readers
+                .iter()
+                .find(|(name, _)| name == "td-mime")
+                .map(|(_, consumers)| consumers.as_slice())
+                .unwrap();
+            assert_eq!(
+                consumers,
+                ["td-mta"],
+                "td-mime gained a reader; revisit its affected-check mapping"
             );
         } else {
             eprintln!("SKIP: builder-only sandbox has no mail sources");

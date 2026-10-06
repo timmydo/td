@@ -1,0 +1,1790 @@
+//! Complete candidate validation through fixed-state charged field replay.
+#[path = "parameter/display.rs"]
+pub mod display;
+#[path = "parameter/protocol.rs"]
+pub mod protocol;
+#[path = "parameter/scalars.rs"]
+pub mod scalars;
+use crate::{
+    attribute::{self, Form},
+    decode_work::{self, Work},
+    fields::{self, Parameter},
+    parameter_value,
+    time::Tick,
+    work::{Charge, Meter, Stop},
+};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Attribute {
+    Boundary,
+    Charset,
+    Name,
+    Filename,
+}
+impl Attribute {
+    const fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::Boundary => b"boundary",
+            Self::Charset => b"charset",
+            Self::Name => b"name",
+            Self::Filename => b"filename",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Plan {
+    Ordinary(Parameter),
+    Extended(Parameter),
+    Sections { count: u64, initial_encoded: bool },
+}
+/// Candidate evidence and a passive rejection diagnostic, not metadata authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Selection {
+    pub plan: Option<Plan>,
+    pub invalid_extended: bool,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Status {
+    Yield,
+    Complete(Selection),
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    Malformed,
+    NestingLimit,
+    Work(Stop),
+    InterpretationLimit,
+    InvalidState,
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed => f.write_str("malformed MIME parameter candidate"),
+            Self::NestingLimit => f.write_str("MIME parameter nesting limit"),
+            Self::Work(e) => write!(f, "MIME parameter work: {e}"),
+            Self::InterpretationLimit => f.write_str("MIME parameter interpretation limit"),
+            Self::InvalidState => f.write_str("invalid MIME parameter state"),
+        }
+    }
+}
+impl std::error::Error for Error {}
+impl From<decode_work::Error> for Error {
+    fn from(e: decode_work::Error) -> Self {
+        match e {
+            decode_work::Error::Work(e) => Self::Work(e),
+            decode_work::Error::InterpretationLimit => Self::InterpretationLimit,
+            decode_work::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
+impl From<fields::Error> for Error {
+    fn from(e: fields::Error) -> Self {
+        match e {
+            fields::Error::Malformed => Self::Malformed,
+            fields::Error::NestingLimit => Self::NestingLimit,
+            fields::Error::Work(e) => Self::Work(e),
+            fields::Error::InterpretationLimit => Self::InterpretationLimit,
+            fields::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
+impl From<attribute::Error> for Error {
+    fn from(e: attribute::Error) -> Self {
+        match e {
+            attribute::Error::Work(e) => Self::Work(e),
+            attribute::Error::InterpretationLimit => Self::InterpretationLimit,
+            attribute::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
+impl From<parameter_value::Error> for Error {
+    fn from(e: parameter_value::Error) -> Self {
+        match e {
+            parameter_value::Error::Malformed => Self::Malformed,
+            parameter_value::Error::Work(e) => Self::Work(e),
+            parameter_value::Error::InterpretationLimit => Self::InterpretationLimit,
+            parameter_value::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum Family {
+    None,
+    Single(Parameter),
+    Sections,
+    Invalid,
+}
+#[derive(Clone, Copy)]
+enum Pass {
+    Initial,
+    Lookup(u64),
+}
+#[derive(Clone, Copy)]
+enum Phase {
+    Start,
+    Scan,
+    Name,
+    Match,
+    Validate,
+    Finish,
+    Complete,
+}
+enum Event {
+    Yield,
+    Octet {
+        role: parameter_value::Role,
+        value: u8,
+    },
+    Complete(Selection),
+}
+
+/// Complete candidate selection; source plans are not publication authority.
+/// ```compile_fail,E0277
+/// fn cloned<T: Clone>() {} cloned::<td_mime::parameter::Cursor<'_>>();
+/// ```
+/// ```compile_fail,E0277
+/// fn copied<T: Copy>() {} copied::<td_mime::parameter::Cursor<'_>>();
+/// ```
+pub struct Cursor<'a> {
+    source: &'a [u8],
+    kind: fields::Kind,
+    attribute: Attribute,
+    phase: Phase,
+    pass: Pass,
+    fields: Option<fields::Cursor<'a>>,
+    name: Option<attribute::Cursor<'a>>,
+    value: Option<parameter_value::Cursor<'a>>,
+    parameter: Option<Parameter>,
+    classified: Option<attribute::Name>,
+    ordinary: Option<Parameter>,
+    family: Family,
+    count: u64,
+    max: u64,
+    found: Option<(Parameter, bool)>,
+    duplicate: bool,
+    initial_encoded: bool,
+    replay: bool,
+    result: Selection,
+    failure: Option<Error>,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct Checkpoint<'a> {
+    source: &'a [u8],
+    kind: fields::Kind,
+    attribute: Attribute,
+    phase: Phase,
+    pass: Pass,
+    fields: Option<fields::Checkpoint<'a>>,
+    name: Option<td_header::mime_attribute::Checkpoint<'a, decode_work::Error>>,
+    value: Option<td_header::mime_value::Checkpoint<'a, decode_work::Error>>,
+    parameter: Option<Parameter>,
+    classified: Option<attribute::Name>,
+    ordinary: Option<Parameter>,
+    family: Family,
+    count: u64,
+    max: u64,
+    found: Option<(Parameter, bool)>,
+    duplicate: bool,
+    initial_encoded: bool,
+    replay: bool,
+    result: Selection,
+}
+
+impl<'a> Cursor<'a> {
+    pub(crate) fn checkpoint(&self) -> Result<Checkpoint<'a>, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        Ok(Checkpoint {
+            source: self.source,
+            kind: self.kind,
+            attribute: self.attribute,
+            phase: self.phase,
+            pass: self.pass,
+            fields: self
+                .fields
+                .as_ref()
+                .map(|cursor| cursor.checkpoint())
+                .transpose()?,
+            name: self
+                .name
+                .as_ref()
+                .map(|cursor| cursor.checkpoint())
+                .transpose()?,
+            value: self
+                .value
+                .as_ref()
+                .map(|cursor| cursor.checkpoint())
+                .transpose()?,
+            parameter: self.parameter,
+            classified: self.classified,
+            ordinary: self.ordinary,
+            family: self.family,
+            count: self.count,
+            max: self.max,
+            found: self.found,
+            duplicate: self.duplicate,
+            initial_encoded: self.initial_encoded,
+            replay: self.replay,
+            result: self.result,
+        })
+    }
+    pub(crate) fn resume(checkpoint: Checkpoint<'a>) -> Self {
+        Self {
+            source: checkpoint.source,
+            kind: checkpoint.kind,
+            attribute: checkpoint.attribute,
+            phase: checkpoint.phase,
+            pass: checkpoint.pass,
+            fields: checkpoint.fields.map(fields::Cursor::resume),
+            name: checkpoint.name.map(attribute::Cursor::resume),
+            value: checkpoint.value.map(parameter_value::Cursor::resume),
+            parameter: checkpoint.parameter,
+            classified: checkpoint.classified,
+            ordinary: checkpoint.ordinary,
+            family: checkpoint.family,
+            count: checkpoint.count,
+            max: checkpoint.max,
+            found: checkpoint.found,
+            duplicate: checkpoint.duplicate,
+            initial_encoded: checkpoint.initial_encoded,
+            replay: checkpoint.replay,
+            result: checkpoint.result,
+            failure: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn new(source: &'a [u8], kind: fields::Kind, attribute: Attribute) -> Self {
+        Self {
+            source,
+            kind,
+            attribute,
+            phase: Phase::Start,
+            pass: Pass::Initial,
+            fields: None,
+            name: None,
+            value: None,
+            parameter: None,
+            classified: None,
+            ordinary: None,
+            family: Family::None,
+            count: 0,
+            max: 0,
+            found: None,
+            duplicate: false,
+            initial_encoded: false,
+            replay: false,
+            result: Selection {
+                plan: None,
+                invalid_extended: false,
+            },
+            failure: None,
+        }
+    }
+    pub fn check_deadline(&mut self, now: Tick, work: &mut Meter) -> Result<(), Error> {
+        self.check(|| Work::charge(work, now, Charge::default()))
+    }
+    fn check(
+        &mut self,
+        admit: impl FnOnce() -> Result<(), decode_work::Error>,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.failure {
+            return Err(e);
+        }
+        let result = admit().map_err(Error::from);
+        if let Err(e) = result {
+            self.failure = Some(e);
+            self.result.plan = None;
+        }
+        result
+    }
+    pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work)
+    }
+    fn poll_with_work(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
+        self.poll_event(now, work).map(|event| match event {
+            Event::Yield | Event::Octet { .. } => Status::Yield,
+            Event::Complete(selection) => Status::Complete(selection),
+        })
+    }
+    fn poll_event(&mut self, now: Tick, work: &mut impl Work) -> Result<Event, Error> {
+        if let Some(e) = self.failure {
+            return Err(e);
+        }
+        if matches!(self.phase, Phase::Complete) {
+            return Ok(Event::Complete(self.result));
+        }
+        let result = self.step(now, work);
+        if let Err(e) = result {
+            self.failure = Some(e);
+            self.result.plan = None;
+        }
+        result
+    }
+    fn begin_value(&mut self, p: Parameter, mode: parameter_value::Mode) -> Result<(), Error> {
+        let source = self
+            .source
+            .get(p.value.start..p.value.end)
+            .ok_or(Error::InvalidState)?;
+        self.value = Some(parameter_value::Cursor::new(source, p.quoted, mode));
+        self.phase = Phase::Validate;
+        Ok(())
+    }
+    fn choose_fallback(&mut self) -> Result<(), Error> {
+        if self.replay {
+            return Err(Error::InvalidState);
+        }
+        self.result.invalid_extended = !matches!(self.family, Family::None);
+        self.family = Family::Invalid;
+        self.value = None;
+        self.result.plan = self.ordinary.map(Plan::Ordinary);
+        self.phase = Phase::Finish;
+        Ok(())
+    }
+    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Event, Error> {
+        work.charge(
+            now,
+            Charge {
+                records: 1,
+                ..Charge::default()
+            },
+        )?;
+        match self.phase {
+            Phase::Start => {
+                if self.kind == fields::Kind::TransferEncoding {
+                    return Err(Error::InvalidState);
+                }
+                self.fields = Some(fields::Cursor::new(self.source, self.kind));
+                self.found = None;
+                self.duplicate = false;
+                self.phase = Phase::Scan;
+            }
+            Phase::Scan => {
+                match self
+                    .fields
+                    .as_mut()
+                    .ok_or(Error::InvalidState)?
+                    .poll_with_work(now, work)?
+                {
+                    fields::Status::Yield | fields::Status::Head(_) => {}
+                    fields::Status::Parameter(p) => {
+                        let source = self
+                            .source
+                            .get(p.name.start..p.name.end)
+                            .ok_or(Error::InvalidState)?;
+                        self.parameter = Some(p);
+                        self.name = Some(attribute::Cursor::new(source));
+                        self.phase = Phase::Name;
+                    }
+                    fields::Status::Complete => {
+                        self.fields = None;
+                        match self.pass {
+                            Pass::Initial => match self.family {
+                                Family::Single(p) => {
+                                    self.begin_value(p, parameter_value::Mode::ExtendedInitial)?
+                                }
+                                Family::Sections => {
+                                    if self.max.checked_add(1) != Some(self.count) {
+                                        self.choose_fallback()?
+                                    } else {
+                                        self.pass = Pass::Lookup(0);
+                                        self.phase = Phase::Start;
+                                    }
+                                }
+                                _ => self.choose_fallback()?,
+                            },
+                            Pass::Lookup(index) => {
+                                if self.duplicate {
+                                    self.choose_fallback()?
+                                } else if let Some((p, encoded)) = self.found {
+                                    if index == 0 {
+                                        self.initial_encoded = encoded;
+                                    }
+                                    let mode = if !encoded {
+                                        parameter_value::Mode::Ordinary
+                                    } else if index == 0 {
+                                        parameter_value::Mode::ExtendedInitial
+                                    } else {
+                                        parameter_value::Mode::ExtendedContinuation
+                                    };
+                                    self.begin_value(p, mode)?;
+                                } else {
+                                    self.choose_fallback()?
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Phase::Name => {
+                if let attribute::Status::Complete(name) = self
+                    .name
+                    .as_mut()
+                    .ok_or(Error::InvalidState)?
+                    .poll_with_work(now, work)?
+                {
+                    self.classified = Some(name);
+                    self.name = None;
+                    self.phase = Phase::Match;
+                }
+            }
+            Phase::Match => {
+                let name = self.classified.take().ok_or(Error::InvalidState)?;
+                let p = self.parameter.take().ok_or(Error::InvalidState)?;
+                let length = name
+                    .base
+                    .end
+                    .checked_sub(name.base.start)
+                    .ok_or(Error::InvalidState)?;
+                self.phase = Phase::Scan;
+                if length != self.attribute.bytes().len() {
+                    return Ok(Event::Yield);
+                }
+                let start = p
+                    .name
+                    .start
+                    .checked_add(name.base.start)
+                    .ok_or(Error::InvalidState)?;
+                let end = start.checked_add(length).ok_or(Error::InvalidState)?;
+                work.charge(
+                    now,
+                    Charge {
+                        io_bytes: length as u64,
+                        ..Charge::default()
+                    },
+                )?;
+                if !self
+                    .source
+                    .get(start..end)
+                    .ok_or(Error::InvalidState)?
+                    .eq_ignore_ascii_case(self.attribute.bytes())
+                {
+                    return Ok(Event::Yield);
+                }
+                match self.pass {
+                    Pass::Initial => match name.form {
+                        Form::Ordinary => {
+                            if self.ordinary.is_none() {
+                                self.ordinary = Some(p)
+                            }
+                        }
+                        Form::Extended => {
+                            self.family = if matches!(self.family, Family::None) {
+                                Family::Single(p)
+                            } else {
+                                Family::Invalid
+                            }
+                        }
+                        Form::Malformed => self.family = Family::Invalid,
+                        Form::Section { index, .. } => {
+                            match self.family {
+                                Family::None => self.family = Family::Sections,
+                                Family::Single(_) => self.family = Family::Invalid,
+                                _ => {}
+                            }
+                            if matches!(self.family, Family::Sections) {
+                                self.count =
+                                    self.count.checked_add(1).ok_or(Error::InvalidState)?;
+                                self.max = self.max.max(index);
+                            }
+                        }
+                    },
+                    Pass::Lookup(wanted) => {
+                        if let Form::Section { index, encoded } = name.form {
+                            if index == wanted {
+                                if self.found.is_some() {
+                                    self.duplicate = true;
+                                } else {
+                                    self.found = Some((p, encoded));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Phase::Validate => {
+                match self
+                    .value
+                    .as_mut()
+                    .ok_or(Error::InvalidState)?
+                    .poll_with_work(now, work)
+                {
+                    Ok(parameter_value::Status::Yield) => {}
+                    Ok(parameter_value::Status::Octet { role, value }) => {
+                        return Ok(Event::Octet { role, value });
+                    }
+                    Err(parameter_value::Error::Malformed) if !self.replay => {
+                        self.choose_fallback()?
+                    }
+                    Err(parameter_value::Error::Malformed) => return Err(Error::InvalidState),
+                    Err(e) => return Err(e.into()),
+                    Ok(parameter_value::Status::Complete) => {
+                        self.value = None;
+                        match self.pass {
+                            Pass::Initial => {
+                                if !self.replay {
+                                    let Family::Single(p) = self.family else {
+                                        return Err(Error::InvalidState);
+                                    };
+                                    self.result.plan = Some(Plan::Extended(p));
+                                }
+                                self.phase = Phase::Finish;
+                            }
+                            Pass::Lookup(index) => {
+                                let next = index.checked_add(1).ok_or(Error::InvalidState)?;
+                                if next == self.count {
+                                    self.result.plan = Some(Plan::Sections {
+                                        count: self.count,
+                                        initial_encoded: self.initial_encoded,
+                                    });
+                                    self.phase = Phase::Finish;
+                                } else {
+                                    self.pass = Pass::Lookup(next);
+                                    self.phase = Phase::Start;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Phase::Finish => {
+                self.phase = Phase::Complete;
+                return Ok(Event::Complete(self.result));
+            }
+            Phase::Complete => return Err(Error::InvalidState),
+        }
+        Ok(Event::Yield)
+    }
+}
+
+/// Retains the original job and header interpretation allowance across all passes.
+/// ```compile_fail,E0277
+/// fn cloned<T: Clone>() {} cloned::<td_mime::parameter::Budgeted<'_, '_>>();
+/// ```
+/// ```compile_fail,E0277
+/// fn copied<T: Copy>() {} copied::<td_mime::parameter::Budgeted<'_, '_>>();
+/// ```
+pub struct Budgeted<'a, 'w> {
+    cursor: Cursor<'a>,
+    work: &'w mut Meter,
+    budget: &'w mut crate::nfc::HeaderBudget,
+    credit: u8,
+}
+impl<'a, 'w> Budgeted<'a, 'w> {
+    #[must_use]
+    pub fn new(
+        source: &'a [u8],
+        kind: fields::Kind,
+        attribute: Attribute,
+        work: &'w mut Meter,
+        budget: &'w mut crate::nfc::HeaderBudget,
+    ) -> Self {
+        Self {
+            cursor: Cursor::new(source, kind, attribute),
+            work,
+            budget,
+            credit: 0,
+        }
+    }
+    pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
+        self.cursor.check(|| {
+            td_header::Work::charge(
+                &mut decode_work::Admission::new(now, self.work, self.budget, &mut self.credit),
+                td_header::Charge::default(),
+            )
+        })
+    }
+    pub fn poll(&mut self, now: Tick) -> Result<Status, Error> {
+        self.cursor.poll_with_work(
+            now,
+            &mut decode_work::Parsing::new(self.work, self.budget, &mut self.credit),
+        )
+    }
+}
+
+/// Provisional octets after complete family validation; retain only at Complete.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OctetStatus {
+    Yield,
+    Octet {
+        role: parameter_value::Role,
+        value: u8,
+    },
+    Complete(Selection),
+}
+/// One inline selector reused for validation and replay under original work.
+/// ```compile_fail,E0277
+/// fn cloned<T: Clone>() {} cloned::<td_mime::parameter::Octets<'_>>();
+/// ```
+/// ```compile_fail,E0277
+/// fn copied<T: Copy>() {} copied::<td_mime::parameter::Octets<'_>>();
+/// ```
+pub struct Octets<'a> {
+    cursor: Cursor<'a>,
+    selection: Option<Selection>,
+    complete: bool,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct OctetsCheckpoint<'a> {
+    cursor: Checkpoint<'a>,
+    selection: Option<Selection>,
+    complete: bool,
+}
+
+impl<'a> Octets<'a> {
+    pub(crate) fn checkpoint(&self) -> Result<OctetsCheckpoint<'a>, Error> {
+        Ok(OctetsCheckpoint {
+            cursor: self.cursor.checkpoint()?,
+            selection: self.selection,
+            complete: self.complete,
+        })
+    }
+    pub(crate) fn resume(checkpoint: OctetsCheckpoint<'a>) -> Self {
+        Self {
+            cursor: Cursor::resume(checkpoint.cursor),
+            selection: checkpoint.selection,
+            complete: checkpoint.complete,
+        }
+    }
+
+    fn validated_selection(&self) -> Option<Selection> {
+        if self.cursor.failure.is_some() {
+            None
+        } else {
+            self.selection
+        }
+    }
+
+    #[must_use]
+    pub const fn new(source: &'a [u8], kind: fields::Kind, attribute: Attribute) -> Self {
+        Self {
+            cursor: Cursor::new(source, kind, attribute),
+            selection: None,
+            complete: false,
+        }
+    }
+    pub fn check_deadline(&mut self, now: Tick, work: &mut Meter) -> Result<(), Error> {
+        self.cursor.check_deadline(now, work)
+    }
+    pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<OctetStatus, Error> {
+        self.poll_with_work(now, work)
+    }
+    fn poll_with_work(&mut self, now: Tick, work: &mut impl Work) -> Result<OctetStatus, Error> {
+        if let Some(error) = self.cursor.failure {
+            return Err(error);
+        }
+        if self.complete {
+            return Ok(OctetStatus::Complete(
+                self.selection.ok_or(Error::InvalidState)?,
+            ));
+        }
+        let result = self.advance(now, work);
+        if let Err(error) = result {
+            self.cursor.failure = Some(error);
+            self.cursor.result.plan = None;
+        }
+        result
+    }
+    fn advance(&mut self, now: Tick, work: &mut impl Work) -> Result<OctetStatus, Error> {
+        if let Some(selection) = self.selection {
+            if selection.plan.is_none() {
+                work.charge(
+                    now,
+                    Charge {
+                        records: 1,
+                        ..Charge::default()
+                    },
+                )?;
+                self.complete = true;
+                return Ok(OctetStatus::Complete(selection));
+            }
+            return match self.cursor.poll_event(now, work)? {
+                Event::Yield => Ok(OctetStatus::Yield),
+                Event::Octet { role, value } => Ok(OctetStatus::Octet { role, value }),
+                Event::Complete(replayed) => {
+                    if replayed != selection {
+                        return Err(Error::InvalidState);
+                    }
+                    self.complete = true;
+                    Ok(OctetStatus::Complete(selection))
+                }
+            };
+        }
+        match self.cursor.poll_event(now, work)? {
+            Event::Yield | Event::Octet { .. } => Ok(OctetStatus::Yield),
+            Event::Complete(selection) => {
+                self.cursor =
+                    Cursor::new(self.cursor.source, self.cursor.kind, self.cursor.attribute);
+                self.cursor.replay = true;
+                self.cursor.result = selection;
+                match selection.plan {
+                    Some(Plan::Ordinary(parameter)) => {
+                        self.cursor
+                            .begin_value(parameter, parameter_value::Mode::Ordinary)?;
+                    }
+                    Some(Plan::Extended(parameter)) => {
+                        self.cursor
+                            .begin_value(parameter, parameter_value::Mode::ExtendedInitial)?;
+                    }
+                    Some(Plan::Sections { count, .. }) => {
+                        self.cursor.count = count;
+                        self.cursor.pass = Pass::Lookup(0);
+                    }
+                    None => {}
+                }
+                self.selection = Some(selection);
+                Ok(OctetStatus::Yield)
+            }
+        }
+    }
+}
+/// Owns original allowances and private credit across validation and drain.
+/// ```compile_fail,E0277
+/// fn cloned<T: Clone>() {} cloned::<td_mime::parameter::BudgetedOctets<'_, '_>>();
+/// ```
+/// ```compile_fail,E0277
+/// fn copied<T: Copy>() {} copied::<td_mime::parameter::BudgetedOctets<'_, '_>>();
+/// ```
+pub struct BudgetedOctets<'a, 'w> {
+    octets: Octets<'a>,
+    work: &'w mut Meter,
+    budget: &'w mut crate::nfc::HeaderBudget,
+    credit: u8,
+}
+impl<'a, 'w> BudgetedOctets<'a, 'w> {
+    #[must_use]
+    pub fn new(
+        source: &'a [u8],
+        kind: fields::Kind,
+        attribute: Attribute,
+        work: &'w mut Meter,
+        budget: &'w mut crate::nfc::HeaderBudget,
+    ) -> Self {
+        Self {
+            octets: Octets::new(source, kind, attribute),
+            work,
+            budget,
+            credit: 0,
+        }
+    }
+    pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
+        self.octets.cursor.check(|| {
+            td_header::Work::charge(
+                &mut decode_work::Admission::new(now, self.work, self.budget, &mut self.credit),
+                td_header::Charge::default(),
+            )
+        })
+    }
+    pub fn poll(&mut self, now: Tick) -> Result<OctetStatus, Error> {
+        self.octets.poll_with_work(
+            now,
+            &mut decode_work::Parsing::new(self.work, self.budget, &mut self.credit),
+        )
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use crate::time::Deadline;
+    fn work() -> Meter {
+        Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000_000,
+                records: 100_000_000,
+                ..Charge::default()
+            },
+        )
+    }
+    fn select(source: &[u8]) -> Result<Option<Plan>, Error> {
+        let mut cursor = Cursor::new(
+            source,
+            fields::Kind::ContentDisposition,
+            Attribute::Filename,
+        );
+        assert!(std::mem::size_of_val(&cursor) <= 1024);
+        let mut work = work();
+        for _ in 0..10000 {
+            let before = work.remaining();
+            let status = cursor.poll(Tick(1), &mut work)?;
+            assert!(before.io_bytes - work.remaining().io_bytes <= 160);
+            assert!(before.records - work.remaining().records <= 33);
+            if let Status::Complete(p) = status {
+                let before = work.remaining();
+                assert_eq!(cursor.poll(Tick(100), &mut work), Ok(Status::Complete(p)));
+                assert_eq!(work.remaining(), before);
+                return Ok(p.plan);
+            }
+        }
+        panic!("not complete")
+    }
+    #[test]
+    fn first_ordinary_and_single_extended_precedence() {
+        for (source, raw, extended) in [
+            (
+                b"attachment;filename=one;filename=two".as_slice(),
+                b"one".as_slice(),
+                false,
+            ),
+            (
+                b"attachment;filename=one;filename*=utf-8''two",
+                b"utf-8''two",
+                true,
+            ),
+            (
+                b"attachment;filename*=utf-8''two;filename=one",
+                b"utf-8''two",
+                true,
+            ),
+            (
+                b"attachment;filename*=utf-8''two%xx;filename=one",
+                b"one",
+                false,
+            ),
+            (
+                b"attachment;filename*=utf-8''two;filename*=utf-8''three;filename=one",
+                b"one",
+                false,
+            ),
+        ] {
+            let p = select(source).unwrap().unwrap();
+            let p = match p {
+                Plan::Ordinary(p) => {
+                    assert!(!extended);
+                    p
+                }
+                Plan::Extended(p) => {
+                    assert!(extended);
+                    p
+                }
+                _ => panic!("wrong plan"),
+            };
+            assert_eq!(source.get(p.value.start..p.value.end), Some(raw));
+        }
+        assert_eq!(select(b"attachment;x=one").unwrap(), None);
+    }
+    #[test]
+    fn order_independent_mixed_sections_require_complete_series() {
+        for source in [
+            b"attachment;filename*2=last;filename*0*=utf-8''first;filename*1*=%20mid".as_slice(),
+            b"attachment;filename*0=one;filename*1=two;filename*2=three",
+            b"attachment;filename*0=one;filename*1*=%20two;filename*2=three",
+        ] {
+            assert!(matches!(
+                select(source).unwrap(),
+                Some(Plan::Sections { count: 3, .. })
+            ))
+        }
+        for source in [
+            b"attachment;filename*0*=utf-8''one;filename*2=two;filename=saved".as_slice(),
+            b"attachment;filename*0=one;filename*0=dup;filename*2=two;filename=saved",
+            b"attachment;filename*1=one;filename*1=dup;filename=saved",
+            b"attachment;filename*0=one;filename*01=evil;filename*1=two;filename=saved",
+            b"attachment;filename*0=one;filename*1=two;filename*=utf-8''other;filename=saved",
+            b"attachment;filename*18446744073709551615=one;filename=saved",
+            b"attachment;filename*0*=utf-8''%E2%;filename*1*=82;filename=saved",
+        ] {
+            let Some(Plan::Ordinary(p)) = select(source).unwrap() else {
+                panic!("invalid series chosen")
+            };
+            assert_eq!(
+                source.get(p.value.start..p.value.end),
+                Some(b"saved".as_slice())
+            );
+        }
+    }
+    #[test]
+    fn complete_rejection_diagnostic_and_final_admission_are_sticky() {
+        for (source, rejected, has_plan) in [
+            (b"attachment;x=one".as_slice(), false, false),
+            (b"attachment;filename=one", false, true),
+            (b"attachment;filename*01=bad", true, false),
+            (
+                b"attachment;filename*=utf-8''%xx;filename=saved",
+                true,
+                true,
+            ),
+            (
+                b"attachment;filename*0=a;filename*2=b;filename=saved",
+                true,
+                true,
+            ),
+            (b"attachment;FILENAME*=utf-8'en'good", false, true),
+        ] {
+            let mut cursor = Cursor::new(
+                source,
+                fields::Kind::ContentDisposition,
+                Attribute::Filename,
+            );
+            let mut meter = work();
+            while !matches!(cursor.phase, Phase::Finish) {
+                assert_eq!(cursor.poll(Tick(1), &mut meter).unwrap(), Status::Yield);
+            }
+            assert_eq!(cursor.result.invalid_extended, rejected);
+            assert_eq!(cursor.result.plan.is_some(), has_plan);
+            assert_eq!(
+                cursor.poll(Tick(100), &mut meter),
+                Err(Error::Work(Stop::Deadline))
+            );
+            assert_eq!(cursor.result.plan, None);
+            let mut replacement = work();
+            let before = replacement.remaining();
+            assert_eq!(
+                cursor.poll(Tick(1), &mut replacement),
+                Err(Error::Work(Stop::Deadline))
+            );
+            assert_eq!(
+                cursor.check_deadline(Tick(1), &mut replacement),
+                Err(Error::Work(Stop::Deadline))
+            );
+            assert_eq!(replacement.remaining(), before);
+        }
+        let mut cursor = Cursor::new(
+            b"text/plain;charset=Us-Ascii",
+            fields::Kind::ContentType,
+            Attribute::Charset,
+        );
+        let mut meter = work();
+        let selected = loop {
+            if let Status::Complete(selected) = cursor.poll(Tick(1), &mut meter).unwrap() {
+                break selected;
+            }
+        };
+        let Some(Plan::Ordinary(parameter)) = selected.plan else {
+            panic!("charset not selected")
+        };
+        assert_eq!(
+            b"text/plain;charset=Us-Ascii".get(parameter.value.start..parameter.value.end),
+            Some(b"Us-Ascii".as_slice())
+        );
+        assert!(!selected.invalid_extended);
+        assert_eq!(
+            cursor.check_deadline(Tick(100), &mut meter),
+            Err(Error::Work(Stop::Deadline))
+        );
+        assert_eq!(
+            cursor.poll(Tick(1), &mut work()),
+            Err(Error::Work(Stop::Deadline))
+        );
+        assert_eq!(
+            Cursor::new(
+                b"base64",
+                fields::Kind::TransferEncoding,
+                Attribute::Filename
+            )
+            .poll(Tick(1), &mut work()),
+            Err(Error::InvalidState)
+        );
+    }
+    #[test]
+    fn malformed_whole_field_and_depth_are_not_fallback() {
+        assert_eq!(select(b"attachment;filename=saved;"), Err(Error::Malformed));
+        let source = format!(
+            "attachment;filename=saved {}x{}",
+            "(".repeat(33),
+            ")".repeat(33)
+        );
+        assert_eq!(select(source.as_bytes()), Err(Error::NestingLimit));
+    }
+    #[test]
+    fn long_names_and_many_sections_are_bounded_charged_replay() {
+        let mut source = String::from("attachment;filename=saved;");
+        source.push_str(&"x".repeat(4096));
+        source.push_str("=ignored");
+        for index in (0..24).rev() {
+            source.push_str(&format!(";filename*{index}=value"));
+        }
+        let mut meter = work();
+        let mut budget = crate::nfc::HeaderBudget::new();
+        let mut cursor = Budgeted::new(
+            source.as_bytes(),
+            fields::Kind::ContentDisposition,
+            Attribute::Filename,
+            &mut meter,
+            &mut budget,
+        );
+        let mut turns = 0;
+        loop {
+            let before = (
+                cursor.work.remaining(),
+                cursor.budget.source_bytes_remaining(),
+                cursor.budget.steps_remaining(),
+            );
+            let status = cursor.poll(Tick(1)).unwrap();
+            assert!(before.0.io_bytes - cursor.work.remaining().io_bytes <= 160);
+            assert!(before.0.records - cursor.work.remaining().records <= 16);
+            assert!(before.1 - cursor.budget.source_bytes_remaining() <= 160);
+            assert!(before.2 - cursor.budget.steps_remaining() <= 256);
+            turns += 1;
+            if let Status::Complete(plan) = status {
+                assert_eq!(
+                    plan,
+                    Selection {
+                        plan: Some(Plan::Sections {
+                            count: 24,
+                            initial_encoded: false
+                        }),
+                        invalid_extended: false
+                    }
+                );
+                break;
+            }
+            assert!(turns < 100_000);
+        }
+        // Every index replays the entire field rather than trusting max/count.
+        assert!(
+            crate::nfc::HeaderBudget::new().source_bytes_remaining()
+                - cursor.budget.source_bytes_remaining()
+                > 24 * source.len() as u64
+        );
+        let mut adversarial = String::from("attachment;filename=saved");
+        for index in 0..128 {
+            adversarial.push_str(&format!(";filename*{index}=value"));
+        }
+        let mut meter = work();
+        let mut budget = crate::nfc::HeaderBudget::new();
+        let mut credit = 0;
+        let remaining = budget.source_bytes_remaining();
+        budget
+            .charge_local(&mut meter, Tick(1), remaining - 32_000, 0, &mut credit)
+            .unwrap();
+        let mut cursor = Budgeted::new(
+            adversarial.as_bytes(),
+            fields::Kind::ContentDisposition,
+            Attribute::Filename,
+            &mut meter,
+            &mut budget,
+        );
+        loop {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => {}
+                Ok(Status::Complete(_)) => panic!("replay exhaustion admitted fallback"),
+                Err(error) => {
+                    assert_eq!(error, Error::InterpretationLimit);
+                    assert_eq!(cursor.poll(Tick(1)), Err(error));
+                    break;
+                }
+            }
+        }
+    }
+    #[test]
+    fn independent_attributes_and_unicode_sections_keep_fixed_turns() {
+        for (kind, attribute, source, expected) in [
+            (
+                fields::Kind::ContentType,
+                Attribute::Boundary,
+                b"multipart/mixed;BoUnDaRy=CaseSensitive;boundary=ignored".as_slice(),
+                b"CaseSensitive".as_slice(),
+            ),
+            (
+                fields::Kind::ContentType,
+                Attribute::Name,
+                b"text/plain;filename*=utf-8''other;NAME=kept",
+                b"kept",
+            ),
+            (
+                fields::Kind::ContentDisposition,
+                Attribute::Filename,
+                b"attachment;filename*=utf-8''kept;name*01=other",
+                b"utf-8''kept",
+            ),
+        ] {
+            let mut cursor = Cursor::new(source, kind, attribute);
+            let mut meter = work();
+            let selection = loop {
+                if let Status::Complete(selection) = cursor.poll(Tick(1), &mut meter).unwrap() {
+                    break selection;
+                }
+            };
+            let parameter = match selection.plan {
+                Some(Plan::Ordinary(parameter) | Plan::Extended(parameter)) => parameter,
+                _ => panic!("missing independent attribute"),
+            };
+            assert_eq!(
+                source.get(parameter.value.start..parameter.value.end),
+                Some(expected)
+            );
+            assert!(!selection.invalid_extended);
+        }
+        let source = format!(
+            "attachment;filename*1=tail;filename*0=\"{}\"",
+            "🐈".repeat(1024)
+        );
+        let mut meter = work();
+        let mut budget = crate::nfc::HeaderBudget::new();
+        let mut cursor = Budgeted::new(
+            source.as_bytes(),
+            fields::Kind::ContentDisposition,
+            Attribute::Filename,
+            &mut meter,
+            &mut budget,
+        );
+        let mut peak_visits = 0;
+        loop {
+            let before = (
+                cursor.work.remaining(),
+                cursor.budget.source_bytes_remaining(),
+                cursor.budget.steps_remaining(),
+            );
+            let status = cursor.poll(Tick(1)).unwrap();
+            let visits = before.1 - cursor.budget.source_bytes_remaining();
+            peak_visits = peak_visits.max(visits);
+            assert!(visits <= 160);
+            assert!(before.0.io_bytes - cursor.work.remaining().io_bytes <= 160);
+            assert!(before.0.records - cursor.work.remaining().records <= 16);
+            assert!(before.2 - cursor.budget.steps_remaining() <= 256);
+            if let Status::Complete(selection) = status {
+                assert_eq!(
+                    selection,
+                    Selection {
+                        plan: Some(Plan::Sections {
+                            count: 2,
+                            initial_encoded: false
+                        }),
+                        invalid_extended: false
+                    }
+                );
+                break;
+            }
+        }
+        assert_eq!(peak_visits, 160);
+    }
+
+    #[test]
+    fn small_many_section_fields_can_exhaust_the_fresh_email_allowance() {
+        for (count, succeeds) in [(400, true), (600, false)] {
+            let mut source = String::from("attachment;filename=saved");
+            for index in 0..count {
+                source.push_str(&format!(";filename*{index}=x"));
+            }
+            let mut meter = work();
+            let mut budget = crate::nfc::HeaderBudget::new();
+            let initial_steps = budget.steps_remaining();
+            let mut cursor = Budgeted::new(
+                source.as_bytes(),
+                fields::Kind::ContentDisposition,
+                Attribute::Filename,
+                &mut meter,
+                &mut budget,
+            );
+            loop {
+                match cursor.poll(Tick(1)) {
+                    Ok(Status::Yield) => {}
+                    Ok(Status::Complete(selection)) => {
+                        assert!(succeeds);
+                        assert_eq!(
+                            selection,
+                            Selection {
+                                plan: Some(Plan::Sections {
+                                    count,
+                                    initial_encoded: false
+                                }),
+                                invalid_extended: false
+                            }
+                        );
+                        assert_eq!(source.len(), 5915);
+                        assert_eq!(initial_steps - cursor.budget.steps_remaining(), 15_759_691);
+                        break;
+                    }
+                    Err(error) => {
+                        assert!(!succeeds);
+                        assert_eq!(source.len(), 8915);
+                        assert_eq!(error, Error::InterpretationLimit);
+                        assert_eq!(cursor.poll(Tick(1)), Err(error));
+                        assert_eq!(
+                            cursor.budget.charge_local(
+                                cursor.work,
+                                Tick(1),
+                                0,
+                                0,
+                                &mut cursor.credit
+                            ),
+                            Err(crate::nfc::Error::InterpretationLimit)
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_aggregate_and_job_cut_refuses_instead_of_falling_back() {
+        let source = b"attachment;filename=saved;filename*1*=two;filename*0*=utf-8''one";
+        let mut full_work = work();
+        let mut full_budget = crate::nfc::HeaderBudget::new();
+        let before = (
+            full_work.remaining(),
+            full_budget.source_bytes_remaining(),
+            full_budget.steps_remaining(),
+        );
+        let mut full = Budgeted::new(
+            source,
+            fields::Kind::ContentDisposition,
+            Attribute::Filename,
+            &mut full_work,
+            &mut full_budget,
+        );
+        assert!(std::mem::size_of_val(&full) <= 1056);
+        loop {
+            let turn = (
+                full.work.remaining(),
+                full.budget.source_bytes_remaining(),
+                full.budget.steps_remaining(),
+                full.credit,
+            );
+            full.check_deadline(Tick(1)).unwrap();
+            assert_eq!(
+                (
+                    full.work.remaining(),
+                    full.budget.source_bytes_remaining(),
+                    full.budget.steps_remaining(),
+                    full.credit
+                ),
+                turn
+            );
+            let status = full.poll(Tick(1)).unwrap();
+            assert!(turn.0.io_bytes - full.work.remaining().io_bytes <= 160);
+            assert!(turn.0.records - full.work.remaining().records <= 16);
+            assert!(turn.1 - full.budget.source_bytes_remaining() <= 160);
+            assert!(turn.2 - full.budget.steps_remaining() <= 256);
+            if let Status::Complete(p) = status {
+                assert!(matches!(
+                    p.plan,
+                    Some(Plan::Sections {
+                        count: 2,
+                        initial_encoded: true
+                    })
+                ));
+                assert_eq!(full.poll(Tick(100)), Ok(Status::Complete(p)));
+                break;
+            }
+        }
+        let visits = before.1 - full.budget.source_bytes_remaining();
+        let steps = before.2 - full.budget.steps_remaining();
+        let records = before.0.records - full.work.remaining().records;
+        full.check_deadline(Tick(100)).unwrap_err();
+        assert_eq!(full.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+        for flavor in 0..4 {
+            let amount = match flavor {
+                0 | 2 => visits,
+                1 => steps,
+                _ => records,
+            };
+            for limit in 0..amount {
+                let mut admission = if flavor >= 2 {
+                    Meter::new(
+                        Deadline::after(Tick(0), 100).unwrap(),
+                        Charge {
+                            io_bytes: if flavor == 2 { limit } else { visits },
+                            records: if flavor == 3 { limit } else { records },
+                            ..Charge::default()
+                        },
+                    )
+                } else {
+                    work()
+                };
+                let mut budget = crate::nfc::HeaderBudget::new();
+                let mut credit = 0;
+                if flavor < 2 {
+                    let (bytes, steps) = if flavor == 0 {
+                        (budget.source_bytes_remaining() - limit, 0)
+                    } else {
+                        (0, budget.steps_remaining() - limit)
+                    };
+                    budget
+                        .charge_local(&mut admission, Tick(1), bytes, steps, &mut credit)
+                        .unwrap();
+                }
+                let mut cursor = Budgeted::new(
+                    source,
+                    fields::Kind::ContentDisposition,
+                    Attribute::Filename,
+                    &mut admission,
+                    &mut budget,
+                );
+                loop {
+                    match cursor.poll(Tick(1)) {
+                        Ok(Status::Complete(_)) => panic!("cut admitted candidate or fallback"),
+                        Ok(Status::Yield) => {}
+                        Err(e) => {
+                            assert_eq!(
+                                e,
+                                match flavor {
+                                    0 | 1 => Error::InterpretationLimit,
+                                    2 => Error::Work(Stop::IoBytes),
+                                    _ => Error::Work(Stop::Records),
+                                }
+                            );
+                            assert_eq!(cursor.check_deadline(Tick(1)), Err(e));
+                            assert_eq!(cursor.poll(Tick(1)), Err(e));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fn drain(source: &[u8]) -> Result<(Selection, [Vec<u8>; 3]), Error> {
+        let mut cursor = Octets::new(
+            source,
+            fields::Kind::ContentDisposition,
+            Attribute::Filename,
+        );
+        let mut meter = work();
+        let mut bytes: [Vec<u8>; 3] = std::array::from_fn(|_| Vec::new());
+        assert!(std::mem::size_of_val(&cursor) <= 1088);
+        loop {
+            let before = meter.remaining();
+            let status = cursor.poll(Tick(1), &mut meter)?;
+            assert!(before.io_bytes - meter.remaining().io_bytes <= 160);
+            assert!(before.records - meter.remaining().records <= 33);
+            match status {
+                OctetStatus::Yield => {}
+                OctetStatus::Octet { role, value } => bytes[match role {
+                    parameter_value::Role::Charset => 0,
+                    parameter_value::Role::Language => 1,
+                    parameter_value::Role::Data => 2,
+                }]
+                .push(value),
+                OctetStatus::Complete(selection) => {
+                    let before = meter.remaining();
+                    assert_eq!(
+                        cursor.poll(Tick(100), &mut meter),
+                        Ok(OctetStatus::Complete(selection))
+                    );
+                    assert_eq!(meter.remaining(), before);
+                    assert_eq!(
+                        cursor.check_deadline(Tick(100), &mut meter),
+                        Err(Error::Work(Stop::Deadline))
+                    );
+                    assert_eq!(
+                        cursor.poll(Tick(1), &mut work()),
+                        Err(Error::Work(Stop::Deadline))
+                    );
+                    return Ok((selection, bytes));
+                }
+            }
+        }
+    }
+    #[test]
+    fn complete_family_precedes_any_provisional_octet() {
+        for (source, rejected, expected) in [
+            (
+                b"attachment;filename*0*=utf-8''secret;filename*1*=%xx;filename=saved".as_slice(),
+                true,
+                b"saved".as_slice(),
+            ),
+            (
+                b"attachment;filename*0=secret;filename*0=duplicate;filename*2=tail;filename=saved",
+                true,
+                b"saved",
+            ),
+            (b"attachment;filename*=utf-8''%xx", true, b""),
+            (b"attachment;x=ignored", false, b""),
+        ] {
+            let (selection, bytes) = drain(source).unwrap();
+            assert_eq!(selection.invalid_extended, rejected);
+            assert!(bytes[0].is_empty() && bytes[1].is_empty());
+            assert_eq!(bytes[2], expected);
+        }
+        assert_eq!(drain(b"attachment;filename=saved;"), Err(Error::Malformed));
+    }
+    #[test]
+    fn replay_roles_order_and_original_raw_plan_are_preserved() {
+        for (source, expected, kind) in [
+            (
+                b"attachment;filename*2*=%AC%00;filename*0*=UTF-8'en'%E2;filename*1*=%82"
+                    .as_slice(),
+                [
+                    b"UTF-8".to_vec(),
+                    b"en".to_vec(),
+                    b"\xe2\x82\xac\0".to_vec(),
+                ],
+                2,
+            ),
+            (
+                b"attachment;filename*1=mid;filename*0*=latin1''%E9;filename*2*=%FF",
+                [b"latin1".to_vec(), vec![], b"\xe9mid\xff".to_vec()],
+                2,
+            ),
+            (
+                b"attachment;filename*1=two;filename*0=one",
+                [vec![], vec![], b"onetwo".to_vec()],
+                2,
+            ),
+            (
+                b"attachment;filename*=unknown''%3D%3Futf-8%3FQ%3Fx%3F%3D",
+                [b"unknown".to_vec(), vec![], b"=?utf-8?Q?x?=".to_vec()],
+                1,
+            ),
+            (
+                b"attachment;filename*= ''data",
+                [vec![], vec![], b"data".to_vec()],
+                1,
+            ),
+            (
+                b"attachment;filename=\"one\\ two\";filename=ignored",
+                [vec![], vec![], b"one two".to_vec()],
+                0,
+            ),
+            (
+                b"attachment;filename*0*=latin1''%E9;filename*1=\"\xc3\xa9%41\"",
+                [b"latin1".to_vec(), vec![], b"\xe9\xc3\xa9%41".to_vec()],
+                2,
+            ),
+        ] {
+            let (selection, bytes) = drain(source).unwrap();
+            assert!(!selection.invalid_extended);
+            assert_eq!(bytes, expected);
+            let selected_kind = match selection.plan {
+                Some(Plan::Ordinary(_)) => 0,
+                Some(Plan::Extended(_)) => 1,
+                Some(Plan::Sections { .. }) => 2,
+                None => 3,
+            };
+            assert_eq!(selected_kind, kind);
+            if kind == 0 {
+                let Some(Plan::Ordinary(parameter)) = selection.plan else {
+                    panic!("missing ordinary raw plan")
+                };
+                assert_eq!(
+                    source.get(parameter.value.start..parameter.value.end),
+                    Some(b"\"one\\ two\"".as_slice())
+                );
+            }
+        }
+    }
+    #[test]
+    fn replay_every_work_cut_and_fresh_admission_remains_fatal() {
+        for source in [
+            b"attachment;filename=saved;filename*1*=%82%AC;filename*0*=utf-8''%E2".as_slice(),
+            b"attachment;filename=saved",
+            b"attachment;filename*=utf-8''value",
+            b"attachment;x=missing",
+        ] {
+            let mut meter = work();
+            let mut budget = crate::nfc::HeaderBudget::new();
+            let before = (
+                meter.remaining(),
+                budget.source_bytes_remaining(),
+                budget.steps_remaining(),
+            );
+            let mut full = BudgetedOctets::new(
+                source,
+                fields::Kind::ContentDisposition,
+                Attribute::Filename,
+                &mut meter,
+                &mut budget,
+            );
+            assert!(std::mem::size_of_val(&full) <= 1120);
+            loop {
+                let before = (
+                    full.work.remaining(),
+                    full.budget.source_bytes_remaining(),
+                    full.budget.steps_remaining(),
+                    full.credit,
+                );
+                full.check_deadline(Tick(1)).unwrap();
+                assert_eq!(
+                    (
+                        full.work.remaining(),
+                        full.budget.source_bytes_remaining(),
+                        full.budget.steps_remaining(),
+                        full.credit
+                    ),
+                    before
+                );
+                let status = full.poll(Tick(1)).unwrap();
+                assert!(before.0.io_bytes - full.work.remaining().io_bytes <= 160);
+                assert!(before.0.records - full.work.remaining().records <= 16);
+                assert!(before.1 - full.budget.source_bytes_remaining() <= 160);
+                assert!(before.2 - full.budget.steps_remaining() <= 256);
+                if matches!(status, OctetStatus::Complete(_)) {
+                    break;
+                }
+            }
+            let visits = before.1 - full.budget.source_bytes_remaining();
+            let steps = before.2 - full.budget.steps_remaining();
+            let records = before.0.records - full.work.remaining().records;
+            for flavor in 0..4 {
+                let amount = match flavor {
+                    0 | 2 => visits,
+                    1 => steps,
+                    _ => records,
+                };
+                for limit in 0..amount {
+                    let mut meter = if flavor >= 2 {
+                        Meter::new(
+                            Deadline::after(Tick(0), 100).unwrap(),
+                            Charge {
+                                io_bytes: if flavor == 2 { limit } else { visits },
+                                records: if flavor == 3 { limit } else { records },
+                                ..Charge::default()
+                            },
+                        )
+                    } else {
+                        work()
+                    };
+                    let mut budget = crate::nfc::HeaderBudget::new();
+                    let mut credit = 0;
+                    if flavor < 2 {
+                        let (bytes, steps) = if flavor == 0 {
+                            (budget.source_bytes_remaining() - limit, 0)
+                        } else {
+                            (0, budget.steps_remaining() - limit)
+                        };
+                        budget
+                            .charge_local(&mut meter, Tick(1), bytes, steps, &mut credit)
+                            .unwrap();
+                    }
+                    let mut cursor = BudgetedOctets::new(
+                        source,
+                        fields::Kind::ContentDisposition,
+                        Attribute::Filename,
+                        &mut meter,
+                        &mut budget,
+                    );
+                    loop {
+                        match cursor.poll(Tick(1)) {
+                            Ok(OctetStatus::Complete(_)) => panic!("cut admitted complete drain"),
+                            Ok(_) => {}
+                            Err(error) => {
+                                assert_eq!(
+                                    error,
+                                    match flavor {
+                                        0 | 1 => Error::InterpretationLimit,
+                                        2 => Error::Work(Stop::IoBytes),
+                                        _ => Error::Work(Stop::Records),
+                                    }
+                                );
+                                assert_eq!(cursor.poll(Tick(1)), Err(error));
+                                assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn replay_final_and_midstream_deadlines_cannot_publish_or_fallback() {
+        for source in [
+            b"attachment;filename=saved;filename*=utf-8''value".as_slice(),
+            b"attachment;x=missing",
+        ] {
+            let mut cursor = Octets::new(
+                source,
+                fields::Kind::ContentDisposition,
+                Attribute::Filename,
+            );
+            let mut meter = work();
+            loop {
+                if cursor.selection.is_some()
+                    && (cursor.selection.is_some_and(|s| s.plan.is_none())
+                        || matches!(cursor.cursor.phase, Phase::Finish))
+                {
+                    break;
+                }
+                assert!(!matches!(
+                    cursor.poll(Tick(1), &mut meter).unwrap(),
+                    OctetStatus::Complete(_)
+                ));
+            }
+            assert_eq!(
+                cursor.poll(Tick(100), &mut meter),
+                Err(Error::Work(Stop::Deadline))
+            );
+            let mut replacement = work();
+            let before = replacement.remaining();
+            assert_eq!(
+                cursor.poll(Tick(1), &mut replacement),
+                Err(Error::Work(Stop::Deadline))
+            );
+            assert_eq!(
+                cursor.check_deadline(Tick(1), &mut replacement),
+                Err(Error::Work(Stop::Deadline))
+            );
+            assert_eq!(replacement.remaining(), before);
+        }
+        let mut cursor = Octets::new(
+            b"attachment;filename=saved;filename*=utf-8''value",
+            fields::Kind::ContentDisposition,
+            Attribute::Filename,
+        );
+        let mut meter = work();
+        while !matches!(
+            cursor.poll(Tick(1), &mut meter).unwrap(),
+            OctetStatus::Octet { .. }
+        ) {}
+        assert_eq!(
+            cursor.poll(Tick(100), &mut meter),
+            Err(Error::Work(Stop::Deadline))
+        );
+        assert_eq!(
+            cursor.poll(Tick(1), &mut work()),
+            Err(Error::Work(Stop::Deadline))
+        );
+    }
+    #[test]
+    fn long_unicode_replay_keeps_original_fixed_turn_bounds() {
+        let mut source = format!("attachment;filename*0=\"{}\"", "🐈".repeat(1024));
+        for index in (1..8).rev() {
+            source.push_str(&format!(";filename*{index}=tail"));
+        }
+        let mut meter = work();
+        let mut budget = crate::nfc::HeaderBudget::new();
+        let mut cursor = BudgetedOctets::new(
+            source.as_bytes(),
+            fields::Kind::ContentDisposition,
+            Attribute::Filename,
+            &mut meter,
+            &mut budget,
+        );
+        let mut bytes = 0;
+        let mut peak = 0;
+        loop {
+            let before = (
+                cursor.work.remaining(),
+                cursor.budget.source_bytes_remaining(),
+                cursor.budget.steps_remaining(),
+            );
+            let status = cursor.poll(Tick(1)).unwrap();
+            let visits = before.1 - cursor.budget.source_bytes_remaining();
+            peak = peak.max(visits);
+            assert!(visits <= 160);
+            assert!(before.0.io_bytes - cursor.work.remaining().io_bytes <= 160);
+            assert!(before.0.records - cursor.work.remaining().records <= 16);
+            assert!(before.2 - cursor.budget.steps_remaining() <= 256);
+            match status {
+                OctetStatus::Yield => {}
+                OctetStatus::Octet { role, value } => {
+                    assert_eq!(role, parameter_value::Role::Data);
+                    let expected = if bytes < 4096 {
+                        "🐈".as_bytes().get(bytes % 4)
+                    } else {
+                        b"tail".get((bytes - 4096) % 4)
+                    };
+                    assert_eq!(Some(&value), expected);
+                    bytes += 1;
+                }
+                OctetStatus::Complete(selection) => {
+                    assert!(!selection.invalid_extended);
+                    break;
+                }
+            }
+        }
+        assert_eq!(bytes, 4096 + 7 * 4);
+        assert_eq!(peak, 160);
+    }
+    #[test]
+    fn replay_can_exhaust_a_family_that_selection_accepts() {
+        let mut source = String::from("attachment;filename=saved");
+        for index in 0..400 {
+            source.push_str(&format!(";filename*{index}=x"));
+        }
+        let mut meter = work();
+        let mut budget = crate::nfc::HeaderBudget::new();
+        let mut cursor = BudgetedOctets::new(
+            source.as_bytes(),
+            fields::Kind::ContentDisposition,
+            Attribute::Filename,
+            &mut meter,
+            &mut budget,
+        );
+        let mut provisional = 0;
+        loop {
+            match cursor.poll(Tick(1)) {
+                Ok(OctetStatus::Yield) => {}
+                Ok(OctetStatus::Octet { role, value }) => {
+                    assert_eq!(role, parameter_value::Role::Data);
+                    assert_eq!(value, b'x');
+                    provisional += 1;
+                }
+                Ok(OctetStatus::Complete(_)) => panic!("drain exceeded original allowance"),
+                Err(error) => {
+                    assert_eq!(error, Error::InterpretationLimit);
+                    assert_eq!(provisional, 6);
+                    assert_eq!(cursor.budget.steps_remaining(), 0);
+                    assert_eq!(cursor.budget.source_bytes_remaining(), 10_006_514);
+                    assert_eq!(cursor.poll(Tick(1)), Err(error));
+                    assert_eq!(
+                        cursor
+                            .budget
+                            .charge_local(cursor.work, Tick(1), 0, 0, &mut cursor.credit),
+                        Err(crate::nfc::Error::InterpretationLimit)
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    #[test]
+    fn inconsistent_replay_cannot_fallback_or_publish_the_original_plan() {
+        let source = b"attachment;filename=saved;filename*0=one;filename*1=two";
+        for (count, expected) in [(1, b"one".as_slice()), (3, b"onetwo".as_slice())] {
+            let mut cursor = Octets::new(
+                source,
+                fields::Kind::ContentDisposition,
+                Attribute::Filename,
+            );
+            let mut meter = work();
+            while cursor.selection.is_none() {
+                assert_eq!(
+                    cursor.poll(Tick(1), &mut meter).unwrap(),
+                    OctetStatus::Yield
+                );
+            }
+            cursor.cursor.count = count;
+            let mut bytes = Vec::new();
+            loop {
+                match cursor.poll(Tick(1), &mut meter) {
+                    Ok(OctetStatus::Yield) => {}
+                    Ok(OctetStatus::Octet { role, value }) => {
+                        assert_eq!(role, parameter_value::Role::Data);
+                        bytes.push(value);
+                    }
+                    Ok(OctetStatus::Complete(_)) => panic!("inconsistent replay published"),
+                    Err(error) => {
+                        assert_eq!(error, Error::InvalidState);
+                        assert_eq!(bytes, expected);
+                        assert_eq!(cursor.cursor.result.plan, None);
+                        assert_eq!(cursor.poll(Tick(1), &mut work()), Err(error));
+                        break;
+                    }
+                }
+            }
+        }
+        let mut cursor = Octets::new(
+            b"attachment;filename*=utf-8''valid",
+            fields::Kind::ContentDisposition,
+            Attribute::Filename,
+        );
+        let mut meter = work();
+        while cursor.selection.is_none() {
+            assert_eq!(
+                cursor.poll(Tick(1), &mut meter).unwrap(),
+                OctetStatus::Yield
+            );
+        }
+        cursor.cursor.value = Some(parameter_value::Cursor::new(
+            b"utf-8''%xx",
+            false,
+            parameter_value::Mode::ExtendedInitial,
+        ));
+        loop {
+            match cursor.poll(Tick(1), &mut meter) {
+                Ok(OctetStatus::Complete(_)) => panic!("inconsistent value published"),
+                Ok(_) => {}
+                Err(error) => {
+                    assert_eq!(error, Error::InvalidState);
+                    assert_eq!(cursor.poll(Tick(1), &mut work()), Err(error));
+                    break;
+                }
+            }
+        }
+    }
+}

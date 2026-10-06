@@ -1,0 +1,156 @@
+//! Private charging seam for decoding under job and aggregate header budgets.
+use crate::{
+    nfc::{self, HeaderBudget},
+    time::Tick,
+    work::{Charge, Meter, Stop},
+};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Error {
+    Work(Stop),
+    InterpretationLimit,
+    InvalidState,
+}
+pub(crate) trait Work {
+    fn charge(&mut self, now: Tick, charge: Charge) -> Result<(), Error>;
+}
+impl Work for Meter {
+    fn charge(&mut self, now: Tick, charge: Charge) -> Result<(), Error> {
+        Meter::charge(self, now, charge).map_err(Error::Work)
+    }
+}
+
+impl From<nfc::Error> for Error {
+    fn from(error: nfc::Error) -> Self {
+        match error {
+            nfc::Error::Work(stop) => Self::Work(stop),
+            nfc::Error::InterpretationLimit => Self::InterpretationLimit,
+            nfc::Error::InvalidState | nfc::Error::InvalidTable => Self::InvalidState,
+        }
+    }
+}
+/// Private visit/record admission; the enclosing owner retains credit and failures.
+pub(crate) struct Parsing<'w> {
+    work: &'w mut Meter,
+    budget: &'w mut HeaderBudget,
+    credit: &'w mut u8,
+}
+impl<'w> Parsing<'w> {
+    pub(crate) fn new(
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+        credit: &'w mut u8,
+    ) -> Self {
+        Self {
+            work,
+            budget,
+            credit,
+        }
+    }
+}
+impl Work for Parsing<'_> {
+    fn charge(&mut self, now: Tick, charge: Charge) -> Result<(), Error> {
+        if charge.output_bytes != 0 || charge.unlinks != 0 {
+            return Err(Error::InvalidState);
+        }
+        let steps = charge
+            .io_bytes
+            .checked_add(charge.records)
+            .ok_or(Error::InvalidState)?
+            .max(1);
+        self.budget
+            .charge_local(self.work, now, charge.io_bytes, steps, self.credit)
+            .map_err(Error::from)
+    }
+}
+
+/// Parsing admission plus separately charged conversion output.
+pub(crate) struct Conversion<'w> {
+    work: &'w mut Meter,
+    budget: &'w mut HeaderBudget,
+    credit: &'w mut u8,
+}
+impl<'w> Conversion<'w> {
+    pub(crate) fn new(
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+        credit: &'w mut u8,
+    ) -> Self {
+        Self {
+            work,
+            budget,
+            credit,
+        }
+    }
+}
+impl Work for Conversion<'_> {
+    fn charge(&mut self, now: Tick, charge: Charge) -> Result<(), Error> {
+        if charge.output_bytes == 0 {
+            return Parsing::new(self.work, self.budget, self.credit).charge(now, charge);
+        }
+        if charge.io_bytes != 0 || charge.records != 0 || charge.unlinks != 0 {
+            return Err(Error::InvalidState);
+        }
+        self.budget
+            .charge_local(self.work, now, 0, 1, self.credit)
+            .map_err(Error::from)?;
+        self.work.charge(now, charge).map_err(Error::Work)
+    }
+}
+
+/// Binds shared lexical admission to this turn's original mail work owner.
+pub(crate) struct Lexical<'w, W> {
+    work: &'w mut W,
+    now: Tick,
+}
+impl<'w, W> Lexical<'w, W> {
+    pub(crate) const fn new(work: &'w mut W, now: Tick) -> Self {
+        Self { work, now }
+    }
+}
+impl<W: Work> td_header::Work for Lexical<'_, W> {
+    type Error = Error;
+    fn charge(&mut self, charge: td_header::Charge) -> Result<(), Error> {
+        self.work.charge(
+            self.now,
+            Charge {
+                io_bytes: charge.visits,
+                records: charge.records,
+                ..Charge::default()
+            },
+        )
+    }
+}
+
+/// Zero-count live header admission; does not spend parsing steps or credit.
+pub(crate) struct Admission<'w> {
+    now: Tick,
+    work: &'w mut Meter,
+    budget: &'w mut HeaderBudget,
+    credit: &'w mut u8,
+}
+impl<'w> Admission<'w> {
+    pub(crate) const fn new(
+        now: Tick,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+        credit: &'w mut u8,
+    ) -> Self {
+        Self {
+            now,
+            work,
+            budget,
+            credit,
+        }
+    }
+}
+impl td_header::Work for Admission<'_> {
+    type Error = Error;
+    fn charge(&mut self, charge: td_header::Charge) -> Result<(), Error> {
+        if charge != td_header::Charge::default() {
+            return Err(Error::InvalidState);
+        }
+        self.budget
+            .charge_local(self.work, self.now, 0, 0, self.credit)
+            .map_err(Error::from)
+    }
+}

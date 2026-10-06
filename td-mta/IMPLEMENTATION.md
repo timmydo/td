@@ -6,7 +6,7 @@ Read `DESIGN.md`, root `AGENTS.md`, and `DEVELOPMENT.md` before work.
 Crypto/backend tasks also read `td-crypto/DESIGN.md` and `td-crypto/TLS.md`.
 Service-facing tasks also read `RESOURCES.md` and `ADMISSION.md`, including
 their named milestone-specific evidence. Message/query tasks read `POLICY.md`,
-`UNICODE.md` and `CASES.md`. Storage tasks read `STORAGE.md`.
+`../td-mime/UNICODE.md` and `CASES.md`. Storage tasks read `STORAGE.md`.
 This plan
 describes future implementation; none of its tasks are complete merely because
 this file exists. Its scope is the personal service specified in the design.
@@ -152,7 +152,7 @@ writing production mail or advertising capabilities.
   reply staging and fixed worker/pool ownership; **M02c3b** freezes disk/work/
   maintenance budgets and request/result retention in ADMISSION.md; **M02c3c**
   freezes thread/search/MIME policies in POLICY.md, approved data and bounded
-  NFC in UNICODE.md, and the traceable wire fixture inventory in CASES.md.
+  NFC in ../td-mime/UNICODE.md, and the traceable wire fixture inventory in CASES.md.
   None relaxes the M02 dependency gate for protocol consumers.
 
 **Depends on:** M01. **Own:** module interfaces, format specification and golden
@@ -2498,7 +2498,7 @@ grow working memory. Part downloads match original bytes/decoded content as
 specified; forged locators and parent-deletion/reuse races follow STORAGE §3.1. Round-trip fixtures prove From/To/Cc/Bcc and attachment behavior.
 Raw-message retention does not depend on rendering success. Do not reuse an
 allocating client parser merely because it is already std-only.
-CASES.md H01-H06/M01-M10 and UNICODE.md's adversarial replay/failure cases are
+CASES.md H01-H06/M01-M10 and ../td-mime/UNICODE.md's adversarial replay/failure cases are
 required independent oracles, including exact malformed-transfer blob bytes.
 
 ## M07 — Shared TLS implementation and mail transport adapters

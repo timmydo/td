@@ -130,7 +130,7 @@ the bounded callback and binds current clock, cancellation and aggregate/job
 budgets to it. No replacement callback can revive a failed cursor; Error<E>
 retains the original Copy error. Cached completion performs no new work.
 Live final admission belongs to the caller. Generic cursor size depends on
-E; with td-mta's fixed errors CFWS and delimited cursors remain within 64
+E; with td-mime's fixed errors CFWS and delimited cursors remain within 64
 bytes, and the parameter-name cursor within 128 bytes and the
 parameter-value cursor within 160 bytes. Live cursors remain neither Clone
 nor Copy: healthy pure progress may be replayed through snapshots, while
@@ -147,16 +147,16 @@ Every subsequent source/transition access is admitted again. The caller must
 keep the original allowances across replay; a historically healthy snapshot
 cannot revive a failed enclosing owner or replace its admission context.
 Restoring cached completion is inert and requires enclosing fresh admission.
-Mail keeps snapshots private inside its normalization source; its live owner
+td-mime keeps snapshots private inside its normalization source; its live owner
 structurally retains the original Meter/HeaderBudget/credit and sticky refusal.
 Shared event/cost and all per-turn callback-cut fixtures qualify snapshot
 fidelity. These snapshots change no lexical work or live-cursor size ceiling.
 
-Mail wrappers preserve their public errors and original budget/clock
+td-mime wrappers preserve their public errors and original budget/clock
 binding. The source grammars migrate atomically: no old parser remains
 alongside the shared implementation. Shared fixtures exercise
-lexical/refusal contracts; mail tests and allocation probes retain consumer
-composition qualification. These bounds do not establish total worker/native
+lexical/refusal contracts; td-mime tests and the mail allocation probe retain
+consumer composition qualification. These bounds do not establish total worker/native
 memory or scheduler latency.
 
 The mime_protocol Validator classifies already admitted logical parameter

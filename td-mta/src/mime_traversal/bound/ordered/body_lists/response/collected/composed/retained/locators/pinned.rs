@@ -1,4 +1,5 @@
 //! Match original resident source identity while retaining its actual file pin.
+#[path = "pinned/members.rs"]
 pub mod members;
 use super::{Mapped, View};
 use crate::{
@@ -55,7 +56,7 @@ pub struct Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, C: Crypto> {
     digest: Option<C::Sha256>,
     position: usize,
     complete: bool,
-    credit: u8,
+    credit: crate::nfc::Credit,
     failure: Option<Error>,
 }
 impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, C: Crypto> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, C> {
@@ -89,7 +90,7 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, C: Crypto> Cursor<'a, 'w, 'n, 'c, 'o, '
             digest: Some(digest),
             position: 0,
             complete: false,
-            credit: 0,
+            credit: crate::nfc::Credit::new(),
             failure: None,
         })
     }
@@ -248,4 +249,5 @@ const _: () = assert!(std::mem::size_of::<Bound<'_, '_, '_, '_, '_, '_, '_, '_, 
 #[cfg(test)]
 pub use tests::probe as probe_allocations;
 #[cfg(test)]
+#[path = "pinned/tests.rs"]
 mod tests;

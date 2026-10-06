@@ -276,7 +276,13 @@ fn child_capacity_refusal_and_acceptance_quotas_propagate() {
                     let steps = structure.budget.steps_remaining();
                     structure
                         .budget
-                        .charge(structure.work, Tick(1), 0, steps, &mut 0)
+                        .charge(
+                            structure.work,
+                            Tick(1),
+                            0,
+                            steps,
+                            &mut crate::nfc::Credit::new(),
+                        )
                         .unwrap();
                 } else {
                     structure

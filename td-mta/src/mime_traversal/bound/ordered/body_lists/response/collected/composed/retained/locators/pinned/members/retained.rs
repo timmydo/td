@@ -1,4 +1,5 @@
 //! Whole source-bound part-member bytes in a separately admitted fixed window.
+#[path = "retained/collected.rs"]
 pub mod collected;
 use super::{Bound, Error, Member, Status};
 pub use crate::mime_traversal::Status as RetainStatus;
@@ -180,4 +181,5 @@ const _: () =
 #[cfg(test)]
 pub use tests::probe as probe_allocations;
 #[cfg(test)]
+#[path = "retained/tests.rs"]
 mod tests;

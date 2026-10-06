@@ -336,7 +336,13 @@ fn interpretation_record_and_wire_refusal_hide_whole_values() {
                 let left = structure.budget.steps_remaining();
                 structure
                     .budget
-                    .charge(structure.work, Tick(1), 0, left, &mut 0)
+                    .charge(
+                        structure.work,
+                        Tick(1),
+                        0,
+                        left,
+                        &mut crate::nfc::Credit::new(),
+                    )
                     .unwrap();
                 crate::nfc::Error::InterpretationLimit
             } else {

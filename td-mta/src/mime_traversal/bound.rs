@@ -1,4 +1,5 @@
 //! Bind completed structure and part metadata to one authorized resident source.
+#[path = "bound/ordered.rs"]
 pub mod ordered;
 use super::{Part, Status};
 const NODE_EXTRA_OUTPUT: u64 = (std::mem::size_of::<Node>() - std::mem::size_of::<Class>()) as u64;
@@ -89,7 +90,7 @@ impl<'a, 'w> Structure<'a, 'w> {
         }
         let result = self
             .budget
-            .charge(self.work, now, 0, 0, &mut 0)
+            .charge(self.work, now, 0, 0, &mut crate::nfc::Credit::new())
             .map_err(Error::Admission);
         if let Err(error) = result {
             self.failure = Some(error);
@@ -195,9 +196,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
         self.child.check_deadline(now).map_err(Error::Traversal)
     }
     pub fn finish(self, now: Tick) -> Result<Structure<'a, 'w>, Error> {
-        let source = self.child.source;
-        let base = self.child.base;
-        let header_limit = self.child.max_headers;
+        let (source, base, header_limit) = self.child.input();
         let (parts, work, budget) = self.child.finish(now).map_err(Error::Traversal)?;
         Ok(Structure {
             source,
@@ -414,4 +413,5 @@ const _: () = assert!(
 );
 
 #[cfg(test)]
+#[path = "bound/tests.rs"]
 mod tests;

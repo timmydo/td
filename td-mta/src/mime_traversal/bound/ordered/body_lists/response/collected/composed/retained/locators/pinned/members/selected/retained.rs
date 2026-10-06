@@ -1,4 +1,5 @@
 //! Whole selected part members through the shared original-bound fixed window.
+#[path = "retained/collected.rs"]
 pub mod collected;
 use super::super::retained as shared;
 use super::{Bound, Error, Properties};
@@ -116,4 +117,5 @@ const _: () =
 #[cfg(test)]
 pub use tests::probe as probe_allocations;
 #[cfg(test)]
+#[path = "retained/tests.rs"]
 mod tests;

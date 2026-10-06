@@ -1,4 +1,5 @@
 //! Fixed metadata member fragments; braces, locators and tree composition are external.
+#[path = "json/retained.rs"]
 pub mod retained;
 use super::{Error, Part};
 use crate::{
@@ -31,7 +32,7 @@ struct Scalars<'w> {
     digits: [u8; 20],
     used: usize,
     position: usize,
-    credit: u8,
+    credit: crate::nfc::Credit,
 }
 impl Scalars<'_> {
     fn bytes(&self) -> Result<&[u8], nfc::Error> {
@@ -195,7 +196,7 @@ impl<'w> Cursor<'w> {
                 digits: [0; 20],
                 used: 0,
                 position: 0,
-                credit: 0,
+                credit: crate::nfc::Credit::new(),
             },
             scratch,
             parent_failure: part.child.parent_failure,
@@ -406,4 +407,5 @@ impl<'w> Cursor<'w> {
 const _: () =
     assert!(std::mem::size_of::<Cursor<'_>>() + std::mem::size_of::<HeaderBudget>() <= 1024);
 #[cfg(test)]
+#[path = "json/tests.rs"]
 mod tests;

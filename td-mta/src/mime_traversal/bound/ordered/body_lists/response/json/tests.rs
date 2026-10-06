@@ -289,7 +289,7 @@ fn original_output_and_interpretation_cutoffs_are_sticky_without_replacement_own
                             Tick(1),
                             if kind == 0 { left[0] - cut } else { 0 },
                             if kind == 1 { left[1] - cut } else { 0 },
-                            &mut 0,
+                            &mut crate::nfc::Credit::new(),
                         )
                         .unwrap();
                 } else {

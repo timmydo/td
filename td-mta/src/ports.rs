@@ -60,8 +60,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Monotonic milliseconds within one boot; never a persisted UTC timestamp.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Tick(pub u64);
+pub use td_mime::time::Tick;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Deadline(Tick);
 impl Deadline {
@@ -76,6 +75,11 @@ impl Deadline {
     }
     pub fn expired(self, now: Tick) -> bool {
         now >= self.0
+    }
+}
+impl From<Deadline> for td_mime::time::Deadline {
+    fn from(deadline: Deadline) -> Self {
+        Self::at(deadline.tick())
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -596,6 +600,7 @@ mod crypto_boundary_tests {
                 r#"td-crypto = { path = "../td-crypto" }"#,
                 r#"td-header = { path = "../td-header" }"#,
                 r#"td-json = { path = "../td-json" }"#,
+                r#"td-mime = { path = "../td-mime" }"#,
                 r#"td-nfc = { path = "../td-nfc" }"#
             ]
         );

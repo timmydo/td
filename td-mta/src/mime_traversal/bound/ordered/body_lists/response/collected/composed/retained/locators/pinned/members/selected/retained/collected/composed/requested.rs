@@ -1,5 +1,7 @@
 //! Requested outer properties preserve selected metadata and original custody.
+#[path = "requested/retained.rs"]
 pub mod retained;
+#[path = "requested/subparts.rs"]
 pub mod subparts;
 use super::super::super::super::super::retained::collected::composed::requested as shared;
 use super::super::{Serialized, View};
@@ -113,4 +115,5 @@ const _: () =
 #[cfg(test)]
 pub use tests::probe as probe_allocations;
 #[cfg(test)]
+#[path = "requested/tests.rs"]
 mod tests;

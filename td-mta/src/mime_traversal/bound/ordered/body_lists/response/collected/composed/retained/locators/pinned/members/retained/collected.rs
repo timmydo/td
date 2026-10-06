@@ -1,4 +1,5 @@
 //! Collect every original source-bound member while retaining the actual pin.
+#[path = "collected/composed.rs"]
 pub mod composed;
 use super::super::super::super::Error as OriginalError;
 use super::{Bound, Cursor, Error, RetainStatus, View as MemberView};
@@ -244,7 +245,7 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 't, 'm> Child<'a, 'w, 'n, 'c, 'o, 'r, '
         let structure = &mut source.original.source.original.source.projected.structure;
         let result = structure
             .budget
-            .charge(structure.work, now, 0, 1, &mut 0)
+            .charge(structure.work, now, 0, 1, &mut crate::nfc::Credit::new())
             .map_err(|error| Error::Original(OriginalError::Admission(error)))
             .and_then(|()| {
                 structure
@@ -338,4 +339,5 @@ const _: () =
 #[cfg(test)]
 pub use tests::probe as probe_allocations;
 #[cfg(test)]
+#[path = "collected/tests.rs"]
 mod tests;

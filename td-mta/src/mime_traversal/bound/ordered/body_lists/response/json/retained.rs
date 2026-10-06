@@ -102,4 +102,5 @@ impl<'w, 'o> Cursor<'w, 'o> {
 const _: () =
     assert!(std::mem::size_of::<Cursor<'_, '_>>() + std::mem::size_of::<HeaderBudget>() <= 1024);
 #[cfg(test)]
+#[path = "retained/tests.rs"]
 mod tests;

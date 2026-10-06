@@ -1,4 +1,5 @@
 //! Original direct-leaf locator candidates; parent authorization stays external.
+#[path = "locators/pinned.rs"]
 pub mod pinned;
 use super::{Error, Retained, ViewBytes};
 use crate::{
@@ -58,7 +59,7 @@ pub struct Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l> {
     parent: BlobId,
     candidates: &'l mut [Candidate],
     next: usize,
-    credit: u8,
+    credit: crate::nfc::Credit,
     failure: Option<Error>,
 }
 impl<'a, 'w, 'n, 'c, 'o, 'r, 'l> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l> {
@@ -81,7 +82,7 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l> {
             parent,
             candidates,
             next: 0,
-            credit: 0,
+            credit: crate::nfc::Credit::new(),
             failure: None,
         })
     }
@@ -261,4 +262,5 @@ const _: () = assert!(
 const _: () = assert!(std::mem::size_of::<Mapped<'_, '_, '_, '_, '_, '_, '_>>() <= 256);
 
 #[cfg(test)]
+#[path = "locators/tests.rs"]
 mod tests;

@@ -1,4 +1,5 @@
 //! Selected per-part fields under the original bounded tree/list framing.
+#[path = "composed/requested.rs"]
 pub mod requested;
 use super::super::super::super::retained::collected::composed as shared;
 use super::{Error, Properties, Serialized, View};
@@ -118,4 +119,5 @@ const _: () =
 #[cfg(test)]
 pub use tests::probe as probe_allocations;
 #[cfg(test)]
+#[path = "composed/tests.rs"]
 mod tests;

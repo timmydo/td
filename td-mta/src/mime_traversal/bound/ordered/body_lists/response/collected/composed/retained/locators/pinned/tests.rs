@@ -406,7 +406,13 @@ fn hash_visits_are_funded_before_digest_and_exhaustion_preserves_position() {
                         let left = structure.budget.steps_remaining();
                         structure
                             .budget
-                            .charge(structure.work, Tick(1), 0, left - cutoff, &mut 0)
+                            .charge(
+                                structure.work,
+                                Tick(1),
+                                0,
+                                left - cutoff,
+                                &mut crate::nfc::Credit::new(),
+                            )
                             .unwrap();
                     } else {
                         structure
@@ -799,12 +805,35 @@ fn measured_mime_catalog_keeps_live_library_module_visibility() {
             .map(str::to_owned)
             .collect::<std::collections::BTreeSet<_>>()
     };
-    let current = declarations(&library);
+    let shared = std::fs::read_to_string(root.join("../../td-mime/src/lib.rs")).unwrap();
+    let mut current = declarations(&library);
+    current.extend(declarations(&shared));
     let measured = declarations(&catalog);
     assert!(!measured.is_empty());
     for line in &measured {
         assert!(current.contains(line), "stale measured module: {line}");
     }
+    let mut shared_paths = 0;
+    for line in catalog.lines() {
+        if let Some(path) = line
+            .strip_prefix("#[path = \"../../td-mime/src/")
+            .and_then(|value| value.strip_suffix("\"]"))
+        {
+            let name = path.strip_suffix(".rs").unwrap();
+            assert!(
+                current.contains(&format!("pub mod {name};"))
+                    || current.contains(&format!("mod {name};")),
+                "unregistered shared source: {path}"
+            );
+            assert!(root.join("../../td-mime/src").join(path).is_file());
+            shared_paths += 1;
+        }
+    }
+    let linked = ["pub mod buffer;", "pub mod time;", "pub mod work;"];
+    assert!(linked
+        .iter()
+        .all(|line| declarations(&shared).contains(*line)));
+    assert_eq!(shared_paths, declarations(&shared).len() - linked.len());
     assert_eq!(
         measured.len(),
         catalog

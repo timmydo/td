@@ -287,7 +287,9 @@ fn original_step_record_and_wire_refusal_hide_values_without_source_io() {
             let left = s.work.remaining();
             if kind == 2 {
                 let steps = s.budget.steps_remaining();
-                s.budget.charge(s.work, Tick(1), 0, steps, &mut 0).unwrap();
+                s.budget
+                    .charge(s.work, Tick(1), 0, steps, &mut crate::nfc::Credit::new())
+                    .unwrap();
             } else {
                 s.work
                     .charge(
@@ -370,7 +372,9 @@ fn actual_post_turn_pin_fence_wins_over_original_funding_refusal() {
                     .projected
                     .structure;
                 let left = s.budget.steps_remaining();
-                s.budget.charge(s.work, Tick(1), 0, left, &mut 0).unwrap();
+                s.budget
+                    .charge(s.work, Tick(1), 0, left, &mut crate::nfc::Credit::new())
+                    .unwrap();
             }
             let before = clock.calls.load(Ordering::SeqCst);
             clock.expire_at.store(before + 3, Ordering::SeqCst);

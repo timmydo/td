@@ -394,7 +394,7 @@ fn every_original_quota_cutoff_includes_slot_consumption_and_is_sticky() {
                             Tick(1),
                             if kind == 0 { left - cut } else { 0 },
                             if kind == 1 { left - cut } else { 0 },
-                            &mut 0,
+                            &mut crate::nfc::Credit::new(),
                         )
                         .unwrap();
                 } else {

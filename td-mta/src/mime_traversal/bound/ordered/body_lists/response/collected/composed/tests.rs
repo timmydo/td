@@ -294,7 +294,7 @@ fn original_step_record_and_wire_cutoffs_refuse_stickily_without_source_io() {
                                 Tick(1),
                                 if kind == 0 { left - cut } else { 0 },
                                 if kind == 1 { left - cut } else { 0 },
-                                &mut 0,
+                                &mut crate::nfc::Credit::new(),
                             )
                             .unwrap();
                     } else {

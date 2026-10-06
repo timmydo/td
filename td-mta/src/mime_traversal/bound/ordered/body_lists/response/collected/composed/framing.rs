@@ -37,7 +37,13 @@ enum Bytes {
 }
 // Adapters own freshness domains beyond the original job (for example a file pin).
 pub(crate) trait Source {
-    fn charge(&mut self, now: Tick, steps: u64, output: u64, credit: &mut u8) -> Result<(), Error>;
+    fn charge(
+        &mut self,
+        now: Tick,
+        steps: u64,
+        output: u64,
+        credit: &mut crate::nfc::Credit,
+    ) -> Result<(), Error>;
     fn parts(&self) -> Result<&[Part], Error>;
     fn node(&self, index: usize) -> Result<Part, Error>;
     fn fragment(&self, index: usize) -> Result<&[u8], Error>;
@@ -55,7 +61,7 @@ pub(crate) struct Frame {
     bytes: Bytes,
     offset: usize,
     after: Phase,
-    credit: u8,
+    credit: crate::nfc::Credit,
     properties: u8,
     follow_lists: bool,
     sub_parts: bool,
@@ -73,7 +79,7 @@ impl Frame {
             bytes: Bytes::Static(b""),
             offset: 0,
             after: Phase::Complete,
-            credit: 0,
+            credit: crate::nfc::Credit::new(),
             properties: 15,
             follow_lists: false,
             sub_parts: true,

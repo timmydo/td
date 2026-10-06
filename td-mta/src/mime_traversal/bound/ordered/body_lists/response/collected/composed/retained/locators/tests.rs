@@ -294,7 +294,7 @@ fn positive_cutoffs_preserve_reused_slots_exact_error_and_no_source_io() {
                             Tick(1),
                             if counter == 0 { left - cutoff } else { 0 },
                             if counter == 1 { left - cutoff } else { 0 },
-                            &mut 0,
+                            &mut crate::nfc::Credit::new(),
                         )
                         .unwrap();
                 } else {

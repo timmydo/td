@@ -1507,7 +1507,7 @@ by the supported signed-minute offset range. Arithmetic on these bounded
 components cannot wrap; year boundary transitions use checked operations.
 
 M06ab qualifies second 60 using the operator-approved IANA source pin in
-leap-seconds/README.md. Offline tooling verifies the exact source and derives
+../td-mime/leap-seconds/README.md. Offline tooling verifies the exact source and derives
 27 positive insertion dates; only the generated 108-byte table enters the
 runtime. After validating raw components, normalize the offset without
 changing the second. Known offsets become UTC; unknown -0000/obsolete zones

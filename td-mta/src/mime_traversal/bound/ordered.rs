@@ -1,4 +1,5 @@
 //! Complete ordinal-ordered classification under one immutable source binding.
+#[path = "ordered/body_lists.rs"]
 pub mod body_lists;
 use super::{ClassifiedView, Error, PartCursor, Structure};
 use crate::{
@@ -167,4 +168,5 @@ const _: () = assert!(
 );
 const _: () = assert!(std::mem::size_of::<Classified<'_, '_, '_>>() <= 128);
 #[cfg(test)]
+#[path = "ordered/tests.rs"]
 mod tests;

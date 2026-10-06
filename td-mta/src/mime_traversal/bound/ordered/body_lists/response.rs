@@ -1,5 +1,7 @@
 //! Replay original selected part metadata in preorder for response composition.
+#[path = "response/collected.rs"]
 pub mod collected;
+#[path = "response/json.rs"]
 pub mod json;
 use super::{Selected, View};
 use crate::{
@@ -203,4 +205,5 @@ const _: () = assert!(
 const _: () = assert!(std::mem::size_of::<Projected<'_, '_, '_>>() <= 256);
 
 #[cfg(test)]
+#[path = "response/tests.rs"]
 mod tests;

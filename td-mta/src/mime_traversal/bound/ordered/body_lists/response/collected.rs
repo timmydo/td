@@ -1,4 +1,5 @@
 //! Retain every original fragment before granting whole serialization ownership.
+#[path = "collected/composed.rs"]
 pub mod composed;
 use super::{json::retained, Error, Part, Projected, Projecting, Selected, View as ListsView};
 pub use crate::mime_traversal::Status;
@@ -106,7 +107,7 @@ impl<'a, 'w, 'n, 'c, 'o> Collecting<'a, 'w, 'n, 'c, 'o> {
         let structure = &mut self.projecting.structure;
         let result = structure
             .budget
-            .charge(structure.work, now, 0, 1, &mut 0)
+            .charge(structure.work, now, 0, 1, &mut crate::nfc::Credit::new())
             .map_err(Error::Admission);
         if let Err(error) = result {
             self.failure = Some(error);
@@ -225,7 +226,7 @@ impl<'a, 'm, 'o> Child<'a, 'm, 'o> {
         };
         let (retained, work, budget, _) = self.outcome(result)?;
         let result = budget
-            .charge(work, now, 0, 1, &mut 0)
+            .charge(work, now, 0, 1, &mut crate::nfc::Credit::new())
             .map_err(Error::Admission);
         self.outcome(result)?;
         let result = work
@@ -288,4 +289,5 @@ const _: () = assert!(
 const _: () = assert!(std::mem::size_of::<Cell<'_>>() <= 128);
 const _: () = assert!(std::mem::size_of::<Serialized<'_, '_, '_, '_, '_>>() <= 256);
 #[cfg(test)]
+#[path = "collected/tests.rs"]
 mod tests;

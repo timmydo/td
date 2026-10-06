@@ -417,7 +417,13 @@ fn whole_prefixes_and_completed_owner_freshly_admit() {
             let bytes = selected.budget.source_bytes_remaining();
             assert!(selected
                 .budget
-                .charge(selected.work, Tick(1), bytes + 1, 0, &mut 0)
+                .charge(
+                    selected.work,
+                    Tick(1),
+                    bytes + 1,
+                    0,
+                    &mut crate::nfc::Credit::new()
+                )
                 .is_err());
             assert_eq!(
                 Projecting::new(selected, Tick(1)).err(),
@@ -502,7 +508,13 @@ fn extra_parts_forgetting_capacity_and_original_cuts_retire_replay() {
                 let remaining = selected.budget.source_bytes_remaining();
                 selected
                     .budget
-                    .charge(selected.work, Tick(1), remaining - 1, 0, &mut 0)
+                    .charge(
+                        selected.work,
+                        Tick(1),
+                        remaining - 1,
+                        0,
+                        &mut crate::nfc::Credit::new(),
+                    )
                     .unwrap();
             }
         }

@@ -274,7 +274,7 @@ fn original_budget_refusal_hides_whole_retained_bytes() {
                                 Tick(1),
                                 if counter == 0 { left - cutoff } else { 0 },
                                 if counter == 1 { left - cutoff } else { 0 },
-                                &mut 0,
+                                &mut crate::nfc::Credit::new(),
                             )
                             .unwrap();
                     } else {

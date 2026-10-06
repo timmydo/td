@@ -1,5 +1,7 @@
 //! Source-bound part members; current access authorization and publication follow.
+#[path = "members/retained.rs"]
 pub mod retained;
+#[path = "members/selected.rs"]
 pub mod selected;
 use super::{Bound, Error};
 use crate::{admission::work::Charge, nfc::HeaderBudget, ports::Tick};
@@ -21,7 +23,7 @@ pub struct Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> {
     ordinal: u16,
     position: usize,
     total: usize,
-    credit: u8,
+    credit: crate::nfc::Credit,
     selection: Option<selected::Index>,
     failure: Option<Error>,
 }
@@ -45,7 +47,7 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 
             ordinal,
             position: 0,
             total: 0,
-            credit: 0,
+            credit: crate::nfc::Credit::new(),
             selection: None,
             failure: None,
         };
@@ -335,4 +337,5 @@ const _: () = assert!(std::mem::size_of::<Member<'_, '_, '_, '_, '_, '_, '_, '_,
 #[cfg(test)]
 pub use tests::probe as probe_allocations;
 #[cfg(test)]
+#[path = "members/tests.rs"]
 mod tests;

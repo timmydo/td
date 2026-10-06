@@ -61,7 +61,7 @@ fn drain(
     for _ in 0..10000 {
         let mut output = [0xa5; 128];
         let before = costs(cursor);
-        let credit = cursor.credit;
+        let credit = cursor.credit.remaining();
         let progress = cursor.poll(Tick(1), &mut output[..width])?;
         let after = costs(cursor);
         assert_eq!(before[0], after[0]);
@@ -259,7 +259,13 @@ fn quota_cutoffs_refuse_before_copying_and_hide_every_partial_value() {
                     let steps = structure.budget.steps_remaining();
                     structure
                         .budget
-                        .charge(structure.work, Tick(1), 0, steps - cut, &mut 0)
+                        .charge(
+                            structure.work,
+                            Tick(1),
+                            0,
+                            steps - cut,
+                            &mut crate::nfc::Credit::new(),
+                        )
                         .unwrap();
                 } else {
                     structure
@@ -477,7 +483,13 @@ fn post_work_pin_deadline_overrides_original_quota_failure() {
                 let remaining = structure.budget.steps_remaining();
                 structure
                     .budget
-                    .charge(structure.work, Tick(1), 0, remaining, &mut 0)
+                    .charge(
+                        structure.work,
+                        Tick(1),
+                        0,
+                        remaining,
+                        &mut crate::nfc::Credit::new(),
+                    )
                     .unwrap();
             } else {
                 let remaining = structure.work.remaining().output_bytes;
