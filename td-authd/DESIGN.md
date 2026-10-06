@@ -987,7 +987,75 @@ backslash as itself, backslash as `\\`, space as `\s`, every other byte as
 width; a cut label has no room left for another escape. Hostname and
 username are printable ASCII without space or backslash, and the requester
 must equal the owner. The widest value is 252 bytes. The whole value is at
-most 256 bytes; unknown tags, truncation and trailing bytes refuse.
+most 256 bytes; unknown tags, truncation and trailing bytes refuse. Tag 3,
+a retired write form, stays unassigned.
+
+Login-key operations ("Login keys and session lock" below) take tags 7 to
+10: session unlock (7), first enrollment (8), key addition (9) and key
+removal (10). Each adds a big-endian u32 account, which must equal the
+owner, then the key count before and after the operation, one byte each.
+Unlock has 1 to 8 keys and the same count after. Enrollment has 0 before
+and 1 or 2 after, then one byte naming the new key the step concerns, 1
+through the after count. Addition has 1 to 7 before and one more after.
+Removal has 1 to 8 before, then a one-byte count of 1 to 8 and that many
+slots, and after is before less that count. A slot is its 1-based
+position in the record's canonical slot order (one byte, at most the
+before count), which the key-management screen's digits name, then its
+fingerprint; positions strictly increase. A fingerprint is the first four
+bytes of the credential ID's SHA-256, so two slots may share one, and the
+position tells them apart: the authorize step's client-data hash binds the
+record digest, which fixes the order. Then one step byte and the step's
+fields:
+
+| Step | Byte | Fields |
+| --- | --- | --- |
+| identify | 1 | none |
+| authorize | 2 | fingerprint, retries |
+| create | 3 | retries |
+| prove | 4 | fingerprint, retries |
+| repeat | 5 | fingerprint, retries |
+| probe | 6 | fingerprint |
+| unlock | 7 | fingerprint, retries |
+| connect | 8 | none |
+
+Steps 1 to 7 are the client-data phase bytes of `td-login/TOKEN-LOGIN.md`,
+which reserves 8 for connect. Connect, in which the person connects the
+next new key alone, sends no assertion and has no client-data phase: it is
+the presentation root derives before a create step, whose retries only
+the connected key can answer. Identify and probe are silent. Retries, on
+exactly the PIN steps, are one byte: the key's own getPINRetries answer,
+shown as the key's claim; the codec takes any value and admission refuses
+zero, since the worker reports a key with none left as PIN blocked instead
+of presenting a PIN step. A step's fingerprint names the identified
+baseline slot (authorize, unlock) or the credential just created (prove,
+repeat, probe). An identified fingerprint is the key's own answer to the
+silent identify probe: it shows which enrolled credential the key
+claims, not proof that the connected key holds it, which only the
+following signed assertion gives. The only orders are
+identify, unlock for unlock; identify, authorize for removal; identify,
+authorize, connect, create, prove, repeat, probe for addition; and connect,
+create, prove, repeat, probe for each new key of an enrollment in turn. A
+step outside its operation's list refuses. The widest login value, a
+removal of eight keys at its authorize step, is 98 bytes.
+
+`Request::begin_login` builds root's first presentation of a login
+operation and refuses unless its step is the operation's first (identify,
+or connect for an enrollment's first key) and the baseline matches, as
+below. `Request::admit_login_step` is root's pure check on a worker's next
+step, amendment 4 below. The baseline is the presented record's slot
+fingerprints in canonical order; the created fingerprint is the
+credential the worker reported creating in the current key's ceremony. It
+refuses unless the invitation keeps the nonce, owner, operation, account,
+counts and removal slots; the baseline holds the before count (none for
+enrollment) and each removal slot's fingerprint at its position; the step
+is the one legal successor, an enrollment's probe moving to the next
+key's connect; an authorize or unlock fingerprint is in the baseline; a
+prove fingerprint is the reported credential, which repeat and probe keep
+and no baseline slot names; no credential is reported before prove; and a
+PIN step's retries are not zero. It answers `Last` when the admitted step
+is the operation's final one (unlock's unlock, removal's authorize, the
+last new key's probe) and `Next` otherwise; the operation's commit is
+legal only after `Last`. Nothing calls either yet.
 
 The human UID is 1000 through 65533; the external application UID is 65536
 through 2147483647. A write's requester must equal its human owner. Names are
@@ -1020,6 +1088,19 @@ refuses, so the producer must narrow those or refuse the plan before
 consent; a kernel disk name is at most 31 bytes. "Whole-disk installation
 intake" below presents it. All consumers pin the codec source and its
 tests assert the complete public argument display.
+
+A login prompt shows the operation with its key count as `(BEFORE ->
+AFTER KEYS)`, an enrollment's `NEW KEY K OF N`, the account UID, a
+removal's slots as `POSITION:FINGERPRINT`, two to a row under `REMOVE:`
+with continuation rows aligned beneath, and `LOGIN WILL NOT NEED A KEY`
+when a removal leaves none. Every login row is at most 34 columns
+(`PROMPT_COLUMNS`), the renderer's width at its narrowest accepted output
+of 320 pixels, so wrapping never splits a fingerprint. Then the step:
+which key to connect or remove, or the step's fingerprint in lowercase
+hex, and on a PIN step `N PIN ATTEMPTS LEFT ON THIS KEY` and `ENTER ITS
+PIN, THEN TOUCH THE KEY`. Unlock alone omits its count, which it does not
+change and which its bytes still bind: the lock surface shows the prompt
+to whoever is at the machine.
 
 These are structural checks, not caller admission or proof of
 randomness. The private root unlock and enrollment workers in
@@ -1568,7 +1649,9 @@ staged into the target authority recipe.
 
 ## Login keys and session lock (target)
 
-Not implemented. [`td-login/TOKEN-LOGIN.md`](../td-login/TOKEN-LOGIN.md)
+Not implemented, except the consent codec and its pure step admission
+(amendments 3 and 4), which nothing calls yet.
+[`td-login/TOKEN-LOGIN.md`](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier. "Session lock" there is the compositor's
 display and input lock; it is unrelated to this document's secret-session
 statuses (idle, a released key, relocking), and unlocking the session
@@ -1612,24 +1695,28 @@ TOKEN-LOGIN.md's.
    child per login operation, with the unlock worker's launch, framing,
    presentation and commit rounds, cancellation, reaping and generation
    teardown. It shares the single operation slot.
-3. **Consent operations (2).** `consent.rs` gains tags 7 to 10: login
-   unlock, first enrollment, key addition and key removal. Each carries its
-   step, the key count before and after and the fingerprints involved, and
-   every PIN step of every one of them carries the key's reported PIN
-   retries. Exact bytes are pinned with literal tests.
+3. **Consent operations (2).** Implemented, inert: `consent.rs` has tags
+   7 to 10, login unlock, first enrollment, key addition and key removal.
+   Each carries its step, the key count before and after and the
+   fingerprints involved, and every PIN step of every one of them carries
+   the key's reported PIN retries. "Immutable consent description
+   prerequisite" above gives the bytes, which literal tests pin.
 4. **Step admission with device data (2).** `following_enrollment_step`
    derives the whole successor and requires the worker's invitation to equal
    it. A login step instead names data only the token supplies. Root still
-   derives nonce, owner, operation, policy, counts and the next step, and
-   accepts the worker's fingerprint only when it names a slot of the
-   baseline record (identify, authorize) or the credential the worker
-   reports creating (prove, repeat, probe), and a retry count only as one
+   derives nonce, owner, operation, counts, removal slots and the next
+   step, and accepts the worker's fingerprint only when it names a slot
+   of the baseline record (the authorize or unlock step after identify)
+   or the credential the worker reports creating (prove, repeat, probe),
+   which no baseline slot names, and a retry count only as one nonzero
    byte displayed as a device claim. Any other difference cancels the
-   child.
+   child. A commit frame is accepted only after the operation's final
+   step. `begin_login` and `admit_login_step` are those checks; the
+   supervision that applies them is not implemented.
 5. **Requests and version (2).** The paired protocol becomes `TDLA003`,
    because TDLA002 states that no record contains a credential. Request
    `1b` selects a login operation (unlock, one-key or two-key first
-   enrollment, addition, or removal with its key set), and `1c` carries the
+   enrollment, addition, or removal with its slots), and `1c` carries the
    exact current description followed by one PIN. Root forwards that PIN to
    the worker as one bounded frame in a clearing owner and keeps no copy.
    Both peers ship atomically, without negotiation, as earlier additions

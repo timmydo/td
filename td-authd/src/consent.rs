@@ -36,6 +36,212 @@ pub enum Platform {
     TpmPcr7,
 }
 
+/// The most login keys one account enrolls (td-login/TOKEN-LOGIN.md).
+pub const LOGIN_KEYS: u8 = 8;
+
+/// The first four bytes of a credential ID's SHA-256, shown as hex.
+pub type Fingerprint = [u8; 4];
+
+/// The renderer's columns at its narrowest accepted output, 320 pixels less
+/// 48 of margin in 8-pixel Unifont cells (td-compositor/src/attention.rs).
+/// Every login row fits, so wrapping never splits a fingerprint.
+pub const PROMPT_COLUMNS: usize = 34;
+
+/// One key a removal names: its 1-based position in the record's canonical
+/// slot order, which the key-management screen's digits also name, and its
+/// fingerprint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Slot {
+    pub position: u8,
+    pub key: Fingerprint,
+}
+
+/// What admitting a login step allows next: another step, or, after the
+/// operation's final step, only its commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Admitted {
+    Next,
+    Last,
+}
+
+/// One presented step of a login-key operation. Each step's byte is its
+/// client-data phase byte; `Connect` sends no assertion and has none.
+/// Retries are the key's own unverified getPINRetries answer. An identified
+/// key is the key's own silent selection, not proof of which key it is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoginStep {
+    /// Silent selection of the connected enrolled key.
+    Identify,
+    Authorize {
+        key: Fingerprint,
+        retries: u8,
+    },
+    Create {
+        retries: u8,
+    },
+    Prove {
+        key: Fingerprint,
+        retries: u8,
+    },
+    Repeat {
+        key: Fingerprint,
+        retries: u8,
+    },
+    /// Silent check that the new credential is selectable.
+    Probe {
+        key: Fingerprint,
+    },
+    Unlock {
+        key: Fingerprint,
+        retries: u8,
+    },
+    /// The person connects the next new key alone.
+    Connect,
+}
+
+impl LoginStep {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Identify => 1,
+            Self::Authorize { .. } => 2,
+            Self::Create { .. } => 3,
+            Self::Prove { .. } => 4,
+            Self::Repeat { .. } => 5,
+            Self::Probe { .. } => 6,
+            Self::Unlock { .. } => 7,
+            Self::Connect => 8,
+        }
+    }
+
+    fn key(self) -> Option<Fingerprint> {
+        match self {
+            Self::Authorize { key, .. }
+            | Self::Prove { key, .. }
+            | Self::Repeat { key, .. }
+            | Self::Probe { key }
+            | Self::Unlock { key, .. } => Some(key),
+            Self::Identify | Self::Create { .. } | Self::Connect => None,
+        }
+    }
+
+    /// Present exactly on the steps that ask for a PIN.
+    fn retries(self) -> Option<u8> {
+        match self {
+            Self::Authorize { retries, .. }
+            | Self::Create { retries }
+            | Self::Prove { retries, .. }
+            | Self::Repeat { retries, .. }
+            | Self::Unlock { retries, .. } => Some(retries),
+            Self::Identify | Self::Probe { .. } | Self::Connect => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoginKind {
+    Unlock,
+    Enroll,
+    Add,
+    Remove,
+}
+
+impl LoginKind {
+    fn tag(self) -> u8 {
+        match self {
+            Self::Unlock => 7,
+            Self::Enroll => 8,
+            Self::Add => 9,
+            Self::Remove => 10,
+        }
+    }
+
+    /// Step bytes in their only order; enrollment repeats its list per key.
+    fn steps(self) -> &'static [u8] {
+        match self {
+            Self::Unlock => &[1, 7],
+            Self::Enroll => &[8, 3, 4, 5, 6],
+            Self::Add => &[1, 2, 8, 3, 4, 5, 6],
+            Self::Remove => &[1, 2],
+        }
+    }
+}
+
+/// The fields every login-key operation shares.
+struct Login<'a> {
+    kind: LoginKind,
+    account: u32,
+    before: u8,
+    after: u8,
+    /// Which new key of a first enrollment this step concerns; 1 otherwise.
+    key: u8,
+    removed: &'a [Slot],
+    step: LoginStep,
+}
+
+impl Login<'_> {
+    fn valid(&self, owner: u32) -> bool {
+        let counts = match self.kind {
+            LoginKind::Unlock => {
+                (1..=LOGIN_KEYS).contains(&self.before) && self.after == self.before
+            }
+            LoginKind::Enroll => {
+                self.before == 0
+                    && (1..=2).contains(&self.after)
+                    && (1..=self.after).contains(&self.key)
+            }
+            LoginKind::Add => {
+                (1..LOGIN_KEYS).contains(&self.before)
+                    && self.before.checked_add(1) == Some(self.after)
+            }
+            LoginKind::Remove => {
+                (1..=LOGIN_KEYS).contains(&self.before)
+                    && !self.removed.is_empty()
+                    && usize::from(self.before).checked_sub(self.removed.len())
+                        == Some(usize::from(self.after))
+                    && self
+                        .removed
+                        .iter()
+                        .all(|slot| (1..=self.before).contains(&slot.position))
+                    && self
+                        .removed
+                        .windows(2)
+                        .all(|pair| matches!(pair, [low, high] if low.position < high.position))
+            }
+        };
+        self.account == owner && counts && self.kind.steps().contains(&self.step.byte())
+    }
+
+    /// The baseline holds the counted keys (none before an enrollment) and
+    /// every removal slot's fingerprint at its position.
+    fn matches(&self, baseline: &[Fingerprint]) -> bool {
+        let enrolled = match self.kind {
+            LoginKind::Enroll => 0,
+            _ => self.before,
+        };
+        baseline.len() == usize::from(enrolled)
+            && self.removed.iter().all(|slot| {
+                usize::from(slot.position)
+                    .checked_sub(1)
+                    .and_then(|index| baseline.get(index))
+                    == Some(&slot.key)
+            })
+    }
+
+    /// The step that must follow this one, with its new-key ordinal, or none
+    /// after the operation's final step.
+    fn following(&self) -> Option<(u8, u8)> {
+        let steps = self.kind.steps();
+        let index = steps.iter().position(|byte| *byte == self.step.byte())?;
+        match steps.get(index.saturating_add(1)) {
+            Some(step) => Some((*step, self.key)),
+            None if self.kind == LoginKind::Enroll && self.key < self.after => {
+                Some((*steps.first()?, self.key.saturating_add(1)))
+            }
+            None => None,
+        }
+    }
+}
+
 /// A disk label as the trusted renderer shows it: printable ASCII other than
 /// space and backslash as itself, backslash as `\\`, space as `\s`, every
 /// other byte as `\xNN`, cut before the first escape that would pass the
@@ -169,6 +375,94 @@ pub enum Operation {
         // Pin the authenticated requester separately; this profile admits only its owner.
         requester: u32,
     },
+    /// Unlock the locked session with one enrolled login key.
+    LoginUnlock {
+        account: u32,
+        before: u8,
+        after: u8,
+        step: LoginStep,
+    },
+    /// First enrollment of `after` keys; `key` is the one this step creates.
+    LoginEnroll {
+        account: u32,
+        before: u8,
+        after: u8,
+        key: u8,
+        step: LoginStep,
+    },
+    LoginAdd {
+        account: u32,
+        before: u8,
+        after: u8,
+        step: LoginStep,
+    },
+    /// `removed` is in strictly increasing slot position.
+    LoginRemove {
+        account: u32,
+        before: u8,
+        after: u8,
+        removed: Vec<Slot>,
+        step: LoginStep,
+    },
+}
+
+impl Operation {
+    fn login(&self) -> Option<Login<'_>> {
+        let (kind, account, before, after, key, removed, step) = match self {
+            Self::LoginUnlock {
+                account,
+                before,
+                after,
+                step,
+            } => (LoginKind::Unlock, account, before, after, 1, &[][..], step),
+            Self::LoginEnroll {
+                account,
+                before,
+                after,
+                key,
+                step,
+            } => (
+                LoginKind::Enroll,
+                account,
+                before,
+                after,
+                *key,
+                &[][..],
+                step,
+            ),
+            Self::LoginAdd {
+                account,
+                before,
+                after,
+                step,
+            } => (LoginKind::Add, account, before, after, 1, &[][..], step),
+            Self::LoginRemove {
+                account,
+                before,
+                after,
+                removed,
+                step,
+            } => (
+                LoginKind::Remove,
+                account,
+                before,
+                after,
+                1,
+                removed.as_slice(),
+                step,
+            ),
+            _ => return None,
+        };
+        Some(Login {
+            kind,
+            account: *account,
+            before: *before,
+            after: *after,
+            key,
+            removed,
+            step: *step,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,6 +477,9 @@ impl Request {
     pub fn new(nonce: [u8; 32], owner: u32, operation: Operation) -> Result<Self, String> {
         if nonce == [0; 32] || !(1000..=65533).contains(&owner) {
             return Err("invalid consent request identity".into());
+        }
+        if operation.login().is_some_and(|login| !login.valid(owner)) {
+            return Err("invalid consent login operation".into());
         }
         match &operation {
             Operation::Install {
@@ -281,6 +578,95 @@ impl Request {
         .map(Some)
     }
 
+    /// Root's first presentation of a login operation, whose step must be
+    /// the operation's first: identify, or connect for an enrollment's first
+    /// key. `baseline` is the presented record's slot fingerprints in its
+    /// canonical order, which the counts and any removal set must match.
+    pub fn begin_login(
+        nonce: [u8; 32],
+        owner: u32,
+        operation: Operation,
+        baseline: &[Fingerprint],
+    ) -> Result<Self, String> {
+        let request = Self::new(nonce, owner, operation)?;
+        let login = request
+            .operation
+            .login()
+            .ok_or("not a login operation step")?;
+        if login.kind.steps().first() != Some(&login.step.byte()) || login.key != 1 {
+            return Err("a login operation begins at its first step".into());
+        }
+        if !login.matches(baseline) {
+            return Err("login step does not match its baseline record".into());
+        }
+        Ok(request)
+    }
+
+    /// Admits `invitation`, the worker's next step of this login operation.
+    /// Root supplies the presented record's slot fingerprints in canonical
+    /// order and the credential the worker reported creating in the current
+    /// key's ceremony, which exists only between its create and probe steps.
+    /// All but the step's device data must be what root derives: the same
+    /// nonce, owner, operation, account, counts and removal slots, and the
+    /// only legal next step. A step's key names a baseline slot (authorize,
+    /// unlock) or the created credential (prove, repeat, probe), which no
+    /// baseline slot names; retries are a claim, refused at zero. `Last`
+    /// means the admitted step is the operation's final one, after which
+    /// only its commit may follow.
+    pub fn admit_login_step(
+        &self,
+        invitation: &Self,
+        baseline: &[Fingerprint],
+        created: Option<Fingerprint>,
+    ) -> Result<Admitted, String> {
+        let (Some(current), Some(next)) = (self.operation.login(), invitation.operation.login())
+        else {
+            return Err("not a login operation step".into());
+        };
+        if invitation.nonce != self.nonce
+            || invitation.owner != self.owner
+            || next.kind != current.kind
+            || next.account != current.account
+            || next.before != current.before
+            || next.after != current.after
+            || next.removed != current.removed
+        {
+            return Err("login step changed its operation".into());
+        }
+        if !current.matches(baseline) {
+            return Err("login step does not match its baseline record".into());
+        }
+        let Some(following) = current.following() else {
+            return Err("login operation has no further step".into());
+        };
+        if (next.step.byte(), next.key) != following {
+            return Err("illegal login step order".into());
+        }
+        let created_is = |key| created == Some(key) && !baseline.contains(&key);
+        let admitted = match next.step {
+            LoginStep::Identify | LoginStep::Connect | LoginStep::Create { .. } => {
+                created.is_none()
+            }
+            LoginStep::Authorize { key, .. } | LoginStep::Unlock { key, .. } => {
+                created.is_none() && baseline.contains(&key)
+            }
+            LoginStep::Prove { key, .. } => created_is(key),
+            LoginStep::Repeat { key, .. } | LoginStep::Probe { key } => {
+                created_is(key) && current.step.key() == Some(key)
+            }
+        };
+        if !admitted {
+            return Err("login step names a key root did not admit".into());
+        }
+        if next.step.retries() == Some(0) {
+            return Err("a blocked key cannot take a PIN".into());
+        }
+        Ok(match next.following() {
+            Some(_) => Admitted::Next,
+            None => Admitted::Last,
+        })
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(MAX_BYTES);
         bytes.extend_from_slice(MAGIC);
@@ -362,6 +748,36 @@ impl Request {
                 bytes.extend_from_slice(application.as_bytes());
                 bytes.push(name.len() as u8);
                 bytes.extend_from_slice(name.as_bytes());
+            }
+            Operation::LoginUnlock { .. }
+            | Operation::LoginEnroll { .. }
+            | Operation::LoginAdd { .. }
+            | Operation::LoginRemove { .. } => {
+                if let Some(login) = self.operation.login() {
+                    bytes.push(login.kind.tag());
+                    bytes.extend_from_slice(&login.account.to_be_bytes());
+                    bytes.push(login.before);
+                    bytes.push(login.after);
+                    match login.kind {
+                        LoginKind::Enroll => bytes.push(login.key),
+                        LoginKind::Remove => {
+                            // Construction bounds the set to LOGIN_KEYS.
+                            bytes.push(login.removed.len() as u8);
+                            for slot in login.removed {
+                                bytes.push(slot.position);
+                                bytes.extend_from_slice(&slot.key);
+                            }
+                        }
+                        LoginKind::Unlock | LoginKind::Add => {}
+                    }
+                    bytes.push(login.step.byte());
+                    if let Some(key) = login.step.key() {
+                        bytes.extend_from_slice(&key);
+                    }
+                    if let Some(retries) = login.step.retries() {
+                        bytes.push(retries);
+                    }
+                }
             }
         }
         bytes
@@ -449,6 +865,56 @@ impl Request {
                     requester,
                 }
             }
+            tag @ 7..=10 => {
+                let account = input.number()?;
+                let before = input.byte()?;
+                let after = input.byte()?;
+                match tag {
+                    7 => Operation::LoginUnlock {
+                        account,
+                        before,
+                        after,
+                        step: input.login_step()?,
+                    },
+                    8 => {
+                        let key = input.byte()?;
+                        Operation::LoginEnroll {
+                            account,
+                            before,
+                            after,
+                            key,
+                            step: input.login_step()?,
+                        }
+                    }
+                    9 => Operation::LoginAdd {
+                        account,
+                        before,
+                        after,
+                        step: input.login_step()?,
+                    },
+                    _ => {
+                        let count = input.byte()?;
+                        if count > LOGIN_KEYS {
+                            return Err("invalid consent login key set".into());
+                        }
+                        let mut removed = Vec::with_capacity(usize::from(count));
+                        for _ in 0..count {
+                            let position = input.byte()?;
+                            removed.push(Slot {
+                                position,
+                                key: input.fingerprint()?,
+                            });
+                        }
+                        Operation::LoginRemove {
+                            account,
+                            before,
+                            after,
+                            removed,
+                            step: input.login_step()?,
+                        }
+                    }
+                }
+            }
             _ => return Err("unknown consent operation".into()),
         };
         if !input.0.is_empty() {
@@ -493,12 +959,7 @@ impl Request {
                 lines.push("ALL DATA ON THIS DISK WILL BE LOST".into());
                 lines.push(format!("HOSTNAME: {hostname}"));
                 lines.push(format!("USER: {username}"));
-                let mut prefix = String::with_capacity(16);
-                for byte in deployment {
-                    use std::fmt::Write as _;
-                    // Writing to a String cannot fail.
-                    let _ = write!(prefix, "{byte:02x}");
-                }
+                let prefix = hex(deployment);
                 lines.push(format!("DEPLOYMENT: {prefix}..."));
                 lines.push("UNENCRYPTED STORAGE, AUTOMATIC LOGIN".into());
                 lines.push("ENTER: ERASE AND INSTALL   ESC: CANCEL".into());
@@ -573,6 +1034,14 @@ impl Request {
                     .into(),
                 );
             }
+            Operation::LoginUnlock { .. }
+            | Operation::LoginEnroll { .. }
+            | Operation::LoginAdd { .. }
+            | Operation::LoginRemove { .. } => {
+                if let Some(login) = self.operation.login() {
+                    login_lines(&mut lines, &login);
+                }
+            }
         }
         if !matches!(
             self.operation,
@@ -618,6 +1087,79 @@ fn label_line(field: &str, label: Option<&Label>) -> String {
         Some(label) if label.truncated() => format!("{field}: {} (TRUNCATED)", label.text()),
         Some(label) => format!("{field}: {}", label.text()),
     }
+}
+
+/// A login operation's rows. The unlock prompt, shown on the lock surface,
+/// omits the key count, which unlocking does not change.
+fn login_lines(lines: &mut Vec<String>, login: &Login<'_>) {
+    let change = format!(
+        "({} -> {} {})",
+        login.before,
+        login.after,
+        if login.after == 1 { "KEY" } else { "KEYS" }
+    );
+    match login.kind {
+        LoginKind::Unlock => lines.push("UNLOCK SESSION WITH A LOGIN KEY".into()),
+        LoginKind::Enroll => {
+            lines.push(format!("ENROLL LOGIN KEYS {change}"));
+            lines.push(format!("NEW KEY {} OF {}", login.key, login.after));
+        }
+        LoginKind::Add => lines.push(format!("ADD A LOGIN KEY {change}")),
+        LoginKind::Remove => lines.push(match login.removed.len() {
+            1 => format!("REMOVE A LOGIN KEY {change}"),
+            count => format!("REMOVE {count} LOGIN KEYS {change}"),
+        }),
+    }
+    lines.push(format!("ACCOUNT UID {}", login.account));
+    // Two to a row fit PROMPT_COLUMNS, so wrapping never splits a slot.
+    for (index, slots) in login.removed.chunks(2).enumerate() {
+        let mut row = String::from(if index == 0 { "REMOVE:" } else { "       " });
+        for slot in slots {
+            row.push_str(&format!(" {}:{}", slot.position, hex(&slot.key)));
+        }
+        lines.push(row);
+    }
+    if login.kind == LoginKind::Remove && login.after == 0 {
+        lines.push("LOGIN WILL NOT NEED A KEY".into());
+    }
+    match login.step {
+        LoginStep::Identify => lines.push("CONNECT ONLY ONE ENROLLED KEY".into()),
+        LoginStep::Connect => {
+            if login.kind == LoginKind::Add {
+                lines.push("REMOVE THE AUTHORIZING KEY".into());
+            } else if login.key > 1 {
+                lines.push("REMOVE THE PREVIOUS KEY".into());
+            }
+            lines.push("CONNECT ONLY THE NEW KEY".into());
+        }
+        LoginStep::Authorize { key, .. } => {
+            lines.push(format!("AUTHORIZE WITH KEY {}", hex(&key)));
+        }
+        LoginStep::Unlock { key, .. } => lines.push(format!("UNLOCK WITH KEY {}", hex(&key))),
+        LoginStep::Create { .. } => lines.push("CREATE A LOGIN CREDENTIAL".into()),
+        LoginStep::Prove { key, .. } => lines.push(format!("VERIFY NEW KEY {}", hex(&key))),
+        LoginStep::Repeat { key, .. } => {
+            lines.push(format!("VERIFY NEW KEY {} AGAIN", hex(&key)));
+        }
+        LoginStep::Probe { key } => {
+            lines.push(format!("CHECKING NEW KEY {}", hex(&key)));
+            lines.push("KEEP IT CONNECTED".into());
+        }
+    }
+    if let Some(retries) = login.step.retries() {
+        lines.push(format!("{retries} PIN ATTEMPTS LEFT ON THIS KEY"));
+        lines.push("ENTER ITS PIN, THEN TOUCH THE KEY".into());
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        // Writing to a String cannot fail.
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 fn put_text(bytes: &mut Vec<u8>, text: &str) {
@@ -678,6 +1220,52 @@ impl<'a> Input<'a> {
                 .try_into()
                 .map_err(|_| "truncated consent number")?,
         ))
+    }
+    fn fingerprint(&mut self) -> Result<Fingerprint, String> {
+        self.take(4)?
+            .try_into()
+            .map_err(|_| "truncated consent fingerprint".into())
+    }
+    fn login_step(&mut self) -> Result<LoginStep, String> {
+        Ok(match self.byte()? {
+            1 => LoginStep::Identify,
+            2 => {
+                let key = self.fingerprint()?;
+                LoginStep::Authorize {
+                    key,
+                    retries: self.byte()?,
+                }
+            }
+            3 => LoginStep::Create {
+                retries: self.byte()?,
+            },
+            4 => {
+                let key = self.fingerprint()?;
+                LoginStep::Prove {
+                    key,
+                    retries: self.byte()?,
+                }
+            }
+            5 => {
+                let key = self.fingerprint()?;
+                LoginStep::Repeat {
+                    key,
+                    retries: self.byte()?,
+                }
+            }
+            6 => LoginStep::Probe {
+                key: self.fingerprint()?,
+            },
+            7 => {
+                let key = self.fingerprint()?;
+                LoginStep::Unlock {
+                    key,
+                    retries: self.byte()?,
+                }
+            }
+            8 => LoginStep::Connect,
+            _ => return Err("invalid consent login step".into()),
+        })
     }
     fn label(&mut self) -> Result<Option<Label>, String> {
         let head = self.byte()?;
@@ -1103,6 +1691,7 @@ mod tests {
                 }
             }
         }
+        operations.extend(every_login_operation());
         let mut encodings = std::collections::BTreeSet::new();
         for operation in operations {
             let request = Request::new([1; 32], 1000, operation).unwrap();
@@ -1279,6 +1868,891 @@ mod tests {
                 .encode()
                 .len()
                 <= MAX_BYTES
+        );
+    }
+
+    const A: Fingerprint = [0x3f, 0xa2, 0xc1, 0xd0];
+    const B: Fingerprint = [0x01, 0x02, 0x03, 0x04];
+    const N: Fingerprint = [0xde, 0xad, 0xbe, 0xef];
+    const M: Fingerprint = [0x00, 0xff, 0x00, 0xff];
+
+    fn slot(position: u8, key: Fingerprint) -> Slot {
+        Slot { position, key }
+    }
+
+    fn every_step(key: Fingerprint) -> [LoginStep; 8] {
+        [
+            LoginStep::Identify,
+            LoginStep::Authorize { key, retries: 8 },
+            LoginStep::Create { retries: 0 },
+            LoginStep::Prove { key, retries: 255 },
+            LoginStep::Repeat { key, retries: 1 },
+            LoginStep::Probe { key },
+            LoginStep::Unlock { key, retries: 3 },
+            LoginStep::Connect,
+        ]
+    }
+
+    /// Every count, key ordinal, removal set and step a login operation may
+    /// carry.
+    fn every_login_operation() -> Vec<Operation> {
+        let sets = [
+            vec![slot(1, A)],
+            vec![slot(2, A)],
+            vec![slot(1, B), slot(2, A), slot(3, A)],
+            (1..=8)
+                .map(|position| slot(position, [position; 4]))
+                .collect(),
+            (1..=9).map(|position| slot(position, A)).collect(),
+        ];
+        let mut operations = Vec::new();
+        for step in every_step(A) {
+            for before in 0..=LOGIN_KEYS + 1 {
+                operations.push(Operation::LoginUnlock {
+                    account: 1000,
+                    before,
+                    after: before,
+                    step,
+                });
+                operations.push(Operation::LoginAdd {
+                    account: 1000,
+                    before,
+                    after: before.saturating_add(1),
+                    step,
+                });
+                for removed in &sets {
+                    if let Some(after) = before.checked_sub(removed.len() as u8) {
+                        operations.push(Operation::LoginRemove {
+                            account: 1000,
+                            before,
+                            after,
+                            removed: removed.clone(),
+                            step,
+                        });
+                    }
+                }
+            }
+            for after in 1..=2 {
+                for key in 1..=after {
+                    operations.push(Operation::LoginEnroll {
+                        account: 1000,
+                        before: 0,
+                        after,
+                        key,
+                        step,
+                    });
+                }
+            }
+        }
+        operations.retain(|operation| Request::new([1; 32], 1000, operation.clone()).is_ok());
+        operations
+    }
+
+    fn login(operation: Operation) -> Request {
+        Request::new([9; 32], 1000, operation).unwrap()
+    }
+
+    fn header(tag: u8) -> Vec<u8> {
+        let mut literal = b"TDCONS01".to_vec();
+        literal.extend([9; 32]);
+        literal.extend([0, 0, 3, 232, tag, 0, 0, 3, 232]);
+        literal
+    }
+
+    fn add(step: LoginStep) -> Operation {
+        Operation::LoginAdd {
+            account: 1000,
+            before: 2,
+            after: 3,
+            step,
+        }
+    }
+
+    fn enroll(after: u8, key: u8, step: LoginStep) -> Operation {
+        Operation::LoginEnroll {
+            account: 1000,
+            before: 0,
+            after,
+            key,
+            step,
+        }
+    }
+
+    /// A removal from a three-key record.
+    fn remove(removed: Vec<Slot>, step: LoginStep) -> Operation {
+        Operation::LoginRemove {
+            account: 1000,
+            before: 3,
+            after: 3 - removed.len() as u8,
+            removed,
+            step,
+        }
+    }
+
+    fn unlock(step: LoginStep) -> Operation {
+        Operation::LoginUnlock {
+            account: 1000,
+            before: 2,
+            after: 2,
+            step,
+        }
+    }
+
+    #[test]
+    fn every_login_step_has_an_independent_literal_encoding() {
+        // Account 1000, then the counts, the operation's own field, the step.
+        let cases: Vec<(Operation, u8, Vec<u8>)> = vec![
+            (unlock(LoginStep::Identify), 7, vec![2, 2, 1]),
+            (
+                unlock(LoginStep::Unlock { key: A, retries: 8 }),
+                7,
+                vec![2, 2, 7, 0x3f, 0xa2, 0xc1, 0xd0, 8],
+            ),
+            (enroll(2, 1, LoginStep::Connect), 8, vec![0, 2, 1, 8]),
+            (
+                enroll(2, 2, LoginStep::Create { retries: 7 }),
+                8,
+                vec![0, 2, 2, 3, 7],
+            ),
+            (
+                enroll(1, 1, LoginStep::Prove { key: N, retries: 6 }),
+                8,
+                vec![0, 1, 1, 4, 0xde, 0xad, 0xbe, 0xef, 6],
+            ),
+            (
+                enroll(1, 1, LoginStep::Repeat { key: N, retries: 5 }),
+                8,
+                vec![0, 1, 1, 5, 0xde, 0xad, 0xbe, 0xef, 5],
+            ),
+            (
+                enroll(1, 1, LoginStep::Probe { key: N }),
+                8,
+                vec![0, 1, 1, 6, 0xde, 0xad, 0xbe, 0xef],
+            ),
+            (add(LoginStep::Identify), 9, vec![2, 3, 1]),
+            (
+                add(LoginStep::Authorize { key: A, retries: 4 }),
+                9,
+                vec![2, 3, 2, 0x3f, 0xa2, 0xc1, 0xd0, 4],
+            ),
+            (add(LoginStep::Connect), 9, vec![2, 3, 8]),
+            (
+                remove(vec![slot(1, B), slot(3, A)], LoginStep::Identify),
+                10,
+                vec![3, 1, 2, 1, 1, 2, 3, 4, 3, 0x3f, 0xa2, 0xc1, 0xd0, 1],
+            ),
+            (
+                Operation::LoginRemove {
+                    account: 1000,
+                    before: 1,
+                    after: 0,
+                    removed: vec![slot(1, A)],
+                    step: LoginStep::Authorize { key: A, retries: 0 },
+                },
+                10,
+                vec![
+                    1, 0, 1, 1, 0x3f, 0xa2, 0xc1, 0xd0, 2, 0x3f, 0xa2, 0xc1, 0xd0, 0,
+                ],
+            ),
+        ];
+        let mut tags = std::collections::BTreeSet::new();
+        let mut steps = std::collections::BTreeSet::new();
+        for (operation, tag, tail) in cases {
+            let request = login(operation);
+            let mut literal = header(tag);
+            literal.extend(&tail);
+            assert_eq!(request.encode(), literal, "{request:?}");
+            assert_eq!(Request::decode(&literal).unwrap(), request);
+            tags.insert(tag);
+            steps.insert(request.operation().login().unwrap().step.byte());
+        }
+        assert!(tags.into_iter().eq(7..=10));
+        assert!(steps.into_iter().eq(1..=8));
+    }
+
+    #[test]
+    fn login_operations_roundtrip_and_refuse_every_cut_and_trailing_byte() {
+        let operations = every_login_operation();
+        // Unlock's 2 steps at 8 counts, enrollment's 5 for each of 3 keys,
+        // addition's 7 at 7 counts, removal's 2 over each set's valid counts.
+        assert_eq!(
+            operations.len(),
+            2 * 8 + 5 * 3 + 7 * 7 + 2 * (8 + 7 + 6 + 1)
+        );
+        for operation in operations {
+            let request = Request::new([1; 32], 1000, operation).unwrap();
+            let mut bytes = request.encode();
+            assert_eq!(Request::decode(&bytes).unwrap(), request);
+            for end in 0..bytes.len() {
+                assert!(Request::decode(&bytes[..end]).is_err(), "{request:?} {end}");
+            }
+            bytes.push(0);
+            assert!(Request::decode(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn unknown_login_tags_steps_slots_and_inconsistent_counts_refuse() {
+        let mut identify = header(7);
+        identify.extend([2, 2, 1]);
+        assert!(Request::decode(&identify).is_ok());
+        for tag in [0, 3, 11, 255] {
+            let mut bad = identify.clone();
+            bad[44] = tag;
+            assert_eq!(
+                Request::decode(&bad).err().unwrap(),
+                "unknown consent operation",
+                "{tag}"
+            );
+        }
+        for byte in [0, 9, 255] {
+            let mut bad = identify.clone();
+            bad[51] = byte;
+            assert_eq!(
+                Request::decode(&bad).err().unwrap(),
+                "invalid consent login step"
+            );
+        }
+        // A step another operation owns is refused as it is decoded.
+        for (tag, tail) in [
+            (7, vec![2, 2, 8]),
+            (7, vec![2, 2, 2, 1, 2, 3, 4, 8]),
+            (8, vec![0, 1, 1, 1]),
+            (8, vec![0, 1, 1, 7, 1, 2, 3, 4, 8]),
+            (9, vec![2, 3, 7, 1, 2, 3, 4, 8]),
+            (10, vec![2, 1, 1, 1, 1, 2, 3, 4, 3, 8]),
+            (10, vec![2, 1, 1, 1, 1, 2, 3, 4, 6, 1, 2, 3, 4]),
+        ] {
+            let mut bytes = header(tag);
+            bytes.extend(tail);
+            assert_eq!(
+                Request::decode(&bytes).err().unwrap(),
+                "invalid consent login operation",
+                "{bytes:?}"
+            );
+        }
+        let removal = |before: u8, positions: &[u8]| {
+            let mut bytes = header(10);
+            bytes.extend([before, before.saturating_sub(positions.len() as u8)]);
+            bytes.push(positions.len() as u8);
+            for position in positions {
+                bytes.push(*position);
+                bytes.extend(A);
+            }
+            bytes.push(1);
+            Request::decode(&bytes)
+        };
+        assert!(removal(3, &[1, 3]).is_ok());
+        assert!(removal(3, &[3]).is_ok());
+        // Non-increasing, repeated, zero and out-of-range positions.
+        for positions in [&[3, 1][..], &[2, 2], &[0], &[4], &[1, 4], &[]] {
+            assert_eq!(
+                removal(3, positions).err().unwrap(),
+                "invalid consent login operation",
+                "{positions:?}"
+            );
+        }
+        assert_eq!(
+            removal(8, &[1, 2, 3, 4, 5, 6, 7, 8, 9]).err().unwrap(),
+            "invalid consent login key set"
+        );
+        let refused = [
+            unlock(LoginStep::Create { retries: 1 }),
+            Operation::LoginUnlock {
+                account: 1000,
+                before: 0,
+                after: 0,
+                step: LoginStep::Identify,
+            },
+            Operation::LoginUnlock {
+                account: 1000,
+                before: 9,
+                after: 9,
+                step: LoginStep::Identify,
+            },
+            Operation::LoginUnlock {
+                account: 1000,
+                before: 2,
+                after: 3,
+                step: LoginStep::Identify,
+            },
+            Operation::LoginUnlock {
+                account: 1001,
+                before: 2,
+                after: 2,
+                step: LoginStep::Identify,
+            },
+            Operation::LoginEnroll {
+                account: 1000,
+                before: 1,
+                after: 2,
+                key: 1,
+                step: LoginStep::Connect,
+            },
+            enroll(3, 1, LoginStep::Connect),
+            enroll(0, 0, LoginStep::Connect),
+            enroll(1, 2, LoginStep::Connect),
+            enroll(2, 0, LoginStep::Connect),
+            enroll(2, 1, LoginStep::Identify),
+            Operation::LoginAdd {
+                account: 1000,
+                before: 0,
+                after: 1,
+                step: LoginStep::Identify,
+            },
+            Operation::LoginAdd {
+                account: 1000,
+                before: 8,
+                after: 9,
+                step: LoginStep::Identify,
+            },
+            Operation::LoginAdd {
+                account: 1000,
+                before: 2,
+                after: 2,
+                step: LoginStep::Identify,
+            },
+            add(LoginStep::Unlock { key: A, retries: 1 }),
+            remove(vec![slot(1, A)], LoginStep::Connect),
+            Operation::LoginRemove {
+                account: 1000,
+                before: 2,
+                after: 0,
+                removed: vec![slot(1, A)],
+                step: LoginStep::Identify,
+            },
+            Operation::LoginRemove {
+                account: 1000,
+                before: 1,
+                after: 0,
+                removed: vec![slot(1, A), slot(1, A)],
+                step: LoginStep::Identify,
+            },
+            Operation::LoginRemove {
+                account: 1000,
+                before: 9,
+                after: 8,
+                removed: vec![slot(1, A)],
+                step: LoginStep::Identify,
+            },
+        ];
+        for operation in refused {
+            assert_eq!(
+                Request::new([1; 32], 1000, operation.clone())
+                    .err()
+                    .unwrap(),
+                "invalid consent login operation",
+                "{operation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn eight_removal_slots_fit_the_request_bound() {
+        let request = login(Operation::LoginRemove {
+            account: 1000,
+            before: LOGIN_KEYS,
+            after: 0,
+            removed: (1..=LOGIN_KEYS)
+                .map(|position| slot(position, [0xff; 4]))
+                .collect(),
+            step: LoginStep::Authorize {
+                key: [0xff; 4],
+                retries: 255,
+            },
+        });
+        // Header 45, account and counts 6, the set 1 + 8 * 5, the step 1 + 4 + 1.
+        assert_eq!(request.encode().len(), 98);
+        assert!(request.encode().len() <= MAX_BYTES);
+        assert_eq!(Request::decode(&request.encode()).unwrap(), request);
+        let widest = every_login_operation()
+            .into_iter()
+            .map(|operation| login(operation).encode().len())
+            .max();
+        assert_eq!(widest, Some(98));
+    }
+
+    /// No login row wraps at the renderer's narrowest output, even with the
+    /// widest owner and account, so wrapping never splits a fingerprint.
+    #[test]
+    fn every_login_row_fits_the_narrowest_prompt() {
+        for operation in every_login_operation() {
+            let mut operation = operation;
+            if let Operation::LoginUnlock { account, .. }
+            | Operation::LoginEnroll { account, .. }
+            | Operation::LoginAdd { account, .. }
+            | Operation::LoginRemove { account, .. } = &mut operation
+            {
+                *account = 65533;
+            }
+            let request = Request::new([1; 32], 65533, operation).unwrap();
+            for line in request.lines() {
+                assert!(line.len() <= PROMPT_COLUMNS, "{line:?}");
+            }
+        }
+    }
+
+    /// Begins at `first`, admits `steps` with their created keys, expecting
+    /// `Last` only at the end, then refuses every step after the last.
+    fn walk(
+        first: Operation,
+        baseline: &[Fingerprint],
+        steps: &[(Operation, Option<Fingerprint>)],
+    ) {
+        let mut current = Request::begin_login([9; 32], 1000, first, baseline).unwrap();
+        for (index, (operation, created)) in steps.iter().enumerate() {
+            let next = login(operation.clone());
+            let expected = if index + 1 == steps.len() {
+                Admitted::Last
+            } else {
+                Admitted::Next
+            };
+            assert_eq!(
+                current.admit_login_step(&next, baseline, *created),
+                Ok(expected),
+                "{operation:?}"
+            );
+            current = next;
+        }
+        for operation in every_login_operation() {
+            let next = login(operation);
+            for created in [None, Some(A), Some(N), Some(M)] {
+                assert!(current.admit_login_step(&next, baseline, created).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn login_steps_are_admitted_only_in_their_order() {
+        let baseline = [B, A];
+        walk(
+            unlock(LoginStep::Identify),
+            &baseline,
+            &[(unlock(LoginStep::Unlock { key: A, retries: 8 }), None)],
+        );
+        walk(
+            add(LoginStep::Identify),
+            &baseline,
+            &[
+                (add(LoginStep::Authorize { key: B, retries: 8 }), None),
+                (add(LoginStep::Connect), None),
+                (add(LoginStep::Create { retries: 8 }), None),
+                (add(LoginStep::Prove { key: N, retries: 8 }), Some(N)),
+                (add(LoginStep::Repeat { key: N, retries: 7 }), Some(N)),
+                (add(LoginStep::Probe { key: N }), Some(N)),
+            ],
+        );
+        // Two slots may share a fingerprint; positions tell them apart.
+        let both = vec![slot(1, A), slot(3, A)];
+        walk(
+            remove(both.clone(), LoginStep::Identify),
+            &[A, B, A],
+            &[(
+                remove(both, LoginStep::Authorize { key: A, retries: 1 }),
+                None,
+            )],
+        );
+        let ceremony = |after, key, new| {
+            vec![
+                (enroll(after, key, LoginStep::Create { retries: 8 }), None),
+                (
+                    enroll(
+                        after,
+                        key,
+                        LoginStep::Prove {
+                            key: new,
+                            retries: 8,
+                        },
+                    ),
+                    Some(new),
+                ),
+                (
+                    enroll(
+                        after,
+                        key,
+                        LoginStep::Repeat {
+                            key: new,
+                            retries: 8,
+                        },
+                    ),
+                    Some(new),
+                ),
+                (enroll(after, key, LoginStep::Probe { key: new }), Some(new)),
+            ]
+        };
+        walk(enroll(1, 1, LoginStep::Connect), &[], &ceremony(1, 1, N));
+        // The first key's probe is not the last step of a two-key enrollment.
+        let mut two = ceremony(2, 1, N);
+        two.push((enroll(2, 2, LoginStep::Connect), None));
+        two.extend(ceremony(2, 2, M));
+        walk(enroll(2, 1, LoginStep::Connect), &[], &two);
+    }
+
+    #[test]
+    fn a_login_operation_begins_only_at_its_first_step() {
+        let begin = |operation, baseline: &[Fingerprint]| {
+            Request::begin_login([9; 32], 1000, operation, baseline)
+        };
+        assert!(begin(unlock(LoginStep::Identify), &[B, A]).is_ok());
+        assert!(begin(enroll(2, 1, LoginStep::Connect), &[]).is_ok());
+        for (operation, baseline) in [
+            (
+                unlock(LoginStep::Unlock { key: A, retries: 8 }),
+                &[B, A][..],
+            ),
+            (add(LoginStep::Authorize { key: A, retries: 8 }), &[B, A]),
+            (add(LoginStep::Connect), &[B, A]),
+            (enroll(2, 1, LoginStep::Create { retries: 8 }), &[]),
+            (enroll(2, 2, LoginStep::Connect), &[]),
+            (
+                remove(
+                    vec![slot(1, B)],
+                    LoginStep::Authorize { key: B, retries: 8 },
+                ),
+                &[B, A, N],
+            ),
+        ] {
+            assert_eq!(
+                begin(operation.clone(), baseline).err().unwrap(),
+                "a login operation begins at its first step",
+                "{operation:?}"
+            );
+        }
+        // The counts and removal slots must be the presented record's.
+        for (operation, baseline) in [
+            (unlock(LoginStep::Identify), &[A][..]),
+            (enroll(1, 1, LoginStep::Connect), &[A]),
+            (remove(vec![slot(2, B)], LoginStep::Identify), &[B, A, N]),
+        ] {
+            assert_eq!(
+                begin(operation, baseline).err().unwrap(),
+                "login step does not match its baseline record"
+            );
+        }
+        let store = Operation::Unlock {
+            role: Role::Primary,
+        };
+        assert!(begin(store, &[]).is_err());
+    }
+
+    #[test]
+    fn login_step_admission_refuses_what_root_did_not_derive() {
+        let baseline = [B, A];
+        let admit = |current: &Operation, next: Operation, baseline: &[Fingerprint], created| {
+            login(current.clone()).admit_login_step(&login(next), baseline, created)
+        };
+        let identify = add(LoginStep::Identify);
+        let authorize = |key| add(LoginStep::Authorize { key, retries: 8 });
+        assert_eq!(
+            admit(&identify, authorize(A), &baseline, None),
+            Ok(Admitted::Next)
+        );
+        // A forged fingerprint, or a created key reported early.
+        assert!(admit(&identify, authorize(N), &baseline, None).is_err());
+        assert!(admit(&identify, authorize(A), &baseline, Some(N)).is_err());
+        let selecting = unlock(LoginStep::Identify);
+        let unlocking = |key| unlock(LoginStep::Unlock { key, retries: 8 });
+        assert_eq!(
+            admit(&selecting, unlocking(A), &baseline, None),
+            Ok(Admitted::Last)
+        );
+        assert!(admit(&selecting, unlocking(N), &baseline, None).is_err());
+        let removing = remove(vec![slot(2, A)], LoginStep::Identify);
+        let removal = remove(
+            vec![slot(2, A)],
+            LoginStep::Authorize { key: B, retries: 8 },
+        );
+        assert_eq!(
+            admit(&removing, removal.clone(), &[B, A, N], None),
+            Ok(Admitted::Last)
+        );
+        assert!(admit(&removing, removal.clone(), &[B, A, N], Some(N)).is_err());
+        let create = add(LoginStep::Create { retries: 8 });
+        let prove = |key| add(LoginStep::Prove { key, retries: 8 });
+        assert!(admit(&create, prove(N), &baseline, Some(N)).is_ok());
+        assert!(admit(&create, prove(N), &baseline, None).is_err());
+        assert!(admit(&create, prove(N), &baseline, Some(M)).is_err());
+        assert!(admit(&create, prove(A), &baseline, Some(N)).is_err());
+        // A created credential no baseline slot may name.
+        assert!(admit(&create, prove(A), &baseline, Some(A)).is_err());
+        let repeat = |key| add(LoginStep::Repeat { key, retries: 8 });
+        assert!(admit(&prove(N), repeat(N), &baseline, Some(N)).is_ok());
+        assert!(admit(&prove(N), repeat(M), &baseline, Some(M)).is_err());
+        assert!(admit(&prove(A), repeat(A), &baseline, Some(A)).is_err());
+        let probe = |key| add(LoginStep::Probe { key });
+        assert_eq!(
+            admit(&repeat(N), probe(N), &baseline, Some(N)),
+            Ok(Admitted::Last)
+        );
+        assert!(admit(&repeat(N), probe(M), &baseline, Some(M)).is_err());
+        assert!(admit(&repeat(A), probe(A), &baseline, Some(A)).is_err());
+        let connect = add(LoginStep::Connect);
+        assert!(admit(&authorize(A), connect.clone(), &baseline, None).is_ok());
+        assert!(admit(&authorize(A), connect, &baseline, Some(N)).is_err());
+        assert!(admit(&add(LoginStep::Connect), create.clone(), &baseline, Some(N)).is_err());
+        // A blocked key, which the worker reports instead of asking its PIN.
+        let blocked = add(LoginStep::Authorize { key: A, retries: 0 });
+        assert_eq!(
+            admit(&identify, blocked, &baseline, None).err().unwrap(),
+            "a blocked key cannot take a PIN"
+        );
+        let blocked = add(LoginStep::Create { retries: 0 });
+        assert!(admit(&add(LoginStep::Connect), blocked, &baseline, None).is_err());
+        let blocked = unlock(LoginStep::Unlock { key: A, retries: 0 });
+        assert!(admit(&selecting, blocked, &baseline, None).is_err());
+        let blocked = add(LoginStep::Prove { key: N, retries: 0 });
+        assert!(admit(&create, blocked, &baseline, Some(N)).is_err());
+        // Counts inconsistent with the baseline.
+        assert!(admit(&identify, authorize(A), &[A], None).is_err());
+        assert!(admit(&identify, authorize(A), &[B, A, N], None).is_err());
+        assert!(admit(&selecting, unlocking(A), &[A], None).is_err());
+        assert!(admit(&selecting, unlocking(A), &[A, B, N], None).is_err());
+        let three = Operation::LoginAdd {
+            account: 1000,
+            before: 3,
+            after: 4,
+            step: LoginStep::Authorize { key: A, retries: 8 },
+        };
+        assert!(admit(&identify, three, &[B, A, N], None).is_err());
+        let first = enroll(1, 1, LoginStep::Connect);
+        let created = |after| enroll(after, 1, LoginStep::Create { retries: 8 });
+        assert!(admit(&first, created(1), &[], None).is_ok());
+        assert!(admit(&first, created(1), &[A], None).is_err());
+        assert!(admit(&first, created(2), &[], None).is_err());
+        // A removal slot whose position names another fingerprint, or none.
+        assert!(admit(&removing, removal.clone(), &[A, B, N], None).is_err());
+        assert!(admit(&removing, removal, &[B, M, N], None).is_err());
+        let other = remove(
+            vec![slot(1, B)],
+            LoginStep::Authorize { key: B, retries: 8 },
+        );
+        assert!(admit(&removing, other, &[B, A, N], None).is_err());
+        let moved = remove(
+            vec![slot(3, A)],
+            LoginStep::Authorize { key: B, retries: 8 },
+        );
+        assert!(admit(&removing, moved, &[B, A, A], None).is_err());
+        // Another operation, nonce, owner or account.
+        assert!(admit(&identify, unlocking(A), &baseline, None).is_err());
+        let current = login(identify.clone());
+        let renonced = Request::new([8; 32], 1000, authorize(A)).unwrap();
+        assert!(current
+            .admit_login_step(&renonced, &baseline, None)
+            .is_err());
+        let other_account = Request::new(
+            [9; 32],
+            1001,
+            Operation::LoginAdd {
+                account: 1001,
+                before: 2,
+                after: 3,
+                step: LoginStep::Authorize { key: A, retries: 8 },
+            },
+        )
+        .unwrap();
+        assert!(current
+            .admit_login_step(&other_account, &baseline, None)
+            .is_err());
+        let store = Request::new(
+            [9; 32],
+            1000,
+            Operation::Unlock {
+                role: Role::Primary,
+            },
+        )
+        .unwrap();
+        assert!(current.admit_login_step(&store, &baseline, None).is_err());
+        assert!(store.admit_login_step(&current, &baseline, None).is_err());
+        // Out of order: repeated, skipped, backwards or restarted.
+        for (from, to, created) in [
+            (&identify, add(LoginStep::Identify), None),
+            (&identify, add(LoginStep::Connect), None),
+            (&authorize(A), create.clone(), None),
+            (&authorize(A), add(LoginStep::Identify), None),
+            (&create, repeat(N), Some(N)),
+            (&prove(N), probe(N), Some(N)),
+            (&prove(N), prove(N), Some(N)),
+        ] {
+            assert!(admit(from, to, &baseline, created).is_err());
+        }
+        // A first enrollment's second key follows only the first's probe,
+        // and only the second key's probe is last.
+        let probe_first = enroll(2, 1, LoginStep::Probe { key: N });
+        assert_eq!(
+            admit(
+                &enroll(2, 1, LoginStep::Repeat { key: N, retries: 8 }),
+                probe_first.clone(),
+                &[],
+                Some(N)
+            ),
+            Ok(Admitted::Next)
+        );
+        assert_eq!(
+            admit(&probe_first, enroll(2, 2, LoginStep::Connect), &[], None),
+            Ok(Admitted::Next)
+        );
+        assert!(admit(&probe_first, enroll(2, 1, LoginStep::Connect), &[], None).is_err());
+        assert!(admit(&probe_first, enroll(2, 2, LoginStep::Connect), &[], Some(N)).is_err());
+        assert_eq!(
+            admit(
+                &enroll(2, 2, LoginStep::Repeat { key: M, retries: 8 }),
+                enroll(2, 2, LoginStep::Probe { key: M }),
+                &[],
+                Some(M)
+            ),
+            Ok(Admitted::Last)
+        );
+        let create_first = enroll(2, 1, LoginStep::Create { retries: 8 });
+        let create_second = enroll(2, 2, LoginStep::Create { retries: 8 });
+        assert!(admit(&create_first, create_second, &[], None).is_err());
+        let single = enroll(1, 1, LoginStep::Probe { key: N });
+        assert!(admit(&single, enroll(1, 1, LoginStep::Connect), &[], None).is_err());
+    }
+
+    #[test]
+    fn login_prompts_show_counts_slots_and_device_retries() {
+        let rows = |operation| login(operation).lines();
+        assert_eq!(
+            rows(unlock(LoginStep::Identify)),
+            [
+                "TD SECURE ATTENTION",
+                "SESSION USER 1000",
+                "UNLOCK SESSION WITH A LOGIN KEY",
+                "ACCOUNT UID 1000",
+                "CONNECT ONLY ONE ENROLLED KEY",
+                "ESC TO CANCEL",
+            ]
+        );
+        assert_eq!(
+            rows(unlock(LoginStep::Unlock { key: A, retries: 7 }))[4..],
+            [
+                "UNLOCK WITH KEY 3fa2c1d0",
+                "7 PIN ATTEMPTS LEFT ON THIS KEY",
+                "ENTER ITS PIN, THEN TOUCH THE KEY",
+                "ESC TO CANCEL",
+            ]
+        );
+        assert_eq!(
+            rows(add(LoginStep::Connect))[2..],
+            [
+                "ADD A LOGIN KEY (2 -> 3 KEYS)",
+                "ACCOUNT UID 1000",
+                "REMOVE THE AUTHORIZING KEY",
+                "CONNECT ONLY THE NEW KEY",
+                "ESC TO CANCEL",
+            ]
+        );
+        assert_eq!(
+            rows(add(LoginStep::Authorize { key: B, retries: 8 }))[4..],
+            [
+                "AUTHORIZE WITH KEY 01020304",
+                "8 PIN ATTEMPTS LEFT ON THIS KEY",
+                "ENTER ITS PIN, THEN TOUCH THE KEY",
+                "ESC TO CANCEL",
+            ]
+        );
+        assert_eq!(
+            rows(enroll(2, 1, LoginStep::Connect))[2..],
+            [
+                "ENROLL LOGIN KEYS (0 -> 2 KEYS)",
+                "NEW KEY 1 OF 2",
+                "ACCOUNT UID 1000",
+                "CONNECT ONLY THE NEW KEY",
+                "ESC TO CANCEL",
+            ]
+        );
+        assert_eq!(
+            rows(enroll(2, 2, LoginStep::Connect))[5..],
+            [
+                "REMOVE THE PREVIOUS KEY",
+                "CONNECT ONLY THE NEW KEY",
+                "ESC TO CANCEL",
+            ]
+        );
+        assert_eq!(
+            rows(enroll(1, 1, LoginStep::Create { retries: 8 }))[2..],
+            [
+                "ENROLL LOGIN KEYS (0 -> 1 KEY)",
+                "NEW KEY 1 OF 1",
+                "ACCOUNT UID 1000",
+                "CREATE A LOGIN CREDENTIAL",
+                "8 PIN ATTEMPTS LEFT ON THIS KEY",
+                "ENTER ITS PIN, THEN TOUCH THE KEY",
+                "ESC TO CANCEL",
+            ]
+        );
+        for (step, row) in [
+            (
+                LoginStep::Prove { key: N, retries: 1 },
+                "VERIFY NEW KEY deadbeef",
+            ),
+            (
+                LoginStep::Repeat { key: N, retries: 1 },
+                "VERIFY NEW KEY deadbeef AGAIN",
+            ),
+        ] {
+            assert_eq!(
+                rows(enroll(1, 1, step))[5..],
+                [
+                    row,
+                    "1 PIN ATTEMPTS LEFT ON THIS KEY",
+                    "ENTER ITS PIN, THEN TOUCH THE KEY",
+                    "ESC TO CANCEL",
+                ]
+            );
+        }
+        assert_eq!(
+            rows(enroll(1, 1, LoginStep::Probe { key: N }))[5..],
+            [
+                "CHECKING NEW KEY deadbeef",
+                "KEEP IT CONNECTED",
+                "ESC TO CANCEL"
+            ]
+        );
+        assert_eq!(
+            rows(remove(vec![slot(2, A)], LoginStep::Identify))[2..],
+            [
+                "REMOVE A LOGIN KEY (3 -> 2 KEYS)",
+                "ACCOUNT UID 1000",
+                "REMOVE: 2:3fa2c1d0",
+                "CONNECT ONLY ONE ENROLLED KEY",
+                "ESC TO CANCEL",
+            ]
+        );
+        assert_eq!(
+            rows(remove(vec![slot(1, B), slot(3, A)], LoginStep::Identify))[2..5],
+            [
+                "REMOVE 2 LOGIN KEYS (3 -> 1 KEY)",
+                "ACCOUNT UID 1000",
+                "REMOVE: 1:01020304 3:3fa2c1d0",
+            ]
+        );
+        assert_eq!(
+            rows(Operation::LoginRemove {
+                account: 1000,
+                before: 8,
+                after: 0,
+                removed: (1..=8)
+                    .map(|position| slot(position, [position; 4]))
+                    .collect(),
+                step: LoginStep::Authorize {
+                    key: [6; 4],
+                    retries: 2
+                },
+            })[2..],
+            [
+                "REMOVE 8 LOGIN KEYS (8 -> 0 KEYS)",
+                "ACCOUNT UID 1000",
+                "REMOVE: 1:01010101 2:02020202",
+                "        3:03030303 4:04040404",
+                "        5:05050505 6:06060606",
+                "        7:07070707 8:08080808",
+                "LOGIN WILL NOT NEED A KEY",
+                "AUTHORIZE WITH KEY 06060606",
+                "2 PIN ATTEMPTS LEFT ON THIS KEY",
+                "ENTER ITS PIN, THEN TOUCH THE KEY",
+                "ESC TO CANCEL",
+            ]
         );
     }
 }

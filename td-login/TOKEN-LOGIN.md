@@ -3,13 +3,15 @@
 This is the normative target for td's login-key tier. td-authd, td-secret,
 td-compositor and td-login implement it together; this document owns the
 tier's rules, and each component document states the amendments its own
-contract needs. **Only the record codec is implemented**, inert: no
-caller uses td-secret's private `login_record` module ("The login
-record"). Nothing else below is implemented. Until the increments at the
-end land, `THREAT-MODEL.md` §3 is the complete current behaviour: the
-installed account logs in automatically and the session never locks. No
-document, UI or release note may describe this tier as available before
-its acceptance evidence exists.
+contract needs. **Only the record codec and the consent descriptions are
+implemented**, inert: no caller uses td-secret's private `login_record`
+module ("The login record") or td-authd's login consent operations and
+step admission (`td-authd/DESIGN.md`). Nothing else below is
+implemented. Until the increments at the end land, `THREAT-MODEL.md` §3
+is the complete current behaviour: the installed account logs in
+automatically and the session never locks. No document, UI or release
+note may describe this tier as available before its acceptance evidence
+exists.
 
 **Enrollment requires §L.1 elevation.** Enrolling a key refuses every
 interactive login, and on a fresh install `su` cannot elevate from a
@@ -237,32 +239,43 @@ SHA-256 digest of the exact record bytes being changed, so the signature
 itself binds an addition or removal to that record; the worker's baseline
 comparison is a second check, not the binding. Length prefixes are u32.
 The identify, authorize, create, prove, repeat, probe and unlock phases
-are distinct, with phase bytes 1 through 7 in that order.
+are distinct, with phase bytes 1 through 7 in that order. Byte 8 is
+reserved for the consent description's connect step (`td-authd/DESIGN.md`):
+a presentation that sends no assertion and so has no client-data phase.
+No phase may use it.
 
 - **Identify.** Before any PIN, a silent getAssertion (`up=false`, no PIN
   and no extension) over the enrolled credential IDs, in batches no larger
   than the key's advertised list limit (one when absent), selects the slot.
   Only `CTAP2_ERR_NO_CREDENTIALS` for every batch means the key is not
   enrolled here; any other status fails the operation. The silent response
-  selects only; it authenticates nothing. This probe is new work:
-  `PORTABLE.md`'s flows do not probe.
+  selects only; it authenticates nothing, and the fingerprint the next
+  step shows is that selection, not proof of which key is connected. This
+  probe is new work: `PORTABLE.md`'s flows do not probe.
 - **Unlock and authorize.** One credential, its salt, the PIN, required
   presence and UV. Verify the RP hash, UP, UV and the signature over
   authenticator data and the hash with the slot's key, then decrypt the
   hmac-secret output, derive the verifier and compare in constant time. The
   output is retired immediately; nothing is released. Counters are checked
   structurally only and not persisted, so clone detection is not claimed.
-- **New key.** Creation's exclusion list holds every enrolled credential
-  and every key already proved in this operation, and must fit the key's
-  advertised list and size limits whole, as `PORTABLE.md`'s creation codec
-  requires; a key that cannot take it is refused before any PIN. Then a
-  proof, then a repeat assertion on a new channel that must reproduce the
-  identical secret, each with its own PIN entry and touch as in
-  `PORTABLE.md`. Right after the repeat, while that key is still the
-  connected device, the worker runs the identify probe for the new
-  credential and refuses the operation unless the probe finds it, so a
-  credential that a later unlock could not select never enters the record.
-  Each slot's salt is fresh.
+- **New key.** It begins at a connect step: the screen asks the person to
+  connect the new key alone, removing the authorizing or previous key, and
+  no assertion is sent until exactly one device is present, whose PIN
+  retries the create step then shows. Creation's exclusion list holds
+  every enrolled credential and every key already proved in this
+  operation, and must fit the key's advertised list and size limits whole,
+  as `PORTABLE.md`'s creation codec requires; a key that cannot take it is
+  refused before any PIN. Then a proof, then a repeat assertion on a new
+  channel that must reproduce the identical secret, each with its own PIN
+  entry and touch as in `PORTABLE.md`. Right after the repeat, while that
+  key is still the connected device, the worker runs the identify probe
+  for the new credential and refuses the operation unless the probe finds
+  it, so a credential that a later unlock could not select never enters
+  the record. Each slot's salt is fresh. In a two-key enrollment the
+  backup is kept distinct from the primary by this exclusion list and the
+  record's refusal of duplicate credentials, not by td-authd's step
+  admission, which sees only the current key's credential and an empty
+  baseline.
 
 Nothing is retried automatically, and cancellation kills and reaps the
 worker as `td-secret/DESIGN.md` specifies. Deadlines are td-authd's.
@@ -289,8 +302,10 @@ The authenticator's own retry counter is the only guess limit. td keeps no
 counter of its own: one on an unencrypted disk could be reset by anyone
 who can write it and would only add lockout. Before every PIN step td
 queries getPINRetries and shows `N PIN ATTEMPTS LEFT ON THIS KEY` as an
-untrusted device claim. Typed CTAP statuses, never diagnostic text, select
-what follows:
+untrusted device claim. A key that reports none left gets no PIN step: the
+worker reports it as PIN blocked, and td-authd refuses a PIN step whose
+retries are zero. Typed CTAP statuses, never diagnostic text, select what
+follows:
 
 | status | td shows | then |
 | --- | --- | --- |
@@ -451,7 +466,8 @@ A deployment that carries the marker never stops honouring the record.
 ## Enrollment, addition and removal
 
 Key management opens with `K` on the attention screen of an unlocked
-session. The screen lists enrolled keys by fingerprint, the first four
+session. The screen numbers enrolled keys 1 to N in the record's
+canonical slot order and shows each one's fingerprint, the first four
 bytes of the credential ID's SHA-256 as in `PORTABLE.md`, and the cap of
 eight. The configured human is the only principal; td-authd refuses any
 other.
@@ -483,11 +499,16 @@ Every key is created, proved, repeated and probed before anything is
 published; publication then makes the cutover above.
 
 **Adding a key** (`A`) refuses at eight keys before any token. One enrolled
-key and its PIN authorize it with an authorize-phase assertion. The new key
-is then created with every enrolled credential excluded, proved, repeated
-and probed, and the record is published against the unchanged baseline.
+key and its PIN authorize it with an authorize-phase assertion. At a
+connect step the person then removes that key and connects only the new
+one, which is created with every enrolled credential excluded, proved,
+repeated and probed, and the record is published against the unchanged
+baseline.
 
-**Removing keys** (`D`) takes a nonempty set selected by digit. One
+**Removing keys** (`D`) takes a nonempty set selected by digit. The
+description names each selected key by its position in the record's
+canonical slot order, which the digits show, and its fingerprint, so two
+keys that share a fingerprint stay distinct. One
 enrolled key and its PIN authorize it, and that key may be in the set.
 Leaving exactly one key requires the one-key disclosure. Removing every key
 requires a disclosure that the machine will log in without a key, confirmed

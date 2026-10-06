@@ -321,4 +321,37 @@ mod tests {
         .unwrap();
         assert!(Prepared::with_time(typical, 800, 600, 3200, Some(120)).is_ok());
     }
+
+    /// Consent keeps every login row within `PROMPT_COLUMNS`, this renderer's
+    /// columns at its narrowest accepted width, so wrapping never splits a
+    /// fingerprint; the widest login prompt is shown whole from 800x600.
+    #[test]
+    fn login_rows_fit_the_narrowest_prompt_and_an_800_by_600_output() {
+        use crate::authority::consent::{LoginStep, Slot, LOGIN_KEYS, PROMPT_COLUMNS};
+        let font = crate::font::pinned().unwrap();
+        assert_eq!((320 - 48) / font.width(), PROMPT_COLUMNS);
+        let widest = Request::new(
+            [1; 32],
+            65533,
+            Operation::LoginRemove {
+                account: 65533,
+                before: LOGIN_KEYS,
+                after: 0,
+                removed: (1..=LOGIN_KEYS)
+                    .map(|position| Slot {
+                        position,
+                        key: [0xff; 4],
+                    })
+                    .collect(),
+                step: LoginStep::Authorize {
+                    key: [0xff; 4],
+                    retries: 255,
+                },
+            },
+        )
+        .unwrap();
+        assert!(Prepared::with_time(widest.clone(), 320, 480, 1280, Some(120)).is_ok());
+        assert!(Prepared::with_time(widest.clone(), 319, 480, 1276, Some(120)).is_err());
+        assert!(Prepared::with_time(widest, 800, 600, 3200, Some(120)).is_ok());
+    }
 }

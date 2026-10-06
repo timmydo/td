@@ -322,6 +322,7 @@ pub(super) enum Phase {
     Repeat = 5,
     Probe = 6,
     Unlock = 7,
+    // 8 is reserved: consent's connect step sends no assertion.
 }
 
 /// `baseline` is the record an authorize phase changes; no other phase has one.

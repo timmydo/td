@@ -5875,8 +5875,9 @@ The shared `td-authd/src/consent.rs` value describes one session and one
 operation: enrollment with an encoded platform profile, explicit recovery
 policy and proof step, session unlock with a token role, one credential write
 with the exact application name, credential name, external application UID and
-requester UID, or a whole-disk installation's fixed summary with escaped disk
-labels (td-authd/DESIGN.md). Its private fields preserve construction checks.
+requester UID, a whole-disk installation's fixed summary with escaped disk
+labels, or one step of a login-key operation, which td-authd does not yet
+send (td-authd/DESIGN.md). Its private fields preserve construction checks.
 Decoding validates bounded canonical framing and identities; it does not
 authenticate a sender, prove nonce freshness or admit an operation. The
 authority must supply fresh entropy and independently admitted identities over
