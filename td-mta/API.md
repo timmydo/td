@@ -5308,6 +5308,51 @@ compile-fail guards pin exclusive ownership and reject passive input.
 Eight additional measured Rust allocation trials preserve the earlier
 57. Native-stack/RSS and authenticated response publication remain open.
 
+### 1.126 Original resident source identity with a retained file pin
+
+M06du adds retained::locators::pinned. Its constructor consumes original
+Mapped and an actual complete PinnedBlob. Root/account authorization and
+query admission remain caller obligations before open_blob_input; a
+present row or matching digest does not establish email visibility or
+upload-lease access. Neither released candidates nor a passive view can
+supply the original completion. Refuse differing parent IDs or lengths
+before digest creation, then hash the complete original resident source,
+including headers and encoded bodies, against the pin's authoritative
+digest. A parsed sub-entity cannot flatten into root-file coordinates.
+
+Each poll visits at most 4096 bytes, charging original work I/O for every
+visited byte, one interpretation step with carried record credit and one
+explicit record before digest update. No new allowance, wire output,
+header-source debit or filesystem replay is introduced. The owned
+Provider SHA-256 and fixed digest comparison stay behind the existing
+crypto port. The generic constructor checks the same combined Cursor, HeaderBudget
+and final-digest 1 KiB envelope as the Provider size assertion.
+Crypto errors discard the digest and retire this cursor.
+
+PinnedBlob::check_deadline samples its own retained query clock before
+and after a no-I/O fence. It preserves existing sticky deadline/source
+failure and monotonic regression semantics. The binding checks both
+original supplied-tick admission and this actual clock before work,
+then checks the parent clock after digest work, even when that work
+returns an error; post-work parent failure takes precedence. Only a
+matching full digest completes. Cached Complete is inert and passive
+views remain provisional. Explicit checks and consuming finish are
+fresh. Caller workers must supply a fresh Tick for original-job admission
+and couple the pin query deadline to their enclosing request; the pin's
+independent clock fence does not authenticate that supplied Tick.
+A private Bound retains both original Mapped and actual pin;
+its checked low-level release returns these exclusive owners, not an
+issuance/publication permission.
+
+The Provider cursor plus original HeaderBudget and final digest fits
+1 KiB; Bound fits 768 bytes. Original candidate/metadata windows and
+resident source stay live throughout, and the pin retains its already
+admitted pooled view. There is no new explicit heap allocation in the
+wrapper; this increment does not qualify binding-path Rust/native
+allocations, stack or RSS. Earlier 65 locator/metadata allocation trials
+remain separate evidence. Complete service admission, current access
+policy, nested p2 contexts and authenticated response publication follow.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
@@ -5531,7 +5576,9 @@ and a shared monotonic watermark span lookup, open, every input read, finish
 and subsequent random reads. Post-work time/source failure overrides an earlier
 result; any body-step failure is terminal, with subsequent calls returning the
 same fixed error without further clock or I/O work. Errors may have changed
-caller output. Dropping the body owner releases its descriptor and view borrow;
+caller output. Its check_deadline performs a fresh no-I/O fence through
+that same clock, preserving remembered failures. Dropping the body owner
+releases its descriptor and view borrow;
 it does not mechanically retire the writer or the pooled view. A present
 row with missing, truncated or invalid-length bytes returns Corrupt, as does
 a digest mismatch. Other I/O and caller-argument failures retain their fixed

@@ -12,7 +12,7 @@ const UNKNOWN: &[u8] = b"Content-Transfer-Encoding: strange\r\n\r\nxyz";
 fn forget<T>(value: T) {
     std::mem::forget(value);
 }
-fn exercise<T>(
+pub(super) fn exercise<T>(
     source: &[u8],
     base: u64,
     f: impl FnOnce(Cursor<'_, '_, '_, '_, '_, '_, '_>) -> T,

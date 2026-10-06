@@ -23,6 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[path = "verify/publication.rs"]
 mod publication;
 #[cfg(test)]
+pub use publication::with_pinned_fixture;
+#[cfg(test)]
 pub use publication::{
     probe_journal_publication, probe_pinned_blobs, probe_pinned_reads, probe_read_pool,
 };

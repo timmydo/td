@@ -15,6 +15,8 @@ use std::sync::{Mutex, TryLockError};
 mod blob;
 #[cfg(test)]
 pub use blob::probe_pinned_blobs;
+#[cfg(test)]
+pub use blob::with_pinned_fixture;
 pub use blob::{PinnedBlob, PinnedBlobInput};
 
 #[derive(Debug)]

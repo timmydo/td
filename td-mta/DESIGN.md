@@ -750,6 +750,17 @@ live account/lease authorization must bind this proof before issuance,
 download or reuse. This adds no permission, parent pin, body decoding,
 nested locator context or complete response publication.
 
+M06du binds that original Mapped to a real complete PinnedBlob by parent
+ID, full length and an incremental digest of all original resident bytes.
+Bound keeps both exclusive owners, including the actual pooled-view pin.
+The pin's own query clock fences digest work and final consumption; a
+healthy supplied parsing Tick cannot revive expired file access. Root
+authorization remains the existing caller obligation before opening the
+pin, and source matching alone grants no permission. Hash visits are
+bounded and funded in original work, with no replacement allowance.
+This adds source identity, not authenticated issuance or publication;
+binding-path allocation/whole-service qualification remains open.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

@@ -20,6 +20,8 @@ use std::sync::{
 #[path = "publication/pool.rs"]
 mod pool;
 #[cfg(test)]
+pub use pool::with_pinned_fixture;
+#[cfg(test)]
 pub use pool::{probe_pinned_blobs, probe_read_pool};
 pub use pool::{
     PinnedBlob, PinnedBlobInput, PooledRead, ReadPoolError, ReadScratchPool, ReadScratchSlot,

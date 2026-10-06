@@ -2336,6 +2336,23 @@ exclusive owners and reject passive substitution. Destructor-free
 forgetting tests consuming loss of proof. These checks do not qualify
 native stack, RSS, parent authorization or complete response memory.
 
+M06du original source binding consumes Mapped plus the already admitted
+complete PinnedBlob; no new body backing or allowance is constructed.
+Every turn hashes at most 4096 resident bytes and charges that many
+original work I/O bytes, one interpretation step with carried control
+credit and one explicit record before update. Thus a turn uses at most
+two records and no new wire/header-source bytes. This counts an additional
+resident source visit, not a filesystem read or a renewal of input work.
+The Provider cursor plus HeaderBudget and final 32-byte digest fits
+1 KiB; Bound fits 768 bytes. The constructor checks that same combined envelope for generic digest
+state. All original resident source, retained metadata and
+candidate slots overlap the live pin's existing pooled-view reservation.
+The actual query clock is fenced before/after crypto work and freshly
+on explicit checks and consuming release. Terminal refusal hides views
+and drops digest state. The earlier 65 measured metadata/locator trials
+remain unchanged; binding-path Rust/native allocation, stack, RSS and
+complete response/service bounds are not qualified by this increment.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

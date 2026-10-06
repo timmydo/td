@@ -165,6 +165,17 @@ impl PinnedBlob<'_, '_> {
     pub fn is_failed(&self) -> bool {
         self.failed.is_some()
     }
+    /// Freshly fence this pin without reading bytes; failures remain terminal.
+    pub fn check_deadline(&mut self) -> Result<(), PolicyError> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        let result = checked(&self.clock, || Ok(()));
+        if let Err(error) = result {
+            self.failed = Some(error);
+        }
+        result
+    }
 }
 impl BlobReader for PinnedBlob<'_, '_> {
     fn len(&self) -> u64 {
@@ -189,6 +200,8 @@ impl BlobReader for PinnedBlob<'_, '_> {
 
 #[cfg(test)]
 pub use tests::probe as probe_pinned_blobs;
+#[cfg(test)]
+pub use tests::with_pinned_fixture;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
@@ -251,6 +264,23 @@ mod tests {
                     .unwrap();
             },
         );
+    }
+    pub fn with_pinned_fixture(
+        bytes: &[u8],
+        clock: &dyn Clock,
+        run: impl FnOnce(PinnedBlob<'_, '_>),
+    ) {
+        with_blob(bytes, BlobKind::Message, |_dir, pool, session| {
+            let mut view = pool.capture(session).unwrap();
+            let mut input = view
+                .open_blob_input(&Provider, clock, read_request(), ID, bytes.len() as u64)
+                .unwrap();
+            let mut scratch = [0; 4096];
+            while input.position() != input.len() {
+                assert_ne!(input.read(&mut scratch).unwrap(), 0);
+            }
+            run(input.finish().unwrap());
+        });
     }
     fn path(dir: &Fixture, session: &JournalSession<'_, '_>, kind: BlobKind) -> std::path::PathBuf {
         dir.path.join(

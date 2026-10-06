@@ -27,6 +27,8 @@ pub use validation::{
 #[path = "stopped/verify.rs"]
 mod verify;
 #[cfg(test)]
+pub use verify::with_pinned_fixture;
+#[cfg(test)]
 pub use verify::{
     probe_journal_publication, probe_pinned_blobs, probe_pinned_reads, probe_read_pool,
     probe_verify_account,

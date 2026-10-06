@@ -1,4 +1,5 @@
 //! Original direct-leaf locator candidates; parent authorization stays external.
+pub mod pinned;
 use super::{Error, Retained, ViewBytes};
 use crate::{
     admission::work::Charge,

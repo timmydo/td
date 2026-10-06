@@ -2212,6 +2212,16 @@ Initial independently landable increments:
   remain untrusted until exact source identity and live authorized parent
   access bind original Mapped; nested contexts and publication follow.
 
+- **M06du — complete resident source identity and actual parent pin:**
+  consume original Mapped and complete PinnedBlob; match ID/length then
+  hash all original bytes in funded 4 KiB turns against its authoritative
+  digest. Keep the actual pin through fresh Bound completion/release,
+  with actual-clock post-work precedence and terminal digest errors.
+  Root access authorization remains external before pin opening. Pin
+  literal whole-source mismatch, original backing and actual-clock
+  refusal; allocation/service qualification, issuance and publication
+  remain later.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
