@@ -1540,7 +1540,13 @@ mod tests {
         /// Makes the record directory group-readable, which damages it, at
         /// that point.
         damage: Option<(PathBuf, At)>,
+        /// Called with each step the worker presents after root's own
+        /// first, once root admits it and before its acknowledgement: a
+        /// guest swaps its keys at a connect step.
+        admitted: Option<OnStep>,
     }
+
+    type OnStep = std::sync::Arc<dyn Fn(&Request) + Send + Sync>;
 
     fn pin(bytes: &[u8]) -> Plan {
         Plan {
@@ -1693,7 +1699,8 @@ mod tests {
             assert!(!rounds.contains(&round));
             rounds.push(round);
             let invitation = Request::decode(&frame[33..]).unwrap();
-            if tag == 0x10 && invitation != current {
+            let fresh = tag == 0x10 && invitation != current;
+            if fresh {
                 assert!(!last);
                 created = match step_of(&invitation) {
                     LoginStep::Prove { key, .. } => Some(key),
@@ -1727,6 +1734,9 @@ mod tests {
             }
             if tag == 0x12 {
                 change(At::Commit);
+            }
+            if let (true, Some(admitted)) = (fresh, &plan.admitted) {
+                admitted(&current);
             }
             let step = step_of(&current);
             let pin_step = tag == 0x10 && asks_pin(step);
@@ -3661,5 +3671,10 @@ mod tests {
         assert_eq!(new.state().retries, 7);
         assert!(new.state().credentials.is_empty());
         assert_eq!(fixture.bytes(), Some(bytes));
+    }
+
+    /// The qemu-secret login guests, which share this module's root and keys.
+    mod vm {
+        include!("login_vm.rs");
     }
 }

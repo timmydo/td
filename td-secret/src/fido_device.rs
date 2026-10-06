@@ -24,6 +24,15 @@ const MAX_DESCRIPTOR: usize = 4096;
 const CANCEL_INTERVAL: Duration = Duration::from_millis(50);
 const WRITE: u8 = 1;
 const READ: u8 = 2;
+/// The program a Session starts as its HID worker: this one. A test
+/// harness cannot serve that role, so a test build's Session starts the
+/// source-built program a guest image carries (td-secret/DESIGN.md,
+/// "Login-key worker guests").
+const WORKER_PROGRAM: &str = if cfg!(test) {
+    "/bin/td-secret"
+} else {
+    "/proc/self/exe"
+};
 
 /// Who may open a token, fixed when a device is discovered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -451,7 +460,7 @@ impl Session {
             .into();
         let child_input: OwnedFd = child_socket.into();
         operation.remaining()?;
-        let child = Command::new("/proc/self/exe")
+        let child = Command::new(WORKER_PROGRAM)
             .arg(role)
             .args(args)
             .env_clear()
@@ -1472,6 +1481,20 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn only_a_test_build_starts_the_guest_program_as_its_worker() {
+        let source = include_str!("fido_device.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(source.contains(
+            "const WORKER_PROGRAM: &str = if cfg!(test) {\n    \"/bin/td-secret\"\n} else {\n    \"/proc/self/exe\"\n};"
+        ));
+        assert_eq!(source.matches("Command::new(").count(), 1);
+        assert_eq!(source.matches("Command::new(WORKER_PROGRAM)").count(), 1);
+        assert_eq!(WORKER_PROGRAM, "/bin/td-secret");
+    }
+
+    #[test]
     fn production_worker_retains_its_lock_before_device_access() {
         let source = include_str!("fido_device.rs")
             .split("#[cfg(test)]")
@@ -1668,40 +1691,14 @@ pub(crate) mod tests {
 #[cfg(test)]
 mod vm_tests {
     use super::*;
+    use crate::fido_uhid::{guard, Uhid, FIDO_DESCRIPTOR, FIDO_PRODUCT};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     };
     use std::thread::{self, JoinHandle};
 
-    const CREATE2_DESCRIPTOR: usize = 4 + 128 + 64 + 64 + 2 + 2 + 4 * 4;
-    const UHID_EVENT_SIZE: usize = CREATE2_DESCRIPTOR + 4096;
     const CHANNEL: u32 = 0x10203040;
-    const DESCRIPTOR: &[u8] = &[
-        0x06, 0xd0, 0xf1, 0x09, 1, 0xa1, 1, 0x09, 0x20, 0x15, 0, 0x26, 0xff, 0, 0x75, 8, 0x95, 64,
-        0x81, 2, 0x09, 0x21, 0x95, 64, 0x91, 2, 0xc0,
-    ];
-
-    fn guard(case: &str) {
-        assert!(fs::read_to_string("/proc/cmdline")
-            .unwrap()
-            .split_ascii_whitespace()
-            .any(|arg| arg == "td.hid-fixture=1"));
-        assert_eq!(fs::read_to_string("/case").unwrap(), case);
-        store::require_root().unwrap();
-    }
-
-    fn write_event(file: &mut File, event: &[u8]) {
-        assert_eq!(file.write(event).unwrap(), event.len());
-    }
-
-    fn input(file: &mut File, report: &[u8; 64]) {
-        let mut event = [0; 70];
-        event[..4].copy_from_slice(&12_u32.to_ne_bytes());
-        event[4..6].copy_from_slice(&64_u16.to_ne_bytes());
-        event[6..].copy_from_slice(report);
-        write_event(file, &event);
-    }
 
     struct Token {
         stop: Arc<AtomicBool>,
@@ -1721,28 +1718,7 @@ mod vm_tests {
             keepalive: bool,
             mut reply: impl FnMut(&[u8], usize) -> Vec<u8> + Send + 'static,
         ) -> Self {
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(NOFOLLOW | NONBLOCK)
-                .open("/dev/uhid")
-                .unwrap();
-            let meta = file.metadata().unwrap();
-            assert!(meta.file_type().is_char_device());
-            assert_eq!(
-                (meta.uid(), meta.gid(), meta.mode() & 0o7777),
-                (0, 0, 0o600)
-            );
-            let mut event = [0; UHID_EVENT_SIZE];
-            event[..4].copy_from_slice(&11_u32.to_ne_bytes());
-            event[4..20].copy_from_slice(b"td FIDO fixture\0");
-            event[260..262].copy_from_slice(&(DESCRIPTOR.len() as u16).to_ne_bytes());
-            event[262..264].copy_from_slice(&3_u16.to_ne_bytes());
-            event[264..268].copy_from_slice(&0x1209_u32.to_ne_bytes());
-            event[268..272].copy_from_slice(&1_u32.to_ne_bytes());
-            event[CREATE2_DESCRIPTOR..CREATE2_DESCRIPTOR + DESCRIPTOR.len()]
-                .copy_from_slice(DESCRIPTOR);
-            write_event(&mut file, &event);
+            let mut device = Uhid::create("td FIDO fixture", FIDO_PRODUCT, FIDO_DESCRIPTOR);
             let stop = Arc::new(AtomicBool::new(false));
             let stopped = stop.clone();
             let worker = thread::spawn(move || {
@@ -1754,58 +1730,33 @@ mod vm_tests {
                 let mut keepalives = 0;
                 while !stopped.load(Ordering::Relaxed) {
                     assert!(Instant::now() < deadline, "virtual HID fixture expired");
-                    event.fill(0);
-                    match file.read(&mut event) {
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(error) => panic!("read UHID: {error}"),
-                        Ok(size) => {
-                            assert!(size >= 4);
-                            let kind = u32::from_ne_bytes(event[..4].try_into().unwrap());
-                            if kind == 6 {
-                                let size = u16::from_ne_bytes(event[4100..4102].try_into().unwrap())
-                                    as usize;
-                                assert_eq!(event[4102], 1);
-                                // hidraw's unnumbered output carries its leading report ID.
-                                assert_eq!(size, 65);
-                                assert_eq!(event[4], 0);
-                                let report: [u8; 64] = event[5..69].try_into().unwrap();
-                                if report[..7] == [255, 255, 255, 255, 0x86, 0, 8] {
-                                    let mut reply = [0; 64];
-                                    reply[..7].copy_from_slice(&[255, 255, 255, 255, 0x86, 0, 17]);
-                                    reply[7..15].copy_from_slice(&report[7..15]);
-                                    reply[15..19].copy_from_slice(&CHANNEL.to_be_bytes());
-                                    reply[19..24].copy_from_slice(&[2, 1, 0, 0, 4]);
-                                    input(&mut file, &reply);
-                                } else if let hid::Event::Complete(request) =
-                                    decoder.push(&report).unwrap()
-                                {
-                                    let response = reply(request.as_ref(), requests);
-                                    requests += 1;
-                                    if keepalive {
-                                        waiting = true;
-                                    } else {
-                                        for report in
-                                            hid::cbor(CHANNEL, &response).unwrap().as_ref()
-                                        {
-                                            input(&mut file, report);
-                                        }
-                                    }
-                                    decoder = hid::Decoder::cbor(CHANNEL).unwrap();
-                                }
+                    if let Some(report) = device.output() {
+                        if report[..7] == [255, 255, 255, 255, 0x86, 0, 8] {
+                            let mut reply = [0; 64];
+                            reply[..7].copy_from_slice(&[255, 255, 255, 255, 0x86, 0, 17]);
+                            reply[7..15].copy_from_slice(&report[7..15]);
+                            reply[15..19].copy_from_slice(&CHANNEL.to_be_bytes());
+                            reply[19..24].copy_from_slice(&[2, 1, 0, 0, 4]);
+                            device.input(&reply);
+                        } else if let hid::Event::Complete(request) = decoder.push(&report).unwrap()
+                        {
+                            let response = reply(request.as_ref(), requests);
+                            requests += 1;
+                            if keepalive {
+                                waiting = true;
                             } else {
-                                assert!(
-                                    [2, 3, 4, 5].contains(&kind),
-                                    "unexpected UHID event {kind}"
-                                );
+                                for report in hid::cbor(CHANNEL, &response).unwrap().as_ref() {
+                                    device.input(report);
+                                }
                             }
+                            decoder = hid::Decoder::cbor(CHANNEL).unwrap();
                         }
                     }
                     if waiting && Instant::now() >= next_keepalive {
                         let mut report = [0; 64];
                         report[..4].copy_from_slice(&CHANNEL.to_be_bytes());
                         report[4..8].copy_from_slice(&[0xbb, 0, 1, 2]);
-                        input(&mut file, &report);
+                        device.input(&report);
                         keepalives += 1;
                         next_keepalive = Instant::now() + Duration::from_millis(20);
                     }
@@ -3153,25 +3104,10 @@ mod vm_tests {
             0, 0x29, 0x65, 0x81, 0, 0xc0,
         ];
 
-        struct Keyboard(File);
+        struct Keyboard(Uhid);
         impl Keyboard {
             fn new() -> Self {
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .custom_flags(NOFOLLOW | NONBLOCK)
-                    .open("/dev/uhid")
-                    .unwrap();
-                let mut event = [0; UHID_EVENT_SIZE];
-                event[..4].copy_from_slice(&11_u32.to_ne_bytes());
-                event[4..24].copy_from_slice(b"td desktop keyboard\0");
-                event[260..262].copy_from_slice(&(KEYBOARD.len() as u16).to_ne_bytes());
-                event[262..264].copy_from_slice(&3_u16.to_ne_bytes());
-                event[264..268].copy_from_slice(&0x1209_u32.to_ne_bytes());
-                event[268..272].copy_from_slice(&2_u32.to_ne_bytes());
-                event[CREATE2_DESCRIPTOR..CREATE2_DESCRIPTOR + KEYBOARD.len()]
-                    .copy_from_slice(KEYBOARD);
-                write_event(&mut file, &event);
+                let device = Uhid::create("td desktop keyboard", 2, KEYBOARD);
                 wait("keyboard enumeration", || {
                     fs::read_dir("/sys/class/input").unwrap().any(|entry| {
                         let path = entry.unwrap().path();
@@ -3184,15 +3120,10 @@ mod vm_tests {
                                 == Some("td desktop keyboard\n")
                     })
                 });
-                Self(file)
+                Self(device)
             }
             fn report(&mut self, modifiers: u8, key: u8) {
-                let mut event = [0; 14];
-                event[..4].copy_from_slice(&12_u32.to_ne_bytes());
-                event[4..6].copy_from_slice(&8_u16.to_ne_bytes());
-                event[6] = modifiers;
-                event[8] = key;
-                write_event(&mut self.0, &event);
+                self.0.input(&[modifiers, 0, key, 0, 0, 0, 0, 0]);
                 thread::sleep(Duration::from_millis(100));
             }
             fn key(&mut self, key: u8) {

@@ -914,7 +914,11 @@ metadata. The normal bounded `Device::discover` and root-only admission
 checks select it without changing permissions or accepting alternate
 device paths. The fixture launches the source-built `/bin/td-secret
 hid-worker` and exercises the unchanged Session initialization and CBOR
-exchange. Production Session creation still uses `/proc/self/exe`.
+exchange. Production Session creation still uses `/proc/self/exe`; a
+test build's `Session::open` starts `/bin/td-secret` instead, since a
+test harness cannot serve the worker role, and a source test pins that
+choice to `cfg!(test)`. The UHID event code is `fido_uhid.rs`'s ("UHID
+binding").
 
 The assertion case exchanges a fresh HID initialization nonce and a
 fragmented CTAP request and response. Its known challenge, public key and
@@ -1981,14 +1985,49 @@ for byte, and the assertion reply too once a test pins the hmac-secret
 output (`Output::Fixed`), since the vectors' output is not derived from a
 credential secret. It does not reproduce the makeCredential replies,
 whose credential ID and key it draws itself. It does not model
-attestation chains or certificates, real or timed presence, keepalives,
-resident credentials, built-in UV, credProtect requested by the client,
-PIN setting or change, reset, largeBlobs or persistence across processes;
-it is not a USB or HID device, and passing against it proves no
-hardware's behaviour. This in-process core is the authenticator logic
-TOKEN-LOGIN.md's Evidence names; its UHID transport and keepalives come
-with the QEMU worker increment, and persistence on the disposable disk
-with the power-cut increment.
+attestation chains or certificates, real presence, resident credentials,
+built-in UV, credProtect requested by the client, PIN setting or change,
+reset, largeBlobs or persistence across processes, and passing against
+it proves no hardware's behaviour. A key is one shared, locked state, so
+a clone serves it from another thread; `touching` says whether a request
+is inside its scripted presence delay. This core is the authenticator
+logic TOKEN-LOGIN.md's Evidence names; persistence on the disposable
+disk comes with the power-cut increment.
+
+### UHID binding
+
+`fido_uhid.rs`, also test-only, holds the UHID event code every guest
+fixture shares: `guard` requires the guest's `td.hid-fixture=1` and exact
+`/case` and root before any fixture opens `/dev/uhid`; `Uhid::create`
+checks that it is a root-owned, root-group mode-0600 character device
+and sends CREATE2 for a USB-bus device under vendor 0x1209 with the
+caller's name, product and report descriptor; `input` sends INPUT2 and
+`output` returns the next queued 64-byte output report after its
+leading zero report ID, passing over START, STOP, OPEN and CLOSE and
+refusing anything else. Reads are nonblocking; closing the descriptor
+destroys the device. The scripted HID guests' token and the desktop guest's keyboard
+use it; both check `/dev/uhid`'s owner, group and mode.
+
+`Plugged` presents a virtual key as a FIDO device with the descriptor
+`Device::discover` admits, and waits until a hidraw node whose
+`HID_NAME` is the caller's exists; its thread speaks CTAPHID (CTAP 2.1
+section 11.2). A broadcast INIT allocates a fresh channel, answered with
+the nonce, protocol 2 and the CBOR and NMSG capabilities: a CTAP2-only
+key, which td's sessions are the only clients of. They allocate no other
+way and send no CTAPHID_MSG; a report on any channel but the last
+allocated one, or anything but INIT and CBOR, fails the fixture. A
+complete CBOR request goes to the key on a helper thread; while it
+works, the binding sends a KEEPALIVE each 98 ms (`KEEPALIVE_PERIOD`, the
+section's 100 ms ceiling less its 2 ms poll, so only scheduling can
+stretch a gap past the ceiling), UPNEEDED while the key is touching and
+PROCESSING otherwise, then the reply's fragments. The key also totals
+how long its scripted touches actually took (`touched`). It counts
+channels, requests and each keepalive status and records the longest a
+pending request went without a frame, and `remove` returns those counts
+once the device and its node are gone. Removing and inserting a key
+again, with `power_cycle` between, is a reinsertion: a new device and
+node, and a cleared PIN AUTH BLOCKED. It needs no TPM. Its thread ends
+itself after 170 seconds, inside the guest's bound.
 
 ## Login-key worker
 
@@ -2280,3 +2319,55 @@ bounds, its wait past a frame time, its operation deadline, and an
 open session bounding every wait without narrowing the operation's.
 Clearing a dropped PIN, or any frame, is by construction, which a source
 test pins; safe code cannot observe freed memory.
+
+### Login-key worker guests
+
+`td-recipe-eval qemu-secret` runs seven more fresh, diskless guests, with
+or without `--tpm`, since none needs a TPM. Each boots the same kernel
+and fixture init as the authority cases with `td.hid-fixture=1`, selects
+one ignored test of `login_vm.rs`, a module of the worker's tests, and
+holds the 180-second bound and the one-test passing summary. The test
+calls the worker's own `operate` over `Physical`, as `run` does, through
+a test-only wrapper that passes every call through unchanged and records
+how many devices each discovery found:
+`Device::discover`, `Session::open` and each session's production
+`/bin/td-secret hid-worker` with its `/run/td-fido/operation.lock`,
+kernel entropy and the protected-memory check, against virtual keys
+`Plugged` presents through UHID. Root is the host tests' own over a
+socketpair `Wire`, and every frame it sees is asserted as the host tests
+assert it. The record is the production `/var/lib/td/login/1000`, the
+directory made root's with mode 0700 as firstboot will. The one
+departure from `run` is the versions: both retained deployments read
+this build's, standing for increment 4's tier marker, since production
+still refuses every write that leaves a record. After each operation the
+lock is root's, mode 0600 and free.
+
+A swap follows the worker, not a clock. Root's hook at the connect step
+runs before its acknowledgement, so no discovery for the new key has
+happened yet; the swap thread then removes the old key only after a
+later discovery found it alone, and inserts the new one only after a
+discovery after that found the port empty. The worker is thus seen to
+wait through both, and the guest fails if either is not seen within 20
+seconds, inserting the new key regardless so the worker is not left
+waiting. A host test drives the same gate against a simulated worker
+that starts late and requires it to see the old key, the empty port and
+the new key in that order.
+
+| Case | Proves over HID |
+| --- | --- |
+| `login-unlock` | each key of a two-key record unlocks over an identify and an assertion session, every CTAP request crossing the device; WRONG PIN at 8 then 7 and a later unlock at 6; a stranger NOT ENROLLED with no PIN step; no device and two devices ONE KEY with no report to either |
+| `login-blocked` | three wrong PINs end PIN AUTH BLOCKED, and an unlock gets no PIN step until the device is destroyed, the key power-cycled and a new device created, which then unlocks at 5; one retry left blocks for good, across reinsertions |
+| `login-enroll-one` | a one-key enrollment's three sessions publish the record, which a fresh worker then reads and the key unlocks; removing that last key unlinks it |
+| `login-enroll-two` | a two-key enrollment across a gated swap at the second connect step: the worker polls with the first key alone, then with none, then takes the second; the second creation excludes the first credential; each key then unlocks |
+| `login-add-remove` | an addition authorized by the enrolled key, then the same gated swap to the new key; the new key unlocks and removes the authorizing one, which then is NOT ENROLLED |
+| `login-keepalive` | a three-second scripted touch on the unlock assertion: the Session waits through UPNEEDED keepalives and unlocks. Over the touch's measured length, at most one keepalive per period plus two, at least one per observed longest silence less two, and no request silent for a second |
+| `login-probe` | a key whose default credProtect hides its credential from a silent assertion is KEY REFUSED `06` at the probe, and nothing is published |
+
+A record written in one guest's step is read back in its next; across
+cold boots it is not, since keys and records do not yet persist on a
+disk (the power-cut increment). Every operation kind, unlock,
+enrollment, addition and removal, crosses the kernel's HID path. The
+acknowledgements are simulated root, the keys are software, and USB
+metadata and presence are fixtures: this proves no USB controller,
+YubiKey behaviour, physical presence or touch timing, and no td-authd
+supervision, which is a later increment.

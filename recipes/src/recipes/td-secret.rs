@@ -233,6 +233,14 @@ pub fn recipe() -> Recipe {
             include_str!("../../../td-secret/src/fido_virtual.rs"),
         ),
         (
+            "{src}/td-secret/src/fido_uhid.rs",
+            include_str!("../../../td-secret/src/fido_uhid.rs"),
+        ),
+        (
+            "{src}/td-secret/src/login_vm.rs",
+            include_str!("../../../td-secret/src/login_vm.rs"),
+        ),
+        (
             "{src}/td-authd/tests/secret_sys.rs",
             include_str!("../../../td-authd/tests/secret_sys.rs"),
         ),
@@ -493,14 +501,37 @@ mod tests {
             })
             .collect();
         for (name, source) in MODULES {
-            for attribute in source.split("#[path = \"").skip(1) {
-                let file = attribute.split('"').next().unwrap_or_default();
-                if file.contains('/') {
-                    continue;
+            for marker in ["#[path = \"", "include!(\""] {
+                for attribute in source.split(marker).skip(1) {
+                    let file = attribute.split('"').next().unwrap_or_default();
+                    if file.contains('/') {
+                        continue;
+                    }
+                    let path = format!("{{src}}/td-secret/src/{file}");
+                    assert!(written.contains(&path), "{name} declares {file}");
                 }
-                let path = format!("{{src}}/td-secret/src/{file}");
-                assert!(written.contains(&path), "{name} declares {file}");
             }
+        }
+        // lib.rs's own modules, test-only ones included, unless a path names them.
+        let lines: Vec<&str> = LIB_RS.lines().collect();
+        for (at, line) in lines.iter().enumerate() {
+            let declaration = ["pub(crate) ", "pub "]
+                .iter()
+                .find_map(|visibility| line.strip_prefix(visibility))
+                .unwrap_or(line);
+            let Some(name) = declaration
+                .strip_prefix("mod ")
+                .and_then(|n| n.strip_suffix(';'))
+            else {
+                continue;
+            };
+            let pathed = lines[..at]
+                .iter()
+                .rev()
+                .take_while(|line| line.starts_with("#["))
+                .any(|line| line.starts_with("#[path"));
+            let path = format!("{{src}}/td-secret/src/{name}.rs");
+            assert!(pathed || written.contains(&path), "lib.rs declares {name}");
         }
     }
 

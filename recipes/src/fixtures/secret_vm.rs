@@ -81,6 +81,37 @@ pub const FIDO_CASES: &[(&str, &str)] = &[
         "fido_device::vm_tests::desktop::qemu_desktop_recovers_persistent_store_without_primary",
     ),
 ];
+/// The login worker over UHID virtual keys; these guests need no TPM.
+pub const LOGIN_CASES: &[(&str, &str)] = &[
+    (
+        "login-unlock",
+        "login_operation::tests::vm::qemu_login_worker_unlocks_each_key_and_refuses_wrong_pins_strangers_and_counts",
+    ),
+    (
+        "login-blocked",
+        "login_operation::tests::vm::qemu_login_worker_blocks_after_three_wrong_pins_until_the_key_is_reinserted",
+    ),
+    (
+        "login-enroll-one",
+        "login_operation::tests::vm::qemu_login_worker_enrolls_one_key_whose_record_unlocks_and_is_then_removed",
+    ),
+    (
+        "login-enroll-two",
+        "login_operation::tests::vm::qemu_login_worker_enrolls_two_keys_across_a_swap_of_devices",
+    ),
+    (
+        "login-add-remove",
+        "login_operation::tests::vm::qemu_login_worker_adds_a_key_across_a_swap_and_removes_the_authorizing_one",
+    ),
+    (
+        "login-keepalive",
+        "login_operation::tests::vm::qemu_login_worker_waits_through_keepalives_for_a_slow_touch",
+    ),
+    (
+        "login-probe",
+        "login_operation::tests::vm::qemu_login_worker_refuses_a_key_whose_credprotect_default_fails_the_probe",
+    ),
+];
 pub const SYSTEM_TEST: &str =
     "fido_device::vm_tests::desktop::system::qemu_installed_system_secret_lifecycle";
 pub const SYSTEM_PASS: &str = "TD-SECRET-SYSTEM-PASS";
@@ -159,6 +190,7 @@ fn run() -> Result<(), String> {
             TPM_CASES
                 .iter()
                 .chain(FIDO_CASES)
+                .chain(LOGIN_CASES)
                 .map(|(name, test)| (*name, *test, "/bin/td-secret-tests")),
         )
         .find(|(name, _, _)| *name == selected)

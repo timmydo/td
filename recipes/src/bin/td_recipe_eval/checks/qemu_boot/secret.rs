@@ -310,13 +310,17 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
             Ok::<_, String>(path)
         })
         .transpose()?;
-    let cases = fixture::CASES.iter().map(|case| (case, false)).chain(
-        fixture::TPM_CASES
-            .iter()
-            .chain(fixture::FIDO_CASES)
-            .filter(|_| tpm.is_some())
-            .map(|case| (case, true)),
-    );
+    let cases = fixture::CASES
+        .iter()
+        .chain(fixture::LOGIN_CASES)
+        .map(|case| (case, false))
+        .chain(
+            fixture::TPM_CASES
+                .iter()
+                .chain(fixture::FIDO_CASES)
+                .filter(|_| tpm.is_some())
+                .map(|case| (case, true)),
+        );
     for ((name, test), is_tpm) in cases {
         let emulator = match (is_tpm, tpm, tpm_scratch.as_ref()) {
             (true, Some(executable), Some(scratch)) => {
@@ -366,7 +370,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
                 mem: "512",
                 target_marker: fixture::PASS,
                 kill_on_marker: false,
-                extra_append: if name.starts_with("fido-") {
+                extra_append: if name.starts_with("fido-") || name.starts_with("login-") {
                     "td.hid-fixture=1"
                 } else if is_tpm {
                     "td.tpm-fixture=1"
@@ -419,6 +423,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
         );
     }
     println!("PASS: secret authority VM cases ({} fresh guests); credential intake, inspection and relocking; no token or TPM release claim", fixture::CASES.len());
+    println!("PASS: login-key worker over UHID virtual keys ({} fresh guests); production discovery, HID worker and operation lock for unlock, one- and two-key enrollment, addition and removal; wrong PIN, PIN AUTH BLOCKED until reinsertion, PIN BLOCKED, no key, two keys, a stranger key, a credProtect probe refusal and keepalives through a slow touch; simulated root acknowledgements and tier marker, no TPM, physical-presence or YubiKey claim", fixture::LOGIN_CASES.len());
     if tpm.is_some() {
         println!("PASS: TPM guest device, persistent sealed key, cold reopen, changed PCR and different TPM refusal; fixture measurements only, no FIDO2 or measured-deployment claim");
         println!("PASS: virtual credential creation, proof, recovery exclusion and both recovery policies; fresh assertion before TPM unseal, replay and wrong-key refusal; no physical presence or session-release claim");
@@ -682,6 +687,50 @@ mod tests {
         for (_, test) in fixture::FIDO_CASES {
             assert!(source.contains(&format!("fn {}()", test.rsplit("::").next().unwrap())));
         }
+    }
+
+    #[test]
+    fn login_guest_roster_is_pinned_and_each_guest_guards_its_own_case() {
+        let names: Vec<&str> = fixture::LOGIN_CASES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            [
+                "login-unlock",
+                "login-blocked",
+                "login-enroll-one",
+                "login-enroll-two",
+                "login-add-remove",
+                "login-keepalive",
+                "login-probe",
+            ]
+        );
+        let source = include_str!("../../../../../../td-secret/src/login_vm.rs");
+        for (name, test) in fixture::LOGIN_CASES {
+            let function = test.strip_prefix("login_operation::tests::vm::").unwrap();
+            assert!(function.starts_with("qemu_login_worker_"));
+            let body = source.split(&format!("fn {function}() {{")).nth(1).unwrap();
+            assert!(
+                body.trim_start()
+                    .starts_with(&format!("guard(\"{name}\");")),
+                "{name}"
+            );
+        }
+        // The module's every guest is on the roster, and only those.
+        assert_eq!(
+            source.matches("#[ignore = ").count(),
+            fixture::LOGIN_CASES.len()
+        );
+        let all: std::collections::BTreeSet<_> = fixture::CASES
+            .iter()
+            .chain(fixture::TPM_CASES)
+            .chain(fixture::FIDO_CASES)
+            .chain(fixture::LOGIN_CASES)
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(all.len(), 4 + 4 + 11 + 7);
+        assert!(fixture::LOGIN_CASES
+            .iter()
+            .all(|(name, _)| name.starts_with("login-")));
     }
 
     #[test]

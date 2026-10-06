@@ -13,8 +13,9 @@ identify, PIN-retry, assertion and creation steps ("Token profile"), or
 td-authd's login consent operations and step admission
 (`td-authd/DESIGN.md`). No deployment carries the tier marker yet, so
 the worker reads no record version for either retained deployment and
-refuses every write that would leave a record ("Versions"). Nothing else
-below is implemented.
+refuses every write that would leave a record ("Versions"). Its
+`qemu-secret` guests run it over UHID virtual keys ("Evidence"), standing
+in for that marker. Nothing else below is implemented.
 Until the increments at the end land, `THREAT-MODEL.md` §3 is the
 complete current behaviour: the installed account logs in automatically
 and the session never locks. No document, UI or release
@@ -706,11 +707,37 @@ It signs with test-only ECDSA over td-secret's private P-256 arithmetic;
 host tests check its signatures and PIN-protocol messages against the
 existing committed independent vectors. Its state persists on the
 disposable disk so a key keeps its credentials across cold boots. The
-authenticator logic exists now as an in-process, host-test-only core
-(`td-secret/DESIGN.md`, "Virtual authenticator") with no transport,
-keepalive or persistence; the UHID transport and keepalives come with
-the QEMU worker increment, and persistence on the disposable disk with
-the power-cut increment.
+authenticator logic is a test-only core (`td-secret/DESIGN.md`,
+"Virtual authenticator") that host tests drive in process and that a
+test-only UHID binding presents in a guest as a hidraw FIDO device
+speaking CTAPHID, with keepalives within the 100 ms ceiling while the
+key works, UPNEEDED during a scripted touch ("UHID binding").
+Persistence on the disposable disk comes with the power-cut increment.
+
+Seven `qemu-secret` guests, none with a TPM, run the root worker's own
+operation over the production discovery, Session and HID worker with
+its operation lock, against those devices, with simulated root
+acknowledgements and both retained deployments taken to read this
+build's record version (`td-secret/DESIGN.md`, "Login-key worker
+guests"): unlock with each key, wrong PIN with a falling count, PIN AUTH
+BLOCKED cleared only by reinsertion, PIN BLOCKED, a key not in the
+record, no key and two keys; one-key enrollment whose record a fresh
+worker then unlocks, and removal of the last key; two-key enrollment
+across a device swap; addition across a swap and removal of the
+authorizing key; a slow touch held by keepalives; and a credProtect
+default refused at the probe. The rest of increment 2's guest list has
+no guest yet. Host tests of the worker's operation over virtual keys
+cover additions to eight, a too-small list, a tampered verifier or
+public key, a replayed (stale) signature, a changed baseline and an
+incompatible version. Denied presence and `alwaysUv` are covered only
+at the transaction and virtual-key layer, and the bytes of the worker's
+DENIED and KEY REFUSED `02` frames are pinned, but no worker operation
+meets either. Leftover temporaries are covered by the record store's
+host tests.
+Power cuts are not covered: the host tests inject a failure at each
+publication and removal stage, which models neither power loss nor
+cold-boot durability, so a missing fsync could pass them. They remain
+unproven until the power-cut increment's guests.
 
 The stock VM stays unenrolled: no recipe or firstboot path writes a record,
 and its valid, empty directory is decided unenrolled without any helper,
@@ -763,7 +790,8 @@ proves and the oracle that shows it.
      refusals, tampered verifier or public key, replayed assertion, changed
      baseline, incompatible record version; guest power cuts before and
      after publication leaving one whole record and no unenrolled machine
-     locked; leftover temporaries ignored and removed.
+     locked; leftover temporaries ignored and removed. Seven guests
+     covering the cases "Evidence" names have landed; the rest remain.
 3. **Compositor trusted PIN entry and lock surface**, driven by fixtures
    and not yet activated by a record; the compositor sends `1b` and `1c`.
    - Native compositor and device-dispatcher tests: lock rendering excludes

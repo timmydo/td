@@ -1508,12 +1508,18 @@ unseal, or a credential-store write. The public intake fixture explicitly
 stands in for the completion reply. Pinned-emulator tests in
 `td-secret/DESIGN.md` cover the separate cryptographic store operations.
 
+The same command then runs seven fresh, diskless, TPM-free guests of
+td-secret's login-key worker over UHID virtual keys, with the same
+bound, selection and passing summary (`td-secret/DESIGN.md`, "Login-key
+worker guests"). They play root themselves; td-authd's supervision of
+that worker is not among them.
 
 The optional `qemu-secret --tpm /absolute/path/to/swtpm` mode adds four
-TPM device cases to those authority checks. It uses the existing pinned
-host emulator and a private raw fixture disk, with cold reopen and changed
-PCR/different-TPM refusals specified in `td-secret/DESIGN.md`. These
-additional tests do not replace the authority's token-consent boundary.
+TPM device cases and the eleven HID guests `td-secret/DESIGN.md`
+describes to those checks, fifteen more guests. It uses the existing
+pinned host emulator and private raw fixture disks, with cold reopen and
+changed PCR/different-TPM refusals specified there. These additional
+tests do not replace the authority's token-consent boundary.
 
 ## Consent for a locally built system
 

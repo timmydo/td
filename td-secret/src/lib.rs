@@ -183,6 +183,9 @@ mod terminal_fixture_sys;
 mod fido_virtual;
 
 #[cfg(test)]
+mod fido_uhid;
+
+#[cfg(test)]
 mod confinement {
     #[test]
     fn manual_token_check_requires_explicit_creation_and_has_no_input_arguments() {
@@ -218,7 +221,7 @@ mod confinement {
         );
         assert_eq!(
             fingerprint(include_str!("login_operation.rs")),
-            0xc3fd7c74eeb201ed
+            0xf615dc3cec18736e
         );
         assert_eq!(
             fingerprint(include_str!("write_operation.rs")),
@@ -318,7 +321,9 @@ mod confinement {
             ("fido_pin.rs", include_str!("fido_pin.rs")),
             ("fido_transaction.rs", include_str!("fido_transaction.rs")),
             ("fido_virtual.rs", include_str!("fido_virtual.rs")),
+            ("fido_uhid.rs", include_str!("fido_uhid.rs")),
             ("login_operation.rs", include_str!("login_operation.rs")),
+            ("login_vm.rs", include_str!("login_vm.rs")),
             ("login_record.rs", include_str!("login_record.rs")),
             ("login_store.rs", include_str!("login_store.rs")),
             ("pin_sys.rs", include_str!("pin_sys.rs")),
@@ -448,11 +453,13 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "fido_p256.rs",
                 "fido_pin.rs",
                 "fido_transaction.rs",
+                "fido_uhid.rs",
                 "fido_virtual.rs",
                 "lib.rs",
                 "login_operation.rs",
                 "login_record.rs",
                 "login_store.rs",
+                "login_vm.rs",
                 "main.rs",
                 "operation.rs",
                 "pin_sys.rs",

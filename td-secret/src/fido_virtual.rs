@@ -1,6 +1,7 @@
-//! Test-only, in-process CTAP 2.1 authenticator for td's subset, behind the
-//! transaction Channel. It decrypts and verifies every PIN-protocol message
-//! itself. No attestation chain, real presence, keepalives or persistence.
+//! Test-only CTAP 2.1 authenticator for td's subset, behind the transaction
+//! Channel in process or, in a guest, `fido_uhid`'s HID device. It decrypts
+//! and verifies every PIN-protocol message itself. No attestation chain,
+//! real presence or persistence.
 
 use crate::fido_cbor::{self as cbor, Encoder, Value};
 use crate::fido_ctap::RP_ID;
@@ -9,9 +10,9 @@ use crate::fido_hid::Message;
 use crate::fido_p256::{fixture_scalar, PublicKey, SecretScalar};
 use crate::fido_transaction::Channel;
 use crate::{crypto, fido_aes};
-use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 const MAX_RETRIES: u8 = 8;
@@ -176,14 +177,30 @@ struct Authenticator {
     last_signature: Option<Vec<u8>>,
     injected: VecDeque<Vec<u8>>,
     transcript: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The scripted presence delays, read without the lock.
+    touch: Arc<Touch>,
+}
+
+/// Whether a scripted presence delay runs now, and how long all of them
+/// have taken, in microseconds.
+#[derive(Default)]
+struct Touch {
+    now: AtomicBool,
+    total: AtomicU64,
 }
 
 /// One virtual key; `link` is the channel a Transaction owns and drops.
-pub(crate) struct Virtual(Rc<RefCell<Authenticator>>);
+/// A clone is the same key, which a HID binding serves from its own thread.
+#[derive(Clone)]
+pub(crate) struct Virtual {
+    inner: Arc<Mutex<Authenticator>>,
+    touch: Arc<Touch>,
+}
 
 impl Virtual {
     pub(crate) fn new(config: Config, pin: Option<&[u8]>, seed: &str) -> Self {
-        Self(Rc::new(RefCell::new(Authenticator {
+        let touch = Arc::new(Touch::default());
+        let inner = Arc::new(Mutex::new(Authenticator {
             config,
             state: State {
                 pin: pin.map(<[u8]>::to_vec),
@@ -200,16 +217,22 @@ impl Virtual {
             last_signature: None,
             injected: VecDeque::new(),
             transcript: Vec::new(),
-        })))
+            touch: Arc::clone(&touch),
+        }));
+        Self { inner, touch }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Authenticator> {
+        self.inner.lock().unwrap()
     }
 
     pub(crate) fn link(&self) -> Link {
-        Link(Rc::clone(&self.0))
+        Link(Arc::clone(&self.inner))
     }
 
     /// Simulated reinsertion: clears PIN AUTH BLOCKED, never PIN BLOCKED.
     pub(crate) fn power_cycle(&self) {
-        let mut inner = self.0.borrow_mut();
+        let mut inner = self.lock();
         inner.agreement = None;
         inner.token = None;
         inner.failures = 0;
@@ -217,39 +240,50 @@ impl Virtual {
     }
 
     pub(crate) fn state(&self) -> State {
-        self.0.borrow().state.clone()
+        self.lock().state.clone()
     }
 
     pub(crate) fn with_state(&self, change: impl FnOnce(&mut State)) {
-        change(&mut self.0.borrow_mut().state);
+        change(&mut self.lock().state);
     }
 
     pub(crate) fn script(&self, script: Script) {
-        self.0.borrow_mut().script = script;
+        self.lock().script = script;
     }
 
     /// Replaces the next random draw, which must have this length.
     pub(crate) fn inject(&self, bytes: Vec<u8>) {
-        self.0.borrow_mut().injected.push_back(bytes);
+        self.lock().injected.push_back(bytes);
     }
 
     pub(crate) fn transcript(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.0.borrow().transcript.clone()
+        self.lock().transcript.clone()
     }
 
     pub(crate) fn exchange(&self, request: &[u8]) -> Vec<u8> {
-        self.0.borrow_mut().handle(request)
+        self.lock().handle(request)
+    }
+
+    /// Whether a request waits on its scripted presence delay, which a HID
+    /// binding reports in its keepalives as UPNEEDED.
+    pub(crate) fn touching(&self) -> bool {
+        self.touch.now.load(Ordering::Acquire)
+    }
+
+    /// How long the key's scripted presence delays have actually taken.
+    pub(crate) fn touched(&self) -> Duration {
+        Duration::from_micros(self.touch.total.load(Ordering::Acquire))
     }
 }
 
-pub(crate) struct Link(Rc<RefCell<Authenticator>>);
+pub(crate) struct Link(Arc<Mutex<Authenticator>>);
 
 impl Channel for Link {
     fn check(&self) -> Result<(), Interruption> {
         Ok(())
     }
     fn exchange(&mut self, request: &[u8]) -> Result<Message, String> {
-        let reply = self.0.borrow_mut().handle(request);
+        let reply = self.0.lock().unwrap().handle(request);
         Ok(crate::fido_transaction::tests::message(&reply))
     }
 }
@@ -493,7 +527,12 @@ impl Authenticator {
         match self.script.presence {
             Presence::Granted => Ok(()),
             Presence::Delayed(delay) => {
+                let started = std::time::Instant::now();
+                self.touch.now.store(true, Ordering::Release);
                 std::thread::sleep(delay);
+                self.touch.now.store(false, Ordering::Release);
+                let took = u64::try_from(started.elapsed().as_micros()).unwrap();
+                self.touch.total.fetch_add(took, Ordering::AcqRel);
                 Ok(())
             }
             Presence::Denied => Err(OPERATION_DENIED),
