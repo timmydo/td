@@ -444,6 +444,60 @@ impl Point {
     }
 }
 
+// Test-only signing for the virtual authenticator; td's production never signs.
+#[cfg(test)]
+impl SecretScalar {
+    /// ES256 over an already hashed message with a caller-chosen nonce in 1..n,
+    /// DER-encoded. No low-S normalization: verification admits either s.
+    pub(super) fn sign(
+        &self,
+        digest: &[u8; 32],
+        nonce: &[u8; 32],
+    ) -> Result<Vec<u8>, &'static str> {
+        let k = Scalar::from_bytes(nonce)?;
+        let point = Point::generator().multiply(nonce).affine()?;
+        let r = Scalar::from_raw(reduce(&decode(&point.x.bytes()), 0, &N));
+        let d = Scalar::from_bytes(&self.0)?;
+        let e = Scalar::from_raw(reduce(&decode(digest), 0, &N));
+        let s = e.add(r.mul(d)).mul(k.inverse());
+        if r.is_zero() != 0 || s.is_zero() != 0 {
+            return Err("ES256 signature scalar is zero");
+        }
+        let mut body = der_integer(&r.bytes());
+        body.extend(der_integer(&s.bytes()));
+        // Two integers of at most 33 bytes keep the short length form.
+        let mut out = vec![0x30, body.len() as u8];
+        out.extend(body);
+        Ok(out)
+    }
+}
+
+/// The test vectors' scalar from a hash: `hash mod (n - 1) + 1`.
+#[cfg(test)]
+pub(super) fn fixture_scalar(hash: &[u8; 32]) -> [u8; 32] {
+    let raw = decode(hash);
+    let (reduced, borrow) = subtract(&raw, &subtract(&N, &ONE).0);
+    let value = add(if borrow == 0 { &reduced } else { &raw }, &ONE).0;
+    let mut out = [0; 32];
+    for (bytes, word) in out.as_chunks_mut::<8>().0.iter_mut().rev().zip(value) {
+        *bytes = word.to_be_bytes();
+    }
+    out
+}
+
+#[cfg(test)]
+fn der_integer(value: &[u8; 32]) -> Vec<u8> {
+    let start = value.iter().position(|byte| *byte != 0).unwrap_or(31);
+    let digits = value.get(start..).unwrap_or_default();
+    let pad = digits.first().is_some_and(|byte| byte & 0x80 != 0);
+    let mut out = vec![2, (digits.len() + usize::from(pad)) as u8];
+    if pad {
+        out.push(0);
+    }
+    out.extend_from_slice(digits);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

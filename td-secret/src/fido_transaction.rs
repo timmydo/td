@@ -685,7 +685,7 @@ pub(crate) mod tests {
         ]);
         steps
     }
-    fn message(bytes: &[u8]) -> Message {
+    pub(crate) fn message(bytes: &[u8]) -> Message {
         let mut decoder = hid::Decoder::cbor(1).unwrap();
         for report in hid::cbor(1, bytes).unwrap().as_ref() {
             if let Event::Complete(message) = decoder.push(report).unwrap() {

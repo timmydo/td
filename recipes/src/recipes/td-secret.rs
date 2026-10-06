@@ -225,6 +225,10 @@ pub fn recipe() -> Recipe {
             include_str!("../../../td-secret/src/system_vm.rs"),
         ),
         (
+            "{src}/td-secret/src/fido_virtual.rs",
+            include_str!("../../../td-secret/src/fido_virtual.rs"),
+        ),
+        (
             "{src}/td-authd/tests/secret_sys.rs",
             include_str!("../../../td-authd/tests/secret_sys.rs"),
         ),

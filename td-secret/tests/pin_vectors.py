@@ -312,6 +312,10 @@ try:
                 data += cbor({"hmac-secret": enc(result, iv_output)})
                 rows[name] = b"\0"+cbor({1: {"id": credential_id, "type": "public-key"},
                     2: data, 3: sign(signing, sha(data + phase_hashes[2]))})
+        if not manual:
+            # The authenticator's side of the same transcript, for the virtual key.
+            rows.update(peer=peer.to_bytes(32, "big"), signing=signing.to_bytes(32, "big"),
+                        token=token, iv_token=iv_token, iv_output=iv_output)
         for key, value in rows.items():
             print(label, key, value.hex())
 finally:

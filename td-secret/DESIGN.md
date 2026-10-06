@@ -1905,3 +1905,60 @@ requests with Python's `hashlib` and `hmac` alone. It recomputes
 `pin_vectors.py`'s public creation seeds, so its creation rows differ
 from that file's only in the labels; the committed
 `tests/login_ctap_vectors.txt` is what the tests read.
+
+### Virtual authenticator
+
+`fido_virtual.rs` is a test-only (`#[cfg(test)]`) CTAP 2.1
+authenticator behind the transaction runner's `Channel`, so host tests
+drive the production notebook and login steps end to end without a
+device; nothing in the shipped program contains it. It models td's
+subset: getInfo, whose versions, extensions, `clientPin` (derived from
+whether a PIN is set), `alwaysUv`, `pinUvAuthToken`, PIN protocols and
+message, list and ID limits a test chooses; clientPIN getPINRetries,
+getKeyAgreement, getPinToken and getPinUvAuthTokenUsingPinWithPermissions
+for both PIN protocols; non-resident ES256 makeCredential with
+hmac-secret, an exclusion list, configurable credential-ID length and a
+none or packed self attestation; and getAssertion, silent or
+PIN-authorized, with hmac-secret's separate UV and non-UV secrets. It
+derives its own ECDH, KDF, AES-CBC and HMAC keys from td's primitives
+and decrypts and verifies every PIN hash, token authorization and salt
+authentication rather than trusting the client. A
+getPinUvAuthTokenUsingPinWithPermissions request for makeCredential or
+getAssertion must name its RP, which the permission table marks
+Required; undefined permission bits are ignored. A token authorizes
+only its own RP and permissions; on a FIDO_2_1 key a legacy getPinToken
+token takes the RP of its first authorized use, and a FIDO_2_0-only
+key's token never binds one. A FIDO_2_1 key clears a token's
+permissions, except lbw, once makeCredential's or getAssertion's
+presence step (CTAP 2.1 sections 6.1.2 step 14 and 6.2.2 step 9)
+collects presence, whatever follows; the excludeList presence returns
+CREDENTIAL_EXCLUDED before that step, whatever its outcome, and leaves
+the token. A FIDO_2_0-only key keeps its pinToken until the next
+getPinToken or power cycle. hmac-secret without presence, `rk` on
+getAssertion and `uv` without pinUvAuthParam are refused with the
+specified option errors, and `alwaysUv` requires pinUvAuthParam only
+for a getAssertion that asks for presence. Retries start at eight;
+each mismatch spends one, three consecutive mismatches return
+PIN AUTH BLOCKED until `power_cycle`, zero is PIN BLOCKED, which a power
+cycle does not clear, and a correct PIN restores both. A default
+credProtect level 3 hides its credentials from any assertion without
+UV. Scripts add presence delay, denial and timeout, a wrong secret, a
+stale or foreign signature and signed backup flags. Its state is a
+plain clonable struct; randomness is SHA-256 over a seed and a count,
+or bytes a test injects.
+
+It signs with `fido_p256`'s test-only ES256 signer, whose nonce follows
+`pin_vectors.py`'s rule, so given that file's authenticator-side rows
+it reproduces the committed key-agreement and PIN-token replies byte
+for byte, and the assertion reply too once a test pins the hmac-secret
+output (`Output::Fixed`), since the vectors' output is not derived from a
+credential secret. It does not reproduce the makeCredential replies,
+whose credential ID and key it draws itself. It does not model
+attestation chains or certificates, real or timed presence, keepalives,
+resident credentials, built-in UV, credProtect requested by the client,
+PIN setting or change, reset, largeBlobs or persistence across processes;
+it is not a USB or HID device, and passing against it proves no
+hardware's behaviour. This in-process core is the authenticator logic
+TOKEN-LOGIN.md's Evidence names; its UHID transport and keepalives come
+with the QEMU worker increment, and persistence on the disposable disk
+with the power-cut increment.

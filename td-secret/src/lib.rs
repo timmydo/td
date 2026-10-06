@@ -178,6 +178,9 @@ fn parse_uid(value: &str) -> Result<u32, String> {
 mod terminal_fixture_sys;
 
 #[cfg(test)]
+mod fido_virtual;
+
+#[cfg(test)]
 mod confinement {
     #[test]
     fn manual_token_check_requires_explicit_creation_and_has_no_input_arguments() {
@@ -308,6 +311,7 @@ mod confinement {
             ("fido_p256.rs", include_str!("fido_p256.rs")),
             ("fido_pin.rs", include_str!("fido_pin.rs")),
             ("fido_transaction.rs", include_str!("fido_transaction.rs")),
+            ("fido_virtual.rs", include_str!("fido_virtual.rs")),
             ("login_record.rs", include_str!("login_record.rs")),
             ("login_store.rs", include_str!("login_store.rs")),
             ("pin_sys.rs", include_str!("pin_sys.rs")),
@@ -437,6 +441,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "fido_p256.rs",
                 "fido_pin.rs",
                 "fido_transaction.rs",
+                "fido_virtual.rs",
                 "lib.rs",
                 "login_record.rs",
                 "login_store.rs",

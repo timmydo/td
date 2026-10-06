@@ -669,7 +669,12 @@ implements:
 It signs with test-only ECDSA over td-secret's private P-256 arithmetic;
 host tests check its signatures and PIN-protocol messages against the
 existing committed independent vectors. Its state persists on the
-disposable disk so a key keeps its credentials across cold boots.
+disposable disk so a key keeps its credentials across cold boots. The
+authenticator logic exists now as an in-process, host-test-only core
+(`td-secret/DESIGN.md`, "Virtual authenticator") with no transport,
+keepalive or persistence; the UHID transport and keepalives come with
+the QEMU worker increment, and persistence on the disposable disk with
+the power-cut increment.
 
 The stock VM stays unenrolled: no recipe or firstboot path writes a record,
 and its valid, empty directory is decided unenrolled without any helper,
