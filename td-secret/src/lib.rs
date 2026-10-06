@@ -41,9 +41,8 @@ mod fido_p256;
 mod fido_pin;
 #[allow(dead_code, reason = "private portable transaction runner")]
 mod fido_transaction;
-#[allow(dead_code, reason = "login record codec staged for the login worker")]
+mod login_operation;
 mod login_record;
-#[allow(dead_code, reason = "login record store staged for the login worker")]
 mod login_store;
 #[path = "../../td-busd/src/message.rs"]
 #[allow(dead_code, reason = "shared bounded D-Bus codec")]
@@ -99,6 +98,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
         [command, flag, uid] if command == "unlock-operation" && flag == "--uid" => {
             operation::run(parse_uid(uid)?)
+        }
+        [command, flag, uid] if command == "login-operation" && flag == "--uid" => {
+            login_operation::run(parse_uid(uid)?)
         }
         [command, flag, uid] if command == "inspect-store" && flag == "--uid" => {
             let mut endpoint = operation::startup()?;
@@ -212,7 +214,11 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("operation.rs")),
-            0x9e52120007bef08f
+            0x63b7e28b777306cd
+        );
+        assert_eq!(
+            fingerprint(include_str!("login_operation.rs")),
+            0x43c67b9c95ce722d
         );
         assert_eq!(
             fingerprint(include_str!("write_operation.rs")),
@@ -312,6 +318,7 @@ mod confinement {
             ("fido_pin.rs", include_str!("fido_pin.rs")),
             ("fido_transaction.rs", include_str!("fido_transaction.rs")),
             ("fido_virtual.rs", include_str!("fido_virtual.rs")),
+            ("login_operation.rs", include_str!("login_operation.rs")),
             ("login_record.rs", include_str!("login_record.rs")),
             ("login_store.rs", include_str!("login_store.rs")),
             ("pin_sys.rs", include_str!("pin_sys.rs")),
@@ -443,6 +450,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "fido_transaction.rs",
                 "fido_virtual.rs",
                 "lib.rs",
+                "login_operation.rs",
                 "login_record.rs",
                 "login_store.rs",
                 "main.rs",

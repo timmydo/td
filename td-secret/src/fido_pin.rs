@@ -301,6 +301,33 @@ impl Profile {
             bytes,
         })
     }
+
+    /// A login assertion whose client-data hash comes after the PIN prompt:
+    /// the step it binds names the retries the key reports after key
+    /// agreement. The credential is checked now; `bind` adds the hash.
+    pub(super) fn login_assertion(
+        self,
+        credential: &[u8],
+        key: PublicKey,
+        salt: [u8; 32],
+    ) -> Result<KeyRequest<Unbound>, String> {
+        if credential.is_empty() || credential.len() > self.max_id {
+            return Err("credential ID exceeds portable token profile".into());
+        }
+        // The hash's value never changes the request's size.
+        AssertionRequest::new(credential, [0; 32], self.max_message)?;
+        let out = client_pin(self.protocol, 2, 2)?;
+        let bytes = command(6, out, self.max_message)?;
+        Ok(KeyRequest {
+            profile: self,
+            intent: Unbound {
+                credential: Secret(credential.into()),
+                key,
+                salt: Secret(Box::new(salt)),
+            },
+            bytes,
+        })
+    }
 }
 
 /// clientPIN getPINRetries. The count is an untrusted device claim for display.
@@ -353,6 +380,14 @@ impl Drop for Intent {
     }
 }
 
+/// A login assertion awaiting its client-data hash. Its owners clear the
+/// credential and salt on drop, as `Intent` does.
+pub(super) struct Unbound {
+    credential: Secret,
+    key: PublicKey,
+    salt: Secret,
+}
+
 pub(super) trait Operation {
     fn challenge(&self) -> &[u8; 32];
     fn permission(&self) -> u64;
@@ -371,11 +406,40 @@ pub(super) struct KeyRequest<I = Intent> {
     intent: I,
     bytes: Secret,
 }
-impl<I: Operation> KeyRequest<I> {
+impl<I> KeyRequest<I> {
     pub(super) fn bytes(&self) -> &[u8] {
         &self.bytes.0
     }
-
+}
+impl KeyRequest<Unbound> {
+    /// The key-agreement request is unchanged; only the intent gains its hash.
+    pub(super) fn bind(self, challenge: [u8; 32]) -> Result<KeyRequest, String> {
+        let Self {
+            profile,
+            intent:
+                Unbound {
+                    credential,
+                    key,
+                    salt,
+                },
+            bytes,
+        } = self;
+        let verifier = AssertionRequest::new(&credential.0, challenge, profile.max_message)?;
+        let salt = <[u8; 32]>::try_from(&*salt.0).map_err(|_| "login salt extent")?;
+        Ok(KeyRequest {
+            profile,
+            intent: Intent {
+                verifier,
+                credential,
+                key,
+                challenge,
+                salt,
+            },
+            bytes,
+        })
+    }
+}
+impl<I: Operation> KeyRequest<I> {
     /// Each transition consumes its state, including on refusal. No retry policy.
     pub(super) fn with_pin(
         self,

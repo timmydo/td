@@ -1,5 +1,6 @@
 //! One private root-owned unlock operation, with separate presentation and commit.
 
+use super::fido_pin::Pin;
 use super::{consent, crypto, fido_device, fido_enroll, fido_metadata, store, tpm};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -10,11 +11,16 @@ use std::time::{Duration, Instant};
 
 const LIMIT: usize = 289;
 const FRAME_TIME: Duration = Duration::from_secs(5);
+/// Root's PIN frame: this tag, then the PIN's 4 to 63 bytes.
+pub(super) const PIN: u8 = 0x16;
+const PIN_FRAME: usize = 64;
 pub(super) const OPERATION_TIME: Duration = fido_device::MAX_LIFETIME;
 
 pub(super) struct Wire {
     stream: UnixStream,
     deadline: Instant,
+    /// A frame or the operation ran out of time; nothing else sets it.
+    expired: bool,
 }
 
 impl Wire {
@@ -22,16 +28,28 @@ impl Wire {
         self.deadline
     }
 
+    /// Whether a failure so far was a frame or operation deadline.
+    pub(super) fn expired(&self) -> bool {
+        self.expired
+    }
+
     pub(super) fn new(stream: UnixStream, deadline: Instant) -> Result<Self, String> {
         stream
             .set_nonblocking(false)
             .map_err(|_| "set blocking operation endpoint")?;
-        Ok(Self { stream, deadline })
+        Ok(Self {
+            stream,
+            deadline,
+            expired: false,
+        })
     }
 
-    fn frame_remaining(&self, deadline: Instant) -> Result<Duration, String> {
-        remaining(self.deadline)?;
-        remaining(deadline).map_err(|_| "private operation frame timed out".into())
+    fn frame_remaining(&mut self, deadline: Instant) -> Result<Duration, String> {
+        let result = remaining(self.deadline).and_then(|_| {
+            remaining(deadline).map_err(|_| "private operation frame timed out".into())
+        });
+        self.expired |= result.is_err();
+        result
     }
 
     fn frame_deadline(&self) -> Result<Instant, String> {
@@ -43,8 +61,9 @@ impl Wire {
 
     fn read(&mut self, mut bytes: &mut [u8], deadline: Instant) -> Result<(), String> {
         while !bytes.is_empty() {
+            let timeout = self.frame_remaining(deadline)?;
             self.stream
-                .set_read_timeout(Some(self.frame_remaining(deadline)?))
+                .set_read_timeout(Some(timeout))
                 .map_err(|_| "set operation read timeout")?;
             let count = match self.stream.read(bytes) {
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -55,6 +74,7 @@ impl Wire {
                     ) =>
                 {
                     self.frame_remaining(deadline)?;
+                    self.expired = true;
                     return Err("private operation frame timed out".into());
                 }
                 result => result.map_err(|_| "read private operation frame")?,
@@ -70,6 +90,13 @@ impl Wire {
     }
 
     pub(super) fn receive(&mut self) -> Result<Vec<u8>, String> {
+        let mut frame = self.receive_cleared()?;
+        Ok(std::mem::take(&mut frame.0).into_vec())
+    }
+
+    /// One frame in clearing storage: a misordered PIN, or a partial
+    /// frame, is zeroed when it is dropped.
+    pub(super) fn receive_cleared(&mut self) -> Result<Cleared, String> {
         let deadline = self.frame_deadline()?;
         let mut header = [0; 2];
         self.read(&mut header, deadline)?;
@@ -77,9 +104,9 @@ impl Wire {
         if length == 0 || length > LIMIT {
             return Err("invalid operation frame length".into());
         }
-        let mut bytes = vec![0; length];
-        self.read(&mut bytes, deadline)?;
-        Ok(bytes)
+        let mut frame = Cleared(vec![0; length].into_boxed_slice());
+        self.read(&mut frame.0, deadline)?;
+        Ok(frame)
     }
 
     pub(super) fn receive_credential(&mut self) -> Result<Credential, String> {
@@ -95,6 +122,28 @@ impl Wire {
         Ok(credential)
     }
 
+    /// One PIN frame. A person types it, so its header waits for the
+    /// operation deadline rather than a frame's; the rest then has one frame
+    /// time. The bytes stay in clearing owners and never enter a diagnostic.
+    pub(super) fn receive_pin(&mut self) -> Result<Pin, String> {
+        let mut header = [0; 2];
+        self.read(&mut header, self.deadline)?;
+        let length = usize::from(u16::from_be_bytes(header));
+        if !(2..=PIN_FRAME).contains(&length) {
+            return Err("invalid operation PIN frame length".into());
+        }
+        let deadline = self.frame_deadline()?;
+        let mut tag = [0];
+        self.read(&mut tag, deadline)?;
+        if tag != [PIN] {
+            return Err("operation frame is not a PIN".into());
+        }
+        let mut pin = Cleared(vec![0; length - 1].into_boxed_slice());
+        self.read(&mut pin.0, deadline)?;
+        Pin::new(std::mem::take(&mut pin.0))
+            .map_err(|_| "operation PIN is outside its profile".into())
+    }
+
     pub(super) fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
         if bytes.is_empty() || bytes.len() > LIMIT {
             return Err("invalid operation frame length".into());
@@ -105,8 +154,9 @@ impl Wire {
         frame.extend_from_slice(bytes);
         let mut pending = frame.as_slice();
         while !pending.is_empty() {
+            let timeout = self.frame_remaining(deadline)?;
             self.stream
-                .set_write_timeout(Some(self.frame_remaining(deadline)?))
+                .set_write_timeout(Some(timeout))
                 .map_err(|_| "set operation write timeout")?;
             let count = match self.stream.write(pending) {
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -117,6 +167,7 @@ impl Wire {
                     ) =>
                 {
                     self.frame_remaining(deadline)?;
+                    self.expired = true;
                     return Err("private operation frame timed out".into());
                 }
                 result => result.map_err(|_| "write private operation frame")?,
@@ -145,11 +196,26 @@ impl Wire {
         message.extend_from_slice(&round);
         message.extend_from_slice(&request.encode());
         self.send(&message)?;
-        let reply = self.receive()?;
+        let reply = self.receive_cleared()?;
+        let reply = reply.bytes();
         if reply.first() != Some(&answer) || reply.get(1..) != message.get(1..) {
             return Err("operation acknowledgement does not match its request and round".into());
         }
         Ok(())
+    }
+}
+
+/// Zeroed on drop, including after a partial read.
+pub(super) struct Cleared(Box<[u8]>);
+impl Cleared {
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+impl Drop for Cleared {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        std::hint::black_box(&mut self.0);
     }
 }
 
@@ -585,6 +651,69 @@ mod tests {
             child.receive().unwrap_err(),
             "private token operation expired"
         );
+    }
+
+    #[test]
+    fn a_pin_waits_for_the_operation_deadline_not_a_frame_time() {
+        let (child, mut parent) = UnixStream::pair().unwrap();
+        let mut wire = Wire::new(child, Instant::now() + FRAME_TIME * 2).unwrap();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(FRAME_TIME + Duration::from_millis(500));
+            parent
+                .write_all(&[0, 5, PIN, b'1', b'2', b'3', b'4'])
+                .unwrap();
+        });
+        assert!(wire.receive_pin().is_ok());
+        assert!(!wire.expired());
+        sender.join().unwrap();
+        // The operation deadline still bounds it.
+        let (child, _parent) = UnixStream::pair().unwrap();
+        let mut wire = Wire::new(child, Instant::now() + Duration::from_millis(30)).unwrap();
+        assert_eq!(
+            wire.receive_pin().err().unwrap(),
+            "private token operation expired"
+        );
+        assert!(wire.expired());
+    }
+
+    #[test]
+    fn pin_frames_are_bounded_and_never_echo_the_pin() {
+        let mut largest = vec![0, 64, PIN];
+        largest.extend([b'~'; 63]);
+        let mut oversized = vec![0, 65, PIN];
+        oversized.extend([b'~'; 64]);
+        for (frame, accepted) in [
+            (&[0, 5, PIN, b'1', b'2', b'3', b'4'][..], true),
+            (&largest, true),
+            (&oversized, false),
+            (&[0, 1, PIN], false),
+            (&[0, 0], false),
+            (&[0, 5, 0x11, b'1', b'2', b'3', b'4'], false),
+            (&[0, 4, PIN, b'1', b'2', b'3'], false),
+            (&[0, 5, PIN, b's', b'e', b'c', 0x7f], false),
+            // Truncated: the clearing owner drops a partial PIN.
+            (&[0, 5, PIN, b'1', b'2'], false),
+        ] {
+            let (mut child, mut parent) = pair();
+            parent.stream.write_all(frame).unwrap();
+            drop(parent);
+            match child.receive_pin() {
+                Ok(_) => assert!(accepted, "{frame:?}"),
+                Err(error) => {
+                    assert!(!accepted, "{frame:?}");
+                    assert!(!error.contains("sec"), "{error}");
+                    assert!(!child.expired());
+                }
+            }
+        }
+        // A header beyond the bound refuses before waiting for its payload.
+        let (mut child, mut parent) = pair();
+        parent.stream.write_all(&[0, 65]).unwrap();
+        assert_eq!(
+            child.receive_pin().err().unwrap(),
+            "invalid operation PIN frame length"
+        );
+        assert!(!child.expired());
     }
 
     #[test]

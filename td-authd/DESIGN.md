@@ -1708,7 +1708,10 @@ TOKEN-LOGIN.md's.
 2. **Worker (2).** One fixed root `td-secret login-operation --uid 1000`
    child per login operation, with the unlock worker's launch, framing,
    presentation and commit rounds, cancellation, reaping and generation
-   teardown. It shares the single operation slot.
+   teardown. It shares the single operation slot. Its baseline (`18`),
+   PIN (`16`) and typed failure (`15`) frames, and the commit round an
+   unlock also runs, are `td-secret/DESIGN.md`'s, "Login-key worker"; the
+   worker's unlock is implemented in `login_operation.rs`, inert.
 3. **Consent operations (2).** Implemented, inert: `consent.rs` has tags
    7 to 10, login unlock, first enrollment, key addition and key removal.
    Each carries its step, the key count before and after and the
@@ -1719,11 +1722,13 @@ TOKEN-LOGIN.md's.
    derives the whole successor and requires the worker's invitation to equal
    it. A login step instead names data only the token supplies. Root still
    derives nonce, owner, operation, counts, removal slots and the next
-   step, and accepts the worker's fingerprint only when it names a slot
-   of the baseline record (the authorize or unlock step after identify)
-   or the credential the worker reports creating (prove, repeat, probe),
-   which no baseline slot names, and a retry count only as one nonzero
-   byte displayed as a device claim. Any other difference cancels the
+   step. The baseline is the slot fingerprints of the worker's `18` frame,
+   which it sends before any presentation. Root accepts the worker's
+   fingerprint only when it names a slot of the baseline record (the
+   authorize or unlock step after identify) or the credential the worker
+   reports creating (prove, repeat, probe), which no baseline slot names,
+   and a retry count only as one nonzero byte displayed as a device
+   claim. Any other difference cancels the
    child. A commit frame is accepted only after the operation's final
    step. `begin_login` and `admit_login_step` are those checks; the
    supervision that applies them is not implemented.

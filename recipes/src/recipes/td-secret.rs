@@ -77,6 +77,10 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-secret/src/fido_transaction.rs"),
     ),
     (
+        "login_operation",
+        include_str!("../../../td-secret/src/login_operation.rs"),
+    ),
+    (
         "login_record",
         include_str!("../../../td-secret/src/login_record.rs"),
     ),

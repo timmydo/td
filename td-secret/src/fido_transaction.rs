@@ -98,6 +98,13 @@ pub(super) struct Assertion<'a> {
     pub challenge: [u8; 32],
     pub salt: [u8; 32],
 }
+/// A login assertion's enrolled credential. Its client-data hash comes from
+/// the prompt, which presents the step naming the key's reported retries.
+pub(super) struct LoginAssertion<'a> {
+    pub credential: &'a [u8],
+    pub key: PublicKey,
+    pub salt: [u8; 32],
+}
 pub(super) struct Enrollment<'a> {
     pub challenge: [u8; 32],
     pub user: [u8; 32],
@@ -258,6 +265,17 @@ impl<C: Channel> Transaction<C> {
     ) -> Result<HmacOutput, Error> {
         let reply = self.command(request.bytes())?;
         let pin = pin(self, PinPurpose::Assertion)?;
+        self.pin_assertion(request, reply, pin, entropy)
+    }
+
+    /// The PIN token and the signed hmac-secret assertion after key agreement.
+    fn pin_assertion(
+        &mut self,
+        request: KeyRequest,
+        reply: Message,
+        pin: Pin,
+        entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+    ) -> Result<HmacOutput, Error> {
         let request = self.with_entropy(entropy, |entropy| {
             request.with_pin(reply.as_ref(), pin, &mut |bytes| entropy(bytes))
         })?;
@@ -321,12 +339,12 @@ impl<C: Channel> Transaction<C> {
     }
 
     /// getPINRetries immediately before each prompt; a key with none left gets no prompt.
-    fn login_pin(
+    fn login_pin<T>(
         &mut self,
         purpose: PinPurpose,
         retries: &RetriesRequest,
-        prompt: &mut impl FnMut(PinPurpose, u8) -> Result<Pin, String>,
-    ) -> Result<Pin, Error> {
+        prompt: &mut impl FnMut(PinPurpose, u8) -> Result<T, String>,
+    ) -> Result<T, Error> {
         let reply = self.command(retries.bytes())?;
         let claim = self.transition(retries.parse(reply.as_ref()))?;
         drop(reply);
@@ -415,26 +433,23 @@ impl<C: Channel> Transaction<C> {
         Ok(None)
     }
 
-    /// One credential's PIN-authorized hmac-secret assertion: unlock, authorize, repeat.
+    /// One credential's PIN-authorized hmac-secret assertion: unlock, authorize,
+    /// repeat. The prompt returns the PIN and the client-data hash of the step
+    /// it presented with the reported retries.
     pub(super) fn login_assertion(
         mut self,
-        intent: Assertion<'_>,
-        prompt: &mut impl FnMut(PinPurpose, u8) -> Result<Pin, String>,
+        intent: LoginAssertion<'_>,
+        prompt: &mut impl FnMut(PinPurpose, u8) -> Result<(Pin, [u8; 32]), String>,
         entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
     ) -> Result<HmacOutput, LoginError> {
         let profile = self.login_profile()?;
         let retries = self.transition(profile.retries())?;
-        let request = self.transition(profile.assertion(
-            intent.credential,
-            intent.key,
-            intent.challenge,
-            intent.salt,
-        ))?;
-        let output = self.authorized_assertion(
-            request,
-            &mut |run, purpose| run.login_pin(purpose, &retries, prompt),
-            entropy,
-        )?;
+        let request =
+            self.transition(profile.login_assertion(intent.credential, intent.key, intent.salt))?;
+        let reply = self.command(request.bytes())?;
+        let (pin, challenge) = self.login_pin(PinPurpose::Assertion, &retries, prompt)?;
+        let request = self.transition(request.bind(challenge))?;
+        let output = self.pin_assertion(request, reply, pin, entropy)?;
         if output.info.backup_eligible || output.info.backed_up {
             return Err(Error::Protocol("login assertion is not device-bound".into()).into());
         }
@@ -610,6 +625,23 @@ pub(crate) mod tests {
             challenge: fixture(label, "challenge").try_into().unwrap(),
             salt: fixture(label, "salt").try_into().unwrap(),
         }
+    }
+    /// The fixture assertion as a login intent and the hash its prompt returns.
+    pub(crate) fn login_intent(label: &str) -> (LoginAssertion<'static>, [u8; 32]) {
+        let Assertion {
+            credential,
+            key,
+            challenge,
+            salt,
+        } = assertion(label);
+        (
+            LoginAssertion {
+                credential,
+                key,
+                salt,
+            },
+            challenge,
+        )
     }
     pub(crate) fn enrollment(label: &str) -> Enrollment<'static> {
         Enrollment {
@@ -1415,16 +1447,33 @@ pub(crate) mod tests {
         };
         (prompt, seen)
     }
+    type Hashed = Result<(Pin, [u8; 32]), String>;
+    /// `login_prompt` returning the fixture's hash with the PIN.
+    fn assertion_prompt(
+        label: &str,
+        trace: &Rc<Trace>,
+    ) -> (impl FnMut(PinPurpose, u8) -> Hashed + use<>, Prompted) {
+        let (mut prompt, seen) = login_prompt(label, trace);
+        let (_, challenge) = login_intent(label);
+        (
+            move |purpose, left| Ok((prompt(purpose, left)?, challenge)),
+            seen,
+        )
+    }
 
     #[test]
     fn login_assertion_queries_retries_immediately_before_its_one_prompt() {
         for label in LABELS {
             for (retries, count) in [("eight", 8), ("five", 5)] {
                 let (channel, trace) = Script::steps(login_assertion_steps(label, retries));
-                let (mut prompt, seen) = login_prompt(label, &trace);
+                let (mut prompt, seen) = assertion_prompt(label, &trace);
                 let output = Transaction::new(channel)
                     .unwrap()
-                    .login_assertion(assertion(label), &mut prompt, &mut entropy(label, false))
+                    .login_assertion(
+                        login_intent(label).0,
+                        &mut prompt,
+                        &mut entropy(label, false),
+                    )
                     .unwrap();
                 assert_eq!(output.bytes(), fixture(label, "output"));
                 assert!(output.info.user_verified);
@@ -1440,9 +1489,9 @@ pub(crate) mod tests {
         let label = "p2-scoped";
         let run = |steps: Vec<(Vec<u8>, Vec<u8>)>| {
             let (channel, trace) = Script::steps(steps);
-            let (mut prompt, seen) = login_prompt(label, &trace);
+            let (mut prompt, seen) = assertion_prompt(label, &trace);
             let result = Transaction::new(channel).unwrap().login_assertion(
-                assertion(label),
+                login_intent(label).0,
                 &mut prompt,
                 &mut entropy(label, false),
             );
@@ -1493,7 +1542,7 @@ pub(crate) mod tests {
             Transaction::new(channel)
                 .unwrap()
                 .login_assertion(
-                    assertion(label),
+                    login_intent(label).0,
                     &mut |_, _| Err("prompt cancelled".into()),
                     &mut |_| panic!("unexpected entropy"),
                 )
@@ -1506,8 +1555,8 @@ pub(crate) mod tests {
             let mut steps = login_assertion_steps(label, "eight");
             steps[4] = (fixture(label, "enroll_assertion"), fixture(label, response));
             let (channel, trace) = Script::steps(steps);
-            let (mut prompt, _) = login_prompt(label, &trace);
-            let mut intent = assertion(label);
+            let (mut prompt, _) = assertion_prompt(label, &trace);
+            let (mut intent, _) = login_intent(label);
             intent.credential = &credential;
             assert_eq!(
                 Transaction::new(channel)
@@ -1696,7 +1745,7 @@ pub(crate) mod tests {
                 Transaction::new(channel)
                     .unwrap()
                     .login_assertion(
-                        assertion(label),
+                        login_intent(label).0,
                         &mut |_, _| panic!("unexpected prompt"),
                         &mut |_| panic!("unexpected entropy")
                     )

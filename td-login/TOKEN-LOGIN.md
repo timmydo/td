@@ -4,14 +4,17 @@ This is the normative target for td's login-key tier. td-authd, td-secret,
 td-compositor and td-login implement it together; this document owns the
 tier's rules, and each component document states the amendments its own
 contract needs. **Only the record codec, the record store, the consent
-descriptions and the CTAP login primitives are implemented**, inert: no
-caller uses td-secret's private `login_record` and `login_store` modules
+descriptions, the CTAP login primitives and the root worker's unlock are
+implemented**, inert: td-secret's private `login-operation` worker
+unlocks against the record ("Placement"), but nothing starts it, so
+nothing in production uses its `login_record` and `login_store` modules
 ("The login record"), its login identify, PIN-retry, assertion and
 creation steps ("Token profile"), or td-authd's login consent operations
-and step admission (`td-authd/DESIGN.md`). Nothing else below is
-implemented. Until the increments at the end land, `THREAT-MODEL.md` §3
-is the complete current behaviour: the installed account logs in
-automatically and the session never locks. No document, UI or release
+and step admission (`td-authd/DESIGN.md`). The worker's enrollment,
+addition and removal are not implemented, nor is anything else below.
+Until the increments at the end land, `THREAT-MODEL.md` §3 is the
+complete current behaviour: the installed account logs in automatically
+and the session never locks. No document, UI or release
 note may describe this tier as available before its acceptance evidence
 exists.
 
@@ -86,7 +89,12 @@ transport"). That is the exclusive mediation §L.1 requires: raw token nodes
 stay root-only, td-owned workers serialize, and every assertion is bound to
 one presented operation. The worker verifies assertions and publishes the
 record; td-authd trusts its success frame only together with its observed
-successful exit.
+successful exit. Before any presentation or token I/O the worker reports
+the state it read: unenrolled, or the enrolled record's slot count and
+fingerprints in canonical order, which is the baseline td-authd's step
+admission uses. An unavailable state reports its cause instead and the
+operation ends. Every failure reaches td-authd as a typed kind, never as
+text; `td-secret/DESIGN.md`, "Login-key worker", gives the frames.
 
 **td-login** never talks CTAP2, verifies an assertion or parses the
 record. It is the credential-switch program, single-threaded with three
@@ -254,8 +262,11 @@ next.
 
 Every client-data hash is SHA-256 over `td-login/operation/v1`, a zero
 byte, a phase byte, the u32-length-prefixed complete canonical description
-and 32 fresh kernel-random bytes. The authorize phase also includes, before
-the random bytes, the length-prefixed record ID and the length-prefixed
+and 32 fresh kernel-random bytes. The description is that of the step
+the assertion answers, so a PIN step's hash is computed once
+getPINRetries has answered and binds the count it presents. The
+authorize phase also includes, before the random bytes, the
+length-prefixed record ID and the length-prefixed
 SHA-256 digest of the exact record bytes being changed, so the signature
 itself binds an addition or removal to that record; the worker's baseline
 comparison is a second check, not the binding. Length prefixes are u32.
@@ -426,12 +437,15 @@ The lock protects the interactive surfaces, not running processes, as
 
 On the lock surface Ctrl+Alt+Esc opens a login-unlock attention lifetime
 directly, without the menu. The prompt presents the unlock description; the
-worker identifies the connected key; the next presented step names its
-fingerprint and remaining PIN attempts and opens the PIN field; after the
-PIN comes the touch. td-authd reports success only after the worker's
-success frame and observed exit, and the compositor then drains held input
-and restores the ordinary screen and focus. A failure shows its typed
-reason on the trusted screen; Escape returns to the lock surface. One
+worker identifies the connected key, which must already be the only one
+connected (the worker does not wait for it); the next presented step
+names its fingerprint and remaining PIN attempts and opens the PIN field;
+after the PIN comes the touch. The worker compares the record with its
+baseline before identify and again before its success. td-authd reports
+success only after the worker's success frame and observed exit, and the
+compositor then drains held input and restores the ordinary screen and
+focus. A failure shows its typed reason on the trusted screen; Escape
+returns to the lock surface. One
 unlock is allowed per attention lifetime. Unlocking starts no process,
 switches no credential and releases no secret.
 

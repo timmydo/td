@@ -962,7 +962,9 @@ mod tests {
     use crate::fido_pin::LoginRefusal;
     use crate::fido_pin::{EnrolledCredential, HmacOutput, Pin};
     use crate::fido_transaction::tests::fixture;
-    use crate::fido_transaction::{Assertion, Enrollment, Error, LoginError, Status, Transaction};
+    use crate::fido_transaction::{
+        Assertion, Enrollment, Error, LoginAssertion, LoginError, Status, Transaction,
+    };
     use crate::login_record::{NewKey, Record, VERSION};
     use std::time::Instant;
 
@@ -1036,15 +1038,14 @@ mod tests {
         shown: &mut Vec<u8>,
     ) -> Result<HmacOutput, LoginError> {
         Transaction::new(key.link()).unwrap().login_assertion(
-            Assertion {
+            LoginAssertion {
                 credential: credential.id(),
                 key: key_of(credential.cose()),
-                challenge: [0x11; 32],
                 salt: SALT,
             },
             &mut |_, count| {
                 shown.push(count);
-                pin(guess)
+                Ok((pin(guess)?, [0x11; 32]))
             },
             &mut entropy(),
         )

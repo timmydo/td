@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub(super) const DIRECTORY: &str = "/var/lib/td/login";
 /// Every temporary name starts with this; no other td name does.
+#[allow(dead_code, reason = "the login writes arrive in C7")]
 pub(super) const TEMPORARY: &str = "tmp-";
 const FD_ROOT: &str = "/proc/self/fd";
 const NOFOLLOW: i32 = 0o400000;
@@ -64,6 +65,7 @@ pub(super) enum Baseline {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code, reason = "the login writes arrive in C7")]
 pub(super) enum Outcome {
     /// Published or removed, and the directory synced.
     Committed,
@@ -81,6 +83,7 @@ enum ReadStage {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code, reason = "the login writes arrive in C7")]
 enum Stage {
     Created,
     Written,
@@ -308,6 +311,7 @@ impl Store {
             .map_err(|_| Cause::RecordDamaged)
     }
 
+    #[allow(dead_code, reason = "the login writes arrive in C7")]
     fn current(&self) -> Result<Baseline, String> {
         match self.read_record() {
             Ok(None) => Ok(Baseline::Absent),
@@ -316,6 +320,7 @@ impl Store {
         }
     }
 
+    #[allow(dead_code, reason = "the login writes arrive in C7")]
     fn unchanged(&self, baseline: Baseline) -> Result<(), String> {
         if self.current()? == baseline {
             Ok(())
@@ -324,6 +329,7 @@ impl Store {
         }
     }
 
+    #[allow(dead_code, reason = "the login writes arrive in C7")]
     fn admit(&self, file: &File) -> Result<(), String> {
         let meta = file
             .metadata()
@@ -336,6 +342,7 @@ impl Store {
     }
 
     /// Unlinks every name starting with `TEMPORARY`, and only those.
+    #[allow(dead_code, reason = "the login writes arrive in C7")]
     pub fn remove_temporaries(&self) -> Result<(), String> {
         self.check_directory()
             .and_then(|()| resolves(&self.root, &self.directory))
@@ -363,10 +370,12 @@ impl Store {
 
     /// Publishes `record`, written in the version it was built with: the
     /// caller chose it with `login_record::write_version`.
+    #[allow(dead_code, reason = "the login writes arrive in C7")]
     pub fn publish(&self, baseline: Baseline, record: &Record, random: &mut impl Read) -> Outcome {
         self.publish_inner(baseline, record, random, &mut |_| Ok(()))
     }
 
+    #[allow(dead_code, reason = "the login writes arrive in C7")]
     fn publish_inner(
         &self,
         baseline: Baseline,
@@ -448,10 +457,12 @@ impl Store {
     }
 
     /// Removes the last key: unlinks the record named by `baseline`.
+    #[allow(dead_code, reason = "the login writes arrive in C7")]
     pub fn remove(&self, baseline: Baseline) -> Outcome {
         self.remove_inner(baseline, &mut |_| Ok(()))
     }
 
+    #[allow(dead_code, reason = "the login writes arrive in C7")]
     fn remove_inner(
         &self,
         baseline: Baseline,
@@ -491,6 +502,7 @@ impl Store {
     }
 }
 
+#[allow(dead_code, reason = "the login writes arrive in C7")]
 fn still_named(path: &Path, file: &File) -> Result<(), String> {
     let current = fs::symlink_metadata(path).map_err(|_| "login record object disappeared")?;
     let retained = file
