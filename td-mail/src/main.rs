@@ -581,6 +581,7 @@ fn main() {
     }
 
     log::init();
+    log_info!("[Main] td-mail starting");
 
     let config_path = args
         .iter()
@@ -591,6 +592,8 @@ fn main() {
     let config = match Config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
+            log_error!("[Main] config {}: {}", config_path.display(), e);
+            log_info!("[Main] td-mail exiting");
             eprintln!("Error loading config from {}: {}", config_path.display(), e);
             eprintln!("Create a config file with:");
             eprintln!();
@@ -662,12 +665,15 @@ fn main() {
             deleted_mailbox_id,
             offline,
         );
+        log_info!("[Main] td-mail exiting");
         std::process::exit(0);
     }
 
     // `Config::parse` refuses a configuration with no account, so this holds;
     // saying it here is cheaper than a proof in a comment.
     let Some(first_account) = config.accounts.first() else {
+        log_error!("[Main] no accounts in {}", config_path.display());
+        log_info!("[Main] td-mail exiting");
         eprintln!("No accounts configured in {}", config_path.display());
         std::process::exit(1);
     };
@@ -701,7 +707,10 @@ fn main() {
     );
 
     if let Err(e) = outcome {
+        log_error!("[Main] window error: {}", e);
+        log_info!("[Main] td-mail exiting");
         eprintln!("Window error: {}", e);
         std::process::exit(1);
     }
+    log_info!("[Main] td-mail exiting");
 }

@@ -376,14 +376,18 @@ impl Session {
             }
             ViewAction::Pop => {
                 let Some(slot) = self.stack.pop() else {
-                    self.quitting = true;
+                    self.quit(if self.closing {
+                        "the compositor asked the window to close; its draft is closed"
+                    } else {
+                        "the last view closed"
+                    });
                     return;
                 };
                 self.pane.close(slot.text);
                 // The draft the window's close asked about is closed:
                 // the window follows.
                 if self.closing {
-                    self.quitting = true;
+                    self.quit("the compositor asked the window to close; its draft is closed");
                     return;
                 }
                 // Let the revealed view refresh state that may have changed
@@ -397,7 +401,7 @@ impl Session {
                 self.prepare_frame();
                 self.redraw();
             }
-            ViewAction::Quit => self.quitting = true,
+            ViewAction::Quit => self.quit("q or the bar's Quit"),
             ViewAction::Compose(draft) => self.compose(&draft),
             ViewAction::SwitchAccount(name) => self.switch_account(&name),
             ViewAction::SetUpAccount {
@@ -1095,7 +1099,7 @@ impl Session {
         let page = self.page();
         match self.stack.handle_key(key, page) {
             Some(action) => self.act(action),
-            None => self.quitting = true,
+            None => self.quit("a key with no view open"),
         }
     }
 
@@ -1314,8 +1318,18 @@ impl Session {
             self.redraw();
             Flow::Continue
         } else {
+            self.quit("the compositor asked the window to close");
             Flow::Quit
         }
+    }
+
+    /// Ends the window, logging why once: a quit is an exit 0 that
+    /// leaves no other trace.
+    fn quit(&mut self, why: &str) {
+        if !self.quitting {
+            crate::log_info!("[UI] quitting: {}", why);
+        }
+        self.quitting = true;
     }
 
     /// Points the pane's underline at the link under the hover point,

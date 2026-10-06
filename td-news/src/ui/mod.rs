@@ -459,6 +459,15 @@ impl App {
 
     // ---- the window's inputs ------------------------------------------
 
+    /// Ends the window, logging why once: a quit is an exit 0 that
+    /// leaves no other trace.
+    fn quit(&mut self, why: &str) {
+        if !self.quitting {
+            crate::log::info(format!("quitting: {why}"));
+        }
+        self.quitting = true;
+    }
+
     /// One input from the window; whether the reader is quitting.
     fn input(
         &mut self,
@@ -482,7 +491,7 @@ impl App {
             self.pending_redraw = true;
         }
         match input {
-            Input::Close => self.quitting = true,
+            Input::Close => self.quit("the compositor asked the window to close"),
             Input::Resize(surface) => {
                 self.surface = surface;
                 self.pending_redraw = true;
@@ -653,7 +662,7 @@ impl App {
 
     fn handle_feed_keys(&mut self, key: Key, cache: &Cache, cmd_tx: &mpsc::Sender<BackendCommand>) {
         match key {
-            Key::Char('q') => self.quitting = true,
+            Key::Char('q') => self.quit("q or the bar's Quit on the feed list"),
             Key::Down | Key::Char('j') | Key::Char('n') => self.move_feed(1),
             Key::Up | Key::Char('k') | Key::Char('p') => self.move_feed(-1),
             Key::PageDown => self.move_feed(self.list_rows() as isize),
