@@ -24,7 +24,10 @@ use crate::workspace::Workspace;
 use td_json::Json;
 
 /// `O_NOFOLLOW` on x86-64, as td-ui's control socket spells it.
-const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const O_NOFOLLOW: i32 = 0o100000;
 
 /// The longest `meta` read back.
 const MAX_META: u64 = 64 * 1024;
@@ -408,8 +411,23 @@ impl StateDir {
             meta.removed |= removed;
             replace(&dir, "meta", meta.to_json().to_string().as_bytes())
         });
+        // Its background processes' output is kept until it is archived
+        // (DESIGN.md §12), and only then; `remove_dir_all` follows no link.
+        let cleared = if archived && written.is_ok() {
+            let outputs = dir.join(crate::output::DIR);
+            match std::fs::remove_dir_all(&outputs) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!(
+                    "archived, but its background output {} was not removed: {e}",
+                    outputs.display()
+                )),
+            }
+        } else {
+            Ok(())
+        };
         drop(lock);
-        written
+        written.and(cleared)
     }
 
     /// The workspace conversation `id`'s `meta` records, as stored.
@@ -3117,7 +3135,21 @@ pub mod tests {
             .unwrap_err();
         assert!(refused.contains("lock"), "{refused}");
         drop(conversation);
+        // Its background processes' output goes with archiving, and
+        // unarchiving leaves another's be.
+        let outputs = state.conversation(&id).join(crate::output::DIR);
+        let mut writer = crate::output::Writer::create(&outputs, 1, 1024).unwrap();
+        writer.push(b"built").unwrap();
+        // An archive that is not stored removes nothing.
+        let meta = std::fs::read(state.conversation(&id).join("meta")).unwrap();
+        std::fs::write(state.conversation(&id).join("meta"), "torn").unwrap();
+        assert!(state.set_archived(&id, true, false, LOCK_WAIT).is_err());
+        assert!(outputs.is_dir());
+        std::fs::write(state.conversation(&id).join("meta"), meta).unwrap();
+        state.set_archived(&id, false, false, LOCK_WAIT).unwrap();
+        assert!(outputs.is_dir());
         state.set_archived(&id, true, false, LOCK_WAIT).unwrap();
+        assert!(!outputs.exists());
         let (metas, _) = state.list();
         assert!(metas.iter().all(|m| m.archived && m.id == id));
         // A process that opens it keeps it, and writes it back with what

@@ -46,6 +46,8 @@ pub struct Client {
     pub template_shared: Vec<TemplateShared>,
     /// The most background processes a conversation runs at once.
     pub max_background: u32,
+    /// The bytes of each background process's output kept.
+    pub background_output_bytes: u64,
 }
 
 /// A configured template and its own shared directories, admitted; none
@@ -68,6 +70,7 @@ impl Default for Client {
             shared: Vec::new(),
             template_shared: Vec::new(),
             max_background: DEFAULT_MAX_BACKGROUND,
+            background_output_bytes: DEFAULT_BACKGROUND_OUTPUT_BYTES,
         }
     }
 }
@@ -165,6 +168,10 @@ impl Client {
                 "max_background".into(),
                 Json::from(u64::from(self.max_background)),
             ),
+            (
+                "background_output_bytes".into(),
+                Json::from(self.background_output_bytes),
+            ),
             ("shared".into(), shared_json(&self.shared)),
             (
                 "template_shared".into(),
@@ -217,6 +224,13 @@ impl Client {
                     .and_then(|n| u32::try_from(n).ok())
                     .filter(|n| MAX_BACKGROUND.contains(n))
                     .ok_or("max_background is out of range")?,
+            },
+            background_output_bytes: match value.get("background_output_bytes") {
+                None => DEFAULT_BACKGROUND_OUTPUT_BYTES,
+                Some(n) => n
+                    .as_u64()
+                    .filter(|n| BACKGROUND_OUTPUT_BYTES.contains(n))
+                    .ok_or("background_output_bytes is out of range")?,
             },
             shared: match value.get("shared") {
                 None => Vec::new(),
@@ -377,7 +391,7 @@ const KEYS: &[(&str, Use)] = &[
     ("fetch_interval", Use::Read),
     ("fetch_concurrency", Use::Later(11)),
     ("max_background", Use::Read),
-    ("background_output_bytes", Use::Later(12)),
+    ("background_output_bytes", Use::Read),
     ("auto_compact", Use::Later(16)),
     ("compact_at", Use::Later(16)),
     ("compact_keep_tokens", Use::Later(16)),
@@ -428,6 +442,10 @@ pub struct Config {
 /// (DESIGN.md §12, §15), by default and as a file may set it.
 pub const DEFAULT_MAX_BACKGROUND: u32 = 4;
 const MAX_BACKGROUND: std::ops::RangeInclusive<u32> = 1..=16;
+/// The bytes of a background process's output kept, the latest
+/// (DESIGN.md §12, §15), by default and as a file may set it.
+pub const DEFAULT_BACKGROUND_OUTPUT_BYTES: u64 = 16 << 20;
+const BACKGROUND_OUTPUT_BYTES: std::ops::RangeInclusive<u64> = (64 << 10)..=(1 << 30);
 
 /// How often, in seconds, the stores are fetched in the background
 /// (DESIGN.md §7, Keeping current), and the bounds a file may set.
@@ -819,6 +837,20 @@ pub fn parse(text: &str) -> Result<Config, String> {
             )
         })?;
     }
+    if let Some(value) = table.get("background_output_bytes") {
+        config.client.background_output_bytes = match value {
+            Toml::Int(n) => u64::try_from(*n).ok(),
+            _ => None,
+        }
+        .filter(|n| BACKGROUND_OUTPUT_BYTES.contains(n))
+        .ok_or_else(|| {
+            format!(
+                "`background_output_bytes` is a whole number of bytes from {} to {}, not {value:?}",
+                BACKGROUND_OUTPUT_BYTES.start(),
+                BACKGROUND_OUTPUT_BYTES.end()
+            )
+        })?;
+    }
     let client = &mut config.client;
     for (key, slot) in [
         ("max_cost_per_turn", &mut client.limits.turn),
@@ -1040,6 +1072,22 @@ mod tests {
         for text in ["59", "86401", "-1", "600.5", "\"10m\""] {
             let refused = parse(&format!("fetch_interval = {text}")).unwrap_err();
             assert!(refused.contains("whole number of seconds"), "{refused}");
+        }
+    }
+
+    #[test]
+    fn background_output_bytes_are_bounded_and_cross_whole() {
+        assert_eq!(Config::default().client.background_output_bytes, 16 << 20);
+        for (text, bytes) in [("65536", 65_536), ("1073741824", 1 << 30)] {
+            let config = parse(&format!("background_output_bytes = {text}")).unwrap();
+            assert_eq!(config.client.background_output_bytes, bytes);
+            assert!(config.notes.is_empty(), "{:?}", config.notes);
+            let client = &config.client;
+            assert_eq!(&Client::from_json(&client.to_json()).unwrap(), client);
+        }
+        for text in ["65535", "1073741825", "-1", "\"16M\""] {
+            let refused = parse(&format!("background_output_bytes = {text}")).unwrap_err();
+            assert!(refused.contains("`background_output_bytes`"), "{refused}");
         }
     }
 

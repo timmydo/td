@@ -3532,7 +3532,8 @@ for `timeout_ms` when the call gives one, at most 24 hours.
 - `process_output {id, from?, max_bytes?}`: output from a byte offset
   counted from the process's start, bounded like `read_file`, naming the
   next offset and the range still retained. The conversation process
-  keeps each process's output, standard error interleaved and marked, in
+  keeps each process's output, standard error interleaved as a
+  foreground call's is, through the one pipe, in
   its conversation directory up to `background_output_bytes` (default 16
   MiB), dropping the oldest beyond that; a read from before the retained
   range starts at its beginning and says how many bytes were dropped.
@@ -3569,36 +3570,70 @@ a command in the background"). It is refused before any card when
 `max_background` processes run (§15: 1 to 16, 4 by default, carried to
 the conversation in its `Setup`). Otherwise the conversation launches
 its instance as for any `shell`, from its main thread, logs a `process`
-event with its number, the next after the log's highest, its
-`ToolCall` and its command, and hands the instance to a thread of its
-own, which watches it until its answer, its kill or its time with the
-grace a call has (`bench::limit`). The call's result is its id. The
-tool host runs it as a `shell`, but answers with how it ended alone.
-How it ended comes back through the inbox: heard, the process runs no
-more for the cap, `process_list` and `process_kill`, and it is logged
-as an `ended` event between a turn's steps, before an undo or a redo,
-or while idle (then synced), as one bounded line with every control
-named, since a replaced tool host could say anything: its exit status
-as a call's says it (`timed out after ...` when the tool host's own
-timeout ended it), `killed`, `timed out` (the conversation's
-deadline), or `failed:` with why. `process_list` shows the latest 50
-of the log's processes, saying how many earlier it leaves out, each
-with its state, start time and command cut to 200 characters; and
-`process_kill` tells its watcher to drop the instance, which ends
-everything in it; both are the conversation's own tools, with no card.
-A conversation's process that ends drops its watchers, and with them
-its instances; the next one to open the log records each process still
-running there as `lost` (`store::PROCESS_LOST`), as it records an
-interrupted call. The window counts a conversation's running processes
-from those events (a restart, or a hello, zeroes the count before the
-log replays) and keeps its process while any runs. An undo or a redo
-is refused before any other check while one runs, whichever step it
-names. Not built yet: the output store, `process_output`,
-`process_wait` and the list's output size (the instance's output is
-read and dropped meanwhile); the exit notice to the model, which sees
-an end only through `process_list`; the window's process list and the
-status row's count; `conversations`, which still says `background 0`;
-and the step diff's note.
+event with its number, the next after the log's highest, its `ToolCall`
+and its command, and hands the instance to a thread of its own, which
+watches it until its answer, its kill or its time with the grace a call
+has (`bench::limit`). The call's result is its id. The tool host runs it
+as a `shell`, but answers with how it ended alone. How it ended comes
+back through the inbox: heard, the process runs no more for the cap,
+`process_list` and `process_kill`, and it is logged as an `ended` event
+between a turn's steps, before an undo or a redo, or while idle (then
+synced), as one bounded line with every control named, since a replaced
+tool host could say anything: its exit status as a call's says it
+(`timed out after ...` when the tool host's own timeout ended it),
+`killed`, `timed out` (the conversation's deadline), or `failed:` with
+why. `process_list` shows the latest 50 of the log's processes, saying
+how many earlier it leaves out, each with its state, start time and
+command cut to 200 characters; and `process_kill` tells its watcher to
+drop the instance, which ends everything in it; both are the
+conversation's own tools, with no card. A conversation's process that
+ends drops its watchers, and with them its instances; the next one to
+open the log records each process still running there as `lost`
+(`store::PROCESS_LOST`), as it records an interrupted call. The window
+counts a conversation's running processes from those events (a restart,
+or a hello, zeroes the count before the log replays) and keeps its
+process while any runs. An undo or a redo is refused before any other
+check while one runs, whichever step it names. The output store,
+`process_output`, `process_wait` and the list's output size came next
+(As built (increment 12, output)). Not built yet: the exit notice to the
+model, which sees an end only through `process_list` and `process_wait`;
+the window's process list and the status row's count; `conversations`,
+which still says `background 0`; and the step diff's note.
+
+**As built (increment 12, output).** The tool host sends a background
+call's output up as it comes, waiting for room rather than dropping what
+does not fit, as a foreground call's is dropped from the live view; and
+once the process ends it reads what is left until the pipe has been
+quiet for 300 ms, however long each piece waits for room, for at most a
+minute (`shell::run_whole`; its answer says when output was still coming
+then), where a foreground call stops 300 ms after its end. The watcher
+writes it to `processes/` in the conversation's directory
+(`output::Writer`), in segment files of a quarter of
+`background_output_bytes` (§15: 64 KiB to 1 GiB, 16 MiB by default,
+carried in the `Setup`), each named for the offset it begins at
+(`p1-00000000000000000000`), dropping the oldest while the rest hold
+more than the bound, so between three quarters of it and all of it is
+kept. An offset counts the output as kept, text, each byte the process
+wrote that was not UTF-8 replaced, since the tool host's protocol
+carries text. Files are made private, opened with no link followed, and
+only segments named so are read; a writer first removes any its number
+left, a process whose start a crash kept from the log. A write that
+fails stops the keeping and the process's end says from which byte. A
+read (`output::read`) lists the segments, starts at `from` or where what
+is kept begins, and cuts at characters, a start inside one moving on to
+the next, and takes at least one whole character, so a read always moves
+on; a segment dropped while being read is listed again. `process_output`
+says the process's state, the bytes read, how many were written, the
+next offset, how many were dropped, and when an offset it was given lies
+before what is kept or past what was written; 32 KiB by default, 100 KiB
+at most, as `read_file`'s. `process_wait` waits, hearing the window,
+until the process ends, the person interrupts, the window closes, or
+`timeout_ms` (at most ten minutes) passes, and says how it stands with
+the last 15 KiB of its output, a foreground call's shown tail.
+`process_list` says each process's bytes written. Archiving the
+conversation removes `processes/` under its lock once the archive is
+stored (`StateDir::set_archived`), and deleting it removes the rest with
+it.
 
 **Todo list.** `todo_write` replaces the conversation's whole list with
 items of `pending`, `in_progress`, `done` or `cancelled`, at most one in
@@ -4094,7 +4129,8 @@ default, except `jev_threshold` until it is calibrated (§11):
 - `fetch_interval`, a whole number of seconds from 60 to 86,400, and
   `fetch_concurrency`; defaults 600 (ten minutes) and 4
 - `max_background`, a whole number from 1 to 16, and
-  `background_output_bytes`; defaults 4 and 16 MiB (§12)
+  `background_output_bytes`, from 64 KiB to 1 GiB; defaults 4 and
+  16 MiB (§12)
 - `auto_compact`, `compact_at`, `compact_keep_tokens` and
   `compact_model`; defaults `true`, 80%, 20,000 and the conversation's
   model (§14)

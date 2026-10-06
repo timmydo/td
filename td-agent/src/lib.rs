@@ -53,6 +53,7 @@ pub mod keydialog;
 pub mod menu;
 pub mod models;
 pub mod notes;
+pub mod output;
 pub mod picker;
 pub mod post;
 pub mod prompt;

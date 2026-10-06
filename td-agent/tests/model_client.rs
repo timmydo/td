@@ -2257,6 +2257,76 @@ fn until_ended(h: &mut Harness, number: u64) -> String {
     }
 }
 
+/// A background process's output is all kept, the newest
+/// `background_output_bytes` of it, and read by offset; a wait returns
+/// when it ends with the tail of it (DESIGN.md §12).
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn a_background_commands_output_is_kept_and_read_by_offset() {
+    let mut h = Harness::new_in(
+        "bgout",
+        Role::Conversation,
+        Some("scratch"),
+        true,
+        vec![
+            Reply::sse("stream-tool-background-output.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client {
+        background_output_bytes: 64 * 1024,
+        ..Client::default()
+    });
+    h.say("Run them.");
+    for _ in 0..2 {
+        let (call, _, _) = h.until_ask();
+        h.down(&Down::Decision { call, allow: true });
+    }
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let said = results(&events);
+    assert_eq!(
+        said[2].1,
+        "[p1 exit status 0; the last 16 of 16 bytes it wrote]\nline1\nline2\ndone"
+    );
+    // Every byte of it reached the store, the oldest dropped past 64 KiB.
+    assert_eq!(
+        said[3].1,
+        format!(
+            "[p2 exit status 0; the last 15360 of 300000 bytes it wrote]\n{}",
+            "0".repeat(15360)
+        )
+    );
+    assert_eq!(
+        said[4].1,
+        "[p1 exit status 0; bytes 6 to 11 of 16 written; next from 11]\nline2"
+    );
+    let dropped = &said[5].1;
+    assert!(
+        dropped.starts_with("[p2 exit status 0; bytes ")
+            && dropped.contains(" of 300000 written; ")
+            && dropped.contains(" were dropped, so what is kept begins at ")
+            && dropped.ends_with("]\n0000000000")
+            && !dropped.contains("before what is kept"),
+        "{dropped}"
+    );
+    assert!(said[6].1.contains("| 16 bytes | printf"), "{}", said[6].1);
+    assert!(said[6].1.contains("| 300000 bytes | i=0"), "{}", said[6].1);
+    let before = &said[7].1;
+    assert!(
+        before.contains("; 5 is before what is kept, so this read begins at "),
+        "{before}"
+    );
+    assert!(
+        said[8].1.contains("; 400000 is past what was written]"),
+        "{}",
+        said[8].1
+    );
+    let outputs = h.state.conversation(&h.id).join(td_agent::output::DIR);
+    assert!(outputs.is_dir());
+}
+
 /// `process_list` shows the latest processes, each command cut, so its
 /// result fits however many ran; `process_kill` of one that ended says
 /// how (DESIGN.md §12).

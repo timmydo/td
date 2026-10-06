@@ -54,7 +54,9 @@ use crate::history;
 use crate::host;
 use crate::key::Secret;
 use crate::models::{Model, Models};
+use crate::output;
 use crate::protocol::{Down, Fetched as Stored, Up, MAX_TEXT};
+use crate::shell;
 use crate::snapshot;
 use crate::sse::{self, Fault};
 use crate::store::{
@@ -346,27 +348,50 @@ pub fn serve_in(
 /// Watches background call `call` on `client` until it ends, `killed`
 /// says to kill it or is dropped, or `limit` passes: how it ended, as
 /// `process_list` says it. Its instance ends with `client`.
-fn watch(mut client: host::Client, call: u64, limit: Duration, killed: &Receiver<()>) -> String {
+fn watch(
+    mut client: host::Client,
+    call: u64,
+    limit: Duration,
+    killed: &Receiver<()>,
+    mut kept: Option<output::Writer>,
+) -> String {
     let deadline = Instant::now().checked_add(limit);
-    loop {
+    // Why its output stopped being kept, when it did.
+    let mut lost = None;
+    let how = loop {
         match killed.try_recv() {
-            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => return "killed".into(),
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break "killed".to_string(),
             Err(mpsc::TryRecvError::Empty) => {}
         }
         if deadline.is_some_and(|at| Instant::now() >= at) {
-            return "timed out".into();
+            break "timed out".into();
         }
         match client.next_reply(HOST_POLL) {
-            None | Some(Ok(host::Up::Output { .. })) => {}
-            Some(Ok(host::Up::Done { id, outcome })) if id == call => {
-                return match outcome {
-                    Ok(done) => done.text,
-                    Err(why) => format!("failed: {why}"),
+            None => {}
+            Some(Ok(host::Up::Output { id, text })) if id == call => {
+                if let Some(writer) = kept.as_mut() {
+                    if let Err(e) = writer.push(text.as_bytes()) {
+                        lost = Some(format!(
+                            "its output past byte {} could not be kept: {e}",
+                            writer.total()
+                        ));
+                        kept = None;
+                    }
                 }
             }
-            Some(Ok(host::Up::Done { .. })) => {}
-            Some(Err(why)) => return format!("failed: {why}"),
+            Some(Ok(host::Up::Done { id, outcome })) if id == call => {
+                break match outcome {
+                    Ok(done) => done.text,
+                    Err(why) => format!("failed: {why}"),
+                };
+            }
+            Some(Ok(_)) => {}
+            Some(Err(why)) => break format!("failed: {why}"),
         }
+    };
+    match lost {
+        Some(lost) => format!("{how}; {lost}"),
+        None => how,
     }
 }
 
@@ -2266,12 +2291,25 @@ impl Session {
             call: started,
             command: command.to_string(),
         })?;
+        let cap = self.setup.as_ref().map_or(
+            crate::config::DEFAULT_BACKGROUND_OUTPUT_BYTES,
+            |(_, client)| client.background_output_bytes,
+        );
+        // A process whose output cannot be kept still runs, and says so
+        // when it ends.
+        let (kept, unkept) = match output::Writer::create(&self.outputs(), number, cap) {
+            Ok(writer) => (Some(writer), None),
+            Err(e) => (None, Some(format!("its output could not be kept: {e}"))),
+        };
         let (kill, killed) = mpsc::channel();
         let inbox = self.sender.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("p{number}"))
             .spawn(move || {
-                let how = watch(client, call, limit, &killed);
+                let mut how = watch(client, call, limit, &killed, kept);
+                if let Some(unkept) = unkept {
+                    how = format!("{how}; {unkept}");
+                }
                 let _ = inbox.send(Inbound::Ended { number, how });
             });
         if let Err(e) = spawned {
@@ -2280,7 +2318,7 @@ impl Session {
         }
         self.processes.insert(number, kill);
         Ok(format!(
-            "started p{number} in the background; process_list shows it, process_kill ends it"
+            "started p{number} in the background; process_output reads its output, process_wait waits for it to end, process_kill ends it"
         ))
     }
 
@@ -2340,22 +2378,19 @@ impl Session {
         if earlier > 0 {
             out.push_str(&format!("{earlier} earlier not shown"));
         }
+        let dir = self.outputs();
         for one in all.iter().skip(earlier) {
-            let state = match &one.ended {
-                Some(how) => how.clone(),
-                None if self.processes.contains_key(&one.number) => "running".into(),
-                // Its end heard and not yet logged; "ending" only when
-                // logging an end failed.
-                None => self
-                    .heard_end(one.number)
-                    .unwrap_or_else(|| "ending".into()),
-            };
+            let state = self.state_of(one);
             if !out.is_empty() {
                 out.push('\n');
             }
             let command: String = one.command.chars().take(MAX_LISTED_COMMAND).collect();
+            let size = output::total(&dir, one.number).map_or_else(
+                |e| format!("output unread: {}", quoted(&e)),
+                |n| format!("{n} bytes"),
+            );
             out.push_str(&format!(
-                "p{} | {state} | started {} | {}{}",
+                "p{} | {state} | started {} | {size} | {}{}",
                 one.number,
                 history::utc(one.started),
                 tools::visible(&command),
@@ -2367,6 +2402,109 @@ impl Session {
             ));
         }
         out
+    }
+
+    /// Where this conversation's background processes' output is kept.
+    fn outputs(&self) -> PathBuf {
+        StateDir::at(self.state.clone())
+            .conversation(&self.conversation.meta().id)
+            .join(output::DIR)
+    }
+
+    /// Background process `one`'s state, as the process tools say it.
+    fn state_of(&self, one: &store::Background) -> String {
+        match &one.ended {
+            Some(how) => how.clone(),
+            None if self.processes.contains_key(&one.number) => "running".into(),
+            // Its end heard and not yet logged; "ending" only when
+            // logging an end failed.
+            None => self
+                .heard_end(one.number)
+                .unwrap_or_else(|| "ending".into()),
+        }
+    }
+
+    /// The log's background process `number`, or why there is none.
+    fn process(&self, number: u64) -> Result<store::Background, String> {
+        store::backgrounds(self.conversation.events())
+            .into_iter()
+            .rev()
+            .find(|one| one.number == number)
+            .ok_or_else(|| format!("there is no p{number}"))
+    }
+
+    /// `process_output`: at most `max` bytes of background process
+    /// `number`'s output from offset `from`, with where they lie in it.
+    fn process_output(
+        &mut self,
+        number: u64,
+        from: Option<u64>,
+        max: usize,
+    ) -> Result<String, String> {
+        self.hear();
+        let one = self.process(number)?;
+        let asked = from.unwrap_or(0);
+        let out = output::read(&self.outputs(), number, asked, max)?;
+        let mut head = format!(
+            "[p{number} {}; bytes {} to {} of {} written; next from {}",
+            self.state_of(&one),
+            out.from,
+            out.to,
+            out.total,
+            out.to
+        );
+        if out.start > 0 {
+            head.push_str(&format!(
+                "; the first {} were dropped, so what is kept begins at {}",
+                out.start, out.start
+            ));
+        }
+        match from {
+            Some(asked) if asked < out.start => head.push_str(&format!(
+                "; {asked} is before what is kept, so this read begins at {}",
+                out.from
+            )),
+            Some(asked) if asked > out.total => {
+                head.push_str(&format!("; {asked} is past what was written"))
+            }
+            _ => {}
+        }
+        head.push_str("]\n");
+        head.push_str(&out.text);
+        Ok(head)
+    }
+
+    /// `process_wait`: waits at most `time` for background process
+    /// `number` to end, the person's interrupt ending the wait; how it
+    /// stands, and the tail of its output.
+    fn process_wait(&mut self, number: u64, time: Duration) -> Result<String, String> {
+        self.process(number)?;
+        let deadline = Instant::now().checked_add(time);
+        let waited = loop {
+            self.hear();
+            if !self.processes.contains_key(&number) {
+                break None;
+            }
+            if self.interrupt || self.gone {
+                break Some("the wait was interrupted");
+            }
+            if deadline.is_some_and(|at| Instant::now() >= at) {
+                break Some("the wait timed out");
+            }
+            std::thread::sleep(HOST_POLL);
+        };
+        let one = self.process(number)?;
+        let tail = output::tail(&self.outputs(), number, shell::SHOWN_TAIL)?;
+        let state = match waited {
+            None => self.state_of(&one),
+            Some(why) => format!("still running: {why}"),
+        };
+        Ok(format!(
+            "[p{number} {state}; the last {} of {} bytes it wrote]\n{}",
+            tail.to.saturating_sub(tail.from),
+            tail.total,
+            tail.text
+        ))
     }
 
     /// `process_kill`: background process `number` told to end; its end
@@ -2501,6 +2639,14 @@ impl Session {
             Args::Conversations => self.conversations(),
             Args::Processes => Ok(self.process_list()),
             Args::Kill(number) => self.kill(number),
+            Args::Output {
+                number,
+                from,
+                max_bytes,
+            } => self.process_output(number, from, max_bytes),
+            Args::Wait { number, timeout_ms } => {
+                self.process_wait(number, Duration::from_millis(timeout_ms))
+            }
             Args::Send { to, text } => {
                 match self.cross(started, Some(&to), Op::Message, Reach::Message(&text))? {
                     Ok(_) => self.post(to, text),

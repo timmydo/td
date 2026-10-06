@@ -176,6 +176,9 @@ pub struct Exit {
     pub elapsed: Duration,
     /// The timeout the call ran under.
     pub timeout: Duration,
+    /// Output still came at `MAX_LINGER` after its end, and the rest was
+    /// not read.
+    pub cut: bool,
 }
 
 impl Exit {
@@ -218,12 +221,39 @@ pub fn environment() -> Vec<(OsString, OsString)> {
 
 /// Runs `command`, its standard input empty and its standard output and
 /// error one stream, until it ends, `timeout` passes or `cancel` is set,
-/// giving `sink` each piece of output as it comes.
+/// giving `sink` each piece of output as it comes; after it ends, what
+/// is left is read for `DRAIN`.
 pub fn run(
+    command: Command,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    sink: &mut dyn FnMut(&[u8]),
+) -> Result<Exit, String> {
+    run_draining(command, timeout, cancel, sink, false)
+}
+
+/// `run` for a background process, whose output is all kept: after it
+/// ends, what is left is read until the pipe is quiet for `DRAIN`,
+/// however long `sink` takes each piece, for at most `MAX_LINGER`.
+pub fn run_whole(
+    command: Command,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    sink: &mut dyn FnMut(&[u8]),
+) -> Result<Exit, String> {
+    run_draining(command, timeout, cancel, sink, true)
+}
+
+/// How long a background process's output is still read after it ends,
+/// while a descendant still writes.
+const MAX_LINGER: Duration = Duration::from_secs(60);
+
+fn run_draining(
     mut command: Command,
     timeout: Duration,
     cancel: &AtomicBool,
     sink: &mut dyn FnMut(&[u8]),
+    whole: bool,
 ) -> Result<Exit, String> {
     let started = Instant::now();
     let (mut reader, writer) = std::io::pipe().map_err(|e| format!("a pipe: {e}"))?;
@@ -264,15 +294,19 @@ pub fn run(
     let mut stopped = None;
     let mut status = None;
     let mut ended_at: Option<Instant> = None;
+    // When the pipe last brought output.
+    let mut heard = started;
     // Whether the pipe may still bring output: a process that closes its
     // output and runs on is waited for by the clock, not by spinning.
     let mut open = true;
-    loop {
+    let cut = loop {
         // The process's state, the cancel and the clock are looked at on
         // every pass, so a process that writes without pause still ends.
+        let quiet_since = |at: Instant| if whole { at.max(heard) } else { at };
         if let Some(at) = ended_at {
-            if !open || at.elapsed() >= DRAIN {
-                break;
+            let lingered = whole && at.elapsed() >= MAX_LINGER;
+            if !open || quiet_since(at).elapsed() >= DRAIN || lingered {
+                break open && lingered;
             }
         } else if let Some(exited) = match child.try_wait() {
             Ok(exited) => exited,
@@ -296,7 +330,9 @@ pub fn run(
             status = Some(child.wait().map_err(|e| format!("waiting: {e}"))?);
             ended_at = Some(Instant::now());
         }
-        let wait = ended_at.map_or(TICK, |at| DRAIN.saturating_sub(at.elapsed()).min(TICK));
+        let wait = ended_at.map_or(TICK, |at| {
+            DRAIN.saturating_sub(quiet_since(at).elapsed()).min(TICK)
+        });
         if !open {
             std::thread::sleep(wait);
             continue;
@@ -305,11 +341,12 @@ pub fn run(
             Ok(chunk) => {
                 output.push(&chunk);
                 sink(&chunk);
+                heard = Instant::now();
             }
             Err(RecvTimeoutError::Disconnected) => open = false,
             Err(RecvTimeoutError::Timeout) => {}
         }
-    }
+    };
     let status = status.ok_or("the process's status was not read")?;
     Ok(Exit {
         code: status.code(),
@@ -318,6 +355,7 @@ pub fn run(
         output,
         elapsed: started.elapsed(),
         timeout,
+        cut,
     })
 }
 

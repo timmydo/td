@@ -62,6 +62,8 @@ pub enum Tool {
     Sed,
     Shell,
     ProcessList,
+    ProcessOutput,
+    ProcessWait,
     ProcessKill,
 }
 
@@ -86,6 +88,8 @@ const WORKSPACE: &[Tool] = &[
     Tool::Sed,
     Tool::Shell,
     Tool::ProcessList,
+    Tool::ProcessOutput,
+    Tool::ProcessWait,
     Tool::ProcessKill,
 ];
 
@@ -105,6 +109,8 @@ impl Tool {
             Self::Sed => "sed",
             Self::Shell => "shell",
             Self::ProcessList => "process_list",
+            Self::ProcessOutput => "process_output",
+            Self::ProcessWait => "process_wait",
             Self::ProcessKill => "process_kill",
         }
     }
@@ -363,8 +369,29 @@ fn definition(tool: Tool) -> Json {
             ),
         ),
         Tool::ProcessList => (
-            "List this conversation's background processes: each one's id, state (running, or how it ended: its exit status, killed, timed out, failed, or lost when td-agent stopped while it ran), start time and command.".to_string(),
+            "List this conversation's background processes, the latest 50: each one's id, state (running, or how it ended: its exit status, killed, timed out, failed, or lost when td-agent stopped while it ran), start time, the bytes of output it wrote and command.".to_string(),
             schema(Vec::new(), &[]),
+        ),
+        Tool::ProcessOutput => (
+            format!("Read a background process's output, standard error interleaved, from a byte offset counted from its start: the bytes read, where they lie and the offset to read on from. Up to the newest {} MiB of each process's output are kept unless td-agent is configured otherwise, the oldest dropped beyond that, and offsets count it as text, each byte that was not UTF-8 replaced; a read from before what is kept begins where it does and says so. Kept after it ends, until this conversation is archived or deleted.", crate::config::DEFAULT_BACKGROUND_OUTPUT_BYTES >> 20),
+            schema(
+                vec![
+                    ("id", property("string", "The process's id, such as p1.")),
+                    ("from", integer("The byte offset to read from; 0 when left out.", 0, None)),
+                    ("max_bytes", integer(&format!("The most bytes to read; {} when left out.", crate::output::READ_BYTES), 1, Some(crate::output::MAX_READ_BYTES as u64))),
+                ],
+                &["id"],
+            ),
+        ),
+        Tool::ProcessWait => (
+            format!("Wait for a background process to end, at most `timeout_ms`: how it ended, or that it still runs, and the last {} KiB of its output.", shell::SHOWN_TAIL >> 10),
+            schema(
+                vec![
+                    ("id", property("string", "The process's id, such as p1.")),
+                    ("timeout_ms", integer("How long to wait, in milliseconds.", 1, Some(MAX_WAIT_MS))),
+                ],
+                &["id", "timeout_ms"],
+            ),
         ),
         Tool::ProcessKill => (
             "Kill a background process, by its id from shell or process_list, and everything it started.".to_string(),
@@ -450,6 +477,17 @@ pub enum Args {
     Processes,
     /// `process_kill`, of the background process numbered so.
     Kill(u64),
+    /// `process_output`.
+    Output {
+        number: u64,
+        from: Option<u64>,
+        max_bytes: usize,
+    },
+    /// `process_wait`.
+    Wait {
+        number: u64,
+        timeout_ms: u64,
+    },
     /// A workspace tool's, for the tool host; `acts` when the human
     /// decides it first. A write's or an edit's expected digest is the
     /// conversation's to fill.
@@ -656,6 +694,9 @@ fn number(
     Ok(Some(number))
 }
 
+/// The longest `process_wait` waits: ten minutes (DESIGN.md §12).
+pub const MAX_WAIT_MS: u64 = 600_000;
+
 /// A background process's number from its id, `p1` being 1.
 fn process_id(id: &str) -> Result<u64, String> {
     id.trim()
@@ -848,6 +889,23 @@ pub fn parse_in(workspace: bool, name: &str, arguments: &str) -> Result<Args, St
         Tool::ProcessKill => {
             let m = members(tool_name, &value, &["id"])?;
             Args::Kill(process_id(required(m, "id")?)?)
+        }
+        Tool::ProcessOutput => {
+            let m = members(tool_name, &value, &["id", "from", "max_bytes"])?;
+            Args::Output {
+                number: process_id(required(m, "id")?)?,
+                from: number(m, "from", 0, u64::MAX)?,
+                max_bytes: number(m, "max_bytes", 1, crate::output::MAX_READ_BYTES as u64)?
+                    .map_or(crate::output::READ_BYTES, |n| n as usize),
+            }
+        }
+        Tool::ProcessWait => {
+            let m = members(tool_name, &value, &["id", "timeout_ms"])?;
+            Args::Wait {
+                number: process_id(required(m, "id")?)?,
+                timeout_ms: number(m, "timeout_ms", 1, MAX_WAIT_MS)?
+                    .ok_or("`timeout_ms` is missing")?,
+            }
         }
         Tool::SendMessage => {
             let m = members(tool_name, &value, &["to", "text"])?;
@@ -1311,7 +1369,7 @@ mod tests {
     fn a_workspace_adds_its_tools_and_their_calls_go_to_the_host() {
         let names: Vec<&str> = Tool::all(true).iter().map(|t| t.name()).collect();
         assert_eq!(
-            names[names.len() - 9..],
+            names[names.len() - 11..],
             [
                 "read_file",
                 "write_file",
@@ -1321,6 +1379,8 @@ mod tests {
                 "sed",
                 "shell",
                 "process_list",
+                "process_output",
+                "process_wait",
                 "process_kill"
             ]
         );
@@ -1376,6 +1436,34 @@ mod tests {
             Args::Kill(12)
         );
         assert!(!Tool::acting("process_kill"));
+        assert_eq!(
+            call("process_output", r#"{"id":"p2"}"#).unwrap(),
+            Args::Output {
+                number: 2,
+                from: None,
+                max_bytes: crate::output::READ_BYTES
+            }
+        );
+        assert_eq!(
+            call(
+                "process_output",
+                r#"{"id":"p2","from":7,"max_bytes":102400}"#
+            )
+            .unwrap(),
+            Args::Output {
+                number: 2,
+                from: Some(7),
+                max_bytes: 102_400
+            }
+        );
+        assert_eq!(
+            call("process_wait", r#"{"id":"p3","timeout_ms":600000}"#).unwrap(),
+            Args::Wait {
+                number: 3,
+                timeout_ms: 600_000
+            }
+        );
+        assert!(!Tool::acting("process_output") && !Tool::acting("process_wait"));
         assert!(parse("process_list", "{}").is_err());
         assert_eq!(
             call("read_file", r#"{"path":"/w/a","offset":3}"#).unwrap(),
@@ -1443,6 +1531,23 @@ mod tests {
             ("process_kill", r#"{"id":"p0"}"#, "process id"),
             ("process_kill", r#"{"id":"p+1"}"#, "process id"),
             ("process_kill", r#"{}"#, "`id` is missing"),
+            (
+                "process_output",
+                r#"{"id":"p1","max_bytes":102401}"#,
+                "max_bytes",
+            ),
+            (
+                "process_output",
+                r#"{"id":"p1","max_bytes":0}"#,
+                "max_bytes",
+            ),
+            ("process_wait", r#"{"id":"p1"}"#, "`timeout_ms` is missing"),
+            (
+                "process_wait",
+                r#"{"id":"p1","timeout_ms":600001}"#,
+                "timeout_ms",
+            ),
+            ("process_wait", r#"{"id":"x","timeout_ms":1}"#, "process id"),
             ("sed", r#"{"script":"p","paths":[]}"#, "`paths` is empty"),
             ("sed", r#"{"script":"p","paths":[1]}"#, "not a string"),
             ("grep", r#"{"pattern":"x","context":21}"#, "context"),

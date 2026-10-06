@@ -204,10 +204,18 @@ pub fn serve(
                 let config = config.clone();
                 // A thread the system refuses drops `finish` unrun, which
                 // answers the call as failed.
+                // A background call's output is all kept (DESIGN.md §12),
+                // so it waits for room; a call's is shown as it comes, and
+                // what does not fit is dropped.
+                let whole = matches!(call, Call::Background { .. });
                 let spawned = std::thread::Builder::new().spawn(move || {
                     let live = finish.outbox.clone();
                     finish.end(perform(&call, &config, &flag, &mut |text| {
-                        let _ = live.try_send(Up::Output { id, text });
+                        if whole {
+                            let _ = live.send(Up::Output { id, text });
+                        } else {
+                            let _ = live.try_send(Up::Output { id, text });
+                        }
                     }));
                 });
                 if let Ok(thread) = spawned {
@@ -406,9 +414,15 @@ fn act(
             if !dir.is_dir() {
                 return Err(format!("`workdir` {} is not a directory", dir.display()));
             }
-            let exit = shell::run(shell::shell(command, &dir), timeout, cancel, sink)?;
+            let exit = shell::run_whole(shell::shell(command, &dir), timeout, cancel, sink)?;
+            let mut text = exit.status();
+            if exit.cut {
+                text.push_str(
+                    "; output still came a minute after its end, and the rest was not read",
+                );
+            }
             Ok(Done {
-                text: exit.status(),
+                text,
                 kept: None,
                 digest: None,
             })
@@ -642,6 +656,41 @@ mod tests {
             })
             .unwrap();
         assert!(done(&mut client, id).unwrap_err().contains("relative"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A background call's output all comes up, however slowly it is
+    /// taken, the end of it included: the host waits for room rather
+    /// than dropping it, and its answer is how it ended (DESIGN.md §12).
+    #[test]
+    fn a_background_calls_output_waits_for_room_and_none_is_dropped() {
+        let dir = scratch("background");
+        let mut client = host(vec![dir.clone()]);
+        // More than every queue on the way holds, taken a piece at a time
+        // and slowly, so the end is still on its way when the process ends.
+        let id = client
+            .call(Call::Background {
+                command: "i=0; while [ $i -lt 8000 ]; do printf '%01000d' 0; i=$((i+1)); done"
+                    .into(),
+                timeout_ms: None,
+                workdir: None,
+            })
+            .unwrap();
+        let mut bytes = 0;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let ended = loop {
+            assert!(Instant::now() < deadline, "{bytes} bytes so far");
+            match client.next_reply(Duration::from_millis(50)) {
+                Some(Ok(Up::Output { id: of, text })) if of == id => {
+                    bytes += text.len();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Some(Ok(Up::Done { id: of, outcome })) if of == id => break outcome,
+                _ => {}
+            }
+        };
+        assert_eq!(bytes, 8_000_000);
+        assert_eq!(ended.unwrap().text, "exit status 0");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
