@@ -5818,28 +5818,48 @@ kernel queue. Each device discards through its first `SYN_REPORT` under a
 new cutoff, even if the whole report has a newer timestamp: the input core
 can buffer a value before close and timestamp its report only when it
 flushes afterward. This conservatively drops the first wholly fresh report
-from an idle device as well. Later stale records are discarded through
-their report boundary; they cannot restore modifiers or pointer buttons.
-At each discarded report boundary, a tablet re-reads EVIOCGABS and
-refreshes its held position, including when quarantine swallowed a
-SYN_DROPPED marker; a touchpad instead forgets its contact keys and named
-axes, so a finger held across the quarantine moves nothing until it is
-lifted (section 2). A buttonless position update reaches ordinary routing
-only while attention is closed; a reopened screen suppresses it. Later
-button-only reports therefore use the current device position. No rejected
-key, button, wheel or relative-motion change is replayed by recovery. Evdev
-timestamps classify kernel reports, not electrical actuation time; deeper
-driver and hardware buffering remains a trusted-device limitation. The
-bindings lock covers this filter, pointer accumulation, and delivery. A
-failed transition restores input capture and attempts a full private
-repaint; every recovery failure is included in its returned diagnostic.
+from an idle device as well. After the seat closes a committed
+device-bound installation's screen itself, which no key did ("Physical
+installation confirmation"), that discard would take the person's next
+key, so it is replaced by a 100 ms settle window instead: a report
+stamped at or before the cutoff plus 100 ms is discarded, and the first
+one after it is taken. A driver flushes a report in the call that began
+it, far inside that window. So a key pressed within 100 ms of a self-close
+is discarded, by design: its press never reaches the session, and its
+release, if later, is taken by the seat but not forwarded. The close is
+said on standard error, which reaches the console, as
+`TD-ATTENTION-SELF-CLOSE` with the cutoff and the window's end, and the
+first report taken past the window says `TD-ATTENTION-SETTLED` with the
+count of reports the window dropped: times and a count only, never a key,
+since td-setup's next keys are the typed-back recovery key. Later stale
+records are discarded through their report boundary; they cannot restore
+modifiers or pointer buttons. At each discarded report boundary, a tablet
+re-reads EVIOCGABS and refreshes its held position, including when
+quarantine swallowed a SYN_DROPPED marker; a touchpad instead forgets its
+contact keys and named axes, so a finger held across the quarantine moves
+nothing until it is lifted (section 2). A buttonless position update
+reaches ordinary routing only while attention is closed; a reopened screen
+suppresses it. Later button-only reports therefore use the current device
+position. No rejected key, button, wheel or relative-motion change is
+replayed by recovery. Evdev timestamps classify kernel reports, not
+electrical actuation time; deeper driver and hardware buffering remains a
+trusted-device limitation. The bindings lock covers this filter, pointer
+accumulation, and delivery. A failed transition restores input capture and
+attempts a full private repaint; every recovery failure is included in its
+returned diagnostic.
 
 Cancellation displays `RELEASE KEYS AND BUTTONS` until every admitted held
 key, button and partial pointer report drains. Device removal performs both
 keyboard and pointer cleanup before checking that condition. A stuck device
 can keep input captured; there is no timeout that silently returns input to
-applications. Unplugging the device drains its bookkeeping. The current
-fixed device roster requires compositor restart to add a replacement.
+applications. Two closes are not started by Escape, and both drain the
+same way: a login unlock's after root's `06` ("The lock surface"), which
+keeps the first-report discard, and a committed device-bound disk
+installation's after its notice ("Physical installation confirmation"),
+which settles as above. If the installation's drain fails, the screen
+stays open as it was, and Escape still closes it. Unplugging the device
+drains its bookkeeping. The current fixed device roster requires
+compositor restart to add a replacement.
 Direct-profile readers retain their per-device partial-report fast path;
 they never claim secure attention or use the trusted timestamp cutoff.
 
@@ -5867,11 +5887,29 @@ monotonic syscall caller role; secret_client consumes the returned sample.
 
 The existing atomic cancellation/commit transition consumes that confirmation
 before sending the exact private commit. Repeated status invitations without
-Enter only wait. Success displays SYSTEM INSTALLED and a restart instruction.
-After commit, Escape can close the screen but cannot promise to undo an
-installation; the root controller retains the transaction until completion.
-This confirmation does not authorize any secret-store operation or enroll or
-rotate a signing key. The installation protocol is in td-authd/DESIGN.md.
+Enter only wait. What follows commit depends on the description's storage.
+An update or an unencrypted disk installation keeps its prompt until the
+operation ends; success then displays SYSTEM INSTALLED and a restart
+instruction. A device-bound disk installation completes only after its
+recovery key is typed back in td-setup, which the screen hides, so on the
+first status after commit the compositor replaces the prompt with its own
+fixed notice, `INSTALLING - RETURNING TO SETUP FOR THE RECOVERY KEY`, and
+four seconds later closes the screen itself: the secret worker asks the
+physical seat that opened this attempt (`input::Seat::release`, the seat
+a login unlock leaves the lock surface through, with its weak references
+and its lock order) to drain and close it exactly as Escape does,
+checking that attention is open and the attempt is still the screen's,
+so a held key or button still keeps capture until released, and focus
+returns to td-setup. The notice and the close are compositor-owned:
+nothing td-setup or a client sends selects, words or times them, and
+while the screen drains it keeps the notice rather than saying CANCELLING
+REQUEST, since nothing is being cancelled. That installation shows no
+SYSTEM INSTALLED; td-setup's completion page says it. Before commit Escape
+declines exactly as before. After commit, Escape can close the screen but
+cannot promise to undo an installation; the root controller retains the
+transaction until completion. This confirmation does not authorize any
+secret-store operation or enroll or rotate a signing key. The installation
+protocol is in td-authd/DESIGN.md.
 
 ### Login-key operations
 

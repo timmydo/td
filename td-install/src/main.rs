@@ -101,7 +101,7 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install serve [--storage device-bound] <td-boot> <deployment-directory> <trusted-key> <verified-root> <td-firstboot> (stdin: connected Unix stream socket)\n       td-install prepare-selector <template> <trusted-key> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install serve <td-boot> <deployment-directory> <trusted-key> <verified-root> <td-firstboot> (stdin: connected Unix stream socket)\n       td-install prepare-selector <template> <trusted-key> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]\n       \
                      td-install format ... --trusted-key <trusted-key> --publish <td-boot> <deployment> <mountpoint>";
@@ -596,35 +596,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         (verb, None)
     };
     let rest: Vec<PathBuf> = args.map(PathBuf::from).collect();
-    // The service's control-plane storage operand (INSTALLER.md
-    // "Installation service core"): leading, once, and only device-bound.
-    let (storage, rest) = if rest
-        .first()
-        .is_some_and(|arg| arg.as_os_str() == "--storage")
-    {
-        if verb != "serve" {
-            return Err(invalid("--storage is only supported by serve".into()));
-        }
-        if !rest
-            .get(1)
-            .is_some_and(|arg| arg.as_os_str() == "device-bound")
-        {
-            return Err(invalid("--storage admits only device-bound".into()));
-        }
-        (
-            installation_plan::Storage::DeviceBound,
-            rest.get(2..).ok_or_else(|| invalid(USAGE.into()))?,
-        )
-    } else {
-        (installation_plan::Storage::Unencrypted, rest.as_slice())
-    };
-    if rest.iter().any(|arg| arg.as_os_str() == "--storage") {
-        return Err(invalid(if verb == "serve" {
-            "--storage must appear once, before the serve operands".into()
-        } else {
-            "--storage is only supported by serve".into()
-        }));
-    }
+    let rest = rest.as_slice();
     let (uuid, rest) = if rest.first().is_some_and(|arg| arg.as_os_str() == "--uuid") {
         if verb != "volume" {
             return Err(invalid("--uuid is only supported by volume".into()));
@@ -812,8 +784,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 timezones: PathBuf::from(TIMEZONE_ROOT),
                 catalog: None,
                 booted: PathBuf::from(BOOTED_DEPLOYMENT),
-                storage,
-                // Serve's probes set it once admitted.
+                // Serve's probes set it once admitted; storage follows it.
                 basis: installation_plan::Basis::default(),
             };
             if [
@@ -1046,9 +1017,8 @@ struct LiveHost {
     catalog: Option<Result<installation_plan::Zones, installation_protocol::Refusal>>,
     /// Which deployment the running root was authenticated as.
     booted: PathBuf,
-    /// The caller's storage operand; every plan names it.
-    storage: installation_plan::Storage,
-    /// What serve's probes found at its start; every plan records it.
+    /// What serve's probes found at its start; every plan records it and
+    /// names the storage it implies.
     basis: installation_plan::Basis,
 }
 
@@ -1231,10 +1201,6 @@ impl installation_service::Host for LiveHost {
             .map_err(|error| refuse(installation_protocol::Refusal::PowerUnavailable, error))
     }
 
-    fn storage(&self) -> installation_plan::Storage {
-        self.storage
-    }
-
     fn basis(&self) -> installation_plan::Basis {
         self.basis
     }
@@ -1245,24 +1211,24 @@ impl installation_service::Host for LiveHost {
 /// PCR_Read answers the SHA-256 bank for PCRs 4 and 9, neither unmeasured.
 /// td-protector's observed policy is exactly that read and refusal; the
 /// policy itself is dropped, since nothing is sealed to it here. Serve
-/// runs it once at every start: a device-bound service refuses to start
-/// on its failure, and every service records its outcome in the basis.
-/// `Err` is the cause, which the caller words.
+/// runs it once at every start and records its outcome in the basis, which
+/// chooses storage; its failure refuses nothing. `Err` is the cause, which
+/// the caller words.
 fn probe_tpm<T: td_tpm::Transport>(open: impl FnOnce() -> Result<T, String>) -> Result<(), String> {
     let transport = open()?;
     td_protector::observed_policy(&mut td_tpm::Client::new(transport)).map(drop)
 }
 
-/// How long a service without the storage operand waits for its TPM
-/// probe. Its installer allows the greeting ten seconds, and a TPM
-/// command the kernel retries can take minutes.
+/// How long serve waits for its TPM probe. Its installer allows the
+/// greeting ten seconds, and a TPM command the kernel retries can take
+/// minutes.
 const TPM_PROBE_DEADLINE: Duration = Duration::from_secs(3);
 
 /// `probe` on a thread of its own, its outcome if it ends within
 /// `deadline` and a refusal otherwise. A probe that is late is abandoned,
-/// never joined; such a service makes no further TPM use, since only a
-/// device-bound execution would, and the caller probes without a deadline
-/// for that.
+/// never joined; it is recorded as not passed, so that service's plans are
+/// unencrypted and it makes no further TPM use, since only a device-bound
+/// execution would.
 fn probe_within(
     deadline: Duration,
     probe: impl FnOnce() -> Result<(), String> + Send + 'static,
@@ -2502,28 +2468,18 @@ fn run_serve(mut host: LiveHost) -> io::Result<()> {
     let stdout = File::from(io::stdout().as_fd().try_clone_to_owned()?);
     let (stream, consent) = admit_serve(euid, stdin, stdout)?;
     // After admission, so a misplaced start never opens the TPM or reads
-    // sysfs, and before a byte: each probe once, recorded in every plan
-    // (INSTALLER.md "Storage choice"). Only the operand chooses storage,
-    // so a device-bound service without a usable TPM still refuses to
-    // start rather than serve unencrypted plans.
-    let tpm = if host.storage == installation_plan::Storage::DeviceBound {
-        probe_tpm(td_tpm::Device::open).map_err(|error| {
-            invalid(format!(
-                "no usable TPM 2.0 for device-bound storage: {error}"
-            ))
-        })?;
-        true
-    } else {
-        // Bounded, so a slow TPM cannot outlast the installer's greeting.
-        match probe_within(TPM_PROBE_DEADLINE, || probe_tpm(td_tpm::Device::open)) {
-            Ok(()) => true,
-            Err(error) => {
-                let _ = writeln!(
-                    io::stderr(),
-                    "td-install serve: TPM probe: no usable TPM 2.0: {error}"
-                );
-                false
-            }
+    // sysfs, and before a byte: each probe once, recorded in every plan,
+    // whose storage follows them (INSTALLER.md "Storage choice"): neither
+    // refuses. The TPM's is bounded, so a slow TPM cannot outlast the
+    // installer's greeting.
+    let tpm = match probe_within(TPM_PROBE_DEADLINE, || probe_tpm(td_tpm::Device::open)) {
+        Ok(()) => true,
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "td-install serve: TPM probe: no usable TPM 2.0: {error}"
+            );
+            false
         }
     };
     let console = match keyboard_console::probe(Path::new("/sys")) {
@@ -5271,7 +5227,6 @@ mod tests {
                 timezones: PathBuf::from(TIMEZONE_ROOT),
                 catalog: None,
                 booted: PathBuf::from(BOOTED_DEPLOYMENT),
-                storage: installation_plan::Storage::Unencrypted,
                 basis: installation_plan::Basis::default(),
             })
         );
@@ -5289,10 +5244,10 @@ mod tests {
         }
     }
 
-    /// Only a leading `--storage device-bound` makes the service
-    /// device-bound; without it storage is unencrypted, as above.
+    /// Storage has no operand: serve chooses it from its probes, so a
+    /// `--storage` anywhere is an operand like any other, and refused.
     #[test]
-    fn serve_takes_one_leading_storage_operand() {
+    fn serve_takes_no_storage_operand() {
         let operands = [
             "/bin/td-boot",
             "/source",
@@ -5300,67 +5255,28 @@ mod tests {
             "/root",
             "/bin/td-firstboot",
         ];
-        let with = |leading: &[&str]| {
-            parse_args(args(&[&["serve"], leading, operands.as_slice()].concat()))
-        };
-        let Mode::Serve(host) = with(&["--storage", "device-bound"]).unwrap() else {
-            panic!("not serve");
-        };
-        assert_eq!(host.storage, installation_plan::Storage::DeviceBound);
-        assert_eq!(host.td_boot, PathBuf::from("/bin/td-boot"));
-        assert_eq!(host.firstboot, PathBuf::from("/bin/td-firstboot"));
-        let Mode::Serve(host) = with(&[]).unwrap() else {
-            panic!("not serve");
-        };
-        assert_eq!(host.storage, installation_plan::Storage::Unencrypted);
-        for (leading, refusal) in [
+        // An operand beside the five is a usage error; one in place of
+        // td-boot is not an absolute path. Neither is a storage choice.
+        for (line, reason) in [
             (
-                &["--storage", "unencrypted"][..],
-                "--storage admits only device-bound",
+                [&["serve", "--storage", "device-bound"][..], &operands].concat(),
+                USAGE,
             ),
             (
-                &["--storage", "Device-Bound"],
-                "--storage admits only device-bound",
+                [&["serve"][..], &operands, &["--storage", "device-bound"]].concat(),
+                USAGE,
             ),
-            (&["--storage", ""], "--storage admits only device-bound"),
             (
-                &["--storage", "device-bound", "--storage", "device-bound"],
-                "--storage must appear once, before the serve operands",
+                [&["serve", "--storage"][..], &operands[1..]].concat(),
+                "serve operands must be absolute paths",
             ),
         ] {
-            assert_eq!(
-                with(leading).unwrap_err().to_string(),
-                refusal,
-                "{leading:?}"
-            );
+            let Err(error) = parse_args(args(&line)) else {
+                panic!("{line:?} was admitted");
+            };
+            assert_eq!(error.to_string(), reason, "{line:?}");
         }
-        // A missing value takes the next operand as the value, which the
-        // operand refuses as not device-bound.
-        assert_eq!(
-            with(&["--storage"]).unwrap_err().to_string(),
-            "--storage admits only device-bound"
-        );
-        // Not after an operand, and not another verb's.
-        let mut trailing = vec!["serve"];
-        trailing.extend(operands);
-        trailing.extend(["--storage", "device-bound"]);
-        assert_eq!(
-            parse_args(args(&trailing)).unwrap_err().to_string(),
-            "--storage must appear once, before the serve operands"
-        );
-        for verb in [
-            &["timezones"][..],
-            &["observe-plan"],
-            &["volume", "/dev/vda", "/bin/mkfs.btrfs", "/scratch"],
-        ] {
-            let mut line = vec![verb[0], "--storage", "device-bound"];
-            line.extend(&verb[1..]);
-            assert_eq!(
-                parse_args(args(&line)).unwrap_err().to_string(),
-                "--storage is only supported by serve",
-                "{verb:?}"
-            );
-        }
+        assert!(!USAGE.contains("--storage"));
     }
 
     /// A scripted TPM answering each command from its queue, and recording
@@ -5782,7 +5698,6 @@ mod tests {
             timezones: zones,
             catalog: None,
             booted: PathBuf::from(BOOTED_DEPLOYMENT),
-            storage: installation_plan::Storage::Unencrypted,
             basis: installation_plan::Basis::default(),
         };
         for (choice, expected) in [
@@ -5933,7 +5848,6 @@ mod tests {
             destination,
             [0xab; 32],
             uuid,
-            installation_plan::Storage::Unencrypted,
             installation_plan::Basis::default(),
             settings,
         )
@@ -5995,7 +5909,6 @@ mod tests {
             destination,
             [0xab; 32],
             uuid,
-            installation_plan::Storage::Unencrypted,
             installation_plan::Basis::default(),
             settings,
         )
@@ -11935,7 +11848,6 @@ mod tests {
                 destination,
                 deployment,
                 uuid,
-                installation_plan::Storage::Unencrypted,
                 installation_plan::Basis::default(),
                 settings,
             )
@@ -12011,8 +11923,7 @@ mod tests {
             reviewed.destination().clone(),
             *reviewed.deployment(),
             *reviewed.volume_uuid(),
-            installation_plan::Storage::DeviceBound,
-            installation_plan::Basis::default(),
+            installation_plan::Basis::new(true, true),
             reviewed.settings().clone(),
         )
         .unwrap();
@@ -12207,7 +12118,6 @@ mod tests {
             timezones: execution.timezones.clone(),
             catalog: None,
             booted: execution.booted.clone(),
-            storage: installation_plan::Storage::Unencrypted,
             basis: installation_plan::Basis::default(),
         };
         let fit = |host: &mut LiveHost| host.check_fit(&fixture.plan);
@@ -12412,7 +12322,6 @@ mod tests {
             timezones: execution.timezones.clone(),
             catalog: None,
             booted: execution.booted.clone(),
-            storage: installation_plan::Storage::Unencrypted,
             basis: installation_plan::Basis::default(),
         };
         assert_eq!(host.authenticate_source(), Ok(*fixture.plan.deployment()));
@@ -12442,7 +12351,6 @@ mod tests {
             timezones: execution.timezones.clone(),
             catalog: None,
             booted: execution.booted.clone(),
-            storage: installation_plan::Storage::Unencrypted,
             basis: installation_plan::Basis::default(),
         };
         assert_eq!(host.candidates(), Err(Refusal::DiscoveryFailed));

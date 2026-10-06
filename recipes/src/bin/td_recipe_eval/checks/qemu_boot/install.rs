@@ -2595,6 +2595,7 @@ pub(super) fn plan<'a>(path: &'a Path, read_only: bool, marker: &'a str) -> Boot
         cut: false,
         keep_console: None,
         screens: None,
+        devices: Devices::ALL,
         screen: None,
         shell: None,
     }

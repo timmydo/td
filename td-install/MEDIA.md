@@ -377,8 +377,8 @@ installer wizard and no other (INSTALLER.md "Live startup"), which
 `qemu-boot-live` proves on this medium, and td-authd binds its setup intake
 in place of the deployment intake. The live session is also what the
 installer's keyboard-console probe observes (ENCRYPTION.md
-"Activation"), which every plan records and increment 7's activation
-makes choose storage: it runs the kernel an installed selector runs, on
-the machine being installed.
+"Activation"), which every plan records and which, with the TPM probe,
+chooses storage: it runs the kernel an installed selector runs, on the
+machine being installed.
 
 `build-iso` ("Live installation media") provisions the live selector.

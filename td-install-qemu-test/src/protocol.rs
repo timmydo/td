@@ -67,11 +67,18 @@ pub const ENCRYPTED_SECRETS_ABSENT_MARKER: &str = "TD-INSTALL-ENCRYPTED-SECRETS-
 /// orphan keyslot, a superseded device-bound token on a keyslot of its own
 /// and an orphaned first-boot token: the keyslots, then the tokens' numbers.
 pub const ENCRYPTED_HEADERS_MARKER: &str = "TD-INSTALL-ENCRYPTED-HEADERS-BUILT";
-/// Without a TPM, `serve --storage device-bound` refused to start before
-/// sending a byte.
-pub const NO_TPM_MARKER: &str = "TD-INSTALL-NO-TPM-REFUSED";
-/// The service's diagnostic for that refusal (td-install `probe_tpm`).
-pub const NO_TPM_DIAGNOSTIC: &str = "no usable TPM 2.0 for device-bound storage";
+/// Every review the guest is sent, with the storage it names and the
+/// service's probes it records (`tpm=` and `console=`, 1 passed and 0
+/// not): the storage is the one the probes name.
+pub const STORAGE_REVIEWED_MARKER: &str = "TD-INSTALL-STORAGE-REVIEWED";
+/// Without a TPM, the service reviewed unencrypted storage, its TPM probe
+/// recorded as failed, and the review was withdrawn with the disk
+/// unchanged.
+pub const NO_TPM_MARKER: &str = "TD-INSTALL-NO-TPM-UNENCRYPTED";
+/// With the TPM and without a keyboard console, the service reviewed and
+/// installed unencrypted storage: the last record before the end line,
+/// with the UUID and the disk.
+pub const NO_CONSOLE_MARKER: &str = "TD-INSTALL-NO-CONSOLE-UNENCRYPTED";
 
 pub const MEDIA_MARKER: &str = "TD-INSTALL-MEDIA-READONLY";
 /// ISO names and fixture paths; Linux's normal ISO name map lowercases.

@@ -801,7 +801,6 @@ mod tests {
             destination,
             [2; 32],
             uuid,
-            crate::installation_plan::Storage::Unencrypted,
             crate::installation_plan::Basis::default(),
             settings,
         )
@@ -870,7 +869,6 @@ mod tests {
             destination,
             [2; 32],
             uuid,
-            crate::installation_plan::Storage::Unencrypted,
             crate::installation_plan::Basis::default(),
             settings,
         )

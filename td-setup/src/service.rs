@@ -589,23 +589,22 @@ pub(crate) mod tests {
 
     /// The service's review of `destination` with `settings`.
     pub(crate) fn plan(destination: &Destination, settings: &Settings) -> Plan {
-        stored(destination, settings, Storage::Unencrypted)
+        stored(destination, settings, Basis::default())
     }
 
     /// A device-bound service's review of `destination` with `settings`.
     pub(crate) fn bound_plan(destination: &Destination, settings: &Settings) -> Plan {
-        stored(destination, settings, Storage::DeviceBound)
+        stored(destination, settings, Basis::new(true, true))
     }
 
-    fn stored(destination: &Destination, settings: &Settings, storage: Storage) -> Plan {
+    fn stored(destination: &Destination, settings: &Settings, basis: Basis) -> Plan {
         let uuid = [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 0];
         Plan::new(
             [7; 32],
             destination.clone(),
             [9; 32],
             uuid,
-            storage,
-            Basis::default(),
+            basis,
             settings.clone(),
         )
         .unwrap()

@@ -862,7 +862,9 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
     let loops = bound_loops()?;
     let uuid = if system_autotest {
         bind_root_store()?;
-        let uuid = served_install(device, media, deployment, &id)?;
+        // No TPM, and the harness's display device and PS/2 keyboard.
+        let basis = installation_plan::Basis::new(false, true);
+        let uuid = served_install(device, media, deployment, &id, basis)?;
         command("/bin/umount", &["/td/store"])?;
         uuid
     } else {
@@ -1018,17 +1020,19 @@ fn format_install(device: &str, interrupt: bool) -> Result<String, String> {
 
 /// The installation service as td-authd starts it on a live boot, with its
 /// operands and both channels: this fixture is the installer on stdin and
-/// td-authd's consent end on stdout, and consents to the review it is sent.
-/// Returns the reviewed volume UUID.
+/// td-authd's consent end on stdout, and consents to the review it is sent,
+/// which must be unencrypted and record `basis`. Returns the reviewed
+/// volume UUID.
 fn served_install(
     device: &str,
     media: &str,
     deployment: [u8; 32],
     id: &str,
+    basis: installation_plan::Basis,
 ) -> Result<String, String> {
     record_deployment(id)?;
-    let mut service = Service::start(installation_plan::Storage::Unencrypted, Stdio::inherit())?;
-    let served = drive_service(&mut service, device, media, deployment);
+    let mut service = Service::start(Stdio::inherit())?;
+    let served = drive_service(&mut service, device, media, deployment, basis);
     let uuid = service.finish(served)?;
     report(
         std::io::stdout(),
@@ -1058,29 +1062,25 @@ struct Service {
 }
 
 impl Service {
-    /// Started as td-authd starts it: root, an empty environment and `/` as
-    /// its directory. Device-bound storage adds the control-plane operand
-    /// td-authd never passes.
-    fn start(storage: installation_plan::Storage, stderr: Stdio) -> Result<Self, String> {
+    /// Started as td-authd starts it: root, an empty environment, `/` as
+    /// its directory and no storage operand, for there is none: its own
+    /// probes choose the storage.
+    fn start(stderr: Stdio) -> Result<Self, String> {
         use std::os::fd::OwnedFd;
         use std::os::unix::net::UnixStream;
         let (installer, theirs) =
             UnixStream::pair().map_err(|error| format!("installer channel: {error}"))?;
         let (authority, channel) =
             UnixStream::pair().map_err(|error| format!("consent channel: {error}"))?;
-        let mut args = vec!["serve"];
-        if storage == installation_plan::Storage::DeviceBound {
-            args.extend(["--storage", "device-bound"]);
-        }
-        args.extend([
-            "/bin/td-boot",
-            "/media",
-            "/trusted.pub",
-            "/root-image",
-            "/bin/td-firstboot",
-        ]);
         let child = Command::new("/bin/td-install")
-            .args(args)
+            .args([
+                "serve",
+                "/bin/td-boot",
+                "/media",
+                "/trusted.pub",
+                "/root-image",
+                "/bin/td-firstboot",
+            ])
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::from(OwnedFd::from(theirs)))
@@ -1141,20 +1141,18 @@ fn require_no_workspace() -> Result<(), String> {
 }
 
 /// One unencrypted installation through the service's protocols, to its
-/// finished report.
+/// finished report, under a review recording `basis`.
 fn drive_service(
     service: &mut Service,
     device: &str,
     media: &str,
     deployment: [u8; 32],
+    basis: installation_plan::Basis,
 ) -> Result<String, String> {
-    let plan = start_installation(
-        service,
-        device,
-        media,
-        deployment,
-        installation_plan::Storage::Unencrypted,
-    )?;
+    if basis.storage() != installation_plan::Storage::Unencrypted {
+        return Err("an unencrypted installation needs a basis that names it".into());
+    }
+    let plan = start_installation(service, device, media, deployment, basis)?;
     let nonce = *plan.nonce();
     let mut phases = Vec::new();
     poll_installation(&mut service.installer, nonce, &mut phases, None)?;
@@ -1163,19 +1161,19 @@ fn drive_service(
     plan_uuid(&plan)
 }
 
-/// Greets both channels, proposes the target with the fixed settings,
-/// executes the review and consents to it on the consent channel, through
-/// the started report. Returns the plan the service reviewed, which must be
-/// of the validated source, the proposed disk and `storage`.
-fn start_installation(
+/// Greets both channels and proposes the target with the fixed settings.
+/// Returns the plan the service reviewed, which must be of the validated
+/// source and the proposed disk, record `basis` as the service's probes,
+/// and name the storage it implies, once recorded on the console.
+fn review_installation(
     service: &mut Service,
     device: &str,
     media: &str,
     deployment: [u8; 32],
-    storage: installation_plan::Storage,
+    basis: installation_plan::Basis,
 ) -> Result<installation_plan::Plan, String> {
     use installation_consent as consent;
-    use installation_protocol::{self as wire, Reply, Request, State};
+    use installation_protocol::{self as wire, Reply, Request};
     let installer = &mut service.installer;
     let authority = &mut service.authority;
     let name = device
@@ -1225,13 +1223,46 @@ fn start_installation(
         Reply::Reviewed(plan) => *plan,
         other => return Err(format!("the service did not review: {other:?}")),
     };
+    report(
+        std::io::stdout(),
+        format_args!(
+            "{STORAGE_REVIEWED_MARKER} {} tpm={} console={}",
+            match plan.storage() {
+                installation_plan::Storage::Unencrypted => "unencrypted",
+                installation_plan::Storage::DeviceBound => "device-bound",
+            },
+            u8::from(plan.basis().tpm()),
+            u8::from(plan.basis().keyboard_console()),
+        ),
+    )?;
     if *plan.deployment() != deployment
         || *plan.destination() != destination
-        || plan.storage() != storage
+        || plan.basis() != basis
+        || plan.storage() != basis.storage()
     {
-        return Err("the review is not of the source, disk and storage proposed".into());
+        return Err("the review is not of the source, disk and probes expected".into());
     }
-    let reviewed_storage = match storage {
+    Ok(plan)
+}
+
+/// Reviews as `review_installation` does, then executes the review and
+/// consents to it on the consent channel, through the started report.
+fn start_installation(
+    service: &mut Service,
+    device: &str,
+    media: &str,
+    deployment: [u8; 32],
+    basis: installation_plan::Basis,
+) -> Result<installation_plan::Plan, String> {
+    use installation_consent as consent;
+    use installation_protocol::{Reply, Request, State};
+    let plan = review_installation(service, device, media, deployment, basis)?;
+    let installer = &mut service.installer;
+    let authority = &mut service.authority;
+    let name = device
+        .strip_prefix("/dev/")
+        .ok_or("invalid target device")?;
+    let reviewed_storage = match plan.storage() {
         installation_plan::Storage::Unencrypted => consent::Storage::Unencrypted,
         installation_plan::Storage::DeviceBound => consent::Storage::DeviceBound,
     };
@@ -1246,7 +1277,7 @@ fn start_installation(
     };
     if *review.nonce() != nonce
         || review.disk() != name
-        || review.capacity() != destination.capacity()
+        || review.capacity() != plan.destination().capacity()
         || review.hostname() != HOSTNAME
         || review.username() != USERNAME
         || *review.deployment() != deployment
@@ -2001,7 +2032,8 @@ fn run() -> Result<(), String> {
         }
         b"encrypted-inspect\n" => encrypted_boot::inspect(&target()?),
         b"encrypted-headers\n" => encrypted_boot::build_headers(&target()?),
-        b"install-no-tpm\n" => encrypted::refuse_without_tpm(&target()?),
+        b"install-no-tpm\n" => encrypted::review_without_tpm(&target()?),
+        b"install-no-console\n" => encrypted::install_without_console(&target()?),
         b"interrupt\n" => install(&target()?, true, false),
         b"install-scratch\n" => scratch_limited_install(&target()?),
         b"protect-media\n" => protect_writable_media(&target()?),

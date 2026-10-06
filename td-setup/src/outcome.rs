@@ -15,6 +15,12 @@ const FAILED_FOOTER: &str = "Installation stopped \u{b7} step 5 of 6";
 const UNKNOWN_FOOTER: &str = "Outcome unknown \u{b7} step 5 of 6";
 const UNCONFIRMED_FOOTER: &str = "Installation not finished \u{b7} step 6 of 6";
 const COMPLETE_FOOTER: &str = "Complete \u{b7} step 6 of 6";
+/// What a device-bound consent page adds: the secure screen closes by
+/// itself after confirmation, and the key follows here.
+const RETURN_AFTER_CONSENT: &[&str] = &[
+    "After you confirm, the secure screen closes by itself and you",
+    "return here to write down your recovery key.",
+];
 
 /// A bounded operation label supplied by the installation service.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +107,7 @@ pub struct ProgressPage {
     surface: Surface,
     progress: Progress,
     footer: Status,
+    recovery_key: bool,
 }
 
 impl ProgressPage {
@@ -110,7 +117,15 @@ impl ProgressPage {
             surface,
             progress,
             footer: Status::new(surface),
+            recovery_key: false,
         })
+    }
+
+    /// Whether the review consented to is device-bound: its consent page
+    /// says what follows confirmation.
+    pub fn with_recovery_key(mut self, follows: bool) -> Self {
+        self.recovery_key = follows;
+        self
     }
 
     pub fn progress(&self) -> Progress {
@@ -149,6 +164,11 @@ impl Composition for ProgressPage {
                     damage,
                     sink,
                 );
+                if self.recovery_key {
+                    for (index, text) in RETURN_AFTER_CONSENT.iter().enumerate() {
+                        row(self.surface, 10 + index, text, damage, sink);
+                    }
+                }
                 CONSENT_FOOTER
             }
             Progress::Running(phase) => {
@@ -500,6 +520,23 @@ mod tests {
         let consent = ProgressPage::new(screen, Progress::Consent).unwrap();
         let painted = glyphs(&consent, screen);
         assert!(painted.contains("secure prompt") && painted.contains(CONSENT_FOOTER));
+        assert!(!painted.contains("recovery key"));
+        let bound = ProgressPage::new(screen, Progress::Consent)
+            .unwrap()
+            .with_recovery_key(true);
+        let painted = glyphs(&bound, screen);
+        for text in RETURN_AFTER_CONSENT {
+            assert!(painted.contains(text), "{text}");
+        }
+        assert!(painted.contains(CONSENT_FOOTER));
+        // Only the consent page says it.
+        let running = ProgressPage::new(screen, Progress::Running(Phase::PreparingDisk))
+            .unwrap()
+            .with_recovery_key(true);
+        let painted = glyphs(&running, screen);
+        for text in RETURN_AFTER_CONSENT {
+            assert!(!painted.contains(text), "{text}");
+        }
         let unknown = ProgressPage::new(screen, Progress::Unknown).unwrap();
         let painted = glyphs(&unknown, screen);
         assert!(painted.contains("outcome unknown"));

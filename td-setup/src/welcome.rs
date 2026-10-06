@@ -4,11 +4,12 @@
 //! and a `Status` footer naming the step. It holds no state and reads
 //! nothing but its surface; the wizard drives it.
 //!
-//! INSTALLER.md requires the welcome screen to disclose that storage is
-//! unencrypted and that the account signs in automatically, and forbids a
-//! PIN or password field here. The prose below states those facts and the
-//! page draws no text entry, so a reader is told before any disk is
-//! touched.
+//! INSTALLER.md requires the welcome screen to disclose when storage is
+//! encrypted to this computer and when it is not, that the review says
+//! which, and that the account signs in automatically either way, and
+//! forbids a PIN or password field here. The prose below states those
+//! facts and the page draws no text entry, so a reader is told before any
+//! disk is touched.
 
 use td_ui::chrome::{Block, Status, ROW};
 use td_ui::raster::{
@@ -20,15 +21,19 @@ use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 pub const HEADING: &str = "Install td";
 
 /// The disclosure paragraphs, wrapped to the surface at construction. They
-/// state the two facts INSTALLER.md requires the welcome screen to
-/// disclose: storage is not encrypted, and the account signs in
-/// automatically with no password or PIN.
-pub const BODY: [&str; 3] = [
+/// state what INSTALLER.md "Storage choice" requires the welcome screen to
+/// disclose: when storage is encrypted to this computer and when not, that
+/// the review says which, and that the account signs in automatically
+/// with no password or PIN either way.
+pub const BODY: &[&str] = &[
     "This installs td onto one whole disk that you choose. Everything now on \
      that disk is erased.",
-    "Storage on this system is not encrypted: anyone who has the disk can \
-     read its files. The account you create signs in automatically when the \
-     machine starts, with no password or PIN.",
+    "Storage will be encrypted to this computer when it has a usable TPM 2.0 \
+     and a screen and keyboard its startup recovery prompt can use. \
+     Otherwise it is not encrypted, and anyone who has the disk can read its \
+     files. The review says which, and why. Either way, the account you \
+     create signs in automatically when the machine starts, with no password \
+     or PIN.",
     "Next you choose the disk, then a username, hostname, keyboard layout \
      and time zone. Networking is set up after the installed system starts. \
      No password is needed to install.",
@@ -87,7 +92,7 @@ impl Welcome {
         surface.check().ok()?;
         let scale = surface.scale.value();
         let columns = surface.width.checked_sub(2 * CELL_WIDTH * scale)? / (CELL_WIDTH * scale);
-        let lines = wrap(&BODY, columns);
+        let lines = wrap(BODY, columns);
         let block = Block::new(surface, (BODY_Y * scale) as i64, lines.len())?;
         let body_bottom = (BODY_Y + lines.len() * CELL_HEIGHT) * scale;
         let footer = Status::new(surface);

@@ -998,15 +998,16 @@ Whole-disk installation (6) adds a big-endian u32 requester and u64 capacity
 in bytes, then one-byte-length fields for the disk's kernel name (1 to 31
 ASCII alphanumerics, hyphen or underscore), its model and serial labels, the
 hostname (1 to 63 bytes) and the username (1 to 32), then the first eight
-bytes of the deployment ID. A label's length byte is 0xFF when the disk
-reported none, and otherwise its length (at most 32 for the model, 24 for
+bytes of the deployment ID and one storage byte, 0 unencrypted or 1
+device-bound, any other refused. A label's length byte is 0xFF when the
+disk reported none, and otherwise its length (at most 32 for the model, 24 for
 the serial) with bit 7 set when it was cut. Its bytes are the canonical
 escape of what the disk reported: printable ASCII other than space and
 backslash as itself, backslash as `\\`, space as `\s`, every other byte as
 `\xNN` in lowercase hex, cut before the first escape that would pass the
 width; a cut label has no room left for another escape. Hostname and
 username are printable ASCII without space or backslash, and the requester
-must equal the owner. The widest value is 252 bytes. The whole value is at
+must equal the owner. The widest value is 253 bytes. The whole value is at
 most 256 bytes; unknown tags, truncation and trailing bytes refuse. Tag 3,
 a retired write form, stays unassigned.
 
@@ -1123,8 +1124,10 @@ A disk installation shows its disk name, size in decimal GB and exact
 bytes, model and serial (`NOT REPORTED`, `REPORTED EMPTY` or `(TRUNCATED)`
 where they apply; each marker holds a space, which a label always escapes),
 that all data on the disk will be lost, the hostname, user and deployment
-ID prefix, that storage is unencrypted and login automatic (the v1 plan's
-fixed policies), and `ENTER: ERASE AND INSTALL   ESC: CANCEL`. The
+ID prefix, its storage with automatic login (`UNENCRYPTED STORAGE,
+AUTOMATIC LOGIN` or `ENCRYPTED TO THIS COMPUTER, AUTOMATIC LOGIN`, the
+latter device-bound storage; login is the v1 plan's fixed policy), and
+`ENTER: ERASE AND INSTALL   ESC: CANCEL`. The
 widest summary, with its time line, is shown whole on a 1024x768 output; a
 smaller output that cannot hold every row refuses, as for any request. The
 summary is display only and does not bind the installation plan: the
@@ -1679,11 +1682,10 @@ Only private request 19 selects the open review, once; with none, or a busy
 operation slot, it answers 99 00. Selection makes the review's consent
 summary, the disk installation description of "Immutable consent description
 prerequisite", with the review's nonce, the session owner as requester, the
-escaped model and serial and the deployment digest's first eight bytes. A
-review it cannot show (a name consent refuses, or device-bound storage,
-which a service started without the storage operand never reviews and the
-summary has no row for until that tier is activated), or whose operation
-cannot start, is declined as unavailable at once and answers 99 00. Otherwise it
+escaped model and serial, the deployment digest's first eight bytes and
+the review's storage. A review it cannot show (a name consent refuses),
+or whose operation cannot start, is declined as unavailable at once and
+answers 99 00. Otherwise it
 answers 92 DESCRIPTION and holds the slot. Presentation (13), then one
 commit (14) after a fresh physical Enter, within 120 seconds, as for an
 update. Commit sends consent naming the review; Escape before commit sends
@@ -1694,7 +1696,10 @@ answers 94 without sending and the operation fails. After commit only the
 service's reports end the operation: finished-complete completes it, and an
 ended or finished-failed report, or the service retiring, fails it; without
 commit nothing completes it. Closing the screen after commit revokes
-nothing.
+nothing. A device-bound review's completion follows its recovery key typed
+back in td-setup, so the compositor closes the screen by itself after
+commit (td-compositor/DESIGN.md "Physical installation confirmation");
+td-authd still holds the operation until the service reports.
 
 On failed-generation teardown td-authd kills the service and any retired one
 and waits for each, before secret-session cleanup, and removes its socket;

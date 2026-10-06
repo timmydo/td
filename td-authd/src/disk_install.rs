@@ -2,7 +2,7 @@
 //! for each installer, and the one physically confirmed whole-disk
 //! installation (td-authd/DESIGN.md "Whole-disk installation intake").
 
-use crate::consent::{Label, Operation, Request};
+use crate::consent::{Label, Operation, Request, Storage};
 use crate::installation_consent::{self as wire, Answer, NoConsent, Outcome, Report};
 use crate::secret_sys as sys;
 use crate::unlock::Event;
@@ -292,11 +292,6 @@ impl Drop for Service {
 
 /// The consent summary of a review, for `owner`.
 fn summary(review: &wire::Review, owner: u32) -> Result<Request, String> {
-    // The service runs without the storage operand, and the prompt shows
-    // no storage row until the device-bound tier is activated.
-    if review.storage() != wire::Storage::Unencrypted {
-        return Err("a device-bound review is not shown".into());
-    }
     let deployment = review
         .deployment()
         .first_chunk::<8>()
@@ -314,6 +309,10 @@ fn summary(review: &wire::Review, owner: u32) -> Result<Request, String> {
             hostname: review.hostname().into(),
             username: review.username().into(),
             deployment,
+            storage: match review.storage() {
+                wire::Storage::Unencrypted => Storage::Unencrypted,
+                wire::Storage::DeviceBound => Storage::DeviceBound,
+            },
         },
     )
 }

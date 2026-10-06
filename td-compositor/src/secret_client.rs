@@ -24,6 +24,9 @@ const SENDING: u8 = 4;
 
 /// A store operation's or an installation review's attention lifetime.
 const SECRET_LIFETIME: Duration = Duration::from_secs(120);
+/// How long a committed device-bound disk installation's notice stays
+/// before attention closes by itself.
+const RETURN_NOTICE: Duration = Duration::from_secs(4);
 
 /// FIDO's PIN profile (td-login/TOKEN-LOGIN.md, "Token profile"): 4 to 63
 /// printable ASCII bytes, so each byte is one code point.
@@ -567,6 +570,18 @@ impl Attempt {
         }
     }
 
+    /// Closes this attempt's screen through the seat that opened it, as
+    /// Escape would; only a committed installation asks.
+    fn release(&self) -> Result<(), String> {
+        if self.state.load(Ordering::SeqCst) != COMMITTED {
+            return Ok(());
+        }
+        match &self.seat {
+            Some(seat) => seat.release(self),
+            None => Err("no input seat opened this attention".into()),
+        }
+    }
+
     /// Input records cancellation before waiting for painting or channel I/O.
     /// Escape's cancellation zeroes the PIN field too. The mark is one
     /// atomic change of the state `take_pin` moves to `SENDING`, so exactly
@@ -852,6 +867,22 @@ struct Pending {
     receipt: Option<Request>,
     committed: bool,
     cancelled: bool,
+    /// When a committed device-bound installation's notice was shown.
+    returning: Option<Instant>,
+    /// Whether that installation's screen was asked to close.
+    released: bool,
+}
+
+/// A whole-disk installation whose recovery key td-setup shows and takes
+/// back: it completes only after the attention screen has closed.
+fn returns_for_recovery_key(request: &Request) -> bool {
+    matches!(
+        request.operation(),
+        Operation::InstallDisk {
+            storage: crate::authority::consent::Storage::DeviceBound,
+            ..
+        }
+    )
 }
 
 struct Inspection {
@@ -1173,6 +1204,8 @@ impl Client {
             receipt: None,
             committed: false,
             cancelled: false,
+            returning: None,
+            released: false,
         });
         Ok(())
     }
@@ -1214,6 +1247,28 @@ impl Client {
             pending.request = description;
         }
         match status {
+            // Committed, a device-bound installation waits for its key in
+            // td-setup: say so, then close the screen by itself.
+            3 if pending.committed
+                && !pending.released
+                && pending.attempt.selection == Selection::Install
+                && returns_for_recovery_key(&pending.request) =>
+            {
+                match pending.returning {
+                    None => {
+                        pending.attempt.notice(Notice::Returning)?;
+                        pending.returning = Some(Instant::now());
+                    }
+                    Some(shown) if shown.elapsed() >= RETURN_NOTICE => {
+                        pending.released = true;
+                        // A screen left open still closes with Escape.
+                        if let Err(error) = pending.attempt.release() {
+                            eprintln!("td-compositor: close attention after consent: {error}");
+                        }
+                    }
+                    Some(_) => (),
+                }
+            }
             3 => (),
             4 if pending.receipt.is_none() && !pending.committed && !pending.cancelled => {
                 match pending.attempt.present(pending.request.clone()) {
@@ -1734,6 +1789,7 @@ mod tests {
                     hostname: "td".into(),
                     username: "alice".into(),
                     deployment: [0xab; 8],
+                    storage: crate::authority::consent::Storage::DeviceBound,
                 },
             )
             .unwrap()
@@ -1819,6 +1875,117 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn disk(storage: crate::authority::consent::Storage) -> Request {
+        Request::new(
+            [42; 32],
+            1000,
+            Operation::InstallDisk {
+                requester: 1000,
+                disk: "vda".into(),
+                capacity: 8 << 30,
+                model: None,
+                serial: None,
+                hostname: "td".into(),
+                username: "alice".into(),
+                deployment: [0xab; 8],
+                storage,
+            },
+        )
+        .unwrap()
+    }
+
+    /// A committed device-bound disk installation shows the returning
+    /// notice on the first status after commit and, once it has stood
+    /// `RETURN_NOTICE`, asks the seat to close the screen, once; an
+    /// unencrypted one keeps its prompt until the installed notice.
+    #[test]
+    fn a_committed_device_bound_installation_says_so_then_closes_attention() {
+        use crate::authority::consent::Storage;
+        for storage in [Storage::DeviceBound, Storage::Unencrypted] {
+            let request = disk(storage);
+            let tagged = |tag: &[u8]| [tag, request.encode().as_slice()].concat();
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+            let mut wire = wire(vec![
+                tagged(&[0x92]),
+                tagged(&[0x91, 4]),
+                vec![0x93],
+                tagged(&[0x91, 5]),
+                vec![0x94],
+                tagged(&[0x91, 3]),
+                tagged(&[0x91, 3]),
+                tagged(&[0x91, 3]),
+                tagged(&[0x91, 3]),
+            ]);
+            let mut client = Client::default();
+            client
+                .start(&mut wire, Arc::clone(&screen.attempt))
+                .unwrap();
+            client.tick(&mut wire).unwrap();
+            let completed = screen
+                .attempt
+                .presentation
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .1;
+            screen
+                .attempt
+                .confirm_install(&crate::input::test_origin(), completed + 1)
+                .unwrap();
+            client.tick(&mut wire).unwrap();
+            assert!(client.pending.as_ref().unwrap().committed);
+            let prompt = std::fs::read(&screen.path).unwrap();
+            client.tick(&mut wire).unwrap();
+            let pending = client.pending.as_ref().unwrap();
+            let bound = storage == Storage::DeviceBound;
+            assert_eq!(pending.returning.is_some(), bound);
+            // The notice replaced the prompt only for device-bound storage.
+            assert_eq!(std::fs::read(&screen.path).unwrap() != prompt, bound);
+            client.tick(&mut wire).unwrap();
+            assert!(!client.pending.as_ref().unwrap().released);
+            if let Some(shown) = client.pending.as_mut().unwrap().returning.as_mut() {
+                *shown = Instant::now().checked_sub(RETURN_NOTICE).unwrap();
+            }
+            client.tick(&mut wire).unwrap();
+            assert_eq!(client.pending.as_ref().unwrap().released, bound);
+            // Asked once: a later status leaves it.
+            client.tick(&mut wire).unwrap();
+            assert_eq!(client.pending.as_ref().unwrap().released, bound);
+            assert!(wire.replies.is_empty());
+        }
+    }
+
+    /// Escape before the commit still declines: no notice, no release, and
+    /// the cancellation goes to root.
+    #[test]
+    fn escape_before_commit_still_declines_a_device_bound_installation() {
+        let request = disk(crate::authority::consent::Storage::DeviceBound);
+        let tagged = |tag: &[u8]| [tag, request.encode().as_slice()].concat();
+        let mut screen = Screen::new();
+        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+        let mut wire = wire(vec![
+            tagged(&[0x92]),
+            tagged(&[0x91, 4]),
+            vec![0x93],
+            vec![0x95, 0],
+            tagged(&[0x91, 3]),
+        ]);
+        let mut client = Client::default();
+        client
+            .start(&mut wire, Arc::clone(&screen.attempt))
+            .unwrap();
+        client.tick(&mut wire).unwrap();
+        screen.attempt.cancel();
+        client.tick(&mut wire).unwrap();
+        let pending = client.pending.as_ref().unwrap();
+        assert!(pending.cancelled && !pending.committed);
+        assert!(pending.returning.is_none() && !pending.released);
+        assert!(!wire.calls.iter().any(|call| call.first() == Some(&0x14)));
+        assert!(wire.calls.iter().any(|call| call.first() == Some(&0x15)));
     }
 
     #[test]

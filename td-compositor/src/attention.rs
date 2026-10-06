@@ -14,6 +14,9 @@ pub(crate) enum Notice {
     /// (td-authd/DESIGN.md, amendment 8).
     UpdateRefused,
     Installed,
+    /// A committed device-bound disk installation, before its recovery key:
+    /// the screen then closes by itself (secret_client).
+    Returning,
     Enrolled,
     Unenrolled,
     Unavailable,
@@ -329,9 +332,14 @@ fn ink(font: &crate::font::Font, text: &str, scale: usize) -> Result<Vec<(usize,
     Ok(ink)
 }
 
+/// What a committed device-bound disk installation shows before attention
+/// closes by itself: its recovery key is shown and typed back in td-setup.
+pub(crate) const RETURNING_NOTICE: &str = "INSTALLING - RETURNING TO SETUP FOR THE RECOVERY KEY";
+
 /// Display-only pixels: ordinary scene rendering never calls this painter.
 /// A lifetime that left the lock surface keeps its success notice while
-/// held input drains: that drain cancels nothing.
+/// held input drains: that drain cancels nothing. Nor does the close after
+/// a committed device-bound installation's returning notice.
 pub(crate) fn paint(
     frame: &mut [u8],
     width: usize,
@@ -345,7 +353,7 @@ pub(crate) fn paint(
     ui::fill(frame, width, height, stride, bounds, [0x28, 0x20, 0x18, 0]);
     let (scale, columns) = layout(width, height);
     let mut rows = vec![String::from("TD SECURE ATTENTION")];
-    if draining && !unlocked {
+    if draining && !unlocked && notice != Notice::Returning {
         rows.push("CANCELLING REQUEST".into());
     } else {
         rows.extend(notice_rows(notice));
@@ -511,6 +519,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::NoInstall => "NO INSTALLATION IS READY TO REVIEW",
         Notice::UpdateRefused => "UPDATE CANNOT READ LOGIN KEYS",
         Notice::Installed => "SYSTEM INSTALLED - RESTART TO BOOT IT",
+        Notice::Returning => RETURNING_NOTICE,
         Notice::Stored => "CREDENTIAL STORED",
         Notice::NoWrite => "NO READY CREDENTIAL WRITE - RUN TD-SECRET SET FIRST",
         Notice::Unlocked => "SECRETS UNLOCKED",
@@ -609,7 +618,9 @@ mod tests {
     /// hold it refuse rather than clip.
     #[test]
     fn the_widest_disk_installation_prompt_fits_a_1024_by_768_output() {
-        use crate::authority::consent::{Label, DISK_NAME_BYTES, HOSTNAME_BYTES, USERNAME_BYTES};
+        use crate::authority::consent::{
+            Label, Storage, DISK_NAME_BYTES, HOSTNAME_BYTES, USERNAME_BYTES,
+        };
         let widest = Request::new(
             [1; 32],
             1000,
@@ -622,6 +633,7 @@ mod tests {
                 hostname: "h".repeat(HOSTNAME_BYTES),
                 username: "u".repeat(USERNAME_BYTES),
                 deployment: [0xff; 8],
+                storage: Storage::DeviceBound,
             },
         )
         .unwrap();
@@ -644,10 +656,43 @@ mod tests {
                 hostname: "td-laptop".into(),
                 username: "tester".into(),
                 deployment: [0xab; 8],
+                storage: Storage::Unencrypted,
             },
         )
         .unwrap();
         assert!(Prepared::with_time(typical, 800, 600, 3200, Some(120)).is_ok());
+    }
+
+    /// The returning notice is drawn whole at a 1280-wide output, and is
+    /// what the screen says while it closes, never a cancellation.
+    #[test]
+    fn the_returning_notice_is_whole_and_never_says_cancelling() {
+        let font = crate::font::pinned().unwrap();
+        assert!(RETURNING_NOTICE.chars().all(|c| font.covers(c)));
+        assert!(24 + RETURNING_NOTICE.len() * font.width() * 2 <= 1280);
+        assert_eq!(
+            notice_rows(Notice::Returning),
+            vec![String::from(RETURNING_NOTICE)]
+        );
+        let painted = |draining: bool, notice: Notice| {
+            let mut frame = vec![0; 1280 * 800 * 4];
+            paint(&mut frame, 1280, 800, 1280 * 4, draining, false, notice);
+            frame
+        };
+        assert_ne!(
+            painted(false, Notice::Returning),
+            painted(false, Notice::Installed)
+        );
+        // Every other notice says CANCELLING REQUEST while draining; the
+        // returning notice stays.
+        assert_eq!(
+            painted(true, Notice::Installed),
+            painted(true, Notice::Menu)
+        );
+        assert_ne!(
+            painted(true, Notice::Returning),
+            painted(true, Notice::Menu)
+        );
     }
 
     /// Consent keeps every login row within `PROMPT_COLUMNS`, this renderer's
@@ -821,7 +866,7 @@ mod tests {
             [0x28, 0x20, 0x18, 0],
         );
         let mut rows = vec![String::from("TD SECURE ATTENTION")];
-        if draining {
+        if draining && notice != Notice::Returning {
             rows.push("CANCELLING REQUEST".into());
         } else {
             rows.extend(notice_rows(notice));
@@ -877,6 +922,11 @@ mod tests {
         ] {
             for draining in [false, true] {
                 for notice in SCREENS {
+                    // Newer than HEAD's painter, which clipped it where it
+                    // is now wrapped; where it fits one row it is the same.
+                    if *notice == Notice::Returning && width < 24 + RETURNING_NOTICE.len() * 16 {
+                        continue;
+                    }
                     let stride = width * 4;
                     let mut frame = vec![0; stride * height];
                     paint(&mut frame, width, height, stride, draining, false, *notice);
@@ -904,6 +954,7 @@ mod tests {
         Notice::NoInstall,
         Notice::UpdateRefused,
         Notice::Installed,
+        Notice::Returning,
         Notice::Enrolled,
         Notice::Unenrolled,
         Notice::Unavailable,

@@ -36,6 +36,7 @@ pub(crate) mod guest_screens;
 pub(crate) mod install;
 pub(crate) mod live;
 pub(crate) mod media;
+pub(crate) mod recovery_screen;
 pub(crate) mod secret;
 pub(crate) mod serial_shell;
 pub(crate) mod setup_input;
@@ -689,6 +690,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             cut: false,
             keep_console: None,
             screens: None,
+            devices: Devices::ALL,
             screen: None,
             shell: None,
         },
@@ -750,6 +752,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
             cut: false,
             keep_console: None,
             screens: None,
+            devices: Devices::ALL,
             screen: None,
             shell: None,
         },
@@ -891,6 +894,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             cut: false,
             keep_console: None,
             screens: None,
+            devices: Devices::ALL,
             screen: None,
             shell: None,
         },
@@ -1485,6 +1489,7 @@ fn boot_system_once(
             cut: false,
             keep_console: None,
             screens: None,
+            devices: Devices::ALL,
             screen: None,
             shell: None,
         },
@@ -1527,6 +1532,7 @@ fn boot_failed_target_once(
             cut: false,
             keep_console: None,
             screens: None,
+            devices: Devices::ALL,
             screen: None,
             shell: None,
         },
@@ -2751,6 +2757,7 @@ pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
             cut: false,
             keep_console: None,
             screens: None,
+            devices: Devices::ALL,
             screen: None,
             shell: None,
         },
@@ -2842,6 +2849,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             cut: false,
             keep_console: None,
             screens: None,
+            devices: Devices::ALL,
             screen: None,
             shell: None,
         },
@@ -2992,6 +3000,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
             cut: false,
             keep_console: None,
             screens: None,
+            devices: Devices::ALL,
             screen: None,
             shell: None,
         },
@@ -4573,6 +4582,26 @@ struct BootPlan<'a> {
     /// Display checks the guest asks for on its console and waits for on
     /// ttyS0 (`guest_screens`); a boot that ends before the last fails.
     screens: Option<&'a guest_screens::GuestScreens<'a>>,
+    /// The display device and keyboard the machine has.
+    devices: Devices,
+}
+
+/// The display device and keyboard a boot attaches: virtio-vga, and q35's
+/// i8042 PS/2 controller with its keyboard. Without the display no other
+/// display device is attached either (QEMU's default VGA would give
+/// firmware a GOP); without the keyboard the q35 machine has `i8042=off`
+/// and no USB or virtio keyboard is attached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Devices {
+    display: bool,
+    keyboard: bool,
+}
+
+impl Devices {
+    const ALL: Self = Self {
+        display: true,
+        keyboard: true,
+    };
 }
 
 /// A capture the display must come to show: what it is, and the check of
@@ -4977,6 +5006,21 @@ fn boot_source(
             "guest screens cannot share QMP or the serial console with another controller".into(),
         );
     }
+    // Answers typed on the VT go through QMP's keyboard, and nothing is
+    // typed on the serial line, which is then a plain file.
+    let vt_answers = plan
+        .answers
+        .is_some_and(|answers| answers.line == serial_shell::AnswerLine::Vt);
+    if vt_answers && (input || plan.screen.is_some() || !plan.devices.keyboard) {
+        return Err("answers on the VT need the keyboard and QMP to themselves".into());
+    }
+    let serial_answers = plan.answers.is_some() && !vt_answers;
+    if !plan.devices.display && (plan.screen.is_some() || plan.screens.is_some()) {
+        return Err("a screen expectation needs the display device".into());
+    }
+    if !plan.devices.keyboard && (input || plan.physical_input) {
+        return Err("physical input needs the keyboard".into());
+    }
     let qmp_scratch = if input
         || plan.screen.is_some()
         || plan.shell.is_some()
@@ -4991,11 +5035,11 @@ fn boot_source(
     };
     let qmp_path = qmp_scratch
         .as_ref()
-        .filter(|_| input || plan.screen.is_some() || plan.screens.is_some())
+        .filter(|_| input || plan.screen.is_some() || vt_answers || plan.screens.is_some())
         .map(|scratch| scratch.dir.join("qmp.sock"));
     let serial_path = qmp_scratch
         .as_ref()
-        .filter(|_| plan.shell.is_some() || plan.answers.is_some() || plan.screens.is_some())
+        .filter(|_| plan.shell.is_some() || serial_answers || plan.screens.is_some())
         .map(|scratch| scratch.dir.join("tty.sock"));
     // Every non-audit oracle disables audit initialization explicitly. Merely
     // leaving the kernel's audit state off still permits unconditional seccomp
@@ -5020,7 +5064,15 @@ fn boot_source(
         source,
         BootSource::Firmware { .. } | BootSource::LiveSetup { .. }
     );
-    cmd.args(["-M", if q35 { "q35" } else { "pc" }]);
+    cmd.args([
+        "-M",
+        match (q35, plan.devices.keyboard) {
+            (true, true) => "q35",
+            (true, false) => "q35,i8042=off",
+            (false, true) => "pc",
+            (false, false) => return Err("only a q35 boot can leave out the keyboard".into()),
+        },
+    ]);
     for name in accel.names {
         let arg = if q35 {
             crate::checks::accel::q35_accel_arg(name)
@@ -5034,8 +5086,10 @@ fn boot_source(
     cmd.args(["-cpu", "Nehalem", "-m", plan.mem, "-no-reboot"])
         .args(["-display", "none", "-monitor", "none"])
         .args(["-no-user-config", "-vga", "none"])
-        .args(["-device", "virtio-vga"])
         .args(["-device", "virtio-tablet-pci"]);
+    if plan.devices.display {
+        cmd.args(["-device", "virtio-vga"]);
+    }
     match &serial_path {
         // A socket the oracle types into, QEMU waiting for it so no console
         // byte is sent before, and logging ttyS0 to the same console file.
@@ -5259,6 +5313,7 @@ fn boot_source(
         .screens
         .zip(qmp_path.clone())
         .map(|(steps, path)| guest_screens::ScreenSteps::new(steps, path, CAP));
+    let mut vt_typist = qmp_path.clone().filter(|_| vt_answers).map(VtTypist::new);
     let mut setup_input = match (source, qmp_path) {
         (BootSource::LiveSetup { script, .. }, Some(path)) => {
             let capture = path.with_file_name("attention.ppm");
@@ -5328,7 +5383,9 @@ fn boot_source(
                     let _ = child.wait();
                     let console = String::from_utf8_lossy(&buf);
                     return Err(format!(
-                        "drive the installer wizard: {error}. Last serial output:\n{}",
+                        "drive the installer wizard: {error}. Last compositor and setup \
+                         markers:\n{}\nLast serial output:\n{}",
+                        setup_input::markers(&console),
                         tail(&console, 80)
                     ));
                 }
@@ -5356,16 +5413,24 @@ fn boot_source(
                 ));
             }
         }
-        if let (Some(responder), Some(port)) = (responder.as_mut(), serial_port.as_mut()) {
-            if let Err(error) = responder.poll(port, &buf) {
-                let _ = child.kill();
-                let _ = child.wait();
-                let console = String::from_utf8_lossy(&buf);
-                return Err(format!(
-                    "{error}. Last serial output:\n{}",
-                    tail(&console, 80)
-                ));
+        // On the VT when the plan says so, else on the serial line.
+        let answered = match (responder.as_mut(), vt_typist.as_mut(), serial_port.as_mut()) {
+            (Some(responder), Some(typist), _) => {
+                responder.poll(&mut |reply| typist.type_line(reply), &buf)
             }
+            (Some(responder), None, Some(port)) => {
+                responder.poll(&mut |reply| port.answer(reply), &buf)
+            }
+            _ => Ok(()),
+        };
+        if let Err(error) = answered {
+            let _ = child.kill();
+            let _ = child.wait();
+            let console = String::from_utf8_lossy(&buf);
+            return Err(format!(
+                "{error}. Last serial output:\n{}",
+                tail(&console, 80)
+            ));
         }
         if let (Some(steps), Some(port)) = (screens.as_mut(), serial_port.as_mut()) {
             if let Err(error) = steps.poll(port, &buf) {
@@ -8088,6 +8153,47 @@ fn download_is_armed(phase: PhysicalInputPhase, evidence: &ConsoleEvidence) -> b
         PhysicalInputPhase::FirefoxPaste | PhysicalInputPhase::FirefoxPasteRetried
     ) && evidence.td_firefox_clipboard
         && evidence.td_firefox_download_armed
+}
+
+/// Types console answers on the guest's VT through QMP key events to its
+/// PS/2 keyboard, one key at a time, `VT_KEY_PACE` apart so that the
+/// controller's small queue never overflows.
+struct VtTypist {
+    path: PathBuf,
+    qmp: Option<Qmp>,
+}
+
+/// The gap after each key a `VtTypist` or the wizard's key entry presses.
+const VT_KEY_PACE: Duration = Duration::from_millis(50);
+
+impl VtTypist {
+    fn new(path: PathBuf) -> Self {
+        Self { path, qmp: None }
+    }
+
+    /// `line`'s keys and then Return.
+    fn type_line(&mut self, line: &[u8]) -> Result<(), String> {
+        let keys = line
+            .iter()
+            .map(|byte| setup_input::console_key(*byte))
+            .collect::<Option<Vec<_>>>()
+            .ok_or("an answer escapes the VT's typed set")?;
+        if self.qmp.is_none() {
+            self.qmp = Some(Qmp::connect_until(
+                &self.path,
+                qmp_deadline(QMP_IO_TIMEOUT)?,
+            )?);
+        }
+        let qmp = self
+            .qmp
+            .as_mut()
+            .ok_or("QMP disappeared before the VT's answer")?;
+        for key in keys.into_iter().chain(["ret"]) {
+            qmp.press_until(key, qmp_deadline(QMP_IO_TIMEOUT)?)?;
+            thread::sleep(VT_KEY_PACE);
+        }
+        Ok(())
+    }
 }
 
 struct Qmp {
@@ -13110,6 +13216,7 @@ mod tests {
             cut: false,
             keep_console: None,
             screens: None,
+            devices: Devices::ALL,
             screen: None,
             shell: None,
         };
@@ -13170,6 +13277,7 @@ mod tests {
         let answers = serial_shell::ConsoleAnswers {
             answers: &[],
             refusal: "never",
+            line: serial_shell::AnswerLine::Serial,
         };
         let kernel = Path::new("/nonexistent/bzImage");
         for other in ["screen", "shell", "answers", "input"] {
@@ -13189,6 +13297,7 @@ mod tests {
                 cut: false,
                 keep_console: None,
                 screens: Some(&steps),
+                devices: Devices::ALL,
                 screen: (other == "screen").then_some(ScreenExpect {
                     what: "anything",
                     check: &check,

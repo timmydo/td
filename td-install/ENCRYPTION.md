@@ -10,9 +10,13 @@ at boot and binds it to this machine's TPM and boot chain. The
 and authenticated login. A device-bound volume upgrades to the protected
 tier by replacing protectors and its volume key, never by reinstalling.
 
-The current image remains unencrypted and auto-logs in. No increment may
-describe enrollment, disk confidentiality, or protected login as shipped
-until its complete boot and recovery path passes the acceptance tests below.
+The live installer installs device-bound storage on a machine with a
+usable TPM 2.0 and a keyboard console, and unencrypted storage otherwise
+("Activation"); the installed account logs in automatically either way.
+Device binding protects a disk read away from its machine, not a lost
+one. No increment may describe enrollment, disk confidentiality beyond
+that, or protected login as shipped until its complete boot and recovery
+path passes the acceptance tests below.
 The planned TPM-free login-key tier in
 [td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md) is an authentication
 tier over either storage state, not a third storage tier: it replaces
@@ -135,12 +139,11 @@ When the cap runs, it closes release until the next platform reset on
 every later path, including refusal, recovery and `kexec`. No other td
 component extends PCR 12. The installed selector caps PCR 12 when its
 volume is encrypted; on an unencrypted volume it makes no TPM contact,
-and increment 7's activation ("Activation") leaves that unchanged, so
-the residual below for a not-yet-booted disk's first-boot protector
-stays. The live selector's cap is MEDIA.md's
-("Live boot"): it caps whenever a TPM device is present, proceeds when
-PCR 12 is already closed or the TPM has no SHA-256 bank, and skips the
-cap without a device.
+which increment 7's activation ("Activation") left unchanged, so the
+residual below for a not-yet-booted disk's first-boot protector stays.
+The live selector's cap is MEDIA.md's ("Live boot"): it caps whenever a
+TPM device is present, proceeds when PCR 12 is already closed or the TPM
+has no SHA-256 bank, and skips the cap without a device.
 
 Without a TPM device (`/dev/tpmrm0` absent) nothing can release or be
 capped. An installed selector booting a td LUKS2 volume waits for the
@@ -268,13 +271,10 @@ Without a usable TPM 2.0, the installer offers no device-bound volume and no
 passphrase substitute. A usable TPM has a SHA-256 PCR bank, and the live
 boot shows PCR 4 and PCR 9 measured. The review discloses that storage will
 be unencrypted, and installation proceeds only under that disclosed plan.
-Before activation, the service started with the device-bound operand
-probes for a usable TPM and refuses to start without one; it never falls
-back to an unencrypted volume. The default wizard's unencrypted disclosure
-changes only at activation (increment 7). There the operand is gone and
-the service chooses for itself: device-bound only when this probe passes
-and the live system shows a keyboard console, unencrypted with the
-disclosure otherwise, and it refuses neither ("Activation").
+The service chooses for itself, with no operand: device-bound only when
+this probe passes and the live system shows a keyboard console,
+unencrypted with the disclosure otherwise, and it refuses neither
+("Activation").
 
 Upgrading to the protected tier enrolls and verifies its protectors, then
 re-encrypts the volume online to a fresh volume key, keeping only those
@@ -288,15 +288,12 @@ integrity before the upgrade.
 
 ## Device-bound formatting
 
-Increment 5 formats device-bound volumes without activating them. Until
-increment 7, `td-install serve` formats one only when its caller passes the
-control-plane storage operand (INSTALLER.md "Installation service core").
-td-authd never passes it; the encrypted-installation oracle does. No
-review, wizard page or request selects it: storage policy is not a
-caller-selectable flag. The default installation stays unencrypted, and no
-text may describe disk confidentiality as shipped. Increment 7 deletes the
-operand in the landing that makes the tier the default, when `td-install
-serve` starts choosing storage from its own probes ("Activation").
+Increment 5 formats device-bound volumes, and increment 7 makes them the
+default: `td-install serve` formats one exactly when its plan names
+device-bound storage, which follows its own probes ("Activation"). No
+review, wizard page, request or operand selects it: storage policy is not
+a caller-selectable flag. Increment 7 deleted the storage operand that
+reached this path before it.
 
 The volume is formatted with exactly these parameters, the device being a
 loop over the volume's extent (DESIGN.md "Device-bound formatting"):
@@ -495,8 +492,8 @@ release its protector instead. The recovery key, its passphrase text,
 each entry and the new protector's secret are zeroed when dropped, on
 every path.
 
-Before activation the default unencrypted boot is behaviour-identical,
-not byte-identical: cryptsetup enters both initramfs and the boot
+An unencrypted volume's boot is behaviour-identical to one before this
+tier, not byte-identical: cryptsetup enters both initramfs and the boot
 binaries change, but an unencrypted volume's boot makes no TPM contact
 and takes the same steps, beyond `mount-root`'s removal of a key member
 and an `initrd.image` that are not there. On a machine with a TPM, the
@@ -504,10 +501,9 @@ live selector's cap is the one change a live boot shows.
 
 ## Keyboard console
 
-This section is increment 7's target, and current: it gives the
-selector's recovery flow a screen and keyboard beside the serial line,
-which stays. What the installer does with it is "Activation", whose
-probes are current and whose activation is not yet implemented.
+This section is increment 7's, and current: it gives the selector's
+recovery flow a screen and keyboard beside the serial line, which stays.
+What the installer does with it is "Activation", also current.
 
 The built-in command line (DESIGN.md "Full-system volume consumers")
 names `console=tty0` before `console=ttyS0,115200`. Linux writes its
@@ -726,24 +722,18 @@ contact and takes the same steps.
 
 ## Activation
 
-This section is increment 7's target. The two probes and their record
-are current: `td-install serve` runs both at every start and records
-them in every plan, and the review shows them (INSTALLER.md "Storage
-choice"), but nothing acts on them. Until the activation commit lands,
-storage follows the storage operand ("Device-bound formatting"), and a
-device-bound service still refuses to start without a usable TPM.
+This section is increment 7's, and current.
 
-At activation `serve` takes no storage operand. Once its admission
-checks pass and before its greeting, it runs two probes, each once, and
-records both outcomes in every plan (INSTALLER.md "Storage choice"):
+`serve` takes no storage operand. Once its admission checks pass and
+before its greeting, it runs two probes, each once, and records both
+outcomes in every plan (INSTALLER.md "Storage choice"):
 
-- the TPM probe as today: PCR_Read of PCRs 4 and 9 in the SHA-256 bank
-  answers that bank, and neither value is zero. It now records rather
-  than refuses, and runs under a 3-second deadline, so that a slow TPM
-  cannot outlast the installer's ten-second greeting wait: a read still
-  unanswered then is abandoned and recorded as not passed. (Before
-  activation the deadline applies to a service without the operand; a
-  device-bound service waits for the read and refuses on its failure.)
+- the TPM probe: PCR_Read of PCRs 4 and 9 in the SHA-256 bank answers
+  that bank, and neither value is zero. It records rather than refuses,
+  and runs under a 3-second deadline, so that a slow TPM cannot outlast
+  the installer's ten-second greeting wait: a read still unanswered then
+  is abandoned and recorded as not passed, and that service makes no
+  further TPM use, since its plans are unencrypted.
 - the keyboard-console probe of the running live system, through sysfs:
   some `/sys/class/vtconsole/vtcon*` whose `name` reads exactly
   `(M) frame buffer device` and a newline and whose `bind` reads `1` and
@@ -794,8 +784,8 @@ token's one-time-password interface, a wireless receiver with no
 keyboard paired or a barcode scanner, passes it, and the disclosed
 limit then applies.
 
-Automatic login remains and stays disclosed, and td-authd still never
-passes an operand: there is none. What remains deferred is hardware the
+Automatic login remains and stays disclosed, and td-authd passes no
+storage operand: there is none. What remains deferred is hardware the
 probe refuses and so installs unencrypted: a display with neither a UEFI
 GOP framebuffer simple-framebuffer can describe nor a td driver, and a
 keyboard td's kernel has no driver for (USB keyboards on ports served by
@@ -1051,8 +1041,9 @@ same-uid process may impersonate the trusted UI or approve a request.
    measurement runs over the same client; the LUKS2 token format is
    increments 5 and 6.
 5. Add installer formatting, the first-boot protector, the recovery key,
-   the no-TPM refusal and crash-safe enrollment, reachable only through the
-   service's storage operand ("Device-bound formatting"); preserve
+   the no-TPM refusal and crash-safe enrollment, reachable then only
+   through the service's storage operand, which increment 7 deleted
+   ("Device-bound formatting"); preserve
    file-image testing and the single deployment publisher. The encrypted
    path keeps no plaintext scratch image, accounts for header and
    re-encryption space, and identifies backing devices without `/dev/vda`
@@ -1124,7 +1115,8 @@ qemu-install-encrypted --tpm /absolute/path/to/swtpm`, is separate from
 the integration tier. Like `qemu-secret-system` it needs an explicit
 swtpm path (td-secret/DESIGN.md "TPM validation" says which builds
 serve); without one it is an unprovisioned host gap, not a usage error.
-Its guest drives the service with the device-bound operand onto a
+Its guest drives the service, with the swtpm, a display device and the
+PS/2 keyboard attached so that its plans are device-bound, onto a
 disposable disk whose two table ranges hold a valid GPT the host seeded,
 as both of its peers: it fetches the recovery key once, requires a
 second ask refused as sent and a mistyped type-back refused as a
@@ -1147,22 +1139,23 @@ in the opened volume's plaintext, on the console or in any
 no workspace. The protector secret never leaves td-install, so the
 oracle cannot look for it; it requires instead that every sampled
 cryptsetup command line is exactly one of td-install's documented
-argument lists, that its environment is empty, and that `luksFormat`
-and `luksAddKey` were among those sampled, the two invocations the host
-requires to have been seen. Sampling may still miss a short-lived process, so it is not
-proof that no other process carried a secret. It derives the
-destination's partition devices from the kernel's block inventory,
-never from `/dev/vda` literals. A no-TPM leg requires the operand's
-refusal with the disk unchanged, and a leg cut off in the recovery-key
-phase leaves both table ranges zero. The installed system is not booted:
-its release is increment 6's oracle.
+argument lists, that its environment is empty, and that `luksFormat` and
+`luksAddKey` were among those sampled, the two invocations the host
+requires to have been seen. Sampling may still miss a short-lived
+process, so it is not proof that no other process carried a secret. It
+derives the destination's partition devices from the kernel's block
+inventory, never from `/dev/vda` literals. A leg cut off in the
+recovery-key phase leaves both table ranges zero; increment 7's legs
+follow below. The installed system is not booted: its release is
+increment 6's oracle.
 
 Increment 6's oracle, `td-recipe-eval qemu-boot-encrypted --tpm
-/absolute/path/to/swtpm`, is likewise outside the integration tier and an
-unprovisioned host gap without `--tpm`. Its legs are the device-bound
-requirements above, except the no-TPM disclosure, which changes only at
-activation; `qemu-boot-live`, which attaches no TPM, keeps proving the
-live selector's skip. A fresh swtpm state stands in for a cleared or
+/absolute/path/to/swtpm`, is likewise outside the integration tier and
+an unprovisioned host gap without `--tpm`. Its legs are the device-bound
+requirements above, except the no-TPM disclosure, which `qemu-boot-live`
+proves by installing (`qemu-install-encrypted`'s no-TPM leg reviews and
+withdraws); `qemu-boot-live`, which attaches no TPM, also keeps proving
+the live selector's skip. A fresh swtpm state stands in for a cleared or
 different TPM: a cleared TPM's new storage primary seed has the same
 effect on these policies, since no protector sealed under the old
 primary loads. There is no test-only selector build: the oracle boots
@@ -1289,37 +1282,52 @@ key appears in argv.
 
 Increment 7's evidence ("Keyboard console", "Activation") extends both
 oracles. `qemu-boot-live`, which attaches no TPM, keeps proving the live
-selector's skip, and from activation its review must name unencrypted
-storage for want of a TPM. td-init's tests drive the two-line order
-through scripted lines (the first to complete is read, a partial entry
-on the other is discarded, a skipped line, no line, end of input on
-either, a line whose prompt write would block or is short finished on
-`POLLOUT` while the other reads, a hard write error dropping a line,
-one terminal under two names saved and restored once), and the
-keyboard-console probe's tests run over fixture sysfs trees (a bound and
-an unbound fbcon, a dummy console alone, key bitmaps with and without
-each needed bit, interior zero words, over-long and malformed
-attributes).
+selector's skip, and its review must name unencrypted storage for want
+of a TPM, with the keyboard console found (`disclosure=no-tpm`); its
+consent prompt must show exactly `UNENCRYPTED STORAGE, AUTOMATIC LOGIN`
+among its rows, and it installs and boots. It is the evidence that a
+machine without a TPM installs unencrypted with that disclosure in the
+plan consented to; `qemu-install-encrypted`'s no-TPM leg only reviews
+and withdraws. td-init's tests drive the two-line order through scripted
+lines (the first to complete is read, a partial entry on the other is
+discarded, a skipped line, no line, end of input on either, a line whose
+prompt write would block or is short finished on `POLLOUT` while the
+other reads, a hard write error dropping a line, one terminal under two
+names saved and restored once), and the keyboard-console probe's tests
+run over fixture sysfs trees (a bound and an unbound fbcon, a dummy
+console alone, key bitmaps with and without each needed bit, interior
+zero words, over-long and malformed attributes).
 
 - **Default wizard.** `qemu-boot-encrypted` gains a leg that boots the
   production live medium over USB with the swtpm, a display device and
   the PS/2 keyboard attached, and drives td-setup with physical keys as
-  `qemu-boot-live` does. The review must name device-bound storage with
-  its disclosures, td-authd's consent summary the same storage, and the
-  completion page must show the key. The host learns the key only from
-  that page's pixels, by QMP `screendump`, never from a console or an
-  evidence line. Its reference glyphs are the ten digits drawn by
-  td-ui's own rasterizer (`Face` over the `jetbrains-mono-nerd-font`
-  recipe's face, in the style and cell size the page draws the key in),
-  as `qemu-boot-live` already draws the status bar's expected text
-  (`update::BarText`); each digit cell must match exactly one of them.
-  It types the key back with physical keys. A misread fails closed: a
-  cell matching no digit, or more than one, fails the leg before
-  anything is typed, and a wrong digit is refused by td-setup's group
-  check or by the service as 17, recovery key mismatch, so the leg fails
-  and the installation never completes on a misread key. The installed
-  disk then boots through firmware twice with nothing typed, as "First
-  boot" and "Second boot" require.
+  `qemu-boot-live` does. The review must name device-bound storage, its
+  evidence line the disclosure set its page shows
+  (`disclosure=device-bound`; td-setup's review tests pin each set's
+  text), and td-authd's consent summary the same storage. It first opens
+  the prompt and presses Escape on it with the target unwritten, and
+  requires the screen closed and td-setup back at its settings with the
+  target still unwritten: Escape before commit declines. It then reviews
+  again and consents, and after Enter presses nothing: the compositor's
+  returning notice must show in the attention screen's notice row, pixel
+  for pixel, with no installed notice before it, and the screen must
+  then close by itself within 30 seconds (td-compositor/DESIGN.md
+  "Physical installation confirmation"). The completion page must then
+  show the key. The host learns the key only from that page's pixels, by
+  QMP `screendump`, never from a console or an evidence line. Its
+  reference glyphs are the ten digits drawn by td-ui's own rasterizer
+  (`Face` over the `jetbrains-mono-nerd-font` recipe's face, in the
+  style and cell size the page draws the key in), as `qemu-boot-live`
+  already draws the status bar's expected text (`update::BarText`); each
+  digit cell must match exactly one of them, the row found by its seven
+  hyphen cells at either scale td-setup may draw. It types the key back
+  with physical keys. A misread fails closed: a cell matching no digit,
+  or more than one, fails the leg before anything is typed, and a wrong
+  digit is refused by td-setup's group check or by the service as 17,
+  recovery key mismatch, so the leg fails and the installation never
+  completes on a misread key. The installed disk then boots through
+  firmware twice with nothing typed, as "First boot" and "Second boot"
+  require.
 - **Storage choice without the operand.** `qemu-install-encrypted`'s
   guest drives the service with no operand. With the swtpm and a display
   device attached its plans are device-bound and its legs run as above.
@@ -1331,7 +1339,12 @@ attributes).
   so that no framebuffer console binds, and one with a display device
   but no keyboard, its
   machine `q35,i8042=off` (which the host QEMU 10.2.1 accepts) with no
-  USB or virtio keyboard attached.
+  USB or virtio keyboard attached. The guest records every review's
+  storage and probe findings on the console, and the host requires
+  exactly the expected one; it then reads an unencrypted leg's image
+  itself: the installer's GPT, and a Btrfs volume with the reviewed
+  identity and no LUKS2 header. The no-TPM leg withdraws its review and
+  leaves its disk unchanged.
 - **Recovery on the VT.** The changed-initramfs leg attaches a display
   device and answers its three secret-line prompts and the reseal
   question on the VT, through QMP key events to the PS/2 keyboard

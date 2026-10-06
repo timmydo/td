@@ -945,11 +945,10 @@ installation service's execution needs; it does not activate that execution.
 
 ### Device-bound formatting
 
-A service started with the device-bound storage operand (INSTALLER.md
-"Installation service core") executes a consented installation as
-"Executing a consented installation" says, except as follows.
-[ENCRYPTION.md](ENCRYPTION.md) "Device-bound formatting" owns the volume
-format, its parameters and the operand's activation boundary.
+A plan naming device-bound storage, which a service's own probes choose
+(INSTALLER.md "Storage choice"), is executed as "Executing a consented
+installation" says, except as follows. [ENCRYPTION.md](ENCRYPTION.md)
+"Device-bound formatting" owns the volume format and its parameters.
 
 No plaintext volume image exists. The settings, account and trusted key
 are staged as a directory tree in the workspace before the first write,
@@ -2178,8 +2177,10 @@ builds and boots the same live fixture through optical firmware media
 onto a fresh 512-byte virtio target, each
 leg from its own ISO and firmware variables, the emulated TPM a tpm-tis
 device on a fresh swtpm state behind a private socket. A no-TPM leg
-requires `serve --storage device-bound` to refuse with its diagnostic and
-no byte on either channel, and the whole target unchanged. The installed
+requires an unencrypted review, withdrawn with the whole target
+unchanged, and two legs with the TPM and no display device, or no
+keyboard, an unencrypted review installed as GPT and a Btrfs volume with
+no LUKS2 header (ENCRYPTION.md "Activation"). The installed
 leg's and the cut leg's targets start with a valid GPT the host wrote
 into the two table ranges alone. The installed leg drives the
 device-bound service through the recovery-key phase as both of its
@@ -2234,12 +2235,13 @@ media when each boot ends. Each disk copy is searched by
 `encrypted-inspect` before it is deleted. Every boot's console is
 captured whole to a private file and scanned as raw bytes.
 
-ENCRYPTION.md increment 7 changes both oracles ("Acceptance evidence"):
-the guest's service runs without the storage operand, which is deleted,
-so its no-TPM leg expects an unencrypted review rather than a refusal,
-and legs without a display device or without a keyboard expect one too;
-`qemu-boot-encrypted` gains the default wizard's leg and a recovery
-answered on the VT.
+ENCRYPTION.md increment 7 changed both oracles ("Acceptance evidence"):
+the guest's service runs with no storage operand, for there is none, so
+its no-TPM leg expects an unencrypted review rather than a refusal, and
+legs without a display device or without a keyboard expect one too;
+`qemu-boot-encrypted` gained the default wizard's leg, first, on its own
+machine, and its changed-initramfs leg answers recovery on the VT
+through QMP key events with nothing typed on the serial line.
 
 The oracle signs with a **per-run throwaway key**: generate a keypair, sign
 the staged bundle, build `td-boot` pinned to that run's public key, boot, and
@@ -2272,9 +2274,11 @@ stronger claim than it is:
 - **No A/B partition scheme.** Deployments are directories on one volume with
   `current`/`previous` selectors, which is already transactional. A/B
   partitioning solves a problem td does not have.
-- **The disk is not encrypted.** [ENCRYPTION.md](ENCRYPTION.md) specifies the
-  device-bound default, the lost-laptop tier, authentication policy and
-  activation gates. It changes no current boot or installation behavior.
+- **No lost-laptop encryption.** [ENCRYPTION.md](ENCRYPTION.md) specifies the
+  device-bound default, current on machines with a usable TPM 2.0 and a
+  keyboard console, which protects a disk read away from its machine but
+  not a lost one, and the lost-laptop tier, authentication policy and
+  activation gates, which remain targets.
 
 ## 10. Sequence
 

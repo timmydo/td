@@ -48,8 +48,12 @@ use super::install::{
     cold_boots, image_volume_identity, installation_timeout, system_target_capacity, ColdBoots,
     Firmware, Installed, TargetDisk,
 };
-use super::setup_input::{disk_prompt_rows, typed, Act, SetupStep, STEP_TIMEOUT};
+use super::recovery_screen::KeyGlyphs;
+use super::setup_input::{
+    disk_prompt_rows, typed, Act, KeyCell, SetupStep, INSTALL_TIMEOUT, STEP_TIMEOUT,
+};
 use super::*;
+use std::rc::Rc;
 
 const TD_SETUP_LIVE_MARKER: &str = td_recipe::ladder::TD_SETUP_LIVE_MARKER;
 /// The live volume is half of RAM and the live session runs on the rest.
@@ -63,6 +67,131 @@ const HOSTNAME: &str = "td-wizard";
 /// Typed into the time zone row, which seeks the first zone it begins.
 const ZONE_SEEK: &str = "asia/tok";
 const ZONE: &str = "Asia/Tokyo";
+/// This oracle's machine has no TPM, so the review names unencrypted
+/// storage for want of one (ENCRYPTION.md "Activation").
+const LIVE_WIZARD: Wizard<'static> = Wizard {
+    username: USERNAME,
+    hostname: HOSTNAME,
+    zone_seek: ZONE_SEEK,
+    zone: ZONE,
+    storage: WizardStorage::Unencrypted,
+};
+
+/// What a run of the wizard types, and the storage its review must name.
+pub(super) struct Wizard<'a> {
+    pub(super) username: &'a str,
+    pub(super) hostname: &'a str,
+    pub(super) zone_seek: &'a str,
+    pub(super) zone: &'a str,
+    pub(super) storage: WizardStorage,
+}
+
+/// The storage a wizard's review names, by the live system's probes.
+pub(super) enum WizardStorage {
+    /// No TPM, the display and the PS/2 keyboard attached.
+    Unencrypted,
+    /// The TPM, the display and the PS/2 keyboard: the key the completion
+    /// page shows is read with `glyphs` into `key` and typed back.
+    DeviceBound { glyphs: Rc<KeyGlyphs>, key: KeyCell },
+}
+
+impl WizardStorage {
+    /// The review's storage fields in td-setup's evidence.
+    fn review_fields(&self) -> &'static str {
+        match self {
+            Self::Unencrypted => "storage=unencrypted tpm=missing console=found disclosure=no-tpm",
+            Self::DeviceBound { .. } => {
+                "storage=device-bound tpm=found console=found disclosure=device-bound"
+            }
+        }
+    }
+}
+
+/// One live boot of `iso` through firmware as USB mass storage, the
+/// wizard driven through `wizard` onto `target`, a disk of `capacity`
+/// bytes, to the restart its completion page asks for.
+pub(super) struct LiveRun<'a> {
+    pub(super) qemu: &'a str,
+    pub(super) code: &'a Path,
+    pub(super) vars: &'a Path,
+    pub(super) iso: &'a Path,
+    pub(super) target: &'a TargetDisk,
+    pub(super) capacity: u64,
+    pub(super) id: &'a str,
+    pub(super) wizard: &'a Wizard<'a>,
+    pub(super) tpm_socket: Option<&'a Path>,
+    pub(super) keep_console: Option<&'a Path>,
+    pub(super) scratch: &'a Path,
+    pub(super) label: &'a str,
+}
+
+/// Boots `run`, prints what td-setup showed, and requires the live session
+/// to have carried the wizard to its restart.
+pub(super) fn drive_wizard(run: &LiveRun<'_>) -> Result<BootResult, String> {
+    let wizard = run.wizard;
+    let encrypted = matches!(wizard.storage, WizardStorage::DeviceBound { .. });
+    let script = script(
+        &disk_prompt_rows(
+            TARGET_KERNEL_NAME,
+            run.capacity,
+            super::setup_input::TARGET_SERIAL,
+            wizard.hostname,
+            wizard.username,
+            run.id,
+            encrypted,
+        )?,
+        wizard,
+    )?;
+    let timeout = boot_timeout();
+    let tokens = format!(
+        "{AUTOTEST_CMDLINE_TOKEN} {} {}",
+        autotest_wait_token(timeout),
+        td_recipe::ladder::SETUP_INPUT_CMDLINE_TOKEN
+    );
+    let result = boot_source(
+        run.qemu,
+        BootSource::LiveSetup {
+            code: run.code,
+            vars: run.vars,
+            target: run.target,
+            script: &script,
+        },
+        BootPlan {
+            disk: Some(BootDisk::new(run.iso, true)),
+            mem: LIVE_MEMORY_MIB,
+            target_marker: TD_SETUP_LIVE_MARKER,
+            kill_on_marker: false,
+            extra_append: &tokens,
+            user_net: false,
+            // The live session's audio service supervises the emulated sound
+            // device, as an installed one does.
+            audio: true,
+            physical_input: false,
+            capture_firefox_audio: false,
+            tpm_socket: run.tpm_socket,
+            side_channel: None,
+            answers: None,
+            cut: false,
+            keep_console: run.keep_console,
+            screens: None,
+            devices: Devices::ALL,
+            screen: None,
+            shell: None,
+        },
+        run.scratch,
+        timeout,
+    )?;
+    println!(
+        "   [{}] live wizard elapsed: {:.2}s",
+        run.label,
+        result.elapsed.as_secs_f64()
+    );
+    for (sequence, state) in &result.evidence.td_setup_shown {
+        println!("   [{}] td-setup showed {sequence}: {state}", run.label);
+    }
+    require_live_session(&result)?;
+    Ok(result)
+}
 /// What the settings page starts at: the catalog's UTC.
 const DEFAULT_ZONE: &str = "Etc/UTC";
 /// How the installed session's status bar ends its clock in `ZONE`, which
@@ -112,61 +241,21 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let target_name = "target.raw";
     let capacity = system_target_capacity(payload_bytes)?;
     let target = TargetDisk::with_capacity(&scratch.dir, target_name, capacity)?;
-    let script = script(&disk_prompt_rows(
-        TARGET_KERNEL_NAME,
-        capacity,
-        super::setup_input::TARGET_SERIAL,
-        HOSTNAME,
-        USERNAME,
-        &id,
-    )?)?;
-    let timeout = boot_timeout();
-    let tokens = format!(
-        "{AUTOTEST_CMDLINE_TOKEN} {} {}",
-        autotest_wait_token(timeout),
-        td_recipe::ladder::SETUP_INPUT_CMDLINE_TOKEN
-    );
     println!("   [qemu-boot-live] booting deployment {id} live from its medium through firmware");
-    let result = boot_source(
-        &qemu,
-        BootSource::LiveSetup {
-            code: &code,
-            vars: &vars,
-            target: &target,
-            script: &script,
-        },
-        BootPlan {
-            disk: Some(BootDisk::new(&iso, true)),
-            mem: LIVE_MEMORY_MIB,
-            target_marker: TD_SETUP_LIVE_MARKER,
-            kill_on_marker: false,
-            extra_append: &tokens,
-            user_net: false,
-            // The live session's audio service supervises the emulated sound
-            // device, as an installed one does.
-            audio: true,
-            physical_input: false,
-            capture_firefox_audio: false,
-            tpm_socket: None,
-            side_channel: None,
-            answers: None,
-            cut: false,
-            keep_console: None,
-            screens: None,
-            screen: None,
-            shell: None,
-        },
-        &scratch.dir,
-        timeout,
-    )?;
-    println!(
-        "   [qemu-boot-live] elapsed: {:.2}s",
-        result.elapsed.as_secs_f64()
-    );
-    for (sequence, state) in &result.evidence.td_setup_shown {
-        println!("   [qemu-boot-live] td-setup showed {sequence}: {state}");
-    }
-    require_live_session(&result)?;
+    drive_wizard(&LiveRun {
+        qemu: &qemu,
+        code: &code,
+        vars: &vars,
+        iso: &iso,
+        target: &target,
+        capacity,
+        id: &id,
+        wizard: &LIVE_WIZARD,
+        tpm_socket: None,
+        keep_console: None,
+        scratch: &scratch.dir,
+        label: "qemu-boot-live",
+    })?;
     require_partitioned(&scratch.dir.join(target_name), capacity)?;
     // The medium is detached: the disk the wizard installed boots alone
     // through firmware, as the account and host it was given.
@@ -295,10 +384,19 @@ fn require_partitioned(path: &Path, capacity: u64) -> Result<(), String> {
 }
 
 /// Welcome, the one destination, the settings typed a key at a time, the
-/// review of exactly those, back from it until the service has released
-/// the review, the same review again, consent to it showing `rows`, and the
-/// completed installation. Every act waits on its own state.
-fn script(rows: &[String]) -> Result<Vec<SetupStep>, String> {
+/// review of exactly those naming the wizard's storage, back from it until
+/// the service has released the review, the same review again, consent to
+/// it showing `rows`, a device-bound installation's recovery key read from
+/// the display and typed back, and the completed installation. Every act
+/// waits on its own state.
+fn script(rows: &[String], wizard: &Wizard<'_>) -> Result<Vec<SetupStep>, String> {
+    let Wizard {
+        username,
+        hostname,
+        zone_seek,
+        zone,
+        storage,
+    } = wizard;
     fn press(steps: &mut Vec<SetupStep>, shown: String, key: &'static str) {
         steps.push(SetupStep::press(shown, key));
     }
@@ -326,61 +424,107 @@ fn script(rows: &[String]) -> Result<Vec<SetupStep>, String> {
         "{} seek= zone={DEFAULT_ZONE} withdrawal=none",
         settings(0, "", "")
     );
-    for (index, key) in typed(USERNAME)?.into_iter().enumerate() {
+    for (index, key) in typed(username)?.into_iter().enumerate() {
         press(&mut steps, shown, key);
-        shown = settings(0, prefix(USERNAME, index)?, "");
+        shown = settings(0, prefix(username, index)?, "");
     }
     press(&mut steps, shown, "tab");
-    shown = settings(1, USERNAME, "");
-    for (index, key) in typed(HOSTNAME)?.into_iter().enumerate() {
+    shown = settings(1, username, "");
+    for (index, key) in typed(hostname)?.into_iter().enumerate() {
         press(&mut steps, shown, key);
-        shown = settings(1, USERNAME, prefix(HOSTNAME, index)?);
+        shown = settings(1, username, prefix(hostname, index)?);
     }
     // Past the fixed keyboard row to the time zone.
     press(&mut steps, shown, "tab");
-    press(&mut steps, settings(2, USERNAME, HOSTNAME), "tab");
+    press(&mut steps, settings(2, username, hostname), "tab");
     shown = format!(
         "{} seek= zone={DEFAULT_ZONE}",
-        settings(3, USERNAME, HOSTNAME)
+        settings(3, username, hostname)
     );
-    for (index, key) in typed(ZONE_SEEK)?.into_iter().enumerate() {
+    for (index, key) in typed(zone_seek)?.into_iter().enumerate() {
         press(&mut steps, shown, key);
         shown = format!(
             "{} seek={}",
-            settings(3, USERNAME, HOSTNAME),
-            prefix(ZONE_SEEK, index)?
+            settings(3, username, hostname),
+            prefix(zone_seek, index)?
         );
     }
-    press(&mut steps, format!("{shown} zone={ZONE}"), "ret");
+    press(&mut steps, format!("{shown} zone={zone}"), "ret");
     let review = format!(
-        "page=review disk={TARGET_KERNEL_NAME} username={USERNAME} \
-         hostname={HOSTNAME} zone={ZONE}"
+        "page=review disk={TARGET_KERNEL_NAME} username={username} \
+         hostname={hostname} zone={zone} {}",
+        storage.review_fields()
     );
     press(&mut steps, review.clone(), "esc");
     steps.push(SetupStep {
         untouched: true,
         ..SetupStep::press(
             format!(
-                "{} zone={ZONE} withdrawal=none",
-                settings(3, USERNAME, HOSTNAME)
+                "{} zone={zone} withdrawal=none",
+                settings(3, username, hostname)
             ),
             "ret",
         )
     });
-    press(&mut steps, review, "ret");
-    steps.push(SetupStep {
-        shown: "page=consent".into(),
-        act: Act::Consent(rows.to_vec()),
-        untouched: true,
-        within: STEP_TIMEOUT,
-    });
+    press(&mut steps, review.clone(), "ret");
+    match storage {
+        WizardStorage::Unencrypted => steps.push(SetupStep {
+            shown: "page=consent".into(),
+            act: Act::Consent(rows.to_vec()),
+            untouched: true,
+            within: STEP_TIMEOUT,
+        }),
+        // Escape on the prompt first declines with the target untouched,
+        // and the wizard is back at its settings to review again. Then
+        // consent: the compositor says it returns to setup and closes the
+        // screen by itself; the installation runs to its recovery-key
+        // phase, the key the page shows is read from the display, Return
+        // asks to type it back, and it is typed back.
+        WizardStorage::DeviceBound { glyphs, key } => {
+            steps.push(SetupStep {
+                shown: "page=consent".into(),
+                act: Act::Decline(rows.to_vec()),
+                untouched: true,
+                within: STEP_TIMEOUT,
+            });
+            steps.push(SetupStep {
+                untouched: true,
+                ..SetupStep::press(
+                    format!(
+                        "{} zone={zone} withdrawal=none",
+                        settings(3, username, hostname)
+                    ),
+                    "ret",
+                )
+            });
+            press(&mut steps, review.clone(), "ret");
+            steps.push(SetupStep {
+                shown: "page=consent".into(),
+                act: Act::ConsentThenReturn(rows.to_vec()),
+                untouched: true,
+                within: STEP_TIMEOUT,
+            });
+            steps.push(SetupStep {
+                shown: "page=recovery step=shown".into(),
+                act: Act::ReadKey(Rc::clone(glyphs), Rc::clone(key)),
+                untouched: false,
+                within: INSTALL_TIMEOUT,
+            });
+            steps.push(SetupStep {
+                shown: "page=recovery step=typeback".into(),
+                act: Act::TypeKey(Rc::clone(key)),
+                untouched: false,
+                within: STEP_TIMEOUT,
+            });
+        }
+    }
     // td-authd ends the attention only once the installation finished, so
     // td-setup's next poll says so; Return then restarts the computer.
     steps.push(SetupStep {
         shown: "page=complete choice=restart end=offered".into(),
         act: Act::Keys(vec!["ret"]),
         untouched: false,
-        within: STEP_TIMEOUT,
+        within: INSTALL_TIMEOUT,
     });
     Ok(steps)
 }
@@ -450,7 +594,7 @@ mod tests {
     #[test]
     fn the_script_types_only_its_closed_keys_and_waits_on_distinct_states() {
         let rows = vec!["ROW".to_string()];
-        let script = script(&rows).unwrap();
+        let script = script(&rows, &LIVE_WIZARD).unwrap();
         let typed_keys = USERNAME.len() + HOSTNAME.len() + ZONE_SEEK.len();
         // The three tabs and Enter; Escape; Enter from the release and from
         // the second review; consent; and the completion's restart.
@@ -478,7 +622,14 @@ mod tests {
         // Return on the completion page restarts the computer.
         assert_eq!(last.shown, "page=complete choice=restart end=offered");
         assert!(matches!(&last.act, Act::Keys(keys) if keys == &["ret"]));
-        assert_eq!(last.within, STEP_TIMEOUT);
+        assert_eq!(last.within, INSTALL_TIMEOUT);
+        // Without a TPM the review names unencrypted storage.
+        assert!(script
+            .iter()
+            .find(|step| step.shown.starts_with("page=review "))
+            .unwrap()
+            .shown
+            .ends_with(" storage=unencrypted tpm=missing console=found disclosure=no-tpm"));
         // The same review is asked twice, and consent follows the second.
         let reviews: Vec<usize> = (0..script.len())
             .filter(|index| script[*index].shown.starts_with("page=review "))

@@ -253,7 +253,8 @@ credentials. Typed credential writes require their own presented token
 operation; they cannot use an existing session release. The stock VM
 remains unenrolled. Do not make a user-facing flow
 depend on the current escape hatch; see `APPLICATIONS.md` §L.1 and
-`td-login/THREAT-MODEL.md`. The planned device-bound encrypted default
+`td-login/THREAT-MODEL.md`. The device-bound encrypted default, which the
+installer chooses on machines with a usable TPM and a keyboard console,
 releases storage to TPM possession alone; it is device binding under this
 principle and advances no authentication or protector-authorization claim.
 The planned TPM-free login-key tier (`td-login/TOKEN-LOGIN.md`; nothing

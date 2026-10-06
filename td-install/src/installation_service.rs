@@ -41,11 +41,9 @@ pub(crate) trait Host {
     /// Asks the supervisor for its orderly reboot or power-off; `Ok` once
     /// it has accepted, before anything is stopped.
     fn end(&mut self, ending: Ending) -> Result<(), Refusal>;
-    /// The storage every plan of this service names: its caller's operand,
-    /// never a request's.
-    fn storage(&self) -> Storage;
     /// What the service's own probes found when it started; every plan
-    /// records it, and storage does not follow it yet.
+    /// records it, and names the storage it implies (`Basis::storage`),
+    /// never a request's.
     fn basis(&self) -> Basis;
 }
 
@@ -346,7 +344,6 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             destination,
             deployment,
             uuid,
-            self.host.storage(),
             self.host.basis(),
             settings,
         )
@@ -981,7 +978,6 @@ mod tests {
         /// Proposals so far; each draws its own nonce.
         drawn: u8,
         end: Result<(), Refusal>,
-        storage: Storage,
         basis: Basis,
     }
     impl Fake {
@@ -998,7 +994,6 @@ mod tests {
                 zones: Ok(()),
                 drawn: 0,
                 end: Ok(()),
-                storage: Storage::Unencrypted,
                 basis: Basis::default(),
             }
         }
@@ -1067,9 +1062,6 @@ mod tests {
                 Ending::PowerOff => "power off",
             });
             self.end
-        }
-        fn storage(&self) -> Storage {
-            self.storage
         }
         fn basis(&self) -> Basis {
             self.basis
@@ -1391,7 +1383,6 @@ mod tests {
             disk("vda", 1, Some("Disk")),
             [0xab; 32],
             uuid,
-            Storage::Unencrypted,
             Basis::default(),
             settings(),
         )
@@ -2040,16 +2031,24 @@ mod tests {
         }
     }
 
-    /// The host's storage, and only it, names every review's storage: a
-    /// proposal carries none.
+    /// The host's basis, and only it, names every review's storage:
+    /// device-bound exactly when both probes passed, and a proposal carries
+    /// neither. The consent channel's review carries that storage alone.
     #[test]
-    fn the_service_storage_names_the_review() {
-        for storage in Storage::ALL {
+    fn the_service_basis_names_the_review_storage() {
+        let mut reviews = Vec::new();
+        for (tpm, console) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut fake = Fake::new();
-            fake.storage = *storage;
+            fake.basis = Basis::new(tpm, console);
             let mut service = Service::new(fake);
             let plan = reviewed(&mut service);
-            assert_eq!(plan.storage(), *storage);
+            assert_eq!(plan.basis(), Basis::new(tpm, console));
+            let storage = if tpm && console {
+                Storage::DeviceBound
+            } else {
+                Storage::Unencrypted
+            };
+            assert_eq!(plan.storage(), storage);
             assert_eq!(
                 consent_review(&plan).unwrap().storage(),
                 match storage {
@@ -2057,30 +2056,12 @@ mod tests {
                     Storage::DeviceBound => consent::Storage::DeviceBound,
                 }
             );
+            reviews
+                .push(consent::Report::Review(Box::new(consent_review(&plan).unwrap())).encode());
         }
-    }
-
-    /// The host's basis is recorded in every review and changes nothing
-    /// else: the storage stays the host's, whatever the probes found, and
-    /// the consent channel's review is the same.
-    #[test]
-    fn the_service_basis_is_recorded_and_inert() {
-        for storage in Storage::ALL {
-            let mut reviews = Vec::new();
-            for (tpm, console) in [(false, false), (true, false), (false, true), (true, true)] {
-                let mut fake = Fake::new();
-                fake.storage = *storage;
-                fake.basis = Basis::new(tpm, console);
-                let mut service = Service::new(fake);
-                let plan = reviewed(&mut service);
-                assert_eq!(plan.basis(), Basis::new(tpm, console));
-                assert_eq!(plan.storage(), *storage);
-                reviews.push(
-                    consent::Report::Review(Box::new(consent_review(&plan).unwrap())).encode(),
-                );
-            }
-            assert!(reviews.windows(2).all(|pair| pair[0] == pair[1]));
-        }
+        // The three unencrypted bases are one review on the consent channel.
+        assert!(reviews[..3].windows(2).all(|pair| pair[0] == pair[1]));
+        assert_ne!(reviews[2], reviews[3]);
     }
 
     /// The consent channel's review carries the plan's storage.
@@ -2094,8 +2075,7 @@ mod tests {
             plan.destination().clone(),
             *plan.deployment(),
             *plan.volume_uuid(),
-            Storage::DeviceBound,
-            Basis::default(),
+            Basis::new(true, true),
             plan.settings().clone(),
         )
         .unwrap();

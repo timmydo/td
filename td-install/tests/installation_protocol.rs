@@ -6,8 +6,8 @@
 )]
 
 use td_install::installation_plan::{
-    Basis, Candidates, Destination, DestinationObservation, Plan, Settings, Storage, Zones,
-    MAX_CANDIDATES, MAX_CANDIDATE_BYTES, MAX_ZONES,
+    Basis, Candidates, Destination, DestinationObservation, Plan, Settings, Zones, MAX_CANDIDATES,
+    MAX_CANDIDATE_BYTES, MAX_ZONES,
 };
 use td_install::installation_protocol::{
     check_greeting, frame, payload_len, scrub, Abandon, Ending, Failure, Phase, RecoveryDigits,
@@ -51,7 +51,6 @@ fn plan() -> Plan {
         destination(),
         [2; 32],
         uuid(),
-        Storage::Unencrypted,
         Basis::new(true, false),
         settings(),
     )
@@ -349,7 +348,6 @@ fn maximal_messages_fit_their_direction_bounds() {
         maximal(0),
         [0; 32],
         uuid(),
-        Storage::Unencrypted,
         Basis::new(true, true),
         settings,
     )

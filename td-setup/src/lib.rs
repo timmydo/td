@@ -25,9 +25,7 @@ pub mod settings;
 pub mod welcome;
 pub mod window;
 
-use td_install::installation_plan::{
-    Basis, Destination, DestinationObservation, Plan, Settings, Storage,
-};
+use td_install::installation_plan::{Basis, Destination, DestinationObservation, Plan, Settings};
 use td_ui::raster::{Composition, Primitive, Raster, Scale, Surface};
 use welcome::Welcome;
 
@@ -156,21 +154,12 @@ fn render_check_surface(font: &td_ui::font::Font, surface: Surface) -> Result<()
     )?;
     let settings = Settings::new("alice", "tdhost", "us", "Etc/UTC")?;
     let uuid = [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 0];
-    let plan = Plan::new(
-        [1; 32],
-        disk,
-        [2; 32],
-        uuid,
-        Storage::Unencrypted,
-        Basis::default(),
-        settings,
-    )?;
+    let plan = Plan::new([1; 32], disk, [2; 32], uuid, Basis::default(), settings)?;
     let bound = Plan::new(
         [1; 32],
         plan.destination().clone(),
         [2; 32],
         uuid,
-        Storage::DeviceBound,
         Basis::new(true, true),
         plan.settings().clone(),
     )?;

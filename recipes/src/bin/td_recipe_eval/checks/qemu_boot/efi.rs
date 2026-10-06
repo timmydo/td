@@ -53,6 +53,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 cut: false,
                 keep_console: None,
                 screens: None,
+                devices: Devices::ALL,
                 screen: None,
                 shell: None,
             },

@@ -47,6 +47,14 @@ pub const LOGIN_CEREMONY: Duration = Duration::from_secs(120);
 /// An addition and a two-key enrollment: two ceremonies.
 pub const LOGIN_TWO_CEREMONIES: Duration = Duration::from_secs(240);
 
+/// How a disk installation stores its volume, as its plan names it
+/// (td-install/INSTALLER.md "Storage choice").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Storage {
+    Unencrypted,
+    DeviceBound,
+}
+
 /// The first four bytes of a credential ID's SHA-256, shown as hex.
 pub type Fingerprint = [u8; 4];
 
@@ -380,6 +388,7 @@ pub enum Operation {
         username: String,
         /// The first eight bytes of the deployment ID, shown as hex.
         deployment: [u8; 8],
+        storage: Storage,
     },
     Enroll {
         platform: Platform,
@@ -519,6 +528,7 @@ impl Request {
                 hostname,
                 username,
                 deployment: _,
+                storage: _,
             } if *requester != owner
                 || !disk_name(disk)
                 || *capacity == 0
@@ -761,6 +771,7 @@ impl Request {
                 hostname,
                 username,
                 deployment,
+                storage,
             } => {
                 bytes.push(6);
                 bytes.extend_from_slice(&requester.to_be_bytes());
@@ -772,6 +783,10 @@ impl Request {
                 put_text(&mut bytes, hostname);
                 put_text(&mut bytes, username);
                 bytes.extend_from_slice(deployment);
+                bytes.push(match storage {
+                    Storage::Unencrypted => 0,
+                    Storage::DeviceBound => 1,
+                });
             }
             Operation::Enroll {
                 platform,
@@ -888,6 +903,11 @@ impl Request {
                         .take(8)?
                         .try_into()
                         .map_err(|_| "truncated deployment prefix")?,
+                    storage: match input.byte()? {
+                        0 => Storage::Unencrypted,
+                        1 => Storage::DeviceBound,
+                        _ => return Err("invalid consent disk storage".into()),
+                    },
                 }
             }
             1 => {
@@ -1017,6 +1037,7 @@ impl Request {
                 hostname,
                 username,
                 deployment,
+                storage,
             } => {
                 lines.push("ERASE DISK AND INSTALL TD".into());
                 lines.push(format!("DISK: {disk}"));
@@ -1032,7 +1053,13 @@ impl Request {
                 lines.push(format!("USER: {username}"));
                 let prefix = hex(deployment);
                 lines.push(format!("DEPLOYMENT: {prefix}..."));
-                lines.push("UNENCRYPTED STORAGE, AUTOMATIC LOGIN".into());
+                lines.push(
+                    match storage {
+                        Storage::Unencrypted => "UNENCRYPTED STORAGE, AUTOMATIC LOGIN",
+                        Storage::DeviceBound => "ENCRYPTED TO THIS COMPUTER, AUTOMATIC LOGIN",
+                    }
+                    .into(),
+                );
                 lines.push("ENTER: ERASE AND INSTALL   ESC: CANCEL".into());
             }
             Operation::Enroll {
@@ -1472,6 +1499,7 @@ mod tests {
             hostname: "td".into(),
             username: "tester".into(),
             deployment: [0xab, 0xcd, 0, 1, 2, 3, 4, 0xff],
+            storage: Storage::Unencrypted,
         }
     }
 
@@ -1486,6 +1514,7 @@ mod tests {
             hostname: "h".repeat(HOSTNAME_BYTES),
             username: "u".repeat(USERNAME_BYTES),
             deployment: [0xff; 8],
+            storage: Storage::DeviceBound,
         }
     }
 
@@ -1560,7 +1589,29 @@ mod tests {
         literal.push(6);
         literal.extend(b"tester");
         literal.extend([0xab, 0xcd, 0, 1, 2, 3, 4, 0xff]);
+        literal.push(0);
         assert_eq!(request.encode(), literal);
+        // Device-bound storage is the one byte after the prefix, and its
+        // row replaces the unencrypted one.
+        let mut bound = disk(Some(Label::escape(b"Samsung SSD 980", MODEL_WIDTH)), None);
+        if let Operation::InstallDisk { storage, .. } = &mut bound {
+            *storage = Storage::DeviceBound;
+        }
+        let bound = Request::new([7; 32], 1000, bound).unwrap();
+        let mut lines = request.lines();
+        lines[11] = "ENCRYPTED TO THIS COMPUTER, AUTOMATIC LOGIN".into();
+        assert_eq!(bound.lines(), lines);
+        let mut bound_literal = literal.clone();
+        *bound_literal.last_mut().unwrap() = 1;
+        assert_eq!(bound.encode(), bound_literal);
+        assert_eq!(Request::decode(&bound_literal).unwrap(), bound);
+        for code in 2..=255 {
+            *bound_literal.last_mut().unwrap() = code;
+            assert_eq!(
+                Request::decode(&bound_literal).err().unwrap(),
+                "invalid consent disk storage"
+            );
+        }
 
         let truncated = Request::new(
             [7; 32],
@@ -1631,6 +1682,7 @@ mod tests {
             "{}",
             widest.encode().len()
         );
+        assert_eq!(widest.encode().len(), 253);
         assert_eq!(Request::decode(&widest.encode()).unwrap(), widest);
 
         let make = |edit: fn(&mut Operation)| {

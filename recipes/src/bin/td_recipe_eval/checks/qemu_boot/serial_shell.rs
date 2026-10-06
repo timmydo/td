@@ -110,6 +110,11 @@ impl SerialPort {
         self.send_bytes(line.as_bytes())
     }
 
+    /// A console answer: `line` and a newline.
+    pub(super) fn answer(&mut self, line: &[u8]) -> Result<(), String> {
+        self.send_bytes(line)
+    }
+
     /// `line` and a newline, straight from the caller's buffer.
     fn send_bytes(&mut self, line: &[u8]) -> Result<(), String> {
         self.input
@@ -240,12 +245,24 @@ impl Drop for ConsoleAnswer {
     }
 }
 
-/// The answers one boot types, in order, and the console text that ends
-/// the boot unanswered: a prompt that never comes must not wait out the
-/// boot's whole deadline.
+/// The answers one boot types, in order, the console text that ends the
+/// boot unanswered (a prompt that never comes must not wait out the boot's
+/// whole deadline), and where they are typed. Prompts are read from the
+/// serial console either way.
 pub(super) struct ConsoleAnswers<'a> {
     pub(super) answers: &'a [ConsoleAnswer],
     pub(super) refusal: &'a str,
+    pub(super) line: AnswerLine,
+}
+
+/// Where a boot's console answers are typed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AnswerLine {
+    /// On the serial line, through its socket.
+    Serial,
+    /// On the VT, through QMP key events to the PS/2 keyboard; nothing is
+    /// typed on the serial line, which is then a plain file.
+    Vt,
 }
 
 /// Types `ConsoleAnswers` as their prompts arrive. Positions are offsets
@@ -303,10 +320,15 @@ impl<'a> ConsoleResponder<'a> {
         Ok(None)
     }
 
-    /// Types the answer due on `console`, if any.
-    pub(super) fn poll(&mut self, port: &mut SerialPort, console: &[u8]) -> Result<(), String> {
+    /// Types the answer due on `console`, if any, through `type_line`,
+    /// which types it and then the end of the line.
+    pub(super) fn poll(
+        &mut self,
+        type_line: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+        console: &[u8],
+    ) -> Result<(), String> {
         if let Some((answer, end)) = self.due(console)? {
-            port.send_bytes(&answer.reply)?;
+            type_line(&answer.reply)?;
             self.next += 1;
             self.from = end;
         }
@@ -339,6 +361,7 @@ mod tests {
         let plan = ConsoleAnswers {
             answers: &answers,
             refusal: "halted",
+            line: AnswerLine::Serial,
         };
         let mut responder = ConsoleResponder::new(&plan, 1024);
         let mut take = |console: &str| -> Result<Option<Vec<u8>>, String> {
@@ -373,6 +396,7 @@ mod tests {
         let none = ConsoleAnswers {
             answers: &[],
             refusal: "key: ",
+            line: AnswerLine::Serial,
         };
         let unattended = ConsoleResponder::new(&none, 1024);
         assert!(unattended.done());

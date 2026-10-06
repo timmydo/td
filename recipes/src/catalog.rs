@@ -842,10 +842,14 @@ mod named_dirs_tests {
     /// naming a file in `build.rs`'s own-source list, read with comments
     /// stripped, so the oracles' verdict key holds its bytes (as
     /// `host-evaluator`, `HOST_CHECK_SOURCES`): the face and Unifont
-    /// modules the screen oracles draw the compositor's chrome text with.
-    /// Only `qemu_boot/update.rs` and `live.rs` may name them, which serve
-    /// `qemu-boot-live`, a command rather than a recipe check, so no check
-    /// scope is owed.
+    /// modules the screen oracles draw the compositor's chrome text and
+    /// td-setup's recovery key with. Only `qemu_boot/update.rs` and
+    /// `live.rs`, which serve `qemu-boot-live`, and `recovery_screen.rs` and
+    /// `encrypted_boot.rs`, which serve `qemu-boot-encrypted`, may name
+    /// them. Both are commands rather than recipe checks, run on demand
+    /// outside the integration tier as their own `td-recipe-eval` verbs,
+    /// and qemu_boot is a boot harness no recipe check runs
+    /// (`no_recipe_check_runs_a_boot_harness`), so no check scope is owed.
     #[test]
     fn the_evaluator_embeds_crate_files_only_in_its_test_modules() {
         use crate::embed_scan::{block_end, strip_comments};
@@ -886,9 +890,14 @@ mod named_dirs_tests {
                     continue;
                 }
                 let code = strip_comments(&std::fs::read_to_string(&path).expect("read"));
-                let oracle = ["update.rs", "live.rs"]
-                    .iter()
-                    .any(|name| path.ends_with(format!("checks/qemu_boot/{name}")));
+                let oracle = [
+                    "update.rs",
+                    "live.rs",
+                    "recovery_screen.rs",
+                    "encrypted_boot.rs",
+                ]
+                .iter()
+                .any(|name| path.ends_with(format!("checks/qemu_boot/{name}")));
                 for module in mounts {
                     assert!(
                         oracle || !code.contains(module),

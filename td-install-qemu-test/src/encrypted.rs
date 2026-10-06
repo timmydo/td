@@ -1,7 +1,9 @@
 //! The guest legs of `qemu-install-encrypted` (td-install/ENCRYPTION.md
-//! increment 5): the service started with its device-bound storage operand,
-//! driven as both of its peers through the recovery-key phase, and the
-//! installed volume then opened with the key typed back. The key's digits
+//! increments 5 and 7): the service, started without a storage operand,
+//! reviews device-bound storage with the TPM and keyboard console its
+//! probes find, and is driven as both of its peers through the
+//! recovery-key phase, and the installed volume then opened with the key
+//! typed back; without either probe it reviews unencrypted. The key's digits
 //! stay in this process and the service: no record, argv or environment
 //! carries them, and every copy here is zeroed when dropped.
 
@@ -51,7 +53,7 @@ pub(super) fn install(device: &str, cut: bool, channel: Option<&Path>) -> Result
     // The host seeded a GPT, so the service is what clears it.
     require_table(device, true)?;
     let sampler = Sampler::start()?;
-    let mut service = Service::start(installation_plan::Storage::DeviceBound, Stdio::inherit())?;
+    let mut service = Service::start(Stdio::inherit())?;
     let driven = drive(&mut service, device, media, deployment, cut);
     let (uuid, key) = service.finish(driven)?;
     let samples = sampler.finish()?;
@@ -139,13 +141,9 @@ fn drive(
     deployment: [u8; 32],
     cut: bool,
 ) -> Result<(String, RecoveryDigits), String> {
-    let plan = start_installation(
-        service,
-        device,
-        media,
-        deployment,
-        installation_plan::Storage::DeviceBound,
-    )?;
+    // The swtpm, the display device and the PS/2 keyboard: both probes.
+    let basis = installation_plan::Basis::new(true, true);
+    let plan = start_installation(service, device, media, deployment, basis)?;
     let nonce = *plan.nonce();
     let review = ReviewNonce::new(nonce)?;
     let uuid = plan_uuid(&plan)?;
@@ -837,10 +835,11 @@ fn matches(expected: Word, word: &[u8], uuid: &str) -> bool {
     }
 }
 
-/// Without a TPM, `serve --storage device-bound` refuses to start: it exits
-/// unsuccessfully naming the missing TPM, sends neither channel a byte and
-/// leaves the disk as it was.
-pub(super) fn refuse_without_tpm(device: &str) -> Result<(), String> {
+/// Without a TPM the service reviews unencrypted storage, its plan
+/// recording the TPM probe failed and the keyboard console found: nothing
+/// refuses. The review is withdrawn by closing its channels, so the service
+/// exits successfully and the disk is left as it was.
+pub(super) fn review_without_tpm(device: &str) -> Result<(), String> {
     for node in ["/dev/tpm0", "/dev/tpmrm0"] {
         match fs::symlink_metadata(node) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -849,54 +848,42 @@ pub(super) fn refuse_without_tpm(device: &str) -> Result<(), String> {
         }
     }
     let before = canaries(device)?;
-    mount_source(device)?;
-    let (_, id) = source_deployment()?;
+    let media = mount_source(device)?;
+    let (deployment, id) = source_deployment()?;
     mount_system_root()?;
     bind_root_store()?;
     record_deployment(&id)?;
-    let Service {
-        mut child,
-        mut installer,
-        mut authority,
-    } = Service::start(installation_plan::Storage::DeviceBound, Stdio::piped())?;
-    let mut diagnostic = Vec::new();
-    // The host's deadline bounds a service that does not exit.
-    let read = child
-        .stderr
-        .take()
-        .ok_or("the service's stderr is not piped")
-        .and_then(|stderr| {
-            stderr
-                .take(64 * 1024)
-                .read_to_end(&mut diagnostic)
-                .map_err(|_| "read the service's stderr")
-        });
-    let status = child.wait();
-    read?;
-    let status = status.map_err(|error| format!("wait for the service: {error}"))?;
-    let diagnostic = String::from_utf8_lossy(&diagnostic);
-    report(std::io::stderr(), format_args!("{}", diagnostic.trim_end()))?;
-    if status.success() || !diagnostic.contains(NO_TPM_DIAGNOSTIC) {
-        return Err(format!(
-            "the device-bound service did not refuse for want of a TPM: {status}"
-        ));
-    }
-    for (label, stream) in [("installer", &mut installer), ("consent", &mut authority)] {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .map_err(|error| format!("bound the {label} channel: {error}"))?;
-        let mut byte = [0; 1];
-        match stream.read(&mut byte) {
-            Ok(0) => {}
-            Ok(_) => return Err(format!("the refusing service wrote to its {label} channel")),
-            Err(error) => return Err(format!("read the {label} channel: {error}")),
-        }
-    }
+    let mut service = Service::start(Stdio::inherit())?;
+    let basis = installation_plan::Basis::new(false, true);
+    let reviewed = review_installation(&mut service, device, media, deployment, basis);
+    service.finish(reviewed)?;
     if canaries(device)? != before {
-        return Err("the refusing service changed the disk".into());
+        return Err("the withdrawn review changed the disk".into());
     }
     command("/bin/umount", &["/td/store"])?;
     report(std::io::stdout(), format_args!("{NO_TPM_MARKER}"))
+}
+
+/// With the TPM and without a keyboard console (no display device, or no
+/// keyboard), the service reviews unencrypted storage and installs it.
+pub(super) fn install_without_console(device: &str) -> Result<(), String> {
+    let media = mount_source(device)?;
+    let (deployment, id) = source_deployment()?;
+    mount_system_root()?;
+    let loops = bound_loops()?;
+    bind_root_store()?;
+    let basis = installation_plan::Basis::new(true, false);
+    let uuid = served_install(device, media, deployment, &id, basis)?;
+    if bound_loops()? != loops {
+        return Err("the installation left a loop device bound".into());
+    }
+    command("/bin/umount", &["/td/store"])?;
+    applet(&["sync"])?;
+    report(
+        std::io::stdout(),
+        format_args!("{NO_CONSOLE_MARKER} {uuid} {device}"),
+    )?;
+    report(std::io::stdout(), format_args!("{ENCRYPTED_END_MARKER}"))
 }
 
 #[cfg(test)]

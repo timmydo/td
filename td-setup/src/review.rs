@@ -14,21 +14,79 @@ const INSET: usize = CELL_WIDTH;
 const BODY_TOP: usize = 4 * ROW;
 const BODY_ROWS: usize = 15;
 const WARNING_TOP: usize = BODY_TOP + BODY_ROWS * CELL_HEIGHT + ROW;
-/// The warnings for each storage the service's own operand chooses; no
-/// request chooses it, so the page says what the review carries.
-const UNENCRYPTED: &[&str] = &[
-    "All data on the selected disk will be lost after trusted consent.",
-    "Storage is not encrypted. The account signs in automatically without a password or PIN.",
-];
+/// The fixed warnings under the details. Storage follows the service's
+/// own probes, which the plan's basis records; no request chooses it, so
+/// the page says what the review carries (td-install/INSTALLER.md
+/// "Storage choice").
+const LOSS: &str = "All data on the selected disk will be lost after trusted consent.";
+const AUTOMATIC: &str = "The account signs in automatically without a password or PIN.";
 /// Device-bound storage protects a disk read away from this computer, not
 /// a lost one (td-install/ENCRYPTION.md "Device-bound default").
 const DEVICE_BOUND: &[&str] = &[
-    "All data on the selected disk will be lost after trusted consent.",
+    LOSS,
     "Storage is encrypted to this computer's TPM; this does not protect a lost computer.",
     "The account signs in automatically. Write down the recovery key shown at the end.",
 ];
+const UNENCRYPTED_NO_TPM: &[&str] = &[
+    LOSS,
+    "Storage is not encrypted: this computer has no usable TPM 2.0.",
+    AUTOMATIC,
+];
+const UNENCRYPTED_NO_CONSOLE: &[&str] = &[
+    LOSS,
+    "Storage is not encrypted: this computer has no keyboard console.",
+    AUTOMATIC,
+];
+const UNENCRYPTED_NEITHER: &[&str] = &[
+    LOSS,
+    "Storage is not encrypted: no usable TPM 2.0 and no keyboard console.",
+    AUTOMATIC,
+];
 /// The most warning rows any storage shows.
 const WARNING_ROWS: usize = 3;
+
+/// The device-bound tier's disclosures (td-install/INSTALLER.md "Storage
+/// choice"), on the detail pages after the settings; each is a paragraph
+/// the detail block wraps.
+const DEVICE_BOUND_DETAILS: &[&str] = &[
+    "Storage is encrypted to this computer and released at power-on with no \
+     interaction. That binds the disk to this computer; it does not \
+     authenticate a person: anyone who powers on this computer with its TPM \
+     unlocks the disk and reaches the desktop, which the account enters \
+     automatically. It protects the disk read away from this computer (a \
+     removed drive or a copied image), not a lost or stolen computer.",
+    "What the disk held before installation is not erased: blocks the new \
+     system has not overwritten keep it, readable to whoever has the disk.",
+    "A recovery key follows. It is shown once, no copy is kept, and it must \
+     be typed back before the installation completes; until then the disk \
+     does not start. It is the only way to open the disk if this computer's \
+     TPM, firmware measurements or startup files change.",
+    "Until the installed system first starts, release is not bound to this \
+     computer's startup chain: any other system that leaves PCR 12 at zero, \
+     td's live medium excepted, can release it, and so can the administrator \
+     of an unencrypted td system running on this computer. A one-time \
+     firmware boot-menu choice used for that first start can send later \
+     ordinary starts to recovery.",
+    "When release fails, the recovery prompt appears on the screen and on \
+     the serial console. The key's digits are never shown, but a console \
+     server or BMC recorder on the serial line may record what is typed.",
+    "If this computer's TPM is missing at a start, or reaches the system \
+     only after td's startup wait for it, that start goes to recovery, and \
+     on a TPM that appears late the running system's administrator can \
+     release the disk until the next restart.",
+    "The screen and keyboard found now are what recovery will expect. One \
+     removed or changed later (a USB keyboard unplugged, a display moved to \
+     a graphics card without UEFI GOP or a td driver) can leave recovery on \
+     the serial console alone, where the computer has one; the live medium \
+     and the recovery key still open the disk. A device that only \
+     advertises a keyboard's keys (a security token, a receiver with no \
+     keyboard paired, a barcode scanner) counts as a keyboard here.",
+    "The account signs in automatically.",
+];
+
+/// What an unencrypted review's details say a keyboard console is.
+const KEYBOARD_CONSOLE: &str = "A keyboard console is a framebuffer console and a keyboard with \
+     Enter and the top-row digits, which the startup recovery prompt needs.";
 
 /// The row under `rows` warnings that says what became of an install
 /// request.
@@ -36,17 +94,62 @@ const fn notice_top(rows: usize) -> usize {
     WARNING_TOP + rows * ROW
 }
 
-fn warnings(storage: Storage) -> &'static [&'static str] {
-    match storage {
-        Storage::Unencrypted => UNENCRYPTED,
-        Storage::DeviceBound => DEVICE_BOUND,
+/// Pushes `paragraph` after a blank line, word-wrapped to `columns`.
+fn push_paragraph(lines: &mut Vec<String>, paragraph: &str, columns: usize) {
+    lines.push(String::new());
+    lines.extend(td_ui::text::wrap(paragraph, columns));
+}
+
+/// Which fixed disclosure set a review shows: the storage its basis names,
+/// and for unencrypted storage why. Its tag names it in the evidence line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Disclosure {
+    DeviceBound,
+    NoTpm,
+    NoConsole,
+    Neither,
+}
+
+impl Disclosure {
+    pub fn of(basis: Basis) -> Self {
+        match (basis.storage(), basis.tpm(), basis.keyboard_console()) {
+            (Storage::DeviceBound, _, _) => Self::DeviceBound,
+            (Storage::Unencrypted, false, true) => Self::NoTpm,
+            (Storage::Unencrypted, true, false) => Self::NoConsole,
+            (Storage::Unencrypted, _, _) => Self::Neither,
+        }
+    }
+
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::DeviceBound => "device-bound",
+            Self::NoTpm => "no-tpm",
+            Self::NoConsole => "no-console",
+            Self::Neither => "no-tpm-no-console",
+        }
     }
 }
 
-/// The detail row naming what the service's probes found, worded as
-/// findings so that it never reads as the storage. Storage does not follow
-/// it yet: the warnings are the storage's alone (td-install/INSTALLER.md
-/// "Storage choice").
+/// The fixed warnings for the storage the plan's basis names, and why.
+fn warnings(basis: Basis) -> &'static [&'static str] {
+    match Disclosure::of(basis) {
+        Disclosure::DeviceBound => DEVICE_BOUND,
+        Disclosure::NoTpm => UNENCRYPTED_NO_TPM,
+        Disclosure::NoConsole => UNENCRYPTED_NO_CONSOLE,
+        Disclosure::Neither => UNENCRYPTED_NEITHER,
+    }
+}
+
+/// The detail row naming the storage the plan's basis names.
+fn storage_line(basis: Basis) -> String {
+    match basis.storage() {
+        Storage::DeviceBound => "Storage: encrypted to this computer".into(),
+        Storage::Unencrypted => "Storage: not encrypted".into(),
+    }
+}
+
+/// The detail row naming what the service's probes found: why the storage
+/// is what the row above names.
 fn basis_line(basis: Basis) -> String {
     let found = |passed: bool| if passed { "found" } else { "not found" };
     format!(
@@ -103,9 +206,18 @@ impl ReviewPage {
                 format!("Time zone: {}", safe_label(settings.timezone())),
                 "| Time zone: ",
             ),
+            (storage_line(plan.basis()), "| Storage: "),
             (basis_line(plan.basis()), "| Probes: "),
         ] {
             push_lines_with(&mut lines, &line, columns, continuation);
+        }
+        let paragraphs = match plan.storage() {
+            Storage::DeviceBound => DEVICE_BOUND_DETAILS,
+            Storage::Unencrypted if !plan.basis().keyboard_console() => &[KEYBOARD_CONSOLE][..],
+            Storage::Unencrypted => &[],
+        };
+        for paragraph in paragraphs {
+            push_paragraph(&mut lines, paragraph, columns);
         }
         let pages = lines.len().div_ceil(BODY_ROWS);
         if page >= pages {
@@ -128,7 +240,7 @@ impl ReviewPage {
             status,
             footer,
             notice: None,
-            warnings: warnings(plan.storage()),
+            warnings: warnings(plan.basis()),
         })
     }
 
@@ -249,7 +361,7 @@ mod tests {
         let mut row = String::new();
         page.emit(surface.bounds(), &mut |draw| {
             if let Primitive::Glyph { y, scalar, .. } = draw.primitive {
-                if y == notice_top(UNENCRYPTED.len()) as i64 {
+                if y == notice_top(UNENCRYPTED_NEITHER.len()) as i64 {
                     row.push(scalar);
                 }
             }
@@ -259,10 +371,10 @@ mod tests {
     }
 
     fn plan(serial: &str) -> Plan {
-        stored(serial, Storage::Unencrypted, Basis::default())
+        stored(serial, Basis::default())
     }
 
-    fn stored(serial: &str, storage: Storage, basis: Basis) -> Plan {
+    fn stored(serial: &str, basis: Basis) -> Plan {
         let disk = Destination::new(DestinationObservation {
             name: "nvme0n1",
             major: 259,
@@ -280,7 +392,7 @@ mod tests {
         let mut uuid = [0u8; 16];
         *uuid.get_mut(6).unwrap() = 0x40;
         *uuid.get_mut(8).unwrap() = 0x80;
-        Plan::new([1; 32], disk, [2; 32], uuid, storage, basis, settings).unwrap()
+        Plan::new([1; 32], disk, [2; 32], uuid, basis, settings).unwrap()
     }
 
     fn surface(width: usize, height: usize) -> Surface {
@@ -307,7 +419,7 @@ mod tests {
                     glyphs.push(scalar);
                 }
             });
-            for warning in UNENCRYPTED {
+            for warning in UNENCRYPTED_NEITHER {
                 assert!(glyphs.contains(warning));
             }
             for line in view.detail.lines() {
@@ -342,7 +454,9 @@ mod tests {
             "tdhost",
             "Keyboard layout: us",
             "America/Los_Angeles",
+            "Storage: not encrypted",
             "Probes: usable TPM 2.0 not found, keyboard console not found",
+            "A keyboard console is a framebuffer console",
         ] {
             assert!(details.contains(expected), "missing {expected}");
         }
@@ -356,86 +470,146 @@ mod tests {
         assert!(ReviewPage::new(too_narrow, &plan, 0).is_none());
     }
 
+    /// Every page's text, and the glyphs painted for it.
+    fn painted(plan: &Plan) -> (String, String) {
+        let screen = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
+        let (_, pages) = ReviewPage::new(screen, plan, 0).unwrap().position();
+        let (mut details, mut glyphs) = (String::new(), String::new());
+        for index in 0..pages {
+            let view = ReviewPage::new(screen, plan, index).unwrap();
+            assert!(view.detail.chars().count() <= BLOCK_SCALARS);
+            assert_eq!(view.warnings, warnings(plan.basis()));
+            let mut page = String::new();
+            view.emit(screen.bounds(), &mut |draw| {
+                if let Primitive::Glyph { scalar, .. } = draw.primitive {
+                    page.push(scalar);
+                }
+            });
+            for line in view.detail.lines() {
+                assert!(page.contains(line), "unpainted detail: {line}");
+            }
+            details.push_str(&view.detail);
+            details.push('\n');
+            glyphs.push_str(&page);
+        }
+        (details, glyphs)
+    }
+
     /// A device-bound review never says storage is unencrypted, never
-    /// claims to protect a lost computer, and fits as the other does.
+    /// claims to protect a lost computer, carries every one of the tier's
+    /// disclosures on its detail pages, and fits as the other does.
     #[test]
     fn a_device_bound_review_says_what_its_storage_is() {
         let screen = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
         let columns = (crate::MIN_PAGE_WIDTH - 2 * INSET) / CELL_WIDTH;
-        for warning in UNENCRYPTED.iter().chain(DEVICE_BOUND) {
-            assert!(warning.chars().count() <= columns, "{warning}");
+        for set in [
+            DEVICE_BOUND,
+            UNENCRYPTED_NO_TPM,
+            UNENCRYPTED_NO_CONSOLE,
+            UNENCRYPTED_NEITHER,
+        ] {
+            assert!(set.len() <= WARNING_ROWS);
+            for warning in set {
+                assert!(warning.chars().count() <= columns, "{warning}");
+            }
         }
-        assert!(UNENCRYPTED.len().max(DEVICE_BOUND.len()) <= WARNING_ROWS);
-        let plan = stored("SERIAL", Storage::DeviceBound, Basis::new(true, true));
+        let plan = stored("SERIAL", Basis::new(true, true));
+        assert_eq!(plan.storage(), Storage::DeviceBound);
         let view = ReviewPage::new(screen, &plan, 0)
             .unwrap()
             .with_notice(Some("trusted consent is unavailable"));
-        let mut glyphs = String::new();
         let mut notice = String::new();
         view.emit(screen.bounds(), &mut |draw| {
             if let Primitive::Glyph { y, scalar, .. } = draw.primitive {
-                glyphs.push(scalar);
                 if y == notice_top(DEVICE_BOUND.len()) as i64 {
                     notice.push(scalar);
                 }
             }
         });
+        assert_eq!(notice, "trusted consent is unavailable");
+        let (details, glyphs) = painted(&plan);
         for warning in DEVICE_BOUND {
             assert!(glyphs.contains(warning), "{warning}");
         }
         assert!(!glyphs.contains("not encrypted"));
         assert!(glyphs.contains("does not protect a lost computer"));
-        assert_eq!(notice, "trusted consent is unavailable");
+        assert!(details.contains("Storage: encrypted to this computer"));
+        assert!(details.contains("Probes: usable TPM 2.0 found, keyboard console found"));
+        // Each disclosure whole, its wrapped words in order.
+        let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let flowed = words(&details);
+        for paragraph in DEVICE_BOUND_DETAILS {
+            assert!(flowed.contains(&words(paragraph)), "{paragraph}");
+        }
+        for phrase in [
+            "not authenticate a person",
+            "not a lost or stolen computer",
+            "is not erased",
+            "shown once, no copy is kept",
+            "PCR 12 at zero",
+            "boot-menu choice",
+            "never shown, but a console server or BMC recorder",
+            "TPM is missing at a start",
+            "counts as a keyboard here",
+            "The account signs in automatically.",
+        ] {
+            assert!(flowed.contains(phrase), "{phrase}");
+        }
+        assert!(!flowed.contains(&words(KEYBOARD_CONSOLE)));
         assert!(ReviewPage::new(surface(752, 479), &plan, 0).is_none());
     }
 
-    /// Every basis is named on a detail row, painted, and changes nothing
-    /// else: the warnings stay the storage's.
+    /// Storage follows the basis: each basis names its storage and why on
+    /// detail rows, and its warnings say the same.
     #[test]
-    fn the_basis_is_a_detail_row_and_changes_no_warning() {
-        let screen = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
-        for storage in Storage::ALL {
-            for (tpm, console, line) in [
-                (
-                    false,
-                    false,
-                    "Probes: usable TPM 2.0 not found, keyboard console not found",
-                ),
-                (
-                    true,
-                    false,
-                    "Probes: usable TPM 2.0 found, keyboard console not found",
-                ),
-                (
-                    false,
-                    true,
-                    "Probes: usable TPM 2.0 not found, keyboard console found",
-                ),
-                (
-                    true,
-                    true,
-                    "Probes: usable TPM 2.0 found, keyboard console found",
-                ),
-            ] {
-                let plan = stored("SERIAL", *storage, Basis::new(tpm, console));
-                let (_, pages) = ReviewPage::new(screen, &plan, 0).unwrap().position();
-                let mut found = false;
-                for index in 0..pages {
-                    let view = ReviewPage::new(screen, &plan, index).unwrap();
-                    assert_eq!(view.warnings, warnings(*storage));
-                    if view.detail.lines().any(|detail| detail == line) {
-                        let mut glyphs = String::new();
-                        view.emit(screen.bounds(), &mut |draw| {
-                            if let Primitive::Glyph { scalar, .. } = draw.primitive {
-                                glyphs.push(scalar);
-                            }
-                        });
-                        assert!(glyphs.contains(line), "{line}");
-                        found = true;
-                    }
-                }
-                assert!(found, "{line}");
-            }
+    fn the_basis_names_the_storage_and_why() {
+        for (tpm, console, storage, probes, warning, tag) in [
+            (
+                false,
+                false,
+                "Storage: not encrypted",
+                "Probes: usable TPM 2.0 not found, keyboard console not found",
+                "Storage is not encrypted: no usable TPM 2.0 and no keyboard console.",
+                "no-tpm-no-console",
+            ),
+            (
+                true,
+                false,
+                "Storage: not encrypted",
+                "Probes: usable TPM 2.0 found, keyboard console not found",
+                "Storage is not encrypted: this computer has no keyboard console.",
+                "no-console",
+            ),
+            (
+                false,
+                true,
+                "Storage: not encrypted",
+                "Probes: usable TPM 2.0 not found, keyboard console found",
+                "Storage is not encrypted: this computer has no usable TPM 2.0.",
+                "no-tpm",
+            ),
+            (
+                true,
+                true,
+                "Storage: encrypted to this computer",
+                "Probes: usable TPM 2.0 found, keyboard console found",
+                "Storage is encrypted to this computer's TPM; this does not protect a lost computer.",
+                "device-bound",
+            ),
+        ] {
+            assert_eq!(Disclosure::of(Basis::new(tpm, console)).tag(), tag);
+            let plan = stored("SERIAL", Basis::new(tpm, console));
+            let (details, glyphs) = painted(&plan);
+            assert!(details.lines().any(|line| line == storage), "{storage}");
+            assert!(details.lines().any(|line| line == probes), "{probes}");
+            assert!(glyphs.contains(warning), "{warning}");
+            assert!(glyphs.contains("signs in automatically"));
+            // Only a review without a keyboard console says what one is.
+            let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert_eq!(
+                words(&details).contains(&words(KEYBOARD_CONSOLE)),
+                !console
+            );
         }
     }
 }

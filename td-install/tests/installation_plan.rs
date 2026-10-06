@@ -57,7 +57,6 @@ fn plan() -> Plan {
         destination(),
         [2; 32],
         uuid(),
-        Storage::Unencrypted,
         Basis::default(),
         settings(),
     )
@@ -240,7 +239,6 @@ fn deployment_id_requires_exact_lowercase_manifest_digest() {
         destination(),
         [0xab; 32],
         uuid(),
-        Storage::Unencrypted,
         Basis::default(),
         settings(),
     )
@@ -324,6 +322,27 @@ fn every_truncation_and_extension_refuses() {
     }
 }
 
+/// Storage follows the basis: device-bound exactly when both probes
+/// passed (ENCRYPTION.md "Activation"), and nothing else names it.
+#[test]
+fn storage_follows_the_basis() {
+    for (tpm, console, storage) in [
+        (false, false, Storage::Unencrypted),
+        (true, false, Storage::Unencrypted),
+        (false, true, Storage::Unencrypted),
+        (true, true, Storage::DeviceBound),
+    ] {
+        let basis = Basis::new(tpm, console);
+        assert_eq!(basis.storage(), storage, "{tpm} {console}");
+        let p = Plan::new([1; 32], destination(), [2; 32], uuid(), basis, settings()).unwrap();
+        assert_eq!(p.storage(), storage);
+    }
+    assert_eq!(Storage::ALL, [Storage::Unencrypted, Storage::DeviceBound]);
+}
+
+/// The storage byte follows the removable flag, the storage the basis
+/// names; a storage byte the basis does not name, or no storage at all,
+/// is refused.
 #[test]
 fn storage_is_one_byte_after_the_removable_flag() {
     let unencrypted = plan();
@@ -332,8 +351,7 @@ fn storage_is_one_byte_after_the_removable_flag() {
         destination(),
         [2; 32],
         uuid(),
-        Storage::DeviceBound,
-        Basis::default(),
+        Basis::new(true, true),
         settings(),
     )
     .unwrap();
@@ -346,9 +364,22 @@ fn storage_is_one_byte_after_the_removable_flag() {
     assert_eq!(unencrypted.encode()[at], 0);
     let mut differs = unencrypted.encode();
     differs[at] = 1;
+    differs[at + 1] = 3;
     assert_eq!(differs, bytes);
     assert_eq!(Plan::decode(&bytes).unwrap(), bound);
-    assert_eq!(Storage::ALL, [Storage::Unencrypted, Storage::DeviceBound]);
+    // Each storage byte with a basis that names the other is refused.
+    let mut unfollowed = bytes.clone();
+    unfollowed[at] = 0;
+    assert_eq!(
+        Plan::decode(&unfollowed).unwrap_err(),
+        "plan storage does not follow its basis"
+    );
+    let mut unfollowed = unencrypted.encode();
+    unfollowed[at] = 1;
+    assert_eq!(
+        Plan::decode(&unfollowed).unwrap_err(),
+        "plan storage does not follow its basis"
+    );
     for code in 2..=255 {
         let mut other = bytes.clone();
         other[at] = code;
@@ -361,59 +392,35 @@ fn storage_is_one_byte_after_the_removable_flag() {
 }
 
 /// The basis is one byte after the storage byte: bit 0 the TPM probe, bit
-/// 1 the keyboard-console probe, every other bit refused. It is
-/// independent of the storage.
+/// 1 the keyboard-console probe, every other bit refused.
 #[test]
 fn the_basis_is_one_byte_after_the_storage_byte() {
     let at = 8 + 32 + 32 + 16 + 4 + 4 + 8 + 8 + 4 + 1 + 1;
-    for storage in Storage::ALL {
-        for (tpm, console, code) in [
-            (false, false, 0),
-            (true, false, 1),
-            (false, true, 2),
-            (true, true, 3),
-        ] {
-            let basis = Basis::new(tpm, console);
-            assert_eq!((basis.tpm(), basis.keyboard_console()), (tpm, console));
-            let p = Plan::new(
-                [1; 32],
-                destination(),
-                [2; 32],
-                uuid(),
-                *storage,
-                basis,
-                settings(),
-            )
-            .unwrap();
-            let bytes = p.encode();
-            assert_eq!(bytes[at], code);
-            let mut differs = bytes.clone();
-            differs[at] = 0;
-            let plain = Plan::new(
-                [1; 32],
-                destination(),
-                [2; 32],
-                uuid(),
-                *storage,
-                Basis::default(),
-                settings(),
-            )
-            .unwrap();
-            assert_eq!(differs, plain.encode());
-            assert_eq!(p == plain, code == 0);
-            let decoded = Plan::decode(&bytes).unwrap();
-            assert_eq!(decoded, p);
-            assert_eq!(decoded.basis(), basis);
-            assert_eq!(decoded.storage(), *storage);
-            for other in 4..=255 {
-                let mut other_bytes = bytes.clone();
-                other_bytes[at] = other;
-                assert_eq!(
-                    Plan::decode(&other_bytes).unwrap_err(),
-                    "invalid plan storage basis",
-                    "{other}"
-                );
-            }
+    for (tpm, console, code) in [
+        (false, false, 0),
+        (true, false, 1),
+        (false, true, 2),
+        (true, true, 3),
+    ] {
+        let basis = Basis::new(tpm, console);
+        assert_eq!((basis.tpm(), basis.keyboard_console()), (tpm, console));
+        let p = Plan::new([1; 32], destination(), [2; 32], uuid(), basis, settings()).unwrap();
+        let bytes = p.encode();
+        assert_eq!(bytes[at], code);
+        assert_eq!(bytes[at - 1], u8::from(code == 3));
+        let decoded = Plan::decode(&bytes).unwrap();
+        assert_eq!(decoded, p);
+        assert_eq!(decoded.basis(), basis);
+        assert_eq!(decoded.storage(), basis.storage());
+        assert_eq!(p == plan(), code == 0);
+        for other in 4..=255 {
+            let mut other_bytes = bytes.clone();
+            other_bytes[at] = other;
+            assert_eq!(
+                Plan::decode(&other_bytes).unwrap_err(),
+                "invalid plan storage basis",
+                "{other}"
+            );
         }
     }
 }
@@ -473,16 +480,7 @@ fn retained_plan_owns_settings_and_labels() {
     )
     .unwrap();
     let s = Settings::new(&username, "host", "us", "Etc/UTC").unwrap();
-    let p = Plan::new(
-        [1; 32],
-        d,
-        [2; 32],
-        uuid(),
-        Storage::Unencrypted,
-        Basis::default(),
-        s,
-    )
-    .unwrap();
+    let p = Plan::new([1; 32], d, [2; 32], uuid(), Basis::default(), s).unwrap();
     let original = p.encode();
     label.clear();
     username.clear();
@@ -511,16 +509,7 @@ fn boundaries_and_missing_labels_remain_distinct() {
         &"z".repeat(64),
     )
     .unwrap();
-    let p = Plan::new(
-        [255; 32],
-        d,
-        [0; 32],
-        uuid(),
-        Storage::DeviceBound,
-        Basis::new(true, true),
-        s,
-    )
-    .unwrap();
+    let p = Plan::new([255; 32], d, [0; 32], uuid(), Basis::new(true, true), s).unwrap();
     assert_eq!(p.encode().len(), 1193);
     assert!(p.encode().len() <= MAX_BYTES);
     assert_eq!(Plan::decode(&p.encode()).unwrap(), p);
@@ -535,16 +524,7 @@ fn boundaries_and_missing_labels_remain_distinct() {
     ] {
         let d = observed_destination("vda", (254, 0), 1, (512, 512), false, (model, None, None))
             .unwrap();
-        let p = Plan::new(
-            [1; 32],
-            d,
-            [2; 32],
-            uuid(),
-            Storage::Unencrypted,
-            Basis::default(),
-            settings(),
-        )
-        .unwrap();
+        let p = Plan::new([1; 32], d, [2; 32], uuid(), Basis::default(), settings()).unwrap();
         assert_eq!(
             Plan::decode(&p.encode()).unwrap().destination().model(),
             model
@@ -591,7 +571,6 @@ fn malformed_observations_and_choices_refuse() {
         destination(),
         [2; 32],
         uuid(),
-        Storage::Unencrypted,
         Basis::default(),
         settings()
     )
@@ -604,7 +583,6 @@ fn malformed_observations_and_choices_refuse() {
             destination(),
             [2; 32],
             bad,
-            Storage::Unencrypted,
             Basis::default(),
             settings()
         )
@@ -657,7 +635,6 @@ fn generated_uuid_text_maps_to_the_plan_network_byte_order() {
         destination(),
         [2; 32],
         uuid,
-        Storage::Unencrypted,
         Basis::default(),
         settings(),
     )

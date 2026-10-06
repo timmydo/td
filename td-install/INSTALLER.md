@@ -45,13 +45,12 @@ wiped (ENCRYPTION.md "Device-bound formatting"), and receives GPT, a FAT32
 ESP and the td Btrfs volume.
 
 The wizard collects one human username, hostname and timezone; the keyboard
-layout is `us`, the only one version 1 admits. Storage is unencrypted and
-the installed account automatically enters the desktop. The welcome and
-final review screens disclose those facts. From ENCRYPTION.md increment
-7's activation, storage is device-bound where the live system has a
-usable TPM 2.0 and a keyboard console and unencrypted otherwise, which
-the review states with its reason; the account still enters the desktop
-automatically ("Storage choice"). There is no PIN field, password
+layout is `us`, the only one version 1 admits. Storage is device-bound
+where the live system has a usable TPM 2.0 and a keyboard console and
+unencrypted otherwise (ENCRYPTION.md "Activation"), which the review
+states with its reason, and the installed account automatically enters
+the desktop either way. The welcome and final review screens disclose
+those facts ("Storage choice"). There is no PIN field, password
 substitute or inert enrollment screen. [ENCRYPTION.md](ENCRYPTION.md) owns
 the later complete encrypted boot, hardware-backed PIN, recovery and
 session-authentication cutover. No account secret is needed to install.
@@ -225,8 +224,10 @@ room is refused. Once `TD-SETUP-LIVE-READY` is seen it drives the wizard
 through QEMU's emulated keyboard, acting only after td-setup has said the
 state the act is for: welcome, the one listed destination, a username,
 hostname and time zone typed a key at a time, the service's review of
-exactly those, back from the review until td-setup says the service released
-it, and the same review again. Enter on it asks for consent, which the drive
+exactly those, naming unencrypted storage for want of a TPM with the
+keyboard console found, back from the review until td-setup says the
+service released it, and the same review again. Enter on it asks for
+consent, which the drive
 gives as a person does: the secure attention chord, the menu's `I`, and
 Enter only once a capture of the compositor's prompt shows, pixel for pixel
 above its countdown, exactly td-authd's rows for that disk, its size and
@@ -353,15 +354,15 @@ drops a proposal not yet sent and releases one that arrives later.
 
 The pure review page renders one immutable `Plan` proposal. It shows the
 complete escaped disk identity, all four selected settings and the
-plan's storage basis ("Storage choice") across bounded detail pages. The
-destructive-loss and unencrypted automatic-login notices
-remain visible on every page. A device-bound review, which only a service
-started with the storage operand makes ("Device-bound records"), shows in
-place of the unencrypted notice that storage is encrypted to this
-computer's TPM, which does not protect a lost computer, that the account
-signs in automatically, and that a recovery key follows; the tier's full
-review disclosures (ENCRYPTION.md "Device-bound default") are increment
-7's, with its activation ("Storage choice"). It cannot authenticate the
+plan's storage and its basis ("Storage choice") across bounded detail
+pages. The destructive-loss notice, the storage notice and the
+automatic-login notice remain visible on every page: an unencrypted
+review's says storage is not encrypted and why, and a device-bound
+review's that storage is encrypted to this computer's TPM, which does
+not protect a lost computer, that the account signs in automatically,
+and that a recovery key follows. A device-bound review's detail pages
+carry the tier's full disclosures ("Storage choice"). It cannot
+authenticate the
 source, establish a disk claim or authorize execution; the service and
 compositor-owned trusted consent remain mandatory. In the live window it
 shows the service's review, never the drafts: PageUp and PageDown move
@@ -408,8 +409,14 @@ The caller may show the view only after the service reports durable
 filesystem and deployment publication, verified boot artifacts, and settings
 publication. In the live window, execute answered awaiting consent shows a
 consent view: confirm or decline at the secure prompt, since this window
-cannot give consent. While consent is sought or the installation runs, the
-window asks for status over the same connection, at most every half second
+cannot give consent. For a device-bound review the view adds that after
+confirmation the secure screen closes by itself and the person returns here
+to write down the recovery key: the compositor, not this window, shows its
+returning notice and closes the screen once consent is committed
+(td-compositor/DESIGN.md "Physical installation confirmation"), and the
+recovery-key pages follow. An unencrypted installation's screen keeps its
+prompt until the compositor says the system is installed. While consent is
+sought or the installation runs, the window asks for status over the same connection, at most every half second
 from each ask, and follows only the review it executed: awaiting consent, a
 running phase, failure and completion are shown as reported; a review
 abandoned before any write (declined, expired, unavailable or the disk
@@ -554,9 +561,9 @@ shared references or copied scalar values. Equality compares every
 field, including optional labels and nonce. A clone is the same
 proposal, never a fresh consent or retry. The record describes whole-
 disk erasure and automatic login, which are not caller-selectable flags,
-a storage byte naming the storage the service's own operand chose
-("Device-bound records") and a basis byte recording what the service's
-own probes found ("Storage choice"); a request carries neither.
+a basis byte recording what the service's own probes found and a
+storage byte naming the storage they choose ("Storage choice",
+"Device-bound records"); a request carries neither.
 
 The public `DestinationObservation` names each unvalidated input field;
 `Destination::new` validates and copies it. Construction and decoding admit
@@ -770,8 +777,9 @@ them `TDINS06` and `TDPLAN03` with the plan's basis byte ("Storage
 choice"); `TDINA02` is unchanged.
 
 - The plan gains one storage byte after the removable flag: 0 unencrypted
-  or 1 device-bound, any other value refused. The service sets it from
-  its storage operand; a propose request carries none. The review page
+  or 1 device-bound, any other value refused. It is the storage the
+  plan's basis names ("Storage choice"), and a plan whose byte is not is
+  refused; a propose request carries none. The review page
   and the consent channel's review report, which gains the same byte
   after the deployment digest, show it.
 - Running phase 6, recovery key, follows verifying boot on a device-bound
@@ -822,24 +830,20 @@ execution's behalf: it withdraws the installation, which fails as
 recovery unconfirmed. One lost after it changes nothing: the execution
 finishes as it would have.
 
-A service started without the storage operand reviews unencrypted plans;
-with it, its plans are device-bound. td-setup shows a review of either
-storage as the service made it, and follows the phase and failure 6
-only for a review it executed as device-bound: the worker remembers the
-storage of the review execute last named, and the phase, failure 6, the
-key or a confirmation reported of any other review ends the connection.
-td-authd declines a device-bound review as unavailable and never passes
-the operand, so the live wizard never shows device-bound storage until
-increment 7 activates the tier; the completion page's display and
-type-back are reached by td-setup's own tests and a caller that starts
-the service with the operand.
+A service's plans are device-bound or unencrypted as its probes found
+("Storage choice"). td-setup shows a review of either storage as the
+service made it, and follows the phase and failure 6 only for a review
+it executed as device-bound: the worker remembers the storage of the
+review execute last named, and the phase, failure 6, the key or a
+confirmation reported of any other review ends the connection. td-authd
+shows either storage on its consent summary, so the live wizard reaches
+the completion page's display and type-back on a machine with both
+probes, as `qemu-boot-encrypted`'s wizard leg proves.
 
 ### Storage choice
 
-This section is ENCRYPTION.md increment 7's target. Its first paragraph,
-the probes and their record, is current; the rest is not yet
-implemented. Today the operand below chooses storage and td-authd
-declines a device-bound review.
+This section is ENCRYPTION.md increment 7's, and current: `serve`
+chooses storage from its own probes.
 
 The plan carries one byte after the storage byte, the storage basis: bit
 0 set when the service's TPM probe passed and bit 1 when its
@@ -851,35 +855,39 @@ it carries no storage. The consent channel's review report keeps its
 storage byte alone and its `TDINA02`. `serve` runs both probes at every
 start, once each, after admission and before its greeting, writes the
 cause of each that fails to standard error, and records them in every
-plan, and the review page shows the basis on a detail row worded as
-findings, never as storage (`Probes: usable TPM 2.0 found` or `not
-found`, `keyboard console found` or `not found`). Nothing acts on them:
-storage still follows the operand, the review's warnings are its
-storage's alone, and a device-bound service still refuses to start
-without a usable TPM. A service without the operand, td-authd's, now
-reaches the TPM for that one read, under a 3-second deadline
-(`TPM_PROBE_DEADLINE`) so that a slow TPM, whose command the kernel may
-retry for minutes, cannot outlast the installer's ten-second greeting
-wait: a missing device, a failed read or a read still unanswered at the
-deadline is recorded as not passed, with its cause on standard error,
-and never refused. A late read is abandoned on its own thread, never
-waited for, and that service makes no further TPM use, since only a
-device-bound execution would. The kernel's wait for a TPM command takes
-no signal, so with a wedged TPM that service's process cannot exit until
+plan. The TPM's read has a 3-second deadline (`TPM_PROBE_DEADLINE`) so
+that a slow TPM, whose command the kernel may retry for minutes, cannot
+outlast the installer's ten-second greeting wait: a missing device, a
+failed read or a read still unanswered at the deadline is recorded as
+not passed, with its cause on standard error, and never refused. A late
+read is abandoned on its own thread, never waited for, and that service
+makes no further TPM use, since only a device-bound execution would and
+its plans are unencrypted. The kernel's wait for a TPM command takes no
+signal, so with a wedged TPM that service's process cannot exit until
 the read returns, up to the kernel's two-minute command duration;
 td-authd does not wait on it, but admits no new wizard connection while
 the old service is still stopping, so a reconnect can wait that long.
 
-The activation commit deletes the operand. Every plan then names
-device-bound storage exactly when its basis has both bits, and
-unencrypted storage otherwise; nothing refuses for a missing TPM or
-keyboard console. td-authd starts the service as today, no longer
-declines a device-bound review, and its consent summary shows the plan's
-storage in place of the fixed unencrypted policy, with td-authd/DESIGN.md
-amended in that commit. td-setup follows a device-bound review it
-executed through the recovery-key phase as now.
+Every plan names device-bound storage exactly when its basis has both
+bits, and unencrypted storage otherwise (`Basis::storage`); nothing
+refuses for a missing TPM or keyboard console. The plan's storage byte
+is that storage, so it adds nothing to the basis and a plan whose
+storage byte the basis does not name is refused; the encoding and
+`TDPLAN03` are unchanged. td-authd starts the service with no storage
+operand, for there is none, and its consent summary shows the plan's
+storage ("ENCRYPTED TO THIS COMPUTER, AUTOMATIC LOGIN" or "UNENCRYPTED
+STORAGE, AUTOMATIC LOGIN"; td-authd/DESIGN.md "Immutable consent
+description prerequisite"). td-setup follows a device-bound review it
+executed through the recovery-key phase.
 
-From activation the welcome page says that storage will be encrypted to
+The review page shows the storage on a detail row (`Storage: encrypted
+to this computer` or `Storage: not encrypted`) above the basis, worded
+as findings (`Probes: usable TPM 2.0 found` or `not found`, `keyboard
+console found` or `not found`), and its evidence line names both
+(`storage=device-bound|unencrypted tpm=found|missing
+console=found|missing`).
+
+The welcome page says that storage will be encrypted to
 this computer when it has a usable TPM 2.0 and a screen and keyboard its
 startup recovery prompt can use, and unencrypted otherwise, that the
 review says which, and that the account signs in automatically either
@@ -929,8 +937,8 @@ but drops none:
 
 ## Installation service core
 
-`td-install serve [--storage device-bound] <td-boot> <deployment-directory>
-<trusted-key> <verified-root> <td-firstboot>` is the service core for one
+`td-install serve <td-boot> <deployment-directory> <trusted-key>
+<verified-root> <td-firstboot>` is the service core for one
 installer. Its five operands are absolute control-plane inputs bound by its
 caller, never by the installer, and must be present and of their kind:
 `td-boot` and `td-firstboot` executable files, the deployment directory and
@@ -952,24 +960,17 @@ installation runs to its finished report first. td-authd starts it for each
 installer on a live boot (td-authd/DESIGN.md "Whole-disk installation
 intake").
 
-The leading `--storage device-bound` operand, the only storage operand,
-makes every installation of this service device-bound
-([ENCRYPTION.md](ENCRYPTION.md) "Device-bound formatting", which owns its
-activation boundary); without it, storage is unencrypted. td-authd never
-passes it. Every serve opens the TPM once the admission checks above
-pass, so a misplaced start never reaches it, and before sending a byte,
-and probes whether it is usable: PCR_Read of PCRs 4 and 9 in the SHA-256
-bank answers that bank, and neither value is zero. That read is
-td-protector's observed policy, made once on a fresh client and never
-retried; the probe seals nothing, and the TPM's state may change before
-execution, which seals under its own policy. Every plan records the
-outcome ("Storage choice"); without the operand the read has a deadline
-there. With the operand it has none, as before, and serve refuses to
-start, with a diagnostic, unless the TPM is usable; every plan the service
-reviews then names device-bound storage, and its execution formats it
-encrypted (DESIGN.md "Device-bound formatting"). Increment
-7's activation deletes the operand, and the service then chooses
-storage from its own probes ("Storage choice").
+serve takes no storage operand. Every serve opens the TPM once the
+admission checks above pass, so a misplaced start never reaches it, and
+before sending a byte, and probes whether it is usable: PCR_Read of PCRs
+4 and 9 in the SHA-256 bank answers that bank, and neither value is
+zero. That read is td-protector's observed policy, made once on a fresh
+client and never retried; the probe seals nothing, and the TPM's state
+may change before execution, which seals under its own policy. Every
+plan records the outcome, under the probe's deadline, beside the
+keyboard-console probe's, and names the storage they choose ("Storage
+choice"); a device-bound plan's execution formats it encrypted (DESIGN.md
+"Device-bound formatting").
 
 It holds at most one review, under the admission rules above. Propose
 checks, in order: busy; the settings (the username through `td-firstboot
@@ -1025,8 +1026,9 @@ with consent installs. Tests drive the core's two ends with fakes and the
 execution on a regular-file disk; `qemu-install-system` drives the service
 itself as root in a guest, as both of its peers, onto a disposable disk it
 then boots (td-install-qemu-test/DESIGN.md), and `qemu-install-encrypted`
-drives it with the storage operand under an emulated TPM, typing the
-recovery key back (ENCRYPTION.md "Acceptance evidence"). The service holds the source
+drives it under an emulated TPM with a display and keyboard, typing the
+recovery key back, and without either probe's device (ENCRYPTION.md
+"Acceptance evidence"). The service holds the source
 directory open for its life, so the medium's filesystem, and the kernel's
 exclusive claim on the disk under it, outlive even a lazy unmount, and that
 disk is never claimable as a destination; the live root, a loop over the

@@ -14,7 +14,10 @@
 //! it is kept.
 use super::encrypted::{self, Bench, HeaderState, HeaderToken};
 use super::install::{self, protocol, Installed, TargetDisk};
-use super::serial_shell::{ConsoleAnswer, ConsoleAnswers};
+use super::live;
+use super::recovery_screen::KeyGlyphs;
+use super::serial_shell::{AnswerLine, ConsoleAnswer, ConsoleAnswers};
+use super::setup_input::KeyCell;
 use super::*;
 
 /// What this oracle builds: the system and the guest fixture.
@@ -156,6 +159,17 @@ impl Change {
         !matches!(self, Self::SelectorImage)
     }
 
+    /// Where the leg answers recovery: the changed initramfs on the VT,
+    /// through the PS/2 keyboard with the serial line idle, the others on
+    /// the serial line with the VT idle (ENCRYPTION.md "Acceptance
+    /// evidence", increment 7).
+    fn line(self) -> AnswerLine {
+        match self {
+            Self::Initramfs => AnswerLine::Vt,
+            _ => AnswerLine::Serial,
+        }
+    }
+
     /// How td-protector types the device-bound token's refusal: a changed
     /// chain passes PolicyPCR before the cap and is refused at Unseal; a
     /// new storage primary cannot load the sealed object at all.
@@ -170,6 +184,11 @@ impl Change {
 /// One leg of the oracle, in the order `LEGS` runs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Leg {
+    /// The default wizard on the production live medium, the TPM, display
+    /// and keyboard attached: device-bound by the probes, its key read from
+    /// the completion page's pixels and typed back, then the installed disk
+    /// booted twice with nothing typed. A machine of its own.
+    Wizard,
     /// The device-bound installation, the key typed back and sent to the
     /// host over the private serial port.
     Install,
@@ -198,6 +217,7 @@ enum Leg {
 }
 
 const LEGS: &[Leg] = &[
+    Leg::Wizard,
     Leg::Install,
     Leg::FirstBoot,
     Leg::SecondBoot,
@@ -1012,6 +1032,7 @@ impl Machine<'_> {
         let unattended = ConsoleAnswers {
             answers: &[],
             refusal: KEY_PROMPT,
+            line: AnswerLine::Serial,
         };
         plan.answers = Some(extra.answers.unwrap_or(&unattended));
         plan.cut = extra.cut;
@@ -1076,9 +1097,12 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), String> 
                 machine = Some(made);
                 "installed device-bound, the key typed back".to_string()
             }
-            (Leg::FirstBoot, Some(machine), Some((disk, _))) => first_boot(runner, machine, disk)?,
+            (Leg::Wizard, _, _) => wizard(runner, &bench, tpm)?,
+            (Leg::FirstBoot, Some(machine), Some((disk, _))) => {
+                first_boot(runner, machine, disk, "first-boot")?
+            }
             (Leg::SecondBoot, Some(machine), Some((disk, _))) => {
-                second_boot(runner, machine, disk)?
+                second_boot(runner, machine, disk, "second-boot")?
             }
             (Leg::Interrupted(commit), Some(machine), Some((_, pristine))) => {
                 interrupted(runner, machine, pristine, commit)?
@@ -1104,6 +1128,118 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), String> 
         summary.join("; ")
     );
     Ok(())
+}
+
+/// The face td-setup draws the recovery key in: the image's outline face.
+const FACE_RECIPE: &str = "jetbrains-mono-nerd-font";
+/// Typed into the wizard's time zone row, which seeks the first zone it
+/// begins: `protocol::TIMEZONE_ID`.
+const ZONE_SEEK: &str = "europe/lon";
+
+/// The default wizard's leg (ENCRYPTION.md "Acceptance evidence",
+/// increment 7): the production live medium over USB on a machine with the
+/// swtpm, a display device and the PS/2 keyboard, its wizard driven with
+/// physical keys to a review naming device-bound storage and consent to
+/// the same; the recovery key read only from the completion page's pixels
+/// and typed back; then the installed disk's first and second boots with
+/// nothing typed, under the same TPM state.
+fn wizard(runner: &RecipeCheckRunner, bench: &Bench, tpm: &Path) -> Result<String, String> {
+    runner.prepare_recipe_target(FACE_RECIPE)?;
+    let face_out = runner.build_plan(FACE_RECIPE)?;
+    let face_dir = runner
+        .ladder_out_from(&face_out, FACE_RECIPE)?
+        .join(td_recipe::catalog::outline_face::DIR);
+    let glyphs = std::rc::Rc::new(KeyGlyphs::render(&crate::face_file::read(
+        &face_dir,
+        crate::face_file::REGULAR,
+    )?)?);
+    let key: KeyCell = std::rc::Rc::default();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let state = Scratch {
+        dir: create_qmp_scratch_dir(&env::temp_dir(), &SEQ)?,
+    };
+    let dir = bench.scratch.dir.join("wizard");
+    fs::create_dir(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+    let medium =
+        build_iso::live_medium(&bench.selector, &bench.store_deployment, &dir, &bench.trust)?;
+    if medium.id != bench.id {
+        return Err(format!(
+            "the live medium's deployment {} is not the bench's {}",
+            medium.id, bench.id
+        ));
+    }
+    let iso = dir.join("live.iso");
+    media::write_image_with_payloads(&iso, &bench.kernel, &medium.selector, &medium.payloads)?;
+    let disk = TargetDisk::with_capacity(&bench.scratch.dir, "wizard.img", bench.capacity)?;
+    let vars = bench.vars("wizard")?;
+    let console = console_path(bench, "wizard");
+    let emulator = secret::Emulator::start(tpm, &state.dir, "wizard")?;
+    let wizard = live::Wizard {
+        username: protocol::USERNAME,
+        hostname: protocol::HOSTNAME,
+        zone_seek: ZONE_SEEK,
+        zone: protocol::TIMEZONE_ID,
+        storage: live::WizardStorage::DeviceBound {
+            glyphs,
+            key: std::rc::Rc::clone(&key),
+        },
+    };
+    println!("   [{LABEL}] the default wizard under swtpm, with a display and keyboard");
+    let driven = live::drive_wizard(&live::LiveRun {
+        qemu: &bench.qemu,
+        code: &bench.code,
+        vars: &vars,
+        iso: &iso,
+        target: &disk,
+        capacity: bench.capacity,
+        id: &medium.id,
+        wizard: &wizard,
+        tpm_socket: Some(emulator.socket.as_path()),
+        keep_console: Some(&console),
+        scratch: &bench.scratch.dir,
+        label: LABEL,
+    })
+    .map_err(|error| encrypted::redacted(&emulator.diagnostic(&error)));
+    drop(wizard);
+    let raw = take_console(&console);
+    let result = driven?;
+    let raw = raw?;
+    emulator.finish()?;
+    encrypted::remove(&iso)?;
+    encrypted::remove(&vars)?;
+    let digits = key
+        .borrow_mut()
+        .take()
+        .ok_or("the wizard completed with no key read")?;
+    let key = RecoveryKey(digits);
+    require_whole("wizard", &result, &raw)?;
+    if key.found_in(&raw) {
+        return Err("the live session's console carries the recovery key".into());
+    }
+    encrypted::require_no_key_text(&String::from_utf8_lossy(&raw))?;
+    fs::write(
+        runner.scratch_dir().join("boot-encrypted-wizard.log"),
+        encrypted::redacted(&result.console),
+    )
+    .map_err(|error| format!("save the wizard's console: {error}"))?;
+    let uuid = encrypted::luks_uuid(&disk.path)?;
+    let image = encrypted::verify_image(&disk.path, 512, &uuid, true)?;
+    let mut machine = Machine {
+        bench,
+        tpm,
+        state,
+        uuid,
+        key,
+        consoles: raw,
+    };
+    let first = first_boot(runner, &mut machine, &disk, "wizard-first-boot")?;
+    let second = second_boot(runner, &mut machine, &disk, "wizard-second-boot")?;
+    encrypted::remove(&disk.path)?;
+    Ok(format!(
+        "the wizard reviewed device-bound storage and consented to it, the key read from the \
+         page's pixels and typed back, LUKS2 volume {} with {} data bytes; {first}; {second}",
+        machine.uuid, image.data_bytes
+    ))
 }
 
 /// The installation, as `qemu-install-encrypted`'s installed leg checks it,
@@ -1139,6 +1275,7 @@ fn install_leg<'a>(
             Some(emulator.socket.as_path()),
             Some(&channel),
             Some(&console),
+            Devices::ALL,
         )
         .map_err(|error| encrypted::redacted(&emulator.diagnostic(&error)));
     // The channel and the console are read and removed whatever the boot
@@ -1225,6 +1362,7 @@ fn first_boot(
     runner: &RecipeCheckRunner,
     machine: &mut Machine<'_>,
     disk: &TargetDisk,
+    leg: &str,
 ) -> Result<String, String> {
     let nonce = nonce(&machine.uuid);
     let installed = machine.installed();
@@ -1232,13 +1370,13 @@ fn first_boot(
     let (result, result_raw) = machine.boot_installed(
         disk,
         &machine.state.dir,
-        "first-boot",
+        leg,
         SYSTEM_BOOT_SUCCESS_MARKER,
         true,
         Some(&steps),
         Extra::default(),
     )?;
-    machine.keep(runner, "first-boot", &result, &result_raw)?;
+    machine.keep(runner, leg, &result, &result_raw)?;
     let mut expected = vec![FIRST_BOOT_RELEASED, CAP_CLOSED];
     expected.extend_from_slice(FIRST_BOOT_STEPS);
     require_release(
@@ -1269,6 +1407,7 @@ fn second_boot(
     runner: &RecipeCheckRunner,
     machine: &mut Machine<'_>,
     disk: &TargetDisk,
+    leg: &str,
 ) -> Result<String, String> {
     let nonce = nonce(&machine.uuid);
     let kept = install::reported_home_inode(&String::from_utf8_lossy(&machine.consoles), &nonce)?;
@@ -1277,13 +1416,13 @@ fn second_boot(
     let (result, result_raw) = machine.boot_installed(
         disk,
         &machine.state.dir,
-        "second-boot",
+        leg,
         SYSTEM_BOOT_SUCCESS_MARKER,
         true,
         Some(&steps),
         Extra::default(),
     )?;
-    machine.keep(runner, "second-boot", &result, &result_raw)?;
+    machine.keep(runner, leg, &result, &result_raw)?;
     require_release(
         &result,
         &machine.uuid,
@@ -1534,6 +1673,7 @@ fn headers(
         Some(emulator.socket.as_path()),
         None,
         Some(&console),
+        Devices::ALL,
     );
     // The medium carried the key: it goes whatever the boot did.
     encrypted::remove(&iso)?;
@@ -1634,6 +1774,7 @@ fn changed(
     let typed = ConsoleAnswers {
         answers: &answers,
         refusal: HALTED,
+        line: change.line(),
     };
     let (recovered, recovered_raw) = machine.boot_installed(
         &disk,
@@ -1822,6 +1963,7 @@ fn inspect_disk(
         None,
         None,
         Some(&console),
+        Devices::ALL,
     );
     encrypted::remove(&iso)?;
     let raw = take_console(&console);
@@ -1895,7 +2037,8 @@ mod tests {
     /// boot follows the first; every commit and change runs once.
     #[test]
     fn the_leg_plan_runs_each_leg_once_in_order() {
-        assert_eq!(LEGS.first(), Some(&Leg::Install));
+        assert_eq!(LEGS.first(), Some(&Leg::Wizard));
+        assert_eq!(LEGS.get(1), Some(&Leg::Install));
         assert_eq!(LEGS.last(), Some(&Leg::Inspect));
         let at = |leg: Leg| LEGS.iter().position(|each| *each == leg).unwrap();
         assert!(at(Leg::FirstBoot) < at(Leg::SecondBoot));
@@ -1928,7 +2071,13 @@ mod tests {
                 1
             );
         }
-        assert_eq!(LEGS.len(), 14);
+        assert_eq!(LEGS.len(), 15);
+        // The changed initramfs answers recovery on the VT, every other
+        // changed chain on the serial line.
+        for change in [Change::SelectorImage, Change::LoadOption, Change::FreshTpm] {
+            assert_eq!(change.line(), AnswerLine::Serial);
+        }
+        assert_eq!(Change::Initramfs.line(), AnswerLine::Vt);
     }
 
     #[test]

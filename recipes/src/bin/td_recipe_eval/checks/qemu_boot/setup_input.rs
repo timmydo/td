@@ -8,9 +8,12 @@
 //! whole-disk rows, then Escape from the installed notice back to the
 //! wizard. The guest learns nothing from the host but keys.
 
+use super::recovery_screen::{KeyGlyphs, DIGITS};
 use super::update::{menu_pixels_match, menu_row_matches, ppm, read_capture, row_matches};
-use super::{qmp_deadline, qmp_json_path, ConsoleEvidence, Qmp, QMP_IO_TIMEOUT};
+use super::{qmp_deadline, qmp_json_path, ConsoleEvidence, Qmp, QMP_IO_TIMEOUT, VT_KEY_PACE};
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// How long a state may take to follow its key, or the ready marker, under
@@ -27,11 +30,67 @@ const NOTICE_INTERVAL: Duration = Duration::from_secs(2);
 /// second row of a 1280x800 menu.
 const NOTICE_TOP: usize = (800 - 248) / 2 + 36;
 const INSTALLED_NOTICE: &str = "SYSTEM INSTALLED - RESTART TO BOOT IT";
+/// The attention menu's title row, the first.
+const TITLE_TOP: usize = (800 - 248) / 2;
+/// What a committed device-bound installation shows before the screen
+/// closes by itself (td-compositor/src/attention.rs).
+const RETURNING_NOTICE: &str = "INSTALLING - RETURNING TO SETUP FOR THE RECOVERY KEY";
+/// How often the screen is captured from Enter until it has closed after
+/// the returning notice, and how long the close may take once it showed.
+const RETURN_INTERVAL: Duration = Duration::from_millis(500);
+const RETURN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long after the screen is seen closed before the next key: twice
+/// the compositor's settle window after a close it made itself
+/// (`SELF_CLOSE_SETTLE`, td-compositor/src/input.rs), which discards a key
+/// pressed inside it.
+const CLOSED_QUIET: Duration = Duration::from_millis(200);
+/// Begin the lines a failed drive repeats from the whole console: the
+/// compositor's attention evidence and errors, and td-setup's states.
+const MARKER_PREFIXES: &[&str] = &["TD-ATTENTION-", "td-compositor: ", "TD-SETUP-SHOWN "];
+/// How many of those lines a failure repeats, the last ones.
+const MARKERS_KEPT: usize = 16;
 const FAILED_NOTICE: &str = "REQUEST FAILED";
 const NO_INSTALL_NOTICE: &str = "NO INSTALLATION IS READY TO REVIEW";
 
+/// How long the recovery-key page may take to show a key the oracle reads,
+/// once td-setup said it showed it, and how often it is captured.
+const KEY_SHOWN_TIMEOUT: Duration = Duration::from_secs(60);
+const KEY_SHOWN_INTERVAL: Duration = Duration::from_millis(500);
+
 /// The disposable target disk's serial, as the wizard's destinations see it.
 pub(crate) const TARGET_SERIAL: &str = "td-setup-target";
+
+/// The recovery key as the oracle read it from the display, its digits
+/// zeroed on drop. Only `Act::ReadKey` fills it, and `Act::TypeKey` and
+/// the host's later legs use it.
+#[derive(Default)]
+pub(crate) struct ReadKey {
+    digits: Option<Box<[u8; DIGITS]>>,
+}
+
+impl Drop for ReadKey {
+    fn drop(&mut self) {
+        if let Some(digits) = self.digits.as_mut() {
+            digits.fill(0);
+            std::hint::black_box(&digits);
+        }
+    }
+}
+
+impl ReadKey {
+    /// The 48 digits read, if they have been.
+    pub(crate) fn digits(&self) -> Option<&[u8; DIGITS]> {
+        self.digits.as_deref()
+    }
+
+    /// The digits read, moved out.
+    pub(crate) fn take(&mut self) -> Option<Box<[u8; DIGITS]>> {
+        self.digits.take()
+    }
+}
+
+/// Where the read key is kept between the steps that read and type it.
+pub(crate) type KeyCell = Rc<RefCell<ReadKey>>;
 
 pub(crate) enum Act {
     /// Press each key alone, in turn.
@@ -39,6 +98,19 @@ pub(crate) enum Act {
     /// Consent through secure attention once the prompt shows exactly
     /// these rows, then return from the installed notice.
     Consent(Vec<String>),
+    /// Consent as `Consent` does, then require the compositor's returning
+    /// notice and its own close of the screen, pressing nothing: a
+    /// device-bound installation finishes only after its recovery key is
+    /// typed back in the wizard, so no installed notice comes first.
+    ConsentThenReturn(Vec<String>),
+    /// Open the prompt as `Consent` does, then press Escape on it before
+    /// consent, with nothing written, and require the screen closed.
+    Decline(Vec<String>),
+    /// Read the recovery key from the display with these references into
+    /// the cell, then press Return to type it back.
+    ReadKey(Rc<KeyGlyphs>, KeyCell),
+    /// Type the key the cell holds on the keyboard, then Return.
+    TypeKey(KeyCell),
 }
 
 /// Once td-setup says it showed a state holding every space-separated
@@ -119,15 +191,35 @@ pub(super) fn restart_progress(
     Ok(())
 }
 
+const DIGIT_KEYS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
 /// Whether `key` is one the wizard's oracle may press.
 pub(super) fn setup_key(key: &str) -> bool {
-    LETTERS.contains(&key) || matches!(key, "minus" | "slash" | "tab" | "down" | "ret" | "esc")
+    LETTERS.contains(&key)
+        || DIGIT_KEYS.contains(&key)
+        || matches!(
+            key,
+            "minus" | "slash" | "tab" | "down" | "ret" | "esc" | "spc"
+        )
+}
+
+/// The key that types `byte` at a console on td's US keymap: a digit, a
+/// lower-case letter, a hyphen or a space.
+pub(super) fn console_key(byte: u8) -> Option<&'static str> {
+    match byte {
+        b'0'..=b'9' => DIGIT_KEYS.get(usize::from(byte - b'0')).copied(),
+        b'a'..=b'z' => LETTERS.get(usize::from(byte - b'a')).copied(),
+        b'-' => Some("minus"),
+        b' ' => Some("spc"),
+        _ => None,
+    }
 }
 
 /// The rows td-authd's whole-disk consent summary puts on the prompt
 /// (td-authd/src/consent.rs), for session user 1000 and a disk that
 /// reports no model and a serial QEMU keeps whole (20 bytes at most) of
-/// bytes the prompt shows as themselves.
+/// bytes the prompt shows as themselves, with device-bound storage when
+/// `encrypted`.
 pub(crate) fn disk_prompt_rows(
     disk: &str,
     capacity: u64,
@@ -135,6 +227,7 @@ pub(crate) fn disk_prompt_rows(
     hostname: &str,
     username: &str,
     deployment: &str,
+    encrypted: bool,
 ) -> Result<Vec<String>, String> {
     let prefix = deployment
         .get(..16)
@@ -168,7 +261,11 @@ pub(crate) fn disk_prompt_rows(
         format!("HOSTNAME: {hostname}"),
         format!("USER: {username}"),
         format!("DEPLOYMENT: {prefix}..."),
-        "UNENCRYPTED STORAGE, AUTOMATIC LOGIN".into(),
+        if encrypted {
+            "ENCRYPTED TO THIS COMPUTER, AUTOMATIC LOGIN".into()
+        } else {
+            "UNENCRYPTED STORAGE, AUTOMATIC LOGIN".into()
+        },
         "ENTER: ERASE AND INSTALL   ESC: CANCEL".into(),
     ])
 }
@@ -249,6 +346,29 @@ fn after(now: Instant, wait: Duration) -> Result<Instant, String> {
         .ok_or_else(|| "wizard drive deadline overflow".to_string())
 }
 
+/// What a consent step does once the prompt shows exactly the review.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Then {
+    /// Enter, then Escape from the installed notice.
+    Installed,
+    /// Enter, then the compositor's returning notice and its own close:
+    /// no key after Enter.
+    Return,
+    /// Escape before consent: declined, the target untouched.
+    Decline,
+}
+
+impl Then {
+    /// How often the screen is captured once Enter was pressed: the
+    /// returning notice stands only `td-compositor`'s four seconds.
+    fn interval(self) -> Duration {
+        match self {
+            Self::Return => RETURN_INTERVAL,
+            Self::Installed | Self::Decline => NOTICE_INTERVAL,
+        }
+    }
+}
+
 /// What the secure attention screen is doing for a consent step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Attention {
@@ -256,15 +376,27 @@ enum Attention {
     /// The chord was pressed; the menu should offer the installation.
     Menu {
         until: Instant,
+        then: Then,
     },
     /// `I` was pressed; the prompt should show exactly the review.
     Prompt {
         until: Instant,
+        then: Then,
     },
-    /// Enter was pressed; the installed notice should follow.
+    /// Enter was pressed; the installed notice should follow, or for
+    /// `Then::Return` the returning notice.
     Installing {
         until: Instant,
         next: Instant,
+        then: Then,
+    },
+    /// The returning notice showed; the screen must close by itself.
+    Returning {
+        until: Instant,
+    },
+    /// Escape was pressed on the prompt; the screen must close.
+    Declining {
+        until: Instant,
     },
 }
 
@@ -272,7 +404,7 @@ enum Attention {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Writes {
     Any,
-    /// Consent is about to be given: nothing written yet.
+    /// Consent is about to be given or declined: nothing written yet.
     None,
     /// Enter again only while nothing is written: the compositor drops an
     /// Enter stamped before its prompt's receipt, which a capture can
@@ -306,6 +438,33 @@ fn admitted(writes: Writes, count: Option<u64>) -> Result<bool, String> {
 enum Seen {
     Wait,
     Press(&'static str, Writes, Attention),
+    /// The screen moved on by itself: no key.
+    Move(Attention),
+}
+
+/// Whether the capture shows the attention menu's layout: its title row.
+fn attention_shown(pixels: &[u8]) -> Result<bool, String> {
+    menu_row_matches(pixels, TITLE_TOP, "TD SECURE ATTENTION")
+}
+
+/// The last `MARKERS_KEPT` lines of `console` that begin with one of
+/// `MARKER_PREFIXES`, for a failed drive to repeat: what the compositor
+/// and td-setup last said, which the console's tail may have scrolled past.
+pub(super) fn markers(console: &str) -> String {
+    let lines: Vec<&str> = console
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| {
+            MARKER_PREFIXES
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
+        .collect();
+    let start = lines.len().saturating_sub(MARKERS_KEPT);
+    lines
+        .get(start..)
+        .map(|kept| kept.join("\n"))
+        .unwrap_or_default()
 }
 
 /// The decision one capture makes in `attention`, at `now`.
@@ -317,13 +476,14 @@ fn seen(
 ) -> Result<Seen, String> {
     match attention {
         Attention::Closed => Ok(Seen::Wait),
-        Attention::Menu { until } => {
+        Attention::Menu { until, then } => {
             if menu_pixels_match(pixels)? {
                 Ok(Seen::Press(
                     "i",
                     Writes::Any,
                     Attention::Prompt {
                         until: after(now, ATTENTION_TIMEOUT)?,
+                        then,
                     },
                 ))
             } else if now > until {
@@ -335,16 +495,26 @@ fn seen(
                 Ok(Seen::Wait)
             }
         }
-        Attention::Prompt { until } => {
+        Attention::Prompt { until, then } => {
             if disk_prompt_matches(pixels, rows)? {
-                Ok(Seen::Press(
-                    "ret",
-                    Writes::None,
-                    Attention::Installing {
-                        until: after(now, INSTALL_TIMEOUT)?,
-                        next: after(now, NOTICE_INTERVAL)?,
-                    },
-                ))
+                Ok(match then {
+                    Then::Decline => Seen::Press(
+                        "esc",
+                        Writes::None,
+                        Attention::Declining {
+                            until: after(now, ATTENTION_TIMEOUT)?,
+                        },
+                    ),
+                    Then::Installed | Then::Return => Seen::Press(
+                        "ret",
+                        Writes::None,
+                        Attention::Installing {
+                            until: after(now, INSTALL_TIMEOUT)?,
+                            next: after(now, then.interval())?,
+                            then,
+                        },
+                    ),
+                })
             } else if menu_row_matches(pixels, NOTICE_TOP, NO_INSTALL_NOTICE)? {
                 Err("secure attention found no installation to review".into())
             } else if menu_row_matches(pixels, NOTICE_TOP, FAILED_NOTICE)? {
@@ -361,24 +531,72 @@ fn seen(
                 Ok(Seen::Wait)
             }
         }
-        Attention::Installing { until, .. } => {
-            if disk_prompt_matches(pixels, rows)? {
+        Attention::Installing { until, then, .. } => {
+            if menu_row_matches(pixels, NOTICE_TOP, FAILED_NOTICE)? {
+                Err("the compositor said the consented installation failed".into())
+            } else if disk_prompt_matches(pixels, rows)? {
                 Ok(Seen::Press(
                     "ret",
                     Writes::Retry,
                     Attention::Installing {
                         until,
-                        next: after(now, NOTICE_INTERVAL)?,
+                        next: after(now, then.interval())?,
+                        then,
                     },
                 ))
+            } else if then == Then::Return
+                && menu_row_matches(pixels, NOTICE_TOP, RETURNING_NOTICE)?
+            {
+                Ok(Seen::Move(Attention::Returning {
+                    until: after(now, RETURN_TIMEOUT)?,
+                }))
             } else if menu_row_matches(pixels, NOTICE_TOP, INSTALLED_NOTICE)? {
-                Ok(Seen::Press("esc", Writes::Some, Attention::Closed))
+                if then == Then::Return {
+                    Err(
+                        "the compositor said a device-bound installation was installed \
+                         before its recovery key"
+                            .into(),
+                    )
+                } else {
+                    Ok(Seen::Press("esc", Writes::Some, Attention::Closed))
+                }
+            } else if now > until {
+                Err(match then {
+                    Then::Return => format!(
+                        "the compositor did not say it was returning to setup within {}s",
+                        INSTALL_TIMEOUT.as_secs()
+                    ),
+                    Then::Installed | Then::Decline => format!(
+                        "the compositor did not say the system was installed within {}s",
+                        INSTALL_TIMEOUT.as_secs()
+                    ),
+                })
+            } else {
+                Ok(Seen::Wait)
+            }
+        }
+        Attention::Returning { until } => {
+            if !attention_shown(pixels)? && !disk_prompt_matches(pixels, rows)? {
+                Ok(Seen::Move(Attention::Closed))
             } else if menu_row_matches(pixels, NOTICE_TOP, FAILED_NOTICE)? {
                 Err("the compositor said the consented installation failed".into())
             } else if now > until {
                 Err(format!(
-                    "the compositor did not say the system was installed within {}s",
-                    INSTALL_TIMEOUT.as_secs()
+                    "the secure attention screen did not close by itself within {}s \
+                     of its returning notice",
+                    RETURN_TIMEOUT.as_secs()
+                ))
+            } else {
+                Ok(Seen::Wait)
+            }
+        }
+        Attention::Declining { until } => {
+            if !attention_shown(pixels)? && !disk_prompt_matches(pixels, rows)? {
+                Ok(Seen::Move(Attention::Closed))
+            } else if now > until {
+                Err(format!(
+                    "the secure attention screen did not close within {}s of Escape",
+                    ATTENTION_TIMEOUT.as_secs()
                 ))
             } else {
                 Ok(Seen::Wait)
@@ -400,6 +618,8 @@ pub(super) struct SetupInputController<'a> {
     attention: Attention,
     /// The rows the open prompt must show.
     rows: &'a [String],
+    /// No key before this, once the screen was seen closed.
+    quiet: Option<Instant>,
 }
 
 impl<'a> SetupInputController<'a> {
@@ -414,6 +634,7 @@ impl<'a> SetupInputController<'a> {
             since: None,
             attention: Attention::Closed,
             rows: &[],
+            quiet: None,
         }
     }
 
@@ -444,7 +665,7 @@ impl<'a> SetupInputController<'a> {
         {
             return Err(format!("td-setup showed {state:?}"));
         }
-        if !self.attend(now)? {
+        if !self.attend(now)? || self.quiet.is_some_and(|quiet| now < quiet) {
             return Ok(false);
         }
         while let Some(step) = self.script.get(self.step) {
@@ -488,7 +709,7 @@ impl<'a> SetupInputController<'a> {
                         qmp.press_until(key, deadline)?;
                     }
                 }
-                Act::Consent(rows) => {
+                Act::Consent(rows) | Act::ConsentThenReturn(rows) | Act::Decline(rows) => {
                     let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
                     let qmp = self.qmp(deadline)?;
                     qmp.key_chord_until(&["ctrl", "alt", "esc"], deadline)?;
@@ -497,7 +718,31 @@ impl<'a> SetupInputController<'a> {
                     self.rows = rows;
                     self.attention = Attention::Menu {
                         until: after(now, ATTENTION_TIMEOUT)?,
+                        then: match step.act {
+                            Act::ConsentThenReturn(_) => Then::Return,
+                            Act::Decline(_) => Then::Decline,
+                            _ => Then::Installed,
+                        },
                     };
+                }
+                Act::ReadKey(glyphs, cell) => {
+                    let digits = self.read_key(glyphs)?;
+                    cell.borrow_mut().digits = Some(digits);
+                    self.press("ret")?;
+                }
+                Act::TypeKey(cell) => {
+                    let keys = cell
+                        .borrow()
+                        .digits()
+                        .ok_or("no recovery key was read to type back")?
+                        .iter()
+                        .map(|digit| console_key(*digit))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or("the key read holds a byte that is not a digit")?;
+                    for key in keys.into_iter().chain(["ret"]) {
+                        self.press(key)?;
+                        std::thread::sleep(VT_KEY_PACE);
+                    }
                 }
             }
             self.step = self.step.saturating_add(1);
@@ -515,7 +760,10 @@ impl<'a> SetupInputController<'a> {
         let next = match self.attention {
             Attention::Closed => return Ok(true),
             Attention::Installing { next, .. } => Some(next),
-            Attention::Menu { .. } | Attention::Prompt { .. } => None,
+            Attention::Menu { .. }
+            | Attention::Prompt { .. }
+            | Attention::Returning { .. }
+            | Attention::Declining { .. } => None,
         };
         if next.is_some_and(|next| now < next) {
             return Ok(false);
@@ -524,11 +772,21 @@ impl<'a> SetupInputController<'a> {
         let pixels = ppm(&capture)?;
         match seen(self.attention, pixels, self.rows, now)? {
             Seen::Wait => {
-                if let Attention::Installing { until, .. } = self.attention {
+                if let Attention::Installing { until, then, .. } = self.attention {
                     self.attention = Attention::Installing {
                         until,
-                        next: after(now, NOTICE_INTERVAL)?,
+                        next: after(now, then.interval())?,
+                        then,
                     };
+                }
+                Ok(false)
+            }
+            Seen::Move(attention) => {
+                self.attention = attention;
+                if attention == Attention::Closed {
+                    self.since = Some(now);
+                    self.quiet = Some(after(now, CLOSED_QUIET)?);
+                    return Ok(false);
                 }
                 Ok(false)
             }
@@ -566,6 +824,25 @@ impl<'a> SetupInputController<'a> {
         self.qmp(deadline)?.press_until(key, deadline)
     }
 
+    /// The recovery key the display shows, read with `glyphs` from
+    /// captures until one shows it: a misread fails at once.
+    fn read_key(&mut self, glyphs: &KeyGlyphs) -> Result<Box<[u8; DIGITS]>, String> {
+        let until = after(Instant::now(), KEY_SHOWN_TIMEOUT)?;
+        loop {
+            let capture = self.screen()?;
+            if let Some(digits) = glyphs.read(ppm(&capture)?)? {
+                return Ok(Box::new(digits));
+            }
+            if Instant::now() > until {
+                return Err(format!(
+                    "the recovery-key page showed no key the oracle could read within {}s",
+                    KEY_SHOWN_TIMEOUT.as_secs()
+                ));
+            }
+            std::thread::sleep(KEY_SHOWN_INTERVAL);
+        }
+    }
+
     /// The display as QEMU scans it out now.
     fn screen(&mut self) -> Result<Vec<u8>, String> {
         let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
@@ -594,7 +871,12 @@ impl<'a> SetupInputController<'a> {
             Attention::Closed => self.script.get(self.step).map(|step| step.shown.as_str()),
             Attention::Menu { .. } => Some("the secure attention menu"),
             Attention::Prompt { .. } => Some("the whole-disk consent prompt"),
+            Attention::Installing {
+                then: Then::Return, ..
+            } => Some("the compositor's returning notice"),
             Attention::Installing { .. } => Some("the installed notice"),
+            Attention::Returning { .. } => Some("the secure attention screen closing by itself"),
+            Attention::Declining { .. } => Some("the declined secure attention screen closing"),
         }
     }
 }
@@ -728,6 +1010,7 @@ mod tests {
             "td-wizard",
             "dana",
             &"0123456789abcdef".repeat(4),
+            false,
         )
         .unwrap()
     }
@@ -817,13 +1100,208 @@ mod tests {
         let hex = "0".repeat(64);
         for serial in ["a b", "", "a\\b", "abcdefghijklmnopqrstu"] {
             assert!(
-                disk_prompt_rows("vdb", 1, serial, "h", "u", &hex).is_err(),
+                disk_prompt_rows("vdb", 1, serial, "h", "u", &hex, false).is_err(),
                 "{serial:?}"
             );
         }
-        assert!(disk_prompt_rows("vdb", 1, "abcdefghijklmnopqrst", "h", "u", &hex).is_ok());
-        assert!(disk_prompt_rows("vdb", 1, "s", "h", "u", &"A".repeat(64)).is_err());
-        assert!(disk_prompt_rows("vdb", 1, "s", "h", "u", "0123").is_err());
+        assert!(disk_prompt_rows("vdb", 1, "abcdefghijklmnopqrst", "h", "u", &hex, false).is_ok());
+        assert!(disk_prompt_rows("vdb", 1, "s", "h", "u", &"A".repeat(64), false).is_err());
+        assert!(disk_prompt_rows("vdb", 1, "s", "h", "u", "0123", false).is_err());
+    }
+
+    /// A console answer types digits, letters, hyphens and spaces, and
+    /// nothing else; the wizard's keys include the digits and the space.
+    #[test]
+    fn console_keys_are_a_closed_set() {
+        assert_eq!(console_key(b'0'), Some("0"));
+        assert_eq!(console_key(b'9'), Some("9"));
+        assert_eq!(console_key(b'r'), Some("r"));
+        assert_eq!(console_key(b'-'), Some("minus"));
+        assert_eq!(console_key(b' '), Some("spc"));
+        for byte in [b'A', b'\n', b'/', b'_', 0x80] {
+            assert_eq!(console_key(byte), None, "{byte}");
+        }
+        for byte in (b'0'..=b'9').chain(b'a'..=b'z').chain([b'-', b' ']) {
+            assert!(setup_key(console_key(byte).unwrap()));
+        }
+    }
+
+    /// Consent that returns to the wizard presses Enter while its prompt
+    /// stays, then takes the compositor's returning notice and its own
+    /// close with no key; an installed notice first fails it, as does a
+    /// screen that never closes.
+    #[test]
+    fn a_consent_that_returns_waits_for_the_screen_to_close_by_itself() {
+        let rows = rows();
+        let now = Instant::now();
+        let installing = Attention::Installing {
+            until: now + INSTALL_TIMEOUT,
+            next: now,
+            then: Then::Return,
+        };
+        assert_eq!(
+            seen(installing, &prompt(&rows, Some(COUNTDOWN)), &rows, now).unwrap(),
+            Seen::Press(
+                "ret",
+                Writes::Retry,
+                Attention::Installing {
+                    until: now + INSTALL_TIMEOUT,
+                    next: now + RETURN_INTERVAL,
+                    then: Then::Return,
+                }
+            )
+        );
+        let returning = Attention::Returning {
+            until: now + RETURN_TIMEOUT,
+        };
+        assert_eq!(
+            seen(installing, &menu(Some(RETURNING_NOTICE)), &rows, now).unwrap(),
+            Seen::Move(returning)
+        );
+        for screen in [background(), menu(None)] {
+            assert_eq!(seen(installing, &screen, &rows, now).unwrap(), Seen::Wait);
+        }
+        assert!(seen(installing, &menu(Some(INSTALLED_NOTICE)), &rows, now).is_err());
+        assert!(seen(installing, &menu(Some(FAILED_NOTICE)), &rows, now).is_err());
+        // Returning: the notice stands, then the screen is gone.
+        assert_eq!(
+            seen(returning, &menu(Some(RETURNING_NOTICE)), &rows, now).unwrap(),
+            Seen::Wait
+        );
+        assert_eq!(
+            seen(returning, &background(), &rows, now).unwrap(),
+            Seen::Move(Attention::Closed)
+        );
+        assert!(seen(returning, &menu(Some(FAILED_NOTICE)), &rows, now).is_err());
+        assert!(seen(
+            returning,
+            &menu(Some(RETURNING_NOTICE)),
+            &rows,
+            now + RETURN_TIMEOUT + Duration::from_secs(1)
+        )
+        .is_err());
+        // The prompt's own choice reaches the installing state.
+        let prompt_phase = Attention::Prompt {
+            until: now + ATTENTION_TIMEOUT,
+            then: Then::Return,
+        };
+        assert_eq!(
+            seen(prompt_phase, &prompt(&rows, Some(COUNTDOWN)), &rows, now).unwrap(),
+            Seen::Press(
+                "ret",
+                Writes::None,
+                Attention::Installing {
+                    until: now + INSTALL_TIMEOUT,
+                    next: now + RETURN_INTERVAL,
+                    then: Then::Return,
+                }
+            )
+        );
+    }
+
+    /// Once the screen is seen closed, the next step waits out the quiet
+    /// interval even though its state was already said, so its key cannot
+    /// land in the compositor's settle window; then it acts.
+    #[test]
+    fn a_step_after_the_close_waits_out_the_settle_window() {
+        let script = [SetupStep {
+            shown: "page=recovery step=shown".into(),
+            act: Act::Keys(Vec::new()),
+            untouched: false,
+            within: STEP_TIMEOUT,
+        }];
+        let mut controller = SetupInputController::new(
+            PathBuf::from("/nonexistent/qmp"),
+            PathBuf::from("/nonexistent/attention.ppm"),
+            &script,
+        );
+        let now = Instant::now();
+        controller.quiet = Some(now + CLOSED_QUIET);
+        let mut evidence = ConsoleEvidence::default();
+        evidence.target = true;
+        evidence
+            .td_setup_shown
+            .push((1, "page=recovery step=shown".into()));
+        assert_eq!(controller.progress_at(&evidence, now), Ok(false));
+        assert_eq!(controller.awaiting(), Some("page=recovery step=shown"));
+        assert_eq!(
+            controller.progress_at(&evidence, now + CLOSED_QUIET),
+            Ok(true)
+        );
+        // Twice the compositor's window, whose length and markers these are.
+        let input = include_str!("../../../../../../td-compositor/src/input.rs");
+        assert_eq!(
+            input
+                .matches("const SELF_CLOSE_SETTLE: u128 = 100_000_000;")
+                .count(),
+            1
+        );
+        assert!(CLOSED_QUIET >= Duration::from_millis(100) * 2);
+        for marker in ["TD-ATTENTION-SELF-CLOSE", "TD-ATTENTION-SETTLED"] {
+            assert!(input.contains(&format!("_MARKER: &str = \"{marker}\";")));
+            assert!(MARKER_PREFIXES
+                .iter()
+                .any(|prefix| marker.starts_with(prefix)));
+        }
+    }
+
+    /// A failed drive repeats the last compositor and td-setup lines from
+    /// the whole console, and no other line.
+    #[test]
+    fn a_failed_drive_repeats_the_last_markers() {
+        let mut console =
+            String::from("noise\r\ntd-compositor: close attention after consent: x\r\n");
+        console.push_str("TD-ATTENTION-SELF-CLOSE cutoff=1 settle-until=2\n");
+        for n in 1..=MARKERS_KEPT {
+            console.push_str(&format!("BTRFS info\nTD-SETUP-SHOWN n={n} page=a\n"));
+        }
+        console.push_str("  TD-SETUP-SHOWN indented\ntail\n");
+        let kept = markers(&console);
+        assert_eq!(kept.lines().count(), MARKERS_KEPT);
+        assert!(kept.starts_with("TD-SETUP-SHOWN n=1 page=a\n"));
+        assert!(kept.ends_with(&format!("n={MARKERS_KEPT} page=a")));
+        let short = markers("x\ntd-compositor: e\r\nTD-ATTENTION-SETTLED cutoff=1 dropped=0\n");
+        assert_eq!(
+            short,
+            "td-compositor: e\nTD-ATTENTION-SETTLED cutoff=1 dropped=0"
+        );
+        assert_eq!(markers("nothing here"), "");
+    }
+
+    /// A declined consent presses Escape on the exact prompt with nothing
+    /// written, then waits for the screen to close.
+    #[test]
+    fn a_declined_consent_escapes_the_prompt_and_waits_for_the_close() {
+        let rows = rows();
+        let now = Instant::now();
+        let prompt_phase = Attention::Prompt {
+            until: now + ATTENTION_TIMEOUT,
+            then: Then::Decline,
+        };
+        let declining = Attention::Declining {
+            until: now + ATTENTION_TIMEOUT,
+        };
+        assert_eq!(
+            seen(prompt_phase, &prompt(&rows, Some(COUNTDOWN)), &rows, now).unwrap(),
+            Seen::Press("esc", Writes::None, declining)
+        );
+        for screen in [
+            menu(Some("CANCELLING REQUEST")),
+            prompt(&rows, Some(COUNTDOWN)),
+        ] {
+            assert_eq!(seen(declining, &screen, &rows, now).unwrap(), Seen::Wait);
+        }
+        assert_eq!(
+            seen(declining, &background(), &rows, now).unwrap(),
+            Seen::Move(Attention::Closed)
+        );
+        assert!(seen(
+            declining,
+            &menu(None),
+            &rows,
+            now + ATTENTION_TIMEOUT + Duration::from_secs(1)
+        )
+        .is_err());
     }
 
     /// Each capture moves the consent on only from the screen it waits for,
@@ -836,6 +1314,7 @@ mod tests {
         let blank = background();
         let menu_phase = Attention::Menu {
             until: now + ATTENTION_TIMEOUT,
+            then: Then::Installed,
         };
         // The menu offering the installation is answered with `I`.
         assert_eq!(
@@ -844,7 +1323,8 @@ mod tests {
                 "i",
                 Writes::Any,
                 Attention::Prompt {
-                    until: now + ATTENTION_TIMEOUT
+                    until: now + ATTENTION_TIMEOUT,
+                    then: Then::Installed,
                 }
             )
         );
@@ -853,6 +1333,7 @@ mod tests {
         // The exact prompt is answered with Enter, with nothing yet written.
         let prompt_phase = Attention::Prompt {
             until: now + ATTENTION_TIMEOUT,
+            then: Then::Installed,
         };
         assert_eq!(
             seen(prompt_phase, &prompt(&rows, Some(COUNTDOWN)), &rows, now).unwrap(),
@@ -861,7 +1342,8 @@ mod tests {
                 Writes::None,
                 Attention::Installing {
                     until: now + INSTALL_TIMEOUT,
-                    next: now + NOTICE_INTERVAL
+                    next: now + NOTICE_INTERVAL,
+                    then: Then::Installed,
                 }
             )
         );
@@ -882,6 +1364,7 @@ mod tests {
         let installing = Attention::Installing {
             until: now + INSTALL_TIMEOUT,
             next: now,
+            then: Then::Installed,
         };
         // A prompt still shown is answered with Enter again, while unwritten.
         assert_eq!(
@@ -891,7 +1374,8 @@ mod tests {
                 Writes::Retry,
                 Attention::Installing {
                     until: now + INSTALL_TIMEOUT,
-                    next: now + NOTICE_INTERVAL
+                    next: now + NOTICE_INTERVAL,
+                    then: Then::Installed,
                 }
             )
         );
@@ -954,7 +1438,8 @@ mod tests {
             "lines.push(format!(\"HOSTNAME: {hostname}\"));",
             "lines.push(format!(\"USER: {username}\"));",
             "lines.push(format!(\"DEPLOYMENT: {prefix}...\"));",
-            "lines.push(\"UNENCRYPTED STORAGE, AUTOMATIC LOGIN\".into());",
+            "Storage::Unencrypted => \"UNENCRYPTED STORAGE, AUTOMATIC LOGIN\",",
+            "Storage::DeviceBound => \"ENCRYPTED TO THIS COMPUTER, AUTOMATIC LOGIN\",",
             "lines.push(\"ENTER: ERASE AND INSTALL   ESC: CANCEL\".into());",
         ] {
             assert_eq!(consent.matches(line).count(), 1, "{line}");
@@ -963,6 +1448,18 @@ mod tests {
         for notice in [INSTALLED_NOTICE, FAILED_NOTICE, NO_INSTALL_NOTICE] {
             assert!(attention.contains(&format!("=> \"{notice}\",")), "{notice}");
         }
+        assert!(attention.contains(&format!(
+            "const RETURNING_NOTICE: &str = \"{RETURNING_NOTICE}\";"
+        )));
+        // The notice stands long enough for captures `RETURN_INTERVAL` apart.
+        let secret = include_str!("../../../../../../td-compositor/src/secret_client.rs");
+        assert_eq!(
+            secret
+                .matches("const RETURN_NOTICE: Duration = Duration::from_secs(4);")
+                .count(),
+            1
+        );
+        assert!(RETURN_INTERVAL * 4 <= Duration::from_secs(4));
         for line in [
             // The menu's rows: 36 apart at the doubled scale.
             "let top = height.saturating_sub(248) / 2;",

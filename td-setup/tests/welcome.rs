@@ -110,13 +110,18 @@ fn wrap_keeps_words_whole_within_the_columns_and_separates_paragraphs() {
 }
 
 #[test]
-fn the_welcome_screen_discloses_unencrypted_storage_and_auto_login_and_no_pin() {
-    // INSTALLER.md requires the welcome screen to disclose that storage is
-    // unencrypted and the account signs in automatically, and forbids a PIN
-    // field here. Pin the whole phrases in the content constant.
+fn the_welcome_screen_discloses_the_storage_rule_and_auto_login_and_no_pin() {
+    // INSTALLER.md requires the welcome screen to disclose when storage is
+    // encrypted to this computer and when not, that the review says which,
+    // and that the account signs in automatically, and forbids a PIN field
+    // here. Pin the whole phrases in the content constant.
     let prose = BODY.join(" ");
     for phrase in [
-        "not encrypted",
+        "encrypted to this computer when it has a usable TPM 2.0",
+        "a screen and keyboard its startup recovery prompt can use",
+        "Otherwise it is not encrypted",
+        "The review says which",
+        "Either way",
         "signs in automatically",
         "no password or PIN",
         "erased",
@@ -220,7 +225,7 @@ fn the_disclosure_prose_renders_below_the_rule() {
         .filter(|(&y, _)| (64..576).contains(&y))
         .map(|(_, line)| line.clone())
         .collect();
-    let expected: Vec<String> = welcome::wrap(&BODY, 98)
+    let expected: Vec<String> = welcome::wrap(BODY, 98)
         .into_iter()
         .filter(|line| !line.is_empty())
         .collect();
@@ -260,20 +265,20 @@ fn the_footer_names_the_step_on_the_bottom_row() {
 #[test]
 fn new_refuses_a_surface_too_small_and_accepts_at_the_exact_boundary() {
     // The binding narrow-end limit is the block's row budget: at scale 1,
-    // 39 columns (width 328) wrap the prose to exactly the block's rows and
+    // 51 columns (width 424) wrap the prose to exactly the block's rows and
     // end exactly where the footer begins (height 336).
-    assert!(Welcome::new(surface(328, 336, 1)).is_some());
+    assert!(Welcome::new(surface(424, 336, 1)).is_some());
     // One column narrower wraps a row past the budget.
-    assert!(Welcome::new(surface(327, 336, 1)).is_none());
+    assert!(Welcome::new(surface(423, 336, 1)).is_none());
     // One pixel shorter overlaps the footer.
-    assert!(Welcome::new(surface(328, 335, 1)).is_none());
+    assert!(Welcome::new(surface(424, 335, 1)).is_none());
     // Grossly too narrow is refused.
     assert!(Welcome::new(surface(200, 600, 1)).is_none());
-    // The height boundary at width 800: the prose is 7 rows, ending at
-    // 72 + 7 * 16 = 184, so the footer needs the row from height - 24, i.e.
-    // height 208 accepts and 207 overlaps.
-    assert!(Welcome::new(surface(800, 208, 1)).is_some());
-    assert!(Welcome::new(surface(800, 207, 1)).is_none());
+    // The height boundary at width 800: the prose is 9 rows, ending at
+    // 72 + 9 * 16 = 216, so the footer needs the row from height - 24, i.e.
+    // height 240 accepts and 239 overlaps.
+    assert!(Welcome::new(surface(800, 240, 1)).is_some());
+    assert!(Welcome::new(surface(800, 239, 1)).is_none());
     // Degenerate: narrower than the two insets, refused without underflow.
     assert!(Welcome::new(surface(8, 600, 1)).is_none());
     // An invalid literal surface (axis past the ceiling) is refused, not

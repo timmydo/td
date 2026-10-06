@@ -228,7 +228,10 @@ fixture's own, the same recipe outputs the image carries.
 The fixture greets both channels, then asks for destinations, which must
 list the target and not the media disk. It proposes the target with the
 fixed settings and the `us` keyboard. The review must be of the validated
-deployment and the proposed disk. Execute must answer awaiting consent, and
+deployment and the proposed disk, and unencrypted: the machine has no TPM,
+and its plan must record that and the keyboard console its display and
+PS/2 keyboard give, which `TD-INSTALL-STORAGE-REVIEWED` reports.
+Execute must answer awaiting consent, and
 the consent channel's review must carry the review's nonce, the disk's
 name and capacity, the hostname, the username and the deployment. The
 fixture consents and requires the started report, polls status every half
@@ -596,23 +599,35 @@ matrix remains unchanged.
 ## Device-bound installation
 
 `qemu-install-encrypted` (td-install/DESIGN.md, ENCRYPTION.md "Acceptance
-evidence") boots three phases of this fixture from the full-system ISO
+evidence") boots four phases of this fixture from the full-system ISO
 through optical firmware media onto a fresh virtio target. Each mounts
 the source, validates it, loop-mounts the signed EROFS as the verified
 root with its store bound at `/td/store`, and records the deployment, as
-the full-system installation does, and starts `td-install serve
---storage device-bound` with the same operands and channels.
+the full-system installation does, and starts `td-install serve` with
+the same operands and channels and no storage operand, for there is
+none: the service's own probes choose. Every review the guest is sent is
+recorded as `TD-INSTALL-STORAGE-REVIEWED` with its storage and its
+basis (`tpm=` and `console=`, 1 passed and 0 not), and each phase
+requires the basis it expects and the storage that basis names.
 
-`install-no-tpm` runs with no TPM attached: it first requires neither
-`/dev/tpm0` nor `/dev/tpmrm0`, then that the service exits unsuccessfully
-with td-install's no-usable-TPM diagnostic on its captured stderr, that
-neither channel receives a byte before end of file, and that the disk's
-canaries are unchanged; then `TD-INSTALL-NO-TPM-REFUSED`.
+`install-no-tpm` runs with no TPM attached and the display and keyboard:
+it first requires neither `/dev/tpm0` nor `/dev/tpmrm0`, then the review
+unencrypted with the TPM probe failed and the keyboard console found; it
+withdraws the review by closing both channels, requires the service to
+exit successfully with no workspace and the disk's canaries unchanged,
+then reports `TD-INSTALL-NO-TPM-UNENCRYPTED`.
+
+`install-no-console` runs with the TPM and without a display device or
+without a keyboard: the review unencrypted with the TPM found and no
+keyboard console, it installs as "Installation through the service"
+does and reports `TD-INSTALL-NO-CONSOLE-UNENCRYPTED` with the UUID and
+the disk, then `TD-INSTALL-ENCRYPTED-END`. The host reads the image: the
+installer's GPT and a Btrfs volume with that UUID and no LUKS2 header.
 
 `install-encrypted` drives the service as in "Installation through the
-service", except that the review, the consent report and the plan must
-name device-bound storage and the polled phases must end in the
-recovery-key phase. Before the service starts, the fixture requires both
+service", except that the review, with both probes passed, the consent
+report and the plan must name device-bound storage and the polled phases
+must end in the recovery-key phase. Before the service starts, the fixture requires both
 of the disk's GPT ranges to hold the table the host seeded, so the
 service is what clears them. A thread samples every process's command
 line in `/proc` every two milliseconds from before the service starts

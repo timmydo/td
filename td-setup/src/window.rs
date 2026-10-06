@@ -13,7 +13,7 @@
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
-use td_install::installation_plan::{Destination, Plan, Settings};
+use td_install::installation_plan::{Destination, Plan, Settings, Storage};
 
 use td_ui::client::{run, App, Client, Handled, KeyboardEvent, Tag};
 use td_ui::font::Font;
@@ -927,6 +927,23 @@ impl Wizard {
                     field(&mut state, "username", settings.username());
                     field(&mut state, "hostname", settings.hostname());
                     field(&mut state, "zone", settings.timezone());
+                    // The storage the review names, and the probes it
+                    // follows.
+                    let basis = plan.basis();
+                    let storage = match plan.storage() {
+                        Storage::Unencrypted => "unencrypted",
+                        Storage::DeviceBound => "device-bound",
+                    };
+                    field(&mut state, "storage", storage);
+                    let found = |passed: bool| if passed { "found" } else { "missing" };
+                    field(&mut state, "tpm", found(basis.tpm()));
+                    field(&mut state, "console", found(basis.keyboard_console()));
+                    // The disclosure set the page shows, by name.
+                    field(
+                        &mut state,
+                        "disclosure",
+                        crate::review::Disclosure::of(basis).tag(),
+                    );
                 }
             }
             Page::Progress(Progress::Consent) => state.push_str("consent"),
@@ -1357,10 +1374,18 @@ impl Window {
             _ => None,
         };
         let outcome: Option<Option<Box<dyn Composition>>> = match wizard.page {
-            Page::Progress(progress) => Some(
-                ProgressPage::new(surface, progress)
-                    .map(|view| Box::new(view) as Box<dyn Composition>),
-            ),
+            Page::Progress(progress) => {
+                // Consent to a device-bound review says the person returns
+                // here for its recovery key.
+                let key = wizard
+                    .plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.storage() == Storage::DeviceBound);
+                Some(
+                    ProgressPage::new(surface, progress)
+                        .map(|view| Box::new(view.with_recovery_key(key)) as Box<dyn Composition>),
+                )
+            }
             Page::Complete => {
                 let notice = match wizard.power {
                     Power::Offered => None,
@@ -1747,7 +1772,9 @@ mod tests {
         wizard.answered(Ok(Answer::Reviewed(plan)));
         assert_eq!(
             wizard.state(),
-            "page=review disk=vdb username=al hostname=h zone=Europe/London"
+            "page=review disk=vdb username=al hostname=h zone=Europe/London \
+             storage=unencrypted tpm=missing console=missing \
+             disclosure=no-tpm-no-console"
         );
         // Back from review is pending until the service releases it.
         wizard.key("Escape");

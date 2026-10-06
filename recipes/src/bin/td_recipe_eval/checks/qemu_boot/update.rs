@@ -1190,7 +1190,7 @@ impl BarText {
 
 /// `from` moved toward `to` by `alpha` of 255 in each channel, rounded, as
 /// the compositor's chrome text blends.
-fn mix(from: [u8; 3], to: [u8; 3], alpha: u8) -> [u8; 3] {
+pub(super) fn mix(from: [u8; 3], to: [u8; 3], alpha: u8) -> [u8; 3] {
     let alpha = u16::from(alpha);
     let mut color = [0; 3];
     for ((out, from), to) in color.iter_mut().zip(from).zip(to) {

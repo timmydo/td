@@ -791,7 +791,8 @@ fn evaluator_source_fingerprint(
         "tests/recipe-eval-tool.sh",
         "builder/src/stage0.rs",
         // Mounted into the evaluator by path (src/bin/td-recipe-eval.rs):
-        // the screen oracles draw the compositor's chrome text with them.
+        // the screen oracles draw the compositor's chrome text, and
+        // td-setup's recovery key, with them.
         "td-ui/src/atlas.rs",
         "td-ui/src/coverage.rs",
         "td-ui/src/face.rs",

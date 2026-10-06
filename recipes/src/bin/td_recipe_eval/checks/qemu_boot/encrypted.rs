@@ -1,5 +1,8 @@
 //! `td-recipe-eval qemu-install-encrypted --tpm /absolute/path/to/swtpm`:
-//! td-install/ENCRYPTION.md increment 5's encrypted-installation oracle.
+//! td-install/ENCRYPTION.md increment 5's encrypted-installation oracle,
+//! with increment 7's storage choice: the service takes no storage
+//! operand, and its review is device-bound exactly when the machine has
+//! the TPM, a display device and a keyboard.
 //! Outside the integration tier. Like `qemu-secret-system` it takes an
 //! explicit swtpm (td-secret/DESIGN.md "TPM validation"), run from a fresh
 //! state directory behind a private socket for each leg, never a host TPM;
@@ -176,8 +179,10 @@ impl Bench {
 }
 
 /// The legs, each on a fresh disk from one ISO apiece: the service's
-/// refusal without a TPM, the device-bound installation typed back and
-/// verified, and a power cut in the recovery-key phase.
+/// unencrypted review without a TPM, withdrawn; unencrypted installations
+/// with the TPM and without a display device or a keyboard; the
+/// device-bound installation typed back and verified; and a power cut in
+/// the recovery-key phase.
 pub(crate) fn run(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), String> {
     secret::verify_swtpm(tpm)?;
     let bench = Bench::new(runner)?;
@@ -188,19 +193,79 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), String> 
     let host = bench.host();
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    // Without a TPM the operand refuses, the disk untouched.
+    // Without a TPM the review is unencrypted, the disk untouched.
     {
         let iso = medium("install-no-tpm")?;
         let target = TargetDisk::with_capacity(&scratch.dir, "no-tpm.img", capacity)?;
         target.seed_preservation_canaries()?;
         let before = target.fingerprint()?;
         let vars = firmware("no-tpm")?;
-        println!("   [qemu-install-encrypted] no TPM: the device-bound service must refuse");
+        println!("   [qemu-install-encrypted] no TPM: the review must be unencrypted");
+        let started = Instant::now();
         let result = host.boot(&iso, &vars, &target, protocol::NO_TPM_MARKER, None)?;
         validate_no_tpm(&result)?;
         if target.fingerprint()? != before {
             return Err("the no-TPM leg changed its disk".into());
         }
+        println!(
+            "   [qemu-install-encrypted] no TPM passed in {:.2}s",
+            started.elapsed().as_secs_f64()
+        );
+        remove(&target.path)?;
+        remove(&iso)?;
+    }
+
+    // With the TPM and without a keyboard console, unencrypted and
+    // installed: no display device, so no framebuffer console binds, and
+    // a display with no keyboard.
+    for (leg, devices, what) in [
+        (
+            "no-display",
+            Devices {
+                display: false,
+                keyboard: true,
+            },
+            "no display device",
+        ),
+        (
+            "no-keyboard",
+            Devices {
+                display: true,
+                keyboard: false,
+            },
+            "no keyboard (q35,i8042=off)",
+        ),
+    ] {
+        let iso = medium("install-no-console")?;
+        let target = TargetDisk::with_capacity(&scratch.dir, &format!("{leg}.img"), capacity)?;
+        let vars = firmware(leg)?;
+        let tpm_scratch = Scratch {
+            dir: create_qmp_scratch_dir(&env::temp_dir(), &SEQ)?,
+        };
+        let emulator = secret::Emulator::start(tpm, &tpm_scratch.dir, leg)?;
+        println!("   [qemu-install-encrypted] {what} under swtpm: unencrypted, installed");
+        let result = host
+            .boot_with(
+                &iso,
+                &vars,
+                &target,
+                protocol::ENCRYPTED_END_MARKER,
+                Some(emulator.socket.as_path()),
+                None,
+                None,
+                devices,
+            )
+            .map_err(|error| redacted(&emulator.diagnostic(&error)))?;
+        save_console(runner, leg, &result)?;
+        let uuid =
+            validate_no_console(&result).map_err(|error| redacted(&emulator.diagnostic(&error)))?;
+        emulator.finish()?;
+        verify_unencrypted(&target.path, &uuid)?;
+        println!(
+            "   [qemu-install-encrypted] {leg} passed in {:.2}s: GPT and Btrfs volume {uuid}, \
+             no LUKS2 header",
+            result.elapsed.as_secs_f64()
+        );
         remove(&target.path)?;
         remove(&iso)?;
     }
@@ -279,8 +344,11 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), String> 
         remove(&iso)?;
     }
     println!(
-        "PASS: device-bound installation through the installation service under the pinned \
-         swtpm: refused without a TPM with its disk unchanged; LUKS2 formatted with the plan's \
+        "PASS: storage chosen by the installation service's own probes: without a TPM an \
+         unencrypted review, withdrawn with its disk unchanged; with the pinned swtpm and no \
+         display device, or no keyboard, an unencrypted review installed as GPT and a Btrfs \
+         volume with no LUKS2 header; with the swtpm, display and keyboard a device-bound \
+         installation: LUKS2 formatted with the plan's \
          UUID, keyslots 0 and 1 and the first-boot token, verified in the guest by td's reader \
          and the TPM; recovery key sent once, a second ask and a mistyped type-back refused, \
          confirmed, then the table written over the seeded one's cleared ranges; the recovery \
@@ -317,7 +385,7 @@ impl Host<'_> {
         marker: &str,
         socket: Option<&Path>,
     ) -> Result<BootResult, String> {
-        self.boot_with(iso, vars, target, marker, socket, None, None)
+        self.boot_with(iso, vars, target, marker, socket, None, None, Devices::ALL)
     }
 
     /// `boot`, the guest's private virtio port written to `side_channel`
@@ -332,11 +400,13 @@ impl Host<'_> {
         socket: Option<&Path>,
         side_channel: Option<&Path>,
         console: Option<&Path>,
+        devices: Devices,
     ) -> Result<BootResult, String> {
         let mut plan = install::plan(iso, true, marker);
         plan.tpm_socket = socket;
         plan.side_channel = side_channel;
         plan.keep_console = console;
+        plan.devices = devices;
         boot_source(
             self.qemu,
             BootSource::Firmware {
@@ -526,19 +596,93 @@ fn refused(result: &BootResult) -> bool {
 
 fn validate_no_tpm(result: &BootResult) -> Result<(), String> {
     require_no_key_text(&result.console)?;
-    require_end(result, protocol::NO_TPM_MARKER, "no-TPM refusal")?;
+    require_end(result, protocol::NO_TPM_MARKER, "no-TPM review")?;
     require_once(
         result,
         &format!("{} {SOURCE_DEVICE}", protocol::MEDIA_MARKER),
         "read-only medium",
     )?;
-    if !result.console.contains(protocol::NO_TPM_DIAGNOSTIC)
-        || refused(result)
-        || result.console.contains(protocol::SERVED_MARKER)
-    {
+    require_storage(result, "unencrypted tpm=0 console=1")?;
+    if refused(result) || result.console.contains(protocol::SERVED_MARKER) {
         return Err(format!(
-            "the no-TPM leg did not refuse as the operand requires\n{}",
+            "the no-TPM leg did not withdraw an unencrypted review\n{}",
             shown(result)
+        ));
+    }
+    Ok(())
+}
+
+/// The one review the guest was sent named `storage`: the storage, then
+/// the probes' findings.
+fn require_storage(result: &BootResult, storage: &str) -> Result<(), String> {
+    require_once(
+        result,
+        &format!("{} {storage}", protocol::STORAGE_REVIEWED_MARKER),
+        "reviewed storage",
+    )?;
+    let reviews = result
+        .console
+        .lines()
+        .filter(|line| line.starts_with(protocol::STORAGE_REVIEWED_MARKER))
+        .count();
+    if reviews != 1 {
+        return Err(format!(
+            "the guest was sent {reviews} reviews, not one\n{}",
+            shown(result)
+        ));
+    }
+    Ok(())
+}
+
+/// The guest's evidence for a leg without a keyboard console: its review
+/// unencrypted with the TPM found, and the installation served. Returns
+/// the plan's UUID.
+fn validate_no_console(result: &BootResult) -> Result<String, String> {
+    require_no_key_text(&result.console)?;
+    let ended = reached(
+        result,
+        protocol::NO_CONSOLE_MARKER,
+        "installation without a keyboard console",
+    )?;
+    if refused(result) {
+        return Err(format!("the guest refused\n{}", shown(result)));
+    }
+    require_storage(result, "unencrypted tpm=1 console=0")?;
+    let uuid = ended
+        .strip_suffix(&format!(" {TARGET_DEVICE}"))
+        .filter(|uuid| protocol::is_v4_volume_uuid(uuid))
+        .ok_or_else(|| format!("malformed {} record", protocol::NO_CONSOLE_MARKER))?;
+    require_once(
+        result,
+        &format!("{} {uuid} {TARGET_DEVICE}", protocol::SERVED_MARKER),
+        "served installation",
+    )?;
+    if result
+        .console
+        .contains(protocol::RECOVERY_TYPED_BACK_MARKER)
+    {
+        return Err("an unencrypted installation reached the recovery key".into());
+    }
+    Ok(uuid.to_string())
+}
+
+/// An unencrypted installation's image: the installer's GPT, and after the
+/// ESP a Btrfs volume whose identity is `uuid`, with no LUKS2 header.
+fn verify_unencrypted(path: &Path, uuid: &str) -> Result<(), String> {
+    let file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let capacity = file
+        .metadata()
+        .map_err(|error| format!("stat {}: {error}", path.display()))?
+        .len();
+    read_table(&file, capacity, 512)?;
+    let start = read_at(&file, volume_offset()?, 6)?;
+    if start == b"LUKS\xba\xbe" || start == b"SKUL\xba\xbe" {
+        return Err("the unencrypted installation's volume holds a LUKS2 header".into());
+    }
+    let found = install::image_volume_identity(path)?;
+    if found != uuid {
+        return Err(format!(
+            "the installed volume is {found}, not the reviewed {uuid}"
         ));
     }
     Ok(())
@@ -565,6 +709,7 @@ pub(super) fn validate_installation(
         &format!("{} {SOURCE_DEVICE}", protocol::MEDIA_MARKER),
         "read-only medium",
     )?;
+    require_storage(result, "device-bound tpm=1 console=1")?;
     let uuid = ended
         .strip_suffix(&format!(" {TARGET_DEVICE}"))
         .filter(|uuid| protocol::is_v4_volume_uuid(uuid))
@@ -641,6 +786,7 @@ fn validate_cut(result: &BootResult) -> Result<String, String> {
             shown(result)
         ));
     }
+    require_storage(result, "device-bound tpm=1 console=1")?;
     let uuid = cut
         .strip_suffix(&format!(" {TARGET_DEVICE}"))
         .filter(|uuid| protocol::is_v4_volume_uuid(uuid))
@@ -972,6 +1118,21 @@ pub(super) fn parse_luks2_after_cut(
         }
     };
     Ok((header_state(&chosen)?, note))
+}
+
+/// The UUID the primary LUKS2 header of the image at `path` names, read
+/// on the host alone; `verify_image` then checks both copies name it.
+pub(super) fn luks_uuid(path: &Path) -> Result<String, String> {
+    let file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let header = read_at(&file, volume_offset()?, LUKS2_HEADER_BYTES)?;
+    if header.get(..6) != Some(&b"LUKS\xba\xbe"[..]) {
+        return Err("the installed volume has no primary LUKS2 header".into());
+    }
+    let uuid = text(&header, 168..208)?;
+    if !protocol::is_v4_volume_uuid(uuid) {
+        return Err(format!("the LUKS2 header names {uuid:?}, not a v4 UUID"));
+    }
+    Ok(uuid.to_string())
 }
 
 /// One header copy, independently of the other: its sequence number and
@@ -1399,6 +1560,64 @@ mod tests {
             console: console.into(),
             elapsed: Duration::ZERO,
             firefox_audio: FirefoxAudioCapture::NotRequested,
+        }
+    }
+
+    /// A leg without a keyboard console needs its one review unencrypted
+    /// with the TPM found and the console not, its served installation of
+    /// that UUID, and no recovery key; the no-TPM leg its one review with
+    /// the TPM not found and nothing served.
+    #[test]
+    fn storage_legs_need_exactly_their_review() {
+        let uuid = "12345678-1234-4234-8234-123456789abc";
+        let reviewed = |storage: &str| format!("{} {storage}\n", protocol::STORAGE_REVIEWED_MARKER);
+        let served = format!("{} {uuid} {TARGET_DEVICE}\n", protocol::SERVED_MARKER);
+        let ended = format!(
+            "{} {uuid} {TARGET_DEVICE}\n{}\n",
+            protocol::NO_CONSOLE_MARKER,
+            protocol::ENCRYPTED_END_MARKER
+        );
+        let whole = format!("{}{served}{ended}", reviewed("unencrypted tpm=1 console=0"));
+        assert_eq!(validate_no_console(&boot(true, &whole)).unwrap(), uuid);
+        for console in [
+            format!("{}{served}{ended}", reviewed("unencrypted tpm=0 console=0")),
+            format!(
+                "{}{served}{ended}",
+                reviewed("device-bound tpm=1 console=1")
+            ),
+            format!("{served}{ended}"),
+            format!(
+                "{}{}{served}{ended}",
+                reviewed("unencrypted tpm=1 console=0"),
+                reviewed("unencrypted tpm=1 console=0")
+            ),
+            format!("{}{ended}", reviewed("unencrypted tpm=1 console=0")),
+            format!(
+                "{}{served}{}\n{ended}",
+                reviewed("unencrypted tpm=1 console=0"),
+                protocol::RECOVERY_TYPED_BACK_MARKER
+            ),
+        ] {
+            assert!(
+                validate_no_console(&boot(true, &console)).is_err(),
+                "{console}"
+            );
+        }
+        let media = format!("{} {SOURCE_DEVICE}\n", protocol::MEDIA_MARKER);
+        let no_tpm = |storage: &str, extra: &str| {
+            format!(
+                "{media}{}{extra}{}\n",
+                reviewed(storage),
+                protocol::NO_TPM_MARKER
+            )
+        };
+        validate_no_tpm(&boot(true, &no_tpm("unencrypted tpm=0 console=1", ""))).unwrap();
+        for console in [
+            no_tpm("unencrypted tpm=1 console=1", ""),
+            no_tpm("device-bound tpm=1 console=1", ""),
+            no_tpm("unencrypted tpm=0 console=1", &served),
+        ] {
+            assert!(validate_no_tpm(&boot(true, &console)).is_err(), "{console}");
         }
     }
 

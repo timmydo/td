@@ -307,8 +307,8 @@ impl Settings {
     }
 }
 
-/// How the installed volume is stored. The service sets it from its own
-/// storage operand; no request carries it.
+/// How the installed volume is stored. It follows the plan's basis
+/// (`Basis::storage`); no request carries it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Storage {
     Unencrypted,
@@ -340,7 +340,8 @@ impl Storage {
 
 /// What the service's own probes found when it started (ENCRYPTION.md
 /// "Activation"): a usable TPM 2.0, and a keyboard console. Every plan of
-/// that service records it; no request carries it.
+/// that service records it, and its storage follows it; no request
+/// carries it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Basis {
     tpm: bool,
@@ -364,6 +365,16 @@ impl Basis {
     pub fn keyboard_console(self) -> bool {
         self.keyboard_console
     }
+    /// The storage a plan with this basis names: device-bound exactly when
+    /// both probes passed, unencrypted otherwise (ENCRYPTION.md
+    /// "Activation"). Neither outcome refuses.
+    pub fn storage(self) -> Storage {
+        if self.tpm && self.keyboard_console {
+            Storage::DeviceBound
+        } else {
+            Storage::Unencrypted
+        }
+    }
 
     fn code(self) -> u8 {
         u8::from(self.tpm) | (u8::from(self.keyboard_console) << 1)
@@ -377,8 +388,8 @@ impl Basis {
     }
 }
 
-/// One proposed whole-disk, automatic-login installation, with the storage
-/// the service chose and the basis its probes found. A fresh nonce
+/// One proposed whole-disk, automatic-login installation, with the basis
+/// the service's probes found and the storage it names. A fresh nonce
 /// distinguishes otherwise equal proposals. Equality binds all fields;
 /// cloning copies a proposal and never creates another authorization.
 ///
@@ -393,7 +404,6 @@ pub struct Plan {
     destination: Destination,
     deployment: [u8; 32],
     volume_uuid: [u8; 16],
-    storage: Storage,
     basis: Basis,
     settings: Settings,
 }
@@ -406,7 +416,6 @@ impl Plan {
         destination: Destination,
         deployment: [u8; 32],
         volume_uuid: [u8; 16],
-        storage: Storage,
         basis: Basis,
         settings: Settings,
     ) -> Result<Self, String> {
@@ -421,7 +430,6 @@ impl Plan {
             destination,
             deployment,
             volume_uuid,
-            storage,
             basis,
             settings,
         })
@@ -460,8 +468,9 @@ impl Plan {
     pub fn volume_uuid(&self) -> &[u8; 16] {
         &self.volume_uuid
     }
+    /// The storage the plan's basis names.
     pub fn storage(&self) -> Storage {
-        self.storage
+        self.basis.storage()
     }
     pub fn basis(&self) -> Basis {
         self.basis
@@ -482,7 +491,7 @@ impl Plan {
         put_destination_with(
             &mut out,
             &self.destination,
-            &[self.storage.code(), self.basis.code()],
+            &[self.storage().code(), self.basis.code()],
         );
         put_settings(&mut out, &self.settings);
         out
@@ -499,21 +508,19 @@ impl Plan {
         let nonce = r.array()?;
         let deployment = r.array()?;
         let uuid = r.array()?;
-        let (destination, (storage, basis)) = read_destination_with(&mut r, |r| {
+        let (destination, basis) = read_destination_with(&mut r, |r| {
             let [storage, basis] = r.array()?;
-            Ok((Storage::from_code(storage)?, Basis::from_code(basis)?))
+            let basis = Basis::from_code(basis)?;
+            // The storage byte is redundant with the basis: only the storage
+            // the basis names is admitted.
+            if Storage::from_code(storage)? != basis.storage() {
+                return Err("plan storage does not follow its basis".into());
+            }
+            Ok(basis)
         })?;
         let settings = read_settings(&mut r)?;
         r.finish()?;
-        Self::new(
-            nonce,
-            destination,
-            deployment,
-            uuid,
-            storage,
-            basis,
-            settings,
-        )
+        Self::new(nonce, destination, deployment, uuid, basis, settings)
     }
 }
 

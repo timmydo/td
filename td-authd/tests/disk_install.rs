@@ -174,6 +174,7 @@ fn a_review_is_shown_once_as_its_escaped_summary() {
         hostname,
         username,
         deployment,
+        storage,
     } = request.operation()
     else {
         panic!("{request:?}")
@@ -186,12 +187,15 @@ fn a_review_is_shown_once_as_its_escaped_summary() {
     assert_eq!(hostname, "td-laptop");
     assert_eq!(username, "alice");
     assert_eq!(deployment, &[0xab; 8]);
+    assert_eq!(*storage, Storage::Unencrypted);
     // Selected once; a second selection would show it twice.
     assert!(intake.select().is_err());
 }
 
+/// A device-bound review is shown as one, its storage row in place of
+/// the unencrypted one.
 #[test]
-fn a_device_bound_review_is_declined_as_unavailable() {
+fn a_device_bound_review_shows_its_storage() {
     let (mut intake, mut service) = served();
     greet(&mut intake, &mut service);
     let bound = wire::Review::new(wire::ReviewFields {
@@ -207,12 +211,22 @@ fn a_device_bound_review_is_declined_as_unavailable() {
     })
     .unwrap();
     report(&mut service, Report::Review(Box::new(bound)));
-    reviewed(&mut intake);
-    assert!(intake.select().is_err());
-    assert_eq!(
-        answer(&mut service),
-        Answer::Declined([9; 32], NoConsent::Unavailable)
-    );
+    let request = selected(&mut intake);
+    assert_eq!(request.nonce(), &[9; 32]);
+    assert!(matches!(
+        request.operation(),
+        Operation::InstallDisk {
+            storage: Storage::DeviceBound,
+            ..
+        }
+    ));
+    assert!(request
+        .lines()
+        .contains(&"ENCRYPTED TO THIS COMPUTER, AUTOMATIC LOGIN".to_string()));
+    assert!(!request
+        .lines()
+        .iter()
+        .any(|line| line.starts_with("UNENCRYPTED")));
 }
 
 #[test]

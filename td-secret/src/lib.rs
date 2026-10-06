@@ -267,7 +267,7 @@ mod confinement {
             fingerprint(include_str!("enrollment_operation.rs")),
             0x30dcb428ed75a535
         );
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x0c9abd729126791a, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x002d4bc49483c0dc, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
     }
 
     /// TOKEN-LOGIN.md, "Deployments": the shared tier reader only opens and
