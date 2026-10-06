@@ -60,6 +60,12 @@ pub struct Client {
     pub template_shared: Vec<TemplateShared>,
     /// The most background processes a conversation runs at once.
     pub max_background: u32,
+    /// Whether a conversation past `compact_at` is compacted, or its turn
+    /// stopped (DESIGN.md §14).
+    pub auto_compact: bool,
+    /// The share of a model's context, in percent, past which a request
+    /// compacts first.
+    pub compact_at: u8,
     /// The bytes of each background process's output kept.
     pub background_output_bytes: u64,
 }
@@ -88,6 +94,8 @@ impl Default for Client {
             shared: Vec::new(),
             template_shared: Vec::new(),
             max_background: DEFAULT_MAX_BACKGROUND,
+            auto_compact: true,
+            compact_at: DEFAULT_COMPACT_AT,
             background_output_bytes: DEFAULT_BACKGROUND_OUTPUT_BYTES,
         }
     }
@@ -216,6 +224,8 @@ impl Client {
                 "max_background".into(),
                 Json::from(u64::from(self.max_background)),
             ),
+            ("auto_compact".into(), Json::Bool(self.auto_compact)),
+            ("compact_at".into(), Json::from(u64::from(self.compact_at))),
             (
                 "background_output_bytes".into(),
                 Json::from(self.background_output_bytes),
@@ -281,6 +291,18 @@ impl Client {
                 turn: limit("max_cost_per_turn")?,
                 conversation: limit("max_cost_per_conversation")?,
                 day: limit("max_cost_per_day")?,
+            },
+            auto_compact: match value.get("auto_compact") {
+                None => true,
+                Some(on) => on.as_bool().ok_or("auto_compact is not true or false")?,
+            },
+            compact_at: match value.get("compact_at") {
+                None => DEFAULT_COMPACT_AT,
+                Some(n) => n
+                    .as_u64()
+                    .and_then(|n| u8::try_from(n).ok())
+                    .filter(|n| COMPACT_AT.contains(n))
+                    .ok_or("compact_at is out of range")?,
             },
             max_background: match value.get("max_background") {
                 None => DEFAULT_MAX_BACKGROUND,
@@ -377,6 +399,34 @@ pub(crate) fn effort(text: &str) -> Result<String, String> {
 /// nearest such case Jev answered `matches` to (DESIGN.md §11; the
 /// commit that set it records the counts).
 const JEV_THRESHOLD_SHIPPED: u16 = 775;
+/// `compact_at`'s default, in percent.
+const DEFAULT_COMPACT_AT: u8 = 80;
+/// What `compact_at` may be, in percent.
+const COMPACT_AT: std::ops::RangeInclusive<u8> = 10..=100;
+
+/// `compact_at`: a share of the context from 0.1 to 1 in at most two
+/// decimal places, in percent.
+fn compact_at(value: &Toml) -> Result<u8, String> {
+    let wrong = || {
+        format!("`compact_at` is a share of the context from 0.1 to 1 in at most two decimal places, not {value:?}")
+    };
+    let p = match value {
+        Toml::Float(p) => *p,
+        Toml::Int(1) => 1.0,
+        _ => return Err(wrong()),
+    };
+    let percent = (p * 100.0).round();
+    if !p.is_finite() || (p * 100.0 - percent).abs() > 1e-6 {
+        return Err(wrong());
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let percent = percent as i64;
+    u8::try_from(percent)
+        .ok()
+        .filter(|p| COMPACT_AT.contains(p))
+        .ok_or_else(wrong)
+}
+
 /// The thresholds `jev_threshold` may be, in thousandths.
 const JEV_THRESHOLD: std::ops::RangeInclusive<u16> = 500..=1000;
 
@@ -489,8 +539,8 @@ const KEYS: &[(&str, Use)] = &[
     ("fetch_concurrency", Use::Later(11)),
     ("max_background", Use::Read),
     ("background_output_bytes", Use::Read),
-    ("auto_compact", Use::Later(16)),
-    ("compact_at", Use::Later(16)),
+    ("auto_compact", Use::Read),
+    ("compact_at", Use::Read),
     ("compact_keep_tokens", Use::Later(16)),
     ("compact_model", Use::Later(16)),
 ];
@@ -935,6 +985,19 @@ pub fn parse(text: &str) -> Result<Config, String> {
             }
         };
     }
+    if let Some(value) = table.get("auto_compact") {
+        config.client.auto_compact = match value {
+            Toml::Bool(on) => *on,
+            _ => {
+                return Err(format!(
+                    "`auto_compact` is `true` or `false`, not {value:?}"
+                ))
+            }
+        };
+    }
+    if let Some(value) = table.get("compact_at") {
+        config.client.compact_at = compact_at(value)?;
+    }
     if let Some(value) = table.get("max_background") {
         config.client.max_background = match value {
             Toml::Int(n) => u32::try_from(*n).ok(),
@@ -1220,6 +1283,47 @@ mod tests {
             Client::from_json(&value).unwrap_err(),
             "jev_threshold is not a whole number"
         );
+    }
+
+    #[test]
+    fn compaction_is_configured_by_its_share_of_the_context() {
+        let client = Config::default().client;
+        assert!(client.auto_compact);
+        assert_eq!(client.compact_at, 80);
+        let client = parse("auto_compact = false\ncompact_at = 0.65\n")
+            .unwrap()
+            .client;
+        assert!(!client.auto_compact);
+        assert_eq!(client.compact_at, 65);
+        assert_eq!(Client::from_json(&client.to_json()).unwrap(), client);
+        // A setup without them, from a window before them, has the
+        // defaults.
+        let mut older = client.to_json();
+        older.remove("auto_compact");
+        older.remove("compact_at");
+        let older = Client::from_json(&older).unwrap();
+        assert!(older.auto_compact);
+        assert_eq!(older.compact_at, 80);
+        for (text, percent) in [("1", 100), ("1.0", 100), ("0.1", 10), ("0.95", 95)] {
+            assert_eq!(
+                parse(&format!("compact_at = {text}"))
+                    .unwrap()
+                    .client
+                    .compact_at,
+                percent,
+                "{text}"
+            );
+        }
+        for text in ["0.05", "0.805", "1.01", "80", "0", "\"0.8\"", "true"] {
+            let refused = parse(&format!("compact_at = {text}")).unwrap_err();
+            assert!(
+                refused.contains("`compact_at` is a share of the context"),
+                "{text}: {refused}"
+            );
+        }
+        assert!(parse("auto_compact = 1")
+            .unwrap_err()
+            .contains("`auto_compact` is `true` or `false`"));
     }
 
     #[test]

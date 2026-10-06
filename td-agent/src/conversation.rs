@@ -48,6 +48,7 @@ use crate::assemble::Assembly;
 use crate::bench::Bench;
 use crate::classifier;
 use crate::client::{self, Completion, Failure, Params};
+use crate::compact;
 use crate::config::Client;
 use crate::cost;
 use crate::frame;
@@ -1378,6 +1379,9 @@ impl Session {
             }
         }
         let mut attempt = 0u32;
+        // Compaction runs once a request, and a context-length refusal is
+        // asked again once (DESIGN.md §14).
+        let (mut compacted, mut refused_context) = (false, false);
         loop {
             // A checkout done while a request waited to be asked again is
             // taken up before it is, its worktrees bound for this step's
@@ -1390,6 +1394,9 @@ impl Session {
             let events = self.conversation.events();
             let (prefix, prefix_text) =
                 client::current_prefix(events, self.conversation.prefix_file());
+            // Owned, so that a compaction may be logged while it is held.
+            let prefix_text = prefix_text.to_string();
+            let prefix_text = prefix_text.as_str();
             let messages = client::messages(events, client::timed(prefix_text));
             let mut max_tokens = model
                 .as_ref()
@@ -1414,9 +1421,22 @@ impl Session {
             let (mut head, mut body) = build(max_tokens)?;
             let estimate = client::estimate(events, body.len() as u64);
             if let Some(context) = model.as_ref().and_then(|m| m.context_length) {
+                let past = compact::past(estimate, max_tokens, context, client.compact_at);
+                if let (false, Some(room)) = (compacted, past) {
+                    if !client.auto_compact {
+                        return Ok(Outcome::stop(format!(
+                            "the conversation is about {estimate} tokens, which with its reply's {room} is past compact_at, {}% of {name}'s context of {context}; auto_compact is off, so start another conversation",
+                            client.compact_at
+                        )));
+                    }
+                    compacted = true;
+                    if self.prune(compact::MINIMUM_TOKENS)? {
+                        continue;
+                    }
+                }
                 if estimate >= context {
                     return Ok(Outcome::stop(format!(
-                        "the conversation is about {estimate} tokens, past {name}'s context of {context}; start another conversation (compaction comes later)"
+                        "the conversation is about {estimate} tokens, past {name}'s context of {context}, with nothing more to prune; start another conversation"
                     )));
                 }
                 if estimate.saturating_add(max_tokens) > context {
@@ -1525,6 +1545,20 @@ impl Session {
                     }
                     attempt += 1;
                 }
+                // Past the context by the provider's count, not ours: what
+                // can be pruned is, and the request asked again, once.
+                Failure::Stop { status, message }
+                    if client.auto_compact
+                        && !refused_context
+                        && client::context_exceeded(status, &message) =>
+                {
+                    self.settle(request.seq, None, (0, Basis::Nothing), outcome.clone())?;
+                    self.spent(id, 0);
+                    (compacted, refused_context) = (true, true);
+                    if !self.prune(0)? {
+                        return Ok(Outcome::stop(outcome));
+                    }
+                }
                 Failure::Stop { .. } => {
                     self.settle(request.seq, None, (0, Basis::Nothing), outcome.clone())?;
                     self.spent(id, 0);
@@ -1543,6 +1577,19 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Logs a compaction pruning what `compact::prunable` gives when it
+    /// frees at least `minimum` tokens: whether it did.
+    fn prune(&mut self, minimum: u64) -> Result<bool, String> {
+        let pruned =
+            compact::prunable(self.conversation.events(), compact::PROTECT_TOKENS, minimum);
+        if pruned.is_empty() {
+            return Ok(false);
+        }
+        self.log(Kind::Compaction { pruned })?;
+        self.sync()?;
+        Ok(true)
     }
 
     /// Logs a completion: the assistant message, its usage and the

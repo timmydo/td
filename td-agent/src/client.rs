@@ -236,6 +236,10 @@ pub fn messages(events: &[Event], timed: bool) -> Vec<String> {
         }
     };
     let mut purposes: Vec<(u64, Purpose)> = Vec::new();
+    // What compaction pruned, and the replies whose calls its stubs name.
+    let pruned = crate::compact::pruned(events);
+    let mut replies: std::collections::BTreeMap<u64, &[crate::store::Call]> =
+        std::collections::BTreeMap::new();
     // Each background process's command, for its exit notice.
     let mut commands: Vec<(u64, &str)> = Vec::new();
     let mut out = Vec::new();
@@ -297,6 +301,9 @@ pub fn messages(events: &[Event], timed: bool) -> Vec<String> {
                 calls,
                 ..
             } => {
+                if !pruned.is_empty() {
+                    replies.insert(event.seq, calls.as_slice());
+                }
                 let turn = purposes
                     .iter()
                     .rev()
@@ -343,14 +350,28 @@ pub fn messages(events: &[Event], timed: bool) -> Vec<String> {
                 message.push('}');
                 out.push(message);
             }
-            Kind::ToolResult { id, content, .. } => out.push(
-                Json::Obj(vec![
-                    ("role".into(), Json::Str("tool".into())),
-                    ("tool_call_id".into(), Json::Str(id.clone())),
-                    ("content".into(), Json::Str(content.clone())),
-                ])
-                .to_string(),
-            ),
+            Kind::ToolResult {
+                reply,
+                id,
+                name,
+                content,
+                ..
+            } => {
+                let content = if pruned.contains(&event.seq) {
+                    let path = crate::compact::path_of(&replies, *reply, id);
+                    crate::compact::stub(name, path.as_deref(), content.len(), event.seq)
+                } else {
+                    content.clone()
+                };
+                out.push(
+                    Json::Obj(vec![
+                        ("role".into(), Json::Str("tool".into())),
+                        ("tool_call_id".into(), Json::Str(id.clone())),
+                        ("content".into(), Json::Str(content)),
+                    ])
+                    .to_string(),
+                )
+            }
             _ => {}
         }
     }
@@ -481,6 +502,8 @@ pub fn estimate(events: &[Event], bytes: u64) -> u64 {
                     last = Some((tokens.prompt.saturating_add(tokens.completion), *sent));
                 }
             }
+            // The view a compaction rebuilt is estimated afresh.
+            Kind::Compaction { .. } => last = None,
             _ => {}
         }
     }
@@ -813,6 +836,26 @@ fn completion(value: &Json, body: &[u8]) -> Result<Completion, Failure> {
         usage: usage(value),
         calls,
     })
+}
+
+/// Whether a refusal says the request was past the model's context:
+/// what a provider's context-length error says (DESIGN.md §14).
+pub fn context_exceeded(status: Option<u16>, message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    match status {
+        // Too large a body, whatever the provider or a proxy says of it.
+        Some(413) => true,
+        Some(400) => [
+            "context length",
+            "context_length",
+            "context window",
+            "prompt is too long",
+            "input token count",
+        ]
+        .iter()
+        .any(|said| message.contains(said)),
+        _ => false,
+    }
 }
 
 /// A failure by its HTTP status (DESIGN.md §5).
@@ -1581,6 +1624,24 @@ mod tests {
     }
 
     #[test]
+    fn a_context_length_refusal_is_told_from_others() {
+        let said = "This endpoint's maximum context length is 200000 tokens. However, you requested about 213000 tokens.";
+        assert!(context_exceeded(Some(400), said));
+        assert!(context_exceeded(Some(413), "Request Entity Too Large"));
+        assert!(context_exceeded(
+            Some(400),
+            "prompt is too long: 213412 tokens > 200000 maximum"
+        ));
+        assert!(context_exceeded(
+            Some(400),
+            "The input token count (1100000) exceeds the maximum number of tokens allowed (1048576)."
+        ));
+        assert!(!context_exceeded(Some(400), "invalid tool schema"));
+        assert!(!context_exceeded(Some(401), said));
+        assert!(!context_exceeded(None, said));
+    }
+
+    #[test]
     fn the_prompt_estimate_starts_from_the_last_report() {
         let events = vec![
             event(
@@ -1624,6 +1685,10 @@ mod tests {
         // 2,100 reported, and 1,000 bytes more since: 250 tokens.
         assert_eq!(estimate(&events, 5000), 2350);
         assert_eq!(estimate(&events, 40_000), 2100 + 9000);
+        // A compaction's view is estimated afresh, from its bytes.
+        let mut compacted = events.clone();
+        compacted.push(event(4, Kind::Compaction { pruned: vec![2] }));
+        assert_eq!(estimate(&compacted, 5000), 1250);
         // A failed request's report, its reply incomplete or absent,
         // leaves the estimate as it was: a retry sends the same head.
         for incomplete in [true, false] {

@@ -2115,6 +2115,12 @@ impl App {
             Kind::Approval { outcome, by, .. } => {
                 self.notice_message(&format!("approval: {outcome}, decided by {by}"));
             }
+            // A divider where the model's view was compacted; the
+            // transcript above it stays whole (DESIGN.md §14).
+            Kind::Compaction { pruned } => self.notice_message(&format!(
+                "compacted: from here the model is sent {} older tool results as stubs, which history_read resolves",
+                pruned.len()
+            )),
         }
         self.touch();
     }

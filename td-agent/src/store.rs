@@ -1430,6 +1430,9 @@ pub enum Kind {
         kept: Option<String>,
         digest: Option<String>,
     },
+    /// A compaction (DESIGN.md §14): the tool results it pruned, sent as
+    /// stubs from here on.
+    Compaction { pruned: Vec<u64> },
     /// The todo list as written, whole (DESIGN.md §12); `cleared` when the
     /// human cleared it from the window.
     Todo { items: Vec<TodoItem>, cleared: bool },
@@ -1734,6 +1737,13 @@ impl Event {
                     put("held", Json::Str(held.word().into()));
                 }
             }
+            Kind::Compaction { pruned } => {
+                put("kind", Json::Str("compaction".into()));
+                put(
+                    "pruned",
+                    Json::Arr(pruned.iter().map(|n| Json::from(*n)).collect()),
+                );
+            }
             Kind::Pause { paused } => {
                 put("kind", Json::Str("pause".into()));
                 put("paused", Json::Bool(*paused));
@@ -1995,6 +2005,15 @@ impl Event {
                         })
                     })
                     .collect::<Result<_, String>>()?,
+            },
+            Some("compaction") => Kind::Compaction {
+                pruned: value
+                    .get("pruned")
+                    .and_then(Json::as_arr)
+                    .ok_or("no pruned list")?
+                    .iter()
+                    .map(|n| n.as_u64().ok_or("a pruned result that is no number"))
+                    .collect::<Result<_, _>>()?,
             },
             Some("pause") => Kind::Pause {
                 paused: value

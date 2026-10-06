@@ -1285,8 +1285,8 @@ it fits a log line. `http-referer` is `https://github.com/timmydo/td`.
   lacks it, since `require_parameters` would otherwise route it nowhere.
 - **`max_tokens`** is 16,384, or the model's `max_completion_tokens` if
   that is less, cut to what the context has left after §14's estimate. A
-  conversation whose estimate already fills the context stops the turn
-  and says so, until compaction.
+  conversation whose estimate still fills the context once compacted
+  stops the turn and says so (§14).
 - **`reasoning_details`** is found in the 200's bytes by a byte-span
   walk over the JSON (`span.rs`), stored as that text, and spliced back.
   The log holds it as a string, so the bytes sent again are the bytes
@@ -4450,7 +4450,7 @@ threshold and asks the human instead. Compaction has two steps:
    with content arguments elided as §11 elides them, the byte count
    omitted and the sequence number `history_read` (§12) recovers it from,
    when that frees at least 20,000 tokens (opencode's thresholds,
-   configurable).
+   fixed in td-agent).
 2. **Handoff summary.** If pruning leaves the estimate above the
    threshold, the model writes a handoff summary for a successor:
    progress, decisions, constraints, open questions, next steps and
@@ -4492,6 +4492,34 @@ rebuilt view. The read-before-write digests of §12 are the conversation
 process's, not the context's, so they survive compaction; the model
 re-reads a file it needs to see again. A second compaction summarizes
 the view, earlier summary included, and carries the state again.
+
+**As built (increment 16, pruning).** A request whose estimate plus its
+`max_tokens`, cut, where it alone is past the threshold, to what the
+threshold leaves of the context, so that a small context is not past it
+at once, is past `compact_at` of the model's context, once in that
+request's asking, logs a `compaction` event naming the tool results it
+prunes, when they free at least 20,000 tokens, and is built again; with
+`auto_compact = false` the turn stops there and says why. The selection
+walks the log from its end, a quarter of a token a byte of what each
+event sends (a reply only when a turn's and whole, as a request sends
+it), and takes each result older than the most recent 40,000 tokens
+whose stub is shorter than it and which a turn request answered whole
+has sent: a result the model has not seen, a refused request
+notwithstanding, is never pruned. From that event on, a request sends
+each pruned result as `[The result of <tool> for <path>, <n> bytes, was
+pruned when the conversation was compacted; history_read from <seq>
+reads it.]`, the tool's name and the call's `path` made visible and cut
+to 200 characters, so every request remains a pure function of the log;
+the estimate restarts from the rebuilt body's bytes. A refusal of status
+413, or of 400 whose message speaks of a context length or window, a
+prompt too long or an input token count, prunes what can be, whatever it
+frees, and asks the request again, once; with nothing to prune, refused
+again, or with `auto_compact = false`, the turn stops with the
+provider's words. A compaction is found by `history_search` as its kind.
+The transcript marks the event with a notice. The handoff summary, a
+summary when pruning leaves the request past `compact_at`, is this
+increment's next step; until then such a request is sent as before if
+the context holds it.
 
 **Resuming cold.** A long conversation left long enough for the
 provider's cache to expire costs its whole context again at the
@@ -4577,8 +4605,9 @@ default; `jev_threshold`'s is calibrated (§11):
 - `max_background`, a whole number from 1 to 16, and
   `background_output_bytes`, from 64 KiB to 1 GiB; defaults 4 and
   16 MiB (§12)
-- `auto_compact`, `compact_at`, `compact_keep_tokens` and
-  `compact_model`; defaults `true`, 80%, 20,000 and the conversation's
+- `auto_compact`, `compact_at`, a share of the context from 0.1 to 1 in
+  at most two decimal places, `compact_keep_tokens` and
+  `compact_model`; defaults `true`, 0.8, 20,000 and the conversation's
   model (§14)
 - `cache_ttl` (later, with increment 16), a whole number of seconds,
   and `cold_resume_tokens`, or `none`; defaults 300 and 32,000 (§14)

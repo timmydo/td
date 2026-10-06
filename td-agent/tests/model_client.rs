@@ -481,6 +481,7 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Kind::Restore { .. } => "restore",
             Kind::Process { .. } => "process",
             Kind::Ended { .. } => "ended",
+            Kind::Compaction { .. } => "compaction",
             Kind::Pause { .. } => "pause",
             Kind::Choice { .. } => "choice",
             Kind::Approval { .. } => "approval",
@@ -5467,4 +5468,238 @@ fn calibrate_puts_each_case_to_both_stages_and_counts_them() {
     assert_eq!((count("typesafe/jev"), count("gpt-oss-safeguard")), (2, 3));
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A finished turn that read two files: an old result of `old` bytes and
+/// a recent one of `recent`. The old result's sequence number.
+fn read_two(conversation: &mut Conversation, old: usize, recent: usize) -> u64 {
+    let user = conversation
+        .append(Kind::User {
+            delivery: "1".repeat(32),
+            text: "Read both.".into(),
+        })
+        .unwrap()
+        .seq;
+    let turn = conversation
+        .append(Kind::Started {
+            effect: td_agent::store::Effect::Turn,
+            of: user,
+        })
+        .unwrap()
+        .seq;
+    let mut results = Vec::new();
+    for (id, path, bytes) in [
+        ("toolu_old", "old.txt", old),
+        ("toolu_new", "new.txt", recent),
+    ] {
+        let request = conversation
+            .append(Kind::Request {
+                turn,
+                purpose: Purpose::Turn,
+                prefix: 0,
+                head: "\"model\":\"x\"".into(),
+                bytes: 0,
+                reserved: 0,
+            })
+            .unwrap()
+            .seq;
+        let reply = conversation
+            .append(Kind::Assistant {
+                request,
+                content: None,
+                reasoning: None,
+                details: None,
+                finish: "tool_calls".into(),
+                incomplete: false,
+                calls: vec![td_agent::store::Call {
+                    id: id.into(),
+                    name: "read_file".into(),
+                    arguments: format!(r#"{{"path":"{path}"}}"#),
+                }],
+            })
+            .unwrap()
+            .seq;
+        let result = conversation
+            .append(Kind::ToolResult {
+                reply,
+                id: id.into(),
+                name: "read_file".into(),
+                call: 0,
+                content: path.chars().next().unwrap().to_string().repeat(bytes),
+                error: false,
+                kept: None,
+                digest: None,
+            })
+            .unwrap()
+            .seq;
+        results.push(result);
+    }
+    conversation
+        .append(Kind::Finished {
+            started: turn,
+            outcome: "replied".into(),
+            retry: false,
+        })
+        .unwrap();
+    conversation.sync().unwrap();
+    results[0]
+}
+
+/// The sent body's tool results, in order.
+fn tool_results(body: &str) -> Vec<String> {
+    let body = td_json::parse_slice(body.as_bytes()).unwrap();
+    body.get("messages")
+        .and_then(td_json::Json::as_arr)
+        .unwrap()
+        .iter()
+        .filter(|m| m.get("role").and_then(td_json::Json::as_str) == Some("tool"))
+        .map(|m| {
+            m.get("content")
+                .and_then(td_json::Json::as_str)
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+/// A request past `compact_at` of the model's context first prunes the
+/// tool results older than the most recent 40,000 tokens, which go to
+/// the model as stubs from then on; with `auto_compact` off the turn
+/// stops instead and says why (DESIGN.md §14).
+#[test]
+fn a_request_past_compact_at_prunes_old_tool_results_first() {
+    let h = Harness::new(
+        "compact-at",
+        Role::Conversation,
+        vec![Reply::sse("stream-sonnet.sse")],
+    );
+    h.mock.route(
+        "Write a title for the conversation",
+        vec![Reply::ok("title.json")],
+    );
+    let (mut conversation, mut h) = h.close();
+    // 30,000 tokens old, 45,000 recent: past 80% of a 100,000 context
+    // with the reply's 16,384, and 75,000 is within the context itself.
+    let old = read_two(&mut conversation, 120_000, 180_000);
+    drop(conversation);
+    let list = String::from_utf8(fixture("models.json"))
+        .unwrap()
+        .replace(r#""context_length":200000"#, r#""context_length":100000"#);
+    Models::from_provider(list.as_bytes())
+        .unwrap()
+        .save(h.state.root())
+        .unwrap();
+    h.reopen();
+    // The turn read back, as the window hears it.
+    let _ = h.turn();
+    h.setup(Client {
+        auto_compact: false,
+        ..Client::default()
+    });
+    h.say("Go on.");
+    let (events, outcome, _) = h.turn();
+    assert!(
+        outcome.contains("past compact_at, 80% of anthropic/claude-sonnet-5.5's context of 100000; auto_compact is off"),
+        "{outcome}"
+    );
+    assert!(kinds(&events)
+        .iter()
+        .all(|k| *k != "compaction" && *k != "request"));
+    assert!(h.mock.requests().is_empty());
+    h.setup(Client::default());
+    h.say("Go on.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let pruned: Vec<&Vec<u64>> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::Compaction { pruned } => Some(pruned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pruned, [&vec![old]]);
+    let turn = h
+        .mock
+        .requests()
+        .into_iter()
+        .find(|r| r.text().contains("Go on."))
+        .unwrap();
+    assert_eq!(
+        tool_results(&turn.text()),
+        [
+            format!("[The result of read_file for old.txt, 120000 bytes, was pruned when the conversation was compacted; history_read from {old} reads it.]"),
+            "n".repeat(180_000),
+        ]
+    );
+}
+
+/// A provider's context-length refusal prunes what can be and asks
+/// again, once; a second refusal stops the turn (DESIGN.md §14).
+#[test]
+fn a_context_length_refusal_prunes_and_asks_again_once() {
+    let h = Harness::new(
+        "compact-refused",
+        Role::Conversation,
+        vec![
+            Reply::status(400, "error-context.json"),
+            Reply::status(400, "error-context.json"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::status(400, "error-context.json"),
+            Reply::status(400, "error-context.json"),
+        ],
+    );
+    h.mock.route(
+        "Write a title for the conversation",
+        vec![Reply::ok("title.json")],
+    );
+    let (mut conversation, mut h) = h.close();
+    // Within 80% of the context by td-agent's estimate: only the
+    // provider refuses it.
+    let old = read_two(&mut conversation, 120_000, 180_000);
+    drop(conversation);
+    h.reopen();
+    // The turn read back, as the window hears it.
+    let _ = h.turn();
+    // With `auto_compact` off a refusal compacts nothing: the turn stops.
+    h.setup(Client {
+        auto_compact: false,
+        ..Client::default()
+    });
+    h.say("Not yet.");
+    let (events, outcome, _) = h.turn();
+    assert!(outcome.contains("maximum context length"), "{outcome}");
+    assert!(kinds(&events).iter().all(|k| *k != "compaction"));
+    h.setup(Client::default());
+    h.say("Go on.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(
+        kinds(&events)
+            .into_iter()
+            .filter(|k| ["request", "compaction"].contains(k))
+            .collect::<Vec<_>>(),
+        ["request", "compaction", "request"]
+    );
+    let turns: Vec<String> = h
+        .mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.text().contains("Go on."))
+        .map(|r| r.text())
+        .collect();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(tool_results(&turns[0])[0], "o".repeat(120_000));
+    assert!(tool_results(&turns[1])[0].contains(&format!("history_read from {old} reads it")));
+    // Refused again with nothing left to prune: the turn stops, its
+    // request asked once more and no further.
+    h.say("And again.");
+    let (events, outcome, _) = h.turn();
+    assert!(outcome.contains("maximum context length"), "{outcome}");
+    assert_eq!(
+        kinds(&events)
+            .into_iter()
+            .filter(|k| ["request", "compaction"].contains(k))
+            .collect::<Vec<_>>(),
+        ["request"]
+    );
 }

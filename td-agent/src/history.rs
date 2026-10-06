@@ -131,6 +131,7 @@ fn kind(event: &Event) -> &'static str {
         Kind::Restore { undo: false, .. } => "redo",
         Kind::Process { .. } => "process",
         Kind::Ended { .. } => "ended",
+        Kind::Compaction { .. } => "compaction",
         Kind::Pause { .. } => "pause",
         Kind::Choice { .. } => "choice",
         Kind::Approval { .. } => "approval",
@@ -296,6 +297,7 @@ pub fn render(event: &Event) -> String {
         Kind::Restore { step, undo: false } => {
             format!("the person redid the step snapshotted at #{step}")
         }
+        Kind::Compaction { pruned } => compacted(pruned),
         Kind::Pause { paused: true } => "the person paused this conversation".into(),
         Kind::Pause { paused: false } => "the person resumed this conversation".into(),
         Kind::Choice { model, effort } => format!(
@@ -310,6 +312,14 @@ pub fn render(event: &Event) -> String {
         event.seq,
         kind(event),
         utc(event.time)
+    )
+}
+
+/// What a compaction says of itself.
+fn compacted(pruned: &[u64]) -> String {
+    format!(
+        "the conversation was compacted: {} older tool results are sent from here on as stubs that name where history_read finds them",
+        pruned.len()
     )
 }
 
@@ -334,6 +344,7 @@ fn searchable(event: &Event) -> Vec<(Searchable, String)> {
                 format!("{}\n{text}", message(from, *role, status.as_deref(), *held)),
             )]
         }
+        Kind::Compaction { pruned } => vec![(Searchable::Compaction, compacted(pruned))],
         // A notification is found as a notice is: `kinds` names both.
         Kind::Notice { text } | Kind::Notification { text } => {
             vec![(Searchable::Notice, text.clone())]
@@ -552,6 +563,22 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
     use crate::store::{Call, Id};
+
+    /// A compaction is found by `history_search`'s kind for it, saying
+    /// what it pruned.
+    #[test]
+    fn a_compaction_is_searched_as_its_kind() {
+        let compaction = Event {
+            seq: 9,
+            time: 0,
+            kind: Kind::Compaction { pruned: vec![3, 5] },
+        };
+        assert_eq!(
+            searchable(&compaction),
+            [(Searchable::Compaction, compacted(&[3, 5]))]
+        );
+        assert!(compacted(&[3, 5]).contains("2 older tool results"));
+    }
 
     fn event(seq: u64, kind: Kind) -> Event {
         Event {
