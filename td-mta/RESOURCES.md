@@ -2126,6 +2126,37 @@ extended filename, original owner reuse into body lists and late fresh
 part refusal. Inputs and caller backing precede counting; native, worker
 and RSS reservations remain separate.
 
+M06dl keeps Classifying plus one ordered Part plus HeaderBudget below a
+compiled 8 KiB ceiling within the existing parser reservation. Completed
+Classified alone has a compiled 128-byte ceiling. The observed host
+assembly snapshot is 96 Classifying, 6096 ordered Part, 88 Classified
+and 24 HeaderBudget bytes: 6216 live construction bytes including
+admission. These are host layout observations, not exact target ABI,
+native stack or RSS promises. The original source, caller
+Part/Node/membership slots, scratch and metadata/list backing remain
+separately admitted. No second traversal frame set, metadata table,
+growing state or new descriptor reservation is added. Ordinal mapping,
+slot writes, progress advance and healthy owner handoff add no positive
+charge or renewed credit; original child parsing/classification/output
+costs are unchanged.
+
+Four units qualify the ordered owner. One compares exact five costs,
+child poll counts, original pointers, complete descriptors and literal
+nodes with independent bound projections at zero/nonzero/maximum-fitting
+bases, including forged prefilled slots and untouched spare backing.
+Three others cover every completed-part prefix, every
+root/digest-child/explicit-leaf metadata progress prefix,
+fresh-before-premature and fresh complete-owner finish,
+capacity/premature/extra refusal and unfinished/completed safe
+forgetting. Total/completed queries, healthy owner/part admission,
+late construction-owner checks and already-retired Structure admission
+are pinned too. Three exclusive ordered types have six active Copy/Clone
+compile-fail guards. Counted Rust intervals cover healthy
+whole-owner release, partial/completed late admission, serial
+original-owner reuse, capacity failure and completed-child forgetting
+with all caller backing created before counting. Native, worker and RSS
+qualification stays separate.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

@@ -4979,6 +4979,9 @@ descriptor region is added. Caller nodes fit beside traversal parts and
 membership in the existing 64-byte slot reservation. Their backing must
 already be admitted.
 
+The complete ordered owner in §1.117 enforces the correspondence that
+this lower-level handoff leaves to its caller.
+
 After serial short-borrow part consumption, fresh Structure::finish can
 release the original job/header owners to the existing body-list cursor.
 Caller node slots must still correspond to every original descriptor in
@@ -4989,6 +4992,39 @@ order or uniqueness, serialize a response, derive locators or authorize
 publication. Earlier copied passive metadata/nodes remain provisional
 through whole response success and must be discarded after later
 refusal.
+
+### 1.117 Complete ordered original-source classification
+
+M06dl adds mime_traversal::bound::ordered. Classifying::new consumes a
+healthy original Structure and clips separately admitted caller Node
+backing to the completed descriptor count. Insufficient backing refuses
+with NodeCapacity before another parse or positive charge. Construction
+neither parses nor freshly admits. Healthy total/completed queries expose
+the original descriptor count and completed prefix, so callers can stop
+before an extra next request without saving a pre-construction count.
+
+Classifying::next(backing, scratch) constructs metadata for exactly its
+next original ordinal; callers cannot skip, repeat, reorder or
+substitute parts. Its exclusive Part polls/checks only the original
+bound child. Fresh Part::finish(now) consumes healthy original
+classification, writes that node to its reserved slot and advances once.
+It returns ClassifiedView with original ordinal/metadata plus the same
+Meter/HeaderBudget/Scratch reborrows for one-pass response consumption.
+Copies remain provisional. Node output was charged by the child;
+slot/progress writes add no positive charge or renewed credit. Refusal
+or safe forgetting leaves the original binding retired. An extra next
+call after all parts retires it too.
+
+Classifying::finish(now) freshly admits before the all-parts decision.
+Only exact full completion creates Classified, whose private original
+Structure and immutable complete nodes cannot be reconstructed from
+passive copies. nodes/parts hide after explicit refusal; check_deadline
+and consuming finish freshly admit. Finish returns passive complete View
+plus original job/header owners. Source/blob/locator authority and
+publication remain external; prior copied metadata/nodes must be
+discarded after later failure. Future body-list binding must consume
+Classified, never accept constructible passive View as source/order
+authority. Body-list binding and response serialization remain next.
 
 ## 2. Read views and change history
 

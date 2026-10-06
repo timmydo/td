@@ -1,4 +1,5 @@
 //! Bind completed structure and part metadata to one authorized resident source.
+pub mod ordered;
 use super::{Part, Status};
 const NODE_EXTRA_OUTPUT: u64 = (std::mem::size_of::<Node>() - std::mem::size_of::<Class>()) as u64;
 const _: () = assert!(std::mem::size_of::<Node>() >= std::mem::size_of::<Class>());
@@ -17,6 +18,7 @@ pub enum Error {
     Metadata(label_json::Error),
     Classification(mime_body_lists::Error),
     Admission(nfc::Error),
+    NodeCapacity,
     PartOrdinal,
     InvalidRange,
     InvalidState,
@@ -29,6 +31,7 @@ impl std::fmt::Display for Error {
             Self::Metadata(error) => write!(f, "bound MIME part metadata: {error}"),
             Self::Classification(error) => write!(f, "bound MIME classification: {error}"),
             Self::Admission(error) => write!(f, "bound MIME structure admission: {error}"),
+            Self::NodeCapacity => f.write_str("bound MIME classification node capacity"),
             Self::PartOrdinal => f.write_str("invalid bound MIME part ordinal"),
             Self::InvalidRange => f.write_str("invalid bound MIME part range"),
             Self::Abandoned => f.write_str("unconsumed bound MIME part cursor"),

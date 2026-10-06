@@ -5430,6 +5430,197 @@ fn bound_mime_classification() {
     assert_eq!(before, after, "bound MIME classification allocated");
 }
 
+fn ordered_mime_classification() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_select::SourceEnd,
+        limits::Limits,
+        mime_body_lists::Node,
+        mime_part_headers::{self, label_json},
+        mime_traversal::{
+            bound::{ordered::Classifying, Cursor, Error},
+            Part, Status,
+        },
+        nfc::{HeaderBudget, Scratch},
+        ports::{Deadline, Tick},
+    };
+    const SOURCE: &[u8] = concat!(
+        "Content-Type: multipart/digest;boundary=a\r\n",
+        "Content-Location: ../root\r\n\r\n--a\r\n",
+        "Content-ID: <id@a>\r\nContent-Language: fr\r\n\r\nbody\r\n--a\r\n",
+        "Content-Type: text/plain\r\nContent-Location: ../leaf\r\n\r\nbody\r\n--a--\r\n"
+    )
+    .as_bytes();
+    fn forget<T>(value: T) {
+        std::mem::forget(value);
+    }
+    let mut heads = [0; 256];
+    let mut charset = [0; 256];
+    let mut filename = [0; 256];
+    let mut id = [0; 256];
+    let mut language = [0; 256];
+    let mut location = [0; 256];
+    let mut parts = [Part::default(); 8];
+    let mut nodes = [Node::default(); 8];
+    let mut scratch = Scratch::new();
+    let before = COUNTERS.snapshot();
+    for trial in 0..8 {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000_000,
+                records: 10_000_000,
+                output_bytes: 10_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let pointers = (
+            std::ptr::from_mut(&mut work),
+            std::ptr::from_mut(&mut budget),
+            std::ptr::from_mut(&mut scratch),
+        );
+        let mut cursor = Cursor::new(
+            black_box(SOURCE),
+            17,
+            SourceEnd::Eof,
+            &Limits::default(),
+            &mut parts,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        let mut complete = false;
+        for _ in 0..100000 {
+            if cursor.poll(Tick(1)).unwrap() == Status::Complete {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+        let source = cursor.finish(Tick(1)).unwrap();
+        if trial == 6 {
+            assert_eq!(
+                Classifying::new(source, nodes.get_mut(..2).unwrap()).err(),
+                Some(Error::NodeCapacity)
+            );
+            assert_eq!(work.stopped(), None);
+            continue;
+        }
+        let mut owner = Classifying::new(source, &mut nodes).unwrap();
+        let total = owner.total().unwrap();
+        assert_eq!(total, 3);
+        let mut failure = None;
+        let count = if trial < 4 { trial } else { total };
+        for index in 0..count {
+            let mut part = owner
+                .next(
+                    label_json::Backing {
+                        headers: mime_part_headers::Backing {
+                            heads: &mut heads,
+                            charset: &mut charset,
+                            filename: &mut filename,
+                        },
+                        labels: td_mta::mime_label_fields::json::Backing {
+                            content_id: &mut id,
+                            content_language: &mut language,
+                        },
+                        content_location: location
+                            .get_mut(..if trial == 5 && index == 2 { 0 } else { 256 })
+                            .unwrap(),
+                    },
+                    &mut scratch,
+                )
+                .unwrap();
+            let mut complete = false;
+            let mut error = None;
+            for _ in 0..100000 {
+                match part.poll(Tick(1)) {
+                    Ok(Status::Complete) => {
+                        complete = true;
+                        break;
+                    }
+                    Ok(Status::Yield) => {}
+                    Err(refusal) => {
+                        error = Some(refusal);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = error {
+                assert_eq!(part.finish(Tick(1)).err(), Some(error));
+                assert_eq!(owner.completed(), Err(error));
+                failure = Some(error);
+                break;
+            }
+            assert!(complete);
+            if trial == 4 && index == 1 {
+                forget(part);
+                assert_eq!(owner.completed(), Err(Error::Abandoned));
+                failure = Some(Error::Abandoned);
+                break;
+            }
+            let (view, work, budget, scratch) = part.finish(Tick(1)).unwrap();
+            assert_eq!(view.part.ordinal, u16::try_from(index + 1).unwrap());
+            assert_eq!(
+                (
+                    std::ptr::from_mut(work),
+                    std::ptr::from_mut(budget),
+                    std::ptr::from_mut(scratch)
+                ),
+                pointers
+            );
+            assert_eq!(owner.completed(), Ok(index + 1));
+        }
+        if let Some(error) = failure {
+            assert_eq!(owner.finish(Tick(1)).err(), Some(error));
+            assert_eq!(work.stopped(), None);
+            continue;
+        }
+        if count < total {
+            assert_eq!(
+                owner.finish(Tick(100)).err(),
+                Some(Error::Admission(td_mta::nfc::Error::Work(Stop::Deadline)))
+            );
+            assert_eq!(work.stopped(), Some(Stop::Deadline));
+            continue;
+        }
+        let mut classified = owner.finish(Tick(1)).unwrap();
+        assert_eq!(classified.parts().unwrap().len(), 3);
+        assert_eq!(classified.nodes().unwrap().len(), 3);
+        assert_eq!(
+            classified.nodes().unwrap().get(1).unwrap().class.media,
+            td_mta::mime_body_lists::Media::Other
+        );
+        assert_eq!(
+            classified.nodes().unwrap().get(2).unwrap().class.media,
+            td_mta::mime_body_lists::Media::Plain
+        );
+        if trial == 7 {
+            let (view, work, budget) = classified.finish(Tick(1)).unwrap();
+            assert_eq!(view.parts.len(), 3);
+            assert_eq!(view.nodes.len(), 3);
+            assert_eq!(
+                (std::ptr::from_mut(work), std::ptr::from_mut(budget)),
+                (pointers.0, pointers.1)
+            );
+            continue;
+        }
+        let error = classified.check_deadline(Tick(100)).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Admission(td_mta::nfc::Error::Work(Stop::Deadline))
+        ));
+        assert_eq!(classified.nodes(), Err(error));
+        assert_eq!(classified.parts(), Err(error));
+        assert_eq!(classified.finish(Tick(1)).err(), Some(error));
+        assert_eq!(work.stopped(), Some(Stop::Deadline));
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "ordered MIME classification allocated");
+}
+
 fn resident_mime_delimiters() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -11787,6 +11978,7 @@ fn main() {
         resident_mime_traversal();
         bound_mime_part_metadata();
         bound_mime_classification();
+        ordered_mime_classification();
         resident_part_headers();
         mime_body_list_selection();
         mime_label_fields();
@@ -11965,6 +12157,7 @@ fn main() {
     resident_mime_traversal();
     bound_mime_part_metadata();
     bound_mime_classification();
+    ordered_mime_classification();
     resident_part_headers();
     mime_body_list_selection();
     mime_label_fields();

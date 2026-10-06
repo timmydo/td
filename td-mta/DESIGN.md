@@ -632,6 +632,17 @@ response publication remain external. Existing body-list traversal
 checks supplied depth/parent shape but cannot certify sibling order or
 completeness against the source.
 
+M06dl owns complete ordered classification. A private source-bound owner
+chooses each original ordinal exactly once, writes only freshly consumed
+nodes into separately admitted fixed slots and exposes a complete node
+set only after all descriptors finish under original owners. Part
+consumption also returns original metadata for one-pass response use.
+Safe forgetting, capacity/child refusal and extra-part requests cannot
+leave healthy completion. Finishing ordered construction and consuming
+the completed owner freshly admit; passive views do not confer source or
+publication authority. Source-bound body-list/response serialization
+remains a separate next boundary.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

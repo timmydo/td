@@ -2114,6 +2114,16 @@ Initial independently landable increments:
   zero measured Rust allocation. Whole-part visit enforcement, response
   serialization and authenticated locators remain next boundaries.
 
+- **M06dl — complete ordered classification:** consume original
+  Structure into private ordered construction with admitted fixed Node
+  backing. Choose every original ordinal once, consume
+  metadata/classification before slot writes and retain original owners.
+  Return per-part metadata for one-pass response work, then freshly
+  expose only whole complete nodes. Qualify independent
+  costs/owners/preorder at three bases, every child/whole prefix, fresh
+  complete-owner finish, capacity/extra/forget refusal and measured zero
+  Rust allocation. Source-bound body-list and response work remain next.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
