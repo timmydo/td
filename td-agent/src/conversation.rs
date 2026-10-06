@@ -4126,11 +4126,6 @@ impl Session {
         // Jev, when it can be asked: its endpoint and price.
         let jev = if !client.allow_data_collection {
             Err("`data_collection = \"deny\"` leaves it no provider".to_string())
-        } else if client.jev_threshold.is_none() {
-            Err(
-                "`jev_threshold` is not set, and none is shipped until one is calibrated"
-                    .to_string(),
-            )
         } else {
             match classifier::jev_url(&client.base_url) {
                 None => Err(

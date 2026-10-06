@@ -440,8 +440,8 @@ pub fn reasoning_verdict(content: &str) -> Result<(Verdict, String), String> {
 /// What Jev came to.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Fast {
-    /// Not asked, and why: no provider, no threshold, no endpoint, or no
-    /// price.
+    /// Not asked, and why: no provider, no endpoint, or no price, or a
+    /// price on its output.
     Unavailable(String),
     /// Asked, and no answer could be read.
     Failed(String),
@@ -467,20 +467,21 @@ pub struct Outcome {
 pub fn combine(
     fast: &Fast,
     required: bool,
-    threshold: Option<u16>,
+    threshold: u16,
     reasoning: &Result<(Verdict, String), String>,
 ) -> Outcome {
     let (jev_allows, jev_said) = match fast {
         Fast::Unavailable(why) => (!required, format!("Jev is unavailable: {why}")),
         Fast::Failed(why) => (false, format!("Jev gave no answer: {why}")),
-        Fast::Answered(jev) => match threshold {
-            Some(t) if jev.allows(t) => (true, "Jev allows".to_string()),
-            Some(t) => (
-                false,
-                format!("Jev does not allow at {}.{:03}", t / 1000, t % 1000),
+        Fast::Answered(jev) if jev.allows(threshold) => (true, "Jev allows".to_string()),
+        Fast::Answered(_) => (
+            false,
+            format!(
+                "Jev does not allow at {}.{:03}",
+                threshold / 1000,
+                threshold % 1000
             ),
-            None => (false, "Jev has no threshold".to_string()),
-        },
+        ),
     };
     let (reasoning_allows, reasoning_said) = match reasoning {
         Ok((verdict, reason)) => (
@@ -663,7 +664,7 @@ mod tests {
         let allow = Ok((Verdict::Allow, "asked for".to_string()));
         let escalate = Ok((Verdict::Escalate, "unsure".to_string()));
         let answered = Fast::Answered(jev("matches", 0.99, 0.01));
-        let outcome = combine(&answered, true, Some(950), &allow);
+        let outcome = combine(&answered, true, 950, &allow);
         assert!(outcome.allow);
         assert_eq!(
             outcome.reason,
@@ -673,27 +674,26 @@ mod tests {
             .probabilities
             .unwrap()
             .starts_with("request matches"));
-        assert!(!combine(&answered, true, Some(950), &escalate).allow);
-        assert!(!combine(&answered, true, Some(995), &allow).allow);
-        assert!(!combine(&answered, true, None, &allow).allow);
-        assert!(!combine(&answered, true, Some(950), &Err("timed out".into())).allow);
+        assert!(!combine(&answered, true, 950, &escalate).allow);
+        assert!(!combine(&answered, true, 995, &allow).allow);
+        assert!(!combine(&answered, true, 950, &Err("timed out".into())).allow);
         let unavailable = Fast::Unavailable("no provider".into());
-        assert!(!combine(&unavailable, true, Some(950), &allow).allow);
-        let alone = combine(&unavailable, false, None, &allow);
+        assert!(!combine(&unavailable, true, 950, &allow).allow);
+        let alone = combine(&unavailable, false, 950, &allow);
         assert!(alone.allow);
         assert_eq!(alone.probabilities, None);
         assert!(alone
             .reason
             .starts_with("Jev is unavailable: no provider; "));
         let failed = Fast::Failed("not JSON".into());
-        assert!(!combine(&failed, false, Some(950), &allow).allow);
+        assert!(!combine(&failed, false, 950, &allow).allow);
         assert_eq!(
-            combine(&answered, true, Some(995), &escalate).reason,
+            combine(&answered, true, 995, &escalate).reason,
             "Jev does not allow at 0.995; the reasoning stage answers escalate: unsure"
         );
         let unsure = Fast::Answered(jev("matches", 0.99, 0.02));
         assert_eq!(
-            combine(&unsure, true, Some(1000), &allow).reason,
+            combine(&unsure, true, 1000, &allow).reason,
             "Jev does not allow at 1.000; the reasoning stage answers allow: asked for"
         );
     }

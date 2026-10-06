@@ -45,9 +45,9 @@ pub struct Client {
     /// stage's.
     pub classifier_fast_model: String,
     pub classifier_model: String,
-    /// The probability Jev's answers must reach, in thousandths; none
-    /// until calibrated, and Jev then allows nothing.
-    pub jev_threshold: Option<u16>,
+    /// The probability Jev's answers must reach, in thousandths;
+    /// `JEV_THRESHOLD_SHIPPED` by default.
+    pub jev_threshold: u16,
     /// Whether the classifier allows nothing without Jev; `true` by
     /// default.
     pub jev_required: bool,
@@ -82,7 +82,7 @@ impl Default for Client {
             allow_data_collection: false,
             classifier_fast_model: DEFAULT_JEV_MODEL.into(),
             classifier_model: DEFAULT_CLASSIFIER_MODEL.into(),
-            jev_threshold: None,
+            jev_threshold: JEV_THRESHOLD_SHIPPED,
             jev_required: true,
             limits: Limits::default(),
             shared: Vec::new(),
@@ -203,8 +203,7 @@ impl Client {
             ),
             (
                 "jev_threshold".into(),
-                self.jev_threshold
-                    .map_or(Json::Null, |t| Json::from(u64::from(t))),
+                Json::from(u64::from(self.jev_threshold)),
             ),
             ("jev_required".into(), Json::Bool(self.jev_required)),
             ("max_cost_per_turn".into(), limit(self.limits.turn)),
@@ -266,15 +265,13 @@ impl Client {
                 text("classifier_fast_model")?,
             )?,
             classifier_model: model_id("classifier_model", text("classifier_model")?)?,
-            jev_threshold: match value.get("jev_threshold") {
-                Some(Json::Null) => None,
-                Some(t) => Some(
-                    t.as_u64()
-                        .and_then(|t| u16::try_from(t).ok())
-                        .filter(|t| JEV_THRESHOLD.contains(t))
-                        .ok_or("jev_threshold is out of range")?,
-                ),
+            jev_threshold: match value.get("jev_threshold").map(Json::as_u64) {
                 None => return Err("no jev_threshold".into()),
+                Some(None) => return Err("jev_threshold is not a whole number".into()),
+                Some(Some(t)) => u16::try_from(t)
+                    .ok()
+                    .filter(|t| JEV_THRESHOLD.contains(t))
+                    .ok_or("jev_threshold is out of range")?,
             },
             jev_required: value
                 .get("jev_required")
@@ -374,6 +371,12 @@ pub(crate) fn effort(text: &str) -> Result<String, String> {
     }
 }
 
+/// `jev_threshold`'s default, in thousandths: a threshold at which no
+/// case of `calibration/crossings.json` that should be asked about was
+/// allowed by both stages in either of two live runs, 0.055 above the
+/// nearest such case Jev answered `matches` to (DESIGN.md §11; the
+/// commit that set it records the counts).
+const JEV_THRESHOLD_SHIPPED: u16 = 775;
 /// The thresholds `jev_threshold` may be, in thousandths.
 const JEV_THRESHOLD: std::ops::RangeInclusive<u16> = 500..=1000;
 
@@ -920,7 +923,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         );
     }
     if let Some(value) = table.get("jev_threshold") {
-        config.client.jev_threshold = Some(jev_threshold(value)?);
+        config.client.jev_threshold = jev_threshold(value)?;
     }
     if let Some(value) = table.get("jev_required") {
         config.client.jev_required = match value {
@@ -1172,7 +1175,7 @@ mod tests {
         let client = Config::default().client;
         assert_eq!(client.classifier_fast_model, "typesafe/jev-1.13");
         assert_eq!(client.classifier_model, "openai/gpt-oss-safeguard-20b");
-        assert_eq!(client.jev_threshold, None);
+        assert_eq!(client.jev_threshold, 775);
         assert!(client.jev_required);
         let config = parse(
             "classifier_fast_model = \"~typesafe/jev-latest\"\nclassifier_model = \"m/safe\"\n\
@@ -1183,7 +1186,7 @@ mod tests {
         let client = config.client;
         assert_eq!(client.classifier_fast_model, "~typesafe/jev-latest");
         assert_eq!(client.classifier_model, "m/safe");
-        assert_eq!(client.jev_threshold, Some(925));
+        assert_eq!(client.jev_threshold, 925);
         assert!(!client.jev_required);
         assert_eq!(Client::from_json(&client.to_json()).unwrap(), client);
         for (text, thousandths) in [("0.5", 500), ("1", 1000), ("1.0", 1000), ("0.999", 999)] {
@@ -1192,7 +1195,7 @@ mod tests {
                     .unwrap()
                     .client
                     .jev_threshold,
-                Some(thousandths),
+                thousandths,
                 "{text}"
             );
         }
@@ -1212,6 +1215,11 @@ mod tests {
         let mut value = client.to_json();
         value.insert("jev_threshold", 400u64);
         assert!(Client::from_json(&value).is_err());
+        value.insert("jev_threshold", Json::Null);
+        assert_eq!(
+            Client::from_json(&value).unwrap_err(),
+            "jev_threshold is not a whole number"
+        );
     }
 
     #[test]

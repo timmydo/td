@@ -3399,7 +3399,7 @@ messages are kept newest first within 32 KiB, each at most 8 KiB, and
 the last 64 calls are named. Project instructions are in it, as
 `project`, only for a workspace the human marked trusted (As built
 (increment 13, the trust mark), below). Jev is asked only when
-`data_collection` is `allow`, `jev_threshold` is set and `base_url` ends
+`data_collection` is `allow` and `base_url` ends
 in `/v1`, and the models list, or for Jev, which it leaves out, Jev's
 endpoints listing, prices `classifier_fast_model` while a cost limit is
 set, and prices nothing of its output, which its reservation does not
@@ -3426,9 +3426,9 @@ approval of outcome `ask` `by` `classifier`, and the card says why, with
 Jev's probabilities when it answered; the human's answer is logged after
 it. A card waiting on a crossing is not taken back when its workspace
 goes to `auto`. The status row says `classifier without Jev` beside the
-mode while `jev_required` is `false`. `jev_threshold` has no shipped
-value until increment 13's calibration records one, so Jev allows
-nothing until the human sets one.
+mode while `jev_required` is `false`. `jev_threshold` is shipped as
+0.775, as increment 13's calibration chose it (As built (increment 13,
+the calibration), below).
 
 **As built (increment 13, the circuit breaker).** The breaker counts the
 classifier's verdicts, the approvals logged `by` `classifier`, in the
@@ -3505,8 +3505,23 @@ It prints what each stage answered of each case and every stage's false
 allows and false escalations, Jev's and both stages' together at
 thresholds from 0.500 to 0.999, and to standard error what the requests
 reported spending, failed ones included, and how many that ran reported
-nothing; it keeps nothing. `jev_threshold` still has no shipped value:
-the commit that records a run's counts sets it.
+nothing; it keeps nothing.
+
+**As built (increment 13, the calibration).** Two runs of the shipped
+set against OpenRouter, `classifier_model` and `classifier_fast_model`
+at their defaults, chose `jev_threshold` 0.775. At it both stages
+together allowed no case that should be asked about in either run, and
+it is 0.055 above 0.72, the highest `matches` Jev gave any such case it
+did not catch by `discloses` (in the first run; the same case drew 0.68
+in the second), more than that case moved between the runs; from 0.73 up
+neither run has a false allow. The reasoning stage allowed five and four
+of the fifteen cases that should be asked about, in the first run and
+the second, and escalated none of the fifteen that should be allowed;
+Jev's `discloses` or its low `matches` caught each. At 0.775 both stages
+escalate five and six of the fifteen that should be allowed, most of
+them messages Jev gives a `discloses` above 0.225. The commit that set
+it records each run's counts. Thirty cases and two runs are a small
+sample; §17's open question on Jev stands.
 
 **Repetition.** Three consecutive calls of one tool with identical
 arguments go to the human whatever the table says, as opencode's
@@ -3593,8 +3608,8 @@ it add its calibrated second opinion without ever being the only allower.
 If Jev is unavailable, including because `data_collection = "deny"` leaves
 it no provider, its rows go to the human; `jev_required = false` lets the
 reasoning stage decide alone, and the status row says so. `jev_threshold`
-has no shipped value until the fixture set of §17 has calibrated one; the
-increment that lands the classifier records it.
+is shipped as calibrated on the fixture set of §17, and the commit that
+changes it records the counts.
 
 **Outcome.** A refusal by the human reaches the acting model as the tool's
 result with an instruction not to work around it. The circuit breaker
@@ -4518,14 +4533,15 @@ design.
 `$XDG_CONFIG_HOME/td-agent/config` is TOML, read by td-toml, the crate
 td-news and td-mail also read theirs with (TOML 1.0 without dates and
 times). Every key has a
-default, except `jev_threshold` until it is calibrated (§11):
+default; `jev_threshold`'s is calibrated (§11):
 
 - `base_url`
 - `model`, which every conversation uses unless the human chose another
   for it (§4), `title_model`, `classifier_fast_model` and
   `classifier_model`
 - `jev_threshold`, a probability from 0.5 to 1 in at most three decimal
-  places, and `jev_required`; default `true`
+  places; default 0.775
+- `jev_required`; default `true`
 - `reasoning_effort`
 - `mode`: `auto` or `ask`; default `auto`
 - `data_collection`: `deny` or `allow`; default `deny`

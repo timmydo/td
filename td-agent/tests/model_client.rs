@@ -4028,9 +4028,9 @@ fn the_classifier_decides_a_crossing_in_auto_mode() {
         .unwrap();
     conversation.sync().unwrap();
     drop(conversation);
+    // The shipped threshold, which a person who sets none has.
     h.setup(Client {
         allow_data_collection: true,
-        jev_threshold: Some(900),
         ..Client::default()
     });
     h.down(&Down::Policy {
@@ -4142,7 +4142,7 @@ fn the_classifier_decides_a_crossing_in_auto_mode() {
     let (call, _, details) = h.until_ask();
     assert_eq!(
         details[0],
-        format!("Asked because the classifier did not allow it: Jev does not allow at 0.900; {because}.")
+        format!("Asked because the classifier did not allow it: Jev does not allow at 0.775; {because}.")
     );
     assert_eq!(
         details[1],
@@ -4254,7 +4254,7 @@ fn a_deny_taken_while_the_classifier_is_asked_refuses_the_crossing() {
     drop(conversation);
     h.setup(Client {
         allow_data_collection: true,
-        jev_threshold: Some(900),
+        jev_threshold: 900,
         ..Client::default()
     });
     h.down(&Down::Policy {
@@ -4392,7 +4392,7 @@ fn a_repeated_crossing_and_a_waiting_one_stay_with_the_person() {
     );
     h.setup(Client {
         allow_data_collection: true,
-        jev_threshold: Some(900),
+        jev_threshold: 900,
         ..Client::default()
     });
     h.down(&Down::Policy {
@@ -4553,7 +4553,7 @@ fn the_classifier_is_given_the_project_instructions_only_when_trusted() {
     while !matches!(h.next(), Up::Fetch { .. }) {}
     h.setup(Client {
         allow_data_collection: true,
-        jev_threshold: Some(900),
+        jev_threshold: 900,
         ..Client::default()
     });
     let key = workspace.key(&h.id);
@@ -4652,7 +4652,7 @@ fn three_crossings_the_classifier_does_not_allow_trip_its_breaker() {
     );
     h.setup(Client {
         allow_data_collection: true,
-        jev_threshold: Some(900),
+        jev_threshold: 900,
         ..Client::default()
     });
     h.down(&Down::Policy {
@@ -4826,7 +4826,7 @@ fn without_jev_the_classifier_allows_only_when_jev_is_not_required() {
         .unwrap();
     h.setup(Client {
         allow_data_collection: true,
-        jev_threshold: Some(900),
+        jev_threshold: 900,
         ..Client::default()
     });
     h.say("Once more.");
@@ -4893,7 +4893,7 @@ fn a_run_of_messages_the_classifier_allows_goes_back_to_the_person() {
     );
     h.setup(Client {
         allow_data_collection: true,
-        jev_threshold: Some(900),
+        jev_threshold: 900,
         ..Client::default()
     });
     h.down(&Down::Policy {
