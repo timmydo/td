@@ -896,6 +896,17 @@ legacy complete owner. API §1.139 defines the bounded state and eight Rust
 intervals. Tree/list composition, request parsing and current
 authenticated publication follow.
 
+M06ei selected-field composition retains §1.139's immutable metadata
+selection and original collection custody while delegating to the shared
+source-bound frame. The provisional tree/list structural subParts
+scaffold is independent of those ten fields; NONE removes metadata, not
+nodes or list entries. Suppress its leading comma for empty whole
+metadata. ALL keeps legacy turns and charges. Fresh consuming/explicit
+checks and passive labels remain the existing boundaries. API §1.140
+scopes eight Rust intervals; request parsing/defaults,
+headers/header:*/subParts selection, full admission and current
+authenticated publication remain later.
+
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot
 select bodyStructure. They remain public facades over the same shared

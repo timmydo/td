@@ -2370,6 +2370,17 @@ Initial independently landable increments:
   Selected-field tree/list composition, request parsing and current
   authenticated publication follow.
 
+- **M06ei — original selected-field tree/list composition:** preserve
+  whole metadata selection through the original bounded structure/list
+  frame, keeping provisional structural subParts independent and
+  omitting its leading comma for NONE metadata. Preserve legacy ALL
+  bytes/turns/five costs, original collection/cell/backing/descriptor
+  custody, sticky refusal and fresh consuming boundaries. Six
+  constructor/ownership compile guards and eight Rust allocation
+  intervals qualify API §1.140. Request selection/defaults,
+  headers/header:*/subParts selection, full admission and current
+  authenticated publication follow.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

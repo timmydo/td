@@ -1,4 +1,5 @@
 //! Collect every original ordinal with one immutable ten-field selection.
+pub mod composed;
 use super::super::super::retained::collected as shared;
 pub use super::Status;
 use super::{Bound, Error, Properties, View as MemberView};

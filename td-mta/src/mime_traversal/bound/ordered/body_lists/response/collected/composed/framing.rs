@@ -229,6 +229,7 @@ impl Frame {
             Phase::Fragment => self.begin(Bytes::Fragment(self.index), Phase::Subparts),
             Phase::Subparts => {
                 let part = source.node(self.index)?;
+                let empty = source.fragment(self.index)?.is_empty();
                 if self.mode == Mode::Structure && part.media == Media::Multipart {
                     let next = self.index.checked_add(1).ok_or(Error::InvalidState)?;
                     let child = source.parts()?.get(next);
@@ -239,13 +240,24 @@ impl Frame {
                             .ok_or(Error::InvalidState)?;
                         *target = part.ordinal;
                         self.opened = self.opened.checked_add(1).ok_or(Error::InvalidState)?;
-                        self.begin(Bytes::Static(b",\"subParts\":["), Phase::Descend);
+                        self.begin(
+                            Bytes::Static(if empty {
+                                b"\"subParts\":["
+                            } else {
+                                b",\"subParts\":["
+                            }),
+                            Phase::Descend,
+                        );
                     } else {
                         return Err(Error::InvalidState);
                     }
                 } else {
                     self.begin(
-                        Bytes::Static(b",\"subParts\":null}"),
+                        Bytes::Static(if empty {
+                            b"\"subParts\":null}"
+                        } else {
+                            b",\"subParts\":null}"
+                        }),
                         self.after_part(source)?,
                     );
                 }

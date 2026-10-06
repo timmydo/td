@@ -5928,6 +5928,54 @@ Native allocation, stack/RSS, full admission, selected-field tree/list
 composition, request defaults/parsing, headers/header:*/subParts and
 current authenticated publication remain later or unqualified.
 
+### 1.140 Original selected-field tree/list composition
+
+M06ei adds
+`mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed`.
+Only complete §1.139 selected Serialized and an explicit Mode construct
+exclusive Cursor. Preserve immutable per-part Properties, original
+collection/cells/backing and actual descriptor through Cursor, Composed
+and fresh complete release back to the selected Serialized. Passive
+views and advanced legacy cursors cannot reconstruct the selected owner.
+
+The facade privately delegates to the original source-bound composition
+owner and shared frame. Every original member is already whole and
+selection-complete. Structure walks the original tree; Lists visits the
+original text/html/attachment ordinals and attachment flag. Both retain
+the existing provisional structural subParts scaffolding. Ten-field
+Properties select only metadata inside each object, not this scaffold.
+NONE therefore emits objects with only structural subParts; it does not
+remove original tree nodes or list entries. Omit the scaffold's leading
+comma exactly when the whole selected member is empty. This is
+provisional generated composition, not request bodyProperties
+parsing/defaults or a complete JMAP response.
+
+ALL preserves legacy bytes, turns and five-cost debits. Each funded turn
+pays the existing interpretation step and control/record fee, with exact
+copied wire bytes and no source/I/O fees; copy stays at most 64 bytes.
+Empty unfinished output freshly checks both domains and spends no work.
+Work refusal prevents completion; clock refusal hides completed views.
+Cached complete polls stay inert. Explicit checks and consuming
+Cursor/Composed/Serialized/released Bound boundaries remain fresh in
+both domains. Only fresh completed Cursor finish constructs Composed.
+Bytes and labels confer no publication authority.
+
+Cursor plus HeaderBudget and 64 output bytes fits 1 KiB; Composed fits
+768 bytes. Original backing, cell and member windows remain separately
+caller-owned/admitted. Eight sequential Rust allocation intervals
+measure near-u64 multi-node structure, NONE lists, actual pin expiry
+after copied frame output, complete Cursor expiry, complete Composed
+expiry, explicitly checked released Bound expiry, healthy empty output
+and constructor pin expiry. Original matching/generated members,
+filesystem, windows and cells stay cold. Descriptor teardown is counted;
+pooled view/scratch, cells and enclosing cleanup remain outside. Other
+masks/sources/capacities, supplied Tick expiry, quotas, premature
+finish, cached polls, post-turn/clock faults and other explicit checks
+remain allocation-unqualified. Earlier 169 intervals remain separate.
+Native allocation, stack/RSS, full admission, request property
+parsing/defaults, headers/header:*/subParts selection and current
+authenticated publication remain later or unqualified.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

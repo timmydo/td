@@ -49,6 +49,26 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
             failure: None,
         })
     }
+    #[cfg(test)]
+    pub(in super::super::super) fn costs(&self) -> [u64; 5] {
+        let structure = &self
+            .source
+            .source
+            .original
+            .source
+            .original
+            .source
+            .projected
+            .structure;
+        let left = structure.work.remaining();
+        [
+            structure.budget.source_bytes_remaining(),
+            structure.budget.steps_remaining(),
+            left.io_bytes,
+            left.records,
+            left.output_bytes,
+        ]
+    }
     fn outcome<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         if let Err(error) = result {
             self.failure = Some(error);

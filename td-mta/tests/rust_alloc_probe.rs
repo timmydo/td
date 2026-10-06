@@ -12404,6 +12404,21 @@ fn collected_selected_source_bound_part_fields() {
     }
 }
 
+fn composed_selected_source_bound_part_fields() {
+    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed;
+    let mut samples = [COUNTERS.snapshot(); 16];
+    let mut slots = samples.iter_mut();
+    composed::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|sample| !sample.invalid));
+    for [before, after] in samples.as_chunks::<2>().0 {
+        assert_eq!(
+            before, after,
+            "composed selected source-bound part fields allocated"
+        );
+    }
+}
+
 fn whole_source_bound_members() {
     use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained;
     let mut samples = [COUNTERS.snapshot(); 16];
@@ -12918,6 +12933,7 @@ fn main() {
     selected_source_bound_part_fields();
     whole_selected_source_bound_part_fields();
     collected_selected_source_bound_part_fields();
+    composed_selected_source_bound_part_fields();
     whole_source_bound_members();
     collected_source_bound_members();
     composed_source_bound_members();
