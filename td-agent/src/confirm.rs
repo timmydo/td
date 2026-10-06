@@ -261,6 +261,7 @@ impl Confirm {
             confirmations::Focus::Cancel => "cancel",
             confirmations::Focus::Alternate
             | confirmations::Focus::Further
+            | confirmations::Focus::Extra
             | confirmations::Focus::Confirm => match self.purpose {
                 Purpose::Delete(_) => "delete",
                 Purpose::Approve { .. } => "allow",

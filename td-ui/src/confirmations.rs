@@ -43,6 +43,8 @@ pub struct Model<A, R> {
     alternate: Option<(String, A)>,
     /// A further action shown after the alternate, before Confirm.
     further: Option<(String, A)>,
+    /// An extra action shown after the further one, before Confirm.
+    extra: Option<(String, A)>,
     revision: R,
 }
 impl<A: Copy, R: Copy + Eq> Model<A, R> {
@@ -90,6 +92,7 @@ impl<A: Copy, R: Copy + Eq> Model<A, R> {
             action,
             alternate: None,
             further: None,
+            extra: None,
             revision,
         })
     }
@@ -107,20 +110,33 @@ impl<A: Copy, R: Copy + Eq> Model<A, R> {
         self.further = Some((action_label(label)?, action));
         Ok(self)
     }
+    /// Adds an extra action, labelled as the alternate is, after the
+    /// further action and before Confirm: a five-way choice such as an
+    /// approval's Cancel, three remembered answers, and Allow. A second
+    /// call replaces the first.
+    pub fn with_extra(mut self, label: &str, action: A) -> Result<Self, Error> {
+        self.extra = Some((action_label(label)?, action));
+        Ok(self)
+    }
     pub fn storage_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.title.capacity()
             + self.confirm.capacity()
-            + [&self.alternate, &self.further]
-                .into_iter()
-                .flatten()
+            + self
+                .between()
                 .map(|(label, _)| label.capacity())
                 .sum::<usize>()
             + self.details.capacity() * std::mem::size_of::<String>()
             + self.details.iter().map(String::capacity).sum::<usize>()
     }
     fn actions(&self) -> usize {
-        2 + usize::from(self.alternate.is_some()) + usize::from(self.further.is_some())
+        2 + self.between().count()
+    }
+    /// The actions between Cancel and Confirm, in their order.
+    fn between(&self) -> impl Iterator<Item = &(String, A)> {
+        [&self.alternate, &self.further, &self.extra]
+            .into_iter()
+            .flatten()
     }
     pub fn revision(&self) -> R {
         self.revision
@@ -162,28 +178,19 @@ pub enum Focus {
     Alternate,
     /// The model's further action; never focused without one.
     Further,
+    /// The model's extra action; never focused without one.
+    Extra,
     Confirm,
 }
 
-// Tab order, the detail list included.
-const TWO_ACTIONS: [Focus; 3] = [Focus::Details, Focus::Cancel, Focus::Confirm];
-const THREE_ACTIONS: [Focus; 4] = [
-    Focus::Details,
-    Focus::Cancel,
-    Focus::Alternate,
-    Focus::Confirm,
-];
-const FURTHER_ACTIONS: [Focus; 4] = [
-    Focus::Details,
-    Focus::Cancel,
-    Focus::Further,
-    Focus::Confirm,
-];
-const FOUR_ACTIONS: [Focus; 5] = [
+// Tab order, the detail list included; the model's absent actions are
+// passed over.
+const ORDER: &[Focus] = &[
     Focus::Details,
     Focus::Cancel,
     Focus::Alternate,
     Focus::Further,
+    Focus::Extra,
     Focus::Confirm,
 ];
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,9 +332,8 @@ impl<A: Copy, R: Copy + Eq, F: Copy> Controller<A, R, F> {
         if columns < 16
             || model.title.chars().count() > columns
             || model.confirm.chars().count() > columns
-            || [&model.alternate, &model.further]
-                .into_iter()
-                .flatten()
+            || model
+                .between()
                 .any(|(label, _)| label.chars().count() > columns)
         {
             return Err(Error::NoRoom);
@@ -421,37 +427,42 @@ impl<A: Copy, R: Copy + Eq, F: Copy> Controller<A, R, F> {
         self.action_row(focus).and_then(|row| self.actions.row(row))
     }
     // Rows top to bottom: Cancel, the alternate if any, the further
-    // action if any, Confirm.
+    // action if any, the extra action if any, Confirm.
     fn action_row(&self, focus: Focus) -> Option<usize> {
+        let alternate = usize::from(self.model.alternate.is_some());
+        let further = usize::from(self.model.further.is_some());
         match focus {
             Focus::Cancel => Some(0),
             Focus::Alternate => self.model.alternate.as_ref().map(|_| 1),
-            Focus::Further => self
-                .model
-                .further
-                .as_ref()
-                .map(|_| 1 + usize::from(self.model.alternate.is_some())),
+            Focus::Further => self.model.further.as_ref().map(|_| 1 + alternate),
+            Focus::Extra => self.model.extra.as_ref().map(|_| 1 + alternate + further),
             Focus::Confirm => Some(self.model.actions() - 1),
             Focus::Details => None,
         }
     }
-    fn order(&self) -> &'static [Focus] {
-        match (self.model.alternate.is_some(), self.model.further.is_some()) {
-            (false, false) => &TWO_ACTIONS,
-            (true, false) => &THREE_ACTIONS,
-            (false, true) => &FURTHER_ACTIONS,
-            (true, true) => &FOUR_ACTIONS,
-        }
+    /// Whether `focus` is in the tab order: the details, or an action the
+    /// model has.
+    fn present(&self, focus: Focus) -> bool {
+        focus == Focus::Details || self.action_row(focus).is_some()
     }
     fn cycled(&self, forward: bool) -> Focus {
-        let order = self.order();
-        let at = order.iter().position(|f| *f == self.focus).unwrap_or(0);
+        let count = ORDER.iter().filter(|f| self.present(**f)).count();
+        let at = ORDER
+            .iter()
+            .filter(|f| self.present(**f))
+            .position(|f| *f == self.focus)
+            .unwrap_or(0);
         let next = if forward {
-            (at + 1) % order.len()
+            (at + 1) % count
         } else {
-            (at + order.len() - 1) % order.len()
+            (at + count - 1) % count
         };
-        order.get(next).copied().unwrap_or(Focus::Cancel)
+        ORDER
+            .iter()
+            .filter(|f| self.present(**f))
+            .nth(next)
+            .copied()
+            .unwrap_or(Focus::Cancel)
     }
     pub fn detail_rows(&self) -> usize {
         self.wrapped.len()
@@ -469,6 +480,7 @@ impl<A: Copy, R: Copy + Eq, F: Copy> Controller<A, R, F> {
             Focus::Cancel,
             Focus::Alternate,
             Focus::Further,
+            Focus::Extra,
             Focus::Confirm,
         ]
         .into_iter()
@@ -486,8 +498,8 @@ impl<A: Copy, R: Copy + Eq, F: Copy> Controller<A, R, F> {
             },
         }
     }
-    /// Closes with an alternate's or a further action's ID; one the model
-    /// lacks consumes the input.
+    /// Closes with an alternate's, a further or an extra action's ID; one
+    /// the model lacks consumes the input.
     fn choose(&mut self, action: Option<A>, prior_focus_exists: bool) -> Outcome<A, F> {
         match action {
             Some(action) => self.close(Choice::Confirmed(action), prior_focus_exists),
@@ -504,6 +516,10 @@ impl<A: Copy, R: Copy + Eq, F: Copy> Controller<A, R, F> {
             }
             Focus::Further => {
                 let action = self.model.further.as_ref().map(|(_, action)| *action);
+                self.choose(action, prior_focus_exists)
+            }
+            Focus::Extra => {
+                let action = self.model.extra.as_ref().map(|(_, action)| *action);
                 self.choose(action, prior_focus_exists)
             }
             Focus::Details => Outcome::Consumed,
@@ -678,10 +694,7 @@ impl<A: Copy, R: Copy + Eq, F: Copy> Controller<A, R, F> {
             enabled: true,
             checked: false,
         };
-        let between = [&self.model.alternate, &self.model.further]
-            .into_iter()
-            .flatten()
-            .map(|(label, _)| row(label.as_str()));
+        let between = self.model.between().map(|(label, _)| row(label.as_str()));
         self.actions.emit(
             std::iter::once(row("Cancel"))
                 .chain(between)

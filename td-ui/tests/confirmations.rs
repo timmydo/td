@@ -902,6 +902,212 @@ fn a_further_action_without_an_alternate_takes_the_alternates_place() {
     );
 }
 
+fn five_way(scale: u8) -> Controller<u32, u64, u32> {
+    let model = Model::new("Run it?", "Allow", &["command: make"], 1, 9)
+        .unwrap()
+        .with_alternate("Always allow here", 2)
+        .unwrap()
+        .with_further("Always deny here", 3)
+        .unwrap()
+        .with_extra("Always deny everywhere", 4)
+        .unwrap();
+    Controller::new(model, surface(scale), rect(scale), Some(42)).unwrap()
+}
+
+const FIVE: [Focus; 5] = [
+    Focus::Cancel,
+    Focus::Alternate,
+    Focus::Further,
+    Focus::Extra,
+    Focus::Confirm,
+];
+
+#[test]
+fn an_extra_action_sits_between_the_further_one_and_confirm() {
+    for scale in 1..=4 {
+        let d = five_way(scale);
+        let rows = FIVE.map(|focus| d.action_rect(focus).unwrap());
+        assert!(
+            rows.windows(2).all(|pair| pair[0].y < pair[1].y),
+            "{rows:?}"
+        );
+        for row in rows {
+            assert_eq!(row.intersection(d.rect()), Some(row));
+        }
+        assert!(d.details_rect().y + i64::from(d.details_rect().height) <= rows[0].y);
+        for (focus, choice) in FIVE.into_iter().zip([
+            Choice::Cancelled,
+            Choice::Confirmed(2),
+            Choice::Confirmed(3),
+            Choice::Confirmed(4),
+            Choice::Confirmed(1),
+        ]) {
+            let mut d = five_way(scale);
+            let at = d.action_rect(focus).unwrap();
+            assert_eq!(event(&mut d, press(at)), Outcome::Changed);
+            assert_eq!(
+                event(&mut d, release(at)),
+                Outcome::Closed {
+                    choice,
+                    restore_focus: Some(42)
+                }
+            );
+        }
+    }
+    // Tab visits every action in row order, BackTab the reverse.
+    let mut d = five_way(1);
+    for expected in [
+        Focus::Alternate,
+        Focus::Further,
+        Focus::Extra,
+        Focus::Confirm,
+        Focus::Details,
+        Focus::Cancel,
+    ] {
+        key(&mut d, Key::Tab);
+        assert_eq!(d.focus(), expected);
+    }
+    for expected in [
+        Focus::Details,
+        Focus::Confirm,
+        Focus::Extra,
+        Focus::Further,
+        Focus::Alternate,
+        Focus::Cancel,
+    ] {
+        key(&mut d, Key::BackTab);
+        assert_eq!(d.focus(), expected);
+    }
+    for _ in 0..3 {
+        key(&mut d, Key::Tab);
+    }
+    assert_eq!(
+        key(&mut d, Key::Activate),
+        Outcome::Closed {
+            choice: Choice::Confirmed(4),
+            restore_focus: Some(42)
+        }
+    );
+    // Alone between Cancel and Confirm, it takes the alternate's place.
+    let model = Model::new("Run it?", "Allow", &["entry"], 1u32, 9u64)
+        .unwrap()
+        .with_extra("Always deny everywhere", 4)
+        .unwrap();
+    let mut d = Controller::new(model, surface(1), rect(1), Some(42u32)).unwrap();
+    assert_eq!(d.action_rect(Focus::Alternate), None);
+    assert_eq!(d.action_rect(Focus::Further), None);
+    let rows =
+        [Focus::Cancel, Focus::Extra, Focus::Confirm].map(|focus| d.action_rect(focus).unwrap());
+    assert!(rows[0].y < rows[1].y && rows[1].y < rows[2].y, "{rows:?}");
+    key(&mut d, Key::Tab);
+    assert_eq!(d.focus(), Focus::Extra);
+    // A four-way dialog has no extra row and never focuses one.
+    let mut d = four_way(1);
+    assert_eq!(d.action_rect(Focus::Extra), None);
+    for _ in 0..6 {
+        key(&mut d, Key::Tab);
+        assert_ne!(d.focus(), Focus::Extra);
+    }
+    // Its label must fit as the others' do, and a dialog too short for
+    // its five rows is refused, not cut.
+    let wide = "D".repeat(200);
+    let model = Model::new("Run it?", "Allow", &["entry"], 1u32, 9u64)
+        .unwrap()
+        .with_extra(&wide, 4)
+        .unwrap();
+    assert_eq!(
+        Controller::new(model, surface(1), rect(1), Some(42u32)).unwrap_err(),
+        Error::NoRoom
+    );
+}
+
+#[test]
+fn an_extra_label_is_bounded_and_needs_its_own_row() {
+    let model = || {
+        Model::new("Run it?", "Allow", &["entry"], 1u32, 9u64)
+            .unwrap()
+            .with_alternate("a", 2)
+            .unwrap()
+            .with_further("b", 3)
+            .unwrap()
+    };
+    assert_eq!(model().with_extra("", 4).unwrap_err(), Error::InvalidText);
+    assert_eq!(
+        model().with_extra("c\td", 4).unwrap_err(),
+        Error::InvalidText
+    );
+    let long = "x".repeat(257);
+    assert_eq!(model().with_extra(&long, 4).unwrap_err(), Error::Limit);
+    let four = model().storage_bytes();
+    let five = model().with_extra("Always deny everywhere", 4).unwrap();
+    assert!(five.storage_bytes() >= four + "Always deny everywhere".len());
+    // Six rows hold a four-action dialog but not a five-action one.
+    let row = td_ui::chrome::ROW as u32;
+    let short = Rect {
+        height: 6 * row,
+        ..rect(1)
+    };
+    assert!(Controller::new(model(), surface(1), short, Some(42u32)).is_ok());
+    assert_eq!(
+        Controller::new(five, surface(1), short, Some(42u32)).unwrap_err(),
+        Error::NoRoom
+    );
+    // A five-way dialog resized to that height closes unavailable.
+    let mut d = five_way(1);
+    assert_eq!(
+        event(
+            &mut d,
+            Event::Resize {
+                surface: surface(1),
+                rect: short,
+            }
+        ),
+        Outcome::Closed {
+            choice: Choice::Unavailable(Error::NoRoom),
+            restore_focus: Some(42)
+        }
+    );
+    assert!(!d.is_open());
+}
+
+#[test]
+fn each_of_five_action_rows_paints_its_own_label() {
+    use td_ui::chrome::SELECTED_ROW;
+    use td_ui::raster::Primitive;
+    for scale in 1..=4 {
+        let mut d = five_way(scale);
+        for focused in FIVE {
+            let rows = FIVE.map(|focus| d.action_rect(focus).unwrap());
+            let mut labels: [String; 5] = Default::default();
+            let mut highlighted = Vec::new();
+            d.emit(surface(scale).bounds(), &mut |draw| match draw.primitive {
+                Primitive::Glyph { x, y, scalar, .. } => {
+                    if let Some(at) = rows.iter().position(|row| row.contains(x, y)) {
+                        labels[at].push(scalar);
+                    }
+                }
+                Primitive::Fill { rect, color } if color == SELECTED_ROW => {
+                    highlighted.push(rect);
+                }
+                _ => {}
+            });
+            assert_eq!(
+                labels.map(|l| l.replace(' ', "")),
+                [
+                    "Cancel",
+                    "Alwaysallowhere",
+                    "Alwaysdenyhere",
+                    "Alwaysdenyeverywhere",
+                    "Allow"
+                ]
+            );
+            let at = FIVE.iter().position(|f| *f == focused).unwrap();
+            assert_eq!(highlighted, [rows[at]], "{focused:?} at scale {scale}");
+            key(&mut d, Key::Tab);
+        }
+    }
+}
+
 #[test]
 fn each_of_four_action_rows_paints_its_own_label() {
     use td_ui::chrome::SELECTED_ROW;

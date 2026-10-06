@@ -1398,6 +1398,7 @@ impl App {
                     confirmations::Focus::Confirm,
                     confirmations::Focus::Alternate,
                     confirmations::Focus::Further,
+                    confirmations::Focus::Extra,
                 ]
                 .into_iter()
                 .filter_map(|focus| dialog.action_rect(focus))
