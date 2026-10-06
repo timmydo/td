@@ -1,8 +1,8 @@
 # Native QEMU installation fixture
 
 This crate is a diagnostic PID-1 program for `td-recipe-eval qemu-install`
-and the live installation phases of `qemu-install-system` and
-`qemu-install-encrypted`.
+and the live installation phases of `qemu-install-system`,
+`qemu-install-encrypted` and `qemu-boot-encrypted`.
 It is built from source through the ordinary Rust ladder and is never packed
 in the system or graphical installer profile. It adds no user-facing device
 admission, account configuration or signing identity. In
@@ -628,7 +628,8 @@ refusal (17) and status still in the phase, then types the key back and
 requires status still in the phase (`TD-INSTALL-RECOVERY-KEY-TYPED-BACK`)
 and, polling, completion and the finished-complete report. The service
 must exit successfully and leave no workspace or bound loop. No sampled
-line may hold the key's 48 digits or its hyphenated display form; every
+line may hold the key's 48 digits or its groups joined by hyphens or by
+spaces; every
 sampled cryptsetup line must be exactly one of td-install's argument
 lists (`luksFormat`, `luksAddKey`, `token import`, `open`,
 `--test-passphrase`, `close`, `status`), word for word, its variable
@@ -671,4 +672,62 @@ The protector secret never leaves td-install, so the fixture cannot
 search for it; the argument and environment checks are its evidence.
 Sampling may miss a short-lived process, which is why it is not proof
 that no other process carried the key, and the installed system is not
-booted, since selector release is ENCRYPTION.md increment 6.
+booted here; `qemu-boot-encrypted` boots it.
+
+### Selector release legs
+
+`qemu-boot-encrypted` (td-install/DESIGN.md, ENCRYPTION.md "Acceptance
+evidence", increment 6) uses three more phases.
+
+**`install-encrypted-key`** runs `install-encrypted` and then, after
+every check, writes the recovery key's 48 digits and a newline to
+the virtio serial port named `td.oracle-side`, found under
+`/sys/class/virtio-ports` and opened without becoming its controlling
+terminal. Firmware writes its console to every ISA serial port, so the
+channel is not one. The host
+backs that port with a private file. The fixture scrubs its copy and
+reports `TD-INSTALL-ENCRYPTED-KEY-SENT`. The key never reaches the
+console.
+
+The two later phases mount the source and the verified root's store as
+the installation phases do, so cryptsetup is td's. Each reads the
+recovery key from `/oracle/recovery-key` in its initramfs, scrubs the
+buffer it read and then removes the file, before anything else touches
+the disk. The host deletes the medium when the boot ends.
+
+**`encrypted-headers`** runs on a volume whose first-boot transition
+has finished. It requires exactly one td token, device-bound, read with
+`token export`. Then, with keyslot 0's key authorizing each change and
+each new keyslot under a throwaway random passphrase in a mode-0600 RAM
+file, it builds three states:
+
+- an orphan keyslot 1;
+- a keyslot 3 under token 2, a copy of the device-bound token naming
+  keyslot 3, i.e. a superseded protector;
+- a keyslot 4 under a first-boot token 0, then killed with
+  `luksKillSlot`, which leaves token 0 naming no keyslot.
+
+It reports `TD-INSTALL-ENCRYPTED-HEADERS-BUILT`, then
+`TD-INSTALL-ENCRYPTED-END`.
+
+**`encrypted-inspect`** takes the volume key with `luksDump
+--dump-volume-key` into a fresh mode-0700 directory of the RAM root. It
+reads the key, then unlinks the file and removes the directory. With the
+clean page cache dropped, it searches for the volume key (raw, and
+hexadecimal in both cases) and the recovery key (its digits, and its
+groups joined by hyphens or by spaces) in three places:
+
+- every byte of the disk;
+- every byte of the volume opened read-only as `td-oracle`, then closed,
+  with `status` answering inactive;
+- `/oracle/artifacts`, the whole raw consoles the host kept from every
+  boot, the installation's included, at most 64 MiB. The host also runs
+  this phase over each disk copy a leg booted, before deleting the copy,
+  without the file; the phase then searches no artifacts and reports 0
+  for them.
+
+Each search keeps an overlap that the longest form fits in. It reports
+`TD-INSTALL-ENCRYPTED-SECRETS-ABSENT` with the three byte counts, which
+the host requires to be the disk's capacity, the data segment's length
+and the artifacts' length, then `TD-INSTALL-ENCRYPTED-END`. Every copy
+of either key is zeroed on drop.

@@ -839,13 +839,127 @@ activation; `qemu-boot-live`, which attaches no TPM, keeps proving the
 live selector's skip. A fresh swtpm state stands in for a cleared or
 different TPM: a cleared TPM's new storage primary seed has the same
 effect on these policies, since no protector sealed under the old
-primary loads. The interrupted transition's evidence comes from runs the
-host kills when the selector's console reports each transition commit,
-and from header states a guest constructs with cryptsetup (an orphaned
-keyslot or token, a superseded token) before the selector boots them.
-There is no test-only selector build: the oracle boots the selector td
-ships. The unseal after the cap is the deployment initramfs's
-defence-in-depth attempt ("Boot and authority boundaries").
+primary loads. There is no test-only selector build: the oracle boots
+the selector td ships. The unseal after the cap is the deployment
+initramfs's defence-in-depth attempt ("Boot and authority boundaries").
+
+It installs as increment 5's installed leg does, with one difference:
+after the guest's checks it writes the recovery key to a virtio serial
+port that only the host reads, never to the console. Firmware writes its
+own console to every ISA serial port, so the channel is not one. The
+host keeps the key in memory and deletes the port's file. Every later
+boot runs the same firmware code from a fresh copy of the variable
+template. Unless a leg says otherwise, it runs under the installed
+machine's swtpm state with only the installed disk, or a copy of it,
+attached. The exceptions are these: the live leg attaches its medium
+over USB; the fresh-TPM leg runs under a new swtpm state; the
+header-state and inspection guests boot a fixture ISO beside the disk;
+and the inspection guests attach no TPM.
+
+- **First boot.** It must print the first-boot token's release, the cap,
+  the six transition commits in plan order, and the volume opened with
+  keyslot 2 as the `td-selector` mapping. After the selection, the
+  deployment initramfs's post-cap check must report a policy refusal of
+  the device-bound token, and the system must acknowledge boot success.
+  The account's serial shell writes a file into its home.
+- **Second boot.** It releases the device-bound token with no
+  interaction and tests keyslot 2. The shell reads the file back from
+  the same home.
+- **Host check after the second boot.** The host parses both header
+  copies: keyslots 0 and 2, and one device-bound token, 1, on keyslot 2.
+  The data segment must hold neither a plaintext marker nor the file's
+  contents.
+- **Interrupted transition.** Four legs boot copies of the disk as
+  installed. The host kills qemu when the console reports the keyslot,
+  token, test and destroy commits (steps 2 to 5), polling the console
+  every 5 ms in these boots. The header is read as cryptsetup and td's
+  reader read it: the newer checksum-valid copy, with a torn copy or one
+  a write behind reported. Each cut must leave exactly its own commit's
+  state (the token and test commits leave the same header). The guest
+  keeps committing until the kill lands, so a cut that leaves a later
+  state interrupted nothing. It is a miss, never a pass: the leg tries
+  again on a fresh copy, up to three attempts in all, and fails if
+  none lands. The next boot must finish a transition and bring the
+  system up with one device-bound token on a keyslot other than 0.
+- **Live medium.** The production live medium boots on the installed
+  machine, with the same swtpm and the installed disk attached. It must
+  cap PCR 12 before booting its own deployment, with no release line,
+  and leave both header copies byte for byte unchanged.
+- **Constructed header states.** A guest booted with the recovery key in
+  its initramfs uses cryptsetup on the converged volume to build three
+  states:
+  - an orphan keyslot 1;
+  - a superseded device-bound token 2 (the same sealed object) on its
+    own keyslot 3;
+  - a first-boot token 0 whose keyslot cryptsetup then killed, leaving
+    it naming none.
+  The next boot must release tokens 1 and 2, test keyslot 2, retire
+  exactly those three states in any order and converge, and bring the
+  system up.
+- **Changed chain and fresh TPM.** These legs boot copies of the
+  converged disk:
+  - `\EFI\BOOT\BOOTX64.EFI` with its PE time stamp moved, found
+    through the ESP's FAT;
+  - `\EFI\BOOT\INITRD` with one cpio mtime digit moved;
+  - a firmware boot entry carrying a load option, which the selector
+    kernel's printed command line must show (and every other leg's
+    must not);
+  - a fresh swtpm state.
+  Each must refuse the device-bound token (by policy, or at load for the
+  fresh TPM), close the cap, release nothing and reach the recovery
+  flow. The host answers its secret-line prompts over the serial
+  console, three key prompts in turn:
+  - an entry the recovery-key codec refuses, which prompts again;
+  - a well-formed wrong key (one group's value moved and its Damm check
+    digit made again), which keyslot 0 refuses, prompting again;
+  - the recovery key, which opens keyslot 0.
+  The console must never show the key. Then comes the reseal warning
+  and question. The selector-image leg declines: the system boots once
+  through keyslot 0 with the header unchanged. The other three confirm:
+  - the reseal's commits run;
+  - it reports its new keyslot;
+  - the header holds keyslot 0 and one new device-bound protector;
+  - the deployment initramfs refuses that protector after the cap;
+  - the system boots;
+  - the next boot of the same changed chain or TPM releases the new
+    protector with no interaction.
+- **Inspection.** A guest booted with the recovery key and every
+  console the host kept, the installation's included, takes the volume
+  key with `luksDump --dump-volume-key` into RAM. It requires the volume
+  key (raw and hexadecimal) and the recovery key nowhere: not on the
+  whole disk (read after the clean page cache is dropped), not in the
+  read-only opened volume's plaintext, and not in those consoles. The
+  volume key never leaves that guest's RAM. The interrupted,
+  header-state and changed legs run the same guest, without the
+  consoles, over each disk copy they booted, a missed cut's included,
+  before deleting it.
+
+Every console is captured whole: the host creates a private file empty,
+QEMU writes every console byte to it with no cap, and the host reads,
+removes and scans it as raw bytes. That creation and the absent cap make
+the capture whole; the boot loop's bounded text tail, read from the same
+file, serves only diagnostics and the leg's line checks, and requiring
+the capture to hold that tail is a sanity guard rather than proof. The
+final inspection guest's own console is checked only for the recovery
+key, since the volume key never leaves that guest's RAM for the host to
+look for.
+Each capture is checked for the recovery key before the host keeps it:
+its digits alone, and its groups joined by hyphens or by spaces. Each
+medium that carried the key is deleted when its boot ends, and the
+host zeroes the buffers it built that medium from. The ISO writer's own
+copies and the host's process memory are not otherwise cleared.
+
+The oracle can search only for keys it holds: the recovery key, and the
+volume key it takes inside the inspection guest. The protector secrets
+never leave td-boot inside the selector, so it cannot search for them
+on the disk or in any console. Increment 5's text says the same of
+td-install's. And it builds no test-only selector, so it cannot sample
+the selector's cryptsetup command lines as increment 5 samples
+td-install's: neither the protector's `open` and transition commands
+nor the recovery flow's `cryptsetup open` with the recovery key.
+Instead, td-protector's cryptsetup runner tests pin that each argument
+list is spelled exactly, that a child gets no environment, and that no
+key appears in argv.
 
 For the protected tier, require a real encrypted read/write roundtrip and
 reboot persistence; wrong PIN, missing token and changed boot measurements

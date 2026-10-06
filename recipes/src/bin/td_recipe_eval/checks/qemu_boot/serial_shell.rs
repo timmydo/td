@@ -107,11 +107,16 @@ impl SerialPort {
     }
 
     fn send(&mut self, line: &str) -> Result<(), String> {
+        self.send_bytes(line.as_bytes())
+    }
+
+    /// `line` and a newline, straight from the caller's buffer.
+    fn send_bytes(&mut self, line: &[u8]) -> Result<(), String> {
         self.input
-            .write_all(line.as_bytes())
+            .write_all(line)
             .and_then(|()| self.input.write_all(b"\n"))
             .and_then(|()| self.input.flush())
-            .map_err(|error| format!("type into the serial shell: {error}"))
+            .map_err(|error| format!("type into the serial console: {error}"))
     }
 
     /// Ends the drain: shutting the socket down ends its clone's read too.
@@ -219,9 +224,165 @@ impl<'a> SerialShell<'a> {
     }
 }
 
+/// One answer typed at a console prompt that prints no newline of its
+/// own, such as td-init's secret-line: `reply` and a newline, once
+/// `prompt` appears after the previous answer's prompt. The reply is
+/// zeroed on drop, since it may be a recovery key.
+pub(super) struct ConsoleAnswer {
+    pub(super) prompt: &'static str,
+    pub(super) reply: Vec<u8>,
+}
+
+impl Drop for ConsoleAnswer {
+    fn drop(&mut self) {
+        self.reply.fill(0);
+        std::hint::black_box(&self.reply);
+    }
+}
+
+/// The answers one boot types, in order, and the console text that ends
+/// the boot unanswered: a prompt that never comes must not wait out the
+/// boot's whole deadline.
+pub(super) struct ConsoleAnswers<'a> {
+    pub(super) answers: &'a [ConsoleAnswer],
+    pub(super) refusal: &'a str,
+}
+
+/// Types `ConsoleAnswers` as their prompts arrive. Positions are offsets
+/// into the boot loop's console buffer, which drops its head only past
+/// `cap` bytes: a buffer that full before the last answer refuses rather
+/// than misplace a prompt.
+pub(super) struct ConsoleResponder<'a> {
+    answers: &'a ConsoleAnswers<'a>,
+    next: usize,
+    from: usize,
+    cap: usize,
+}
+
+impl<'a> ConsoleResponder<'a> {
+    pub(super) fn new(answers: &'a ConsoleAnswers<'a>, cap: usize) -> Self {
+        Self {
+            answers,
+            next: 0,
+            from: 0,
+            cap,
+        }
+    }
+
+    pub(super) fn done(&self) -> bool {
+        self.next >= self.answers.answers.len()
+    }
+
+    /// The answer due on `console`, with the offset just past its prompt.
+    fn due(&self, console: &[u8]) -> Result<Option<(&'a ConsoleAnswer, usize)>, String> {
+        let pending = self.answers.answers.get(self.next);
+        if pending.is_some() && console.len() >= self.cap {
+            return Err(format!(
+                "the console filled its {}-byte buffer before prompt {} of {} was answered",
+                self.cap,
+                self.next + 1,
+                self.answers.answers.len()
+            ));
+        }
+        let rest = console.get(self.from..).unwrap_or_default();
+        let found = |needle: &[u8]| rest.windows(needle.len()).position(|w| w == needle);
+        if let Some(answer) = pending {
+            if let Some(at) = found(answer.prompt.as_bytes()) {
+                return Ok(Some((answer, self.from + at + answer.prompt.len())));
+            }
+        }
+        // After the last answer too: what refuses the boot then is as final.
+        if found(self.answers.refusal.as_bytes()).is_some() {
+            return Err(format!(
+                "the console reported {:?} after {} of its {} answers",
+                self.answers.refusal,
+                self.next,
+                self.answers.answers.len()
+            ));
+        }
+        Ok(None)
+    }
+
+    /// Types the answer due on `console`, if any.
+    pub(super) fn poll(&mut self, port: &mut SerialPort, console: &[u8]) -> Result<(), String> {
+        if let Some((answer, end)) = self.due(console)? {
+            port.send_bytes(&answer.reply)?;
+            self.next += 1;
+            self.from = end;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each answer waits for its own prompt after the previous one's, and
+    /// the refusal before a prompt ends the boot.
+    #[test]
+    fn answers_follow_their_prompts_in_order() {
+        let answers = [
+            ConsoleAnswer {
+                prompt: "key: ",
+                reply: b"1".to_vec(),
+            },
+            ConsoleAnswer {
+                prompt: "key: ",
+                reply: b"2".to_vec(),
+            },
+            ConsoleAnswer {
+                prompt: "word: ",
+                reply: b"3".to_vec(),
+            },
+        ];
+        let plan = ConsoleAnswers {
+            answers: &answers,
+            refusal: "halted",
+        };
+        let mut responder = ConsoleResponder::new(&plan, 1024);
+        let mut take = |console: &str| -> Result<Option<Vec<u8>>, String> {
+            match responder.due(console.as_bytes())? {
+                Some((answer, end)) => {
+                    let reply = answer.reply.clone();
+                    responder.next += 1;
+                    responder.from = end;
+                    Ok(Some(reply))
+                }
+                None => Ok(None),
+            }
+        };
+        assert_eq!(take("boot\nke").unwrap(), None);
+        assert_eq!(take("boot\nkey: ").unwrap(), Some(b"1".to_vec()));
+        // The same prompt again is not yet there.
+        assert_eq!(take("boot\nkey: \nwrong\n").unwrap(), None);
+        assert_eq!(
+            take("boot\nkey: \nwrong\nkey: ").unwrap(),
+            Some(b"2".to_vec())
+        );
+        assert!(take("boot\nkey: \nwrong\nkey: \nhalted\n").is_err());
+        assert_eq!(
+            take("boot\nkey: \nwrong\nkey: \nok\nword: ").unwrap(),
+            Some(b"3".to_vec())
+        );
+        assert_eq!(take("anything").unwrap(), None);
+        // A refusal after the last answer still ends the boot.
+        assert!(take("boot\nkey: \nwrong\nkey: \nok\nword: \nhalted\n").is_err());
+        assert!(responder.done());
+        // With no answers, the refusal alone.
+        let none = ConsoleAnswers {
+            answers: &[],
+            refusal: "key: ",
+        };
+        let unattended = ConsoleResponder::new(&none, 1024);
+        assert!(unattended.done());
+        assert!(unattended.due(b"booting\n").unwrap().is_none());
+        assert!(unattended.due(b"booting\nkey: ").is_err());
+        let mut full = ConsoleResponder::new(&plan, 8);
+        assert!(full.due(b"12345678").is_err());
+        full.next = answers.len();
+        assert!(full.due(b"12345678").unwrap().is_none());
+    }
 
     fn step(command: &str, report: &str, payload: &'static str) -> ShellStep {
         ShellStep {

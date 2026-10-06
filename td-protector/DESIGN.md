@@ -687,7 +687,12 @@ gate does not provide, so increment 5's encrypted-installation oracle
 (`qemu-install-encrypted`) reads one in the guest: the installer's
 verifying-boot check runs this reader and `verify_first_boot_object` on
 the header cryptsetup wrote, under the pinned swtpm, and the oracle
-requires the recovery-key phase that check gates. Ignored oracles run the protector lifecycle and
+requires the recovery-key phase that check gates. Increment 6's oracle
+(`qemu-boot-encrypted`) boots the shipped selector over real headers.
+The host parses each header the selector's transitions leave: after a
+whole first boot, after a power cut on each transition commit and the
+boot that completes it, and after constructed orphan and superseded
+states that the next plan retires. Ignored oracles run the protector lifecycle and
 the release order against the pinned swtpm under td-secret's convention
 (`td-secret/DESIGN.md`, "TPM validation"): a first boot's transition
 over the scripted cryptsetup, the TPM's PolicyPCR refusal after the

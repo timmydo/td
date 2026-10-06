@@ -9,14 +9,14 @@ pub(super) const TARGET_DRIVE_ID: &str = "install-target";
 const MINIMUM_TARGET_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 // Verifying the full deployment fills page cache before kexec allocates its
 // control page without reclaim retries. Reserve room above the 3 GiB payload.
-const INSTALLED_SYSTEM_MEMORY_MIB: &str = "4096";
+pub(super) const INSTALLED_SYSTEM_MEMORY_MIB: &str = "4096";
 
 /// Only this module can create a writable installation target, in owned scratch.
 pub(super) struct TargetDisk {
     pub(super) path: PathBuf,
     read_only: bool,
     sector_size: SectorSize,
-    bus: DiskBus,
+    pub(super) bus: DiskBus,
 }
 
 impl TargetDisk {
@@ -90,6 +90,30 @@ impl TargetDisk {
             .write_all(&superblock)
             .and_then(|()| output.sync_all())
             .map_err(|error| error.to_string())
+    }
+
+    /// A new private image `name` in `scratch` holding this one's bytes,
+    /// attached as this one is. On a copy-on-write filesystem the kernel
+    /// shares the extents rather than copying them.
+    pub(super) fn copy_to(&self, scratch: &Path, name: &str) -> Result<Self, String> {
+        let path = scratch.join(name);
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("create {}: {e}", path.display()))?;
+        let mut input =
+            File::open(&self.path).map_err(|e| format!("open {}: {e}", self.path.display()))?;
+        std::io::copy(&mut input, &mut output)
+            .and_then(|_| output.sync_all())
+            .map_err(|e| format!("copy {} to {}: {e}", self.path.display(), path.display()))?;
+        Ok(Self {
+            path,
+            read_only: self.read_only,
+            sector_size: self.sector_size,
+            bus: self.bus,
+        })
     }
 
     fn create(scratch: &Path, name: &str) -> Result<Self, String> {
@@ -2005,7 +2029,7 @@ const SESSION_HOME: &str = "TD-SESSION-HOME-2";
 /// which zone it was given; on the first boot it writes `nonce` into its
 /// home, and each boot reports the file and the home's inode, which on the
 /// second must be `kept`.
-fn session_steps(
+pub(super) fn session_steps(
     installed: &Installed<'_>,
     nonce: &str,
     kept: Option<&str>,
@@ -2071,7 +2095,7 @@ fn session_home<'p>(payload: &'p str, nonce: &str) -> Option<&'p str> {
 }
 
 /// The inode the first boot's shell reported for its home.
-fn reported_home_inode(console: &str, nonce: &str) -> Result<String, String> {
+pub(super) fn reported_home_inode(console: &str, nonce: &str) -> Result<String, String> {
     let prefix = format!("{SESSION_HOME} ");
     let reports: Vec<_> = console
         .lines()
@@ -2264,7 +2288,7 @@ fn validate_installed_system(
 
 /// The healthy `installed` system, its volume on `device`, with a fresh
 /// machine identity when `fresh` and a kept one otherwise.
-fn validate_installed_as(
+pub(super) fn validate_installed_as(
     result: &BootResult,
     device: &str,
     installed: &Installed<'_>,
@@ -2540,7 +2564,7 @@ pub(super) fn installation_timeout(value: Option<&str>, default_secs: u64) -> Du
         .unwrap_or(Duration::from_secs(default_secs))
 }
 
-fn target_plan<'a>(target: &'a TargetDisk, marker: &'a str) -> BootPlan<'a> {
+pub(super) fn target_plan<'a>(target: &'a TargetDisk, marker: &'a str) -> BootPlan<'a> {
     let mut result = plan(&target.path, false, marker);
     result.disk = Some(BootDisk {
         path: &target.path,
@@ -2563,6 +2587,10 @@ pub(super) fn plan<'a>(path: &'a Path, read_only: bool, marker: &'a str) -> Boot
         physical_input: false,
         capture_firefox_audio: false,
         tpm_socket: None,
+        side_channel: None,
+        answers: None,
+        cut: false,
+        keep_console: None,
         screen: None,
         shell: None,
     }

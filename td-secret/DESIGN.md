@@ -876,7 +876,10 @@ passthrough. The source-built test executable calls the unchanged
 `td-recipe-eval qemu-install-encrypted --tpm` (td-install/ENCRYPTION.md
 "Acceptance evidence") requires the same pinned emulator and starts it
 the same way, from fresh state for each leg, attached to a UEFI firmware
-boot whose measurements reach it.
+boot whose measurements reach it. `td-recipe-eval qemu-boot-encrypted --tpm` starts
+it the same way, but keeps one state across the installed machine's
+installation and boots, as a machine's TPM would, and uses a fresh state
+only in its fresh-TPM leg.
 
 The sealing guest extends SHA-256 PCR 7 with a fixed fixture measurement,
 seals a known fixture key with a metadata binding, verifies immediate

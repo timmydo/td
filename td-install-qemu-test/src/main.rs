@@ -9,6 +9,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 mod encrypted;
+mod encrypted_boot;
 #[allow(dead_code, reason = "shared codec; this fixture is its consent end")]
 #[path = "../../td-install/src/installation_consent.rs"]
 mod installation_consent;
@@ -1992,8 +1993,13 @@ fn run() -> Result<(), String> {
     match read(Path::new("/fixture-phase"), 32)?.as_slice() {
         b"install\n" => install(&target()?, false, false),
         b"install-system\n" => install(&target()?, false, true),
-        b"install-encrypted\n" => encrypted::install(&target()?, false),
-        b"install-encrypted-cut\n" => encrypted::install(&target()?, true),
+        b"install-encrypted\n" => encrypted::install(&target()?, false, None),
+        b"install-encrypted-cut\n" => encrypted::install(&target()?, true, None),
+        b"install-encrypted-key\n" => {
+            encrypted::install(&target()?, false, Some(&encrypted_boot::key_channel()?))
+        }
+        b"encrypted-inspect\n" => encrypted_boot::inspect(&target()?),
+        b"encrypted-headers\n" => encrypted_boot::build_headers(&target()?),
         b"install-no-tpm\n" => encrypted::refuse_without_tpm(&target()?),
         b"interrupt\n" => install(&target()?, true, false),
         b"install-scratch\n" => scratch_limited_install(&target()?),

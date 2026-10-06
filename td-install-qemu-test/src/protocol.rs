@@ -38,7 +38,8 @@ pub const ENCRYPTED_CMDLINES_MARKER: &str = "TD-INSTALL-ENCRYPTED-CMDLINES";
 /// mapping, all read without finding the key.
 pub const ENCRYPTED_VOLUME_MARKER: &str = "TD-INSTALL-ENCRYPTED-VOLUME";
 /// The whole disk's bytes, read past the page cache before the volume is
-/// opened, hold the key in neither its passphrase nor its display form.
+/// opened, hold the key neither as its digits nor as its groups joined by
+/// hyphens or by spaces.
 pub const ENCRYPTED_KEY_ABSENT_MARKER: &str = "TD-INSTALL-ENCRYPTED-KEY-ABSENT";
 /// The device-bound installation leg's last record, with the UUID and
 /// the disk.
@@ -46,6 +47,26 @@ pub const ENCRYPTED_MARKER: &str = "TD-INSTALL-ENCRYPTED-WRITTEN";
 /// A bare line after either encrypted leg's last record, on which the host
 /// stops: the records before it, which carry arguments, are then whole.
 pub const ENCRYPTED_END_MARKER: &str = "TD-INSTALL-ENCRYPTED-END";
+// qemu-boot-encrypted's guest evidence (td-install/ENCRYPTION.md increment
+// 6). No record carries a key's bytes or anything derived from them.
+/// The installed leg's recovery key went to the host over the private
+/// second serial port, never the console.
+pub const ENCRYPTED_KEY_SENT_MARKER: &str = "TD-INSTALL-ENCRYPTED-KEY-SENT";
+/// The virtio serial port's name the key typed back travels over: firmware
+/// writes its console to every ISA serial port, never to a virtio one.
+pub const ORACLE_SIDE_PORT: &str = "td.oracle-side";
+/// Where the host places the recovery key in a leg's initramfs, and the
+/// artifacts it asks the inspection leg to search.
+pub const ORACLE_RECOVERY_KEY: &str = "oracle/recovery-key";
+pub const ORACLE_ARTIFACTS: &str = "oracle/artifacts";
+/// The inspection leg: the whole disk, the opened volume's plaintext and
+/// the host's artifacts, each with its byte count, hold neither the volume
+/// key (raw or hexadecimal) nor the recovery key.
+pub const ENCRYPTED_SECRETS_ABSENT_MARKER: &str = "TD-INSTALL-ENCRYPTED-SECRETS-ABSENT";
+/// The header-state leg built, with cryptsetup and the recovery key, an
+/// orphan keyslot, a superseded device-bound token on a keyslot of its own
+/// and an orphaned first-boot token: the keyslots, then the tokens' numbers.
+pub const ENCRYPTED_HEADERS_MARKER: &str = "TD-INSTALL-ENCRYPTED-HEADERS-BUILT";
 /// Without a TPM, `serve --storage device-bound` refused to start before
 /// sending a byte.
 pub const NO_TPM_MARKER: &str = "TD-INSTALL-NO-TPM-REFUSED";

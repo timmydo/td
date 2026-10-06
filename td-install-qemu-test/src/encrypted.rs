@@ -16,13 +16,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// The verified root's static cryptsetup: the binary the service runs.
-const CRYPTSETUP: &str = "/root-image/bin/cryptsetup";
+pub(super) const CRYPTSETUP: &str = "/root-image/bin/cryptsetup";
 /// This fixture's own mapping of the installed volume.
-const MAPPING: &str = "td-oracle";
+pub(super) const MAPPING: &str = "td-oracle";
 /// cryptsetup's exit when no keyslot accepts the passphrase (`-EPERM`).
 const BAD_PASSPHRASE: i32 = 2;
 /// cryptsetup 2.8.8's exit for `status` of an inactive mapping.
-const INACTIVE: i32 = 4;
+pub(super) const INACTIVE: i32 = 4;
 /// Digits per group of the key's display form (td-protector "Recovery key").
 const GROUP_DIGITS: usize = 6;
 /// The display form: eight groups of six digits joined by hyphens.
@@ -38,8 +38,10 @@ const MAX_SAMPLE_BYTES: u64 = 4096;
 
 /// The device-bound installation onto `device`. With `cut`, the leg stops
 /// in the recovery-key phase, the key sent and not typed back, for the
-/// host's power cut.
-pub(super) fn install(device: &str, cut: bool) -> Result<(), String> {
+/// host's power cut. With `channel`, the key typed back then goes to the
+/// host over that private serial port, never the console, for the
+/// installed system's oracle (`qemu-boot-encrypted`).
+pub(super) fn install(device: &str, cut: bool, channel: Option<&Path>) -> Result<(), String> {
     let media = mount_source(device)?;
     let (deployment, id) = source_deployment()?;
     mount_system_root()?;
@@ -78,6 +80,13 @@ pub(super) fn install(device: &str, cut: bool) -> Result<(), String> {
     )?;
     let (volume, mapped) = open_installed(device, &key, &needles, &id)?;
     drop(needles);
+    if let Some(channel) = channel {
+        send_key(channel, &key)?;
+        report(
+            std::io::stdout(),
+            format_args!("{ENCRYPTED_KEY_SENT_MARKER}"),
+        )?;
+    }
     drop(key);
     report(
         std::io::stdout(),
@@ -92,10 +101,28 @@ pub(super) fn install(device: &str, cut: bool) -> Result<(), String> {
     report(std::io::stdout(), format_args!("{ENCRYPTED_END_MARKER}"))
 }
 
+/// The 48 digits and a newline, in one write, to `channel`: a port only
+/// the host reads, opened without becoming this process's terminal.
+fn send_key(channel: &Path, key: &RecoveryDigits) -> Result<(), String> {
+    const O_NOCTTY: i32 = 0o400;
+    let mut line = Box::new([b'\n'; RECOVERY_DIGITS + 1]);
+    if let Some(digits) = line.get_mut(..RECOVERY_DIGITS) {
+        digits.copy_from_slice(key.as_bytes());
+    }
+    let sent = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(O_NOCTTY)
+        .open(channel)
+        .and_then(|mut port| port.write_all(&line[..]).and_then(|()| port.flush()))
+        .map_err(|error| format!("send the recovery key over {}: {error}", channel.display()));
+    installation_protocol::scrub(&mut line[..]);
+    sent
+}
+
 /// Writes back and then drops the clean page cache, so the scan that
 /// follows reads `/dev/vda`'s blocks from the disk rather than from pages
 /// a writer left: `drop_caches` drops only clean pages, hence the sync.
-fn drop_page_cache() -> Result<(), String> {
+pub(super) fn drop_page_cache() -> Result<(), String> {
     applet(&["sync"])?;
     fs::write("/proc/sys/vm/drop_caches", b"1\n")
         .map_err(|error| format!("drop the page cache: {error}"))
@@ -252,30 +279,39 @@ fn table_ranges(len: u64, sector: u64) -> Result<[(&'static str, u64, u64); 2], 
 }
 
 /// The recovery key as a disk or a command line could carry it: its
-/// passphrase digits and its hyphen-grouped display form, zeroed on drop.
-struct Needles {
+/// passphrase digits, its hyphen-grouped display form and the same groups
+/// joined by spaces, as the selector accepts it; zeroed on drop.
+pub(super) struct Needles {
     passphrase: Box<[u8; RECOVERY_DIGITS]>,
     display: Box<[u8; DISPLAY_BYTES]>,
+    spaced: Box<[u8; DISPLAY_BYTES]>,
 }
 
 impl Needles {
-    fn new(key: &RecoveryDigits) -> Self {
+    pub(super) fn new(key: &RecoveryDigits) -> Self {
         let mut passphrase = Box::new([0; RECOVERY_DIGITS]);
         passphrase.copy_from_slice(key.as_bytes());
         let mut display = Box::new([b'-'; DISPLAY_BYTES]);
+        let mut spaced = Box::new([b' '; DISPLAY_BYTES]);
         for (index, digit) in key.as_bytes().iter().enumerate() {
-            if let Some(slot) = display.get_mut(index + index / GROUP_DIGITS) {
-                *slot = *digit;
+            let at = index + index / GROUP_DIGITS;
+            for form in [&mut display, &mut spaced] {
+                if let Some(slot) = form.get_mut(at) {
+                    *slot = *digit;
+                }
             }
         }
         Self {
             passphrase,
             display,
+            spaced,
         }
     }
 
-    fn found_in(&self, haystack: &[u8]) -> bool {
-        contains(haystack, &self.passphrase[..]) || contains(haystack, &self.display[..])
+    pub(super) fn found_in(&self, haystack: &[u8]) -> bool {
+        contains(haystack, &self.passphrase[..])
+            || contains(haystack, &self.display[..])
+            || contains(haystack, &self.spaced[..])
     }
 }
 
@@ -283,10 +319,11 @@ impl Drop for Needles {
     fn drop(&mut self) {
         installation_protocol::scrub(&mut self.passphrase[..]);
         installation_protocol::scrub(&mut self.display[..]);
+        installation_protocol::scrub(&mut self.spaced[..]);
     }
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+pub(super) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     let Some(&first) = needle.first() else {
         return true;
     };
@@ -308,8 +345,21 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// the ciphertext alike; or the opened mapping's plaintext), read in order with an overlap no form of the key fits in; returns
 /// the bytes read.
 fn require_key_absent(device: &str, needles: &Needles) -> Result<u64, String> {
+    require_absent(device, DISPLAY_BYTES - 1, &|window| {
+        needles.found_in(window).then_some("the recovery key")
+    })
+}
+
+/// Every byte of `device` read in order, each window overlapping the last
+/// by `keep` bytes, so a needle of up to `keep + 1` bytes split across two
+/// reads is still seen; `found` names what a window holds, if anything.
+/// Returns the bytes read.
+pub(super) fn require_absent(
+    device: &str,
+    keep: usize,
+    found: &dyn Fn(&[u8]) -> Option<&'static str>,
+) -> Result<u64, String> {
     const CHUNK: usize = 4 << 20;
-    let keep = DISPLAY_BYTES - 1;
     let mut file = File::open(device).map_err(|error| format!("open {device}: {error}"))?;
     let mut buffer = vec![0; keep + CHUNK];
     let mut carried = 0;
@@ -325,8 +375,8 @@ fn require_key_absent(device: &str, needles: &Needles) -> Result<u64, String> {
         total = total.saturating_add(read as u64);
         let filled = carried + read;
         let window = buffer.get(..filled).ok_or("scan buffer overflow")?;
-        if needles.found_in(window) {
-            return Err(format!("the recovery key is on {device} near byte {total}"));
+        if let Some(what) = found(window) {
+            return Err(format!("{what} is on {device} near byte {total}"));
         }
         let start = filled.saturating_sub(keep);
         buffer.copy_within(start..filled, 0);
@@ -336,7 +386,7 @@ fn require_key_absent(device: &str, needles: &Needles) -> Result<u64, String> {
 
 /// The verified root's cryptsetup with `input` on standard input and an
 /// empty environment, its output on the console; its exit code.
-fn cryptsetup(args: &[&str], input: &[u8]) -> Result<Option<i32>, String> {
+pub(super) fn cryptsetup(args: &[&str], input: &[u8]) -> Result<Option<i32>, String> {
     let mut child = Command::new(CRYPTSETUP)
         .args(args)
         .env_clear()
@@ -422,7 +472,7 @@ fn open_installed(
 
 /// The destination's partitions as the kernel lists them under the disk:
 /// exactly 1 and 2, as `/dev` paths.
-fn partitions(device: &str) -> Result<(String, String), String> {
+pub(super) fn partitions(device: &str) -> Result<(String, String), String> {
     let name = device.strip_prefix("/dev/").ok_or("invalid target path")?;
     let disk = Path::new("/sys/class/block").join(name);
     let mut found = Vec::new();
@@ -868,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn needles_find_the_passphrase_and_the_display_form_only() {
+    fn needles_find_the_passphrase_and_its_grouped_forms_only() {
         let needles = Needles::new(&RecoveryDigits::new(KEY).unwrap());
         assert_eq!(
             &needles.display[..],
@@ -879,7 +929,8 @@ mod tests {
         assert!(needles.found_in(&haystack));
         assert!(needles.found_in(b"x123456-789012-345678-901234-567890-123456-789012-345678y"));
         assert!(!needles.found_in(&KEY[1..]));
-        assert!(!needles.found_in(b"123456 789012 345678 901234 567890 123456 789012 345678"));
+        assert!(needles.found_in(b"123456 789012 345678 901234 567890 123456 789012 345678"));
+        assert!(!needles.found_in(b"123456_789012_345678_901234_567890_123456_789012_345678"));
         assert!(!needles.found_in(b""));
     }
 

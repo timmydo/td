@@ -31,6 +31,7 @@
 pub(crate) mod build_iso;
 pub(crate) mod efi;
 pub(crate) mod encrypted;
+pub(crate) mod encrypted_boot;
 pub(crate) mod install;
 pub(crate) mod live;
 pub(crate) mod media;
@@ -349,6 +350,9 @@ pub(crate) const SYSTEM_GUEST_MEMORY_MIB: &str = "2048";
 pub(crate) const QEMU_USER_NETDEV: &str = "user,id=net0";
 pub(crate) const QEMU_USER_NET_DEVICE: &str = "virtio-net-pci,netdev=net0";
 const POLL: Duration = Duration::from_millis(200);
+/// A power-cut boot's poll: the kill should land as close after its
+/// marker as the host allows, since the guest keeps committing meanwhile.
+const CUT_POLL: Duration = Duration::from_millis(5);
 const QMP_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_QMP_LINE_BYTES: usize = 64 * 1024;
 const MAX_QMP_RESPONSE_LINES: usize = 32;
@@ -424,6 +428,8 @@ const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 /// panicking cannot balloon memory or turn the poll loop quadratic. The marker is
 /// latched the moment it is seen, so trimming older bytes never loses it.
 const CAP: usize = 256 * 1024;
+/// How long a marker kill waits for an empty side channel to fill.
+const SIDE_CHANNEL_GRACE: Duration = Duration::from_secs(10);
 
 /// Per-poll read budget. Bounds the inner drain loop so the outer deadline check
 /// runs regularly even if qemu writes ttyS0 as fast as we read it.
@@ -675,6 +681,10 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            side_channel: None,
+            answers: None,
+            cut: false,
+            keep_console: None,
             screen: None,
             shell: None,
         },
@@ -731,6 +741,10 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            side_channel: None,
+            answers: None,
+            cut: false,
+            keep_console: None,
             screen: None,
             shell: None,
         },
@@ -867,6 +881,10 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            side_channel: None,
+            answers: None,
+            cut: false,
+            keep_console: None,
             screen: None,
             shell: None,
         },
@@ -1455,6 +1473,10 @@ fn boot_system_once(
             physical_input,
             capture_firefox_audio,
             tpm_socket: None,
+            side_channel: None,
+            answers: None,
+            cut: false,
+            keep_console: None,
             screen: None,
             shell: None,
         },
@@ -1492,6 +1514,10 @@ fn boot_failed_target_once(
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            side_channel: None,
+            answers: None,
+            cut: false,
+            keep_console: None,
             screen: None,
             shell: None,
         },
@@ -2697,6 +2723,10 @@ pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            side_channel: None,
+            answers: None,
+            cut: false,
+            keep_console: None,
             screen: None,
             shell: None,
         },
@@ -2783,6 +2813,10 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            side_channel: None,
+            answers: None,
+            cut: false,
+            keep_console: None,
             screen: None,
             shell: None,
         },
@@ -2928,6 +2962,10 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            side_channel: None,
+            answers: None,
+            cut: false,
+            keep_console: None,
             screen: None,
             shell: None,
         },
@@ -4484,6 +4522,11 @@ struct BootPlan<'a> {
     capture_firefox_audio: bool,
     /// Private swtpm control socket; never a host TPM passthrough.
     tpm_socket: Option<&'a Path>,
+    /// A file QEMU writes the guest's virtio serial port named
+    /// `ORACLE_SIDE_PORT` to: a channel only the oracle reads, never the
+    /// console, and one firmware does not write to as it does every ISA
+    /// serial port. The file must not exist yet.
+    side_channel: Option<&'a Path>,
     /// What the display must come to show once the target marker is seen; a
     /// marker kill waits for it, and a boot that ends without it fails.
     screen: Option<ScreenExpect<'a>>,
@@ -4491,6 +4534,16 @@ struct BootPlan<'a> {
     /// and the greeter are seen; a marker kill waits for every report, and
     /// a boot that ends without them fails.
     shell: Option<&'a [serial_shell::ShellStep]>,
+    /// Typed at console prompts as they arrive, over the same serial
+    /// socket the shell uses; the marker kill waits for the last.
+    answers: Option<&'a serial_shell::ConsoleAnswers<'a>>,
+    /// The marker is a power cut: the console is polled every few
+    /// milliseconds rather than every `POLL`.
+    cut: bool,
+    /// A path, which must not exist yet, for QEMU to write the whole raw
+    /// console to instead of the boot's scratch, so that it outlives the
+    /// boot for a caller that must scan every byte. The caller removes it.
+    keep_console: Option<&'a Path>,
 }
 
 /// A capture the display must come to show: what it is, and the check of
@@ -4812,7 +4865,19 @@ fn boot_source(
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = create_scratch_dir(scratch_base, &SEQ)?;
     let _scratch = Scratch { dir: dir.clone() };
-    let console_path = dir.join("console.log");
+    let console_path = match plan.keep_console {
+        // Created here, exclusively, empty and private: no stale marker.
+        Some(path) => {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|error| format!("create the console {}: {error}", path.display()))?;
+            path.to_path_buf()
+        }
+        None => dir.join("console.log"),
+    };
     let diag_path = dir.join("diag.log");
     let firefox_audio_path = plan
         .capture_firefox_audio
@@ -4876,20 +4941,21 @@ fn boot_source(
     if input && plan.screen.is_some() {
         return Err("a screen expectation cannot share QMP with an input controller".into());
     }
-    let qmp_scratch = if input || plan.screen.is_some() || plan.shell.is_some() {
-        Some(Scratch {
-            dir: create_qmp_scratch_dir(&env::temp_dir(), &QMP_SEQ)?,
-        })
-    } else {
-        None
-    };
+    let qmp_scratch =
+        if input || plan.screen.is_some() || plan.shell.is_some() || plan.answers.is_some() {
+            Some(Scratch {
+                dir: create_qmp_scratch_dir(&env::temp_dir(), &QMP_SEQ)?,
+            })
+        } else {
+            None
+        };
     let qmp_path = qmp_scratch
         .as_ref()
         .filter(|_| input || plan.screen.is_some())
         .map(|scratch| scratch.dir.join("qmp.sock"));
     let serial_path = qmp_scratch
         .as_ref()
-        .filter(|_| plan.shell.is_some())
+        .filter(|_| plan.shell.is_some() || plan.answers.is_some())
         .map(|scratch| scratch.dir.join("tty.sock"));
     // Every non-audit oracle disables audit initialization explicitly. Merely
     // leaving the kernel's audit state off still permits unconditional seccomp
@@ -4945,6 +5011,25 @@ fn boot_source(
         None => {
             cmd.args(["-serial", &serial]);
         }
+    }
+    if let Some(path) = plan.side_channel {
+        // Created here, exclusively and private, so QEMU's open finds this
+        // file and no other.
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|error| format!("create the side channel {}: {error}", path.display()))?;
+        cmd.arg("-chardev").arg(format!(
+            "file,id=oracle-side,path={}",
+            path.display().to_string().replace(',', ",,")
+        ));
+        cmd.args(["-device", "virtio-serial-pci,id=oracle-side-bus"]);
+        cmd.arg("-device").arg(format!(
+            "virtserialport,bus=oracle-side-bus.0,chardev=oracle-side,name={}",
+            install::protocol::ORACLE_SIDE_PORT
+        ));
     }
     match source {
         BootSource::Direct { kernel, initramfs }
@@ -5127,6 +5212,9 @@ fn boot_source(
         .zip(qmp_path.clone())
         .map(|(expect, path)| ScreenWatch::new(expect, path));
     let mut shell = plan.shell.map(serial_shell::SerialShell::new);
+    let mut responder = plan
+        .answers
+        .map(|answers| serial_shell::ConsoleResponder::new(answers, CAP));
     let mut setup_input = match (source, qmp_path) {
         (BootSource::LiveSetup { script, .. }, Some(path)) => {
             let capture = path.with_file_name("attention.ppm");
@@ -5138,6 +5226,7 @@ fn boot_source(
     };
     let mut end;
     let mut marker_killed = false;
+    let mut marker_seen_at: Option<Instant> = None;
     let mut restart_asked = None;
     loop {
         if let Err(error) = drain_console(
@@ -5223,9 +5312,34 @@ fn boot_source(
                 ));
             }
         }
-        // The marker kill waits for the display and the shell.
+        if let (Some(responder), Some(port)) = (responder.as_mut(), serial_port.as_mut()) {
+            if let Err(error) = responder.poll(port, &buf) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let console = String::from_utf8_lossy(&buf);
+                return Err(format!(
+                    "{error}. Last serial output:\n{}",
+                    tail(&console, 80)
+                ));
+            }
+        }
+        // The marker kill waits for the display, the shell and the answers,
+        // and briefly for the side channel: QEMU drains the guest's virtio
+        // queue on its own schedule, so a write the guest made before its
+        // marker may not have reached the file yet.
+        if evidence.target && marker_seen_at.is_none() {
+            marker_seen_at = Some(Instant::now());
+        }
+        let draining = plan.side_channel.is_some_and(|path| {
+            fs::metadata(path).map_or(true, |meta| meta.len() == 0)
+                && marker_seen_at.is_some_and(|seen| seen.elapsed() < SIDE_CHANNEL_GRACE)
+        });
         let waits = screen.as_ref().is_some_and(|watch| !watch.seen)
-            || shell.as_ref().is_some_and(|controller| !controller.done());
+            || shell.as_ref().is_some_and(|controller| !controller.done())
+            || responder
+                .as_ref()
+                .is_some_and(|responder| !responder.done())
+            || draining;
         if evidence.target && plan.kill_on_marker && !waits {
             let sent = child.kill().is_ok();
             marker_killed = child
@@ -5281,7 +5395,7 @@ fn boot_source(
             end = EndReason::TimedOut(timeout.as_secs());
             break;
         }
-        thread::sleep(POLL);
+        thread::sleep(if plan.cut { CUT_POLL } else { POLL });
     }
 
     // Drain all final bytes qemu flushed before it was reaped. A marker-killed
@@ -12884,6 +12998,10 @@ mod tests {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            side_channel: None,
+            answers: None,
+            cut: false,
+            keep_console: None,
             screen: None,
             shell: None,
         };

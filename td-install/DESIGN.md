@@ -2173,9 +2173,40 @@ The data segment starts zeroed, so this shows the filesystem only inside
 the mapping and claims no erasure. A cut leg powers the guest off in the
 phase after the key was sent: the host finds the seeded table's ranges
 zero and the header with both keyslots. Every console the host saves or
-prints has key-shaped text redacted, after the check that refuses it. The installed system is not booted:
-selector release is increment 6. td-install-qemu-test/DESIGN.md
-"Device-bound installation" owns the guest's side.
+prints has key-shaped text redacted, after the check that refuses it.
+This oracle does not boot the installed system; `qemu-boot-encrypted`
+does. td-install-qemu-test/DESIGN.md "Device-bound installation" owns
+the guest's side.
+
+`td-recipe-eval qemu-boot-encrypted --tpm /absolute/path/to/swtpm` is
+selector release's oracle (ENCRYPTION.md "Acceptance evidence", increment
+6). It sits outside the integration tier, and without `--tpm` it is an
+unprovisioned host gap (exit 69). It installs as the installed leg above
+does, from the `install-encrypted-key` phase, which writes the recovery
+key to a virtio serial port backed by a mode-0600 host file. The host
+reads that file once and removes it. It then boots the installed disk,
+or a copy of it, through the same firmware code (ENCRYPTION.md names
+the legs that change the TPM state or the attachments), under
+`TD_QEMU_BOOT_TIMEOUT_SECS` (1800 seconds by default) for each boot. The
+legs, in order:
+
+1. first boot;
+2. second boot;
+3. four power cuts on transition commits, each on a copy of the disk
+   as installed, a cut that lands past its own commit tried again;
+4. the live medium on the installed machine;
+5. constructed header states;
+6. a changed selector image, initramfs or load option, and a fresh TPM,
+   each on a copy of the converged disk. Each reaches the recovery flow,
+   where the host types the key at its prompts over the serial console.
+   Three of them confirm a reseal, which the next boot releases;
+7. a final inspection for the volume and recovery keys.
+
+The guest legs that need the recovery key (`encrypted-headers` and
+`encrypted-inspect`) get it as an initramfs file. The host deletes their
+media when each boot ends. Each disk copy is searched by
+`encrypted-inspect` before it is deleted. Every boot's console is
+captured whole to a private file and scanned as raw bytes.
 
 The oracle signs with a **per-run throwaway key**: generate a keypair, sign
 the staged bundle, build `td-boot` pinned to that run's public key, boot, and
