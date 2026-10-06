@@ -5239,6 +5239,33 @@ and maximum depth. Five compile-fail guards pin exclusivity and reject
 passive input. Eight additional measured Rust allocation trials preserve
 all earlier 41. Native-stack and RSS qualification remain separate.
 
+### 1.124 Whole original body-member retention
+
+M06ds adds composed::retained. Cursor::new consumes original Serialized,
+chooses one composition mode and privately constructs a fresh composer
+bound to a separately admitted fixed output window. Advanced composers,
+completed emission owners and passive evidence cannot substitute. Only
+reported bytes advance shared Window; retention adds no wire charge.
+
+Fresh admission precedes capacity, including full midstream windows.
+Sticky capacity/resource refusal hides every partial value. Cached
+Complete is inert; fresh complete finish creates exclusive Retained,
+which owns original Composed and the whole retained member bytes. Its
+explicit check and consuming finish freshly admit, hide values after
+refusal and release original work/header owners. ViewBytes is passive,
+forgeable and provisional through authenticated whole-job publication.
+Safe forgetting cannot reconstruct the consumed original proof.
+
+Cursor plus HeaderBudget fits 1 KiB; Retained fits 256 bytes. The whole
+window is separately admitted, with no heap arena or new allowance.
+Five units cover bare-composer byte/cost parity, every shorter capacity,
+every prefix, fresh final consumption, deadline priority, step/record/wire
+refusal cutoffs and zero-source/I/O debit. Six compile-fail guards pin
+exclusive owners and reject advanced/emitted constructor substitution.
+Eight additional
+measured Rust allocation intervals preserve the earlier 49. Native stack,
+RSS, authenticated locators and complete response publication remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

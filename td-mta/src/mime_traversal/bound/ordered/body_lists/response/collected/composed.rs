@@ -1,4 +1,5 @@
 //! Private body metadata members; authenticated blob locators and publication follow.
+pub mod retained;
 use super::{Error, Serialized, View};
 use crate::{admission::work::Charge, mime_traversal::Media, ports::Tick};
 pub use td_json::string::{Progress, Status};

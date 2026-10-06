@@ -2284,6 +2284,36 @@ original owner identity, every prefix and quota cutoff, and depth 64;
 five compile-fail guards reject copying, cloning and passive substitution.
 These fixtures do not qualify native stack, RSS or full JMAP responses.
 
+M06ds whole body-member retention uses one separately admitted fixed
+window. Cursor plus HeaderBudget fits 1 KiB; exclusive Retained fits
+256 bytes. Shared Window adds no heap, source-sized internal buffer,
+allowance or repeated wire charge. The fresh private composer preserves
+all five bare-composer costs, including generated-byte billing.
+
+Eight measured Rust allocation intervals preserve the earlier 49:
+healthy tree/list release, partial expiry, completed retained expiry,
+capacity refusal, partial/complete forgetting and constructor expiry.
+All output backing exists before counting. Units pin exact-fit and every
+shorter capacity, original window/tables/owner identities, every prefix,
+fresh whole release, deadline priority and every step/record/wire cutoff and zero-source/I/O debit.
+Six compile-fail guards pin exclusive ownership and reject advanced or
+emission-only substitution. Native-stack and RSS qualification remain
+separate; this does not qualify complete authenticated response memory.
+
+For N original parts, a conservative Structure window bound is 16 plus
+sum(fragment length + 19) over all N parts. For Lists, use 66 plus that
+sum over every list occurrence, including duplicates across text/html/
+attachment lists. The constants cover member names, object/subParts
+framing, list delimiters, separators and hasAttachment. Compute bounds
+with checked arithmetic before separately admitting the window. This
+copy overlaps all original fragment cells until release; include both
+in admission. A short window consumes the original completion proof;
+retry needs newly reconstructed traversal/collection under admission.
+Every healthy incomplete composer state still owes a byte, so capacity
+precedes the next funded step; fresh deadline admission precedes both.
+Partial/complete forgetting exercises loss of proof and is equivalent to
+dropping these destructor-free owners; no destructor cleanup is claimed.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

@@ -5479,8 +5479,9 @@ fn ordered_mime_classification() {
     let mut json_output = [0; 8];
     let mut retained_output = [0; 256];
     let mut collection_output = [[0; 256]; 3];
+    let mut composed_output = [0; 2048];
     let before = COUNTERS.snapshot();
-    for trial in 0..49 {
+    'trial_loop: for trial in 0..57 {
         let mut work = Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
             Charge {
@@ -5766,6 +5767,79 @@ fn ordered_mime_classification() {
                 }
                 let mut serialized = response.finish(Tick(1)).unwrap();
                 assert_eq!(serialized.value().unwrap().fragments.len(), 3);
+                if trial >= 49 {
+                    use td_mta::mime_traversal::bound::ordered::body_lists::response::collected::composed::{Mode, retained::Cursor as WholeRetention};
+                    let mode = if trial == 50 {
+                        Mode::Lists
+                    } else {
+                        Mode::Structure
+                    };
+                    let deadline = Error::Admission(td_mta::nfc::Error::Work(Stop::Deadline));
+                    if trial == 56 {
+                        assert_eq!(
+                            WholeRetention::new(serialized, mode, &mut composed_output, Tick(100))
+                                .err(),
+                            Some(deadline)
+                        );
+                        continue;
+                    }
+                    let window = if trial == 53 {
+                        &mut composed_output[..1]
+                    } else {
+                        &mut composed_output[..]
+                    };
+                    let mut cursor =
+                        WholeRetention::new(serialized, mode, window, Tick(1)).unwrap();
+                    if trial == 51 || trial == 54 {
+                        cursor.poll(Tick(1)).unwrap();
+                        if trial == 51 {
+                            assert_eq!(cursor.finish(Tick(100)).err(), Some(deadline));
+                        } else {
+                            forget(cursor);
+                        }
+                        continue;
+                    }
+                    let mut done = false;
+                    for _ in 0..100000 {
+                        match cursor.poll(Tick(1)) {
+                            Ok(Status::Complete) => {
+                                done = true;
+                                break;
+                            }
+                            Err(error) => {
+                                assert_eq!(trial, 53);
+                                assert_eq!(error, Error::ResponseCapacity);
+                                assert!(cursor.value().is_none());
+                                assert_eq!(cursor.poll(Tick(100)), Err(error));
+                                assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+                                continue 'trial_loop;
+                            }
+                            Ok(Status::Yield) => {}
+                        }
+                    }
+                    assert!(done);
+                    assert_ne!(trial, 53, "short retention window unexpectedly completed");
+                    if trial == 55 {
+                        forget(cursor);
+                        continue;
+                    }
+                    let mut retained = cursor.finish(Tick(1)).unwrap();
+                    if trial == 52 {
+                        assert_eq!(retained.check_deadline(Tick(100)), Err(deadline));
+                        assert!(retained.value().is_none());
+                        assert_eq!(retained.finish(Tick(1)).err(), Some(deadline));
+                        continue;
+                    }
+                    let ((actual, bytes, view), work, budget) = retained.finish(Tick(1)).unwrap();
+                    assert_eq!(actual, mode);
+                    assert!(!bytes.is_empty());
+                    assert_eq!(view.fragments.len(), 3);
+                    assert_eq!(
+                        (std::ptr::from_mut(work), std::ptr::from_mut(budget)),
+                        (pointers.0, pointers.1)
+                    );
+                    continue;
+                }
                 if trial >= 41 {
                     use td_mta::mime_traversal::bound::ordered::body_lists::response::collected::composed::{Cursor as Composition, Mode, Status as CompositionStatus};
                     let mode = if trial == 42 {

@@ -729,6 +729,16 @@ fresh composer from Serialized; an advanced composer or Composed cannot
 prove that an omitted prefix was retained. Locators, property selection
 and complete response publication remain subsequent boundaries.
 
+M06ds binds original whole collection to fresh private composition and a
+fixed separately admitted member window. An advanced composer or completed
+emission cannot provide constructor authority, so an omitted prefix cannot
+become retained proof. Shared Window records only reported bytes, without
+additional wire debit. Fresh complete retention yields exclusive Retained
+with original Composed and full bytes; passive ViewBytes cannot reconstruct
+that owner. Fresh checks/consumption preserve original allowance identity
+and sticky refusal. These members remain provisional through authenticated
+locators, request property selection and complete job publication.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or
