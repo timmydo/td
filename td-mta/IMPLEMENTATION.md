@@ -2260,6 +2260,19 @@ Initial independently landable increments:
   collection and composition, request selection and current
   authorization follow.
 
+- **M06dy — whole original source-bound member collection:** consume
+  original Bound and exact fixed cells, hand off one original ordinal
+  exclusively into fresh whole retention. Keep abandonment/refusal
+  sticky; require fresh complete child acceptance with exactly one
+  original step and two records (fresh control plus explicit acceptance),
+  and actual pin fence even on quota failure.
+  Restore original Bound only after installing its whole member. Mint
+  exclusive Serialized only after every ordinal, preserving pin custody
+  through fresh release. Pin bytes/backing/costs, cell cardinality/reuse,
+  abandonment, premature completion, deadlines and quota precedence.
+  Qualify eight enumerated Rust allocation intervals; composition,
+  request selection and current authorized publication remain later.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

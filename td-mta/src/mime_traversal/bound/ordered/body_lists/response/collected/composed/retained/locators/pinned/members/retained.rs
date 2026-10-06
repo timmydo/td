@@ -1,4 +1,5 @@
 //! Whole source-bound part-member bytes in a separately admitted fixed window.
+pub mod collected;
 use super::{Bound, Error, Member, Status};
 pub use crate::mime_traversal::Status as RetainStatus;
 use crate::{nfc::HeaderBudget, ports::Tick};

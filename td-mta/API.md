@@ -5461,6 +5461,53 @@ with native allocation, stack, RSS and complete-service admission.
 Earlier 65 metadata/locator, eight binding and eight member intervals
 remain separate evidence.
 
+### 1.130 Whole original source-bound member collection
+
+M06dy adds pinned::members::retained::collected. Collecting consumes only
+original Bound and an exactly sized separately admitted mutable Cell
+array, one fixed output window per original candidate. Fresh supplied
+job Tick and actual pin admission precede cardinality refusal. It does
+not accept passive bytes or one completed member as whole collection.
+Each next borrows the parent exclusively and transfers its original
+Bound into a fresh private retention cursor for the next ordinal.
+The parent records Abandoned until that child freshly completes; drop,
+including after cached completion, cannot authorize a skipped ordinal.
+
+Child owns the original descriptor and all prior backing while emitting
+and retaining at most 64 bytes per funded turn. Child finish freshly
+consumes complete Retained and funds one interpretation step with fresh
+zero control credit, spending one prepaid control record and one
+explicit acceptance record in original work: exactly one step and two
+records, without wire/source/I/O debit. Credit is not carried from
+emission or between acceptances. It then samples the actual
+pin even if funding refused. The post-acceptance pin refusal wins.
+Only success installs the whole original member into its original Cell,
+returns the original Bound, advances exactly one ordinal and clears
+Abandoned. Cell values remain passive and provisional; used cells
+cannot renew custody. Failure hides child values and poisons the parent.
+
+Whole finish freshly requires every ordinal, yielding exclusive
+Serialized with original Bound, all cells and actual descriptor. Its
+explicit admission and consuming low-level release stay fresh. The
+released cells alone supply no whole collection/source/composition or
+current access authority. Tree/list composition, request property
+selection and authenticated publication still follow.
+
+Collecting plus Child plus HeaderBudget fit 2 KiB; Cell fits 64 bytes and
+Serialized fits 768 bytes. These caps do not reserve whole-job memory
+or qualify worker stack. Eight Rust allocation intervals cover near-u64
+leaf, zero-base multipart, partial/completed child expiry, completed
+parent expiry, Serialized expiry, abandonment and constructor pin
+expiry. Original mapping/matching, backing and file setup stay cold;
+descriptor teardown is counted, enclosing pooled-view/scratch lease and
+fixture cleanup are outside. Only those intervals are qualified; cell
+cardinality/reuse, capacity/quota failures, supplied-Tick expiry,
+post-acceptance expiry, clock Invalid/Busy, premature finish and cached
+polls have unit/type coverage or remain future cases, not independent
+allocation qualification. Native allocation, stack/RSS, complete job
+admission and publication remain open. Earlier 65 metadata/locator and
+eight each binding, emission and whole-retention intervals are separate.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

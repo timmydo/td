@@ -790,6 +790,16 @@ original Bound; passive retained bytes alone cannot establish source
 custody or publication. Whole collection/composition and current access
 policy remain later boundaries.
 
+M06dy collects all original source-bound whole members into separately
+admitted fixed cells. Child handoff retains exclusive source and actual
+pin custody; abandonment cannot skip an ordinal. Fresh complete child
+acceptance funds original work and samples the actual pin before
+installing its original cell and returning Bound. Whole Serialized
+ownership requires every original ordinal and stays fresh through
+release. Cells remain provisional; composition, request selection and
+current access policy/publication still follow. Only the eight allocation
+intervals named in API §1.130 are qualified.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

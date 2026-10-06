@@ -2402,6 +2402,24 @@ outside. Only these eight intervals are qualified; API §1.129 records
 remaining unmeasured boundaries. Existing 65 metadata/locator, eight
 binding and eight member intervals remain separate.
 
+M06dy whole original source-bound collection overlaps original Bound,
+actual descriptor, prior source/windows/candidates and separately
+admitted member cells. Each child retains one fresh emitter/window;
+acceptance starts fresh zero credit and adds exactly one original
+interpretation step, one prepaid control record and one explicit record
+(two work records), with no new wire or source/I/O debit. Collecting plus Child plus
+HeaderBudget fit 2 KiB; Cell fits 64 bytes and Serialized fits 768 bytes.
+These are size caps, not whole-ledger or worker-stack proofs. Eight
+sequential Rust allocation intervals cover healthy leaf/multipart,
+partial/completed child expiry, completed parent/Serialized expiry,
+abandonment and constructor expiry. Mapping, matching, file/backing
+setup and cell-array allocation are cold; descriptor teardown is
+counted, enclosing pooled-view/scratch lease and fixture cleanup remain
+outside. API §1.130 names remaining unmeasured variants. Earlier 65
+metadata/locator and eight each source-binding, emission and whole
+retention intervals remain separate. Native/stack/RSS and complete
+admission/publication qualification remain open.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no
