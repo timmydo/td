@@ -1,5 +1,7 @@
 //! Immutable public request description shared with the trusted renderer.
 
+use std::time::Duration;
+
 const MAGIC: &[u8; 8] = b"TDCONS01";
 const MAX_BYTES: usize = 256;
 // Whole-disk installation summary bounds, in displayed (escaped) bytes.
@@ -38,6 +40,12 @@ pub enum Platform {
 
 /// The most login keys one account enrolls (td-login/TOKEN-LOGIN.md).
 pub const LOGIN_KEYS: u8 = 8;
+
+/// One ceremony with one key: root's and the worker's ceiling for an
+/// unlock, a removal and a one-key enrollment (td-login/TOKEN-LOGIN.md).
+pub const LOGIN_CEREMONY: Duration = Duration::from_secs(120);
+/// An addition and a two-key enrollment: two ceremonies.
+pub const LOGIN_TWO_CEREMONIES: Duration = Duration::from_secs(240);
 
 /// The first four bytes of a credential ID's SHA-256, shown as hex.
 pub type Fingerprint = [u8; 4];
@@ -111,6 +119,11 @@ impl LoginStep {
             Self::Unlock { .. } => 7,
             Self::Connect => 8,
         }
+    }
+
+    /// Whether the step asks for the key's PIN.
+    pub fn asks_pin(self) -> bool {
+        self.retries().is_some()
     }
 
     fn key(self) -> Option<Fingerprint> {
@@ -225,6 +238,15 @@ impl Login<'_> {
                     .and_then(|index| baseline.get(index))
                     == Some(&slot.key)
             })
+    }
+
+    /// Root's ceiling, which is the worker's: one ceremony per key the
+    /// person handles in turn.
+    fn ceiling(&self) -> Duration {
+        match (self.kind, self.after) {
+            (LoginKind::Unlock | LoginKind::Remove, _) | (LoginKind::Enroll, 1) => LOGIN_CEREMONY,
+            (LoginKind::Enroll | LoginKind::Add, _) => LOGIN_TWO_CEREMONIES,
+        }
     }
 
     /// The step that must follow this one, with its new-key ordinal, or none
@@ -548,6 +570,22 @@ impl Request {
         &self.operation
     }
 
+    /// Whether this describes a step of a login-key operation.
+    pub fn is_login(&self) -> bool {
+        self.operation.login().is_some()
+    }
+
+    /// The step a login description presents.
+    pub fn login_step(&self) -> Option<LoginStep> {
+        self.operation.login().map(|login| login.step)
+    }
+
+    /// A login operation's ceiling, root's and the worker's alike, fixed by
+    /// its kind and counts and so the same at every step.
+    pub fn login_ceiling(&self) -> Option<Duration> {
+        self.operation.login().map(|login| login.ceiling())
+    }
+
     /// The only next presentation in this same enrollment operation.
     pub fn following_enrollment_step(&self) -> Result<Option<Self>, String> {
         let Operation::Enroll {
@@ -578,10 +616,24 @@ impl Request {
         .map(Some)
     }
 
-    /// Root's first presentation of a login operation, whose step must be
-    /// the operation's first: identify, or connect for an enrollment's first
-    /// key. `baseline` is the presented record's slot fingerprints in its
-    /// canonical order, which the counts and any removal set must match.
+    /// The shape of a login operation's first presentation, without the
+    /// record: its step is the operation's first, identify, or connect for
+    /// an enrollment's first key, never a later key's.
+    pub fn login_start(&self) -> Result<(), String> {
+        self.start().map(|_| ())
+    }
+
+    fn start(&self) -> Result<Login<'_>, String> {
+        let login = self.operation.login().ok_or("not a login operation step")?;
+        if login.kind.steps().first() != Some(&login.step.byte()) || login.key != 1 {
+            return Err("a login operation begins at its first step".into());
+        }
+        Ok(login)
+    }
+
+    /// Root's first presentation of a login operation: `login_start`, then
+    /// `baseline`, the presented record's slot fingerprints in its canonical
+    /// order, which the counts and any removal set must match.
     pub fn begin_login(
         nonce: [u8; 32],
         owner: u32,
@@ -589,82 +641,101 @@ impl Request {
         baseline: &[Fingerprint],
     ) -> Result<Self, String> {
         let request = Self::new(nonce, owner, operation)?;
-        let login = request
-            .operation
-            .login()
-            .ok_or("not a login operation step")?;
-        if login.kind.steps().first() != Some(&login.step.byte()) || login.key != 1 {
-            return Err("a login operation begins at its first step".into());
-        }
-        if !login.matches(baseline) {
+        if !request.start()?.matches(baseline) {
             return Err("login step does not match its baseline record".into());
         }
         Ok(request)
     }
 
-    /// Admits `invitation`, the worker's next step of this login operation.
+    /// The shape of `next` as this login step's successor, from the two
+    /// descriptions alone: `next` keeps the nonce, owner, operation,
+    /// account, counts and removal slots; its step is the only legal next
+    /// one, an enrollment's probe moving to the next key's connect; a
+    /// repeat or probe names the credential the step before it named; and
+    /// a PIN step's retries are not zero. Whether a fingerprint is the
+    /// record's or the created credential needs root's record and the
+    /// worker's report, so a step that passes here may still be one root
+    /// refuses. `Last` means `next` is the operation's final step; nothing
+    /// follows it.
+    pub fn login_successor(&self, next: &Self) -> Result<Admitted, String> {
+        self.successor(next).map(|(admitted, _, _)| admitted)
+    }
+
+    fn successor<'a>(&'a self, next: &'a Self) -> Result<(Admitted, Login<'a>, Login<'a>), String> {
+        let (Some(current), Some(following)) = (self.operation.login(), next.operation.login())
+        else {
+            return Err("not a login operation step".into());
+        };
+        if next.nonce != self.nonce
+            || next.owner != self.owner
+            || following.kind != current.kind
+            || following.account != current.account
+            || following.before != current.before
+            || following.after != current.after
+            || following.removed != current.removed
+        {
+            return Err("login step changed its operation".into());
+        }
+        let Some(order) = current.following() else {
+            return Err("login operation has no further step".into());
+        };
+        if (following.step.byte(), following.key) != order {
+            return Err("illegal login step order".into());
+        }
+        // A ceremony keeps the credential its prove step named.
+        if matches!(
+            following.step,
+            LoginStep::Repeat { .. } | LoginStep::Probe { .. }
+        ) && following.step.key() != current.step.key()
+        {
+            return Err("login step changed its key".into());
+        }
+        if following.step.retries() == Some(0) {
+            return Err("a blocked key cannot take a PIN".into());
+        }
+        let admitted = match following.following() {
+            Some(_) => Admitted::Next,
+            None => Admitted::Last,
+        };
+        Ok((admitted, current, following))
+    }
+
+    /// Admits `invitation`, the worker's next step of this login operation:
+    /// `login_successor`, then the device data against what root holds.
     /// Root supplies the presented record's slot fingerprints in canonical
     /// order and the credential the worker reported creating in the current
     /// key's ceremony, which exists only between its create and probe steps.
-    /// All but the step's device data must be what root derives: the same
-    /// nonce, owner, operation, account, counts and removal slots, and the
-    /// only legal next step. A step's key names a baseline slot (authorize,
-    /// unlock) or the created credential (prove, repeat, probe), which no
-    /// baseline slot names; retries are a claim, refused at zero. `Last`
-    /// means the admitted step is the operation's final one, after which
-    /// only its commit may follow.
+    /// The record must hold the counted keys and every removal slot. A
+    /// step's key names a baseline slot (authorize, unlock) or the created
+    /// credential (prove, repeat, probe), which no baseline slot names.
+    /// `Last` means the admitted step is the operation's final one, after
+    /// which only its commit may follow.
     pub fn admit_login_step(
         &self,
         invitation: &Self,
         baseline: &[Fingerprint],
         created: Option<Fingerprint>,
     ) -> Result<Admitted, String> {
-        let (Some(current), Some(next)) = (self.operation.login(), invitation.operation.login())
-        else {
-            return Err("not a login operation step".into());
-        };
-        if invitation.nonce != self.nonce
-            || invitation.owner != self.owner
-            || next.kind != current.kind
-            || next.account != current.account
-            || next.before != current.before
-            || next.after != current.after
-            || next.removed != current.removed
-        {
-            return Err("login step changed its operation".into());
-        }
+        let (admitted, current, next) = self.successor(invitation)?;
         if !current.matches(baseline) {
             return Err("login step does not match its baseline record".into());
         }
-        let Some(following) = current.following() else {
-            return Err("login operation has no further step".into());
-        };
-        if (next.step.byte(), next.key) != following {
-            return Err("illegal login step order".into());
-        }
         let created_is = |key| created == Some(key) && !baseline.contains(&key);
-        let admitted = match next.step {
+        let named = match next.step {
             LoginStep::Identify | LoginStep::Connect | LoginStep::Create { .. } => {
                 created.is_none()
             }
             LoginStep::Authorize { key, .. } | LoginStep::Unlock { key, .. } => {
                 created.is_none() && baseline.contains(&key)
             }
-            LoginStep::Prove { key, .. } => created_is(key),
-            LoginStep::Repeat { key, .. } | LoginStep::Probe { key } => {
-                created_is(key) && current.step.key() == Some(key)
-            }
+            LoginStep::Prove { key, .. }
+            | LoginStep::Repeat { key, .. }
+            | LoginStep::Probe { key } => created_is(key),
         };
-        if !admitted {
+        if !named {
             return Err("login step names a key root did not admit".into());
         }
-        if next.step.retries() == Some(0) {
-            return Err("a blocked key cannot take a PIN".into());
-        }
-        Ok(match next.following() {
-            Some(_) => Admitted::Next,
-            None => Admitted::Last,
-        })
+        Ok(admitted)
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -2607,6 +2678,554 @@ mod tests {
         assert!(admit(&create_first, create_second, &[], None).is_err());
         let single = enroll(1, 1, LoginStep::Probe { key: N });
         assert!(admit(&single, enroll(1, 1, LoginStep::Connect), &[], None).is_err());
+    }
+
+    /// A step's name and new-key ordinal, read from the operation alone.
+    fn place(request: &Request) -> (&'static str, u8) {
+        let (step, key) = match request.operation() {
+            Operation::LoginEnroll { key, step, .. } => (*step, *key),
+            Operation::LoginUnlock { step, .. }
+            | Operation::LoginAdd { step, .. }
+            | Operation::LoginRemove { step, .. } => (*step, 1),
+            _ => return ("none", 0),
+        };
+        let name = match step {
+            LoginStep::Identify => "identify",
+            LoginStep::Authorize { .. } => "authorize",
+            LoginStep::Create { .. } => "create",
+            LoginStep::Prove { .. } => "prove",
+            LoginStep::Repeat { .. } => "repeat",
+            LoginStep::Probe { .. } => "probe",
+            LoginStep::Unlock { .. } => "unlock",
+            LoginStep::Connect => "connect",
+        };
+        (name, key)
+    }
+
+    /// A step's fingerprint and retries, read from the operation alone.
+    fn device(request: &Request) -> (Option<Fingerprint>, Option<u8>) {
+        let step = match request.operation() {
+            Operation::LoginUnlock { step, .. }
+            | Operation::LoginEnroll { step, .. }
+            | Operation::LoginAdd { step, .. }
+            | Operation::LoginRemove { step, .. } => *step,
+            _ => return (None, None),
+        };
+        match step {
+            LoginStep::Identify | LoginStep::Connect => (None, None),
+            LoginStep::Create { retries } => (None, Some(retries)),
+            LoginStep::Probe { key } => (Some(key), None),
+            LoginStep::Authorize { key, retries }
+            | LoginStep::Prove { key, retries }
+            | LoginStep::Repeat { key, retries }
+            | LoginStep::Unlock { key, retries } => (Some(key), Some(retries)),
+        }
+    }
+
+    #[test]
+    fn login_successors_follow_each_operations_literal_table() {
+        let ceremony = |key| {
+            [
+                ("connect", key),
+                ("create", key),
+                ("prove", key),
+                ("repeat", key),
+                ("probe", key),
+            ]
+        };
+        let one = ceremony(1).to_vec();
+        let two = [ceremony(1), ceremony(2)].concat();
+        /// An operation's step builder, its new-key count and its order.
+        type Table<'a> = (fn(u8, LoginStep) -> Operation, u8, &'a [(&'a str, u8)]);
+        let tables: &[Table] = &[
+            (|_, step| unlock(step), 1, &[("identify", 1), ("unlock", 1)]),
+            (
+                |_, step| remove(vec![slot(2, A)], step),
+                1,
+                &[("identify", 1), ("authorize", 1)],
+            ),
+            (
+                |_, step| add(step),
+                1,
+                &[
+                    ("identify", 1),
+                    ("authorize", 1),
+                    ("connect", 1),
+                    ("create", 1),
+                    ("prove", 1),
+                    ("repeat", 1),
+                    ("probe", 1),
+                ],
+            ),
+            (|key, step| enroll(1, key, step), 1, &one),
+            (|key, step| enroll(2, key, step), 2, &two),
+        ];
+        for (make, ordinals, table) in tables {
+            // Every description of the operation: each step with two
+            // fingerprints and blocked or unblocked retries, at each ordinal.
+            let mut steps = Vec::new();
+            for key in [A, N] {
+                for step in every_step(key).into_iter().chain([
+                    LoginStep::Authorize { key, retries: 0 },
+                    LoginStep::Create { retries: 8 },
+                    LoginStep::Repeat { key, retries: 0 },
+                    LoginStep::Unlock { key, retries: 0 },
+                ]) {
+                    for ordinal in 1..=*ordinals {
+                        if let Ok(request) = Request::new([9; 32], 1000, make(ordinal, step)) {
+                            steps.push(request);
+                        }
+                    }
+                }
+            }
+            let mut admitted = Vec::new();
+            let mut device_refusals = 0;
+            for current in &steps {
+                let index = table.iter().position(|entry| *entry == place(current));
+                assert!(index.is_some(), "{:?}", place(current));
+                for next in &steps {
+                    let ordered = index
+                        .and_then(|index| table.get(index + 1))
+                        .is_some_and(|entry| *entry == place(next));
+                    // A ceremony keeps its credential; a blocked key takes
+                    // no PIN.
+                    let kept = !matches!(place(next).0, "repeat" | "probe")
+                        || device(next).0 == device(current).0;
+                    let unblocked = device(next).1 != Some(0);
+                    let expected = (ordered && kept && unblocked).then(|| {
+                        if Some(&place(next)) == table.last() {
+                            Admitted::Last
+                        } else {
+                            Admitted::Next
+                        }
+                    });
+                    if ordered && expected.is_none() {
+                        device_refusals += 1;
+                    }
+                    let result = current.login_successor(next);
+                    assert_eq!(result.clone().ok(), expected, "{current:?} -> {next:?}");
+                    if result.is_ok() {
+                        admitted.push((place(current), place(next), result));
+                    }
+                }
+            }
+            // Each table pair is admitted, with fingerprints only the record
+            // or the worker's report can refuse.
+            for pair in table.windows(2) {
+                assert!(admitted.iter().any(|(from, to, _)| [*from, *to] == pair));
+            }
+            assert!(admitted.iter().all(
+                |(_, to, result)| (Some(to) == table.last()) == (*result == Ok(Admitted::Last))
+            ));
+            assert!(device_refusals > 0);
+        }
+    }
+
+    #[test]
+    fn a_two_key_enrollment_moves_to_its_second_key_only_after_the_first_probe() {
+        let successor = |current, next| login(current).login_successor(&login(next));
+        let probe = |key, new| enroll(2, key, LoginStep::Probe { key: new });
+        let connect = |key| enroll(2, key, LoginStep::Connect);
+        let create = |key| enroll(2, key, LoginStep::Create { retries: 8 });
+        assert_eq!(successor(probe(1, N), connect(2)), Ok(Admitted::Next));
+        assert_eq!(successor(connect(2), create(2)), Ok(Admitted::Next));
+        // The second key's probe ends the operation.
+        for next in [connect(1), connect(2), create(2)] {
+            assert_eq!(
+                successor(probe(2, M), next),
+                Err("login operation has no further step".into())
+            );
+        }
+        for (current, next) in [
+            // The first key again, or its ceremony restarted.
+            (probe(1, N), connect(1)),
+            (probe(1, N), create(1)),
+            // The second key's connect skipped.
+            (probe(1, N), create(2)),
+            // The second key before the first finishes.
+            (
+                enroll(2, 1, LoginStep::Repeat { key: N, retries: 8 }),
+                connect(2),
+            ),
+            (connect(1), connect(2)),
+            (create(1), create(2)),
+            // Back to the first key.
+            (connect(2), create(1)),
+        ] {
+            assert_eq!(
+                successor(current.clone(), next.clone()),
+                Err("illegal login step order".into()),
+                "{current:?} -> {next:?}"
+            );
+        }
+        // The second key's ceremony keeps its own credential, which may be
+        // any the worker reports, the first key's included.
+        let prove = |new| {
+            enroll(
+                2,
+                2,
+                LoginStep::Prove {
+                    key: new,
+                    retries: 8,
+                },
+            )
+        };
+        let repeat = |new| {
+            enroll(
+                2,
+                2,
+                LoginStep::Repeat {
+                    key: new,
+                    retries: 8,
+                },
+            )
+        };
+        assert_eq!(successor(create(2), prove(M)), Ok(Admitted::Next));
+        assert_eq!(successor(prove(M), repeat(M)), Ok(Admitted::Next));
+        assert_eq!(successor(repeat(M), probe(2, M)), Ok(Admitted::Last));
+        assert_eq!(
+            successor(prove(M), repeat(N)),
+            Err("login step changed its key".into())
+        );
+        assert_eq!(
+            successor(repeat(M), probe(2, N)),
+            Err("login step changed its key".into())
+        );
+        // A one-key enrollment ends at its first probe.
+        assert_eq!(
+            successor(
+                enroll(1, 1, LoginStep::Probe { key: N }),
+                enroll(1, 1, LoginStep::Connect)
+            ),
+            Err("login operation has no further step".into())
+        );
+        assert_eq!(
+            successor(enroll(1, 1, LoginStep::Probe { key: N }), connect(2)),
+            Err("login step changed its operation".into())
+        );
+    }
+
+    #[test]
+    fn a_login_successor_refuses_a_changed_operation_key_or_order() {
+        // Field by field, past what `Request::new` would build: each check
+        // stands on its own.
+        let forged = |nonce, owner, operation| Request {
+            nonce,
+            owner,
+            operation,
+        };
+        let changed = Err("login step changed its operation".into());
+        let order = Err("illegal login step order".into());
+        let identify = login(add(LoginStep::Identify));
+        let authorize = |account, before, after| Operation::LoginAdd {
+            account,
+            before,
+            after,
+            step: LoginStep::Authorize { key: N, retries: 8 },
+        };
+        assert_eq!(
+            identify.login_successor(&login(authorize(1000, 2, 3))),
+            Ok(Admitted::Next)
+        );
+        for next in [
+            Request::new([8; 32], 1000, authorize(1000, 2, 3)).unwrap(),
+            Request::new([9; 32], 1001, authorize(1001, 2, 3)).unwrap(),
+            forged([9; 32], 1001, authorize(1000, 2, 3)),
+            forged([9; 32], 1000, authorize(1001, 2, 3)),
+            login(authorize(1000, 3, 4)),
+            forged([9; 32], 1000, authorize(1000, 1, 3)),
+            forged([9; 32], 1000, authorize(1000, 2, 2)),
+            // Removal's authorize, its counts unchanged.
+            forged(
+                [9; 32],
+                1000,
+                Operation::LoginRemove {
+                    account: 1000,
+                    before: 2,
+                    after: 3,
+                    removed: Vec::new(),
+                    step: LoginStep::Authorize { key: N, retries: 8 },
+                },
+            ),
+        ] {
+            assert_eq!(identify.login_successor(&next), changed, "{next:?}");
+        }
+        // The removal slots alone, the counts kept: another position,
+        // another fingerprint, or another slot as well.
+        let removing = login(remove(vec![slot(2, A)], LoginStep::Identify));
+        let removal = |removed| {
+            forged(
+                [9; 32],
+                1000,
+                Operation::LoginRemove {
+                    account: 1000,
+                    before: 3,
+                    after: 2,
+                    removed,
+                    step: LoginStep::Authorize { key: B, retries: 8 },
+                },
+            )
+        };
+        assert_eq!(
+            removing.login_successor(&removal(vec![slot(2, A)])),
+            Ok(Admitted::Last)
+        );
+        for removed in [
+            vec![slot(1, A)],
+            vec![slot(2, B)],
+            vec![slot(2, A), slot(3, A)],
+        ] {
+            let next = removal(removed);
+            assert_eq!(removing.login_successor(&next), changed, "{next:?}");
+        }
+        // Repeated, skipped or backwards.
+        for (current, next) in [
+            (add(LoginStep::Identify), add(LoginStep::Identify)),
+            (add(LoginStep::Identify), add(LoginStep::Connect)),
+            (
+                add(LoginStep::Authorize { key: A, retries: 8 }),
+                add(LoginStep::Create { retries: 8 }),
+            ),
+            (
+                add(LoginStep::Prove { key: N, retries: 8 }),
+                add(LoginStep::Probe { key: N }),
+            ),
+            (add(LoginStep::Connect), add(LoginStep::Identify)),
+            (unlock(LoginStep::Identify), unlock(LoginStep::Identify)),
+        ] {
+            assert_eq!(
+                login(current.clone()).login_successor(&login(next.clone())),
+                order,
+                "{current:?} -> {next:?}"
+            );
+        }
+        // A ceremony keeps the credential its prove step named, and a
+        // blocked key takes no PIN.
+        let key = Err("login step changed its key".into());
+        let blocked = Err("a blocked key cannot take a PIN".into());
+        let prove = |new, retries| add(LoginStep::Prove { key: new, retries });
+        let repeat = |new, retries| add(LoginStep::Repeat { key: new, retries });
+        let probe = |new| add(LoginStep::Probe { key: new });
+        for (current, next, expected) in [
+            (prove(N, 8), repeat(N, 1), Ok(Admitted::Next)),
+            (repeat(N, 8), probe(N), Ok(Admitted::Last)),
+            (prove(N, 8), repeat(M, 8), key.clone()),
+            (repeat(N, 8), probe(M), key),
+            (
+                add(LoginStep::Identify),
+                add(LoginStep::Authorize { key: A, retries: 0 }),
+                blocked.clone(),
+            ),
+            (
+                add(LoginStep::Connect),
+                add(LoginStep::Create { retries: 0 }),
+                blocked.clone(),
+            ),
+            (
+                add(LoginStep::Create { retries: 8 }),
+                prove(N, 0),
+                blocked.clone(),
+            ),
+            (prove(N, 8), repeat(N, 0), blocked.clone()),
+            (
+                unlock(LoginStep::Identify),
+                unlock(LoginStep::Unlock { key: A, retries: 0 }),
+                blocked,
+            ),
+        ] {
+            assert_eq!(
+                login(current.clone()).login_successor(&login(next.clone())),
+                expected,
+                "{current:?} -> {next:?}"
+            );
+        }
+        // Nothing follows the final step.
+        let unlocked = login(unlock(LoginStep::Unlock { key: A, retries: 8 }));
+        for next in [
+            unlock(LoginStep::Identify),
+            unlock(LoginStep::Unlock { key: A, retries: 8 }),
+        ] {
+            assert_eq!(
+                unlocked.login_successor(&login(next)),
+                Err("login operation has no further step".into())
+            );
+        }
+        // Neither side may be another kind of request.
+        let store = Request::new(
+            [9; 32],
+            1000,
+            Operation::Unlock {
+                role: Role::Primary,
+            },
+        )
+        .unwrap();
+        let not_login = Err("not a login operation step".into());
+        assert_eq!(identify.login_successor(&store), not_login);
+        assert_eq!(store.login_successor(&identify), not_login);
+        assert_eq!(store.login_successor(&store), not_login);
+    }
+
+    #[test]
+    fn root_admits_only_what_the_successor_shape_admits_and_then_the_device_data() {
+        // The shape passes a fingerprint no record holds, and a credential
+        // the worker did not report; root refuses both.
+        let selecting = login(unlock(LoginStep::Identify));
+        let forged = login(unlock(LoginStep::Unlock { key: N, retries: 8 }));
+        assert_eq!(selecting.login_successor(&forged), Ok(Admitted::Last));
+        assert!(selecting.admit_login_step(&forged, &[B, A], None).is_err());
+        let create = login(add(LoginStep::Create { retries: 8 }));
+        let prove = login(add(LoginStep::Prove { key: N, retries: 8 }));
+        assert_eq!(create.login_successor(&prove), Ok(Admitted::Next));
+        assert!(create.admit_login_step(&prove, &[B, A], None).is_err());
+        assert!(create.admit_login_step(&prove, &[B, A], Some(M)).is_err());
+        assert_eq!(
+            create.admit_login_step(&prove, &[B, A], Some(N)),
+            Ok(Admitted::Next)
+        );
+        // A wrong baseline is root's alone.
+        let unlocking = login(unlock(LoginStep::Unlock { key: A, retries: 8 }));
+        assert_eq!(selecting.login_successor(&unlocking), Ok(Admitted::Last));
+        assert_eq!(
+            selecting.admit_login_step(&unlocking, &[A], None),
+            Err("login step does not match its baseline record".into())
+        );
+        assert_eq!(
+            selecting.admit_login_step(&unlocking, &[B, A], None),
+            Ok(Admitted::Last)
+        );
+        // Whatever the shape refuses, root refuses. This holds by
+        // construction, since root's admission begins with the shape; the
+        // loop keeps a later split from losing it.
+        for operation in every_login_operation() {
+            let current = Request::new([9; 32], 1000, operation).unwrap();
+            for next in every_login_operation() {
+                let next = login(next);
+                if current.login_successor(&next).is_err() {
+                    for created in [None, Some(A), Some(N)] {
+                        for baseline in [&[][..], &[B, A], &[A, B, A]] {
+                            assert!(current.admit_login_step(&next, baseline, created).is_err());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_login_start_is_each_operations_first_step_without_the_record() {
+        let first = "a login operation begins at its first step";
+        for operation in every_login_operation() {
+            let request = login(operation.clone());
+            let expected = match (&operation, place(&request)) {
+                (Operation::LoginEnroll { .. }, ("connect", 1)) => true,
+                (Operation::LoginEnroll { .. }, _) => false,
+                (_, ("identify", 1)) => true,
+                _ => false,
+            };
+            assert_eq!(
+                request.login_start(),
+                if expected { Ok(()) } else { Err(first.into()) },
+                "{operation:?}"
+            );
+        }
+        for operation in [
+            // An enrollment's second key, an unlock at its unlock step, an
+            // addition's mid-operation connect, a removal at its authorize.
+            enroll(2, 2, LoginStep::Connect),
+            unlock(LoginStep::Unlock { key: A, retries: 8 }),
+            add(LoginStep::Connect),
+            remove(
+                vec![slot(1, B)],
+                LoginStep::Authorize { key: B, retries: 8 },
+            ),
+        ] {
+            assert_eq!(login(operation).login_start(), Err(first.into()));
+        }
+        for operation in [
+            enroll(1, 1, LoginStep::Connect),
+            enroll(2, 1, LoginStep::Connect),
+            unlock(LoginStep::Identify),
+            add(LoginStep::Identify),
+            remove(vec![slot(1, B)], LoginStep::Identify),
+        ] {
+            assert_eq!(login(operation).login_start(), Ok(()));
+        }
+        let store = Request::new(
+            [9; 32],
+            1000,
+            Operation::Unlock {
+                role: Role::Primary,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            store.login_start(),
+            Err("not a login operation step".into())
+        );
+        // Root's beginning is the start's shape, then the record.
+        let begin = |operation, baseline: &[Fingerprint]| {
+            Request::begin_login([9; 32], 1000, operation, baseline)
+        };
+        assert_eq!(
+            begin(enroll(2, 2, LoginStep::Connect), &[]).err().unwrap(),
+            first
+        );
+        assert_eq!(
+            begin(unlock(LoginStep::Identify), &[A]).err().unwrap(),
+            "login step does not match its baseline record"
+        );
+        assert!(begin(unlock(LoginStep::Identify), &[B, A]).is_ok());
+    }
+
+    #[test]
+    fn login_accessors_name_the_pin_steps_the_kind_and_the_ceiling() {
+        for (step, pin) in [
+            (LoginStep::Identify, false),
+            (LoginStep::Authorize { key: A, retries: 1 }, true),
+            (LoginStep::Create { retries: 1 }, true),
+            (LoginStep::Prove { key: A, retries: 1 }, true),
+            (LoginStep::Repeat { key: A, retries: 1 }, true),
+            (LoginStep::Probe { key: A }, false),
+            (LoginStep::Unlock { key: A, retries: 1 }, true),
+            (LoginStep::Connect, false),
+        ] {
+            assert_eq!(step.asks_pin(), pin, "{step:?}");
+        }
+        assert_eq!(LOGIN_CEREMONY, Duration::from_secs(120));
+        assert_eq!(LOGIN_TWO_CEREMONIES, Duration::from_secs(240));
+        let ceremony = Some(Duration::from_secs(120));
+        let two = Some(Duration::from_secs(240));
+        for operation in every_login_operation() {
+            let request = login(operation.clone());
+            assert!(request.is_login());
+            let (expected, step) = match operation {
+                Operation::LoginUnlock { step, .. }
+                | Operation::LoginRemove { step, .. }
+                | Operation::LoginEnroll { after: 1, step, .. } => Some((ceremony, step)),
+                Operation::LoginEnroll { step, .. } | Operation::LoginAdd { step, .. } => {
+                    Some((two, step))
+                }
+                _ => None,
+            }
+            .unwrap();
+            assert_eq!(request.login_ceiling(), expected, "{operation:?}");
+            assert_eq!(request.login_step(), Some(step));
+        }
+        for operation in [
+            Operation::Unlock {
+                role: Role::Primary,
+            },
+            Operation::Enroll {
+                platform: Platform::TpmPcr7,
+                recovery: Recovery::SecondToken,
+                step: Enrollment::CreatePrimary,
+            },
+        ] {
+            let request = Request::new([9; 32], 1000, operation).unwrap();
+            assert!(!request.is_login());
+            assert_eq!(request.login_ceiling(), None);
+            assert_eq!(request.login_step(), None);
+        }
     }
 
     #[test]

@@ -1,7 +1,10 @@
 //! Nonblocking ownership of one root login-key worker, `td-secret
 //! login-operation` (td-login/TOKEN-LOGIN.md): root's side of its frames.
 
-use crate::consent::{Admitted, Fingerprint, LoginStep, Operation, Request, Slot, LOGIN_KEYS};
+use crate::consent::{
+    Admitted, Fingerprint, LoginStep, Operation, Request, Slot, LOGIN_CEREMONY, LOGIN_KEYS,
+    LOGIN_TWO_CEREMONIES,
+};
 use crate::unlock::{command, deadline_after, Event, Wire};
 use std::fs::File;
 use std::io::Read;
@@ -15,10 +18,6 @@ use std::time::{Duration, Instant};
 /// fixtures drive them.
 pub(crate) const WRITES: bool = cfg!(test);
 
-/// Unlock, removal and a one-key enrollment: the worker's ceilings.
-const CEREMONY: Duration = Duration::from_secs(120);
-/// An addition and a two-key enrollment.
-const TWO_CEREMONIES: Duration = Duration::from_secs(240);
 /// Margin against the worker's five-second acknowledgement window.
 const ACK_TIME: Duration = Duration::from_secs(3);
 /// The worker's PIN frame: its tag and at most 63 PIN bytes.
@@ -107,8 +106,8 @@ impl Selection {
     /// Root's ceiling, the worker's own: fixed when the operation starts.
     fn ceiling(&self) -> Duration {
         match self {
-            Self::Unlock | Self::Remove(_) | Self::Enroll(1) => CEREMONY,
-            Self::Enroll(_) | Self::Add => TWO_CEREMONIES,
+            Self::Unlock | Self::Remove(_) | Self::Enroll(1) => LOGIN_CEREMONY,
+            Self::Enroll(_) | Self::Add => LOGIN_TWO_CEREMONIES,
         }
     }
 
@@ -243,30 +242,6 @@ pub(crate) struct Login {
     terminal: Option<Event>,
 }
 
-/// The step a login description presents.
-fn step(operation: &Operation) -> Option<LoginStep> {
-    match operation {
-        Operation::LoginUnlock { step, .. }
-        | Operation::LoginEnroll { step, .. }
-        | Operation::LoginAdd { step, .. }
-        | Operation::LoginRemove { step, .. } => Some(*step),
-        _ => None,
-    }
-}
-
-fn asks_pin(step: Option<LoginStep>) -> bool {
-    matches!(
-        step,
-        Some(
-            LoginStep::Authorize { .. }
-                | LoginStep::Create { .. }
-                | LoginStep::Prove { .. }
-                | LoginStep::Repeat { .. }
-                | LoginStep::Unlock { .. }
-        )
-    )
-}
-
 /// `18 00` unenrolled, or `18 01`, the slot count and each fingerprint.
 fn baseline(frame: &[u8]) -> Option<Vec<Fingerprint>> {
     match frame {
@@ -388,7 +363,7 @@ impl Login {
             // From here a write may begin: anything but success is uncertain.
             self.committed = self.selection.writes();
             Phase::Completion
-        } else if asks_pin(step(request.operation())) {
+        } else if request.login_step().is_some_and(LoginStep::asks_pin) {
             Phase::Pin
         } else {
             Phase::Running
@@ -595,7 +570,7 @@ impl Login {
                 self.phase = Phase::Presented;
             }
             _ => {
-                let created = match step(invitation.operation()) {
+                let created = match invitation.login_step() {
                     Some(LoginStep::Prove { key, .. }) => Some(key),
                     Some(LoginStep::Repeat { .. } | LoginStep::Probe { .. }) => self.created,
                     _ => None,

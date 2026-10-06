@@ -1058,24 +1058,49 @@ create, prove, repeat, probe for each new key of an enrollment in turn. A
 step outside its operation's list refuses. The widest login value, a
 removal of eight keys at its authorize step, is 98 bytes.
 
+Step admission has two parts. The descriptions alone decide a step's
+shape, which a reader without the record or the device, the compositor
+among them (TOKEN-LOGIN.md increment 3), can check; root's record and the
+worker's report decide its fingerprints. `Request::login_start` is the
+first presentation's shape: a login operation's first step (identify, or
+connect for an enrollment's first key, never a later key's).
+`Request::login_successor` is a next step's: it refuses unless the next
+description keeps the nonce, owner, operation, account, counts and
+removal slots; its step is the one legal successor, an enrollment's probe
+moving to the next key's connect; a repeat or probe names the credential
+the step before it named; and a PIN step's retries are not zero. It
+answers `Last` when that step is the operation's final one (unlock's
+unlock, removal's authorize, the last new key's probe), after which every
+step refuses, and `Next` otherwise. A step either admits may still be
+one root refuses. Both see one step and its predecessor, so a rule that
+spans further is the reader's own: in an addition the new key's prove,
+repeat and probe never name the key that authorized it, which root
+derives from the baseline and a reader without it must remember from
+the authorize step.
+
 `Request::begin_login` builds root's first presentation of a login
-operation and refuses unless its step is the operation's first (identify,
-or connect for an enrollment's first key) and the baseline matches, as
-below. `Request::admit_login_step` is root's pure check on a worker's next
-step, amendment 4 below. The baseline is the presented record's slot
-fingerprints in canonical order; the created fingerprint is the
-credential the worker reported creating in the current key's ceremony. It
-refuses unless the invitation keeps the nonce, owner, operation, account,
-counts and removal slots; the baseline holds the before count (none for
-enrollment) and each removal slot's fingerprint at its position; the step
-is the one legal successor, an enrollment's probe moving to the next
-key's connect; an authorize or unlock fingerprint is in the baseline; a
-prove fingerprint is the reported credential, which repeat and probe keep
-and no baseline slot names; no credential is reported before prove; and a
-PIN step's retries are not zero. It answers `Last` when the admitted step
-is the operation's final one (unlock's unlock, removal's authorize, the
-last new key's probe) and `Next` otherwise; the operation's commit is
-legal only after `Last`. Nothing calls either yet.
+operation: `login_start`, then the baseline, as below.
+`Request::admit_login_step` is root's pure check on a worker's next step,
+amendment 4 below: `login_successor`, then the device data. The baseline
+is the presented record's slot fingerprints in canonical order; the
+created fingerprint is the credential the worker reported creating in the
+current key's ceremony. It refuses unless the baseline holds the before
+count (none for enrollment) and each removal slot's fingerprint at its
+position; an authorize or unlock fingerprint is in the baseline; a prove,
+repeat or probe fingerprint is the reported credential, which no baseline
+slot names; and no credential is reported before prove. Its answer is the
+successor's; the operation's commit is legal only after `Last`. Root's
+supervision (`login.rs`, "Login-key operation supervision") calls
+`begin_login` and `admit_login_step`, and the worker
+(`td-secret/DESIGN.md`) applies the same admission to each step before
+presenting it. `LoginStep::asks_pin` names the PIN steps,
+`Request::is_login` and `Request::login_step` read a description, and
+`Request::login_ceiling` is the operation's deadline, amendment 6:
+`LOGIN_CEREMONY` (120 seconds) for an unlock, a removal and a one-key
+enrollment, `LOGIN_TWO_CEREMONIES` (240) for an addition and a two-key
+enrollment. Root's supervision takes its ceilings from these constants
+and reads a step and whether it asks for a PIN through these accessors;
+the worker takes its ceiling from `login_ceiling`.
 
 The human UID is 1000 through 65533; the external application UID is 65536
 through 2147483647. A write's requester must equal its human owner. Names are
@@ -1771,7 +1796,8 @@ TOKEN-LOGIN.md's.
    claim. Any other difference cancels the
    child. A commit frame is accepted only after the operation's final
    step. `begin_login` and `admit_login_step` are those checks, and
-   `login.rs` applies them.
+   `login.rs` applies them; `login_start` and `login_successor` are the
+   parts that need neither the record nor the worker's report.
 5. **Requests and version (2).** The paired protocol becomes `TDLA003`,
    because TDLA002 states that no record contains a credential. Request
    `1b` selects a login operation (unlock, one-key or two-key first

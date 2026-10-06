@@ -749,6 +749,14 @@ fn deadlines_are_the_workers_ceilings_counted_from_before_its_start() {
         (Selection::Add, 240),
     ] {
         assert_eq!(selection.ceiling(), Duration::from_secs(seconds));
+        // The compositor reads the same ceiling from the description.
+        let baseline: &[Fingerprint] = match selection {
+            Selection::Enroll(_) => &[],
+            _ => &[A, B, C],
+        };
+        let operation = selection.operation(1000, baseline).unwrap();
+        let request = Request::begin_login(NONCE, 1000, operation, baseline).unwrap();
+        assert_eq!(request.login_ceiling(), Some(selection.ceiling()));
         let before = Instant::now();
         let login = scripted(selection, "silent");
         let ceiling = Duration::from_secs(seconds);

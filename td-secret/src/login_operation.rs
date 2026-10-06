@@ -2,7 +2,9 @@
 //! first enrollment, key addition and key removal. Nothing in production
 //! starts it yet.
 
-use crate::consent::{Admitted, Fingerprint, LoginStep, Operation, Request, Slot};
+use crate::consent::{
+    Admitted, Fingerprint, LoginStep, Operation, Request, Slot, LOGIN_TWO_CEREMONIES,
+};
 use crate::fido_ctap;
 use crate::fido_device::{self, Interruption};
 use crate::fido_p256::PublicKey;
@@ -20,11 +22,6 @@ use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// One key ceremony: unlock, removal and a one-key enrollment
-/// (td-authd/DESIGN.md, "Login keys", Deadlines).
-const CEREMONY: Duration = Duration::from_secs(120);
-/// An addition, and a two-key enrollment.
-const TWO_CEREMONIES: Duration = Duration::from_secs(240);
 /// How often a connect step looks for the new key.
 const POLL: Duration = Duration::from_millis(100);
 /// What a commit round must leave of the operation deadline, at its
@@ -207,7 +204,7 @@ pub(super) fn run(uid: u32) -> Result<(), String> {
     let started = Instant::now();
     // The longest ceiling until the description names the operation.
     let deadline = started
-        .checked_add(TWO_CEREMONIES)
+        .checked_add(LOGIN_TWO_CEREMONIES)
         .ok_or("login operation deadline overflow")?;
     let mut wire = Wire::new(stream, deadline)?;
     let context = Context {
@@ -263,18 +260,6 @@ fn report(wire: &mut Wire, result: Result<(), Failure>) -> Result<(), Failure> {
     result
 }
 
-/// The operation's fixed deadline: one ceremony, or two for an addition and
-/// a two-key enrollment. None for anything but a login operation.
-fn ceiling(operation: &Operation) -> Option<Duration> {
-    match operation {
-        Operation::LoginUnlock { .. }
-        | Operation::LoginRemove { .. }
-        | Operation::LoginEnroll { after: 1, .. } => Some(CEREMONY),
-        Operation::LoginEnroll { .. } | Operation::LoginAdd { .. } => Some(TWO_CEREMONIES),
-        _ => None,
-    }
-}
-
 fn perform<D: Devices>(
     wire: &mut Wire,
     context: &Context<'_>,
@@ -312,7 +297,9 @@ fn perform<D: Devices>(
         return Err(Failure::Internal);
     }
     let operation = request.operation().clone();
-    let ceiling = ceiling(&operation).ok_or(Failure::Internal)?;
+    // One ceremony, or two for an addition and a two-key enrollment
+    // (td-authd/DESIGN.md, "Login keys", Deadlines).
+    let ceiling = request.login_ceiling().ok_or(Failure::Internal)?;
     wire.limit(
         context
             .started
@@ -1102,6 +1089,7 @@ fn token(error: LoginError, reported: Option<u8>, wire: &Wire) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consent::LOGIN_CEREMONY;
     use crate::crypto;
     use crate::fido_cbor::{self as cbor, Value};
     use crate::fido_ctap::fingerprint;
@@ -1621,27 +1609,6 @@ mod tests {
         stream.write_all(bytes).unwrap();
     }
 
-    fn step_of(request: &Request) -> LoginStep {
-        match request.operation() {
-            Operation::LoginUnlock { step, .. }
-            | Operation::LoginEnroll { step, .. }
-            | Operation::LoginAdd { step, .. }
-            | Operation::LoginRemove { step, .. } => *step,
-            _ => panic!("not a login step"),
-        }
-    }
-
-    fn asks_pin(step: LoginStep) -> bool {
-        matches!(
-            step,
-            LoginStep::Authorize { .. }
-                | LoginStep::Create { .. }
-                | LoginStep::Prove { .. }
-                | LoginStep::Repeat { .. }
-                | LoginStep::Unlock { .. }
-        )
-    }
-
     /// Root's side: every frame it saw, each invitation's round zeroed. It
     /// begins the operation from the baseline and admits every later step
     /// with consent's own admission, taking a prove step's key as the
@@ -1707,7 +1674,7 @@ mod tests {
             let fresh = tag == 0x10 && invitation != current;
             if fresh {
                 assert!(!last);
-                created = match step_of(&invitation) {
+                created = match invitation.login_step().unwrap() {
                     LoginStep::Prove { key, .. } => Some(key),
                     LoginStep::Repeat { .. } | LoginStep::Probe { .. } => created,
                     _ => None,
@@ -1743,8 +1710,8 @@ mod tests {
             if let (true, Some(admitted)) = (fresh, &plan.admitted) {
                 admitted(&current);
             }
-            let step = step_of(&current);
-            let pin_step = tag == 0x10 && asks_pin(step);
+            let step = current.login_step().unwrap();
+            let pin_step = tag == 0x10 && step.asks_pin();
             if pin_step && plan.pin.is_none() {
                 break;
             }
@@ -2037,31 +2004,37 @@ mod tests {
 
     #[test]
     fn deadlines_are_the_designs_and_every_session_the_transports() {
-        assert_eq!(CEREMONY, Duration::from_secs(120));
-        assert_eq!(TWO_CEREMONIES, Duration::from_secs(240));
-        assert!(CEREMONY <= fido_device::MAX_LIFETIME);
+        assert_eq!(LOGIN_CEREMONY, Duration::from_secs(120));
+        assert_eq!(LOGIN_TWO_CEREMONIES, Duration::from_secs(240));
+        assert!(LOGIN_CEREMONY <= fido_device::MAX_LIFETIME);
         let slot = Slot {
             position: 1,
             key: [1; 4],
         };
         for (operation, ceiling) in [
-            (step(1, LoginStep::Identify).operation().clone(), CEREMONY),
-            (removing(1, &[slot], LoginStep::Identify), CEREMONY),
-            (enrolling(1, 1, LoginStep::Connect), CEREMONY),
-            (enrolling(2, 1, LoginStep::Connect), TWO_CEREMONIES),
-            (adding(1, LoginStep::Identify), TWO_CEREMONIES),
+            (
+                step(1, LoginStep::Identify).operation().clone(),
+                LOGIN_CEREMONY,
+            ),
+            (removing(1, &[slot], LoginStep::Identify), LOGIN_CEREMONY),
+            (enrolling(1, 1, LoginStep::Connect), LOGIN_CEREMONY),
+            (enrolling(2, 1, LoginStep::Connect), LOGIN_TWO_CEREMONIES),
+            (adding(1, LoginStep::Identify), LOGIN_TWO_CEREMONIES),
         ] {
-            assert_eq!(super::ceiling(&operation), Some(ceiling));
+            assert_eq!(login(operation).login_ceiling(), Some(ceiling));
         }
         let store = Operation::Unlock {
             role: crate::consent::Role::Primary,
         };
-        assert_eq!(super::ceiling(&store), None);
+        assert_eq!(
+            Request::new(NONCE, UID, store).unwrap().login_ceiling(),
+            None
+        );
         // A session opened under a longer deadline keeps the transport's lifetime.
         let key = blank("lifetime");
         let mut keys = Keys::all(&[&key]);
         let (worker, _parent) = UnixStream::pair().unwrap();
-        let mut wire = Wire::new(worker, Instant::now() + TWO_CEREMONIES).unwrap();
+        let mut wire = Wire::new(worker, Instant::now() + LOGIN_TWO_CEREMONIES).unwrap();
         let before = Instant::now();
         let lifetime = fido_device::MAX_LIFETIME;
         assert!(super::open(&mut keys, 0, &mut wire, lifetime).is_ok());
@@ -2069,15 +2042,15 @@ mod tests {
         assert!(keys.deadlines[0] >= before + fido_device::MAX_LIFETIME);
         // The open session bounds the wire, not the operation, until it ends.
         assert_eq!(wire.bound(), keys.deadlines[0]);
-        assert!(wire.deadline() > keys.deadlines[0] + CEREMONY / 2);
+        assert!(wire.deadline() > keys.deadlines[0] + LOGIN_CEREMONY / 2);
         assert_eq!(super::ended(&mut wire, Ok(()), None, None), Ok(()));
         assert_eq!(wire.bound(), wire.deadline());
         // Knowing the operation narrows the deadline, never extends it.
-        wire.limit(before + CEREMONY);
+        wire.limit(before + LOGIN_CEREMONY);
         assert!(super::open(&mut keys, 0, &mut wire, lifetime).is_ok());
-        assert_eq!(keys.deadlines[1], before + CEREMONY);
-        wire.limit(before + TWO_CEREMONIES);
-        assert_eq!(wire.deadline(), before + CEREMONY);
+        assert_eq!(keys.deadlines[1], before + LOGIN_CEREMONY);
+        wire.limit(before + LOGIN_TWO_CEREMONIES);
+        assert_eq!(wire.deadline(), before + LOGIN_CEREMONY);
         // Production sessions live as long as the transport allows.
         let run = include_str!("login_operation.rs")
             .split("pub(super) fn run(")
