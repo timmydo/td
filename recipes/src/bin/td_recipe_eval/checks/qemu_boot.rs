@@ -289,6 +289,7 @@ const SYSTEM_ETC_RO_MARKER: &str = td_recipe::ladder::SYSTEM_ETC_RO_MARKER;
 const SYSTEM_STATE_WRITABLE_MARKER: &str = td_recipe::ladder::SYSTEM_STATE_WRITABLE_MARKER;
 const SYSTEM_STATE_OWNER_MARKER: &str = td_recipe::ladder::SYSTEM_STATE_OWNER_MARKER;
 const SYSTEM_ETC_MUTABLE_MARKER: &str = td_recipe::ladder::SYSTEM_ETC_MUTABLE_MARKER;
+const SYSTEM_LOGIN_DIRECTORY_MARKER: &str = td_recipe::ladder::SYSTEM_LOGIN_DIRECTORY_MARKER;
 const TD_FIRSTBOOT_NEW_MARKER: &str = td_recipe::ladder::TD_FIRSTBOOT_NEW_MARKER;
 const TD_FIRSTBOOT_STABLE_MARKER: &str = td_recipe::ladder::TD_FIRSTBOOT_STABLE_MARKER;
 const TD_COMPOSITOR_DEVICES_PRIVATE_MARKER: &str =
@@ -486,6 +487,7 @@ struct ConsoleEvidence {
     root_read_only: bool,
     etc_read_only: bool,
     etc_mutable: bool,
+    login_directory: bool,
     firstboot_new: bool,
     firstboot_stable: bool,
     principals_enrolled: bool,
@@ -1308,7 +1310,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          minted a DIFFERENT one — so the identity is per machine, not per image. Every full boot \
          kept root and /etc immutable \
          ({SYSTEM_ROOT_RO_MARKER}, {SYSTEM_ETC_RO_MARKER}) while the reviewed per-file /etc \
-         symlinks still reached that writable state ({SYSTEM_ETC_MUTABLE_MARKER}), mounted \
+         symlinks still reached that writable state ({SYSTEM_ETC_MUTABLE_MARKER}), left \
+         the login directory valid ({SYSTEM_LOGIN_DIRECTORY_MARKER}), mounted \
          target-owned writable @var \
          ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), ran uutils \
          ({UUTILS_RUNTIME_MARKER}), ripgrep+fd ({RIPGREP_FD_RUNTIME_MARKER}), Git plus its \
@@ -1890,6 +1893,20 @@ fn validate_system_boot(
              32 hex digits through its symlink, or the unprivileged login user could not \
              start its checked session, could read the SSH host PRIVATE key, or could not \
              read its .pub. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    // TOKEN-LOGIN.md, "The login record": stage-1 init's firstboot step left
+    // the directory every login-state reader requires. Its own marker, not
+    // boot health: a damaged directory boots healthy, and only an oracle
+    // that expects one may accept its absence.
+    if !result.evidence.login_directory {
+        return Err(format!(
+            "the {ordinal} boot reached the greeter but /etc/rootcheck did not report \
+             /var/lib/td/login as the root:root mode-0700 directory the login state \
+             requires ({SYSTEM_LOGIN_DIRECTORY_MARKER:?} absent) — stage-1 init's \
+             `td-firstboot ensure-login-directory` did not create it, or refused what it \
+             found. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -6355,6 +6372,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         SYSTEM_ROOT_RO_MARKER.len(),
         SYSTEM_ETC_RO_MARKER.len(),
         SYSTEM_ETC_MUTABLE_MARKER.len(),
+        SYSTEM_LOGIN_DIRECTORY_MARKER.len(),
         TD_FIRSTBOOT_NEW_MARKER.len(),
         TD_FIRSTBOOT_STABLE_MARKER.len(),
         TD_PRINCIPALS_MARKER.len(),
@@ -6581,6 +6599,11 @@ fn latch_console_evidence_from(
         &mut evidence.etc_mutable,
         buf,
         SYSTEM_ETC_MUTABLE_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.login_directory,
+        buf,
+        SYSTEM_LOGIN_DIRECTORY_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.firstboot_new,
@@ -11267,6 +11290,7 @@ mod tests {
         let mut evidence = ConsoleEvidence::default();
         evidence.boot_success = true;
         evidence.etc_mutable = true;
+        evidence.login_directory = true;
         evidence.etc_read_only = true;
         evidence.firstboot_new = true;
         evidence.principals_enrolled = true;
@@ -11449,6 +11473,36 @@ mod tests {
         assert!(validate(&result)
             .unwrap_err()
             .contains(TD_PRINCIPALS_MARKER));
+    }
+
+    /// Every healthy stock boot shows the login directory rootcheck reports
+    /// on its own marker; its absence names that marker.
+    #[test]
+    fn the_login_directory_is_required_for_every_healthy_boot() {
+        let mut result = BootResult {
+            evidence: healthy_evidence(),
+            exited_clean: true,
+            marker_killed: false,
+            reason: String::new(),
+            console: "TD-PRIMARY-PROFILE-READY tester\n".into(),
+            elapsed: Duration::from_secs(1),
+            firefox_audio: FirefoxAudioCapture::NotRequested,
+        };
+        result.evidence.shutdown = true;
+        let validate = |result: &BootResult| {
+            validate_system_boot(
+                result,
+                PersistencePhase::None,
+                IdentityPhase::Fresh,
+                "first",
+                SelectionExpectation::Current,
+            )
+        };
+        assert_eq!(validate(&result), Ok(()));
+        result.evidence.login_directory = false;
+        assert!(validate(&result)
+            .unwrap_err()
+            .contains(SYSTEM_LOGIN_DIRECTORY_MARKER));
     }
 
     /// What the compositor prints after `TD-COMPOSITOR-KMS-READY` on a healthy
@@ -12503,6 +12557,7 @@ mod tests {
             SYSTEM_ROOT_RO_MARKER,
             SYSTEM_ETC_RO_MARKER,
             SYSTEM_ETC_MUTABLE_MARKER,
+            SYSTEM_LOGIN_DIRECTORY_MARKER,
             TD_FIRSTBOOT_NEW_MARKER,
             TD_FIRSTBOOT_STABLE_MARKER,
             TD_PRINCIPALS_MARKER,
@@ -12571,6 +12626,7 @@ mod tests {
         assert!(evidence.root_read_only);
         assert!(evidence.etc_read_only);
         assert!(evidence.etc_mutable);
+        assert!(evidence.login_directory);
         assert!(evidence.firstboot_new);
         assert!(evidence.firstboot_stable);
         assert!(evidence.principals_enrolled);

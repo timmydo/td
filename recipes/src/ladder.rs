@@ -783,6 +783,13 @@ pub const SYSTEM_STATE_WRITABLE_MARKER: &str = "TD-STATE-WRITABLE-OK";
 /// cannot write the persistent state root or root's home.
 pub const SYSTEM_STATE_OWNER_MARKER: &str = "TD-STATE-OWNER-OK";
 
+/// Printed by `/etc/rootcheck` when `/var/lib/td/login` is the root:root
+/// mode-0700 directory the login-state predicate requires, with no link at
+/// or above it (td-login/TOKEN-LOGIN.md, "The login record"). Its own
+/// marker, outside the flag boot health reads: a damaged directory is the
+/// unavailable state, which boots healthy.
+pub const SYSTEM_LOGIN_DIRECTORY_MARKER: &str = "TD-LOGIN-DIRECTORY-OK";
+
 /// Printed by `/bin/td-firstboot` at sysinit when it had to MINT part of this
 /// machine's identity — i.e. this is the machine's first boot on this `/var`.
 /// Seeing it on a LATER boot means identity did not persist, which is the failure

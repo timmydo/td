@@ -1825,6 +1825,17 @@ uses only std filesystem calls, adds no `unsafe` and no syscall surface,
 and takes no lock: td-authd's single operation slot serializes writers
 ("Login-key worker").
 
+The walk, the directory check, the name lookup and the temporary
+cleanup are the shared login-state predicate's, `login_state.rs`
+(TOKEN-LOGIN.md, "The login record"): one std-only file, with
+`#![forbid(unsafe_code)]`, that td-firstboot compiles through a reviewed
+`#[path]`, and that td-authd and td-login will compile the same way
+(TOKEN-LOGIN.md increment 4's C3 and C5). It takes the root it reads
+under, answers unenrolled, enrolled (the record name exists, whatever
+it holds) or unavailable with a cause, and reads no record bytes; each
+refusal also carries one line saying what was refused, for firstboot's
+console. The store uses it with the production directory under `/`.
+
 `Store::open` walks the directory path (`/var/lib/td/login` in
 production) from `/` one component at a time, each opened with
 `O_DIRECTORY | O_NOFOLLOW` through the previous one's `/proc/self/fd`
@@ -2426,7 +2437,7 @@ kernel entropy and the protected-memory check, against virtual keys
 `Plugged` presents through UHID. Root is the host tests' own over a
 socketpair `Wire`, and every frame it sees is asserted as the host tests
 assert it. The record is the production `/var/lib/td/login/1000`, the
-directory made root's with mode 0700 as firstboot will. The departure
+directory made root's with mode 0700 as firstboot does. The departure
 from `run` is the versions: both retained deployments read this
 build's, standing for increment 4's tier marker, since production still
 refuses every write that leaves a record; `login-changed` also runs
@@ -2495,7 +2506,7 @@ exited `operate`.
 
 | Phase | The boot's write, cut at |
 | --- | --- |
-| `setup` | none: makes the volume, the login directory as firstboot will, the blank keys and the ledger, unmounts and powers off |
+| `setup` | none: makes the volume, the login directory as firstboot does, the blank keys and the ledger, unmounts and powers off |
 | `enroll-created`, `enroll-synced`, `enroll-renamed`, `enroll-committed` | a one-key enrollment of the first key, over no record: `Created`, `FileSynced`, `Renamed`, after the success frame |
 | `add-written`, `add-attempted`, `add-synced` | the second key added by the first, across the gated swap: `Written`, `RenameAttempted`, `DirectorySynced` |
 | `remove-attempted`, `remove-unlinked`, `remove-synced` | both keys removed, authorized by the first, which unlinks the record: `UnlinkAttempted`, `Unlinked`, `DirectorySynced` |
@@ -2594,4 +2605,4 @@ one cut line, its own, a SIGKILL the host sent and saw reaped, and no
 passing summary, fixture success line, failure line or panic. The keys,
 root and presence are the fixtures above; this proves crash consistency
 of the store's own writes on Btrfs in a guest, not firstboot's
-temporary cleanup, which is increment 4's.
+temporary cleanup, which td-firstboot's host tests cover.

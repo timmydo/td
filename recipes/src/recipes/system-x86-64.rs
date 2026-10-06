@@ -19,16 +19,17 @@ use crate::ladder::{
     PERSIST_WRITE_CMDLINE_TOKEN, POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER,
     SETUP_INPUT_CMDLINE_TOKEN, SSHD_MARKER, SYSTEM_BOOT_SUCCESS_MARKER,
     SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_DEPLOY_ROLLBACK_MARKER, SYSTEM_ETC_MUTABLE_MARKER,
-    SYSTEM_ETC_RO_MARKER, SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
-    SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
-    SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_APPLICATIONS_PLACED_MARKER, TD_BUSD_RUNTIME_MARKER, TD_CLAUDE_TERMINAL_MARKER,
-    TD_FETCH_BOOT_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER,
-    TD_FIREFOX_INPUT_FAILED_MARKER, TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER,
-    TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_KILL_REAPS_MARKER,
-    TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
-    TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY,
-    TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
+    SYSTEM_ETC_RO_MARKER, SYSTEM_LOGIN_DIRECTORY_MARKER, SYSTEM_NET_REACH_MARKER,
+    SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER, SYSTEM_PERSIST_READ_MARKER,
+    SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER, SYSTEM_SHUTDOWN_MARKER,
+    SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER, TD_APPLICATIONS_PLACED_MARKER,
+    TD_BUSD_RUNTIME_MARKER, TD_CLAUDE_TERMINAL_MARKER, TD_FETCH_BOOT_MARKER,
+    TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER, TD_FIREFOX_INPUT_FAILED_MARKER,
+    TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER, TD_FIREFOX_SUPPORT_MARKER,
+    TD_INIT_RUNTIME_MARKER, TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
+    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY,
+    TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY, TD_NEWS_NAME,
+    TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_SETUP_LIVE_MARKER,
     TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
@@ -2258,6 +2259,12 @@ pub(super) fn deployment_init_fixture() -> String {
     build_deployment_init(&SYSTEM)
 }
 
+/// Stage-1 init's login-directory step (td-login/TOKEN-LOGIN.md, "The login
+/// record"), on every boot, the live medium's included, once `@var` is
+/// mounted and right before the SSH policy is rendered. A refusal is its one
+/// console line and no more: `|| :` keeps `set -e` from failing the boot.
+const LOGIN_DIRECTORY_STEP: &str = "/bin/td-firstboot ensure-login-directory /sysroot || :";
+
 /// The selected deployment initramfs requires exactly one td.deployment handoff,
 /// validates that manifest and root payload, and enters the immutable root.
 fn build_deployment_init(sys: &SystemDef) -> String {
@@ -2370,6 +2377,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
     ));
     init.push_str(&format!(
         "primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot) || exit 1\n\
+         {LOGIN_DIRECTORY_STEP}\n\
          /bin/sh -c 'umask 077; /bin/td-firstboot render-primary-sshd /sysroot > /sysroot{SSHD_CONFIG} && /bin/td-util chmod 0600 /sysroot{SSHD_CONFIG}' || exit 1\n\
          /bin/umount /proc\n\
          downloads=\"$primary_home/Downloads\"\n\
@@ -2624,6 +2632,13 @@ fn build_rootcheck(sys: &SystemDef) -> String {
             user.uid, user.gid
         ));
     }
+    // The login directory's own marker, never `ok`: a damaged directory is
+    // the unavailable state, which boot health accepts. The check writes
+    // nothing; its reason is stage-1 init's console line, not a second one.
+    s.push_str(&format!(
+        "if /bin/td-firstboot check-login-directory / 2>/dev/null; then \
+         echo {SYSTEM_LOGIN_DIRECTORY_MARKER}; fi\n"
+    ));
     s.push_str(&format!(
         "if [ \"$ok\" = 1 ]; then \
          echo {SYSTEM_STATE_WRITABLE_MARKER}; \
@@ -11634,6 +11649,72 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// TOKEN-LOGIN.md, "The login record": the directory step runs on every
+    /// boot, installed and live alike, once `@var` is mounted, right before
+    /// the SSH render that reads its state, while `/proc` is still mounted
+    /// for the predicate's descriptor paths; and no refusal fails the boot.
+    #[test]
+    fn the_login_directory_is_ensured_before_the_ssh_render_and_never_fails_the_boot() {
+        let init = build_deployment_init(&SYSTEM);
+        assert_eq!(
+            LOGIN_DIRECTORY_STEP,
+            "/bin/td-firstboot ensure-login-directory /sysroot || :"
+        );
+        assert!(init.starts_with("#!/bin/sh\nset -e\n"));
+        assert_eq!(init.matches("ensure-login-directory").count(), 1);
+        let lines: Vec<&str> = init.lines().map(str::trim).collect();
+        let at = lines
+            .iter()
+            .position(|line| *line == LOGIN_DIRECTORY_STEP)
+            .expect("the step is a line of its own");
+        assert!(lines
+            .get(at + 1)
+            .is_some_and(|next| next.contains("/bin/td-firstboot render-primary-sshd /sysroot")));
+        let before = lines.get(..at).unwrap_or_default();
+        let position = |needle: &str| {
+            before
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} does not precede the step"))
+        };
+        // Both branches of the live split have joined, and @var is mounted.
+        assert!(position("/bin/td-boot root-loop") < position("/bin/mount -t erofs"));
+        assert!(position("/bin/td-boot live-root") < position("/bin/mount -t erofs"));
+        position("/bin/td-boot on-volume mount-var /sysroot/var");
+        // No conditional is open around it.
+        let opened = before
+            .iter()
+            .filter(|line| line.starts_with("if ") && !line.ends_with("; fi"))
+            .count();
+        let closed = before.iter().filter(|line| **line == "fi").count();
+        assert_eq!(opened, closed);
+        let proc_unmounted = lines
+            .iter()
+            .position(|line| *line == "/bin/umount /proc")
+            .expect("proc cleanup");
+        assert!(at < proc_unmounted);
+    }
+
+    /// Rootcheck reports the directory on its own marker and never lowers
+    /// the flag boot health reads, so a damaged directory still boots healthy.
+    #[test]
+    fn rootcheck_reports_the_login_directory_outside_boot_health() {
+        let rootcheck = build_rootcheck(&SYSTEM);
+        let report = format!(
+            "if /bin/td-firstboot check-login-directory / 2>/dev/null; then \
+             echo {SYSTEM_LOGIN_DIRECTORY_MARKER}; fi"
+        );
+        assert_eq!(
+            rootcheck.lines().filter(|line| *line == report).count(),
+            1,
+            "{rootcheck}"
+        );
+        assert_eq!(rootcheck.matches("login-directory").count(), 1);
+        assert_eq!(rootcheck.matches(SYSTEM_LOGIN_DIRECTORY_MARKER).count(), 1);
+        assert!(!build_bootsuccess(&SYSTEM).contains(SYSTEM_LOGIN_DIRECTORY_MARKER));
+        assert!(!build_bootsuccess(&SYSTEM).contains("login-directory"));
     }
 
     #[test]

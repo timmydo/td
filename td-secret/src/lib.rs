@@ -43,6 +43,11 @@ mod fido_pin;
 mod fido_transaction;
 mod login_operation;
 mod login_record;
+#[allow(
+    dead_code,
+    reason = "the shared login-state predicate also serves td-firstboot; td-authd and td-login will compile it"
+)]
+mod login_state;
 mod login_store;
 #[path = "../../td-busd/src/message.rs"]
 #[allow(dead_code, reason = "shared bounded D-Bus codec")]
@@ -325,6 +330,7 @@ mod confinement {
             ("login_operation.rs", include_str!("login_operation.rs")),
             ("login_vm.rs", include_str!("login_vm.rs")),
             ("login_record.rs", include_str!("login_record.rs")),
+            ("login_state.rs", include_str!("login_state.rs")),
             ("login_store.rs", include_str!("login_store.rs")),
             ("pin_sys.rs", include_str!("pin_sys.rs")),
             ("pin_terminal.rs", include_str!("pin_terminal.rs")),
@@ -458,6 +464,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "lib.rs",
                 "login_operation.rs",
                 "login_record.rs",
+                "login_state.rs",
                 "login_store.rs",
                 "login_vm.rs",
                 "main.rs",

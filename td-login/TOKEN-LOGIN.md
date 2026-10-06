@@ -40,8 +40,11 @@ inert, since production never reaches a PIN step, and so has the lock
 surface with its login unlock ("Session lock"), inert: its one entry is
 test-only and nothing in production locks. Increment 3 is complete; its
 desktop guest moved to increment 4 as `login-desktop`. Increment 4 is
-specified as eleven commits ("Increments"), none of which has landed.
-Nothing else below is implemented.
+specified as eleven commits ("Increments"), of which only C1 has
+landed: firstboot ensures the login directory at every boot, the live
+medium's included, through the shared login-state predicate, and
+rootcheck reports it on a marker of its own. Nothing in production
+acts on the state yet. Nothing else below is implemented.
 Until the increments at the end land, `THREAT-MODEL.md` §3 is the
 complete current behaviour: the installed account logs in automatically
 and the session never locks. No document, UI or release
@@ -165,7 +168,15 @@ removes a record. It walks the path as the record store does
 (`td-secret/DESIGN.md`, "Login record store") and refuses rather than
 repairs invalid existing metadata: for that, or a `tmp-` entry it cannot
 unlink, it prints one console line, `td-firstboot: login directory
-refused: ` and the reason, and exits nonzero.
+refused: ` and the reason, and exits nonzero, which init's `|| :`
+ignores. It creates only in a parent that root owns and that no group
+or other may write, so nothing else can put a directory under the name
+between its `mkdir` and its open, and refuses otherwise. It then opens
+the new directory without following a link, requires that descriptor
+to show an empty directory with two links, or the one Btrfs reports for
+every directory, and only then chowns and chmods it through that
+descriptor and syncs it and its parent; anything else is refused and
+left as it is.
 
 The login state is **unenrolled** only when the directory is valid and the
 record name is absent, **enrolled** when a valid record is present, and
@@ -1037,7 +1048,8 @@ page cache, so these guests prove crash consistency of the store's
 syncs, not that a sync reached stable media: a missing write-cache
 flush, torn or reordered sectors and host power loss are not covered,
 and I/O in flight at the kill may land or not. Firstboot's own
-temporary cleanup is increment 4's.
+temporary cleanup landed with increment 4's C1 and is tested on the
+host (`td-firstboot/src/login_directory.rs`).
 
 The stock VM stays unenrolled: no recipe or firstboot path writes a record,
 and its valid, empty directory is decided unenrolled without any helper,
@@ -1197,14 +1209,18 @@ and the oracle that shows it.
    attention `L`, lid close and resume detection; and unlock end to end.
    It lands as these commits after this amendment's documentation-only
    C0, each one green and independently landable:
-   - C1: the shared login-state predicate ("The login record"), with
-     the root as a parameter; `td-firstboot ensure-login-directory
-     /sysroot` in stage-1 init before `render-primary-sshd`; and
-     rootcheck's report of `/var/lib/td/login` as a root:root mode-0700
-     directory, on a marker of its own outside the flag boot health
-     reads, so the stock boot oracles see the directory while a damaged
-     one still boots healthy. It changes every boot, so its landing runs
-     `check integration` by hand.
+   - C1, landed: the shared login-state predicate ("The login record"),
+     with the root as a parameter, which td-secret's record store now
+     walks through; `td-firstboot ensure-login-directory /sysroot` in
+     stage-1 init before `render-primary-sshd`; and rootcheck's report
+     of `/var/lib/td/login` as a root:root mode-0700 directory, through
+     the read-only `td-firstboot check-login-directory /`, as
+     `TD-LOGIN-DIRECTORY-OK`, a marker of its own outside the flag boot
+     health reads, so the oracles that require it (`qemu-boot-system`,
+     `qemu-boot-session`, `qemu-install-system` and
+     `qemu-boot-encrypted`) see the directory while a damaged one still
+     boots healthy. It changes every boot, so its landing runs `check
+     integration` by hand.
    - C2: the read-only `td-secret inspect-login --uid 1000` helper
      (`td-secret/DESIGN.md`, "Read-only enrollment-state inspection"),
      which nothing runs yet.

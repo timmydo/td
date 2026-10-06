@@ -3,41 +3,14 @@
 //! are serialized by the caller; this module takes no lock.
 
 use super::login_record::{Record, MAX_RECORD};
+use super::login_state::{same_inode, Directory, Facts, NOFOLLOW};
+pub(super) use super::login_state::{Cause, Owner, DIRECTORY, TEMPORARY};
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
-pub(super) const DIRECTORY: &str = "/var/lib/td/login";
-/// Every temporary name starts with this; no other td name does.
-pub(super) const TEMPORARY: &str = "tmp-";
-const FD_ROOT: &str = "/proc/self/fd";
-const NOFOLLOW: i32 = 0o400000;
-const OPEN_DIRECTORY: i32 = 0o200000;
 const NONBLOCK: i32 = 0o4000;
-const ENOTDIR: i32 = 20;
-const ELOOP: i32 = 40;
-
-/// The owner the directory and record must have: root:root in production.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Owner {
-    pub uid: u32,
-    pub gid: u32,
-}
-
-impl Owner {
-    pub const ROOT: Self = Self { uid: 0, gid: 0 };
-}
-
-/// TOKEN-LOGIN.md's three causes of the unavailable state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Cause {
-    DirectoryDamaged,
-    RecordDamaged,
-    Unreadable,
-}
 
 pub(super) enum State {
     Unenrolled,
@@ -94,103 +67,6 @@ enum Stage {
     DirectorySynced,
 }
 
-/// Metadata the checks read; separate so tests can state an owner they cannot create.
-struct Facts {
-    directory: bool,
-    regular: bool,
-    mode: u32,
-    links: u64,
-    uid: u32,
-    gid: u32,
-}
-
-impl Facts {
-    fn of(meta: &Metadata) -> Self {
-        Self {
-            directory: meta.is_dir(),
-            regular: meta.is_file(),
-            mode: meta.mode() & 0o7777,
-            links: meta.nlink(),
-            uid: meta.uid(),
-            gid: meta.gid(),
-        }
-    }
-
-    fn owned(&self, owner: Owner) -> bool {
-        self.uid == owner.uid && self.gid == owner.gid
-    }
-
-    /// A removed directory has no links; its descriptor must not read as empty.
-    fn valid_directory(&self, owner: Owner) -> bool {
-        self.owned(owner) && self.directory && self.mode == 0o700 && self.links != 0
-    }
-
-    fn valid_record(&self, owner: Owner) -> bool {
-        self.owned(owner) && self.regular && self.mode == 0o600 && self.links == 1
-    }
-}
-
-/// A missing name, a link or a non-directory on the path is the damage; any
-/// other failure is transient.
-fn classify(error: &io::Error, damage: Cause) -> Cause {
-    if error.kind() == io::ErrorKind::NotFound
-        || matches!(error.raw_os_error(), Some(ENOTDIR | ELOOP))
-    {
-        damage
-    } else {
-        Cause::Unreadable
-    }
-}
-
-fn open_directory(root: &Path, path: &Path) -> Result<File, Cause> {
-    let open = |path: &Path| {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(OPEN_DIRECTORY | NOFOLLOW)
-            .open(path)
-            .map_err(|error| classify(&error, Cause::DirectoryDamaged))
-    };
-    let mut components = path.components();
-    if components.next() != Some(Component::RootDir) {
-        return Err(Cause::DirectoryDamaged);
-    }
-    let mut current = open(Path::new("/"))?;
-    for component in components {
-        let Component::Normal(name) = component else {
-            return Err(Cause::DirectoryDamaged);
-        };
-        current = match open(&at(root, &current, name)) {
-            Err(Cause::DirectoryDamaged) => {
-                // Damage only while the parent's descriptor path still names it.
-                resolves(root, &current)?;
-                return Err(Cause::DirectoryDamaged);
-            }
-            opened => opened?,
-        };
-    }
-    Ok(current)
-}
-
-fn at(root: &Path, directory: &File, name: impl AsRef<Path>) -> PathBuf {
-    root.join(directory.as_raw_fd().to_string()).join(name)
-}
-
-/// Whether `directory`'s descriptor path names it: a lost or replaced
-/// `/proc` must not make a name look absent.
-fn resolves(root: &Path, directory: &File) -> Result<(), Cause> {
-    let named = fs::metadata(at(root, directory, "")).map_err(|_| Cause::Unreadable)?;
-    let held = directory.metadata().map_err(|_| Cause::Unreadable)?;
-    if same_inode(&named, &held) {
-        Ok(())
-    } else {
-        Err(Cause::Unreadable)
-    }
-}
-
-fn same_inode(a: &Metadata, b: &Metadata) -> bool {
-    a.dev() == b.dev() && a.ino() == b.ino()
-}
-
 fn unchanged_during_read(before: &Metadata, after: &Metadata) -> bool {
     same_inode(before, after)
         && before.len() == after.len()
@@ -208,45 +84,36 @@ pub(super) fn read(path: &Path, owner: Owner, uid: u32) -> State {
     }
 }
 
-/// The login directory, pinned by descriptor from the walk that opened it.
+/// The login directory and the account whose record it holds.
 pub(super) struct Store {
-    directory: File,
-    owner: Owner,
+    directory: Directory,
     uid: u32,
-    /// `FD_ROOT`; tests replace it to stand for a lost or replaced `/proc`.
-    root: PathBuf,
 }
 
 impl Store {
     /// Walks `path` from `/` one component at a time without following a
-    /// link. A missing name counts only while the directory's own
-    /// `/proc/self/fd` path names it; otherwise it is unreadable.
+    /// link (`login_state::walk`). A missing name counts only while the
+    /// directory's own `/proc/self/fd` path names it; otherwise it is
+    /// unreadable.
     pub fn open(path: &Path, owner: Owner, uid: u32) -> Result<Self, Cause> {
-        Self::open_via(Path::new(FD_ROOT), path, owner, uid)
+        Directory::open(path, owner)
+            .map(|directory| Self { directory, uid })
+            .map_err(|refusal| refusal.cause)
     }
 
-    fn open_via(root: &Path, path: &Path, owner: Owner, uid: u32) -> Result<Self, Cause> {
-        let store = Self {
-            directory: open_directory(root, path)?,
-            owner,
-            uid,
-            root: root.to_path_buf(),
-        };
-        store.check_directory()?;
-        Ok(store)
+    #[cfg(test)]
+    fn open_via(fd_root: &Path, path: &Path, owner: Owner, uid: u32) -> Result<Self, Cause> {
+        Directory::open_via(fd_root, path, owner)
+            .map(|directory| Self { directory, uid })
+            .map_err(|refusal| refusal.cause)
     }
 
     fn check_directory(&self) -> Result<(), Cause> {
-        let meta = self.directory.metadata().map_err(|_| Cause::Unreadable)?;
-        if Facts::of(&meta).valid_directory(self.owner) {
-            Ok(())
-        } else {
-            Err(Cause::DirectoryDamaged)
-        }
+        self.directory.check().map_err(|refusal| refusal.cause)
     }
 
     fn at(&self, name: impl AsRef<Path>) -> PathBuf {
-        at(&self.root, &self.directory, name)
+        self.directory.at(name)
     }
 
     fn record_path(&self) -> PathBuf {
@@ -267,18 +134,16 @@ impl Store {
     }
 
     fn read_record_inner(&self, step: &mut impl FnMut(ReadStage)) -> Result<Option<Record>, Cause> {
-        self.check_directory()?;
-        let path = self.record_path();
         // Inspect the name before opening it, so no device or FIFO is opened.
-        let named = match fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                resolves(&self.root, &self.directory)?;
-                return Ok(None);
-            }
-            Err(_) => return Err(Cause::Unreadable),
+        let Some(named) = self
+            .directory
+            .lookup(&self.uid.to_string())
+            .map_err(|refusal| refusal.cause)?
+        else {
+            return Ok(None);
         };
-        if !Facts::of(&named).valid_record(self.owner) || named.len() > MAX_RECORD as u64 {
+        let owner = self.directory.owner();
+        if !Facts::of(&named).valid_record(owner) || named.len() > MAX_RECORD as u64 {
             return Err(Cause::RecordDamaged);
         }
         step(ReadStage::Inspected);
@@ -286,11 +151,11 @@ impl Store {
         let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(NOFOLLOW | NONBLOCK)
-            .open(&path)
+            .open(self.record_path())
             .map_err(|_| Cause::Unreadable)?;
         let before = file.metadata().map_err(|_| Cause::Unreadable)?;
         if !same_inode(&named, &before)
-            || !Facts::of(&before).valid_record(self.owner)
+            || !Facts::of(&before).valid_record(owner)
             || before.len() > MAX_RECORD as u64
         {
             return Err(Cause::Unreadable);
@@ -330,7 +195,7 @@ impl Store {
         let meta = file
             .metadata()
             .map_err(|_| "inspect login record temporary")?;
-        if Facts::of(&meta).valid_record(self.owner) {
+        if Facts::of(&meta).valid_record(self.directory.owner()) {
             Ok(())
         } else {
             Err("login record temporary owner, mode, type or links refused".into())
@@ -339,28 +204,7 @@ impl Store {
 
     /// Unlinks every name starting with `TEMPORARY`, and only those.
     pub fn remove_temporaries(&self) -> Result<(), String> {
-        self.check_directory()
-            .and_then(|()| resolves(&self.root, &self.directory))
-            .map_err(|cause| format!("login directory unavailable: {cause:?}"))?;
-        let entries = fs::read_dir(self.at("")).map_err(|_| "list login record directory")?;
-        let mut removed = false;
-        for entry in entries {
-            let name = entry
-                .map_err(|_| "list login record directory")?
-                .file_name();
-            if !name.as_bytes().starts_with(TEMPORARY.as_bytes()) {
-                continue;
-            }
-            fs::remove_file(self.at(&name))
-                .map_err(|_| "remove leftover login record temporary")?;
-            removed = true;
-        }
-        if removed {
-            self.directory
-                .sync_all()
-                .map_err(|_| "sync login record directory")?;
-        }
-        Ok(())
+        self.directory.remove_temporaries()
     }
 
     /// Publishes `record`, written in the version it was built with: the
@@ -429,6 +273,7 @@ impl Store {
             fs::rename(&temporary, self.record_path()).map_err(|_| "publish login record")?;
             step(Stage::Renamed)?;
             self.directory
+                .file()
                 .sync_all()
                 .map_err(|_| "sync login record publication")?;
             step(Stage::DirectorySynced)?;
@@ -498,16 +343,17 @@ impl Store {
             fs::remove_file(self.record_path()).map_err(|_| "remove login record")?;
             step(Stage::Unlinked)?;
             self.directory
+                .file()
                 .sync_all()
                 .map_err(|_| "sync login record removal")?;
             step(Stage::DirectorySynced)?;
             self.check_directory()
                 .map_err(|cause| format!("login directory unavailable: {cause:?}"))?;
             match fs::symlink_metadata(self.record_path()) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    resolves(&self.root, &self.directory)
-                        .map_err(|cause| format!("login directory unavailable: {cause:?}"))
-                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => self
+                    .directory
+                    .resolves()
+                    .map_err(|refusal| format!("login directory unavailable: {:?}", refusal.cause)),
                 _ => Err("login record name reappeared".into()),
             }
         })();
@@ -535,6 +381,7 @@ mod tests {
     use crate::crypto;
     use crate::fido_p256::PublicKey;
     use crate::login_record::{NewKey, VERSION};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{symlink, DirBuilderExt};
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -861,19 +708,42 @@ mod tests {
         }
     }
 
+    /// The store and the shared predicate agree on every state the
+    /// directory and the name decide.
     #[test]
-    fn only_a_missing_name_a_link_or_a_non_directory_is_damage() {
-        for (code, cause) in [
-            (2, Cause::DirectoryDamaged),
-            (ENOTDIR, Cause::DirectoryDamaged),
-            (ELOOP, Cause::DirectoryDamaged),
-            (5, Cause::Unreadable),
-            (13, Cause::Unreadable),
-            (24, Cause::Unreadable),
-        ] {
-            let error = io::Error::from_raw_os_error(code);
-            assert_eq!(classify(&error, Cause::DirectoryDamaged), cause, "{code}");
-        }
+    fn the_store_and_the_shared_predicate_agree() {
+        use crate::login_state::{self, state_as};
+        let fixture = Fixture::new();
+        let owner = fixture.owner();
+        let root = fixture.root.join("root");
+        let login = login_state::directory(&root);
+        fs::DirBuilder::new()
+            .mode(0o755)
+            .recursive(true)
+            .create(login.parent().unwrap())
+            .unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&login).unwrap();
+        let agree = |shared: login_state::State| {
+            let stored = match read(&login, owner, UID) {
+                State::Unenrolled => login_state::State::Unenrolled,
+                State::Enrolled(_) => login_state::State::Enrolled,
+                State::Unavailable(cause) => login_state::State::Unavailable(cause),
+            };
+            assert_eq!(state_as(&root, owner, UID), stored);
+            assert_eq!(stored, shared);
+        };
+        agree(login_state::State::Unenrolled);
+        fs::write(login.join("tmp-1"), b"").unwrap();
+        agree(login_state::State::Unenrolled);
+        fs::write(login.join(UID.to_string()), three().encode().unwrap()).unwrap();
+        fs::set_permissions(login.join(UID.to_string()), Permissions::from_mode(0o600)).unwrap();
+        agree(login_state::State::Enrolled);
+        fs::remove_file(login.join(UID.to_string())).unwrap();
+        fs::set_permissions(&login, Permissions::from_mode(0o750)).unwrap();
+        agree(login_state::State::Unavailable(Cause::DirectoryDamaged));
+        fs::set_permissions(&login, Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&login).unwrap();
+        agree(login_state::State::Unavailable(Cause::DirectoryDamaged));
     }
 
     #[test]
@@ -1155,18 +1025,18 @@ mod tests {
         );
         let mut store = fixture.store();
         assert_eq!(seen(store.read()), Seen::Unenrolled);
-        store.root = lost;
+        store.directory.set_fd_root(lost);
         assert_eq!(seen(store.read()), unreadable);
         // A stand-in tree where the descriptor's path names another directory.
         let fake = fixture.root.join("fake");
-        let shadow = fake.join(store.directory.as_raw_fd().to_string());
+        let shadow = fake.join(store.directory.file().as_raw_fd().to_string());
         fs::DirBuilder::new()
             .mode(0o700)
             .recursive(true)
             .create(&shadow)
             .unwrap();
         fs::write(shadow.join("tmp-kept"), b"kept").unwrap();
-        store.root = fake;
+        store.directory.set_fd_root(fake);
         assert_eq!(seen(store.read()), unreadable);
         fixture.seed(&three());
         assert_eq!(seen(store.read()), unreadable);
@@ -1176,7 +1046,9 @@ mod tests {
             Outcome::Rejected(_)
         ));
         assert_eq!(fs::read(shadow.join("tmp-kept")).unwrap(), b"kept");
-        store.root = PathBuf::from(FD_ROOT);
+        store
+            .directory
+            .set_fd_root(PathBuf::from(crate::login_state::FD_ROOT));
         assert_eq!(seen(store.read()), enrolled(&three()));
     }
 

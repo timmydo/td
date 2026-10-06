@@ -1405,7 +1405,9 @@ primary account. The caller owns deployment verification and serializes
 account publication before rendering. No name or policy fragment comes
 from argv, the environment or mutable home content. It preserves the
 per-machine administrator authorization and the distinct volatile,
-loopback-restricted human self-test key. It runs after profile publication.
+loopback-restricted human self-test key. It runs after profile publication,
+right after `td-firstboot ensure-login-directory /sysroot`, whose refusal
+never stops boot (td-login/TOKEN-LOGIN.md, "The login record").
 
 The deployment initramfs writes that output to fresh volatile
 `/run/td-sshd.conf` with a private creation mask and final mode 0600,

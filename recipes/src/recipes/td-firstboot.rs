@@ -58,6 +58,14 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-firstboot/src/hostname.rs"),
     ),
     (
+        "login_directory",
+        include_str!("../../../td-firstboot/src/login_directory.rs"),
+    ),
+    (
+        "login_state",
+        include_str!("../../../td-secret/src/login_state.rs"),
+    ),
+    (
         "fido_cbor",
         include_str!("../../../td-secret/src/fido_cbor.rs"),
     ),
@@ -165,6 +173,7 @@ pub fn recipe() -> Recipe {
                 "fido_enroll" => "{src}/td-secret/src/fido_enroll.rs".into(),
                 "fido_hid" => "{src}/td-secret/src/fido_hid.rs".into(),
                 "fido_metadata" => "{src}/td-secret/src/fido_metadata.rs".into(),
+                "login_state" => "{src}/td-secret/src/login_state.rs".into(),
                 "tpm" => "{src}/td-secret/src/tpm.rs".into(),
                 "crypto" => "{src}/td-secret/src/crypto.rs".into(),
                 "secret_store" => "{src}/td-secret/src/store.rs".into(),

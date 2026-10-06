@@ -51,6 +51,13 @@ mod fido_hid;
 )]
 mod fido_metadata;
 mod hostname;
+mod login_directory;
+#[path = "../../td-secret/src/login_state.rs"]
+#[allow(
+    dead_code,
+    reason = "the shared login-state predicate also serves the record store; td-authd and td-login will compile it"
+)]
+mod login_state;
 mod machineid;
 mod mounts;
 mod primary_home;
@@ -276,6 +283,8 @@ fn usage() -> String {
          td-firstboot check-principals ROOT validates staged deployment identities without writing\n  \
          td-firstboot check-primary-name ROOT NAME checks a proposed human name without writing\n  \
          td-firstboot stage-primary-name ROOT NAME OUT prepares new account tables without activating them\n  \
+         td-firstboot ensure-login-directory ROOT creates an absent ROOT/var/lib/td/login, refuses an invalid one, and removes its tmp- entries\n  \
+         td-firstboot check-login-directory ROOT checks ROOT/var/lib/td/login without writing\n  \
          td-firstboot render-primary-sshd ROOT prints the validated primary-account server policy\n  \
          td-firstboot prepare-primary-profile ROOT publishes the selected primary account and prepares its home before users start\n  \
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
@@ -292,6 +301,14 @@ fn run_with_primary(
     load: impl FnOnce() -> std::io::Result<principals::primary_account::PrimaryAccount>,
 ) -> Result<(), Failure> {
     let config = match parse(args)? {
+        Invocation::EnsureLoginDirectory(root) => {
+            return login_directory::ensure(&root)
+                .map_err(|reason| Failure::Failed(format!("login directory refused: {reason}")));
+        }
+        Invocation::CheckLoginDirectory(root) => {
+            return login_directory::check(&root)
+                .map_err(|reason| Failure::Failed(format!("login directory invalid: {reason}")));
+        }
         Invocation::RenderPrimarySshd(root) => {
             let primary = principals::primary_in_root(&root).map_err(Failure::Failed)?;
             return emit(&ssh_policy::config(primary.name())).map_err(Failure::Failed);
@@ -463,6 +480,8 @@ enum Invocation {
     CheckPrimaryName(PathBuf, String),
     StagePrimaryName(PathBuf, String, PathBuf),
     PreparePrimaryProfile(PathBuf),
+    EnsureLoginDirectory(PathBuf),
+    CheckLoginDirectory(PathBuf),
     RenderPrimarySshd(PathBuf),
     CheckLaunchSession(String, u32, u32),
     CheckLaunchApplication(u32, String),
@@ -470,6 +489,20 @@ enum Invocation {
 }
 
 fn parse(args: &[String]) -> Result<Invocation, Failure> {
+    for (verb, invocation) in [
+        (
+            "ensure-login-directory",
+            Invocation::EnsureLoginDirectory as fn(PathBuf) -> Invocation,
+        ),
+        ("check-login-directory", Invocation::CheckLoginDirectory),
+    ] {
+        if args.first().is_some_and(|first| first == verb) {
+            let [_, root] = args else {
+                return Err(Failure::Usage(format!("{verb} requires ROOT")));
+            };
+            return Ok(invocation(PathBuf::from(root)));
+        }
+    }
     if args
         .first()
         .is_some_and(|verb| verb == "render-primary-sshd")
@@ -1685,6 +1718,8 @@ mod tests {
             | Invocation::CheckPrincipals(_)
             | Invocation::CheckPrimaryName(_, _)
             | Invocation::PreparePrimaryProfile(_)
+            | Invocation::EnsureLoginDirectory(_)
+            | Invocation::CheckLoginDirectory(_)
             | Invocation::RenderPrimarySshd(_)
             | Invocation::StagePrimaryName(_, _, _)
             | Invocation::CheckLaunchApplication(..)
@@ -2275,6 +2310,59 @@ mod principal_arguments {
         }
         let args = ["render-primary-sshd", "/td-missing-primary-sshd-root"].map(str::to_owned);
         assert!(matches!(run(&args), Err(Failure::Failed(_))));
+    }
+
+    #[test]
+    fn the_login_directory_verbs_take_exactly_one_root() {
+        for verb in ["ensure-login-directory", "check-login-directory"] {
+            let args = [verb, "/sysroot"].map(str::to_owned);
+            assert!(matches!(
+                (verb, parse(&args)),
+                ("ensure-login-directory", Ok(Invocation::EnsureLoginDirectory(root)))
+                    | ("check-login-directory", Ok(Invocation::CheckLoginDirectory(root)))
+                    if root == Path::new("/sysroot")
+            ));
+            for args in [vec![verb], vec![verb, "/sysroot", "/sysroot"]] {
+                let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+                assert!(matches!(parse(&args), Err(Failure::Usage(_))));
+            }
+        }
+    }
+
+    /// A refusal is one console line, `td-firstboot: login directory
+    /// refused: ` and its reason, and a nonzero exit; it repairs nothing.
+    #[test]
+    fn a_refused_login_directory_is_one_line_and_a_failure() {
+        let root =
+            std::env::temp_dir().join(format!("td-firstboot-login-refusal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("var")).unwrap();
+        let args = [
+            "ensure-login-directory".to_owned(),
+            root.display().to_string(),
+        ];
+        let Err(Failure::Failed(message)) = run(&args) else {
+            panic!("a root without var/lib must be refused");
+        };
+        let lib = root.join("var/lib");
+        assert_eq!(
+            message,
+            format!("login directory refused: {lib:?} is missing")
+        );
+        assert!(!message.contains('\n'));
+        assert!(!lib.exists());
+        let args = [
+            "check-login-directory".to_owned(),
+            root.display().to_string(),
+        ];
+        let Err(Failure::Failed(message)) = run(&args) else {
+            panic!("a missing directory must be invalid");
+        };
+        assert!(
+            message.starts_with("login directory invalid: "),
+            "{message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
