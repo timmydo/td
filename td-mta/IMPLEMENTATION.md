@@ -2236,6 +2236,17 @@ Initial independently landable increments:
   whole-service resource qualification and authenticated publication
   remain later.
 
+- **M06dw — original source-bound part-member emission:** consume only
+  original Bound and select one original ordinal after fresh admission.
+  Emit retained metadata plus canonical direct-leaf blobId or multipart
+  null in funded 64-byte turns while keeping the actual descriptor.
+  Retain exclusive Member completion through fresh final release of
+  original Bound. Pin literal bytes/costs, final-byte completion, every
+  funded prefix, quota cutoffs, actual-clock post-copy refusal, original
+  backing/custody and passive-owner compile failures. Add eight measured
+  Rust allocation intervals; whole tree/list composition, current access
+  policy, request selection and authenticated publication remain later.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

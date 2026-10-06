@@ -1,4 +1,5 @@
 //! Match original resident source identity while retaining its actual file pin.
+pub mod members;
 use super::{Mapped, View};
 use crate::{
     admission::work::Charge,

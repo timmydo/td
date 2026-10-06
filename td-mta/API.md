@@ -5380,6 +5380,47 @@ premature finish, sticky/cached re-poll and oversized generic crypto
 state remain unmeasured. The near-u64 case repeats healthy binding after
 cold coordinate normalization; it covers no additional hashing branch.
 
+### 1.128 Source-bound original part-member emission
+
+M06dw adds retained::locators::pinned::members. Cursor::new consumes only
+original Bound, freshly checking both original supplied-Tick admission
+and actual pin clock before accepting a one-based original ordinal.
+Passive views, candidate arrays and completed emission alone cannot
+substitute. Emit that original retained metadata fragment followed by
+blobId: the canonical quoted p1 locator for a direct leaf, or JSON null
+for a multipart container. Braces, subParts, whole tree/list composition,
+request property selection and authenticated publication remain later.
+
+Every nonempty-output turn funds one interpretation step with carried
+control credit, one explicit record and at most 64 new wire bytes before
+copying. Retained generated metadata and locator bytes have no source/I/O
+debit. Empty output freshly admits without charge or progress; cached
+Complete is inert. Check the actual parent clock again after work,
+including a work error; post-work parent failure takes precedence.
+Outputs written before refusal are provisional and must be discarded.
+Sticky refusal hides values and cannot refund or renew original work.
+Completion is reported with the final byte, including exact output fit.
+
+Fresh consuming finish creates private Member retaining original Bound,
+actual descriptor and chosen ordinal. Member explicit checks and checked
+release remain fresh; release returns the original Bound and ordinal.
+This proves completed emission, not retained output or access permission.
+Original source, fragments, candidate cells, prior whole-member window
+and pooled-view borrow overlap throughout. Cursor, HeaderBudget, five
+borrowed segments and a 64-byte output slice fit 1 KiB; Member fits
+768 bytes. These size caps do not establish ledger reservations.
+
+Eight dedicated sequential Rust allocation intervals measure construction,
+emission and binding-owned descriptor teardown after cold source matching
+and fixture setup. Cover leaf/container success, partial/completed/Member
+expiry, wire refusal, invalid ordinal and constructor pin expiry. Enclosing
+pooled-view/scratch-lease cleanup stays outside counting. These intervals
+supplement the earlier 65 metadata/locator and eight binding intervals;
+no native/stack/RSS, full request, authorization or publication claim follows.
+Only the listed eight intervals are measured. Supplied-Tick and step/record
+refusal, post-copy clock expiry, Invalid/Busy clocks, sticky/cached polling
+and premature finish remain unqualified for Rust allocation.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

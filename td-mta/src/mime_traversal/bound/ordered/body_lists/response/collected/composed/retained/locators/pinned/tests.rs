@@ -5,12 +5,12 @@ use super::*;
 use crate::ports::{Clock, Time};
 use std::sync::atomic::{AtomicU64, Ordering};
 use td_crypto::Provider;
-struct TestClock(AtomicU64);
+pub(super) struct TestClock(AtomicU64);
 impl TestClock {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self(AtomicU64::new(1))
     }
-    fn expire(&self) {
+    pub(super) fn expire(&self) {
         self.0.store(u64::MAX, Ordering::SeqCst);
     }
 }
@@ -27,7 +27,7 @@ impl Clock for TestClock {
     }
 }
 
-fn mapped<T>(
+pub(super) fn mapped<T>(
     source: &[u8],
     base: u64,
     run: impl FnOnce(Mapped<'_, '_, '_, '_, '_, '_, '_>) -> T,

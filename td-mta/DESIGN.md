@@ -771,6 +771,15 @@ work refusal preserve every counter. This leaves native/whole-service
 resource qualification and authenticated publication open. Unmeasured
 source-binding cases are explicitly listed in API §1.127.
 
+M06dw emits an original part metadata fragment plus its source-bound
+leaf blobId or multipart null while retaining original Bound and actual
+file descriptor. Each turn funds at most 64 new wire bytes in original
+work, with no retained-source reread. Actual pin fences surround work;
+complete emission creates an exclusive Member, freshly checked before
+releasing original Bound. Partial/error bytes remain provisional and
+must be discarded. This is one part-member building block; current
+access policy, whole tree/list composition and publication remain open.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or
