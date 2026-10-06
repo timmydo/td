@@ -1,7 +1,9 @@
 //! Private, single-use PIN-authorized enrollment and assertions. No device I/O.
 
 use super::fido_cbor::{self as cbor, Encoder, Value};
-use super::fido_ctap::{AssertionInfo, AssertionRequest, MAX_CREDENTIAL_ID, RP_ID};
+use super::fido_ctap::{
+    AssertionInfo, AssertionRequest, IdentifyRequest, MAX_CREDENTIAL_ID, RP_ID,
+};
 use super::fido_p256::{PublicKey, SecretScalar};
 use super::{crypto, fido_aes};
 
@@ -70,18 +72,98 @@ impl Pin {
     }
 }
 
+/// Fixed creation display labels: rp name, user name and display name alike.
+pub(super) const PORTABLE_LABEL: &str = "td personal vault";
+pub(super) const LOGIN_LABEL: &str = "td login";
+
+/// Login admission's typed capability refusals (TOKEN-LOGIN.md, "Token profile").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LoginRefusal {
+    NoHmacSecret,
+    AlwaysUv,
+    /// No clientPin option: this key cannot hold a PIN.
+    PinUnsupported,
+    /// clientPin false: a PIN can be set with another tool.
+    PinNotSet,
+    ListTooSmall,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LoginFailure {
+    Refused(LoginRefusal),
+    Protocol(String),
+}
+impl From<String> for LoginFailure {
+    fn from(error: String) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+/// The getInfo claims both admissions read before applying their own policy.
+struct Claims<'a> {
+    info: Value<'a>,
+    aaguid: [u8; 16],
+    hmac_secret: bool,
+    client_pin: Option<bool>,
+    always_uv: bool,
+}
+
 pub(super) struct Profile {
     protocol: Protocol,
     permissions: bool,
     max_message: usize,
     max_id: usize,
     max_credentials: usize,
+    advertised_list: Option<usize>,
     aaguid: [u8; 16],
     can_enroll: bool,
 }
 impl Profile {
     /// Unsigned capability claims select a protocol, never credential identity.
     pub(super) fn parse(response: &[u8]) -> Result<Self, String> {
+        let claims = Self::claims(response, false)?;
+        if !claims.hmac_secret || claims.client_pin != Some(true) {
+            return Err("portable vault requires hmac-secret and a configured PIN".into());
+        }
+        Self::admit(claims)
+    }
+
+    /// Typed refusals precede the shared policy: TOKEN-LOGIN.md, "Token profile".
+    pub(super) fn parse_login(response: &[u8]) -> Result<Self, LoginFailure> {
+        let claims = Self::claims(response, true)?;
+        let refusal = if !claims.hmac_secret {
+            LoginRefusal::NoHmacSecret
+        } else if claims.always_uv {
+            LoginRefusal::AlwaysUv
+        } else {
+            match claims.client_pin {
+                Some(true) => return Ok(Self::admit(claims)?),
+                Some(false) => LoginRefusal::PinNotSet,
+                None => LoginRefusal::PinUnsupported,
+            }
+        };
+        Err(LoginFailure::Refused(refusal))
+    }
+
+    /// maxCredentialCountInList as advertised, clamped to eight; None when absent.
+    pub(super) fn advertised_list_limit(&self) -> Option<usize> {
+        self.advertised_list
+    }
+
+    /// A credential this key could identify: within its ID limit, and alone in
+    /// a silent request within its message limit. Every PIN request is larger.
+    pub(super) fn identifiable(&self, credential: &[u8]) -> bool {
+        credential.len() <= self.max_id
+            && IdentifyRequest::new(&[credential], [0; 32], self.max_message).is_ok()
+    }
+
+    pub(super) fn max_message(&self) -> usize {
+        self.max_message
+    }
+
+    /// Login reads absent extensions and options as advertising nothing (CTAP 2.1
+    /// section 6.4); the notebook keeps requiring both.
+    fn claims(response: &[u8], login: bool) -> Result<Claims<'_>, String> {
         let info = response_value(response, cbor::MAX_BYTES)?;
         let versions = array(info.required(&Value::Unsigned(1))?)?;
         let mut supported = false;
@@ -96,19 +178,43 @@ impl Profile {
             .bytes()?
             .try_into()
             .map_err(|_| "invalid getInfo AAGUID length")?;
+        let extensions = match (info.get(&Value::Unsigned(2))?, login) {
+            (None, true) => &[][..],
+            (Some(Value::Array(values)), true) => values.as_slice(),
+            _ => array(info.required(&Value::Unsigned(2))?)?,
+        };
         let mut hmac_secret = false;
-        for extension in array(info.required(&Value::Unsigned(2))?)? {
+        for extension in extensions {
             hmac_secret |= extension.text()? == "hmac-secret";
         }
+        let (client_pin, always_uv) = match (info.get(&Value::Unsigned(4))?, login) {
+            (None, true) => (None, false),
+            _ => {
+                let options = info.required(&Value::Unsigned(4))?;
+                // Validate even unknown option values, while ignoring their semantics.
+                for (key, value) in options.map()? {
+                    key.text()?;
+                    boolean(value)?;
+                }
+                let client_pin = options.get(&Value::Text("clientPin"))?;
+                (
+                    client_pin.map(boolean).transpose()?,
+                    option(options, "alwaysUv", false)?,
+                )
+            }
+        };
+        Ok(Claims {
+            info,
+            aaguid,
+            hmac_secret,
+            client_pin,
+            always_uv,
+        })
+    }
+
+    fn admit(claims: Claims<'_>) -> Result<Self, String> {
+        let Claims { info, aaguid, .. } = claims;
         let options = info.required(&Value::Unsigned(4))?;
-        // Validate even unknown option values, while ignoring their semantics.
-        for (key, value) in options.map()? {
-            key.text()?;
-            boolean(value)?;
-        }
-        if !hmac_secret || !option(options, "clientPin", false)? {
-            return Err("portable vault requires hmac-secret and a configured PIN".into());
-        }
         if option(options, "plat", false)?
             || !option(options, "up", true)?
             || option(options, "noMcGaPermissionsWithClientPin", false)?
@@ -153,12 +259,17 @@ impl Profile {
                 can_enroll |= kind == "public-key" && alg == &Value::Negative(6);
             }
         }
+        let permissions = option(options, "pinUvAuthToken", false)?;
+        let max_message = limit(&info, 5, 1024, cbor::MAX_BYTES)?;
+        let max_id = limit(&info, 8, MAX_CREDENTIAL_ID, MAX_CREDENTIAL_ID)?;
+        let max_credentials = limit(&info, 7, 8, 8)?;
         Ok(Self {
             protocol,
-            permissions: option(options, "pinUvAuthToken", false)?,
-            max_message: limit(&info, 5, 1024, cbor::MAX_BYTES)?,
-            max_id: limit(&info, 8, MAX_CREDENTIAL_ID, MAX_CREDENTIAL_ID)?,
-            max_credentials: limit(&info, 7, 8, 8)?,
+            permissions,
+            max_message,
+            max_id,
+            max_credentials,
+            advertised_list: info.get(&Value::Unsigned(7))?.map(|_| max_credentials),
             aaguid,
             can_enroll,
         })
@@ -189,6 +300,42 @@ impl Profile {
             intent,
             bytes,
         })
+    }
+}
+
+/// clientPIN getPINRetries. The count is an untrusted device claim for display.
+pub(super) struct RetriesRequest {
+    max_message: usize,
+    bytes: Secret,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Retries {
+    pub(super) count: u8,
+    pub(super) power_cycle: bool,
+}
+impl Profile {
+    pub(super) fn retries(&self) -> Result<RetriesRequest, String> {
+        Ok(RetriesRequest {
+            max_message: self.max_message,
+            bytes: command(6, client_pin(self.protocol, 1, 2)?, self.max_message)?,
+        })
+    }
+}
+impl RetriesRequest {
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes.0
+    }
+
+    /// Not consumed: every PIN step asks again just before its prompt.
+    pub(super) fn parse(&self, response: &[u8]) -> Result<Retries, String> {
+        let value = response_value(response, self.max_message)?;
+        let count = u8::try_from(value.required(&Value::Unsigned(3))?.unsigned()?)
+            .map_err(|_| "invalid PIN retry count")?;
+        let power_cycle = match value.get(&Value::Unsigned(4))? {
+            Some(state) => boolean(state)?,
+            None => false,
+        };
+        Ok(Retries { count, power_cycle })
     }
 }
 
@@ -422,6 +569,7 @@ impl HmacRequest {
 pub(super) struct Creation {
     challenge: [u8; 32],
     user: [u8; 32],
+    label: &'static str,
     excluded: Vec<Secret>,
 }
 impl Drop for Creation {
@@ -449,15 +597,15 @@ impl Creation {
         out.text("id")?;
         out.text(RP_ID)?;
         out.text("name")?;
-        out.text("td personal vault")?;
+        out.text(self.label)?;
         out.head(0, 3)?;
         out.head(5, 3)?;
         out.text("id")?;
         out.bytes(&self.user)?;
         out.text("name")?;
-        out.text("td personal vault")?;
+        out.text(self.label)?;
         out.text("displayName")?;
-        out.text("td personal vault")?;
+        out.text(self.label)?;
         out.head(0, 4)?;
         out.head(4, 1)?;
         out.head(5, 2)?;
@@ -506,9 +654,75 @@ impl Profile {
         if excluded.len() > self.max_credentials {
             return Err("portable exclusion list exceeds token capacity".into());
         }
+        let intent = self.creation(PORTABLE_LABEL, challenge, user, excluded)?;
+        self.creation_request(intent)
+    }
+
+    /// An ID this key could not identify cannot be its credential and is left out;
+    /// the rest must fit the advertised limits whole, one entry when absent.
+    pub(super) fn login_enrollment(
+        self,
+        challenge: [u8; 32],
+        user: [u8; 32],
+        excluded: &[&[u8]],
+    ) -> Result<KeyRequest<Creation>, LoginFailure> {
+        if !self.can_enroll {
+            return Err("login token does not advertise ES256 creation"
+                .to_string()
+                .into());
+        }
+        if excluded
+            .iter()
+            .any(|id| id.is_empty() || id.len() > MAX_CREDENTIAL_ID)
+        {
+            return Err("invalid excluded login credential ID length"
+                .to_string()
+                .into());
+        }
+        if excluded
+            .iter()
+            .enumerate()
+            .any(|(index, id)| excluded.iter().take(index).any(|prior| prior == id))
+        {
+            return Err("repeated excluded login credential ID".to_string().into());
+        }
+        let excluded: Vec<&[u8]> = excluded
+            .iter()
+            .copied()
+            .filter(|id| self.identifiable(id))
+            .collect();
+        let refused = || LoginFailure::Refused(LoginRefusal::ListTooSmall);
+        if excluded.len() > self.advertised_list.unwrap_or(1) {
+            return Err(refused());
+        }
+        let intent = self.creation(LOGIN_LABEL, challenge, user, &excluded)?;
+        // Validated IDs leave the message limit as the only encoding failure.
+        if !intent.excluded.is_empty() && intent.encode(&self, &self.auth_placeholder().0).is_err()
+        {
+            return Err(refused());
+        }
+        Ok(self.creation_request(intent)?)
+    }
+
+    fn auth_placeholder(&self) -> Secret {
+        Secret::zeroed(if self.protocol == Protocol::One {
+            16
+        } else {
+            32
+        })
+    }
+
+    fn creation(
+        &self,
+        label: &'static str,
+        challenge: [u8; 32],
+        user: [u8; 32],
+        excluded: &[&[u8]],
+    ) -> Result<Creation, String> {
         let mut intent = Creation {
             challenge,
             user,
+            label,
             excluded: Vec::with_capacity(excluded.len()),
         };
         for id in excluded {
@@ -522,13 +736,12 @@ impl Profile {
             }
             intent.excluded.push(Secret((*id).into()));
         }
+        Ok(intent)
+    }
+
+    fn creation_request(self, intent: Creation) -> Result<KeyRequest<Creation>, String> {
         // Check the entire future command before spending a PIN attempt.
-        let auth = Secret::zeroed(if self.protocol == Protocol::One {
-            16
-        } else {
-            32
-        });
-        intent.encode(&self, &auth.0)?;
+        intent.encode(&self, &self.auth_placeholder().0)?;
         let bytes = command(6, client_pin(self.protocol, 2, 2)?, self.max_message)?;
         Ok(KeyRequest {
             profile: self,
@@ -1935,5 +2148,422 @@ mod tests {
                 &mut |_| panic!("malformed proof key reply spent entropy")
             )
             .is_err());
+    }
+
+    use crate::fido_transaction::tests::{info_with, login_fixture, Extensions, Info};
+
+    #[test]
+    fn login_creation_differs_from_portable_only_in_its_labels() {
+        for label in LABELS {
+            let prior = &[b"prior-primary".as_slice(), b"prior-backup".as_slice()][..];
+            for (excluded, list, max_id, expected) in [
+                (&[][..], None, None, "login_make_request"),
+                (prior, Some(2), None, "login_make_excluded"),
+                // IDs longer than the key's limit cannot be its credentials.
+                (prior, None, Some(11), "login_make_request"),
+            ] {
+                let info = info_with(
+                    label,
+                    Info {
+                        list,
+                        max_id,
+                        ..Info::default()
+                    },
+                );
+                let request = Profile::parse_login(&info)
+                    .unwrap()
+                    .login_enrollment(
+                        fixture(label, "create_challenge").try_into().unwrap(),
+                        fixture(label, "user").try_into().unwrap(),
+                        excluded,
+                    )
+                    .unwrap();
+                assert_eq!(request.bytes(), fixture(label, "key_request"));
+                let mut calls = 0;
+                let pending = request
+                    .with_pin(
+                        &fixture(label, "create_key_response"),
+                        Pin::new(fixture(label, "pin").into_boxed_slice()).unwrap(),
+                        &mut |bytes| {
+                            let field = ["create_scalar", "create_iv_pin"][calls];
+                            calls += 1;
+                            bytes.copy_from_slice(&fixture(label, field));
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(pending.bytes(), fixture(label, "create_pin_request"));
+                let made = pending
+                    .make(&fixture(label, "create_pin_response"))
+                    .unwrap();
+                assert_eq!(made.bytes(), login_fixture(label, expected));
+                let portable = fixture(label, &expected.replace("login_", ""));
+                assert_ne!(made.bytes(), portable);
+                let ours = made.bytes().to_vec();
+                let swap = |bytes: &[u8], from: &[u8], to: &[u8]| {
+                    let mut out: Vec<u8> = Vec::new();
+                    let mut rest = bytes;
+                    while let Some(at) = rest.windows(from.len()).position(|w| w == from) {
+                        out.extend(&rest[..at]);
+                        out.extend(to);
+                        rest = &rest[at + from.len()..];
+                    }
+                    out.extend(rest);
+                    out
+                };
+                assert_eq!(
+                    swap(&ours, b"\x68td login", b"\x71td personal vault"),
+                    portable
+                );
+            }
+        }
+        assert_eq!(LOGIN_LABEL, "td login");
+        assert_eq!(PORTABLE_LABEL, "td personal vault");
+    }
+
+    #[test]
+    fn pin_retries_codec_matches_independent_vectors_and_refuses_malformed_replies() {
+        for label in LABELS {
+            let profile = Profile::parse(&fixture(label, "info")).unwrap();
+            let request = profile.retries().unwrap();
+            assert_eq!(request.bytes(), login_fixture(label, "retries_request"));
+            for (name, count, power_cycle) in [
+                ("eight", 8, false),
+                ("five", 5, false),
+                ("zero", 0, false),
+                ("power", 3, true),
+            ] {
+                let claim = request.parse(&login_fixture("retries", name)).unwrap();
+                assert_eq!(claim, Retries { count, power_cycle });
+            }
+        }
+        let request = Profile::parse(&fixture("p2-scoped", "info"))
+            .unwrap()
+            .retries()
+            .unwrap();
+        let good = login_fixture("retries", "eight");
+        for size in 0..good.len() {
+            assert!(request.parse(&good[..size]).is_err());
+        }
+        for bad in [
+            &b"\x31"[..],
+            b"\x32",
+            b"\x00\xa0",
+            b"\x00\xa1\x03\x20",
+            b"\x00\xa1\x03\x19\x01\x00",
+            b"\x00\xa1\x03\x41\x08",
+            b"\x00\xa2\x03\x08\x04\x00",
+            b"\x00\xa1\x03\x08\x00",
+            b"\x00\x80",
+        ] {
+            assert!(request.parse(bad).is_err(), "{bad:02x?}");
+        }
+        assert_eq!(
+            request.parse(b"\x00\xa1\x03\x18\xff").unwrap().count,
+            u8::MAX
+        );
+        assert_eq!(request.parse(b"\x00\xa2\x03\x08\x05\x02").unwrap().count, 8);
+        assert!(request.parse(&[0; 1025]).is_err());
+    }
+
+    #[test]
+    fn login_admission_refuses_typed_and_portable_admission_is_unchanged() {
+        for label in LABELS {
+            assert!(Profile::parse_login(&info_with(label, Info::default())).is_ok());
+            // Portable keeps its own opaque refusals and its alwaysUv admission.
+            for (info, refusal, portable) in [
+                (
+                    Info {
+                        extensions: Extensions::Other,
+                        ..Info::default()
+                    },
+                    LoginRefusal::NoHmacSecret,
+                    false,
+                ),
+                (
+                    Info {
+                        extensions: Extensions::Empty,
+                        ..Info::default()
+                    },
+                    LoginRefusal::NoHmacSecret,
+                    false,
+                ),
+                (
+                    Info {
+                        extensions: Extensions::Absent,
+                        ..Info::default()
+                    },
+                    LoginRefusal::NoHmacSecret,
+                    false,
+                ),
+                (
+                    Info {
+                        options: false,
+                        ..Info::default()
+                    },
+                    LoginRefusal::PinUnsupported,
+                    false,
+                ),
+                (
+                    Info {
+                        extensions: Extensions::Absent,
+                        options: false,
+                        ..Info::default()
+                    },
+                    LoginRefusal::NoHmacSecret,
+                    false,
+                ),
+                (
+                    Info {
+                        always_uv: Some(true),
+                        client_pin: None,
+                        ..Info::default()
+                    },
+                    LoginRefusal::AlwaysUv,
+                    false,
+                ),
+                (
+                    Info {
+                        always_uv: Some(true),
+                        ..Info::default()
+                    },
+                    LoginRefusal::AlwaysUv,
+                    true,
+                ),
+                (
+                    Info {
+                        client_pin: Some(false),
+                        ..Info::default()
+                    },
+                    LoginRefusal::PinNotSet,
+                    false,
+                ),
+                (
+                    Info {
+                        client_pin: None,
+                        ..Info::default()
+                    },
+                    LoginRefusal::PinUnsupported,
+                    false,
+                ),
+                (
+                    Info {
+                        extensions: Extensions::Other,
+                        always_uv: Some(true),
+                        client_pin: Some(false),
+                        ..Info::default()
+                    },
+                    LoginRefusal::NoHmacSecret,
+                    false,
+                ),
+                (
+                    Info {
+                        always_uv: Some(true),
+                        client_pin: Some(false),
+                        ..Info::default()
+                    },
+                    LoginRefusal::AlwaysUv,
+                    false,
+                ),
+            ] {
+                let bytes = info_with(label, info);
+                assert_eq!(
+                    Profile::parse_login(&bytes).err(),
+                    Some(LoginFailure::Refused(refusal))
+                );
+                assert_eq!(Profile::parse(&bytes).is_ok(), portable);
+            }
+            let admitted = info_with(
+                label,
+                Info {
+                    always_uv: Some(false),
+                    ..Info::default()
+                },
+            );
+            assert!(Profile::parse_login(&admitted).is_ok());
+        }
+        // The notebook still requires both members, with its own diagnostics.
+        for (info, reason) in [
+            (
+                Info {
+                    extensions: Extensions::Absent,
+                    ..Info::default()
+                },
+                "missing required CBOR member",
+            ),
+            (
+                Info {
+                    extensions: Extensions::Empty,
+                    ..Info::default()
+                },
+                "expected nonempty CTAP array",
+            ),
+            (
+                Info {
+                    options: false,
+                    ..Info::default()
+                },
+                "missing required CBOR member",
+            ),
+            (
+                Info {
+                    client_pin: None,
+                    ..Info::default()
+                },
+                "portable vault requires hmac-secret and a configured PIN",
+            ),
+        ] {
+            let bytes = info_with("p2-scoped", info);
+            assert_eq!(Profile::parse(&bytes).err().as_deref(), Some(reason));
+        }
+        // A present member of the wrong type is malformed, not a refusal.
+        let mut wrong = info_with("p2-scoped", Info::default());
+        let at = wrong
+            .windows(2)
+            .position(|pair| pair == b"\x02\x81")
+            .unwrap();
+        wrong[at + 1] = 0xa0;
+        wrong.drain(at + 2..at + 14);
+        assert!(matches!(
+            Profile::parse_login(&wrong),
+            Err(LoginFailure::Protocol(_))
+        ));
+        let info = fixture("p2-scoped", "info");
+        for size in 0..info.len() {
+            assert!(matches!(
+                Profile::parse_login(&info[..size]),
+                Err(LoginFailure::Protocol(_))
+            ));
+        }
+        let mut forced = info.clone();
+        forced[1] += 1;
+        forced.extend([12, 0xf5]);
+        assert!(matches!(
+            Profile::parse_login(&forced),
+            Err(LoginFailure::Protocol(_))
+        ));
+        for (list, advertised) in [(None, None), (Some(1), Some(1)), (Some(23), Some(8))] {
+            let profile = Profile::parse_login(&info_with(
+                "p2-scoped",
+                Info {
+                    list,
+                    ..Info::default()
+                },
+            ))
+            .unwrap();
+            assert_eq!(profile.advertised_list_limit(), advertised);
+            // Portable keeps its defaulted capacity of eight.
+            assert_eq!(profile.max_credentials, advertised.unwrap_or(8));
+        }
+        assert!(Profile::parse_login(&info_with(
+            "p2-scoped",
+            Info {
+                list: Some(0),
+                ..Info::default()
+            }
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn login_exclusions_must_fit_the_advertised_limits_whole() {
+        let label = "p2-scoped";
+        let challenge = fixture(label, "create_challenge").try_into().unwrap();
+        let user = fixture(label, "user").try_into().unwrap();
+        let ids: Vec<Vec<u8>> = (1..=8).map(|i| vec![i; 64]).collect();
+        let refs: Vec<&[u8]> = ids.iter().map(Vec::as_slice).collect();
+        let create = |info: Info, excluded: &[&[u8]]| {
+            Profile::parse_login(&info_with(label, info))
+                .unwrap()
+                .login_enrollment(challenge, user, excluded)
+        };
+        let too_small = Some(LoginFailure::Refused(LoginRefusal::ListTooSmall));
+        assert!(create(Info::default(), &[]).is_ok());
+        assert!(create(Info::default(), &refs[..1]).is_ok());
+        assert_eq!(create(Info::default(), &refs[..2]).err(), too_small);
+        for list in [2, 7, 8, 23] {
+            let limit = usize::from(list).min(8);
+            let info = || Info {
+                list: Some(list),
+                ..Info::default()
+            };
+            assert!(create(info(), &refs[..limit]).is_ok());
+            if limit < 8 {
+                assert_eq!(create(info(), &refs[..limit + 1]).err(), too_small);
+            }
+        }
+        // Unidentifiable IDs are left out; the count rule applies to the rest.
+        let kept = |request: KeyRequest<Creation>| request.intent.excluded.len();
+        let short_ids = || Info {
+            max_id: Some(63),
+            ..Info::default()
+        };
+        let mixed: &[&[u8]] = &[refs[0], &[9; 63], refs[1]];
+        assert_eq!(create(short_ids(), &refs).map(kept), Ok(0));
+        assert_eq!(create(short_ids(), mixed).map(kept), Ok(1));
+        // A repeat is refused even when neither copy is identifiable here.
+        let repeated = Some(LoginFailure::Protocol(
+            "repeated excluded login credential ID".to_string(),
+        ));
+        assert_eq!(create(short_ids(), &[refs[0], refs[0]]).err(), repeated);
+        assert_eq!(create(Info::default(), &[refs[0], refs[0]]).err(), repeated);
+        let long = [vec![9; 250], vec![8; 250]];
+        let mut sized = Profile::parse_login(&info_with(label, Info::default())).unwrap();
+        sized.max_message = 300;
+        assert!(!sized.identifiable(&long[0]) && sized.identifiable(&[9; 200]));
+        assert_eq!(
+            sized
+                .login_enrollment(challenge, user, &[&long[0], &long[1]])
+                .map(kept),
+            Ok(0)
+        );
+        assert!(Profile::parse_login(&info_with(label, Info::default()))
+            .unwrap()
+            .identifiable(&long[0]));
+        assert!(matches!(
+            create(short_ids(), &[&[9; 1025]]),
+            Err(LoginFailure::Protocol(_))
+        ));
+        let mut small = Profile::parse_login(&info_with(
+            label,
+            Info {
+                list: Some(8),
+                ..Info::default()
+            },
+        ))
+        .unwrap();
+        small.max_message = 400;
+        assert_eq!(
+            small.login_enrollment(challenge, user, &refs[..3]).err(),
+            too_small
+        );
+        // Without exclusions a size failure is not a list refusal.
+        let mut tiny = Profile::parse_login(&info_with(label, Info::default())).unwrap();
+        tiny.max_message = 100;
+        assert!(matches!(
+            tiny.login_enrollment(challenge, user, &[]),
+            Err(LoginFailure::Protocol(_))
+        ));
+        for excluded in [&[b"".as_slice()][..], &[b"same", b"same"]] {
+            assert!(matches!(
+                create(
+                    Info {
+                        list: Some(8),
+                        ..Info::default()
+                    },
+                    excluded
+                ),
+                Err(LoginFailure::Protocol(_))
+            ));
+        }
+        let mut algorithms = info_with(label, Info::default());
+        algorithms[1] += 1;
+        algorithms.extend(b"\x0a\x81\xa2\x63alg\x27\x64type\x6apublic-key");
+        assert!(matches!(
+            Profile::parse_login(&algorithms)
+                .unwrap()
+                .login_enrollment(challenge, user, &[]),
+            Err(LoginFailure::Protocol(_))
+        ));
     }
 }

@@ -3,11 +3,12 @@
 This is the normative target for td's login-key tier. td-authd, td-secret,
 td-compositor and td-login implement it together; this document owns the
 tier's rules, and each component document states the amendments its own
-contract needs. **Only the record codec, the record store and the
-consent descriptions are implemented**, inert: no caller uses td-secret's
-private `login_record` and `login_store` modules ("The login record") or
-td-authd's login consent operations and step admission
-(`td-authd/DESIGN.md`). Nothing else below is
+contract needs. **Only the record codec, the record store, the consent
+descriptions and the CTAP login primitives are implemented**, inert: no
+caller uses td-secret's private `login_record` and `login_store` modules
+("The login record"), its login identify, PIN-retry, assertion and
+creation steps ("Token profile"), or td-authd's login consent operations
+and step admission (`td-authd/DESIGN.md`). Nothing else below is
 implemented. Until the increments at the end land, `THREAT-MODEL.md` §3
 is the complete current behaviour: the installed account logs in
 automatically and the session never locks. No document, UI or release
@@ -244,7 +245,8 @@ getInfo options carry `alwaysUv` with the value true; one reporting false
 is admitted. A key with built-in UV, such as a biometric key, is used with
 its PIN only: td never requests built-in UV. A key without a configured PIN
 is refused before any creation, with an instruction to set one using
-another tool; td never sets, changes or resets a PIN or a key. Every
+another tool, and a key that cannot hold a PIN is refused as unsupported;
+td never sets, changes or resets a PIN or a key. Every
 operation requires exactly one connected FIDO device and refuses none or
 several before asking for a PIN, so the add and enrollment flows tell the
 person to remove the authorizing or previous key before inserting the
@@ -282,8 +284,9 @@ No phase may use it.
   no assertion is sent until exactly one device is present, whose PIN
   retries the create step then shows. Creation's exclusion list holds
   every enrolled credential and every key already proved in this
-  operation, and must fit the key's advertised list and size limits whole,
-  as `PORTABLE.md`'s creation codec requires; a key that cannot take it is
+  operation that the connected key could identify (Wire choices, below),
+  and must fit the key's advertised list and size limits whole, as
+  `PORTABLE.md`'s creation codec requires; a key that cannot take it is
   refused before any PIN. Then a proof, then a repeat assertion on a new
   channel that must reproduce the identical secret, each with its own PIN
   entry and touch as in `PORTABLE.md`. Right after the repeat, while that
@@ -295,6 +298,47 @@ No phase may use it.
   record's refusal of duplicate credentials, not by td-authd's step
   admission, which sees only the current key's credential and an empty
   baseline.
+
+**Wire choices.** These bytes are fixed in td-secret
+(`td-secret/DESIGN.md`, "Login CTAP primitives") and pinned against the
+independent `td-secret/tests/login_ctap_vectors.py`:
+
+- Creation's labels are `td login` for the relying party's name and the
+  user's name and display name, where the notebook uses `td personal
+  vault`; the rest of the request is the notebook's. Requesting no
+  credProtect, td admits a key that advertises it: a key whose default
+  policy hides the credential from a silent assertion fails the new-key
+  probe instead.
+- Admission refuses, typed and in this order: a key without the
+  `hmac-secret` extension, including one whose getInfo omits extensions
+  or lists none; one whose `alwaysUv` is true; one that cannot hold a PIN,
+  whose getInfo omits options or the `clientPin` option; and one with no
+  PIN set (`clientPin` false), which another tool can set. Every other
+  getInfo refusal is the notebook's and untyped.
+- A key can identify a credential when its ID is within the key's
+  `maxCredentialIdLength` and a silent request naming it alone is within
+  the key's message size; every PIN request naming it is larger. Any
+  other credential cannot be one this key enrolled or could unlock, since
+  the new-key probe identifies it on the same key: identify does not send
+  it, and creation leaves it out of the exclusion list.
+- The list limit is getInfo's `maxCredentialCountInList`, clamped to
+  eight, and one when absent. The exclusion list that remains must fit
+  it, and with its exclusions the creation request the message size;
+  otherwise creation refuses as the list being too small.
+- Identify sends getAssertion `{1: "td.invalid", 2: hash, 3: [{"id",
+  "type": "public-key"}...], 5: {"up": false}}` with one client-data hash,
+  of the identify or probe phase, for every batch. Batches take the
+  identifiable IDs in record order, each as many as fit both the list
+  limit and the message size. A NO_CREDENTIALS answer must have no body.
+  A selection must name one ID of its batch, which a one-ID batch may
+  omit; UP, UV and AT must be clear, as for a silent answer; the
+  signature is not checked.
+- Each PIN step sends getKeyAgreement, then getPINRetries `{1: protocol,
+  2: 1}` with the operation's PIN protocol, then opens the prompt. The
+  reply's `pinRetries` (key 3, 0 to 255) is what td shows. Zero is
+  reported as PIN blocked, whatever `powerCycleState` says; otherwise
+  `powerCycleState` (key 4) true is reported as PIN auth blocked. Neither
+  gets a PIN step.
 
 Nothing is retried automatically, and cancellation kills and reaps the
 worker as `td-secret/DESIGN.md` specifies. Deadlines are td-authd's.

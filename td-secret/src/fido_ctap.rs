@@ -154,24 +154,7 @@ impl AssertionRequest {
                 return Err("CTAP assertion credential does not match allow list".into());
             }
         }
-        if let Some(user) = value.get(&Value::Unsigned(4))? {
-            let id = user.required(&Value::Text("id"))?.bytes()?;
-            if id.is_empty() || id.len() > 64 {
-                return Err("invalid CTAP user handle".into());
-            }
-            for field in ["name", "displayName"] {
-                if let Some(field) = user.get(&Value::Text(field))? {
-                    field.text()?;
-                }
-            }
-        }
-        if value
-            .get(&Value::Unsigned(5))?
-            .is_some_and(|count| count != &Value::Unsigned(1))
-            || value.get(&Value::Unsigned(6))?.is_some()
-        {
-            return Err("CTAP assertion is not a single allow-list response".into());
-        }
+        entity(&value, "CTAP assertion is not a single allow-list response")?;
         let data = value.required(&Value::Unsigned(2))?.bytes()?;
         if data.get(..32) != Some(crypto::digest(RP_ID.as_bytes()).as_slice()) {
             return Err("CTAP assertion RP hash mismatch".into());
@@ -186,15 +169,7 @@ impl AssertionRequest {
                 .try_into()
                 .map_err(|_| "invalid authenticator counter")?,
         );
-        let extensions = data.get(37..).ok_or("short authenticator data")?;
-        if flags & 0x80 != 0 {
-            let tail = cbor::decode(extensions)?;
-            for (key, _) in tail.map()? {
-                key.text()?;
-            }
-        } else if !extensions.is_empty() {
-            return Err("unexpected trailing authenticator data".into());
-        }
+        extension_tail(flags, data)?;
         let (r, s) = signature(value.required(&Value::Unsigned(3))?.bytes()?)?;
         let mut signed = Vec::with_capacity(data.len() + 32);
         signed.extend_from_slice(data);
@@ -220,6 +195,151 @@ pub(super) struct ParsedAssertion {
     pub(super) r: [u8; 32],
     pub(super) s: [u8; 32],
     pub(super) info: AssertionInfo,
+}
+
+/// A silent selection over several allowed IDs. It authenticates nothing.
+pub struct IdentifyRequest {
+    credentials: Vec<Vec<u8>>,
+    bytes: Vec<u8>,
+}
+
+impl IdentifyRequest {
+    /// up=false, no PIN and no extension. The caller batches to the list limit.
+    pub fn new(
+        credentials: &[&[u8]],
+        client_data_hash: [u8; 32],
+        max_message: usize,
+    ) -> Result<Self, String> {
+        if credentials.is_empty() {
+            return Err("empty CTAP identify allow list".into());
+        }
+        let mut owned: Vec<Vec<u8>> = Vec::with_capacity(credentials.len());
+        for id in credentials {
+            if id.is_empty() || id.len() > MAX_CREDENTIAL_ID {
+                return Err("invalid CTAP credential ID length".into());
+            }
+            if owned.iter().any(|old| old.as_slice() == *id) {
+                return Err("duplicate CTAP identify credential".into());
+            }
+            owned.push(id.to_vec());
+        }
+        let mut out = Encoder::new();
+        out.head(5, 4)?;
+        out.head(0, 1)?;
+        out.text(RP_ID)?;
+        out.head(0, 2)?;
+        out.bytes(&client_data_hash)?;
+        out.head(0, 3)?;
+        out.head(4, owned.len() as u64)?;
+        for id in &owned {
+            out.head(5, 2)?;
+            out.text("id")?;
+            out.bytes(id)?;
+            out.text("type")?;
+            out.text("public-key")?;
+        }
+        out.head(0, 5)?;
+        out.head(5, 1)?;
+        out.text("up")?;
+        out.boolean(false)?;
+        let encoded = out.finish()?;
+        if encoded.len() >= max_message.min(fido_hid::MAX_MESSAGE) {
+            return Err("CTAP identify request exceeds authenticator message limit".into());
+        }
+        let mut bytes = Vec::with_capacity(encoded.len() + 1);
+        bytes.push(2); // authenticatorGetAssertion
+        bytes.extend_from_slice(&encoded);
+        Ok(Self {
+            credentials: owned,
+            bytes,
+        })
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The selected allow-list index, or None for CTAP2_ERR_NO_CREDENTIALS.
+    pub fn select(&self, response: &[u8]) -> Result<Option<usize>, String> {
+        if response.len() > cbor::MAX_BYTES {
+            return Err("CTAP response byte limit".into());
+        }
+        let (&status, bytes) = response
+            .split_first()
+            .ok_or("missing CTAP response status")?;
+        match status {
+            0 => {}
+            0x2e if bytes.is_empty() => return Ok(None),
+            _ => return Err(format!("CTAP identify refused: {status:#04x}")),
+        }
+        let value = cbor::decode(bytes)?;
+        let index = match value.get(&Value::Unsigned(1))? {
+            Some(descriptor) => {
+                if descriptor.required(&Value::Text("type"))?.text()? != "public-key" {
+                    return Err("CTAP identify selected a non-public-key credential".into());
+                }
+                let id = descriptor.required(&Value::Text("id"))?.bytes()?;
+                self.credentials
+                    .iter()
+                    .position(|candidate| candidate.as_slice() == id)
+                    .ok_or("CTAP identify selected a credential outside its allow list")?
+            }
+            // CTAP permits omission only for a single-entry allow list.
+            None if self.credentials.len() == 1 => 0,
+            None => return Err("CTAP identify response omits its credential".into()),
+        };
+        entity(&value, "CTAP identify is not a single allow-list selection")?;
+        let data = value.required(&Value::Unsigned(2))?.bytes()?;
+        if data.get(..32) != Some(crypto::digest(RP_ID.as_bytes()).as_slice()) {
+            return Err("CTAP identify RP hash mismatch".into());
+        }
+        let flags = *data.get(32).ok_or("short authenticator flags")?;
+        // A silent answer that claims presence or verification was not silent.
+        if flags & 0x45 != 0 || flags & 0x18 == 0x10 {
+            return Err("invalid silent identify flags".into());
+        }
+        data.get(33..37).ok_or("short authenticator counter")?;
+        extension_tail(flags, data)?;
+        value.required(&Value::Unsigned(3))?.bytes()?;
+        Ok(Some(index))
+    }
+}
+
+/// Optional user entity, credential count and userSelected of an allow-list answer.
+fn entity(value: &Value<'_>, refusal: &str) -> Result<(), String> {
+    if let Some(user) = value.get(&Value::Unsigned(4))? {
+        let id = user.required(&Value::Text("id"))?.bytes()?;
+        if id.is_empty() || id.len() > 64 {
+            return Err("invalid CTAP user handle".into());
+        }
+        for field in ["name", "displayName"] {
+            if let Some(field) = user.get(&Value::Text(field))? {
+                field.text()?;
+            }
+        }
+    }
+    if value
+        .get(&Value::Unsigned(5))?
+        .is_some_and(|count| count != &Value::Unsigned(1))
+        || value.get(&Value::Unsigned(6))?.is_some()
+    {
+        return Err(refusal.into());
+    }
+    Ok(())
+}
+
+/// Authenticator data after the counter: one text-keyed map exactly when ED is set.
+fn extension_tail(flags: u8, data: &[u8]) -> Result<(), String> {
+    let extensions = data.get(37..).ok_or("short authenticator data")?;
+    if flags & 0x80 != 0 {
+        let tail = cbor::decode(extensions)?;
+        for (key, _) in tail.map()? {
+            key.text()?;
+        }
+    } else if !extensions.is_empty() {
+        return Err("unexpected trailing authenticator data".into());
+    }
+    Ok(())
 }
 
 pub(super) fn signature(bytes: &[u8]) -> Result<([u8; 32], [u8; 32]), String> {
@@ -320,6 +440,101 @@ mod tests {
         assert!(AssertionRequest::new(&[0; 1024], [0; 32], 1024).is_err());
         assert!(AssertionRequest::new(&[7], [3; 32], expected.len() - 1).is_err());
         assert!(AssertionRequest::new(&[7], [3; 32], expected.len()).is_ok());
+    }
+
+    #[test]
+    fn literal_identify_request_is_silent_over_every_allowed_id() {
+        let request = IdentifyRequest::new(&[&[7], &[8, 9]], [3; 32], 1024).unwrap();
+        let mut expected = b"\x02\xa4\x01\x6atd.invalid\x02\x58\x20".to_vec();
+        expected.extend([3; 32]);
+        expected.extend(b"\x03\x82\xa2\x62id\x41\x07\x64type\x6apublic-key");
+        expected.extend(b"\xa2\x62id\x42\x08\x09\x64type\x6apublic-key\x05\xa1\x62up\xf4");
+        assert_eq!(request.bytes(), expected);
+        assert!(IdentifyRequest::new(&[], [0; 32], 1024).is_err());
+        assert!(IdentifyRequest::new(&[&[]], [0; 32], 1024).is_err());
+        assert!(IdentifyRequest::new(&[&[7], &[7]], [0; 32], 1024).is_err());
+        assert!(IdentifyRequest::new(&[&[0; 1025]], [0; 32], 7609).is_err());
+        assert!(IdentifyRequest::new(&[&[7], &[8, 9]], [3; 32], expected.len()).is_ok());
+        assert!(IdentifyRequest::new(&[&[7], &[8, 9]], [3; 32], expected.len() - 1).is_err());
+    }
+
+    #[test]
+    fn identify_selects_by_index_and_authenticates_nothing() {
+        let ids: [&[u8]; 3] = [&[7], &[8], &[9]];
+        let batch = IdentifyRequest::new(&ids, [3; 32], 1024).unwrap();
+        let single = IdentifyRequest::new(&ids[1..2], [3; 32], 1024).unwrap();
+        let mut silent = data();
+        silent[32] = 0;
+        // The signature is never parsed: identify verifies nothing.
+        for (id, index) in [(&[7][..], 0), (&[8], 1), (&[9], 2)] {
+            let reply = response(&silent, Some(id), None);
+            assert_eq!(batch.select(&reply).unwrap(), Some(index));
+        }
+        assert_eq!(
+            single.select(&response(&silent, None, None)).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            single
+                .select(&response(&silent, Some(&[8]), Some(1)))
+                .unwrap(),
+            Some(0)
+        );
+        assert!(batch.select(&response(&silent, None, None)).is_err());
+        assert!(batch.select(&response(&silent, Some(&[6]), None)).is_err());
+        assert!(single.select(&response(&silent, Some(&[7]), None)).is_err());
+        assert_eq!(
+            batch.select(&response(&silent, Some(&[7]), Some(2))).err(),
+            Some("CTAP identify is not a single allow-list selection".into())
+        );
+        assert_eq!(batch.select(&[0x2e]).unwrap(), None);
+        for refused in [&[0x2e, 0][..], &[0x31], &[0x27], &[], &[0x01]] {
+            assert!(batch.select(refused).is_err());
+        }
+        // UP, UV and AT must be clear; BS needs BE; BE alone and RFU bits are admitted.
+        for (flags, admitted) in [
+            (0x00, true),
+            (0x08, true),
+            (0x18, true),
+            (0x22, true),
+            (0x01, false),
+            (0x04, false),
+            (0x05, false),
+            (0x40, false),
+            (0x10, false),
+        ] {
+            let mut bytes = silent.clone();
+            bytes[32] = flags;
+            let result = batch.select(&response(&bytes, Some(&[8]), None));
+            assert_eq!(result.is_ok(), admitted, "flags {flags:#04x}");
+        }
+        let mut wrong_rp = silent.clone();
+        wrong_rp[0] ^= 1;
+        assert!(batch
+            .select(&response(&wrong_rp, Some(&[8]), None))
+            .is_err());
+        for length in 0..silent.len() {
+            assert!(batch
+                .select(&response(&silent[..length], Some(&[8]), None))
+                .is_err());
+        }
+        let mut extended = silent.clone();
+        extended[32] = 0x80;
+        extended.extend(b"\xa1\x6bcredProtect\x01");
+        assert_eq!(
+            batch
+                .select(&response(&extended, Some(&[8]), None))
+                .unwrap(),
+            Some(1)
+        );
+        extended[32] = 0;
+        assert!(batch
+            .select(&response(&extended, Some(&[8]), None))
+            .is_err());
+        let mut typed = response(&silent, Some(&[8]), None);
+        let at = typed.windows(10).position(|s| s == b"public-key").unwrap();
+        typed[at] ^= 1;
+        assert!(batch.select(&typed).is_err());
     }
 
     #[test]

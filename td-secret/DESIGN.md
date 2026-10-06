@@ -1853,3 +1853,55 @@ one, and a later write succeeds. Private `ReadStage` hooks after the
 inspection and after the read let tests swap the inode, change its mode
 or append to it, each of which reads as unreadable; a test-only
 descriptor root stands for a lost or replaced `/proc`.
+
+## Login CTAP primitives
+
+The third inert piece of the root login worker is the protocol steps
+TOKEN-LOGIN.md's "Token profile" names, in `fido_ctap.rs`, `fido_pin.rs`
+and `fido_transaction.rs`; nothing calls them yet. That section's "Wire
+choices" owns the bytes.
+
+`IdentifyRequest` builds the silent getAssertion over one batch of
+nonempty, distinct IDs, bounded like the assertion request, and `select`
+returns the chosen index, or none for an empty NO_CREDENTIALS answer. It
+refuses a credential outside the batch, an omitted one in a batch of
+several, UP, UV or AT set and inconsistent backup flags, and checks the
+user entity, count and extension tail with the assertion parser's own
+checks, now shared; it parses no signature. `Profile::parse_login` reads
+the getInfo claims the notebook's `Profile::parse` reads, except that
+omitted extensions or options advertise nothing rather than refusing, and
+returns `LoginRefusal::NoHmacSecret`, `AlwaysUv`, `PinUnsupported` or
+`PinNotSet` before the shared policy. The notebook's admission, its
+diagnostics and their order are unchanged, as is its defaulted list
+capacity of eight; `advertised_list_limit` reports the advertised one.
+`Profile::identifiable` says whether a credential's own silent request
+fits the key's ID and message limits. `login_enrollment` labels creation
+`td login`, leaves unidentifiable IDs out of the exclusion list and
+refuses `ListTooSmall` before any PIN. `RetriesRequest` encodes
+getPINRetries and parses the count and the power-cycle state.
+
+`Transaction::identify` refuses an empty, oversized or repeated ID before
+any token I/O, skips unidentifiable IDs, packs the rest in order into
+batches within both the list limit and the message size, and returns an
+index into the caller's list. Its replies come through the raw exchange:
+any status but success or NO_CREDENTIALS is typed as for the notebook,
+and `select` decides the rest, so only a bare NO_CREDENTIALS moves to the
+next batch.
+`login_assertion` and `login_create` run the notebook's key-agreement,
+PIN-token, creation and proof sequence, shared as `authorized_assertion`
+and `create_and_prove`, and query getPINRetries after key agreement and
+before each prompt, which receives the purpose and the count. Zero ends
+as `Status::PinBlocked`, whatever the power-cycle state, and otherwise a
+power-cycle state as `Status::PinAuthBlocked`, with no prompt; device
+statuses stay typed as for the notebook. A failure is `LoginError::Refused` or
+`LoginError::Failed` around the notebook's `Error`. A login assertion
+refuses signed backup flags, as a proof does.
+
+The notebook's bytes are unchanged: its creation passes `td personal
+vault`, and its committed transcripts pass as they were.
+`tests/login_ctap_vectors.py` derives the identify requests and
+selections, the getPINRetries requests and replies and the login creation
+requests with Python's `hashlib` and `hmac` alone. It recomputes
+`pin_vectors.py`'s public creation seeds, so its creation rows differ
+from that file's only in the labels; the committed
+`tests/login_ctap_vectors.txt` is what the tests read.

@@ -201,6 +201,10 @@ pub fn recipe() -> Recipe {
             include_str!("../../../td-secret/tests/login_record_vectors.txt"),
         ),
         (
+            "{src}/td-secret/tests/login_ctap_vectors.txt",
+            include_str!("../../../td-secret/tests/login_ctap_vectors.txt"),
+        ),
+        (
             "{src}/td-secret/tests/aes_vectors.txt",
             include_str!("../../../td-secret/tests/aes_vectors.txt"),
         ),
