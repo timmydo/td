@@ -3185,6 +3185,27 @@ stated only in chat can be lost to compaction, and a rule cannot.
 arguments go to the human whatever the table says, as opencode's
 `doom_loop` does: a loop is a symptom worth a person's look.
 
+**As built (increment 13, repetition).** The run is counted over the
+tools the tool host runs (`read_file`, `write_file`, `edit_file`,
+`glob`, `grep`, `sed` and `shell`), back through earlier replies. The
+human's message ends it; another conversation's message, a
+notification or a process's end does not, so a loop a peer drives
+stays visible. A reply cut off before it was whole is passed over,
+since its calls never ran. Arguments compare as parsed JSON with each
+object's members in key order, so respacing or reordering them does
+not hide a repeat. The third call's card, and every later one's while
+the run lasts, says first why it asks, and its approval is logged with
+the reason `repeated`; refused, the call's answer is the human's
+refusal, as for any card. The process tools run in the conversation's
+own process and are not counted: waiting on a long process with
+`process_wait` repeats by design. Nor are the conversation tools:
+`send_message` and a search or read of another conversation are
+crossings, every one the human's until the classifier decides them,
+and searching or reading this conversation's log, listing
+conversations or writing the todo list changes nothing outside it.
+When the classifier decides crossings, a repeated one must still reach
+the human.
+
 **The classifier** decides only the rows the table gives it, and an action
 it decides runs only when both of its stages allow. Both see the same
 state, built from separated, labelled fields:

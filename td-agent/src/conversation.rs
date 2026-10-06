@@ -1444,7 +1444,10 @@ impl Session {
             // Durable before it runs: a restart never runs it again.
             self.sync()?;
             let (answer, beside) = match tools::parse_in(workspace, &call.name, &call.arguments) {
-                Ok(Args::Host { call, acts }) => self.host(started, call, acts)?,
+                Ok(Args::Host { call: hosted, acts }) => {
+                    let repeated = repeats(self.conversation.events(), reply, at) + 1 >= REPEATS;
+                    self.host(started, hosted, acts, repeated)?
+                }
                 Ok(args) => (self.run(started, args)?, Beside::default()),
                 Err(why) => (Err(why), Beside::default()),
             };
@@ -2271,6 +2274,7 @@ impl Session {
         started: u64,
         call: host::Call,
         acts: bool,
+        repeated: bool,
     ) -> Result<(Result<String, String>, Beside), String> {
         let failed = |why: String| Ok((Err(why), Beside::default()));
         if self.conversation.meta().removed {
@@ -2310,9 +2314,13 @@ impl Session {
                 ));
             }
         }
-        if acts {
-            let (title, details) = tools::card(&call);
-            match self.decide(started, title, details)? {
+        if acts || repeated {
+            let (title, mut details) = tools::card(&call);
+            if repeated {
+                details.insert(0, REPEATED.into());
+            }
+            let why = repeated.then_some("repeated");
+            match self.decide(started, title, details, why)? {
                 Some(true) => {}
                 Some(false) => return failed(CALL_REFUSED.into()),
                 None => return failed(CALL_UNDECIDED.into()),
@@ -2731,6 +2739,7 @@ impl Session {
         started: u64,
         title: String,
         details: Vec<String>,
+        why: Option<&str>,
     ) -> Result<Option<bool>, String> {
         self.send(&Up::Ask {
             call: started,
@@ -2761,8 +2770,8 @@ impl Session {
             }
         };
         let (outcome, by, reason) = match allow {
-            Some(true) => ("allow", "human", None),
-            Some(false) => ("deny", "human", None),
+            Some(true) => ("allow", "human", why.map(str::to_string)),
+            Some(false) => ("deny", "human", why.map(str::to_string)),
             None => {
                 self.send(&Up::Withdraw { call: started });
                 let why = if self.gone {
@@ -2876,7 +2885,7 @@ impl Session {
             return Ok(Err(format!("there is no conversation {target}")));
         };
         let (title, details) = tools::crossing_card(target, &meta.title, reach);
-        match self.decide(started, title, details)? {
+        match self.decide(started, title, details, None)? {
             Some(true) => {}
             Some(false) => return Ok(Err(CALL_REFUSED.into())),
             None => return Ok(Err(CALL_UNDECIDED.into())),
@@ -3762,6 +3771,83 @@ fn track(
     .map_err(|why| format!("setting its remote-tracking refs: {why}"))
 }
 
+/// Calls in a row to one tool with the same arguments that go to the
+/// human whatever the table says (DESIGN.md §11): a loop is worth a look.
+const REPEATS: usize = 3;
+
+/// What such a call's card says first.
+const REPEATED: &str = "Asked because the model made this same call, to the same tool with the same arguments, three times in a row, which may be a loop.";
+
+/// How many calls just before call `at` of reply `reply` in `events` were
+/// to the same tool with the same arguments, in a row: back through the
+/// earlier replies, a message to the conversation ending the run, and
+/// counted only as far as `REPEATS` needs.
+fn repeats(events: &[Event], reply: u64, at: usize) -> usize {
+    let Some(end) = events.iter().rposition(|e| e.seq == reply) else {
+        return 0;
+    };
+    let Some(Kind::Assistant { calls, .. }) = events.get(end).map(|e| &e.kind) else {
+        return 0;
+    };
+    let Some(this) = calls.get(at) else {
+        return 0;
+    };
+    let parsed = td_json::parse(&this.arguments).ok().map(canonical);
+    let same = |other: &&store::Call| {
+        other.name == this.name
+            && match (
+                &parsed,
+                td_json::parse(&other.arguments).ok().map(canonical),
+            ) {
+                (Some(one), Some(two)) => *one == two,
+                _ => other.arguments == this.arguments,
+            }
+    };
+    let before = events
+        .get(..end)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .map_while(|e| match &e.kind {
+            Kind::User { .. } => None,
+            // A broken reply's calls never ran, and the model never saw
+            // them.
+            Kind::Assistant {
+                calls,
+                incomplete: false,
+                ..
+            } => Some(calls.as_slice()),
+            _ => Some(&[][..]),
+        })
+        .flat_map(|calls| calls.iter().rev());
+    calls
+        .get(..at)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .chain(before)
+        .take(REPEATS - 1)
+        .take_while(same)
+        .count()
+}
+
+/// `value` with every object's members in key order, so arguments the
+/// model wrote in another order compare equal.
+fn canonical(value: td_json::Json) -> td_json::Json {
+    match value {
+        td_json::Json::Obj(members) => {
+            let mut members: Vec<(String, td_json::Json)> = members
+                .into_iter()
+                .map(|(key, value)| (key, canonical(value)))
+                .collect();
+            members.sort_by(|one, other| one.0.cmp(&other.0));
+            td_json::Json::Obj(members)
+        }
+        td_json::Json::Arr(items) => td_json::Json::Arr(items.into_iter().map(canonical).collect()),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
@@ -4264,5 +4350,112 @@ mod tests {
             drop(window);
             served.join().unwrap().unwrap();
         }
+    }
+
+    fn replied(seq: u64, calls: &[(&str, &str)]) -> Event {
+        Event {
+            seq,
+            time: 0,
+            kind: Kind::Assistant {
+                request: 0,
+                content: None,
+                reasoning: None,
+                details: None,
+                finish: "tool_calls".into(),
+                incomplete: false,
+                calls: calls
+                    .iter()
+                    .map(|(name, arguments)| store::Call {
+                        id: format!("call-{seq}"),
+                        name: name.to_string(),
+                        arguments: arguments.to_string(),
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn repeats_counts_the_same_call_back_through_replies_until_the_human_speaks() {
+        let read = ("read_file", r#"{"path":"a"}"#);
+        // The same arguments however the model spaced them.
+        let spaced = ("read_file", r#"{ "path" : "a" }"#);
+        let other = ("read_file", r#"{"path":"b"}"#);
+        let events = vec![
+            replied(1, &[read]),
+            Event {
+                seq: 2,
+                time: 0,
+                kind: Kind::User {
+                    delivery: "typed".into(),
+                    text: "again".into(),
+                },
+            },
+            replied(3, &[read, other]),
+            replied(4, &[read]),
+            replied(5, &[spaced, read, ("shell", r#"{"path":"a"}"#)]),
+        ];
+        // Nothing before the first of a reply's calls but the human.
+        assert_eq!(repeats(&events, 3, 0), 0);
+        assert_eq!(repeats(&events, 3, 1), 0);
+        // Another call between ends the run.
+        assert_eq!(repeats(&events, 4, 0), 0);
+        assert_eq!(repeats(&events, 5, 0), 1);
+        // Counted only as far as needed.
+        assert_eq!(repeats(&events, 5, 1), REPEATS - 1);
+        assert!(repeats(&events, 5, 1) + 1 >= REPEATS);
+        // Another tool with the same arguments is another call.
+        assert_eq!(repeats(&events, 5, 2), 0);
+        assert_eq!(repeats(&events, 9, 0), 0);
+        assert_eq!(repeats(&events, 5, 7), 0);
+    }
+
+    #[test]
+    fn repeats_reads_past_records_and_peers_but_not_broken_replies() {
+        let read = ("read_file", r#"{"path":"a","limit":1}"#);
+        // The same members in another order.
+        let reordered = ("read_file", r#"{"limit":1,"path":"a"}"#);
+        let between = |seq: u64, kind: Kind| Event { seq, time: 0, kind };
+        let mut broken = replied(8, &[("read_file", r#"{"path":"b"}"#)]);
+        if let Kind::Assistant { incomplete, .. } = &mut broken.kind {
+            *incomplete = true;
+        }
+        let events = vec![
+            replied(1, &[read]),
+            between(
+                2,
+                Kind::ToolCall {
+                    reply: 1,
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                },
+            ),
+            replied(3, &[reordered]),
+            // Another conversation's message, unlike the human's, does
+            // not end the run.
+            between(
+                4,
+                Kind::Message {
+                    delivery: "sent".into(),
+                    from: Id::random().unwrap(),
+                    role: Role::Conversation,
+                    text: "read it again".into(),
+                    status: None,
+                    held: None,
+                },
+            ),
+            replied(5, &[read]),
+            replied(6, &[reordered]),
+            // A broken reply's calls never ran, and do not break it.
+            broken,
+            replied(9, &[read, read]),
+        ];
+        assert_eq!(repeats(&events, 3, 0), 1);
+        // A fourth and a fifth ask as the third did; only as far as
+        // needed is counted.
+        assert_eq!(repeats(&events, 5, 0), REPEATS - 1);
+        assert_eq!(repeats(&events, 6, 0), REPEATS - 1);
+        assert_eq!(repeats(&events, 9, 0), REPEATS - 1);
+        assert_eq!(repeats(&events, 9, 1), REPEATS - 1);
     }
 }

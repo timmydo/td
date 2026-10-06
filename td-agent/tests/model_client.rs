@@ -1362,6 +1362,65 @@ fn call_record(events: &[Event], id: &str) -> u64 {
         .unwrap()
 }
 
+/// A third call in a row to one tool with the same arguments goes to the
+/// person, though a read asks nothing; the first two ran, and the
+/// approval says why it was asked. Other arguments start a run anew,
+/// though their members come in another order (DESIGN.md §11).
+#[test]
+fn a_third_identical_call_in_a_row_goes_to_the_person() {
+    let mut h = Harness::new_in(
+        "repeat",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-repeat.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Read the notes.");
+    let (call, title, details) = h.until_ask();
+    assert_eq!(title, "Read a file");
+    assert_eq!(
+        details,
+        [
+            "Asked because the model made this same call, to the same tool with the same arguments, three times in a row, which may be a loop.",
+            "notes.txt"
+        ]
+    );
+    let read = results(&h.heard);
+    assert_eq!(read.len(), 2, "{read:?}");
+    assert_eq!(call, call_record(&h.heard, "toolu_read_03"));
+    h.down(&Down::Decision { call, allow: false });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let results = results(&events);
+    assert_eq!(results.len(), 5);
+    assert!(
+        results[2]
+            .1
+            .starts_with("error: not run: the person refused this call"),
+        "{results:?}"
+    );
+    // The fourth and fifth ran without a card: two in a run is no loop.
+    assert!(
+        results[3].1.starts_with("error: the jail: ")
+            && results[4].1.starts_with("error: the jail: "),
+        "{results:?}"
+    );
+    assert_eq!(
+        approvals(&events),
+        [(
+            call,
+            "deny".to_string(),
+            "human".to_string(),
+            Some("repeated".to_string())
+        )]
+    );
+}
+
 /// A workspace conversation's request names its workspace and carries
 /// its tools; a read runs without asking, and a command waits for the
 /// person, whose refusal is the call's answer. Without `./agent`'s
