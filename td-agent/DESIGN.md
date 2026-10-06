@@ -1150,8 +1150,8 @@ because fetchd refuses loopback and link-local destinations, a model
 server on the local machine is not reachable this way. OpenRouter's
 Anthropic Messages and beta Responses endpoints are not used: the first
 covers only Anthropic models, the second is stateless anyway. The
-classifier's first stage uses OpenRouter's decision endpoint instead
-(§11).
+classifier's first stage uses OpenRouter's decisions endpoint,
+`/api/alpha/decisions`, instead (§11).
 
 **Headers.** `authorization: Bearer KEY`, `content-type: application/json`,
 and the attribution pair `http-referer` and `x-openrouter-title: td-agent`.
@@ -1655,7 +1655,9 @@ ones and read as false. New events:
 - `pause`: the human paused or resumed the conversation.
 - `approval`: the decision on a call, by whom (`human`; `td-agent` when
   a card was withdrawn; from increment 13, `rule` when a rule refused or
-  allowed it and `mode` when `auto` mode ran it), and Jev's
+  allowed it, `mode` when `auto` mode ran it, and `classifier` when the
+  classifier allowed it or, outcome `ask`, gave it to the human), and
+  Jev's
   probabilities and the reason; the history tools show only its outcome
   and who decided.
 
@@ -3335,7 +3337,7 @@ its workspace's: in `auto`, a call that acts runs with no card once no
 deny, ask, unread file, repetition or allow has decided it, since each
 such call runs inside the jail, its approval logged `by` `mode` with the
 reason. A crossing is never the mode's: in `auto` the table gives it to
-the classifier, which until it lands is the human, so it keeps its card.
+the classifier (As built (increment 13, the classifier)).
 A card that waits when the workspace goes to `auto` is taken back and
 its call runs, as a rule's allow would. A call the mode or a rule let
 run, the person not having answered it, is judged again when a policy
@@ -3355,6 +3357,58 @@ read, and the configuration's with none open. A deleted conversation's
 workspace's mode goes with its section, but a directory's, which
 outlives its conversations as its rules do; the blank line before a
 section that goes goes with it.
+
+**As built (increment 13, the classifier).** The classifier decides the
+one row of the table's `classifier` column that exists so far,
+crossings: in `auto` mode, a crossing no standing answer, ask, deny or
+unread file has decided, and that is neither repeated nor braked, goes
+to both stages; a repeated one, a fourth message to one conversation
+since the human last wrote (the brake applies to the classifier as to a
+standing answer), and one in `ask` mode, are the human's. The state is
+built by the conversation process from its log alone: the human's
+messages (`User` events, never another conversation's), the workspace's
+mode and the rules in force with where each comes from, and the action
+with what td-agent says of it and its two sides, `source`, whose content
+it carries, and `receiver`, which that content reaches (a message's
+sender and receiver; a read's or a search's other conversation and this
+one), each with its conversation, workspace, remotes and model.
+Everything a model wrote is in the untrusted field: the message or the
+query whole, the tool calls made by tool (a name td-agent has no tool by
+shown as `an unknown tool`) and the `path` each named, cut at 256 bytes,
+the other conversation's title and the latest four messages other
+conversations sent. A payload longer than 32 KiB, which no tool takes,
+is the human's, as the stages would judge a part of it. The human's
+messages are kept newest first within 32 KiB, each at most 8 KiB, and
+the last 64 calls are named. Project instructions are not in it yet: no
+workspace is marked trusted. Jev is asked only when `data_collection` is
+`allow`, `jev_threshold` is set and `base_url` ends in `/v1`, and the
+models list prices `classifier_fast_model` while a cost limit is set;
+otherwise it is unavailable, and while `jev_required` the action goes to
+the human with nothing asked. The reasoning stage is a chat completion
+of `classifier_model` with `prompt/classifier.txt` as its system message
+and the state as its user message, `max_tokens` 4096, `provider` as any
+request's. Both requests are reserved together against the day, the
+turn's and the conversation's limits, logged as `Request` events of
+purpose `classify` with their whole bodies, sent at once, Jev's on a
+thread of its own, and settled as a title request's is, Jev charged by
+its reported cost, or by its input tokens alone; neither can be
+interrupted while it runs. Jev's answers are read strictly, a
+probability outside 0 to 1 being no answer, and allow when `request` is
+`matches` and both its probability and that of not disclosing reach the
+threshold. The reasoning stage's answer is one JSON object with a
+`verdict` and a `reason`; a fence or prose around it is no answer. When
+both allow, the crossing runs, its approval logged `by` `classifier`
+with Jev's probabilities and both stages' words as the reason, once the
+decision holds: a policy that came after the one the crossing was judged
+by, one taken while the classifier waited included, has it judged again,
+a deny refusing it. Otherwise the classifier's verdict is logged as an
+approval of outcome `ask` `by` `classifier`, and the card says why, with
+Jev's probabilities when it answered; the human's answer is logged after
+it. A card waiting on a crossing is not taken back when its workspace
+goes to `auto`. The status row says `classifier without Jev` beside the
+mode while `jev_required` is `false`. `jev_threshold` has no shipped
+value until increment 13's calibration records one, so Jev allows
+nothing until the human sets one.
 
 **Repetition.** Three consecutive calls of one tool with identical
 arguments go to the human whatever the table says, as opencode's
@@ -3377,7 +3431,8 @@ own process and are not counted: waiting on a long process with
 `send_message` and a search or read of another conversation are
 crossings, every one the human's, on a card or by a standing answer
 that a run of messages sends back to them (As built (increment 13,
-crossings answered for good)), until the classifier decides them,
+crossings answered for good)), or in `auto` mode the classifier's
+(As built (increment 13, the classifier)),
 and searching or reading this conversation's log, listing
 conversations or writing the todo list changes nothing outside it.
 When the classifier decides crossings, a repeated one must still reach
@@ -3410,7 +3465,8 @@ the untrusted field is model-authored, and an injected instruction can
 shape it.
 
 1. **Jev**, TypeSafe's decision model, which OpenRouter serves at
-   `POST /api/v1/systemone` (model `typesafe/jev-1.13`, configurable as
+   `POST /api/alpha/decisions`, beside the API's `/v1` root (model
+   `typesafe/jev-1.13`, configurable as
    `classifier_fast_model`), through fetchd like any other request. It
    takes the state and typed questions and answers with probabilities in
    well under a second, at a fraction of a chat model's price. td-agent
@@ -4369,7 +4425,8 @@ default, except `jev_threshold` until it is calibrated (§11):
 - `model`, which every conversation uses unless the human chose another
   for it (§4), `title_model`, `classifier_fast_model` and
   `classifier_model`
-- `jev_threshold`, and `jev_required`; default `true`
+- `jev_threshold`, a probability from 0.5 to 1 in at most three decimal
+  places, and `jev_required`; default `true`
 - `reasoning_effort`
 - `mode`: `auto` or `ask`; default `auto`
 - `data_collection`: `deny` or `allow`; default `deny`

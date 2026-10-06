@@ -28,7 +28,7 @@ use td_agent::workspace::Workspace;
 fn keyless() -> Down {
     Down::Setup {
         key: Err("no API key".into()),
-        client: Client::default(),
+        client: Box::default(),
     }
 }
 
@@ -394,7 +394,7 @@ fn a_repository_conversations_first_turn_waits_for_its_stores() {
     // fails here and reaches nothing.
     let keyed = Down::Setup {
         key: Ok(td_agent::key::Secret::new("sk-or-v1-test".into())),
-        client: Client::default(),
+        client: Box::default(),
     };
     let nowhere = scratch.0.join("run");
     std::fs::create_dir(&nowhere).unwrap();
@@ -485,14 +485,14 @@ fn a_conversation_whose_workspace_went_with_its_archive_prepares_nothing() {
     // to reserve, which nothing answers, so nothing is sent.
     let keyed = Down::Setup {
         key: Ok(td_agent::key::Secret::new("sk-or-v1-test".into())),
-        client: Client {
+        client: Box::new(Client {
             limits: td_agent::cost::Limits {
                 turn: None,
                 conversation: None,
                 day: None,
             },
             ..Client::default()
-        },
+        }),
     };
     let nowhere = scratch.0.join("run");
     std::fs::create_dir(&nowhere).unwrap();
@@ -687,7 +687,7 @@ fn an_interrupt_ends_a_turn_waiting_for_its_stores() {
     let id = Id::random().unwrap();
     let keyed = Down::Setup {
         key: Ok(td_agent::key::Secret::new("sk-or-v1-test".into())),
-        client: Client::default(),
+        client: Box::default(),
     };
     let nowhere = scratch.0.join("run");
     std::fs::create_dir(&nowhere).unwrap();
@@ -864,14 +864,14 @@ fn a_message_sent_just_before_switching_away_runs_its_turn() {
     let state = scratch.state();
     let keyed = Down::Setup {
         key: Ok(td_agent::key::Secret::new("sk-or-test".into())),
-        client: Client {
+        client: Box::new(Client {
             limits: td_agent::cost::Limits {
                 turn: None,
                 conversation: None,
                 day: None,
             },
             ..Client::default()
-        },
+        }),
     };
     let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyed);
     let (a, b) = (Id::random().unwrap(), Id::random().unwrap());

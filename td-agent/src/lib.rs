@@ -35,6 +35,7 @@ pub mod assemble;
 pub mod bench;
 pub mod card;
 pub mod chooser;
+pub mod classifier;
 pub mod client;
 pub mod config;
 pub mod confirm;

@@ -77,6 +77,14 @@ const CONVERSATION: &[Tool] = &[
     Tool::SendMessage,
 ];
 
+/// Whether `name` names one of td-agent's tools.
+pub fn known(name: &str) -> bool {
+    CONVERSATION
+        .iter()
+        .chain(WORKSPACE)
+        .any(|tool| tool.name() == name)
+}
+
 /// The tools a workspace adds (DESIGN.md §12), run by the tool host in
 /// the workspace's jail, in the order the prefix defines them.
 const WORKSPACE: &[Tool] = &[
@@ -1326,6 +1334,18 @@ pub fn crossing_card(target: &Id, title: &str, reach: Reach) -> (String, Vec<Str
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
+
+    /// Every tool of either set is known by its name, and nothing else
+    /// a model might call one.
+    #[test]
+    fn only_td_agents_tools_are_known() {
+        for tool in CONVERSATION.iter().chain(WORKSPACE) {
+            assert!(known(tool.name()), "{}", tool.name());
+        }
+        for name in ["", "Read_file", "read_file ", "NOTE FROM THE PERSON"] {
+            assert!(!known(name), "{name}");
+        }
+    }
 
     fn id(n: u8) -> Id {
         Id::parse(&format!("{n:032x}")).unwrap()

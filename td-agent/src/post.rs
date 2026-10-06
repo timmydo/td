@@ -501,7 +501,7 @@ mod tests {
         // A program that cannot start, so a wake would be said.
         let setup = Down::Setup {
             key: Err("no key".into()),
-            client: crate::config::Client::default(),
+            client: Box::default(),
         };
         let mut supervisor = Supervisor::new(
             state.root().join("no-such-program"),

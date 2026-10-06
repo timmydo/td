@@ -18,6 +18,10 @@ pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5.5";
 /// The cheap model titles come from (DESIGN.md §13).
 pub const DEFAULT_TITLE_MODEL: &str = "anthropic/claude-haiku-4.5";
+/// The classifier's two stages' models (DESIGN.md §11): Jev, and the
+/// reasoning stage's bring-your-own-policy safety model.
+pub const DEFAULT_JEV_MODEL: &str = "typesafe/jev-1.13";
+pub const DEFAULT_CLASSIFIER_MODEL: &str = "openai/gpt-oss-safeguard-20b";
 /// OpenRouter's reasoning efforts, `reasoning.effort`.
 pub const EFFORTS: [&str; 6] = ["none", "minimal", "low", "medium", "high", "xhigh"];
 const DEFAULT_EFFORT: &str = "medium";
@@ -37,6 +41,16 @@ pub struct Client {
     /// `provider.data_collection`: whether providers that may keep or
     /// train on prompts may serve a request; `deny` by default.
     pub allow_data_collection: bool,
+    /// The classifier's models (DESIGN.md §11): Jev, and the reasoning
+    /// stage's.
+    pub classifier_fast_model: String,
+    pub classifier_model: String,
+    /// The probability Jev's answers must reach, in thousandths; none
+    /// until calibrated, and Jev then allows nothing.
+    pub jev_threshold: Option<u16>,
+    /// Whether the classifier allows nothing without Jev; `true` by
+    /// default.
+    pub jev_required: bool,
     pub limits: Limits,
     /// The shared directories the window admitted (DESIGN.md §8),
     /// resolved and absolute: what every workspace instance binds.
@@ -66,6 +80,10 @@ impl Default for Client {
             title_model: DEFAULT_TITLE_MODEL.into(),
             reasoning_effort: DEFAULT_EFFORT.into(),
             allow_data_collection: false,
+            classifier_fast_model: DEFAULT_JEV_MODEL.into(),
+            classifier_model: DEFAULT_CLASSIFIER_MODEL.into(),
+            jev_threshold: None,
+            jev_required: true,
             limits: Limits::default(),
             shared: Vec::new(),
             template_shared: Vec::new(),
@@ -158,6 +176,20 @@ impl Client {
                     .into(),
                 ),
             ),
+            (
+                "classifier_fast_model".into(),
+                Json::Str(self.classifier_fast_model.clone()),
+            ),
+            (
+                "classifier_model".into(),
+                Json::Str(self.classifier_model.clone()),
+            ),
+            (
+                "jev_threshold".into(),
+                self.jev_threshold
+                    .map_or(Json::Null, |t| Json::from(u64::from(t))),
+            ),
+            ("jev_required".into(), Json::Bool(self.jev_required)),
             ("max_cost_per_turn".into(), limit(self.limits.turn)),
             (
                 "max_cost_per_conversation".into(),
@@ -212,6 +244,25 @@ impl Client {
             title_model: model_id("title_model", text("title_model")?)?,
             reasoning_effort: effort(text("reasoning_effort")?)?,
             allow_data_collection: data_collection(text("data_collection")?)?,
+            classifier_fast_model: model_id(
+                "classifier_fast_model",
+                text("classifier_fast_model")?,
+            )?,
+            classifier_model: model_id("classifier_model", text("classifier_model")?)?,
+            jev_threshold: match value.get("jev_threshold") {
+                Some(Json::Null) => None,
+                Some(t) => Some(
+                    t.as_u64()
+                        .and_then(|t| u16::try_from(t).ok())
+                        .filter(|t| JEV_THRESHOLD.contains(t))
+                        .ok_or("jev_threshold is out of range")?,
+                ),
+                None => return Err("no jev_threshold".into()),
+            },
+            jev_required: value
+                .get("jev_required")
+                .and_then(Json::as_bool)
+                .ok_or("no jev_required")?,
             limits: Limits {
                 turn: limit("max_cost_per_turn")?,
                 conversation: limit("max_cost_per_conversation")?,
@@ -306,6 +357,32 @@ pub(crate) fn effort(text: &str) -> Result<String, String> {
     }
 }
 
+/// The thresholds `jev_threshold` may be, in thousandths.
+const JEV_THRESHOLD: std::ops::RangeInclusive<u16> = 500..=1000;
+
+/// `jev_threshold`: a probability from 0.5 to 1 in at most three
+/// decimal places, in thousandths.
+fn jev_threshold(value: &Toml) -> Result<u16, String> {
+    let wrong = || {
+        format!("`jev_threshold` is a probability from 0.5 to 1 in at most three decimal places, not {value:?}")
+    };
+    let p = match value {
+        Toml::Float(p) => *p,
+        Toml::Int(1) => 1.0,
+        _ => return Err(wrong()),
+    };
+    let thousandths = (p * 1000.0).round();
+    if !p.is_finite() || (p * 1000.0 - thousandths).abs() > 1e-6 {
+        return Err(wrong());
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let thousandths = thousandths as i64;
+    u16::try_from(thousandths)
+        .ok()
+        .filter(|t| JEV_THRESHOLD.contains(t))
+        .ok_or_else(wrong)
+}
+
 fn data_collection(text: &str) -> Result<bool, String> {
     match text {
         "deny" => Ok(false),
@@ -371,10 +448,10 @@ const KEYS: &[(&str, Use)] = &[
     ("base_url", Use::Read),
     ("model", Use::Read),
     ("title_model", Use::Read),
-    ("classifier_fast_model", Use::Later(13)),
-    ("classifier_model", Use::Later(13)),
-    ("jev_threshold", Use::Later(13)),
-    ("jev_required", Use::Later(13)),
+    ("classifier_fast_model", Use::Read),
+    ("classifier_model", Use::Read),
+    ("jev_threshold", Use::Read),
+    ("jev_required", Use::Read),
     ("reasoning_effort", Use::Read),
     ("mode", Use::Read),
     ("data_collection", Use::Read),
@@ -774,6 +851,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
     for (key, slot) in [
         ("model", &mut client.model),
         ("title_model", &mut client.title_model),
+        ("classifier_fast_model", &mut client.classifier_fast_model),
+        ("classifier_model", &mut client.classifier_model),
     ] {
         if let Some(id) = text(key)? {
             *slot = model_id(key, id)?;
@@ -822,6 +901,19 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 )
             })?,
         );
+    }
+    if let Some(value) = table.get("jev_threshold") {
+        config.client.jev_threshold = Some(jev_threshold(value)?);
+    }
+    if let Some(value) = table.get("jev_required") {
+        config.client.jev_required = match value {
+            Toml::Bool(required) => *required,
+            _ => {
+                return Err(format!(
+                    "`jev_required` is `true` or `false`, not {value:?}"
+                ))
+            }
+        };
     }
     if let Some(value) = table.get("max_background") {
         config.client.max_background = match value {
@@ -1053,6 +1145,56 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// The classifier's keys (DESIGN.md §11): two models, a threshold
+    /// in thousandths from 0.5 to 1 and unset by default, and whether Jev
+    /// is required, `true` by default; each crosses to a conversation.
+    #[test]
+    fn the_classifiers_keys_are_read_and_checked() {
+        let client = Config::default().client;
+        assert_eq!(client.classifier_fast_model, "typesafe/jev-1.13");
+        assert_eq!(client.classifier_model, "openai/gpt-oss-safeguard-20b");
+        assert_eq!(client.jev_threshold, None);
+        assert!(client.jev_required);
+        let config = parse(
+            "classifier_fast_model = \"~typesafe/jev-latest\"\nclassifier_model = \"m/safe\"\n\
+             jev_threshold = 0.925\njev_required = false\n",
+        )
+        .unwrap();
+        assert!(config.notes.is_empty(), "{:?}", config.notes);
+        let client = config.client;
+        assert_eq!(client.classifier_fast_model, "~typesafe/jev-latest");
+        assert_eq!(client.classifier_model, "m/safe");
+        assert_eq!(client.jev_threshold, Some(925));
+        assert!(!client.jev_required);
+        assert_eq!(Client::from_json(&client.to_json()).unwrap(), client);
+        for (text, thousandths) in [("0.5", 500), ("1", 1000), ("1.0", 1000), ("0.999", 999)] {
+            assert_eq!(
+                parse(&format!("jev_threshold = {text}"))
+                    .unwrap()
+                    .client
+                    .jev_threshold,
+                Some(thousandths),
+                "{text}"
+            );
+        }
+        for text in [
+            "0.4999", "0.49", "1.001", "2", "0", "0.9255", "\"0.9\"", "true",
+        ] {
+            let refused = parse(&format!("jev_threshold = {text}")).unwrap_err();
+            assert!(
+                refused.contains("`jev_threshold` is a probability"),
+                "{text}: {refused}"
+            );
+        }
+        assert!(parse("jev_required = \"no\"")
+            .unwrap_err()
+            .contains("`jev_required` is `true` or `false`"));
+        assert!(parse("classifier_model = \"\"").is_err());
+        let mut value = client.to_json();
+        value.insert("jev_threshold", 400u64);
+        assert!(Client::from_json(&value).is_err());
     }
 
     #[test]

@@ -300,7 +300,7 @@ impl Supervisor {
     /// stored key, every child gets them, now or when it starts.
     pub fn reconfigure(&mut self, client: crate::config::Client) {
         if let Down::Setup { client: held, .. } = &mut self.setup {
-            *held = client;
+            **held = client;
         }
         self.resend_setup();
     }

@@ -1636,6 +1636,7 @@ pub fn run(
     let stream = td_ui::wayland::connect(endpoint)?;
     let surface = Surface::new(1280, 800, Scale::default()).map_err(|e| e.to_string())?;
     let mut app = App::new(surface, state.load_share(), config.mode)?;
+    app.set_without_jev(!config.client.jev_required);
     for note in &config.notes {
         eprintln!("td-agent: configuration: {note}");
     }
@@ -1741,7 +1742,7 @@ pub fn run(
     app.set_limits(client.limits);
     let setup = Down::Setup {
         key: key.clone(),
-        client: client.clone(),
+        client: Box::new(client.clone()),
     };
     let supervisor = Supervisor::new(program, state.root().to_path_buf(), setup);
     let fetcher = match Fetcher::start(

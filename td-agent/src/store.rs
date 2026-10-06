@@ -1045,6 +1045,9 @@ pub enum Purpose {
     Turn,
     /// A title from `title_model` after the first exchange.
     Title,
+    /// One of the classifier's stages on a pending action (DESIGN.md
+    /// §11): Jev's, or the reasoning stage's, as its head's model says.
+    Classify,
 }
 
 impl Purpose {
@@ -1052,12 +1055,14 @@ impl Purpose {
         match self {
             Self::Turn => "turn",
             Self::Title => "title",
+            Self::Classify => "classify",
         }
     }
     fn parse(word: &str) -> Option<Self> {
         match word {
             "turn" => Some(Self::Turn),
             "title" => Some(Self::Title),
+            "classify" => Some(Self::Classify),
             _ => None,
         }
     }

@@ -25,7 +25,7 @@ pub enum Down {
     /// or why there is none, and the configuration's settings.
     Setup {
         key: Result<Secret, String>,
-        client: Client,
+        client: Box<Client>,
     },
     /// The human's message, with an id the conversation logs once.
     User { delivery: String, text: String },
@@ -570,7 +570,10 @@ impl Down {
                 };
                 let client =
                     Client::from_json(value.get("client").ok_or("a setup with no client")?)?;
-                Ok(Self::Setup { key, client })
+                Ok(Self::Setup {
+                    key,
+                    client: Box::new(client),
+                })
             }
             Some("reservation") => Ok(Self::Reservation {
                 id: number(&value, "id")?,
@@ -1326,11 +1329,11 @@ mod tests {
         for down in [
             Down::Setup {
                 key: Ok(Secret::new("sk-or-v1-abc".into())),
-                client: client.clone(),
+                client: Box::new(client.clone()),
             },
             Down::Setup {
                 key: Err("no API key".into()),
-                client,
+                client: Box::new(client),
             },
             Down::Reservation {
                 id: 3,
@@ -1383,7 +1386,7 @@ mod tests {
     fn the_key_crosses_only_in_its_frame_and_never_in_debug() {
         let down = Down::Setup {
             key: Ok(Secret::new("sk-or-v1-secret".into())),
-            client: Client::default(),
+            client: Box::default(),
         };
         assert!(!format!("{down:?}").contains("sk-or-v1-secret"));
         let frame = String::from_utf8(down.encode()).unwrap();

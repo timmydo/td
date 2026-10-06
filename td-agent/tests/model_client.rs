@@ -149,7 +149,7 @@ impl Harness {
     fn setup(&mut self, client: Client) {
         let down = Down::Setup {
             key: Ok(Secret::new(KEY.into())),
-            client,
+            client: Box::new(client),
         };
         frame::write(&mut self.window, &down.encode()).unwrap();
     }
@@ -1330,7 +1330,7 @@ fn without_a_key_a_turn_says_why_and_sends_nothing() {
     let mut h = Harness::new("nokey", Role::Orchestrator, Vec::new());
     h.down(&Down::Setup {
         key: Err("no API key: write one line to /x/openrouter.key, mode 0600".into()),
-        client: Client::default(),
+        client: Box::default(),
     });
     h.say("hello");
     let (_, outcome, _) = h.turn();
@@ -3660,7 +3660,7 @@ fn a_message_between_two_conversations_wakes_the_receiver() {
     let receiver = Id::parse(&"b".repeat(32)).unwrap();
     let setup = Down::Setup {
         key: Ok(Secret::new(KEY.into())),
-        client: Client::default(),
+        client: Box::default(),
     };
     let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), setup)
         .env("XDG_RUNTIME_DIR", &runtime);
@@ -3962,6 +3962,687 @@ fn a_run_of_messages_on_a_standing_answer_goes_back_to_the_person() {
     let (_, outcome, _) = h.turn();
     assert_eq!(outcome, "replied", "{}", h.said());
     assert_eq!(h.sent.len(), 3);
+}
+
+/// The classifier (DESIGN.md §11): in `auto` mode, a crossing no rule
+/// decides goes to Jev and the reasoning stage at once, each given the
+/// same labelled state; both allowing, it runs, its approval the
+/// classifier's with Jev's probabilities; Jev not allowing at the
+/// threshold, or the reasoning stage answering in prose, it goes to a
+/// card that says why, the classifier's verdict logged before the
+/// person's.
+#[test]
+fn the_classifier_decides_a_crossing_in_auto_mode() {
+    let mut h = Harness::new_in(
+        "classifier",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-read-other.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-tool-read-other.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-tool-read-other.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-tool-read-other.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.mock.route(
+        "typesafe/jev",
+        vec![
+            Reply::ok("jev-matches.json"),
+            Reply::ok("jev-exceeds.json"),
+            Reply::ok("jev-matches.json"),
+            Reply::status(502, "error-502.json"),
+        ],
+    );
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![
+            Reply::ok("classifier-allow.json"),
+            Reply::ok("classifier-allow.json"),
+            Reply::ok("classifier-prose.json"),
+            Reply::ok("classifier-allow.json"),
+        ],
+    );
+    let other = Id::parse(&"b".repeat(32)).unwrap();
+    let (mut conversation, _) = Conversation::open(
+        &h.state,
+        &other,
+        Some(Role::Conversation),
+        Duration::from_secs(3),
+    )
+    .unwrap();
+    conversation
+        .append(Kind::User {
+            delivery: "d".repeat(32),
+            text: "the plan for the other work".into(),
+        })
+        .unwrap();
+    conversation.sync().unwrap();
+    drop(conversation);
+    h.setup(Client {
+        allow_data_collection: true,
+        jev_threshold: Some(900),
+        ..Client::default()
+    });
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    let asked = "What did the other conversation say?";
+    h.say(asked);
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let ran = results(&events);
+    assert!(
+        ran.iter()
+            .any(|r| r.1.contains("the plan for the other work")),
+        "{ran:?}"
+    );
+    let read = call_record(&events, "toolu_read_01");
+    let approval = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Kind::Approval {
+                call,
+                outcome,
+                by,
+                probabilities,
+                reason,
+            } if *call == read => Some((
+                outcome.clone(),
+                by.clone(),
+                probabilities.clone(),
+                reason.clone(),
+            )),
+            _ => None,
+        })
+        .unwrap();
+    let because = "the reasoning stage answers allow: The person asked what the other conversation said, which needs this read.";
+    assert_eq!(
+        approval,
+        (
+            "allow".to_string(),
+            "classifier".to_string(),
+            Some(
+                "request matches (matches 0.970, exceeds 0.020, unrelated 0.010); discloses 0.030"
+                    .to_string()
+            ),
+            Some(format!("Jev allows; {because}")),
+        )
+    );
+    // Jev beside the `/v1` root, the reasoning stage a chat completion,
+    // both given the same state.
+    let requests = h.mock.requests();
+    let jev = requests
+        .iter()
+        .find(|r| r.text().contains("typesafe/jev"))
+        .unwrap();
+    assert_eq!(jev.url, "https://openrouter.ai/api/alpha/decisions");
+    let body = flat(&jev.text());
+    assert_eq!(body["questions.request.type"], "choice");
+    assert_eq!(body["questions.discloses.type"], "noul");
+    assert_eq!(body["state.human.0"], asked);
+    assert_eq!(body["state.action.kind"], "read");
+    // A read carries the other conversation's content into this one.
+    assert_eq!(body["state.action.receiver.workspace"], "scratch");
+    assert_eq!(body["state.action.source.conversation"], other.as_str());
+    assert_eq!(body["state.action.source.workspace"], "none");
+    assert!(
+        !body.keys().any(|k| k.starts_with("state.calls")),
+        "{body:?}"
+    );
+    assert_eq!(body["state.policy.mode"], "auto");
+    assert!(body.contains_key("state.untrusted.title"), "{body:?}");
+    let reasoning = requests
+        .iter()
+        .find(|r| r.text().contains("gpt-oss-safeguard"))
+        .unwrap();
+    assert_eq!(
+        reasoning.url,
+        "https://openrouter.ai/api/v1/chat/completions"
+    );
+    assert!(!reasoning.stream);
+    let body = flat(&reasoning.text());
+    assert!(body["messages.0.content"].starts_with("You are td-agent's action classifier."));
+    assert_eq!(body["provider.data_collection"], "allow");
+    let state = flat(&body["messages.1.content"]);
+    assert_eq!(state["human.0"], asked);
+    assert_eq!(state["action.source.conversation"], other.as_str());
+    // Each is logged, and charged as its usage says.
+    let classified: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::Request {
+                purpose: Purpose::Classify,
+                ..
+            } => Some(e.seq),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(classified.len(), 2);
+    for request in classified {
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            Kind::Usage { request: r, basis: td_agent::store::Basis::Reported, .. } if *r == request
+        )));
+    }
+
+    // Jev not allowing at the threshold.
+    h.say("And again?");
+    let (call, _, details) = h.until_ask();
+    assert_eq!(
+        details[0],
+        format!("Asked because the classifier did not allow it: Jev does not allow at 0.900; {because}.")
+    );
+    assert_eq!(
+        details[1],
+        "Jev: request exceeds (matches 0.210, exceeds 0.740, unrelated 0.050); discloses 0.080."
+    );
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let decided: Vec<(String, String)> = approvals(&events)
+        .into_iter()
+        .filter(|a| a.0 == call)
+        .map(|a| (a.1, a.2))
+        .collect();
+    assert_eq!(
+        decided,
+        [
+            ("ask".to_string(), "classifier".to_string()),
+            ("deny".to_string(), "human".to_string())
+        ]
+    );
+
+    // The reasoning stage answering in prose.
+    h.say("Once more.");
+    let (call, _, details) = h.until_ask();
+    assert_eq!(
+        details[0],
+        "Asked because the classifier did not allow it: Jev allows; the reasoning stage gave no answer: the reasoning stage did not answer with JSON."
+    );
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(
+        approvals(&events)
+            .last()
+            .map(|a| (a.1.as_str(), a.2.as_str())),
+        Some(("allow", "human"))
+    );
+
+    // Jev failing: no answer is no allow.
+    h.say("One last time.");
+    let (call, _, details) = h.until_ask();
+    assert!(
+        details[0]
+            .starts_with("Asked because the classifier did not allow it: Jev gave no answer: "),
+        "{details:?}"
+    );
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+}
+
+/// A policy that comes while the classifier waits for its reservation
+/// is one the crossing is judged by again before it runs: a deny then
+/// refuses what both stages allowed, and what they did not, before any
+/// card could put it to the person.
+#[test]
+fn a_deny_taken_while_the_classifier_is_asked_refuses_the_crossing() {
+    let mut h = Harness::new_in(
+        "classifier-policy",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-read-other.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-tool-read-other.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.mock.route(
+        "typesafe/jev",
+        vec![Reply::ok("jev-matches.json"), Reply::ok("jev-exceeds.json")],
+    );
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![
+            Reply::ok("classifier-allow.json"),
+            Reply::ok("classifier-allow.json"),
+        ],
+    );
+    let other = Id::parse(&"b".repeat(32)).unwrap();
+    let (mut conversation, _) = Conversation::open(
+        &h.state,
+        &other,
+        Some(Role::Conversation),
+        Duration::from_secs(3),
+    )
+    .unwrap();
+    conversation
+        .append(Kind::User {
+            delivery: "d".repeat(32),
+            text: "the plan for the other work".into(),
+        })
+        .unwrap();
+    conversation.sync().unwrap();
+    drop(conversation);
+    h.setup(Client {
+        allow_data_collection: true,
+        jev_threshold: Some(900),
+        ..Client::default()
+    });
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    let me = h.id.as_str().to_string();
+    h.say("What did the other conversation say?");
+    // The turn's request's reservation, then the classifier's, with the
+    // deny sent before it is granted.
+    let mut reserved = 0;
+    while reserved < 2 {
+        match h.next() {
+            Up::Reserve { id, amount } => {
+                h.reserved.push((id, amount));
+                reserved += 1;
+                if reserved == 2 {
+                    h.down(&Down::Policy {
+                        version: 2,
+                        rules: Ok(format!("[crossings]\ndeny read {me} {other}\n")),
+                        mode: td_agent::config::Mode::Auto,
+                    });
+                }
+                h.down(&Down::Reservation { id, refusal: None });
+            }
+            Up::Event(event) => h.heard.push(event),
+            up => {
+                h.hear(&up);
+            }
+        }
+    }
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let ran = results(&events);
+    assert!(
+        ran.iter()
+            .all(|r| !r.1.contains("the plan for the other work")),
+        "{ran:?}"
+    );
+    let read = call_record(&events, "toolu_read_01");
+    let decided: Vec<(u64, String, String)> = approvals(&events)
+        .into_iter()
+        .map(|a| (a.0, a.1, a.2))
+        .collect();
+    assert_eq!(decided, [(read, "deny".to_string(), "rule".to_string())]);
+
+    // The deny lifted, then sent again while the classifier is asked,
+    // which this time does not allow: no card, the rule refuses it.
+    h.down(&Down::Policy {
+        version: 3,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    h.say("And now?");
+    let mut reserved = 0;
+    while reserved < 2 {
+        match h.next() {
+            Up::Reserve { id, amount } => {
+                h.reserved.push((id, amount));
+                reserved += 1;
+                if reserved == 2 {
+                    h.down(&Down::Policy {
+                        version: 4,
+                        rules: Ok(format!("[crossings]\ndeny read {me} {other}\n")),
+                        mode: td_agent::config::Mode::Auto,
+                    });
+                }
+                h.down(&Down::Reservation { id, refusal: None });
+            }
+            Up::Event(event) => h.heard.push(event),
+            Up::Ask { .. } => panic!("a card for a crossing a rule denies"),
+            up => {
+                h.hear(&up);
+            }
+        }
+    }
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let read = call_record(&events, "toolu_read_01");
+    let decided: Vec<(u64, String, String)> = approvals(&events)
+        .into_iter()
+        .filter(|a| a.0 == read)
+        .map(|a| (a.0, a.1, a.2))
+        .collect();
+    assert_eq!(decided, [(read, "deny".to_string(), "rule".to_string())]);
+    assert_eq!(
+        h.mock
+            .requests()
+            .iter()
+            .filter(|r| r.text().contains("typesafe/jev"))
+            .count(),
+        2
+    );
+}
+
+/// In `auto` mode a crossing the model makes a third time in a row is
+/// the person's, never the classifier's; and a crossing card waiting
+/// when its workspace goes to `auto` stays for the person.
+#[test]
+fn a_repeated_crossing_and_a_waiting_one_stay_with_the_person() {
+    let mut h = Harness::new_in(
+        "classifier-repeat",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-read-other-repeat.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-tool-read-other.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.mock.route(
+        "typesafe/jev",
+        vec![Reply::ok("jev-matches.json"), Reply::ok("jev-matches.json")],
+    );
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![
+            Reply::ok("classifier-allow.json"),
+            Reply::ok("classifier-allow.json"),
+        ],
+    );
+    let other = Id::parse(&"b".repeat(32)).unwrap();
+    drop(
+        Conversation::open(
+            &h.state,
+            &other,
+            Some(Role::Conversation),
+            Duration::from_secs(3),
+        )
+        .unwrap(),
+    );
+    h.setup(Client {
+        allow_data_collection: true,
+        jev_threshold: Some(900),
+        ..Client::default()
+    });
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    h.say("Read the other conversation.");
+    let (call, _, details) = h.until_ask();
+    assert_eq!(
+        details[0],
+        "Asked because the model made this same call, to the same tool with the same arguments, three times in a row, which may be a loop."
+    );
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(call, call_record(&events, "toolu_read_03"));
+    let decided: Vec<(u64, String, String)> = approvals(&events)
+        .into_iter()
+        .map(|a| (a.0, a.1, a.2))
+        .collect();
+    assert_eq!(
+        decided,
+        [
+            (
+                call_record(&events, "toolu_read_01"),
+                "allow".to_string(),
+                "classifier".to_string()
+            ),
+            (
+                call_record(&events, "toolu_read_02"),
+                "allow".to_string(),
+                "classifier".to_string()
+            ),
+            (call, "deny".to_string(), "human".to_string()),
+        ]
+    );
+    let asked = |h: &Harness| {
+        h.mock
+            .requests()
+            .iter()
+            .filter(|r| r.text().contains("typesafe/jev"))
+            .count()
+    };
+    assert_eq!(asked(&h), 2);
+
+    // In `ask` mode, a card; the workspace going to `auto` leaves it.
+    let here = format!("conversation {}", h.id.as_str());
+    h.down(&Down::Policy {
+        version: 2,
+        rules: Ok(format!("[{here}]\nmode ask\n")),
+        mode: td_agent::config::Mode::Auto,
+    });
+    h.say("Again.");
+    let (call, _, _) = h.until_ask();
+    h.down(&Down::Policy {
+        version: 3,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let decided: Vec<(String, String)> = approvals(&events)
+        .into_iter()
+        .filter(|a| a.0 == call)
+        .map(|a| (a.1, a.2))
+        .collect();
+    assert_eq!(decided, [("allow".to_string(), "human".to_string())]);
+    assert_eq!(asked(&h), 2);
+}
+
+/// With Jev unavailable, `data_collection` being `deny`: a crossing is
+/// the person's while Jev is required, and the reasoning stage's alone
+/// when not; nothing is asked of Jev either way.
+#[test]
+fn without_jev_the_classifier_allows_only_when_jev_is_not_required() {
+    let mut h = Harness::new_in(
+        "classifier-alone",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-read-other.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-tool-read-other.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![Reply::ok("classifier-allow.json")],
+    );
+    let other = Id::parse(&"b".repeat(32)).unwrap();
+    drop(
+        Conversation::open(
+            &h.state,
+            &other,
+            Some(Role::Conversation),
+            Duration::from_secs(3),
+        )
+        .unwrap(),
+    );
+    h.setup(Client::default());
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    h.say("What did the other conversation say?");
+    let (call, _, details) = h.until_ask();
+    assert_eq!(
+        details[0],
+        "Asked because the classifier did not allow it: Jev is unavailable, and `jev_required`: `data_collection = \"deny\"` leaves it no provider."
+    );
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    // The process takes a new setup as it comes.
+    h.setup(Client {
+        jev_required: false,
+        ..Client::default()
+    });
+    h.say("Try again.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let read = call_record(&events, "toolu_read_01");
+    let decided = approvals(&events)
+        .into_iter()
+        .rfind(|a| a.0 == read)
+        .unwrap();
+    assert_eq!(
+        (decided.1.as_str(), decided.2.as_str()),
+        ("allow", "classifier")
+    );
+    assert!(decided
+        .3
+        .unwrap()
+        .starts_with("Jev is unavailable: `data_collection = \"deny\"` leaves it no provider; the reasoning stage answers allow: "));
+    assert!(h
+        .mock
+        .requests()
+        .iter()
+        .all(|r| !r.text().contains("typesafe/jev")));
+}
+
+/// The classifier allowing messages sends three to one conversation
+/// since the human last wrote; the fourth, in a turn a peer's message
+/// began, goes to a card that says why, not to the classifier.
+#[test]
+fn a_run_of_messages_the_classifier_allows_goes_back_to_the_person() {
+    let mut script = vec![
+        Reply::sse("stream-tool-send.sse"),
+        Reply::sse("stream-sonnet.sse"),
+        Reply::ok("title.json"),
+    ];
+    // Two messages in turn, so no run of identical calls is a loop.
+    for n in 0..3 {
+        script.push(Reply::sse(if n % 2 == 0 {
+            "stream-tool-send-other.sse"
+        } else {
+            "stream-tool-send.sse"
+        }));
+        script.push(Reply::sse("stream-sonnet.sse"));
+    }
+    let mut h = Harness::new_in(
+        "classifier-run",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        script,
+    );
+    h.mock
+        .route("typesafe/jev", vec![Reply::ok("jev-matches.json"); 3]);
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![Reply::ok("classifier-allow.json"); 3],
+    );
+    let other = Id::parse(&"b".repeat(32)).unwrap();
+    drop(
+        Conversation::open(
+            &h.state,
+            &other,
+            Some(Role::Conversation),
+            Duration::from_secs(3),
+        )
+        .unwrap(),
+    );
+    h.setup(Client {
+        allow_data_collection: true,
+        jev_threshold: Some(900),
+        ..Client::default()
+    });
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    h.say("Tell the other conversation.");
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    for n in 1..=2 {
+        h.down(&Down::Message {
+            delivery: td_agent::store::random_hex(16).unwrap(),
+            from: other.clone(),
+            role: Role::Conversation,
+            text: format!("reply {n}"),
+            status: None,
+        });
+        let (_, outcome, _) = h.turn();
+        assert_eq!(outcome, "replied", "{}", h.said());
+    }
+    assert_eq!(h.sent.len(), 3, "{:?}", h.sent);
+    h.down(&Down::Message {
+        delivery: td_agent::store::random_hex(16).unwrap(),
+        from: other.clone(),
+        role: Role::Conversation,
+        text: "reply 3".into(),
+        status: None,
+    });
+    let (call, _, details) = h.until_ask();
+    assert!(
+        details[0].starts_with("Asked because this conversation has sent that one 3 messages"),
+        "{details:?}"
+    );
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(h.sent.len(), 3);
+    assert_eq!(
+        h.mock
+            .requests()
+            .iter()
+            .filter(|r| r.text().contains("typesafe/jev"))
+            .count(),
+        3
+    );
 }
 
 /// The human's standing answer for a crossing (DESIGN.md §3, §11) is

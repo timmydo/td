@@ -567,6 +567,9 @@ pub struct App {
     /// Each workspace's mode as the human's rules set it, by its key;
     /// none while the rules cannot be read, every workspace then `ask`.
     modes: Option<Vec<(String, Mode)>>,
+    /// `jev_required = false`: the classifier may allow on its reasoning
+    /// stage alone, which the status row says (DESIGN.md §11).
+    without_jev: bool,
     /// td-agent's notes, which the Messages window shows.
     log: crate::notes::Log,
     /// Each row's workspace as the list's third column names it.
@@ -743,6 +746,7 @@ impl App {
             capture: None,
             mode,
             modes: Some(Vec::new()),
+            without_jev: false,
             log: crate::notes::Log::default(),
             labels: Vec::new(),
             show_archived: false,
@@ -976,11 +980,22 @@ impl App {
             .map(|c| format!(" | {c}"))
             .unwrap_or_default();
         format!(
-            "{state}{retry}{keyless}{unread}{card} | {model} {effort} | {context} | cost {}{today}{credit} | mode {} | no limits | {} background",
+            "{state}{retry}{keyless}{unread}{card} | {model} {effort} | {context} | cost {}{today}{credit} | mode {}{} | no limits | {} background",
             of(self.meter.spent, self.limits.conversation),
             self.shown_mode().word(),
+            if self.without_jev {
+                ", classifier without Jev"
+            } else {
+                ""
+            },
             self.processes.values().map(Vec::len).sum::<usize>()
         )
+    }
+
+    /// Whether the classifier may allow without Jev.
+    pub fn set_without_jev(&mut self, without: bool) {
+        self.without_jev = without;
+        self.touch();
     }
 
     /// Each workspace's mode as the human's rules set it, or none while
@@ -6946,6 +6961,14 @@ pub mod tests {
         );
         app.set_modes(None);
         assert!(app.status_line().contains("| mode ask |"));
+        app.set_without_jev(true);
+        assert!(
+            app.status_line()
+                .contains("| mode ask, classifier without Jev |"),
+            "{}",
+            app.status_line()
+        );
+        app.set_without_jev(false);
         // No workspace: `ask`, and nothing to set.
         app.set_modes(Some(Vec::new()));
         app.add_row(row(8, 2));

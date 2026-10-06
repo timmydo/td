@@ -1,0 +1,1 @@
+{"id":"gen-dec-1759400102-Jv5gH6iJ7kL8","model":"typesafe/jev-1.13-20260801","provider":"TypeSafe","answers":{"request":{"type":"choice","choice":"exceeds","confidence":0.71,"probabilities":{"matches":0.21,"exceeds":0.74,"unrelated":0.05}},"discloses":{"type":"noul","noul":0.08}},"usage":{"input_tokens":1236,"output_tokens":0,"cost":0.0000519}}

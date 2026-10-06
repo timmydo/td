@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 use crate::accounts;
 use crate::assemble::Assembly;
 use crate::bench::Bench;
+use crate::classifier;
 use crate::client::{self, Completion, Failure, Params};
 use crate::config::Client;
 use crate::cost;
@@ -870,7 +871,7 @@ impl Session {
                 Some(Work::Down(down)) => down,
             };
             match down {
-                Down::Setup { key, client } => self.setup = Some((key, client)),
+                Down::Setup { key, client } => self.setup = Some((key, *client)),
                 Down::Policy {
                     version,
                     rules,
@@ -1581,7 +1582,10 @@ impl Session {
                     let repeated = repeats(self.conversation.events(), reply, at) + 1 >= REPEATS;
                     self.host(started, &call.name, hosted, acts, repeated)?
                 }
-                Ok(args) => (self.run(started, args)?, Beside::default()),
+                Ok(args) => {
+                    let repeated = repeats(self.conversation.events(), reply, at) + 1 >= REPEATS;
+                    (self.run(started, args, repeated)?, Beside::default())
+                }
                 Err(why) => (Err(why), Beside::default()),
             };
             let (content, error) = match answer {
@@ -3065,7 +3069,12 @@ impl Session {
                                 why.unwrap_or_else(|| RULES_CHANGED.into()),
                             ))))
                         }
-                        Some(Ruling::Auto) => break Some(Err(Ok(("mode", AUTO.into())))),
+                        // A crossing's `auto` is the classifier's, and a
+                        // card it waits on stays.
+                        Some(Ruling::Auto) if matches!(judged, Some(Judged::Host { .. })) => {
+                            break Some(Err(Ok(("mode", AUTO.into()))))
+                        }
+                        Some(Ruling::Auto) => {}
                         Some(Ruling::Card(_)) | None => {}
                     }
                 }
@@ -3145,19 +3154,18 @@ impl Session {
                     }
                 };
                 let me = self.conversation.meta().id.as_str();
+                // A run of messages to one conversation with no word from
+                // the human goes back to them: two standing answers, or two
+                // classifiers, could otherwise keep two conversations
+                // messaging each other.
+                let braked = op == crate::rules::Crossed::Message
+                    && unasked(self.conversation.events(), to) > MESSAGES_UNASKED;
                 return match crate::rules::cross(&policy.crossings, op, me, to) {
                     crate::rules::Verdict::Deny(why) => Ruling::Deny(tools::visible(&why)),
-                    // A run of messages to one conversation with no word
-                    // from the human goes back to them: two standing
-                    // answers could otherwise keep two conversations
-                    // messaging each other.
-                    crate::rules::Verdict::Allow(_)
-                        if op == crate::rules::Crossed::Message
-                            && unasked(self.conversation.events(), to) > MESSAGES_UNASKED =>
-                    {
-                        Ruling::Card(Some(UNASKED.into()))
-                    }
+                    _ if braked => Ruling::Card(Some(UNASKED.into())),
                     crate::rules::Verdict::Allow(why) => Ruling::Run(Some(tools::visible(&why))),
+                    // The table: `auto`'s column is the classifier's.
+                    _ if self.workspace_mode() == crate::config::Mode::Auto => Ruling::Auto,
                     _ => Ruling::Card(None),
                 };
             }
@@ -3182,7 +3190,12 @@ impl Session {
     /// Runs one call, the `ToolCall` record `started`: the tool's answer,
     /// or why it failed, which the model is told; an error of the log's
     /// own ends the process.
-    fn run(&mut self, started: u64, args: Args) -> Result<Result<String, String>, String> {
+    fn run(
+        &mut self,
+        started: u64,
+        args: Args,
+        repeated: bool,
+    ) -> Result<Result<String, String>, String> {
         Ok(match args {
             Args::Todo(items) => {
                 let text = tools::todo_text(&items);
@@ -3194,7 +3207,13 @@ impl Session {
             }
             Args::Search(search) => {
                 let reach = Reach::Search(&search.query);
-                match self.cross(started, search.conversation.as_ref(), Op::Read, reach)? {
+                match self.cross(
+                    started,
+                    search.conversation.as_ref(),
+                    Op::Read,
+                    reach,
+                    repeated,
+                )? {
                     Ok(other) => self.with_log(other.as_ref(), |events| {
                         Ok(history::search(
                             events,
@@ -3213,7 +3232,13 @@ impl Session {
                     count: read.count,
                     max_bytes: read.max_bytes,
                 };
-                match self.cross(started, read.conversation.as_ref(), Op::Read, reach)? {
+                match self.cross(
+                    started,
+                    read.conversation.as_ref(),
+                    Op::Read,
+                    reach,
+                    repeated,
+                )? {
                     Ok(other) => self.with_log(other.as_ref(), |events| {
                         history::read(events, read.from, read.offset, read.count, read.max_bytes)
                     }),
@@ -3232,7 +3257,8 @@ impl Session {
                 self.process_wait(number, Duration::from_millis(timeout_ms))
             }
             Args::Send { to, text } => {
-                match self.cross(started, Some(&to), Op::Message, Reach::Message(&text))? {
+                let reach = Reach::Message(&text);
+                match self.cross(started, Some(&to), Op::Message, reach, repeated)? {
                     Ok(_) => self.post(to, text),
                     Err(why) => Err(why),
                 }
@@ -3249,15 +3275,18 @@ impl Session {
 
     /// Whether the call `started` may reach conversation `target` for
     /// `op`, as `reach` says (DESIGN.md §3, §11): another conversation,
-    /// when one the store holds and the human allows it on a card; none
-    /// when it is this one or none is named; else why not, which the call
-    /// is answered with. An error of the log's own ends the process.
+    /// when one the store holds and a standing answer, the classifier in
+    /// `auto` mode, or the human on a card allows it; none when it is this
+    /// one or none is named; else why not, which the call is answered
+    /// with. A `repeated` call is the human's. An error of the log's own
+    /// ends the process.
     fn cross(
         &mut self,
         started: u64,
         target: Option<&Id>,
         op: Op,
         reach: Reach,
+        repeated: bool,
     ) -> Result<Result<Option<Id>, String>, String> {
         let Some(target) = target else {
             return Ok(Ok(None));
@@ -3281,12 +3310,20 @@ impl Session {
             op,
             to: target.as_str(),
         };
-        // Until a decision holds, as a host call's.
+        // Until a decision holds, as a host call's, judged again when a
+        // policy comes after the one it was judged by: one taken while
+        // the classifier was asked included.
+        let mut ruled_at = self.human.0;
         let mut ruling = self.ruling(&judged);
         loop {
             let mut human = false;
-            let mut allowed: Option<Option<String>> = None;
-            match ruling {
+            // Who let it run, Jev's probabilities and why, logged once the
+            // decision holds.
+            let mut allowed: Option<(&str, Option<String>, Option<String>)> = None;
+            // The card's reason, and Jev's probabilities when the
+            // classifier asked.
+            let mut jev = None;
+            let card = match ruling {
                 Ruling::Deny(why) => {
                     self.log(Kind::Approval {
                         call: started,
@@ -3297,16 +3334,48 @@ impl Session {
                     })?;
                     return Ok(Err(ruled(&why)));
                 }
-                // Logged once the decision holds.
-                Ruling::Run(why) => allowed = Some(why),
-                // A crossing is never the mode's: `auto` gives it the
-                // classifier, which until it lands is the human.
-                ruling @ (Ruling::Card(_) | Ruling::Auto) => {
-                    let asked = match ruling {
-                        Ruling::Card(asked) => asked,
-                        _ => None,
-                    };
+                Ruling::Run(why) => {
+                    allowed = Some(("rule", None, why));
+                    None
+                }
+                // `auto`'s column is the classifier's (DESIGN.md §11), but
+                // a repeated call is the human's.
+                Ruling::Auto if repeated => Some(Some(REPEATED_WHY.to_string())),
+                Ruling::Auto => {
+                    let outcome = self.classify(&meta, reach)?;
+                    // A policy taken while it was asked is judged first:
+                    // a deny in force is never put to the person.
+                    if self.human.0 != ruled_at {
+                        ruled_at = self.human.0;
+                        ruling = self.ruling(&judged);
+                        continue;
+                    }
+                    if outcome.allow {
+                        allowed = Some(("classifier", outcome.probabilities, Some(outcome.reason)));
+                        None
+                    } else {
+                        self.log(Kind::Approval {
+                            call: started,
+                            outcome: "ask".into(),
+                            by: "classifier".into(),
+                            probabilities: outcome.probabilities.clone(),
+                            reason: Some(outcome.reason.clone()),
+                        })?;
+                        jev = outcome.probabilities;
+                        Some(Some(format!(
+                            "the classifier did not allow it: {}",
+                            outcome.reason
+                        )))
+                    }
+                }
+                Ruling::Card(asked) => Some(asked),
+            };
+            if let Some(asked) = card {
+                {
                     let (title, mut details) = tools::crossing_card(target, &meta.title, reach);
+                    if let Some(jev) = &jev {
+                        details.insert(0, format!("Jev: {jev}."));
+                    }
                     if let Some(why) = &asked {
                         details.insert(0, format!("Asked because {why}."));
                     }
@@ -3315,14 +3384,17 @@ impl Session {
                         op,
                         to: target.as_str().to_string(),
                     });
-                    match self.decide(
+                    let decided = self.decide(
                         started,
                         title,
                         details,
                         asked.as_deref(),
                         always,
                         Some(&judged),
-                    )? {
+                    )?;
+                    // The card was judged again at every policy it saw.
+                    ruled_at = self.human.0;
+                    match decided {
                         Decided::Allowed => human = true,
                         Decided::Released => {}
                         Decided::Refused => return Ok(Err(CALL_REFUSED.into())),
@@ -3333,12 +3405,12 @@ impl Session {
             }
             // An interrupt that came with the decision, or before it; a
             // deny taken since.
-            let decided_at = self.human.0;
             self.hear();
             if self.interrupt {
                 return Ok(Err(CALL_SKIPPED.into()));
             }
-            if self.human.0 != decided_at {
+            if self.human.0 != ruled_at {
+                ruled_at = self.human.0;
                 match self.ruling(&judged) {
                     Ruling::Deny(why) => {
                         self.log(Kind::Approval {
@@ -3357,12 +3429,12 @@ impl Session {
                     _ => {}
                 }
             }
-            if let Some(why) = allowed {
+            if let Some((by, probabilities, why)) = allowed {
                 self.log(Kind::Approval {
                     call: started,
                     outcome: "allow".into(),
-                    by: "rule".into(),
-                    probabilities: None,
+                    by: by.into(),
+                    probabilities,
                     reason: why,
                 })?;
             }
@@ -3934,21 +4006,376 @@ impl Session {
                 }
             }
             Err(failure) => {
-                let (usage, cost) = match &failure {
-                    Failure::Retryable { usage, .. } => match usage {
-                        Some(client::Usage {
-                            cost: Some(cost), ..
-                        }) => (*usage, (*cost, Basis::Reported)),
-                        _ => (*usage, (reserved, Basis::Reserved)),
-                    },
-                    _ => (None, (0, Basis::Nothing)),
-                };
+                let (usage, cost) = failed_cost(&failure, reserved);
                 (usage, cost, failure.outcome())
             }
         };
         self.settle(request.seq, usage, cost, outcome)?;
         self.spent(id, cost.0);
         Ok(())
+    }
+
+    /// The classifier on this conversation reaching conversation `to` as
+    /// `reach` says (DESIGN.md §11): Jev and the reasoning stage asked at
+    /// once, each request reserved, logged and settled as a title's is,
+    /// and what the two came to. Whatever stops a stage from being asked
+    /// leaves the action to the human, said in the outcome's reason.
+    fn classify(&mut self, to: &store::Meta, reach: Reach) -> Result<classifier::Outcome, String> {
+        let refused = |reason: String| classifier::Outcome {
+            allow: false,
+            probabilities: None,
+            reason,
+        };
+        let Some((Ok(key), client)) = self.setup.clone() else {
+            return Ok(refused("there is no key to ask it with".into()));
+        };
+        let Some(turn) = self
+            .conversation
+            .events()
+            .iter()
+            .rev()
+            .find_map(|e| matches!(e.kind, Kind::Started { .. }).then_some(e.seq))
+        else {
+            return Ok(refused("no turn is under way".into()));
+        };
+        // Jev, when it can be asked: its endpoint and price.
+        let jev = if !client.allow_data_collection {
+            Err("`data_collection = \"deny\"` leaves it no provider".to_string())
+        } else if client.jev_threshold.is_none() {
+            Err(
+                "`jev_threshold` is not set, and none is shipped until one is calibrated"
+                    .to_string(),
+            )
+        } else {
+            match classifier::jev_url(&client.base_url) {
+                None => Err(
+                    "`base_url` does not end in `/v1`, beside which Jev's endpoint is".to_string(),
+                ),
+                Some(url) => self
+                    .model(
+                        "`classifier_fast_model`",
+                        &client.classifier_fast_model,
+                        &client,
+                    )
+                    .map(|model| (url, model.and_then(|m| m.pricing))),
+            }
+        };
+        if let (Err(why), true) = (&jev, client.jev_required) {
+            return Ok(refused(format!(
+                "Jev is unavailable, and `jev_required`: {why}"
+            )));
+        }
+        let model = match self.model("`classifier_model`", &client.classifier_model, &client) {
+            Ok(model) => model,
+            Err(why) => {
+                return Ok(refused(format!(
+                    "the reasoning stage cannot be asked: {why}"
+                )))
+            }
+        };
+        if model.as_ref().is_some_and(|m| !m.supports("max_tokens")) {
+            return Ok(refused(format!(
+                "{} takes no max_tokens; set `classifier_model` to a model that does",
+                client.classifier_model
+            )));
+        }
+        if let Reach::Message(text) | Reach::Search(text) = reach {
+            if text.len() > classifier::MAX_PAYLOAD {
+                return Ok(refused(format!(
+                    "what it carries is longer than the {} bytes it is shown",
+                    classifier::MAX_PAYLOAD
+                )));
+            }
+        }
+        let state = self.classifier_state(to, reach, &client);
+        let head = classifier::reasoning_head(&client, &state);
+        let bytes = head.len() as u64 + 2;
+        let pricing = model.as_ref().and_then(|m| m.pricing);
+        let reserved = pricing.map_or(0, |p| {
+            p.reserve(bytes.div_ceil(4), classifier::REASONING_TOKENS)
+        });
+        // Jev's request: its body, without braces, as a head; billed by
+        // its input alone.
+        let jev = jev.map(|(url, pricing)| {
+            let body = classifier::jev_body(&client.classifier_fast_model, &state);
+            let head = body
+                .strip_prefix('{')
+                .and_then(|b| b.strip_suffix('}'))
+                .unwrap_or_default()
+                .to_string();
+            let bytes = head.len() as u64 + 2;
+            let reserved = pricing.map_or(0, |p| p.reserve(bytes.div_ceil(4), 0));
+            (url, pricing, head, bytes, reserved)
+        });
+        let total = reserved.saturating_add(jev.as_ref().map_or(0, |j| j.4));
+        let events = self.conversation.events();
+        let within = cost::within(
+            "max_cost_per_turn",
+            client.limits.turn,
+            accounts::turn_spent(events, turn),
+            total,
+        )
+        .and_then(|()| {
+            cost::within(
+                "max_cost_per_conversation",
+                client.limits.conversation,
+                accounts::spent(events),
+                total,
+            )
+        })
+        .and_then(|()| self.reserve(total));
+        let id = match within {
+            Ok(id) => id,
+            Err(why) => return Ok(refused(format!("it was not asked: {why}"))),
+        };
+        let reasoning_request = self
+            .log(Kind::Request {
+                turn,
+                purpose: Purpose::Classify,
+                prefix: 0,
+                head: head.clone(),
+                bytes,
+                reserved,
+            })?
+            .seq;
+        let jev = match jev {
+            Ok((url, pricing, head, bytes, reserved)) => {
+                let request = self
+                    .log(Kind::Request {
+                        turn,
+                        purpose: Purpose::Classify,
+                        prefix: 0,
+                        head: head.clone(),
+                        bytes,
+                        reserved,
+                    })?
+                    .seq;
+                Ok((url, pricing, head, reserved, request))
+            }
+            Err(why) => Err(why),
+        };
+        self.sync()?;
+        // The two at once: Jev on a thread of its own.
+        let asked = jev.as_ref().ok().map(|(url, _, head, _, _)| {
+            let (url, body, key) = (url.clone(), format!("{{{head}}}"), key.clone());
+            std::thread::Builder::new().spawn(move || {
+                let headers = client::headers(key.expose());
+                let headers: Vec<(&str, &str)> =
+                    headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
+                td_fetch_client::post(&url, &headers, body.as_bytes(), Some(client::MAX_REPLY))
+            })
+        });
+        let answer = client::classify(post(&client, &key, &format!("{{{head}}}")));
+        let replied = asked.map(|spawned| match spawned {
+            Ok(thread) => thread.join().unwrap_or_else(|_| {
+                Err(td_fetch_client::Error::Io(
+                    "the thread asking Jev failed".into(),
+                ))
+            }),
+            // Never sent, so nothing is charged.
+            Err(e) => Err(td_fetch_client::Error::Refused(format!(
+                "no thread could ask Jev: {e}"
+            ))),
+        });
+        let (verdict, usage, cost, outcome) = match answer {
+            Ok(completion) => {
+                let cost = charge(completion.usage, pricing, reserved);
+                let verdict = classifier::reasoning_verdict(
+                    completion.content.as_deref().unwrap_or_default(),
+                );
+                let outcome = match &verdict {
+                    Ok((verdict, _)) => format!("answered {}", verdict.word()),
+                    Err(why) => why.clone(),
+                };
+                (verdict, completion.usage, cost, outcome)
+            }
+            Err(failure) => {
+                let (usage, cost) = failed_cost(&failure, reserved);
+                (
+                    Err(format!("its request failed: {}", failure.outcome())),
+                    usage,
+                    cost,
+                    failure.outcome(),
+                )
+            }
+        };
+        self.settle(reasoning_request, usage, cost, outcome)?;
+        let mut spent = cost.0;
+        let fast = match (jev, replied) {
+            (Err(why), _) => classifier::Fast::Unavailable(why),
+            (Ok((_, pricing, _, reserved, request)), Some(replied)) => {
+                let (fast, usage, cost, outcome) = match client::reply(replied) {
+                    Ok((value, _)) => {
+                        let usage = classifier::jev_usage(&value);
+                        let cost = charge(usage, pricing, reserved);
+                        match classifier::jev_answers(&value) {
+                            Ok(jev) => (
+                                classifier::Fast::Answered(jev),
+                                usage,
+                                cost,
+                                "answered".to_string(),
+                            ),
+                            Err(why) => (classifier::Fast::Failed(why.clone()), usage, cost, why),
+                        }
+                    }
+                    Err(failure) => {
+                        let (usage, cost) = failed_cost(&failure, reserved);
+                        (
+                            classifier::Fast::Failed(failure.outcome()),
+                            usage,
+                            cost,
+                            failure.outcome(),
+                        )
+                    }
+                };
+                self.settle(request, usage, cost, outcome)?;
+                spent = spent.saturating_add(cost.0);
+                fast
+            }
+            (Ok(_), None) => classifier::Fast::Failed("it was not asked".into()),
+        };
+        self.spent(id, spent);
+        Ok(classifier::combine(
+            &fast,
+            client.jev_required,
+            client.jev_threshold,
+            &verdict,
+        ))
+    }
+
+    /// The state the classifier sees of this conversation reaching `to`
+    /// as `reach` says (DESIGN.md §11): the person's messages, this
+    /// workspace's rules, the calls made by tool and path, the action and
+    /// both sides, and what a model wrote apart, untrusted.
+    fn classifier_state(&self, to: &store::Meta, reach: Reach, client: &Client) -> td_json::Json {
+        use td_json::Json;
+        let events = self.conversation.events();
+        let human: Vec<String> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Kind::User { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        let calls: Vec<(String, Option<String>)> = events
+            .iter()
+            .flat_map(|e| match &e.kind {
+                Kind::Assistant { calls, .. } => calls.as_slice(),
+                _ => &[],
+            })
+            .map(|call| {
+                let path = td_json::parse_slice(call.arguments.as_bytes())
+                    .ok()
+                    .and_then(|a| a.get("path").and_then(Json::as_str).map(str::to_string));
+                let tool = if tools::known(&call.name) {
+                    call.name.clone()
+                } else {
+                    "an unknown tool".to_string()
+                };
+                (tool, path)
+            })
+            .collect();
+        let (rules, _) = self.rules();
+        let policy = Json::Obj(vec![
+            (
+                "mode".into(),
+                Json::Str(self.workspace_mode().word().into()),
+            ),
+            (
+                "rules".into(),
+                Json::Arr(
+                    rules
+                        .iter()
+                        .map(|one| Json::Str(format!("{} ({})", one.rule.text(), one.from)))
+                        .collect(),
+                ),
+            ),
+        ]);
+        let side = |meta: &store::Meta| classifier::Side {
+            conversation: meta.id.as_str().to_string(),
+            workspace: match &meta.workspace {
+                None => "none".into(),
+                Some(Workspace::Scratch) => "scratch".into(),
+                Some(Workspace::Template(name)) => format!("template {name}"),
+                Some(Workspace::Directory(path)) => format!("directory {}", path.display()),
+                Some(Workspace::Repositories(r)) => {
+                    format!("repositories of template {}", r.template)
+                }
+            },
+            remotes: match &meta.workspace {
+                Some(Workspace::Repositories(r)) => {
+                    r.entries.iter().map(|e| e.remote.clone()).collect()
+                }
+                _ => Vec::new(),
+            },
+            model: meta.model.clone().unwrap_or_else(|| client.model.clone()),
+        };
+        let (action, detail, payload) = match reach {
+            Reach::Message(text) => (
+                "message",
+                format!("send a message to conversation {}, starting a turn there", to.id),
+                Some(("message", text.to_string())),
+            ),
+            Reach::Search(query) => (
+                "search",
+                format!("search conversation {}'s whole log; what it finds comes into this conversation", to.id),
+                Some(("query", query.to_string())),
+            ),
+            Reach::Read {
+                from,
+                offset,
+                count,
+                max_bytes,
+            } => (
+                "read",
+                format!("read conversation {}'s log, up to {count} events and {max_bytes} bytes from event {from}, {offset} bytes in; what it reads comes into this conversation", to.id),
+                None,
+            ),
+        };
+        let mut untrusted = vec![("title", to.title.clone())];
+        // What other conversations sent this one, the latest few.
+        let received: Vec<&str> = events
+            .iter()
+            .rev()
+            .filter_map(|e| match &e.kind {
+                Kind::Message { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .take(4)
+            .collect();
+        if !received.is_empty() {
+            untrusted.push(("received", received.join("\n---\n")));
+        }
+        // Where the content comes from and goes: a message carries this
+        // conversation's, a read or a search the other's.
+        let (here, there) = (side(self.conversation.meta()), side(to));
+        let (source, receiver) = match reach {
+            Reach::Message(_) => (here, there),
+            Reach::Search(_) | Reach::Read { .. } => (there, here),
+        };
+        let pending = classifier::Pending {
+            action,
+            source,
+            receiver,
+            detail,
+            payload,
+            untrusted,
+        };
+        classifier::state(&human, policy, &calls, &pending)
+    }
+}
+
+/// What a failed request is charged: a retryable one its reported cost,
+/// else its reservation; a refused one nothing.
+fn failed_cost(failure: &Failure, reserved: u64) -> (Option<client::Usage>, (u64, Basis)) {
+    match failure {
+        Failure::Retryable { usage, .. } => match usage {
+            Some(client::Usage {
+                cost: Some(cost), ..
+            }) => (*usage, (*cost, Basis::Reported)),
+            _ => (*usage, (reserved, Basis::Reserved)),
+        },
+        _ => (None, (0, Basis::Nothing)),
     }
 }
 
@@ -4250,6 +4677,8 @@ const REPEATS: usize = 3;
 
 /// What such a call's card says first.
 const REPEATED: &str = "Asked because the model made this same call, to the same tool with the same arguments, three times in a row, which may be a loop.";
+/// Why a repeated crossing goes to the human in `auto` mode.
+const REPEATED_WHY: &str = "the model made this same call, to the same tool with the same arguments, three times in a row, which may be a loop";
 
 /// How many calls just before call `at` of reply `reply` in `events` were
 /// to the same tool with the same arguments, in a row: back through the
@@ -4447,7 +4876,7 @@ mod tests {
     fn keyless(stream: &mut UnixStream) {
         let down = Down::Setup {
             key: Err("no API key: write one".into()),
-            client: Client::default(),
+            client: Box::default(),
         };
         frame::write(stream, &down.encode()).unwrap();
     }
@@ -4553,7 +4982,7 @@ mod tests {
         assert_eq!(outcome(&mut window), "no API key: write one");
         let down = Down::Setup {
             key: Ok(Secret::new("sk-or-v1-stored".into())),
-            client: Client::default(),
+            client: Box::default(),
         };
         frame::write(&mut window, &down.encode()).unwrap();
         say(&mut window, D2, "two");
@@ -4579,7 +5008,7 @@ mod tests {
         };
         let setup = Down::Setup {
             key: Ok(Secret::new("sk-or-v1-stored".into())),
-            client: Client::default(),
+            client: Box::default(),
         };
         let pause = Down::Pause { paused: true };
         let choose = |effort: &str| Down::Choose {

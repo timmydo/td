@@ -73,7 +73,7 @@ pub struct Params<'a> {
 
 /// `provider`: never routed to a provider that would drop a parameter,
 /// and data collection as configured.
-fn provider(client: &Client) -> Json {
+pub(crate) fn provider(client: &Client) -> Json {
     Json::Obj(vec![
         ("require_parameters".into(), Json::Bool(true)),
         (
@@ -91,7 +91,7 @@ fn provider(client: &Client) -> Json {
 }
 
 /// An object's members without its braces, to be spliced.
-fn members(object: Json) -> String {
+pub(crate) fn members(object: Json) -> String {
     let text = object.to_string();
     text.strip_prefix('{')
         .and_then(|t| t.strip_suffix('}'))
@@ -440,7 +440,8 @@ pub fn body(events: &[Event], index: usize, prefix_file: &str) -> Result<String,
         return Err(format!("event {} is not a request", event.seq));
     };
     match purpose {
-        Purpose::Title => Ok(format!("{{{head}}}")),
+        // A side request's head holds its whole body.
+        Purpose::Title | Purpose::Classify => Ok(format!("{{{head}}}")),
         Purpose::Turn => {
             let before = events.get(..index).unwrap_or_default();
             let prefix = prefix_text(before, prefix_file, *prefix)
@@ -648,6 +649,15 @@ fn unsent(error: &td_fetch_client::Error) -> bool {
 pub fn classify(
     result: Result<td_fetch_client::Response, td_fetch_client::Error>,
 ) -> Result<Completion, Failure> {
+    let (value, body) = reply(result)?;
+    completion(&value, &body)
+}
+
+/// A request's reply, a 200 with no error object, as JSON and its
+/// bytes; else what it came to, as `classify` says.
+pub fn reply(
+    result: Result<td_fetch_client::Response, td_fetch_client::Error>,
+) -> Result<(Json, Vec<u8>), Failure> {
     let response = match result {
         Ok(response) => response,
         Err(e) if unsent(&e) => {
@@ -698,13 +708,18 @@ pub fn classify(
             usage: usage(&value),
         });
     }
+    Ok((value, response.body))
+}
+
+/// A reply's completion, from its JSON and bytes: its first choice.
+fn completion(value: &Json, body: &[u8]) -> Result<Completion, Failure> {
     let choice = value
         .get("choices")
         .and_then(|c| c.index(0))
         .ok_or_else(|| Failure::Retryable {
             status: Some(200),
             message: "a reply with no choices".into(),
-            usage: usage(&value),
+            usage: usage(value),
         })?;
     let finish = match choice.get("finish_reason") {
         Some(Json::Str(reason)) => reason.clone(),
@@ -715,20 +730,20 @@ pub fn classify(
         return Err(Failure::Retryable {
             status: code.or(Some(200)),
             message,
-            usage: usage(&value),
+            usage: usage(value),
         });
     }
     if finish == "error" {
         return Err(Failure::Retryable {
             status: Some(200),
             message: "the provider ended the completion with an error".into(),
-            usage: usage(&value),
+            usage: usage(value),
         });
     }
     let message = choice.get("message").ok_or_else(|| Failure::Retryable {
         status: Some(200),
         message: "a choice with no message".into(),
-        usage: usage(&value),
+        usage: usage(value),
     })?;
     let text = |name: &str| -> Result<Option<String>, Failure> {
         match message.get(name) {
@@ -737,7 +752,7 @@ pub fn classify(
             Some(_) => Err(Failure::Retryable {
                 status: Some(200),
                 message: format!("the message's {name} is not text"),
-                usage: usage(&value),
+                usage: usage(value),
             }),
         }
     };
@@ -745,7 +760,7 @@ pub fn classify(
         None | Some(Json::Null) => None,
         Some(Json::Arr(_)) => {
             let range = span::find(
-                &response.body,
+                body,
                 &[
                     Step::Key("choices"),
                     Step::Index(0),
@@ -756,23 +771,23 @@ pub fn classify(
             .ok_or_else(|| Failure::Retryable {
                 status: Some(200),
                 message: "reasoning_details could not be found in the reply's bytes".into(),
-                usage: usage(&value),
+                usage: usage(value),
             })?;
-            let bytes = response.body.get(range).unwrap_or_default();
+            let bytes = body.get(range).unwrap_or_default();
             Some(String::from_utf8_lossy(bytes).into_owned())
         }
         Some(_) => {
             return Err(Failure::Retryable {
                 status: Some(200),
                 message: "reasoning_details is not a list".into(),
-                usage: usage(&value),
+                usage: usage(value),
             })
         }
     };
     let malformed = |message: &str| Failure::Retryable {
         status: Some(200),
         message: message.into(),
-        usage: usage(&value),
+        usage: usage(value),
     };
     let calls = match message.get("tool_calls") {
         None | Some(Json::Null) => Vec::new(),
@@ -795,7 +810,7 @@ pub fn classify(
         reasoning: text("reasoning")?,
         details,
         finish,
-        usage: usage(&value),
+        usage: usage(value),
         calls,
     })
 }

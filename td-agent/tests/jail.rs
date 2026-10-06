@@ -463,7 +463,7 @@ fn a_repository_conversation_prepares_its_workspace() {
     state.ensure().unwrap();
     let keyless = Down::Setup {
         key: Err("no API key".into()),
-        client: td_agent::config::Client::default(),
+        client: Box::default(),
     };
     let named = |var: &str| std::env::var_os(var).unwrap_or_else(|| panic!("{var}"));
     let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless)
@@ -579,7 +579,7 @@ fn a_repository_conversation_prepares_its_workspace() {
         .to_string();
     let keyless = Down::Setup {
         key: Err("no API key".into()),
-        client: td_agent::config::Client::default(),
+        client: Box::default(),
     };
     let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless)
         .env(jail::JAIL_VAR, named(jail::JAIL_VAR))
