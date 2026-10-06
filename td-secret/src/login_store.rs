@@ -2,7 +2,7 @@
 //! the login state and publishes or removes `<directory>/<uid>`. Writers
 //! are serialized by the caller; this module takes no lock.
 
-use super::login_record::{Record, MAX_RECORD};
+use super::login_record::{Record, MAX_RECORD, MAX_SLOTS};
 use super::login_state::{same_inode, Directory, Facts, NOFOLLOW};
 pub(super) use super::login_state::{Cause, Owner, DIRECTORY, TEMPORARY};
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
@@ -11,6 +11,12 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const NONBLOCK: i32 = 0o4000;
+/// `inspect-login`'s result tag (td-secret/DESIGN.md, "Read-only
+/// enrollment-state inspection").
+const INSPECTED: u8 = 0x1a;
+/// Its longest result: the tag, the state, the version, the count and
+/// eight four-byte fingerprints.
+pub(super) const MAX_INSPECTION: usize = 4 + 4 * MAX_SLOTS;
 
 pub(super) enum State {
     Unenrolled,
@@ -84,6 +90,35 @@ pub(super) fn read(path: &Path, owner: Owner, uid: u32) -> State {
     }
 }
 
+/// `inspect-login`'s result for the state at `path`, read once: `1a 00`
+/// for a damaged record, or `1a 01`, the version, the count and each
+/// slot's fingerprint in canonical order for an enrolled one. Every other
+/// state has none. Only `read`: no lock, no temporary cleanup, no write.
+pub(super) fn inspection(path: &Path, owner: Owner, uid: u32) -> Result<Vec<u8>, String> {
+    inspected(read(path, owner, uid))
+}
+
+fn inspected(state: State) -> Result<Vec<u8>, String> {
+    match state {
+        State::Enrolled(record) => {
+            let slots = record.slots();
+            let count = u8::try_from(slots.len()).map_err(|_| "login key count overflow")?;
+            let mut result = Vec::with_capacity(MAX_INSPECTION);
+            result.extend_from_slice(&[INSPECTED, 1, record.version(), count]);
+            for slot in slots {
+                result.extend_from_slice(&slot.fingerprint());
+            }
+            if result.len() > MAX_INSPECTION {
+                return Err("login inspection exceeds its bound".into());
+            }
+            Ok(result)
+        }
+        State::Unavailable(Cause::RecordDamaged) => Ok(vec![INSPECTED, 0]),
+        State::Unenrolled => Err("no login record to inspect".into()),
+        State::Unavailable(cause) => Err(format!("login state unavailable: {cause:?}")),
+    }
+}
+
 /// The login directory and the account whose record it holds.
 pub(super) struct Store {
     directory: Directory,
@@ -122,11 +157,7 @@ impl Store {
 
     /// Looks up only the exact record name; every other entry is ignored.
     pub fn read(&self) -> State {
-        match self.read_record() {
-            Ok(None) => State::Unenrolled,
-            Ok(Some(record)) => State::Enrolled(record),
-            Err(cause) => State::Unavailable(cause),
-        }
+        settle(self.read_record())
     }
 
     fn read_record(&self) -> Result<Option<Record>, Cause> {
@@ -134,6 +165,16 @@ impl Store {
     }
 
     fn read_record_inner(&self, step: &mut impl FnMut(ReadStage)) -> Result<Option<Record>, Cause> {
+        self.read_record_seen(&mut |_| (), step)
+    }
+
+    /// `read_record_inner`, with `seen` given the name's facts before they
+    /// are judged, so tests can state what only a race can show.
+    fn read_record_seen(
+        &self,
+        seen: &mut impl FnMut(&mut Facts),
+        step: &mut impl FnMut(ReadStage),
+    ) -> Result<Option<Record>, Cause> {
         // Inspect the name before opening it, so no device or FIFO is opened.
         let Some(named) = self
             .directory
@@ -143,9 +184,9 @@ impl Store {
             return Ok(None);
         };
         let owner = self.directory.owner();
-        if !Facts::of(&named).valid_record(owner) || named.len() > MAX_RECORD as u64 {
-            return Err(Cause::RecordDamaged);
-        }
+        let mut facts = Facts::of(&named);
+        seen(&mut facts);
+        named_record(&facts, named.len(), owner)?;
         step(ReadStage::Inspected);
         // The name was a valid record a moment ago: a failure now is a race.
         let mut file = OpenOptions::new()
@@ -364,6 +405,30 @@ impl Store {
     }
 }
 
+/// Judges the record name's by-name facts. The lookup resolves the name
+/// and reads its metadata in separate steps, so a rename over it, or the
+/// unlink of the last key, between them shows the inode already unlinked:
+/// no links is that race,
+/// read again later, never damage. Two or more links is damage, since td's
+/// writer never hard-links.
+fn named_record(facts: &Facts, size: u64, owner: Owner) -> Result<(), Cause> {
+    if facts.links == 0 {
+        return Err(Cause::Unreadable);
+    }
+    if !facts.valid_record(owner) || size > MAX_RECORD as u64 {
+        return Err(Cause::RecordDamaged);
+    }
+    Ok(())
+}
+
+fn settle(read: Result<Option<Record>, Cause>) -> State {
+    match read {
+        Ok(None) => State::Unenrolled,
+        Ok(Some(record)) => State::Enrolled(record),
+        Err(cause) => State::Unavailable(cause),
+    }
+}
+
 fn still_named(path: &Path, file: &File) -> Result<(), String> {
     let current = fs::symlink_metadata(path).map_err(|_| "login record object disappeared")?;
     let retained = file
@@ -380,7 +445,7 @@ mod tests {
     use super::*;
     use crate::crypto;
     use crate::fido_p256::PublicKey;
-    use crate::login_record::{NewKey, VERSION};
+    use crate::login_record::{NewKey, MAGIC, VERSION};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{symlink, DirBuilderExt};
     use std::os::unix::net::UnixListener;
@@ -1098,5 +1163,374 @@ mod tests {
             // A fresh read shows the state the change settled on.
             assert_eq!(seen(store.read()), *settled, "{index}");
         }
+    }
+
+    fn hex(text: &str) -> Vec<u8> {
+        text.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    /// A record of `count` keys, enrolled in the reverse of canonical order.
+    fn keys(count: u8) -> Record {
+        let x = vector("slot0_x").try_into().unwrap();
+        let y = vector("slot0_y").try_into().unwrap();
+        let keys = (0..count)
+            .rev()
+            .map(|index| NewKey {
+                credential: vec![b'a' + index; 16],
+                key: PublicKey::from_coordinates(&x, &y).unwrap(),
+                salt: [index; 32],
+                output: &[0; 32],
+            })
+            .collect();
+        Record::enroll(UID, [9; 32], VERSION, keys).unwrap()
+    }
+
+    impl Fixture {
+        fn inspect(&self) -> Result<Vec<u8>, String> {
+            inspection(&self.dir, self.owner(), UID)
+        }
+    }
+
+    #[test]
+    fn inspection_answers_an_enrolled_record_exactly() {
+        let fixture = Fixture::new();
+        fixture.seed(&three());
+        // The pinned vector's slots in canonical (credential) order: 1, 2, 0.
+        let expected = hex(concat!(
+            "1a", "01", "01", "03", "7c8975e1", "559aead0", "f8263ada"
+        ));
+        assert_eq!(fixture.inspect().unwrap(), expected);
+        for (index, name) in [(4, "slot1"), (8, "slot2"), (12, "slot0")] {
+            assert_eq!(
+                expected.get(index..index + 4).unwrap(),
+                vector(&format!("{name}_fingerprint"))
+            );
+        }
+        fs::remove_file(fixture.record()).unwrap();
+        // One key through the cap of eight, enrolled out of order.
+        for count in 1..=8 {
+            fixture.seed(&keys(count));
+            let mut expected = vec![0x1a, 1, VERSION, count];
+            for index in 0..count {
+                let digest = crypto::digest(&[b'a' + index; 16]);
+                expected.extend_from_slice(digest.get(..4).unwrap());
+            }
+            let result = fixture.inspect().unwrap();
+            assert_eq!(result, expected, "{count}");
+            assert_eq!(result.len(), 4 + 4 * usize::from(count));
+            fs::remove_file(fixture.record()).unwrap();
+        }
+        assert_eq!(MAX_INSPECTION, 36);
+        fixture.seed(&keys(8));
+        assert_eq!(fixture.inspect().unwrap().len(), MAX_INSPECTION);
+    }
+
+    #[test]
+    fn inspection_answers_a_damaged_record_and_nothing_else() {
+        let fixture = Fixture::new();
+        let owner = fixture.owner();
+        let record = fixture.record();
+        let damaged = Ok(vec![0x1a, 0]);
+        let bytes = three().encode().unwrap();
+        // Unenrolled: no result, temporaries and other names included.
+        assert!(fixture.inspect().is_err());
+        fixture.write("tmp-whole", &bytes);
+        fixture.write("1001", &bytes);
+        assert!(fixture.inspect().is_err());
+        // Every kind of damaged record.
+        fixture.write("copy", &bytes);
+        symlink("copy", &record).unwrap();
+        assert_eq!(fixture.inspect(), damaged, "link");
+        fs::remove_file(&record).unwrap();
+        fixture.seed(&three());
+        fs::hard_link(&record, fixture.dir.join("alias")).unwrap();
+        assert_eq!(fixture.inspect(), damaged, "second link");
+        fs::remove_file(fixture.dir.join("alias")).unwrap();
+        fs::remove_file(&record).unwrap();
+        fs::create_dir(&record).unwrap();
+        assert_eq!(fixture.inspect(), damaged, "directory");
+        fs::remove_dir(&record).unwrap();
+        let listener = UnixListener::bind(&record).unwrap();
+        assert_eq!(fixture.inspect(), damaged, "socket");
+        drop(listener);
+        fs::remove_file(&record).unwrap();
+        for mode in [0o640, 0o400, 0o644, 0o4600] {
+            fixture.seed(&three());
+            fs::set_permissions(&record, Permissions::from_mode(mode)).unwrap();
+            assert_eq!(fixture.inspect(), damaged, "{mode:o}");
+            fs::remove_file(&record).unwrap();
+        }
+        let mut oversized = bytes.clone();
+        oversized.resize(MAX_RECORD + 1, 0);
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        let mut unknown = bytes.clone();
+        *unknown.get_mut(MAGIC.len()).unwrap() = VERSION + 1;
+        for (name, contents) in [
+            ("oversized", oversized),
+            ("zeroes", vec![0; MAX_RECORD]),
+            ("truncated", bytes.get(..bytes.len() - 1).unwrap().to_vec()),
+            ("empty", Vec::new()),
+            ("trailing", trailing),
+            ("unknown version", unknown),
+            ("another account", for_uid(UID + 1).encode().unwrap()),
+        ] {
+            fixture.write(&UID.to_string(), &contents);
+            assert_eq!(fixture.inspect(), damaged, "{name}");
+            fs::remove_file(&record).unwrap();
+        }
+        // A damaged directory: no result, whatever the record.
+        fixture.seed(&three());
+        for mode in [0o750, 0o755, 0o500] {
+            fs::set_permissions(&fixture.dir, Permissions::from_mode(mode)).unwrap();
+            assert!(fixture.inspect().is_err(), "{mode:o}");
+        }
+        fs::set_permissions(&fixture.dir, Permissions::from_mode(0o700)).unwrap();
+        let other = Owner {
+            uid: owner.uid ^ 1,
+            ..owner
+        };
+        assert!(inspection(&fixture.dir, other, UID).is_err());
+        symlink(&fixture.dir, fixture.root.join("link")).unwrap();
+        assert!(inspection(&fixture.root.join("link"), owner, UID).is_err());
+        assert!(inspection(&fixture.root.join("absent"), owner, UID).is_err());
+        assert!(inspection(Path::new("relative/login"), owner, UID).is_err());
+        // Unreadable: a lost /proc names no descriptor.
+        let mut store = fixture.store();
+        assert!(inspected(store.read()).is_ok());
+        store.directory.set_fd_root(fixture.root.join("lost"));
+        assert!(inspected(store.read()).is_err());
+        // The shapes above are the only results there are.
+        assert!(inspected(State::Unavailable(Cause::Unreadable)).is_err());
+        assert!(inspected(State::Unavailable(Cause::DirectoryDamaged)).is_err());
+        assert!(inspected(State::Unenrolled).is_err());
+        assert_eq!(inspected(State::Unavailable(Cause::RecordDamaged)), damaged);
+    }
+
+    /// One entry's identity, mode, links, size, change times and bytes;
+    /// access times excluded.
+    type Entry = (String, u64, u32, u64, u64, [i64; 4], Vec<u8>);
+
+    /// Every entry of `dir`, and the directory's own.
+    fn snapshot(dir: &Path) -> Vec<Entry> {
+        let facts = |name: String, meta: &Metadata, bytes: Vec<u8>| {
+            (
+                name,
+                meta.ino(),
+                meta.mode(),
+                meta.nlink(),
+                meta.len(),
+                [
+                    meta.mtime(),
+                    meta.mtime_nsec(),
+                    meta.ctime(),
+                    meta.ctime_nsec(),
+                ],
+                bytes,
+            )
+        };
+        let mut entries = vec![facts(
+            ".".into(),
+            &fs::symlink_metadata(dir).unwrap(),
+            Vec::new(),
+        )];
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let meta = fs::symlink_metadata(entry.path()).unwrap();
+            let bytes = if meta.is_file() {
+                fs::read(entry.path()).unwrap()
+            } else {
+                Vec::new()
+            };
+            entries.push(facts(
+                entry.file_name().into_string().unwrap(),
+                &meta,
+                bytes,
+            ));
+        }
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn inspection_writes_nothing_and_leaves_temporaries() {
+        let fixture = Fixture::new();
+        let bytes = three().encode().unwrap();
+        let torn = format!("{TEMPORARY}{}", "ab".repeat(16));
+        fixture.write(&torn, bytes.get(..bytes.len() / 2).unwrap());
+        fixture.write("tmp-whole", &bytes);
+        fixture.write("tmp-", b"");
+        fs::create_dir(fixture.dir.join("tmp-dir")).unwrap();
+        fixture.write("cutover-reboot", b"");
+        let unchanged = |expected: Result<Vec<u8>, ()>| {
+            let before = snapshot(&fixture.dir);
+            assert_eq!(fixture.inspect().map_err(|_| ()), expected);
+            assert_eq!(snapshot(&fixture.dir), before);
+        };
+        unchanged(Err(()));
+        fixture.seed(&three());
+        unchanged(Ok(fixture.inspect().unwrap()));
+        fs::set_permissions(fixture.record(), Permissions::from_mode(0o640)).unwrap();
+        unchanged(Ok(vec![0x1a, 0]));
+        fs::set_permissions(&fixture.dir, Permissions::from_mode(0o750)).unwrap();
+        unchanged(Err(()));
+        fs::set_permissions(&fixture.dir, Permissions::from_mode(0o700)).unwrap();
+        // Every temporary is still there, and no lock or other name appeared.
+        assert_eq!(
+            fixture.names(),
+            [
+                "1000",
+                "cutover-reboot",
+                "tmp-",
+                torn.as_str(),
+                "tmp-dir",
+                "tmp-whole"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_race_with_a_writer_reads_no_result_or_a_whole_record() {
+        let fixture = Fixture::new();
+        let record = fixture.record();
+        let whole = |record: &Record| {
+            let mut result = vec![0x1a, 1, VERSION];
+            result.push(u8::try_from(record.slots().len()).unwrap());
+            for slot in record.slots() {
+                result.extend_from_slice(&slot.fingerprint());
+            }
+            result
+        };
+        let replace = || {
+            fixture.write("swap", &two().encode().unwrap());
+            fs::rename(fixture.dir.join("swap"), &record).unwrap();
+        };
+        // Each change a read's checkpoints can see is no result at all.
+        let changes: &[(ReadStage, &dyn Fn())] = &[
+            (ReadStage::Inspected, &replace),
+            (ReadStage::Inspected, &|| {
+                fs::set_permissions(&record, Permissions::from_mode(0o640)).unwrap()
+            }),
+            (ReadStage::Read, &replace),
+            (ReadStage::Read, &|| {
+                OpenOptions::new()
+                    .append(true)
+                    .open(&record)
+                    .and_then(|mut file| file.write_all(&[0]))
+                    .unwrap()
+            }),
+            // Rewritten in place, shorter, after the bytes were read.
+            (ReadStage::Read, &|| {
+                let shorter = two().encode().unwrap();
+                let mut file = OpenOptions::new().write(true).open(&record).unwrap();
+                file.write_all(&shorter).unwrap();
+                file.set_len(shorter.len() as u64).unwrap();
+            }),
+        ];
+        for (index, (stage, change)) in changes.iter().enumerate() {
+            let _ = fs::remove_file(&record);
+            fixture.seed(&three());
+            let store = fixture.store();
+            let read = store.read_record_inner(&mut |point| {
+                if point == *stage {
+                    change();
+                }
+            });
+            let result = inspected(settle(read));
+            assert!(result.is_err(), "{index}: {result:02x?}");
+        }
+        // A writer publishing by rename while inspections run: every
+        // answer is no result or one whole record, never a damaged one.
+        let _ = fs::remove_file(&record);
+        fixture.seed(&three());
+        let answers = [whole(&two()), whole(&three())];
+        // Generous for 200 synced publications; it fails a writer slower
+        // than this, not one stuck in a call.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let (published, seen) = std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                let store = fixture.store();
+                for round in 0..200u8 {
+                    let proposed = if round % 2 == 0 { two() } else { three() };
+                    let baseline = store.read().baseline().unwrap();
+                    let outcome = store.publish(baseline, &proposed, &mut io::repeat(round));
+                    assert_eq!(outcome, Outcome::Committed);
+                }
+                200
+            });
+            let mut seen = [0usize; 3];
+            // A writer that panics has finished too; its panic surfaces at join.
+            while !writer.is_finished() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the writer did not finish: {seen:?}"
+                );
+                match fixture.inspect() {
+                    Ok(result) if result == answers[0] => seen[0] += 1,
+                    Ok(result) if result == answers[1] => seen[1] += 1,
+                    Err(_) => seen[2] += 1,
+                    Ok(result) => panic!("torn or damaged inspection {result:02x?}"),
+                }
+            }
+            let published = writer
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (published, seen)
+        });
+        assert_eq!(published, 200);
+        // Whole records were read, not only refusals.
+        assert!(seen[0] + seen[1] > 0, "{seen:?}");
+        assert_eq!(fixture.inspect().unwrap(), whole(&three()));
+    }
+
+    #[test]
+    fn an_unlinked_inode_seen_by_name_is_a_race_not_damage() {
+        let fixture = Fixture::new();
+        let owner = fixture.owner();
+        fixture.seed(&three());
+        let store = fixture.store();
+        let read = |seen: &mut dyn FnMut(&mut Facts)| {
+            store.read_record_seen(&mut |facts| seen(facts), &mut |_| ())
+        };
+        // A rename over the name between its lookup and its metadata shows
+        // the replaced inode with no links: no result, and no baseline.
+        let unlinked = read(&mut |facts| facts.links = 0);
+        assert!(matches!(unlinked, Err(Cause::Unreadable)));
+        let state = settle(unlinked);
+        assert!(state.baseline().is_none());
+        assert!(inspected(state).is_err());
+        // Whatever else the replaced inode shows.
+        let unlinked = read(&mut |facts| {
+            facts.links = 0;
+            facts.mode = 0o644;
+            facts.uid ^= 1;
+        });
+        assert!(matches!(unlinked, Err(Cause::Unreadable)));
+        // A second link is still damage.
+        let linked = read(&mut |facts| facts.links = 2);
+        assert!(matches!(linked, Err(Cause::RecordDamaged)));
+        assert_eq!(inspected(settle(linked)), Ok(vec![0x1a, 0]));
+        // The judgment alone, and the read once the name settles.
+        let facts = |links| Facts {
+            directory: false,
+            regular: true,
+            mode: 0o600,
+            links,
+            uid: owner.uid,
+            gid: owner.gid,
+        };
+        assert_eq!(named_record(&facts(0), 0, owner), Err(Cause::Unreadable));
+        assert_eq!(named_record(&facts(1), 0, owner), Ok(()));
+        assert_eq!(
+            named_record(&facts(1), MAX_RECORD as u64 + 1, owner),
+            Err(Cause::RecordDamaged)
+        );
+        assert_eq!(named_record(&facts(2), 0, owner), Err(Cause::RecordDamaged));
+        assert_eq!(seen(store.read()), enrolled(&three()));
     }
 }

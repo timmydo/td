@@ -193,7 +193,7 @@ causes, each with its screen text:
   nothing at that path, or a symbolic link at or above it):
   `LOGIN KEY STATE UNAVAILABLE: DIRECTORY DAMAGED`;
 - a damaged record (the name exists, but is not a regular single-link
-  root:root mode-0600 file, or its bytes are truncated, malformed, of an
+  root:root mode-0600 file (an inode with no links is the race below), or its bytes are truncated, malformed, of an
   unknown version or for another UID): `LOGIN KEY STATE UNAVAILABLE:
   RECORD DAMAGED`;
 - a state that could not be read: td-authd's read-only helper did not
@@ -1221,9 +1221,11 @@ and the oracle that shows it.
      `qemu-boot-encrypted`) see the directory while a damaged one still
      boots healthy. It changes every boot, so its landing runs `check
      integration` by hand.
-   - C2: the read-only `td-secret inspect-login --uid 1000` helper
-     (`td-secret/DESIGN.md`, "Read-only enrollment-state inspection"),
-     which nothing runs yet.
+   - C2, landed: the read-only `td-secret inspect-login --uid 1000`
+     helper (`td-secret/DESIGN.md`, "Read-only enrollment-state
+     inspection"), sharing inspect-store's admission and reply code and
+     reading through the record store, which nothing runs yet; host
+     tests only, since no guest reaches it before C3.
    - C3: `1a` end to end (`td-authd/DESIGN.md`, amendment 1): root's
      predicate, the helper under its two-second deadline, the cache and
      the `9a` answer; the compositor's `1a` at connect, after Prepare,

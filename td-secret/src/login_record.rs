@@ -11,7 +11,7 @@ pub(super) const MAGIC: &[u8; 8] = b"TDLOGREC";
 pub(super) const VERSION: u8 = 1;
 /// Record versions this build reads; a tier marker lists exactly these.
 pub(super) const READS: &[u8] = &[VERSION];
-const MAX_SLOTS: usize = 8;
+pub(super) const MAX_SLOTS: usize = 8;
 const KEY_BYTES: usize = 64;
 const HEADER: usize = MAGIC.len() + 1 + 4 + 32 + 1;
 const MAX_SLOT: usize = 2 + MAX_CREDENTIAL_ID + KEY_BYTES + 32 + 32;
@@ -153,7 +153,6 @@ impl Record {
         &self.id
     }
 
-    #[cfg(test)]
     pub fn version(&self) -> u8 {
         self.version
     }

@@ -108,17 +108,20 @@ pub fn run(args: &[String]) -> Result<(), String> {
             login_operation::run(parse_uid(uid)?)
         }
         [command, flag, uid] if command == "inspect-store" && flag == "--uid" => {
-            let mut endpoint = operation::startup()?;
-            let uid = parse_uid(uid)?;
-            let state =
-                store::Store::inspect_owned(&store::user_path(uid), uid, store_owner(uid)?)?;
-            use std::io::Write;
-            endpoint
-                .set_write_timeout(Some(std::time::Duration::from_secs(2)))
-                .map_err(|e| e.to_string())?;
-            endpoint
-                .write_all(&[0x17, state])
-                .map_err(|e| e.to_string())
+            inspect(uid, |uid| {
+                let state =
+                    store::Store::inspect_owned(&store::user_path(uid), uid, store_owner(uid)?)?;
+                Ok(vec![0x17, state])
+            })
+        }
+        [command, flag, uid] if command == "inspect-login" && flag == "--uid" => {
+            inspect(uid, |uid| {
+                login_store::inspection(
+                    std::path::Path::new(login_store::DIRECTORY),
+                    login_store::Owner::ROOT,
+                    uid,
+                )
+            })
         }
         [command, flag, uid] if command == "lock-session" && flag == "--uid" => {
             store::lock_session(parse_uid(uid)?)
@@ -151,6 +154,25 @@ pub fn run(args: &[String]) -> Result<(), String> {
         )
         .into()),
     }
+}
+
+/// A read-only inspection helper (td-secret/DESIGN.md, "Read-only
+/// enrollment-state inspection"): the private operation startup
+/// admission, the UID, then the whole result on the stdin socket. A
+/// failure writes nothing.
+fn inspect(uid: &str, result: impl FnOnce(u32) -> Result<Vec<u8>, String>) -> Result<(), String> {
+    let endpoint = operation::startup()?;
+    let bytes = result(parse_uid(uid)?)?;
+    reply(endpoint, &bytes)
+}
+
+/// Writes `bytes` under a two-second write timeout; there is no buffered stdout result.
+fn reply(mut endpoint: std::os::unix::net::UnixStream, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    endpoint
+        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .map_err(|e| e.to_string())?;
+    endpoint.write_all(bytes).map_err(|e| e.to_string())
 }
 
 fn owned_store(uid: u32) -> Result<store::Store, String> {
@@ -270,6 +292,60 @@ mod confinement {
         let main = include_str!("main.rs");
         assert_eq!(main.matches("td_secret::").count(), 1);
         assert!(!main.contains("mod "));
+    }
+
+    #[test]
+    fn inspection_helpers_admit_only_their_exact_argv_after_startup() {
+        let run =
+            |args: &[&str]| super::run(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        for args in [
+            &["inspect-login"][..],
+            &["inspect-login", "--uid"],
+            &["inspect-login", "--uid", "1000", "1000"],
+            &["inspect-login", "--user", "1000"],
+            &["inspect-login", "1000", "--uid"],
+            &["inspect-login", "--uid=1000"],
+            &["--uid", "1000", "inspect-login"],
+            &["inspect-logins", "--uid", "1000"],
+            &["Inspect-login", "--uid", "1000"],
+        ] {
+            assert!(run(args).unwrap_err().starts_with("usage:"), "{args:?}");
+        }
+        // Every UID meets the root, thread, descriptor and socket admission
+        // before it is parsed or anything is read; this test process passes
+        // none of it.
+        let not_root = super::store::require_root().err();
+        for command in ["inspect-store", "inspect-login"] {
+            for uid in ["1000", "0", "01000", "x"] {
+                let error = run(&[command, "--uid", uid]).unwrap_err();
+                assert!(!error.starts_with("usage:"), "{command} {uid}");
+                assert!(!error.contains("UID"), "{command} {uid}: {error}");
+                if let Some(not_root) = &not_root {
+                    assert_eq!(&error, not_root, "{command} {uid}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reply_writes_the_whole_result_and_drops_its_stream() {
+        use std::io::Read;
+        for result in [
+            &[0x1a, 0][..],
+            &[0x17, 3],
+            &[0x1a; super::login_store::MAX_INSPECTION],
+        ] {
+            let (endpoint, mut parent) = std::os::unix::net::UnixStream::pair().unwrap();
+            super::reply(endpoint, result).unwrap();
+            let mut seen = Vec::new();
+            // EOF here is reply's drop; in the helper it is process exit.
+            parent.read_to_end(&mut seen).unwrap();
+            assert_eq!(seen, result);
+        }
+        // A peer that has gone is a failure, not a silent success.
+        let (endpoint, parent) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(parent);
+        assert!(super::reply(endpoint, &[0x1a, 0]).is_err());
     }
 
     #[test]

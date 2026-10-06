@@ -1562,22 +1562,46 @@ write timeout. There is no buffered stdout result. The parent deadline
 also bounds filesystem work and observed completion. Both production and
 ordinary child fixtures use the same factory and descriptor assignment.
 
-**Login state (target).** TOKEN-LOGIN.md's increment 4 adds a second
-hidden root helper, `td-secret inspect-login --uid UID`, which td-authd
-runs with UID 1000 only, and only when the login record's name exists
-(`td-authd/DESIGN.md`, login-state amendment 1). It has inspect-store's
-startup admission, stdin result socket, two-second write timeout and
-parent requirements above, but reads no application store. It reads
-`/var/lib/td/login` (root:root) once through the record store ("Login
-record store"), takes no lock, opens no token or TPM device and writes
-nothing to the directory. Its result is exactly `1a 00` for a damaged
-record, or for an enrolled one `1a 01`, the record's version byte, the
-slot count and each slot's four-byte fingerprint in canonical slot
-order, at most 36 bytes. Every other state (unenrolled, a damaged
-directory, a read that could not complete) and every failure writes no
-result and exits unsuccessfully; td-authd then answers that the state
-could not be read, and its next refresh runs the directory-and-name
-predicate again, which decides those states without the helper.
+**Login state.** TOKEN-LOGIN.md's increment 4 adds a second hidden
+root helper, `td-secret inspect-login --uid UID`, which td-authd runs
+with UID 1000 only, and only when the login record's name exists
+(`td-authd/DESIGN.md`, login-state amendment 1); until increment 4's C3
+nothing runs it. Both helpers are one function in `lib.rs`: the private
+operation startup admission above, then the UID, then the read, then
+the whole result written to the stdin socket under the two-second write
+timeout, so a refused admission reads nothing and a failure writes
+nothing. It reads no application store and takes the same parent
+requirements. It reads `/var/lib/td/login` (root:root) once through the
+record store ("Login record store"), whose walk, directory check and
+name lookup are the shared predicate's; it takes no lock, opens no token
+or TPM device, runs no temporary cleanup and writes nothing to the
+directory. Its result is exactly `1a 00` for a damaged record, or for an
+enrolled one `1a 01`, the record's version byte, the slot count and each
+slot's four-byte fingerprint (the first four bytes of the credential
+ID's SHA-256) in canonical slot order, so at most 36 bytes at the
+eight-key cap (`login_store::MAX_INSPECTION`). Every other state
+(unenrolled, a damaged directory, a read that could not complete) and
+every failure writes no result and exits unsuccessfully; td-authd then
+answers that the state could not be read, and its next refresh runs the
+directory-and-name predicate again, which decides those states without
+the helper. td's writer publishes by rename, and the store's read
+refuses an inode that is replaced between inspection and open, or whose
+size, mtime or ctime changes while it is read, and reads an inspected
+name whose inode has no links as that race too, so a race with that
+writer answers no result or one whole record, never a mix of two and
+never `1a 00`.
+
+Host tests cover each state and every damaged-record kind (a link, a
+second link, a directory, a socket, a wrong mode, oversized, zeroed,
+truncated, empty or trailing bytes, an unknown version, another
+account's record), the exact bytes of the pinned record vector and of
+one through eight keys enrolled out of order, a directory left
+byte-identical with its temporaries in place, read checkpoints that swap
+the record, change its mode, append to it or rewrite it, a lookup that
+sees an unlinked inode, a renaming writer running alongside, the exact
+argv, and admission before the UID or any read. The root startup
+admission itself is `operation::startup`'s, shared and not re-proved
+here; no root guest runs this helper until C3.
 
 ## Token-authorized named write backend
 
@@ -1858,12 +1882,17 @@ before it lists the directory.
 The name is inspected before it is opened, so a FIFO or device is never
 opened: anything but a regular, single-link, mode-0600 file of the
 expected owner, or a size above `login_record::MAX_RECORD`, is a damaged
-record. The file is then opened `O_NOFOLLOW | O_NONBLOCK`, must be the
-inode inspected and pass the same owner, mode, link and size checks
-through its descriptor, is read through a `MAX_RECORD + 1` bound, and
-must keep its inode, size, mtime and ctime across the read; a failure at
-any of these steps is a race and reads as unreadable, and the next read
-shows what the name settled on. The bytes decode with the
+record. The exception is an inode with no links: the lookup resolves the
+name and reads its metadata in separate steps, so a rename over the
+record, or the unlink of its last key, between them shows the replaced,
+already unlinked inode, which reads as unreadable, never damaged; two or
+more links stay damage, since td's writer never hard-links. The file is
+then opened `O_NOFOLLOW | O_NONBLOCK`, must be the inode inspected and
+pass the same owner, mode, link and size checks through its descriptor,
+is read through a `MAX_RECORD + 1` bound, and must keep its inode, size,
+mtime and ctime across the read; a failure at any of these steps is a
+race and reads as unreadable, and the next read shows what the name
+settled on. The bytes decode with the
 expected UID, and a refusal is a damaged record. `State::Enrolled` keeps
 the decoded record and so its exact-bytes digest. `State::baseline` is
 `Absent` or `Digest` for the two valid states and none for unavailable,
