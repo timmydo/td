@@ -2546,6 +2546,16 @@ Rust intervals with cold preparation and counted descriptor teardown;
 earlier 169 remain separate. Native allocation, stack/RSS, configurable
 subParts selection and full admission/publication remain unqualified.
 
+M06ej requested selected-field composition keeps Cursor plus
+HeaderBudget and 64 output bytes within 1 KiB and completed Composed
+within 768 bytes. The two pure selections add no buffering or parallel
+frame; original admitted backing/windows/cells remain separate. Outer
+NONE spends no emission work; other requests preserve shared exact
+five-cost charges. API §1.141 qualifies eight enumerated Rust intervals
+with cold preparation and counted descriptor teardown; earlier 177
+remain separate. Native allocation, stack/RSS, configurable subParts
+selection and complete admission/publication remain unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

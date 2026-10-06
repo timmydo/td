@@ -73,6 +73,10 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
             properties,
         })
     }
+    #[cfg(test)]
+    pub(in super::super::super::super) fn costs(&self) -> [u64; 5] {
+        self.original.costs()
+    }
     pub fn value(&self) -> Option<(Properties, View<'_, 'm, 'o>)> {
         Some((self.properties, self.original.value()?.1))
     }

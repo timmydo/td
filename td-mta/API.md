@@ -5976,6 +5976,58 @@ Native allocation, stack/RSS, full admission, request property
 parsing/defaults, headers/header:*/subParts selection and current
 authenticated publication remain later or unqualified.
 
+### 1.141 Requested outer properties with selected part metadata
+
+M06ej adds
+`mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed::requested`.
+Only complete selected Serialized and explicit five-property outer
+Properties construct exclusive Cursor. The outer selection chooses
+bodyStructure, textBody, htmlBody, attachments and hasAttachment; the
+source retains its independent explicit ten-field metadata selection.
+Passive complete views expose both selections beside original
+collection/cells/backing. Fresh consuming release returns selected
+Serialized and unchanged outer Properties. No passive view or advanced
+legacy cursor reconstructs the selected owner.
+
+Privately reuse the existing requested source-bound frame and its shared
+funding, freshness, sticky refusal and complete acceptance. Canonical
+outer order is structure, text, HTML, attachments and attachment flag.
+Selected metadata remains byte-identical, including container nulls and
+leaf locator spelling. The provisional structural subParts scaffold
+remains independent of metadata selection under §1.140. Both selections
+are pure explicit caller inputs; absent/null request defaults and JSON
+parsing remain outside this API.
+
+Outer NONE freshly constructs complete zero-work/zero-byte emission
+while retaining original selected collection custody. Cached completion
+polls remain inert; explicit checks and consuming boundaries stay fresh
+in both original-job and actual-pin domains. Combined requests complete
+the original tree before selected lists; neither selection label
+changes. Metadata ALL preserves legacy requested bytes, turns and five
+costs. Other masks preserve the existing one-step/control and exact wire
+fees, zero source/I/O fees and at-most-64-byte copy. Empty unfinished
+output checks freshness without work. Premature finish and work refusal
+prevent completion; clock refusal hides completed views. Refusals retain
+exact sticky errors. Bytes and labels confer no current publication
+authority.
+
+Cursor plus HeaderBudget and 64 output bytes fits 1 KiB; Composed fits
+768 bytes. Original backing/windows/cells remain separately
+caller-owned/admitted. Eight sequential Rust allocation intervals
+measure near-u64 combined multi-node structure/lists, both selections
+NONE, actual pin expiry after copied output, complete Cursor expiry,
+complete Composed expiry, explicitly checked released Bound expiry,
+healthy empty output and constructor pin expiry. Original
+matching/generated member windows, filesystem and cells stay cold.
+Descriptor teardown is counted; pooled view/scratch, cells and enclosing
+cleanup remain outside. Other selections/sources/widths, supplied Tick
+expiry, quota refusal, premature finish, repeated cached polls, post-turn/clock
+faults and other explicit checks remain allocation-unqualified. Earlier
+177 intervals remain separate. Native allocation, stack/RSS, full
+admission, whole composed retention, request parsing/defaults,
+headers/header:*/subParts selection and current authenticated
+publication remain later or unqualified.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -9,10 +9,10 @@ use crate::{
     mime_traversal::bound::ordered::tests::SOURCE,
     ports::{BlobReader, Clock, Error as PolicyError},
 };
-const SIMPLE: &[u8] = b"\r\nabc\r\n";
+pub(super) const SIMPLE: &[u8] = b"\r\nabc\r\n";
 const MULTIPART: &[u8] =
     b"Content-Type: multipart/mixed;boundary=x\r\n\r\n--x\r\n\r\nabc\r\n--x--\r\n";
-fn with_collection<T>(
+pub(super) fn with_collection<T>(
     source: &[u8],
     base: u64,
     bits: u16,
@@ -42,7 +42,7 @@ fn with_collection<T>(
         run(collecting.finish(Tick(1)).unwrap())
     })
 }
-fn expected(source: &[u8], mode: Mode, cells: &[Cell<'_>]) -> Vec<u8> {
+pub(super) fn expected(source: &[u8], mode: Mode, cells: &[Cell<'_>]) -> Vec<u8> {
     let metadata =
         |index: usize| std::str::from_utf8(cells[index].value().unwrap().members).unwrap();
     let sep = |index: usize| if metadata(index).is_empty() { "" } else { "," };
@@ -104,7 +104,7 @@ fn drain(
     }
     panic!("selected composition stalled")
 }
-fn deadline(actual: bool) -> Error {
+pub(super) fn deadline(actual: bool) -> Error {
     if actual {
         Error::Parent(PolicyError::Deadline)
     } else {

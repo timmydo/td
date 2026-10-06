@@ -907,6 +907,17 @@ scopes eight Rust intervals; request parsing/defaults,
 headers/header:*/subParts selection, full admission and current
 authenticated publication remain later.
 
+M06ej requested outer properties preserve independent selected part
+metadata through the existing requested source-bound frame. Immutable
+outer Properties remain in the original requested owner and metadata
+Properties remain in its facade; complete views/releases preserve both.
+Outer NONE spends no composition work but keeps complete original
+collection custody and fresh consuming boundaries. Structural subParts
+remain the provisional internal scaffold. API §1.141 scopes eight Rust
+intervals; whole output retention, request parsing/defaults,
+configurable headers/header:*/subParts selection, full admission and
+current authenticated publication follow.
+
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot
 select bodyStructure. They remain public facades over the same shared

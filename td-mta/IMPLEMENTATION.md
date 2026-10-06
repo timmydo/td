@@ -2381,6 +2381,17 @@ Initial independently landable increments:
   headers/header:*/subParts selection, full admission and current
   authenticated publication follow.
 
+- **M06ej — requested outer properties with selected part metadata:**
+  preserve both immutable selections through the existing source-bound
+  requested frame and original collection/cell/backing/descriptor
+  custody. Outer NONE emits nothing without work; metadata ALL preserves
+  legacy requests. Combined structure/list routing, exact bytes/costs,
+  sticky refusal and both fresh domains remain shared. Six compile
+  guards and eight Rust allocation intervals qualify API §1.141. Whole
+  composed retention, request parsing/defaults,
+  headers/header:*/subParts selection, full admission and current
+  authenticated publication follow.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
