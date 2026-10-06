@@ -130,7 +130,7 @@ pub struct Card {
     pub title: String,
     pub details: Vec<String>,
     /// What its "always" answers would remember, when it offers them.
-    pub always: Option<crate::rules::Always>,
+    pub always: Option<crate::rules::Offer>,
 }
 
 /// The human's answer to a card (DESIGN.md §11): allow or deny this once,
@@ -143,6 +143,13 @@ pub enum Answer {
         allow: bool,
         everywhere: bool,
         bodies: Vec<String>,
+    },
+    /// Always, for a crossing: whether the asking conversation may `op`
+    /// conversation `to`, that way only.
+    Crossing {
+        allow: bool,
+        op: crate::rules::Crossed,
+        to: String,
     },
 }
 
@@ -1426,10 +1433,15 @@ impl App {
         let answer = match (act, always) {
             (None, _) => Answer::Once(false),
             (Some(confirm::Act::Confirm), _) => Answer::Once(true),
-            (Some(act), Some(always)) => Answer::Always {
+            (Some(act), Some(crate::rules::Offer::Rules(always))) => Answer::Always {
                 allow: act == confirm::Act::AlwaysAllowHere && always.allow,
                 everywhere: act == confirm::Act::AlwaysDenyEverywhere,
                 bodies: always.bodies,
+            },
+            (Some(act), Some(crate::rules::Offer::Crossing { op, to })) => Answer::Crossing {
+                allow: act == confirm::Act::AlwaysAllowHere,
+                op,
+                to,
             },
             // An "always" action on a card that offered none.
             (Some(act), None) => Answer::Once(act == confirm::Act::AlwaysAllowHere),
@@ -7280,9 +7292,62 @@ pub mod tests {
                 call: 4,
                 title: "Run a command".into(),
                 details: vec!["cargo test".into()],
-                always: Some(crate::rules::Always {
+                always: Some(crate::rules::Offer::Rules(crate::rules::Always {
                     allow: true,
                     bodies: bodies.clone(),
+                })),
+            });
+            for _ in 0..tabs {
+                key(&mut app, "Tab");
+            }
+            key(&mut app, "Return");
+            assert_eq!(
+                app.take_requests(),
+                [Request::Decide {
+                    conversation: id(2),
+                    call: 4,
+                    answer
+                }],
+                "{tabs}"
+            );
+        }
+    }
+
+    /// A crossing card's "always" answers go to the window as its pair
+    /// and way.
+    #[test]
+    fn a_crossing_cards_always_answers_name_its_pair_and_way() {
+        let to = "b".repeat(32);
+        for (tabs, answer) in [
+            (
+                1,
+                Answer::Crossing {
+                    allow: false,
+                    op: crate::rules::Crossed::Message,
+                    to: to.clone(),
+                },
+            ),
+            (
+                2,
+                Answer::Crossing {
+                    allow: true,
+                    op: crate::rules::Crossed::Message,
+                    to: to.clone(),
+                },
+            ),
+            (3, Answer::Once(true)),
+        ] {
+            let mut app = app();
+            app.settle = Duration::ZERO;
+            app.set_active(id(2));
+            app.ask(Card {
+                conversation: id(2),
+                call: 4,
+                title: "Send a message to another conversation".into(),
+                details: vec!["hello".into()],
+                always: Some(crate::rules::Offer::Crossing {
+                    op: crate::rules::Crossed::Message,
+                    to: to.clone(),
                 }),
             });
             for _ in 0..tabs {

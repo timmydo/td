@@ -444,7 +444,8 @@ conversation counts as a workspace of its own, a fork included. So:
 - a conversation reads and searches its own log without a crossing;
 - reading or searching another conversation's log, and messaging
   another conversation, is a crossing, which the human decides on a
-  card (§11) before it happens, in `ask` and `auto` mode alike. The
+  card (§11), or by a standing answer they gave on one, before it
+  happens, in `ask` and `auto` mode alike. The
   card names the other conversation by its id and title and shows, for
   a message, its text, as long as §11 lets a card part run and saying
   what it leaves out; for a read or a search, the page or the query
@@ -459,7 +460,8 @@ conversation counts as a workspace of its own, a fork included. So:
   16 undelivered;
 - increment 13 brings the rest of §11's design. An "always" answer
   admits one operation in one direction for one pair: allowing A to
-  read B lets neither B read A nor A message B. In `auto` mode the
+  read B lets neither B read A nor A message B (§11, As built
+  (increment 13, crossings answered for good)). In `auto` mode the
   classifier decides a crossing, its `discloses` question covering
   content carried to a conversation that can publish where the source
   cannot. Until then every crossing is the human's, in both modes.
@@ -3274,34 +3276,53 @@ offers its "always" answers with what they would remember (`{"type":
 "ask", ..., "always": {"allow", "rules"}}`): the tool alone, or for each
 segment of a command its program and, for a program whose second word
 names what it does (`git`, `cargo`, `make` and the like), that
-subcommand, at most 8. A crossing's card offers none yet. It offers no
-allow for a command the matcher cannot see into, a segment of
-redirections alone, or such a program with no subcommand to name, nor
-for a word quoted with a space or tab in it, which would read back as
-two, so that no allow is broader than the program and subcommand; and
-none while a rule or an unread file asks, since an allow would not run
-the call before them. A command the matcher cannot split offers nothing.
-The card's rows run Cancel, `Always deny here`, `Always deny
-everywhere`, `Always allow here`, then `Allow`, the allows farthest from
-Cancel, and its last lines say what each adds, a rule a line so that no
-line passes the dialog's bound, and, for an interpreter or build tool,
-that an allow for it is broad. The window adds an "always" answer to the
-file itself, the workspace's key taken from the conversation's record
-rather than its process: below the file's last header when that is the
-scope's, else under a new one at its end, every other line kept, a rule
-the scope holds not added again. It sends the decision with what it
-remembered, which the approval's reason names (`always: …`), and then
-the file to every conversation, so the card's own call is decided by the
-human. One it cannot add, the file unread say, is said in the window,
-and the answer holds once. A card that waits when the policy changes is
-judged again: a rule that now refuses its call, or now lets it run,
-withdraws it, and its approval is the rule's; a policy taken after the
-decision and before the call starts is judged too, and only a deny in it
-then refuses the call, the decision standing otherwise; an allow's
-reason names at most three of the rules that let a call run. Deleting a
-conversation takes its workspace's sections out of the file, a scratch
-or repository workspace being its own; a directory's stay, the directory
-being the human's.
+subcommand, at most 8. It offers no allow for a command the matcher
+cannot see into, a segment of redirections alone, or such a program with
+no subcommand to name, nor for a word quoted with a space or tab in it,
+which would read back as two, so that no allow is broader than the
+program and subcommand; and none while a rule or an unread file asks,
+since an allow would not run the call before them. A command the matcher
+cannot split offers nothing. The card's rows run Cancel, `Always deny
+here`, `Always deny everywhere`, `Always allow here`, then `Allow`, the
+allows farthest from Cancel, and its last lines say what each adds, a
+rule a line so that no line passes the dialog's bound, and, for an
+interpreter or build tool, that an allow for it is broad. The window
+adds an "always" answer to the file itself, the workspace's key taken
+from the conversation's record rather than its process: below the file's
+last header when that is the scope's, else under a new one at its end,
+every other line kept, a rule the scope holds not added again. It sends
+the decision with what it remembered, which the approval's reason names
+(`always: …`), and then the file to every conversation, so the card's
+own call is decided by the human. One it cannot add, the file unread
+say, is said in the window, and the answer holds once. A card that waits
+when the policy changes is judged again: a rule that now refuses its
+call, or now lets it run, withdraws it, and its approval is the rule's;
+a policy taken after the decision and before the call starts is judged
+too, and only a deny in it then refuses the call, the decision standing
+otherwise; an allow's reason names at most three of the rules that let a
+call run. Deleting a conversation takes its workspace's sections out of
+the file, a scratch or repository workspace being its own; a directory's
+stay, the directory being the human's.
+
+**As built (increment 13, crossings answered for good).** The human's
+file holds a `[crossings]` section, each line `allow` or `deny`, `read`
+or `message`, then the conversation that does it and the one it is done
+to, by id: one operation, one way, one pair, so allowing A to read B
+lets neither B read A nor A message B; a search is a read. A
+conversation's crossing takes its standing answer before any card, a
+deny winning, its approval the rule's; but once three messages to one
+conversation have started since the human last wrote in the sender,
+whether allowed, refused or decided on a card, each further one goes to
+a card, so that two standing answers cannot keep two conversations
+messaging each other. With no answer the card asks; with the human's
+rules unread it says so and offers nothing to keep; else it asks,
+offering `Always deny` and `Always allow` beside Cancel and Allow, and
+no "everywhere". The window writes the answer under `[crossings]` with
+the asking conversation as the one that does it, never a pair the
+conversation's process names, and only for a conversation still there,
+and the card's wait, and the check before the crossing runs, take a
+changed policy as a tool call's do. Deleting a conversation takes every
+crossing to or from it out of the file.
 
 **Repetition.** Three consecutive calls of one tool with identical
 arguments go to the human whatever the table says, as opencode's
@@ -3322,7 +3343,9 @@ refusal, as for any card. The process tools run in the conversation's
 own process and are not counted: waiting on a long process with
 `process_wait` repeats by design. Nor are the conversation tools:
 `send_message` and a search or read of another conversation are
-crossings, every one the human's until the classifier decides them,
+crossings, every one the human's, on a card or by a standing answer
+that a run of messages sends back to them (As built (increment 13,
+crossings answered for good)), until the classifier decides them,
 and searching or reading this conversation's log, listing
 conversations or writing the todo list changes nothing outside it.
 When the classifier decides crossings, a repeated one must still reach

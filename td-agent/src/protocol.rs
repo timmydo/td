@@ -179,7 +179,7 @@ pub enum Up {
         call: u64,
         title: String,
         details: Vec<String>,
-        always: Option<crate::rules::Always>,
+        always: Option<crate::rules::Offer>,
     },
     /// The card for `call` is no longer asked: the turn was interrupted,
     /// or the window closed, before the human decided it.
@@ -832,8 +832,9 @@ impl Up {
                         Json::Arr(details.iter().cloned().map(Json::Str).collect()),
                     ),
                 ];
-                if let Some(always) = always {
-                    members.push((
+                match always {
+                    None => {}
+                    Some(crate::rules::Offer::Rules(always)) => members.push((
                         "always".into(),
                         Json::Obj(vec![
                             ("allow".into(), Json::Bool(always.allow)),
@@ -842,7 +843,14 @@ impl Up {
                                 Json::Arr(always.bodies.iter().cloned().map(Json::Str).collect()),
                             ),
                         ]),
-                    ));
+                    )),
+                    Some(crate::rules::Offer::Crossing { op, to }) => members.push((
+                        "always".into(),
+                        Json::Obj(vec![
+                            ("crossing".into(), Json::Str(op.name().into())),
+                            ("to".into(), Json::Str(to.clone())),
+                        ]),
+                    )),
                 }
                 typed("ask", members)
             }
@@ -923,13 +931,25 @@ impl Up {
                     .collect::<Result<_, _>>()?,
                 always: match value.get("always") {
                     None => None,
-                    Some(always) => Some(crate::rules::Always::checked(
-                        always
-                            .get("allow")
-                            .and_then(Json::as_bool)
-                            .ok_or("always without allow")?,
-                        strings(always, "rules")?,
-                    )?),
+                    Some(always) => Some(match always.get("crossing") {
+                        Some(op) => crate::rules::Offer::Crossing {
+                            op: op
+                                .as_str()
+                                .and_then(crate::rules::Crossed::parse)
+                                .ok_or("a crossing that neither reads nor messages")?,
+                            to: crate::store::Id::parse(&string(always, "to")?)
+                                .ok_or("a crossing to no conversation")?
+                                .as_str()
+                                .to_string(),
+                        },
+                        None => crate::rules::Offer::Rules(crate::rules::Always::checked(
+                            always
+                                .get("allow")
+                                .and_then(Json::as_bool)
+                                .ok_or("always without allow")?,
+                            strings(always, "rules")?,
+                        )?),
+                    }),
                 },
             },
             Some("withdraw") => Self::Withdraw {
@@ -1142,9 +1162,27 @@ mod tests {
                 call: 10,
                 title: "Run a command?".into(),
                 details: vec!["cargo test && rm x".into()],
-                always: Some(crate::rules::Always {
+                always: Some(crate::rules::Offer::Rules(crate::rules::Always {
                     allow: true,
                     bodies: vec!["shell cargo test".into(), "shell rm".into()],
+                })),
+            },
+            Up::Ask {
+                call: 11,
+                title: "Read another conversation's log".into(),
+                details: vec!["Conversation ...".into()],
+                always: Some(crate::rules::Offer::Crossing {
+                    op: crate::rules::Crossed::Read,
+                    to: "b".repeat(32),
+                }),
+            },
+            Up::Ask {
+                call: 12,
+                title: "Send a message to another conversation".into(),
+                details: vec!["hello".into()],
+                always: Some(crate::rules::Offer::Crossing {
+                    op: crate::rules::Crossed::Message,
+                    to: "c".repeat(32),
                 }),
             },
             Up::Withdraw { call: 9 },

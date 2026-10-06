@@ -198,7 +198,7 @@ fn schema(properties: Vec<(&str, Json)>, required: &[&str]) -> Json {
     ])
 }
 
-const CONVERSATION_PROPERTY: &str = "Another conversation's id, from `conversations`; this conversation's own log when left out or empty. The person approves each search or read of another conversation's log before it is made, and may refuse it.";
+const CONVERSATION_PROPERTY: &str = "Another conversation's id, from `conversations`; this conversation's own log when left out or empty. The person approves each search or read of another conversation's log before it is made, on a card or by a standing answer, and may refuse it.";
 
 /// One tool's definition as the request carries it.
 fn definition(tool: Tool) -> Json {
@@ -270,7 +270,7 @@ fn definition(tool: Tool) -> Json {
             schema(Vec::new(), &[]),
         ),
         Tool::SendMessage => (
-            "Send a message to another conversation, by its id from `conversations`. The person approves each message before it is sent, and may refuse it. It is delivered between that conversation's turns, labelled with this conversation as its source, and starts a turn there; any reply comes back to you the same way, later, so do not wait for one. At most 32 KiB, and a conversation holds at most 16 messages undelivered.".to_string(),
+            "Send a message to another conversation, by its id from `conversations`. The person approves each message before it is sent, on a card or by a standing answer, and may refuse it. It is delivered between that conversation's turns, labelled with this conversation as its source, and starts a turn there; any reply comes back to you the same way, later, so do not wait for one. At most 32 KiB, and a conversation holds at most 16 messages undelivered.".to_string(),
             schema(
                 vec![
                     ("to", property("string", "The receiving conversation's id.")),

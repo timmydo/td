@@ -66,6 +66,9 @@ pub const ALLOW: &str = "Allow";
 pub const ALWAYS_DENY_HERE: &str = "Always deny here";
 pub const ALWAYS_DENY_EVERYWHERE: &str = "Always deny everywhere";
 pub const ALWAYS_ALLOW_HERE: &str = "Always allow here";
+/// A crossing card's "always" answers.
+pub const ALWAYS_DENY: &str = "Always deny";
+pub const ALWAYS_ALLOW: &str = "Always allow";
 /// The admission card's title and its action's label.
 pub const ADMIT_TITLE: &str = "Admit remotes";
 pub const ADMIT: &str = "Admit";
@@ -146,6 +149,24 @@ fn remembered(always: &crate::rules::Always) -> Vec<String> {
     lines
 }
 
+/// What a crossing card's "always" answers would add, `op` to
+/// conversation `to`: that way only.
+fn crossed(op: crate::rules::Crossed, to: &str) -> Vec<String> {
+    let (doing, other) = match op {
+        crate::rules::Crossed::Read => (
+            format!("reading or searching conversation {to}'s log"),
+            "it reading this one's, or this one messaging it,",
+        ),
+        crate::rules::Crossed::Message => (
+            format!("messaging conversation {to}"),
+            "it messaging this one, or this one reading it,",
+        ),
+    };
+    vec![format!(
+        "{ALWAYS_ALLOW} adds to your rules that this conversation may go on {doing} with no card, and {ALWAYS_DENY} that it never may; {other} still asks."
+    )]
+}
+
 /// The dialog's place: at most 64 cells by 10 rows, centred in `body`.
 /// A card's is larger, at most 100 cells by 24 rows, so more of the
 /// action shows at once.
@@ -208,10 +229,14 @@ impl Confirm {
         call: u64,
         title: &str,
         details: &[String],
-        always: Option<&crate::rules::Always>,
+        always: Option<&crate::rules::Offer>,
         revision: u64,
     ) -> Result<Self, String> {
-        let remembered = always.map(remembered).unwrap_or_default();
+        let remembered = match always {
+            None => Vec::new(),
+            Some(crate::rules::Offer::Rules(always)) => remembered(always),
+            Some(crate::rules::Offer::Crossing { op, to }) => crossed(*op, to),
+        };
         let details: Vec<&str> = details
             .iter()
             .chain(&remembered)
@@ -219,14 +244,25 @@ impl Confirm {
             .collect();
         let mut model = Model::new(title, ALLOW, &details, Act::Confirm, revision)
             .map_err(|e| format!("the card: {e}"))?;
-        if let Some(always) = always {
-            model = model
-                .with_alternate(ALWAYS_DENY_HERE, Act::AlwaysDenyHere)
-                .and_then(|m| m.with_further(ALWAYS_DENY_EVERYWHERE, Act::AlwaysDenyEverywhere))
-                .map_err(|e| format!("the card: {e}"))?;
-            if always.allow {
+        match always {
+            None => {}
+            Some(crate::rules::Offer::Rules(always)) => {
                 model = model
-                    .with_extra(ALWAYS_ALLOW_HERE, Act::AlwaysAllowHere)
+                    .with_alternate(ALWAYS_DENY_HERE, Act::AlwaysDenyHere)
+                    .and_then(|m| m.with_further(ALWAYS_DENY_EVERYWHERE, Act::AlwaysDenyEverywhere))
+                    .map_err(|e| format!("the card: {e}"))?;
+                if always.allow {
+                    model = model
+                        .with_extra(ALWAYS_ALLOW_HERE, Act::AlwaysAllowHere)
+                        .map_err(|e| format!("the card: {e}"))?;
+                }
+            }
+            // A crossing's answers are for its pair and way: no
+            // "everywhere".
+            Some(crate::rules::Offer::Crossing { .. }) => {
+                model = model
+                    .with_alternate(ALWAYS_DENY, Act::AlwaysDenyHere)
+                    .and_then(|m| m.with_extra(ALWAYS_ALLOW, Act::AlwaysAllowHere))
                     .map_err(|e| format!("the card: {e}"))?;
             }
         }
@@ -476,10 +512,10 @@ mod tests {
         let surface = Surface::new(1024, 640, Scale::default()).unwrap();
         let id = Id::parse(&"c".repeat(32)).unwrap();
         let card = |allow: bool| {
-            let always = crate::rules::Always {
+            let always = crate::rules::Offer::Rules(crate::rules::Always {
                 allow,
                 bodies: vec!["shell cargo test".into(), "shell rm".into()],
-            };
+            });
             Confirm::approve(
                 surface,
                 surface.bounds(),
@@ -540,13 +576,11 @@ mod tests {
         });
         assert_eq!(denies.len(), 3);
         // The most a card offers, each rule its longest, still shows.
-        let longest = crate::rules::Always {
-            allow: true,
-            bodies: (0..crate::rules::MAX_BODIES)
-                .map(|n| format!("shell {n}{}", "x".repeat(crate::rules::MAX_LINE - 12)))
-                .collect(),
-        };
-        crate::rules::Always::checked(true, longest.bodies.clone()).unwrap();
+        let bodies: Vec<String> = (0..crate::rules::MAX_BODIES)
+            .map(|n| format!("shell {n}{}", "x".repeat(crate::rules::MAX_LINE - 12)))
+            .collect();
+        let longest =
+            crate::rules::Offer::Rules(crate::rules::Always::checked(true, bodies).unwrap());
         Confirm::approve(
             surface,
             surface.bounds(),
@@ -558,6 +592,53 @@ mod tests {
             3,
         )
         .unwrap();
+    }
+
+    /// A crossing's card: Cancel, Always deny, Always allow, Allow, and a
+    /// line saying the answer is for this pair and way.
+    #[test]
+    fn a_crossings_card_answers_for_its_pair_and_way() {
+        let surface = Surface::new(1024, 640, Scale::default()).unwrap();
+        let id = Id::parse(&"c".repeat(32)).unwrap();
+        let to = "b".repeat(32);
+        let card = || {
+            Confirm::approve(
+                surface,
+                surface.bounds(),
+                id.clone(),
+                5,
+                "Read another conversation's log",
+                &["x".into()],
+                Some(&crate::rules::Offer::Crossing {
+                    op: crate::rules::Crossed::Read,
+                    to: to.clone(),
+                }),
+                3,
+            )
+            .unwrap()
+        };
+        let approve = Purpose::Approve {
+            conversation: id.clone(),
+            call: 5,
+        };
+        for (tabs, act) in [
+            (1, Act::AlwaysDenyHere),
+            (2, Act::AlwaysAllowHere),
+            (3, Act::Confirm),
+        ] {
+            let mut confirm = card();
+            for _ in 0..tabs {
+                key(&mut confirm, "Tab");
+            }
+            assert_eq!(
+                key(&mut confirm, "Return"),
+                Reply::Confirmed(approve.clone(), act)
+            );
+        }
+        assert_eq!(
+            crossed(crate::rules::Crossed::Read, &to),
+            [format!("Always allow adds to your rules that this conversation may go on reading or searching conversation {to}'s log with no card, and Always deny that it never may; it reading this one's, or this one messaging it, still asks.")]
+        );
     }
 
     #[test]

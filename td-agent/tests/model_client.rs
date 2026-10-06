@@ -72,7 +72,7 @@ struct Harness {
     /// Events `until_text` heard, which the next `turn` begins with.
     heard: Vec<Event>,
     /// What the last card `until_ask` heard offered to remember.
-    always: Option<td_agent::rules::Always>,
+    always: Option<td_agent::rules::Offer>,
     stderr: PathBuf,
 }
 
@@ -1496,10 +1496,10 @@ fn a_card_offers_always_and_a_rule_written_while_it_waits_decides_it() {
     let (call, _, _) = h.until_ask();
     assert_eq!(
         h.always,
-        Some(td_agent::rules::Always {
+        Some(td_agent::rules::Offer::Rules(td_agent::rules::Always {
             allow: true,
             bodies: vec!["shell rm".into()],
-        })
+        }))
     );
     h.down(&policy(1, "[workspace td-1]\ndeny shell rm\n"));
     h.down(&policy(2, &format!("[{here}]\ndeny shell rm\n")));
@@ -2017,10 +2017,10 @@ fn a_repositorys_rules_ask_for_a_read_and_refuse_a_command() {
     // denies are offered.
     assert_eq!(
         h.always,
-        Some(td_agent::rules::Always {
+        Some(td_agent::rules::Offer::Rules(td_agent::rules::Always {
             allow: false,
             bodies: vec!["read_file".into()],
-        })
+        }))
     );
     h.down(&Down::Decision {
         call,
@@ -3791,6 +3791,218 @@ fn a_crossing_asks_the_person_and_a_refusal_is_the_calls_result() {
         matches!(approvals[..], [Kind::Approval { outcome, by, .. }] if outcome == "deny" && by == "human"),
         "{approvals:?}"
     );
+}
+
+/// A standing allow for messages sends three to one conversation since
+/// the human last wrote; the fourth, in a turn a peer's message began,
+/// goes to a card that says why (DESIGN.md §11).
+#[test]
+fn a_run_of_messages_on_a_standing_answer_goes_back_to_the_person() {
+    let mut script = vec![
+        Reply::sse("stream-tool-send.sse"),
+        Reply::sse("stream-sonnet.sse"),
+        Reply::ok("title.json"),
+    ];
+    for _ in 0..3 {
+        script.push(Reply::sse("stream-tool-send.sse"));
+        script.push(Reply::sse("stream-sonnet.sse"));
+    }
+    let mut h = Harness::new("message-run", Role::Conversation, script);
+    let other = Id::parse(&"b".repeat(32)).unwrap();
+    drop(
+        Conversation::open(
+            &h.state,
+            &other,
+            Some(Role::Conversation),
+            Duration::from_secs(3),
+        )
+        .unwrap(),
+    );
+    h.setup(Client::default());
+    let me = h.id.as_str().to_string();
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(format!("[crossings]\nallow message {me} {other}\n")),
+    });
+    h.say("Tell the other conversation.");
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    for n in 1..=2 {
+        h.down(&Down::Message {
+            delivery: td_agent::store::random_hex(16).unwrap(),
+            from: other.clone(),
+            role: Role::Conversation,
+            text: format!("reply {n}"),
+            status: None,
+        });
+        let (_, outcome, _) = h.turn();
+        assert_eq!(outcome, "replied", "{}", h.said());
+    }
+    assert_eq!(h.sent.len(), 3, "{:?}", h.sent);
+    h.down(&Down::Message {
+        delivery: td_agent::store::random_hex(16).unwrap(),
+        from: other.clone(),
+        role: Role::Conversation,
+        text: "reply 3".into(),
+        status: None,
+    });
+    let (call, _, details) = h.until_ask();
+    assert!(
+        details[0].starts_with("Asked because this conversation has sent that one 3 messages"),
+        "{details:?}"
+    );
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(h.sent.len(), 3);
+}
+
+/// The human's standing answer for a crossing (DESIGN.md §3, §11) is
+/// for one pair and one way: an allow for this conversation reading the
+/// other reads with no card; one the other way round does not, and that
+/// card offers the answer for this way; a deny written while it waits
+/// refuses the read.
+#[test]
+fn a_crossing_answered_for_good_holds_one_way_only() {
+    let mut h = Harness::new(
+        "crossing-always",
+        Role::Conversation,
+        vec![
+            Reply::sse("stream-tool-read-other.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-tool-read-other.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-tool-read-other.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-tool-read-other.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    let other = Id::parse(&"b".repeat(32)).unwrap();
+    let (mut conversation, _) = Conversation::open(
+        &h.state,
+        &other,
+        Some(Role::Conversation),
+        Duration::from_secs(3),
+    )
+    .unwrap();
+    conversation
+        .append(Kind::User {
+            delivery: "d".repeat(32),
+            text: "the plan for the other work".into(),
+        })
+        .unwrap();
+    conversation.sync().unwrap();
+    drop(conversation);
+    h.setup(Client::default());
+    let me = h.id.as_str().to_string();
+    let allowed = format!("allow read {me} {other}");
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(format!("[crossings]\n{allowed}\n")),
+    });
+    h.say("What did the other conversation say?");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let ran = results(&events);
+    assert!(
+        ran.iter()
+            .any(|r| r.1.contains("the plan for the other work")),
+        "{ran:?}"
+    );
+    let read = call_record(&events, "toolu_read_01");
+    assert_eq!(
+        approvals(&events),
+        [(
+            read,
+            "allow".into(),
+            "rule".into(),
+            Some(format!("your rule `{allowed}` allows it"))
+        )]
+    );
+
+    h.down(&Down::Policy {
+        version: 2,
+        rules: Ok(format!("[crossings]\nallow read {other} {me}\n")),
+    });
+    h.say("And again?");
+    let (call, _, _) = h.until_ask();
+    assert_eq!(
+        h.always,
+        Some(td_agent::rules::Offer::Crossing {
+            op: td_agent::rules::Crossed::Read,
+            to: other.as_str().to_string(),
+        })
+    );
+    let denied = format!("deny read {me} {other}");
+    h.down(&Down::Policy {
+        version: 3,
+        rules: Ok(format!("[crossings]\n{denied}\n")),
+    });
+    assert_eq!(h.until_withdrawn(), call);
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let ran = results(&events);
+    assert!(
+        ran.iter()
+            .all(|r| !r.1.contains("the plan for the other work")),
+        "{ran:?}"
+    );
+    assert!(
+        ran.iter().any(|r| r
+            .1
+            .starts_with(&format!("error: not run: your rule `{denied}` denies it"))),
+        "{ran:?}"
+    );
+    assert_eq!(
+        approvals(&events),
+        [(
+            call,
+            "deny".into(),
+            "rule".into(),
+            Some(format!("your rule `{denied}` denies it"))
+        )]
+    );
+
+    // A standing deny refuses with no card.
+    h.say("Once more?");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let read = call_record(&events, "toolu_read_01");
+    assert_eq!(
+        approvals(&events),
+        [(
+            read,
+            "deny".into(),
+            "rule".into(),
+            Some(format!("your rule `{denied}` denies it"))
+        )]
+    );
+
+    // Rules unread: the card says so and offers nothing to keep.
+    h.down(&Down::Policy {
+        version: 4,
+        rules: Err("rules: line 1: names no tool".into()),
+    });
+    h.say("And now?");
+    let (call, _, details) = h.until_ask();
+    assert_eq!(
+        details[0],
+        "Asked because your rules could not be read: rules: line 1: names no tool."
+    );
+    assert_eq!(h.always, None);
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
 }
 
 /// Reading another conversation's log is a crossing, asked on a card

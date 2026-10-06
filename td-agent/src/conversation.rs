@@ -152,6 +152,46 @@ const MAX_LISTED: usize = 200;
 const CALL_SKIPPED: &str = "not run: the person interrupted the turn before this call ran";
 /// What a call the human refused is answered with (DESIGN.md §11).
 const CALL_REFUSED: &str = "not run: the person refused this call. That is their answer: do not try to reach the same result another way. Say what you needed it for and ask how they would like to go on";
+/// The most messages to one conversation a standing answer sends, since
+/// the human last wrote here, before each further one asks.
+const MESSAGES_UNASKED: usize = 3;
+/// Why such a message is asked.
+const UNASKED: &str = "this conversation has sent that one 3 messages or more since you last wrote here, and two conversations can keep messaging each other on standing answers";
+
+/// How many `send_message` calls to conversation `to` have started, the
+/// one under way among them, since the human last wrote here: each
+/// started call's `to` read as the tool reads it, whether it was then
+/// allowed, refused or decided on a card.
+fn unasked(events: &[Event], to: &str) -> usize {
+    let start = events
+        .iter()
+        .rposition(|e| matches!(e.kind, Kind::User { .. }))
+        .map_or(0, |at| at + 1);
+    let run = events.get(start..).unwrap_or_default();
+    let arguments = |reply: u64, id: &str| {
+        run.iter().find_map(|e| match &e.kind {
+            Kind::Assistant { calls, .. } if e.seq == reply => calls
+                .iter()
+                .find(|call| call.id == id)
+                .map(|call| call.arguments.as_str()),
+            _ => None,
+        })
+    };
+    run.iter()
+        .filter(|e| match &e.kind {
+            Kind::ToolCall { reply, id, name } if name == "send_message" => arguments(*reply, id)
+                .and_then(|arguments| td_json::parse(arguments).ok())
+                .and_then(|args| {
+                    args.get("to")
+                        .and_then(td_json::Json::as_str)
+                        .and_then(|named| store::Id::parse(named.trim()))
+                })
+                .is_some_and(|named| named.as_str() == to),
+            _ => false,
+        })
+        .count()
+}
+
 /// Why a call a card waited on runs with no answer, its rules having
 /// changed so that none asks.
 const RULES_CHANGED: &str = "the rules that asked about it changed";
@@ -162,12 +202,19 @@ fn ruled(why: &str) -> String {
     format!("not run: {why}. That is the workspace's answer: do not try to reach the same result another way. Say what you needed it for and ask the person how they would like to go on")
 }
 
-/// A host call as the rules judge it.
-struct Judged<'a> {
-    name: &'a str,
-    command: Option<&'a str>,
-    acts: bool,
-    repeated: bool,
+/// A call as the rules judge it: a host call, or a crossing (DESIGN.md
+/// §3) to conversation `to`.
+enum Judged<'a> {
+    Host {
+        name: &'a str,
+        command: Option<&'a str>,
+        acts: bool,
+        repeated: bool,
+    },
+    Cross {
+        op: crate::rules::Crossed,
+        to: &'a str,
+    },
 }
 
 /// What the rules make of a host call.
@@ -408,7 +455,7 @@ pub fn serve_in(
         checked: VecDeque::new(),
         processes: BTreeMap::new(),
         exited: VecDeque::new(),
-        human: (0, Ok(Vec::new())),
+        human: (0, Ok(crate::rules::Policy::default())),
     };
     // What this conversation read or wrote before, so a replacement of an
     // unchanged file needs no read again.
@@ -700,7 +747,7 @@ struct Session {
     exited: VecDeque<End>,
     /// The human's rules as the window last sent them, with their
     /// version, or why they could not be read (DESIGN.md §11).
-    human: (u64, Result<Vec<crate::rules::Human>, String>),
+    human: (u64, Result<crate::rules::Policy, String>),
 }
 
 /// A remote whose remote-tracking refs could not be set to `tried`, and
@@ -1142,7 +1189,7 @@ impl Session {
     /// The human's rules, `version` of them, as the window sent them:
     /// taken at once, from the next decision on.
     fn policy(&mut self, version: u64, rules: Result<String, String>) {
-        let rules = rules.and_then(|text| crate::rules::parse_human(&text));
+        let rules = rules.and_then(|text| crate::rules::parse_policy(&text));
         self.human = (version, rules);
     }
 
@@ -2205,8 +2252,9 @@ impl Session {
             .as_ref()
             .map(|workspace| crate::rules::Scope::Workspace(workspace.key(&meta.id)));
         match &self.human.1 {
-            Ok(rules) => found.extend(
-                rules
+            Ok(policy) => found.extend(
+                policy
+                    .rules
                     .iter()
                     .filter(|one| {
                         one.scope == crate::rules::Scope::Everywhere
@@ -2398,7 +2446,7 @@ impl Session {
             }
             _ => None,
         };
-        let judged = Judged {
+        let judged = Judged::Host {
             name,
             command,
             acts,
@@ -2467,9 +2515,11 @@ impl Session {
                     .workspace
                     .as_ref()
                     .and_then(|_| crate::rules::proposals(name, command))
-                    .map(|always| crate::rules::Always {
-                        allow: always.allow && asked.is_none(),
-                        ..always
+                    .map(|always| {
+                        crate::rules::Offer::Rules(crate::rules::Always {
+                            allow: always.allow && asked.is_none(),
+                            ..always
+                        })
                     });
                 let why = asked.as_deref().or(repeated.then_some("repeated"));
                 match self.decide(started, title, details, why, always, Some(&judged))? {
@@ -2917,7 +2967,7 @@ impl Session {
         title: String,
         details: Vec<String>,
         why: Option<&str>,
-        always: Option<crate::rules::Always>,
+        always: Option<crate::rules::Offer>,
         judged: Option<&Judged<'_>>,
     ) -> Result<Decided, String> {
         self.send(&Up::Ask {
@@ -3010,15 +3060,49 @@ impl Session {
     /// deny refuses it; an ask, an unread file, a call that acts with no
     /// allow for it, or a repeated one puts it on a card; else it runs.
     fn ruling(&self, judged: &Judged<'_>) -> Ruling {
+        let (name, command, acts, repeated) = match *judged {
+            Judged::Host {
+                name,
+                command,
+                acts,
+                repeated,
+            } => (name, command, acts, repeated),
+            // A crossing is the human's unless they answered it for
+            // good; with their rules unread, it is theirs.
+            Judged::Cross { op, to } => {
+                let policy = match &self.human.1 {
+                    Ok(policy) => policy,
+                    Err(why) => {
+                        return Ruling::Card(Some(tools::visible(&format!(
+                            "your rules could not be read: {why}"
+                        ))))
+                    }
+                };
+                let me = self.conversation.meta().id.as_str();
+                return match crate::rules::cross(&policy.crossings, op, me, to) {
+                    crate::rules::Verdict::Deny(why) => Ruling::Deny(tools::visible(&why)),
+                    // A run of messages to one conversation with no word
+                    // from the human goes back to them: two standing
+                    // answers could otherwise keep two conversations
+                    // messaging each other.
+                    crate::rules::Verdict::Allow(_)
+                        if op == crate::rules::Crossed::Message
+                            && unasked(self.conversation.events(), to) > MESSAGES_UNASKED =>
+                    {
+                        Ruling::Card(Some(UNASKED.into()))
+                    }
+                    crate::rules::Verdict::Allow(why) => Ruling::Run(Some(tools::visible(&why))),
+                    _ => Ruling::Card(None),
+                };
+            }
+        };
         let (rules, unread) = self.rules();
-        match crate::rules::judge(&rules, &unread, judged.name, judged.command, judged.acts) {
+        match crate::rules::judge(&rules, &unread, name, command, acts) {
             crate::rules::Verdict::Deny(why) => Ruling::Deny(tools::visible(&why)),
             crate::rules::Verdict::Ask(why) => Ruling::Card(Some(tools::visible(&why))),
-            _ if judged.repeated => Ruling::Card(None),
-            crate::rules::Verdict::Allow(why) => {
-                Ruling::Run(judged.acts.then(|| tools::visible(&why)))
-            }
-            crate::rules::Verdict::Table if judged.acts => Ruling::Card(None),
+            _ if repeated => Ruling::Card(None),
+            crate::rules::Verdict::Allow(why) => Ruling::Run(acts.then(|| tools::visible(&why))),
+            crate::rules::Verdict::Table if acts => Ruling::Card(None),
             crate::rules::Verdict::Table => Ruling::Run(None),
         }
     }
@@ -3115,16 +3199,79 @@ impl Session {
         let Some(meta) = self.metas().into_iter().find(|m| &m.id == target) else {
             return Ok(Err(format!("there is no conversation {target}")));
         };
-        let (title, details) = tools::crossing_card(target, &meta.title, reach);
-        match self.decide(started, title, details, None, None, None)? {
-            Decided::Allowed => {}
-            Decided::Refused | Decided::Ruled(_) => return Ok(Err(CALL_REFUSED.into())),
-            Decided::Undecided => return Ok(Err(CALL_UNDECIDED.into())),
+        // The human's standing answer for this pair and way, else a card
+        // offering to make one.
+        let op = match op {
+            Op::Read => crate::rules::Crossed::Read,
+            Op::Message => crate::rules::Crossed::Message,
+        };
+        let judged = Judged::Cross {
+            op,
+            to: target.as_str(),
+        };
+        match self.ruling(&judged) {
+            Ruling::Deny(why) => {
+                self.log(Kind::Approval {
+                    call: started,
+                    outcome: "deny".into(),
+                    by: "rule".into(),
+                    probabilities: None,
+                    reason: Some(why.clone()),
+                })?;
+                return Ok(Err(ruled(&why)));
+            }
+            Ruling::Run(why) => {
+                self.log(Kind::Approval {
+                    call: started,
+                    outcome: "allow".into(),
+                    by: "rule".into(),
+                    probabilities: None,
+                    reason: why,
+                })?;
+            }
+            Ruling::Card(asked) => {
+                let (title, mut details) = tools::crossing_card(target, &meta.title, reach);
+                if let Some(why) = &asked {
+                    details.insert(0, format!("Asked because {why}."));
+                }
+                // With the human's rules unread, no answer can be kept.
+                let always = self.human.1.is_ok().then(|| crate::rules::Offer::Crossing {
+                    op,
+                    to: target.as_str().to_string(),
+                });
+                match self.decide(
+                    started,
+                    title,
+                    details,
+                    asked.as_deref(),
+                    always,
+                    Some(&judged),
+                )? {
+                    Decided::Allowed => {}
+                    Decided::Refused => return Ok(Err(CALL_REFUSED.into())),
+                    Decided::Ruled(why) => return Ok(Err(ruled(&why))),
+                    Decided::Undecided => return Ok(Err(CALL_UNDECIDED.into())),
+                }
+            }
         }
-        // An interrupt that came with the decision, or before it.
+        // An interrupt that came with the decision, or before it; a
+        // deny taken since.
+        let decided_at = self.human.0;
         self.hear();
         if self.interrupt {
             return Ok(Err(CALL_SKIPPED.into()));
+        }
+        if self.human.0 != decided_at {
+            if let Ruling::Deny(why) = self.ruling(&judged) {
+                self.log(Kind::Approval {
+                    call: started,
+                    outcome: "deny".into(),
+                    by: "rule".into(),
+                    probabilities: None,
+                    reason: Some(why.clone()),
+                })?;
+                return Ok(Err(ruled(&why)));
+            }
         }
         Ok(Ok(Some(meta.id)))
     }
@@ -4604,6 +4751,59 @@ mod tests {
                     .collect(),
             },
         }
+    }
+
+    /// Messages to one conversation that started, counted back to the
+    /// human's last message, each `to` read as the tool reads it; a call
+    /// not yet started, another conversation's, and a decision on a card
+    /// neither counted nor ending the run.
+    #[test]
+    fn unasked_counts_messages_to_one_conversation_since_the_human() {
+        let (b, c) = ("b".repeat(32), "c".repeat(32));
+        let to = |id: &str| format!(r#"{{"to":"{id}","text":"x"}}"#);
+        let (to_b, to_c, padded) = (to(&b), to(&c), to(&format!("  {b} ")));
+        let event = |seq: u64, kind: Kind| Event { seq, time: 0, kind };
+        let started = |seq: u64, reply: u64| {
+            event(
+                seq,
+                Kind::ToolCall {
+                    reply,
+                    id: format!("call-{reply}"),
+                    name: "send_message".into(),
+                },
+            )
+        };
+        let mut events = vec![
+            replied(1, &[("send_message", &to_b)]),
+            started(2, 1),
+            event(
+                3,
+                Kind::User {
+                    delivery: "typed".into(),
+                    text: "go on".into(),
+                },
+            ),
+            replied(4, &[("send_message", &to_c)]),
+            started(5, 4),
+            replied(6, &[("send_message", &padded)]),
+            started(7, 6),
+            event(
+                8,
+                Kind::Approval {
+                    call: 7,
+                    outcome: "allow".into(),
+                    by: "human".into(),
+                    probabilities: None,
+                    reason: None,
+                },
+            ),
+            // Not started: not counted.
+            replied(9, &[("send_message", &to_b)]),
+        ];
+        assert_eq!(unasked(&events, &b), 1);
+        assert_eq!(unasked(&events, &c), 1);
+        events.push(started(10, 9));
+        assert_eq!(unasked(&events, &b), 2);
     }
 
     #[test]

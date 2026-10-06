@@ -295,15 +295,115 @@ pub struct Human {
     pub rule: Rule,
 }
 
-/// The human's rules file: a header, `[everywhere]` or `[<workspace>]`,
-/// then that scope's rules, one a line, as a repository's are written
-/// but allow rules among them; blank lines and `#` comments skipped.
+/// The header of the human's standing answers for crossings.
+pub const CROSSINGS: &str = "crossings";
+
+/// What a crossing does to the other conversation (DESIGN.md §3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Crossed {
+    Read,
+    Message,
+}
+
+impl Crossed {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Message => "message",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "read" => Some(Self::Read),
+            "message" => Some(Self::Message),
+            _ => None,
+        }
+    }
+}
+
+/// One of the human's standing answers for a crossing: whether
+/// conversation `from` may `op` conversation `to`, that way only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Crossing {
+    pub allow: bool,
+    pub op: Crossed,
+    pub from: String,
+    pub to: String,
+}
+
+impl Crossing {
+    /// One line, `<allow|deny> <read|message> <from> <to>`, two
+    /// conversation ids.
+    pub fn parse(line: &str) -> Result<Self, String> {
+        let words: Vec<&str> = line.split([' ', '\t']).filter(|w| !w.is_empty()).collect();
+        let [effect, op, from, to] = words.as_slice() else {
+            return Err(
+                "a crossing is `allow` or `deny`, `read` or `message`, then two conversations"
+                    .into(),
+            );
+        };
+        let allow = match *effect {
+            "allow" => true,
+            "deny" => false,
+            _ => return Err("a crossing that neither allows nor denies".into()),
+        };
+        let op = Crossed::parse(op).ok_or("a crossing that neither reads nor messages")?;
+        for id in [from, to] {
+            if crate::store::Id::parse(id).is_none() {
+                return Err(format!("{id:?} is not a conversation's id"));
+            }
+        }
+        if from == to {
+            return Err("a crossing from a conversation to itself".into());
+        }
+        Ok(Self {
+            allow,
+            op,
+            from: from.to_string(),
+            to: to.to_string(),
+        })
+    }
+
+    /// Its line, as `parse` reads it.
+    pub fn text(&self) -> String {
+        let effect = if self.allow { "allow" } else { "deny" };
+        format!("{effect} {} {} {}", self.op.name(), self.from, self.to)
+    }
+}
+
+/// The human's rules file, read: the rules for tool calls, and the
+/// standing answers for crossings.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Policy {
+    pub rules: Vec<Human>,
+    pub crossings: Vec<Crossing>,
+}
+
+/// The human's rules file's rules for tool calls (`parse_policy`).
 pub fn parse_human(text: &str) -> Result<Vec<Human>, String> {
+    parse_policy(text).map(|policy| policy.rules)
+}
+
+/// What a header of the human's file opens.
+#[derive(Clone)]
+enum Section {
+    Scope(Scope),
+    Crossings,
+}
+
+/// The human's rules file: a header, `[everywhere]`, `[<workspace>]` or
+/// `[crossings]`, then that section's lines, one a line: a workspace's
+/// or every workspace's rules as a repository's are written but allow
+/// rules among them, or crossings as `Crossing::parse` reads them; blank
+/// lines and `#` comments skipped.
+pub fn parse_policy(text: &str) -> Result<Policy, String> {
     if text.len() > MAX_HUMAN_FILE {
         return Err(format!("past {MAX_HUMAN_FILE} bytes"));
     }
-    let mut scope = None;
+    let mut section = None;
     let mut rules = Vec::new();
+    let mut crossings = Vec::new();
     for (at, line) in text.lines().enumerate() {
         // Comments too: a control escapes to six bytes on the wire.
         if line.chars().any(|c| c.is_control() && c != '\t') {
@@ -314,20 +414,31 @@ pub fn parse_human(text: &str) -> Result<Vec<Human>, String> {
             continue;
         }
         if let Some(key) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            scope = Some(if key == EVERYWHERE {
-                Scope::Everywhere
-            } else {
-                Scope::Workspace(
+            section = Some(match key {
+                EVERYWHERE => Section::Scope(Scope::Everywhere),
+                CROSSINGS => Section::Crossings,
+                key => Section::Scope(Scope::Workspace(
                     workspace_key(key).map_err(|why| format!("line {}: {why}", at + 1))?,
-                )
+                )),
             });
             continue;
         }
-        let Some(scope) = scope.clone() else {
-            return Err(format!(
-                "line {}: a rule before any [workspace] or [everywhere]",
-                at + 1
-            ));
+        if rules.len() + crossings.len() == MAX_HUMAN_RULES {
+            return Err(format!("more than {MAX_HUMAN_RULES} rules"));
+        }
+        let scope = match section.clone() {
+            None => {
+                return Err(format!(
+                    "line {}: a rule before any [workspace], [everywhere] or [crossings]",
+                    at + 1
+                ))
+            }
+            Some(Section::Crossings) => {
+                crossings
+                    .push(Crossing::parse(line).map_err(|why| format!("line {}: {why}", at + 1))?);
+                continue;
+            }
+            Some(Section::Scope(scope)) => scope,
         };
         let rule = Rule::parse(line).map_err(|why| format!("line {}: {why}", at + 1))?;
         if rule.effect == Effect::Allow && scope == Scope::Everywhere {
@@ -336,12 +447,26 @@ pub fn parse_human(text: &str) -> Result<Vec<Human>, String> {
                 at + 1
             ));
         }
-        if rules.len() == MAX_HUMAN_RULES {
-            return Err(format!("more than {MAX_HUMAN_RULES} rules"));
-        }
         rules.push(Human { scope, rule });
     }
-    Ok(rules)
+    Ok(Policy { rules, crossings })
+}
+
+/// What the human's standing answers say of conversation `from` doing
+/// `op` to conversation `to`: a deny wins, then an allow.
+pub fn cross(crossings: &[Crossing], op: Crossed, from: &str, to: &str) -> Verdict {
+    let said = |allow: bool| {
+        crossings
+            .iter()
+            .find(|one| one.allow == allow && one.op == op && one.from == from && one.to == to)
+    };
+    if let Some(one) = said(false) {
+        return Verdict::Deny(format!("your rule `{}` denies it", one.text()));
+    }
+    if let Some(one) = said(true) {
+        return Verdict::Allow(format!("your rule `{}` allows it", one.text()));
+    }
+    Verdict::Table
 }
 
 /// `key` as a header names a workspace, as `Workspace::key` writes one:
@@ -467,6 +592,15 @@ impl Always {
     }
 }
 
+/// What a card's "always" answers would remember: rules for a tool call,
+/// or, for a crossing, the standing answer for `op` to conversation `to`
+/// from the conversation that asks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Offer {
+    Rules(Always),
+    Crossing { op: Crossed, to: String },
+}
+
 /// Whether `word` reads as a subcommand: lower case, a letter first.
 fn subcommand(word: &str) -> bool {
     word.starts_with(|c: char| c.is_ascii_lowercase())
@@ -538,23 +672,32 @@ pub fn broad(body: &str) -> Option<&str> {
     BROAD.contains(&program(word)).then_some(word)
 }
 
-/// `text`, the human's rules file, without each section under the
-/// header of workspace `key`, a deleted conversation's own, so a later
-/// workspace that came to share its key takes none of its rules; `None`
-/// when it holds none. Refused when `text` is.
-pub fn without(text: &str, key: &str) -> Result<Option<String>, String> {
-    parse_human(text)?;
-    let header = format!("[{key}]");
+/// `text`, the human's rules file, without what deleted conversation
+/// `id` leaves: each section under the header of workspace `key`, its
+/// own, so a later workspace that came to share its key takes none of
+/// its rules, and each crossing to or from it; `None` when it holds
+/// neither. Refused when `text` is.
+pub fn forget(text: &str, key: Option<&str>, id: &str) -> Result<Option<String>, String> {
+    parse_policy(text)?;
+    let header = key.map(|key| format!("[{key}]"));
+    let crossings = format!("[{CROSSINGS}]");
     let mut out = String::new();
     let mut dropping = false;
+    let mut crossing = false;
     let mut dropped = false;
     for line in text.lines() {
         let trimmed = line.trim_matches([' ', '\t']);
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            dropping = trimmed == header;
-            dropped |= dropping;
-        }
-        if !dropping {
+        let drop = if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            dropping = header.as_deref() == Some(trimmed);
+            crossing = trimmed == crossings;
+            dropping
+        } else {
+            dropping
+                || (crossing
+                    && Crossing::parse(trimmed).is_ok_and(|one| one.from == id || one.to == id))
+        };
+        dropped |= drop;
+        if !drop {
             out.push_str(line);
             out.push('\n');
         }
@@ -562,7 +705,7 @@ pub fn without(text: &str, key: &str) -> Result<Option<String>, String> {
     if !dropped {
         return Ok(None);
     }
-    parse_human(&out)?;
+    parse_policy(&out)?;
     Ok(Some(out))
 }
 
@@ -577,6 +720,30 @@ pub fn add(text: &str, scope: &Scope, effect: Effect, bodies: &[String]) -> Resu
         Scope::Everywhere => format!("[{EVERYWHERE}]"),
         Scope::Workspace(key) => format!("[{}]", workspace_key(key)?),
     };
+    let mut lines = Vec::new();
+    for body in bodies {
+        let rule = Rule::parse(&format!("{} {body}", effect.name()))?;
+        let held = |one: &Human| &one.scope == scope && one.rule == rule;
+        if !rules.iter().any(held) && !lines.contains(&rule.text()) {
+            lines.push(rule.text());
+        }
+    }
+    append(text, &header, &lines)
+}
+
+/// `text`, the human's rules file, with `crossing` added under
+/// `[crossings]`, as `add` adds a rule; unchanged when it holds it.
+pub fn add_crossing(text: &str, crossing: &Crossing) -> Result<String, String> {
+    if parse_policy(text)?.crossings.contains(crossing) {
+        return Ok(text.to_string());
+    }
+    append(text, &format!("[{CROSSINGS}]"), &[crossing.text()])
+}
+
+/// `text` with `lines` below the file's last header when that is
+/// `header`, else under a new `header` at its end; refused when the
+/// result is.
+fn append(text: &str, header: &str, lines: &[String]) -> Result<String, String> {
     let mut out = text.to_string();
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
@@ -586,25 +753,20 @@ pub fn add(text: &str, scope: &Scope, effect: Effect, bodies: &[String]) -> Resu
         .rev()
         .map(|line| line.trim_matches([' ', '\t']))
         .find(|line| line.starts_with('[') && line.ends_with(']'));
-    let mut headed = last == Some(header.as_str());
-    for body in bodies {
-        let rule = Rule::parse(&format!("{} {body}", effect.name()))?;
-        let held = |one: &Human| &one.scope == scope && one.rule == rule;
-        if rules.iter().any(held) {
-            continue;
-        }
+    let mut headed = last == Some(header);
+    for line in lines {
         if !headed {
             if !out.is_empty() {
                 out.push('\n');
             }
-            out.push_str(&header);
+            out.push_str(header);
             out.push('\n');
             headed = true;
         }
-        out.push_str(&rule.text());
+        out.push_str(line);
         out.push('\n');
     }
-    parse_human(&out)?;
+    parse_policy(&out)?;
     Ok(out)
 }
 
@@ -1929,14 +2091,72 @@ mod tests {
     /// A deleted conversation's workspace's sections go, every other line
     /// staying; a file with none is left as it is.
     #[test]
-    fn a_deleted_workspaces_rules_go_with_it() {
+    fn a_deleted_conversations_rules_go_with_it() {
         let text = "# mine\n[workspace td-1-ab]\nallow shell cargo test\n\n[everywhere]\ndeny shell rm\n[workspace td-1-ab]\n# again\ndeny glob\n[workspace td-2-cd]\nask glob\n";
+        let id = "a".repeat(32);
         assert_eq!(
-            without(text, "workspace td-1-ab").unwrap().unwrap(),
+            forget(text, Some("workspace td-1-ab"), &id)
+                .unwrap()
+                .unwrap(),
             "# mine\n[everywhere]\ndeny shell rm\n[workspace td-2-cd]\nask glob\n"
         );
-        assert_eq!(without(text, "workspace td-3-ef").unwrap(), None);
-        assert!(without("[x]\n", "workspace td-1-ab").is_err());
+        assert_eq!(forget(text, Some("workspace td-3-ef"), &id).unwrap(), None);
+        assert_eq!(forget(text, None, &id).unwrap(), None);
+        assert!(forget("[x]\n", Some("workspace td-1-ab"), &id).is_err());
+        // Its crossings, either way, and no other.
+        let (a, b, c) = ("a".repeat(32), "b".repeat(32), "c".repeat(32));
+        let text =
+            format!("[crossings]\nallow read {a} {b}\ndeny message {b} {a}\nallow read {b} {c}\n");
+        assert_eq!(
+            forget(&text, None, &a).unwrap().unwrap(),
+            format!("[crossings]\nallow read {b} {c}\n")
+        );
+    }
+
+    /// The human's crossings: read in their section, each a pair and a
+    /// direction; a deny first, then an allow, each for its own way.
+    #[test]
+    fn a_crossing_is_answered_for_one_pair_one_way() {
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
+        let text = format!("[crossings]\nallow read {a} {b}\n# no\ndeny message {a} {b}\n");
+        let policy = parse_policy(&text).unwrap();
+        assert!(policy.rules.is_empty());
+        assert_eq!(policy.crossings.len(), 2);
+        let crossings = &policy.crossings;
+        assert_eq!(
+            cross(crossings, Crossed::Read, &a, &b),
+            Verdict::Allow(format!("your rule `allow read {a} {b}` allows it"))
+        );
+        assert_eq!(cross(crossings, Crossed::Read, &b, &a), Verdict::Table);
+        let c = "c".repeat(32);
+        assert_eq!(cross(crossings, Crossed::Read, &c, &b), Verdict::Table);
+        assert_eq!(
+            cross(crossings, Crossed::Message, &a, &b),
+            Verdict::Deny(format!("your rule `deny message {a} {b}` denies it"))
+        );
+        let both = parse_policy(&format!("{text}allow message {a} {b}\n")).unwrap();
+        assert!(matches!(
+            cross(&both.crossings, Crossed::Message, &a, &b),
+            Verdict::Deny(_)
+        ));
+        for wrong in [
+            format!("[crossings]\nallow read {a}\n"),
+            format!("[crossings]\nask read {a} {b}\n"),
+            format!("[crossings]\nallow write {a} {b}\n"),
+            format!("[crossings]\nallow read {a} {a}\n"),
+            format!("[crossings]\nallow read {a} x\n"),
+            "[crossings]\nallow shell ls\n".to_string(),
+            format!("[everywhere]\nallow read {a} {b}\n"),
+        ] {
+            assert!(parse_policy(&wrong).is_err(), "{wrong}");
+        }
+        let one = Crossing::parse(&format!("allow read {a} {b}")).unwrap();
+        let added = add_crossing("[everywhere]\ndeny glob\n", &one).unwrap();
+        assert_eq!(
+            added,
+            format!("[everywhere]\ndeny glob\n\n[crossings]\nallow read {a} {b}\n")
+        );
+        assert_eq!(add_crossing(&added, &one).unwrap(), added);
     }
 
     /// An "always" answer adds its rules without disturbing the human's
@@ -1993,7 +2213,7 @@ mod tests {
         for (text, why) in [
             (
                 "allow glob\n",
-                "line 1: a rule before any [workspace] or [everywhere]",
+                "line 1: a rule before any [workspace], [everywhere] or [crossings]",
             ),
             (
                 "[everywhere]\nallow glob\n",

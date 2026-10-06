@@ -341,26 +341,41 @@ impl Session {
     /// decision, so the card's own is decided by the human (DESIGN.md
     /// §11); one that cannot be added is said, and the answer holds once.
     fn decide(&mut self, conversation: &Id, call: u64, answer: Answer) {
-        let (allow, always) = match answer {
+        let (allow, remembered) = match answer {
             Answer::Once(allow) => (allow, None),
             Answer::Always {
                 allow,
                 everywhere,
                 bodies,
-            } => match remember(&self.state, conversation, allow, everywhere, &bodies) {
-                Ok(said) => {
-                    self.app.note(format!("remembered {said}"));
-                    (allow, Some(said))
-                }
-                Err(e) => {
-                    let said = format!(
-                        "your answer holds this once; it could not be added to your rules: {e}"
-                    );
-                    eprintln!("td-agent: {said}");
-                    self.app.note(said);
-                    (allow, None)
-                }
-            },
+            } => (
+                allow,
+                Some(remember(
+                    &self.state,
+                    conversation,
+                    allow,
+                    everywhere,
+                    &bodies,
+                )),
+            ),
+            Answer::Crossing { allow, op, to } => (
+                allow,
+                Some(remember_crossing(&self.state, conversation, allow, op, &to)),
+            ),
+        };
+        let always = match remembered {
+            None => None,
+            Some(Ok(said)) => {
+                self.app.note(format!("remembered {said}"));
+                Some(said)
+            }
+            Some(Err(e)) => {
+                let said = format!(
+                    "your answer holds this once; it could not be added to your rules: {e}"
+                );
+                eprintln!("td-agent: {said}");
+                self.app.note(said);
+                None
+            }
         };
         let remembered = always.is_some();
         self.supervisor.answer(
@@ -961,8 +976,9 @@ impl Session {
     /// human's messages they had not taken, opening the next when
     /// `was_open`; whether it is deleted.
     fn delete_now(&mut self, id: &Id, was_open: bool, held: Vec<(String, String)>) -> bool {
-        // The workspace's own rules go with it; a directory is the
-        // human's, and others may work in it.
+        // The workspace's own rules go with it, a directory's staying,
+        // it being the human's and others able to work in it; and its
+        // crossings.
         let ruled = match self.state.workspace(id) {
             Ok(Some(crate::workspace::Workspace::Directory(_))) | Ok(None) | Err(_) => None,
             Ok(Some(workspace)) => Some(workspace.key(id)),
@@ -994,16 +1010,12 @@ impl Session {
             eprintln!("td-agent: the outbox: {e}");
             said.push_str(&format!("; the outbox: {e}"));
         }
-        if let Some(key) = ruled {
-            match forget_rules(&self.state, &key) {
-                Ok(false) => {}
-                Ok(true) => self.supervisor.repolicy(self.state.load_rules()),
-                Err(e) => {
-                    eprintln!("td-agent: forgetting the rules for {key}: {e}");
-                    said.push_str(&format!(
-                        "; its workspace's rules stay in your rules file: {e}"
-                    ));
-                }
+        match forget_rules(&self.state, ruled.as_deref(), id) {
+            Ok(false) => {}
+            Ok(true) => self.supervisor.repolicy(self.state.load_rules()),
+            Err(e) => {
+                eprintln!("td-agent: forgetting the rules for {id}: {e}");
+                said.push_str(&format!("; its rules stay in your rules file: {e}"));
             }
         }
         self.app.remove_row(id);
@@ -1852,19 +1864,48 @@ fn remember(
     Ok(format!("{} in your rules for {whose}", rules.join(", ")))
 }
 
-/// Takes the sections for workspace `key` out of the human's rules:
-/// whether there were any.
-fn forget_rules(state: &StateDir, key: &str) -> Result<bool, String> {
-    match crate::rules::without(&state.load_rules()?, key)? {
+/// Takes what deleted conversation `id` leaves out of the human's rules,
+/// its workspace `key`'s sections and its crossings: whether there were
+/// any.
+fn forget_rules(state: &StateDir, key: Option<&str>, id: &Id) -> Result<bool, String> {
+    match crate::rules::forget(&state.load_rules()?, key, id.as_str())? {
         Some(text) => state.save_rules(&text).map(|()| true),
         None => Ok(false),
     }
 }
 
+/// Adds the human's standing answer for `conversation` doing `op` to
+/// conversation `to`, that way only: what was added, as the approval's
+/// reason says it.
+fn remember_crossing(
+    state: &StateDir,
+    conversation: &Id,
+    allow: bool,
+    op: crate::rules::Crossed,
+    to: &str,
+) -> Result<String, String> {
+    let crossing = crate::rules::Crossing {
+        allow,
+        op,
+        from: conversation.as_str().to_string(),
+        to: to.to_string(),
+    };
+    // As the file reads it: `to` a conversation and not this one, and
+    // one that is still here.
+    let crossing = crate::rules::Crossing::parse(&crossing.text())?;
+    let (metas, _) = state.list();
+    if !metas.iter().any(|meta| meta.id.as_str() == crossing.to) {
+        return Err(format!("there is no conversation {}", crossing.to));
+    }
+    let text = crate::rules::add_crossing(&state.load_rules()?, &crossing)?;
+    state.save_rules(&text)?;
+    Ok(format!("`{}` in your rules for crossings", crossing.text()))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::{default_model, forget_rules, names, remember};
+    use super::{default_model, forget_rules, names, remember, remember_crossing};
     use crate::workspace::Workspace;
 
     /// A card's "always" answer adds its rules under the conversation's
@@ -1896,16 +1937,55 @@ mod tests {
         let text = "[directory /home/u/my%20notes]\nallow shell cargo test\nallow shell rm\n\n[everywhere]\ndeny shell rm\n";
         assert_eq!(state.load_rules().unwrap(), text);
         assert!(remember(&state, &id, true, true, &bodies).is_err());
-        let other = crate::store::Id::random().unwrap();
-        assert!(remember(&state, &other, false, false, &bodies).is_err());
+        let stranger = crate::store::Id::random().unwrap();
+        assert!(remember(&state, &stranger, false, false, &bodies).is_err());
         assert_eq!(state.load_rules().unwrap(), text);
-        assert!(!forget_rules(&state, "workspace td-1-ab").unwrap());
-        assert!(forget_rules(&state, "directory /home/u/my%20notes").unwrap());
-        assert_eq!(state.load_rules().unwrap(), "[everywhere]\ndeny shell rm\n");
+        let other = crate::store::Id::random().unwrap();
+        assert!(remember_crossing(
+            &state,
+            &id,
+            true,
+            crate::rules::Crossed::Read,
+            other.as_str()
+        )
+        .is_err());
+        crate::store::Conversation::create(
+            &state,
+            &other,
+            crate::store::Role::Conversation,
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(
+            remember_crossing(
+                &state,
+                &id,
+                true,
+                crate::rules::Crossed::Read,
+                other.as_str()
+            )
+            .unwrap(),
+            format!(
+                "`allow read {} {}` in your rules for crossings",
+                id.as_str(),
+                other.as_str()
+            )
+        );
+        assert!(
+            remember_crossing(&state, &id, true, crate::rules::Crossed::Read, id.as_str()).is_err()
+        );
+        assert!(remember_crossing(&state, &id, true, crate::rules::Crossed::Read, "x").is_err());
+        assert!(!forget_rules(&state, Some("workspace td-1-ab"), &stranger).unwrap());
+        assert!(forget_rules(&state, Some("directory /home/u/my%20notes"), &id).unwrap());
+        assert_eq!(
+            state.load_rules().unwrap(),
+            "[everywhere]\ndeny shell rm\n\n[crossings]\n"
+        );
         let path = state.root().join(crate::rules::HUMAN_FILE);
         std::fs::write(&path, "[x]\n").unwrap();
         assert!(remember(&state, &id, false, true, &bodies).is_err());
-        assert!(forget_rules(&state, "workspace td-1-ab").is_err());
+        assert!(forget_rules(&state, Some("workspace td-1-ab"), &id).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[x]\n");
     }
 
