@@ -157,9 +157,6 @@ const CALL_REFUSED: &str = "not run: the person refused this call. That is their
 /// the human last wrote here, before each further one asks.
 const MESSAGES_UNASKED: usize = 3;
 
-/// Room on a log line for what a `Request` event holds beside its head.
-const LOGGED_SLACK: usize = 4096;
-
 /// The circuit breaker's bounds (DESIGN.md §11): verdicts of the
 /// classifier's that did not allow, in a row and in all.
 const BRAKE_RUN: usize = 3;
@@ -4197,14 +4194,7 @@ impl Session {
         });
         // Each request is logged whole, escaped once more: one past a
         // line of the log is not asked, its text not cut.
-        let logged = |head: &str| {
-            td_json::Json::Str(head.to_string())
-                .to_string()
-                .len()
-                .saturating_add(LOGGED_SLACK)
-                <= store::MAX_LINE
-        };
-        if !logged(&head) || jev.as_ref().is_ok_and(|j| !logged(&j.2)) {
+        if !classifier::logged(&head) || jev.as_ref().is_ok_and(|j| !classifier::logged(&j.2)) {
             return Ok(refused(
                 "its request would be past the bound of a line of the conversation's log".into(),
             ));
@@ -4413,28 +4403,7 @@ impl Session {
             },
             model: meta.model.clone().unwrap_or_else(|| client.model.clone()),
         };
-        let (action, detail, payload) = match reach {
-            Reach::Message(text) => (
-                "message",
-                format!("send a message to conversation {}, starting a turn there", to.id),
-                Some(("message", text.to_string())),
-            ),
-            Reach::Search(query) => (
-                "search",
-                format!("search conversation {}'s whole log; what it finds comes into this conversation", to.id),
-                Some(("query", query.to_string())),
-            ),
-            Reach::Read {
-                from,
-                offset,
-                count,
-                max_bytes,
-            } => (
-                "read",
-                format!("read conversation {}'s log, up to {count} events and {max_bytes} bytes from event {from}, {offset} bytes in; what it reads comes into this conversation", to.id),
-                None,
-            ),
-        };
+        let (action, detail, payload) = classifier::described(to.id.as_str(), reach);
         let mut untrusted = vec![("title", to.title.clone())];
         // What other conversations sent this one, the latest few.
         let received: Vec<&str> = events

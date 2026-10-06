@@ -450,7 +450,7 @@ pub fn again(attempt: u32, ended: &Ended) -> Option<std::time::Duration> {
 
 /// `GET /models`: the list the cost is bounded from, fetched for each
 /// review, since a cached one may lack a model chosen here.
-fn models(base_url: &str) -> Result<Models, String> {
+pub(crate) fn models(base_url: &str) -> Result<Models, String> {
     let response = td_fetch_client::get(
         &format!("{base_url}/models"),
         &[("accept", "application/json")],

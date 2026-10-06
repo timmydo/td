@@ -93,6 +93,50 @@ fn cut(text: &str, most: usize) -> String {
     format!("{} [cut]", text.get(..end).unwrap_or_default())
 }
 
+/// Room on a log line for what a `Request` event holds beside its head.
+const LOGGED_SLACK: usize = 4096;
+
+/// Whether a request of `head` fits a line of the conversation's log,
+/// where it is kept whole, escaped once more.
+pub fn logged(head: &str) -> bool {
+    Json::Str(head.to_string())
+        .to_string()
+        .len()
+        .saturating_add(LOGGED_SLACK)
+        <= crate::store::MAX_LINE
+}
+
+/// What a crossing to conversation `to` is, as `reach` says: its kind,
+/// what td-agent says it does, and the payload it carries, named.
+pub fn described(
+    to: &str,
+    reach: crate::tools::Reach,
+) -> (&'static str, String, Option<(&'static str, String)>) {
+    use crate::tools::Reach;
+    match reach {
+        Reach::Message(text) => (
+            "message",
+            format!("send a message to conversation {to}, starting a turn there"),
+            Some(("message", text.to_string())),
+        ),
+        Reach::Search(query) => (
+            "search",
+            format!("search conversation {to}'s whole log; what it finds comes into this conversation"),
+            Some(("query", query.to_string())),
+        ),
+        Reach::Read {
+            from,
+            offset,
+            count,
+            max_bytes,
+        } => (
+            "read",
+            format!("read conversation {to}'s log, up to {count} events and {max_bytes} bytes from event {from}, {offset} bytes in; what it reads comes into this conversation"),
+            None,
+        ),
+    }
+}
+
 /// The state both stages see (DESIGN.md §11), as separated, labelled
 /// fields: the person's messages, the workspace's policy, the pending
 /// action, and the untrusted field, which holds the payload whole, the

@@ -33,6 +33,7 @@
 pub mod accounts;
 pub mod assemble;
 pub mod bench;
+pub mod calibrate;
 pub mod card;
 pub mod chooser;
 pub mod classifier;

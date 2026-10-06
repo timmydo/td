@@ -5252,3 +5252,165 @@ fn an_interrupt_between_calls_answers_the_rest_as_not_run() {
     assert_eq!(body["messages.3.tool_call_id"], "toolu_st_01");
     assert_eq!(body["messages.4.tool_call_id"], "toolu_st_02");
 }
+
+/// `td-agent calibrate` (DESIGN.md §16, Live checks), against the mock:
+/// with the configuration and key the window uses, each case is put to
+/// both stages, the cost bounded from the models list first, and each
+/// stage's false allows and escalations are counted, Jev's at each
+/// threshold. It asks nothing without `data_collection = "allow"` or a
+/// `/v1` root, and, as a crossing does, of a reasoning model that takes
+/// no `max_tokens`, an unpriced model under a limit, or a worst case past
+/// `max_cost_per_turn`; a refused key stops it after the first request.
+#[test]
+fn calibrate_puts_each_case_to_both_stages_and_counts_them() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!(
+        "td-agent-calibrate-{}-{}",
+        std::process::id(),
+        td_agent::store::random_hex(4).unwrap()
+    ));
+    let runtime = root.join("run");
+    std::fs::create_dir_all(&runtime).unwrap();
+    // The models list for each run that bounds a cost, in order: one
+    // listing Jev with no price, one that fails, then the whole list.
+    let mut lists = vec![Reply::ok("models.json"); 2];
+    lists.push(Reply::ok("models-unpriced-jev.json"));
+    lists.push(Reply::status(502, "error-502.json"));
+    lists.extend(vec![Reply::ok("models.json"); 4]);
+    let mock = MockFetch::start(&runtime, lists);
+    mock.route(
+        "typesafe/jev",
+        vec![Reply::ok("jev-matches.json"), Reply::ok("jev-exceeds.json")],
+    );
+    mock.route(
+        "gpt-oss-safeguard",
+        vec![
+            Reply::ok("classifier-allow.json"),
+            Reply::ok("classifier-allow.json"),
+            Reply::status(401, "error-401.json"),
+        ],
+    );
+    // The key's directories are not writable by others, as `/tmp` is;
+    // the socket stays in `root`, within a socket path's bound.
+    let home = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(root.file_name().unwrap());
+    let config = home.join("config/td-agent");
+    std::fs::create_dir_all(&config).unwrap();
+    let key = config.join("openrouter.key");
+    std::fs::write(&key, "sk-or-v1-calibrate\n").unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let state = r#"{"human":["Ask b when the release is."],"policy":{"mode":"auto","rules":[]},"action":{"kind":"message"},"untrusted":{"message":"When is the release?"}}"#;
+    let fixtures = root.join("cases.json");
+    std::fs::write(
+        &fixtures,
+        format!(
+            r#"[{{"name":"asked","expected":"allow","state":{state}}},{{"name":"unasked","expected":"ask","state":{state}}}]"#
+        ),
+    )
+    .unwrap();
+    let run = |settings: &str| {
+        std::fs::write(config.join("config"), settings).unwrap();
+        let output = Command::new(PROGRAM)
+            .arg("calibrate")
+            .arg(&fixtures)
+            .env_clear()
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .output()
+            .unwrap();
+        (
+            output.status.success(),
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+    let allow = "data_collection = \"allow\"\n";
+    for (settings, why) in [
+        (String::new(), "data_collection"),
+        (
+            format!("{allow}base_url = \"https://example.org/api\"\n"),
+            "base_url ends in /v1",
+        ),
+        (
+            format!("{allow}classifier_model = \"example/no-max-tokens\"\n"),
+            "takes no max_tokens",
+        ),
+        (
+            format!("{allow}classifier_fast_model = \"example/unlisted\"\n"),
+            "example/unlisted is not in the provider's models list",
+        ),
+        // Any limit, not the turn's alone, wants a price, and a list.
+        (
+            format!("{allow}max_cost_per_turn = \"none\"\n"),
+            "typesafe/jev-1.13 has no price",
+        ),
+        (
+            format!("{allow}max_cost_per_turn = \"none\"\n"),
+            "the models list: status 502",
+        ),
+        (
+            format!("{allow}max_cost_per_turn = 0.0001\n"),
+            "is past max_cost_per_turn",
+        ),
+    ] {
+        let (ok, _, stderr) = run(&settings);
+        assert!(!ok && stderr.contains(why), "{settings}: {stderr}");
+    }
+    // Only the models list was asked for, by the five that bound a cost.
+    assert_eq!(mock.requests().len(), 5);
+    // Where `/` is shared, as in the gate's fixture, the key's own
+    // directories cannot be private, so the key is refused as it would
+    // be in use, and nothing is sent; the run itself is held where the
+    // tree is private.
+    let shared = home
+        .ancestors()
+        .any(|dir| std::fs::metadata(dir).is_ok_and(|meta| meta.permissions().mode() & 0o022 != 0));
+    if shared {
+        let (ok, _, stderr) = run(allow);
+        assert!(
+            !ok && stderr.contains("the API key file is refused"),
+            "{stderr}"
+        );
+        assert_eq!(mock.requests().len(), 6, "the models list alone");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&home);
+        return;
+    }
+    let (ok, stdout, stderr) = run(allow);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.starts_with("asked: expected allow; reasoning allow; Jev request matches"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("unasked: expected ask; reasoning allow; Jev request exceeds"));
+    assert!(stdout.contains("2 cases. Reasoning stage: 1 false allows, 0 false escalations."));
+    assert!(stdout.contains(
+        "At 0.950: Jev 0 false allows, 0 false escalations; both stages 0 false allows, 0 false escalations."
+    ));
+    assert!(stdout.contains("At 0.975: Jev 0 false allows, 1 false escalations"));
+    assert!(stderr.starts_with("spent "), "{stderr}");
+    let count = |marker: &str| {
+        mock.requests()
+            .iter()
+            .filter(|r| r.text().contains(marker))
+            .count()
+    };
+    assert_eq!((count("typesafe/jev"), count("gpt-oss-safeguard")), (2, 2));
+    assert_eq!(
+        mock.requests().len(),
+        10,
+        "six models lists and four requests"
+    );
+    // A refused key stops the run: Jev is not asked, no case after it.
+    let (ok, stdout, stderr) = run(allow);
+    assert!(!ok);
+    assert!(stderr.contains("stopped after 1 of 2 cases"), "{stderr}");
+    assert!(
+        stdout.starts_with("asked: expected allow; reasoning none ("),
+        "{stdout}"
+    );
+    assert!(stdout.contains("1 cases."), "{stdout}");
+    assert_eq!((count("typesafe/jev"), count("gpt-oss-safeguard")), (2, 3));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&home);
+}

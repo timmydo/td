@@ -13,6 +13,7 @@ use td_agent::workspace::Workspace;
 
 const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
 \x20      td-agent review [--model MODEL] [--effort LEVEL] [--max-tokens N] [--] [FILE]\n\
+\x20      td-agent calibrate FIXTURES\n\
 \x20      td-agent --help\n\
 \n\
 td-agent is td's agent harness (td-agent/DESIGN.md). Its window lists the\n\
@@ -47,7 +48,11 @@ which File > Set OpenRouter key... writes.\n\
 \n\
 td-agent review reviews the git commit in FILE (or standard input) as\n\
 `git show` prints it, with the same configuration and key, and writes\n\
-the review to standard output; td-agent review --help says more.\n";
+the review to standard output; td-agent review --help says more.\n\
+\n\
+td-agent calibrate puts the classifier fixtures in FIXTURES to both of\n\
+its stages, live, and counts their false allows and escalations;\n\
+td-agent calibrate --help says more.\n";
 
 /// `td-agent conversation ID --state-dir DIR [--create ROLE [--workspace
 /// WORKSPACE]]`: the window starts these; a person does not.
@@ -125,6 +130,7 @@ fn main() -> ExitCode {
     let result = match args.split_first() {
         Some((first, rest)) if first == "conversation" => conversation(rest),
         Some((first, rest)) if first == "review" => td_agent::review::run(rest),
+        Some((first, rest)) if first == "calibrate" => td_agent::calibrate::run(rest),
         Some((first, rest)) if first == "tool-host" => td_agent::toolhost::Config::parse(rest)
             .and_then(|config| {
                 td_agent::toolhost::serve(std::io::stdin(), std::io::stdout(), config)

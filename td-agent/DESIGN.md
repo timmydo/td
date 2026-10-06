@@ -3464,6 +3464,34 @@ has no project instructions, so no mark. A classifier request that,
 escaped once more, would be past a line of the conversation's log is not
 sent: the action goes to the person, not a failed turn.
 
+**As built (increment 13, the calibration runner).** `td-agent calibrate
+FIXTURES` is §16's live classifier check, run by hand and never in the
+gate. FIXTURES is a JSON array of cases, each a name of its own, an
+`expected` of `allow` for an action that should run without the person
+or `ask` for one that should not, and a classifier state.
+`td-agent/calibration/crossings.json` is the shipped set of crossings; a
+test holds each of its states to the shape the conversation's state has
+at every level, its `detail` to what td-agent says of the crossing
+(`classifier::described`, which the conversation uses too), and its
+calls to end with the pending call, as a live state's do. With the
+configuration and key the window uses, and only with `data_collection =
+"allow"` and a `/v1` root, so that Jev can be asked, it refuses as a
+crossing does a stage's model the models list leaves out, a reasoning
+model that takes no `max_tokens` and, while any cost limit is set, a
+model the list prices not or a list it could not fetch, and bounds the
+worst case of every case's two requests against `max_cost_per_turn`; it
+reads the key only then. Then it puts each case to both stages as a
+crossing in `auto` mode is put, one after the other, except one a
+crossing would not ask about (a payload past 32 KiB, a request past a
+log line), which it reports not asked; a refusal that would refuse every
+request, a key or credit refused, stops it, reporting the cases so far.
+It prints what each stage answered of each case and every stage's false
+allows and false escalations, Jev's and both stages' together at
+thresholds from 0.500 to 0.999, and to standard error what the requests
+reported spending, failed ones included, and how many that ran reported
+nothing; it keeps nothing. `jev_threshold` still has no shipped value:
+the commit that records a run's counts sets it.
+
 **Repetition.** Three consecutive calls of one tool with identical
 arguments go to the human whatever the table says, as opencode's
 `doom_loop` does: a loop is a symptom worth a person's look.

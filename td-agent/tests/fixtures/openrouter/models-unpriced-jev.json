@@ -1,0 +1,9 @@
+{"data":[
+  {"id":"typesafe/jev-1.13","name":"TypeSafe: Jev 1.13","context_length":32768,
+   "top_provider":{"context_length":32768,"max_completion_tokens":null,"is_moderated":false},
+   "supported_parameters":[]},
+  {"id":"openai/gpt-oss-safeguard-20b","name":"OpenAI: gpt-oss-safeguard-20b","context_length":131072,
+   "pricing":{"prompt":"0.000000075","completion":"0.0000003","input_cache_read":"0.0000000375"},
+   "top_provider":{"context_length":131072,"max_completion_tokens":65536,"is_moderated":false},
+   "supported_parameters":["include_reasoning","max_tokens","reasoning","response_format","seed","stop","structured_outputs","temperature","tool_choice","tools","top_p"]}
+]}
