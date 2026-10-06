@@ -132,6 +132,23 @@ fn shared_from_json(value: &Json) -> Result<Vec<Shared>, String> {
 }
 
 impl Client {
+    /// The models this configuration names, each looked for beyond the
+    /// models list when it leaves one out (`models::fetch`).
+    pub fn wanted(&self) -> Vec<String> {
+        let mut wanted: Vec<String> = Vec::new();
+        for id in [
+            &self.model,
+            &self.title_model,
+            &self.classifier_model,
+            &self.classifier_fast_model,
+        ] {
+            if !wanted.contains(id) {
+                wanted.push(id.clone());
+            }
+        }
+        wanted
+    }
+
     /// What a workspace binds: a template's own shared directories when
     /// it was made from one that names them, `shared` when it names none,
     /// and none when its template is no longer configured, so removing or

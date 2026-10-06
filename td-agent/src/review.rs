@@ -450,18 +450,14 @@ pub fn again(attempt: u32, ended: &Ended) -> Option<std::time::Duration> {
 
 /// `GET /models`: the list the cost is bounded from, fetched for each
 /// review, since a cached one may lack a model chosen here.
-pub(crate) fn models(base_url: &str) -> Result<Models, String> {
-    let response = td_fetch_client::get(
-        &format!("{base_url}/models"),
-        &[("accept", "application/json")],
-        Some(crate::models::MAX_LIST),
-        None,
-    )
-    .map_err(|e| format!("the models list: {e}"))?;
-    if response.status != 200 {
-        return Err(format!("the models list: status {}", response.status));
-    }
-    Models::from_provider(&response.body)
+pub(crate) fn models(base_url: &str, wanted: &[&str]) -> Result<Models, String> {
+    crate::models::fetch(base_url, wanted).map_err(|e| {
+        if e.starts_with("the models list") {
+            e
+        } else {
+            format!("the models list: {e}")
+        }
+    })
 }
 
 /// `td-agent review ARGS`: reads the configuration and the key as the
@@ -499,7 +495,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let sized = body("", &commit, &nonce)?;
     // Without a per-turn limit, a list that cannot be had only leaves
     // the model unlisted.
-    let listed = match models(&client.base_url) {
+    let wanted = options.model.as_deref().unwrap_or(&client.model);
+    let listed = match models(&client.base_url, &[wanted]) {
         Ok(listed) => listed,
         Err(_) if client.limits.turn.is_none() => Models::default(),
         Err(e) => return Err(e),

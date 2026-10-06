@@ -4749,6 +4749,8 @@ fn without_jev_the_classifier_allows_only_when_jev_is_not_required() {
             Reply::ok("title.json"),
             Reply::sse("stream-tool-read-other.sse"),
             Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-tool-read-other.sse"),
+            Reply::sse("stream-sonnet.sse"),
         ],
     );
     h.mock.route(
@@ -4812,6 +4814,34 @@ fn without_jev_the_classifier_allows_only_when_jev_is_not_required() {
         .3
         .unwrap()
         .starts_with("Jev is unavailable: `data_collection = \"deny\"` leaves it no provider; the reasoning stage answers allow: "));
+    // A Jev whose price falls on its output, which its reservation does
+    // not cover, is not asked either.
+    let list = String::from_utf8(fixture("models.json")).unwrap().replace(
+        r#""pricing":{"prompt":"0.000000042","completion":"0"}"#,
+        r#""pricing":{"prompt":"0.000000042","completion":"0.000001"}"#,
+    );
+    Models::from_provider(list.as_bytes())
+        .unwrap()
+        .save(h.state.root())
+        .unwrap();
+    h.setup(Client {
+        allow_data_collection: true,
+        jev_threshold: Some(900),
+        ..Client::default()
+    });
+    h.say("Once more.");
+    let (call, _, details) = h.until_ask();
+    assert_eq!(
+        details[0],
+        "Asked because the classifier did not allow it: Jev is unavailable, and `jev_required`: Jev's listing prices its output, which td-agent reserves nothing for."
+    );
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
     assert!(h
         .mock
         .requests()
@@ -5271,12 +5301,26 @@ fn calibrate_puts_each_case_to_both_stages_and_counts_them() {
     ));
     let runtime = root.join("run");
     std::fs::create_dir_all(&runtime).unwrap();
-    // The models list for each run that bounds a cost, in order: one
-    // listing Jev with no price, one that fails, then the whole list.
-    let mut lists = vec![Reply::ok("models.json"); 2];
-    lists.push(Reply::ok("models-unpriced-jev.json"));
-    lists.push(Reply::status(502, "error-502.json"));
-    lists.extend(vec![Reply::ok("models.json"); 4]);
+    // The models list for each run that bounds a cost, in order: the
+    // whole list; the whole list, a model it leaves out not found among
+    // the endpoints either; one listing Jev with no price; one leaving
+    // Jev out and Jev's endpoints listing pricing its output; one that
+    // fails; the whole list; then, for each run that asks, one leaving
+    // Jev out and Jev's own endpoints listing, which prices it.
+    let mut lists = vec![
+        Reply::ok("models.json"),
+        Reply::ok("models.json"),
+        Reply::status(404, "error-401.json"),
+        Reply::ok("models-unpriced-jev.json"),
+        Reply::ok("models-no-jev.json"),
+        Reply::ok("endpoints-jev-priced-output.json"),
+        Reply::status(502, "error-502.json"),
+        Reply::ok("models.json"),
+    ];
+    for _ in 0..2 {
+        lists.push(Reply::ok("models-no-jev.json"));
+        lists.push(Reply::ok("endpoints-jev.json"));
+    }
     let mock = MockFetch::start(&runtime, lists);
     mock.route(
         "typesafe/jev",
@@ -5346,6 +5390,10 @@ fn calibrate_puts_each_case_to_both_stages_and_counts_them() {
         ),
         (
             format!("{allow}max_cost_per_turn = \"none\"\n"),
+            "Jev's listing prices its output",
+        ),
+        (
+            format!("{allow}max_cost_per_turn = \"none\"\n"),
             "the models list: status 502",
         ),
         (
@@ -5356,8 +5404,9 @@ fn calibrate_puts_each_case_to_both_stages_and_counts_them() {
         let (ok, _, stderr) = run(&settings);
         assert!(!ok && stderr.contains(why), "{settings}: {stderr}");
     }
-    // Only the models list was asked for, by the five that bound a cost.
-    assert_eq!(mock.requests().len(), 5);
+    // Only the models list was asked for, by the six that bound a cost,
+    // and the unlisted model's endpoints.
+    assert_eq!(mock.requests().len(), 8);
     // Where `/` is shared, as in the gate's fixture, the key's own
     // directories cannot be private, so the key is refused as it would
     // be in use, and nothing is sent; the run itself is held where the
@@ -5371,7 +5420,7 @@ fn calibrate_puts_each_case_to_both_stages_and_counts_them() {
             !ok && stderr.contains("the API key file is refused"),
             "{stderr}"
         );
-        assert_eq!(mock.requests().len(), 6, "the models list alone");
+        assert_eq!(mock.requests().len(), 10, "the models list alone");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&home);
         return;
@@ -5396,10 +5445,15 @@ fn calibrate_puts_each_case_to_both_stages_and_counts_them() {
             .count()
     };
     assert_eq!((count("typesafe/jev"), count("gpt-oss-safeguard")), (2, 2));
+    // Jev, left out of the list, was priced from its endpoints listing.
+    assert!(mock
+        .requests()
+        .iter()
+        .any(|r| r.url.ends_with("/models/typesafe/jev-1.13/endpoints")));
     assert_eq!(
         mock.requests().len(),
-        10,
-        "six models lists and four requests"
+        14,
+        "the lists, Jev's endpoints and four requests"
     );
     // A refused key stops the run: Jev is not asked, no case after it.
     let (ok, stdout, stderr) = run(allow);

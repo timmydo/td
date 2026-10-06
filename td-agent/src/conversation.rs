@@ -4142,7 +4142,13 @@ impl Session {
                         &client.classifier_fast_model,
                         &client,
                     )
-                    .map(|model| (url, model.and_then(|m| m.pricing))),
+                    .and_then(|model| {
+                        let pricing = model.and_then(|m| m.pricing);
+                        match classifier::jev_unbounded(pricing) {
+                            Some(why) => Err(why),
+                            None => Ok((url, pricing)),
+                        }
+                    }),
             }
         };
         if let (Err(why), true) = (&jev, client.jev_required) {

@@ -93,6 +93,15 @@ fn cut(text: &str, most: usize) -> String {
     format!("{} [cut]", text.get(..end).unwrap_or_default())
 }
 
+/// Why Jev, priced `pricing`, cannot be reserved for: its requests are
+/// reserved by their input alone, so a price on output, reasoning
+/// included, would be charged past the reservation.
+pub fn jev_unbounded(pricing: Option<crate::cost::Pricing>) -> Option<String> {
+    pricing
+        .filter(|p| p.completion > 0 || p.reasoning > 0)
+        .map(|_| "Jev's listing prices its output, which td-agent reserves nothing for".to_string())
+}
+
 /// Room on a log line for what a `Request` event holds beside its head.
 const LOGGED_SLACK: usize = 4096;
 
@@ -494,6 +503,26 @@ pub fn combine(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+
+    /// Jev is reserved by its input alone, so a listing that prices its
+    /// output, reasoning included, leaves it unavailable.
+    #[test]
+    fn jev_priced_for_output_is_unbounded() {
+        let priced = |completion: u64, reasoning: u64| {
+            Some(crate::cost::Pricing {
+                prompt: 42,
+                completion,
+                request: 0,
+                reasoning,
+                cache_read: 0,
+                cache_write: 0,
+            })
+        };
+        assert_eq!(jev_unbounded(priced(0, 0)), None);
+        assert_eq!(jev_unbounded(None), None);
+        assert!(jev_unbounded(priced(1, 0)).is_some());
+        assert!(jev_unbounded(priced(0, 1)).is_some());
+    }
     use super::*;
 
     fn jev(request: &str, matches: f64, discloses: f64) -> Jev {

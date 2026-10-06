@@ -29,7 +29,7 @@ use crate::control::Remote;
 use crate::diagnostics::{self, Exported};
 use crate::jail::Programs;
 use crate::key::{self, Secret, Unwritten};
-use crate::models::{Credit, Models, MAX_LIST};
+use crate::models::{Credit, Models};
 use crate::picker::Offer;
 use crate::post::{Outbox, Post};
 use crate::protocol::{Down, Up};
@@ -68,7 +68,8 @@ const MAX_CREDIT: u64 = 64 * 1024;
 
 /// What the fetcher thread is asked for, and what it answers.
 enum Job {
-    Models,
+    /// The models list, and the configured models to look for beyond it.
+    Models(Vec<String>),
     Credit,
     /// The key the human stored, for the credit asked after it.
     Key(Secret),
@@ -99,7 +100,13 @@ impl Fetcher {
                 let mut key = key;
                 for job in work {
                     let fetched = match job {
-                        Job::Models => Fetched::Models(models(&base_url, &state)),
+                        Job::Models(wanted) => {
+                            let send = |fetched| answer.send(fetched).is_ok();
+                            if models(&base_url, &wanted, &state, &send) {
+                                continue;
+                            }
+                            break;
+                        }
                         Job::Credit => Fetched::Credit(credit(&base_url, key.as_ref())),
                         Job::Key(stored) => {
                             key = Some(stored);
@@ -141,21 +148,35 @@ impl Fetcher {
     }
 }
 
-/// `GET /models`, cached in the state directory as it comes.
-fn models(base_url: &str, state: &std::path::Path) -> Result<Models, String> {
-    let response = td_fetch_client::get(
-        &format!("{base_url}/models"),
-        &[("accept", "application/json")],
-        Some(MAX_LIST),
-        None,
-    )
-    .map_err(|e| e.to_string())?;
-    if response.status != 200 {
-        return Err(format!("status {}", response.status));
+/// `GET /models`, cached in the state directory as it comes and sent;
+/// then, when it leaves any of `wanted` out, each looked for in its
+/// endpoints listing (`models::look_up`), and what that found cached and
+/// sent again, so a slow lookup holds back neither the list nor the
+/// credit asked after it for longer than the lookups take. Whether the
+/// window still listens.
+fn models(
+    base_url: &str,
+    wanted: &[String],
+    state: &std::path::Path,
+    send: &dyn Fn(Fetched) -> bool,
+) -> bool {
+    let listed = crate::models::fetch_list(base_url).and_then(|models| {
+        models.save(state)?;
+        Ok(models)
+    });
+    let Ok(mut models) = listed else {
+        return send(Fetched::Models(listed));
+    };
+    let wanted: Vec<&str> = wanted.iter().map(String::as_str).collect();
+    let missing = wanted.iter().any(|id| models.find(id).is_none());
+    if !send(Fetched::Models(Ok(models.clone()))) {
+        return false;
     }
-    let models = Models::from_provider(&response.body)?;
-    models.save(state)?;
-    Ok(models)
+    if !missing || !crate::models::look_up(base_url, &mut models, &wanted) {
+        return true;
+    }
+    let found = models.save(state).map(|()| models);
+    send(Fetched::Models(found))
 }
 
 /// `GET /key`: the key's credit.
@@ -1918,7 +1939,7 @@ pub fn run(
         Err(e) => session.app.note(format!("the models cache: {e}")),
     }
     if let Some(fetcher) = session.fetcher.as_mut() {
-        let _ = fetcher.jobs.send(Job::Models);
+        let _ = fetcher.jobs.send(Job::Models(session.client.wanted()));
         fetcher.credit(Instant::now());
     }
     // Nothing is made here: with none yet, the human starts one.

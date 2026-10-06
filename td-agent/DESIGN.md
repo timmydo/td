@@ -1340,11 +1340,25 @@ it fits a log line. `http-referer` is `https://github.com/timmydo/td`.
   pricing, or any model before the list is first cached, is refused while
   a limit is set; with all three `none` it is sent and reserves nothing.
 - **The models list** is fetched at window start, without the key, by a
-  thread of the window's, under a 16 MiB bound. It is cached as the state
-  directory's `models`, and only `id`, `context_length` (or the top
-  provider's), `top_provider.max_completion_tokens`, the pricing above
-  and `supported_parameters` are kept. Conversation processes read that
-  cache.
+  thread of the window's, under a 16 MiB bound. It is cached as the
+  state directory's `models`, and only `id`, `context_length` (or the
+  top provider's), `top_provider.max_completion_tokens`, the pricing
+  above and `supported_parameters` are kept. A model the configuration
+  names (`model`, `title_model`, `classifier_model`,
+  `classifier_fast_model`) that the list leaves out is looked for in
+  `GET /models/{id}/endpoints`, the one listing OpenRouter gives Jev,
+  its id taken only when it stands in a path as it is, and kept priced
+  at its dearest endpoint for each price (an endpoint without a
+  cache-read price counted at its prompt price), or unpriced when any
+  endpoint is, with the least context and completion and the
+  parameters every endpoint supports; one not found there stays out,
+  why said on standard error, and is refused where it is used. The list
+  is cached and shown before any lookup, and again with what the
+  lookups found, so a slow lookup holds back no listed model; until it
+  returns, the cache lacks a looked-up model, and a crossing that wants
+  Jev in that time goes to the human while `jev_required`. `review`
+  and `calibrate` look up the models they use the same way. Conversation
+  processes read that cache.
 - **Credit** is `GET /key` with the key and no redirect followed, at
   start and after a turn ends, at most every 20 s. The row shows
   `limit_remaining` (a negative remainder as zero), or what the key has
@@ -3386,11 +3400,13 @@ the last 64 calls are named. Project instructions are in it, as
 `project`, only for a workspace the human marked trusted (As built
 (increment 13, the trust mark), below). Jev is asked only when
 `data_collection` is `allow`, `jev_threshold` is set and `base_url` ends
-in `/v1`, and the models list prices `classifier_fast_model` while a
-cost limit is set; otherwise it is unavailable, and while `jev_required`
-the action goes to the human with nothing asked. The reasoning stage is
-a chat completion of `classifier_model` with `prompt/classifier.txt` as
-its system message and the state as its user message, `max_tokens` 4096,
+in `/v1`, and the models list, or for Jev, which it leaves out, Jev's
+endpoints listing, prices `classifier_fast_model` while a cost limit is
+set, and prices nothing of its output, which its reservation does not
+cover; otherwise it is unavailable, and while `jev_required` the action
+goes to the human with nothing asked. The reasoning stage is a chat
+completion of `classifier_model` with `prompt/classifier.txt` as its
+system message and the state as its user message, `max_tokens` 4096,
 `provider` as any request's. Both requests are reserved together against
 the day, the turn's and the conversation's limits, logged as `Request`
 events of purpose `classify` with their whole bodies, sent at once,

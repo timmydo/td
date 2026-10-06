@@ -1,6 +1,8 @@
 //! What td-agent knows of the provider's models and of the key's credit
 //! (DESIGN.md §5). `GET /models` is fetched by the window process at
-//! startup and cached in the state directory as `models`, each model cut
+//! startup and cached in the state directory as `models`, then again once
+//! each configured model it leaves out is looked for in its own `GET
+//! /models/{id}/endpoints` (Jev's is listed only there), each model cut
 //! to what td-agent uses: its context length, its largest completion, its
 //! prices and the parameters it supports. A conversation process reads the
 //! cache before each request; a cached list serves a start without the
@@ -17,6 +19,69 @@ pub const CACHE: &str = "models";
 /// read back.
 pub const MAX_LIST: u64 = 16 * 1024 * 1024;
 const MAX_CACHE: u64 = 8 * 1024 * 1024;
+
+/// Whether a model id may stand in a URL's path as it is: letters,
+/// digits and `-._:/`, no segment empty or a dot segment.
+fn pathable(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._:/".contains(&b))
+        && id.split('/').all(|part| !matches!(part, "" | "." | ".."))
+}
+
+/// A GET of `url` under the list's bound: the body of a 200.
+fn get(url: &str) -> Result<Vec<u8>, String> {
+    let response =
+        td_fetch_client::get(url, &[("accept", "application/json")], Some(MAX_LIST), None)
+            .map_err(|e| e.to_string())?;
+    if response.status != 200 {
+        return Err(format!("status {}", response.status));
+    }
+    Ok(response.body)
+}
+
+/// `GET /models` from `base_url`.
+pub fn fetch_list(base_url: &str) -> Result<Models, String> {
+    Models::from_provider(&get(&format!("{base_url}/models"))?)
+}
+
+/// Each of `wanted` that `models` leaves out, from its `GET
+/// /models/{id}/endpoints` as `Models::from_endpoints` reads it, added:
+/// whether any was. One not found there, or not `pathable`, stays out,
+/// why said on standard error, and is refused where it is used, as an
+/// unlisted model is.
+pub fn look_up(base_url: &str, models: &mut Models, wanted: &[&str]) -> bool {
+    let mut added = false;
+    for id in wanted {
+        if models.find(id).is_some() {
+            continue;
+        }
+        let found = if pathable(id) {
+            get(&format!("{base_url}/models/{id}/endpoints"))
+                .and_then(|body| Models::from_endpoints(id, &body))
+        } else {
+            Err("its id cannot be named in a URL as it is".into())
+        };
+        match found {
+            Ok(model) => {
+                models.models.push(model);
+                added = true;
+            }
+            Err(why) => eprintln!(
+                "td-agent: {id} is not in the models list, nor found by its endpoints: {why}"
+            ),
+        }
+    }
+    added
+}
+
+/// `fetch_list`, then `look_up` of `wanted`.
+pub fn fetch(base_url: &str, wanted: &[&str]) -> Result<Models, String> {
+    let mut models = fetch_list(base_url)?;
+    look_up(base_url, &mut models, wanted);
+    Ok(models)
+}
 
 /// One model as td-agent uses it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,6 +252,75 @@ impl Models {
         Ok(Self { models })
     }
 
+    /// A model the list leaves out, from its `GET /models/{id}/endpoints`
+    /// body: priced as its dearest endpoint for each price, or unpriced
+    /// when any endpoint is, so its price is never understated; its
+    /// context and completion the least any endpoint takes, and the
+    /// parameters every one supports.
+    pub fn from_endpoints(id: &str, body: &[u8]) -> Result<Model, String> {
+        let value = td_json::parse_slice(body).map_err(|e| format!("{id}'s endpoints: {e}"))?;
+        let data = value
+            .get("data")
+            .ok_or_else(|| format!("{id}'s endpoints: no `data`"))?;
+        if data.get("id").and_then(Json::as_str) != Some(id) {
+            return Err(format!("{id}'s endpoints name another model"));
+        }
+        let endpoints = data
+            .get("endpoints")
+            .and_then(Json::as_arr)
+            .filter(|all| !all.is_empty())
+            .ok_or_else(|| format!("{id} has no endpoints"))?;
+        let mut prices: Vec<(String, String)> = Vec::new();
+        let mut priced = true;
+        let mut context: Option<u64> = None;
+        let mut completion: Option<u64> = None;
+        let mut parameters: Option<Vec<String>> = None;
+        let least = |held: Option<u64>, one: Option<u64>| match (held, one) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        for endpoint in endpoints {
+            let mut own = Model::prices_of(endpoint.get("pricing"));
+            priced &= pricing(&own).is_some();
+            // Without a cache-read price an endpoint bills cached tokens
+            // at its prompt rate, which another's cheaper one must not
+            // stand for.
+            let prompt = own.iter().find(|(name, _)| name == "prompt").cloned();
+            if let Some((_, text)) = prompt {
+                if !own.iter().any(|(name, _)| name == "input_cache_read") {
+                    own.push(("input_cache_read".into(), text));
+                }
+            }
+            for (name, text) in own {
+                let dearer = match prices.iter().find(|(held, _)| *held == name) {
+                    Some((_, held)) => cost::parse(&text, true) > cost::parse(held, true),
+                    None => true,
+                };
+                if dearer {
+                    prices.retain(|(held, _)| *held != name);
+                    prices.push((name, text));
+                }
+            }
+            context = least(context, number(endpoint.get("context_length")));
+            completion = least(completion, number(endpoint.get("max_completion_tokens")));
+            let own = Model::parameters_of(endpoint.get("supported_parameters"));
+            parameters = Some(match parameters {
+                Some(held) => held.into_iter().filter(|p| own.contains(p)).collect(),
+                None => own,
+            });
+        }
+        if !priced {
+            prices.clear();
+        }
+        Ok(Model::from_parts(
+            id.to_string(),
+            context,
+            completion,
+            prices,
+            parameters.unwrap_or_default(),
+        ))
+    }
+
     /// The cache's text: what `from_cache` reads back.
     pub fn to_cache(&self) -> String {
         Json::Arr(self.models.iter().map(Model::to_json).collect()).to_string()
@@ -274,6 +408,96 @@ impl Credit {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    /// A model the list leaves out, as its endpoints listing says (Jev's,
+    /// recorded): priced per field at its dearest endpoint, unpriced when
+    /// any endpoint is; its least context and completion and the
+    /// parameters all share; kept through the cache; refused when the
+    /// listing names another model or has no endpoint.
+    #[test]
+    fn a_model_left_out_of_the_list_is_read_from_its_endpoints() {
+        let recorded = include_bytes!("../tests/fixtures/openrouter/endpoints-jev.json");
+        let jev = Models::from_endpoints("typesafe/jev-1.13", recorded).unwrap();
+        let pricing = jev.pricing.unwrap();
+        assert_eq!(pricing.completion, 0);
+        assert_eq!(Some(pricing.prompt), cost::parse("0.000000042", true));
+        assert_eq!(jev.context_length, Some(32000));
+        let cached = Models {
+            models: vec![jev.clone()],
+        };
+        assert_eq!(
+            Models::from_cache(cached.to_cache().as_bytes())
+                .unwrap()
+                .models,
+            [jev]
+        );
+        let two = |a: &str, b: &str| {
+            format!(
+                r#"{{"data":{{"id":"x/y","endpoints":[{{"pricing":{a},"context_length":8,"supported_parameters":["max_tokens","tools"]}},{{"pricing":{b},"context_length":4,"max_completion_tokens":2,"supported_parameters":["max_tokens"]}}]}}}}"#
+            )
+        };
+        let both = Models::from_endpoints(
+            "x/y",
+            two(
+                r#"{"prompt":"0.000001","completion":"0.000003"}"#,
+                r#"{"prompt":"0.000002","completion":"0.000001"}"#,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let pricing = both.pricing.unwrap();
+        assert_eq!(Some(pricing.prompt), cost::parse("0.000002", true));
+        assert_eq!(Some(pricing.completion), cost::parse("0.000003", true));
+        assert_eq!(
+            (both.context_length, both.max_completion_tokens),
+            (Some(4), Some(2))
+        );
+        assert!(both.supports("max_tokens") && !both.supports("tools"));
+        let routed = Models::from_endpoints(
+            "x/y",
+            two(
+                r#"{"prompt":"0.000001","completion":"0"}"#,
+                r#"{"prompt":"-1","completion":"-1"}"#,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(routed.pricing, None);
+        // One endpoint's cache-read discount does not stand for another
+        // that has none, which bills cached tokens at its prompt rate.
+        let cached = Models::from_endpoints(
+            "x/y",
+            two(
+                r#"{"prompt":"0.000001","completion":"0","input_cache_read":"0.0000001"}"#,
+                r#"{"prompt":"0.000001","completion":"0"}"#,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            Some(cached.pricing.unwrap().cache_read),
+            cost::parse("0.000001", true)
+        );
+        assert!(Models::from_endpoints("other/model", recorded).is_err());
+        assert!(Models::from_endpoints("x/y", br#"{"data":{"id":"x/y","endpoints":[]}}"#).is_err());
+    }
+
+    /// Only an id that stands in a path as it is is looked for.
+    #[test]
+    fn only_a_plain_model_id_is_named_in_a_path() {
+        for id in [
+            "typesafe/jev-1.13",
+            "openai/gpt-oss-safeguard-20b",
+            "a:b/c_d",
+        ] {
+            assert!(pathable(id), "{id}");
+        }
+        for id in [
+            "", "a/../b", "a//b", "./a", "a?b", "a#b", "a%2fb", "a b", "/a",
+        ] {
+            assert!(!pathable(id), "{id}");
+        }
+    }
     use super::*;
 
     const LIST: &str = r#"{"data":[

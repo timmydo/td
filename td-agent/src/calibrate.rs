@@ -377,7 +377,11 @@ fn read(path: &Path) -> Result<String, String> {
 /// model is not in the list, or has no price while any cost limit is
 /// set, or the reasoning stage's model takes no `max_tokens`.
 fn worst_case(client: &Client, cases: &[Case]) -> Result<u64, String> {
-    let (listed, loaded) = match crate::review::models(&client.base_url) {
+    let wanted = [
+        client.classifier_model.as_str(),
+        client.classifier_fast_model.as_str(),
+    ];
+    let (listed, loaded) = match crate::review::models(&client.base_url, &wanted) {
         Ok(listed) => (listed, true),
         Err(_) if !client.limits.any() => (Models::default(), false),
         Err(e) => return Err(e),
@@ -417,6 +421,9 @@ fn worst_case(client: &Client, cases: &[Case]) -> Result<u64, String> {
         priced(&client.classifier_model)?,
         priced(&client.classifier_fast_model)?,
     );
+    if let Some(why) = classifier::jev_unbounded(fast) {
+        return Err(why);
+    }
     let mut worst = 0u64;
     for case in cases {
         let head = classifier::reasoning_head(client, &case.state);
