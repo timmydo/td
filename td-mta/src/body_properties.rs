@@ -280,6 +280,8 @@ fn charge(now: Tick, work: &mut Meter, visits: usize) -> Result<(), Error> {
     )?;
     Ok(())
 }
+#[path = "body_properties/json.rs"]
+pub mod json;
 const _: () = assert!(std::mem::size_of::<Cursor<'_, '_, '_>>() <= 384);
 const _: () = assert!(std::mem::size_of::<Cell<'_>>() <= 64);
 #[cfg(test)]

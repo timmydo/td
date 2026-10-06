@@ -2427,6 +2427,15 @@ Initial independently landable increments:
   structural/header rendering, full admission and current authenticated
   publication remain later.
 
+- **M06en — bounded JSON bodyProperties decoding:** decode an admitted
+  UTF-8 array fragment into caller-preallocated Strings and fixed key
+  slots. Omission is Default, explicit empty remains NONE and null
+  refuses. Prepay bounded input/record/scalar-output work; enforce actual
+  String capacity without hot growth and retain sticky failures. Validate
+  complete syntax/escapes/EOF before exposing borrowed keys. Nine units,
+  two guards and eight Rust allocation intervals are scoped by API
+  §1.145; full request admission/composition/publication remain later.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

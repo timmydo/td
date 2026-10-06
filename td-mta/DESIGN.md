@@ -951,6 +951,16 @@ semantics and eight Rust intervals. JSON shapes/default dispatch,
 configurable structural/header rendering, full admission and current
 authenticated publication remain later.
 
+M06en decodes an admitted UTF-8 bodyProperties JSON fragment into fixed
+caller-preallocated Strings and key-reference slots. Omitted differs
+from explicit empty/null; complete syntax and scalar escapes precede
+semantic selection. Input, record and scalar-output work are prepaid;
+capacity refusal never grows storage. Whole success borrows only the
+completed prefix. Cells are cold/reset storage tied to decoded loans,
+not a persistent request-arena pool. API §1.145 defines exact turn and
+EOF costs and the eight isolated Rust intervals. Full request decoding,
+composition wiring/admission and authenticated publication remain later.
+
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot
 select bodyStructure. They remain public facades over the same shared

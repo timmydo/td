@@ -2592,6 +2592,17 @@ long-key/refusal preparation cold; earlier 201 remain separate. Native
 allocation, stack/RSS, whole request admission and current authenticated
 publication remain unqualified.
 
+M06en JSON argument decoding keeps Cursor within 256 bytes and Cell
+within 16 bytes. Caller source, String capacities, cells and key slots
+are separately admitted cold storage. Each poll prepays at most six
+input visits, one record and four decoded output bytes; terminal EOF
+spends one record, zero visits and performs no text scan. Scalar output
+checks actual capacity before push; no hot String growth occurs.
+Consumed cells must be reconstructed after decoded loans end. API
+§1.145 qualifies eight isolated Rust allocation intervals; earlier 209
+stay separate. Native allocation, stack/RSS, full request admission and
+current authenticated publication remain unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

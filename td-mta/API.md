@@ -6196,6 +6196,65 @@ work limits, premature completion and repeated cached polls remain
 allocation-unqualified. Native allocation, stack/RSS, full request
 admission and current authenticated publication remain unqualified.
 
+### 1.145 Decode a bodyProperties JSON argument
+
+M06en adds body_properties::json::Cursor over an already UTF-8 admitted
+argument fragment, fixed caller-owned key-reference slots and cells
+borrowing caller-preallocated Strings. Cold Cell::new clears each String;
+no allocator growth is allowed during polls. The caller admits input,
+String capacities, cells and reference slots separately. Consumed cells
+must be reconstructed once all decoded loans end before another request.
+
+Only None denotes the omitted argument and returns passive Default with
+zero work. Explicit null and non-array/non-string values refuse Syntax.
+Explicit [] returns Explicit with an empty prefix, preserving NONE rather
+than DEFAULT when passed to §1.144. Decode complete array syntax and EOF,
+accept ASCII JSON whitespace and standard escapes, and reject trailing
+commas/data, controls, malformed escapes and unpaired UTF-16 surrogates.
+Validated raw UTF-8 and surrogate pairs emit whole scalars only. Unknown
+property strings decode successfully; the original BodyPart recognizer
+still owns semantic validation. No JSON object/dispatcher is provided.
+
+Each nonterminal poll prepays one source-octet visit and one record; raw
+non-ASCII scalar decoding additionally prepays its full two-to-four-byte
+width for chars().next() plus one leading-octet visit for the str::get
+boundary check. Thus a poll spends at most six input visits, one record
+and four output bytes.
+Output bytes are paid before checking remaining actual String capacity
+and copying a scalar. A failed capacity check may retain that payment,
+but never grows the String. Hex digits are separate paid turns; a pair
+emits only after the complete validated low surrogate. EOF spends one
+record and zero visits, including the successful terminal poll. There
+is no final source/key rescan. Long ASCII input therefore costs its
+source length in visits and source length plus one records, plus the
+decoded text length in output bytes.
+
+Only complete value/finish exposes the selected key prefix, borrowing
+original String allocations without a second key copy. Partial String
+prefixes and completed earlier slots survive refusal; no whole argument
+is exposed. Malformed JSON/escapes return Syntax; impossible UTF-8 lead/slice
+states return InvalidState. Work, Syntax, Capacity and InvalidState
+errors are sticky across fresh meters. Completed polls are inert passive reads, including
+past a deadline; they confer no job freshness/publication authority.
+Cursor is non-Copy/non-Clone within 256 bytes; each cell fits 16 bytes.
+
+Nine units and two compile-fail guards cover omitted/null/empty
+separation, independent escape/scalar literals and exact work debits,
+all whitespace positions, lowercase hex, separator grammar,
+invalid syntax, actual UTF-8 capacity boundaries and original pointers,
+every deadline cut, exact/one-short input/record/output budgets,
+premature finish, escaped names through §1.144 and a 64 KiB ASCII header
+without a terminal scan. Eight sequential Rust allocation intervals
+cover omitted cached completion, explicit empty, long ASCII plus escaped
+pair, lone high surrogate, actual text capacity, isolated record refusal,
+isolated scalar output refusal and partial-hex deadline refusal. All
+sixteen snapshots are validated; String/source/refusal-state setup is
+cold. Earlier 209 intervals stay separate. Other input shapes, supplied
+limits and repeated cached reads remain allocation-unqualified. Native
+allocation, stack/RSS, complete request UTF-8 validation/admission,
+selection-to-composition wiring and current authenticated publication
+remain unqualified.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
