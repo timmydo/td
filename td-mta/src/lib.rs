@@ -3,6 +3,7 @@
 
 pub mod admission;
 pub mod body_charset;
+pub mod body_properties;
 pub mod body_property;
 pub mod body_value;
 pub mod bounded;

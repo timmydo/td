@@ -2577,6 +2577,21 @@ earlier 193 remain separate. Native allocation, stack/RSS, request
 aggregation/admission and current authenticated publication remain
 unqualified.
 
+M06em decoded body-properties aggregation keeps Cursor within 384
+bytes and Cell within 64 bytes. Original decoded keys, their array and
+fixed header cells remain caller-owned/admitted. Recognition retains
+§1.143 bounds; deduplication prepays at most 128 visits and one record
+per 64-byte two-sided comparison. No second key or dynamic header list
+is allocated. For N requests, H distinct header keys and maximum length
+L, this charged quadratic scan uses O(N H ceil(L/64)) comparison turns
+and O(N H L) visits; equal-length distinct keys walk H(H-1)/2 pairs.
+Fixed cell capacity and meter quotas bound the total. Cells retain their
+key-loan lifetime, including untouched stale tails; reconstruct them
+after old loans end before changing request arenas. API §1.144 qualifies eight enumerated Rust intervals with
+long-key/refusal preparation cold; earlier 201 remain separate. Native
+allocation, stack/RSS, whole request admission and current authenticated
+publication remain unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

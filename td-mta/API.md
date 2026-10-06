@@ -6124,6 +6124,78 @@ selection-to-composition wiring remain later. Recognition of
 headers/subParts does not change §1.140–1.142's provisional structural
 scaffold.
 
+### 1.144 Aggregate decoded body-part properties
+
+M06em adds `body_properties::Cursor` over one immutable borrowed decoded
+key array and fixed caller-owned header cells. Reuse §1.143's BodyPart
+recognizer for every key; no preclassified Email header alias bypass is
+accepted. Fields preserve ten independent metadata flags plus headers
+and subParts. Repeated standard names are idempotent while each key is
+still paid. Unknown keys and malformed/forbidden header forms refuse the
+whole selection and retain exact sticky errors across fresh meters.
+No whole value is exposed from a partially validated array.
+
+Retain distinct parameterized headers in first-request order, borrowing
+the original key/name/forms/occurrence. Deduplicate exact requested key
+bytes, keeping the first loan. Differently capitalized or spelled keys
+remain distinct response keys. Compare at most 64 bytes from each side
+per poll, prepaid as at most 128 byte visits and one record. Different
+lengths spend zero visits and one record; insertion spends one record
+and overwrites only the selected cell prefix. Capacity refusal remains
+sticky and yields no whole value. Reusing filled cells ignores old
+content outside the new prefix; spare cells remain untouched.
+
+The deduplication scan is charged quadratic work, not a linear-time
+claim. For N header requests, H distinct keys and maximum key length L,
+comparison turns are O(N H ceil(L/64)) and visits O(N H L); H distinct
+equal-length keys walk H(H-1)/2 pairs. Cell capacity and work quotas bound
+that total. Reuse requires a common key-loan lifetime: stale tail cells
+retain earlier loans. Reconstruct cells after those loans end before
+reusing storage with a different request arena.
+
+View has private fields and read-only fields()/headers() accessors, so
+only complete cursor output constructs it. It remains passive data.
+Unknown keys return InvalidProperty; malformed/forbidden forms retain
+Recognition(parser error). All work stops, including comparison and
+insertion, use Recognition(Work(stop)) and the existing recognition
+Display beneath the selection prefix. A future RPC dispatcher must
+classify unknown/malformed/forbidden names as invalidArguments; this
+increment supplies no RPC error mapping.
+
+Parsing polls preserve §1.143's bounds. Applying one recognized field or
+starting header deduplication is bounded and shares that recognition
+turn's payment; no rescan or second key copy occurs. Explicit empty
+arrays are immediately complete NONE with zero work and zero cell
+capacity. Completed selection is an inert passive value, not job
+freshness or publication authority. Consuming finish requires complete
+recognition and returns the same borrowed cell prefix. Cursor is
+non-Copy/non-Clone and fits 384 bytes; each Cell fits 64 bytes. Keys,
+array and cells remain separately caller-owned/admitted.
+
+The pure Fields::DEFAULT constant names the ten metadata fields only,
+with headers and subParts false, matching the omitted bodyProperties
+argument in [RFC 8621 §4.2](https://www.rfc-editor.org/rfc/rfc8621.html#section-4.2).
+It does not reinterpret explicit empty or unknown arrays as a default.
+JSON argument decoding/type checks, absent/null handling and actual
+selection-to-composition wiring remain later. The existing compositor's
+provisional subParts scaffold is unchanged; carrying a structural flag
+here does not claim configurable structural/header rendering.
+
+Nine units and three compile-fail guards pin all literal choices,
+default/explicit-empty separation, passive cached completion, exact-key
+header deduplication and first borrowed loans, per-key debit parity,
+unknown/forbidden refusal, prefix/tail/capacity behavior, every deadline
+cut, exact/one-short work limits, premature finish and long two-sided
+comparisons. Eight sequential Rust allocation intervals cover all fields,
+long duplicate header keys, explicit empty cached completion, unknown
+key, forbidden form, header-cell capacity refusal, duplicate comparison
+record refusal and duplicate comparison deadline refusal. Long keys and
+refusal-state setup are cold; all sixteen snapshots must be valid.
+Earlier 201 intervals remain separate. Other masks/keys/forms, supplied
+work limits, premature completion and repeated cached polls remain
+allocation-unqualified. Native allocation, stack/RSS, full request
+admission and current authenticated publication remain unqualified.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

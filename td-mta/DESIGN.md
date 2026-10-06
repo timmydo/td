@@ -940,6 +940,17 @@ full selection aggregation and configurable header/subParts composition
 remain later; this recognition does not change the provisional
 structural scaffold or grant current publication authority.
 
+M06em aggregates decoded body-part keys through the BodyPart recognizer
+into ten metadata flags, structural flags and a caller-owned borrowed
+header-cell prefix. Exact requested header keys deduplicate in bounded
+paid two-sided comparisons while preserving first spelling/loan and
+request order. Unknown/form/capacity/work failures forbid whole success.
+Explicit empty stays NONE; the pure omitted-argument default constant
+contains only the ten metadata fields. API §1.144 scopes passive result
+semantics and eight Rust intervals. JSON shapes/default dispatch,
+configurable structural/header rendering, full admission and current
+authenticated publication remain later.
+
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot
 select bodyStructure. They remain public facades over the same shared

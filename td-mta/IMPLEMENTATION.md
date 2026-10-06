@@ -2415,6 +2415,18 @@ Initial independently landable increments:
   scaffold stays provisional and current authenticated publication
   remains deferred.
 
+- **M06em — decoded body-properties aggregation:** validate each
+  borrowed key in BodyPart context; aggregate independent metadata and
+  structural flags plus a fixed borrowed parameterized-header prefix.
+  Exact requested keys deduplicate with prepaid bounded comparisons,
+  preserving first loans/spelling/order. Unknown/form/capacity/work
+  failures remain sticky and expose no whole result. Explicit empty
+  remains NONE; omitted-argument Fields::DEFAULT contains ten metadata
+  fields only. Nine units, three guards and eight Rust intervals qualify
+  API §1.144. JSON argument decoding/default dispatch, configurable
+  structural/header rendering, full admission and current authenticated
+  publication remain later.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
