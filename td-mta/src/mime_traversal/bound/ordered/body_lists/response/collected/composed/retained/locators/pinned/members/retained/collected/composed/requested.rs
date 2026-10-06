@@ -63,9 +63,18 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
         properties: Properties,
         now: Tick,
     ) -> Result<Self, Error> {
+        Self::with_sub_parts(source, properties, true, now)
+    }
+    pub(crate) fn with_sub_parts(
+        source: Serialized<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>,
+        properties: Properties,
+        sub_parts: bool,
+        now: Tick,
+    ) -> Result<Self, Error> {
         let original = super::Cursor::with_frame(
             source,
-            framing::Frame::requested(properties.body_structure, properties.bits()),
+            framing::Frame::requested(properties.body_structure, properties.bits())
+                .with_sub_parts(sub_parts),
             now,
         )?;
         Ok(Self {

@@ -1,5 +1,6 @@
 //! Requested outer properties preserve selected metadata and original custody.
 pub mod retained;
+pub mod subparts;
 use super::super::super::super::super::retained::collected::composed::requested as shared;
 use super::super::{Serialized, View};
 use super::Error;
@@ -27,8 +28,7 @@ pub use shared::Properties;
 /// fn invalid(source: Source<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_, '_>) { let _ = Cursor::new(source, Properties::ALL, Tick(1)); }
 /// ```
 pub struct Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm> {
-    inner: shared::Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>,
-    part_properties: PartProperties,
+    inner: subparts::Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>,
 }
 impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
     Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
@@ -39,8 +39,14 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
         now: Tick,
     ) -> Result<Self, Error> {
         Ok(Self {
-            part_properties: source.properties,
-            inner: shared::Cursor::new(source.inner, properties, now)?,
+            inner: subparts::Cursor::new(
+                source,
+                subparts::Selection {
+                    properties,
+                    sub_parts: true,
+                },
+                now,
+            )?,
         })
     }
     pub fn poll(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
@@ -52,18 +58,11 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
     ) -> Result<Composed<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>, Error> {
         Ok(Composed {
             inner: self.inner.finish(now)?,
-            part_properties: self.part_properties,
         })
     }
     pub fn value(&self) -> Option<(Properties, View<'_, 'm, 'o>)> {
-        let (properties, original) = self.inner.value()?;
-        Some((
-            properties,
-            View {
-                properties: self.part_properties,
-                original,
-            },
-        ))
+        let (selection, view) = self.inner.value()?;
+        Some((selection.properties, view))
     }
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
         self.inner.check_deadline(now)
@@ -77,8 +76,7 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
 /// fn required<T: Clone>() {} required::<td_mta::mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed::requested::Composed<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_, '_>>();
 /// ```
 pub struct Composed<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm> {
-    inner: shared::Composed<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>,
-    part_properties: PartProperties,
+    inner: subparts::Composed<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>,
 }
 impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
     Composed<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
@@ -93,24 +91,12 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
         ),
         Error,
     > {
-        let (inner, properties) = self.inner.finish(now)?;
-        Ok((
-            Serialized {
-                inner,
-                properties: self.part_properties,
-            },
-            properties,
-        ))
+        let (serialized, selection) = self.inner.finish(now)?;
+        Ok((serialized, selection.properties))
     }
     pub fn value(&self) -> Option<(Properties, View<'_, 'm, 'o>)> {
-        let (properties, original) = self.inner.value()?;
-        Some((
-            properties,
-            View {
-                properties: self.part_properties,
-                original,
-            },
-        ))
+        let (selection, view) = self.inner.value()?;
+        Some((selection.properties, view))
     }
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
         self.inner.check_deadline(now)

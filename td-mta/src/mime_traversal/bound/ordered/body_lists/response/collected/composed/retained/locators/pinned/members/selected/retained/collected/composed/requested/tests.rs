@@ -5,7 +5,7 @@ use super::super::tests::{deadline, expected as mode_expected, with_collection, 
 use super::super::Mode;
 use super::*;
 use crate::{mime_traversal::bound::ordered::tests::SOURCE, ports::BlobReader};
-fn properties(bits: u8) -> Properties {
+pub(super) fn properties(bits: u8) -> Properties {
     Properties {
         body_structure: bits & 16 != 0,
         text_body: bits & 1 != 0,
@@ -14,7 +14,11 @@ fn properties(bits: u8) -> Properties {
         has_attachment: bits & 8 != 0,
     }
 }
-fn expected(source: &[u8], bits: u8, cells: &[super::super::super::Cell<'_>]) -> Vec<u8> {
+pub(super) fn expected(
+    source: &[u8],
+    bits: u8,
+    cells: &[super::super::super::Cell<'_>],
+) -> Vec<u8> {
     let mut fields = Vec::new();
     if bits & 16 != 0 {
         fields.push(String::from_utf8(mode_expected(source, Mode::Structure, cells)).unwrap());

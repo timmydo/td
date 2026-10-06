@@ -930,6 +930,11 @@ scaffold; configurable headers/header:*/subParts selection, request
 parsing/defaults, full admission and current authenticated publication
 remain later.
 
+The M06ei–M06ek constructors above retain their legacy structural
+scaffold. API §1.147 adds explicit subParts selection through the same
+engine; header rendering, full admission and authenticated publication
+still remain later.
+
 M06el decoded body-part key recognition distinguishes all twelve
 standard EmailBodyPart fields and reuses the existing bounded header
 selector in BodyPart context. Result tags and borrowed header plans
@@ -970,6 +975,15 @@ first header loans and caller storage stay intact. API §1.146 scopes
 the eight Rust intervals and fixed cursor footprint. Whole request
 framing, configurable composition/admission and authenticated
 publication remain later.
+
+M06ep selects structural subParts through the existing requested framing
+engine and original selected collection custody. False closes root-only
+bodyStructure and classified list leaves after metadata; true preserves
+legacy tree/null bytes and costs. Immutable structural/outer selection
+survives completion and original owner release without widening the ten
+metadata flags. Both freshness domains remain enforced. API §1.147
+qualifies eight Rust intervals; header rendering, whole admitted request
+wiring and authenticated publication remain later.
 
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot

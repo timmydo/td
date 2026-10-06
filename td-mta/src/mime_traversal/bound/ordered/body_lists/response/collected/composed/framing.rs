@@ -58,6 +58,7 @@ pub(crate) struct Frame {
     credit: u8,
     properties: u8,
     follow_lists: bool,
+    sub_parts: bool,
 }
 impl Frame {
     pub(crate) fn new(mode: Mode) -> Self {
@@ -75,6 +76,7 @@ impl Frame {
             credit: 0,
             properties: 15,
             follow_lists: false,
+            sub_parts: true,
         }
     }
     pub(crate) fn selected_lists(properties: u8) -> Self {
@@ -93,6 +95,10 @@ impl Frame {
         frame.properties = properties & 15;
         frame.follow_lists = frame.properties != 0;
         frame
+    }
+    pub(crate) fn with_sub_parts(mut self, sub_parts: bool) -> Self {
+        self.sub_parts = sub_parts;
+        self
     }
     fn next_property(&self, after: Option<List>) -> Option<Property> {
         let start = match after {
@@ -228,38 +234,52 @@ impl Frame {
             }
             Phase::Fragment => self.begin(Bytes::Fragment(self.index), Phase::Subparts),
             Phase::Subparts => {
-                let part = source.node(self.index)?;
-                let empty = source.fragment(self.index)?.is_empty();
-                if self.mode == Mode::Structure && part.media == Media::Multipart {
-                    let next = self.index.checked_add(1).ok_or(Error::InvalidState)?;
-                    let child = source.parts()?.get(next);
-                    if child.is_some_and(|child| child.parent == part.ordinal) {
-                        let target = self
-                            .parents
-                            .get_mut(self.opened)
-                            .ok_or(Error::InvalidState)?;
-                        *target = part.ordinal;
-                        self.opened = self.opened.checked_add(1).ok_or(Error::InvalidState)?;
-                        self.begin(
-                            Bytes::Static(if empty {
-                                b"\"subParts\":["
-                            } else {
-                                b",\"subParts\":["
-                            }),
-                            Phase::Descend,
-                        );
-                    } else {
+                if !self.sub_parts {
+                    if self.mode == Mode::Structure && (self.opened != 0 || self.index != 0) {
                         return Err(Error::InvalidState);
                     }
-                } else {
                     self.begin(
-                        Bytes::Static(if empty {
-                            b"\"subParts\":null}"
+                        Bytes::Static(b"}"),
+                        if self.mode == Mode::Structure {
+                            Phase::Complete
                         } else {
-                            b",\"subParts\":null}"
-                        }),
-                        self.after_part(source)?,
+                            Phase::Advance
+                        },
                     );
+                } else {
+                    let part = source.node(self.index)?;
+                    let empty = source.fragment(self.index)?.is_empty();
+                    if self.mode == Mode::Structure && part.media == Media::Multipart {
+                        let next = self.index.checked_add(1).ok_or(Error::InvalidState)?;
+                        let child = source.parts()?.get(next);
+                        if child.is_some_and(|child| child.parent == part.ordinal) {
+                            let target = self
+                                .parents
+                                .get_mut(self.opened)
+                                .ok_or(Error::InvalidState)?;
+                            *target = part.ordinal;
+                            self.opened = self.opened.checked_add(1).ok_or(Error::InvalidState)?;
+                            self.begin(
+                                Bytes::Static(if empty {
+                                    b"\"subParts\":["
+                                } else {
+                                    b",\"subParts\":["
+                                }),
+                                Phase::Descend,
+                            );
+                        } else {
+                            return Err(Error::InvalidState);
+                        }
+                    } else {
+                        self.begin(
+                            Bytes::Static(if empty {
+                                b"\"subParts\":null}"
+                            } else {
+                                b",\"subParts\":null}"
+                            }),
+                            self.after_part(source)?,
+                        );
+                    }
                 }
             }
             Phase::Descend => {

@@ -5930,6 +5930,10 @@ current authenticated publication remain later or unqualified.
 
 ### 1.140 Original selected-field tree/list composition
 
+These legacy constructors retain their structural scaffold. API §1.147
+adds explicit subParts selection through the same engine; legacy
+selection types still do not encode JSON request defaults.
+
 M06ei adds
 `mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed`.
 Only complete §1.139 selected Serialized and an explicit Mode construct
@@ -5977,6 +5981,10 @@ parsing/defaults, headers/header:*/subParts selection and current
 authenticated publication remain later or unqualified.
 
 ### 1.141 Requested outer properties with selected part metadata
+
+These legacy constructors retain their structural scaffold. API §1.147
+adds explicit subParts selection through the same engine; legacy
+selection types still do not encode JSON request defaults.
 
 M06ej adds
 `mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed::requested`.
@@ -6029,6 +6037,10 @@ headers/header:*/subParts selection and current authenticated
 publication remain later or unqualified.
 
 ### 1.142 Whole requested output with selected part metadata
+
+These legacy constructors retain their structural scaffold. API §1.147
+adds explicit subParts selection through the same engine; legacy
+selection types still do not encode JSON request defaults.
 
 M06ek adds
 `members::selected::retained::collected::composed::requested::retained`
@@ -6299,6 +6311,50 @@ remain separate. Other masks/shapes/limits, incomplete finish and
 repeated cached polls remain allocation-unqualified. Native allocation,
 stack/RSS, whole request framing/admission, configurable composition
 wiring and current authenticated publication remain unqualified.
+
+### 1.147 Select subParts in requested selected composition
+
+M06ep adds selected::retained::collected::composed::requested::subparts
+under §1.141's original source-bound custody. Its pure Selection combines
+immutable outer Properties with an explicit sub_parts flag; selected
+metadata keeps its existing ten-field label. Original Serialized, rather
+than passive views or advanced composers, is the constructor input.
+
+When sub_parts is false, close each selected BodyPart after its metadata.
+A bodyStructure contains only the original root and does not descend;
+textBody/htmlBody/attachments still use the original leaf classifications.
+Empty metadata gives {}. When true, preserve the existing complete tree
+and leaf-null framing byte-for-byte, turn-for-turn and debit-for-debit.
+The shared Frame owns both paths. Original collection validation and all
+caller buffers remain admitted before construction. No source traversal,
+classification, pointer or fresh ownership is reconstructed from output.
+
+Selection survives passive values, consuming completion and release of
+the exact original selected Serialized. Original constructor, unfinished
+poll, explicit deadline check, consuming finish and release enforce both
+job and pin deadlines. Complete polling remains inert; an explicit failed
+check hides values stickily. No passive value authorizes publication.
+Keep one aggregate step per turn and one job record every sixteen turns,
+zero source/input visits and at most 64 prepaid wire bytes. Zero-capacity
+output is unpaid; outer NONE is immediately complete but construction/release
+remain fresh. Cursor plus HeaderBudget and 64-byte output fits 1 KiB;
+Composed fits 768 bytes. Both owners are non-Copy/non-Clone.
+
+Nine units and seven compile-fail guards cover independent literal JSON,
+root-only/list output, immutable selection and original pointers, legacy
+true-path routing parity backed by independent bytes, a three-node nested
+tree, bounded output widths, every false-path deadline cut,
+fresh construction/completion/release, sticky checks and premature finish.
+Eight Rust allocation intervals cover false root/tree plus lists, outer
+NONE, selected multipart tree composition, expiry after copying, consuming
+completion expiry, composed release expiry, zero-capacity output and
+constructor expiry.
+Caller collection/file/fragments and constructor-refusal setup stay cold;
+expiry transitions after copying/completion remain counted. All sixteen
+snapshots must be valid before comparison. Earlier 225 intervals remain
+separate. Other shapes/masks/limits and native allocation, stack/RSS,
+header/header:* rendering, full request-to-composition admission and
+current authenticated publication remain unqualified.
 
 ## 2. Read views and change history
 

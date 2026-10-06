@@ -2446,6 +2446,14 @@ Initial independently landable increments:
   configurable composition wiring and authenticated publication remain
   later.
 
+- **M06ep — requested subParts composition:** select root-only metadata
+  and classified leaf lists when subParts is omitted; preserve original
+  tree/null framing when selected. Reuse shared bounded framing and
+  original selected ownership with immutable labels and both freshness
+  domains. Nine units, seven guards and eight Rust intervals qualify API
+  §1.147. Header/header:* rendering, full admitted request wiring and
+  authenticated publication remain later.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

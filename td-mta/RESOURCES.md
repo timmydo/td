@@ -2613,6 +2613,17 @@ qualifies eight Rust intervals; earlier 217 remain separate. Native
 allocation, stack/RSS, whole request admission and current authenticated
 publication remain unqualified.
 
+M06ep's selected subParts Cursor plus HeaderBudget and 64-byte output
+fits 1 KiB; Composed fits 768 bytes. Original fragments/cells and file
+remain separately admitted. Shared framing keeps one aggregate step per
+turn, one job record every sixteen turns and at most 64 prepaid wire
+bytes, with no source/input visits. Omitted subParts does not descend
+into root children; original classification still supplies requested
+lists. API §1.147 scopes eight Rust intervals with collection and
+constructor-refusal setup cold and in-interval expiry transitions counted;
+earlier 225 remain separate. Native allocation, stack/RSS, header rendering,
+whole request admission and authenticated publication remain later.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no
