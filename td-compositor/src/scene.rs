@@ -868,6 +868,14 @@ pub struct Scene {
     /// of the PIN step it answers, which stays the one its successor
     /// follows.
     attention_field: Option<crate::attention::Field>,
+    /// The lock surface (td-login/TOKEN-LOGIN.md, "Session lock"): drawn
+    /// by display rendering alone, beneath any attention screen, while no
+    /// client is rendered, focused or given input. Only the test-only
+    /// `lock` sets it; nothing in production locks before increment 4.
+    locked: bool,
+    /// This attention lifetime left the lock surface: its success notice
+    /// stays above the drain row, which cancels nothing.
+    attention_unlocked: bool,
     status: String,
     text: crate::text::Text,
 }
@@ -909,6 +917,8 @@ impl Scene {
             attention_request_attempted: false,
             attention_notice: crate::attention::Notice::Menu,
             attention_field: None,
+            locked: false,
+            attention_unlocked: false,
             status: String::new(),
             text: crate::text::Text::default(),
         }
@@ -2250,7 +2260,7 @@ impl Scene {
     /// Either overlay is modal: it owns the keyboard, withdraws pointer
     /// hover, and must not be clicked through to the tiles it covers.
     pub fn modal(&self) -> bool {
-        self.attention || self.launcher.visible() || self.help.visible()
+        self.private_screen() || self.launcher.visible() || self.help.visible()
     }
 
     pub fn launcher_checkpoint(&self) -> Launcher {
@@ -3193,13 +3203,45 @@ impl Scene {
         self.attention_draining
     }
 
+    /// Whether the output shows only compositor-owned pixels, the
+    /// attention screen or the lock surface: no client is rendered there,
+    /// and none is focused or given input.
+    pub(crate) fn private_screen(&self) -> bool {
+        self.attention || self.locked
+    }
+
+    pub(crate) fn locked(&self) -> bool {
+        self.locked
+    }
+
+    /// The lock surface's one entry, compiled into tests alone: no
+    /// production function can set the lock.
+    #[cfg(test)]
+    pub(crate) fn lock(&mut self) {
+        self.locked = true;
+        self.launcher.apply(LauncherAction::Close);
+        self.help.set(false);
+    }
+
+    /// Leaves the lock surface from the attention lifetime opened on it.
+    pub(crate) fn unlock(&mut self) {
+        self.attention_unlocked = self.attention && self.locked;
+        self.locked = false;
+    }
+
     pub(crate) fn set_attention(&mut self, visible: bool) {
         self.attention_request = None;
         self.attention_field = None;
         self.attention = visible;
         self.attention_draining = false;
+        self.attention_unlocked = false;
+        // On the lock surface the chord is the unlock itself: no menu.
         if visible && !self.attention_request_attempted {
-            self.attention_notice = crate::attention::Notice::Menu;
+            self.attention_notice = if self.locked {
+                crate::attention::Notice::Pending
+            } else {
+                crate::attention::Notice::Menu
+            };
         }
         if visible {
             self.launcher.apply(LauncherAction::Close);
@@ -3336,8 +3378,11 @@ impl Scene {
                 height,
                 stride,
                 self.attention_draining,
+                self.attention_unlocked,
                 self.attention_notice,
             );
+        } else if self.locked {
+            crate::attention::paint_lock(frame, width, height, stride);
         } else {
             self.render(frame, width, height, stride);
         }

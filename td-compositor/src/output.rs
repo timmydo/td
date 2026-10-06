@@ -546,7 +546,7 @@ pub(crate) fn surface_rgb_pixel_counts(
     surface: SurfaceKey,
     rgbs: [[u8; 3]; 2],
 ) -> Result<[usize; 2], String> {
-    if scene.attention_visible() {
+    if scene.private_screen() {
         return Ok([0; 2]);
     }
     let composed = composed.checked()?;

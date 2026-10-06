@@ -327,19 +327,22 @@ fn ink(font: &crate::font::Font, text: &str, scale: usize) -> Result<Vec<(usize,
 }
 
 /// Display-only pixels: ordinary scene rendering never calls this painter.
+/// A lifetime that left the lock surface keeps its success notice while
+/// held input drains: that drain cancels nothing.
 pub(crate) fn paint(
     frame: &mut [u8],
     width: usize,
     height: usize,
     stride: usize,
     draining: bool,
+    unlocked: bool,
     notice: Notice,
 ) {
     let bounds = (0, 0, width, height);
     ui::fill(frame, width, height, stride, bounds, [0x28, 0x20, 0x18, 0]);
     let (scale, columns) = layout(width, height);
     let mut rows = vec![String::from("TD SECURE ATTENTION")];
-    if draining {
+    if draining && !unlocked {
         rows.push("CANCELLING REQUEST".into());
     } else {
         rows.extend(notice_rows(notice));
@@ -356,6 +359,41 @@ pub(crate) fn paint(
         }
         .into(),
     );
+    draw_rows(frame, width, height, stride, scale, columns, &rows);
+}
+
+/// The lock surface's rows (td-login/TOKEN-LOGIN.md, "Session lock"). The
+/// hostname and username join them with request `1a`'s answer, increment
+/// 4's.
+const LOCK_ROWS: &[&str] = &["LOCKED", "PRESS CTRL+ALT+ESC TO UNLOCK"];
+
+/// The lock surface, over the whole output: display-only pixels, as the
+/// attention screen's are, in its chrome rows and place.
+pub(crate) fn paint_lock(frame: &mut [u8], width: usize, height: usize, stride: usize) {
+    ui::fill(
+        frame,
+        width,
+        height,
+        stride,
+        (0, 0, width, height),
+        [0x28, 0x20, 0x18, 0],
+    );
+    let (scale, columns) = layout(width, height);
+    let rows: Vec<String> = LOCK_ROWS.iter().map(|row| String::from(*row)).collect();
+    draw_rows(frame, width, height, stride, scale, columns, &rows);
+}
+
+/// `rows`, each wrapped to `columns`, from the menu's place down.
+fn draw_rows(
+    frame: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    scale: usize,
+    columns: usize,
+    rows: &[String],
+) {
+    let bounds = (0, 0, width, height);
     let rows: Vec<String> = rows.iter().flat_map(|row| wrap(row, columns)).collect();
     let pitch = 18 * scale;
     let block = rows
@@ -667,7 +705,15 @@ mod tests {
     fn the_menu_keeps_its_rows_and_adds_k_below_i() {
         let (width, height, stride) = (1280, 800, 1280 * 4);
         let mut painted = vec![0; stride * height];
-        paint(&mut painted, width, height, stride, false, Notice::Menu);
+        paint(
+            &mut painted,
+            width,
+            height,
+            stride,
+            false,
+            false,
+            Notice::Menu,
+        );
         let mut expected = vec![0; stride * height];
         let bounds = (0, 0, width, height);
         ui::fill(
@@ -773,7 +819,7 @@ mod tests {
                 for notice in SCREENS {
                     let stride = width * 4;
                     let mut frame = vec![0; stride * height];
-                    paint(&mut frame, width, height, stride, draining, *notice);
+                    paint(&mut frame, width, height, stride, draining, false, *notice);
                     assert!(
                         frame == unchanged(width, height, draining, *notice),
                         "{width}x{height} {notice:?}"
@@ -826,7 +872,7 @@ mod tests {
                 for notice in SCREENS.iter().copied() {
                     let stride = width * 4;
                     let mut frame = vec![0; stride * height];
-                    paint(&mut frame, width, height, stride, draining, notice);
+                    paint(&mut frame, width, height, stride, draining, false, notice);
                     // The painted extent: inked rows and columns.
                     let ink = |x: usize, y: usize| frame[y * stride + x * 4] == 0xff;
                     let lowest = (0..height)
@@ -912,6 +958,96 @@ mod tests {
                 "D: REMOVE KEYS"
             ]
         );
+    }
+
+    /// After a login unlock's success the drain keeps the notice above
+    /// `RELEASE KEYS AND BUTTONS`: it cancels nothing. Not draining, the
+    /// screen is the ordinary one.
+    #[test]
+    fn an_unlocked_lifetimes_drain_keeps_its_success_notice() {
+        let (width, height, stride) = (1280, 800, 1280 * 4);
+        let notice = Notice::Login(&["SESSION UNLOCKED"]);
+        let mut painted = vec![0x55; stride * height];
+        paint(&mut painted, width, height, stride, true, true, notice);
+        let mut expected = vec![0; stride * height];
+        let bounds = (0, 0, width, height);
+        ui::fill(
+            &mut expected,
+            width,
+            height,
+            stride,
+            bounds,
+            [0x28, 0x20, 0x18, 0],
+        );
+        for (row, text) in [
+            (0, "TD SECURE ATTENTION"),
+            (1, "SESSION UNLOCKED"),
+            (7, "RELEASE KEYS AND BUTTONS"),
+        ] {
+            ui::draw_text_clipped(
+                &mut expected,
+                width,
+                height,
+                stride,
+                24,
+                276 + row * 36,
+                2,
+                text,
+                [0xff, 0xff, 0xff, 0],
+                bounds,
+            );
+        }
+        assert!(painted == expected);
+        let mut ordinary = vec![0; stride * height];
+        paint(&mut painted, width, height, stride, false, true, notice);
+        paint(&mut ordinary, width, height, stride, false, false, notice);
+        assert!(painted == ordinary);
+    }
+
+    /// The lock surface is the attention screen's chrome over the whole
+    /// output: its rows where the menu's title and notice go, on 1280x800
+    /// at 276 and 312, and nothing else, so no client pixel survives it.
+    #[test]
+    fn the_lock_surface_is_its_two_rows_over_the_whole_output() {
+        let (width, height, stride) = (1280, 800, 1280 * 4);
+        let mut painted = vec![0x55; stride * height];
+        paint_lock(&mut painted, width, height, stride);
+        let mut expected = vec![0; stride * height];
+        let bounds = (0, 0, width, height);
+        ui::fill(
+            &mut expected,
+            width,
+            height,
+            stride,
+            bounds,
+            [0x28, 0x20, 0x18, 0],
+        );
+        for (top, text) in [(276, "LOCKED"), (312, "PRESS CTRL+ALT+ESC TO UNLOCK")] {
+            ui::draw_text_clipped(
+                &mut expected,
+                width,
+                height,
+                stride,
+                24,
+                top,
+                2,
+                text,
+                [0xff, 0xff, 0xff, 0],
+                bounds,
+            );
+        }
+        assert!(painted == expected);
+        // Whole, unwrapped and drawn on the smallest output a prompt takes.
+        for (width, height) in [(320, 200), (800, 600)] {
+            let stride = width * 4;
+            let mut frame = vec![0x55; stride * height];
+            paint_lock(&mut frame, width, height, stride);
+            assert!(frame.chunks(4).all(|pixel| pixel[0] != 0x55));
+            for row in LOCK_ROWS {
+                assert!(row.len() <= layout(width, height).1, "{row}");
+                assert!(row.bytes().all(ui::is_mapped), "{row}");
+            }
+        }
     }
 
     // The PIN field.

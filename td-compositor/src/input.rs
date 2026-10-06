@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 
 const EVENT_SIZE: usize = 24;
@@ -324,6 +324,10 @@ struct KeyDecision {
     /// A key for the PIN field and its evdev time. The attempt takes it only
     /// while its field is open and was on glass before the press.
     field: Option<(crate::secret_client::FieldKey, u128)>,
+    /// This chord may open the lock surface's unlock, which is its
+    /// selection: a fresh Escape and held Control and Alt, each from a
+    /// device secure attention reads.
+    unlock: bool,
     draining: bool,
     command: Option<Command>,
     launcher: Option<LauncherAction>,
@@ -346,6 +350,7 @@ impl KeyBindings {
             notice: None,
             confirm_install: None,
             field: None,
+            unlock: false,
             draining: false,
             command: None,
             launcher: None,
@@ -425,6 +430,11 @@ impl KeyBindings {
             && (self.pressed(KEY_LEFTCTRL) || self.pressed(KEY_RIGHTCTRL))
             && (self.pressed(KEY_LEFTALT) || self.pressed(KEY_RIGHTALT))
         {
+            let held = |left, right| self.attention_pressed(left) || self.attention_pressed(right);
+            decision.unlock = !self.attention_excluded.contains(&device)
+                && !attention_held
+                && held(KEY_LEFTCTRL, KEY_RIGHTCTRL)
+                && held(KEY_LEFTALT, KEY_RIGHTALT);
             self.attention = AttentionState::Open;
             self.secret_selected = false;
             self.login_screen = LoginScreen::Closed;
@@ -1345,6 +1355,10 @@ trait InputTarget {
         None
     }
     fn attention_closed(&mut self) {}
+    /// Whether the lock surface is up; a target with none never is.
+    fn session_locked(&mut self) -> bool {
+        false
+    }
 
     fn attention(&mut self, visible: bool) -> Result<u128, String>;
     fn drain_attention(&mut self) -> Result<(), String>;
@@ -1396,6 +1410,88 @@ struct LiveInputTarget {
     runtime: Arc<Mutex<Runtime>>,
     launches: LaunchBackend,
     secret_attempt: Option<Arc<crate::secret_client::Attempt>>,
+    /// This target's own seat, lent to each attempt it opens.
+    seat: Seat,
+}
+
+/// The evdev adapter's seat, lent to an attention lifetime's attempt so
+/// that root's success for a login unlock (`91 06`) can end the lifetime
+/// the person opened on the lock surface. The authority worker holds no
+/// lock when it calls in, and takes the bindings, then the target, then
+/// through it the attempt's field and the runtime: every input reader's
+/// order. Weak, since the target holds the attempt that holds this.
+#[derive(Clone, Default)]
+pub(crate) struct Seat {
+    bindings: Weak<Mutex<KeyBindings>>,
+    target: Weak<Mutex<LiveInputTarget>>,
+}
+
+impl Seat {
+    /// Leaves the lock surface and ends `attempt`'s lifetime, which must
+    /// still be the open one with its unlock committed and not cancelled:
+    /// under the bindings lock no Escape interleaves, and one that came
+    /// first ended the lifetime still locked. Held input drains first, as
+    /// after Escape, under `RELEASE KEYS AND BUTTONS`; a close that fails
+    /// keeps capture, as there.
+    pub(crate) fn unlocked(&self, attempt: &crate::secret_client::Attempt) -> Result<(), String> {
+        let (Some(bindings), Some(target)) = (self.bindings.upgrade(), self.target.upgrade())
+        else {
+            return Ok(());
+        };
+        let mut bindings = bindings
+            .lock()
+            .map_err(|_| "input bindings lock poisoned".to_string())?;
+        let mut target = target
+            .lock()
+            .map_err(|_| "input target lock poisoned".to_string())?;
+        let current = target
+            .secret_attempt
+            .as_ref()
+            .is_some_and(|current| std::ptr::eq(Arc::as_ptr(current), attempt));
+        if !current || bindings.attention != AttentionState::Open || !attempt.unlock_committed() {
+            return Ok(());
+        }
+        {
+            let mut runtime = target
+                .runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?;
+            let origin = EvdevOrigin { _private: () };
+            runtime.unlock_session(&origin)?;
+            bindings.attention = AttentionState::Draining;
+            // The runtime's drain, not the target's: that one cancels the
+            // attempt, and this one succeeded.
+            runtime.drain_attention(&origin)?;
+        }
+        if let Err(error) = finish_attention(&mut *target, &mut bindings) {
+            let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
+        }
+        Ok(())
+    }
+}
+
+/// The lock surface's entry, through the bindings as increment 4's
+/// triggers must go: the launcher and help capture close with the overlays
+/// the runtime closes. Compiled into tests alone, as the runtime's is.
+#[cfg(test)]
+fn lock_session(
+    bindings: &Mutex<KeyBindings>,
+    target: &Mutex<LiveInputTarget>,
+) -> Result<crate::runtime::NoticePresentation, String> {
+    let mut bindings = bindings
+        .lock()
+        .map_err(|_| "input bindings lock poisoned".to_string())?;
+    let target = target
+        .lock()
+        .map_err(|_| "input target lock poisoned".to_string())?;
+    let presentation = target
+        .runtime
+        .lock()
+        .map_err(|_| "runtime lock poisoned".to_string())?
+        .lock_session()?;
+    bindings.settle_launcher(Some(false));
+    bindings.settle_help(Some(false));
+    Ok(presentation)
 }
 
 /// One synthetic seat for an explicitly enabled headless process generation.
@@ -1692,10 +1788,11 @@ impl InputTarget for LiveInputTarget {
         if self.secret_attempt.is_some() {
             return Err("physical attention already consumed a request".into());
         }
-        let attempt = crate::secret_client::Attempt::new(
+        let attempt = crate::secret_client::Attempt::seated(
             EvdevOrigin { _private: () },
             Arc::clone(&self.runtime),
             role,
+            Some(self.seat.clone()),
         );
         self.secret_attempt = Some(Arc::clone(&attempt));
         if let Err(error) = attempt.notice(crate::attention::Notice::Pending) {
@@ -1730,6 +1827,13 @@ impl InputTarget for LiveInputTarget {
 
     fn attention_closed(&mut self) {
         self.secret_attempt = None;
+    }
+
+    fn session_locked(&mut self) -> bool {
+        // A poisoned runtime is taken as locked: nothing ordinary runs.
+        self.runtime
+            .lock()
+            .map_or(true, |runtime| runtime.session_locked())
     }
 
     fn drain_attention(&mut self) -> Result<(), String> {
@@ -2353,16 +2457,42 @@ fn deliver_pointer_frame<T: InputTarget>(
 fn deliver_key_decision<T: InputTarget>(
     runtime: &mut T,
     bindings: &mut KeyBindings,
-    decision: KeyDecision,
+    mut decision: KeyDecision,
 ) -> Result<(), String> {
     if decision.draining {
         runtime.drain_attention()?;
     }
+    // The lock surface runs no ordinary binding (td-login/TOKEN-LOGIN.md,
+    // "Session lock"); the runtime withholds keys from clients itself.
+    let bindings_ordinary = decision.command.is_some()
+        || decision.launcher.is_some()
+        || decision.help.is_some()
+        || decision.launch.is_some();
+    if bindings_ordinary && runtime.session_locked() {
+        decision.command = None;
+        decision.launcher = None;
+        decision.help = None;
+        decision.launch = None;
+        bindings.settle_launcher(Some(false));
+        bindings.settle_help(Some(false));
+    }
     if let Some(visible) = decision.attention {
-        if visible {
-            runtime.attention(true)?;
-        } else {
+        if !visible {
             finish_attention(runtime, bindings)?;
+        } else if !runtime.session_locked() {
+            runtime.attention(true)?;
+        } else if decision.unlock {
+            // On the lock surface the chord is the selection: a login
+            // unlock, the lifetime's one operation, with no menu.
+            runtime.attention(true)?;
+            bindings.secret_selected = true;
+            decision.secret = Some(crate::secret_client::Selection::Login(
+                crate::secret_client::LoginSelection::Unlock,
+            ));
+        } else {
+            // A security key's own keyboard selects nothing: its chord
+            // leaves the lock surface as it was.
+            bindings.attention = AttentionState::Closed;
         }
     }
     if let Some(timestamp) = decision.confirm_install {
@@ -2870,11 +3000,17 @@ pub fn start(
         attention_excluded,
         ..KeyBindings::default()
     }));
-    let target = Arc::new(Mutex::new(LiveInputTarget {
-        runtime,
-        launches,
-        secret_attempt: None,
-    }));
+    let target = Arc::new_cyclic(|own| {
+        Mutex::new(LiveInputTarget {
+            runtime,
+            launches,
+            secret_attempt: None,
+            seat: Seat {
+                bindings: Arc::downgrade(&bindings),
+                target: own.clone(),
+            },
+        })
+    });
     for (device, (path, mut file)) in devices.into_iter().enumerate() {
         if attention_enabled {
             sys::input_monotonic_clock(&file)?;
@@ -4574,6 +4710,8 @@ mod tests {
         /// Every key offered to the field, open or not.
         field_keys: usize,
         field_times: Vec<u128>,
+        /// The lock surface is up.
+        locked: bool,
     }
 
     impl RecordingTarget {
@@ -4596,6 +4734,10 @@ mod tests {
         fn secret_request(&mut self, role: crate::secret_client::Selection) -> Result<(), String> {
             self.secret_roles.push(role);
             Ok(())
+        }
+
+        fn session_locked(&mut self) -> bool {
+            self.locked
         }
 
         fn pin_key(
@@ -6887,6 +7029,7 @@ mod tests {
             runtime: Arc::clone(&runtime),
             launches: LaunchBackend::Direct(launches),
             secret_attempt: None,
+            seat: Seat::default(),
         });
         let bindings = Mutex::new(KeyBindings::default());
         let mut pointer = PointerMotion::default();
@@ -6936,6 +7079,7 @@ mod tests {
             runtime: Arc::clone(&runtime),
             launches: LaunchBackend::Direct(launches),
             secret_attempt: None,
+            seat: Seat::default(),
         });
         let bindings = Mutex::new(KeyBindings::default());
         let mut pointer = PointerMotion::default();
@@ -7020,6 +7164,7 @@ mod tests {
             runtime: Arc::clone(&runtime),
             launches: LaunchBackend::Direct(launches),
             secret_attempt: None,
+            seat: Seat::default(),
         });
         let bindings = Mutex::new(KeyBindings::default());
         let mut pointer = PointerMotion::default();
@@ -7706,6 +7851,7 @@ mod tests {
             runtime: Arc::clone(&runtime),
             launches: LaunchBackend::Direct(launches),
             secret_attempt: None,
+            seat: Seat::default(),
         };
         let mut bindings = KeyBindings {
             attention_enabled: true,
@@ -9319,5 +9465,784 @@ mod tests {
         assert_eq!(target.secret_roles.len(), 1);
         assert_eq!(target.field_keys, 0);
         assert!(target.field.typed().is_empty());
+    }
+
+    // The lock surface.
+
+    fn locked_target() -> Mutex<RecordingTarget> {
+        Mutex::new(RecordingTarget {
+            locked: true,
+            ..RecordingTarget::default()
+        })
+    }
+
+    /// On the lock surface the chord is the selection: it opens attention
+    /// straight into a login unlock, with no menu, and that is the
+    /// lifetime's one operation. Escape ends it, and the next chord is a
+    /// new lifetime with a new unlock.
+    #[test]
+    fn the_lock_surfaces_chord_selects_its_unlock_with_no_menu() {
+        use crate::secret_client::{LoginSelection, Selection};
+        let unlock = Selection::Login(LoginSelection::Unlock);
+        let target = locked_target();
+        let bindings = attention_bindings(Some(ENROLLED.to_vec()));
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        {
+            let target = target.lock().unwrap();
+            assert_eq!(target.attention_events, [true]);
+            assert_eq!(target.secret_roles, std::slice::from_ref(&unlock));
+            assert!(target.notices.is_empty());
+        }
+        // The menu's letters and the key-management screen select nothing.
+        read_reports(
+            &target,
+            &bindings,
+            0,
+            &presses(&[KEY_K, KEY_1, KEY_A, KEY_D, KEY_U, KEY_I, KEY_W], 20),
+        );
+        {
+            let target = target.lock().unwrap();
+            assert_eq!(target.secret_roles, std::slice::from_ref(&unlock));
+            assert!(target.notices.is_empty());
+        }
+        read_reports(&target, &bindings, 0, &presses(&[KEY_ESC], 40));
+        assert!(bindings.lock().unwrap().attention == AttentionState::Closed);
+        let mut reopen = vec![syn(50)];
+        reopen.extend(chord_reports(51));
+        read_reports(&target, &bindings, 0, &reopen);
+        {
+            let target = target.lock().unwrap();
+            assert_eq!(target.attention_events, [true, false, true]);
+            assert_eq!(target.secret_roles, [unlock.clone(), unlock]);
+        }
+        // Unlocked, the same chord opens the menu as before.
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = attention_bindings(None);
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        assert!(target.lock().unwrap().secret_roles.is_empty());
+    }
+
+    /// A security key's own keyboard cannot open the lock surface's unlock:
+    /// its chord, or its Control and Alt under another keyboard's Escape,
+    /// leaves the lock surface as it was. Its Escape still cancels the
+    /// unlock another keyboard opened.
+    #[test]
+    fn a_security_keys_keyboard_cannot_open_the_lock_surfaces_unlock() {
+        use crate::secret_client::{LoginSelection, Selection};
+        const KEY: usize = 1;
+        let target = locked_target();
+        let bindings = Mutex::new(KeyBindings {
+            attention_enabled: true,
+            attention_excluded: BTreeSet::from([KEY]),
+            ..KeyBindings::default()
+        });
+        read_reports(&target, &bindings, KEY, &chord_reports(10));
+        assert!(bindings.lock().unwrap().attention == AttentionState::Closed);
+        // Its Control and Alt held, the keyboard's Escape.
+        let (mut key_resync, mut keyboard_resync) = (|| None, || None);
+        let mut token = DeviceState::new(None, AbsoluteKind::Tablet, &mut key_resync, true);
+        let mut keyboard = DeviceState::new(None, AbsoluteKind::Tablet, &mut keyboard_resync, true);
+        for (code, value, device) in [
+            (KEY_LEFTCTRL, KEY_PRESS, KEY),
+            (KEY_LEFTALT, KEY_PRESS, KEY),
+            (KEY_ESC, KEY_PRESS, 0),
+            (KEY_ESC, KEY_RELEASE, 0),
+            (KEY_LEFTALT, KEY_RELEASE, KEY),
+            (KEY_LEFTCTRL, KEY_RELEASE, KEY),
+        ] {
+            let state = if device == KEY {
+                &mut token
+            } else {
+                &mut keyboard
+            };
+            apply_device_event(&target, key(code, value), device, &bindings, state).unwrap();
+        }
+        assert!(bindings.lock().unwrap().attention == AttentionState::Closed);
+        {
+            let target = target.lock().unwrap();
+            assert!(target.attention_events.is_empty());
+            assert!(target.secret_roles.is_empty());
+        }
+        // Another keyboard's chord opens it, and the key's Escape cancels.
+        read_reports(&target, &bindings, 0, &chord_reports(20));
+        read_reports(&target, &bindings, KEY, &presses(&[KEY_ESC], 30));
+        let target = target.lock().unwrap();
+        assert_eq!(
+            target.secret_roles,
+            [Selection::Login(LoginSelection::Unlock)]
+        );
+        assert_eq!(target.draining_events, 1);
+        assert_eq!(target.attention_events, [true, false]);
+    }
+
+    /// The lock surface runs no ordinary binding: no terminal, launcher,
+    /// sheet or workspace.
+    #[test]
+    fn the_lock_surface_runs_no_binding() {
+        let target = locked_target();
+        let bindings = attention_bindings(None);
+        let chords = [KEY_T, KEY_ENTER, KEY_SLASH, KEY_1, KEY_LEFT, KEY_F];
+        read_reports(&target, &bindings, 0, &with_held(KEY_LEFTMETA, &chords, 10));
+        let target = target.lock().unwrap();
+        assert!(target.launched.is_empty());
+        assert!(target.launcher_actions.is_empty());
+        assert!(target.help_actions.is_empty());
+        assert!(target.commands.is_empty());
+        assert!(target.secret_roles.is_empty());
+        let bindings = bindings.lock().unwrap();
+        assert!(!bindings.launcher_open && !bindings.help_open);
+    }
+
+    const LOCK_NONCE: [u8; 32] = [9; 32];
+    /// Evdev time far past this host's monotonic clock, so that a press is
+    /// after every paint the runtime timed.
+    const LATER: u128 = 1_000_000_000_000_000_000;
+    /// The client window's colour behind the lock.
+    const CLIENT: [u8; 4] = [1, 2, 3, 0];
+
+    fn later(events: Vec<Event>) -> Vec<Event> {
+        events
+            .into_iter()
+            .map(|mut event| {
+                event.timestamp += LATER;
+                event
+            })
+            .collect()
+    }
+
+    /// Root as the private client meets it: its answers in order, and the
+    /// requests it was sent.
+    struct Root {
+        replies: std::collections::VecDeque<Vec<u8>>,
+        calls: Vec<Vec<u8>>,
+    }
+
+    impl crate::authority::Exchange for Root {
+        fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+            self.calls.push(bytes.to_vec());
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<Vec<u8>, String> {
+            self.replies
+                .pop_front()
+                .ok_or_else(|| "root has no answer".to_string())
+        }
+    }
+
+    fn root(replies: Vec<Vec<u8>>) -> Root {
+        Root {
+            replies: replies.into(),
+            calls: Vec::new(),
+        }
+    }
+
+    impl Root {
+        fn sent(&self, tag: u8) -> usize {
+            self.calls
+                .iter()
+                .filter(|call| call.first() == Some(&tag))
+                .count()
+        }
+    }
+
+    /// Polls until root's answers run out.
+    fn run(client: &mut crate::secret_client::Client, root: &mut Root) -> Result<(), String> {
+        for _ in 0..64 {
+            if root.replies.is_empty() {
+                break;
+            }
+            client.tick(root)?;
+        }
+        Ok(())
+    }
+
+    fn unlock_step(
+        step: crate::authority::consent::LoginStep,
+    ) -> crate::authority::consent::Request {
+        crate::authority::consent::Request::new(
+            LOCK_NONCE,
+            1000,
+            crate::authority::consent::Operation::LoginUnlock {
+                account: 1000,
+                before: 2,
+                after: 2,
+                step,
+            },
+        )
+        .unwrap()
+    }
+
+    fn identify() -> crate::authority::consent::Request {
+        unlock_step(crate::authority::consent::LoginStep::Identify)
+    }
+
+    fn pin_step() -> crate::authority::consent::Request {
+        unlock_step(crate::authority::consent::LoginStep::Unlock {
+            key: [0xa2; 4],
+            retries: 8,
+        })
+    }
+
+    fn status(code: u8, request: &crate::authority::consent::Request) -> Vec<u8> {
+        [&[0x91, code][..], &request.encode()].concat()
+    }
+
+    fn started() -> Vec<u8> {
+        [&[0x9b, 1][..], &LOCK_NONCE].concat()
+    }
+
+    /// Root's answers from `1b` until the PIN step asks for its PIN: the
+    /// identify step presented and worked on, then the PIN step presented.
+    fn to_pin() -> Vec<Vec<u8>> {
+        let (identify, step) = (identify(), pin_step());
+        vec![
+            started(),
+            vec![0x91, 0x0b],
+            status(3, &identify),
+            status(4, &identify),
+            vec![0x93],
+            status(3, &identify),
+            status(4, &step),
+            vec![0x93],
+            status(0x0c, &step),
+        ]
+    }
+
+    /// A paired seat over a locked 800x600 output with one client window
+    /// behind the lock, its attempts queued for the worker the test plays.
+    struct LockedSeat {
+        cleanup: Cleanup,
+        runtime: Arc<Mutex<Runtime>>,
+        bindings: Arc<Mutex<KeyBindings>>,
+        target: Arc<Mutex<LiveInputTarget>>,
+        queued: crate::authority::Queued,
+        surface: crate::scene::SurfaceKey,
+    }
+
+    impl LockedSeat {
+        fn new(excluded: &[usize]) -> Self {
+            let seat = Self::open(excluded);
+            seat.lock().unwrap();
+            seat
+        }
+
+        fn lock(&self) -> Result<crate::runtime::NoticePresentation, String> {
+            lock_session(&self.bindings, &self.target)
+        }
+
+        /// The same seat before it locks.
+        fn open(excluded: &[usize]) -> Self {
+            let cleanup = Cleanup(std::env::temp_dir().join(format!(
+                "td-lock-{}-{}",
+                std::process::id(),
+                TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+            )));
+            let framebuffer =
+                crate::framebuffer::Framebuffer::test_file(&cleanup.0, 800, 600, 3200).unwrap();
+            let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+            let surface = crate::scene::SurfaceKey {
+                client: 1,
+                object: 1,
+            };
+            {
+                let mut runtime = runtime.lock().unwrap();
+                runtime.enable_attention(true);
+                runtime
+                    .commit(
+                        surface,
+                        crate::buffer::Surface::from_shm_pixels(
+                            100,
+                            100,
+                            CLIENT.repeat(10_000),
+                            crate::scene::SHM_XRGB8888,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                assert_eq!(runtime.keyboard_snapshot().focus, Some(surface));
+            }
+            let bindings = Arc::new(Mutex::new(KeyBindings {
+                attention_enabled: true,
+                attention_excluded: excluded.iter().copied().collect(),
+                ..KeyBindings::default()
+            }));
+            let (launcher, queued) = crate::authority::Queued::launcher();
+            let target = Arc::new_cyclic(|own| {
+                Mutex::new(LiveInputTarget {
+                    runtime: Arc::clone(&runtime),
+                    launches: LaunchBackend::Authority(launcher),
+                    secret_attempt: None,
+                    seat: Seat {
+                        bindings: Arc::downgrade(&bindings),
+                        target: own.clone(),
+                    },
+                })
+            });
+            let seat = Self {
+                cleanup,
+                runtime,
+                bindings,
+                target,
+                queued,
+                surface,
+            };
+            assert!(seat.client_shown());
+            seat
+        }
+
+        /// `events` read from `device` by the whole device dispatcher,
+        /// after a report boundary that any new cutoff discards.
+        fn read(&self, device: usize, from: u32, events: Vec<Event>) {
+            let mut all = vec![syn(from)];
+            all.extend(events);
+            let data = later(all).into_iter().flat_map(encode).collect();
+            read_device(
+                Path::new("event-test"),
+                &mut ChunkedReader::new(data, Vec::new()),
+                device,
+                self.target.as_ref(),
+                self.bindings.as_ref(),
+                None,
+                &mut || None,
+            )
+            .unwrap();
+        }
+
+        fn chord(&self, from: u32) {
+            self.read(0, from, chord_reports(from + 1));
+        }
+
+        fn press(&self, codes: &[u16], from: u32) {
+            self.read(0, from, presses(codes, from + 1));
+        }
+
+        fn locked(&self) -> bool {
+            self.runtime.lock().unwrap().session_locked()
+        }
+
+        fn attention_open(&self) -> bool {
+            self.bindings.lock().unwrap().attention != AttentionState::Closed
+        }
+
+        fn shown(&self) -> Option<crate::attention::Notice> {
+            self.runtime.lock().unwrap().attention_shown()
+        }
+
+        fn field(&self) -> Option<crate::attention::Field> {
+            self.runtime.lock().unwrap().attention_field_shown()
+        }
+
+        fn glass(&self) -> Vec<u8> {
+            std::fs::read(&self.cleanup.0).unwrap()
+        }
+
+        /// The lock surface, drawn independently of the runtime.
+        fn lock_surface() -> Vec<u8> {
+            let mut frame = vec![0; 800 * 600 * 4];
+            crate::attention::paint_lock(&mut frame, 800, 600, 3200);
+            frame
+        }
+
+        fn client_shown(&self) -> bool {
+            self.glass().as_chunks::<4>().0.contains(&CLIENT)
+        }
+
+        /// The chord's unlock attempt, as the worker receives it.
+        fn unlock(&self, from: u32) -> Arc<crate::secret_client::Attempt> {
+            use crate::secret_client::{LoginSelection, Selection};
+            self.chord(from);
+            let attempt = self.queued.attempt().unwrap();
+            assert_eq!(
+                attempt.selection(),
+                &Selection::Login(LoginSelection::Unlock)
+            );
+            attempt
+        }
+
+        /// An unlock driven to its committed last step: the chord, the
+        /// identify step, the PIN step whose field the person types into
+        /// on the keyboard, the PIN, the touch and the commit.
+        fn committed(&self) -> (crate::secret_client::Client, Root) {
+            let attempt = self.unlock(10);
+            let step = pin_step();
+            let mut root = root(to_pin());
+            let mut client = crate::secret_client::Client::trusting_memory();
+            client.start(&mut root, attempt).unwrap();
+            run(&mut client, &mut root).unwrap();
+            assert_eq!(self.field(), Some(crate::attention::Field::Pin(0)));
+            self.press(&[KEY_1, KEY_2, KEY_3, KEY_4, KEY_ENTER], 40);
+            assert_eq!(self.field(), Some(crate::attention::Field::Pin(4)));
+            root.replies.extend([
+                status(0x0c, &step),
+                vec![0x9c, 0],
+                status(3, &step),
+                status(5, &step),
+                vec![0x94],
+                status(3, &step),
+            ]);
+            run(&mut client, &mut root).unwrap();
+            assert_eq!(root.sent(0x14), 1);
+            assert_eq!(self.field(), Some(crate::attention::Field::Touch));
+            (client, root)
+        }
+    }
+
+    /// Locked, the output shows the lock surface and no client pixel, a
+    /// client's new frame changes nothing on glass, and no client is
+    /// focused or given a key, a modifier or the pointer. The chord's
+    /// attention screen shows no menu over it.
+    #[test]
+    fn the_lock_surface_hides_every_client_and_withholds_input() {
+        let seat = LockedSeat::new(&[]);
+        assert!(seat.glass() == LockedSeat::lock_surface());
+        assert!(!seat.client_shown());
+        let mut runtime = seat.runtime.lock().unwrap();
+        let before = runtime.keyboard_snapshot();
+        assert_eq!(before.focus, None);
+        runtime.key(key(KEY_A, KEY_PRESS).key_input()).unwrap();
+        runtime
+            .modifiers(ModifierState {
+                depressed: MOD_SHIFT,
+                ..ModifierState::default()
+            })
+            .unwrap();
+        runtime
+            .pointer_frame(1, 40, 40, &[], PointerScroll::default())
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot(), before);
+        assert!(runtime.pointer_snapshot().focus.is_none());
+        runtime
+            .commit(
+                seat.surface,
+                crate::buffer::Surface::from_shm_pixels(
+                    100,
+                    100,
+                    [6, 7, 8, 0].repeat(10_000),
+                    crate::scene::SHM_XRGB8888,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(seat.glass() == LockedSeat::lock_surface());
+        assert_eq!(runtime.keyboard_snapshot().focus, None);
+        // Leaving it needs an open lifetime, whose screen shows no menu;
+        // the entry refuses while one is open.
+        let origin = EvdevOrigin { _private: () };
+        assert!(runtime.unlock_session(&origin).is_err());
+        runtime.attention(&origin, true).unwrap();
+        assert_eq!(
+            runtime.attention_shown(),
+            Some(crate::attention::Notice::Pending)
+        );
+        assert!(runtime.lock_session().is_err());
+        // Closed again, the lock surface, not a client, is what returns.
+        runtime.attention(&origin, false).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, None);
+        drop(runtime);
+        assert!(seat.glass() == LockedSeat::lock_surface());
+        // Only the paired profile has a lock surface.
+        let cleanup = Cleanup(std::env::temp_dir().join(format!(
+            "td-lock-direct-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let mut direct = Runtime::new(
+            crate::framebuffer::Framebuffer::test_file(&cleanup.0, 320, 200, 1280).unwrap(),
+        );
+        assert!(direct.lock_session().is_err());
+        assert!(!direct.session_locked());
+    }
+
+    /// Ctrl+Alt+Esc on the lock surface opens one attention lifetime, which
+    /// carries the whole chained unlock: `1b 07`, the identify step, the
+    /// PIN step and its field typed on the keyboard, the touch and the
+    /// commit. Root's `06` leaves the lock surface and closes attention:
+    /// the client window is on glass and focused again.
+    #[test]
+    fn the_chord_unlocks_through_one_lifetime_and_its_pin_field() {
+        let seat = LockedSeat::new(&[]);
+        let (mut client, mut root) = seat.committed();
+        // Committed, not yet reported: still locked, attention up.
+        assert!(seat.locked() && seat.attention_open());
+        root.replies.push_back(status(6, &pin_step()));
+        run(&mut client, &mut root).unwrap();
+        assert!(!seat.locked());
+        assert!(!seat.attention_open());
+        assert!(seat.target.lock().unwrap().secret_attempt.is_none());
+        assert!(seat.client_shown());
+        assert_eq!(
+            seat.runtime.lock().unwrap().keyboard_snapshot().focus,
+            Some(seat.surface)
+        );
+        // The operation's requests: one `1b 07`, one PIN, one commit.
+        assert_eq!(root.calls.first(), Some(&vec![0x1b, 7]));
+        assert_eq!(root.sent(0x1b), 1);
+        assert_eq!(root.sent(0x13), 2);
+        assert_eq!(root.sent(0x14), 1);
+        let encoded = pin_step().encode();
+        let pin = [
+            &[0x1c, u8::try_from(encoded.len()).unwrap()][..],
+            &encoded,
+            b"1234",
+        ]
+        .concat();
+        let pins: Vec<&Vec<u8>> = root
+            .calls
+            .iter()
+            .filter(|call| call.first() == Some(&0x1c))
+            .collect();
+        assert_eq!(pins, [&pin]);
+    }
+
+    /// A failure leaves the session locked with its text on the trusted
+    /// screen: this build's root answers an unlock NO RECORD, or with the
+    /// directory missing DIRECTORY DAMAGED, before any description; a wrong
+    /// PIN ends it too. Escape returns to the lock surface, and a second
+    /// chord opens a new lifetime with a new unlock.
+    #[test]
+    fn a_failed_unlock_stays_locked_with_its_text() {
+        let step = pin_step();
+        let wrong = vec![
+            status(0x0c, &step),
+            vec![0x9c, 0],
+            [&[0x91, 0x0d, 0x01, 7][..], &step.encode()].concat(),
+        ];
+        for (replies, typed, rows) in [
+            (
+                vec![started(), vec![0x91, 0x0d, 0x09, 0]],
+                None,
+                &["NO LOGIN KEYS ENROLLED"][..],
+            ),
+            (
+                vec![started(), vec![0x91, 0x0d, 0x0a, 0]],
+                None,
+                &["LOGIN KEY STATE UNAVAILABLE:", "DIRECTORY DAMAGED"][..],
+            ),
+            (to_pin(), Some(wrong), &["WRONG PIN"][..]),
+        ] {
+            let seat = LockedSeat::new(&[]);
+            let first = seat.unlock(10);
+            let mut root = root(replies);
+            let mut client = crate::secret_client::Client::trusting_memory();
+            client.start(&mut root, Arc::clone(&first)).unwrap();
+            run(&mut client, &mut root).unwrap();
+            if let Some(then) = typed {
+                seat.press(&[KEY_9, KEY_9, KEY_9, KEY_9, KEY_ENTER], 20);
+                root.replies.extend(then);
+                run(&mut client, &mut root).unwrap();
+                assert_eq!(root.sent(0x1c), 1);
+            }
+            assert!(root.replies.is_empty());
+            assert!(seat.locked() && seat.attention_open());
+            match seat.shown() {
+                Some(crate::attention::Notice::Login(shown)) => assert_eq!(shown, rows),
+                other => panic!("{other:?}"),
+            }
+            // Nothing more is asked of root for that operation.
+            let calls = root.calls.len();
+            client.tick(&mut root).unwrap();
+            assert_eq!(root.calls.len(), calls);
+            seat.press(&[KEY_ESC], 30);
+            assert!(!seat.attention_open() && seat.locked());
+            assert!(seat.glass() == LockedSeat::lock_surface());
+            let second = seat.unlock(40);
+            assert!(!Arc::ptr_eq(&first, &second));
+            assert!(seat.attention_open());
+            assert_eq!(seat.shown(), Some(crate::attention::Notice::Pending));
+        }
+    }
+
+    /// Root's `06` with a key still held leaves the lock surface and drains
+    /// as Escape does, except that the success notice stays: it shows over
+    /// `RELEASE KEYS AND BUTTONS`, with no client shown or focused, until
+    /// the release closes attention onto the client.
+    #[test]
+    fn an_unlock_with_a_key_held_drains_before_it_closes() {
+        let seat = LockedSeat::new(&[]);
+        let (mut client, mut root) = seat.committed();
+        // Fed event by event: a read that ends releases its device.
+        let mut pointer = PointerMotion::default();
+        let feed = |pointer: &mut PointerMotion, value, time| {
+            for event in later(vec![at_millis(key(KEY_A, value), time), syn(time)]) {
+                apply(
+                    seat.target.as_ref(),
+                    event,
+                    0,
+                    seat.bindings.as_ref(),
+                    pointer,
+                    None,
+                )
+                .unwrap();
+            }
+        };
+        feed(&mut pointer, KEY_PRESS, 61);
+        assert!(seat.locked() && seat.attention_open());
+        root.replies.push_back(status(6, &pin_step()));
+        run(&mut client, &mut root).unwrap();
+        assert!(!seat.locked());
+        assert!(seat.bindings.lock().unwrap().attention == AttentionState::Draining);
+        let mut drained = vec![0; 800 * 600 * 4];
+        crate::attention::paint(
+            &mut drained,
+            800,
+            600,
+            3200,
+            true,
+            true,
+            crate::attention::Notice::Login(&["SESSION UNLOCKED"]),
+        );
+        assert!(seat.glass() == drained);
+        assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
+        feed(&mut pointer, KEY_RELEASE, 71);
+        assert!(!seat.attention_open() && !seat.locked());
+        assert!(seat.client_shown());
+        assert_eq!(
+            seat.runtime.lock().unwrap().keyboard_snapshot().focus,
+            Some(seat.surface)
+        );
+    }
+
+    /// Locking goes through the bindings: the launcher's and the help
+    /// sheet's capture close with the overlays the runtime closes, so no
+    /// key is routed to an overlay that is gone.
+    #[test]
+    fn locking_closes_the_launcher_and_help_capture() {
+        for help in [false, true] {
+            let seat = LockedSeat::open(&[]);
+            {
+                let mut bindings = seat.bindings.lock().unwrap();
+                let mut runtime = seat.runtime.lock().unwrap();
+                if help {
+                    bindings.settle_help(Some(runtime.help(HelpAction::Toggle).unwrap()));
+                } else {
+                    runtime.launcher(LauncherAction::Open).unwrap();
+                    bindings.settle_launcher(Some(runtime.launcher_visible()));
+                }
+                assert!(bindings.launcher_open || bindings.help_open);
+            }
+            seat.lock().unwrap();
+            let bindings = seat.bindings.lock().unwrap();
+            assert!(!bindings.launcher_open && !bindings.help_open, "{help}");
+            let runtime = seat.runtime.lock().unwrap();
+            assert!(!runtime.launcher_visible() && !runtime.help_visible());
+        }
+    }
+
+    /// Escape keeps the session locked: before the commit it cancels, and
+    /// after it root's success no longer unlocks, since Escape came first.
+    #[test]
+    fn escape_keeps_the_session_locked() {
+        let seat = LockedSeat::new(&[]);
+        let attempt = seat.unlock(10);
+        let mut root = root(to_pin());
+        let mut client = crate::secret_client::Client::trusting_memory();
+        client.start(&mut root, attempt).unwrap();
+        run(&mut client, &mut root).unwrap();
+        seat.press(&[KEY_1, KEY_ESC], 40);
+        assert!(!seat.attention_open() && seat.locked());
+        root.replies.extend([
+            vec![0x95, 0],
+            [&[0x91, 0x0d, 0x80, 0][..], &pin_step().encode()].concat(),
+        ]);
+        run(&mut client, &mut root).unwrap();
+        assert!(root.replies.is_empty());
+        assert_eq!(root.sent(0x15), 1);
+        assert_eq!(root.sent(0x1c), 0);
+        assert!(seat.locked());
+        assert!(seat.glass() == LockedSeat::lock_surface());
+        // Escape after the commit, before root's success.
+        let seat = LockedSeat::new(&[]);
+        let (mut client, mut root) = seat.committed();
+        seat.press(&[KEY_ESC], 60);
+        assert!(!seat.attention_open());
+        root.replies.push_back(status(6, &pin_step()));
+        run(&mut client, &mut root).unwrap();
+        assert!(root.replies.is_empty());
+        assert!(seat.locked());
+        assert!(seat.glass() == LockedSeat::lock_surface());
+        assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
+    }
+
+    /// Only root's `06` for the unlock this client committed, every step of
+    /// it admitted, leaves the lock surface. A forged one ends the paired
+    /// generation still locked: as the first description, for a step
+    /// before the commit, for another step or nonce than the committed
+    /// one, at the PIN step before its PIN, and as the start of the
+    /// lifetime after a failure.
+    #[test]
+    fn a_forged_or_out_of_order_06_never_unlocks() {
+        let (identify, step) = (identify(), pin_step());
+        let other = crate::authority::consent::Request::new(
+            [8; 32],
+            1000,
+            crate::authority::consent::Operation::LoginUnlock {
+                account: 1000,
+                before: 2,
+                after: 2,
+                step: crate::authority::consent::LoginStep::Unlock {
+                    key: [0xa2; 4],
+                    retries: 8,
+                },
+            },
+        )
+        .unwrap();
+        let mut at_pin = to_pin();
+        at_pin.push(status(6, &step));
+        let early: Vec<Vec<Vec<u8>>> = vec![
+            vec![started(), status(6, &identify)],
+            vec![
+                started(),
+                vec![0x91, 0x0b],
+                status(3, &identify),
+                status(4, &identify),
+                vec![0x93],
+                status(6, &identify),
+            ],
+            at_pin,
+        ];
+        for replies in early {
+            let seat = LockedSeat::new(&[]);
+            let attempt = seat.unlock(10);
+            let mut root = root(replies);
+            let mut client = crate::secret_client::Client::trusting_memory();
+            client.start(&mut root, attempt).unwrap();
+            assert!(run(&mut client, &mut root).is_err());
+            assert!(seat.locked() && seat.attention_open());
+            assert_eq!(root.sent(0x14), 0);
+        }
+        for forged in [status(6, &identify), status(6, &other)] {
+            let seat = LockedSeat::new(&[]);
+            let (mut client, mut root) = seat.committed();
+            root.replies.push_back(forged);
+            assert!(run(&mut client, &mut root).is_err());
+            assert!(seat.locked() && seat.attention_open());
+            assert!(!seat.client_shown());
+        }
+        // After a failure the next lifetime starts afresh: its first
+        // status cannot be a success.
+        let seat = LockedSeat::new(&[]);
+        let attempt = seat.unlock(10);
+        let mut root = root(vec![started(), vec![0x91, 0x0d, 0x09, 0]]);
+        let mut client = crate::secret_client::Client::trusting_memory();
+        client.start(&mut root, attempt).unwrap();
+        run(&mut client, &mut root).unwrap();
+        seat.press(&[KEY_ESC], 30);
+        let attempt = seat.unlock(40);
+        root.replies.extend([started(), status(6, &step)]);
+        client.start(&mut root, attempt).unwrap();
+        assert!(run(&mut client, &mut root).is_err());
+        assert!(seat.locked() && seat.attention_open());
+    }
+
+    /// A security key's own keyboard opens no unlock on the paired seat:
+    /// nothing reaches the worker and the lock surface stays.
+    #[test]
+    fn a_security_keys_chord_reaches_no_worker() {
+        const KEY: usize = 1;
+        let seat = LockedSeat::new(&[KEY]);
+        seat.read(KEY, 10, chord_reports(11));
+        assert!(seat.queued.attempt().is_none());
+        assert!(!seat.attention_open() && seat.locked());
+        assert!(seat.glass() == LockedSeat::lock_surface());
     }
 }

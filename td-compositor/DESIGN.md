@@ -5666,7 +5666,9 @@ all client cursors. Scene::render and render_omitting exclude those private
 pixels; a future screenshot/recording path must use that public rendering.
 The application pixel-evidence oracle returns zero while attention is up,
 so it cannot attribute private screen pixels to an application. No pixel
-capture or synthetic-input portal is implemented by this increment.
+capture or synthetic-input portal is implemented by this increment. The
+lock surface ("The lock surface" below) is a private screen in each of
+these respects.
 
 A fresh physical U selects primary unlock, R recovery unlock, E enrollment
 with a second recovery token, X explicit unrecoverability, and W the ready
@@ -5972,7 +5974,8 @@ a security key's own keyboard, and none before the screen is on glass.
 
 TOKEN-LOGIN.md's PIN entry, inert in production: no production
 operation reaches a PIN step, since root refuses every one that writes
-and nothing sends an unlock's `1b`.
+and only the lock surface's chord sends an unlock's `1b`, which nothing
+in production reaches ("The lock surface" below).
 
 It opens when root answers a poll with `0c` for the current step, which
 must ask for a PIN (consent's `asks_pin`) and have this client's
@@ -6106,9 +6109,97 @@ repeats, a second keyboard's held key, the bounds and Enter while too
 short through `read_device`, and a security key's own keyboard typing
 nothing but cancelling.
 
+### The lock surface
+
+TOKEN-LOGIN.md's lock surface and login unlock, inert in production:
+nothing in production locks the session, and the compiler holds it.
+The scene's lock state is private to it; its one setter,
+`Scene::lock`, is compiled into tests alone, as are the entries above
+it, `Runtime::lock_session` and the evdev adapter's `lock_session`,
+and production's `Scene::unlock` only clears the state, so a
+production caller of any of them does not build. A source pin holds
+what the compiler cannot: `Scene::lock` is the one write of `true`,
+`Scene::new` starts unlocked, nothing borrows the state mutably, and
+every other write of a `locked` field in any source writes `false`.
+TOKEN-LOGIN.md's increment 4 adds the triggers (item 5 below), which
+go through the input bindings as the test entry does. The entry needs
+the paired profile and refuses while attention is up. Like opening
+attention it closes the launcher and sheet, and their key capture in
+the bindings with them, cancels a drag, withdraws keyboard focus and
+grabs, and paints the whole output, answering with that paint's
+`NoticePresentation`.
+
+While locked the scene's private screen is the lock surface, beneath
+any attention screen: display rendering alone draws it, in the
+attention screen's chrome, background and row place, as
+TOKEN-LOGIN.md's lock rows ("Session lock"; on 1280x800 `LOCKED` at 276
+and `PRESS CTRL+ALT+ESC TO UNLOCK` at 312). The hostname and username
+rows join it with increment 4's `1a`. No client pixel, cursor, title or
+workspace bar is drawn, and a client's commit changes nothing on glass.
+The runtime's key, modifier and pointer routing, keyboard and pointer
+targets, the VM bridge's focus snapshot and the application
+pixel-evidence oracle treat the lock surface as they treat the
+attention screen, so no client is focused or given input from any
+source, and the evidence reads zero. The evdev adapter runs no ordinary
+binding on it (terminal, launcher, sheet, workspaces and tiling).
+Control, automation, capture and clipboard control already refuse the
+paired profile, the only one that locks.
+
+On the lock surface Ctrl+Alt+Esc is the selection: it opens attention
+straight into a login unlock, the lifetime's one operation, and the
+private client sends `1b 07`. The attention screen opened there shows
+`PREPARING REQUEST`, never the menu, and the menu's and key-management
+screen's keys select nothing. The chord is read under the selection's
+rules: its Escape a fresh press, and Control and Alt held, each on a
+device secure attention reads, so a security key's own keyboard's
+chord leaves the lock surface as it was; its Escape still cancels an
+unlock another keyboard opened. One attention lifetime carries the
+whole chained unlock, each step admitted and presented as "Login-key
+operations" says, the PIN field included.
+
+Root's `06` for the committed last step of that unlock, and nothing
+else, leaves the lock surface. Every attempt holds the evdev adapter's
+seat (`input::Seat`), weakly. On `06` the authority worker, holding no
+lock, calls it; it takes the input bindings, then the input target,
+then through it the attempt's field and the runtime, every input
+reader's order, so nothing inverts. Under the bindings lock it requires
+that this attempt is still the open lifetime's, that attention is
+open, and that the unlock was committed with no cancellation since; it
+then leaves the lock state and drains attention as Escape does, through
+the runtime's drain and not the target's, which would cancel the
+attempt that succeeded. The screen keeps `SESSION UNLOCKED` above
+`RELEASE KEYS AND BUTTONS`, without Escape's `CANCELLING REQUEST`,
+until every held key and button is released; attention then closes,
+and the ordinary screen, focus and cutoff return as for any close.
+An Escape that came first, even after the commit, ends the lifetime
+still locked whatever root then reports. A `06` out of order, before
+the commit, for another step or nonce, or as a new lifetime's first
+status is a protocol violation that ends the paired generation without
+leaving the lock surface. The next generation starts locked only from
+increment 4, which reads the login state at Prepare; in this build it
+starts unlocked, as every generation does. A failure shows its text on
+the attention screen, still locked; Escape returns to the lock surface
+and a new chord opens a new lifetime. This build's root answers an unlock
+`NO LOGIN KEYS ENROLLED`, or `LOGIN KEY STATE UNAVAILABLE: DIRECTORY
+DAMAGED` while the directory is missing, before any description.
+
+Host and device-dispatcher tests drive the lock surface over a
+committed client window: the frame on glass equals an independent
+drawing of the lock surface, no client pixel and none after a commit;
+no focus, key, modifier or pointer reaches a client; no binding runs;
+the chord's unlock with no menu, one per lifetime and a new one after
+Escape; a security key's own keyboard refused; the whole chained unlock
+through the device dispatcher, its PIN typed on the keyboard, to `06`,
+unlocked with the window on glass and focused; a `06` with a key held,
+drained under its success notice until the release; locking with the
+launcher or sheet open, their capture closed; a failure's text, still
+locked; Escape before and after the commit, still locked; and forged
+and out-of-order `06`s. The desktop guest waits for increment 4.
+
 ### Session lock and login-key entry (target)
 
-Partly implemented: items 1 to 4 are "Login-key operations" above.
+Partly implemented: items 1 to 4 are "Login-key operations" above, and
+item 5's lock surface and unlock are "The lock surface" above.
 [td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier, including when the session locks and what
 clients receive while locked ("Session lock"). The rules in this section
@@ -6117,9 +6208,9 @@ own keyboard ("Physical secure attention") is already excluded, and stays
 excluded from every selection, confirmation and field below.
 
 1. **One operation per lifetime (3).** Implemented for the key-management
-   screen. Still to come: a disclosure's fresh Enter confirms its
-   operation (TOKEN-LOGIN.md increment 5), and on the lock surface the
-   chord opens a login unlock with no selection at all.
+   screen and the lock surface, whose chord opens a login unlock with no
+   selection at all. Still to come: a disclosure's fresh Enter confirms
+   its operation (TOKEN-LOGIN.md increment 5).
 2. **The PIN field (3).** Implemented, inert: "The PIN field" above.
    "The screen accepts no credential bytes" gains
    one exception. The field opens only after the current step has its
@@ -6144,11 +6235,13 @@ excluded from every selection, confirmation and field below.
    is td-authd's ceiling for it, never renewed.
 5. **Lock state (4).** The compositor learns the login state as
    td-authd/DESIGN.md's login-state amendment specifies. What a locked
-   session shows and delivers is TOKEN-LOGIN.md's; here, the lock surface
-   is drawn by display rendering alone, like the attention screen, and a
-   lock is complete only when its own paint has a presentation receipt
-   under the rules below. `Super+l` joins the binding list and the
-   attention screen gains `L`. On an unenrolled account `Super+l` is
+   session shows and delivers is TOKEN-LOGIN.md's; the lock surface and
+   its unlock are implemented ("The lock surface" above), and a lock is
+   complete only when its own paint has a presentation receipt under the
+   rules below. Still to come are its entry points: the state at
+   Prepare, locking an open attention lifetime under the pre-commit
+   cancellation rules, `Super+l` in the binding list and `L` on the
+   attention screen. On an unenrolled account `Super+l` is
    consumed with no effect and reaches no client, a lid close or resume
    does nothing, and `L` shows `NO LOGIN KEYS ENROLLED` on the
    attention screen.
@@ -6179,7 +6272,7 @@ excluded from every selection, confirmation and field below.
    than about three seconds are certain to be detected; TOKEN-LOGIN.md
    discloses that limit.
 
-The current profile has no lock, and no production operation reaches
+Nothing in the current profile locks, so no production operation reaches
 the PIN field.
 
 ### Immutable prompt presentation

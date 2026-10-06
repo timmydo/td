@@ -2981,6 +2981,51 @@ impl Runtime {
         })
     }
 
+    /// Whether the lock surface is up (td-login/TOKEN-LOGIN.md, "Session
+    /// lock"): no client is rendered, focused or given input, and the
+    /// chord opens a login unlock instead of the menu.
+    pub(crate) fn session_locked(&self) -> bool {
+        self.scene.locked()
+    }
+
+    /// The lock surface's one entry, and only tests reach it: nothing in
+    /// production locks the session until TOKEN-LOGIN.md's increment 4
+    /// adds its triggers, which lock an open attention lifetime too. Like
+    /// opening attention it closes the overlays, withdraws focus and
+    /// grabs, and paints the whole output, answering with that paint.
+    #[cfg(test)]
+    pub(crate) fn lock_session(&mut self) -> Result<NoticePresentation, String> {
+        if !self.attention_enabled || self.scene.attention_visible() {
+            return Err("the lock surface needs the paired profile, attention closed".into());
+        }
+        let epoch = self.paints.checked_add(1).ok_or("paint epochs exhausted")?;
+        self.scene.lock();
+        self.owed_damage = Damage::Whole;
+        self.cancel_drag_under_overlay();
+        let events = self.keyboard.suspend()?;
+        self.publish_keyboard(events)?;
+        self.refresh_focus()?;
+        self.repaint()?;
+        Ok(NoticePresentation {
+            epoch,
+            clock: Arc::clone(&self.presented),
+        })
+    }
+
+    /// Leaves the lock surface, once root reported a login unlock's success
+    /// for the attention lifetime the person opened on it; closing that
+    /// lifetime then restores the ordinary screen, focus and input.
+    pub(crate) fn unlock_session(
+        &mut self,
+        _origin: &crate::input::EvdevOrigin,
+    ) -> Result<(), String> {
+        if !self.attention_enabled || !self.scene.attention_visible() {
+            return Err("only an open attention lifetime leaves the lock surface".into());
+        }
+        self.scene.unlock();
+        Ok(())
+    }
+
     pub(crate) fn drain_attention(
         &mut self,
         _origin: &crate::input::EvdevOrigin,
@@ -3230,7 +3275,7 @@ impl Runtime {
         buttons: &[PointerButtonInput],
         scroll: PointerScroll,
     ) -> Result<(), String> {
-        if self.scene.attention_visible() {
+        if self.scene.private_screen() {
             return Ok(());
         }
         // Whether the pointer MOVED, which a nonzero delta does not prove: an
@@ -3260,7 +3305,7 @@ impl Runtime {
         scroll: PointerScroll,
     ) -> Result<(), String> {
         let size = self.backend.dimensions();
-        if self.scene.attention_visible() {
+        if self.scene.private_screen() {
             return Ok(());
         }
         let moved = self.scene.place_pointer(x, y, size.width, size.height);
@@ -3886,7 +3931,7 @@ impl Runtime {
     }
 
     pub fn key(&mut self, input: KeyInput) -> Result<(), String> {
-        if self.scene.attention_visible() {
+        if self.scene.private_screen() {
             return Ok(());
         }
         if let Some(event) = self.keyboard.key(input)? {
@@ -3896,7 +3941,7 @@ impl Runtime {
     }
 
     pub fn modifiers(&mut self, modifiers: ModifierState) -> Result<(), String> {
-        if self.scene.attention_visible() {
+        if self.scene.private_screen() {
             return Ok(());
         }
         if let Some(event) = self.keyboard.modifiers(modifiers)? {
@@ -4761,7 +4806,7 @@ impl Runtime {
     }
 
     pub(crate) fn vm_snapshot(&self) -> Result<u64, String> {
-        if self.scene.attention_visible() || self.keyboard.snapshot().focus.is_none() {
+        if self.scene.private_screen() || self.keyboard.snapshot().focus.is_none() {
             return Err("guest has no ordinary keyboard focus".into());
         }
         Ok(self.vm_revision)
@@ -5327,7 +5372,7 @@ impl Runtime {
     /// than moving this target. The portal dialog differs because it is a
     /// client surface owed keyboard enter/leave while it enforces modality.
     fn keyboard_target(&self) -> Option<SurfaceKey> {
-        if self.scene.attention_visible() {
+        if self.scene.private_screen() {
             return None;
         }
         let size = self.backend.dimensions();
@@ -5359,7 +5404,7 @@ impl Runtime {
     }
 
     fn routed_pointer_targets(&self) -> (Option<PointerTarget>, Option<PointerTarget>) {
-        if self.scene.attention_visible() {
+        if self.scene.private_screen() {
             return (None, None);
         }
         if !self.scene.modal() {

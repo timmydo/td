@@ -509,13 +509,27 @@ pub(crate) struct Attempt {
     /// The PIN field, shared by the evdev adapter that types into it and
     /// the authority worker that sends what it holds.
     field: Mutex<PinField>,
+    /// The evdev adapter's seat that opened this lifetime: a login unlock's
+    /// success ends the lifetime through it.
+    seat: Option<crate::input::Seat>,
 }
 
 impl Attempt {
+    #[cfg(test)]
     pub fn new(
         origin: EvdevOrigin,
         runtime: Arc<Mutex<Runtime>>,
         selection: impl Into<Selection>,
+    ) -> Arc<Self> {
+        Self::seated(origin, runtime, selection, None)
+    }
+
+    /// An attempt the evdev adapter's `seat` opened.
+    pub fn seated(
+        origin: EvdevOrigin,
+        runtime: Arc<Mutex<Runtime>>,
+        selection: impl Into<Selection>,
+        seat: Option<crate::input::Seat>,
     ) -> Arc<Self> {
         let selection = selection.into();
         Arc::new(Self {
@@ -527,7 +541,31 @@ impl Attempt {
             presentation: Mutex::new(None),
             confirmed: AtomicBool::new(false),
             field: Mutex::new(PinField::default()),
+            seat,
         })
+    }
+
+    #[cfg(test)]
+    pub fn selection(&self) -> &Selection {
+        &self.selection
+    }
+
+    /// A login unlock whose last step this client committed, with no
+    /// cancellation since: an Escape that came first keeps the session
+    /// locked, whatever root then reports.
+    pub fn unlock_committed(&self) -> bool {
+        self.selection == Selection::Login(LoginSelection::Unlock)
+            && self.state.load(Ordering::SeqCst) == COMMITTED
+    }
+
+    /// Root reported this login unlock's success: the session leaves its
+    /// lock surface and the lifetime ends, through the seat that opened it
+    /// and under its locks, so no Escape interleaves.
+    fn unlocked(&self) -> Result<(), String> {
+        match &self.seat {
+            Some(seat) if self.unlock_committed() => seat.unlocked(self),
+            _ => Ok(()),
+        }
     }
 
     /// Input records cancellation before waiting for painting or channel I/O.
@@ -873,6 +911,17 @@ impl Default for Client {
     }
 }
 
+#[cfg(test)]
+impl Client {
+    /// A client whose memory check passes, whatever the test host's swap.
+    pub(crate) fn trusting_memory() -> Self {
+        Self {
+            memory: || Ok(()),
+            ..Self::default()
+        }
+    }
+}
+
 impl Client {
     pub fn start(&mut self, wire: &mut impl Exchange, attempt: Arc<Attempt>) -> Result<(), String> {
         if !attempt.active() {
@@ -1025,8 +1074,14 @@ impl Client {
             0x06 if login.committed => {
                 let attempt = Arc::clone(&login.attempt);
                 let rows = login.selection.success();
+                let unlock = login.selection == LoginSelection::Unlock;
                 self.login = None;
                 attempt.notice(Notice::Login(rows))?;
+                // Only root's success for the unlock this client committed,
+                // whose every step it admitted, leaves the lock surface.
+                if unlock {
+                    attempt.unlocked()?;
+                }
             }
             _ => return Err("out-of-order login operation status".into()),
         }
@@ -1582,10 +1637,7 @@ mod tests {
     }
     /// A client whose memory check passes, whatever this host's swap.
     fn login_client() -> Client {
-        Client {
-            memory: || Ok(()),
-            ..Client::default()
-        }
+        Client::trusting_memory()
     }
     fn request() -> Request {
         Request::new(
@@ -2361,6 +2413,7 @@ mod tests {
                 presentation: Mutex::new(None),
                 confirmed: AtomicBool::new(false),
                 field: Mutex::new(PinField::default()),
+                seat: None,
             });
             (screen, deadline)
         }
@@ -4315,5 +4368,26 @@ mod tests {
         assert_eq!(first, painted(b"ZZ9 "));
         assert_eq!(first, painted(b"}~!."));
         assert_ne!(first, painted(b"ab3"));
+    }
+
+    /// Only a login unlock this client committed, with no cancellation
+    /// since, leaves the lock surface: not before its commit, not after
+    /// Escape, and never another operation's success.
+    #[test]
+    fn only_a_committed_uncancelled_unlock_leaves_the_lock() {
+        let unlock = Screen::login(LoginSelection::Unlock);
+        assert!(!unlock.attempt.unlock_committed());
+        assert!(unlock.attempt.commit());
+        assert!(unlock.attempt.unlock_committed());
+        unlock.attempt.cancel();
+        assert!(!unlock.attempt.unlock_committed());
+        for selection in selections().into_iter().skip(1) {
+            let screen = Screen::login(selection);
+            assert!(screen.attempt.commit());
+            assert!(!screen.attempt.unlock_committed());
+        }
+        let store = Screen::new();
+        assert!(store.attempt.commit());
+        assert!(!store.attempt.unlock_committed());
     }
 }

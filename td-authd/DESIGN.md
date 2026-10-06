@@ -1714,7 +1714,9 @@ Implemented, inert: the consent operations and step admission
 deadlines of amendments 2, 5 and 6 ("Login-key operation supervision"
 below). The paired compositor sends `1b` for a first enrollment and an
 addition, which a production build refuses as it refuses every login
-operation that may write, and nothing sends an unlock's `1b`, so
+operation that may write, and an unlock's `1b` only from its lock
+surface, which nothing in production enters before TOKEN-LOGIN.md's
+increment 4 (`td-compositor/DESIGN.md`, "The lock surface"), so
 nothing in production starts the worker. Its PIN field sends `1c` only
 after this supervisor's `91 0c` for a presented PIN step, which no
 production operation reaches (`td-compositor/DESIGN.md`, "The PIN
@@ -1999,8 +2001,11 @@ Until activation (TOKEN-LOGIN.md increment 5) `login::WRITES` is false in
 every production build: `1b` answers `9b 00` for an enrollment, addition
 or removal before starting anything. Test builds set it, so host fixtures
 drive every operation. An unlock is wired, and ends as NO RECORD while no
-record exists; the production compositor sends `1b` only for a first
-enrollment or an addition, which this refuses, and never for an unlock.
+record exists; the production compositor sends `1b` for a first
+enrollment or an addition, which this refuses, and for an unlock only
+from its lock surface, which nothing in production enters. Only this
+supervisor's `91 06` for that unlock's committed last step leaves the
+lock surface.
 
 Host tests drive the controller and the paired Session against scripted
 exec children playing the worker's frames: each operation's exact step

@@ -12,7 +12,8 @@ unlocks, enrolls, adds and removes keys against the record
 `1b` and `1c`. The compositor's key-management screen sends `1b` for a
 first enrollment and an addition, which a production td-authd refuses
 before starting anything; it refuses removal itself, having no key list
-yet, and nothing sends an unlock's `1b`. Its PIN field sends `1c` only
+yet. Only its lock surface's chord sends an unlock's `1b`, and nothing
+in production locks. Its PIN field sends `1c` only
 when root asks for a PIN at a presented PIN step, which no production
 operation reaches. So nothing
 in production starts the worker or uses its `login_record` and
@@ -35,8 +36,11 @@ private client's login-key operations have landed too
 each operation's descriptions checked step by step, its commit and the
 failure texts ("Failure texts"). Production reaches only their refusals.
 The PIN field has landed as well ("PIN entry, presence and retries"),
-inert, since production never reaches a PIN step. The lock surface has
-not landed, and nothing else below is implemented.
+inert, since production never reaches a PIN step, and so has the lock
+surface with its login unlock ("Session lock"), inert: its one entry is
+test-only and nothing in production locks. Increment 3 is complete but
+for its desktop guest, which waits for increment 4. Nothing else below
+is implemented.
 Until the increments at the end land, `THREAT-MODEL.md` §3 is the
 complete current behaviour: the installed account logs in automatically
 and the session never locks. No document, UI or release
@@ -586,6 +590,18 @@ While locked:
 The lock protects the interactive surfaces, not running processes, as
 `td-install/ENCRYPTION.md` says of any locked running machine.
 
+The lock surface's rows are chrome rows, as the failure texts are
+("Failure texts"), and fit 45 columns whole:
+
+| When | Shows |
+| --- | --- |
+| locked, attention closed | `LOCKED`, then `PRESS CTRL+ALT+ESC TO UNLOCK` |
+| the chord on it, until the unlock's first prompt | the attention screen's `PREPARING REQUEST`, never its menu |
+
+The hostname and username rows above them join with increment 4's
+`1a`, which carries the username; until then the lock surface shows
+the two rows alone.
+
 On the lock surface Ctrl+Alt+Esc opens a login-unlock attention lifetime
 directly, without the menu. The prompt presents the unlock description; the
 worker identifies the connected key, which must already be the only one
@@ -595,8 +611,10 @@ after the PIN comes the touch. The worker compares the record with its
 baseline before identify and again before its success. td-authd reports
 success only after the worker's success frame and observed exit, and the
 compositor then drains held input and restores the ordinary screen and
-focus. A failure shows its typed reason on the trusted screen; Escape
-returns to the lock surface. One
+focus. Only that success for the unlock the compositor committed, with
+no Escape since, unlocks: an Escape that came first, even after the
+commit, keeps the session locked. A failure shows its typed reason on
+the trusted screen; Escape returns to the lock surface. One
 unlock is allowed per attention lifetime. Unlocking starts no process,
 switches no credential and releases no secret.
 
@@ -988,7 +1006,8 @@ proves and the oracle that shows it.
      selections against a scripted authority, and their refusal by the
      production one; the chained login lifetime.
    - A desktop guest with a UHID keyboard drives PIN entry against the
-     worker with a seeded record, with framebuffer bitmap checks.
+     worker with a seeded record, with framebuffer bitmap checks:
+     deferred to increment 4.
    - The OTP-keyboard exclusion has landed for the existing selections and
      Enter confirmation: host tests over hand-built sysfs trees (a
      composite key, a plain keyboard, a keyboard behind a hub beside a key, nodes
@@ -1027,7 +1046,31 @@ proves and the oracle that shows it.
      check's refusal and a wrong PIN against a scripted authority, and
      device-dispatcher tests the keymap, repeats, the bounds and the
      excluded keyboard. It is inert: production root refuses every
-     operation that would reach a PIN step. The lock surface follows.
+     operation that would reach a PIN step.
+   - The lock surface has landed (`td-compositor/DESIGN.md`, "The lock
+     surface"), inert: the only setter of its state is compiled into
+     tests alone, so nothing in production can lock. Locked, the
+     output shows only `LOCKED` and `PRESS CTRL+ALT+ESC TO UNLOCK`, no
+     client is focused or given input, and no ordinary binding runs. Its
+     chord, read under the selection rules so that a security key's own
+     keyboard cannot use it, opens one attention lifetime straight into
+     a login unlock, `1b 07` with no menu, which carries the chained
+     unlock with its PIN field; only root's `06` for that unlock's
+     committed step, with no Escape since, leaves the lock surface and
+     closes attention once held input is released, `SESSION UNLOCKED`
+     shown meanwhile. Host and device-dispatcher tests drive the whole
+     unlock through the device dispatcher; a failure's text and Escape
+     before and after the commit, still locked; and forged and
+     out-of-order `06`s, which end the paired generation without
+     unlocking. The next generation starts locked only from increment
+     4's login state at Prepare; until then every generation starts
+     unlocked. This build's root answers an unlock `NO LOGIN KEYS
+     ENROLLED`, or `DIRECTORY DAMAGED` while the directory is missing.
+   - Increment 3 is complete except its desktop guest, deferred by
+     decision to increment 4: without a fixture entry, which this build
+     deliberately lacks, no guest reaches the lock surface before
+     increment 4's locked boot. The hardware record of an OTP touch
+     stays owed with the T430s evidence.
 4. **Locked boot and session lock:** request `1a` and login state at
    Prepare, with the enrolled key list and the primary username,
    `Super+l`, attention `L`, lid close, resume detection, unlock
@@ -1055,6 +1098,9 @@ proves and the oracle that shows it.
      and a marked deployment that does not read the record's version.
    - Compositor input tests replay recorded `SW_LID` events and clock gaps
      through the adapter; QEMU has no lid.
+   - Increment 3's desktop guest: a UHID keyboard drives the lock
+     surface's unlock and its PIN entry against the worker with a seeded
+     record, with framebuffer bitmap checks.
    - `system_def_is_self_consistent` requires the autologin account to be
      the primary account.
 

@@ -96,6 +96,26 @@ impl Launcher {
     }
 }
 
+/// A launcher whose secret attempts wait in a queue a test takes them
+/// from, playing the worker itself.
+#[cfg(test)]
+pub(crate) struct Queued(Receiver<Work>);
+
+#[cfg(test)]
+impl Queued {
+    pub(crate) fn launcher() -> (Launcher, Self) {
+        let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
+        (Launcher { send }, Self(receive))
+    }
+
+    pub(crate) fn attempt(&self) -> Option<std::sync::Arc<crate::secret_client::Attempt>> {
+        match self.0.try_recv() {
+            Ok(Work::Secret(attempt)) => Some(attempt),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Program {
     Home,

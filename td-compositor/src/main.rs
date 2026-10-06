@@ -1081,7 +1081,7 @@ mod confinement {
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0x7b2d03c877bb41a2;
+    const AUTHORITY_FINGERPRINT: u64 = 0xc8f29575166fdb63;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -2791,5 +2791,82 @@ pub struct MappedRegion {
         .is_err());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Nothing in production locks the session before TOKEN-LOGIN.md's
+    /// increment 4 adds its triggers. The compiler holds the capability:
+    /// the scene's `locked` is private, `Scene::lock` is compiled into
+    /// tests alone, and `Scene::unlock` only clears it, so a production
+    /// caller of either lock entry does not build. This pins what the
+    /// compiler cannot: that test-only `lock` is the one write of `true`,
+    /// a new scene starts unlocked, nothing borrows the field mutably, and
+    /// every other field write of a `locked`, in every source, is `false`.
+    #[test]
+    fn nothing_in_production_locks_the_session() {
+        let scene = include_str!("scene.rs");
+        let entry =
+            "    #[cfg(test)]\n    pub(crate) fn lock(&mut self) {\n        self.locked = true;\n";
+        assert_eq!(occurrences(scene, "self.locked = true"), 1);
+        assert_eq!(occurrences(production(scene), entry), 1);
+        assert_eq!(occurrences(scene, "fn lock("), 1);
+        assert_eq!(occurrences(scene, "mut self.locked"), 0);
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        // The field's declaration and its one initializer, in Scene::new.
+        let fields: Vec<&str> = production(scene)
+            .match_indices("locked")
+            .filter(|(at, _)| {
+                !scene[..*at].ends_with(|c: char| ident(c) || c == '.')
+                    && !scene[at + 6..].starts_with(ident)
+            })
+            .filter_map(|(at, _)| scene[at + 6..].trim_start().strip_prefix(':'))
+            .filter(|rest| !rest.starts_with(':'))
+            .map(|rest| rest.trim_start().split(',').next().unwrap_or(""))
+            .collect();
+        assert_eq!(fields, ["bool", "false"]);
+        // Nor is the field bound by a pattern: `Self { locked, .. }` or
+        // `ref mut locked` would write it with no `.locked` to see.
+        for (at, _) in production(scene).match_indices("locked") {
+            let before = scene[..at].trim_end();
+            let after = scene[at + 6..].trim_start();
+            if before.ends_with(ident) && !before.ends_with("mut")
+                || scene[at + 6..].starts_with(ident)
+            {
+                continue;
+            }
+            let bound = (before.ends_with('{') || before.ends_with(','))
+                && (after.starts_with(',') || after.starts_with('}'));
+            assert!(
+                !bound && !before.ends_with("mut"),
+                "scene.rs binds `locked`"
+            );
+        }
+        let sources = OTHER.iter().chain(&[("main.rs", MAIN), ("sys.rs", SYS)]);
+        let mut sets = 0;
+        for (name, source) in sources {
+            let source = source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .map_or(*source, |(body, _)| body);
+            for (at, _) in source.match_indices(".locked") {
+                let rest = &source[at + 7..];
+                if rest.starts_with(ident) {
+                    continue;
+                }
+                let rest = rest.trim_start();
+                assert!(!rest.starts_with("|=") && !rest.starts_with("^="), "{name}");
+                let Some(value) = rest.strip_prefix('=') else {
+                    continue;
+                };
+                if value.starts_with('=') {
+                    continue;
+                }
+                let value = value.trim_start();
+                if *name == "scene.rs" && value.starts_with("true;") {
+                    sets += 1;
+                } else {
+                    assert!(value.starts_with("false;"), "{name}: {value:.40}");
+                }
+            }
+        }
+        assert_eq!(sets, 1);
     }
 }
