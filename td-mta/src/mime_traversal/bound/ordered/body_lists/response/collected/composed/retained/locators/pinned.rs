@@ -245,4 +245,6 @@ const _: () = assert!(
 const _: () = assert!(std::mem::size_of::<Bound<'_, '_, '_, '_, '_, '_, '_, '_, '_>>() <= 768);
 
 #[cfg(test)]
+pub use tests::probe as probe_allocations;
+#[cfg(test)]
 mod tests;

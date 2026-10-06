@@ -761,6 +761,16 @@ bounded and funded in original work, with no replacement allowance.
 This adds source identity, not authenticated issuance or publication;
 binding-path allocation/whole-service qualification remains open.
 
+M06dv qualifies only eight source-binding Rust allocation intervals using
+actual retained file pins and original MIME owners in one test-only
+source graph. Cold setup and original mapping precede counting; binding
+construction, digest work and binding-owned descriptor teardown are
+measured; enclosing pooled-view/scratch-lease release stays outside.
+Successful release, actual-clock refusal, source mismatch and original
+work refusal preserve every counter. This leaves native/whole-service
+resource qualification and authenticated publication open. Unmeasured
+source-binding cases are explicitly listed in API §1.127.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

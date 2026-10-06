@@ -669,3 +669,148 @@ fn generic_cursor_includes_header_and_final_digest_in_its_size_cap() {
         });
     });
 }
+
+/// File setup, complete pin verification and original mapping stay cold.
+pub fn probe(mut snapshot: impl FnMut()) {
+    let mut source = b"\r\n".to_vec();
+    source.extend(std::iter::repeat_n(b'x', 8200));
+    for trial in 0..8 {
+        let clock = TestClock::new();
+        let mut parsed = source.clone();
+        if trial == 5 {
+            *parsed.last_mut().unwrap() = b'y';
+        }
+        let base = if trial == 1 {
+            u64::MAX - source.len() as u64
+        } else {
+            0
+        };
+        crate::store_fs::with_pinned_fixture(&source, &clock, |parent| {
+            mapped(&parsed, base, |original| {
+                if trial == 6 {
+                    let work = original
+                        .source
+                        .original
+                        .source
+                        .projected
+                        .structure
+                        .work
+                        .remaining();
+                    original
+                        .source
+                        .original
+                        .source
+                        .projected
+                        .structure
+                        .work
+                        .charge(
+                            Tick(1),
+                            Charge {
+                                io_bytes: work.io_bytes,
+                                ..Charge::default()
+                            },
+                        )
+                        .unwrap();
+                }
+                if trial == 7 {
+                    clock.expire();
+                }
+                snapshot();
+                if trial == 7 {
+                    assert_eq!(
+                        Cursor::new(original, parent, &Provider, Tick(1)).err(),
+                        Some(Error::Parent(PolicyError::Deadline))
+                    );
+                } else {
+                    let mut cursor = Cursor::new(original, parent, &Provider, Tick(1)).unwrap();
+                    if trial == 6 {
+                        let error = Error::Original(super::super::Error::Admission(
+                            crate::nfc::Error::Work(crate::admission::work::Stop::IoBytes),
+                        ));
+                        assert_eq!(cursor.poll(Tick(1)), Err(error));
+                        assert!(cursor.value().is_none());
+                        assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+                    } else {
+                        assert_eq!(cursor.poll(Tick(1)), Ok(Status::Yield));
+                        if trial == 2 {
+                            clock.expire();
+                            assert_eq!(
+                                cursor.poll(Tick(1)),
+                                Err(Error::Parent(PolicyError::Deadline))
+                            );
+                            assert_eq!(
+                                cursor.finish(Tick(1)).err(),
+                                Some(Error::Parent(PolicyError::Deadline))
+                            );
+                        } else {
+                            assert_eq!(cursor.poll(Tick(1)), Ok(Status::Yield));
+                            let result = cursor.poll(Tick(1));
+                            if trial == 5 {
+                                assert_eq!(result, Err(Error::SourceMismatch));
+                                assert!(cursor.value().is_none());
+                                assert_eq!(
+                                    cursor.finish(Tick(1)).err(),
+                                    Some(Error::SourceMismatch)
+                                );
+                            } else {
+                                assert_eq!(result, Ok(Status::Complete));
+                                if trial == 3 {
+                                    clock.expire();
+                                    assert_eq!(
+                                        cursor.finish(Tick(1)).err(),
+                                        Some(Error::Parent(PolicyError::Deadline))
+                                    );
+                                } else {
+                                    let bound = cursor.finish(Tick(1)).unwrap();
+                                    if trial == 4 {
+                                        clock.expire();
+                                        assert_eq!(
+                                            bound.finish(Tick(1)).err(),
+                                            Some(Error::Parent(PolicyError::Deadline))
+                                        );
+                                    } else {
+                                        let (original, parent) = bound.finish(Tick(1)).unwrap();
+                                        assert_eq!(original.value().unwrap().candidates.len(), 1);
+                                        assert_eq!(parent.len(), source.len() as u64);
+                                        drop(parent);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                snapshot();
+            });
+        });
+    }
+}
+
+#[test]
+fn measured_mime_catalog_keeps_live_library_module_visibility() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let library = std::fs::read_to_string(root.join("lib.rs")).unwrap();
+    let catalog = std::fs::read_to_string(root.join("mime_probe_modules.rs")).unwrap();
+    let declarations = |source: &str| {
+        source
+            .lines()
+            .filter(|line| {
+                line.ends_with(';') && (line.starts_with("pub mod ") || line.starts_with("mod "))
+            })
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let current = declarations(&library);
+    let measured = declarations(&catalog);
+    assert!(!measured.is_empty());
+    for line in &measured {
+        assert!(current.contains(line), "stale measured module: {line}");
+    }
+    assert_eq!(
+        measured.len(),
+        catalog
+            .lines()
+            .filter(|line| line.ends_with(';')
+                && (line.starts_with("pub mod ") || line.starts_with("mod ")))
+            .count()
+    );
+}

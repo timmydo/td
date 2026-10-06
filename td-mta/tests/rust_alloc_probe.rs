@@ -21,7 +21,7 @@ use td_crypto::Digest;
 // Filesystem fixtures need no production exception for the mapped test identity.
 use td_mta::{
     bounded, change_cursor, config, format, frame_changes, ids, limits, merge, overlay, ownership,
-    ports, store_paths,
+    ports, store_paths, wire,
 };
 #[path = "../src/admission.rs"]
 #[allow(unused)] // Keep the private append guard in this measured source compilation.
@@ -42,6 +42,10 @@ mod measured_reference_sweep;
 #[path = "../src/store_fs.rs"]
 #[allow(unused)] // Second compilation; the library build remains the lint authority.
 pub mod measured_store_fs;
+use measured_store_fs as store_fs;
+
+// Expand at this root to retain production child paths and restricted visibility.
+include!("../src/mime_probe_modules.rs");
 
 fn forwarding() {
     let before = COUNTERS.snapshot();
@@ -12334,6 +12338,18 @@ fn mime_base64() {
     assert_eq!(before, after, "MIME base64 allocated");
 }
 
+fn pinned_source_binding() {
+    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned;
+    let mut samples = [COUNTERS.snapshot(); 16];
+    let mut slots = samples.iter_mut();
+    pinned::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|sample| !sample.invalid));
+    for [before, after] in samples.as_chunks::<2>().0 {
+        assert_eq!(before, after, "pinned source binding allocated");
+    }
+}
+
 fn store_pinned_blobs() {
     let mut samples = [COUNTERS.snapshot(); 40];
     let mut slots = samples.iter_mut();
@@ -12739,6 +12755,7 @@ fn main() {
     store_pinned_reads();
     store_read_pool();
     store_pinned_blobs();
+    pinned_source_binding();
     mime_base64();
     mime_qp();
     mime_qp_input();

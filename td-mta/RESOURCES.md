@@ -2353,6 +2353,21 @@ and drops digest state. The earlier 65 measured metadata/locator trials
 remain unchanged; binding-path Rust/native allocation, stack, RSS and
 complete response/service bounds are not qualified by this increment.
 
+M06dv adds eight dedicated sequential Rust allocation intervals around
+original source-binding construction, funded digest turns and consuming
+release/refusal. Real complete PinnedBlob and original Mapped belong to
+one test-only compilation of production sources. Cold filesystem setup,
+pin verification, resident-source construction, original mapping and all
+backing are outside counting; binding ownership and PinnedBlob descriptor
+teardown are inside. Enclosing PooledRead/CommittedView and scratch lease release
+remain outside. Healthy zero/near-u64 bases, partial/completed/Bound expiry,
+same-length source mismatch, original I/O refusal and constructor expiry
+leave every Rust allocation counter unchanged. Only these eight intervals
+are qualified; the remaining source-binding cases listed in API §1.127
+are unmeasured. Existing 65 metadata/locator trials remain separate. Native allocation, worker stacks, RSS,
+complete request admission and access-policy/publication wiring remain
+unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

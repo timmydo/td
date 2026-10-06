@@ -2222,6 +2222,20 @@ Initial independently landable increments:
   refusal; allocation/service qualification, issuance and publication
   remain later.
 
+- **M06dv — original source-binding Rust allocation qualification:**
+  compile real filesystem pin and original MIME owners in one test-only
+  source graph, preserving private owner construction. Measure eight
+  intervals from binding construction through release/refusal teardown;
+  filesystem setup, complete pin verification and original mapping stay
+  cold. Cover healthy zero/near-u64 bases, partial/completed/Bound expiry,
+  same-length source mismatch, original I/O refusal and constructor
+  expiry. Only these eight intervals are qualified; API §1.127 lists
+  remaining unmeasured source-binding cases. Descriptor teardown is
+  counted, enclosing pooled-view/scratch-lease release is outside.
+  Existing 65 metadata/locator trials remain separate. Native,
+  whole-service resource qualification and authenticated publication
+  remain later.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

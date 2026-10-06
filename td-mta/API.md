@@ -5353,6 +5353,33 @@ allocations, stack or RSS. Earlier 65 locator/metadata allocation trials
 remain separate evidence. Complete service admission, current access
 policy, nested p2 contexts and authenticated response publication follow.
 
+### 1.127 Original source-binding Rust allocation qualification
+
+M06dv measures eight source-binding intervals in the dedicated sequential
+Rust allocation process. The probe compiles the production MIME owners
+and filesystem pin in one test-only source graph, preserving their
+private constructors and real pooled-view custody. File creation,
+complete pin verification, source construction, original mapping and
+all backing precede the measured interval. Counting starts before
+binding construction and ends after consuming release or refusal drops
+its retained state and PinnedBlob descriptor. The enclosing PooledRead,
+CommittedView and scratch lease release stay outside this interval.
+
+Cover healthy zero and near-u64 source bases, partial expiry, completed
+cursor expiry, Bound expiry, a same-length changed resident byte, exhausted
+original I/O work and constructor pin expiry. Each interval compares all
+Rust allocation counters unchanged. These eight intervals supplement the
+existing 65 metadata/locator trials. They do not qualify filesystem setup,
+native allocation, worker stacks, RSS, whole-job admission or authorized
+locator publication. The production API and allocation shim are unchanged.
+
+Only the eight listed intervals are qualified. ID/length mismatch,
+supplied-Tick expiry, interpretation-step exhaustion, digest creation/
+update/finish faults, post-crypto clock expiry, clock Invalid/Busy,
+premature finish, sticky/cached re-poll and oversized generic crypto
+state remain unmeasured. The near-u64 case repeats healthy binding after
+cold coordinate normalization; it covers no additional hashing branch.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
