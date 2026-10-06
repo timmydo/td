@@ -9,8 +9,15 @@
 
 #[path = "cap.rs"]
 mod cap;
+// Which terminal `/dev/console` is, td-init's, shared with its secret-line
+// applet: it lives outside this crate, so the `#[path]` is required, and the
+// recipe stages it at `{src}/td-init/src/console.rs`.
+#[path = "../../td-init/src/console.rs"]
+mod console;
 #[path = "measurement.rs"]
 mod measurement;
+#[path = "mirror.rs"]
+mod mirror;
 mod protocol;
 #[path = "selector_release.rs"]
 mod selector_release;
@@ -1473,7 +1480,7 @@ fn warn_unverifiable_resign(root: &Path, id: &str) -> io::Result<()> {
         return Ok(());
     }
     writeln!(
-        io::stderr(),
+        mirror::stderr(),
         "td-boot: warning: replaced the signature of deployment {id}, which {} \
          point{} at; nothing here can check it — the next boot will, and will \
          refuse the deployment if it does not verify",
@@ -2484,7 +2491,7 @@ fn attempt_status(state: Option<u8>) -> String {
 
 fn run_verify(root: &Path) -> io::Result<()> {
     let selection = select_deployment(root)?;
-    report_fallback(&mut io::stderr(), &selection)?;
+    report_fallback(&mut mirror::stderr(), &selection)?;
     let state = read_attempt_state(root, &selection.deployment.id)?;
     if selection.slot == "current" && state == Some(0) {
         if let Ok(previous) = verify_slot(root, "previous").and_then(|previous| {
@@ -2544,7 +2551,7 @@ fn acquire_lock_at(path: &Path) -> io::Result<File> {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {
             let _ = writeln!(
-                io::stderr(),
+                mirror::stderr(),
                 "td-boot: waiting for deployment transaction lock {}",
                 path.display()
             );
@@ -2954,7 +2961,7 @@ fn kexec_boot_decision(
     measured: bool,
     handoff: Option<&unlock::VolumeKey>,
 ) -> io::Result<()> {
-    report_boot_decision(&mut io::stderr(), decision)?;
+    report_boot_decision(&mut mirror::stderr(), decision)?;
     let cmdline = kernel_cmdline(
         base_cmdline,
         &decision.deployment_id,
@@ -2963,7 +2970,7 @@ fn kexec_boot_decision(
     if measured {
         let pcr = measurement::measure(&deployment.id, cmdline.as_bytes())?;
         writeln!(
-            io::stderr(),
+            mirror::stderr(),
             "td-boot: TD-BOOT-MEASURED-PCR11 {}",
             sha256::to_base16(&pcr)
         )?;
@@ -3039,7 +3046,7 @@ fn run_boot(
         }) => {
             let result = (|| {
                 writeln!(
-                    io::stderr(),
+                    mirror::stderr(),
                     "td-boot: selection committed but Btrfs unmount failed \
                          ({unmount_error}); booting the committed deployment"
                 )?;
@@ -3588,7 +3595,7 @@ fn mount_medium(mountpoint: &Path) -> io::Result<()> {
     }
     let medium = volume::find_medium()?;
     writeln!(
-        io::stderr(),
+        mirror::stderr(),
         "td-boot: install medium {}",
         medium.device.display()
     )?;
@@ -3636,7 +3643,7 @@ fn live_trust_root(rootfs: &Path) -> io::Result<TrustRoot> {
 /// `panic=-1` would reboot into the same refusal without end.
 fn halt(reason: &str) -> ! {
     let _ = writeln!(
-        io::stderr(),
+        mirror::stderr(),
         "td-boot: {reason}\ntd-boot: halted; only a platform reset leaves this"
     );
     loop {
@@ -3651,10 +3658,10 @@ fn run_live_boot(mountpoint: &Path, base_cmdline: &OsStr) -> io::Result<()> {
     // are best effort: a failed write must not exit init after a cap. A
     // stuck TPM can hold each command for the kernel's timeout, so the
     // first line says what the console is waiting on.
-    let _ = writeln!(io::stderr(), "td-boot: capping PCR 12");
+    let _ = writeln!(mirror::stderr(), "td-boot: capping PCR 12");
     let capped =
         cap::live().unwrap_or_else(|refusal| halt(&format!("{refusal}; live boot refused")));
-    let _ = writeln!(io::stderr(), "td-boot: {}", capped.describe());
+    let _ = writeln!(mirror::stderr(), "td-boot: {}", capped.describe());
     let ram_disk_kib = live_ram_disk_kib(&read_bounded_real_file(
         Path::new("/proc/meminfo"),
         "memory summary",
@@ -3666,7 +3673,7 @@ fn run_live_boot(mountpoint: &Path, base_cmdline: &OsStr) -> io::Result<()> {
         let deployment = authenticated_media_deployment(mountpoint, &key)?;
         let cmdline = live_cmdline(base_cmdline, &uuid, ram_disk_kib, &deployment.id, &key)?;
         writeln!(
-            io::stderr(),
+            mirror::stderr(),
             "td-boot: live deployment {} volume {uuid} ram-disk-kib {ram_disk_kib}",
             deployment.id
         )?;
@@ -3831,7 +3838,30 @@ fn run_live_seed(mountpoint: &Path, deployment_id: &str, seed: &Path) -> io::Res
 }
 
 fn run() -> io::Result<()> {
-    dispatch(parse_args(std::env::args_os().skip(1))?)
+    let mode = parse_args(std::env::args_os().skip(1))?;
+    if mirrors(&mode) {
+        mirror::start(Path::new(console::ACTIVE));
+    }
+    dispatch(mode)
+}
+
+/// The verbs the two initramfs run, whose console lines are mirrored to the
+/// VT (td-install/ENCRYPTION.md "Keyboard console"): the selector's
+/// `on-volume boot` and `live-boot`, and the deployment initramfs's
+/// `on-volume mount-root`, `on-volume mount-var`, `root-loop`, `live-root`
+/// and `live-seed`. No other run mirrors, so the running system's VT, which
+/// the compositor's display covers, gets nothing from td-boot.
+fn mirrors(mode: &Mode) -> bool {
+    match mode {
+        Mode::OnVolume { operation } => {
+            matches!(**operation, Mode::Boot { .. } | Mode::MountVolume { .. })
+        }
+        Mode::LiveBoot { .. }
+        | Mode::RootLoop { .. }
+        | Mode::LiveRoot { .. }
+        | Mode::LiveSeed { .. } => true,
+        _ => false,
+    }
 }
 
 fn on_volume(mut operation: Mode) -> io::Result<()> {
@@ -3878,14 +3908,14 @@ fn on_volume(mut operation: Mode) -> io::Result<()> {
             &mut unlock::System::new(partition, &uuid)?,
             &partition.path(),
             key,
-            &mut io::stderr(),
+            &mut mirror::stderr(),
         )
     })?;
     let pinned = match binding {
         Binding::Bound(pinned) => pinned,
         Binding::Halt(reason) => halt(&reason),
     };
-    report_volume_binding(&mut io::stderr(), &uuid, &pinned.device)?;
+    report_volume_binding(&mut mirror::stderr(), &uuid, &pinned.device)?;
     dispatch(operation)
 }
 
@@ -3905,7 +3935,7 @@ fn boot_encrypted(
     mountpoint: &Path,
     cmdline: &OsStr,
 ) -> io::Result<()> {
-    report_volume_binding(&mut io::stderr(), uuid, &partition.device)?;
+    report_volume_binding(&mut mirror::stderr(), uuid, &partition.device)?;
     if let Some(mapping) = mapping {
         halt(&format!(
             "td volume {uuid} already has an active mapping, {}, before the selector's \
@@ -3915,7 +3945,7 @@ fn boot_encrypted(
     }
     // Best effort: a failed console write must not exit init after a cap.
     let mut console = |line: &str| {
-        let _ = writeln!(io::stderr(), "td-boot: {line}");
+        let _ = writeln!(mirror::stderr(), "td-boot: {line}");
     };
     // Step 1, before any C parser.
     let header = td_protector::luks2::read(&mut partition.file());
@@ -4147,7 +4177,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            let _ = writeln!(io::stderr(), "td-boot: {error}");
+            let _ = writeln!(mirror::stderr(), "td-boot: {error}");
             ExitCode::FAILURE
         }
     }
@@ -4177,6 +4207,31 @@ mod tests {
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// The initramfs verbs mirror their console lines to the VT; nothing
+    /// the running system runs does.
+    #[test]
+    fn only_the_initramfs_verbs_mirror() {
+        let id = "a".repeat(64);
+        for (argv, want) in [
+            (vec!["on-volume", "boot", "/volume", "quiet"], true),
+            (vec!["on-volume", "mount-root", "/volume"], true),
+            (vec!["on-volume", "mount-var", "/sysroot/var"], true),
+            (vec!["root-loop", "/volume", &id, "/dev/loop0"], true),
+            (vec!["live-boot", "/media", "quiet"], true),
+            (vec!["live-root", "/media", &id, "/dev/loop0"], true),
+            (vec!["live-seed", "/media", &id, "/live-seed"], true),
+            (vec!["on-volume", "success", "/run/td-update", &id], false),
+            (vec!["on-volume", "rollback", "/run/td-update"], false),
+            (vec!["boot", "/dev/vda", "/volume", "quiet"], false),
+            (vec!["mount-root", "/dev/vda", "/volume"], false),
+            (vec!["verify", "/volume"], false),
+            (vec!["volume"], false),
+        ] {
+            let mode = parse_args(args(&argv)).unwrap();
+            assert_eq!(mirrors(&mode), want, "{argv:?}");
         }
     }
 
@@ -8356,11 +8411,14 @@ mod tests {
         let capped = position(
             "cap::live().unwrap_or_else(|refusal| halt(&format!(\"{refusal}; live boot refused\")));",
         );
-        let announced = position("let _ = writeln!(io::stderr(), \"td-boot: capping PCR 12\");");
+        let announced =
+            position("let _ = writeln!(mirror::stderr(), \"td-boot: capping PCR 12\");");
         assert!(checked < announced && announced < capped, "{body}");
         assert!(
             capped
-                < position("let _ = writeln!(io::stderr(), \"td-boot: {}\", capped.describe());")
+                < position(
+                    "let _ = writeln!(mirror::stderr(), \"td-boot: {}\", capped.describe());"
+                )
         );
         for later in [
             "live_ram_disk_kib(",

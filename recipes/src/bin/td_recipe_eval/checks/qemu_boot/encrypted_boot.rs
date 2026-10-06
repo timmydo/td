@@ -53,13 +53,17 @@ const NOTHING_RELEASED: &str = "td-boot: no td protector released";
 const KEY_PROMPT: &str = "td recovery key: ";
 const RESEAL_PROMPT: &str =
     "Type reseal to seal a protector to this boot chain, anything else to boot once: ";
-const RECOVERY_ASKED: &str = "td-boot: recovery: enter the recovery key, its 48 digits with or \
-     without spaces or hyphens between groups; it is not shown as it is typed";
+const RECOVERY_ASKED: &str = "td-boot: recovery: enter the recovery key's 48 digits on the \
+     keyboard's top row, unshifted, spaces or hyphens between groups optional, keypad digits \
+     only with Num Lock on; it is not shown as it is typed";
 const ENTER_AGAIN: &str = ": enter it again";
 const WRONG_KEY_PREFIX: &str = "td-boot: the recovery key does not open keyslot 0 (";
 const KEY_OPENS: &str = "td-boot: the recovery key opens keyslot 0";
 const RESEAL_WARNING: &str = "td-boot: a reseal binds release to this boot chain and retires \
      every other td protector; keyslot 0's recovery key stays";
+/// Printed after the warning, before the reseal question.
+const RESEAL_KEYS: &str =
+    "td-boot: type the answer at its US key positions: the keyboard is read as a US one";
 const RESEAL_DECLINED: &str = "td-boot: reseal declined: this boot opens with the recovery key \
      once and the header is unchanged";
 const RESEAL_COMPLETE_PREFIX: &str = "td-boot: reseal complete: keyslot ";
@@ -479,9 +483,9 @@ fn require_recovered<'a>(
     let lines = release_lines(&result.console, &|line| opened_with(line, uuid).is_some())
         .ok_or_else(|| format!("{leg}: the selector never opened the volume\n{}", show()))?;
     let refusal = format!("td-boot: td token 1 (device-bound): {}", change.refusal());
-    let (head, rest) = lines.split_at(lines.len().min(8));
+    let (head, rest) = lines.split_at(lines.len().min(9));
     let head_ok = match head {
-        [token, cap, nothing, asked, codec, wrong, opens, warning] => {
+        [token, cap, nothing, asked, codec, wrong, opens, warning, keys] => {
             token.starts_with(&refusal)
                 && *cap == CAP_CLOSED
                 && *nothing == NOTHING_RELEASED
@@ -492,6 +496,7 @@ fn require_recovered<'a>(
                 && wrong.ends_with(&format!("){ENTER_AGAIN}"))
                 && *opens == KEY_OPENS
                 && *warning == RESEAL_WARNING
+                && *keys == RESEAL_KEYS
         }
         _ => false,
     };
@@ -2084,6 +2089,7 @@ mod tests {
             KEY_PROMPT,
             KEY_OPENS,
             RESEAL_WARNING,
+            RESEAL_KEYS,
             RESEAL_PROMPT,
         ];
         lines.extend_from_slice(outcome);

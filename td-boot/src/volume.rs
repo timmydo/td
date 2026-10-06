@@ -930,7 +930,7 @@ pub(crate) fn resolve(expected: Option<&Uuid>) -> io::Result<Found> {
     loop {
         let mut notes = Vec::new();
         let found = scan(expected, &mut notes);
-        report_notes(&mut io::stderr(), &mut reported, notes)?;
+        report_notes(&mut crate::mirror::stderr(), &mut reported, notes)?;
         if let Some(volume) = found? {
             return Ok(volume);
         }

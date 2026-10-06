@@ -17,10 +17,13 @@ const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
 const CAP_RS: &str = include_str!("../../../td-boot/src/cap.rs");
 const UNLOCK_RS: &str = include_str!("../../../td-boot/src/unlock.rs");
 const MEASUREMENT_RS: &str = include_str!("../../../td-boot/src/measurement.rs");
+const MIRROR_RS: &str = include_str!("../../../td-boot/src/mirror.rs");
 const SELECTOR_RELEASE_RS: &str = include_str!("../../../td-boot/src/selector_release.rs");
 const VOLUME_RS: &str = include_str!("../../../td-boot/src/volume.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
 const TD_FS_RS: &str = include_str!("../../../td-fs/src/real_file.rs");
+// td-init's console identity, which secret-line and td-boot's VT mirror share.
+const CONSOLE_RS: &str = include_str!("../../../td-init/src/console.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
 const SHA512_RS: &str = include_str!("../../../engine/src/sha512.rs");
 const ED25519_RS: &str = include_str!("../../../engine/src/ed25519.rs");
@@ -98,6 +101,11 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
+            path: "{src}/td-boot/src/mirror.rs".into(),
+            content: MIRROR_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
             path: "{src}/td-boot/src/selector_release.rs".into(),
             content: SELECTOR_RELEASE_RS.into(),
             exec: false,
@@ -115,6 +123,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-fs/src/real_file.rs".into(),
             content: TD_FS_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-init/src/console.rs".into(),
+            content: CONSOLE_RS.into(),
             exec: false,
         },
         Step::WriteFile {

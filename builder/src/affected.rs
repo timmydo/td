@@ -9076,6 +9076,7 @@ mod tests {
             [
                 "td-agent",
                 "td-authd",
+                "td-boot",
                 "td-compositor",
                 "td-crypto",
                 "td-dua",
@@ -9085,6 +9086,7 @@ mod tests {
                 "td-install",
                 "td-install-qemu-test",
                 "td-jail",
+                "td-kexec",
                 "td-login",
                 "td-mail",
                 "td-mta",
@@ -9101,6 +9103,7 @@ mod tests {
                 "td-taskmgr",
                 "td-term",
                 "td-ui",
+                "td-update",
                 "td-vm",
                 "td-vm-guest"
             ]
@@ -9113,9 +9116,11 @@ mod tests {
         // td-mta, adding two commands each, and td-open, which mounts
         // td-secret's descriptor module, adds two; the installation fixture,
         // reading td-install's codecs, adds two, and td-init, whose
-        // secret-line PTY test opens its terminal through td-ui, adds two.
+        // secret-line PTY test opens its terminal through td-ui, adds two;
+        // td-boot, which includes td-init's console identity by `#[path]`,
+        // and td-kexec and td-update, which read td-boot, add two each.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 70, "{comp:?}");
+        assert_eq!(comp.len(), 76, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -9124,6 +9129,7 @@ mod tests {
                 "td-agent",
                 "td-audio",
                 "td-authd",
+                "td-boot",
                 "td-busd",
                 "td-compositor",
                 "td-crypto",
@@ -9134,6 +9140,7 @@ mod tests {
                 "td-install",
                 "td-install-qemu-test",
                 "td-jail",
+                "td-kexec",
                 "td-login",
                 "td-mail",
                 "td-mta",
@@ -9150,6 +9157,7 @@ mod tests {
                 "td-taskmgr",
                 "td-term",
                 "td-ui",
+                "td-update",
                 "td-vm",
                 "td-vm-guest"
             ]

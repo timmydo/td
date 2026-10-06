@@ -184,42 +184,39 @@ options, a cleared or replaced TPM, or a firmware change that alters PCR 4
 or PCR 9 refuses release. Firmware code and configuration PCRs are excluded
 so that most firmware updates are intended to keep releasing.
 
-When release fails, the selector enters a recovery flow on its console. It
-never falls back to plaintext, retries with weaker policy, or skips the
-volume. Today that console is the serial console, which the selector's
+When release fails, the selector enters a recovery flow on its console.
+It never falls back to plaintext, retries with weaker policy, or skips
+the volume. That console is the serial console, which the selector's
 built-in command line makes `/dev/console` (DESIGN.md "Full-system
-volume consumers"); the screen's virtual terminal shows the kernel's
-messages but not the prompt. Increment 7's target completes the keyboard
-console ("Keyboard console"): the same prompt on the serial line and on
-the screen's virtual terminal, read from whichever completes an entry
-first; until it lands, a machine without a serial console shows the
-prompt nowhere. The selector reads the
-recovery key through td-init's secret-line applet with echo off, so its
-digits are never echoed; a console server or BMC recorder on the serial
-line may still log what is typed, which the review discloses. The applet,
-not the selector, prints the prompt, and only after echo is off: it
-switches the console with a flushing settings change (`TCSETSF`,
-UNSAFE.md §3), so anything typed before the prompt is discarded rather
+volume consumers"), and beside it the screen's virtual terminal
+("Keyboard console"): the same prompt on both, read from whichever
+completes an entry first. The selector reads the recovery key through
+td-init's secret-line applet with echo off, so its digits are never
+echoed; a console server or BMC recorder on the serial line may still
+log what is typed, which the review discloses. The applet, not the
+selector, prints the prompt, and only after echo is off: it turns echo
+off with `TCSETS` and then discards pending input with `TCFLSH`
+(UNSAFE.md §3), so anything typed before the prompt is discarded rather
 than kept or joined to the entry. It reads one whole canonical record:
 an entry is bounded at 256 bytes, and a longer record, or one holding a
 newline before its end, is refused whole, consuming nothing after it; a
 record ended by `^D` rather than a newline ends input and is refused.
 Each entry is tried on keyslot 0 alone, and a wrong one prompts again,
 without a limit: a 128-bit key needs no retry bound. End of input
-refuses boot and halts instead ("Selector release"). After the
-cap, a correct recovery key opens the volume; when this boot's own cap
-closed PCR 12 and a reseal can run ("Selector release"), the selector
-then offers, with an explicit console
-confirmation, to seal a device-bound protector to the observed PCR 4 and
-PCR 9 values and a literal-zero PCR 12, commit its keyslot and token, and
-only then destroy every other td keyslot and token, a surviving first-boot
-one included (td-protector "Transitions"). Its release is first proven on
-the next boot, and the recovery keyslot remains, so a failure returns to
-recovery. Recovery without that confirmation boots once and runs no plan,
-leaving the header, orphans included, unchanged. Nothing reseals
-automatically, because that would adopt a changed boot chain without its
-owner's decision. The live medium can open the volume with the recovery
-key for data access.
+refuses boot and halts instead ("Selector release"). After the cap, a
+correct recovery key opens the volume; when this boot's own cap closed
+PCR 12 and a reseal can run ("Selector release"), the selector then
+offers, with an explicit console confirmation, to seal a device-bound
+protector to the observed PCR 4 and PCR 9 values and a literal-zero PCR
+12, commit its keyslot and token, and only then destroy every other td
+keyslot and token, a surviving first-boot one included (td-protector
+"Transitions"). Its release is first proven on the next boot, and the
+recovery keyslot remains, so a failure returns to recovery. Recovery
+without that confirmation boots once and runs no plan, leaving the
+header, orphans included, unchanged. Nothing reseals automatically,
+because that would adopt a changed boot chain without its owner's
+decision. The live medium can open the volume with the recovery key for
+data access.
 
 The recovery key is 128 random bits read from `/dev/random`, encoded in
 grouped decimal digits with a check digit per group so that entry does not
@@ -456,12 +453,13 @@ wrong-passphrase status is a wrong key: 2, which cryptsetup 2.8.8's
 failure of that test (a missing keyslot 0 or bad arguments, exit 1; a
 wrong device, 4; a cryptsetup that cannot start or a signal) fails the
 boot as a failed open does (below), since prompting again could never
-succeed. End of input (status 3: `^D`,
-or a hung-up console) and any other failure of the applet refuse boot
-and halt as a failed cap does: a console that answers end of input at
-once would make a repeating prompt spin, and the selector never boots
-without a key that opened keyslot 0, nor exits init. A platform reset
-returns to the same recovery.
+succeed. End of input (status 3: `^D`, or a hang-up, which fails with
+status 1 instead where the hung-up line then refuses its restore) and
+any other failure of the applet refuse boot and halt as a failed cap
+does: a console that answers end of input at once would make a repeating
+prompt spin, and the selector never boots without a key that opened
+keyslot 0, nor exits init. A platform reset returns to the same
+recovery.
 
 Once keyslot 0 opened, the reseal is offered where it can run: this
 boot's own cap closed PCR 12, td read the header, the release did not
@@ -506,10 +504,10 @@ live selector's cap is the one change a live boot shows.
 
 ## Keyboard console
 
-This section is increment 7's target. It gives the selector's recovery
-flow a screen and keyboard beside the serial line, which stays. Its
-first two paragraphs, the command line and the firmware framebuffer, are
-current; the rest is not yet implemented.
+This section is increment 7's target, and current: it gives the
+selector's recovery flow a screen and keyboard beside the serial line,
+which stays. What the installer does with it is "Activation", whose
+probes are current and whose activation is not yet implemented.
 
 The built-in command line (DESIGN.md "Full-system volume consumers")
 names `console=tty0` before `console=ttyS0,115200`. Linux writes its
@@ -589,7 +587,8 @@ when `/dev/console` is the VT, or when `active` cannot be read or
 parsed, so no line is written twice to one terminal. Nothing waits on
 the mirror: a mirrored write that would block or is short (a VT stopped
 by Scroll Lock or `^S`) is abandoned for that line, and the next line is
-tried afresh, so a stopped VT misses lines only while it is stopped. A
+tried afresh, so a stopped VT misses lines only while it is stopped; any
+other failed write that is not a hard error skips its line the same way. A
 mirror that cannot be opened, or whose write fails with a hard error
 (`EIO`, `ENXIO` or `EBADF`), is said once on standard error and dropped
 for the rest of the run. td-boot's own standard-error writes stay
@@ -605,6 +604,12 @@ unshifted, spaces or hyphens between groups optional, keypad digits only
 with Num Lock on. Before the reseal question it says that the answer is
 typed at its US key positions. The prompts themselves, `td recovery
 key: ` and the reseal question's, are unchanged.
+
+The kernel keeps writing its own messages to both consoles at the default
+console loglevel, so a late one (a USB hot-plug, a driver probe) can
+print over a prompt on either line. Nothing re-prints the prompt: the
+entry being typed is unaffected, since the line discipline holds it and
+echo is off, and no message the kernel prints carries what was typed.
 
 td-init's secret-line keeps its one operand and takes no device operand.
 It opens two fixed lines, each read-write, `O_NOCTTY` and `O_NONBLOCK`:
@@ -627,22 +632,23 @@ silenced.
 
 No step waits on one line's output while the other could be read, so a
 line stopped by flow control (a VT stopped by Scroll Lock or `^S`, a
-serial line held by XOFF from a console server) cannot stop entry on
-the other, and no path halts on a transient stop. The draining `TCSETSF`
-is replaced, with one line or two, by a plain `TCSETS` with its readback
-and a non-draining input flush, `TCFLSH` with `TCIFLUSH`. For each line,
-serial first, echo-off is today's patch applied with `TCSETS` and read
-back, then that flush, which discards what was typed before it, under
-either setting; what arrives after it is not echoed and is read. Only
-once every line it kept is silent and flushed does the applet write the
-prompt to each, so a key typed on a line before that line's flush is
-discarded. A line that cannot be opened, or whose settings cannot be
-read, set or read back as computed, is skipped before the prompt: any
-settings it changed there are restored and its input flushed, and a note
-naming it goes to the line that remains. A VT that opens but has no
-display or keyboard is kept; it never completes an entry. With no line
-left the applet fails with status 1, which td-boot treats as any other
-failure of the applet: it refuses boot and halts.
+serial line held by XOFF from a console server) cannot stop entry on the
+other, and no path halts on a transient stop. Increment 6's draining
+`TCSETSF` was replaced, with one line or two, by a plain `TCSETS` with
+its readback and a non-draining input flush, `TCFLSH` with `TCIFLUSH`.
+For each line, serial first, echo-off is increment 6's patch applied
+with `TCSETS` and read back, then that flush, which discards what was
+typed before it, under either setting; what arrives after it is not
+echoed and is read. Only once every line it kept is silent and flushed
+does the applet write the prompt to each, so a key typed on a line
+before that line's flush is discarded. A line that cannot be opened, or
+whose settings cannot be read, is skipped untouched; one whose settings
+cannot be set or read back as computed is skipped with its settings
+restored and its input flushed; a note naming either goes to the line
+that remains. A VT that opens but has no display or keyboard is kept; it
+never completes an entry. With no line left the applet fails with status
+1, which td-boot treats as any other failure of the applet: it refuses
+boot and halts.
 
 Prompt and note bytes are queued per line and written through the
 non-blocking descriptors. A write that would block (`EAGAIN`) or is
@@ -651,11 +657,19 @@ write leaves the rest from its offset; either way the line stays
 readable and its queue is finished when `poll(2)` reports `POLLOUT` for
 it. A line is dropped only on a hard error: a write failing with `EIO`
 (which a hung-up terminal also returns), `ENXIO` or `EBADF`, or `poll`
-reporting `POLLERR` or `POLLNVAL` for it. A dropped line is restored
-and flushed as below, with a note queued on the line that remains, and
-with no line left the applet fails as above. A stopped line therefore
-only delays its own prompt, which appears when the line resumes, while
-what is typed on it is still read.
+reporting `POLLERR` or `POLLNVAL` for it without `POLLHUP` (a hung-up
+terminal reports `POLLERR` beside its `POLLHUP`, and is read, as below).
+Any other write error, or a write that takes nothing, abandons that
+line's queue and keeps the line readable, so it neither drops the line
+nor spins on `POLLOUT`. A dropped line is restored and flushed as below,
+at once and best effort, since a line gone with `EIO` may refuse its
+restore, which the note then names; a note is queued on the line that
+remains, before its prompt if none of the prompt was written, else on a
+line of its own with the prompt again, and with no line left the applet
+fails as above. Only the restores of the lines kept, and their flushes,
+decide whether the entry stands. A stopped line therefore only delays
+its own prompt, which appears when the line resumes, while what is typed
+on it is still read.
 
 The applet waits in that one `poll(2)` loop, with no timeout, asking
 `POLLIN` of every line and `POLLOUT` of every line with queued bytes. A
@@ -666,25 +680,31 @@ the wait ends at the first line that completes a record, by newline or
 than a dropped line. When both lines are readable at once, the serial
 line is read. Queued prompt bytes still unwritten when a record arrives
 are discarded with the wait. That line's one record is read and judged
-exactly as today, per
-line: the 256-byte bound, a longer record or one holding a newline
-refused whole (status 4), and end of input at `^D` or a hang-up (status
-3). Then every line is restored with `TCSETS` and read back exactly, and
-every line not read is then flushed with `TCIFLUSH`, which discards what
-was typed there with echo off, partial or whole, so no unechoed digits
-stay queued for a later reader. Each line then gets one attempt at its
-newline, non-blocking: echo is back on and the newline is cosmetic, so a
-line that is stopped or takes it short is not waited on, since waiting
-there would hold an entry already made on the other line. Only once
-every restore succeeded is the line written to the pipe. The reseal
-question runs the same way, on both lines.
+exactly as today, per line: the 256-byte bound, a longer record or one
+holding a newline refused whole (status 4), and end of input at `^D` or
+a hang-up (status 3; 1 where the hung-up line then refuses its restore,
+as a `vhangup`ed terminal answers `EIO`, while a pseudo-terminal whose
+master closed may still take it). Then every line is restored with
+`TCSETS` and read back exactly, and every line, the one read included,
+is then flushed with `TCIFLUSH`, which discards what was typed there
+with echo off, partial or whole, and on the line read anything after its
+record (a second record from a pasted key's CR LF, or keys typed after
+the entry), so no unechoed digits stay queued for a later reader on any
+line. A restore and a flush are each attempted whatever the other did,
+here and wherever a line is dropped or skipped, and either failing fails
+the run. Each line then gets one attempt at its newline, non-blocking:
+echo is back on and the newline is cosmetic, so a line that is stopped
+or takes it short is not waited on, since waiting there would hold an
+entry already made on the other line. Only once every restore and flush
+succeeded is the line written to the pipe. The reseal question runs the
+same way, on both lines.
 
-On one line this changes the landed applet only in what it waits in.
-Today it writes the prompt with a blocking write, so a line held by
-XOFF waits there for XON before anything is read. In the new loop a
-lone stopped line still waits, now in `poll(2)`, until it resumes or a
+On one line this changed increment 6's applet only in what it waits in.
+That applet wrote the prompt with a blocking write, so a line held by
+XOFF waited there for XON before anything was read. In the loop a lone
+stopped line still waits, now in `poll(2)`, until it resumes or a
 record arrives, and keys typed meanwhile are read; and the trailing
-newline, which today blocks with echo back on, is attempted once. Its
+newline, which then blocked with echo back on, is attempted once. Its
 guarantees stay: echo off before the prompt, input before the flush
 discarded, the same record rules and statuses, and the restore on every
 path. No path, on one line or two, halts on a transient XOFF.
@@ -698,12 +718,11 @@ nothing attached delivers no byte and no hang-up and its read blocks,
 and a VT with no keyboard blocks the same way. End of input therefore
 comes only from a `^D` someone typed or a line that hung up.
 
-`poll(2)` is a new td-init syscall and `TCFLSH` a new ioctl request,
-replacing `TCSETSF`, which is then left with no caller, so the
-secret-line commit amends UNSAFE.md §3 (planned there) and the amendment
-becomes current with it. These commits change what a boot shows, never
-what it does: an unencrypted volume's boot still makes no TPM contact
-and takes the same steps.
+`poll(2)` is td-init's eleventh syscall and `TCFLSH` the ioctl request
+that replaced `TCSETSF`, which left the roster with no caller, so it
+stays at six (UNSAFE.md §3). These commits change what a boot shows,
+never what it does: an unencrypted volume's boot still makes no TPM
+contact and takes the same steps.
 
 ## Activation
 

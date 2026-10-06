@@ -26,13 +26,16 @@
 //! outside both sets are deliberately ACCEPTED as the line already had them.
 //!
 //! `secret-line` borrows the same discipline for the opposite job: it turns
-//! echo OFF for one line and puts back exactly what it found. `echo_off` and
-//! `restore` run over the `Termios` trait so the ordering can be tested without
-//! a terminal; `Kernel` is the one implementation that reaches the kernel.
+//! echo OFF on each of its lines and puts back exactly what it found. `save`,
+//! `silence`, `restore` and `flush` run over the `Termios` trait so the
+//! ordering can be tested without a terminal; `Kernel` is the one
+//! implementation that reaches the kernel. `wait` is its `poll(2)` over those
+//! lines, here so that `term.rs` stays the only module that reaches the
+//! wrappers secret-line needs.
 
 use crate::sys;
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{BorrowedFd, RawFd};
 
 /// The four leading `u32` flag words of the kernel `struct termios`, in order.
 const IFLAG_AT: usize = 0;
@@ -308,8 +311,8 @@ pub trait Termios {
     fn get(&mut self, out: &mut Bytes) -> io::Result<()>;
     /// `TCSETS`: apply at once.
     fn set(&mut self, termios: &Bytes) -> io::Result<()>;
-    /// `TCSETSF`: apply once output has drained, discarding pending input.
-    fn set_flushing(&mut self, termios: &Bytes) -> io::Result<()>;
+    /// `TCFLSH` with `TCIFLUSH`: discard pending input, waiting on nothing.
+    fn flush_input(&mut self) -> io::Result<()>;
 }
 
 /// The kernel's terminal behind a descriptor the caller keeps open.
@@ -332,12 +335,12 @@ impl Termios for Kernel {
         sys::termios_set(self.fd, termios)
     }
 
-    fn set_flushing(&mut self, termios: &Bytes) -> io::Result<()> {
-        sys::termios_set_flush(self.fd, termios)
+    fn flush_input(&mut self) -> io::Result<()> {
+        sys::termios_flush_input(self.fd)
     }
 }
 
-/// The settings a line had before `echo_off`, which `restore` puts back.
+/// The settings a line had before `silence`, which `restore` puts back.
 /// Opaque, so the only bytes a caller can restore are the kernel's own.
 pub struct Saved(Bytes);
 
@@ -374,41 +377,107 @@ fn secret_patched(before: &Bytes) -> Bytes {
     out
 }
 
-/// Turn echo off and prove it took before anything is read.
-///
-/// The change is applied with `TCSETS` and read back, then applied again with
-/// `TCSETSF`, which discards pending input, and read back again. Input typed
-/// before the switch was echoed under the old settings, and input arriving
-/// during it may have been; both are discarded rather than read as the
-/// entry's start. Input arriving after the flush and before the caller's
-/// prompt is written is not echoed but is read. `TCSETSF` flushes input and
-/// then waits for pending output to drain, so that window lasts the drain:
-/// on a serial console with an output backlog, as long as the backlog takes
-/// to send. On any failure after the settings were read, the
-/// line is restored before returning: a request that applied part of the
-/// change, or a readback that disagrees, must not leave the console silent.
-pub fn echo_off(line: &mut impl Termios) -> Result<Saved, String> {
+/// Read a line's settings before anything changes them. secret-line saves
+/// every line first, so that two names for one terminal could never save
+/// settings it had already silenced.
+pub fn save(line: &mut impl Termios) -> Result<Saved, String> {
     let mut before = [0u8; sys::TERMIOS_LEN];
     line.get(&mut before).map_err(|e| format!("TCGETS: {e}"))?;
-    let saved = Saved(before);
-    let want = secret_patched(&before);
-    let applied = apply(line, &want).and_then(|()| {
-        line.set_flushing(&want)
-            .map_err(|e| format!("TCSETSF: {e}"))?;
-        read_back(line, &want)
-    });
-    match applied {
-        Ok(()) => Ok(saved),
-        Err(e) => match restore(line, &saved) {
+    Ok(Saved(before))
+}
+
+/// Turn echo off and prove it took, then discard pending input.
+///
+/// The change is applied with `TCSETS` and read back, then `TCFLSH` with
+/// `TCIFLUSH` discards what was typed before it, under either setting: a key
+/// typed before the switch was echoed under the old settings and is neither
+/// read as the entry's start nor kept. Input arriving after the flush is not
+/// echoed and is read. Neither request waits on output, so a line stopped by
+/// flow control cannot hold this step. On any failure the line is restored
+/// and flushed before returning: a request that applied part of the change,
+/// or a readback that disagrees, must not leave the line silent, and what
+/// was typed under it must not stay queued.
+pub fn silence(line: &mut impl Termios, saved: &Saved) -> Result<(), String> {
+    let want = secret_patched(&saved.0);
+    let silenced = apply(line, &want).and_then(|()| flush(line));
+    match silenced {
+        Ok(()) => Ok(()),
+        Err(e) => match put_back(line, saved) {
             Ok(()) => Err(e),
-            Err(r) => Err(format!("{e}; restoring the line also failed: {r}")),
+            Err(r) => Err(format!(
+                "{e}; restoring or flushing the line also failed: {r}"
+            )),
         },
     }
 }
 
-/// Put back what `echo_off` found, and refuse unless the kernel agrees exactly.
+/// Restore a line and flush its input, each attempted whatever the other
+/// did: a restore or readback that fails must not leave unechoed keys queued
+/// for the line's next reader. Either failure fails the whole.
+pub fn put_back(line: &mut impl Termios, saved: &Saved) -> Result<(), String> {
+    let restored = restore(line, saved);
+    let flushed = flush(line);
+    match (restored, flushed) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(r), Ok(())) => Err(r),
+        (Ok(()), Err(f)) => Err(f),
+        (Err(r), Err(f)) => Err(format!("{r}; {f}")),
+    }
+}
+
+/// Put back what `save` found, and refuse unless the kernel agrees exactly.
 pub fn restore(line: &mut impl Termios, saved: &Saved) -> Result<(), String> {
     apply(line, &saved.0)
+}
+
+/// Discard a line's pending input, partial record included.
+pub fn flush(line: &mut impl Termios) -> Result<(), String> {
+    line.flush_input().map_err(|e| format!("TCFLSH: {e}"))
+}
+
+/// What one `wait` found on one line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Seen {
+    /// A whole record is queued, or the line hung up: a read will not block,
+    /// and on a hang-up returns end of input.
+    pub input: bool,
+    /// Queued bytes can be written.
+    pub output: bool,
+    /// An error condition with no hang-up beside it: the line is gone.
+    pub failed: bool,
+}
+
+/// What `revents` means for a line. A hung-up terminal reports `POLLHUP`
+/// with `POLLERR`; the hang-up wins, so it is read as end of input rather
+/// than taken for a failed line.
+fn seen(revents: i16) -> Seen {
+    let hangup = revents & sys::POLLHUP != 0;
+    Seen {
+        input: hangup || revents & sys::POLLIN != 0,
+        output: revents & sys::POLLOUT != 0,
+        failed: !hangup && revents & (sys::POLLERR | sys::POLLNVAL) != 0,
+    }
+}
+
+/// Wait, with no timeout, until one of `lines` has a record, has hung up, can
+/// take its queued bytes (the `bool` says it has some), or failed. One or two
+/// lines; an interrupted wait is resumed.
+pub fn wait(lines: &[(BorrowedFd<'_>, bool)], found: &mut [Seen]) -> io::Result<()> {
+    let mut fds: Vec<sys::PollFd<'_>> = lines
+        .iter()
+        .map(|(line, queued)| sys::PollFd::new(*line, *queued))
+        .collect();
+    loop {
+        match sys::poll(&mut fds) {
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    for (slot, fd) in found.iter_mut().zip(&fds) {
+        *slot = seen(fd.revents());
+    }
+    Ok(())
 }
 
 fn apply(line: &mut impl Termios, want: &Bytes) -> Result<(), String> {
@@ -765,6 +834,8 @@ mod tests {
         log: Vec<&'static str>,
         sets: usize,
         fail_set: Option<usize>,
+        flushes: usize,
+        fail_flush: Option<usize>,
         ignore_sets: bool,
     }
 
@@ -777,6 +848,8 @@ mod tests {
                 log: Vec::new(),
                 sets: 0,
                 fail_set: None,
+                flushes: 0,
+                fail_flush: None,
                 ignore_sets: false,
             }
         }
@@ -805,59 +878,141 @@ mod tests {
             self.log.push("set");
             self.store(termios)
         }
-        fn set_flushing(&mut self, termios: &Bytes) -> io::Result<()> {
-            self.log.push("flush-set");
-            self.store(termios)
+        fn flush_input(&mut self) -> io::Result<()> {
+            self.log.push("flush");
+            self.flushes += 1;
+            if self.fail_flush == Some(self.flushes) {
+                return Err(io::Error::other("refused"));
+            }
+            Ok(())
         }
     }
 
     #[test]
-    fn echo_off_proves_the_change_and_restore_puts_back_the_kernels_bytes() {
+    fn silence_proves_the_change_then_flushes_and_restore_puts_back_the_kernels_bytes() {
         let mut line = Script::new();
         let original = line.current;
-        let saved = echo_off(&mut line).unwrap();
+        let saved = save(&mut line).unwrap();
+        silence(&mut line, &saved).unwrap();
         assert_eq!(
             read_u32(&line.current, LFLAG_AT) & (ECHO | ECHONL | ISIG),
             0
         );
         restore(&mut line, &saved).unwrap();
         assert_eq!(line.current, original);
-        assert_eq!(
-            line.log,
-            ["get", "set", "get", "flush-set", "get", "set", "get"]
-        );
+        assert_eq!(line.log, ["get", "set", "get", "flush", "set", "get"]);
     }
 
     /// A driver that accepts TCSETS and changes nothing must not be read from:
-    /// the readback refuses, and the restore still runs.
+    /// the readback refuses, and the restore and its flush still run.
     #[test]
     fn echo_that_did_not_turn_off_is_refused_and_the_line_restored() {
         let mut line = Script::new();
         line.ignore_sets = true;
-        let error = echo_off(&mut line).err().unwrap();
+        let saved = save(&mut line).unwrap();
+        let error = silence(&mut line, &saved).err().unwrap();
         assert!(error.contains("c_iflag"), "{error}");
-        assert_eq!(line.log, ["get", "set", "get", "set", "get"]);
+        assert_eq!(line.log, ["get", "set", "get", "set", "get", "flush"]);
     }
 
     #[test]
-    fn a_refused_tcsets_still_restores_and_a_failed_restore_is_reported() {
+    fn a_refused_request_still_restores_and_a_failed_restore_is_reported() {
         let mut line = Script::new();
         line.fail_set = Some(1);
-        let error = echo_off(&mut line).err().unwrap();
+        let saved = save(&mut line).unwrap();
+        let error = silence(&mut line, &saved).err().unwrap();
         assert_eq!(error, "TCSETS: refused");
-        assert_eq!(line.log, ["get", "set", "set", "get"]);
+        assert_eq!(line.log, ["get", "set", "set", "get", "flush"]);
 
         let mut flush = Script::new();
-        flush.fail_set = Some(2);
-        let error = echo_off(&mut flush).err().unwrap();
-        assert_eq!(error, "TCSETSF: refused");
-        assert_eq!(flush.log, ["get", "set", "get", "flush-set", "set", "get"]);
+        flush.fail_flush = Some(1);
+        let saved = save(&mut flush).unwrap();
+        let error = silence(&mut flush, &saved).err().unwrap();
+        assert_eq!(error, "TCFLSH: refused");
+        assert_eq!(
+            flush.log,
+            ["get", "set", "get", "flush", "set", "get", "flush"]
+        );
 
         let mut both = Script::new();
         both.fail_set = Some(2);
         both.ignore_sets = true;
-        let error = echo_off(&mut both).err().unwrap();
-        assert!(error.contains("restoring the line also failed"), "{error}");
+        let saved = save(&mut both).unwrap();
+        let error = silence(&mut both, &saved).err().unwrap();
+        assert!(
+            error.contains("restoring or flushing the line also failed"),
+            "{error}"
+        );
+        // The refused restore does not skip the flush.
+        assert_eq!(both.log, ["get", "set", "get", "set", "flush"]);
+    }
+
+    /// `put_back` attempts the flush whatever the restore did, and reports
+    /// every failure.
+    #[test]
+    fn put_back_flushes_even_when_the_restore_fails() {
+        let mut line = Script::new();
+        let saved = save(&mut line).unwrap();
+        line.fail_set = Some(1);
+        assert_eq!(put_back(&mut line, &saved), Err("TCSETS: refused".into()));
+        assert_eq!(line.log, ["get", "set", "flush"]);
+
+        let mut line = Script::new();
+        let saved = save(&mut line).unwrap();
+        line.fail_set = Some(1);
+        line.fail_flush = Some(1);
+        assert_eq!(
+            put_back(&mut line, &saved),
+            Err("TCSETS: refused; TCFLSH: refused".into())
+        );
+        assert_eq!(line.log, ["get", "set", "flush"]);
+
+        let mut line = Script::new();
+        let saved = save(&mut line).unwrap();
+        line.fail_flush = Some(1);
+        assert_eq!(put_back(&mut line, &saved), Err("TCFLSH: refused".into()));
+        assert_eq!(line.log, ["get", "set", "get", "flush"]);
+    }
+
+    /// `POLLHUP` reads as input whatever else came with it, `POLLERR` or
+    /// `POLLNVAL` alone fails the line, and `POLLOUT` is reported apart.
+    #[test]
+    fn revents_classify_a_hangup_as_input_and_an_error_as_failure() {
+        let none = Seen::default();
+        assert_eq!(seen(0), none);
+        assert_eq!(
+            seen(sys::POLLIN),
+            Seen {
+                input: true,
+                ..none
+            }
+        );
+        assert_eq!(
+            seen(sys::POLLOUT),
+            Seen {
+                output: true,
+                ..none
+            }
+        );
+        let hung = Seen {
+            input: true,
+            output: true,
+            failed: false,
+        };
+        assert_eq!(
+            seen(sys::POLLIN | sys::POLLOUT | sys::POLLERR | sys::POLLHUP),
+            hung
+        );
+        assert_eq!(
+            seen(sys::POLLHUP),
+            Seen {
+                input: true,
+                ..none
+            }
+        );
+        for error in [sys::POLLERR, sys::POLLNVAL, sys::POLLERR | sys::POLLOUT] {
+            assert!(seen(error).failed && !seen(error).input, "{error:#x}");
+        }
     }
 
     /// The accessors read and write where the offsets say, round-trip, and

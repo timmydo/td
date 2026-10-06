@@ -50,6 +50,18 @@ pub(crate) const RESEAL_PROMPT: &str =
 pub(crate) const RESEAL_WARNING: &str =
     "a reseal binds release to this boot chain and retires every other td protector; \
      keyslot 0's recovery key stays";
+/// The line naming the entry, printed before the first recovery prompt. The
+/// VT reads key positions under the kernel's built-in US keymap, whatever
+/// the keyboard's legends, and starts with Num Lock off
+/// (td-install/ENCRYPTION.md "Keyboard console").
+pub(crate) const ENTRY_KEYS: &str =
+    "recovery: enter the recovery key's 48 digits on the keyboard's top row, unshifted, \
+     spaces or hyphens between groups optional, keypad digits only with Num Lock on; \
+     it is not shown as it is typed";
+/// Printed before the reseal question: on a keyboard whose letters sit
+/// elsewhere, the answer is typed where a US keyboard has them.
+pub(crate) const RESEAL_KEYS: &str =
+    "type the answer at its US key positions: the keyboard is read as a US one";
 /// The one answer that confirms the reseal: no default, and no other word.
 pub(crate) const RESEAL_WORD: &[u8] = b"reseal";
 /// secret-line's longest line (its `LINE_MAX`).
@@ -291,10 +303,7 @@ fn recover<C: Runner>(
     key_directory: &Path,
     console: &mut dyn FnMut(&str),
 ) -> Unlock {
-    console(
-        "recovery: enter the recovery key, its 48 digits with or without spaces or \
-         hyphens between groups; it is not shown as it is typed",
-    );
+    console(ENTRY_KEYS);
     let key = loop {
         let entry = match line.read(KEY_PROMPT) {
             Ok(Entered::Line(entry)) => entry,
@@ -344,6 +353,7 @@ fn recover<C: Runner>(
     match offer {
         Some(header) => {
             console(RESEAL_WARNING);
+            console(RESEAL_KEYS);
             if !confirmed(line, console) {
                 console(
                     "reseal declined: this boot opens with the recovery key once and the \
@@ -1268,6 +1278,7 @@ pub(crate) mod tests {
         }
         assert!(run.resealed.is_empty());
         assert_key_on_keyslot_0_alone(&script, &run.lines);
+        assert_eq!(run.lines.first().map(String::as_str), Some(ENTRY_KEYS));
         for expected in [
             "recovery key entry has 0 digits, not 48: enter it again",
             "recovery key entry has 5 digits, not 48: enter it again",
@@ -1403,7 +1414,9 @@ pub(crate) mod tests {
             };
             assert_eq!(keyslot, 0);
             assert_eq!(run.prompts, [KEY_PROMPT, RESEAL_PROMPT]);
-            assert!(run.lines.iter().any(|l| l == RESEAL_WARNING));
+            let warning = run.lines.iter().position(|l| l == RESEAL_WARNING);
+            let keys = run.lines.iter().position(|l| l == RESEAL_KEYS);
+            assert!(warning.is_some() && keys == warning.map(|w| w + 1));
             assert_eq!(run.resealed, [KEY.to_vec()]);
             assert!(
                 run.lines.iter().any(|l| l.starts_with(report)),
@@ -1547,6 +1560,10 @@ pub(crate) mod tests {
         }
         assert_eq!(RESEAL_WORD, b"reseal");
         assert!(RESEAL_PROMPT.contains("Type reseal"));
+        for named in ["48 digits", "top row", "unshifted", "Num Lock"] {
+            assert!(ENTRY_KEYS.contains(named), "{named}");
+        }
+        assert!(RESEAL_KEYS.contains("US key positions"));
     }
 
     /// td-boot never prints a prompt: each is only secret-line's operand.

@@ -90,8 +90,11 @@ forbidding unsafe code, the TPM being td-tpm's safe file I/O on
 through std. The release's cryptsetup children, and the pipe that hands
 the volume key to td-kexec, are std's, through td-protector's runner and
 its `KeyFile`; its recovery flow's secret-line child and the pipe it
-reads the entry from are std's too, the termios requests being td-init's
-own (§3). The deployment initramfs's unlock adds none: its post-cap
+reads the entry from are std's too, the termios, flush and poll requests
+being td-init's own (§3); its console lines' mirror to the VT is a std
+non-blocking open and write of `/dev/tty1`, and which terminal
+`/dev/console` is comes from sysfs through td-init's std-only
+`console.rs`. The deployment initramfs's unlock adds none: its post-cap
 unseal is td-protector's over the same client, its key member is read
 with std file I/O, and its one cryptsetup child, with the key on a pipe,
 is td-protector's runner's std process and pipe. `td-install` was the
@@ -129,7 +132,7 @@ one.
 |---|-------|----------|
 | 1 | `td-kexec` | `kexec_file_load(2)`, `reboot(2)`, `memfd_create(2)` with pinned flags including `MFD_NOEXEC_SEAL`, `fcntl(2)` pinned to `F_ADD_SEALS` and one seal set (plus a test-only `F_SETLEASE` probe) — see [§1](#1-td-kexec--the-guest-kexec-helper) |
 | 2 | `td-netd` | `ioctl(2)` |
-| 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has six pinned requests |
+| 3 | `td-init` | eleven — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has six pinned requests, `poll(2)` at most two lines |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with seventeen value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` each pinned to a dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region, which is `Send`; also the shared private-channel instruction and adoption of §16 |
@@ -277,55 +280,59 @@ I/O rides `std`, so DHCP needs no AF_PACKET raw socket.
 ## 3. `td-init` — the boot-glue multicall
 
 The `td-init` boot-glue multicall, whose one `syscall5` body in
-`td-init/src/sys.rs` carries EXACTLY these ten syscalls, one per applet
-that safe `std` cannot reach: `reboot(2)` + `sync(2)`
+`td-init/src/sys.rs` carries EXACTLY these eleven syscalls, one per
+applet that safe `std` cannot reach: `reboot(2)` + `sync(2)`
 (reboot/poweroff/halt), `mount(2)` + `umount2(2)` (mount/umount, and
 switch_root's `MS_MOVE`), `chroot(2)` (switch_root), `setsid(2)` +
 `ioctl(2)` (cttyhack and losetup), `sethostname(2)` (`hostname -F`, the
-flag uutils lacks), `wait4(2)` (init, which as PID 1 must reap the orphans
-a targeted `Child::wait` cannot see), and `mknod(2)` — the tenth, and the
-last privileged busybox job on the boot path. The deployment initramfs
-mounts devtmpfs on `/dev` first thing, so `/dev/loop0` normally comes from
-the kernel; this is the fallback for when the loop driver registered none,
-and it cannot come from a cpio `nod` line because the devtmpfs mount
-shadows whatever was there. Unlike `losetup` and `kill`, the busybox
-spelling here WAS build-time checked — `INITRAMFS_APPLETS` names were
-swept against `busybox --list`, and that sweep is emitted only while the
-list has something in it, which since the td-sh flip it does not — so
-this is not that argument. What it buys is narrower and real, and it is
-all about the ARGUMENT rather than the call:
-`dev` is one integer with major and minor packed into disjoint bit ranges,
-and a wrong packing is a well-formed node pointing at a DIFFERENT driver,
-which `mknod(2)` creates and reports success for. So the crate now has
-exactly one `dev_t` packing (`td-init/src/devt.rs`, replacing the private
-copy `losetup` carried), an encode that REFUSES an unencodable pair rather
-than truncating it, and a readback that stats the created node and unlinks
-it — reporting BOTH failures if the unlink also fails — unless the kernel
-agrees about both numbers. Same "nothing observable distinguishes the
-wrong outcome" argument that made `losetup` re-read its read-only flag out
-of sysfs. `mknod.rs` is the only permitted caller of `sys::mknod`,
-asserted like `mount`'s and `attach_loop`'s, because `mode`'s top bits are
-the node type and so choose the driver class. Only BLOCK nodes are served;
-`c`/`u`/`p` are refused, since nothing on td's boot path creates one and
-the type is the part of `mode` that picks the driver. An ELEVENTH syscall
-is an amendment here. `ioctl(2)` is the one with SIX permitted requests —
-`TIOCSCTTY` for cttyhack and getty, `LOOP_SET_FD` for the `losetup` applet,
-`TCGETS`/`TCSETS` for the line settings getty applies, `BLKRRPART` for
-partition rereads, and `TCSETSF` for secret-line's echo-off — each pinned by
-value, so widening that roster is as reviewable as adding a syscall to it.
-Unlike the two-request form this replaced, the roster is now ENFORCED IN
-CODE (td-sh's shape, not td-util's per-wrapper one): a single `ioctl` entry
-point in `sys.rs` refuses anything outside `IOCTL_REQUESTS` before issuing,
-so a seventh request is an edit to a named array rather than a new call site
-somebody has to notice. The six wrappers are pinned whole in turn, because
-with one entry point the syscall-argument pin no longer sees a request
-number: `TIOCSCTTY` reads its third register as the steal flag,
-`LOOP_SET_FD` as a descriptor, and the three termios calls as a pointer the
-kernel copies 36 bytes through. That length is the kernel's `struct
-termios` (four flag words, `c_line`, NCCS=19 slots) and NOT glibc's 60-byte
-one, pinned for td-compositor's `WINSIZE_LEN` reason: the copy has no length
-negotiation, so a buffer sized from the wrong header is an out-of-bounds
-kernel write from code the compiler reads as safe.
+flag uutils lacks), `wait4(2)` (init, which as PID 1 must reap the
+orphans a targeted `Child::wait` cannot see), `mknod(2)` — the tenth,
+and the last privileged busybox job on the boot path — and `poll(2)`,
+the eleventh, secret-line's wait over its two lines (below). The
+deployment initramfs mounts devtmpfs on `/dev` first thing, so
+`/dev/loop0` normally comes from the kernel; this is the fallback for
+when the loop driver registered none, and it cannot come from a cpio
+`nod` line because the devtmpfs mount shadows whatever was there. Unlike
+`losetup` and `kill`, the busybox spelling here WAS build-time checked —
+`INITRAMFS_APPLETS` names were swept against `busybox --list`, and that
+sweep is emitted only while the list has something in it, which since
+the td-sh flip it does not — so this is not that argument. What it buys
+is narrower and real, and it is all about the ARGUMENT rather than the
+call: `dev` is one integer with major and minor packed into disjoint bit
+ranges, and a wrong packing is a well-formed node pointing at a
+DIFFERENT driver, which `mknod(2)` creates and reports success for. So
+the crate now has exactly one `dev_t` packing (`td-init/src/devt.rs`,
+replacing the private copy `losetup` carried), an encode that REFUSES an
+unencodable pair rather than truncating it, and a readback that stats
+the created node and unlinks it — reporting BOTH failures if the unlink
+also fails — unless the kernel agrees about both numbers. Same "nothing
+observable distinguishes the wrong outcome" argument that made `losetup`
+re-read its read-only flag out of sysfs. `mknod.rs` is the only
+permitted caller of `sys::mknod`, asserted like `mount`'s and
+`attach_loop`'s, because `mode`'s top bits are the node type and so
+choose the driver class. Only BLOCK nodes are served; `c`/`u`/`p` are
+refused, since nothing on td's boot path creates one and the type is the
+part of `mode` that picks the driver. A TWELFTH syscall is an amendment
+here. `ioctl(2)` is the one with SIX permitted requests — `TIOCSCTTY`
+for cttyhack and getty, `LOOP_SET_FD` for the `losetup` applet,
+`TCGETS`/`TCSETS` for the line settings getty applies and secret-line
+silences and restores, `BLKRRPART` for partition rereads, and `TCFLSH`
+for secret-line's input flush — each pinned by value, so widening that
+roster is as reviewable as adding a syscall to it. Unlike the
+two-request form this replaced, the roster is now ENFORCED IN CODE
+(td-sh's shape, not td-util's per-wrapper one): a single `ioctl` entry
+point in `sys.rs` refuses anything outside `IOCTL_REQUESTS` before
+issuing, so a seventh request is an edit to a named array rather than a
+new call site somebody has to notice. The six wrappers are pinned whole
+in turn, because with one entry point the syscall-argument pin no longer
+sees a request number: `TIOCSCTTY` reads its third register as the steal
+flag, `LOOP_SET_FD` as a descriptor, the two termios calls as a pointer
+the kernel copies 36 bytes through, and `TCFLSH` as the queue to
+discard, fixed to the input queue. That length is the kernel's `struct
+termios` (four flag words, `c_line`, NCCS=19 slots) and NOT glibc's
+60-byte one, pinned for td-compositor's `WINSIZE_LEN` reason: the copy
+has no length negotiation, so a buffer sized from the wrong header is an
+out-of-bounds kernel write from code the compiler reads as safe.
 
 The fifth request is `BLKRRPART` (0x125f, Linux `_IO(0x12,95)`).
 `sys::reread_partitions` borrows one live File and fixes the third argument
@@ -354,94 +361,104 @@ to write through its whole-disk descriptor for both destination kinds;
 publication from inside the formatter goes through its own loop surface
 (§21), not this applet, which serves the separate mounted route.
 
-The sixth request is `TCSETSF` (0x5404), for the console `secret-line`
-applet (`td-install/ENCRYPTION.md` increment 6), which reads the selector's
-recovery-key entry. It applies settings once pending output has drained and
-DISCARDS pending input, which is why getty does not use it and why it was
-refused here before: on secret-line's echo-off, discarding is the point, since
-a key typed before the prompt was echoed under the old settings and must be
-neither kept nor joined to the entry. `sys::termios_set_flush` passes the same
-36-byte pointer as `TCSETS`; only `term.rs`'s `Kernel` calls it, and
-`term::echo_off` is its one caller there, which the confinement tests pin
-beside the value, the roster entry and the wrapper. Every restore, and
-getty, stays on plain `TCSETS`. `TCSETSW` remains refused.
+The sixth request is `TCFLSH` (0x540b), for the console `secret-line`
+applet (`td-install/ENCRYPTION.md` increments 6 and 7), which reads the
+selector's recovery-key entry. Its argument is fixed by the wrapper to
+`TCIFLUSH` (0): it discards the line's pending INPUT, typed and not yet
+read, partial line included, and waits on nothing, so a line stopped by
+flow control cannot hold it. `sys::termios_flush_input` borrows the
+descriptor and takes no other argument; only `term.rs`'s `Kernel` calls
+it, and `term::flush` is its one caller there, which `silence` uses after
+its echo-off readback and secret-line after the restore of a line it did
+not read; the confinement tests pin the value, the argument, the roster
+entry, the wrapper and that caller. It replaced `TCSETSF` (0x5404), which
+flushed input and then waited for pending output to drain, so a stopped
+line would have held the applet: `TCSETSF` left the roster with no caller,
+and the confinement tests refuse its name, `TCSETSW`'s and `TIOCGDEV`'s in
+`sys.rs`. Every restore, and getty, stays on plain `TCSETS`.
+
+`poll(2)` is the eleventh syscall, secret-line's alone: in one loop the
+applet waits for the first of its lines to complete a canonical record and
+finishes each line's queued prompt bytes as the line accepts them. Its one
+wrapper, `sys::poll`, is pinned whole: one or two descriptors, each a
+`PollFd` built only by `PollFd::new` from a `BorrowedFd` of a line the
+caller holds, events `POLLIN`, or `POLLIN` with `POLLOUT` for a line with
+queued bytes, composed there and nowhere else, a timeout of -1, and the
+kernel's 8-byte `struct pollfd` (an `int` descriptor and two `short`s,
+`#[repr(C)]`) pinned by a size check as the termios length is, since the
+kernel writes `revents` back through that pointer. More than two
+descriptors, or none, never reach the kernel. `term::wait` is its one
+caller, resuming an interrupted wait, so `secretline.rs` still names
+nothing in `sys`. A `POLLHUP` reads as input whatever comes with it (a
+hung-up terminal reports `POLLERR` beside it), so a hang-up is end of
+input; `POLLERR` or `POLLNVAL` without it drops the line.
 
 The selector initramfs links it, and nothing else does: the installed
 selector's recovery flow runs it once per entry as td-boot's child and
 reads its line from the pipe (`td-install/ENCRYPTION.md` "Selector
 release"); the live selector, the same stock initramfs, never runs it,
 and the image's shape check refuses it in the deployment initramfs or
-the root. Its one operand is the prompt, 1 to 128
-printable ASCII bytes. It refuses a stdout that is not a pipe (a named FIFO
-is one; a socket, terminal or file is not), then opens `/dev/console`, the
-kernel's console, `O_NOCTTY`. `term::echo_off` patches the kernel's own
-bytes: it clears `ECHO`, `ECHONL`, `ISIG` (as glibc's `getpass` does, so
-`^C`, `^\` and `^Z` are input rather than signals that could kill or stop it
-with echo off), `IEXTEN` (so `^V` cannot quote a newline into a record) and
-`EXTPROC` (as getty clears it, so n_tty itself assembles the record),
-sets `ICANON` so the line discipline keeps its erase and kill keys, sets
-`ICRNL` and clears `IGNCR` and `INLCR` so a serial CR ends the record, and
-disables `VEOL` and `VEOL2`. It applies that with `TCSETS` and reads back
-the whole buffer, then applies it again with `TCSETSF`, which discards input
-that arrived before or during the switch, and reads it back again; only then
-is the prompt written, and nothing is read unless the kernel agreed. Input
-arriving after the flush and before the prompt is not echoed but is read.
-`TCSETSF` flushes input and then waits for pending output to drain, so that
-window lasts the drain: on a serial console with an output backlog, as long
-as the backlog takes to send. One read takes one whole canonical record into a
-heap buffer of 4096 bytes, n_tty's `N_TTY_BUF_SIZE`: n_tty holds at most
-4095 bytes of an unterminated line and still admits its newline, so no
-record is longer and none is ever drained. A record of at most 256 bytes and
-its newline, with no other newline, is the line; a longer one, or one with a
-newline inside, is refused whole with its own exit status, consuming nothing
-after it; one without a newline ended at `^D`, and like an empty read it
-ends input with a third status. On every path after echo went off
-`term::restore` writes the saved bytes back with `TCSETS` and requires an
-exact readback, and then the console gets a newline, so a flow-controlled
-line that blocks it does so with echo back on; only after the restore is the
-line written to the pipe, in one write, and the buffer is zeroed on every
-path. `term.rs` remains the only caller of the three termios wrappers,
-through its `Termios` trait, whose kernel implementation is the one place
-they are named; the applet's tests drive the ordering through a scripted
-implementation and the canonical reading through a real pseudo-terminal,
-opened through td-ui's PTY requests (§19) as a test-only dependency because
-this roster has none. The confinement tests pin that `secretline.rs` names
-nothing in `sys` and writes its line only to the duplicated pipe. Residuals:
-zeroing is best effort in safe Rust, the kernel's tty and pipe buffers keep
-their own copies, and with no signal handler on this surface a signal sent
-from elsewhere that kills the applet while echo is off leaves the console
-silent until something sets it again, in the selector at most until `kexec`
-or reset.
-
-Planned, not current: `td-install/ENCRYPTION.md` increment 7 ("Keyboard
-console") puts secret-line on two fixed lines, `/dev/console` and the
-first virtual terminal, `/dev/tty1`, opened `O_NONBLOCK` so that no
-write waits on a line stopped by flow control, and needs these changes
-here, which its secret-line commit makes in this section, current from
-then. `poll(2)` becomes the ELEVENTH syscall: in one loop the applet
-waits for the first line to complete a canonical record and finishes
-each line's queued prompt bytes as the line accepts them. Its one
-wrapper is pinned whole: at most two descriptors, each a line the
-applet holds, events `POLLIN`, or `POLLIN` with `POLLOUT` for a line
-with queued bytes and nothing else, a timeout of -1, and the kernel's
-8-byte `struct pollfd` (an `int` descriptor and two `short`s) pinned by
-a size check as the termios length is, since the kernel writes `revents` back
-through that pointer. `TCFLSH` (0x540b) with `TCIFLUSH` (0) becomes a
-pinned request, its argument fixed by the wrapper: a non-draining input
-flush. It replaces `TCSETSF`, whose drain would hold the applet on a
-stopped line: echo-off becomes `TCSETS` with its readback and then that
-flush, and the restore of every line the applet did not read is
-`TCSETS` with its readback and then that flush, which discards what was
-typed there with echo off. `TCSETSF` then has no caller and leaves the
-roster, so it stays at six requests. Both new wrappers' one caller is
-the applet, through `term.rs` as the termios wrappers are, so
-`secretline.rs` still names nothing in `sys`. Which terminal
-`/dev/console` is comes from `/sys/class/tty/console/active`, read with
-std, never from an ioctl (`TIOCGDEV` stays off the roster), and termios
-is saved once per distinct terminal. The implementing commit also
-corrects `td-init/src/getty.rs`'s `drain` comment, which calls `TCFLSH`
-"a FIFTH ioctl request" its own amendment would add: `TCFLSH` is then
-pinned and `TCSETSF` gone, and the six requests stay six.
+the root. Its one operand is the prompt, 1 to 128 printable ASCII bytes,
+and it takes no device operand. It refuses a stdout that is not a pipe
+(a named FIFO is one; a socket, terminal or file is not), then chooses
+its lines: `/dev/console`, which the selector's built-in command line
+makes the serial console, and `/dev/tty1`, the first virtual terminal,
+unless `/sys/class/tty/console/active`, read with std through td-init's
+`console.rs` (which td-boot includes too), says `/dev/console` is the VT
+or cannot be read or parsed, when `/dev/console` alone is the one line.
+Each is opened read-write, `O_NOCTTY` and `O_NONBLOCK`. Every line's
+settings are saved before any changes, so two names for one terminal
+could never save silenced settings. Then, serial first, `term::silence`
+patches the kernel's own bytes: it clears `ECHO`, `ECHONL`, `ISIG` (as
+glibc's `getpass` does, so `^C`, `^\` and `^Z` are input rather than
+signals that could kill or stop it with echo off), `IEXTEN` (so `^V`
+cannot quote a newline into a record) and `EXTPROC` (as getty clears it,
+so n_tty itself assembles the record), sets `ICANON` so the line
+discipline keeps its erase and kill keys, sets `ICRNL` and clears
+`IGNCR` and `INLCR` so a serial CR ends the record, and disables `VEOL`
+and `VEOL2`. It applies that with `TCSETS`, reads back the whole buffer,
+then flushes input with `TCFLSH`, discarding what was typed before; a
+line that cannot be opened or saved is skipped untouched, one that
+cannot be set or read back is restored, flushed and skipped, each with a
+note to the line that remains, and with none left the applet fails. Only
+then is the prompt queued on each line and written non-blocking: a write
+that would block, is interrupted or is short leaves the rest for
+`POLLOUT`, a write failing with `EIO`, `ENXIO` or `EBADF` drops the line
+(restored, flushed, noted), and any other write error or a write taking
+nothing abandons that line's queue. One read takes one whole canonical
+record from the first line `poll` reports readable, the serial line on a
+tie, into a heap buffer of 4096 bytes, n_tty's `N_TTY_BUF_SIZE`: n_tty
+holds at most 4095 bytes of an unterminated line and still admits its
+newline, so no record is longer and none is ever drained. A record of at
+most 256 bytes and its newline, with no other newline, is the line; a
+longer one, or one with a newline inside, is refused whole with its own
+exit status, consuming nothing after it; one without a newline ended at
+`^D` or a hang-up, and like an empty read it ends input with a third
+status. On every path after echo went off `term::restore` writes each
+line's saved bytes back with `TCSETS` and requires an exact readback,
+every line, the one read included, is then flushed with `TCFLSH`, so no
+unechoed digits stay queued there, a restore that fails never skipping
+its flush, and each line gets one non-blocking attempt at a newline,
+never waited on; only after every restore and flush is the line written
+to the pipe, in one write, and the buffer is zeroed on every path. A
+hang-up is end of input's status 3 unless the hung-up line then refuses
+its restore, as a `vhangup`ed terminal answers `EIO`, which makes it 1
+(a pseudo-terminal whose master closed can still take the restore);
+td-boot halts on either. `term.rs` remains the only caller of the
+termios, flush and poll wrappers, through its `Termios` trait and
+`wait`, whose kernel implementations are the one place they are named;
+the applet's tests drive the two-line order through scripted lines and
+the canonical reading, both lines, a stopped line and its resumption
+through real pseudo-terminals, opened through td-ui's PTY requests (§19)
+as a test-only dependency because this roster has none. The confinement
+tests pin that `secretline.rs` names nothing in `sys`, opens its two
+fixed names with exactly those flags, saves before it silences, restores
+before it flushes, and writes its line only to the duplicated pipe.
+Residuals: zeroing is best effort in safe Rust, the kernel's tty and
+pipe buffers keep their own copies, and with no signal handler on this
+surface a signal sent from elsewhere that kills the applet while echo is
+off leaves its lines silent until something sets them again, in the
+selector at most until `kexec` or reset.
 
 `TCGETS`/`TCSETS` arrived with the `getty` applet, which is what took the
 LAST busybox name off the image — the tty setup half of the login chain,
@@ -527,7 +544,7 @@ Deliberately NOT in that surface:
 the mount as util-linux and busybox do), `fork`/`execve` (`Command` plus
 the safe `CommandExt::exec` cover both), `dup2` (`Stdio::from(File)` wires
 the console), and any signal handler — which is why td's init supports no
-`ctrlaltdel`, `shutdown` or `restart` inittab action. An ELEVENTH syscall,
+`ctrlaltdel`, `shutdown` or `restart` inittab action. A TWELFTH syscall,
 a new `MS_*` bit, or a second scoped `#[allow]` is an amendment here;
 `td-init/src/main.rs`'s confinement tests assert all three against the
 crate's own source, since the compiler alone cannot.

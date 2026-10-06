@@ -1426,16 +1426,14 @@ keyboard console is no longer deferred: increment 7 specifies it
 (ENCRYPTION.md "Keyboard console"). The kernel carries the firmware
 framebuffer (simpledrm over sysfb's simple-framebuffer) and the prefix's
 `console=tty0`, so a UEFI GOP display shows the kernel's messages even
-where td has no driver for it. td-boot's lines mirrored to the VT, the
-recovery prompt on both consoles, and an installer that encrypts only
-where the live system shows a keyboard console ("Activation") remain
-increment 7's target; until those commits land, the selector's prompts
-are on the serial line alone. What stays deferred is a display with
-neither a UEFI GOP framebuffer nor a td driver, a keyboard td's kernel
-has no driver for (USB keyboards on ports served by OHCI or UHCI
-controllers, companions included, and I2C-HID and Bluetooth keyboards),
-keymaps other than US on the VT, and a
-console policy for the running system's own text greeter, which stays
+where td has no driver for it. td-boot's lines are mirrored to the VT
+and the recovery prompt is offered on both consoles; an installer that
+encrypts only where the live system shows a keyboard console
+("Activation") remains increment 7's target. What stays deferred is a
+display with neither a UEFI GOP framebuffer nor a td driver, a keyboard
+td's kernel has no driver for (USB keyboards on ports served by OHCI or
+UHCI controllers, companions included, and I2C-HID and Bluetooth
+keyboards), keymaps other than US on the VT, and a console policy for the running system's own text greeter, which stays
 on `ttyS0`, so a machine without a serial port has none.
 Each kernel entry prepends the built-in prefix; selector-to-deployment
 kexec therefore adds a second copy. The current short profile arguments

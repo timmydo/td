@@ -185,10 +185,11 @@ fn claim(tty: &File, path: &str) -> Result<(), String> {
 /// Bytes typed at a console during boot — or left by a session that died
 /// mid-line — are delivered to whatever reads next, and what reads next here is
 /// a shell that was auto-logged-in. They would arrive as COMMANDS. A complete
-/// flush is `TCFLSH`, a FIFTH ioctl request and so its own reviewed amendment;
-/// this is what the four already on the roster can do, and it is bounded rather
-/// than complete: in canonical mode the line discipline hands over whole lines,
-/// so a PARTIAL line still sitting in its buffer survives and completes when the
+/// flush is `TCFLSH`, which is on the roster for secret-line alone, reached
+/// only through `term.rs`'s secret-line path; giving getty a caller is its own
+/// reviewed amendment. This is what getty's own requests can do, and it is
+/// bounded rather than complete: in canonical mode the line discipline hands
+/// over whole lines, so a PARTIAL line still sitting in its buffer survives and completes when the
 /// operator next presses Enter. Reading is capped so a device with something
 /// permanently ready cannot spin here instead of starting the session.
 fn drain(tty: &File) {

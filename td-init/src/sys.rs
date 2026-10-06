@@ -13,13 +13,15 @@
 //! — then compiles. `main.rs`'s confinement tests are what close that, and they
 //! are the durable enforcement here.
 //!
-//! The amended surface is exactly the ten syscalls below, one per boot-glue
-//! applet requirement that safe `std` does not expose. An ELEVENTH is a reviewed
+//! The amended surface is exactly the eleven syscalls below, one per boot-glue
+//! applet requirement that safe `std` does not expose. A TWELFTH is a reviewed
 //! amendment, not an edit; `main.rs`'s confinement test asserts the roster.
 //! `ioctl(2)` is the one with SIX permitted requests — `TIOCSCTTY` for
 //! cttyhack and getty, `LOOP_SET_FD` for losetup, `TCGETS`/`TCSETS` for the
-//! line settings getty applies, `TCSETSF` for secret-line's echo-off, plus
-//! BLKRRPART for partition rereads. Each is
+//! line settings getty applies and secret-line silences and restores,
+//! `TCFLSH` for secret-line's input flush, plus BLKRRPART for partition
+//! rereads. `poll(2)`, the eleventh, is secret-line's wait over its lines.
+//! Each request is
 //! pinned by value and checked against the roster by the one `ioctl` entry
 //! point below, so widening it is as reviewable as adding a syscall.
 //! Notably absent: `pivot_root(2)` (it fails on the initramfs rootfs, so
@@ -30,13 +32,15 @@
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::marker::PhantomData;
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::ptr;
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 compile_error!("td-init is x86_64-linux only (raw syscall ABI)");
 
-// The amended ten (x86_64 syscall numbers).
+// The amended eleven (x86_64 syscall numbers).
+const SYS_POLL: usize = 7;
 const SYS_IOCTL: usize = 16;
 const SYS_MKNOD: usize = 133;
 const SYS_WAIT4: usize = 61;
@@ -261,8 +265,8 @@ const LOOP_SET_FD: usize = 0x4c00;
 const TCGETS: usize = 0x5401;
 const TCSETS: usize = 0x5402;
 const BLKRRPART: usize = 0x125f;
-const TCSETSF: usize = 0x5404;
-const IOCTL_REQUESTS: [usize; 6] = [TIOCSCTTY, LOOP_SET_FD, TCGETS, TCSETS, BLKRRPART, TCSETSF];
+const TCFLSH: usize = 0x540b;
+const IOCTL_REQUESTS: [usize; 6] = [TIOCSCTTY, LOOP_SET_FD, TCGETS, TCSETS, BLKRRPART, TCFLSH];
 
 /// The only path to `ioctl(2)` in this crate. `request` is checked against the
 /// roster before the syscall, so an unlisted number cannot reach the kernel even
@@ -353,13 +357,83 @@ pub fn termios_set(fd: RawFd, termios: &[u8; TERMIOS_LEN]) -> io::Result<()> {
     ioctl(fd, TCSETS, termios.as_ptr() as usize)
 }
 
-/// `ioctl(fd, TCSETSF, &termios)` — apply line settings once pending output
-/// has drained, discarding pending INPUT. secret-line's echo-off alone uses it:
-/// whatever was typed before its prompt was echoed under the old settings, and
-/// discarding it is the point, so a key typed early is neither shown and then
-/// kept nor joined to the entry.
-pub fn termios_set_flush(fd: RawFd, termios: &[u8; TERMIOS_LEN]) -> io::Result<()> {
-    ioctl(fd, TCSETSF, termios.as_ptr() as usize)
+/// `TCFLSH`'s argument, and the only value of it this crate may pass:
+/// `TCIFLUSH`, the input queue. Output is never discarded, and nothing waits
+/// for it to drain, so a line stopped by flow control cannot hold the call.
+const TCIFLUSH: usize = 0;
+
+/// `ioctl(fd, TCFLSH, TCIFLUSH)` — discard the line's pending INPUT, typed
+/// and not yet read, partial line included. secret-line alone uses it: after
+/// echo goes off, so a key typed before its prompt is neither kept nor joined
+/// to the entry, and after each line's restore, attempted even when that
+/// restore failed, so no unechoed digits stay queued for a later reader.
+pub fn termios_flush_input(fd: RawFd) -> io::Result<()> {
+    ioctl(fd, TCFLSH, TCIFLUSH)
+}
+
+// ── secret-line's wait ──────────────────────────────────────────────────────
+
+/// `poll(2)` events this crate may ask for, and the ones the kernel may
+/// answer with beside them.
+pub const POLLIN: i16 = 0x1;
+pub const POLLOUT: i16 = 0x4;
+pub const POLLERR: i16 = 0x8;
+pub const POLLHUP: i16 = 0x10;
+pub const POLLNVAL: i16 = 0x20;
+
+/// The kernel's `struct pollfd`: an `int` descriptor, then `events` and
+/// `revents`, two `short`s. The kernel writes `revents` back through the
+/// pointer, so the size is pinned as `TERMIOS_LEN` is. The descriptor is
+/// borrowed from a line the caller holds for as long as the entry lives, and
+/// the events are composed here alone: `POLLIN`, or `POLLIN` with `POLLOUT`.
+#[repr(C)]
+pub struct PollFd<'a> {
+    fd: i32,
+    events: i16,
+    revents: i16,
+    line: PhantomData<BorrowedFd<'a>>,
+}
+
+pub const POLLFD_LEN: usize = 8;
+const _: () = assert!(POLLFD_LEN == 4 + 2 + 2);
+const _: () = assert!(std::mem::size_of::<PollFd<'static>>() == POLLFD_LEN);
+
+impl<'a> PollFd<'a> {
+    /// Ask `POLLIN` of `line`, with `POLLOUT` when it has queued bytes.
+    pub fn new(line: BorrowedFd<'a>, queued: bool) -> PollFd<'a> {
+        PollFd {
+            fd: line.as_raw_fd(),
+            events: if queued { POLLIN | POLLOUT } else { POLLIN },
+            revents: 0,
+            line: PhantomData,
+        }
+    }
+
+    /// What the kernel answered for this line.
+    pub fn revents(&self) -> i16 {
+        self.revents
+    }
+}
+
+/// secret-line holds at most two lines.
+const POLL_LINES: usize = 2;
+/// `poll(2)`'s timeout: wait until a line is ready, however long.
+const NO_TIMEOUT: usize = -1isize as usize;
+
+/// `poll(lines, n, -1)` over one or two lines.
+pub fn poll(fds: &mut [PollFd<'_>]) -> io::Result<usize> {
+    if fds.is_empty() || fds.len() > POLL_LINES {
+        return Err(io::Error::from_raw_os_error(EINVAL));
+    }
+    check(syscall5(
+        SYS_POLL,
+        fds.as_mut_ptr() as usize,
+        fds.len(),
+        NO_TIMEOUT,
+        0,
+        0,
+    ))
+    .map(|n| n as usize)
 }
 
 // ── init's reaper ───────────────────────────────────────────────────────────
@@ -489,11 +563,53 @@ mod tests {
             Some(ENOTTY),
             "the write did not reach the kernel"
         );
-        let flush = termios_set_flush(fd, &buf).unwrap_err();
+        let flush = termios_flush_input(fd).unwrap_err();
         assert_eq!(
             flush.raw_os_error(),
             Some(ENOTTY),
-            "the flushing write did not reach the kernel"
+            "the input flush did not reach the kernel"
+        );
+    }
+
+    /// The wait reaches the kernel and reads `revents` back through the
+    /// pinned layout: a pipe with a byte in it is readable, an empty one with
+    /// its writer gone has hung up, and a writable end answers `POLLOUT`.
+    /// More than two lines, or none, never reach the kernel.
+    #[test]
+    fn the_wait_reaches_the_kernel_and_reads_its_answer_back() {
+        use std::io::Write;
+        use std::os::fd::AsFd;
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(b"x").unwrap();
+        let mut fds = [PollFd::new(reader.as_fd(), false)];
+        assert_eq!(poll(&mut fds).unwrap(), 1);
+        assert_eq!(fds[0].revents() & POLLIN, POLLIN);
+        let mut both = [
+            PollFd::new(reader.as_fd(), false),
+            PollFd::new(writer.as_fd(), true),
+        ];
+        assert_eq!(poll(&mut both).unwrap(), 2);
+        assert_eq!(both[1].revents() & POLLOUT, POLLOUT);
+        assert_eq!(
+            both[1].revents() & POLLIN,
+            0,
+            "a write end is never readable"
+        );
+        let (empty, gone) = std::io::pipe().unwrap();
+        drop(gone);
+        let mut hung = [PollFd::new(empty.as_fd(), false)];
+        assert_eq!(poll(&mut hung).unwrap(), 1);
+        assert_eq!(hung[0].revents() & POLLHUP, POLLHUP);
+        let mut three = [
+            PollFd::new(reader.as_fd(), false),
+            PollFd::new(reader.as_fd(), false),
+            PollFd::new(reader.as_fd(), false),
+        ];
+        assert_eq!(poll(&mut three).unwrap_err().raw_os_error(), Some(22));
+        assert_eq!(poll(&mut []).unwrap_err().raw_os_error(), Some(22));
+        assert_eq!(
+            (POLLFD_LEN, std::mem::align_of::<PollFd<'static>>()),
+            (8, 4)
         );
     }
 

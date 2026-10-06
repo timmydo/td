@@ -14,8 +14,9 @@ use crate::types::{Recipe, Step};
 // chroot), `mount`/`umount` (mount + umount2), `cttyhack` (setsid + TIOCSCTTY),
 // `getty` (both of those plus TCGETS/TCSETS — the last busybox name on the image),
 // `losetup` (ioctl LOOP_SET_FD), `mknod` (mknod), `devpts` (no syscall of its own
-// — it mounts through the `mount` applet), and `hostname` (sethostname,
-// the `-F` flag uutils lacks). That is the complement of td-util,
+// — it mounts through the `mount` applet), `hostname` (sethostname,
+// the `-F` flag uutils lacks), and `secret-line` (TCGETS/TCSETS, TCFLSH and
+// poll over the console and the first VT). That is the complement of td-util,
 // which covers the applets safe `std` already reaches and is
 // `#![forbid(unsafe_code)]` as a result. The crate confines its `unsafe` to one
 // `syscall5` body under a scoped `#[allow]` beneath a crate-level `deny` — the
@@ -61,6 +62,7 @@ const MAIN_RS: &str = include_str!("../../../td-init/src/main.rs");
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
+    ("console", include_str!("../../../td-init/src/console.rs")),
     ("cttyhack", include_str!("../../../td-init/src/cttyhack.rs")),
     ("devpts", include_str!("../../../td-init/src/devpts.rs")),
     ("devt", include_str!("../../../td-init/src/devt.rs")),

@@ -8,11 +8,13 @@
 //! (`setsid(2)` + `TIOCSCTTY`), `init` (`wait4(2)`), and `hostname`
 //! (`sethostname(2)` — the `-F` flag uutils lacks).
 //!
-//! `secret-line` reads one line from `/dev/console` with echo off for the
-//! selector's recovery-key entry, through the `TCGETS`/`TCSETS` pair `getty`
-//! already uses and `TCSETSF`, which discards what was typed before its
-//! prompt; the selector initramfs alone links it, for the installed
-//! selector's recovery flow.
+//! `secret-line` reads one line with echo off for the selector's recovery-key
+//! entry, from `/dev/console` and, when that is not the VT, `/dev/tty1`,
+//! whichever completes an entry first: through the `TCGETS`/`TCSETS` pair
+//! `getty` already uses, `TCFLSH`, which discards what was typed before its
+//! prompt, and `poll(2)`, which waits on both lines at once. The selector
+//! initramfs alone links it, for the installed selector's recovery flow.
+//! `console` tells which terminal `/dev/console` is; td-boot includes it too.
 //!
 //! `devpts` is the one applet here that needs no syscall of its own: it mounts
 //! through the `mount` applet's own argv, and lives here rather than in td-util
@@ -24,7 +26,7 @@
 //! to `sys.rs` — one `syscall5` body under a scoped `#[allow]`. That is the THIRD
 //! target-side unsafe exception UNSAFE.md records, after td-kexec and td-netd.
 //! The `deny` above is the first line of that, not the last: `mod confinement`
-//! below is what actually holds the surface to ten syscalls and one asm body,
+//! below is what actually holds the surface to eleven syscalls and one asm body,
 //! because a lint level can be demoted and the compiler cannot count syscalls.
 //!
 //! Dispatch is on argv[0]'s basename, the busybox/uutils convention, so a
@@ -32,6 +34,7 @@
 //! `/sbin/init` the kernel execs. An explicit `td-init <applet> [args]` form
 //! covers the un-symlinked case.
 
+mod console;
 mod cttyhack;
 mod devpts;
 mod devt;
@@ -517,6 +520,7 @@ mod confinement {
         ("SYS_IOCTL", "16"),
         ("SYS_MKNOD", "133"),
         ("SYS_MOUNT", "165"),
+        ("SYS_POLL", "7"),
         ("SYS_REBOOT", "169"),
         ("SYS_SETHOSTNAME", "170"),
         ("SYS_SETSID", "112"),
@@ -553,8 +557,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            16,
-            "expected sixteen modules beside the crate root"
+            17,
+            "expected seventeen modules beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model,
@@ -582,12 +586,13 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_seventeen_scanned_modules() {
+    fn src_holds_exactly_the_eighteen_scanned_modules() {
         let scan::Tree { rs, other } = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             paths,
             [
+                "console.rs",
                 "cttyhack.rs",
                 "devpts.rs",
                 "devt.rs",
@@ -747,7 +752,7 @@ mod confinement {
     /// and call-site assertion here still green. Squeezed, position on a line
     /// stops existing.
     #[test]
-    fn the_syscall_surface_is_the_amended_ten() {
+    fn the_syscall_surface_is_the_amended_eleven() {
         const DECL: &str = concat!("const", "SYS_");
         let sys = squeeze(&source("sys.rs"));
         let mut declared = Vec::new();
@@ -813,7 +818,6 @@ mod confinement {
     /// THREE mentions each since the roster moved into the code: the
     /// declaration, the `IOCTL_REQUESTS` entry the entry point checks against,
     /// and the one wrapper that issues it. A fourth is a second binding.
-    /// `TCSETS` is a prefix of `TCSETSF`, so its count excludes those.
     #[test]
     fn no_ioctl_request_can_be_shadowed() {
         let sys = code_only(&source("sys.rs"));
@@ -823,12 +827,9 @@ mod confinement {
             "TCGETS",
             "TCSETS",
             "BLKRRPART",
-            "TCSETSF",
+            "TCFLSH",
         ] {
-            let mut mentions = sys.matches(request).count();
-            if request == "TCSETS" {
-                mentions -= sys.matches("TCSETSF").count();
-            }
+            let mentions = sys.matches(request).count();
             assert_eq!(
                 mentions, 3,
                 "{request} is declared once, listed once and used once; \
@@ -845,9 +846,10 @@ mod confinement {
     /// the numbers is half of it; the other half is that they are checked
     /// BEFORE the syscall, which is what makes a seventh request an edit to
     /// this array rather than a new call site somebody has to notice. `TCSETS`
-    /// mistyped as `0x5404` is `TCSETSF`, which DISCARDS pending input: on
-    /// the roster since secret-line, so the array alone cannot tell them apart
-    /// and only the value pins and the wrapper pins below can.
+    /// mistyped as `0x5404` is `TCSETSF`, which waits for output to drain and
+    /// then DISCARDS pending input: secret-line's flush is `TCFLSH` instead,
+    /// which waits on nothing, so `TCSETSF` left the roster and is refused
+    /// below by name.
     #[test]
     fn the_ioctl_requests_are_the_amended_six() {
         let sys = squeeze(&code_only(&source("sys.rs")));
@@ -857,7 +859,7 @@ mod confinement {
             "constTCGETS:usize=0x5401;",
             "constTCSETS:usize=0x5402;",
             "constBLKRRPART:usize=0x125f;",
-            "constTCSETSF:usize=0x5404;",
+            "constTCFLSH:usize=0x540b;",
         ] {
             assert_eq!(
                 sys.matches(decl).count(),
@@ -867,7 +869,7 @@ mod confinement {
         }
         assert_eq!(
             sys.matches(
-                "constIOCTL_REQUESTS:[usize;6]=[TIOCSCTTY,LOOP_SET_FD,TCGETS,TCSETS,BLKRRPART,TCSETSF];"
+                "constIOCTL_REQUESTS:[usize;6]=[TIOCSCTTY,LOOP_SET_FD,TCGETS,TCSETS,BLKRRPART,TCFLSH];"
             )
             .count(),
             1,
@@ -879,10 +881,12 @@ mod confinement {
             "the ioctl entry point must refuse an off-roster request before issuing it"
         );
         // The refused neighbours, absent from the file entirely: `TCSETSW`
-        // waits on terminal output another process may own, `TIOCSWINSZ`
-        // resizes an operator's terminal, and `TIOCSTI` injects input into one
-        // — the classic escape from a restricted session.
-        for refused in ["TCSETSW", "TIOCSWINSZ", "TIOCSTI"] {
+        // and `TCSETSF` wait on terminal output another process may own or
+        // flow control may hold, `TIOCSWINSZ` resizes an operator's terminal,
+        // `TIOCSTI` injects input into one — the classic escape from a
+        // restricted session — and `TIOCGDEV`, which would name the terminal
+        // behind `/dev/console`, is read from sysfs instead.
+        for refused in ["TCSETSW", "TCSETSF", "TIOCSWINSZ", "TIOCSTI", "TIOCGDEV"] {
             assert_eq!(
                 sys.matches(refused).count(),
                 0,
@@ -891,7 +895,7 @@ mod confinement {
         }
     }
 
-    /// All ten calls, pinned WHOLE — every register, not just the selector.
+    /// All eleven calls, pinned WHOLE — every register, not just the selector.
     ///
     /// `every_syscall_call_site_uses_a_named_constant` reads argument ONE and
     /// stops. The other five are where the amendment's restrictions actually
@@ -919,6 +923,7 @@ mod confinement {
             "(SYS_MKNOD,path.as_ptr()asusize,mode,dev,0,0)",
             "(SYS_IOCTL,fdasusize,request,arg,0,0)",
             "(SYS_WAIT4,PID_ANY,ptr::addr_of_mut!(status)asusize,opts,0,0,)",
+            "(SYS_POLL,fds.as_mut_ptr()asusize,fds.len(),NO_TIMEOUT,0,0,)",
         ];
         // One pin per SYSCALL now: the six ioctl requests share a single entry
         // point, so what each one passes is pinned at its wrapper instead —
@@ -945,8 +950,9 @@ mod confinement {
     /// this is where "restricted to these six" becomes a claim about what is
     /// actually issued. The arguments matter as much as the requests:
     /// `TIOCSCTTY` reads its third register as the STEAL flag, `LOOP_SET_FD`
-    /// reads it as a descriptor, and the three termios calls read it as a
-    /// pointer the kernel copies 36 bytes through.
+    /// reads it as a descriptor, the two termios calls read it as a pointer
+    /// the kernel copies 36 bytes through, and `TCFLSH` as the queue to
+    /// discard, pinned to the input queue alone.
     #[test]
     fn the_ioctl_wrappers_pass_the_request_they_are_named_for() {
         const CALLS: &[&str] = &[
@@ -955,7 +961,7 @@ mod confinement {
             "ioctl(fd,TCGETS,out.as_mut_ptr()asusize)",
             "ioctl(fd,TCSETS,termios.as_ptr()asusize)",
             "ioctl(device.as_raw_fd(),BLKRRPART,0)",
-            "ioctl(fd,TCSETSF,termios.as_ptr()asusize)",
+            "ioctl(fd,TCFLSH,TCIFLUSH)",
         ];
         let sys = squeeze(&source("sys.rs"));
         for call in CALLS {
@@ -1131,7 +1137,12 @@ mod confinement {
             // property of that one module, so it has to be the only one.
             (concat!("sys::", "termios_get"), &["term.rs"][..]),
             (concat!("sys::", "termios_set"), &["term.rs"][..]),
-            (concat!("sys::", "termios_set_flush"), &["term.rs"][..]),
+            (concat!("sys::", "termios_flush_input"), &["term.rs"][..]),
+            // The wait passes the kernel a pointer it writes `revents` back
+            // through; `term.rs` composes it from lines secret-line holds.
+            (concat!("sys::", "poll"), &["term.rs"][..]),
+            (concat!("sys::", "PollFd"), &["term.rs"][..]),
+            (concat!("sys::", "POLL"), &["term.rs"][..]),
             // Claiming a terminal decides which session can be signalled from a
             // keyboard. Two applets do it, for opposite reasons — cttyhack
             // degrades without one, getty refuses to continue.
@@ -1312,7 +1323,7 @@ mod confinement {
                 .collect();
             assert!(
                 AMENDED.iter().any(|(name, _)| *name == selector),
-                "called with '{selector}', which is not one of the amended ten"
+                "called with '{selector}', which is not one of the amended eleven"
             );
             // The constant must BE the argument, not the start of an expression:
             // `SYS_REBOOT - 130` selects getpid(2) while spelling an audited
@@ -1338,15 +1349,15 @@ mod confinement {
             "each amended syscall is issued exactly once"
         );
         // One call per wrapper: reboot, sync, mount, umount2, chroot,
-        // sethostname, setsid, ioctl, wait4.
-        assert_eq!(sites, 10, "expected exactly ten call sites");
+        // sethostname, setsid, mknod, ioctl, wait4, poll.
+        assert_eq!(sites, 11, "expected exactly eleven call sites");
         // ...and the definition, and NOTHING else. The loop skips any mention
         // not followed by `(`, which is the function ITEM: bind it once and
         // every later call goes through a name this scan does not know.
         assert_eq!(
             mentions,
             sites + 1,
-            "mentioned somewhere that is not one of the ten calls or its definition"
+            "mentioned somewhere that is not one of the eleven calls or its definition"
         );
     }
 
@@ -1372,13 +1383,19 @@ mod confinement {
         assert!(applet.contains("letopened=file.metadata()?;if!opened.file_type().is_block_device()||(before.dev(),before.ino(),before.rdev())!=(opened.dev(),opened.ino(),opened.rdev())"));
     }
 
-    /// `secret-line` reaches the terminal only through `term.rs`, whose
+    /// `secret-line` reaches its lines only through `term.rs`, whose
     /// readback refuses to read under echo, and its secret has one sink: the
     /// duplicated pipe. A `sys::` reach would skip the readback; std's stdout
     /// (`emit`, the print macros) keeps an unzeroed buffer and writes to
-    /// whatever stdout is, pipe or not.
+    /// whatever stdout is, pipe or not. Its lines are the two fixed names,
+    /// opened `O_NOCTTY|O_NONBLOCK`, and its session runs in the specified
+    /// order: every line saved before any is silenced, the prompt queued only
+    /// after, and every line restored, then every line flushed, the one read
+    /// included, before the newline is tried and the entry allowed to stand.
+    /// A failed restore never skips a flush: both go through
+    /// `term::put_back` or `finish`'s separate loops.
     #[test]
-    fn the_secret_line_reaches_the_terminal_through_term_and_writes_one_pipe() {
+    fn the_secret_line_reaches_its_lines_through_term_and_writes_one_pipe() {
         let applet = squeeze(&code_only(&source("secretline.rs")));
         assert_eq!(
             applet.matches(concat!("sys", "::")).count(),
@@ -1386,12 +1403,19 @@ mod confinement {
             "secret-line must reach the terminal through term.rs alone"
         );
         assert!(applet.contains("constCONSOLE:&str=\"/dev/console\";"));
+        assert!(applet.contains("constVT:&str=\"/dev/tty1\";"));
         assert!(applet.contains("constO_NOCTTY:i32=0o400;"));
+        assert!(applet.contains("constO_NONBLOCK:i32=0o4000;"));
+        assert_eq!(applet.matches("OpenOptions::new()").count(), 1);
         assert!(applet.contains(
-            "OpenOptions::new().read(true).write(true).custom_flags(O_NOCTTY).open(CONSOLE)"
+            "OpenOptions::new().read(true).write(true).custom_flags(O_NOCTTY|O_NONBLOCK).open(path)"
         ));
+        assert!(applet.contains("ifconsole.vt_is_second(){&[CONSOLE,VT]}else{&[CONSOLE]}"));
+        assert!(applet.contains("line_names(console::read(Path::new(console::ACTIVE)))"));
         assert!(applet.contains("constLINE_MAX:usize=256;"));
         assert!(applet.contains("constRECORD_MAX:usize=4096;"));
+        assert!(applet.contains("Some(EIO|ENXIO|EBADF)"));
+        assert!(applet.contains("constEIO:i32=5;constENXIO:i32=6;constEBADF:i32=9;"));
         assert_eq!(applet.matches(concat!("io::", "stdout()")).count(), 1);
         assert!(applet.contains(concat!(
             "io::stdout().as_fd().try_clone_to_owned()",
@@ -1406,56 +1430,117 @@ mod confinement {
         ] {
             assert_eq!(applet.matches(sink).count(), 0, "secret-line names {sink}");
         }
-        // The line is written once, after the session restored the console.
-        assert_eq!(applet.matches("line.as_bytes()").count(), 1);
-        let session = applet
-            .split_once("fnsession(")
-            .and_then(|(_, rest)| rest.split_once("fnpiped_stdout"))
-            .map(|(body, _)| body)
-            .unwrap_or_default();
-        let at = |needle: &str| session.match_indices(needle).next().map(|(i, _)| i);
-        let (off, prompt, read, restore, newline) = (
-            at("term::echo_off(console)?;"),
-            at("console.write_out(prompt.as_bytes())"),
-            at("read_line(console,line)"),
-            at("term::restore(console,&saved)"),
-            at("console.write_out(b\"\\n\")"),
+        // The line is written once, after the session restored the lines.
+        assert_eq!(applet.matches("record.as_bytes()").count(), 1);
+        let body = |from: &str, to: &str| {
+            applet
+                .split_once(from)
+                .and_then(|(_, rest)| rest.split_once(to))
+                .map(|(body, _)| body.to_string())
+                .unwrap_or_default()
+        };
+        let at = |text: &str, needle: &str| text.match_indices(needle).next().map(|(i, _)| i);
+        let prepare = body("fnprepare<", "fnno_line(");
+        let (save, silence, prompt) = (
+            at(&prepare, "term::save(&mutline)"),
+            at(&prepare, "term::silence(&mutline,&settings)"),
+            at(&prepare, "line.queue.extend_from_slice(prompt.as_bytes());"),
         );
         assert!(
-            [off, prompt, read, restore, newline]
-                .iter()
-                .all(Option::is_some),
-            "secret-line's session changed shape: {session}"
+            save.is_some() && save < silence && silence < prompt,
+            "save every line, silence each, then queue the prompt: {prepare}"
+        );
+        let finish = body("fnfinish<", "fnpiped_stdout(");
+        let (restore, flush, newline, stands) = (
+            at(&finish, "term::restore(&mutline.line,&line.saved)"),
+            at(&finish, "term::flush(&mutline.line)"),
+            at(&finish, "line.line.write(b\"\\n\")"),
+            at(&finish, "returnentry;"),
         );
         assert!(
-            off < prompt && prompt < read && read < restore && restore < newline,
-            "echo off, prompt, read, restore, newline"
+            restore.is_some() && restore < flush && flush < newline && newline < stands,
+            "restore, flush every line, newline, then the entry: {finish}"
         );
+        assert!(
+            !finish.contains("continue;"),
+            "no line skips its flush: {finish}"
+        );
+        assert!(!applet.contains(".and_then(|()|term::flush("));
+        assert!(applet.contains("term::put_back(&mutgone.line,&gone.saved)"));
     }
 
-    /// `TCSETSF` discards pending input, which is right for exactly one step:
-    /// secret-line's echo-off, so a key typed before its prompt is neither
-    /// kept nor joined to the entry. Its wrapper is reached only through
-    /// `term::Kernel`, and the flushing set is issued once, by `echo_off`;
-    /// getty's settings and every restore stay plain `TCSETS`.
+    /// `TCFLSH` discards pending input and waits on nothing. Its wrapper is
+    /// reached only through `term::Kernel`, and `term::flush` is its one
+    /// caller there, used by `silence` after its readback and by secret-line
+    /// after a restore. getty never flushes this way.
     #[test]
-    fn the_flushing_set_is_secret_lines_echo_off_alone() {
+    fn the_input_flush_is_reached_through_term_alone() {
         let term = squeeze(&code_only(&source("term.rs")));
         assert_eq!(
-            term.matches(concat!("sys::", "termios_set_flush(")).count(),
+            term.matches(concat!("sys::", "termios_flush_input("))
+                .count(),
             1
         );
         assert!(term.contains(concat!(
-            "fnset_flushing(&mutself,termios:&Bytes)->io::Result<()>{",
-            "sys::termios_set_flush(self.fd,termios)}"
+            "fnflush_input(&mutself)->io::Result<()>{",
+            "sys::termios_flush_input(self.fd)}"
         )));
-        assert_eq!(term.matches(".set_flushing(").count(), 1);
-        let echo_off = term
-            .split_once("pubfnecho_off(")
-            .and_then(|(_, rest)| rest.split_once("pubfnrestore("))
-            .map(|(body, _)| body)
-            .unwrap_or_default();
-        assert!(echo_off.contains(".set_flushing(&want)"));
+        assert_eq!(term.matches(".flush_input()").count(), 1);
+        assert!(term.contains("letsilenced=apply(line,&want).and_then(|()|flush(line));"));
+        let getty = squeeze(&code_only(&source("getty.rs")));
+        assert_eq!(getty.matches("flush_input").count(), 0);
+        let sys = squeeze(&code_only(&source("sys.rs")));
+        assert!(sys.contains("constTCIFLUSH:usize=0;"));
+        assert_eq!(
+            sys.matches("TCIFLUSH").count(),
+            2,
+            "the flush's argument is declared once and used once"
+        );
+    }
+
+    /// `poll(2)`'s one wrapper, pinned whole: one or two descriptors, each
+    /// borrowed from a line the caller holds, events composed here alone as
+    /// `POLLIN` or `POLLIN|POLLOUT`, no timeout, and the kernel's 8-byte
+    /// `struct pollfd`, which it writes `revents` back through, pinned by
+    /// size as `TERMIOS_LEN` is. `term::wait` is its one caller.
+    #[test]
+    fn the_wait_is_pinned_whole() {
+        let sys = squeeze(&code_only(&source("sys.rs")));
+        for pinned in [
+            "pubconstPOLLIN:i16=0x1;",
+            "pubconstPOLLOUT:i16=0x4;",
+            "pubconstPOLLERR:i16=0x8;",
+            "pubconstPOLLHUP:i16=0x10;",
+            "pubconstPOLLNVAL:i16=0x20;",
+            "#[repr(C)]pubstructPollFd<'a>{fd:i32,events:i16,revents:i16,line:PhantomData<BorrowedFd<'a>>,}",
+            "pubconstPOLLFD_LEN:usize=8;",
+            "const_:()=assert!(POLLFD_LEN==4+2+2);",
+            "const_:()=assert!(std::mem::size_of::<PollFd<'static>>()==POLLFD_LEN);",
+            "pubfnnew(line:BorrowedFd<'a>,queued:bool)->PollFd<'a>{PollFd{fd:line.as_raw_fd(),events:ifqueued{POLLIN|POLLOUT}else{POLLIN},revents:0,line:PhantomData,}}",
+            "constPOLL_LINES:usize=2;",
+            "constNO_TIMEOUT:usize=-1isizeasusize;",
+            "pubfnpoll(fds:&mut[PollFd<'_>])->io::Result<usize>{iffds.is_empty()||fds.len()>POLL_LINES{returnErr(io::Error::from_raw_os_error(EINVAL));}",
+        ] {
+            assert_eq!(sys.matches(pinned).count(), 1, "the wait changed: {pinned}");
+        }
+        for (name, uses) in [("POLL_LINES", 2), ("NO_TIMEOUT", 2), (",events:", 2)] {
+            assert_eq!(sys.matches(name).count(), uses, "{name}");
+        }
+        let term = squeeze(&code_only(&source("term.rs")));
+        assert_eq!(term.matches(concat!("sys::", "poll(")).count(), 1);
+        assert_eq!(term.matches(concat!("sys::", "PollFd::new(")).count(), 1);
+    }
+
+    /// `console.rs` is compiled into td-boot as well, by `#[path]`: it reads
+    /// sysfs with std and reaches nothing in `sys`.
+    #[test]
+    fn the_console_identity_is_std_alone() {
+        let console = squeeze(&code_only(&source("console.rs")));
+        assert_eq!(console.matches(concat!("sys", "::")).count(), 0);
+        assert_eq!(console.matches(concat!("crate", "::")).count(), 0);
+        assert!(console.contains("pubconstACTIVE:&str=\"/sys/class/tty/console/active\";"));
+        assert!(console.contains("pubconstACTIVE_MAX:usize=4096;"));
+        assert!(console.contains("Some(b\"tty0\"|b\"tty1\")=>Console::Vt,"));
     }
 
     /// The ioctl entry point has EXACTLY the six call sites pinned above, and
