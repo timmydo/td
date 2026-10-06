@@ -10,6 +10,11 @@ pub(crate) enum List {
     Html,
     Attachments,
 }
+#[derive(Clone, Copy)]
+enum Property {
+    List(List),
+    HasAttachment,
+}
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Phase {
     Prepare,
@@ -50,6 +55,7 @@ pub(crate) struct Frame {
     offset: usize,
     after: Phase,
     credit: u8,
+    properties: u8,
 }
 impl Frame {
     pub(crate) fn new(mode: Mode) -> Self {
@@ -65,6 +71,59 @@ impl Frame {
             offset: 0,
             after: Phase::Complete,
             credit: 0,
+            properties: 15,
+        }
+    }
+    pub(crate) fn selected_lists(properties: u8) -> Self {
+        let mut frame = Self::new(Mode::Lists);
+        frame.properties = properties & 15;
+        if frame.properties == 0 {
+            frame.phase = Phase::Complete;
+        }
+        frame
+    }
+    fn next_property(&self, after: Option<List>) -> Option<Property> {
+        let start = match after {
+            None => 0,
+            Some(List::Text) => 1,
+            Some(List::Html) => 2,
+            Some(List::Attachments) => 3,
+        };
+        if start == 0 && self.properties & 1 != 0 {
+            Some(Property::List(List::Text))
+        } else if start <= 1 && self.properties & 2 != 0 {
+            Some(Property::List(List::Html))
+        } else if start <= 2 && self.properties & 4 != 0 {
+            Some(Property::List(List::Attachments))
+        } else if self.properties & 8 != 0 {
+            Some(Property::HasAttachment)
+        } else {
+            None
+        }
+    }
+    fn begin_property(&mut self, source: &impl Source, property: Property, first: bool) {
+        match property {
+            Property::List(list) => {
+                self.list = list;
+                let bytes: &'static [u8] = match (list, first) {
+                    (List::Text, true) => b"\"textBody\":[",
+                    (List::Text, false) => b",\"textBody\":[",
+                    (List::Html, true) => b"\"htmlBody\":[",
+                    (List::Html, false) => b",\"htmlBody\":[",
+                    (List::Attachments, true) => b"\"attachments\":[",
+                    (List::Attachments, false) => b",\"attachments\":[",
+                };
+                self.begin(Bytes::Static(bytes), Phase::ListPrepare);
+            }
+            Property::HasAttachment => self.begin(
+                Bytes::Static(match (first, source.has_attachment()) {
+                    (true, true) => b"\"hasAttachment\":true",
+                    (true, false) => b"\"hasAttachment\":false",
+                    (false, true) => b",\"hasAttachment\":true",
+                    (false, false) => b",\"hasAttachment\":false",
+                }),
+                Phase::Complete,
+            ),
         }
     }
     pub(crate) fn mode(&self) -> Mode {
@@ -115,7 +174,10 @@ impl Frame {
                 Mode::Structure => {
                     self.begin(Bytes::Static(b"\"bodyStructure\":"), Phase::StartPart)
                 }
-                Mode::Lists => self.begin(Bytes::Static(b"\"textBody\":["), Phase::ListPrepare),
+                Mode::Lists => {
+                    let property = self.next_property(None).ok_or(Error::InvalidState)?;
+                    self.begin_property(source, property, true);
+                }
             },
             Phase::StartPart => {
                 let part = source.node(self.index)?;
@@ -210,29 +272,20 @@ impl Frame {
                         .ok_or(Error::InvalidState)?;
                     self.phase = Phase::StartPart;
                 } else {
-                    self.begin(Bytes::Static(b"]"), Phase::NextList);
+                    let after = if self.next_property(Some(self.list)).is_some() {
+                        Phase::NextList
+                    } else {
+                        Phase::Complete
+                    };
+                    self.begin(Bytes::Static(b"]"), after);
                 }
             }
             Phase::NextList => {
                 self.position = 0;
-                match self.list {
-                    List::Text => {
-                        self.list = List::Html;
-                        self.begin(Bytes::Static(b",\"htmlBody\":["), Phase::ListPrepare);
-                    }
-                    List::Html => {
-                        self.list = List::Attachments;
-                        self.begin(Bytes::Static(b",\"attachments\":["), Phase::ListPrepare);
-                    }
-                    List::Attachments => self.begin(
-                        Bytes::Static(if source.has_attachment() {
-                            b",\"hasAttachment\":true"
-                        } else {
-                            b",\"hasAttachment\":false"
-                        }),
-                        Phase::Complete,
-                    ),
-                }
+                let property = self
+                    .next_property(Some(self.list))
+                    .ok_or(Error::InvalidState)?;
+                self.begin_property(source, property, false);
             }
             Phase::Copy => {
                 let length = self.bytes(source)?.len();

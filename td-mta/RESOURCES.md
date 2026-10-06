@@ -2455,6 +2455,24 @@ variants. Earlier 105 intervals remain separate evidence. Native
 allocation, worker stack/RSS, full request admission, selection and
 current authorized publication remain open.
 
+M06eb requested source-bound list selection overlaps original complete
+collection, source/fragments and member cells with the actual descriptor
+and small pure selection. One shared Frame produces only requested keys;
+full-list callers retain prior ALL bytes/turns/fees. Each unfinished
+nonempty turn funds one original step and at most 64 actual wire bytes;
+empty selection freshly admits but generates zero bytes and charges no
+new work. Cursor plus HeaderBudget and 64 output bytes fits 1 KiB;
+Composed fits 768 bytes. These size caps are not whole-ledger/stack proofs.
+Eight sequential Rust allocation intervals cover near-u64 digest textBody
+only, zero-base empty selection, actual-pin copied-prefix expiry,
+completed Cursor/Composed expiry, released Serialized explicit-check
+expiry, wire refusal and constructor pin expiry. Original mapping,
+matching, collection/backing, full verification and file setup stay cold;
+descriptor teardown is counted, pooled view/scratch lease, cell array and
+fixture cleanup stay outside. API §1.133 lists unmeasured variants.
+Earlier 113 intervals remain separate. Native/stack/RSS, full request
+admission, selected retention/routing and current publication remain open.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

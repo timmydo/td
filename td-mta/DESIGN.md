@@ -820,6 +820,16 @@ are sticky; whole output stays provisional through current authenticated
 publication. Only API §1.132's eight allocation intervals are qualified.
 Whole ledger admission, request selection and publication remain later.
 
+M06eb selects requested textBody, htmlBody, attachments and hasAttachment
+members through the same bounded Frame while retaining original complete
+collection and actual file pin. A pure four-boolean selection supplies no
+permission; full-list callers retain their prior ALL behavior and fees.
+Empty selection freshly admits, then completes without output or charge;
+all explicit/final owner boundaries remain fresh. Exclusive selected
+Composed carries selection and original collection through release.
+Only API §1.133's eight allocation intervals are measured. Whole selected
+retention, broader request routing and current publication remain later.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

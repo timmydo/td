@@ -2296,6 +2296,18 @@ Initial independently landable increments:
   Qualify eight enumerated Rust allocation intervals; complete admission,
   request property selection and authenticated publication follow.
 
+- **M06eb — requested source-bound body-list member selection:** keep
+  original complete collection and actual descriptor while selecting
+  textBody/htmlBody/attachments/hasAttachment through one shared Frame.
+  Preserve existing ALL bytes, turns and funding; frame selected keys in
+  canonical order and finish on the final selected copy. Freshly admit
+  empty selection, then complete without bytes/work; keep final owner
+  admissions fresh. Carry selection through exclusive Composed release.
+  Pin all sixteen subsets, original custody, ALL parity/funding,
+  deadlines, quotas and final-copy sticky pin expiry. Qualify eight
+  enumerated allocation intervals; selected retention, broader request
+  routing/bodyProperties and authenticated publication follow.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

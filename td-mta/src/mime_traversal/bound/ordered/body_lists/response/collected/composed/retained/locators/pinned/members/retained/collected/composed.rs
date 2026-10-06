@@ -1,5 +1,6 @@
 //! Original source-bound whole members share the bounded tree/list frame.
 pub mod retained;
+pub mod selected;
 use super::super::super::super::super::Error as OriginalError;
 use super::{Error, Serialized, View};
 use crate::mime_traversal::bound::ordered::body_lists::response::collected::composed::framing::{
@@ -29,14 +30,21 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
     Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
 {
     pub fn new(
-        mut source: Serialized<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>,
+        source: Serialized<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>,
         mode: Mode,
+        now: Tick,
+    ) -> Result<Self, Error> {
+        Self::with_frame(source, framing::Frame::new(mode), now)
+    }
+    fn with_frame(
+        mut source: Serialized<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>,
+        frame: framing::Frame,
         now: Tick,
     ) -> Result<Self, Error> {
         source.check_deadline(now)?;
         Ok(Self {
             source,
-            frame: framing::Frame::new(mode),
+            frame,
             failure: None,
         })
     }
