@@ -52,6 +52,10 @@ The manifest is strict, versioned ASCII: header `td-deployment-v1`, then
 exactly three `<64 lowercase hex>  <label>` lines for `bzImage`,
 `initramfs.cpio` and `root.erofs`, a trailing newline, and nothing else
 (`td-boot/src/main.rs`, `parse_manifest`). It is bounded at 4096 bytes.
+Data a deployment must declare to td's own readers therefore travels in
+a covered payload, never a new manifest line: the login-key tier marker
+is a member of `initramfs.cpio` (`td-login/TOKEN-LOGIN.md`,
+"Deployments").
 
 The **deployment id is the sha256 of the manifest bytes** — computed at
 publish and recomputed at every verify, which is what makes the id a claim

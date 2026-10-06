@@ -38,9 +38,10 @@ failure texts ("Failure texts"). Production reaches only their refusals.
 The PIN field has landed as well ("PIN entry, presence and retries"),
 inert, since production never reaches a PIN step, and so has the lock
 surface with its login unlock ("Session lock"), inert: its one entry is
-test-only and nothing in production locks. Increment 3 is complete but
-for its desktop guest, which waits for increment 4. Nothing else below
-is implemented.
+test-only and nothing in production locks. Increment 3 is complete; its
+desktop guest moved to increment 4 as `login-desktop`. Increment 4 is
+specified as eleven commits ("Increments"), none of which has landed.
+Nothing else below is implemented.
 Until the increments at the end land, `THREAT-MODEL.md` §3 is the
 complete current behaviour: the installed account logs in automatically
 and the session never locks. No document, UI or release
@@ -151,17 +152,30 @@ root:root mode-0600 file in the root:root mode-0700 directory
 `/var/lib/td/login` on the persistent `@var` volume. Only the root login
 worker publishes or removes a record.
 
-Firstboot ensures the directory on every boot before any consumer runs. It
-never creates or removes a record, and it removes leftover temporaries
-(below). It refuses rather than repairs invalid existing metadata.
+**Firstboot** ensures the directory on every boot before any consumer
+runs. It is one stage-1 init step, `td-firstboot ensure-login-directory
+/sysroot`, run once `@var` is mounted at `/sysroot/var` and before
+`render-primary-sshd` (SSH), on the live medium too. It is not fatal:
+init continues whatever it reports. It creates only what is absent,
+`/var/lib/td` as root:root mode 0755 and `/var/lib/td/login` as root:root
+mode 0700, and never changes the owner or mode of anything that exists,
+a parent included. In a valid directory it unlinks every entry whose
+name begins with `tmp-` (below) and nothing else; it never creates or
+removes a record. It walks the path as the record store does
+(`td-secret/DESIGN.md`, "Login record store") and refuses rather than
+repairs invalid existing metadata: for that, or a `tmp-` entry it cannot
+unlink, it prints one console line, `td-firstboot: login directory
+refused: ` and the reason, and exits nonzero.
 
 The login state is **unenrolled** only when the directory is valid and the
 record name is absent, **enrolled** when a valid record is present, and
 **unavailable** otherwise. The first test is a directory-and-name check,
-the same predicate in firstboot, td-login and td-authd, and needs no
-helper; only a name that exists is parsed, so nothing about the record's
-bytes can make an unenrolled machine look enrolled or the reverse
-(`td-authd/DESIGN.md`, login-state amendment). Unavailable has three typed
+the same predicate in firstboot, td-login and td-authd, one shared
+std-only module (`td-secret/src/login_state.rs`, increment 4) that takes
+the root it reads under, and needs no helper; only a name that exists is
+parsed, so nothing about the record's bytes can make an unenrolled
+machine look enrolled or the reverse (`td-authd/DESIGN.md`, login-state
+amendment). Unavailable has three typed
 causes, each with its screen text:
 
 - a damaged directory (a wrong owner, group or mode, a non-directory or
@@ -550,11 +564,15 @@ ENROLLED`, `LOGIN KEY ADDED` or `LOGIN KEYS REMOVED`.
 
 ## Session lock
 
-The lock exists only for an enrolled account; on an unenrolled one the
-triggers below change nothing (`td-compositor/DESIGN.md` says what each
-shows). The compositor learns the login state as `td-authd/DESIGN.md`
-specifies. Enrolled and unavailable both start locked; unavailable shows
-its cause's text ("The login record") and offers no unlock.
+The lock exists only for an enrolled or unavailable account; on an
+unenrolled one the triggers below change nothing
+(`td-compositor/DESIGN.md` says what each shows). The compositor learns
+the login state as `td-authd/DESIGN.md` specifies. Enrolled and
+unavailable both start locked; unavailable shows its cause's text ("The
+login record") and offers no unlock. The live
+medium never locks: td-authd answers it unenrolled (`td-authd/DESIGN.md`,
+amendment 1). Only the compositor's paired profile locks; the direct
+development profile leaves `Super+l` as it is.
 
 The session locks at every compositor generation start (boot, and any
 compositor or authority restart or crash), on `Super+l`, on the attention
@@ -562,24 +580,32 @@ screen's `L`, on a lid close and on resume from any suspend, however it
 began, that lasted longer than the compositor's two-second threshold plus
 the kernel's one-second RTC granularity for measuring sleep on x86
 without a TSC that runs in S3. A shorter suspend can go unnoticed. The
-compositor's detection of each trigger is in its design. td has
+compositor's detection of each trigger is in its design; it only
+detects a suspend and never starts or delays one. td has
 no suspend initiator and this tier adds none. Any initiator that lands
 later must, for an enrolled account, obtain the lock surface's
 presentation receipt before writing `/sys/power/state` and refuse to
 suspend when locking fails. Hibernation stays disabled.
 
-Locking cancels an open attention lifetime under the existing pre-commit
-cancellation rules, closes overlays, withdraws focus and grabs, and paints
-the lock surface over the whole output. Until that paint has a
-presentation receipt, no client receives input.
+Locking closes overlays, withdraws focus and grabs, and paints the lock
+surface over the whole output. Until that paint has a presentation
+receipt, no client receives input. A lock that comes while an attention
+lifetime is open, from a lid close or a resume (the attention screen
+suppresses `Super+l`, and `L` is itself the lifetime's selection), ends
+that lifetime first. Before its operation's commit it cancels the
+operation under the existing pre-commit cancellation rules. After the
+commit the screen drains as Escape's does and the result is not shown:
+root finishes a committed operation whatever the screen does. In a
+login-unlock lifetime, already on the lock surface, the lock counts as
+Escape, so even a committed unlock leaves the session locked.
 
 While locked:
 
-- The output shows only the lock surface: hostname, username, `LOCKED` and
-  `PRESS CTRL+ALT+ESC TO UNLOCK`. No client pixel, cursor, title or
-  workspace bar is shown.
+- The output shows only the lock surface: hostname, username and the
+  state's rows below. No client pixel, cursor, title or workspace bar is
+  shown.
 - Applications keep running. They receive no focus and no input from any
-  source; new windows map behind the lock. Frame callbacks may be
+  source; new windows map behind the lock. Frame callbacks are not
   throttled. Audio and network continue.
 - Ordinary bindings (terminal, launcher, help, workspaces) are suppressed.
   Control-socket and automation requests that inject input or capture output
@@ -591,16 +617,36 @@ The lock protects the interactive surfaces, not running processes, as
 `td-install/ENCRYPTION.md` says of any locked running machine.
 
 The lock surface's rows are chrome rows, as the failure texts are
-("Failure texts"), and fit 45 columns whole:
+("Failure texts"): the hostname, the username, then the state's rows
+below. Both names are the current `1a` answer's
+(`td-authd/DESIGN.md`, amendment 1), drawn uppercase, and an answer
+without a hostname leaves out its row. Every row but the hostname fits
+45 columns whole. A hostname of up to 63 bytes has no space to wrap at,
+so it breaks at the output's last column instead
+(`td-compositor/DESIGN.md`, "Session lock and login-key entry"). The
+surface gives no recovery hint (Recovery).
 
 | When | Shows |
 | --- | --- |
-| locked, attention closed | `LOCKED`, then `PRESS CTRL+ALT+ESC TO UNLOCK` |
-| the chord on it, until the unlock's first prompt | the attention screen's `PREPARING REQUEST`, never its menu |
+| enrolled, attention closed | `LOCKED`, then `PRESS CTRL+ALT+ESC TO UNLOCK` |
+| unavailable, attention closed | `LOCKED`, then its cause's two rows |
+| unenrolled, attention closed | `LOCKED`, then `NO LOGIN KEYS ENROLLED` |
+| the chord, enrolled, until the unlock's first prompt | the attention screen's `PREPARING REQUEST`, never its menu |
+| the chord, unavailable | the attention screen with the cause's two rows; no `1b` |
+| the chord, unenrolled | the attention screen with `NO LOGIN KEYS ENROLLED`; no `1b` |
 
-The hostname and username rows above them join with increment 4's
-`1a`, which carries the username; until then the lock surface shows
-the two rows alone.
+Only a generation's start, `Super+l`, `L`, a lid close and a resume
+lock. A `1a` answer never locks an unlocked session, even one whose
+state turns unavailable; it changes only what the next lock shows and
+whether one is offered. While locked, the rows follow each `1a` answer.
+A state that could not be read resolves through the compositor's
+polling (`td-authd/DESIGN.md`, amendment 1), and enrolled brings back
+the unlock. A locked session
+whose state becomes unenrolled stays locked for the rest of its
+generation, since nothing on the lock surface unlocks it; the next
+generation, at a reboot or a compositor or authority restart, starts
+unlocked, as every unenrolled one does. Until increment 4's `1a`, the
+lock surface shows `LOCKED` and `PRESS CTRL+ALT+ESC TO UNLOCK` alone.
 
 On the lock surface Ctrl+Alt+Esc opens a login-unlock attention lifetime
 directly, without the menu. The prompt presents the unlock description; the
@@ -650,9 +696,14 @@ In the enrolled and unavailable states the rendered policy takes its
 **enforced form**: `PermitRootLogin no`, and no account but the primary is
 admitted. SSH then opens no session without a login key except that
 self-test. Only a verifiably unenrolled state renders the ordinary policy.
-Firstboot renders the form that matches the login state at every boot,
-before `sshd` starts; the cutover renders it within a boot. The QEMU
-persistent-administrator fixture therefore runs only on unenrolled images.
+At every boot stage-1 init's `td-firstboot render-primary-sshd /sysroot`,
+right after the directory step ("The login record") and before `sshd`
+starts, renders the form that matches the login state, decided by the
+directory-and-name check alone, with no helper: a valid directory
+without the record name renders the ordinary policy, byte for byte the
+one rendered before this tier, and anything else the enforced form. The
+cutover renders it within a boot. The QEMU persistent-administrator
+fixture therefore runs only on unenrolled images.
 
 ## Cutover
 
@@ -695,10 +746,66 @@ lock available or unavailable at once.
 
 ## Deployments
 
-A deployment carries the tier when its manifest holds a fixed tier marker,
-covered by the deployment ID, naming the record versions it reads. A
-deployment without the marker ignores the record, so booting it restores
-automatic login. Therefore:
+A deployment carries the tier when its uncompressed `initramfs.cpio`
+holds the fixed tier marker naming the record versions it reads. The
+marker is the archive member `etc/td-login-tier`, a regular file whose
+whole content is `td-login-tier-v1`, then at least one version, each
+one the build's record codec reads (`READS`), as a space and a decimal
+number from 1 to 255 without leading zeros, strictly increasing, then
+one newline: an increment-4 build's is `td-login-tier-v1 1\n`. The
+deployment ID covers it, being the SHA-256 of the manifest, which holds
+the initramfs's SHA-256.
+
+The system recipe writes it into the deployment phase's
+`gen_init_cpio` spec only, beside `dir /etc 0755 0 0`, as `file
+/etc/td-login-tier` with mode 0444 and owner 0:0, its content a constant
+of the recipe; the selector initramfs carries none. A recipe test reads
+`td-secret/src/login_record.rs`'s `READS` and requires the constant to
+list exactly those versions in the grammar above, so a codec that reads
+a new version cannot ship a marker that omits it.
+
+The marker is not in the manifest. td-boot's `parse_manifest` admits
+exactly the four-line `td-deployment-v1` form, and an installed
+selector, which td has no operation to update
+(`td-install/ENCRYPTION.md`), would refuse every deployment carrying a
+fifth line or a new manifest version. The initramfs is already covered,
+and a member that nothing at boot reads changes no boot.
+
+A reader opens the deployment's `manifest` and `initramfs.cpio` through
+a held directory descriptor, each with `O_NOFOLLOW | O_NONBLOCK` (as
+td-authd opens a queued manifest, through the descriptor's
+`/proc/self/fd` path), and requires each to be a regular file of the
+manifest's owner rule: owned by the requester for a queued update, by
+root for a retained deployment. The manifest keeps its 4096-byte bound
+and the archive takes td-update's 512 MiB initramfs staging bound
+(`td-install/DESIGN.md`), checked before reading; a size change while
+reading refuses. The archive is streamed once, hashed as it is parsed,
+and the read gives up after ten seconds; as for any synchronous
+filesystem read, that bound cannot interrupt a stalled filesystem.
+The manifest's SHA-256 must equal the deployment ID naming it and the
+archive's the manifest's `initramfs.cpio` entry, each over the bytes
+parsed. The newc reader is bounded: magic `070701` only, a member name
+of at most 4096 bytes, at most 65536 members, every other member's data
+skipped unbuffered, the marker at most 256 bytes, and nothing after
+`TRAILER!!!` but NUL padding.
+
+- A **queued update** is read through the directory File td-authd
+  holds for request 19, against the ID it was admitted with.
+- A **retained deployment** is read through a held descriptor of the
+  read-only `/run/td-volume/td`: the `boot/current` or `boot/previous`
+  selector is read once and must be exactly `../deployments/` and 64
+  lowercase hex digits, and `deployments/<id>` is then opened by that
+  name, with `O_DIRECTORY | O_NOFOLLOW`, and checked against that id.
+  Deployment directories are named by their content, so a selector that
+  flips meanwhile cannot mix two deployments' files into one read.
+
+A deployment whose files are missing, of the wrong type, owner or size,
+do not verify or parse, whose marker is absent, duplicated, not a
+regular file or malformed, or that cannot be read in time reads no
+record version, as a deployment without the tier.
+
+A deployment without the marker ignores the record, so booting it
+restores automatic login. Therefore:
 
 - enrollment refuses unless both `current` and `previous` carry the marker
   and meet the record-version rule ("The login record", Versions);
@@ -721,10 +828,11 @@ other.
 That list is td-authd's: its enrolled `1a` answer carries the slot
 count and each slot's fingerprint in canonical order, as `inspect-login`
 reports them, and every `1a` answer carries the validated primary
-username (`td-authd/DESIGN.md`, amendment 1). Increment 4 implements
-it. Until then the compositor has no list, so `D` shows `NOT AVAILABLE
-IN THIS BUILD` and sends nothing; its digits and request are tested
-against a list the tests supply.
+username and the hostname (`td-authd/DESIGN.md`, amendment 1).
+Increment 4 implements it. What `D` shows without a list, before
+increment 4 and on a machine with no enrolled record after it, is
+`td-compositor/DESIGN.md`'s ("Login-key operations"); its digits and
+request are tested against a list the tests supply.
 
 **First enrollment** applies only to an unenrolled account and is
 authorized by the physical selection alone: no key exists yet, and a person
@@ -959,14 +1067,22 @@ own keyboard from secure attention, which is live on every machine with
 or without a record: it denies a security key's own keyboard every
 selection and confirmation, and the only selection it newly admits is
 another keyboard's fresh press of a key the security key's keyboard
-holds. No production path reads the login state until increment 4, which
-also makes firstboot ensure the directory, so its absence, itself a
+holds. No production path reads the login state until increment 4, whose
+C1 makes firstboot ensure the directory, so its absence, itself a
 damaged directory, never meets a production reader. From then on, that
 exclusion apart, behaviour changes only when a record or an invalid
 directory exists, which no production path creates, and the state is
 decided by the directory-and-name check before any helper runs, so no
-helper failure can change an unenrolled machine. Each lists what it
-proves and the oracle that shows it.
+helper failure can change an unenrolled machine. Increment 4 has
+exactly three exceptions, live on every machine the paired compositor
+runs, record or not: `Super+l` is consumed, and does nothing while
+unenrolled; the attention menu always shows `L: LOCK SCREEN` below `K`,
+which answers `NO LOGIN KEYS ENROLLED` while unenrolled; and `D` without
+a key list answers `NO LOGIN KEYS ENROLLED` where it answered `NOT
+AVAILABLE IN THIS BUILD`. Lid-switch admission and resume sampling are
+no exceptions: they run only while the state is enrolled or unavailable
+(`td-compositor/DESIGN.md`, items 6 and 7). Each lists what it proves
+and the oracle that shows it.
 
 1. **This amendment.** Documentation only.
 2. **Protector backend, virtual authenticator and authority:** the record
@@ -1006,8 +1122,8 @@ proves and the oracle that shows it.
      selections against a scripted authority, and their refusal by the
      production one; the chained login lifetime.
    - A desktop guest with a UHID keyboard drives PIN entry against the
-     worker with a seeded record, with framebuffer bitmap checks:
-     deferred to increment 4.
+     worker with a seeded record, with framebuffer bitmap checks: moved
+     to increment 4 as `login-desktop`.
    - The OTP-keyboard exclusion has landed for the existing selections and
      Enter confirmation: host tests over hand-built sysfs trees (a
      composite key, a plain keyboard, a keyboard behind a hub beside a key, nodes
@@ -1066,25 +1182,90 @@ proves and the oracle that shows it.
      4's login state at Prepare; until then every generation starts
      unlocked. This build's root answers an unlock `NO LOGIN KEYS
      ENROLLED`, or `DIRECTORY DAMAGED` while the directory is missing.
-   - Increment 3 is complete except its desktop guest, deferred by
-     decision to increment 4: without a fixture entry, which this build
-     deliberately lacks, no guest reaches the lock surface before
+   - Increment 3 is complete. Its desktop guest moved by decision to
+     increment 4's `login-desktop`: without a fixture entry, which this
+     build deliberately lacks, no guest reaches the lock surface before
      increment 4's locked boot. The hardware record of an OTP touch
      stays owed with the T430s evidence.
-4. **Locked boot and session lock:** request `1a` and login state at
-   Prepare, with the enrolled key list and the primary username,
-   `Super+l`, attention `L`, lid close, resume detection, unlock
-   end to end, firstboot's directory and temporaries, the unavailable
-   state, firstboot's boot-time render of the enforced SSH form for the
-   enrolled and unavailable states, td-login's console refusal with
-   terminal return and greeter hold, removal of `build_autologin`'s
-   `login -f` fallback, the tier marker and td-authd's update-consent
-   refusal, all atomically. Fixtures seed records through the backend.
-   - Full-system QEMU on a disposable volume: a cold boot whose first frame
-     is the lock surface, whose serial greeter prints the exact refusal line
-     and starts no shell, and which each seeded key unlocks; `Super+l` and
-     `L`, unlock, relock after killing the compositor; suspend to RAM in
-     a machine with S3 enabled, held suspended at least 10 seconds and
+4. **Locked boot and session lock:** request `1a` with the login state,
+   the enrolled key list, the primary username and the hostname;
+   firstboot's directory and temporaries; the unavailable state;
+   firstboot's boot-time render of the enforced SSH form for the enrolled
+   and unavailable states; td-login's console refusal; removal of
+   `build_autologin`'s `login -f` fallback; the tier marker and
+   td-authd's update-consent refusal; the locked start; `Super+l`,
+   attention `L`, lid close and resume detection; and unlock end to end.
+   It lands as these commits after this amendment's documentation-only
+   C0, each one green and independently landable:
+   - C1: the shared login-state predicate ("The login record"), with
+     the root as a parameter; `td-firstboot ensure-login-directory
+     /sysroot` in stage-1 init before `render-primary-sshd`; and
+     rootcheck's report of `/var/lib/td/login` as a root:root mode-0700
+     directory, on a marker of its own outside the flag boot health
+     reads, so the stock boot oracles see the directory while a damaged
+     one still boots healthy. It changes every boot, so its landing runs
+     `check integration` by hand.
+   - C2: the read-only `td-secret inspect-login --uid 1000` helper
+     (`td-secret/DESIGN.md`, "Read-only enrollment-state inspection"),
+     which nothing runs yet.
+   - C3: `1a` end to end (`td-authd/DESIGN.md`, amendment 1): root's
+     predicate, the helper under its two-second deadline, the cache and
+     the `9a` answer; the compositor's `1a` at connect, after Prepare,
+     after every login operation and every 250 ms while the state could
+     not be read, feeding the key list `D` uses. Root still answers a
+     removal `9b 00`, and nothing locks yet.
+   - C4: the tier marker in every deployment's initramfs, listing the
+     build's `READS` ("Deployments"); the worker's read sets taken from
+     the retained deployments' markers in place of its empty `UNMARKED`
+     (`td-secret/DESIGN.md`, "Login-key worker"); and request 19's
+     refusal (`td-authd/DESIGN.md`, amendment 8).
+   - C5: td-login's console refusal through the shared predicate
+     (`THREAT-MODEL.md` §3), and the deletion of `build_autologin`'s
+     `login -f` branch, `system_def_is_self_consistent` then requiring
+     the autologin account to be the primary account.
+   - C6: `render-primary-sshd`'s enforced form ("SSH"), its unenrolled
+     output byte-identical to the one before it.
+   - C7, the activating commit: the compositor's locked start. The `1a`
+     state at connect locks an enrolled or unavailable session before
+     the first repaint, the lock surface gains the hostname and username
+     rows, the production lock entry replaces the test-only one with its
+     source pin amended, and every generation relocks.
+   - C8: the `login-desktop` guest (below), which also updates the
+     login-guest counts that say eleven (here, "Evidence", and
+     `td-secret/DESIGN.md`, "Login-key worker guests").
+   - C9: `Super+l`, the attention screen's `L`, locking an open lifetime
+     ("Session lock") and the help sheet's row.
+   - C10: lid-switch (`SW_LID`) and resume-gap detection.
+   - C11: the `qemu-login-system` guest (below).
+
+   C7 lands only after the update-consent refusal (C4), the console
+   refusal (C5) and the enforced SSH render (C6), so no build locks the
+   screen while an update, the console or SSH could pass it. Each commit
+   before C7 changes behaviour only where a record or an invalid
+   directory exists, apart from C1's directory itself and C3's text for
+   `D` without a list (above). Fixtures seed records through the worker
+   with simulated root acknowledgements, as `login_vm.rs` does
+   ("Evidence"), with both retained deployments taken to read this
+   build's version, since production td-authd refuses every write until
+   increment 5.
+   - `login-desktop` (C8), increment 3's desktop guest: a diskless,
+     TPM-free `qemu-secret` login case in the desktop harness without
+     its TPM measurement, with a UHID keyboard and a UHID key, and a
+     record seeded before the paired generation starts. The first frame
+     is the lock surface; the chord, the PIN typed on the keyboard and
+     the key's touch unlock it through the production authority and
+     worker; a wrong PIN, a key not in the record and Escape after the
+     commit stay locked. The host checks the framebuffer at each step
+     with QMP `screendump`, as the boot oracles' `ScreenWatch` does: the
+     lock surface's rows, the PIN field's masks, no client pixel while
+     locked, and the desktop once unlocked.
+   - `qemu-login-system` (C11): a full-system, TPM-free guest on a
+     disposable volume: a cold boot whose first frame is the lock surface,
+     whose serial greeter prints the exact refusal line and starts no
+     shell, which boot health still accepts, and which each seeded key
+     unlocks; `Super+l` and `L`, unlock, relock after killing the
+     compositor; suspend to RAM in a q35 machine with S3 enabled
+     (`ICH9-LPC.disable_s3=0`), held suspended at least 10 seconds and
      woken over QMP `system_wakeup`, whose first routed input after resume
      reaches the lock surface and no client; the unavailable state, with
      its screen text and the enforced SSH form, for a wrong-mode,
@@ -1096,13 +1277,31 @@ proves and the oracle that shows it.
      record that shows `STATE COULD NOT BE READ` and resolves to enrolled
      once the helper answers; refusal to install a marker-less deployment
      and a marked deployment that does not read the record's version.
+   - Both guests run by hand, on KVM only, in neither `check` nor
+     `check integration`.
    - Compositor input tests replay recorded `SW_LID` events and clock gaps
      through the adapter; QEMU has no lid.
-   - Increment 3's desktop guest: a UHID keyboard drives the lock
-     surface's unlock and its PIN entry against the worker with a seeded
-     record, with framebuffer bitmap checks.
-   - `system_def_is_self_consistent` requires the autologin account to be
-     the primary account.
+
+   Shared code lives in one source file each, compiled by its other
+   consumers through a reviewed `#[path]` as td-authd already compiles
+   `td-firstboot/src/principals.rs`, and staged by each consumer's target
+   recipe at the same relative path (the compositor's under `auth/`,
+   behind its `cfg_attr` pair, as it stages `td-authd/src/consent.rs`):
+   - `td-secret/src/login_state.rs`, the predicate, compiled by
+     td-firstboot, td-login (`THREAT-MODEL.md` §3) and td-authd;
+   - `td-secret/src/login_tier.rs`, std-only: the marker's grammar and
+     the bounded newc reader with its file checks ("Deployments"); the
+     worker's own module, and `#[path]` in td-authd. It hashes with the
+     `engine/src/sha256.rs` copy each already compiles, so
+     `TARGET_INCLUDED_ENGINE_SOURCES` (`td-install/DESIGN.md` §7) gains
+     no source;
+   - `td-firstboot/src/hostname.rs`, `Hostname::parse`: in td-authd for
+     the hostname it sends, and in the compositor for its `9a`
+     admission;
+   - `td-authd/src/primary_account.rs`'s `validate_name`: in the
+     compositor for its `9a` admission, the rest of that file under a
+     reasoned `dead_code` allowance, as td-secret compiles the shared
+     hash.
 
 **Prerequisite:** the §L.1 elevation increment lands next, as "Enrollment
 requires §L.1 elevation" above requires.

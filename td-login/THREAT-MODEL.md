@@ -262,7 +262,10 @@ their existing front ends exactly. The applet/symlink roster stays `login,su`.
 The shared reader is compiled beneath `forbid(unsafe_code)` and is included
 in the source-level confinement scan alongside the local modules. Exactly
 one reviewed external path is admitted; other path attributes and code
-inclusion remain forbidden. Metadata's zero-argument UID reads are distinct
+inclusion remain forbidden. TOKEN-LOGIN.md's increment 4 admits a second
+on the same terms, the shared std-only login-state predicate
+`td-secret/src/login_state.rs` (below), and no other. Metadata's
+zero-argument UID reads are distinct
 from credential setters, and the reader's test-only mode-0644/0666 fixtures
 are pinned separately from the two production terminal mode writes. No
 credential syscall, policy decision or terminal handover is added.
@@ -362,13 +365,21 @@ Consequences worth stating plainly:
 **Target, not implemented: login keys.** Under
 [`TOKEN-LOGIN.md`](TOKEN-LOGIN.md), enrolling a FIDO2 login key publishes
 `/var/lib/td/login/1000`. td-login reads no CTAP and does not parse that
-record; it asks only whether one may exist. Unless the root-owned mode-0700
-`/var/lib/td/login` opens with valid metadata and the record name is absent,
-interactive `login` and `login-primary` refuse **every** account, root
-included, so no console path bypasses the key. Before refusing, they return
-a terminal that passes §6's checks to root:root with the pinned `TTY_MODE`,
-so no unprivileged process can open the line afresh. Neither `su` nor
-root's empty shadow field exists as an administrative path on an enrolled
+record; it asks only whether one may exist, through the directory-and-name
+predicate it shares with firstboot and td-authd. Unless the root-owned
+mode-0700 `/var/lib/td/login` opens with valid metadata and the record
+name is absent, interactive `login` and `login-primary` refuse **every**
+account, root included, so no console path bypasses the key. Before
+refusing, they return a terminal that passes §6's checks to root:root
+with the pinned `TTY_MODE`, so no unprivileged process can open the line
+afresh. Each then writes the one fixed line
+`td-login: login keys enrolled or unavailable; console login refused`
+to standard error and parks until killed, in safe `std` and with no new
+syscall surface, rather than exit: the greeter's wrapper reboots the
+machine when its session chain succeeds (`&& exec /bin/td-svc reboot`),
+and its td-svc unit restarts it whenever it ends (`restart=always`), so
+any exit would be a reboot or a respawn loop. Neither `su` nor root's
+empty shadow field exists as an administrative path on an enrolled
 machine (TOKEN-LOGIN.md, "Enrollment requires §L.1 elevation"). The
 forced paths (`login -f`, `su`, `exec-as`, `exec-primary`,
 `exec-service-as`) keep this section's rules: they change credentials only
@@ -376,11 +387,10 @@ for an all-root caller (§4) and are otherwise no-ops. A greeter must
 therefore use `login-primary`; the increment that adds this refusal
 deletes `build_autologin`'s `login -f` fallback for a non-primary
 autologin account, and `system_def_is_self_consistent` then requires the
-autologin account to be the primary one. The refused greeter prints one
-fixed line and holds the line instead of respawning. A console session
-started before enrollment does not survive it; TOKEN-LOGIN.md's "Cutover"
-owns how. The stock image never contains a record, so its console
-behaviour and the table above stand.
+autologin account to be the primary one. A console session started
+before enrollment does not survive it; TOKEN-LOGIN.md's "Cutover" owns
+how. The stock image never contains a record, so its console behaviour
+and the table above stand.
 
 The future hardware-backed disk and session unlock contract lives in
 [`td-install/ENCRYPTION.md`](../td-install/ENCRYPTION.md). It binds primary

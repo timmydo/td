@@ -1562,6 +1562,23 @@ write timeout. There is no buffered stdout result. The parent deadline
 also bounds filesystem work and observed completion. Both production and
 ordinary child fixtures use the same factory and descriptor assignment.
 
+**Login state (target).** TOKEN-LOGIN.md's increment 4 adds a second
+hidden root helper, `td-secret inspect-login --uid UID`, which td-authd
+runs with UID 1000 only, and only when the login record's name exists
+(`td-authd/DESIGN.md`, login-state amendment 1). It has inspect-store's
+startup admission, stdin result socket, two-second write timeout and
+parent requirements above, but reads no application store. It reads
+`/var/lib/td/login` (root:root) once through the record store ("Login
+record store"), takes no lock, opens no token or TPM device and writes
+nothing to the directory. Its result is exactly `1a 00` for a damaged
+record, or for an enrolled one `1a 01`, the record's version byte, the
+slot count and each slot's four-byte fingerprint in canonical slot
+order, at most 36 bytes. Every other state (unenrolled, a damaged
+directory, a read that could not complete) and every failure writes no
+result and exits unsuccessfully; td-authd then answers that the state
+could not be read, and its next refresh runs the directory-and-name
+predicate again, which decides those states without the helper.
+
 ## Token-authorized named write backend
 
 The root-only `Store::set_token` API consumes one owned assertion request
@@ -2130,6 +2147,10 @@ PIN step's acknowledgement. `17` stays store inspection's.
    before any presentation; removing every key writes none. No
    deployment carries the tier marker yet, so `run` passes empty read
    sets and every such write refuses until increment 4 reads the marker.
+   From then on `run` reads the `current` and `previous` deployments'
+   markers through `/run/td-volume/td/boot` as TOKEN-LOGIN.md,
+   "Deployments", specifies, in place of the empty `UNMARKED`; a
+   deployment whose marker does not verify reads no version.
 3. It presents root's own first step (identify, or an enrollment's
    first connect), then reads the record again: if it no longer reads as
    the baseline, an unavailable state included, it fails as RECORD

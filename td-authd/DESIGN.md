@@ -1730,22 +1730,33 @@ neither releases nor clears an application-store key. td-authd's part
 amends the contracts above as follows; increment numbers are
 TOKEN-LOGIN.md's.
 
-1. **Login state (4).** During Prepare, after its cleanup and before the
-   compositor admits any client or input, the authority reports the
-   human's login state in answer to request `1a`: unenrolled, enrolled,
-   or unavailable with its typed cause, as TOKEN-LOGIN.md defines them.
-   The answer also carries the revocation status of amendment 7. Only
-   td-authd decides that a session unlocks: on a login unlock's observed
-   success.
+1. **Login state (4).** Once Prepare has completed, and before the
+   compositor admits any client or input, the compositor sends request
+   `1a` and the authority answers with the human's login state:
+   unenrolled, enrolled, or unavailable with its typed cause, as
+   TOKEN-LOGIN.md defines them ("Login-key operation supervision" below
+   gives the bytes). The answer also carries the revocation status of
+   amendment 7, reserved as `00` until increment 5. Only td-authd
+   decides that a session unlocks: on a login unlock's observed success.
 
    An enrolled answer also carries the record's slot count and each
    slot's four-byte fingerprint in canonical slot order, as
    `inspect-login` reports them: the key list whose positions the
    key-management screen's removal digits name, and the shape of the
    worker's baseline (`18 01`, `td-secret/DESIGN.md`). Every answer, in
-   every state, carries the validated primary username, which the lock
-   surface shows. Increment 4 implements both; until then the compositor
-   has no key list and refuses removal locally, sending nothing.
+   every state, carries the primary username that `terminal-serve`
+   resolved and validated at start, and the hostname, both of which the
+   lock surface shows. Root re-reads `/proc/sys/kernel/hostname` for every
+   answer, cached or not, through a 65-byte bound, drops one trailing
+   newline and sends the name only when it passes td-firstboot's
+   `Hostname::parse` rules; an unreadable, longer or invalid one is sent
+   empty. Increment 4 implements all of this; until then the compositor
+   has no key list ("Login-key operations" in `td-compositor/DESIGN.md`).
+
+   On a live boot (Prepare's `td.live=1`, "Whole-disk installation
+   intake") root answers every `1a` unenrolled without the predicate or
+   the helper below, so the live medium never locks; firstboot's
+   directory step still runs there.
 
    Root first applies the same predicate firstboot and td-login use:
    `/var/lib/td/login` opens as a valid root:root mode-0700 directory and
@@ -1756,21 +1767,28 @@ TOKEN-LOGIN.md's.
    It shares store inspection's fixed helper launch (empty environment,
    `/` cwd, null stdout and stderr, private stdin socketpair), its exact
    bounded result and its two-second observed deadline, but not its
-   protocol: it is not request `17`, it runs synchronously inside Prepare
-   or the `1a` that needs it, it never occupies the operation slot, and a
-   missing helper, failed spawn, malformed result or expired deadline
-   answers unavailable (state could not be read) rather than ending the
-   generation. A name that exists is therefore always the enforced state,
-   whatever the helper does, and a helper failure on an unenrolled machine
-   cannot arise.
+   protocol (`td-secret/DESIGN.md`, "Read-only enrollment-state
+   inspection", gives its result): it is not request `17`, it runs
+   synchronously inside the `1a` that needs it, it never occupies the
+   operation slot, and a missing helper, failed spawn, malformed result
+   or expired deadline answers unavailable (state could not be read)
+   rather than ending the generation. A name that exists is therefore
+   always the enforced state, whatever the helper does, and a helper
+   failure on an unenrolled machine cannot arise.
 
-   Root caches the last answer and serializes `1a`, so requests never
-   overlap: a `1a` returns the cache, and refreshes it first only after a
-   login operation or while the cache reads could-not-be-read. The
-   compositor sends `1a` again after every completed, failed or uncertain
-   login operation, and every 250 ms while a revocation is pending or the
-   state could not be read, so a first enrollment, the removal of the last
-   key or a transient helper failure resolves without a reboot.
+   Root caches the last state, with an enrolled state's key list, and
+   serializes `1a`, so requests never overlap; the cache holds nothing
+   else. A generation's first `1a` fills it, and a later one returns it,
+   refreshing it first only after a login operation or while it reads
+   could-not-be-read. While it reads could-not-be-read, root runs the
+   helper at most once every two seconds: a `1a` in between answers the
+   cached could-not-be-read at once, so the helper's deadline does not
+   hold root for most of the compositor's polls. Request 19's fresh read
+   (amendment 8) also updates the cache. The compositor sends `1a` again
+   after every completed, failed or uncertain login operation, and every
+   250 ms while a revocation is pending or the state could not be read,
+   so a first enrollment, the removal of the last key or a transient
+   helper failure resolves without a reboot.
 2. **Worker (2).** One fixed root `td-secret login-operation --uid 1000`
    child per login operation, with the unlock worker's launch, framing,
    presentation and commit rounds, cancellation, reaping and generation
@@ -1894,11 +1912,24 @@ TOKEN-LOGIN.md's.
    notice; it never reboots unguarded. At most one automatic reboot
    therefore separates two successful checks.
 8. **Update consent (4).** On an enrolled or unavailable machine, request
-   19 refuses, before any presentation, a queued deployment whose manifest
-   lacks the login-key tier marker or, when the record on disk is readable,
-   whose marker does not list that record's version. TOKEN-LOGIN.md cites
-   this as the update-consent rule. No key is required; consent is
-   otherwise unchanged.
+   19 refuses, before any presentation, a queued deployment that does not
+   carry the login-key tier marker or, when the record on disk is
+   readable, whose marker does not list that record's version. The marker
+   is a member of the deployment's `initramfs.cpio`, not a manifest line;
+   TOKEN-LOGIN.md, "Deployments", owns its bytes and how a reader checks
+   them, here through the held directory File, against the ID the update
+   was admitted with, opening `initramfs.cpio` as that section requires
+   of a requester-owned file. The state, and an enrolled record's
+   version, the helper's version byte, are read afresh for the
+   selection: amendment 1's predicate, then its helper, whose answer
+   updates amendment 1's cache. A refusal sends no description, retires
+   the queued request as one whose installation cannot start (its public
+   client's completion byte is `00`) and answers `99 01`; the compositor
+   shows `UPDATE CANNOT READ LOGIN KEYS` on the attention screen, where
+   `99 00` shows its no-installation notice. An unenrolled machine, a
+   live boot's whole-disk installation and every `99 00` case are
+   unchanged. TOKEN-LOGIN.md cites this as the update-consent rule. No
+   key is required; consent is otherwise unchanged.
 
 TOKEN-LOGIN.md, "Placement", owns the rule that only physical input starts
 a login operation.
@@ -1916,8 +1947,16 @@ argument. The paired requests are:
 
 | Request | Response |
 | --- | --- |
+| `1a` (increment 4) | `9a`, then the state: `00` unenrolled; `01`, a slot count of 1 to 8 and that many four-byte fingerprints in canonical slot order; or `02` and the cause `0a`, `0b` or `0c`, TOKEN-LOGIN.md's failure kinds; then a length byte of 1 to 32 and the primary username, a length byte of 0 to 63 and the hostname, and the revocation byte, `00` (amendment 1) |
 | `1b 07` unlock; `1b 08 01` or `1b 08 02` one- or two-key first enrollment; `1b 09` addition; `1b 0a N` and N slots, each a position and a four-byte fingerprint, positions strictly increasing within 1 to 8 | `9b 01` and the 32-byte nonce: started; `9b 00`: refused in this build |
 | `1c`, one length byte, the current step's canonical description, then the PIN (4 to 63 printable ASCII bytes) | `9c 00` PIN queued; `9c 01` the operation had already ended, or root's deadline has passed, which ends it as TIMEOUT: the PIN is dropped |
+
+`1a` needs completed preparation, or it ends the generation, but neither
+needs nor takes the operation slot. The compositor admits only an answer
+of exactly that shape, with a username under `primary_account`'s rules
+and a hostname empty or under `Hostname::parse`'s; anything else, a
+nonzero revocation byte included until increment 5 defines one, is a
+protocol violation that ends the paired generation.
 
 `1b` needs completed preparation and an empty operation slot, as `12`
 does, or it ends the generation. The login operation then holds the

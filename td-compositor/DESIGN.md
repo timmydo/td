@@ -5890,10 +5890,14 @@ device secure attention reads, not an unseen screen.
 `D` needs the enrolled key list, which td-authd's `1a` answer supplies
 from TOKEN-LOGIN.md's increment 4 (`td-authd/DESIGN.md`, amendment 1).
 Until then the compositor has none, so `D` shows `NOT AVAILABLE IN THIS
-BUILD`, sends nothing and ends the choice. With a list, the screen shows
-`REMOVE: PRESS 1 TO N THEN ENTER` and the chosen positions; digit 1 to
-N toggles that position, and Enter selects the nonempty set in position
-order, each slot with its listed fingerprint. Tests supply a list.
+BUILD`, sends nothing and ends the choice. From increment 4 the list is
+the last `1a` answer's; without one `D` still sends nothing and ends the
+choice, showing `NO LOGIN KEYS ENROLLED` when that answer was
+unenrolled, or its cause's rows when unavailable. With a list, the
+screen shows `REMOVE: PRESS 1 TO N THEN ENTER` and the chosen positions;
+digit 1 to N toggles that position, and Enter selects the nonempty set
+in position order, each slot with its listed fingerprint. Tests supply a
+list.
 
 The private client sends the choice as `1b`: `07` unlock, `08 01` or
 `08 02` first enrollment, `09` addition, or `0a`, a count and that many
@@ -6121,9 +6125,11 @@ production caller of any of them does not build. A source pin holds
 what the compiler cannot: `Scene::lock` is the one write of `true`,
 `Scene::new` starts unlocked, nothing borrows the state mutably, and
 every other write of a `locked` field in any source writes `false`.
-TOKEN-LOGIN.md's increment 4 adds the triggers (item 5 below), which
-go through the input bindings as the test entry does. The entry needs
-the paired profile and refuses while attention is up. Like opening
+TOKEN-LOGIN.md's increment 4 adds the triggers (item 5 below). This
+build's test-only entry goes through the input bindings, needs the
+paired profile and refuses while attention is up; item 5 supersedes
+those two limits for the connect-time lock, which needs no binding, and
+for a lid close or resume during an open lifetime. Like opening
 attention it closes the launcher and sheet, and their key capture in
 the bindings with them, cancels a drag, withdraws keyboard focus and
 grabs, and paints the whole output, answering with that paint's
@@ -6134,8 +6140,9 @@ any attention screen: display rendering alone draws it, in the
 attention screen's chrome, background and row place, as
 TOKEN-LOGIN.md's lock rows ("Session lock"; on 1280x800 `LOCKED` at 276
 and `PRESS CTRL+ALT+ESC TO UNLOCK` at 312). The hostname and username
-rows join it with increment 4's `1a`. No client pixel, cursor, title or
-workspace bar is drawn, and a client's commit changes nothing on glass.
+rows join it with increment 4's `1a` (item 5 below). No client pixel,
+cursor, title or workspace bar is drawn, and a client's commit changes
+nothing on glass.
 The runtime's key, modifier and pointer routing, keyboard and pointer
 targets, the VM bridge's focus snapshot and the application
 pixel-evidence oracle treat the lock surface as they treat the
@@ -6194,7 +6201,8 @@ unlocked with the window on glass and focused; a `06` with a key held,
 drained under its success notice until the release; locking with the
 launcher or sheet open, their capture closed; a failure's text, still
 locked; Escape before and after the commit, still locked; and forged
-and out-of-order `06`s. The desktop guest waits for increment 4.
+and out-of-order `06`s. The desktop guest is increment 4's
+`login-desktop`.
 
 ### Session lock and login-key entry (target)
 
@@ -6235,22 +6243,72 @@ excluded from every selection, confirmation and field below.
    is td-authd's ceiling for it, never renewed.
 5. **Lock state (4).** The compositor learns the login state as
    td-authd/DESIGN.md's login-state amendment specifies. What a locked
-   session shows and delivers is TOKEN-LOGIN.md's; the lock surface and
-   its unlock are implemented ("The lock surface" above), and a lock is
-   complete only when its own paint has a presentation receipt under the
-   rules below. Still to come are its entry points: the state at
-   Prepare, locking an open attention lifetime under the pre-commit
-   cancellation rules, `Super+l` in the binding list and `L` on the
-   attention screen. On an unenrolled account `Super+l` is
-   consumed with no effect and reaches no client, a lid close or resume
-   does nothing, and `L` shows `NO LOGIN KEYS ENROLLED` on the
-   attention screen.
-6. **Lid switch (4).** The startup roster admits the ACPI lid switch's
-   evdev node, a switch-only device reporting `SW_LID`. Its close event
-   locks; nothing else is read from it.
+   session shows and delivers, and what a lock does to an open
+   attention lifetime, are TOKEN-LOGIN.md's ("Session lock"); the lock
+   surface and its unlock are implemented ("The lock surface" above),
+   and a lock is complete only when its own paint has a presentation
+   receipt under the rules below. Still to come are its entry points,
+   all in the paired profile only:
+   - **The state at connect.** `Launcher::connect` sends `1a` right
+     after Prepare's answer, before the first repaint, and an enrolled
+     or unavailable answer locks then. It sends `1a` again after every
+     login operation's end and every 250 ms while the answer reads could
+     not be read. A production lock entry replaces the test-only one:
+     `Scene::lock` and the entries above it lose their test-only gate,
+     and the source pin of "The lock surface" names their production
+     callers, this connect-time lock and the triggers below, and no
+     other. Every generation therefore starts locked when the state is
+     enrolled or unavailable. A `1a` answer never locks an unlocked
+     session (TOKEN-LOGIN.md, "Session lock").
+   - **Rows.** Above the state's rows the lock surface draws the `1a`
+     answer's hostname, then its username, both uppercase in the chrome
+     font; with a one-row hostname, on 1280x800 the hostname is at 276,
+     the username at 312, `LOCKED` at 348 and the next row at 384. An
+     empty hostname draws no row. A hostname holds no space, so where it
+     is wider than the output's columns the existing `wrap` breaks it at
+     the column, as it breaks any row with no space to break at; every
+     other row fits 45 columns whole.
+   - **`Super+l`** joins the binding list, and the help sheet's row, in
+     the paired profile only. It is checked before the launcher's and
+     help sheet's key capture, so it closes either and locks; always
+     consumed, reaching no client, it locks an enrolled or unavailable
+     session and does nothing on an unenrolled one. The direct
+     development profile leaves `Super+l` unchanged.
+   - **`L`.** Only the attention menu grows: `L: LOCK SCREEN` sits
+     below `K`, and the menu's last row, `ESC TO RETURN`, moves down one
+     (on 1280x800 `L` at 528 and `ESC TO RETURN` at 564). Every other
+     attention screen keeps its rows, its last at 528, and the rows the
+     boot oracles read (276, 312, 456) do not move. The nine-row menu is
+     302 pixels tall at double scale and holds its top at 276 on an
+     output 800 pixels tall or taller; `rows_top`'s fit rule moves it up
+     on a shorter one. Read under the menu's rules, `L` is the
+     lifetime's one selection: it closes attention into the lock, or on
+     an unenrolled account shows `NO LOGIN KEYS ENROLLED`.
+   - **On the lock surface** the chord sends no `1b` unless the state
+     is enrolled: unavailable shows its cause's rows, and unenrolled
+     `NO LOGIN KEYS ENROLLED`, until Escape.
+   - **A lock during an open lifetime** is TOKEN-LOGIN.md's: a
+     pre-commit cancellation (`15`), a drain without the result after a
+     commit, or Escape within a login unlock. C9 implements it for
+     `Super+l` and `L`, and C10 for a lid close and a resume.
+   - **Request 19's refusal.** `99 01` shows `UPDATE CANNOT READ LOGIN
+     KEYS` on the attention screen, as `99 00` shows its no-installation
+     notice (`td-authd/DESIGN.md`, amendment 8).
+
+   On an unenrolled account a lid close or resume does nothing, since
+   neither is read (items 6 and 7). The live medium's root answers
+   unenrolled, so it never locks.
+6. **Lid switch (4).** When the connect-time `1a` state is enrolled or
+   unavailable, the startup roster admits the ACPI lid switch's evdev
+   node, a switch-only device reporting `SW_LID`; on an unenrolled
+   account it is not admitted. Its close event locks while the last
+   `1a` state is enrolled or unavailable; nothing else is read from it.
+   Since the roster is fixed, a generation that starts unenrolled reads
+   no lid until the next generation.
 7. **Resume (4).** The kernel does not repeat an unchanged switch state, so
    a lid close cannot be relied on to precede every suspend. The compositor
-   detects resume itself: it compares how far the boot-time clock in
+   detects resume itself, sampling only while the last `1a` state is
+   enrolled or unavailable: it compares how far the boot-time clock in
    `/proc/uptime`, which counts suspended time, and `std::time::Instant`
    have advanced since its last check. Each sample reads `/proc/uptime`
    between two `Instant` reads and is discarded when those differ by more
@@ -6265,9 +6323,11 @@ excluded from every selection, confirmation and field below.
 
    This depends on `Instant` being `CLOCK_MONOTONIC` on Linux, which
    excludes suspended time; Rust documents whether `Instant` counts
-   suspend as unspecified. The QEMU S3 oracle in TOKEN-LOGIN.md's
-   increment 4 is therefore the regression guard and must pass on every
-   toolchain bump. On x86 without a TSC that runs in S3 the kernel measures
+   suspend as unspecified. The QEMU S3 case of TOKEN-LOGIN.md's
+   increment 4 (`qemu-login-system`) is therefore the regression guard:
+   a manual oracle, run before landing any change to suspend detection
+   and on toolchain bumps, as `DEVELOPMENT.md` is to record with C11.
+   On x86 without a TSC that runs in S3 the kernel measures
    sleep with the RTC at one-second resolution, so only suspends longer
    than about three seconds are certain to be detected; TOKEN-LOGIN.md
    discloses that limit.
