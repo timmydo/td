@@ -690,6 +690,20 @@ composition, property selection, locators and publication remain later
 boundaries. Completion returns passive descriptor/node evidence and
 original owners, not a publication capability.
 
+M06dp binds the original live replay child and a distinct
+caller-reserved fragment window to private framing plus shared fixed
+retention. It accepts no advanced framer that could omit an
+already-emitted prefix. Admission precedes storage capacity; for a
+retention-bound child, only fresh whole retention consumption advances
+visitation. Failure, premature finish or safe forgetting retires the
+parent, including after Complete. No output is charged a second time by
+retention. The retained fragment/end are passive and provisional; whole
+composition must wrap this live handoff with the original replay owner
+before publication. Bare Part/framer finishes still advance visitation
+without retention; later whole composition must consume the live
+retention path to prove storage. No new parser, arena allocation,
+allowance or source identity enters.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

@@ -1,4 +1,5 @@
 //! Fixed metadata member fragments; braces, locators and tree composition are external.
+pub mod retained;
 use super::{Error, Part};
 use crate::{
     admission::work::{Charge, Meter},

@@ -2228,6 +2228,25 @@ cutoff, short/wide drains, long retained JSON, all scalar widths, exact wire
 debits, final charset mapping and unsigned-size bounds. These are Rust-heap
 and compiler layout checks, not native-stack or RSS qualification.
 
+M06dp fixed fragment retention binds the original live replay child to
+one separately admitted output window. It privately constructs the
+existing framer and uses the shared Window for exact reported prefixes.
+Cursor plus HeaderBudget has a compiled 1 KiB ceiling; no new heap
+storage, parser or serialization algorithm is introduced. Each turn
+retains the existing one-scalar/64-byte bound and adds no wire debit or
+allowance reset.
+
+The dedicated Rust allocation probe preserves all 27 earlier ordered
+MIME and framing trials, then adds seven retention trials: healthy owner
+release, partial/complete deadline refusal, capacity refusal,
+partial/complete safe forgetting and constructor deadline refusal. Its
+distinct caller response window precedes counting. Units pin exact-fit
+and every-shorter capacities, bare-framer bytes and all five cost
+counters, original caller owner/backing pointers, every digest-child
+prefix, escaped/long-raw capacity cuts and sticky resource refusal. Full
+midstream windows preserve deadline priority. These checks do not
+qualify native stack or RSS.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

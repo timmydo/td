@@ -5477,8 +5477,9 @@ fn ordered_mime_classification() {
     let mut attachments = [0; 8];
     let mut membership = [0; 8];
     let mut json_output = [0; 8];
+    let mut retained_output = [0; 256];
     let before = COUNTERS.snapshot();
-    for trial in 0..27 {
+    for trial in 0..34 {
         let mut work = Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
             Charge {
@@ -5746,6 +5747,82 @@ fn ordered_mime_classification() {
                     }
                     assert!(complete);
                     assert!(part.value().is_some());
+                    if trial >= 27 {
+                        if trial == 33 {
+                            assert!(json::retained::Cursor::new(
+                                part,
+                                &mut retained_output,
+                                Tick(100)
+                            )
+                            .is_err());
+                            stopped = true;
+                            break;
+                        }
+                        let mut retained = json::retained::Cursor::new(
+                            part,
+                            retained_output
+                                .get_mut(..if trial == 30 { 0 } else { 256 })
+                                .unwrap(),
+                            Tick(1),
+                        )
+                        .unwrap();
+                        if trial == 28 {
+                            retained.poll(Tick(1)).unwrap();
+                            assert!(retained.finish(Tick(100)).is_err());
+                            stopped = true;
+                            break;
+                        }
+                        if trial == 31 {
+                            retained.poll(Tick(1)).unwrap();
+                            forget(retained);
+                            stopped = true;
+                            break;
+                        }
+                        if trial == 30 {
+                            assert_eq!(retained.poll(Tick(1)), Err(Error::ResponseCapacity));
+                            assert!(retained.value().is_none());
+                            assert_eq!(
+                                retained.finish(Tick(1)).err(),
+                                Some(Error::ResponseCapacity)
+                            );
+                            stopped = true;
+                            break;
+                        }
+                        let mut done = false;
+                        for _ in 0..100000 {
+                            if retained.poll(Tick(1)).unwrap() == Status::Complete {
+                                done = true;
+                                break;
+                            }
+                        }
+                        assert!(done);
+                        let view = retained.value().unwrap();
+                        assert_eq!(view.end.part.ordinal, ordinal);
+                        assert!(!view.fragment.is_empty());
+                        if trial == 29 {
+                            let error = retained.check_deadline(Tick(100)).unwrap_err();
+                            assert!(retained.value().is_none());
+                            assert_eq!(retained.finish(Tick(1)).err(), Some(error));
+                            stopped = true;
+                            break;
+                        }
+                        if trial == 32 {
+                            forget(retained);
+                            stopped = true;
+                            break;
+                        }
+                        let (view, work, budget, scratch) = retained.finish(Tick(1)).unwrap();
+                        assert_eq!(view.end.part.ordinal, ordinal);
+                        assert_eq!(
+                            (
+                                std::ptr::from_mut(work),
+                                std::ptr::from_mut(budget),
+                                std::ptr::from_mut(scratch)
+                            ),
+                            pointers
+                        );
+                        continue;
+                    }
                     if trial >= 21 {
                         if trial == 26 {
                             assert!(json::Cursor::new(part, Tick(100)).is_err());

@@ -5139,6 +5139,42 @@ subParts, requested-property selection, raw headers, body-list/tree
 composition, authenticated locators and final response publication remain
 subsequent work. Projected continues to prove visitation alone.
 
+### 1.121 Fixed original replay fragment retention
+
+M06dp adds response::json::retained. Cursor::new consumes only a live
+response Part with complete metadata and a fresh Tick, and binds one
+separately reserved caller output window. It constructs the framer
+privately; an already advanced framing cursor cannot be rewrapped into a
+new retention window. No source, metadata, field or budget replacement
+enters.
+
+poll drives the same bounded framing turns into the shared td-json
+Window, recording only reported written bytes. It adds no parsing,
+serialization, output debit or new budget. Fresh admission precedes
+capacity inspection; window exhaustion is sticky
+bound::Error::ResponseCapacity. Partial bytes remain caller-owned and
+provisional but no public value exposes them.
+
+Only complete healthy framing exposes a passive Retained view.
+Cached Complete is inert; explicit checks and consuming finish
+freshly admit even after completion. For a retention-bound child, whole
+retention finish alone consumes the framer, clears parent abandonment,
+advances the original ordinal and returns the same work/header/scratch
+owners. Premature consumption, any refusal or safe forgetting retires
+the original parent; copied bytes are not wiped. Exact-fit windows
+succeed, while every shorter window refuses. Bare Part and framer
+finishes still advance visitation without retention; later composition
+must require the live retention handoff to prove storage.
+
+Cursor plus HeaderBudget has a compiled 1 KiB ceiling; caller output
+storage is separately admitted. Three compile-fail guards pin
+exclusivity and reject rewrapping an advanced framer. Rust allocation
+qualification covers seven additional trials after the 27 earlier
+ordered MIME/framing trials. Retained remains passive: enclosing
+body-list/tree composition must wrap the live retention handoff and its
+original replay owner. Braces, locators, subparts, property selection
+and whole-response publication remain external.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

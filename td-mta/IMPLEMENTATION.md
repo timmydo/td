@@ -2159,6 +2159,17 @@ Initial independently landable increments:
   The fixed fragment omits braces, locators, subparts and property selection;
   body-list/tree composition and whole-job publication remain next.
 
+- **M06dp — fixed original replay fragment retention:** bind private fresh
+  framing of a live response Part to a separately reserved fixed window.
+  Retain only reported bytes with shared Window; add no second wire charge
+  or allowance. Fresh admission precedes capacity, and only complete fresh
+  retention consumption advances the parent. Pin exact-fit and every-shorter
+  capacities including escaped scalars and long raw runs, bare-framer byte/
+  cost parity, caller owner/backing identity, every digest-child progress
+  prefix, stale/premature/forgotten refusal, three constructor/exclusivity
+  doctests and seven measured zero-allocation trials. Whole body-list/tree
+  composition, locators and publication remain subsequent work.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
