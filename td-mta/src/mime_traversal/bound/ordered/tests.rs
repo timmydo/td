@@ -9,7 +9,7 @@ use crate::{
     mime_traversal::{self, bound, Status},
     ports::Deadline,
 };
-const SOURCE: &[u8] = concat!(
+pub(super) const SOURCE: &[u8] = concat!(
     "Content-Type: multipart/digest;boundary=a\r\n",
     "Content-Location: ../root\r\n\r\n--a\r\n",
     "Content-ID: <id@a>\r\nContent-Language: fr\r\n\r\nbody\r\n--a\r\n",
@@ -17,7 +17,7 @@ const SOURCE: &[u8] = concat!(
     "body\r\n--a--\r\n"
 )
 .as_bytes();
-struct Storage {
+pub(super) struct Storage {
     heads: [u8; 256],
     charset: [u8; 256],
     name: [u8; 256],
@@ -26,7 +26,7 @@ struct Storage {
     location: [u8; 256],
 }
 impl Storage {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             heads: [0xa5; 256],
             charset: [0xa5; 256],
@@ -36,7 +36,7 @@ impl Storage {
             location: [0xa5; 256],
         }
     }
-    fn backing(&mut self, cap: usize) -> label_json::Backing<'_> {
+    pub(super) fn backing(&mut self, cap: usize) -> label_json::Backing<'_> {
         label_json::Backing {
             headers: mime_part_headers::Backing {
                 heads: &mut self.heads,
@@ -51,7 +51,7 @@ impl Storage {
         }
     }
 }
-fn meter() -> Meter {
+pub(super) fn meter() -> Meter {
     Meter::new(
         Deadline::after(Tick(0), 100).unwrap(),
         Charge {
@@ -62,7 +62,7 @@ fn meter() -> Meter {
         },
     )
 }
-fn structure<'a, 'w>(
+pub(super) fn structure<'a, 'w>(
     source: &'a [u8],
     base: u64,
     parts: &'w mut [mime_traversal::Part],
@@ -103,7 +103,7 @@ fn costs(work: &Meter, budget: &HeaderBudget) -> [u64; 5] {
         10_000_000 - work.remaining().output_bytes,
     ]
 }
-fn complete(
+pub(super) fn complete(
     owner: &mut Classifying<'_, '_, '_>,
     storage: &mut Storage,
     scratch: &mut Scratch,

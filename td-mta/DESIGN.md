@@ -643,6 +643,20 @@ the completed owner freshly admit; passive views do not confer source or
 publication authority. Source-bound body-list/response serialization
 remains a separate next boundary.
 
+M06dm consumes private complete classification into original-source body-list
+selection. The existing iterative selector reads only that owner's original
+nodes and retains the original job/header allowances. No replacement node
+slice, source or budget enters the transition. Fresh admission precedes local
+constructor checks; complete selection creates a private owner retaining the
+same immutable source binding, original header limit, cells and passive lists.
+Caller selection limits only add refusal policy over already bounded nodes;
+they do not renew traversal or job allowances. Explicit
+checks and consuming finish retire all visibility after refusal. Caller list
+windows remain separately admitted; there is no new parsing, charge,
+allowance, source-sized scratch or selection algorithm. Response composition
+must consume that private selected owner, never reconstruct it from passive
+Views. Serialization, authenticated locators and publication remain external.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

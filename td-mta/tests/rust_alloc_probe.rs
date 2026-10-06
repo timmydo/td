@@ -5435,10 +5435,13 @@ fn ordered_mime_classification() {
         admission::work::{Charge, Meter, Stop},
         header_select::SourceEnd,
         limits::Limits,
-        mime_body_lists::Node,
+        mime_body_lists::{self, Node},
         mime_part_headers::{self, label_json},
         mime_traversal::{
-            bound::{ordered::Classifying, Cursor, Error},
+            bound::{
+                ordered::{body_lists::Selecting, Classifying},
+                Cursor, Error,
+            },
             Part, Status,
         },
         nfc::{HeaderBudget, Scratch},
@@ -5463,8 +5466,12 @@ fn ordered_mime_classification() {
     let mut parts = [Part::default(); 8];
     let mut nodes = [Node::default(); 8];
     let mut scratch = Scratch::new();
+    let mut text = [0; 8];
+    let mut html = [0; 8];
+    let mut attachments = [0; 8];
+    let mut membership = [0; 8];
     let before = COUNTERS.snapshot();
-    for trial in 0..8 {
+    for trial in 0..14 {
         let mut work = Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
             Charge {
@@ -5600,6 +5607,82 @@ fn ordered_mime_classification() {
             let (view, work, budget) = classified.finish(Tick(1)).unwrap();
             assert_eq!(view.parts.len(), 3);
             assert_eq!(view.nodes.len(), 3);
+            assert_eq!(
+                (std::ptr::from_mut(work), std::ptr::from_mut(budget)),
+                (pointers.0, pointers.1)
+            );
+            continue;
+        }
+        if trial >= 8 {
+            let mut selection = Selecting::new(
+                classified,
+                &Limits::default(),
+                mime_body_lists::Backing {
+                    text: text.get_mut(..if trial == 12 { 0 } else { 8 }).unwrap(),
+                    html: &mut html,
+                    attachments: &mut attachments,
+                    membership: membership
+                        .get_mut(..if trial == 11 { 0 } else { 8 })
+                        .unwrap(),
+                },
+                Tick(1),
+            )
+            .unwrap();
+            let mut done = false;
+            let mut refused = None;
+            for turn in 0..100000 {
+                match selection.poll(Tick(1)) {
+                    Ok(mime_body_lists::Status::Complete) => {
+                        done = true;
+                        break;
+                    }
+                    Ok(mime_body_lists::Status::Yield) => {}
+                    Err(error) => {
+                        refused = Some(error);
+                        break;
+                    }
+                }
+                if trial == 9 && turn == 0 {
+                    break;
+                }
+            }
+            if trial == 9 {
+                assert_eq!(
+                    selection.finish(Tick(100)).err(),
+                    Some(Error::BodyLists(mime_body_lists::Error::Work(
+                        Stop::Deadline
+                    )))
+                );
+                continue;
+            }
+            if let Some(error) = refused {
+                assert_eq!(
+                    error,
+                    Error::BodyLists(mime_body_lists::Error::OutputCapacity)
+                );
+                assert!(selection.value().is_none());
+                assert_eq!(selection.finish(Tick(1)).err(), Some(error));
+                continue;
+            }
+            assert!(done);
+            let mut selected = selection.finish(Tick(1)).unwrap();
+            if trial == 10 {
+                let error = selected.check_deadline(Tick(100)).unwrap_err();
+                assert!(selected.value().is_none());
+                assert_eq!(selected.finish(Tick(1)).err(), Some(error));
+                continue;
+            }
+            if trial == 13 {
+                forget(selected);
+                continue;
+            }
+            let (view, work, budget) = selected.finish(Tick(1)).unwrap();
+            assert_eq!(view.structure.parts.len(), 3);
+            assert_eq!(view.structure.nodes.len(), 3);
+            assert_eq!(view.lists.text, &[3]);
+            assert_eq!(view.lists.html, &[3]);
+            assert_eq!(view.lists.attachments, &[2]);
+            assert!(view.lists.has_attachment);
             assert_eq!(
                 (std::ptr::from_mut(work), std::ptr::from_mut(budget)),
                 (pointers.0, pointers.1)

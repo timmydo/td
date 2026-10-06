@@ -2157,6 +2157,28 @@ original-owner reuse, capacity failure and completed-child forgetting
 with all caller backing created before counting. Native, worker and RSS
 qualification stays separate.
 
+M06dm's original-source Selecting plus HeaderBudget has a compiled 16 KiB
+ceiling in the existing parser reservation; completed Selected has a compiled
+256-byte ceiling. The existing body-list cursor supplies the only 65-frame
+set. Original source/base and complete Part/Node slices stay privately bound;
+caller lists and membership retain their existing separate admission. No new
+metadata table, backing grant, parser or per-container allocation is added.
+The wrapper adds no positive charge: direct-selector turns and all five cost
+counters remain identical, including unchanged header byte/step counters.
+
+One unit compares independent supplied-node selection with bound completion
+at zero/nonzero/maximum-fitting bases, literal digest and nested alternative
+fallback lists, original source/cells/owners, prefilled nodes and spare backing.
+Three further units cover every list progress prefix, cached Complete versus fresh finish,
+late selected-owner retirement, constructor admission priority and local limits, sticky original
+header refusal, premature finish, each job counter cut and all four output
+window failures. Four exclusive-owner Copy/Clone guards and a rejected passive
+constructor compile-fail guard pin ownership. The harness-free Rust allocation
+probe includes healthy complete original-owner release, partial deadline,
+complete-owner refusal, membership/text capacity and completed-owner forgetting
+with all backing created before the counted interval. Native and RSS evidence
+remain separate.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

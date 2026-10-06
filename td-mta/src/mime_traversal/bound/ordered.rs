@@ -1,4 +1,5 @@
 //! Complete ordinal-ordered classification under one immutable source binding.
+pub mod body_lists;
 use super::{ClassifiedView, Error, PartCursor, Structure};
 use crate::{
     admission::work::Meter,

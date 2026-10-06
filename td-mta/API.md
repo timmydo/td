@@ -5022,9 +5022,40 @@ passive copies. nodes/parts hide after explicit refusal; check_deadline
 and consuming finish freshly admit. Finish returns passive complete View
 plus original job/header owners. Source/blob/locator authority and
 publication remain external; prior copied metadata/nodes must be
-discarded after later failure. Future body-list binding must consume
-Classified, never accept constructible passive View as source/order
-authority. Body-list binding and response serialization remain next.
+discarded after later failure. M06dm body-list binding consumes
+Classified, never constructible passive View as source/order authority.
+Response serialization remains next.
+
+### 1.118 Original-source body-list selection
+
+M06dm adds mime_traversal::bound::ordered::body_lists. Selecting::new
+consumes private Classified, separately admitted list/membership Backing,
+limits and the real Tick. It freshly admits the original owners before local
+limit checks, then moves them into the existing mime_body_lists::Cursor.
+Only the complete original node slice can enter; there are no replacement
+source, node or budget parameters. The immutable source/base and original
+parts/nodes and original per-part header limit remain privately pinned.
+Caller limits only constrain selection of those already bounded nodes; they
+do not renew traversal or job allowances. Four Copy/Clone compile-fail guards and
+one rejected passive-View constructor pin the exclusive boundary.
+
+poll/check_deadline delegate to the existing cursor, preserving all turns,
+charges, fixed frames and sticky errors. value exposes combined passive
+structure and lists only after healthy whole selection. Cached Complete
+remains inert and earlier copied Views stay provisional. Fresh consuming
+finish returns private Selected, retaining the original source binding,
+complete cells/lists and pointer-identical job/header owners. Body-list errors
+retain their context as bound::Error::BodyLists; initial and completed-owner
+admission errors remain bound::Error::Admission.
+
+Selected::value hides after explicit refusal. check_deadline and consuming
+finish freshly admit without added positive charge or renewed credit. finish
+releases combined passive View and original owners for low-level reuse; those
+copies grant no source, locator or publication authority. Future response
+composition must consume private Selected rather than accept passive copies.
+Failure or safe forgetting cannot manufacture such an owner. Caller backing
+stays provisional and is not wiped; serialized responses, locators and whole
+job publication remain separate increments.
 
 ## 2. Read views and change history
 

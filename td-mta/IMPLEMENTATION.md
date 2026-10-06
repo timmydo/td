@@ -2124,6 +2124,17 @@ Initial independently landable increments:
   complete-owner finish, capacity/extra/forget refusal and measured zero
   Rust allocation. Source-bound body-list and response work remain next.
 
+- **M06dm — original-source body-list selection:** consume private Classified
+  into the existing iterative selector under original job/header owners,
+  retaining original immutable source/base and complete parts/nodes. Fresh
+  constructor admission precedes local limits. Whole selection alone creates
+  private Selected; fresh consuming handoff restores original owners.
+  Qualify direct-selector turns/costs and literal nested fallback, three source
+  bases, original source/cell/budget identity, every progress prefix, late
+  complete-owner refusal, three job cuts, all four output capacities and
+  measured zero Rust allocation. Response serialization and authenticated
+  locator composition remain next.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
