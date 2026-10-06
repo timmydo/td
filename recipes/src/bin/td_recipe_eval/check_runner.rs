@@ -1960,26 +1960,15 @@ fn trailing_pid(name: &str) -> Option<u32> {
     last.parse::<u32>().ok()
 }
 
-/// Whether a directory name is one of OUR scratch trees, and so eligible for reaping —
-/// `scratch_name` emits `build-…` / `check-…` / `qemu-boot-…` / `run-…` ending in a
-/// numeric pid, optionally `.<n>`-disambiguated. The prefix guard means a coincidental
-/// sibling such as `gcc-14` or `glibc-241` can never be reaped (belt-and-braces: this
-/// dir holds only our scratch trees anyway). The `qemu-boot-` and `run-` prefixes are
-/// essential: the host-side qemu-boot and interactive `run` tools create per-boot
-/// scratch trees here too, and without them a crashed/killed boot's tree (which can
-/// hold a multi-GiB kernel build) would leak forever. Split out so the reaper's
-/// eligibility rule is unit-testable.
+/// Whether a directory name is a per-run scratch tree, and so eligible for reaping:
+/// `scratch_name` output of any prefix, ending in a numeric pid, optionally
+/// `.<n>`-disambiguated. A fixed-name tree (`seed-digests`) is left to its next
+/// claimant. No prefix list: one went stale and leaked every `qemu-install-*` tree.
 ///
-/// Eligible is not reapable: whether the tree is ABANDONED is answered by its claim
-/// lock, never by this name.
+/// Eligible is not reapable: `reap_dead_scratch` also requires the claim file
+/// `claim_scratch` wrote, which is what keeps a foreign `gcc-14` safe, and takes
+/// only a claim it can lock.
 fn reapable_scratch(name: &str) -> bool {
-    if !name.starts_with("build-")
-        && !name.starts_with("check-")
-        && !name.starts_with("qemu-boot-")
-        && !name.starts_with("run-")
-    {
-        return false;
-    }
     trailing_pid(name).is_some()
 }
 
@@ -3783,13 +3772,14 @@ impl RecipeCheckRunner {
         }
     }
 
-    /// Best-effort removal of ABANDONED per-pid scratch trees under `scratch/`. Each
-    /// build-/check-run works in `scratch/<name>-<pid>` and never removes it on exit, so
-    /// dead runs' trees pile up. Removes only trees whose CLAIM it can take, which is
-    /// what makes it safe with peers holding the ladder SHARED: our own in-progress
-    /// scratch and every live peer's are locked, so neither is ever a candidate, and
-    /// that holds across pid namespaces where `/proc` did not. Never fails — any error
-    /// leaves the tree for a later pass.
+    /// Best-effort removal of ABANDONED per-pid scratch trees under `scratch/`. Every
+    /// runner works in the `scratch/<name>-<pid>` it claimed and never removes it on
+    /// exit, so dead runs' trees pile up. Removes only trees with an existing claim
+    /// file it can lock, never minting one: a tree no runner claimed is not ours.
+    /// The lock is what makes it safe with peers holding the ladder SHARED: our own
+    /// in-progress scratch and every live peer's are locked, so neither is ever a
+    /// candidate, and that holds across pid namespaces where `/proc` did not. Never
+    /// fails — any error leaves the tree for a later pass.
     ///
     /// Called from `setup()` (so a build/boot/verify that does real work always reaps,
     /// already holding at least a shared ladder lock by the time it gets here) AND,
@@ -3822,7 +3812,11 @@ impl RecipeCheckRunner {
             // predecessors. Our OWN tree is never a candidate — we are holding its
             // claim. The lock file itself is deliberately left behind; see
             // `claim_scratch`.
-            let lock = match open_lock_file(&scratch_claim_lock(dir, &name)) {
+            let lock = match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(scratch_claim_lock(dir, &name))
+            {
                 Ok(f) => f,
                 Err(_) => continue,
             };
@@ -10088,22 +10082,37 @@ chmod 755 '{}'
     }
 
     #[test]
-    fn reapable_scratch_requires_our_scratch_prefix() {
-        // Our own trees are eligible...
-        assert!(reapable_scratch("build-oyacc-4059"));
-        assert!(reapable_scratch("check-make-test-1-12345"));
-        // ...including the host-side qemu-boot tool's per-boot scratch (a killed boot's
-        // multi-GiB kernel-build tree would otherwise leak forever).
-        assert!(reapable_scratch("qemu-boot-linux-x86-64-22760"));
-        // ...and the interactive `run` tool's per-boot scratch (same multi-GiB leak risk).
-        assert!(reapable_scratch("run-system-x86-64-31820"));
-        // ...and a claim-disambiguated one, which two same-pid runs in different pid
-        // namespaces now produce.
-        assert!(reapable_scratch("check-make-test-1-12345.3"));
-        // ...but a coincidental numeric-suffixed sibling is NEVER reaped.
-        assert!(!reapable_scratch("gcc-14"));
-        assert!(!reapable_scratch("glibc-241"));
-        assert!(!reapable_scratch("binutils-244"));
+    fn reapable_scratch_takes_any_per_run_name_whatever_its_prefix() {
+        // Every `scratch_name` prefix in use is eligible by name, not just the ones someone
+        // remembered to list: `qemu-install-*` was missing from such a list and every
+        // install's tree, disk image included, leaked.
+        for name in [
+            "build-oyacc-4059",
+            "check-make-test-1-12345",
+            "qemu-boot-linux-x86-64-22760",
+            "run-system-x86-64-31820",
+            "qemu-install-system-system-x86-64-127470",
+            "qemu-install-encrypted-system-x86-64-31642",
+            "qemu-secret-system-system-secret-vm-test-8",
+            "warm-codex-4243",
+            "bundle-system-x86-64-77",
+            "gc-store-901",
+            "oracle-memo-qemu-boot-live-55",
+            "verify-store-902",
+            "qemu-secret-linux-x86-64-td-secret-vm-test-9",
+            "qemu-boot-live-system-x86-64-56",
+            "build-iso-system-x86-64-78",
+            "application-closure-firefox-79",
+            // A claim-disambiguated one, which two same-pid runs in different pid
+            // namespaces produce.
+            "check-make-test-1-12345.3",
+        ] {
+            assert!(reapable_scratch(name), "{name}");
+        }
+        // A fixed-name tree is reused by its next claimant, never reaped.
+        assert!(!reapable_scratch("seed-digests"));
+        assert!(!reapable_scratch("seed-digests.2"));
+        assert!(!reapable_scratch("bootstrap-root-pin"));
         assert!(!reapable_scratch("build-cache")); // the cache dir, no pid
         assert!(!reapable_scratch("store"));
         assert!(!reapable_scratch("seed-store"));
@@ -10112,13 +10121,65 @@ chmod 755 '{}'
         assert!(!reapable_scratch(".check-make-test-1-9.claim"));
     }
 
+    // What a hard-killed run leaves: its claim file, released, beside its tree.
+    // Unlocked explicitly rather than by the drop; see
+    // `two_live_claims_on_one_name_get_separate_scratch_dirs`.
+    fn abandoned_scratch(scratch_root: &Path, name: &str) {
+        let (dir, lock) = claim_scratch(scratch_root, name).unwrap();
+        fs::create_dir_all(dir).unwrap();
+        lock.unlock().unwrap();
+    }
+
+    // Eligibility by name is only half: the reaper also requires the claim
+    // `claim_scratch` wrote, so a tree no runner made — `gcc-14` reads as pid 14 —
+    // is never ours to take, and the reaper never mints a claim for it.
+    #[test]
+    fn the_reaper_takes_every_abandoned_claimed_tree_and_nothing_unclaimed() {
+        let lw = env::temp_dir().join(format!("td-reap-kinds-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let runner = shared_test_runner(&lw);
+        let scratch_root = lw.join("scratch");
+
+        let abandoned = [
+            "qemu-install-system-system-x86-64-999997",
+            "qemu-install-encrypted-system-x86-64-999996",
+            "warm-codex-999995",
+            "check-make-test-1-999994",
+        ];
+        for name in abandoned {
+            abandoned_scratch(&scratch_root, name);
+        }
+        let live = "qemu-install-system-system-x86-64-999993";
+        let held = claim_scratch(&scratch_root, live).unwrap().1;
+        fs::create_dir_all(scratch_root.join(live)).unwrap();
+        let foreign = "gcc-14";
+        fs::create_dir_all(scratch_root.join(foreign)).unwrap();
+
+        runner.reap_dead_scratch();
+
+        for name in abandoned {
+            assert!(!scratch_root.join(name).exists(), "{name} was not reaped");
+        }
+        assert!(
+            scratch_root.join(live).is_dir(),
+            "a held claim must survive"
+        );
+        assert!(
+            scratch_root.join(foreign).is_dir(),
+            "an unclaimed tree is not ours"
+        );
+        assert!(!scratch_claim_lock(&scratch_root, foreign).exists());
+        drop(held);
+        let _ = fs::remove_dir_all(&lw);
+    }
+
     // The reaper's whole safety rule, and the one the pid could not express: a tree
     // whose claim is HELD is live and must survive, whoever holds it and in whatever
     // pid namespace; a tree whose claim is free is abandoned and goes. Driven with a
     // real lock rather than a real peer, since a peer in another pid namespace is
     // exactly what the gate cannot spawn.
     #[test]
-    fn the_reaper_spares_a_claimed_tree_and_takes_an_unclaimed_one() {
+    fn the_reaper_spares_a_held_claim_and_takes_a_released_one() {
         let lw = env::temp_dir().join(format!("td-reap-claim-{}", process::id()));
         let _ = fs::remove_dir_all(&lw);
         let runner = shared_test_runner(&lw);
@@ -10133,7 +10194,7 @@ chmod 755 '{}'
 
         // An abandoned tree: same shape, claim free.
         let dead = "check-dead-test-1-999998";
-        fs::create_dir_all(scratch_root.join(dead)).unwrap();
+        abandoned_scratch(&scratch_root, dead);
 
         runner.reap_dead_scratch();
 
@@ -10143,7 +10204,7 @@ chmod 755 '{}'
         );
         assert!(
             !scratch_root.join(dead).exists(),
-            "an unclaimed tree is abandoned and must be reclaimed"
+            "a tree whose claim was released is abandoned and must be reclaimed"
         );
         // The claim FILE survives either way — reaping it would let two runs hold one
         // name through the replaced inode.
@@ -10179,7 +10240,7 @@ chmod 755 '{}'
 
         // A peer hard-killed mid-run: its claim is free, so its tree is abandoned.
         let dead = "check-td-boot-test-1-31337";
-        fs::create_dir_all(scratch_root.join(dead)).unwrap();
+        abandoned_scratch(&scratch_root, dead);
 
         assert!(
             reap_then_check_memoized(&runner, stem, index, key),
@@ -10216,7 +10277,7 @@ chmod 755 '{}'
             .unwrap();
 
         let dead = "check-td-boot-test-1-31337";
-        fs::create_dir_all(scratch_root.join(dead)).unwrap();
+        abandoned_scratch(&scratch_root, dead);
 
         // Simulate a concurrent `clear-store`/fsck/seed-digest generator: hold the
         // SAME general ladder lock path exclusively, as `lock_ladder` would.
