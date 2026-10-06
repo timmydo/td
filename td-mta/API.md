@@ -5057,6 +5057,42 @@ Failure or safe forgetting cannot manufacture such an owner. Caller backing
 stays provisional and is not wiped; serialized responses, locators and whole
 job publication remain separate increments.
 
+### 1.119 Original-source response metadata replay
+
+M06dn adds ordered::body_lists::response. Projecting::new consumes private
+Selected with a fresh real Tick; no passive View, replacement source, node,
+header limit or budget argument can enter. It retains the original source,
+base, header limit, complete cells, selected lists and original work/header
+owners. Caller backing and scratch remain separately admitted.
+
+next freshly admits before choosing exactly the next original ordinal. It
+reuses Structure::metadata to clip only the original immutable source with
+its traversal context and header limit. Part delegates bounded polling and
+fresh consuming metadata finish, returning the original descriptor,
+retained metadata and its already-complete classified node. It does not
+classify or charge a node again. Metadata replay spends the original
+allowances, including rereads and retained output; no credit is renewed.
+Only successful consuming finish advances the ordinal. Child refusal or
+safe forgetting retires the whole replay owner, including after Complete.
+
+Projecting::finish freshly admits before requiring every original part.
+Only complete replay creates private Projected, which retains the original
+source and allowances. Explicit refusal hides its passive complete view;
+its consuming finish also freshly admits before low-level owner release.
+Earlier copied metadata and lists remain provisional, and caller bytes are
+not wiped. This owner proves complete metadata visitation, not serialized
+JSON, locator authority or publication. A composing response job must bind
+its output framing and retention to that visitation separately. The next
+framer wraps each live Part before its metadata window is reused; consuming
+Projected alone cannot serialize metadata or prove response completion.
+
+Six Copy/Clone guards and a rejected passive constructor pin exclusivity.
+The replay plus its one metadata child and HeaderBudget fits the existing
+8 KiB parser reservation; Projected has a compiled 256-byte ceiling. These
+are layout ceilings, not native stack or RSS measurements. Whole metadata
+retention, JSON structure framing, authenticated locators and final response
+publication remain subsequent boundaries.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

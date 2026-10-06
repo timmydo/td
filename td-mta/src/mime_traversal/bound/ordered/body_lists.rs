@@ -1,4 +1,5 @@
 //! Select body lists only from the complete original classified preorder.
+pub mod response;
 use super::{Classified, Error};
 use crate::{
     admission::work::Meter,
@@ -10,10 +11,10 @@ use crate::{
 };
 
 struct Binding<'a, 'w, 'n> {
-    // Keep the original immutable source pinned for later response composition.
-    _source: &'a [u8],
-    _base: u64,
-    _header_limit: u64,
+    // Keep the original immutable source and header policy pinned across replay.
+    source: &'a [u8],
+    base: u64,
+    header_limit: u64,
     parts: &'w [Part],
     nodes: &'n [Node],
 }
@@ -64,9 +65,9 @@ impl<'a, 'w, 'n> Selecting<'a, 'w, 'n> {
         .map_err(Error::BodyLists)?;
         Ok(Self {
             binding: Binding {
-                _source: structure.source,
-                _base: structure.base,
-                _header_limit: structure.header_limit,
+                source: structure.source,
+                base: structure.base,
+                header_limit: structure.header_limit,
                 parts: structure.parts,
                 nodes: classified.nodes,
             },

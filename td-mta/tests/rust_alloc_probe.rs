@@ -5439,7 +5439,10 @@ fn ordered_mime_classification() {
         mime_part_headers::{self, label_json},
         mime_traversal::{
             bound::{
-                ordered::{body_lists::Selecting, Classifying},
+                ordered::{
+                    body_lists::{response::Projecting, Selecting},
+                    Classifying,
+                },
                 Cursor, Error,
             },
             Part, Status,
@@ -5471,7 +5474,7 @@ fn ordered_mime_classification() {
     let mut attachments = [0; 8];
     let mut membership = [0; 8];
     let before = COUNTERS.snapshot();
-    for trial in 0..14 {
+    for trial in 0..21 {
         let mut work = Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
             Charge {
@@ -5666,6 +5669,114 @@ fn ordered_mime_classification() {
             }
             assert!(done);
             let mut selected = selection.finish(Tick(1)).unwrap();
+            if trial >= 14 {
+                if trial == 20 {
+                    assert_eq!(
+                        Projecting::new(selected, Tick(100)).err(),
+                        Some(Error::Admission(td_mta::nfc::Error::Work(Stop::Deadline)))
+                    );
+                    continue;
+                }
+                let mut response = Projecting::new(selected, Tick(1)).unwrap();
+                if trial == 15 {
+                    assert_eq!(
+                        response.finish(Tick(100)).err(),
+                        Some(Error::Admission(td_mta::nfc::Error::Work(Stop::Deadline)))
+                    );
+                    continue;
+                }
+                let mut stopped = false;
+                for ordinal in 1..=3 {
+                    let mut part = response
+                        .next(
+                            label_json::Backing {
+                                headers: mime_part_headers::Backing {
+                                    heads: &mut heads,
+                                    charset: &mut charset,
+                                    filename: &mut filename,
+                                },
+                                labels: td_mta::mime_label_fields::json::Backing {
+                                    content_id: &mut id,
+                                    content_language: &mut language,
+                                },
+                                content_location: location
+                                    .get_mut(..if trial == 18 { 0 } else { 256 })
+                                    .unwrap(),
+                            },
+                            &mut scratch,
+                            Tick(1),
+                        )
+                        .unwrap();
+                    if trial == 19 {
+                        forget(part);
+                        stopped = true;
+                        break;
+                    }
+                    if trial == 16 {
+                        part.poll(Tick(1)).unwrap();
+                        assert!(part.finish(Tick(100)).is_err());
+                        stopped = true;
+                        break;
+                    }
+                    let mut complete = false;
+                    let mut refusal = None;
+                    for _ in 0..100000 {
+                        match part.poll(Tick(1)) {
+                            Ok(Status::Complete) => {
+                                complete = true;
+                                break;
+                            }
+                            Ok(Status::Yield) => {}
+                            Err(error) => {
+                                refusal = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(error) = refusal {
+                        assert_eq!(trial, 18);
+                        assert!(part.value().is_none());
+                        assert_eq!(part.finish(Tick(1)).err(), Some(error));
+                        stopped = true;
+                        break;
+                    }
+                    assert!(complete);
+                    assert!(part.value().is_some());
+                    let (view, work, budget, scratch) = part.finish(Tick(1)).unwrap();
+                    assert_eq!(view.part.ordinal, ordinal);
+                    assert_eq!(
+                        (
+                            std::ptr::from_mut(work),
+                            std::ptr::from_mut(budget),
+                            std::ptr::from_mut(scratch)
+                        ),
+                        pointers
+                    );
+                }
+                if stopped {
+                    assert!(response.completed().is_err());
+                    assert!(response.finish(Tick(1)).is_err());
+                    continue;
+                }
+                let projected = response.finish(Tick(1)).unwrap();
+                if trial == 17 {
+                    assert_eq!(
+                        projected.finish(Tick(100)).err(),
+                        Some(Error::Admission(td_mta::nfc::Error::Work(Stop::Deadline)))
+                    );
+                    continue;
+                }
+                let (view, work, budget) = projected.finish(Tick(1)).unwrap();
+                assert_eq!(view.lists.text, &[3]);
+                assert_eq!(view.lists.html, &[3]);
+                assert_eq!(view.lists.attachments, &[2]);
+                assert!(view.lists.has_attachment);
+                assert_eq!(
+                    (std::ptr::from_mut(work), std::ptr::from_mut(budget)),
+                    (pointers.0, pointers.1)
+                );
+                continue;
+            }
             if trial == 10 {
                 let error = selected.check_deadline(Tick(100)).unwrap_err();
                 assert!(selected.value().is_none());

@@ -8,21 +8,21 @@ use crate::{
     admission::work::{Charge, Stop},
     nfc::Scratch,
 };
-const ALTERNATIVE: &[u8] = concat!(
+pub(super) const ALTERNATIVE: &[u8] = concat!(
     "Content-Type: multipart/alternative;boundary=a\r\n\r\n--a\r\n",
     "Content-Type: multipart/mixed;boundary=m\r\n\r\n--m\r\n",
     "Content-Type: text/plain\r\n\r\nx\r\n--m\r\n",
     "Content-Type: image/png\r\n\r\nx\r\n--m--\r\n--a--\r\n"
 )
 .as_bytes();
-struct Lists {
+pub(super) struct Lists {
     text: [u16; 8],
     html: [u16; 8],
     attachments: [u16; 8],
     flags: [u8; 8],
 }
 impl Lists {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             text: [42; 8],
             html: [42; 8],
@@ -30,7 +30,7 @@ impl Lists {
             flags: [42; 8],
         }
     }
-    fn backing(&mut self, caps: [usize; 4]) -> mime_body_lists::Backing<'_> {
+    pub(super) fn backing(&mut self, caps: [usize; 4]) -> mime_body_lists::Backing<'_> {
         mime_body_lists::Backing {
             text: &mut self.text[..caps[0]],
             html: &mut self.html[..caps[1]],
@@ -39,7 +39,7 @@ impl Lists {
         }
     }
 }
-fn classify<'a, 'w, 'n>(
+pub(super) fn classify<'a, 'w, 'n>(
     source: &'a [u8],
     base: u64,
     parts: &'w mut [Part],
@@ -63,10 +63,10 @@ fn drain(cursor: &mut Selecting<'_, '_, '_>) -> Result<usize, Error> {
     }
     panic!("selection did not complete")
 }
-fn costs(work: &Meter, budget: &HeaderBudget) -> [u64; 5] {
+pub(super) fn costs(work: &Meter, budget: &HeaderBudget) -> [u64; 5] {
     [
-        16 * 1024 * 1024 - budget.source_bytes_remaining(),
-        16_000_000 - budget.steps_remaining(),
+        HeaderBudget::new().source_bytes_remaining() - budget.source_bytes_remaining(),
+        HeaderBudget::new().steps_remaining() - budget.steps_remaining(),
         100_000_000 - work.remaining().io_bytes,
         10_000_000 - work.remaining().records,
         10_000_000 - work.remaining().output_bytes,
@@ -139,16 +139,16 @@ fn lists_match_direct_costs_original_source_and_owner_identity() {
             )
             .unwrap();
             assert!(selecting.value().is_none());
-            assert!(std::ptr::eq(selecting.binding._source, source));
-            assert_eq!(selecting.binding._base, base);
-            assert_eq!(selecting.binding._header_limit, header_limit);
+            assert!(std::ptr::eq(selecting.binding.source, source));
+            assert_eq!(selecting.binding.base, base);
+            assert_eq!(selecting.binding.header_limit, header_limit);
             selecting.check_deadline(Tick(1)).unwrap();
             assert_eq!(drain(&mut selecting).unwrap(), turns);
             assert_eq!(selecting.poll(Tick(100)), Ok(Status::Complete));
             let mut selected = selecting.finish(Tick(1)).unwrap();
             selected.check_deadline(Tick(1)).unwrap();
-            assert!(std::ptr::eq(selected.binding._source, source));
-            assert_eq!(selected.binding._header_limit, header_limit);
+            assert!(std::ptr::eq(selected.binding.source, source));
+            assert_eq!(selected.binding.header_limit, header_limit);
             let (view, work, budget) = selected.finish(Tick(1)).unwrap();
             assert_eq!(view.structure.parts, descriptors);
             assert_eq!(view.structure.nodes, original_nodes);

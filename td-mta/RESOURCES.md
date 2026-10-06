@@ -2179,6 +2179,28 @@ complete-owner refusal, membership/text capacity and completed-owner forgetting
 with all backing created before the counted interval. Native and RSS evidence
 remain separate.
 
+M06dn response metadata replay reuses the original source, header limit,
+classified nodes and selected lists, without another retained metadata table.
+Projecting plus its sole Part child and HeaderBudget has a compiled 8 KiB
+ceiling within the existing parser reservation; Projected has a compiled
+256-byte ceiling. Observed x86-64 host layouts are Projecting 152 bytes,
+Part 6088 bytes, HeaderBudget 24 bytes, totaling 6264 bytes; Projected is
+144 bytes. These are compiler layout observations, not native-stack or RSS
+measurements. Per-part windows and Scratch are reused serially under
+original owners. Replayed metadata incurs the existing source/interpretation
+and output work; node classification and its retained-node output are not
+repeated. An independent metadata comparison pins turns and all five cost
+counters at three bases for digest and nested-alternative fixtures. Further
+units cover every digest part progress prefix, whole completion, late
+constructor/next/complete-owner admission, capacity, extra parts, safe
+forgetting and original job/header cuts. Six exclusivity guards and a
+passive-constructor rejection pin the owner boundary. The existing allocation
+probe retains all prior classification/selection intervals and additionally
+counts healthy replay release, partial/whole/completed-owner deadline
+refusals, location capacity, abandonment and constructor refusal. All backing
+exists before counting. This remains Rust allocation evidence; native-stack
+and RSS qualification are separate.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

@@ -657,6 +657,23 @@ allowance, source-sized scratch or selection algorithm. Response composition
 must consume that private selected owner, never reconstruct it from passive
 Views. Serialization, authenticated locators and publication remain external.
 
+M06dn consumes private selected ownership into original-source response
+metadata replay. Fresh constructor and next-part admission precede local
+state checks. Every original ordinal is visited once using the original
+source, context, header limit and job/header owners. Existing metadata
+projection supplies the only live child, with one reused caller window and
+scratch; rereads and output spend original allowances. No second
+classification, node output charge, metadata table or renewed credit is
+introduced. Only successful fresh consumption advances visitation; child
+refusal or safe forgetting retires the complete owner. Fresh whole replay
+finish produces a private completed owner retaining original source and
+allowances. It proves metadata visitation, not response bytes or publication;
+JSON framing, locators and output admission must compose with that visitation
+in later increments. The next framer wraps each live Part atomically before
+its window is reused; Projected alone contains no retained part metadata or
+serialization proof. Copied cells and previously emitted metadata remain
+provisional through final whole-job admission.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

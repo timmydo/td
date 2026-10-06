@@ -2135,6 +2135,18 @@ Initial independently landable increments:
   measured zero Rust allocation. Response serialization and authenticated
   locator composition remain next.
 
+- **M06dn — original-source response metadata replay:** consume private
+  Selected with original source/base/header limit, cells, lists and
+  allowances. Freshly admit next-part construction; visit each ordinal once
+  through existing bound metadata without reclassification or another node
+  charge. Only freshly consumed metadata advances visitation; refusal and
+  safe forgetting retire the whole owner. Fresh complete replay produces
+  private Projected. Qualify direct metadata costs/turns and literal labels
+  at three bases, original owner identity, every child/whole prefix,
+  constructor and completed-owner refusal, original work/header cuts,
+  extra/forgotten parts, capacity and measured zero Rust allocation.
+  JSON structure framing, authenticated locators and publication remain next.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
