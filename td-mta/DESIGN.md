@@ -257,6 +257,15 @@ The former module names re-export the shared implementations; there is one
 parser implementation. Service adapters continue to borrow the same live
 work meter and aggregate header budget across parsing and serialization.
 
+Service response owners live in the flat `mime_response` module. Named
+adapters such as `part_json`, `body_json`, `metadata_json` and `subparts_json`
+refer directly to one another; ownership transitions do not define a public
+module ancestry. Shared structure parsing is `mime_structure`. Sibling-only
+fields and helpers are restricted to `mime_response`; callers cannot fabricate
+live owners or extract their original admission handles. Each adapter keeps
+its tests in one named child directory. The previous nested response module
+tree is removed in the same change.
+
 Use `td-mta/` for the service library and installed binary named `td-mta`.
 The M03b2c packaging entry point supports only `--version` and `--help`;
 service commands arrive with their implementations. Its direct

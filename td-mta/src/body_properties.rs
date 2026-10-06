@@ -5,7 +5,7 @@ use crate::{
     ports::Tick,
 };
 
-pub use crate::mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::Properties as Metadata;
+pub use crate::mime_response::selected_metadata::Properties as Metadata;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Fields {
     pub metadata: Metadata,

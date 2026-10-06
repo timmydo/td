@@ -127,9 +127,9 @@ pub mod metadata;
 #[allow(unused)]
 pub mod mime_input;
 #[allow(unused)]
-pub mod mime_text;
+pub mod mime_response;
 #[allow(unused)]
-pub mod mime_traversal;
+pub mod mime_text;
 #[allow(unused)]
 #[path = "../../td-mime/src/nfc.rs"]
 pub mod nfc;
@@ -201,3 +201,5 @@ use quoted_printable as mime_qp;
 use td_mime::{buffer, time, work};
 #[allow(unused)]
 use unfold as mime_unfold;
+
+pub use structure as mime_structure;

@@ -4814,13 +4814,12 @@ fn resident_part_headers() {
 }
 
 fn resident_mime_traversal() {
-    use td_mta::{
-        admission::work::{Charge, Meter, Stop},
-        header_select::SourceEnd,
-        limits::Limits,
-        mime_traversal::{Cursor, Error, Part, Status},
-        nfc::HeaderBudget,
-        ports::{Deadline, Tick},
+    use {
+        td_mta::admission::work::Charge, td_mta::admission::work::Meter,
+        td_mta::admission::work::Stop, td_mta::header_select::SourceEnd, td_mta::limits::Limits,
+        td_mta::mime_structure::Cursor, td_mta::mime_structure::Error,
+        td_mta::mime_structure::Part, td_mta::mime_structure::Status, td_mta::nfc::HeaderBudget,
+        td_mta::ports::Deadline, td_mta::ports::Tick,
     };
     fn meter() -> Meter {
         Meter::new(
@@ -4893,8 +4892,8 @@ fn resident_mime_traversal() {
             );
             assert_eq!(
                 parts.get(2).unwrap().diagnostics,
-                td_mta::mime_traversal::DIGEST_CHILD_CONTEXT
-                    | td_mta::mime_traversal::UNKNOWN_ENCODING
+                td_mta::mime_structure::DIGEST_CHILD_CONTEXT
+                    | td_mta::mime_structure::UNKNOWN_ENCODING
             );
             for index in [0, 1, 3] {
                 assert_eq!(
@@ -4996,17 +4995,13 @@ fn resident_mime_traversal() {
 }
 
 fn bound_mime_part_metadata() {
-    use td_mta::{
-        admission::work::{Charge, Meter, Stop},
-        header_select::SourceEnd,
-        limits::Limits,
-        mime_part_headers::{self, label_json},
-        mime_traversal::{
-            bound::{Cursor, Error},
-            Part, Status,
-        },
-        nfc::{HeaderBudget, Scratch},
-        ports::{Deadline, Tick},
+    use {
+        td_mta::admission::work::Charge, td_mta::admission::work::Meter,
+        td_mta::admission::work::Stop, td_mta::header_select::SourceEnd, td_mta::limits::Limits,
+        td_mta::mime_part_headers, td_mta::mime_part_headers::label_json,
+        td_mta::mime_response::bound::Cursor, td_mta::mime_response::bound::Error,
+        td_mta::mime_structure::Part, td_mta::mime_structure::Status, td_mta::nfc::HeaderBudget,
+        td_mta::nfc::Scratch, td_mta::ports::Deadline, td_mta::ports::Tick,
     };
     fn meter() -> Meter {
         Meter::new(
@@ -5266,18 +5261,14 @@ fn bound_mime_part_metadata() {
 }
 
 fn bound_mime_classification() {
-    use td_mta::{
-        admission::work::{Charge, Meter, Stop},
-        header_select::SourceEnd,
-        limits::Limits,
-        mime_body_lists::{self, Node},
-        mime_part_headers::{self, label_json},
-        mime_traversal::{
-            bound::{Cursor, Error},
-            Part, Status,
-        },
-        nfc::{HeaderBudget, Scratch},
-        ports::{Deadline, Tick},
+    use {
+        td_mta::admission::work::Charge, td_mta::admission::work::Meter,
+        td_mta::admission::work::Stop, td_mta::header_select::SourceEnd, td_mta::limits::Limits,
+        td_mta::mime_body_lists, td_mta::mime_body_lists::Node, td_mta::mime_part_headers,
+        td_mta::mime_part_headers::label_json, td_mta::mime_response::bound::Cursor,
+        td_mta::mime_response::bound::Error, td_mta::mime_structure::Part,
+        td_mta::mime_structure::Status, td_mta::nfc::HeaderBudget, td_mta::nfc::Scratch,
+        td_mta::ports::Deadline, td_mta::ports::Tick,
     };
     const SOURCE: &[u8] = concat!(
         "Content-Type: multipart/mixed;boundary=a\r\n\r\n--a\r\n",
@@ -5442,27 +5433,16 @@ fn bound_mime_classification() {
 }
 
 fn ordered_mime_classification() {
-    use td_mta::{
-        admission::work::{Charge, Meter, Stop},
-        header_select::SourceEnd,
-        limits::Limits,
-        mime_body_lists::{self, Node},
-        mime_part_headers::{self, label_json},
-        mime_traversal::{
-            bound::{
-                ordered::{
-                    body_lists::{
-                        response::{json, Projecting},
-                        Selecting,
-                    },
-                    Classifying,
-                },
-                Cursor, Error,
-            },
-            Part, Status,
-        },
-        nfc::{HeaderBudget, Scratch},
-        ports::{Deadline, Tick},
+    use {
+        td_mta::admission::work::Charge, td_mta::admission::work::Meter,
+        td_mta::admission::work::Stop, td_mta::header_select::SourceEnd, td_mta::limits::Limits,
+        td_mta::mime_body_lists, td_mta::mime_body_lists::Node, td_mta::mime_part_headers,
+        td_mta::mime_part_headers::label_json, td_mta::mime_response::bound::Cursor,
+        td_mta::mime_response::bound::Error, td_mta::mime_response::lists::Selecting,
+        td_mta::mime_response::ordered::Classifying, td_mta::mime_response::part_json as json,
+        td_mta::mime_response::response::Projecting, td_mta::mime_structure::Part,
+        td_mta::mime_structure::Status, td_mta::nfc::HeaderBudget, td_mta::nfc::Scratch,
+        td_mta::ports::Deadline, td_mta::ports::Tick,
     };
     const SOURCE: &[u8] = concat!(
         "Content-Type: multipart/digest;boundary=a\r\n",
@@ -5491,7 +5471,7 @@ fn ordered_mime_classification() {
     let mut retained_output = [0; 256];
     let mut collection_output = [[0; 256]; 3];
     let mut composed_output = [0; 2048];
-    use td_mta::mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::Candidate;
+    use td_mta::mime_response::locators::Candidate;
     let mut locator_output = [Candidate::default(); 3];
     let before = COUNTERS.snapshot();
     'trial_loop: for trial in 0..65 {
@@ -5690,8 +5670,9 @@ fn ordered_mime_classification() {
             assert!(done);
             let mut selected = selection.finish(Tick(1)).unwrap();
             if trial >= 34 {
-                use td_mta::mime_traversal::bound::ordered::body_lists::response::collected::{
-                    Cell, Collecting,
+                use {
+                    td_mta::mime_response::part_collection::Cell,
+                    td_mta::mime_response::part_collection::Collecting,
                 };
                 let mut cells = collection_output.each_mut().map(|output| {
                     Cell::new(output.get_mut(..if trial == 37 { 0 } else { 256 }).unwrap())
@@ -5781,7 +5762,10 @@ fn ordered_mime_classification() {
                 let mut serialized = response.finish(Tick(1)).unwrap();
                 assert_eq!(serialized.value().unwrap().fragments.len(), 3);
                 if trial >= 49 {
-                    use td_mta::mime_traversal::bound::ordered::body_lists::response::collected::composed::{Mode, retained::Cursor as WholeRetention};
+                    use {
+                        td_mta::mime_response::body_json::Mode,
+                        td_mta::mime_response::body_window::Cursor as WholeRetention,
+                    };
                     let mode = if trial == 50 || trial == 64 {
                         Mode::Lists
                     } else {
@@ -5838,7 +5822,9 @@ fn ordered_mime_classification() {
                     }
                     let mut retained = cursor.finish(Tick(1)).unwrap();
                     if trial >= 57 {
-                        use td_mta::{ids::BlobId, mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::Cursor as Mapping};
+                        use {
+                            td_mta::ids::BlobId, td_mta::mime_response::locators::Cursor as Mapping,
+                        };
                         let parent = BlobId::from_bytes([0x44; 16]);
                         let deadline = Error::Admission(td_mta::nfc::Error::Work(Stop::Deadline));
                         if trial == 63 {
@@ -5923,7 +5909,11 @@ fn ordered_mime_classification() {
                     continue;
                 }
                 if trial >= 41 {
-                    use td_mta::mime_traversal::bound::ordered::body_lists::response::collected::composed::{Cursor as Composition, Mode, Status as CompositionStatus};
+                    use {
+                        td_mta::mime_response::body_json::Cursor as Composition,
+                        td_mta::mime_response::body_json::Mode,
+                        td_mta::mime_response::body_json::Status as CompositionStatus,
+                    };
                     let mode = if trial == 42 {
                         Mode::Lists
                     } else {
@@ -6080,7 +6070,7 @@ fn ordered_mime_classification() {
                     assert!(part.value().is_some());
                     if trial >= 27 {
                         if trial == 33 {
-                            assert!(json::retained::Cursor::new(
+                            assert!(td_mta::mime_response::part_window::Cursor::new(
                                 part,
                                 &mut retained_output,
                                 Tick(100)
@@ -6089,7 +6079,7 @@ fn ordered_mime_classification() {
                             stopped = true;
                             break;
                         }
-                        let mut retained = json::retained::Cursor::new(
+                        let mut retained = td_mta::mime_response::part_window::Cursor::new(
                             part,
                             retained_output
                                 .get_mut(..if trial == 30 { 0 } else { 256 })
@@ -12346,7 +12336,7 @@ fn mime_base64() {
 }
 
 fn pinned_source_binding() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned;
+    use mime_response::pinned;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     pinned::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12358,7 +12348,7 @@ fn pinned_source_binding() {
 }
 
 fn source_bound_members() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members;
+    use mime_response::metadata as members;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     members::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12370,7 +12360,7 @@ fn source_bound_members() {
 }
 
 fn selected_source_bound_part_fields() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected;
+    use mime_response::selected_metadata as selected;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     selected::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12382,7 +12372,7 @@ fn selected_source_bound_part_fields() {
 }
 
 fn whole_selected_source_bound_part_fields() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained;
+    use mime_response::selected_metadata_window as retained;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     retained::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12397,7 +12387,7 @@ fn whole_selected_source_bound_part_fields() {
 }
 
 fn collected_selected_source_bound_part_fields() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected;
+    use mime_response::selected_metadata_collection as collected;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     collected::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12412,7 +12402,7 @@ fn collected_selected_source_bound_part_fields() {
 }
 
 fn composed_selected_source_bound_part_fields() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed;
+    use mime_response::selected_metadata_json as composed;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     composed::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12438,7 +12428,7 @@ fn body_property_names() {
 }
 
 fn requested_composed_selected_source_bound_part_fields() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed::requested;
+    use mime_response::requested_selected_json as requested;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     requested::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12453,7 +12443,7 @@ fn requested_composed_selected_source_bound_part_fields() {
 }
 
 fn retained_requested_composed_selected_source_bound_part_fields() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed::requested::retained;
+    use mime_response::requested_selected_window as retained;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     retained::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12501,7 +12491,7 @@ fn body_property_requests() {
 }
 
 fn selected_subparts_composition() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed::requested::subparts;
+    use mime_response::subparts_json as subparts;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     subparts::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12513,7 +12503,7 @@ fn selected_subparts_composition() {
 }
 
 fn selected_subparts_retention() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed::requested::subparts::retained;
+    use mime_response::subparts_window as retained;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     retained::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12549,7 +12539,7 @@ fn retained_header_arrays() {
 }
 
 fn whole_source_bound_members() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained;
+    use mime_response::metadata_window as retained;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     retained::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12560,7 +12550,7 @@ fn whole_source_bound_members() {
     }
 }
 fn collected_source_bound_members() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained::collected;
+    use mime_response::metadata_collection as collected;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     collected::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12574,7 +12564,7 @@ fn collected_source_bound_members() {
     }
 }
 fn composed_source_bound_members() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained::collected::composed;
+    use mime_response::metadata_json as composed;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     composed::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12588,7 +12578,7 @@ fn composed_source_bound_members() {
     }
 }
 fn retained_source_bound_composition() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained::collected::composed::retained;
+    use mime_response::metadata_json_window as retained;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     retained::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12599,7 +12589,7 @@ fn retained_source_bound_composition() {
     }
 }
 fn selected_source_bound_lists() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained::collected::composed::selected;
+    use mime_response::selected_body_json as selected;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     selected::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12611,7 +12601,7 @@ fn selected_source_bound_lists() {
 }
 
 fn requested_source_bound_properties() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained::collected::composed::requested;
+    use mime_response::requested_body_json as requested;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     requested::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12623,7 +12613,7 @@ fn requested_source_bound_properties() {
 }
 
 fn retained_selected_source_bound_lists() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained::collected::composed::selected::retained;
+    use mime_response::selected_body_window as retained;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     retained::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
@@ -12638,7 +12628,7 @@ fn retained_selected_source_bound_lists() {
 }
 
 fn retained_requested_source_bound_properties() {
-    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained::collected::composed::requested::retained;
+    use mime_response::requested_body_window as retained;
     let mut samples = [COUNTERS.snapshot(); 16];
     let mut slots = samples.iter_mut();
     retained::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());

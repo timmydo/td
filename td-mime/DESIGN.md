@@ -43,6 +43,9 @@ implementation. The mail allocation probe compiles those same files with
 the service adapters; it does not maintain another parser copy.
 
 Mail-specific source admission, descriptor custody, request selection and
-response publication remain in td-mta. Existing mail module names alias
-these shared modules during adapter consolidation. The shared crate owns
-no storage format, database index or delivery transaction.
+response publication remain in td-mta. Mail re-exports the shared byte
+parsers; the shared structure parser is named mime_structure. Service
+response adapters use the separate flat mime_response module. Its sibling
+adapters can access internal owner fields for composition; external
+callers cannot construct those owners or extract their admission handles.
+The shared crate owns no storage format, database index or transaction.

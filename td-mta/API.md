@@ -4000,7 +4000,7 @@ claim. RESOURCES.md retains the previous public work/layout bounds.
 
 ### 1.85 Complete resident MIME traversal
 
-M06cf adds mime_traversal::Cursor over one complete authorized resident
+M06cf adds mime_structure::Cursor over one complete authorized resident
 entity, checked absolute base, configured structural bounds and caller
 Part slots. SourceEnd::Prefix refuses before parsing. The constructor checks
 only the relevant depth/part/header bounds; full startup resource planning
@@ -4914,7 +4914,7 @@ composition and source/publication authority remain external.
 
 ### 1.115 Original source binding for traversal and part metadata
 
-M06dj adds mime_traversal::bound::Cursor, a fixed wrapper over the
+M06dj adds mime_response::bound::Cursor, a fixed wrapper over the
 existing complete resident walker. Its fresh consuming finish creates
 Structure with the same immutable source/base, admitted header bound,
 completed caller descriptors and original Meter/HeaderBudget. The
@@ -4995,7 +4995,7 @@ refusal.
 
 ### 1.117 Complete ordered original-source classification
 
-M06dl adds mime_traversal::bound::ordered. Classifying::new consumes a
+M06dl adds mime_response::ordered. Classifying::new consumes a
 healthy original Structure and clips separately admitted caller Node
 backing to the completed descriptor count. Insufficient backing refuses
 with NodeCapacity before another parse or positive charge. Construction
@@ -5028,7 +5028,7 @@ Response serialization remains next.
 
 ### 1.118 Original-source body-list selection
 
-M06dm adds mime_traversal::bound::ordered::body_lists. Selecting::new
+M06dm adds mime_response::lists. Selecting::new
 consumes private Classified, separately admitted list/membership Backing,
 limits and the real Tick. It freshly admits the original owners before local
 limit checks, then moves them into the existing mime_body_lists::Cursor.
@@ -5059,7 +5059,7 @@ job publication remain separate increments.
 
 ### 1.119 Original-source response metadata replay
 
-M06dn adds ordered::body_lists::response. Projecting::new consumes private
+M06dn adds mime_response::response. Projecting::new consumes private
 Selected with a fresh real Tick; no passive View, replacement source, node,
 header limit or budget argument can enter. It retains the original source,
 base, header limit, complete cells, selected lists and original work/header
@@ -5095,7 +5095,7 @@ publication remain subsequent boundaries.
 
 ### 1.120 Original replay metadata JSON member framing
 
-M06do adds response::json::Cursor::new. It consumes only a live response::Part
+M06do adds mime_response::part_json::Cursor::new. It consumes only a live mime_response::response::Part
 with a fresh Tick and requires healthy complete metadata. It retains that
 child's original descriptor, classified node, immutable windows, work/header
 owners, scratch and parent abandonment latch. No passive metadata view,
@@ -5141,7 +5141,7 @@ subsequent work. Projected continues to prove visitation alone.
 
 ### 1.121 Fixed original replay fragment retention
 
-M06dp adds response::json::retained. Cursor::new consumes only a live
+M06dp adds mime_response::part_window. Cursor::new consumes only a live
 response Part with complete metadata and a fresh Tick, and binds one
 separately reserved caller output window. It constructs the framer
 privately; an already advanced framing cursor cannot be rewrapped into a
@@ -5177,7 +5177,7 @@ and whole-response publication remain external.
 
 ### 1.122 Whole original fragment collection
 
-M06dq adds response::collected. Cell::new binds one separately admitted
+M06dq adds mime_response::part_collection. Cell::new binds one separately admitted
 caller output window. Collecting::new consumes only the original
 Selected owner and exactly one cell per original ordinal, freshly
 admitting before capacity inspection. Too few cells refuse
@@ -5212,7 +5212,7 @@ native-stack and RSS qualification remain separate.
 
 ### 1.123 Original body metadata composition
 
-M06dr adds response::collected::composed. Cursor::new consumes only live
+M06dr adds mime_response::body_json. Cursor::new consumes only live
 Serialized ownership, freshly admitted; passive View cannot substitute.
 Mode::Structure emits the bodyStructure member with original preorder
 fragments and iterative subParts. Mode::Lists emits textBody, htmlBody,
@@ -5241,7 +5241,7 @@ all earlier 41. Native-stack and RSS qualification remain separate.
 
 ### 1.124 Whole original body-member retention
 
-M06ds adds composed::retained. Cursor::new consumes original Serialized,
+M06ds adds mime_response::body_window. Cursor::new consumes original Serialized,
 chooses one composition mode and privately constructs a fresh composer
 bound to a separately admitted fixed output window. Advanced composers,
 completed emission owners and passive evidence cannot substitute. Only
@@ -5268,7 +5268,7 @@ RSS, authenticated locators and complete response publication remain open.
 
 ### 1.125 Original provisional direct-leaf locator candidates
 
-M06dt adds retained::locators. Cursor::new consumes only original whole
+M06dt adds mime_response::locators. Cursor::new consumes only original whole
 Retained and takes a typed, untrusted parent BlobId plus exactly one
 caller candidate slot per original ordinal. Fresh admission precedes
 capacity; too few slots refuse ResponseCapacity, surplus InvalidState.
@@ -5310,7 +5310,7 @@ Eight additional measured Rust allocation trials preserve the earlier
 
 ### 1.126 Original resident source identity with a retained file pin
 
-M06du adds retained::locators::pinned. Its constructor consumes original
+M06du adds mime_response::pinned. Its constructor consumes original
 Mapped and an actual complete PinnedBlob. Root/account authorization and
 query admission remain caller obligations before open_blob_input; a
 present row or matching digest does not establish email visibility or
@@ -5382,7 +5382,7 @@ cold coordinate normalization; it covers no additional hashing branch.
 
 ### 1.128 Source-bound original part-member emission
 
-M06dw adds retained::locators::pinned::members. Cursor::new consumes only
+M06dw adds mime_response::metadata. Cursor::new consumes only
 original Bound, freshly checking both original supplied-Tick admission
 and actual pin clock before accepting a one-based original ordinal.
 Passive views, candidate arrays and completed emission alone cannot
@@ -5423,7 +5423,7 @@ and premature finish remain unqualified for Rust allocation.
 
 ### 1.129 Whole source-bound part-member retention
 
-M06dx adds pinned::members::retained. Cursor::new consumes original Bound,
+M06dx adds mime_response::metadata_window. Cursor::new consumes original Bound,
 selects one ordinal and privately constructs a fresh member emitter
 bound to a separately admitted caller window. Advanced emitters and
 completed emission owners cannot replace original Bound. Window advances
@@ -5463,7 +5463,7 @@ remain separate evidence.
 
 ### 1.130 Whole original source-bound member collection
 
-M06dy adds pinned::members::retained::collected. Collecting consumes only
+M06dy adds mime_response::metadata_collection. Collecting consumes only
 original Bound and an exactly sized separately admitted mutable Cell
 array, one fixed output window per original candidate. Fresh supplied
 job Tick and actual pin admission precede cardinality refusal. It does
@@ -5510,7 +5510,7 @@ eight each binding, emission and whole-retention intervals are separate.
 
 ### 1.131 Original source-bound whole tree/list emission
 
-M06dz adds pinned::members::retained::collected::composed. Cursor consumes
+M06dz adds mime_response::metadata_json. Cursor consumes
 only original Serialized, selecting Structure or Lists, and retains
 that whole collection and actual descriptor throughout emission.
 The existing metadata composer and this source-bound composer share
@@ -5555,7 +5555,7 @@ admission/current publication remain open.
 
 ### 1.132 Whole source-bound tree/list members in a fixed window
 
-M06ea adds pinned::members::retained::collected::composed::retained.
+M06ea adds mime_response::metadata_json_window.
 Only original complete Serialized can start a fresh private composer
 and shared td-json Window. Advanced emission or Composed cannot establish
 retention of a lost prefix. Keep original collection, source/fragments,
@@ -5596,7 +5596,7 @@ remain open.
 
 ### 1.133 Requested source-bound body-list properties
 
-M06eb adds pinned::members::retained::collected::composed::selected.
+M06eb adds mime_response::selected_body_json.
 Properties is a pure four-boolean caller selection for textBody,
 htmlBody, attachments and hasAttachment. Explicit NONE selects nothing;
 ALL selects all four. There is no implicit default or request-parser
@@ -5648,7 +5648,7 @@ Native/stack/RSS, full admission and current publication remain open.
 ### 1.134 Whole requested source-bound list retention
 
 M06ec adds
-`mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained::collected::composed::selected::retained`
+`mime_response::selected_body_window`
 beside the source-bound list selector.
 Only original complete Serialized and pure Properties start a fresh
 selected frame through the shared source-bound retention core and
@@ -5691,7 +5691,7 @@ admission and authorized publication remain unqualified.
 
 ### 1.135 Requested source-bound tree and list routing
 
-M06ed adds composed::requested for a pure five-boolean bodyStructure,
+M06ed adds mime_response::requested_body_json for a pure five-boolean bodyStructure,
 textBody, htmlBody, attachments and hasAttachment selection. NONE emits
 no members; ALL emits all five, in that order. This is a typed caller
 selection, not request JSON decoding/default policy or per-part
@@ -5732,7 +5732,7 @@ admission and authorized publication remain unqualified.
 
 ### 1.136 Whole requested source-bound tree/list retention
 
-M06ee adds requested::retained. Only original complete Serialized and
+M06ee adds mime_response::requested_body_window. Only original complete Serialized and
 pure requested Properties create a fresh tree/list composer into the
 shared Window. Advanced or emitted-only owners cannot retain a missing
 prefix. Exclusive Cursor keeps original cells/source backing, actual pin
@@ -5770,7 +5770,7 @@ remain unqualified.
 ### 1.137 Selected original source-bound part fields
 
 M06ef adds
-`mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected`.
+`mime_response::selected_metadata`.
 Only original source-matched Bound and its original ordinal enter the
 exclusive Cursor. Pure explicit Properties select partId, size, type,
 charset, name, disposition, cid, language, location and blobId in the
@@ -5826,7 +5826,7 @@ remain unqualified.
 ### 1.138 Whole selected original source-bound part fields
 
 M06eg adds
-`mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained`.
+`mime_response::selected_metadata_window`.
 Accept only original source-matched Bound, original ordinal, explicit
 ten-field Properties and separately caller-owned/admitted output. A
 private original-bound constructor configures a fresh selected emitter;
@@ -5875,7 +5875,7 @@ authenticated publication remain unqualified.
 ### 1.139 Whole original selected-field collection
 
 M06eh adds
-`mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected`.
+`mime_response::selected_metadata_collection`.
 Original Bound, one immutable explicit ten-field Properties and
 caller-owned/admitted exact-count Cell windows construct exclusive
 Collecting. Cell is the shared legacy window slot; its value is passive
@@ -5935,7 +5935,7 @@ adds explicit subParts selection through the same engine; legacy
 selection types still do not encode JSON request defaults.
 
 M06ei adds
-`mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed`.
+`mime_response::selected_metadata_json`.
 Only complete §1.139 selected Serialized and an explicit Mode construct
 exclusive Cursor. Preserve immutable per-part Properties, original
 collection/cells/backing and actual descriptor through Cursor, Composed
@@ -5987,7 +5987,7 @@ adds explicit subParts selection through the same engine; legacy
 selection types still do not encode JSON request defaults.
 
 M06ej adds
-`mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed::requested`.
+`mime_response::requested_selected_json`.
 Only complete selected Serialized and explicit five-property outer
 Properties construct exclusive Cursor. The outer selection chooses
 bodyStructure, textBody, htmlBody, attachments and hasAttachment; the
@@ -6043,7 +6043,7 @@ adds explicit subParts selection through the same engine; legacy
 selection types still do not encode JSON request defaults.
 
 M06ek adds
-`members::selected::retained::collected::composed::requested::retained`
+`mime_response::requested_selected_window`
 over §1.141's original selected collection. Cursor starts only from
 complete selected Serialized, pure outer Properties and one caller-owned
 fixed output window; an advanced requested Cursor, emitted-only Composed
@@ -6314,7 +6314,7 @@ wiring and current authenticated publication remain unqualified.
 
 ### 1.147 Select subParts in requested selected composition
 
-M06ep adds selected::retained::collected::composed::requested::subparts
+M06ep adds mime_response::subparts_json
 under §1.141's original source-bound custody. Its pure Selection combines
 immutable outer Properties with an explicit sub_parts flag; selected
 metadata keeps its existing ten-field label. Original Serialized, rather
@@ -6358,7 +6358,7 @@ current authenticated publication remain unqualified.
 
 ### 1.148 Retain whole selected subParts composition
 
-M06eq adds §1.147's subparts::retained facade over the original shared
+M06eq adds §1.147's mime_response::subparts_window facade over the original shared
 fixed Window and retention core. Only the original selected Serialized
 may begin fresh whole retention. Advanced cursors, completed emitted-only
 owners, passive views and unselected collections cannot recover missing
