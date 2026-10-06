@@ -503,9 +503,33 @@ pub fn debug_line_source_root_check(
     Step::run("{root}", &[POST_BOOTSTRAP_SH, "-c", &command]).env("PATH", &post_bootstrap_path())
 }
 
+/// `debug_line_source_root_check` for a recipe on the post-Rust tool farm:
+/// the same validator under td-sh, its awk the farm's.
+pub fn post_rust_debug_line_source_root_check(
+    readelf: &str,
+    debug: &str,
+    source: &str,
+    source_root: &str,
+) -> Step {
+    let producer = format!("'{readelf}' --debug-dump=rawline '{debug}' 2>/dev/null");
+    let command = debug_line_validation_command(&producer, source, source_root);
+    Step::run("{root}", &[POST_RUST_SH, "-c", &command]).env("PATH", "{tools}")
+}
+
 /// Execute the shared parser against hostile captured-table shapes. This is a
-/// recipe step so the oracle uses the same declared BusyBox awk as production.
+/// recipe step so the oracle uses the same declared awk as production: this
+/// one BusyBox's, `post_rust_debug_line_validator_regression_steps` the
+/// post-Rust farm's.
 pub fn debug_line_validator_regression_steps() -> Vec<Step> {
+    debug_line_validator_regression_steps_under(POST_BOOTSTRAP_SH, &post_bootstrap_path())
+}
+
+/// The same hostile-table oracle under td-sh and the post-Rust farm's awk.
+pub fn post_rust_debug_line_validator_regression_steps() -> Vec<Step> {
+    debug_line_validator_regression_steps_under(POST_RUST_SH, "{tools}")
+}
+
+fn debug_line_validator_regression_steps_under(shell: &str, path: &str) -> Vec<Step> {
     const GOOD: &str = r#"  Offset: 0
   DWARF Version: 5
  The Directory Table
@@ -618,8 +642,7 @@ pub fn debug_line_validator_regression_steps() -> Vec<Step> {
             content: DEBUG_LINE_AWK.into(),
             exec: false,
         },
-        Step::run("{root}", &[POST_BOOTSTRAP_SH, "-c", &command])
-            .env("PATH", &post_bootstrap_path()),
+        Step::run("{root}", &[shell, "-c", &command]).env("PATH", path),
     ]
 }
 

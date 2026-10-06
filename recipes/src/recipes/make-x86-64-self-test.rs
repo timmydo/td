@@ -1,4 +1,7 @@
-use crate::ladder::{debug_line_source_root_check, post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{
+    post_rust_debug_line_source_root_check, post_rust_debug_line_validator_regression_steps,
+    post_rust_inputs, post_rust_tool_farm, POST_RUST_SH,
+};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 pub fn recipe() -> Recipe {
@@ -10,6 +13,7 @@ pub fn recipe() -> Recipe {
             paths: vec![make.into()],
             exec: true,
         },
+        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
         Step::Require {
             paths: vec![debug.into()],
             exec: false,
@@ -24,7 +28,8 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
     ];
-    steps.push(debug_line_source_root_check(
+    steps.extend(post_rust_debug_line_validator_regression_steps());
+    steps.push(post_rust_debug_line_source_root_check(
         readelf,
         debug,
         "main.c",
@@ -34,7 +39,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "if grep -a -Fq 'guix-build' '{debug}'; then \
@@ -43,24 +48,24 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}/test",
             &[
                 make,
-                "SHELL={in:busybox-x86-64}/bin/sh",
-                "CONFIG_SHELL={in:busybox-x86-64}/bin/sh",
+                &format!("SHELL={POST_RUST_SH}"),
+                &format!("CONFIG_SHELL={POST_RUST_SH}"),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}/test",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 "grep -qx -F 'hello, world' greeting.txt || { echo 'final make did not drive the test build' >&2; exit 1; }; \
                  v=$(\"{in:make-x86-64-self}/bin/make\" --version) || exit 1; \
@@ -73,7 +78,7 @@ pub fn recipe() -> Recipe {
                  if grep -q -a -F '/gnu/store' \"{in:make-x86-64-self}/bin/make\"; then echo 'final make retains a foreign store reference' >&2; exit 1; fi",
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(Step::MkDir {
         path: "{out}".into(),
@@ -91,11 +96,10 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("make-x86-64-self-test", "1.0")
-        .native_inputs(&[
-            "make-x86-64-self",
-            "binutils-x86-64-self",
-            "busybox-x86-64",
-        ])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &["make-x86-64-self", "binutils-x86-64-self"],
+        ))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -112,7 +116,7 @@ mod tests {
     use super::{recipe, Step};
 
     #[test]
-    fn test_uses_only_post_bootstrap_inputs() {
+    fn test_uses_only_post_rust_inputs() {
         let recipe = recipe();
         assert_eq!(
             recipe
@@ -120,9 +124,13 @@ mod tests {
                 .as_deref()
                 .map(|inputs| inputs.iter().map(String::as_str).collect::<Vec<_>>()),
             Some(vec![
+                "td-sh",
+                "td-txt",
+                "td-util",
+                "uutils",
+                "gawk-x86-64-self",
                 "make-x86-64-self",
                 "binutils-x86-64-self",
-                "busybox-x86-64",
             ])
         );
         assert!(recipe.inputs.is_none());

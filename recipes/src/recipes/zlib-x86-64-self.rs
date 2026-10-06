@@ -1,4 +1,4 @@
-use crate::ladder::{post_bootstrap_path, unpack_into, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, unpack_into, POST_RUST_SH};
 use crate::types::{Recipe, Step};
 
 // Final-toolchain zlib for source-built userland. The earlier zlib-x86-64
@@ -9,28 +9,18 @@ pub fn recipe() -> Recipe {
     let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
     let sbin = "{in:binutils-x86-64-self}/bin";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
-    let path = format!("{{root}}/wb:{{tools}}:{sbin}:{}", post_bootstrap_path());
+    let path = format!("{{root}}/wb:{{tools}}:{sbin}");
 
     let mut steps = unpack_into("zlib-x86-64-self-source", "{src}");
-    steps.push(Step::ToolFarm {
-        links: [
-            "awk", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "diff", "dirname",
-            "echo", "env", "expr", "false", "find", "grep", "head", "install", "ln", "ls", "mkdir",
-            "mktemp", "mv", "printf", "pwd", "rm", "rmdir", "sed", "sort", "tail", "tee", "test",
-            "touch", "tr", "true", "uname", "wc", "which", "xargs",
-        ]
-        .iter()
-        .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))
-        .collect(),
-    });
+    steps.push(post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
-        shell: POST_BOOTSTRAP_SH.into(),
+        shell: POST_RUST_SH.into(),
     });
     steps.push(Step::WriteFile {
         path: "{root}/wb/cc".into(),
         content: format!(
-            "#!{POST_BOOTSTRAP_SH}\n\
+            "#!{POST_RUST_SH}\n\
              exec \"{sgcc}\" -static -isystem \"{xglibc}/include\" \
              -B\"{sbin}/\" -B\"{xglibc}/lib\" \
              -L\"{xglibc}/lib\" -static-libgcc \"$@\" \
@@ -43,20 +33,15 @@ pub fn recipe() -> Recipe {
     steps.push(
         Step::run(
             "{src}",
-            &[
-                POST_BOOTSTRAP_SH,
-                "./configure",
-                "--prefix={out}",
-                "--static",
-            ],
+            &[POST_RUST_SH, "./configure", "--prefix={out}", "--static"],
         )
         .env("PATH", &path)
         .env("CC", "{root}/wb/cc")
         .env("CHOST", "x86_64-pc-linux-gnu")
         .env("AR", "{in:binutils-x86-64-self}/bin/ar")
         .env("RANLIB", "{in:binutils-x86-64-self}/bin/ranlib")
-        .env("CONFIG_SHELL", POST_BOOTSTRAP_SH)
-        .env("SHELL", POST_BOOTSTRAP_SH)
+        .env("CONFIG_SHELL", POST_RUST_SH)
+        .env("SHELL", POST_RUST_SH)
         .env("CFLAGS", "-O2")
         .env("SOURCE_DATE_EPOCH", "1"),
     );
@@ -67,7 +52,7 @@ pub fn recipe() -> Recipe {
                 "{in:make-x86-64-self}/bin/make",
                 "-j{jobs}",
                 "libz.a",
-                &format!("SHELL={POST_BOOTSTRAP_SH}"),
+                &format!("SHELL={POST_RUST_SH}"),
             ],
         )
         .env("PATH", &path)
@@ -105,13 +90,15 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("zlib-x86-64-self", "1.3.1")
         .source_input("zlib-x86-64-source")
-        .native_inputs(&[
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-            "make-x86-64-self",
-            "busybox-x86-64",
-        ])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &[
+                "gcc-x86-64-self",
+                "binutils-x86-64-self",
+                "glibc-x86-64",
+                "make-x86-64-self",
+            ],
+        ))
         .steps(steps)
 }
 
@@ -121,17 +108,21 @@ mod tests {
     use crate::types::Step;
 
     #[test]
-    fn static_build_uses_only_post_bootstrap_inputs() {
+    fn static_build_uses_only_post_rust_inputs() {
         let recipe = recipe();
         assert_eq!(
             recipe.native_inputs.as_deref(),
             Some(
                 [
+                    "td-sh",
+                    "td-txt",
+                    "td-util",
+                    "uutils",
+                    "gawk-x86-64-self",
                     "gcc-x86-64-self",
                     "binutils-x86-64-self",
                     "glibc-x86-64",
                     "make-x86-64-self",
-                    "busybox-x86-64",
                 ]
                 .map(str::to_string)
                 .as_slice()

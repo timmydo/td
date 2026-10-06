@@ -1,4 +1,4 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 pub fn recipe() -> Recipe {
@@ -6,9 +6,10 @@ pub fn recipe() -> Recipe {
     let sbin = "{in:binutils-x86-64-self}/bin";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let zlib = "{in:zlib-x86-64-self}";
-    let path = format!("{{tools}}:{sbin}:{}", post_bootstrap_path());
+    let path = format!("{{tools}}:{sbin}");
 
     let mut steps = vec![
+        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
         Step::MkDir {
             path: "{root}/archive".into(),
         },
@@ -23,7 +24,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}/archive",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 "objects=0; found_adler=0; \
                  for object in *.o; do \
@@ -46,7 +47,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 "if grep -a -Fq '/gnu/store' '{in:zlib-x86-64-self}/lib/libz.a'; then echo 'zlib archive retains a foreign store reference' >&2; exit 1; fi",
             ],
@@ -198,13 +199,15 @@ int main(void) {
     });
 
     Recipe::mesboot("zlib-x86-64-self-test", "1.0")
-        .native_inputs(&[
-            "zlib-x86-64-self",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-            "busybox-x86-64",
-        ])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &[
+                "zlib-x86-64-self",
+                "gcc-x86-64-self",
+                "binutils-x86-64-self",
+                "glibc-x86-64",
+            ],
+        ))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -227,11 +230,15 @@ mod tests {
             recipe.native_inputs.as_deref(),
             Some(
                 [
+                    "td-sh",
+                    "td-txt",
+                    "td-util",
+                    "uutils",
+                    "gawk-x86-64-self",
                     "zlib-x86-64-self",
                     "gcc-x86-64-self",
                     "binutils-x86-64-self",
                     "glibc-x86-64",
-                    "busybox-x86-64",
                 ]
                 .map(str::to_string)
                 .as_slice()

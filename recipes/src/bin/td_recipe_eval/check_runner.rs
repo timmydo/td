@@ -11463,17 +11463,24 @@ chmod 755 '{}'
     /// beside a reached entry too, so the gate runs every check.
     #[test]
     fn a_recipe_source_reaches_the_checks_of_its_readers() {
-        // uutils is in one check's owner closure, the build-only gawk's
-        // (its post-Rust tool farm), and in rust-toolchain's declared builds.
+        // uutils is in rust-toolchain's declared builds, and in the owner
+        // closure of every check built on the post-Rust tool farm, the
+        // build-only gawk's first; that set grows as recipes move onto it.
         for scope in [
             "recipes/src/recipes/uutils.rs",
             "recipes/locks/uutils/Cargo.lock",
         ] {
             let reach = checks_reaching(&[scope]).expect(scope);
-            assert_eq!(
-                reach.keys().map(String::as_str).collect::<Vec<_>>(),
-                ["gawk-x86-64-self-test", "rust-toolchain"]
-            );
+            for check in [
+                "gawk-x86-64-self-test",
+                "make-x86-64-self-test",
+                "zlib-x86-64-self-test",
+                "rust-toolchain",
+            ] {
+                assert!(reach.contains_key(check), "{scope}: {reach:?}");
+            }
+            // The bootstrap side builds before uutils exists.
+            assert!(!reach.contains_key("hello-test"), "{scope}: {reach:?}");
             assert!(reach["rust-toolchain"].contains(scope), "{reach:?}");
         }
         // td-jail-test names firefox's module; so does system-x86-64,
