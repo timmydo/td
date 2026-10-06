@@ -813,8 +813,31 @@ fn physical_submenus_confirm_owned_stop_and_resume() {
             tap(&mut compositor.borrow_mut(), code);
         },
         || {
-            let pixels = compositor.borrow().tile(&place);
-            assert_confirmation_cancel(&pixels, &place);
+            // The client reports its confirmation before its frame with the
+            // confirmation is committed, so a settled frame captured at once
+            // can still be the menu's: capture until the band matches, and
+            // compare the last capture at the deadline.
+            let (rows, expected) = expected_confirmation_cancel(&place);
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                let pixels = compositor.borrow().tile(&place);
+                let shown = rows
+                    .iter()
+                    .all(|&(begin, end)| pixels.get(begin..end) == expected.get(begin..end));
+                if shown {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    for &(begin, end) in &rows {
+                        assert_eq!(
+                            &pixels[begin..end],
+                            &expected[begin..end],
+                            "mapped default-Cancel band"
+                        );
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
         },
     );
     assert_eq!(client.request(3, &["action", "quit"]), ["ok", "quit"]);
@@ -822,9 +845,10 @@ fn physical_submenus_confirm_owned_stop_and_resume() {
     compositor.borrow_mut().stop();
 }
 
-// Compare the displayed default-Cancel band with an independently constructed
-// shared confirmation; unrelated search/menu changes cannot satisfy this.
-fn assert_confirmation_cancel(pixels: &[u8], place: &Placement) {
+// The default-Cancel band's byte ranges in a tile's RGB rows, and the RGB
+// rows of an independently constructed shared confirmation they must equal;
+// unrelated search/menu changes cannot match them.
+fn expected_confirmation_cancel(place: &Placement) -> (Vec<(usize, usize)>, Vec<u8>) {
     use td_ui::confirmations::{Controller, Focus, Model};
     use td_ui::raster::{self, Raster, Rect, Surface};
     let surface = Surface::new(place.width, place.height, Default::default()).unwrap();
@@ -849,15 +873,13 @@ fn assert_confirmation_cancel(pixels: &[u8], place: &Placement) {
     let mut raster = Raster::new(&mut expected, &font, surface, place.width * 4).unwrap();
     widget.emit(surface.bounds(), &mut |draw| raster.draw(draw));
     let expected = raster::rgb(&expected, surface, place.width * 4).unwrap();
-    for y in band.y as usize..band.y as usize + band.height as usize {
-        let begin = (y * place.width + band.x as usize) * 3;
-        let end = begin + band.width as usize * 3;
-        assert_eq!(
-            &pixels[begin..end],
-            &expected[begin..end],
-            "mapped default-Cancel band"
-        );
-    }
+    let rows = (band.y as usize..band.y as usize + band.height as usize)
+        .map(|y| {
+            let begin = (y * place.width + band.x as usize) * 3;
+            (begin, begin + band.width as usize * 3)
+        })
+        .collect();
+    (rows, expected)
 }
 
 #[test]
@@ -917,8 +939,13 @@ fn physical_double_click_opens_history_and_back_restores_the_ranked_list() {
     compositor.click(x, y);
     compositor.click(x, y);
     wait_state(&client, |s| s.get("detail") == Some(&key));
-    let detail = compositor.tile(&place);
-    assert_ne!(before, detail);
+    // The detail is reported before the frame showing it is committed, and a
+    // still status line leaves a stale capture equal to `before`.
+    let deadline = Instant::now() + TIMEOUT;
+    while compositor.tile(&place) == before {
+        assert!(Instant::now() < deadline, "history detail never drawn");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let text = client.request(4, &["text"]);
     let text = String::from_utf8(td_ui::control::unhex(text.last().unwrap()).unwrap()).unwrap();
     assert!(text.contains("CPU time:"), "{text}");
