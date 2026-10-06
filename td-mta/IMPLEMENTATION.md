@@ -2326,6 +2326,16 @@ Initial independently landable increments:
   requested retention, per-part properties, request JSON decoding,
   full admission and authenticated publication follow.
 
+- **M06ee — whole requested source-bound tree/list retention:** retain
+  successful selected output from its first byte in the shared Window,
+  holding original collection, requested Properties and actual pin
+  through fresh complete owners/release. Pin NONE zero capacity,
+  final-copy exact fit, meaningful short capacities, byte/five-cost
+  parity, both deadline domains and sticky hiding. Qualify eight Rust
+  allocation intervals and six compile-fail guards (API §1.136).
+  Per-part properties, JSON decoding, full admission and current
+  authenticated publication remain later.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

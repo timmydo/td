@@ -849,6 +849,15 @@ Only API §1.135's eight intervals are allocation-qualified. Whole
 requested retention, per-part bodyProperties, JSON request decoding,
 full admission and authorized publication remain later.
 
+M06ee retains whole requested source-bound tree/list members through
+the shared Window while holding original collection, requested selection
+and actual descriptor through fresh Retained/release. NONE accepts zero
+capacity; nonempty final-copy exact fit completes. Advance only
+successful reported output, with no additional work fee, fresh
+unfinished checks before capacity and sticky hiding. Only API §1.136's
+eight intervals are qualified. Per-part properties, request JSON
+parsing, whole admission and current publication remain later.
+
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot
 select bodyStructure. They remain public facades over the same shared

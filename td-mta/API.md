@@ -5730,6 +5730,43 @@ checks remain allocation-unqualified. Earlier 129
 intervals are separate evidence; native allocation, stack/RSS, full
 admission and authorized publication remain unqualified.
 
+### 1.136 Whole requested source-bound tree/list retention
+
+M06ee adds requested::retained. Only original complete Serialized and
+pure requested Properties create a fresh tree/list composer into the
+shared Window. Advanced or emitted-only owners cannot retain a missing
+prefix. Exclusive Cursor keeps original cells/source backing, actual pin
+and whole caller-owned output. Its passive ViewBytes includes Properties,
+complete provisional members and original view. Advance only successful
+reported output with no extra interpretation, record, wire or source/I/O
+charge. Fresh admission precedes unfinished capacity, all failures stay
+sticky and hide the value, and final-copy exact fit completes. NONE
+freshly constructs complete into even zero capacity; cached completion
+is inert. Explicit checks and all consuming finishes freshly validate
+both original-job and actual-pin deadlines, including NONE.
+
+Fresh complete finish yields exclusive Retained, and fresh release
+returns original Serialized, unchanged requested Properties and complete
+borrowed bytes. There is no reconstructed source owner, second byte or
+window engine, complete JMAP object or publication authority. Per-part
+bodyProperties, request JSON decoding, full admission and current
+authenticated publication remain later.
+
+Compiled Cursor plus HeaderBudget fits 1 KiB and Retained fits 768 bytes,
+without claiming a whole ledger or stack proof. Eight sequential Rust
+allocation intervals measure near-u64 digest tree+textBody, zero-base
+NONE into zero capacity, actual pin expiry after copied output, completed
+Cursor expiry, Retained expiry, explicitly checked released Serialized
+expiry, nonempty zero capacity and constructor pin expiry. Original
+mapping/matching/collection, backing, full verification, filesystem and
+output preparation stay cold. Descriptor teardown is counted; enclosing
+pooled view/scratch, cells and fixture cleanup stay outside. Only these
+eight intervals are qualified; other subsets, capacities/sources,
+supplied-Tick expiry, funding refusal and explicit completed-owner
+checks remain allocation-unqualified. Earlier 137 intervals are separate.
+Native allocation, stack/RSS, full admission and authorized publication
+remain unqualified.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

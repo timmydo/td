@@ -2493,6 +2493,13 @@ and empty selection, with original preparation/enclosing resources
 outside and descriptor teardown counted. Earlier 129 intervals remain
 separate; native/stack/RSS/full admission are unqualified.
 
+M06ee whole requested tree/list retention keeps the compiled 1 KiB
+Cursor plus HeaderBudget and 768-byte Retained caps. Whole output is
+separately caller-owned/admitted. API §1.136 names eight allocation
+intervals, with cold original preparation/enclosing resources excluded
+and descriptor teardown counted. Earlier 137 intervals remain separate;
+native allocation, stack/RSS/full admission remain unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no
