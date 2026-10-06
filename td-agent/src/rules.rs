@@ -373,12 +373,16 @@ impl Crossing {
 }
 
 /// The human's rules file, read: the rules for tool calls, the standing
-/// answers for crossings, and each workspace's mode, by its key.
+/// answers for crossings, and each workspace's mode and trust mark, by
+/// its key.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Policy {
     pub rules: Vec<Human>,
     pub crossings: Vec<Crossing>,
     pub modes: Vec<(String, crate::config::Mode)>,
+    /// Each trust mark: the digest of the project instructions the
+    /// human trusted (DESIGN.md §11).
+    pub trusts: Vec<(String, String)>,
 }
 
 impl Policy {
@@ -390,6 +394,34 @@ impl Policy {
             .find(|(of, _)| of == key)
             .map(|(_, mode)| *mode)
     }
+
+    /// The digest of the project instructions workspace `key`'s last
+    /// `trust` line trusts.
+    pub fn trust(&self, key: &str) -> Option<&str> {
+        self.trusts
+            .iter()
+            .rev()
+            .find(|(of, _)| of == key)
+            .map(|(_, digest)| digest.as_str())
+    }
+}
+
+/// A `trust` line's digest, `trust` and a SHA-256 in lowercase hex;
+/// none for a line that is not one.
+fn trust_line(line: &str) -> Option<Result<String, String>> {
+    let mut words = line.split([' ', '\t']).filter(|w| !w.is_empty());
+    if words.next() != Some("trust") {
+        return None;
+    }
+    Some(match (words.next(), words.next()) {
+        (Some(digest), None) if digest_hex(digest) => Ok(digest.to_string()),
+        _ => Err("a trust mark is `trust` and the instructions' SHA-256 in lowercase hex".into()),
+    })
+}
+
+/// Whether `text` is a SHA-256 in lowercase hex.
+fn digest_hex(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// A `mode` line's mode, `mode ask` or `mode auto`; none for a line that
@@ -421,9 +453,9 @@ enum Section {
 /// The human's rules file: a header, `[everywhere]`, `[<workspace>]` or
 /// `[crossings]`, then that section's lines, one a line: a workspace's
 /// or every workspace's rules as a repository's are written but allow
-/// rules among them, a workspace's `mode ask` or `mode auto`, or
-/// crossings as `Crossing::parse` reads them; blank lines and `#`
-/// comments skipped.
+/// rules among them, a workspace's `mode ask` or `mode auto` and its
+/// `trust` mark, or crossings as `Crossing::parse` reads them; blank
+/// lines and `#` comments skipped.
 pub fn parse_policy(text: &str) -> Result<Policy, String> {
     if text.len() > MAX_HUMAN_FILE {
         return Err(format!("past {MAX_HUMAN_FILE} bytes"));
@@ -432,6 +464,7 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
     let mut rules = Vec::new();
     let mut crossings = Vec::new();
     let mut modes = Vec::new();
+    let mut trusts = Vec::new();
     for (at, line) in text.lines().enumerate() {
         // Comments too: a control escapes to six bytes on the wire.
         if line.chars().any(|c| c.is_control() && c != '\t') {
@@ -451,7 +484,7 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
             });
             continue;
         }
-        if rules.len() + crossings.len() + modes.len() == MAX_HUMAN_RULES {
+        if rules.len() + crossings.len() + modes.len() + trusts.len() == MAX_HUMAN_RULES {
             return Err(format!("more than {MAX_HUMAN_RULES} rules"));
         }
         let scope = match section.clone() {
@@ -479,6 +512,17 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
             modes.push((key, mode));
             continue;
         }
+        if let Some(digest) = trust_line(line) {
+            let digest = digest.map_err(|why| format!("line {}: {why}", at + 1))?;
+            let Scope::Workspace(key) = scope else {
+                return Err(format!(
+                    "line {}: a trust mark is for one workspace, not every one",
+                    at + 1
+                ));
+            };
+            trusts.push((key, digest));
+            continue;
+        }
         let rule = Rule::parse(line).map_err(|why| format!("line {}: {why}", at + 1))?;
         if rule.effect == Effect::Allow && scope == Scope::Everywhere {
             return Err(format!(
@@ -492,6 +536,7 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
         rules,
         crossings,
         modes,
+        trusts,
     })
 }
 
@@ -515,6 +560,34 @@ pub fn set_mode(text: &str, key: &str, mode: crate::config::Mode) -> Result<Stri
         kept.push('\n');
     }
     append(&kept, &header, &[format!("mode {}", mode.word())])
+}
+
+/// `text`, the human's rules file, with workspace `key` trusting the
+/// project instructions of `digest`, or none: each `trust` line under
+/// its header taken out, then one added as `set_mode` adds a mode.
+/// Refused when `text` is, or the result would be.
+pub fn set_trust(text: &str, key: &str, digest: Option<&str>) -> Result<String, String> {
+    parse_policy(text)?;
+    let header = format!("[{}]", workspace_key(key)?);
+    let mut kept = String::new();
+    let mut under = false;
+    for line in text.lines() {
+        let trimmed = line.trim_matches([' ', '\t']);
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            under = trimmed == header;
+        } else if under && trust_line(trimmed).is_some() {
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    match digest {
+        Some(digest) => append(&kept, &header, &[format!("trust {digest}")]),
+        None => {
+            parse_policy(&kept)?;
+            Ok(kept)
+        }
+    }
 }
 
 /// What the human's standing answers say of conversation `from` doing
@@ -2181,6 +2254,71 @@ mod tests {
         assert_eq!(
             forget(&text, None, &a).unwrap().unwrap(),
             format!("[crossings]\nallow read {b} {c}\n")
+        );
+    }
+
+    /// A workspace's trust mark: its last `trust` line, a digest in
+    /// lowercase hex under its own header; set, set again and taken
+    /// back as one line, its other lines kept.
+    #[test]
+    fn a_workspaces_trust_mark_is_its_last_trust_line() {
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let text =
+            format!("[workspace td-1-ab]\ntrust {a}\nmode auto\n[workspace td-1-ab]\ntrust {b}\n");
+        let policy = parse_policy(&text).unwrap();
+        assert_eq!(policy.trust("workspace td-1-ab"), Some(b.as_str()));
+        assert_eq!(policy.trust("workspace td-2-cd"), None);
+        for (bad, why) in [
+            (
+                format!("[everywhere]\ntrust {a}\n"),
+                "line 2: a trust mark is for one workspace, not every one",
+            ),
+            (
+                "[workspace w]\ntrust\n".to_string(),
+                "line 2: a trust mark is `trust` and the instructions' SHA-256 in lowercase hex",
+            ),
+            (
+                format!("[workspace w]\ntrust {}\n", "A".repeat(64)),
+                "line 2: a trust mark is `trust` and the instructions' SHA-256 in lowercase hex",
+            ),
+            (
+                format!("[workspace w]\ntrust {}\n", "a".repeat(63)),
+                "line 2: a trust mark is `trust` and the instructions' SHA-256 in lowercase hex",
+            ),
+            (
+                format!("[workspace w]\ntrust {a} {a}\n"),
+                "line 2: a trust mark is `trust` and the instructions' SHA-256 in lowercase hex",
+            ),
+        ] {
+            assert_eq!(parse_policy(&bad).unwrap_err(), why, "{bad}");
+        }
+        assert!(parse_policy(&format!("[crossings]\ntrust {a}\n")).is_err());
+        let set = set_trust(&text, "workspace td-1-ab", Some(&a)).unwrap();
+        assert_eq!(
+            set,
+            format!("[workspace td-1-ab]\nmode auto\n[workspace td-1-ab]\ntrust {a}\n")
+        );
+        let taken = set_trust(&set, "workspace td-1-ab", None).unwrap();
+        assert_eq!(
+            taken,
+            "[workspace td-1-ab]\nmode auto\n[workspace td-1-ab]\n"
+        );
+        assert_eq!(
+            parse_policy(&taken).unwrap().trust("workspace td-1-ab"),
+            None
+        );
+        // Another workspace's mark is its own.
+        let other = set_trust(&set, "workspace td-2-cd", Some(&b)).unwrap();
+        let policy = parse_policy(&other).unwrap();
+        assert_eq!(policy.trust("workspace td-1-ab"), Some(a.as_str()));
+        assert_eq!(policy.trust("workspace td-2-cd"), Some(b.as_str()));
+        assert!(set_trust("", "everywhere", Some(&a)).is_err());
+        assert!(set_trust("", "workspace w", Some("x")).is_err());
+        // A mode set keeps the mark.
+        let moded = set_mode(&set, "workspace td-1-ab", crate::config::Mode::Ask).unwrap();
+        assert_eq!(
+            parse_policy(&moded).unwrap().trust("workspace td-1-ab"),
+            Some(a.as_str())
         );
     }
 

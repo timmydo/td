@@ -83,14 +83,24 @@ pub fn prefix_in(created: u64, place: Option<&Place>) -> String {
 /// before any is recorded: each worktree's, those read at one base of one
 /// remote together, each text in a fence no line of it can close.
 fn project(place: &Place) -> Option<String> {
-    let repositories = place.repositories?;
-    if place.instructions.is_empty() {
+    instructions_text(place.repositories?, place.instructions)
+}
+
+/// The project instructions `instructions` as the model is given them
+/// in `repositories`' prefix (`project`): the text the classifier is
+/// given for a workspace the human trusts, whose digest the trust mark
+/// holds (DESIGN.md §11, §13).
+pub fn instructions_text(
+    repositories: &crate::workspace::Repositories,
+    instructions: &[crate::store::Instructed],
+) -> Option<String> {
+    if instructions.is_empty() {
         return None;
     }
     let shown = |dir: &Path| crate::tools::visible(&dir.to_string_lossy());
     // Worktrees read at one commit of one remote share one block.
     let mut blocks: Vec<(Vec<&Path>, &crate::store::Instructed)> = Vec::new();
-    for recorded in place.instructions {
+    for recorded in instructions {
         let remote = |checkout: &Path| {
             repositories
                 .entries

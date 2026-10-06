@@ -1866,9 +1866,10 @@ open is counted, not added to it. The control seam's state ends with
 entry also says what its repository's `.td-agent/rules` add at the
 commit, listed as the matcher reads them, or that there are none, or why
 they were not read (§11, As built (increment 13, a repository's rules)).
-It does not show the trust mark, which changes nothing until increment
-13's classifier and is added with it, so the card does not offer what
-would do nothing yet.
+Its last entry, once a worktree's instructions were found, is the trust
+mark (§11, As built (increment 13, the trust mark)): whether the
+classifier is given the instructions shown, and `C-S-y`, which trusts
+them as shown or takes the trust back, from the person's keyboard only.
 
 **Layout.**
 
@@ -3381,20 +3382,21 @@ the other conversation's title and the latest four messages other
 conversations sent. A payload longer than 32 KiB, which no tool takes,
 is the human's, as the stages would judge a part of it. The human's
 messages are kept newest first within 32 KiB, each at most 8 KiB, and
-the last 64 calls are named. Project instructions are not in it yet: no
-workspace is marked trusted. Jev is asked only when `data_collection` is
-`allow`, `jev_threshold` is set and `base_url` ends in `/v1`, and the
-models list prices `classifier_fast_model` while a cost limit is set;
-otherwise it is unavailable, and while `jev_required` the action goes to
-the human with nothing asked. The reasoning stage is a chat completion
-of `classifier_model` with `prompt/classifier.txt` as its system message
-and the state as its user message, `max_tokens` 4096, `provider` as any
-request's. Both requests are reserved together against the day, the
-turn's and the conversation's limits, logged as `Request` events of
-purpose `classify` with their whole bodies, sent at once, Jev's on a
-thread of its own, and settled as a title request's is, Jev charged by
-its reported cost, or by its input tokens alone; neither can be
-interrupted while it runs. Jev's answers are read strictly, a
+the last 64 calls are named. Project instructions are in it, as
+`project`, only for a workspace the human marked trusted (As built
+(increment 13, the trust mark), below). Jev is asked only when
+`data_collection` is `allow`, `jev_threshold` is set and `base_url` ends
+in `/v1`, and the models list prices `classifier_fast_model` while a
+cost limit is set; otherwise it is unavailable, and while `jev_required`
+the action goes to the human with nothing asked. The reasoning stage is
+a chat completion of `classifier_model` with `prompt/classifier.txt` as
+its system message and the state as its user message, `max_tokens` 4096,
+`provider` as any request's. Both requests are reserved together against
+the day, the turn's and the conversation's limits, logged as `Request`
+events of purpose `classify` with their whole bodies, sent at once,
+Jev's on a thread of its own, and settled as a title request's is, Jev
+charged by its reported cost, or by its input tokens alone; neither can
+be interrupted while it runs. Jev's answers are read strictly, a
 probability outside 0 to 1 being no answer, and allow when `request` is
 `matches` and both its probability and that of not disclosing reach the
 threshold. The reasoning stage's answer is one JSON object with a
@@ -3437,6 +3439,30 @@ unread, so every call asks. The window takes nothing else from it. The
 count is one conversation's: a directory workspace's other conversations
 keep their own, so twenty is counted per conversation, not per
 workspace, until the window keeps the counts.
+
+**As built (increment 13, the trust mark).** A repository workspace's
+trust mark is a `trust` line in its section of the human's rules file,
+the SHA-256 of its project instructions as the model is given them in
+its prefix (§13), every worktree's together; it is refused in
+`[everywhere]` and `[crossings]`, and the last line under the
+workspace's header holds. The workspace card shows it after the
+instructions, once a worktree's file was found, since before there is
+nothing to trust, as the rules the conversations were last sent hold it,
+which is what they act on: trusted, not trusted, trusted for a text
+these are no longer, or unknown when the human's rules could not be
+read. `C-S-y` on the card, from the person's own keyboard and never the
+control seam, writes the digest of the text the card showed, or takes
+the line out when that text is the one trusted, sends every conversation
+the rules and shows the card again. The conversation process gives the
+classifier that text, in the state's `project` field, cut at 32 KiB as
+the other fields are, labelled in both the reasoning stage's policy and
+Jev's instructions as the project's text and not the person's request,
+only when the mark holds the digest of the instructions it recorded: a
+worktree read again at another commit before it was prepared is another
+text, which the mark does not trust. A directory or scratch workspace
+has no project instructions, so no mark. A classifier request that,
+escaped once more, would be past a line of the conversation's log is not
+sent: the action goes to the person, not a failed turn.
 
 **Repetition.** Three consecutive calls of one tool with identical
 arguments go to the human whatever the table says, as opencode's

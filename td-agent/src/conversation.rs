@@ -157,6 +157,9 @@ const CALL_REFUSED: &str = "not run: the person refused this call. That is their
 /// the human last wrote here, before each further one asks.
 const MESSAGES_UNASKED: usize = 3;
 
+/// Room on a log line for what a `Request` event holds beside its head.
+const LOGGED_SLACK: usize = 4096;
+
 /// The circuit breaker's bounds (DESIGN.md §11): verdicts of the
 /// classifier's that did not allow, in a row and in all.
 const BRAKE_RUN: usize = 3;
@@ -4192,6 +4195,20 @@ impl Session {
             let reserved = pricing.map_or(0, |p| p.reserve(bytes.div_ceil(4), 0));
             (url, pricing, head, bytes, reserved)
         });
+        // Each request is logged whole, escaped once more: one past a
+        // line of the log is not asked, its text not cut.
+        let logged = |head: &str| {
+            td_json::Json::Str(head.to_string())
+                .to_string()
+                .len()
+                .saturating_add(LOGGED_SLACK)
+                <= store::MAX_LINE
+        };
+        if !logged(&head) || jev.as_ref().is_ok_and(|j| !logged(&j.2)) {
+            return Ok(refused(
+                "its request would be past the bound of a line of the conversation's log".into(),
+            ));
+        }
         let total = reserved.saturating_add(jev.as_ref().map_or(0, |j| j.4));
         let events = self.conversation.events();
         let within = cost::within(
@@ -4330,8 +4347,9 @@ impl Session {
 
     /// The state the classifier sees of this conversation reaching `to`
     /// as `reach` says (DESIGN.md §11): the person's messages, this
-    /// workspace's rules, the calls made by tool and path, the action and
-    /// both sides, and what a model wrote apart, untrusted.
+    /// workspace's rules, its project instructions when the human trusts
+    /// them, the calls made by tool and path, the action and both sides,
+    /// and what a model wrote apart, untrusted.
     fn classifier_state(&self, to: &store::Meta, reach: Reach, client: &Client) -> td_json::Json {
         use td_json::Json;
         let events = self.conversation.events();
@@ -4446,7 +4464,22 @@ impl Session {
             payload,
             untrusted,
         };
-        classifier::state(&human, policy, &calls, &pending)
+        classifier::state(&human, policy, self.trusted_project(), &calls, &pending)
+    }
+
+    /// This repository workspace's project instructions as the model is
+    /// given them, for the classifier, only while the human's trust mark
+    /// holds their digest: instructions read again at another commit are
+    /// not the text the human trusted (DESIGN.md §11).
+    fn trusted_project(&self) -> Option<String> {
+        let meta = self.conversation.meta();
+        let Some(workspace @ Workspace::Repositories(repositories)) = &meta.workspace else {
+            return None;
+        };
+        let policy = self.human.1.as_ref().ok()?;
+        let trusted = policy.trust(&workspace.key(&meta.id))?;
+        let (text, digest) = crate::card::project(repositories, self.conversation.instructions())?;
+        (digest == trusted).then_some(text)
     }
 }
 

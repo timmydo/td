@@ -28,15 +28,85 @@ const SHORT: usize = 12;
 /// A group's or worktree's state when its record cannot be read.
 const UNKNOWN: &str = "unknown, since the record above could not be read";
 
+/// The chord that trusts the project instructions the card shows, or
+/// takes the trust back (DESIGN.md §11).
+pub const TRUST: &str = "C-S-y";
+
 /// What the window reads for the card from the conversation's
 /// directory: its recorded project instructions, the workspace
 /// repositories it has prepared, and whether the workspace went with
-/// its archive.
+/// its archive; and from the human's rules, the digest the workspace's
+/// trust mark holds, if any.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Record {
     pub instructions: Result<Vec<Instructed>, String>,
     pub prepared: Result<Vec<PathBuf>, String>,
     pub removed: bool,
+    pub trusted: Result<Option<String>, String>,
+}
+
+/// The project instructions a trust mark can trust, as the model is
+/// given them, and their digest: none until a worktree's file was
+/// found, since there is nothing to trust before.
+pub fn project(
+    repositories: &Repositories,
+    instructions: &[Instructed],
+) -> Option<(String, String)> {
+    if !instructions
+        .iter()
+        .any(|one| matches!(one.read, Instructions::Found { .. }))
+    {
+        return None;
+    }
+    let text = crate::prompt::instructions_text(repositories, instructions)?;
+    let digest = crate::files::digest(text.as_bytes());
+    Some((text, digest))
+}
+
+/// What the card's trust mark says, and what its chord asks for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Trust {
+    /// The text shown is trusted; the chord takes it back.
+    Trusted,
+    /// Not trusted, or another text was: the chord trusts this digest.
+    Untrusted(String),
+}
+
+/// The card's trust mark: none while there is nothing to trust or the
+/// record of the instructions could not be read.
+pub fn trust(repositories: &Repositories, record: &Record) -> Option<Trust> {
+    let (_, digest) = project(repositories, record.instructions.as_deref().ok()?)?;
+    Some(match &record.trusted {
+        Ok(Some(trusted)) if *trusted == digest => Trust::Trusted,
+        _ => Trust::Untrusted(digest),
+    })
+}
+
+/// The trust mark's entry, beside the instructions it trusts.
+fn trust_entry(repositories: &Repositories, record: &Record) -> Option<(String, String)> {
+    let text = match (trust(repositories, record)?, &record.trusted) {
+        (Trust::Trusted, _) => format!(
+            "Trusted: in auto mode the classifier is given the project instructions above, \
+             their first {} KiB when they are longer, as the project's text, never as your \
+             authority. {TRUST} takes the trust back.",
+            crate::classifier::MAX_PROJECT / 1024
+        ),
+        (Trust::Untrusted(_), Err(why)) => format!(
+            "Whether these project instructions are trusted is unknown, since your rules \
+             could not be read, so the classifier is given none: {}",
+            crate::tools::visible(why)
+        ),
+        (Trust::Untrusted(_), Ok(Some(_))) => format!(
+            "The project instructions you trusted are no longer these, so the classifier is \
+             given none. {TRUST} trusts them as shown above."
+        ),
+        (Trust::Untrusted(_), Ok(None)) => format!(
+            "Not trusted: the classifier is given none of these project instructions. {TRUST} \
+             trusts them as shown above, so in auto mode it weighs them as the project's \
+             text, never as your authority."
+        ),
+    };
+    Some(("Trust".into(), text))
 }
 
 /// A worktree's state once its workspace went with the archive.
@@ -97,6 +167,7 @@ pub fn entries(repositories: &Repositories, record: &Record) -> Vec<(String, Str
             record.removed,
         ));
     }
+    out.extend(trust_entry(repositories, record));
     out
 }
 
@@ -308,6 +379,7 @@ mod tests {
             ]),
             prepared: Ok(Vec::new()),
             removed: false,
+            trusted: Ok(None),
         };
         let card = entries(&repositories, &record);
         let text = |at: usize| card.get(at).map(|(_, t)| t.as_str()).unwrap();
@@ -382,6 +454,7 @@ mod tests {
             ]),
             prepared: Ok(vec!["/r/w/td-1/td".into()]),
             removed: false,
+            trusted: Ok(None),
         };
         let card = entries(&repositories, &record);
         let headers: Vec<&str> = card.iter().map(|(h, _)| h.as_str()).collect();
@@ -392,7 +465,8 @@ mod tests {
                 "td at aaaaaaaaaaaa",
                 "other at bbbbbbbbbbbb",
                 "third at cccccccccccc",
-                "fourth, not read yet"
+                "fourth, not read yet",
+                "Trust"
             ]
         );
         let text = |at: usize| card.get(at).map(|(_, t)| t.as_str()).unwrap();
@@ -411,11 +485,51 @@ mod tests {
         assert!(text(2).contains("no AGENTS.md or CLAUDE.md"));
         assert!(text(3).contains("not read, which the model is told: AGENTS.md is not UTF-8"));
         assert!(text(4).contains("read once their commit is fetched"));
+        assert!(text(5).starts_with("Not trusted: "), "{}", text(5));
+        // Trusted, it says so; another text's mark trusts not this one.
+        let Some(Trust::Untrusted(digest)) = trust(&repositories, &record) else {
+            panic!("not trustable");
+        };
+        let (shown, again) =
+            project(&repositories, record.instructions.as_deref().unwrap()).unwrap();
+        assert_eq!(digest, again);
+        assert_eq!(digest, crate::files::digest(shown.as_bytes()));
+        assert!(shown.contains("Read DESIGN.md."), "{shown}");
+        let trusted = Record {
+            trusted: Ok(Some(digest.clone())),
+            ..record.clone()
+        };
+        assert_eq!(trust(&repositories, &trusted), Some(Trust::Trusted));
+        let last = |record: &Record| entries(&repositories, record).last().unwrap().1.clone();
+        assert!(last(&trusted).starts_with("Trusted: "));
+        let other = Record {
+            trusted: Ok(Some("0".repeat(64))),
+            ..record.clone()
+        };
+        assert_eq!(trust(&repositories, &other), Some(Trust::Untrusted(digest)));
+        assert!(
+            last(&other).starts_with("The project instructions you trusted are no longer these")
+        );
+        let unknown = Record {
+            trusted: Err("rules: unreadable".into()),
+            ..record.clone()
+        };
+        assert!(last(&unknown).ends_with("given none: rules: unreadable"));
+        // Nothing found, nothing to trust.
+        let mut absent = record.clone();
+        if let Ok(read) = &mut absent.instructions {
+            read.retain(|one| !matches!(one.read, Instructions::Found { .. }));
+        }
+        assert_eq!(trust(&repositories, &absent), None);
+        assert!(entries(&repositories, &absent)
+            .iter()
+            .all(|(h, _)| h != "Trust"));
 
         let unreadable = Record {
             instructions: Err("instructions: not a list".into()),
             prepared: Err("meta: gone".into()),
             removed: false,
+            trusted: Ok(None),
         };
         let card = entries(&repositories, &unreadable);
         let all: String = card.iter().map(|(_, t)| t.as_str()).collect();

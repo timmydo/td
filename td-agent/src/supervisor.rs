@@ -305,6 +305,14 @@ impl Supervisor {
         self.resend_setup();
     }
 
+    /// The human's rules as every conversation was last sent them.
+    pub fn sent_rules(&self) -> Option<&Result<String, String>> {
+        match &self.policy {
+            Down::Policy { rules, .. } => Some(rules),
+            _ => None,
+        }
+    }
+
     /// The human's rules, read again, and the configuration's `mode`:
     /// every child is sent them, now or when it starts, numbered one past
     /// the last (DESIGN.md §3, §11).

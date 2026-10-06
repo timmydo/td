@@ -4473,6 +4473,138 @@ fn a_repeated_crossing_and_a_waiting_one_stay_with_the_person() {
     assert_eq!(asked(&h), 2);
 }
 
+/// A trust mark (DESIGN.md §11): the classifier is given a repository
+/// workspace's project instructions, as the model is, only while the
+/// human's rules hold their digest; unmarked, or marked for another text,
+/// it is given none.
+#[test]
+fn the_classifier_is_given_the_project_instructions_only_when_trusted() {
+    let base = std::env::temp_dir().join(format!(
+        "td-agent-model-trust-{}-{}",
+        std::process::id(),
+        td_agent::store::random_hex(4).unwrap()
+    ));
+    let template = td_agent::config::Template {
+        name: "td".into(),
+        repos: vec![td_agent::config::Repo {
+            remote: "https://example.org/a/td".into(),
+            base: "main".into(),
+            branch: "agent".into(),
+            sparse: None,
+        }],
+        shared: None,
+    };
+    let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
+    let made = td_agent::workspace::repositories(
+        &template,
+        &Id::random().unwrap(),
+        &base.join("data"),
+        &base.join("trees"),
+        &admitted,
+        0,
+    )
+    .unwrap();
+    let workspace = td_agent::workspace::Workspace::Repositories(made.clone());
+    let argument = workspace.argument();
+    let mut script = vec![
+        Reply::sse("stream-tool-read-other.sse"),
+        Reply::sse("stream-sonnet.sse"),
+        Reply::ok("title.json"),
+    ];
+    for _ in 0..2 {
+        script.push(Reply::sse("stream-tool-read-other.sse"));
+        script.push(Reply::sse("stream-sonnet.sse"));
+    }
+    let mut h = Harness::new_in(
+        "trust",
+        Role::Conversation,
+        Some(argument.to_str().unwrap()),
+        false,
+        script,
+    );
+    h.mock
+        .route("typesafe/jev", vec![Reply::ok("jev-matches.json"); 3]);
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![Reply::ok("classifier-allow.json"); 3],
+    );
+    let other = Id::parse(&"b".repeat(32)).unwrap();
+    drop(
+        Conversation::open(
+            &h.state,
+            &other,
+            Some(Role::Conversation),
+            Duration::from_secs(3),
+        )
+        .unwrap(),
+    );
+    let fetched = Down::Fetched {
+        remote: "https://example.org/a/td".into(),
+        result: Ok(td_agent::protocol::Fetched {
+            identity: td_agent::repo::Identity::default(),
+            ids: vec!["a".repeat(40)],
+            instructions: vec![td_agent::repo::Instructions::Found {
+                name: "AGENTS.md".into(),
+                text: "Keep the trust marks honest.\n".into(),
+            }],
+            rules: vec![td_agent::rules::Read::Absent],
+        }),
+    };
+    while !matches!(h.next(), Up::Fetch { .. }) {}
+    h.setup(Client {
+        allow_data_collection: true,
+        jev_threshold: Some(900),
+        ..Client::default()
+    });
+    let key = workspace.key(&h.id);
+    let policy = |version: u64, rules: String| Down::Policy {
+        version,
+        rules: Ok(rules),
+        mode: td_agent::config::Mode::Auto,
+    };
+    h.down(&policy(1, String::new()));
+    h.down(&fetched);
+    while !matches!(h.next(), Up::Prepared { .. }) {}
+    let given = |h: &Harness| -> Vec<bool> {
+        h.mock
+            .requests()
+            .iter()
+            .filter(|r| r.text().contains("typesafe/jev") || r.text().contains("gpt-oss-safeguard"))
+            .map(|r| r.text().contains("Keep the trust marks honest."))
+            .collect()
+    };
+    h.say("Read it.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(approvals(&events).last().unwrap().2, "classifier");
+    assert_eq!(given(&h), [false, false]);
+    let instructions = h.state.instructions(&h.id).unwrap();
+    let (text, digest) = td_agent::card::project(&made, &instructions).unwrap();
+    assert!(text.contains("Keep the trust marks honest."), "{text}");
+    // Trusted: both stages are given the text.
+    h.down(&policy(2, format!("[{key}]\ntrust {digest}\n")));
+    h.say("Read it again.");
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(given(&h), [false, false, true, true]);
+    // Another text's mark trusts not this one, nor another workspace's
+    // mark this text.
+    let elsewhere = format!("conversation {}", "c".repeat(32));
+    h.down(&policy(
+        3,
+        format!(
+            "[{key}]\ntrust {}\n[{elsewhere}]\ntrust {digest}\n",
+            "0".repeat(64)
+        ),
+    ));
+    h.say("Read it once more.");
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(given(&h), [false, false, true, true, false, false]);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// The classifier's circuit breaker (DESIGN.md §11): three crossings it
 /// does not allow in a row, each refused on its card, put the workspace
 /// in `ask` mode, said in the log and asked of the window; the next

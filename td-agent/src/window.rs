@@ -305,11 +305,7 @@ impl Session {
                 Request::SaveKey { secret, replace } => self.save_key(&secret, replace),
                 Request::Export => self.export(),
                 Request::Workspace(id) => {
-                    let record = crate::card::Record {
-                        instructions: self.state.instructions(&id),
-                        prepared: self.state.prepared(&id),
-                        removed: self.state.removed(&id) == Ok(true),
-                    };
+                    let record = self.card_record(&id);
                     self.app.show_workspace(&id, &record);
                 }
                 Request::Delete(id) => self.delete(&id),
@@ -337,6 +333,10 @@ impl Session {
                 } => self.decide(&conversation, call, answer),
                 Request::SetDefault(model) => self.set_default(model),
                 Request::SetMode { conversation, mode } => self.set_mode(&conversation, mode),
+                Request::Trust {
+                    conversation,
+                    digest,
+                } => self.trust(&conversation, digest.as_deref()),
                 Request::Quit => self.quit = true,
             }
         }
@@ -421,6 +421,52 @@ impl Session {
             }
         }
         self.supervisor.repolicy(rules, self.mode);
+    }
+
+    /// What `conversation`'s workspace card shows, read now: its trust
+    /// mark as the conversations were last sent the rules, which is
+    /// what they act on, not a file changed since.
+    fn card_record(&self, conversation: &Id) -> crate::card::Record {
+        let trusted = match self.supervisor.sent_rules() {
+            // With no workspace there is no mark.
+            Some(Ok(text)) => match workspace_key(&self.state, conversation) {
+                Ok(key) => crate::rules::parse_policy(text)
+                    .map(|policy| policy.trust(&key).map(str::to_string)),
+                Err(_) => Ok(None),
+            },
+            Some(Err(why)) => Err(why.clone()),
+            None => Err("no rules were sent yet".into()),
+        };
+        crate::card::Record {
+            instructions: self.state.instructions(conversation),
+            prepared: self.state.prepared(conversation),
+            removed: self.state.removed(conversation) == Ok(true),
+            trusted,
+        }
+    }
+
+    /// Marks `conversation`'s workspace as trusting the project
+    /// instructions of `digest`, or none, in the human's rules (DESIGN.md
+    /// §11), sends every conversation the rules, and shows its card again.
+    fn trust(&mut self, conversation: &Id, digest: Option<&str>) {
+        let written = workspace_key(&self.state, conversation).and_then(|key| {
+            let text = crate::rules::set_trust(&self.state.load_rules()?, &key, digest)?;
+            self.state.save_rules(&text)
+        });
+        match written {
+            Ok(()) => {
+                self.app.note(match digest {
+                    Some(_) => "the classifier is now given this workspace's project instructions, as the card shows them",
+                    None => "the classifier is no longer given this workspace's project instructions",
+                });
+                self.repolicy();
+            }
+            Err(e) => self
+                .app
+                .note(format!("the workspace's trust mark is unchanged: {e}")),
+        }
+        let record = self.card_record(conversation);
+        self.app.reshow_workspace(conversation, &record);
     }
 
     /// Puts `conversation`'s workspace in `mode`, in the human's rules

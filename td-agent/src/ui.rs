@@ -301,6 +301,13 @@ pub enum Request {
     /// Put conversation `conversation`'s workspace in this mode, from
     /// Conversation → Auto mode in this workspace (DESIGN.md §11).
     SetMode { conversation: Id, mode: Mode },
+    /// Mark conversation `conversation`'s workspace as trusting the
+    /// project instructions of `digest`, which its card showed, or as
+    /// trusting none, from the card's chord (DESIGN.md §11).
+    Trust {
+        conversation: Id,
+        digest: Option<String>,
+    },
     /// Read what this conversation's workspace card shows; the session
     /// answers through `show_workspace` (DESIGN.md §7).
     Workspace(Id),
@@ -630,6 +637,9 @@ pub struct App {
     /// Why no workspace can be made, when none can: said at once, before
     /// a directory is chosen.
     no_workspaces: Option<String>,
+    /// The open workspace card's conversation and what its trust mark
+    /// said when it was read: what its chord asks for.
+    card_trust: Option<(Id, crate::card::Trust)>,
     /// The question before a conversation is deleted, or a card, while
     /// it is open, modal over the window; its revision counts the
     /// questions asked.
@@ -806,6 +816,7 @@ impl App {
                 .map_err(|e| format!("the menu: {e}"))?,
             keys_chosen: false,
             live: false,
+            card_trust: None,
             dialog: None,
             key_path: None,
             keyed: true,
@@ -3475,9 +3486,10 @@ impl App {
         if open != id || self.modal() {
             return;
         }
-        let (title, entries) = (
+        let (title, entries, trust) = (
             crate::card::title(repositories),
             crate::card::entries(repositories, record),
+            crate::card::trust(repositories, record),
         );
         match crate::notes::Panel::card(
             self.surface,
@@ -3488,6 +3500,7 @@ impl App {
         ) {
             Ok(panel) => {
                 self.notes = Some(panel);
+                self.card_trust = trust.map(|trust| (id.clone(), trust));
                 self.apply_focus();
                 self.touch();
             }
@@ -3495,8 +3508,48 @@ impl App {
         }
     }
 
+    /// Shows conversation `id`'s workspace card again from `record`,
+    /// once its trust mark changed: only while it is the card open.
+    pub fn reshow_workspace(&mut self, id: &Id, record: &crate::card::Record) {
+        let open = self.workspace_card().is_some()
+            && self
+                .card_trust
+                .as_ref()
+                .is_some_and(|(shown, _)| shown == id);
+        // Replaced in place: a card waiting is offered only once it is
+        // closed, not in between.
+        if open {
+            self.notes = None;
+            self.card_trust = None;
+            self.show_workspace(id, record);
+            if self.notes.is_none() {
+                self.close_messages();
+            }
+        }
+    }
+
+    /// The workspace card's chord, from the person's own keyboard only:
+    /// trust the instructions it shows, or take the trust back.
+    fn trust_card(&mut self) {
+        if !self.live {
+            return;
+        }
+        let Some((conversation, trust)) = self.card_trust.clone() else {
+            return self.note("there are no project instructions on this card to trust");
+        };
+        let digest = match trust {
+            crate::card::Trust::Trusted => None,
+            crate::card::Trust::Untrusted(digest) => Some(digest),
+        };
+        self.requests.push(Request::Trust {
+            conversation,
+            digest,
+        });
+    }
+
     fn close_messages(&mut self) {
         self.notes = None;
+        self.card_trust = None;
         self.apply_focus();
         self.touch();
         self.offer();
@@ -3515,6 +3568,15 @@ impl App {
                 return self.apply_focus();
             }
             _ => {}
+        }
+        if let Input::Key {
+            chord: crate::card::TRUST,
+            repeat: false,
+        } = input
+        {
+            if self.workspace_card().is_some() {
+                return self.trust_card();
+            }
         }
         let clock = self.clock;
         let Some(notes) = self.notes.as_mut() else {
@@ -3921,6 +3983,7 @@ impl App {
                 // Messages window, the chooser and the question.
                 self.picker = None;
                 self.notes = None;
+                self.card_trust = None;
                 self.chooser = None;
                 self.confirm = None;
                 self.dialog = Some(dialog);
@@ -6456,13 +6519,14 @@ pub mod tests {
             }]),
             prepared: Ok(Vec::new()),
             removed: false,
+            trusted: Ok(None),
         };
         // Another conversation's answer shows nothing.
         app.show_workspace(&id(2), &record);
         assert!(app.workspace_card().is_none());
         app.show_workspace(&id(1), &record);
         let card = app.workspace_card().unwrap();
-        assert_eq!(card.len(), 2);
+        assert_eq!(card.len(), 3);
         assert!(app.messages_window().is_none());
         let shown = text(&app);
         assert!(shown.contains("Workspace td-1:"), "{shown}");
@@ -6470,7 +6534,7 @@ pub mod tests {
         // A note is counted, not added to the card.
         let unread = app.unread();
         app.note("a note while the card is open");
-        assert_eq!(app.workspace_card().unwrap().len(), 2);
+        assert_eq!(app.workspace_card().unwrap().len(), 3);
         assert_eq!(app.unread(), unread + 1);
         // It is what was read when it opened: a prepared repository asks
         // nothing, and an answer over it shows nothing.
@@ -6504,8 +6568,66 @@ pub mod tests {
         assert_eq!(app.take_requests(), [Request::Workspace(id(1))]);
         app.show_workspace(&id(1), &prepared);
         assert!(text(&app).contains("/w/td-1/td (main on branch td-agent/td-1): checked out"));
+        // Its trust chord, from the person's keyboard only, asks to trust
+        // what it shows; shown trusted, to take the trust back.
+        key(&mut app, crate::card::TRUST);
+        assert!(app.take_requests().is_empty());
+        key_live(&mut app, crate::card::TRUST);
+        let digest = match crate::card::trust(app.repositories().unwrap().1, &prepared) {
+            Some(crate::card::Trust::Untrusted(digest)) => digest,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            app.take_requests(),
+            [Request::Trust {
+                conversation: id(1),
+                digest: Some(digest.clone())
+            }]
+        );
+        assert!(app.workspace_card().is_some());
+        let trusted = crate::card::Record {
+            trusted: Ok(Some(digest)),
+            ..prepared.clone()
+        };
+        app.reshow_workspace(&id(2), &trusted);
+        assert!(!text(&app).contains("Trusted: "));
+        // A card that came meanwhile waits through the refresh, and is
+        // shown once the workspace card closes.
+        app.settle = Duration::ZERO;
+        app.ask(Card {
+            conversation: id(1),
+            call: 9,
+            title: "Run a command".into(),
+            details: vec!["make".into()],
+            always: None,
+        });
+        assert!(app.confirm().is_none());
+        app.reshow_workspace(&id(1), &trusted);
+        assert!(text(&app).contains("Trusted: "), "{}", text(&app));
+        assert!(app.confirm().is_none());
+        key_live(&mut app, crate::card::TRUST);
+        assert_eq!(
+            app.take_requests(),
+            [Request::Trust {
+                conversation: id(1),
+                digest: None
+            }]
+        );
         key(&mut app, "Escape");
         assert!(app.workspace_card().is_none());
+        assert!(app.confirm().is_some());
+        // Closed, it is not shown again.
+        app.reshow_workspace(&id(1), &trusted);
+        assert!(app.workspace_card().is_none());
+        key(&mut app, "Escape");
+        assert_eq!(
+            app.take_requests(),
+            [Request::Decide {
+                conversation: id(1),
+                call: 9,
+                answer: Answer::Once(false)
+            }]
+        );
         // The Conversation menu's item asks for it too.
         app.menu_action(menu::Action::Workspace);
         assert_eq!(app.take_requests(), [Request::Workspace(id(1))]);
