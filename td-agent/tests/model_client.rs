@@ -32,7 +32,7 @@ use td_agent::frame;
 use td_agent::key::Secret;
 use td_agent::models::Models;
 use td_agent::protocol::{Down, Up};
-use td_agent::store::{Basis, Conversation, Event, Id, Kind, Purpose, Role, StateDir};
+use td_agent::store::{Basis, Conversation, Event, Held, Id, Kind, Purpose, Role, StateDir};
 
 /// Whether `content` is `text` after its `[received <UTC time>]` line.
 fn is_sent(content: &str, text: &str) -> bool {
@@ -2059,6 +2059,7 @@ fn a_step_that_may_change_files_is_snapshotted_or_says_why_not_once() {
     // then one in its own, which with no jail is not restored.
     let snapped = |checkout: &str| Kind::Snapshot {
         reply: 1,
+        background: Vec::new(),
         worktrees: vec![td_agent::store::Snapped {
             checkout: checkout.into(),
             before: "a".repeat(40),
@@ -2246,7 +2247,7 @@ fn until_ended(h: &mut Harness, number: u64) -> String {
             continue;
         }
         if let Up::Event(Event {
-            kind: Kind::Ended { number: n, how },
+            kind: Kind::Ended { number: n, how, .. },
             ..
         }) = up
         {
@@ -2362,6 +2363,8 @@ fn the_process_list_is_the_latest_and_bounded() {
             .append(Kind::Ended {
                 number,
                 how: "exit status 0".into(),
+                tail: None,
+                held: None,
             })
             .unwrap();
     }
@@ -2414,7 +2417,7 @@ fn a_background_command_runs_on_until_it_ends_or_is_killed() {
         ..Client::default()
     });
     h.say("Build in the background.");
-    for command in ["sleep 60", "sleep 2; exit 3"] {
+    for command in ["sleep 60", "sleep 8; echo built; exit 3"] {
         let (call, title, details) = h.until_ask();
         assert_eq!(title, "Run a command in the background");
         assert_eq!(details[1], command);
@@ -2432,15 +2435,37 @@ fn a_background_command_runs_on_until_it_ends_or_is_killed() {
     );
     assert!(said[3].1.contains("p1 | running | started "), "{said:?}");
     assert!(said[3].1.contains("| sleep 60"), "{said:?}");
-    // Logged inside the turn, or after it.
-    let ended = events
+    // Its end, after the turn, wakes the idle conversation with a notice
+    // of how it ended and the last of its output.
+    h.mock.then(vec![Reply::sse("stream-sonnet.sse")]);
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let (ended, how, tail) = events
         .iter()
         .find_map(|e| match &e.kind {
-            Kind::Ended { number: 2, how } => Some(how.clone()),
+            Kind::Ended {
+                number: 2,
+                how,
+                tail,
+                held: None,
+            } => Some((e.seq, how.clone(), tail.clone())),
             _ => None,
         })
-        .unwrap_or_else(|| until_ended(&mut h, 2));
-    assert_eq!(ended, "exit status 3");
+        .unwrap();
+    assert_eq!(how, "exit status 3");
+    assert_eq!(tail.as_deref(), Some("| built\n| "));
+    assert!(events.iter().any(|e| matches!(
+        e.kind,
+        Kind::Started { of, .. } if of == ended
+    )));
+    let requests = h.mock.requests();
+    let woke = String::from_utf8_lossy(&requests.last().unwrap().body).to_string();
+    assert!(
+        woke.contains(
+            "background process p2 (`sleep 8; echo built; exit 3`) ended: exit status 3\\nthe last of its output, made visible, follows; process_output reads it all\\n| built\\n| "
+        ),
+        "{woke}"
+    );
     // While one runs, nothing is restored, whichever step.
     h.down(&Down::Restore {
         step: 1,
@@ -2475,7 +2500,7 @@ fn a_background_command_runs_on_until_it_ends_or_is_killed() {
     let killed = events
         .iter()
         .find_map(|e| match &e.kind {
-            Kind::Ended { number: 1, how } => Some(how.clone()),
+            Kind::Ended { number: 1, how, .. } => Some(how.clone()),
             _ => None,
         })
         .unwrap_or_else(|| until_ended(&mut h, 1));
@@ -2493,12 +2518,43 @@ fn a_background_command_runs_on_until_it_ends_or_is_killed() {
     }
     let (events, _, _) = h.turn();
     assert!(results(&events)[0].1.starts_with("started p3 "));
+    // Paused, an end is held; resumed, it starts its turn.
+    h.down(&Down::Pause { paused: true });
+    let held = loop {
+        let up = h.next();
+        if h.hear(&up) {
+            continue;
+        }
+        match up {
+            Up::Event(Event {
+                seq,
+                kind: Kind::Ended {
+                    number: 4, held, ..
+                },
+                ..
+            }) => break (seq, held),
+            Up::Event(Event {
+                kind: Kind::Started { .. },
+                ..
+            }) => panic!("a paused conversation started a turn"),
+            _ => {}
+        }
+    };
+    assert_eq!(held.1, Some(Held::Paused));
+    h.mock.then(vec![Reply::sse("stream-sonnet.sse")]);
+    h.down(&Down::Pause { paused: false });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(events.iter().any(|e| matches!(
+        e.kind,
+        Kind::Started { of, .. } if of == held.0
+    )));
     let (conversation, mut h) = h.close();
     drop(conversation);
     h.reopen();
     let (conversation, _h) = h.close();
     let ended = conversation.events().iter().find_map(|e| match &e.kind {
-        Kind::Ended { number: 3, how } => Some(how.clone()),
+        Kind::Ended { number: 3, how, .. } => Some(how.clone()),
         _ => None,
     });
     assert_eq!(

@@ -5,10 +5,11 @@
 //! conversation, further messages are logged without starting a turn,
 //! held for the human, who is told once.
 //!
-//! A report, which a log from before there were only conversations may
-//! hold, was a notification its sender's own budget bounded, and does not
-//! count. Background exit notices will count when they exist (increment
-//! 12); a schedule's firings will not.
+//! A background process's exit notice counts too: a model and its own
+//! processes could wake each other as two models can. A report, which a
+//! log from before there were only conversations may hold, was a
+//! notification its sender's own budget bounded, and does not count; a
+//! schedule's firings will not.
 
 use std::collections::HashSet;
 
@@ -38,7 +39,7 @@ pub fn spent(events: &[Event]) -> usize {
     let mut count = 0;
     for event in events {
         match event.kind {
-            Kind::Message { status: None, .. } => {
+            Kind::Message { status: None, .. } | Kind::Ended { .. } => {
                 wakers.insert(event.seq);
             }
             // Noted as started whether or not it counts, so a turn asked
@@ -65,6 +66,9 @@ pub fn told(events: &[Event]) -> bool {
                 Kind::Message {
                     held: Some(Held::Budget),
                     ..
+                } | Kind::Ended {
+                    held: Some(Held::Budget),
+                    ..
                 }
             )
     })
@@ -73,7 +77,7 @@ pub fn told(events: &[Event]) -> bool {
 /// What the human is told when the budget is spent.
 pub fn notice() -> String {
     format!(
-        "messages from other conversations have started {BUDGET} turns here since you last wrote to this conversation; until you do, further messages are logged without starting a turn"
+        "messages from other conversations and background processes' ends have started {BUDGET} turns here since you last wrote to this conversation; until you do, further ones are logged without starting a turn"
     )
 }
 
@@ -147,6 +151,29 @@ mod tests {
         assert!(!told(&events));
         let m = next();
         events.push(message(m, 130, None, Some(Held::Budget)));
+        assert!(told(&events));
+    }
+
+    /// A background process's end that starts a turn counts as a message
+    /// does, and one held for the budget tells the human.
+    #[test]
+    fn a_background_processs_end_counts_against_the_budget() {
+        let ended = |seq, held| {
+            event(
+                seq,
+                100,
+                Kind::Ended {
+                    number: seq,
+                    how: "exit status 0".into(),
+                    tail: None,
+                    held,
+                },
+            )
+        };
+        let mut events = vec![ended(1, None), started(2, 100, 1), ended(3, None)];
+        assert_eq!(spent(&events), 1);
+        assert!(!told(&events));
+        events.push(ended(4, Some(Held::Budget)));
         assert!(told(&events));
     }
 }

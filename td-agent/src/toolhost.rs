@@ -417,9 +417,7 @@ fn act(
             let exit = shell::run_whole(shell::shell(command, &dir), timeout, cancel, sink)?;
             let mut text = exit.status();
             if exit.cut {
-                text.push_str(
-                    "; output still came a minute after its end, and the rest was not read",
-                );
+                text.push_str(shell::CUT_NOTE);
             }
             Ok(Done {
                 text,

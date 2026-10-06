@@ -986,6 +986,8 @@ pub struct Listed {
     /// Its workspace as the window's list names it, none outside one.
     pub workspace: Option<String>,
     pub state: String,
+    /// Its background processes running, as its log has them.
+    pub background: usize,
     pub cost: u64,
     pub activity: u64,
     pub title: String,
@@ -1009,7 +1011,7 @@ pub fn listing(caller: &Id, entries: &[Listed], omitted: usize) -> String {
     for entry in entries {
         let own = &entry.id == caller;
         out.push_str(&format!(
-            "\n{}{} | workspace {} | {} | background 0 | cost {} | active {}",
+            "\n{}{} | workspace {} | {} | background {} | cost {} | active {}",
             entry.id,
             if own { " (this conversation)" } else { "" },
             entry
@@ -1017,6 +1019,7 @@ pub fn listing(caller: &Id, entries: &[Listed], omitted: usize) -> String {
                 .as_deref()
                 .map_or("none".to_string(), visible),
             entry.state,
+            entry.background,
             crate::cost::show(entry.cost),
             crate::history::utc(entry.activity),
         ));
@@ -1973,6 +1976,7 @@ mod tests {
             id: id(n),
             workspace: workspace.map(str::to_string),
             state: "idle".into(),
+            background: usize::from(n),
             cost: 0,
             activity: 0,
             title: format!("title {n}"),
@@ -1992,7 +1996,10 @@ mod tests {
             assert!(!mine.contains(hidden), "{hidden} in {mine}");
         }
         assert!(
-            mine.contains(&format!("{} | workspace none", id(1))),
+            mine.contains(&format!(
+                "{} | workspace none | idle | background 1 |",
+                id(1)
+            )),
             "{mine}"
         );
         assert!(

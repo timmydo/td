@@ -1171,6 +1171,24 @@ pub struct Snapped {
     pub more: u64,
 }
 
+/// The background processes of `events` running at any time after the
+/// event at `since`: started, and not ended by then.
+pub fn running_since(events: &[Event], since: u64) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    for event in events {
+        match &event.kind {
+            Kind::Process { number, .. } => out.push(*number),
+            Kind::Ended { number, .. } if event.seq <= since => {
+                if let Some(at) = out.iter().rposition(|n| n == number) {
+                    out.remove(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// One item of a todo list.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TodoItem {
@@ -1237,7 +1255,7 @@ pub fn backgrounds(events: &[Event]) -> Vec<Background> {
                 started: event.time,
                 ended: None,
             }),
-            Kind::Ended { number, how } => {
+            Kind::Ended { number, how, .. } => {
                 if let Some(one) = out
                     .iter_mut()
                     .rev()
@@ -1362,8 +1380,13 @@ pub enum Kind {
     /// human cleared it from the window.
     Todo { items: Vec<TodoItem>, cleared: bool },
     /// The worktrees the step of the reply at `reply` changed, each as a
-    /// git tree before and after it (DESIGN.md §12).
-    Snapshot { reply: u64, worktrees: Vec<Snapped> },
+    /// git tree before and after it, and the background processes running
+    /// while it ran, whose changes it may hold (DESIGN.md §12).
+    Snapshot {
+        reply: u64,
+        worktrees: Vec<Snapped>,
+        background: Vec<u64>,
+    },
     /// The human undid the step whose snapshot is at `step`, its
     /// worktrees brought back to their trees before it, or, not `undo`,
     /// redid it (DESIGN.md §12).
@@ -1376,8 +1399,16 @@ pub enum Kind {
         command: String,
     },
     /// Background process `number` ended: `how`, as `process_list` says
-    /// it, an exit status, killed, timed out, failed or lost.
-    Ended { number: u64, how: String },
+    /// it, an exit status, killed, timed out, failed or lost; the tail of
+    /// its output, made visible, when its conversation's process heard
+    /// it end; and why it started no turn, when it would have (DESIGN.md
+    /// §3, §12). The model is told it as a notification.
+    Ended {
+        number: u64,
+        how: String,
+        tail: Option<String>,
+        held: Option<Held>,
+    },
     /// The human paused or resumed the conversation (DESIGN.md §3).
     Pause { paused: bool },
     /// The human chose the conversation's model and reasoning effort
@@ -1586,9 +1617,19 @@ impl Event {
                     put("cleared", Json::Bool(true));
                 }
             }
-            Kind::Snapshot { reply, worktrees } => {
+            Kind::Snapshot {
+                reply,
+                worktrees,
+                background,
+            } => {
                 put("kind", Json::Str("snapshot".into()));
                 put("reply", Json::from(*reply));
+                if !background.is_empty() {
+                    put(
+                        "background",
+                        Json::Arr(background.iter().map(|n| Json::from(*n)).collect()),
+                    );
+                }
                 let worktrees = worktrees
                     .iter()
                     .map(|one| {
@@ -1623,10 +1664,21 @@ impl Event {
                 put("call", Json::from(*call));
                 put("command", Json::Str(command.clone()));
             }
-            Kind::Ended { number, how } => {
+            Kind::Ended {
+                number,
+                how,
+                tail,
+                held,
+            } => {
                 put("kind", Json::Str("ended".into()));
                 put("number", Json::from(*number));
                 put("how", Json::Str(how.clone()));
+                if let Some(tail) = tail {
+                    put("tail", Json::Str(tail.clone()));
+                }
+                if let Some(held) = held {
+                    put("held", Json::Str(held.word().into()));
+                }
             }
             Kind::Pause { paused } => {
                 put("kind", Json::Str("pause".into()));
@@ -1827,6 +1879,11 @@ impl Event {
             Some("ended") => Kind::Ended {
                 number: number("number")?,
                 how: string("how")?,
+                tail: optional("tail")?,
+                held: match optional("held")? {
+                    None => None,
+                    Some(word) => Some(Held::parse(&word).ok_or("an unknown hold")?),
+                },
             },
             Some(undo @ ("undo" | "redo")) => Kind::Restore {
                 step: number("step")?,
@@ -1834,6 +1891,15 @@ impl Event {
             },
             Some("snapshot") => Kind::Snapshot {
                 reply: number("reply")?,
+                background: match value.get("background") {
+                    None => Vec::new(),
+                    Some(numbers) => numbers
+                        .as_arr()
+                        .ok_or("background that is no list")?
+                        .iter()
+                        .map(|n| n.as_u64().ok_or("a background process that is no number"))
+                        .collect::<Result<_, _>>()?,
+                },
                 worktrees: value
                     .get("worktrees")
                     .and_then(Json::as_arr)
@@ -2100,6 +2166,8 @@ impl Conversation {
             conversation.append(Kind::Ended {
                 number,
                 how: PROCESS_LOST.into(),
+                tail: None,
+                held: None,
             })?;
             repaired = true;
         }
@@ -2843,6 +2911,43 @@ pub mod tests {
         assert_eq!(conversation.events().len(), 3);
     }
 
+    /// A step names each background process that ran while it did: one
+    /// still running, or ended after it began, not one ended before.
+    #[test]
+    fn a_step_names_the_background_processes_running_while_it_ran() {
+        let process = |seq, number| Event {
+            seq,
+            time: 0,
+            kind: Kind::Process {
+                number,
+                call: 0,
+                command: "make".into(),
+            },
+        };
+        let ended = |seq, number| Event {
+            seq,
+            time: 0,
+            kind: Kind::Ended {
+                number,
+                how: "exit status 0".into(),
+                tail: None,
+                held: None,
+            },
+        };
+        let events = [
+            process(1, 1),
+            process(2, 2),
+            process(3, 3),
+            ended(4, 1),
+            // The step's reply.
+            ended(6, 2),
+            process(7, 4),
+        ];
+        assert_eq!(running_since(&events, 5), vec![2, 3, 4]);
+        assert_eq!(running_since(&events, 6), vec![3, 4]);
+        assert_eq!(running_since(&events[..3], 5), vec![1, 2, 3]);
+    }
+
     /// No background process outlives its conversation's process: one
     /// the log has running when it opens is recorded lost, once.
     #[test]
@@ -2866,6 +2971,8 @@ pub mod tests {
                 .append(Kind::Ended {
                     number: 2,
                     how: "killed".into(),
+                    tail: None,
+                    held: None,
                 })
                 .unwrap();
             // A number the log holds twice, as only a hand could write
@@ -2913,6 +3020,7 @@ pub mod tests {
                 seq,
                 Kind::Snapshot {
                     reply: seq,
+                    background: Vec::new(),
                     worktrees: Vec::new(),
                 },
             )
@@ -2959,6 +3067,7 @@ pub mod tests {
             time: 0,
             kind: Kind::Snapshot {
                 reply: 1,
+                background: Vec::new(),
                 worktrees: vec![Snapped {
                     checkout: "/w".into(),
                     before: "a".repeat(40),
@@ -2972,6 +3081,7 @@ pub mod tests {
         let fine = Event {
             kind: Kind::Snapshot {
                 reply: 1,
+                background: Vec::new(),
                 worktrees: vec![Snapped {
                     checkout: "/w".into(),
                     before: "a".repeat(40),
@@ -3080,9 +3190,12 @@ pub mod tests {
             Kind::Ended {
                 number: 1,
                 how: "exit status 2".into(),
+                tail: Some("built\n<U+001B>[0m".into()),
+                held: Some(Held::Budget),
             },
             Kind::Snapshot {
                 reply: 3,
+                background: vec![1, 2],
                 worktrees: vec![Snapped {
                     checkout: "/w/td".into(),
                     before: "a".repeat(40),

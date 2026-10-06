@@ -572,8 +572,8 @@ there are.
   conversation ID, status S, not from the person]` for a `report`, its
   status `in_progress`, `done` or `blocked`.
 - **The wake budget** is counted from the receiver's log: the first turn
-  of each message from another conversation after the human's last
-  message in that log. A turn the human asks again (`C-r`) does not
+  of each message from another conversation, or of each background
+  process's end (§12), after the human's last message in that log. A turn the human asks again (`C-r`) does not
   count, nor does a report an older log holds: it was the notification
   of its sender's own turn, which the sender's budget bounded. Past
   twenty, a message is logged `held` without starting a turn, and the
@@ -3547,7 +3547,8 @@ for `timeout_ms` when the call gives one, at most 24 hours.
 
 A conversation runs at most `max_background` (default 4) at once. When
 one exits, a notice with its status and output tail is delivered between
-turns like a message (§3) and wakes the conversation if idle. Background
+turns like a message (§3) and wakes the conversation if idle, unless it
+was killed: whoever killed it knows. Background
 processes are listed under their conversation in the window's tree, each
 with a kill action and its output viewable read-only, and the status row
 counts them. They end when killed, when their conversation is archived
@@ -3595,10 +3596,10 @@ or a hello, zeroes the count before the log replays) and keeps its
 process while any runs. An undo or a redo is refused before any other
 check while one runs, whichever step it names. The output store,
 `process_output`, `process_wait` and the list's output size came next
-(As built (increment 12, output)). Not built yet: the exit notice to the
-model, which sees an end only through `process_list` and `process_wait`;
-the window's process list and the status row's count; `conversations`,
-which still says `background 0`; and the step diff's note.
+(As built (increment 12, output)), then the exit notice,
+`conversations`' count and the step's note (As built (increment 12,
+notices)). Not built yet: the window's process list and the status row's
+count.
 
 **As built (increment 12, output).** The tool host sends a background
 call's output up as it comes, waiting for room rather than dropping what
@@ -3634,6 +3635,38 @@ the last 15 KiB of its output, a foreground call's shown tail.
 conversation removes `processes/` under its lock once the archive is
 stored (`StateDir::set_archived`), and deleting it removes the rest with
 it.
+
+**As built (increment 12, notices).** A process's end is logged as an
+`ended` event carrying, besides how it ended, the last 2 KiB of its
+output, each line made visible and marked `| ` so that none passes for a
+line of td-agent's, its last lines kept within 4 KiB as framed, the
+first that does not fit cut to the room left and the tail left out when
+the log has no room for it; the model reads it as td-agent's news,
+naming the process's command, cut to 200 characters. How it ended is
+taken from its tool host, which is the jail's, only in the shapes
+`shell::Exit::status` gives (`exit status N`, `killed by signal N`,
+timed out or interrupted with one of those, or the note that output was
+still coming); anything else, and a failure the tool host's client
+gives, which may carry the jail's standard error, is quoted, at most 300
+characters. Whether its end is known already, a kill or a watcher that
+could not start, which its call said, is carried apart from that text,
+and such an end wakes nothing. An end heard during a turn is logged
+between its steps, where the next request reads it, and before an undo
+or a redo, and so is the end of a process whose watcher could not start;
+one heard while the conversation is idle starts a turn whose `of` is the
+end, counted against the wake budget as a message's (`wake::spent`),
+held as a message is when the conversation is paused or the budget is
+spent (the event's `held`; resuming starts the held turn), and starting
+none when there is no usable key, or a turn of the person's waits. The
+end and its turn's start are both logged before either is sent, and the
+window is told first (`Up::Waking`) that a turn comes, keeping the
+process until its start arrives even when that end was its last
+process's. `conversations` counts each conversation's running processes
+from its log. A step's snapshot names the processes running at any time
+after its reply (`store::running_since`), and the window and
+`history_read` say it may hold their changes. The end of one heard as a
+person undoes wakes nothing: the undo is theirs, and the notice is read
+with their next turn.
 
 **Todo list.** `todo_write` replaces the conversation's whole list with
 items of `pending`, `in_progress`, `done` or `cancelled`, at most one in

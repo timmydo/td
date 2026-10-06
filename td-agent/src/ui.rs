@@ -1541,7 +1541,8 @@ impl App {
                 | Up::Fetch { .. }
                 | Up::Heads { .. }
                 | Up::Prepared { .. }
-                | Up::Restored,
+                | Up::Restored
+                | Up::Waking,
             )
             | Update::Undeliverable { .. } => {}
             Update::Up(Up::Delta {
@@ -1843,11 +1844,18 @@ impl App {
                     self.note(format!("the transcript refused a tool result: {e}"));
                 }
             }
-            Kind::Snapshot { worktrees, .. } => {
-                let lines: Vec<String> = worktrees
+            Kind::Snapshot {
+                worktrees,
+                background,
+                ..
+            } => {
+                let mut lines: Vec<String> = worktrees
                     .iter()
                     .map(crate::history::snapshot_line)
                     .collect();
+                if !background.is_empty() {
+                    lines.push(crate::history::running_line(&background));
+                }
                 self.notice_message(&format!(
                     "this step changed {}; C-z undoes it",
                     lines.join("; ")
@@ -1859,9 +1867,16 @@ impl App {
             )),
             // The `shell` call's result says it started.
             Kind::Process { .. } => {}
-            Kind::Ended { number, how } => {
-                self.notice_message(&format!("background process p{number} ended: {how}"))
-            }
+            Kind::Ended {
+                number, how, held, ..
+            } => self.notice_message(&format!(
+                "background process p{number} ended: {how}{}",
+                match held {
+                    Some(Held::Paused) => "; held: paused",
+                    Some(Held::Budget) => "; held: wake budget",
+                    None => "",
+                }
+            )),
             Kind::Todo { items, cleared } => {
                 if cleared {
                     self.notice_message("you cleared the todo list");
@@ -5196,6 +5211,7 @@ pub mod tests {
                 seq,
                 Kind::Snapshot {
                     reply: seq - 1,
+                    background: if seq == 5 { vec![1, 3] } else { Vec::new() },
                     worktrees: vec![crate::store::Snapped {
                         checkout: "/w/td".into(),
                         before: "a".repeat(40),
@@ -5209,7 +5225,7 @@ pub mod tests {
         app.update(snapshot(3), 0);
         app.update(snapshot(5), 0);
         assert!(text(&app).contains("this step changed /w/td"));
-        assert!(text(&app).contains("C-z undoes it"));
+        assert!(text(&app).contains("background processes were running (p1, p3)"));
         key(&mut app, "C-z");
         assert_eq!(app.take_requests(), [Request::Undo(5)]);
         // Only between turns.
@@ -5269,6 +5285,8 @@ pub mod tests {
                 Kind::Ended {
                     number: 1,
                     how: "exit status 2".into(),
+                    tail: None,
+                    held: None,
                 },
             ),
             0,

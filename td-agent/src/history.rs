@@ -137,6 +137,16 @@ fn kind(event: &Event) -> &'static str {
     }
 }
 
+/// What a step's snapshot says of the background processes running while
+/// it ran (DESIGN.md §12).
+pub fn running_line(background: &[u64]) -> String {
+    let names: Vec<String> = background.iter().map(|n| format!("p{n}")).collect();
+    format!(
+        "background processes were running ({}), so it may hold their changes",
+        names.join(", ")
+    )
+}
+
 /// A worktree a step changed, on one line: its checkout, its trees, and
 /// the files changed, each made visible, since a jail named them.
 pub fn snapshot_line(one: &crate::store::Snapped) -> String {
@@ -240,10 +250,17 @@ pub fn render(event: &Event) -> String {
             items,
         } if items.is_empty() => "the person cleared the todo list".into(),
         Kind::Todo { items, .. } => crate::tools::todo_text(items),
-        Kind::Snapshot { reply, worktrees } => {
+        Kind::Snapshot {
+            reply,
+            worktrees,
+            background,
+        } => {
             let mut out = format!("the step of #{reply} changed files, snapshotted");
             for one in worktrees {
                 out.push_str(&format!("\n{}", snapshot_line(one)));
+            }
+            if !background.is_empty() {
+                out.push_str(&format!("\n{}", running_line(background)));
             }
             out
         }
@@ -255,7 +272,27 @@ pub fn render(event: &Event) -> String {
             call,
             command,
         } => format!("background process p{number} started by #{call}: {command}"),
-        Kind::Ended { number, how } => format!("background process p{number} ended: {how}"),
+        Kind::Ended {
+            number,
+            how,
+            tail,
+            held,
+        } => {
+            let mut text = format!("background process p{number} ended: {how}");
+            match held {
+                Some(Held::Paused) => {
+                    text.push_str(" (it started no turn: this conversation was paused)")
+                }
+                Some(Held::Budget) => {
+                    text.push_str(" (it started no turn: the wake budget was spent)")
+                }
+                None => {}
+            }
+            if let Some(tail) = tail {
+                text.push_str(&format!("; the tail of its output:\n{tail}"));
+            }
+            text
+        }
         Kind::Restore { step, undo: false } => {
             format!("the person redid the step snapshotted at #{step}")
         }

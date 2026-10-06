@@ -244,6 +244,10 @@ pub fn run_whole(
     run_draining(command, timeout, cancel, sink, true)
 }
 
+/// What a background call's answer adds when output was still coming
+/// at `MAX_LINGER`.
+pub const CUT_NOTE: &str = "; output still came a minute after its end, and the rest was not read";
+
 /// How long a background process's output is still read after it ends,
 /// while a descendant still writes.
 const MAX_LINGER: Duration = Duration::from_secs(60);

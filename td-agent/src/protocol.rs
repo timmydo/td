@@ -172,6 +172,9 @@ pub enum Up {
     /// for, done or not: until then the window keeps its process
     /// (DESIGN.md §12).
     Restored,
+    /// A background process's end is about to start a turn: until the
+    /// turn's start, the window keeps the process (DESIGN.md §12).
+    Waking,
     /// The conversation is done preparing `remote`'s repository, ready or
     /// not: until then the window keeps its process (DESIGN.md §7).
     Prepared {
@@ -654,6 +657,7 @@ impl Up {
             ),
             Self::Query { id } => typed("query", vec![("id".into(), Json::from(*id))]),
             Self::Restored => typed("restored", Vec::new()),
+            Self::Waking => typed("waking", Vec::new()),
             Self::Prepared { remote } => typed(
                 "prepared",
                 vec![("remote".into(), Json::Str(remote.clone()))],
@@ -777,6 +781,7 @@ impl Up {
                 bases: strings(&value, "bases")?,
             },
             Some("restored") => Self::Restored,
+            Some("waking") => Self::Waking,
             Some("prepared") => Self::Prepared {
                 remote: string(&value, "remote")?,
             },
@@ -899,6 +904,7 @@ mod tests {
                 remote: "https://github.com/timmydo/td".into(),
             },
             Up::Restored,
+            Up::Waking,
             Up::Heads {
                 remote: "https://github.com/timmydo/td".into(),
                 bases: vec!["main".into()],

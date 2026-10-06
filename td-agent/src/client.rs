@@ -236,6 +236,8 @@ pub fn messages(events: &[Event], timed: bool) -> Vec<String> {
         }
     };
     let mut purposes: Vec<(u64, Purpose)> = Vec::new();
+    // Each background process's command, for its exit notice.
+    let mut commands: Vec<(u64, &str)> = Vec::new();
     let mut out = Vec::new();
     for event in events {
         match &event.kind {
@@ -248,6 +250,31 @@ pub fn messages(events: &[Event], timed: bool) -> Vec<String> {
                 "user",
                 &format!("{}{NOTIFICATION}\n{text}", at(event.time)),
             )),
+            Kind::Process {
+                number, command, ..
+            } => commands.push((*number, command.as_str())),
+            // A background process's exit notice (DESIGN.md §12).
+            Kind::Ended {
+                number, how, tail, ..
+            } => {
+                let command = commands.iter().rev().find(|(n, _)| n == number).map_or(
+                    String::new(),
+                    |(_, command)| {
+                        let cut: String = command.chars().take(200).collect();
+                        format!(" (`{}`)", crate::tools::visible(&cut))
+                    },
+                );
+                let mut text = format!("background process p{number}{command} ended: {how}");
+                if let Some(tail) = tail {
+                    text.push_str(&format!(
+                        "\nthe last of its output, made visible, follows; process_output reads it all\n{tail}"
+                    ));
+                }
+                out.push(crate::prompt::message(
+                    "user",
+                    &format!("{}{NOTIFICATION}\n{text}", at(event.time)),
+                ))
+            }
             Kind::Message {
                 from,
                 role,
@@ -834,6 +861,59 @@ mod tests {
 
     fn event(seq: u64, kind: Kind) -> Event {
         Event { seq, time: 0, kind }
+    }
+
+    /// A background process's end goes to the model as td-agent's news,
+    /// naming its command and the framed tail of its output (DESIGN.md
+    /// §12).
+    #[test]
+    fn a_background_processs_end_goes_to_the_model_as_news() {
+        let events = vec![
+            event(
+                1,
+                Kind::Process {
+                    number: 1,
+                    call: 0,
+                    command: "make\tall".into(),
+                },
+            ),
+            event(
+                2,
+                Kind::Ended {
+                    number: 1,
+                    how: "exit status 2".into(),
+                    tail: Some("| built".into()),
+                    held: None,
+                },
+            ),
+            event(
+                3,
+                Kind::Ended {
+                    number: 7,
+                    how: "killed".into(),
+                    tail: None,
+                    held: None,
+                },
+            ),
+        ];
+        let sent = messages(&events, false);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(
+            sent.first().unwrap(),
+            &crate::prompt::message(
+                "user",
+                &format!(
+                    "{NOTIFICATION}\nbackground process p1 (`make<U+0009>all`) ended: exit status 2\nthe last of its output, made visible, follows; process_output reads it all\n| built"
+                )
+            )
+        );
+        assert_eq!(
+            sent.get(1).unwrap(),
+            &crate::prompt::message(
+                "user",
+                &format!("{NOTIFICATION}\nbackground process p7 ended: killed")
+            )
+        );
     }
 
     fn response(status: u16, body: &str, headers: &[(&str, &str)]) -> td_fetch_client::Response {

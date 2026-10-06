@@ -92,6 +92,9 @@ struct Running {
     /// Told to resume and not yet heard resuming: a turn for what it
     /// held may be about to start, so it is kept.
     resuming: bool,
+    /// A background process's end said to be starting a turn whose start
+    /// has not come yet: its end, already heard, counted the process out.
+    waking: bool,
     /// The remotes it asked the window for and has not said prepared:
     /// a repository workspace being made ready, kept until it is.
     preparing: Vec<String>,
@@ -111,6 +114,7 @@ impl Running {
     fn working(&self) -> bool {
         self.busy.is_some()
             || self.resuming
+            || self.waking
             || !self.preparing.is_empty()
             || self.restoring > 0
             || self.background > 0
@@ -228,6 +232,7 @@ impl Supervisor {
             restoring: 0,
             background: 0,
             resuming: false,
+            waking: false,
         });
         Ok(())
     }
@@ -388,6 +393,7 @@ impl Supervisor {
             restoring: 0,
             background: 0,
             resuming: false,
+            waking: false,
         });
         self.open = Some(id);
         Ok(Opened::Started)
@@ -598,6 +604,7 @@ impl Supervisor {
             let _ = running.child.kill();
             let _ = running.child.wait();
             running.busy = None;
+            running.waking = false;
             // Its process gone, nothing is half written by it any more,
             // and the new one is not asked again; its background
             // processes went with it.
@@ -721,6 +728,7 @@ fn drain(running: &mut Running, updates: &mut Vec<(Id, Update)>) -> Option<Strin
                         Up::Hello { .. } => {
                             running.busy = None;
                             running.resuming = false;
+                            running.waking = false;
                             // Its log, replayed next, counts them again.
                             running.background = 0;
                             // A process started again asks again.
@@ -733,6 +741,7 @@ fn drain(running: &mut Running, updates: &mut Vec<(Id, Update)>) -> Option<Strin
                         }
                         Up::Prepared { remote } => running.preparing.retain(|r| r != remote),
                         Up::Restored => running.restoring = running.restoring.saturating_sub(1),
+                        Up::Waking => running.waking = true,
                         Up::Event(event) => match event.kind {
                             // Logged after any turn it starts, whose start
                             // has marked the child busy.
@@ -740,7 +749,10 @@ fn drain(running: &mut Running, updates: &mut Vec<(Id, Update)>) -> Option<Strin
                             Kind::Started {
                                 effect: Effect::Turn,
                                 ..
-                            } => running.busy = Some(event.seq),
+                            } => {
+                                running.busy = Some(event.seq);
+                                running.waking = false;
+                            }
                             Kind::Finished { started, .. } | Kind::Interrupted { started }
                                 if running.busy == Some(started) =>
                             {
@@ -876,6 +888,8 @@ mod background_tests {
         let end = Kind::Ended {
             number: 1,
             how: "killed".into(),
+            tail: None,
+            held: None,
         };
         assert_eq!(background(0, &start), 1);
         assert_eq!(background(1, &end), 0);

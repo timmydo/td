@@ -6,7 +6,7 @@ data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"an
 
 data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":1,"id":"toolu_bg_02","type":"function","function":{"name":"shell","arguments":""}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
 
-data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":1,"function":{"arguments":"{\"command\":\"sleep 2; exit 3\",\"background\":true}"}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":1,"function":{"arguments":"{\"command\":\"sleep 8; echo built; exit 3\",\"background\":true}"}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
 
 data: {"id":"gen-1759400400-bAcKgRoUnD000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":2,"id":"toolu_bg_03","type":"function","function":{"name":"shell","arguments":""}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
 
