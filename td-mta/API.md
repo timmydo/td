@@ -6028,6 +6028,56 @@ admission, whole composed retention, request parsing/defaults,
 headers/header:*/subParts selection and current authenticated
 publication remain later or unqualified.
 
+### 1.142 Whole requested output with selected part metadata
+
+M06ek adds
+`members::selected::retained::collected::composed::requested::retained`
+over §1.141's original selected collection. Cursor starts only from
+complete selected Serialized, pure outer Properties and one caller-owned
+fixed output window; an advanced requested Cursor, emitted-only Composed
+or passive view cannot recreate a lost prefix. Privately reuse the
+original whole requested retention core while preserving immutable
+per-part metadata selection. Retained ViewBytes exposes outer
+properties, complete provisional members and the original selected view.
+Fresh release returns selected Serialized, unchanged outer properties
+and the same complete borrowed output bytes; the collection still owns
+original cells/backing and actual descriptor custody.
+
+Reuse at-most-64-byte funded copies, exact five-cost debits and sticky
+window/work/freshness errors. Exact windows succeed, spare tails remain
+untouched and insufficient windows expose no whole value. Outer NONE
+needs no output capacity or composition work. Completed polls remain
+inert; explicit and consuming Cursor/Retained/Serialized boundaries
+check both original-job and actual-pin domains, including NONE. Clock
+refusal hides a completed view. Work and capacity refusal prevent
+completion. Bytes and selection labels remain provisional through
+current authenticated publication.
+
+Cursor plus HeaderBudget fits 1 KiB; Retained fits 768 bytes. Output
+storage, original backing, generated metadata windows and collection
+cells remain separately caller-owned/admitted. No additional allocation
+or borrowed arena is introduced. Eight units and eight compile-fail guards
+cover exact/spare and short windows, selected labels, original custody,
+bare-composer bytes/turns/five-cost parity, constructor and
+partial-prefix deadline precedence, premature completion, inert complete
+polls, explicit/consuming freshness and sticky wire refusal.
+
+Eight sequential Rust allocation intervals cover near-u64 SOURCE
+combined tree/list retention; both selections NONE with zero output
+capacity; actual expiry after copied bytes; complete Cursor expiry;
+complete Retained expiry; released Serialized explicit expiry;
+zero-capacity refusal; and constructor actual expiry. Source matching,
+complete selected metadata, collection cells and output window are cold;
+hot descriptor teardown is counted while pooled scratch/cells and
+enclosing cleanup remain outside. All sixteen snapshots must be valid
+before comparison. Earlier 185 intervals remain separate. Other metadata masks/sources/capacities, supplied-Tick expiry,
+wire/funding refusal, premature finish, cached complete polls, explicit
+Cursor/Retained checks and other freshness boundaries remain
+allocation-unqualified. Native allocation, stack/RSS and full worker
+admission remain unqualified. The fixed subParts scaffold is provisional;
+configurable headers/header:*/subParts selection, request bodyProperties
+parsing/defaults and current authenticated publication remain later.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

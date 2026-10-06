@@ -51,6 +51,10 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm, 'z>
             properties,
         })
     }
+    #[cfg(test)]
+    pub(in super::super::super::super::super) fn costs(&self) -> [u64; 5] {
+        self.inner.costs()
+    }
     pub fn value(&self) -> Option<ViewBytes<'_, 'm, 'o>> {
         let view = self.inner.value()?;
         Some(ViewBytes {

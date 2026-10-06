@@ -1,4 +1,5 @@
 //! Requested outer properties preserve selected metadata and original custody.
+pub mod retained;
 use super::super::super::super::super::retained::collected::composed::requested as shared;
 use super::super::{Serialized, View};
 use super::Error;

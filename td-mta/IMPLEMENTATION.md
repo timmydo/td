@@ -2392,6 +2392,18 @@ Initial independently landable increments:
   headers/header:*/subParts selection, full admission and current
   authenticated publication follow.
 
+- **M06ek — whole requested output with selected part metadata:** retain
+  complete combined outer properties in one caller-owned fixed window
+  through original source custody. Private shared retention preserves
+  immutable part and outer labels; fresh release returns selected
+  Serialized, outer properties and the same output bytes. Exact/spare
+  and insufficient windows, deadline precedence, inert completion,
+  explicit/consuming freshness and exact funding stay shared. Eight
+  units, eight guards and eight Rust intervals qualify API §1.142. The
+  subParts scaffold remains provisional; configurable
+  headers/header:*/subParts selection, request parsing/defaults, full
+  admission and current authenticated publication remain later.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

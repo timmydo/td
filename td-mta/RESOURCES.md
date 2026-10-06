@@ -2556,6 +2556,16 @@ with cold preparation and counted descriptor teardown; earlier 177
 remain separate. Native allocation, stack/RSS, configurable subParts
 selection and complete admission/publication remain unqualified.
 
+M06ek whole requested selected-field retention keeps Cursor plus
+HeaderBudget within 1 KiB and Retained within 768 bytes. Reuse the
+original bounded retention Window, composer and all five exact cost
+debits; output, original backing, generated metadata windows and
+collection cells remain separately caller-owned/admitted. API §1.142
+qualifies eight enumerated Rust intervals with cold preparation and
+counted descriptor teardown; earlier 185 remain separate. Native
+allocation, stack/RSS, configurable subParts selection and full
+admission/publication remain unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

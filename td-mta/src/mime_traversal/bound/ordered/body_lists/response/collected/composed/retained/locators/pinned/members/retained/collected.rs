@@ -289,6 +289,25 @@ pub type Release<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm> =
 impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
     Serialized<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
 {
+    #[cfg(test)]
+    pub(in super::super) fn costs(&self) -> [u64; 5] {
+        let structure = &self
+            .source
+            .original
+            .source
+            .original
+            .source
+            .projected
+            .structure;
+        let left = structure.work.remaining();
+        [
+            structure.budget.source_bytes_remaining(),
+            structure.budget.steps_remaining(),
+            left.io_bytes,
+            left.records,
+            left.output_bytes,
+        ]
+    }
     pub fn value(&self) -> Option<View<'_, 'm, 'o>> {
         Some(View {
             original: self.source.value()?,

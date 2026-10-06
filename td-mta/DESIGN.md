@@ -918,6 +918,18 @@ intervals; whole output retention, request parsing/defaults,
 configurable headers/header:*/subParts selection, full admission and
 current authenticated publication follow.
 
+M06ek whole requested selected-field retention reuses the original
+fixed-window core under exclusive selected facades. Complete Serialized
+alone starts fresh requested composition; immutable part and outer
+selections survive complete output and fresh release alongside original
+backing/cells/descriptor custody. Capacity and work refusal prevent
+completion; original-job/actual-pin refusal hides completed views and
+remains sticky. API §1.142 scopes eight Rust allocation intervals and
+caller-owned windows. Structural subParts remains a provisional
+scaffold; configurable headers/header:*/subParts selection, request
+parsing/defaults, full admission and current authenticated publication
+remain later.
+
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot
 select bodyStructure. They remain public facades over the same shared
