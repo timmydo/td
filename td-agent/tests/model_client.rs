@@ -2238,6 +2238,50 @@ fn a_tool_host_that_does_not_answer_is_torn_down_at_the_deadline() {
     assert!(asked.elapsed() < Duration::from_secs(25));
 }
 
+/// The person kills a background process from the window: it ends
+/// killed, and its end wakes nothing (DESIGN.md §12).
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn a_background_process_the_person_kills_ends_and_wakes_nothing() {
+    let mut h = Harness::new_in(
+        "bgkill",
+        Role::Conversation,
+        Some("scratch"),
+        true,
+        vec![
+            Reply::sse("stream-tool-background.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client {
+        max_background: 1,
+        ..Client::default()
+    });
+    h.say("Build in the background.");
+    let (call, _, _) = h.until_ask();
+    h.down(&Down::Decision { call, allow: true });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(results(&events)[0].1.starts_with("started p1 "));
+    h.down(&Down::Kill { number: 1 });
+    assert_eq!(until_ended(&mut h, 1), "killed");
+    // A kill of one that has ended is nothing.
+    h.down(&Down::Kill { number: 1 });
+    let (conversation, _h) = h.close();
+    let events = conversation.events();
+    let ended = events
+        .iter()
+        .find(|e| matches!(e.kind, Kind::Ended { number: 1, .. }))
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.seq > ended.seq && matches!(e.kind, Kind::Started { .. })),
+        "{events:?}"
+    );
+}
+
 /// The end of background process `number` this process logs, waiting
 /// for it.
 fn until_ended(h: &mut Harness, number: u64) -> String {

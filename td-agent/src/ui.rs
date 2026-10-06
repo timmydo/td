@@ -28,7 +28,7 @@
 //! model picker (`picker`), each modal over the window until it closes;
 //! Help → Keys opens the window's key list.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -193,6 +193,11 @@ enum Picking {
     Template,
 }
 
+/// How much of a background process's command its row shows.
+const MAX_PROCESS_LABEL: usize = 120;
+/// How many lines of a process's output make one entry of its view.
+const OUTPUT_LINES: usize = 40;
+
 /// One conversation in the list.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Row {
@@ -263,6 +268,12 @@ pub enum Request {
     Delete(Id),
     /// Archive this conversation, or bring it back, from its row's menu.
     Archive { id: Id, archived: bool },
+    /// Kill conversation `id`'s background process `number`, from its
+    /// row's menu (DESIGN.md §12).
+    Kill { id: Id, number: u64 },
+    /// Read the output of conversation `id`'s background process
+    /// `number`; the session answers through `show_output`.
+    Output { id: Id, number: u64 },
     /// Make this the default model, from Conversation → Default model….
     SetDefault(String),
     /// Read what this conversation's workspace card shows; the session
@@ -619,6 +630,19 @@ pub struct App {
     menu_revision: u64,
     /// The conversation the menu is the row menu of, while it is one.
     menu_row: Option<Id>,
+    /// The background process whose row menu is open.
+    menu_process: Option<(Id, u64)>,
+    /// Each conversation's background processes running, as its events
+    /// say, by number with its command (DESIGN.md §12).
+    processes: BTreeMap<Id, Vec<(u64, String)>>,
+    /// The list's process rows, after its conversations: the row at
+    /// `rows.len() + n` is the `n`th here.
+    process_items: Vec<(Id, u64)>,
+    /// Each process row's label: its number and command.
+    process_labels: Vec<String>,
+    /// The id of the list's first process row: `rows.len()` when the list
+    /// was last built, which a change to `rows` before its rebuild keeps.
+    process_base: usize,
     credit: Option<String>,
     today: Option<u64>,
     limits: cost::Limits,
@@ -726,6 +750,11 @@ impl App {
             removal_trouble: None,
             menu_revision: 1,
             menu_row: None,
+            menu_process: None,
+            processes: BTreeMap::new(),
+            process_items: Vec::new(),
+            process_labels: Vec::new(),
+            process_base: 0,
             credit: None,
             today: None,
             limits: cost::Limits {
@@ -842,7 +871,7 @@ impl App {
     pub fn workspace_card(&self) -> Option<&crate::notes::Panel> {
         self.notes
             .as_ref()
-            .filter(|panel| panel.card_of().is_some())
+            .filter(|panel| panel.name() == crate::notes::WORKSPACE_CARD)
     }
 
     /// The open conversation's repository workspace, if it has one.
@@ -911,9 +940,10 @@ impl App {
             .map(|c| format!(" | {c}"))
             .unwrap_or_default();
         format!(
-            "{state}{retry}{keyless}{unread}{card} | {model} {effort} | {context} | cost {}{today}{credit} | mode {} | no limits | 0 background",
+            "{state}{retry}{keyless}{unread}{card} | {model} {effort} | {context} | cost {}{today}{credit} | mode {} | no limits | {} background",
             of(self.meter.spent, self.limits.conversation),
-            self.mode.word()
+            self.mode.word(),
+            self.processes.values().map(Vec::len).sum::<usize>()
         )
     }
 
@@ -993,6 +1023,8 @@ impl App {
         if let Some(doing) = doing {
             self.closing.push((id.clone(), doing));
             self.background_turns.retain(|(of, _)| of != id);
+            // Its process is ended with them, saying nothing more.
+            self.processes.remove(id);
             if let Some(row) = self.rows.iter_mut().find(|r| &r.id == id) {
                 row.state = RowState::Closed;
             }
@@ -1059,6 +1091,8 @@ impl App {
         }
         if archived {
             self.background_turns.retain(|(of, _)| of != id);
+            // Its process is ended with them, saying nothing more.
+            self.processes.remove(id);
             if self.active.as_ref() == Some(id) {
                 self.active = None;
                 self.clear_transcript();
@@ -1100,6 +1134,7 @@ impl App {
     pub fn remove_row(&mut self, id: &Id) {
         self.rows.retain(|row| &row.id != id);
         self.background_turns.retain(|(of, _)| of != id);
+        self.processes.remove(id);
         if self.active.as_ref() == Some(id) {
             self.active = None;
             self.clear_transcript();
@@ -1387,6 +1422,10 @@ impl App {
     /// store, its process's later events to follow.
     pub fn replay(&mut self, prefix: Result<&str, &str>, events: Vec<Event>) {
         self.clear_transcript();
+        // Counted again from the log.
+        if let Some(id) = self.active.clone() {
+            self.processes.remove(&id);
+        }
         self.system(prefix, false);
         for event in events {
             self.event(event);
@@ -1405,6 +1444,17 @@ impl App {
     /// What a conversation that is not open said: only its state and
     /// activity show, in its row; `now` is in milliseconds.
     pub fn background(&mut self, id: &Id, update: &Update, now: u64) {
+        match update {
+            Update::Up(Up::Event(event)) => {
+                self.heard_process(id, &event.kind);
+            }
+            // Its log, replayed next, counts them again; a failed process
+            // took them with it.
+            Update::Up(Up::Hello { .. }) | Update::Failed { .. } => {
+                self.processes.remove(id);
+            }
+            _ => {}
+        }
         let Some(row) = self.rows.iter_mut().find(|r| &r.id == id) else {
             return;
         };
@@ -1493,6 +1543,10 @@ impl App {
                 ..
             }) => {
                 self.clear_transcript();
+                // Its log, replayed next, counts its processes again.
+                if let Some(id) = self.active.clone() {
+                    self.processes.remove(&id);
+                }
                 self.system(prefix.as_deref().ok_or(LONG_PREFIX), false);
                 if let Some(row) = self.active_row() {
                     row.title = crate::store::title(&title);
@@ -1562,6 +1616,10 @@ impl App {
             }
             Update::Failed { reason } => {
                 self.stream_died();
+                // Its background processes went with its process.
+                if let Some(id) = self.active.clone() {
+                    self.processes.remove(&id);
+                }
                 if let Some(row) = self.active_row() {
                     row.state = RowState::Failed;
                 }
@@ -1580,6 +1638,11 @@ impl App {
         }
         self.last_seq = event.seq;
         self.steps.apply(&event);
+        if let Some(id) = self.active.clone() {
+            if self.heard_process(&id, &event.kind) {
+                self.refresh_list();
+            }
+        }
         // From the end: a turn's records follow its message closely, so a
         // replay finds each at once rather than scanning the whole log.
         let message_of = |messages: &[(u64, usize)], turns: &[(u64, u64)], started: u64| {
@@ -2213,9 +2276,15 @@ impl App {
     /// shown, so an update does not move the keyboard's place; else the
     /// open conversation is.
     fn refresh_list(&mut self) {
+        let kept_process = self
+            .list
+            .selected()
+            .and_then(|index| self.process_item(index))
+            .cloned();
         let kept = self
             .list
             .selected()
+            .filter(|index| *index < self.process_base)
             .and_then(|index| self.rows.get(index))
             .map(|row| row.id.clone());
         self.rows
@@ -2235,19 +2304,38 @@ impl App {
             })
             .collect();
         let show = self.show_archived;
-        let tree: Vec<TreeRow<usize>> = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| show || !row.archived)
-            .map(|(id, _)| TreeRow {
-                id,
+        // Each conversation's background processes under it, always shown.
+        let mut tree: Vec<TreeRow<usize>> = Vec::new();
+        let mut items: Vec<(Id, u64)> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        for (index, row) in self.rows.iter().enumerate() {
+            if !show && row.archived {
+                continue;
+            }
+            let running = self.processes.get(&row.id).filter(|p| !p.is_empty());
+            tree.push(TreeRow {
+                id: index,
                 parent: None,
                 depth: 0,
-                children: false,
-                expanded: false,
-            })
-            .collect();
+                children: running.is_some(),
+                expanded: running.is_some(),
+            });
+            for (number, command) in running.into_iter().flatten() {
+                let cut: String = command.chars().take(MAX_PROCESS_LABEL).collect();
+                labels.push(format!("p{number} {}", crate::tools::visible(&cut)));
+                tree.push(TreeRow {
+                    id: self.rows.len() + items.len(),
+                    parent: Some(index),
+                    depth: 1,
+                    children: false,
+                    expanded: false,
+                });
+                items.push((row.id.clone(), *number));
+            }
+        }
+        self.process_items = items;
+        self.process_labels = labels;
+        self.process_base = self.rows.len();
         match Model::new(&tree, COLUMNS) {
             Ok(model) => {
                 if let Err(e) = self.list.replace(model) {
@@ -2256,15 +2344,38 @@ impl App {
             }
             Err(e) => self.note(format!("the list: {e}")),
         }
-        let selected = kept
-            .and_then(|id| {
-                self.rows
+        let selected = kept_process
+            .as_ref()
+            .and_then(|kept| {
+                self.process_items
                     .iter()
-                    .position(|r| r.id == id && (show || !r.archived))
+                    .position(|item| item == kept)
+                    .map(|n| self.process_base + n)
+            })
+            // A process that ended leaves its conversation selected.
+            .or_else(|| {
+                kept.or(kept_process.map(|(id, _)| id)).and_then(|id| {
+                    self.rows
+                        .iter()
+                        .position(|r| r.id == id && (show || !r.archived))
+                })
             })
             .or_else(|| self.shown_active());
         self.list.select(selected, true);
         self.touch();
+    }
+
+    /// The list's row `index` activated: its conversation opened, or its
+    /// background process's output shown.
+    fn activate(&mut self, index: usize) {
+        if let Some((id, number)) = self.process_item(index).cloned() {
+            self.cancel_pointer();
+            return self.requests.push(Request::Output { id, number });
+        }
+        if let Some(row) = self.rows.get(index) {
+            let id = row.id.clone();
+            self.open(id);
+        }
     }
 
     /// The open conversation's index in `rows`, when the list shows it.
@@ -2808,6 +2919,7 @@ impl App {
             }
             Ok(Outcome::Dismissed | Outcome::Stale) => {
                 self.menu_row = None;
+                self.menu_process = None;
                 self.touch();
             }
             Ok(Outcome::Changed) => self.touch(),
@@ -2843,6 +2955,134 @@ impl App {
                     self.ask_delete(id);
                 }
             }
+            menu::Action::ShowOutput => {
+                if let Some((id, number)) = self.menu_process.take() {
+                    self.requests.push(Request::Output { id, number });
+                }
+            }
+            menu::Action::KillProcess => {
+                if let Some((id, number)) = self.menu_process.take() {
+                    self.requests.push(Request::Kill { id, number });
+                    self.note(format!("killing p{number}"));
+                }
+            }
+        }
+    }
+
+    /// The list's process row `index`: its conversation and number.
+    fn process_item(&self, index: usize) -> Option<&(Id, u64)> {
+        self.process_items
+            .get(index.checked_sub(self.process_base)?)
+    }
+
+    /// What conversation `id`'s event `kind` says of its background
+    /// processes: one started, or one ended.
+    fn heard_process(&mut self, id: &Id, kind: &Kind) -> bool {
+        match kind {
+            Kind::Process {
+                number, command, ..
+            } => {
+                let running = self.processes.entry(id.clone()).or_default();
+                if !running.iter().any(|(n, _)| n == number) {
+                    running.push((*number, command.clone()));
+                }
+                true
+            }
+            Kind::Ended { number, .. } => {
+                if let Some(running) = self.processes.get_mut(id) {
+                    running.retain(|(n, _)| n != number);
+                    if running.is_empty() {
+                        self.processes.remove(id);
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Opens background process `number`'s row menu at `x`, `y`: Show
+    /// output, then Kill.
+    fn open_process_menu(&mut self, id: Id, number: u64, x: i64, y: i64) {
+        self.cancel_pointer();
+        let revision = self.menu_revision.wrapping_add(1);
+        let opened = menu::process(self.surface, revision)
+            .and_then(|mut menu| menu.open_context(x, y).map(|()| menu));
+        match opened {
+            Ok(menu) => {
+                self.menu = menu;
+                self.menu_revision = revision;
+                self.menu_row = None;
+                self.menu_process = Some((id, number));
+                self.touch();
+            }
+            Err(e) => self.note(format!("the process's menu: {e}")),
+        }
+    }
+
+    /// Shows the output of conversation `id`'s background process
+    /// `number` as the session read it, read-only, over no modal: its
+    /// last `output::READ_BYTES`, each line made visible.
+    pub fn show_output(
+        &mut self,
+        id: &Id,
+        number: u64,
+        read: Result<crate::output::Output, String>,
+    ) {
+        if self.modal() {
+            return;
+        }
+        let read = match read {
+            Ok(read) => read,
+            Err(why) => return self.note(format!("p{number}'s output: {why}")),
+        };
+        let lines: Vec<String> = read.text.split('\n').map(crate::tools::visible).collect();
+        // A list entry holds a bounded run of lines, each headed by them,
+        // the range ahead of the first, so a long output scrolls entry by
+        // entry.
+        let range = format!(
+            "bytes {} to {} of {} written{}",
+            read.from,
+            read.to,
+            read.total,
+            if read.start > 0 {
+                format!(", the first {} dropped", read.start)
+            } else {
+                String::new()
+            }
+        );
+        let mut entries = Vec::new();
+        for (n, chunk) in lines.chunks(OUTPUT_LINES).enumerate() {
+            let first = n * OUTPUT_LINES + 1;
+            let lines = format!("lines {first} to {}", first + chunk.len() - 1);
+            let header = match n {
+                0 => format!("{range}; {lines}"),
+                _ => lines,
+            };
+            entries.push((header, chunk.join("\n")));
+        }
+        let command = self
+            .processes
+            .get(id)
+            .and_then(|running| running.iter().find(|(n, _)| *n == number))
+            .map(|(_, command)| {
+                let cut: String = command.chars().take(80).collect();
+                format!(": {}", crate::tools::visible(&cut))
+            })
+            .unwrap_or_default();
+        match crate::notes::Panel::output(
+            self.surface,
+            body(self.surface),
+            id.clone(),
+            format!("p{number} output{command}"),
+            &entries,
+        ) {
+            Ok(panel) => {
+                self.notes = Some(panel);
+                self.apply_focus();
+                self.touch();
+            }
+            Err(why) => self.note(why),
         }
     }
 
@@ -2864,6 +3104,9 @@ impl App {
         let Some(tree_table::Target::Row(index)) = self.list.target(x, y) else {
             return;
         };
+        if let Some((id, number)) = self.process_item(index).cloned() {
+            return self.open_process_menu(id, number, x, y);
+        }
         if let Some(id) = self.rows.get(index).map(|r| r.id.clone()) {
             self.open_row_menu(id, x, y);
         }
@@ -2884,8 +3127,7 @@ impl App {
         let Some(index) = selected.or_else(|| self.shown_active()) else {
             return self.note("no conversation is open or selected");
         };
-        let (Some(regions), Some(id)) = (self.regions, self.rows.get(index).map(|r| r.id.clone()))
-        else {
+        let Some(regions) = self.regions else {
             return;
         };
         let under = self
@@ -2895,6 +3137,12 @@ impl App {
             .and_then(|at| self.list.geometry()?.row(at))
             .map(|rect| (rect.x, rect.y.saturating_add(i64::from(rect.height))));
         let (x, y) = under.unwrap_or((regions.list.x, regions.list.y));
+        if let Some((id, number)) = self.process_item(index).cloned() {
+            return self.open_process_menu(id, number, x, y);
+        }
+        let Some(id) = self.rows.get(index).map(|r| r.id.clone()) else {
+            return;
+        };
         self.open_row_menu(id, x, y);
     }
 
@@ -2940,6 +3188,7 @@ impl App {
                 self.menu = menu;
                 self.menu_revision = revision;
                 self.menu_row = None;
+                self.menu_process = None;
             }
             Err(e) => self.note(format!("the menu: {e}")),
         }
@@ -3789,12 +4038,7 @@ impl App {
                     key,
                     repeated: repeat,
                 }) {
-                    tree_table::Outcome::Activate(index) => {
-                        if let Some(row) = self.rows.get(index) {
-                            let id = row.id.clone();
-                            self.open(id);
-                        }
-                    }
+                    tree_table::Outcome::Activate(index) => self.activate(index),
                     tree_table::Outcome::Ignored => {}
                     _ => self.touch(),
                 }
@@ -3921,12 +4165,17 @@ impl App {
                     PointerPhase::Move => tree_table::Event::Move { x, y },
                     PointerPhase::Release => tree_table::Event::Release { x, y },
                 };
+                let before = self.list.selected();
                 match self.list.event(event) {
+                    // A process row is chosen by a press, and its output
+                    // shown by a press once it is: a double press does.
+                    tree_table::Outcome::Selected(index)
+                        if self.process_item(index).is_some() && before != Some(index) =>
+                    {
+                        self.touch()
+                    }
                     tree_table::Outcome::Selected(index) | tree_table::Outcome::Activate(index) => {
-                        if let Some(row) = self.rows.get(index) {
-                            let id = row.id.clone();
-                            self.open(id);
-                        }
+                        self.activate(index)
                     }
                     tree_table::Outcome::Ignored => {}
                     _ => self.touch(),
@@ -3965,6 +4214,17 @@ impl App {
 
     /// A conversation's cell in the list.
     fn cell(&self, index: usize, column: usize) -> Cell<'_> {
+        if let Some(label) = index
+            .checked_sub(self.process_base)
+            .and_then(|n| self.process_labels.get(n))
+        {
+            let text = match column {
+                0 => label.as_str(),
+                1 => "running",
+                _ => "",
+            };
+            return Cell::new(text).unwrap_or_else(|_| Cell::empty());
+        }
         let Some(row) = self.rows.get(index) else {
             return Cell::empty();
         };
@@ -5264,9 +5524,9 @@ pub mod tests {
             0,
         );
         assert!(text(&app).contains("you undid the step snapshotted at #5"));
-        // A background process's start is its call's result; its end is
-        // a notice.
-        let shown = text(&app);
+        // A background process's start is its call's result, and its
+        // row under its conversation's; its end is a notice.
+        let shown = app.transcript.len();
         app.update(
             at(
                 9,
@@ -5278,7 +5538,9 @@ pub mod tests {
             ),
             0,
         );
-        assert_eq!(text(&app), shown);
+        assert_eq!(app.transcript.len(), shown);
+        assert!(text(&app).contains("p1 make"));
+        assert!(app.status_line().ends_with("| 1 background"));
         app.update(
             at(
                 10,
@@ -5292,6 +5554,8 @@ pub mod tests {
             0,
         );
         assert!(text(&app).contains("background process p1 ended: exit status 2"));
+        assert!(!text(&app).contains("p1 make"));
+        assert!(app.status_line().ends_with("| 0 background"));
         key(&mut app, "C-z");
         assert_eq!(app.take_requests(), [Request::Undo(3)]);
         key(&mut app, "C-S-z");
@@ -5550,6 +5814,186 @@ pub mod tests {
             .iter()
             .map(|r| app.rows()[r.id].id.clone())
             .collect()
+    }
+
+    /// A conversation's background processes are rows under its own,
+    /// counted on the status row, each with a menu to show its output or
+    /// kill it; its output shows read-only (DESIGN.md §12).
+    #[test]
+    fn background_processes_are_listed_under_their_conversation() {
+        let mut app = app();
+        let process = |seq, number, command: &str| {
+            at(
+                seq,
+                Kind::Process {
+                    number,
+                    call: 1,
+                    command: command.into(),
+                },
+            )
+        };
+        app.background(&id(3), &process(4, 1, "make\tall"), 0);
+        app.background(&id(3), &process(5, 2, "cargo test"), 0);
+        app.update(process(6, 1, "sleep 60"), 0);
+        assert!(app.status_line().ends_with("| 3 background"));
+        let three = app.rows().iter().position(|r| r.id == id(3)).unwrap();
+        let rows = app.list.model().rows();
+        let place = rows.iter().position(|r| r.id == three).unwrap();
+        let children: Vec<usize> = rows
+            .get(place + 1..place + 3)
+            .unwrap()
+            .iter()
+            .map(|r| {
+                assert_eq!((r.parent, r.depth), (Some(three), 1));
+                r.id
+            })
+            .collect();
+        let first = *children.first().unwrap();
+        assert_eq!(app.cell(first, 0).text(), "p1 make<U+0009>all");
+        assert_eq!(app.cell(first, 1).text(), "running");
+        // Its menu from the keyboard: Show output, then Kill.
+        app.set_focus(Focus::List);
+        app.list.select(Some(first), true);
+        key(&mut app, "S-F10");
+        assert!(app.menu_open());
+        assert!(text(&app).contains(menu::SHOW_OUTPUT) && text(&app).contains(menu::KILL_PROCESS));
+        key(&mut app, "Down");
+        key(&mut app, "Return");
+        assert_eq!(
+            app.take_requests(),
+            [Request::Kill {
+                id: id(3),
+                number: 1
+            }]
+        );
+        // Return on it shows its output; no conversation opens.
+        key(&mut app, "Return");
+        assert_eq!(
+            app.take_requests(),
+            [Request::Output {
+                id: id(3),
+                number: 1
+            }]
+        );
+        app.show_output(
+            &id(3),
+            1,
+            Ok(crate::output::Output {
+                text: "built\n\u{1b}[0m".into(),
+                from: 4,
+                to: 15,
+                start: 4,
+                total: 15,
+            }),
+        );
+        let shown = text(&app);
+        assert!(shown.contains("p1 output: make<U+0009>all"), "{shown}");
+        assert!(shown.contains("bytes 4 to 15 of 15 written, the first 4 dropped; lines 1 to 2"));
+        assert_eq!(app.notes.as_ref().unwrap().name(), "process output");
+        assert!(app.workspace_card().is_none());
+        assert!(shown.contains("<U+001B>[0m"), "{shown}");
+        key(&mut app, "Escape");
+        assert!(!text(&app).contains("p1 output"));
+        // A long output shows to its last line, entry by entry.
+        let long: Vec<String> = (1..=100).map(|n| format!("line {n}")).collect();
+        app.show_output(
+            &id(3),
+            1,
+            Ok(crate::output::Output {
+                text: long.join("\n"),
+                ..crate::output::Output::default()
+            }),
+        );
+        assert_eq!(app.notes.as_ref().unwrap().len(), 3);
+        key(&mut app, "Escape");
+        // By the pointer: a press selects it, a second shows its output.
+        let (x, y) = {
+            let at = app.list.model().find(first).unwrap();
+            let rect = app.list.geometry().unwrap().row(at).unwrap();
+            (rect.x + 8, rect.y + 4)
+        };
+        app.list.select(None, true);
+        press(&mut app, x, y);
+        assert!(app.take_requests().is_empty());
+        assert_eq!(app.active(), Some(&id(1)));
+        press(&mut app, x, y);
+        assert_eq!(
+            app.take_requests(),
+            [Request::Output {
+                id: id(3),
+                number: 1
+            }]
+        );
+        // Its end takes its row away; its process failing takes them all.
+        app.background(
+            &id(3),
+            &at(
+                7,
+                Kind::Ended {
+                    number: 1,
+                    how: "killed".into(),
+                    tail: None,
+                    held: None,
+                },
+            ),
+            0,
+        );
+        assert!(!text(&app).contains("p1 make"));
+        assert!(app.status_line().ends_with("| 2 background"));
+        app.background(&id(3), &Update::Failed { reason: "x".into() }, 0);
+        assert!(app.status_line().ends_with("| 1 background"));
+        // Archiving or deleting a conversation ends its processes, which
+        // say nothing more.
+        app.background(&id(2), &process(8, 1, "sleep 60"), 0);
+        assert!(app.status_line().ends_with("| 2 background"));
+        app.set_archived(&id(2), true);
+        assert!(app.status_line().ends_with("| 1 background"));
+        // A row removed keeps the selected process selected; its end
+        // leaves its conversation selected.
+        app.background(&id(3), &process(9, 3, "sleep 60"), 0);
+        app.set_archived(&id(2), false);
+        app.background(&id(2), &process(10, 7, "sleep 60"), 0);
+        app.background(&id(2), &process(11, 8, "sleep 60"), 0);
+        let seven = app
+            .process_items
+            .iter()
+            .position(|item| *item == (id(2), 7))
+            .unwrap()
+            + app.process_base;
+        app.list.select(Some(seven), true);
+        app.remove_row(&id(3));
+        let selected = app.list.selected().unwrap();
+        assert_eq!(app.process_item(selected), Some(&(id(2), 7)));
+        assert!(app.status_line().ends_with("| 3 background"));
+        app.background(
+            &id(2),
+            &at(
+                12,
+                Kind::Ended {
+                    number: 7,
+                    how: "killed".into(),
+                    tail: None,
+                    held: None,
+                },
+            ),
+            0,
+        );
+        let selected = app.list.selected().unwrap();
+        assert_eq!(app.rows().get(selected).map(|r| &r.id), Some(&id(2)));
+        // The open one's hello starts its count again from its log; the
+        // other's stays.
+        assert!(app.status_line().ends_with("| 2 background"));
+        app.update(
+            Update::Up(Up::Hello {
+                title: "t".into(),
+                torn: None,
+                interrupted: Vec::new(),
+                paused: false,
+                prefix: Some(String::new()),
+            }),
+            0,
+        );
+        assert!(app.status_line().ends_with("| 1 background"));
     }
 
     #[test]

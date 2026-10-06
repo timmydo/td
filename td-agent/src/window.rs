@@ -308,6 +308,18 @@ impl Session {
                 Request::Delete(id) => self.delete(&id),
                 Request::Remove { id, remove } => self.finish_removal(&id, remove),
                 Request::Archive { id, archived } => self.archive(&id, archived),
+                // A conversation with no process has none running.
+                Request::Kill { id, number } => self.supervisor.answer(&id, &Down::Kill { number }),
+                // Read here: the files are the conversation's, written by
+                // its watchers and only read meanwhile (DESIGN.md §12).
+                Request::Output { id, number } => {
+                    let read = crate::output::tail(
+                        &self.state.conversation(&id).join(crate::output::DIR),
+                        number,
+                        crate::output::READ_BYTES,
+                    );
+                    self.app.show_output(&id, number, read);
+                }
                 Request::Admit { template, remotes } => self.admit(&template, &remotes),
                 // To whichever conversation asked, open or not; one whose
                 // process has gone asks again from nothing.

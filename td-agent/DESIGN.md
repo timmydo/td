@@ -3598,8 +3598,8 @@ check while one runs, whichever step it names. The output store,
 `process_output`, `process_wait` and the list's output size came next
 (As built (increment 12, output)), then the exit notice,
 `conversations`' count and the step's note (As built (increment 12,
-notices)). Not built yet: the window's process list and the status row's
-count.
+notices)). The window's process list and the status row's count came
+last (As built (increment 12, window)).
 
 **As built (increment 12, output).** The tool host sends a background
 call's output up as it comes, waiting for room rather than dropping what
@@ -3667,6 +3667,29 @@ after its reply (`store::running_since`), and the window and
 `history_read` say it may hold their changes. The end of one heard as a
 person undoes wakes nothing: the undo is theirs, and the notice is read
 with their next turn.
+
+**As built (increment 12, window).** The window keeps each
+conversation's running processes from its events, the open one's and
+those working in the background alike: a `process` event adds one, an
+`ended` one takes it away, and a hello, a replay of the log or the
+conversation's process failing starts the count again, and archiving or
+deleting the conversation, which ends them, clears it. Each is a row
+under its conversation's in the list, `p1` and its command made visible,
+always shown, and the status row counts them all. A right press on one,
+or `S-F10` with it selected, opens its menu: Show output, then Kill.
+Return shows its output, as the menu's Show output does, and so does a
+press on it while it is selected, by an earlier press, a double press
+among them, or the keyboard; a press that selects it opens no
+conversation. Kill sends `Down::Kill`, which the conversation acts on as
+soon as it hears it, between turns or within one, ending the process as
+`process_kill` does; its end wakes nothing. Show output has the window
+read the process's last 32 KiB from the conversation's `processes/`
+(`output::tail`), the files its watchers write and nothing else does
+meanwhile, and shows it read-only in the workspace card's panel, named a
+process output, in entries of 40 lines each headed by their numbers, the
+range ahead of the first, each line made visible, closed by Escape. A
+change to the conversations keeps a selected process selected, and its
+end leaves its conversation selected.
 
 **Todo list.** `todo_write` replaces the conversation's whole list with
 items of `pending`, `in_progress`, `done` or `cancelled`, at most one in

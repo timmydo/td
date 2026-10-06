@@ -32,10 +32,9 @@ pub const TITLE: &str =
 pub const NO_ROOM: &str = "The window is too small to show the notes: widen it, or Escape closes.";
 /// What a card's entry too large for its list says instead.
 const TOO_LARGE: &str =
-    "This entry is too large to show at this size: close the card and open it again in a larger window.";
-/// And a workspace card where its list has none.
-pub const CARD_NO_ROOM: &str =
-    "The window is too small to show the workspace card: widen it, or Escape closes.";
+    "This entry is too large to show at this size: close this and open it again in a larger window.";
+/// And a workspace card or a process output where its list has none.
+pub const CARD_NO_ROOM: &str = "The window is too small to show this: widen it, or Escape closes.";
 /// What a cut note ends with.
 const CUT: &str = " \u{2026} (cut)";
 
@@ -125,10 +124,15 @@ pub struct Panel {
     rect: Rect,
     list: Controller,
     title: String,
-    /// The conversation whose workspace card it is; none for the
-    /// Messages window.
+    /// The conversation whose workspace card, or process output, it is;
+    /// none for the Messages window.
     card: Option<crate::store::Id>,
+    /// What it is, as a note names it.
+    name: &'static str,
 }
+
+/// A workspace card's name.
+pub const WORKSPACE_CARD: &str = "workspace card";
 
 /// The title row and the list below it within `rect`.
 fn split(surface: Surface, rect: Rect) -> (Rect, Rect) {
@@ -161,6 +165,7 @@ impl Panel {
             list,
             title: TITLE.to_string(),
             card: None,
+            name: "Messages window",
         };
         for (at, text) in &log.notes {
             panel.add(&crate::history::utc(*at), text);
@@ -178,15 +183,27 @@ impl Panel {
         title: String,
         entries: &[(String, String)],
     ) -> Result<Self, String> {
+        Self::carded(surface, body, id, title, entries, WORKSPACE_CARD)
+    }
+
+    /// A card named `name`: conversation `id`'s entries over `body`.
+    fn carded(
+        surface: Surface,
+        body: Rect,
+        id: crate::store::Id,
+        title: String,
+        entries: &[(String, String)],
+        name: &'static str,
+    ) -> Result<Self, String> {
         let (_, list_rect) = split(surface, body);
-        let list =
-            Controller::new(surface, list_rect).map_err(|e| format!("the workspace card: {e}"))?;
+        let list = Controller::new(surface, list_rect).map_err(|e| format!("the {name}: {e}"))?;
         let mut panel = Self {
             surface,
             rect: body,
             list,
             title,
             card: Some(id),
+            name,
         };
         for (header, text) in entries {
             panel.add(header, text);
@@ -213,11 +230,19 @@ impl Panel {
 
     /// What it is, as a note names it.
     pub fn name(&self) -> &'static str {
-        if self.card.is_some() {
-            "workspace card"
-        } else {
-            "Messages window"
-        }
+        self.name
+    }
+
+    /// Conversation `id`'s background process output over `body`, as
+    /// a card shows its entries: read-only, first entry first.
+    pub fn output(
+        surface: Surface,
+        body: Rect,
+        id: crate::store::Id,
+        title: String,
+        entries: &[(String, String)],
+    ) -> Result<Self, String> {
+        Self::carded(surface, body, id, title, entries, "process output")
     }
 
     /// Adds an entry, the oldest shown going while the list refuses it;

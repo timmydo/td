@@ -63,6 +63,10 @@ pub enum Action {
     Unarchive,
     /// The row menu's: ask whether to delete its conversation.
     DeleteRow,
+    /// A background process's row menu: show its output.
+    ShowOutput,
+    /// A background process's row menu: kill it.
+    KillProcess,
 }
 
 /// The File menu's items: label, the chord shown beside it (one that
@@ -96,6 +100,8 @@ pub const SHOW_ARCHIVED: &str = "Show archived";
 pub const ARCHIVE: &str = "Archive";
 pub const UNARCHIVE: &str = "Unarchive";
 pub const DELETE_ROW: &str = "Delete\u{2026}";
+pub const SHOW_OUTPUT: &str = "Show output";
+pub const KILL_PROCESS: &str = "Kill";
 
 /// What the Conversation menu shows: whether a conversation is open, its
 /// effort, whether its model takes one, and whether archived
@@ -219,6 +225,33 @@ pub fn row(surface: Surface, archived: bool, revision: u64) -> Result<Menu, menu
             Kind::Context,
             revision,
             &[first, item(DELETE_ROW, Action::DeleteRow)],
+        )?,
+        surface,
+        Fit::Adaptive,
+    )
+}
+
+/// A background process's row menu over `surface` at `revision`, closed:
+/// Show output, then Kill (DESIGN.md §12).
+pub fn process(surface: Surface, revision: u64) -> Result<Menu, menus::Error> {
+    let item = |label, action| Node {
+        parent: None,
+        row: Row {
+            label,
+            shortcut: "",
+            enabled: true,
+            checked: false,
+        },
+        item: Item::Action(action),
+    };
+    Controller::new(
+        Model::new(
+            Kind::Context,
+            revision,
+            &[
+                item(SHOW_OUTPUT, Action::ShowOutput),
+                item(KILL_PROCESS, Action::KillProcess),
+            ],
         )?,
         surface,
         Fit::Adaptive,
@@ -393,6 +426,18 @@ mod tests {
             .map(|node| node.row.label)
             .collect();
         assert_eq!(labels, [UNARCHIVE, DELETE_ROW]);
+        // A background process's: Show output, then Kill.
+        let labels: Vec<&str> = nodes(&process(surface(), 1).unwrap())
+            .iter()
+            .map(|node| node.row.label)
+            .collect();
+        assert_eq!(labels, [SHOW_OUTPUT, KILL_PROCESS]);
+        let mut menu = process(surface(), 1).unwrap();
+        menu.open_context(300, 200).unwrap();
+        assert_eq!(
+            key(&mut menu, "Return"),
+            Outcome::Activated(Action::ShowOutput)
+        );
         // S-F10 closes it as it opened it.
         let mut menu = row(surface(), false, 1).unwrap();
         menu.open_context(300, 200).unwrap();

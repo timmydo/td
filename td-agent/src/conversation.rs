@@ -704,7 +704,7 @@ impl Session {
         // them (DESIGN.md §2, §3).
         while self.ended.is_none() {
             match self.inbox.try_recv() {
-                Ok(Inbound::Down(down)) => self.queue.push_back(down),
+                Ok(Inbound::Down(down)) => self.later(down),
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
@@ -779,6 +779,7 @@ impl Session {
                 Down::Retry => self.retry()?,
                 Down::Pause { paused } => self.pause(paused)?,
                 Down::ClearTodo => self.clear_todo()?,
+                Down::Kill { number } => self.killed_by_person(number),
                 Down::Restore { step, undo } => self.restore(step, undo)?,
                 Down::Choose { model, effort } => self.choose(model, effort)?,
                 Down::Fetched { remote, result } => self.stored(remote, result)?,
@@ -1050,7 +1051,7 @@ impl Session {
                 })) => self.spent(late, 0),
                 // Said while waiting: the turn ends at its next step.
                 Ok(Inbound::Down(Down::Interrupt)) => self.interrupt = true,
-                Ok(Inbound::Down(down)) => self.queue.push_back(down),
+                Ok(Inbound::Down(down)) => self.later(down),
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
@@ -1075,12 +1076,30 @@ impl Session {
             match inbound {
                 Inbound::Down(Down::Interrupt) => self.interrupt = true,
                 Inbound::Down(Down::Reservation { id, refusal: None }) => self.spent(id, 0),
-                Inbound::Down(down) => self.queue.push_back(down),
+                Inbound::Down(down) => self.later(down),
                 Inbound::Fetch { .. } => {}
                 Inbound::Checked { remote, result } => self.checked.push_back((remote, result)),
                 Inbound::Ended(end) => self.exit(end),
                 Inbound::Closed | Inbound::Broken(_) => self.gone = true,
             }
+        }
+    }
+
+    /// What the window said that waits for its turn, queued; a kill is
+    /// not kept waiting.
+    fn later(&mut self, down: Down) {
+        match down {
+            Down::Kill { number } => self.killed_by_person(number),
+            down => self.queue.push_back(down),
+        }
+    }
+
+    /// The person killed background process `number` from the window:
+    /// its end is logged when its watcher hears it, and one already
+    /// ended is left be.
+    fn killed_by_person(&mut self, number: u64) {
+        if let Some(kill) = self.processes.get(&number) {
+            let _ = kill.send(());
         }
     }
 
@@ -2187,7 +2206,7 @@ impl Session {
                 }
                 Ok(Inbound::Down(Down::Interrupt)) => return interrupted(),
                 Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
-                Ok(Inbound::Down(down)) => self.queue.push_back(down),
+                Ok(Inbound::Down(down)) => self.later(down),
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
@@ -2730,7 +2749,7 @@ impl Session {
                 Ok(Inbound::Down(Down::Decision { .. })) => {}
                 Ok(Inbound::Down(Down::Interrupt)) => self.interrupt = true,
                 Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
-                Ok(Inbound::Down(down)) => self.queue.push_back(down),
+                Ok(Inbound::Down(down)) => self.later(down),
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
@@ -3173,7 +3192,7 @@ impl Session {
             match self.inbox.recv_timeout(left) {
                 Ok(Inbound::Down(Down::Interrupt)) => return true,
                 Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
-                Ok(Inbound::Down(down)) => self.queue.push_back(down),
+                Ok(Inbound::Down(down)) => self.later(down),
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
@@ -3237,7 +3256,7 @@ impl Session {
                     }
                 }
                 Inbound::Down(Down::Reservation { id, refusal: None }) => self.spent(id, 0),
-                Inbound::Down(down) => self.queue.push_back(down),
+                Inbound::Down(down) => self.later(down),
                 Inbound::Closed | Inbound::Broken(_) => self.gone = true,
             }
         };

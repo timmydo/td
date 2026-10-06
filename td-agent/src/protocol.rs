@@ -51,6 +51,9 @@ pub enum Down {
     Pause { paused: bool },
     /// The human cleared the todo list.
     ClearTodo,
+    /// The human killed background process `number` (DESIGN.md §12):
+    /// acted on as soon as it is heard, a turn under way or not.
+    Kill { number: u64 },
     /// Undo, or redo, the step snapshotted at `step` (DESIGN.md §12).
     Restore { step: u64, undo: bool },
     /// The human chose the conversation's model and reasoning effort,
@@ -390,6 +393,7 @@ impl Down {
             ),
             Self::Pause { paused } => typed("pause", vec![("paused".into(), Json::Bool(*paused))]),
             Self::ClearTodo => typed("clear_todo", Vec::new()),
+            Self::Kill { number } => typed("kill", vec![("number".into(), Json::from(*number))]),
             Self::Restore { step, undo } => typed(
                 "restore",
                 vec![
@@ -512,6 +516,12 @@ impl Down {
                     .ok_or("no paused")?,
             }),
             Some("clear_todo") => Ok(Self::ClearTodo),
+            Some("kill") => Ok(Self::Kill {
+                number: value
+                    .get("number")
+                    .and_then(Json::as_u64)
+                    .ok_or("a kill with no number")?,
+            }),
             Some("restore") => Ok(Self::Restore {
                 step: value
                     .get("step")
@@ -989,6 +999,7 @@ mod tests {
             },
             Down::Pause { paused: true },
             Down::ClearTodo,
+            Down::Kill { number: 3 },
             Down::Restore {
                 step: 7,
                 undo: true,
