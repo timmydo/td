@@ -1,5 +1,6 @@
 //! Pure ten-field selection over original generated metadata and bound locators.
 mod index;
+pub mod retained;
 pub use super::Status;
 use super::{Bound, Error, Progress};
 use crate::{nfc::HeaderBudget, ports::Tick};
@@ -43,7 +44,7 @@ impl Properties {
         location: true,
         blob_id: true,
     };
-    fn bits(self) -> u16 {
+    pub(super) fn bits(self) -> u16 {
         self.part_id as u16
             | ((self.size as u16) << 1)
             | ((self.media_type as u16) << 2)
@@ -84,19 +85,7 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 
         properties: Properties,
         now: Tick,
     ) -> Result<Self, Error> {
-        let mut inner = super::Cursor::new(source, ordinal, now)?;
-        let bits = properties.bits();
-        if bits == 0 {
-            inner.position = inner.total;
-        } else if bits != 1023 {
-            let fragment = inner
-                .segments()?
-                .into_iter()
-                .next()
-                .ok_or(Error::InvalidState)?;
-            inner.selection = Some(Index::new(bits, fragment)?);
-            inner.total = 0;
-        }
+        let inner = super::Cursor::with_properties(source, ordinal, properties, now)?;
         Ok(Self { inner, properties })
     }
     pub fn value(&self) -> Option<(Properties, u16)> {

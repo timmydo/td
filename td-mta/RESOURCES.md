@@ -2513,6 +2513,17 @@ original preparation and counted descriptor teardown; earlier 145
 intervals remain separate. Native/stack/RSS/full admission and complete
 request/publication paths remain unqualified.
 
+M06eg whole selected source-bound part fields reuse the shared Window
+beside original custody, fixed nine-span index and explicit Properties.
+Cursor plus HeaderBudget, five segment references and 64 output bytes
+fits 1 KiB; Retained fits 768 bytes. Caller output/backing remains
+separately owned/admitted. Whole retention adds no interpretation,
+record, wire or source/I/O work beyond selected emission. API §1.138
+qualifies eight enumerated Rust allocation intervals with cold original
+preparation and counted descriptor teardown; earlier 153 intervals stay
+separate. Native allocation, worker stack/RSS, full admission and
+complete request/publication paths remain unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

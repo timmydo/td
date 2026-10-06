@@ -27,8 +27,16 @@ pub struct Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> {
 }
 impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> {
     pub fn new(
+        source: Bound<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k>,
+        ordinal: u16,
+        now: Tick,
+    ) -> Result<Self, Error> {
+        Self::with_properties(source, ordinal, selected::Properties::ALL, now)
+    }
+    fn with_properties(
         mut source: Bound<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k>,
         ordinal: u16,
+        properties: selected::Properties,
         now: Tick,
     ) -> Result<Self, Error> {
         source.check_deadline(now)?;
@@ -48,6 +56,18 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 
                 total.checked_add(bytes.len()).ok_or(Error::InvalidState)
             })?;
         cursor.total = total;
+        let bits = properties.bits();
+        if bits == 0 {
+            cursor.position = cursor.total;
+        } else if bits != 1023 {
+            let fragment = cursor
+                .segments()?
+                .into_iter()
+                .next()
+                .ok_or(Error::InvalidState)?;
+            cursor.selection = Some(selected::Index::new(bits, fragment)?);
+            cursor.total = 0;
+        }
         Ok(cursor)
     }
     fn segments(&self) -> Result<[&[u8]; 5], Error> {

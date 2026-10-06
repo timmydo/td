@@ -868,6 +868,20 @@ Only API §1.137's eight intervals are allocation-qualified. Whole selected
 retention/collection/tree integration, headers/subParts, JSON requests,
 full admission and authenticated publication remain later.
 
+M06eg whole selected part-field retention privately configures a fresh
+original-bound emitter from Bound, ordinal and pure ten-field
+Properties. Legacy ALL and the selected adapter share the existing fixed
+Window, polling, sticky failure and fresh finalization; no advanced
+emitter enters whole retention. The adapter holds only immutable
+selection beside the shared core and maps whole views/release labels.
+Exact fit completes on the final selected copy; NONE admits empty
+complete into zero capacity with original custody and fresh consuming
+boundaries. Generated-index/copy work keeps §1.137's exact five-cost
+charges. API §1.138 defines passive bytes and measured Rust intervals;
+collection/tree integration, headers, header:*, subParts, request
+defaults/parsing, full admission and current authenticated publication
+remain later.
+
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot
 select bodyStructure. They remain public facades over the same shared

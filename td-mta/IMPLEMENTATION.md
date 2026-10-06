@@ -2348,6 +2348,18 @@ Initial independently landable increments:
   intervals (API §1.137). Whole selected retention/collection/tree,
   headers/subParts, request parsing and current publication follow.
 
+- **M06eg — whole selected source-bound part members:** retain from byte
+  zero in the shared fixed window. Pure ten-field Properties configure a
+  fresh original-bound emitter; advanced and emitted-only owners cannot
+  reconstruct the prefix. Exact/spare capacity, meaningful short cuts,
+  per-turn bytes/five costs, original descriptor custody, NONE zero
+  capacity, both freshness domains, premature finish, sticky work
+  refusal and six ownership/constructor guards qualify this increment.
+  Eight Rust allocation intervals cover the API §1.138 scope. No
+  complete BodyPart/JMAP objects, headers/header:*/subParts, request
+  defaults/parsing, whole collection/tree integration, full admission or
+  current authenticated publication is claimed.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

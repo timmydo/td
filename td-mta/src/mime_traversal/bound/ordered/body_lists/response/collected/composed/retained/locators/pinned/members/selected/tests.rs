@@ -9,7 +9,7 @@ use crate::{
 const SIMPLE: &[u8] = b"\r\nabc\r\n";
 const MULTIPART: &[u8] =
     b"Content-Type: multipart/mixed;boundary=x\r\n\r\n--x\r\n\r\nabc\r\n--x--\r\n";
-fn properties(bits: u16) -> Properties {
+pub(super) fn properties(bits: u16) -> Properties {
     Properties {
         part_id: bits & 1 != 0,
         size: bits & 2 != 0,
@@ -23,7 +23,7 @@ fn properties(bits: u16) -> Properties {
         blob_id: bits & 512 != 0,
     }
 }
-fn costs(cursor: &super::super::Cursor<'_, '_, '_, '_, '_, '_, '_, '_, '_>) -> [u64; 5] {
+pub(super) fn costs(cursor: &super::super::Cursor<'_, '_, '_, '_, '_, '_, '_, '_, '_>) -> [u64; 5] {
     let structure = &cursor
         .source
         .original

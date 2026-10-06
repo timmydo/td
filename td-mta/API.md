@@ -5823,6 +5823,55 @@ per-part selection integration into whole retention/collection/tree
 composition, request parsing and current authenticated publication
 remain unqualified.
 
+### 1.138 Whole selected original source-bound part fields
+
+M06eg adds
+`mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained`.
+Accept only original source-matched Bound, original ordinal, explicit
+ten-field Properties and separately caller-owned/admitted output. A
+private original-bound constructor configures a fresh selected emitter;
+no advanced Cursor or emitted-only Member can retain a missing prefix.
+Both legacy ALL and selected whole retention use the same Window, poll,
+sticky failure and finalization core.
+
+Fresh original-job and actual-pin admission precedes output capacity and
+ordinal validation. ALL preserves the original path; NONE freshly
+completes into zero capacity without work or bytes, retaining source
+custody. Other subsets fund generated indexing and selected copying
+exactly as §1.137. Whole retention advances only successful reported
+output without adding any of the five costs. Exact fit completes on the
+final selected copy. Unfinished zero/short capacity refuses exactly and
+stickily; healthy premature finish refuses. Fresh deadline checks
+precede unfinished capacity checks. Cached Complete polls remain inert,
+while explicit checks and consuming Cursor/Retained/released Bound
+boundaries remain fresh in both domains.
+
+Complete passive View reports unchanged Properties, ordinal and whole
+members. Fresh finish returns exclusive Retained with the same labels;
+fresh release returns original Bound, ordinal, Properties and complete
+caller-window bytes. Original collection/backing/candidates and actual
+descriptor remain held throughout; emitted bytes are provisional part
+members, not complete BodyPart/JMAP objects or publication authority.
+headers, header:* and subParts, request defaults and parsing, whole
+collection/tree integration, full admission and current authenticated
+publication remain later.
+
+Cursor plus HeaderBudget, five segment references and 64 output bytes
+fits 1 KiB; Retained fits 768 bytes. These caps do not qualify worker
+stack/RSS or whole admission. Eight sequential Rust allocation intervals
+measure near-u64 leaf partId+blobId, zero-capacity NONE, actual pin
+expiry after selected copied output, completed Cursor expiry, Retained
+expiry, explicitly checked released Bound expiry, nonempty short
+capacity and constructor pin expiry. Original matching/generated
+metadata/backing, filesystem and output preparation stay cold.
+Descriptor teardown is counted; pooled view/scratch, cells and fixture
+cleanup stay outside. Other sources/subsets/capacities, supplied-Tick
+expiry, interpretation/record/wire refusal, post-turn/clock failures,
+invalid ordinals, cached polls, premature finish and other explicit
+checks remain allocation-unqualified. Earlier 153 intervals are
+separate. Native allocation, stack/RSS, full admission and current
+authenticated publication remain unqualified.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
