@@ -575,9 +575,7 @@ fn expand_param(
         Some(ParamOp::Length | ParamOp::Substring { .. }) => raw,
         Some(ParamOp::Default { word, colon }) => {
             if raw.is_none() || (*colon && empty) {
-                let chars = expand_chars(sh, word, quoted, splitting)?;
-                push_chars(&mut cur.chars, &chars, quoted);
-                return Ok(());
+                return push_word(sh, word, quoted, splitting, done, cur);
             }
             raw
         }
@@ -585,9 +583,7 @@ fn expand_param(
             if raw.is_none() || (*colon && empty) {
                 Some(String::new())
             } else {
-                let chars = expand_chars(sh, word, quoted, splitting)?;
-                push_chars(&mut cur.chars, &chars, quoted);
-                return Ok(());
+                return push_word(sh, word, quoted, splitting, done, cur);
             }
         }
         Some(ParamOp::Assign { word, colon }) => {
@@ -645,6 +641,42 @@ fn expand_param(
     };
 
     push_expanded(&mut cur.chars, &value.unwrap_or_default(), quoted);
+    Ok(())
+}
+
+/// Append a `-` or `+` operator's word to the field being built, keeping the
+/// field breaks a `"$@"` inside it makes: the word is expanded as a word, so
+/// `${1+"$@"}` is the positionals one field each, which every autoconf
+/// configure's re-exec relies on. A word taken as ONE string (`v=${x-"$@"}`,
+/// a `case` subject) has no fields to keep and joins them as before.
+fn push_word(
+    sh: &mut Shell,
+    word: &Word,
+    quoted: bool,
+    splitting: bool,
+    done: &mut Vec<Field>,
+    cur: &mut Field,
+) -> R<()> {
+    if !splitting {
+        let chars = expand_chars(sh, word, quoted, splitting)?;
+        push_chars(&mut cur.chars, &chars, quoted);
+        return Ok(());
+    }
+    let mut fields = expand_raw(sh, word, quoted, splitting)?.into_iter();
+    if let Some(first) = fields.next() {
+        if first.had_quotes {
+            cur.had_quotes = true;
+        }
+        push_chars(&mut cur.chars, &first.chars, quoted);
+    }
+    for field in fields {
+        let mut next = Field {
+            chars: Vec::new(),
+            had_quotes: field.had_quotes || quoted,
+        };
+        push_chars(&mut next.chars, &field.chars, quoted);
+        done.push(std::mem::replace(cur, next));
+    }
     Ok(())
 }
 
@@ -1072,6 +1104,39 @@ mod tests {
             out.extend(expand_fields(sh, w).unwrap_or_default());
         }
         out
+    }
+
+    #[test]
+    fn at_inside_a_default_or_alternative_word_keeps_its_fields() {
+        // autoconf re-execs configure with `${1+"$@"}`: joining the positionals
+        // there hands the new shell ONE argument holding all of them.
+        let mut sh = sh_with(&[]);
+        sh.params = vec!["a b".into(), String::new(), "c".into()];
+        let all = ["a b", "", "c"].map(String::from).to_vec();
+        assert_eq!(fields(&mut sh, r#"${1+"$@"}"#), all);
+        assert_eq!(fields(&mut sh, r#""${1+$@}""#), all);
+        assert_eq!(fields(&mut sh, r#"${unset-"$@"}"#), all);
+        assert_eq!(fields(&mut sh, r#"${unset:-"$@"}"#), all);
+        assert_eq!(
+            fields(&mut sh, r#"x${1:+"$@"}y"#),
+            ["xa b", "", "cy"].map(String::from).to_vec()
+        );
+        // Unquoted, the word's `$@` fields split like a bare `$@`'s.
+        assert_eq!(
+            fields(&mut sh, "${unset-$@}"),
+            ["a", "b", "c"].map(String::from).to_vec()
+        );
+        // A context that takes ONE string joins them, as before.
+        assert_eq!(
+            expand_single(&mut sh, &word(r#"${unset-"$@"}"#)).ok(),
+            Some("a b  c".to_string())
+        );
+        // With no positionals the word is "$@" over nothing: no field at all,
+        // unless the whole expansion is quoted, which is one empty field.
+        sh.params.clear();
+        assert!(fields(&mut sh, r#"${unset-"$@"}"#).is_empty());
+        assert!(fields(&mut sh, r#"${1+"$@"}"#).is_empty());
+        assert_eq!(fields(&mut sh, r#""${unset-$@}""#), vec![String::new()]);
     }
 
     #[test]
