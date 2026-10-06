@@ -5872,6 +5872,62 @@ checks remain allocation-unqualified. Earlier 153 intervals are
 separate. Native allocation, stack/RSS, full admission and current
 authenticated publication remain unqualified.
 
+### 1.139 Whole original selected-field collection
+
+M06eh adds
+`mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected`.
+Original Bound, one immutable explicit ten-field Properties and
+caller-owned/admitted exact-count Cell windows construct exclusive
+Collecting. Cell is the shared legacy window slot; its value is passive
+ordinal/member bytes. Complete selected collection View supplies the
+common Properties beside the original source-bound collection view. No
+passive view or emitted-only retained member reconstructs an original
+collection.
+
+The shared core privately accepts pure Properties and starts each child
+from the original Bound and next original ordinal, using §1.138's whole
+selected emitter. Legacy public construction passes ALL. No second
+collection, abandonment or acceptance mechanism is introduced. Fresh
+original-job and actual-pin checks precede short/extra cell cardinality.
+Only successful fresh complete Child finish commits its whole bytes and
+advances the parent. Original selection/candidates/backing and actual
+descriptor return to the parent at each accepted ordinal. Dropped child,
+premature finish, window/work refusal and deadline failures poison the
+parent with the exact shared sticky error. Every original ordinal must
+complete; neither skipped slots nor prefilled slots can renew the proof.
+
+NONE children freshly complete into zero-capacity windows without
+emission work. Exactly one Cell per original ordinal remains required.
+Child acceptance still pays the unchanged one interpretation step, one
+record and its control fee: the existing zero-credit handoff totals two
+records, with zero source/I/O or wire fees. ALL preserves legacy turns
+and costs. Other masks preserve bare selected per-turn five-cost debits
+plus those original handoff fees. Complete child polls remain inert;
+explicit and consuming child/parent/Serialized/released Bound boundaries
+stay fresh in both domains. Fresh complete Serialized release returns
+original Bound, unchanged Properties and complete original slots.
+Selection labels and bytes remain provisional and confer no current
+publication authority.
+
+Cell fits 64 bytes; Collecting plus Child and HeaderBudget fits 2 KiB;
+Serialized fits 768 bytes. Original backing, windows and cells remain
+separately caller-owned/admitted. These compiled caps do not prove
+stack/RSS or whole admission. Eight sequential Rust allocation intervals
+measure near-u64 multipart partId+blobId across both original ordinals,
+zero-window NONE, actual pin expiry after selected copied child output,
+completed parent finish expiry, completed Serialized expiry, explicitly
+checked released Bound expiry, nonempty zero child capacity and
+constructor pin expiry. Original source matching/generated
+fragments/backing, filesystem, windows and cells stay cold. Descriptor
+teardown is counted; pooled view/scratch, cells and enclosing fixture
+cleanup remain outside. Other sources/subsets/capacities, supplied-Tick
+expiry, cardinality, abandonment, handoff quotas, post-turn/clock
+failures, cached polls, premature finish and other explicit checks
+remain allocation-unqualified. Earlier 161 intervals remain separate.
+Native allocation, stack/RSS, full admission, selected-field tree/list
+composition, request defaults/parsing, headers/header:*/subParts and
+current authenticated publication remain later or unqualified.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

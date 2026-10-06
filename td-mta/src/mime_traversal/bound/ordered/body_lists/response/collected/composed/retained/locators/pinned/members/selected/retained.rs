@@ -1,4 +1,5 @@
 //! Whole selected part members through the shared original-bound fixed window.
+pub mod collected;
 use super::super::retained as shared;
 use super::{Bound, Error, Properties};
 pub use crate::mime_traversal::Status;

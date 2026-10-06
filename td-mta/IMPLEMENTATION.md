@@ -2360,6 +2360,16 @@ Initial independently landable increments:
   defaults/parsing, whole collection/tree integration, full admission or
   current authenticated publication is claimed.
 
+- **M06eh — whole original selected-field collection:** carry one
+  immutable explicit ten-field selection through every original Bound
+  ordinal and the shared whole-retained child/slot handoff. Preserve
+  legacy ALL, zero-capacity NONE windows plus original acceptance fees,
+  exact bytes/five costs, custody, cardinality, abandonment, sticky
+  refusal and both fresh domains. Add ten ownership/constructor
+  compile guards and eight Rust allocation intervals under API §1.139.
+  Selected-field tree/list composition, request parsing and current
+  authenticated publication follow.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

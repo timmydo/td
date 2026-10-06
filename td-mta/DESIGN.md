@@ -882,6 +882,20 @@ collection/tree integration, headers, header:*, subParts, request
 defaults/parsing, full admission and current authenticated publication
 remain later.
 
+M06eh original selected-field collection privately threads one immutable
+ten-field Properties through the existing source-bound collection core
+and each fresh whole-retained child. Legacy public construction passes
+ALL. The selected facade preserves labels while sharing exact
+cardinality, ordinal custody, abandonment, sticky child/parent refusal
+and fresh complete acceptance. NONE needs zero-capacity child windows
+and one Cell per original ordinal. It pays no emission work but still
+pays the original ordinal handoff. Complete Serialized/released slots
+remain passive and keep original
+Bound/descriptor custody; no public conversion strips selection into a
+legacy complete owner. API §1.139 defines the bounded state and eight Rust
+intervals. Tree/list composition, request parsing and current
+authenticated publication follow.
+
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot
 select bodyStructure. They remain public facades over the same shared

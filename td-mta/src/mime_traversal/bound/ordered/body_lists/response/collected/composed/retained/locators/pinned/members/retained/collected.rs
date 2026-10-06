@@ -43,13 +43,22 @@ pub struct Collecting<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm> {
     source: Option<Bound<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k>>,
     cells: &'s mut [Cell<'m>],
     next: usize,
+    properties: super::super::selected::Properties,
     failure: Option<Error>,
 }
 impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
     Collecting<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
 {
     pub fn new(
+        source: Bound<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k>,
+        cells: &'s mut [Cell<'m>],
+        now: Tick,
+    ) -> Result<Self, Error> {
+        Self::with_properties(source, super::super::selected::Properties::ALL, cells, now)
+    }
+    pub(in super::super) fn with_properties(
         mut source: Bound<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k>,
+        properties: super::super::selected::Properties,
         cells: &'s mut [Cell<'m>],
         now: Tick,
     ) -> Result<Self, Error> {
@@ -65,6 +74,7 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
             source: Some(source),
             cells,
             next: 0,
+            properties,
             failure: None,
         })
     }
@@ -84,6 +94,19 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
             .ok_or(Error::InvalidState)?
             .check_deadline(now);
         self.outcome(result)
+    }
+    #[cfg(test)]
+    pub(in super::super) fn costs(&self) -> Option<[u64; 5]> {
+        let source = self.source.as_ref()?;
+        let structure = &source.original.source.original.source.projected.structure;
+        let left = structure.work.remaining();
+        Some([
+            structure.budget.source_bytes_remaining(),
+            structure.budget.steps_remaining(),
+            left.io_bytes,
+            left.records,
+            left.output_bytes,
+        ])
     }
     pub fn completed(&self) -> Result<usize, Error> {
         if let Some(error) = self.failure {
@@ -122,7 +145,7 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>
         }
         let output = cell.output.take().ok_or(Error::InvalidState)?;
         let source = self.source.take().ok_or(Error::InvalidState)?;
-        let cursor = match Cursor::new(source, ordinal, output, now) {
+        let cursor = match Cursor::with_properties(source, ordinal, self.properties, output, now) {
             Ok(cursor) => cursor,
             Err(error) => {
                 self.failure = Some(error);
@@ -169,6 +192,10 @@ pub struct Child<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 't, 'm> {
     failure: Option<Error>,
 }
 impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 't, 'm> Child<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 't, 'm> {
+    #[cfg(test)]
+    pub(in super::super) fn costs(&self) -> Option<[u64; 5]> {
+        Some(self.cursor.as_ref()?.costs())
+    }
     fn outcome<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         if let Err(error) = result {
             self.failure = Some(error);

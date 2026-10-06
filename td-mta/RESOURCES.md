@@ -2524,6 +2524,19 @@ preparation and counted descriptor teardown; earlier 153 intervals stay
 separate. Native allocation, worker stack/RSS, full admission and
 complete request/publication paths remain unqualified.
 
+M06eh selected-field collection keeps the shared Cell within 64 bytes,
+Collecting plus active Child and HeaderBudget within 2 KiB, and
+completed Serialized within 768 bytes. Original backing, windows and
+cells remain separately caller-owned/admitted. Each child preserves
+selected emission's exact five-cost debits; accepting one complete
+original ordinal adds the unchanged one step and two records (one record
+plus zero-credit control), with zero source/I/O/wire fees. NONE does not
+waive acceptance work. API §1.139 qualifies eight enumerated Rust
+allocation intervals with cold original preparation and counted
+descriptor teardown; earlier 161 remain separate. Native allocation,
+stack/RSS, full admission and complete request/publication paths remain
+unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no
