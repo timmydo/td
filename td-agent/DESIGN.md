@@ -4124,6 +4124,25 @@ process's, not the context's, so they survive compaction; the model
 re-reads a file it needs to see again. A second compaction summarizes
 the view, earlier summary included, and carries the state again.
 
+**Resuming cold.** A long conversation left long enough for the
+provider's cache to expire costs its whole context again at the
+uncached rate on its next request, which compacting first with a
+cheaper model can save. Before a turn's first request, when the time
+since the conversation's last request exceeds `cache_ttl` (default 300
+seconds, Anthropic's ephemeral cache lifetime; providers that keep
+theirs longer can be given a longer one) and the estimated prompt
+exceeds `cold_resume_tokens` (default 32,000), the turn pauses and asks
+the human, on a card, with both estimated costs: resend the whole
+context, or compact with `compact_model` first and then send. The
+estimates are the reservations of §5 for each: the prompt at the
+model's uncached rate, and the summary request plus the compacted
+prompt. The answer applies to that turn alone; nothing is remembered.
+The log already holds everything the summary needs (§6), so no request
+is needed to resume. Compacting is the handoff summary below, its
+pruning first, so the conversation continues from the summary, the
+carried state and its recent tail. With `cold_resume_tokens = "none"`
+nothing is asked.
+
 **Manual compaction.** The human can compact at any time from the
 composer, `/compact` followed by an optional focus ("keep the failing test
 names") that is added to the summary request, or from a button. Neither
@@ -4190,6 +4209,8 @@ default, except `jev_threshold` until it is calibrated (§11):
 - `auto_compact`, `compact_at`, `compact_keep_tokens` and
   `compact_model`; defaults `true`, 80%, 20,000 and the conversation's
   model (§14)
+- `cache_ttl` (later, with increment 16), a whole number of seconds,
+  and `cold_resume_tokens`, or `none`; defaults 300 and 32,000 (§14)
 
 There is no `limits` key until §8's limits land. `orchestrator_model`
 is retired, since there is no orchestrator (§3): a file that still sets
@@ -5090,8 +5111,10 @@ in parallel with it.
 15. **Network.** The egress relay applet with its §W.8 amendment and its
     address predicate, the in-jail proxy, the policies and allowlist
     crossings.
-16. **Compaction.** Automatic and manual compaction, the carried state, and
-    stubs that `history_read` resolves.
+16. **Compaction.** Automatic and manual compaction, the carried state,
+    stubs that `history_read` resolves, and the card that offers to
+    compact a long conversation whose cache has gone cold before
+    resending it (§14, "Resuming cold").
 17. **Packaging.** A recipe, an application package with
     `sockets=wayland;fetch` and the egress socket, the portal credential,
     the in-td jail path of §8 with its td-authd amendment, and a boot
