@@ -431,6 +431,7 @@ fn a_repository_conversations_first_turn_waits_for_its_stores() {
         &Down::Fetched {
             remote: "https://example.org/a/td".into(),
             result: Ok(td_agent::protocol::Fetched {
+                rules: vec![td_agent::rules::Read::Absent],
                 identity: td_agent::repo::Identity::default(),
                 ids: vec!["a".repeat(40)],
                 instructions: vec![td_agent::repo::Instructions::Found {
@@ -506,6 +507,7 @@ fn a_conversation_whose_workspace_went_with_its_archive_prepares_nothing() {
         &Down::Fetched {
             remote: "https://example.org/a/td".into(),
             result: Ok(td_agent::protocol::Fetched {
+                rules: vec![td_agent::rules::Read::Absent],
                 identity: td_agent::repo::Identity::default(),
                 ids: vec!["a".repeat(40)],
                 instructions: vec![td_agent::repo::Instructions::Absent],

@@ -494,6 +494,7 @@ fn a_repository_conversation_prepares_its_workspace() {
                         &Down::Fetched {
                             remote,
                             result: Ok(Fetched {
+                                rules: vec![td_agent::rules::Read::Absent],
                                 identity: Identity {
                                     name: Some("Human".into()),
                                     email: Some("h@example.org".into()),

@@ -1446,7 +1446,7 @@ impl Session {
             let (answer, beside) = match tools::parse_in(workspace, &call.name, &call.arguments) {
                 Ok(Args::Host { call: hosted, acts }) => {
                     let repeated = repeats(self.conversation.events(), reply, at) + 1 >= REPEATS;
-                    self.host(started, hosted, acts, repeated)?
+                    self.host(started, &call.name, hosted, acts, repeated)?
                 }
                 Ok(args) => (self.run(started, args)?, Beside::default()),
                 Err(why) => (Err(why), Beside::default()),
@@ -2141,10 +2141,38 @@ impl Session {
         Ok(Some(said))
     }
 
+    /// The workspace's repository rules, each with where it came from,
+    /// and the rules files that could not be read, each where from and
+    /// why (DESIGN.md §11).
+    fn rules(&self) -> (Vec<crate::rules::Sourced>, Vec<(String, String)>) {
+        let mut found = Vec::new();
+        let mut unread = Vec::new();
+        for one in self.conversation.instructions() {
+            let from = format!(
+                "the repository at {}",
+                tools::visible(&one.checkout.display().to_string())
+            );
+            match &one.rules {
+                crate::rules::Read::Absent => {}
+                crate::rules::Read::Found(rules) => {
+                    found.extend(rules.iter().map(|rule| crate::rules::Sourced {
+                        rule: rule.clone(),
+                        from: from.clone(),
+                    }))
+                }
+                crate::rules::Read::Unread { why } => unread.push((from, why.clone())),
+            }
+        }
+        (found, unread)
+    }
+
     /// Records the project instructions `fetched` read at each of
     /// `entries`' bases, one remote's (DESIGN.md §13).
     fn instructed(&mut self, entries: &[&Entry], fetched: &Stored) -> Result<(), String> {
-        if fetched.ids.len() != entries.len() || fetched.instructions.len() != entries.len() {
+        if fetched.ids.len() != entries.len()
+            || fetched.instructions.len() != entries.len()
+            || fetched.rules.len() != entries.len()
+        {
             return Err("the window answered for another number of bases".into());
         }
         if !fetched.ids.iter().all(|id| crate::git::object_id(id)) {
@@ -2154,10 +2182,12 @@ impl Session {
             .iter()
             .zip(&fetched.ids)
             .zip(&fetched.instructions)
-            .map(|((entry, base), read)| store::Instructed {
+            .zip(&fetched.rules)
+            .map(|(((entry, base), read), rules)| store::Instructed {
                 checkout: entry.checkout.clone(),
                 base: base.clone(),
                 read: read.clone(),
+                rules: rules.clone(),
             })
             .collect();
         self.conversation.instructed(recorded)
@@ -2272,6 +2302,7 @@ impl Session {
     fn host(
         &mut self,
         started: u64,
+        name: &str,
         call: host::Call,
         acts: bool,
         repeated: bool,
@@ -2279,6 +2310,32 @@ impl Session {
         let failed = |why: String| Ok((Err(why), Beside::default()));
         if self.conversation.meta().removed {
             return failed(WORKSPACE_GONE.into());
+        }
+        // The rules before the table (DESIGN.md §11): a deny refuses the
+        // call whether or not it could run yet, and an ask puts it on a
+        // card, once it could, whatever the table says.
+        let command = match &call {
+            host::Call::Shell { command, .. } | host::Call::Background { command, .. } => {
+                Some(command.as_str())
+            }
+            _ => None,
+        };
+        let (rules, unread) = self.rules();
+        let mut asked = None;
+        match crate::rules::judge(&rules, &unread, name, command, acts) {
+            crate::rules::Verdict::Deny(why) => {
+                let why = tools::visible(&why);
+                self.log(Kind::Approval {
+                    call: started,
+                    outcome: "deny".into(),
+                    by: "rule".into(),
+                    probabilities: None,
+                    reason: Some(why.clone()),
+                })?;
+                return failed(format!("not run: {why}. That is the workspace's answer: do not try to reach the same result another way. Say what you needed it for and ask the person how they would like to go on"));
+            }
+            crate::rules::Verdict::Ask(why) => asked = Some(tools::visible(&why)),
+            crate::rules::Verdict::Table => {}
         }
         // Before any card: the person is not asked about a call that
         // cannot run yet.
@@ -2314,12 +2371,15 @@ impl Session {
                 ));
             }
         }
-        if acts || repeated {
+        if acts || repeated || asked.is_some() {
             let (title, mut details) = tools::card(&call);
             if repeated {
                 details.insert(0, REPEATED.into());
             }
-            let why = repeated.then_some("repeated");
+            if let Some(why) = &asked {
+                details.insert(0, format!("Asked because {why}."));
+            }
+            let why = asked.as_deref().or(repeated.then_some("repeated"));
             match self.decide(started, title, details, why)? {
                 Some(true) => {}
                 Some(false) => return failed(CALL_REFUSED.into()),
@@ -3780,7 +3840,7 @@ const REPEATED: &str = "Asked because the model made this same call, to the same
 
 /// How many calls just before call `at` of reply `reply` in `events` were
 /// to the same tool with the same arguments, in a row: back through the
-/// earlier replies, a message to the conversation ending the run, and
+/// earlier replies, the human's message ending the run, and
 /// counted only as far as `REPEATS` needs.
 fn repeats(events: &[Event], reply: u64, at: usize) -> usize {
     let Some(end) = events.iter().rposition(|e| e.seq == reply) else {

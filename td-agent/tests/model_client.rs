@@ -1735,6 +1735,108 @@ fn a_workspace_gone_with_its_archive_refuses_its_tools() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A repository's rules come before the table (DESIGN.md §11): an ask
+/// rule puts a read before the person, saying which rule asks, and a
+/// deny refuses a command with no card, the rule its answer and its
+/// approval logged by the rule.
+#[test]
+fn a_repositorys_rules_ask_for_a_read_and_refuse_a_command() {
+    let base = std::env::temp_dir().join(format!(
+        "td-agent-model-rules-{}-{}",
+        std::process::id(),
+        td_agent::store::random_hex(4).unwrap()
+    ));
+    let template = td_agent::config::Template {
+        name: "td".into(),
+        repos: vec![td_agent::config::Repo {
+            remote: "https://example.org/a/td".into(),
+            base: "main".into(),
+            branch: "agent".into(),
+            sparse: None,
+        }],
+        shared: None,
+    };
+    let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
+    let made = td_agent::workspace::repositories(
+        &template,
+        &Id::random().unwrap(),
+        &base.join("data"),
+        &base.join("trees"),
+        &admitted,
+        0,
+    )
+    .unwrap();
+    let checkout = made.entries[0].checkout.display().to_string();
+    let argument = td_agent::workspace::Workspace::Repositories(made).argument();
+    let mut h = Harness::new_in(
+        "rules",
+        Role::Conversation,
+        Some(argument.to_str().unwrap()),
+        false,
+        vec![
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    let rule = |line: &str| td_agent::rules::Rule::parse(line).unwrap();
+    let fetched = Down::Fetched {
+        remote: "https://example.org/a/td".into(),
+        result: Ok(td_agent::protocol::Fetched {
+            identity: td_agent::repo::Identity::default(),
+            ids: vec!["a".repeat(40)],
+            instructions: vec![td_agent::repo::Instructions::Absent],
+            rules: vec![td_agent::rules::Read::Found(vec![
+                rule("ask read_file"),
+                rule("deny shell rm"),
+            ])],
+        }),
+    };
+    while !matches!(h.next(), Up::Fetch { .. }) {}
+    h.setup(Client::default());
+    h.down(&fetched);
+    while !matches!(h.next(), Up::Prepared { .. }) {}
+    h.say("Tidy the notes.");
+    let (call, title, details) = h.until_ask();
+    assert_eq!(title, "Read a file");
+    assert_eq!(
+        details[0],
+        format!("Asked because the rule `ask read_file` of the repository at {checkout} asks.")
+    );
+    assert_eq!(call, call_record(&h.heard, "toolu_read_01"));
+    h.down(&Down::Decision { call, allow: true });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let denied = format!("the rule `deny shell rm` of the repository at {checkout} denies it");
+    let results = results(&events);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert_eq!(results[1].0, "toolu_shell_01");
+    assert!(results[1].2);
+    assert!(
+        results[1].1.starts_with(&format!(
+            "error: not run: {denied}. That is the workspace's answer"
+        )),
+        "{results:?}"
+    );
+    let shell = call_record(&events, "toolu_shell_01");
+    assert_eq!(
+        approvals(&events),
+        [
+            (
+                call,
+                "allow".to_string(),
+                "human".to_string(),
+                Some(format!(
+                    "the rule `ask read_file` of the repository at {checkout} asks"
+                ))
+            ),
+            (shell, "deny".to_string(), "rule".to_string(), Some(denied)),
+        ]
+    );
+    drop(h);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A repository's checkout runs on a thread of its own, so a turn goes
 /// on without it; done while the conversation is idle, its news wakes a
 /// turn that reads it, though not before the person has written, not
@@ -1787,6 +1889,7 @@ fn a_checkout_done_while_idle_wakes_its_conversation() {
     let fetched = Down::Fetched {
         remote: remote.clone(),
         result: Ok(td_agent::protocol::Fetched {
+            rules: vec![td_agent::rules::Read::Absent],
             identity: td_agent::repo::Identity::default(),
             ids: vec!["a".repeat(40)],
             instructions: vec![td_agent::repo::Instructions::Absent],

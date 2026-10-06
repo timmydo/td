@@ -61,6 +61,7 @@ pub mod protocol;
 pub mod removal;
 pub mod repo;
 pub mod review;
+pub mod rules;
 #[allow(dead_code, reason = "shared dependency-free SHA-256 implementation")]
 #[path = "../../engine/src/sha256.rs"]
 mod sha256;

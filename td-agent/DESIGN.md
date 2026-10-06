@@ -1651,9 +1651,10 @@ ones and read as false. New events:
 - `todo`: the whole list as written, marked `cleared` when the human
   cleared it.
 - `pause`: the human paused or resumed the conversation.
-- `approval`: the decision on a call, by whom, and Jev's probabilities
-  and the reason; nothing writes one until increment 13, and the
-  history tools already show only its outcome and who decided.
+- `approval`: the decision on a call, by whom (`human`; `td-agent` when
+  a card was withdrawn; `rule` when a rule refused it, from increment
+  13), and Jev's probabilities and the reason; the history tools show
+  only its outcome and who decided.
 
 An `assistant` event carries its `tool_calls` (id, tool and the
 arguments as the model wrote them) when it made any. On load, every
@@ -1828,37 +1829,39 @@ recommends against opening the tree in tools that execute on open
 of template already made.
 
 **As built (increment 11, the workspace card).** While the open
-conversation has a repository workspace, the status row says
-`workspace: C-S-w` after its notes, and `C-S-w` or Conversation →
-`Workspace card…` (shown with `C-S-w`, off otherwise) opens its card,
-modal over the body in the Messages window's panel and with its keys,
-titled with the workspace's name, at its first entry rather than
-following the newest; `Escape` or `C-S-w` closes it. The window reads,
-as it opens, the conversation's recorded project instructions and
-which of its workspace repositories `meta` says are prepared, and
-shows: first the recommendation against opening the worktrees in a
-tool that runs code on opening a folder, then one entry for the
-worktrees of a remote read at one commit alike, as the prompt groups
-them (§13), and one for a remote's worktrees not read yet. An entry
-names the remote, each worktree with its base and branch and whether
-it is checked out, and what the model is given at the commit: the
-file's text as the prompt carries it, every control, whitespace other
-than a space, and invisible or bidirectional character (a
-right-to-left override, a zero-width space) named as `<U+XXXX>`, and a
-`<` that begins such a name in the text named too, so a name on the
-card is always one; or that there is none, or was not read and why, or
-is read once the commit is fetched. It does not catch look-alike
-letters from other scripts. A record that cannot be read is said, and
-what it would have told is then unknown, not guessed. An entry too
-large for the list says so in its place; no entry gives way to
-another, the recommendation least of all. It is what was read when it
-opened, and opening it again reads again; it opens only over no other
-modal, for the open conversation, and a note while it is open is
-counted, not added to it. The control seam's state ends with `card`,
-`open` or `closed`, and its `workspace` action is `C-S-w`. It shows
-neither the trust mark nor the repository's `.td-agent/rules`: neither
-changes anything until increment 13's classifier and rules, which add
-both to it, so the card does not offer what would do nothing yet.
+conversation has a repository workspace, the status row says `workspace:
+C-S-w` after its notes, and `C-S-w` or Conversation → `Workspace card…`
+(shown with `C-S-w`, off otherwise) opens its card, modal over the body
+in the Messages window's panel and with its keys, titled with the
+workspace's name, at its first entry rather than following the newest;
+`Escape` or `C-S-w` closes it. The window reads, as it opens, the
+conversation's recorded project instructions and which of its workspace
+repositories `meta` says are prepared, and shows: first the
+recommendation against opening the worktrees in a tool that runs code on
+opening a folder, then one entry for the worktrees of a remote read at
+one commit alike, as the prompt groups them (§13), and one for a
+remote's worktrees not read yet. An entry names the remote, each
+worktree with its base and branch and whether it is checked out, and
+what the model is given at the commit: the file's text as the prompt
+carries it, every control, whitespace other than a space, and invisible
+or bidirectional character (a right-to-left override, a zero-width
+space) named as `<U+XXXX>`, and a `<` that begins such a name in the
+text named too, so a name on the card is always one; or that there is
+none, or was not read and why, or is read once the commit is fetched. It
+does not catch look-alike letters from other scripts. A record that
+cannot be read is said, and what it would have told is then unknown, not
+guessed. An entry too large for the list says so in its place; no entry
+gives way to another, the recommendation least of all. It is what was
+read when it opened, and opening it again reads again; it opens only
+over no other modal, for the open conversation, and a note while it is
+open is counted, not added to it. The control seam's state ends with
+`card`, `open` or `closed`, and its `workspace` action is `C-S-w`. Each
+entry also says what its repository's `.td-agent/rules` add at the
+commit, listed as the matcher reads them, or that there are none, or why
+they were not read (§11, As built (increment 13, a repository's rules)).
+It does not show the trust mark, which changes nothing until increment
+13's classifier and is added with it, so the card does not offer what
+would do nothing yet.
 
 **Layout.**
 
@@ -3187,6 +3190,49 @@ deny and ask rules and nothing else, so a hostile checkout can narrow what
 runs but never widen it. A boundary the human states ("don't push")
 becomes a rule through a card, not text in the transcript; a boundary
 stated only in chat can be lost to compaction, and a rule cannot.
+
+**As built (increment 13, a repository's rules).** `.td-agent/rules`
+holds one rule a line: `deny` or `ask`, then a tool the tool host runs
+(`read_file`, `write_file`, `edit_file`, `glob`, `grep`, `sed` or
+`shell`), then, for `shell` alone, the words of an argv prefix, parted
+by spaces or tabs. Blank lines and lines starting with `#` are skipped.
+A word may not hold what the shell would read rather than pass, or what
+the matcher could never match: a quote, `\`, `$`, a backtick, `;`, `&`,
+`|`, `<`, `>`, a parenthesis, `#`, a glob or brace character, a leading
+`~`, or a control. The git worker reads the file at each base beside the
+project instructions, at most 16 KiB and 256 rules, each commit's
+crossing once and all at most 32 KiB in one answer; the conversation
+records them with the instructions, each commit's counted and written
+once against the same bound, and the workspace card lists them. A file
+not read whole (past its bound, not UTF-8, not a regular file, or with a
+line refused, an `allow` among them) is refused whole and its reason
+named on the card in td-agent's own words, as is a record made before
+td-agent read rules; every call that changes the workspace or runs a
+command then asks the human, saying why, so a broken file narrows and
+never widens. A deny refuses the call before any card, whether or not it
+could run yet, its answer to the model naming the rule and its
+repository, and logs the approval `by` `rule` with that reason; an ask
+puts the call on the human's card once it could run, the card saying
+first which rule asks and the approval logged with that reason. A deny
+or ask matches a command word by its name after any `/`, so `/bin/rm` is
+`rm`, and one on `git` reads past git's options before the subcommand,
+so `git --no-pager push` is `git push`; an allow matches the command
+word as written, so `./git` is not `git`. The words after it match word
+for word, and a word an expansion or a glob decides (`$X`, `*.o`, a
+leading `~`) matches none. Besides the set above, the matcher treats as
+opaque what it reads as compound (a reserved word such as `if`, `{` or
+`!`, a subshell, a here-document), a command word an expansion decides,
+an append assignment `NAME+=value`, `$'…'` quoting, a `${…}` holding
+more than a name, `&>` (which dash, as `sh`, reads as `&` and `>`),
+`hash`, fish's `--command`, a shell given `-s` or no script, so reading
+commands from its input, and a shell's or `find`'s option an expansion
+decides, and an option before git's subcommand that may take the next
+word as its argument: one written without `=` that the matcher does not
+know to take none. The shell's joining of `\` and a newline is undone
+first, and a newline after `&&`, `||` or `|` continues the command. A
+command the matcher cannot see into asks while any shell deny or ask
+rule exists, not only a deny. Until modes land, every call that acts
+still takes the `ask` column's card.
 
 **Repetition.** Three consecutive calls of one tool with identical
 arguments go to the human whatever the table says, as opencode's

@@ -431,6 +431,7 @@ mod tests {
             checkout: PathBuf::from(checkout),
             base: base.repeat(40),
             read,
+            rules: Default::default(),
         };
         let text = "Build with `make`.\n```\nnot the end\n```\n";
         let found = Instructions::Found {
@@ -517,6 +518,7 @@ mod tests {
                 name: "AGENTS.md".into(),
                 text: worst,
             },
+            rules: Default::default(),
         }];
         let place = Place {
             scratch: false,

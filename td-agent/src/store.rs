@@ -595,15 +595,21 @@ pub struct Instructed {
     pub checkout: PathBuf,
     pub base: String,
     pub read: crate::repo::Instructions,
+    /// Its repository's `.td-agent/rules` there (§11).
+    pub rules: crate::rules::Read,
 }
 
 impl Instructed {
-    /// Its JSON, its read given whole or as the index of an earlier
-    /// entry with the same (`instructions_json`).
-    fn to_json(&self, same: Option<usize>) -> Json {
+    /// Its JSON, its read and its rules each given whole or as the index
+    /// of an earlier entry with the same (`instructions_json`).
+    fn to_json(&self, same: Option<usize>, same_rules: Option<usize>) -> Json {
         let read = match same {
             Some(index) => ("same".into(), Json::from(index as u64)),
             None => ("read".into(), self.read.to_json()),
+        };
+        let rules = match same_rules {
+            Some(index) => ("same_rules".into(), Json::from(index as u64)),
+            None => ("rules".into(), self.rules.to_json()),
         };
         Json::Obj(vec![
             (
@@ -612,6 +618,7 @@ impl Instructed {
             ),
             ("base".into(), Json::Str(self.base.clone())),
             read,
+            rules,
         ])
     }
 
@@ -647,10 +654,27 @@ impl Instructed {
                     .ok_or("recorded instructions without `read`")?,
             )?,
         };
+        // A record from before rules were read says nothing of them, so
+        // they are not read, and every acting call asks.
+        let rules = match (value.get("same_rules"), value.get("rules")) {
+            (Some(same), _) => same
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .filter(|index| *index < at)
+                .and_then(|index| earlier.get(index))
+                .filter(|other| other.base == base)
+                .map(|other| other.rules.clone())
+                .ok_or("recorded rules naming no earlier entry at their commit")?,
+            (None, Some(rules)) => crate::rules::Read::from_json(rules)?,
+            (None, None) => {
+                crate::rules::Read::unread("recorded before td-agent read repository rules")
+            }
+        };
         Ok(Self {
             checkout,
             base: base.to_string(),
             read,
+            rules,
         })
     }
 }
@@ -700,7 +724,11 @@ fn instructions_json(all: &[Instructed]) -> Json {
                     .iter()
                     .take(at)
                     .position(|other| other.base == one.base && other.read == one.read);
-                one.to_json(earlier)
+                let earlier_rules = all
+                    .iter()
+                    .take(at)
+                    .position(|other| other.base == one.base && other.rules == one.rules);
+                one.to_json(earlier, earlier_rules)
             })
             .collect(),
     )
@@ -2290,7 +2318,9 @@ impl Conversation {
     /// repository not yet prepared is read again (DESIGN.md §7), so the
     /// record is the commit its worktree was checked out at, and holds
     /// once it is. Past `MAX_INSTRUCTED` bytes in all, a commit's text
-    /// counted once, a later worktree's is recorded unread, saying so.
+    /// counted once, a later worktree's is recorded unread, saying so;
+    /// past `rules::MAX_CARRIED` bytes of rules, every worktree's
+    /// counted, a later worktree's rules are too, so it asks.
     pub fn instructed(&mut self, more: Vec<Instructed>) -> Result<(), String> {
         // What stays is held as it was: only the new reads are bounded,
         // against the rest, so no other worktree's record changes.
@@ -2307,8 +2337,34 @@ impl Conversation {
                 counted.push((done.base.as_str(), &done.read));
             }
         }
+        // A commit's rules count once, as its instructions do.
+        let mut ruled: Vec<(String, crate::rules::Read)> = Vec::new();
+        let mut rules_carried = 0usize;
+        for done in &kept {
+            if !ruled
+                .iter()
+                .any(|(base, rules)| *base == done.base && *rules == done.rules)
+            {
+                rules_carried = rules_carried.saturating_add(done.rules.carried());
+                ruled.push((done.base.clone(), done.rules.clone()));
+            }
+        }
         let mut bounded: Vec<Instructed> = Vec::new();
         for mut one in more {
+            if !ruled
+                .iter()
+                .any(|(base, rules)| *base == one.base && *rules == one.rules)
+            {
+                if rules_carried.saturating_add(one.rules.carried()) > crate::rules::MAX_CARRIED {
+                    one.rules = crate::rules::Read::unread(&format!(
+                        "{} is past {} bytes with the other worktrees' rules",
+                        crate::rules::FILE,
+                        crate::rules::MAX_CARRIED
+                    ));
+                }
+                rules_carried = rules_carried.saturating_add(one.rules.carried());
+                ruled.push((one.base.clone(), one.rules.clone()));
+            }
             let seen = counted
                 .iter()
                 .any(|(base, read)| *base == one.base && **read == one.read)
@@ -3292,6 +3348,66 @@ pub mod tests {
     }
 
     #[test]
+    fn repository_rules_are_recorded_beside_the_instructions_within_their_bound() {
+        use crate::repo::Instructions;
+        use crate::rules::{Read, Rule, MAX_CARRIED};
+        let scratch = Scratch::new("ruled");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let ruled = |checkout: &str, base: char, rules: Read| Instructed {
+            checkout: checkout.into(),
+            base: base.to_string().repeat(40),
+            read: Instructions::Absent,
+            rules,
+        };
+        let rule = Rule::parse(&format!("deny shell {}", "x".repeat(500))).unwrap();
+        let half = Read::Found(vec![rule; MAX_CARRIED / 2 / 512]);
+        assert_eq!(half.carried(), MAX_CARRIED / 2);
+        let (mut conversation, _) =
+            Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
+        conversation
+            .instructed(vec![
+                ruled("/w/a", 'a', half.clone()),
+                ruled("/w/b", 'b', half.clone()),
+                // A commit's rules count once.
+                ruled("/w/a2", 'a', half.clone()),
+            ])
+            .unwrap();
+        // Another commit's would pass the bound, so they are recorded
+        // unread, and every acting call asks.
+        conversation
+            .instructed(vec![ruled(
+                "/w/c",
+                'c',
+                Read::Found(vec![Rule::parse("ask glob").unwrap()]),
+            )])
+            .unwrap();
+        drop(conversation);
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        let rules: Vec<&Read> = conversation
+            .instructions()
+            .iter()
+            .map(|one| &one.rules)
+            .collect();
+        assert_eq!(rules.get(..3).unwrap(), [&half, &half, &half]);
+        assert!(
+            matches!(rules.get(3).unwrap(), Read::Unread { why } if why.contains("past")),
+            "{rules:?}"
+        );
+        // A record from before rules were read says nothing of them: not
+        // read, so the table asks.
+        let old = td_json::parse(&format!(
+            r#"{{"checkout":"/w/a","base":"{}","read":{{"kind":"absent"}}}}"#,
+            "a".repeat(40)
+        ))
+        .unwrap();
+        assert!(matches!(
+            Instructed::from_json(&old, &[], 0).unwrap().rules,
+            Read::Unread { why } if why.contains("recorded before")
+        ));
+    }
+
+    #[test]
     fn project_instructions_are_recorded_once_a_worktree_within_their_bound() {
         use crate::repo::Instructions;
         let scratch = Scratch::new("instructed");
@@ -3301,6 +3417,7 @@ pub mod tests {
             checkout: checkout.into(),
             base: "a".repeat(40),
             read,
+            rules: Default::default(),
         };
         let found = |text: &str| Instructions::Found {
             name: "AGENTS.md".into(),
@@ -3390,11 +3507,16 @@ pub mod tests {
             name: "AGENTS.md".into(),
             text: "\u{1}".repeat(MAX_INSTRUCTED),
         };
+        // And rules at their bound, which count and are written once a
+        // commit too.
+        let rule = crate::rules::Rule::parse(&format!("deny shell {}", "x".repeat(500))).unwrap();
+        let rules = crate::rules::Read::Found(vec![rule; crate::rules::MAX_CARRIED / 512]);
         let all: Vec<Instructed> = (0..crate::workspace::MAX_ENTRIES)
             .map(|n| Instructed {
                 checkout: PathBuf::from(format!("/w/{n}")),
                 base: "a".repeat(40),
                 read: read.clone(),
+                rules: rules.clone(),
             })
             .collect();
         conversation.instructed(all.clone()).unwrap();
@@ -3412,6 +3534,17 @@ pub mod tests {
             state.conversation(&id).join(INSTRUCTIONS),
             format!(
                 r#"[{{"checkout": "/w/0", "base": "{a}", "read": {{"kind": "absent"}}}}, {{"checkout": "/w/1", "base": "{b}", "same": 0}}]"#,
+                a = "a".repeat(40),
+                b = "b".repeat(40)
+            ),
+        )
+        .unwrap();
+        assert!(Conversation::open(&state, &id, None, LOCK_WAIT).is_err());
+        // As does one for rules.
+        std::fs::write(
+            state.conversation(&id).join(INSTRUCTIONS),
+            format!(
+                r#"[{{"checkout": "/w/0", "base": "{a}", "read": {{"kind": "absent"}}, "rules": {{"kind": "absent"}}}}, {{"checkout": "/w/1", "base": "{b}", "read": {{"kind": "absent"}}, "same_rules": 0}}]"#,
                 a = "a".repeat(40),
                 b = "b".repeat(40)
             ),

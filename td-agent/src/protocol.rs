@@ -90,6 +90,8 @@ pub struct Fetched {
     pub identity: crate::repo::Identity,
     pub ids: Vec<String>,
     pub instructions: Vec<crate::repo::Instructions>,
+    /// Each base's `.td-agent/rules` (§11), in the same order.
+    pub rules: Vec<crate::rules::Read>,
 }
 
 /// From a conversation to the window.
@@ -271,6 +273,68 @@ fn carried(fetched: &Fetched) -> Json {
     Json::Arr(items)
 }
 
+/// A `Fetched`'s repository rules as they cross: a base at a commit an
+/// earlier base names says so (`{"same": <index>}`), as the project
+/// instructions do (`carried`).
+fn carried_rules(fetched: &Fetched) -> Json {
+    let items = fetched
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(at, read)| {
+            let id = fetched.ids.get(at);
+            let earlier = fetched
+                .ids
+                .iter()
+                .zip(&fetched.rules)
+                .take(at)
+                .position(|(other, same)| Some(other) == id && same == read);
+            match earlier {
+                Some(index) => Json::Obj(vec![("same".into(), Json::from(index as u64))]),
+                None => read.to_json(),
+            }
+        })
+        .collect();
+    Json::Arr(items)
+}
+
+/// A `Fetched`'s repository rules, one a base of `ids`, each as it
+/// crossed (`carried_rules`), within the bound of the store's answer
+/// counted once a commit (DESIGN.md §11).
+fn repository_rules(value: &Json, ids: &[String]) -> Result<Vec<crate::rules::Read>, String> {
+    let items = value
+        .get("rules")
+        .and_then(Json::as_arr)
+        .ok_or("no rules")?;
+    if items.len() != ids.len() {
+        return Err("rules for another number of bases".into());
+    }
+    let mut read: Vec<crate::rules::Read> = Vec::new();
+    let mut carried = 0usize;
+    for (at, item) in items.iter().enumerate() {
+        match item.get("same") {
+            Some(same) => {
+                let index = same
+                    .as_u64()
+                    .and_then(|index| usize::try_from(index).ok())
+                    .filter(|index| *index < at && ids.get(*index) == ids.get(at))
+                    .ok_or("rules name no earlier base at the same commit")?;
+                let earlier = read.get(index).cloned().ok_or("no such rules")?;
+                read.push(earlier);
+            }
+            None => {
+                let one = crate::rules::Read::from_json(item)?;
+                carried = carried.saturating_add(one.carried());
+                read.push(one);
+            }
+        }
+    }
+    if carried > crate::rules::MAX_CARRIED {
+        return Err("rules past their bound".into());
+    }
+    Ok(read)
+}
+
 /// A `Fetched`'s project instructions, one a base of `ids`, each as it
 /// crossed (`carried`), within the bound of the store's answer counted
 /// once a commit.
@@ -427,6 +491,7 @@ impl Down {
                             Json::Arr(fetched.ids.iter().cloned().map(Json::Str).collect()),
                         ),
                         ("instructions".into(), carried(fetched)),
+                        ("rules".into(), carried_rules(fetched)),
                     ]),
                     Err(why) => pairs.push(("error".into(), Json::Str(why.clone()))),
                 }
@@ -571,6 +636,7 @@ impl Down {
                         },
                         ids: strings(&value, "ids")?,
                         instructions: instructions(&value, &strings(&value, "ids")?)?,
+                        rules: repository_rules(&value, &strings(&value, "ids")?)?,
                     }),
                 },
             }),
@@ -827,6 +893,7 @@ mod tests {
             result: Ok(Fetched {
                 identity: crate::repo::Identity::default(),
                 ids: at(texts.len(), one),
+                rules: vec![crate::rules::Read::Absent; texts.len()],
                 instructions: texts
                     .into_iter()
                     .map(|text| crate::repo::Instructions::Found {
@@ -854,8 +921,71 @@ mod tests {
         assert!(bytes.len() <= crate::frame::MAX_FRAME, "{}", bytes.len());
         assert_eq!(Down::decode(&bytes).unwrap(), shared);
         // A back-reference names an earlier base at the same commit.
-        let forged = br#"{"type":"fetched","remote":"https://github.com/timmydo/td","error":null,"name":null,"email":null,"ids":["0000000000000000000000000000000000000000","0000000000000000000000000000000000000001"],"instructions":[{"kind":"absent"},{"same":0}]}"#;
+        let forged = br#"{"type":"fetched","remote":"https://github.com/timmydo/td","error":null,"name":null,"email":null,"ids":["0000000000000000000000000000000000000000","0000000000000000000000000000000000000001"],"instructions":[{"kind":"absent"},{"same":0}],"rules":[{"kind":"absent"},{"kind":"absent"}]}"#;
         assert!(Down::decode(forged).is_err());
+    }
+
+    #[test]
+    fn a_fetched_answer_carries_rules_within_their_bound_beside_the_most_instructions() {
+        use crate::rules::{Read, Rule, MAX_CARRIED, MAX_WHY};
+        // Every base at its own commit, or all at one; the most
+        // instructions, at their worst escaping, at the first commit.
+        let answer = |rules: Vec<Read>, one: bool| Down::Fetched {
+            remote: "https://github.com/timmydo/td".into(),
+            result: Ok(Fetched {
+                identity: crate::repo::Identity::default(),
+                ids: (0..MAX_STRINGS)
+                    .map(|i| format!("{:040x}", if one { 0 } else { i }))
+                    .collect(),
+                instructions: (0..MAX_STRINGS)
+                    .map(|i| {
+                        if i == 0 || one {
+                            crate::repo::Instructions::Found {
+                                name: "AGENTS.md".into(),
+                                text: "\u{1}".repeat(crate::git::MAX_INSTRUCTIONS),
+                            }
+                        } else {
+                            crate::repo::Instructions::Absent
+                        }
+                    })
+                    .collect(),
+                rules,
+            }),
+        };
+        // Every commit's rules, at the bound, beside the worst
+        // instructions.
+        let rule = Rule::parse(&format!("deny shell {}", "x".repeat(500))).unwrap();
+        assert_eq!(rule.text().len() + 1, MAX_CARRIED / MAX_STRINGS / 2);
+        let found = Read::Found(vec![rule.clone(), rule.clone()]);
+        let most = answer(vec![found.clone(); MAX_STRINGS], false);
+        let bytes = most.encode();
+        assert!(bytes.len() <= crate::frame::MAX_FRAME, "{}", bytes.len());
+        assert_eq!(Down::decode(&bytes).unwrap(), most);
+        // Every base's reason, at its bound and escaped at its worst.
+        let unread = Read::unread(&"\u{1}".repeat(MAX_WHY));
+        let most = answer(vec![unread; MAX_STRINGS], false);
+        let bytes = most.encode();
+        assert!(bytes.len() <= crate::frame::MAX_FRAME, "{}", bytes.len());
+        assert_eq!(Down::decode(&bytes).unwrap(), most);
+        // A commit's rules cross once, however many worktrees start
+        // there: every base at one commit, each at the whole bound.
+        let whole = Read::Found(vec![rule.clone(); MAX_CARRIED / 512]);
+        assert_eq!(whole.carried(), MAX_CARRIED);
+        let shared = answer(vec![whole; MAX_STRINGS], true);
+        let bytes = shared.encode();
+        assert!(bytes.len() <= crate::frame::MAX_FRAME, "{}", bytes.len());
+        assert_eq!(Down::decode(&bytes).unwrap(), shared);
+        // Past the bound, the answer is refused.
+        let mut past = vec![found; MAX_STRINGS];
+        *past.first_mut().unwrap() = Read::Found(vec![rule.clone(), rule.clone(), rule]);
+        assert!(Down::decode(&answer(past, false).encode()).is_err());
+        // A back-reference names an earlier base at the same commit.
+        let forged = format!(
+            r#"{{"type":"fetched","remote":"https://github.com/timmydo/td","error":null,"name":null,"email":null,"ids":["{0}","{1}"],"instructions":[{{"kind":"absent"}},{{"kind":"absent"}}],"rules":[{{"kind":"absent"}},{{"same":0}}]}}"#,
+            "0".repeat(40),
+            "1".repeat(40)
+        );
+        assert!(Down::decode(forged.as_bytes()).is_err());
     }
 
     #[test]
@@ -1073,6 +1203,14 @@ mod tests {
                         crate::repo::Instructions::Unread {
                             why: "AGENTS.md is not UTF-8".into(),
                         },
+                    ],
+                    rules: vec![
+                        crate::rules::Read::Found(vec![crate::rules::Rule::parse(
+                            "ask shell git push",
+                        )
+                        .unwrap()]),
+                        crate::rules::Read::Absent,
+                        crate::rules::Read::unread(".td-agent/rules is not UTF-8"),
                     ],
                 }),
             },

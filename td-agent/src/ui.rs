@@ -6278,6 +6278,7 @@ pub mod tests {
                     name: "AGENTS.md".into(),
                     text: "Read DESIGN.md first.".into(),
                 },
+                rules: Default::default(),
             }]),
             prepared: Ok(Vec::new()),
             removed: false,

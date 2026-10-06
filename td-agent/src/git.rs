@@ -680,6 +680,28 @@ impl Worker {
     /// none); refused past `MAX_FILE` bytes. Its entry is looked up once,
     /// the path literal, and the blob read by its id.
     pub fn read(&self, store: &Path, id: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
+        self.read_as(store, id, path, false)
+    }
+
+    /// As `read`, but a path there that is not a regular file is an
+    /// error, not absent: a link or a tree where rules are looked for
+    /// is a reason they were not read.
+    pub fn read_regular(
+        &self,
+        store: &Path,
+        id: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.read_as(store, id, path, true)
+    }
+
+    fn read_as(
+        &self,
+        store: &Path,
+        id: &str,
+        path: &str,
+        regular: bool,
+    ) -> Result<Option<Vec<u8>>, String> {
         if !object_id(id) {
             return Err(format!("{id:?} is not a commit id"));
         }
@@ -712,6 +734,9 @@ impl Worker {
                 return Err(format!("{path}: git listed it oddly"));
             };
             if *kind != "blob" || !matches!(*mode, "100644" | "100755") {
+                if regular {
+                    return Err(format!("{path} is not a regular file"));
+                }
                 return Ok(None);
             }
             let size: u64 = size
@@ -838,6 +863,40 @@ fn instructions_at(
                 })
         })
         .collect()
+}
+
+/// The repository rules at each of `ids` (DESIGN.md §11), as `read`
+/// finds `.td-agent/rules` there: each commit's read and counted once
+/// against one bound for the answer, as it crosses once, past which a
+/// commit's are not read, so the human is asked.
+fn rules_at(
+    ids: &[String],
+    mut read: impl FnMut(&str) -> Result<Option<Vec<u8>>, String>,
+) -> Vec<crate::rules::Read> {
+    let mut done: Vec<(&String, crate::rules::Read)> = Vec::new();
+    let mut carried = 0usize;
+    let mut out = Vec::new();
+    for id in ids {
+        if let Some((_, found)) = done.iter().find(|(at, _)| *at == id) {
+            out.push(found.clone());
+            continue;
+        }
+        let mut found = match read(id) {
+            Ok(bytes) => crate::rules::Read::of(bytes),
+            Err(why) => crate::rules::Read::unread(&why),
+        };
+        if carried.saturating_add(found.carried()) > crate::rules::MAX_CARRIED {
+            found = crate::rules::Read::unread(&format!(
+                "{} is past {} bytes with the other bases' rules",
+                crate::rules::FILE,
+                crate::rules::MAX_CARRIED
+            ));
+        }
+        carried = carried.saturating_add(found.carried());
+        done.push((id, found.clone()));
+        out.push(found);
+    }
+    out
 }
 
 /// The window's store fetches (DESIGN.md §7, §9): one thread, which runs
@@ -995,10 +1054,12 @@ impl Worker {
             .map(|base| self.resolve(&store, base))
             .collect::<Result<Vec<_>, _>>()?;
         let instructions = instructions_at(&ids, |id| self.instructions(&store, id));
+        let rules = rules_at(&ids, |id| self.read_regular(&store, id, crate::rules::FILE));
         Ok(crate::protocol::Fetched {
             identity: self.identity()?,
             ids,
             instructions,
+            rules,
         })
     }
 
@@ -1421,6 +1482,11 @@ pub(crate) mod tests {
             b"allow x\n"
         );
         assert_eq!(worker.read(&store, &id, "nothing").unwrap(), None);
+        assert_eq!(worker.read_regular(&store, &id, "nothing").unwrap(), None);
+        assert_eq!(
+            worker.read_regular(&store, &id, ".td-agent").unwrap_err(),
+            ".td-agent is not a regular file"
+        );
         assert_eq!(
             worker.read(&store, &id, ".td-agent").unwrap(),
             None,
@@ -1482,6 +1548,46 @@ pub(crate) mod tests {
             .store(&stores, &remote)
             .unwrap_err()
             .contains("another remote"));
+    }
+
+    #[test]
+    fn each_bases_rules_are_read_once_within_the_answers_bound() {
+        use crate::rules::{Read, MAX_CARRIED};
+        let ids: Vec<String> = ["a", "b", "a", "c", "d"]
+            .iter()
+            .map(|c| c.repeat(40))
+            .collect();
+        let line = format!("deny shell {}\n", "x".repeat(500));
+        let mut reads = Vec::new();
+        let found = rules_at(&ids, |id| {
+            reads.push(id.to_string());
+            Ok(match id.chars().next() {
+                Some('a') => Some(b"ask shell git push\n".to_vec()),
+                Some('b') => None,
+                Some('c') => Some(line.repeat(MAX_CARRIED / line.len()).into_bytes()),
+                _ => Err("git failed".to_string())?,
+            })
+        });
+        assert_eq!(
+            reads,
+            [
+                ids[0].clone(),
+                ids[1].clone(),
+                ids[3].clone(),
+                ids[4].clone()
+            ]
+        );
+        assert_eq!(found[0], found[2]);
+        assert!(matches!(&found[0], Read::Found(rules) if rules.len() == 1));
+        assert_eq!(found[1], Read::Absent);
+        // The answer's bound counts each commit once: c's would pass it.
+        assert!(
+            matches!(&found[3], Read::Unread { why } if why.contains("past")),
+            "{:?}",
+            found[3]
+        );
+        assert_eq!(found[4], Read::unread("git failed"));
+        assert!(found.iter().map(Read::carried).sum::<usize>() <= MAX_CARRIED);
     }
 
     #[test]

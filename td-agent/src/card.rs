@@ -111,7 +111,9 @@ fn shown(text: &str) -> String {
 /// Whether two worktrees' records are one entry's.
 fn alike(one: Option<&Instructed>, other: Option<&Instructed>) -> bool {
     match (one, other) {
-        (Some(one), Some(other)) => one.base == other.base && one.read == other.read,
+        (Some(one), Some(other)) => {
+            one.base == other.base && one.read == other.read && one.rules == other.rules
+        }
         (None, None) => true,
         _ => false,
     }
@@ -159,6 +161,10 @@ fn group(
         ));
     }
     text.push_str("\n\n");
+    if let Some(read) = read {
+        text.push_str(&rules(&read.rules));
+        text.push_str("\n\n");
+    }
     match read.map(|read| (&read.base, &read.read)) {
         None if known => text.push_str(
             "Their project instructions are read once their commit is fetched; the \
@@ -192,6 +198,34 @@ fn group(
         }
     }
     (label(&header), text)
+}
+
+/// What a repository's `.td-agent/rules` at the entry's commit add
+/// (DESIGN.md §11): rules only narrow what runs.
+fn rules(read: &crate::rules::Read) -> String {
+    match read {
+        crate::rules::Read::Absent => {
+            "There is no .td-agent/rules at that commit: the repository adds no rules.".into()
+        }
+        crate::rules::Read::Found(rules) if rules.is_empty() => {
+            "Its .td-agent/rules adds no rules.".into()
+        }
+        crate::rules::Read::Found(rules) => {
+            let mut text = String::from(
+                "Its .td-agent/rules, which can only narrow what runs: a deny refuses a \
+                 call, an ask puts it before you.",
+            );
+            for rule in rules {
+                text.push_str(&format!("\n  {}", shown(&rule.text())));
+            }
+            text
+        }
+        crate::rules::Read::Unread { why } => format!(
+            "Its .td-agent/rules could not be read, so every call that changes the \
+             workspace or runs a command is put before you: {}",
+            shown(why)
+        ),
+    }
 }
 
 /// `text` as a header: nothing that would not show, within td-ui's
@@ -232,7 +266,82 @@ mod tests {
             checkout: checkout.into(),
             base: base.to_string().repeat(40),
             read,
+            rules: Default::default(),
         }
+    }
+
+    /// Each entry says what its repository's rules add: each rule as the
+    /// matcher reads it, its hidden characters named; that there are
+    /// none; or why they were not read, so every acting call asks.
+    #[test]
+    fn each_entry_says_what_its_repositorys_rules_add() {
+        use crate::rules::{Read, Rule};
+        let repositories = Repositories {
+            template: "td".into(),
+            name: "td-1".into(),
+            entries: vec![
+                entry("https://github.com/timmydo/td", "/w/td-1/td"),
+                entry("https://github.com/timmydo/other", "/w/td-1/other"),
+                entry("https://github.com/timmydo/third", "/w/td-1/third"),
+            ],
+        };
+        let ruled = |checkout: &str, base: char, rules: Read| Instructed {
+            rules,
+            ..recorded(checkout, base, Instructions::Absent)
+        };
+        let record = Record {
+            instructions: Ok(vec![
+                ruled(
+                    "/w/td-1/td",
+                    'a',
+                    Read::Found(vec![
+                        Rule::parse("ask shell git push").unwrap(),
+                        Rule::parse("deny shell rm\u{202e}x").unwrap(),
+                    ]),
+                ),
+                ruled("/w/td-1/other", 'b', Read::Absent),
+                ruled(
+                    "/w/td-1/third",
+                    'c',
+                    Read::unread(".td-agent/rules: line 2: names no tool"),
+                ),
+            ]),
+            prepared: Ok(Vec::new()),
+            removed: false,
+        };
+        let card = entries(&repositories, &record);
+        let text = |at: usize| card.get(at).map(|(_, t)| t.as_str()).unwrap();
+        assert!(
+            text(1).contains(
+                "Its .td-agent/rules, which can only narrow what runs: a deny refuses a call, \
+                 an ask puts it before you.\n  ask shell git push\n  deny shell rm<U+202E>x\n\n"
+            ),
+            "{}",
+            text(1)
+        );
+        assert!(text(2).contains("There is no .td-agent/rules at that commit"));
+        assert!(
+            text(3).contains(
+                "could not be read, so every call that changes the workspace or runs a \
+                 command is put before you: .td-agent/rules: line 2: names no tool"
+            ),
+            "{}",
+            text(3)
+        );
+        // Worktrees whose rules differ are not one entry.
+        let mut two = record.clone();
+        if let Ok(read) = &mut two.instructions {
+            read.truncate(1);
+            read.push(ruled("/w/td-1/td-docs", 'a', Read::Absent));
+        }
+        let docs = Repositories {
+            entries: vec![
+                entry("https://github.com/timmydo/td", "/w/td-1/td"),
+                entry("https://github.com/timmydo/td", "/w/td-1/td-docs"),
+            ],
+            ..repositories
+        };
+        assert_eq!(entries(&docs, &two).len(), 3);
     }
 
     /// The recommendation first; then the worktrees of one remote read
