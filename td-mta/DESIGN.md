@@ -995,6 +995,17 @@ values survive expiry until a check or consuming operation. API §1.148
 scopes eight Rust intervals. Header rendering, full admitted request
 wiring and authenticated publication remain later.
 
+M06er streams source-ordered EmailHeader JSON through the original resident
+header Scanner, Raw scalar engine and JSON string frame. Names preserve case
+and duplicates; values preserve folding/leading whitespace and existing Raw
+filtering/replacement policy. Original job and interpretation budgets move
+exclusively between scanning and projection. Emitted fragments remain
+provisional; fresh complete handoff returns only the original budgets and
+passive header boundary/diagnostic. API §1.149 scopes its bounded cursor and
+eight Rust allocation intervals. Fixed-window retention, configurable
+body-part header wiring and original pin/authenticated publication admission
+remain later.
+
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot
 select bodyStructure. They remain public facades over the same shared

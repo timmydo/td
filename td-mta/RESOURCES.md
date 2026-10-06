@@ -2634,6 +2634,17 @@ inside measured intervals; earlier 233 remain separate. Native
 allocation, stack/RSS, full request admission and authenticated
 publication remain unqualified.
 
+M06er keeps the source-ordered header-array Cursor plus HeaderBudget within
+512 bytes and original-budget Completion within 64 bytes; transient caller
+output stays separate. Scanner turns retain the 255-visit/256-step bound;
+Raw/string projection stays bounded and literal copies are at most 64 prepaid
+wire bytes. No source/field/value/output storage grows. API §1.149 scopes
+eight Rust intervals with source/budget/output preparation cold and
+construction/polling/consuming refusals measured. Earlier 241 intervals remain
+separate on the accepted retention parent. Native allocation, stack/RSS,
+fixed-window retention, selected body-part header wiring and full original
+pin/request/publication admission remain unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

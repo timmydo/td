@@ -2462,6 +2462,15 @@ Initial independently landable increments:
   eight Rust intervals qualify API §1.148. Header rendering, full admitted
   request wiring and authenticated publication remain later.
 
+- **M06er — resident header arrays:** stream original source-ordered,
+  case-preserving EmailHeader objects through existing Scanner/Raw/JSON
+  engines. Preserve duplicate fields and Raw folds/filtering without a
+  growing header table or decoded string. Keep original budget leases and
+  fresh handoff, sticky prefix/admission refusals and bounded turns. Nine
+  units, four guards and eight Rust intervals qualify API §1.149.
+  Fixed-window retention, selected body-part header wiring and original
+  pin/authenticated publication admission remain later.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

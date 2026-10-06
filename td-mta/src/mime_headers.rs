@@ -1,4 +1,5 @@
 //! Bounded raw header extents; no value normalization or source ownership.
+pub mod json;
 use crate::{
     admission::work::{Meter, Stop},
     header_work::{Charge, Work},

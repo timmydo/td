@@ -6392,6 +6392,58 @@ intervals remain separate. Other shapes/masks/limits, native allocation,
 stack/RSS, header/header:* rendering, full request admission/wiring and
 current authenticated publication remain unqualified.
 
+### 1.149 Resident source-ordered header arrays
+
+M06er adds mime_headers::json::Cursor over one caller-authorized immutable
+resident Input, including original base, header limit and EOF/prefix
+knowledge. Reuse Scanner's tolerant recognized-field/body-boundary policy;
+this is not a stricter replacement parser. Actual EOF completes an
+unterminated final field; an exhausted prefix without a recognized boundary
+refuses Truncated. Preserve original field order, duplicate names and name
+case. Emit EmailHeader objects with name and value members, using the
+existing Raw scalar and JSON string engines. Keep colon-following whitespace
+and embedded folds, exclude the terminal line ending, drop NUL through Raw,
+and retain its existing UTF-8/noncharacter replacement and diagnostics.
+Do not interpret encoded words or normalize combining sequences.
+
+Each caller-output fragment is provisional until whole healthy completion.
+The cursor retains original job/HeaderBudget borrows across exclusive scan
+and Raw phases. It maps only original scanner extents into that same Input.
+No field-byte vector, header table, decoded string, growing output or second
+scanner is created. Each scan turn visits at most 255 bytes and charges at
+most 256 interpretation steps; string turns reuse the existing bounded Raw
+and six-byte JSON frame. Literal copies are at most 64 prepaid bytes with
+one interpretation step per nonempty turn; each name/value begin turn also
+pays one interpretation step. Raw and coordinator credits stay
+private and non-replayable. The original source visits, interpretation steps,
+job records and wire bytes remain charged; no unlink operation is added.
+Zero-capacity output checks fresh admission without advancing or paying work.
+
+Constructor, every unfinished turn, explicit checks and consuming finish
+check the supplied job deadline and live interpretation admission. Complete
+polls remain inert. Refusals retire the owner, hide completion and remain
+sticky. Fresh finish hands back the exact original Meter/HeaderBudget with
+passive End and encoding diagnostic; it cannot recover emitted output or
+provide source/pin/publication authority. The caller must bracket turns with
+fresh clock/cancellation and original pin checks. Cursor plus HeaderBudget
+fits 512 bytes; Completion fits 64 bytes; caller output is separate storage.
+
+Nine units and four compile-fail guards pin literal ordered Raw JSON, source
+EOF/prefix and tolerant boundary semantics, replacement/filtering/escaping,
+every incomplete prefix, offset/header limits, zero-capacity/prepaid wire
+refusals, every unfinished deadline cut and completed admission, exact budget
+handoff, exact simple-field whole-run charges, budgeted Raw replay refusal
+and bounded scans/interpretation/job refusals. Eight Rust allocation
+intervals cover empty EOF, folded ordered headers, malformed Raw bytes,
+incomplete prefix, wire refusal, header-limit refusal, unfinished expiry and
+completed release expiry. Source/budget/output preparation stays cold;
+constructor, polling and consuming refusals remain measured. Validate all
+sixteen counter snapshots before comparing pairs. Earlier 241 intervals stay
+separate on the accepted retention parent. Fixed-window retention,
+configurable body-part header composition, original pin/admitted request
+integration, authenticated publication, native allocation and stack/RSS
+qualification remain later.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
