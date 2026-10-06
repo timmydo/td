@@ -1,4 +1,5 @@
 //! Source-bound part members; current access authorization and publication follow.
+pub mod retained;
 use super::{Bound, Error};
 use crate::{admission::work::Charge, nfc::HeaderBudget, ports::Tick};
 pub use td_json::string::{Progress, Status};

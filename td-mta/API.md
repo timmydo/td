@@ -5421,6 +5421,46 @@ Only the listed eight intervals are measured. Supplied-Tick and step/record
 refusal, post-copy clock expiry, Invalid/Busy clocks, sticky/cached polling
 and premature finish remain unqualified for Rust allocation.
 
+### 1.129 Whole source-bound part-member retention
+
+M06dx adds pinned::members::retained. Cursor::new consumes original Bound,
+selects one ordinal and privately constructs a fresh member emitter
+bound to a separately admitted caller window. Advanced emitters and
+completed emission owners cannot replace original Bound. Window advances
+only by reported bytes, adding no wire charge. Fresh original-job and
+actual-pin checks precede capacity refusal; source emitter post-work
+pin fences retain deadline precedence over quota failure. Refusal hides
+all partial values. Cached Complete stays inert; explicit checks and
+consuming finish remain fresh, including an exactly full window. Any
+copied bytes after refusal remain provisional and must be discarded.
+
+Complete finish yields private Retained, holding original Member and
+whole member bytes. Its fresh low-level release returns original Bound,
+ordinal and retained bytes. View is passive and provisional; whole
+collection/composition, request selection, current access authorization
+and publication still follow. The caller reservation uses checked
+fragment length plus 81 bytes for the largest suffix: ten blobId prefix
+bytes, 69 canonical p1 bytes and two quotes. This conservative bound also
+covers multipart null. It grants no source or completion authority and
+must overlap existing original source/windows/candidates and pin leases.
+
+Cursor, HeaderBudget, five borrowed segments and 64 output bytes fit
+1 KiB; Retained fits 768 bytes. This is a conservative size envelope;
+the wrapper writes directly into caller backing and allocates no extra
+64-byte scratch. These caps do not enforce whole-job ledger reservations. Eight sequential Rust allocation intervals measure
+construction through retention/release/refusal and descriptor teardown
+after cold original mapping, source matching, backing and filesystem
+setup. Cover near-u64 leaf and zero-base container success,
+partial/completed/Retained actual-pin-clock expiry, short window, wire
+refusal and constructor pin expiry. Enclosing pooled
+view and scratch lease release remain outside counting. Only these
+intervals are qualified. Supplied-job-Tick expiry, record/step refusal,
+post-work pin expiry, invalid ordinal, premature finish, cached re-poll,
+Retained::check_deadline and clock Invalid/Busy remain unmeasured, along
+with native allocation, stack, RSS and complete-service admission.
+Earlier 65 metadata/locator, eight binding and eight member intervals
+remain separate evidence.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

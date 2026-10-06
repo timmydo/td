@@ -2247,6 +2247,19 @@ Initial independently landable increments:
   Rust allocation intervals; whole tree/list composition, current access
   policy, request selection and authenticated publication remain later.
 
+- **M06dx — whole source-bound part-member retention:** consume original
+  Bound into a fresh member emitter with a fixed caller window. Advance
+  only reported bytes, preserve fresh deadline-before-capacity order,
+  sticky refusal and post-work actual-pin fences. Retain whole bytes and
+  exclusive Member through fresh original Bound release. Check fragment
+  length plus 81 for caller reservation. Pin byte/cost/backing parity,
+  exact fit, every shorter capacity and funded prefix, final checks,
+  constructor/refusal ordering, quota refusal and compile guards. Add
+  eight enumerated Rust allocation intervals with actual-pin-clock
+  expiry, leaving the variants listed in API §1.129 unmeasured; whole
+  collection and composition, request selection and current
+  authorization follow.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

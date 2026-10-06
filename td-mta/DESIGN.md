@@ -780,6 +780,16 @@ releasing original Bound. Partial/error bytes remain provisional and
 must be discarded. This is one part-member building block; current
 access policy, whole tree/list composition and publication remain open.
 
+M06dx binds a fresh original source-bound member emitter to a fixed
+caller window and retains the whole fragment plus blobId before granting
+exclusive Retained ownership. Deadline checks precede capacity, with
+original output charging and post-work pin fences preserved. Checked
+fragment length plus 81 reserves the worst suffix while all original
+backing and actual descriptor overlap. Fresh final release preserves
+original Bound; passive retained bytes alone cannot establish source
+custody or publication. Whole collection/composition and current access
+policy remain later boundaries.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

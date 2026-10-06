@@ -2384,6 +2384,24 @@ scratch-lease release stays outside counting. Existing 65 metadata/locator
 and eight binding intervals remain separate. Native/stack/RSS, complete
 request admission, current access policy and publication remain open.
 
+M06dx whole source-bound part-member retention constructs its emitter
+fresh from original Bound and advances a shared fixed Window only by
+reported bytes. It adds no wire charge or replacement allowance. A
+checked fragment length plus 81 bounds the largest blobId suffix and
+covers multipart null; that separate caller reservation overlaps every
+original source/window/candidate and actual descriptor/pool borrow.
+Cursor plus HeaderBudget, five borrowed segments and 64 output bytes
+fits 1 KiB; Retained fits 768 bytes. Complete ledger and worker-stack
+bounds remain open. Eight sequential Rust allocation intervals measure
+construction, retention and descriptor teardown for near-u64 leaf and
+zero-base container success, partial/completed/Retained actual-pin-clock
+expiry, short window, wire refusal
+and constructor expiry. Backing, mapping, source matching and file setup
+precede counting; enclosing pooled-view/scratch-lease release stays
+outside. Only these eight intervals are qualified; API §1.129 records
+remaining unmeasured boundaries. Existing 65 metadata/locator, eight
+binding and eight member intervals remain separate.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no
