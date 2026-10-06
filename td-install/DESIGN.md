@@ -1399,8 +1399,12 @@ is a format check, not a complete PE loader or signature verifier.
 The signed selector packaging and full system firmware oracle remain
 required. The stub has a built-in command line naming
 `initrd=/EFI/BOOT/INITRD`, `console=ttyS0,115200`, `rdinit=/init`,
-and `panic=-1`. `CONFIG_CMDLINE_OVERRIDE` stays off so firmware,
-direct-kernel tests and kexec can supplement those defaults. `INITRD` is
+and `panic=-1`. ENCRYPTION.md increment 7 ("Keyboard console") puts
+`console=tty0` before `console=ttyS0,115200`, so kernel messages also
+reach the VT while `/dev/console` stays `ttyS0`; until that commit the
+line names the serial console alone. `CONFIG_CMDLINE_OVERRIDE` stays
+off so firmware, direct-kernel tests and kexec can supplement those
+defaults. `INITRD` is
 an 8.3 name on the same FAT filesystem as `BOOTX64.EFI`. Linux's EFI
 loader converts these forward slashes to FAT separators; forward slashes
 also satisfy td-boot's unquoted printable command-line grammar.
@@ -1412,13 +1416,25 @@ oracle passes `audit=1`. Linux permanently disables audit initialization on
 any earlier `audit=0`; a later `audit=1` cannot restore it. The built-in
 prefix therefore contains no audit token. Firmware boots without an explicit
 policy retain Linux's initialized but disabled audit default; initialization
-can still permit unconditional seccomp diagnostics. A hardware console policy is a
-v2 requirement before claiming support on machines without a serial port.
+can still permit unconditional seccomp diagnostics. The selector's
+keyboard console is no longer deferred: increment 7 specifies it
+(ENCRYPTION.md "Keyboard console"), with the firmware framebuffer in the
+kernel, td-boot's lines mirrored to the VT and the recovery prompt on
+both consoles, and the installer encrypts only where the live system
+shows one ("Activation"). Until those commits land, the selector's
+console is the serial line alone. What stays deferred is a display with
+neither a UEFI GOP framebuffer nor a td driver, a keyboard td's kernel
+has no driver for (USB keyboards on ports served by OHCI or UHCI
+controllers, companions included, and I2C-HID and Bluetooth keyboards),
+keymaps other than US on the VT, and a
+console policy for the running system's own text greeter, which stays
+on `ttyS0`, so a machine without a serial port has none.
 Each kernel entry prepends the built-in prefix; selector-to-deployment
 kexec therefore adds a second copy. The current short profile arguments
 fit, but this consumes part of both td-boot's 2048-byte command-line bound
-and the kernel's 2048-byte buffer. Future argument expansion must reserve
-room for that second prefix rather than relying on kernel truncation.
+and the kernel's 2048-byte buffer; increment 7's `console=tty0` adds 13
+bytes to each copy. Future argument expansion must reserve room for that
+second prefix rather than relying on kernel truncation.
 
 The x86 kernel recipe discards the inherited EFI initrd configuration-table
 entry before parsing tables on a kexec boot. Its one-shot loader allocation
@@ -2207,6 +2223,13 @@ The guest legs that need the recovery key (`encrypted-headers` and
 media when each boot ends. Each disk copy is searched by
 `encrypted-inspect` before it is deleted. Every boot's console is
 captured whole to a private file and scanned as raw bytes.
+
+ENCRYPTION.md increment 7 changes both oracles ("Acceptance evidence"):
+the guest's service runs without the storage operand, which is deleted,
+so its no-TPM leg expects an unencrypted review rather than a refusal,
+and legs without a display device or without a keyboard expect one too;
+`qemu-boot-encrypted` gains the default wizard's leg and a recovery
+answered on the VT.
 
 The oracle signs with a **per-run throwaway key**: generate a keypair, sign
 the staged bundle, build `td-boot` pinned to that run's public key, boot, and

@@ -305,8 +305,9 @@ volume or runs it. Then it:
    skips the cap, so a machine without one still boots the live medium
    and installs unencrypted. The console says the cap is starting, since
    a stuck TPM holds each command for the kernel's timeout, and then
-   names each outcome; `qemu-boot-live` attaches no TPM, so its boot is
-   the skip's evidence;
+   names each outcome (from ENCRYPTION.md increment 7, on the VT as well
+   as the serial console, "Keyboard console"); `qemu-boot-live` attaches
+   no TPM, so its boot is the skip's evidence;
 1. takes half of `MemTotal` as the RAM disk size, refusing less than
    512 MiB;
 2. draws a fresh version-4 volume UUID from `/dev/urandom`;
@@ -374,6 +375,9 @@ its source under the key that booted it. A live session has no bundled
 session differs from an installed one in its windows: it opens the
 installer wizard and no other (INSTALLER.md "Live startup"), which
 `qemu-boot-live` proves on this medium, and td-authd binds its setup intake
-in place of the deployment intake.
+in place of the deployment intake. At ENCRYPTION.md increment 7's
+activation the live session is also what the installer's
+keyboard-console probe observes ("Activation"): it runs the kernel an
+installed selector runs, on the machine being installed.
 
 `build-iso` ("Live installation media") provisions the live selector.

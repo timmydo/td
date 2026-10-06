@@ -10,8 +10,10 @@ that evidence, run on demand rather than by `check` or `ready`; it boots
 the medium as USB storage, `./test-iso` boots it as optical media by hand,
 and `qemu-boot-media` and `qemu-install-system` boot their own media both
 ways. Version 1 fixes the keyboard layout at `us`: a choice of layout waits
-for a keyboard catalog, a later increment. Every home-path consumer now
-follows the installed account ("Media, boot and persistence").
+for a keyboard catalog, a later increment. From ENCRYPTION.md increment
+7, the selector's disk-recovery prompt reads the kernel's US keymap
+whatever layout is chosen ("Keyboard console"). Every home-path consumer
+now follows the installed account ("Media, boot and persistence").
 
 ## Version 1
 
@@ -45,7 +47,11 @@ ESP and the td Btrfs volume.
 The wizard collects one human username, hostname and timezone; the keyboard
 layout is `us`, the only one version 1 admits. Storage is unencrypted and
 the installed account automatically enters the desktop. The welcome and
-final review screens disclose those facts. There is no PIN field, password
+final review screens disclose those facts. From ENCRYPTION.md increment
+7's activation, storage is device-bound where the live system has a
+usable TPM 2.0 and a keyboard console and unencrypted otherwise, which
+the review states with its reason; the account still enters the desktop
+automatically ("Storage choice"). There is no PIN field, password
 substitute or inert enrollment screen. [ENCRYPTION.md](ENCRYPTION.md) owns
 the later complete encrypted boot, hardware-backed PIN, recovery and
 session-authentication cutover. No account secret is needed to install.
@@ -354,13 +360,14 @@ place of the unencrypted notice that storage is encrypted to this
 computer's TPM, which does not protect a lost computer, that the account
 signs in automatically, and that a recovery key follows; the tier's full
 review disclosures (ENCRYPTION.md "Device-bound default") are increment
-7's, with its activation. It cannot authenticate the source, establish a
-disk claim or authorize execution; the service and compositor-owned trusted
-consent remain mandatory. In the live window it shows the service's review,
-never the drafts: PageUp and PageDown move between its detail pages, Return
-sends execute with the review exactly as the service returned it, once, and
-Escape returns to settings and sends withdraw with the review's nonce,
-releasing the review and its disk claim before anything else is asked; an
+7's, with its activation ("Storage choice"). It cannot authenticate the
+source, establish a disk claim or authorize execution; the service and
+compositor-owned trusted consent remain mandatory. In the live window it
+shows the service's review, never the drafts: PageUp and PageDown move
+between its detail pages, Return sends execute with the review exactly as
+the service returned it, once, and Escape returns to settings and sends
+withdraw with the review's nonce, releasing the review and its disk
+claim before anything else is asked; an
 execute already sent is answered first, and one that already ended the
 review cancels the release. An execute refused as consent unavailable is
 shown under the warnings and leaves the review held, so it may be executed
@@ -820,6 +827,83 @@ increment 7 activates the tier; the completion page's display and
 type-back are reached by td-setup's own tests and a caller that starts
 the service with the operand.
 
+### Storage choice
+
+This section is ENCRYPTION.md increment 7's target; none of it is
+implemented. Today the operand below chooses storage and td-authd
+declines a device-bound review.
+
+Increment 7's probe commit gives the plan one byte after the storage
+byte, the storage basis: bit 0 set when the service's TPM probe passed
+and bit 1 when its keyboard-console probe passed (ENCRYPTION.md
+"Activation" defines both), any other bit refused. The plan's magic
+becomes `TDPLAN03`, its maximal record 1193 bytes, and the greeting
+`TDINS06`, the earlier versions refused rather than negotiated; a
+propose request carries no basis, as it carries no storage. The consent
+channel's review report keeps its storage byte alone and its `TDINA02`.
+In that commit `serve` runs both probes at every start, once each, after
+admission and before its greeting, and records them in every plan, and
+the review page shows the basis on a detail row. Nothing acts on them:
+storage still follows the operand, and a device-bound service still
+refuses to start without a usable TPM.
+
+The activation commit deletes the operand. Every plan then names
+device-bound storage exactly when its basis has both bits, and
+unencrypted storage otherwise; nothing refuses for a missing TPM or
+keyboard console. td-authd starts the service as today, no longer
+declines a device-bound review, and its consent summary shows the plan's
+storage in place of the fixed unencrypted policy, with td-authd/DESIGN.md
+amended in that commit. td-setup follows a device-bound review it
+executed through the recovery-key phase as now.
+
+From activation the welcome page says that storage will be encrypted to
+this computer when it has a usable TPM 2.0 and a screen and keyboard its
+startup recovery prompt can use, and unencrypted otherwise, that the
+review says which, and that the account signs in automatically either
+way. An unencrypted review states that storage is unencrypted and why:
+no usable TPM 2.0, no keyboard console (a framebuffer console and a
+keyboard with Enter and the top-row digits), or both; and that the
+account signs in automatically. A device-bound review states, beside
+the destructive-loss notice and across its detail pages, every one of
+ENCRYPTION.md's disclosures for the tier, in wording that may be shorter
+but drops none:
+
+- Storage is encrypted to this computer and released at power-on with
+  no interaction. That is device binding, not authentication of a
+  person: anyone who powers on this computer with its TPM unlocks the
+  disk and reaches the desktop, which the account enters automatically.
+  It protects the disk read away from this computer (a removed drive or
+  a copied image), not a lost or stolen computer ("Device-bound
+  default").
+- What the disk held before installation is not erased: blocks the new
+  system has not overwritten keep it, readable to whoever has the disk
+  ("Device-bound formatting").
+- A recovery key follows. It is shown once, no copy is kept, and it must
+  be typed back before the installation completes; until then the disk
+  does not start. It is the only way to open the disk if this computer's
+  TPM, firmware measurements or startup files change.
+- Until the installed system first starts, release is not bound to this
+  computer's startup chain: any other system that leaves PCR 12 at zero,
+  td's live medium excepted, can release it, and so can the
+  administrator of an unencrypted td system running on this computer. A
+  one-time firmware boot-menu choice used for that first start can send
+  later ordinary starts to recovery.
+- When release fails, the recovery prompt appears on the screen and on
+  the serial console. The key's digits are never shown, but a console
+  server or BMC recorder on the serial line may record what is typed.
+- If this computer's TPM is missing at a start, or reaches the system
+  only after td's startup wait for it, that start goes to recovery, and
+  on a TPM that appears late the running system's administrator can
+  release the disk until the next restart.
+- The screen and keyboard found now are what recovery will expect. One
+  removed or changed later (a USB keyboard unplugged, a display moved to
+  a graphics card without UEFI GOP or a td driver) can leave recovery on
+  the serial console alone, where the computer has one; the live medium
+  and the recovery key still open the disk. A device that only
+  advertises a keyboard's keys (a security token, a receiver with no
+  keyboard paired, a barcode scanner) counts as a keyboard here.
+- The account signs in automatically.
+
 ## Installation service core
 
 `td-install serve [--storage device-bound] <td-boot> <deployment-directory>
@@ -857,7 +941,9 @@ zero. That read is td-protector's observed policy, made once on a fresh
 client and never retried; the probe seals nothing, and the TPM's state
 may change before execution, which seals under its own policy. Every plan
 the service reviews then names device-bound storage, and its execution
-formats it encrypted (DESIGN.md "Device-bound formatting").
+formats it encrypted (DESIGN.md "Device-bound formatting"). Increment
+7's activation deletes the operand, and the service then chooses
+storage from its own probes ("Storage choice").
 
 It holds at most one review, under the admission rules above. Propose
 checks, in order: busy; the settings (the username through `td-firstboot

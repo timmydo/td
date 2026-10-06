@@ -134,8 +134,10 @@ releases in this order, and no step may move earlier:
 When the cap runs, it closes release until the next platform reset on
 every later path, including refusal, recovery and `kexec`. No other td
 component extends PCR 12. The installed selector caps PCR 12 when its
-volume is encrypted; on an unencrypted volume it makes no TPM contact
-until activation (increment 7). The live selector's cap is MEDIA.md's
+volume is encrypted; on an unencrypted volume it makes no TPM contact,
+and increment 7's activation ("Activation") leaves that unchanged, so
+the residual below for a not-yet-booted disk's first-boot protector
+stays. The live selector's cap is MEDIA.md's
 ("Live boot"): it caps whenever a TPM device is present, proceeds when
 PCR 12 is already closed or the TPM has no SHA-256 bank, and skips the
 cap without a device.
@@ -184,9 +186,12 @@ so that most firmware updates are intended to keep releasing.
 
 When release fails, the selector enters a recovery flow on its console. It
 never falls back to plaintext, retries with weaker policy, or skips the
-volume. That console is the serial console the selector's built-in
-command line names (DESIGN.md "Full-system volume consumers"); a keyboard
-console is increment 7's activation gate. The selector reads the
+volume. Today that console is the serial console the selector's
+built-in command line names (DESIGN.md "Full-system volume consumers").
+Increment 7's target adds the keyboard console ("Keyboard console"): the
+same prompt on the serial line and on the screen's virtual terminal,
+read from whichever completes an entry first; until it lands, a machine
+without a serial console shows the prompt nowhere. The selector reads the
 recovery key through td-init's secret-line applet with echo off, so its
 digits are never echoed; a console server or BMC recorder on the serial
 line may still log what is typed, which the review discloses. The applet,
@@ -267,7 +272,10 @@ be unencrypted, and installation proceeds only under that disclosed plan.
 Before activation, the service started with the device-bound operand
 probes for a usable TPM and refuses to start without one; it never falls
 back to an unencrypted volume. The default wizard's unencrypted disclosure
-changes only at activation (increment 7).
+changes only at activation (increment 7). There the operand is gone and
+the service chooses for itself: device-bound only when this probe passes
+and the live system shows a keyboard console, unencrypted with the
+disclosure otherwise, and it refuses neither ("Activation").
 
 Upgrading to the protected tier enrolls and verifies its protectors, then
 re-encrypts the volume online to a fresh volume key, keeping only those
@@ -288,7 +296,8 @@ td-authd never passes it; the encrypted-installation oracle does. No
 review, wizard page or request selects it: storage policy is not a
 caller-selectable flag. The default installation stays unencrypted, and no
 text may describe disk confidentiality as shipped. Increment 7 deletes the
-operand in the landing that makes the tier the default.
+operand in the landing that makes the tier the default, when `td-install
+serve` starts choosing storage from its own probes ("Activation").
 
 The volume is formatted with exactly these parameters, the device being a
 loop over the volume's extent (DESIGN.md "Device-bound formatting"):
@@ -492,6 +501,270 @@ binaries change, but an unencrypted volume's boot makes no TPM contact
 and takes the same steps, beyond `mount-root`'s removal of a key member
 and an `initrd.image` that are not there. On a machine with a TPM, the
 live selector's cap is the one change a live boot shows.
+
+## Keyboard console
+
+This section is increment 7's target; none of it is implemented. It
+gives the selector's recovery flow a screen and keyboard beside the
+serial line, which stays.
+
+The built-in command line (DESIGN.md "Full-system volume consumers")
+gains `console=tty0` before `console=ttyS0,115200`. Linux writes its
+messages to every console the command line names and makes the last one
+`/dev/console`, so kernel messages reach both the foreground virtual
+terminal (VT) and the serial line, while `/dev/console`, and with it the
+standard streams of both initramfs' init, stays `ttyS0`: serial
+diagnostics and the oracles' console capture and typing are unchanged.
+The prefix appears once per kernel entry, so the selector-to-deployment
+`kexec` carries its 13 added bytes twice, inside the command-line budget
+DESIGN.md states.
+
+The kernel gains the firmware framebuffer: `CONFIG_SYSFB_SIMPLEFB`
+presents a UEFI GOP framebuffer whose pixel format simple-framebuffer can
+describe as a `simple-framebuffer` device, and `CONFIG_DRM_SIMPLEDRM`
+drives it with DRM's fbdev emulation, so fbcon draws the VT on any such
+display before, or without, a native driver. Both are pinned and guarded
+over the resolved configuration as the other console and display symbols
+are (the linux-x86-64 recipe); Linux 7.1.4's `DRM_EFIDRM` and
+`DRM_VESADRM` require `SYSFB_SIMPLEFB` off, so neither is built. A native
+driver takes the display over. In Linux 7.1.4 `sysfb_init` is a device
+initcall in `drivers/firmware`, linked after the GPU drivers, and
+virtio-gpu (as virtio-vga) and i915 remove a conflicting firmware
+framebuffer and disable sysfb when they probe its device; so on a
+machine they drive, simpledrm never binds, fbcon draws on the native
+driver's framebuffer and that card is `card0`. A native driver whose
+probe is deferred past that point removes simpledrm's device when it
+binds, and fbcon moves to it, but its card may then not be `card0`:
+DRM takes the lowest free minor, and simpledrm's is freed only once
+nothing holds it open. On a
+GOP display td has no driver for, simpledrm's card is `card0`
+(td-compositor/DESIGN.md says what the compositor does with it). A GOP
+mode simple-framebuffer cannot describe gets no framebuffer and no
+fbcon.
+
+The VT uses the kernel's built-in keymap, `defkeymap.map`, which is US,
+whatever layout the installed system uses: nothing in the selector loads
+a keymap. The kernel reads key positions, not legends (PS/2 scan codes
+and USB HID usages both name positions), and the keymap turns the top
+row's keys, unshifted, into `1` to `0` from left to right. So a keyboard
+whose top row carries those digits in that order, shifted or not (AZERTY
+shifts them), enters the recovery key's digits whatever its printed
+layout. The selector does not change Num Lock. The kernel starts the VT
+with it as the boot parameters report it, which on td's firmware entry,
+the EFI stub's zeroed parameters, is off; with it off the keypad's digit
+keys send cursor-key escape sequences, which td-protector's codec
+refuses by byte, prompting again, and pressing Num Lock makes them
+digits. The reseal answer is read under the same keymap, so on a
+keyboard whose letters sit elsewhere (AZERTY's A and Q) `reseal` is
+typed at its US key positions, which td-boot's mirrored line before the
+question says; a mistyped answer declines, the safe answer, which leaves
+the header unchanged.
+
+Which terminal `/dev/console` is cannot be learned from its descriptor:
+`fstat` on any open of `/dev/console` reports the console device, 5:1,
+never the terminal behind it, and `/dev/tty1` is 4:1. Both td-boot and
+secret-line therefore read `/sys/class/tty/console/active`, up to 4096
+bytes, one sysfs page, whose last space-separated entry names the
+terminal `/dev/console` is (Linux 7.1.4's `show_cons_active` lists the
+enabled consoles with `/dev/console`'s last). An entry `tty1`, or
+`tty0`, which names the foreground VT and so tty1 here, means the VT is
+`/dev/console`; any other name means it is not. Both initramfs mount
+sysfs before td-boot runs, and no ioctl is needed for this.
+
+td-boot writes each console line to standard error as today and, in both
+initramfs, the same bytes to `/dev/tty1`, opened once, write-only,
+`O_NOCTTY` and `O_NONBLOCK`: in the selector's `on-volume boot` and
+`live-boot`, and in the deployment initramfs's `on-volume mount-root`,
+`on-volume mount-var`, `root-loop`, `live-root` and `live-seed`, the
+verbs those inits run. No other run mirrors, so the running system's VT,
+which the compositor's display covers, gets nothing from td-boot. A line
+is mirrored whole, after its standard-error write. There is no mirror
+when `/dev/console` is the VT, or when `active` cannot be read or
+parsed, so no line is written twice to one terminal. Nothing waits on
+the mirror: a mirrored write that would block or is short (a VT stopped
+by Scroll Lock or `^S`) is abandoned for that line, and the next line is
+tried afresh, so a stopped VT misses lines only while it is stopped. A
+mirror that cannot be opened, or whose write fails with a hard error
+(`EIO`, `ENXIO` or `EBADF`), is said once on standard error and dropped
+for the rest of the run. td-boot's own standard-error writes stay
+blocking, as today, so a serial line held by flow control
+(XOFF from a console server) holds td-boot at its next line, as it does
+today, and so holds the VT's prompt too, which td-boot has not yet
+reached: that step is not bounded. Nothing td-boot prints carries a
+secret, mirrored or not: the recovery key reaches it only through
+secret-line's pipe, and protector secrets and the volume key only
+through descriptors. Before its first recovery prompt td-boot prints one
+line naming the entry: the 48 digits on the keyboard's top row,
+unshifted, spaces or hyphens between groups optional, keypad digits only
+with Num Lock on. Before the reseal question it says that the answer is
+typed at its US key positions. The prompts themselves, `td recovery
+key: ` and the reseal question's, are unchanged.
+
+td-init's secret-line keeps its one operand and takes no device operand.
+It opens two fixed lines, each read-write, `O_NOCTTY` and `O_NONBLOCK`:
+`/dev/console`, which the command line makes the serial console, and
+`/dev/tty1`, the first VT. That is the foreground VT, since nothing in
+either initramfs switches VTs; `/dev/tty0` would name whichever VT is
+foreground when opened, so the applet names tty1 to fix the identity.
+Its node is devtmpfs's: both initramfs mount devtmpfs on `/dev` first,
+which shadows
+the cpio's own `/dev`, and the VT driver registers `tty1` whenever
+`CONFIG_VT` is set, with or without a display or keyboard, so the
+selector cpio needs none, and the increment's check requires the node in
+the booted selector. When `active` says `/dev/console` is the VT (a
+firmware load option naming `console=tty0` last does that), the two
+names are one terminal and the applet opens `/dev/console` alone as its
+one line; so it does when `active` cannot be read or parsed, which is
+today's single line. Termios is saved once per terminal, before anything
+changes it, so a restore never writes back settings the applet itself
+silenced.
+
+No step waits on one line's output while the other could be read, so a
+line stopped by flow control (a VT stopped by Scroll Lock or `^S`, a
+serial line held by XOFF from a console server) cannot stop entry on
+the other, and no path halts on a transient stop. The draining `TCSETSF`
+is replaced, with one line or two, by a plain `TCSETS` with its readback
+and a non-draining input flush, `TCFLSH` with `TCIFLUSH`. For each line,
+serial first, echo-off is today's patch applied with `TCSETS` and read
+back, then that flush, which discards what was typed before it, under
+either setting; what arrives after it is not echoed and is read. Only
+once every line it kept is silent and flushed does the applet write the
+prompt to each, so a key typed on a line before that line's flush is
+discarded. A line that cannot be opened, or whose settings cannot be
+read, set or read back as computed, is skipped before the prompt: any
+settings it changed there are restored and its input flushed, and a note
+naming it goes to the line that remains. A VT that opens but has no
+display or keyboard is kept; it never completes an entry. With no line
+left the applet fails with status 1, which td-boot treats as any other
+failure of the applet: it refuses boot and halts.
+
+Prompt and note bytes are queued per line and written through the
+non-blocking descriptors. A write that would block (`EAGAIN`) or is
+interrupted (`EINTR`) leaves the line's queue as it was, and a short
+write leaves the rest from its offset; either way the line stays
+readable and its queue is finished when `poll(2)` reports `POLLOUT` for
+it. A line is dropped only on a hard error: a write failing with `EIO`
+(which a hung-up terminal also returns), `ENXIO` or `EBADF`, or `poll`
+reporting `POLLERR` or `POLLNVAL` for it. A dropped line is restored
+and flushed as below, with a note queued on the line that remains, and
+with no line left the applet fails as above. A stopped line therefore
+only delays its own prompt, which appears when the line resumes, while
+what is typed on it is still read.
+
+The applet waits in that one `poll(2)` loop, with no timeout, asking
+`POLLIN` of every line and `POLLOUT` of every line with queued bytes. A
+canonical line is readable only once a whole record is queued or it hung
+up (Linux 7.1.4's n_tty reports input only up to its canonical head), so
+the wait ends at the first line that completes a record, by newline or
+`^D`; a `POLLHUP` is read, so a hang-up is end of input as today rather
+than a dropped line. When both lines are readable at once, the serial
+line is read. Queued prompt bytes still unwritten when a record arrives
+are discarded with the wait. That line's one record is read and judged
+exactly as today, per
+line: the 256-byte bound, a longer record or one holding a newline
+refused whole (status 4), and end of input at `^D` or a hang-up (status
+3). Then every line is restored with `TCSETS` and read back exactly, and
+every line not read is then flushed with `TCIFLUSH`, which discards what
+was typed there with echo off, partial or whole, so no unechoed digits
+stay queued for a later reader. Each line then gets one attempt at its
+newline, non-blocking: echo is back on and the newline is cosmetic, so a
+line that is stopped or takes it short is not waited on, since waiting
+there would hold an entry already made on the other line. Only once
+every restore succeeded is the line written to the pipe. The reseal
+question runs the same way, on both lines.
+
+On one line this changes the landed applet only in what it waits in.
+Today it writes the prompt with a blocking write, so a line held by
+XOFF waits there for XON before anything is read. In the new loop a
+lone stopped line still waits, now in `poll(2)`, until it resumes or a
+record arrives, and keys typed meanwhile are read; and the trailing
+newline, which today blocks with echo back on, is attempted once. Its
+guarantees stay: echo off before the prompt, input before the flush
+discarded, the same record rules and statuses, and the restore on every
+path. No path, on one line or two, halts on a transient XOFF.
+
+End of input on either line ends the entry and halts the boot, as today,
+and halting keeps a line that answers end of input at once from spinning
+the prompt. It cannot cut short a person typing on the other line,
+because an idle line never reads end of input: the kernel starts its
+serial lines with modem control off (`CLOCAL`), so a serial line with
+nothing attached delivers no byte and no hang-up and its read blocks,
+and a VT with no keyboard blocks the same way. End of input therefore
+comes only from a `^D` someone typed or a line that hung up.
+
+`poll(2)` is a new td-init syscall and `TCFLSH` a new ioctl request,
+replacing `TCSETSF`, which is then left with no caller, so the
+secret-line commit amends UNSAFE.md §3 (planned there) and the amendment
+becomes current with it. These commits change what a boot shows, never
+what it does: an unencrypted volume's boot still makes no TPM contact
+and takes the same steps.
+
+## Activation
+
+This section is increment 7's target; none of it is implemented, and
+until it lands `td-install serve` follows its storage operand
+("Device-bound formatting").
+
+At activation `serve` takes no storage operand. Once its admission
+checks pass and before its greeting, it runs two probes, each once, and
+records both outcomes in every plan (INSTALLER.md "Storage choice"):
+
+- the TPM probe as today: PCR_Read of PCRs 4 and 9 in the SHA-256 bank
+  answers that bank, and neither value is zero. It now records rather
+  than refuses.
+- the keyboard-console probe of the running live system, through sysfs:
+  some `/sys/class/vtconsole/vtcon*` whose `name` reads exactly
+  `(S) frame buffer device` and a newline and whose `bind` reads `1` and
+  a newline (fbcon is bound to the VT; Linux 7.1.4's `vt.c` prints a
+  built-in console driver's name that way), and some
+  `/sys/class/input/input*` whose `capabilities/key` bitmap sets
+  `KEY_ENTER` (28) and `KEY_1` to `KEY_0` (2 to 11), the keys an entry
+  needs. That bitmap is Linux 7.1.4's `input_print_bitmap` on a 64-bit
+  kernel: one to twelve words (`KEY_MAX` is 767), each 1 to 16 lowercase
+  hexadecimal digits without `0x`, separated by single spaces and ended
+  by one newline; the most significant word comes first, leading zero
+  words are omitted, a later zero word is written `0`, the last word
+  holds bits 0 to 63, and an empty bitmap is `0` alone. Each attribute
+  is read up to 4096 bytes, one sysfs page; one that is missing, longer,
+  unreadable or outside those grammars is malformed and counts as
+  absent, never present, and a listing that fails fails the probe.
+
+Every plan of that service names device-bound storage when both probes
+passed and unencrypted storage otherwise. Neither outcome refuses a
+start, a proposal or an execution: a machine without a usable TPM, or
+without a keyboard console, installs unencrypted under the disclosed
+plan, and one with both installs device-bound. Execution does not probe
+again; the TPM's state may change before execution, which seals under
+its own policy, as today.
+
+The keyboard-console probe is a proxy for the selector. The live medium
+boots the kernel an installed selector runs, with the same built-in
+command line, on the same hardware, and every driver is built in, so a
+framebuffer console and a keyboard the live system has at the probe are
+ones the selector will find. It sees only what is attached then. A
+display or keyboard removed or changed between installation and a later
+recovery (a USB keyboard unplugged, a display moved to a GPU with
+neither UEFI GOP nor a td driver) leaves a recovery the keyboard console
+cannot take; the serial console remains where the machine has one, and
+the live medium with the recovery key opens the volume for data access.
+The review discloses that limit. A keyboard attached only after the
+probe is not seen, and the plan stays unencrypted. The keyboard half
+reads advertised keys, not a keyboard a person types on: a HID device
+that advertises a keyboard's keys without being one, such as a security
+token's one-time-password interface, a wireless receiver with no
+keyboard paired or a barcode scanner, passes it, and the disclosed
+limit then applies.
+
+Automatic login remains and stays disclosed, and td-authd still never
+passes an operand: there is none. What remains deferred is hardware the
+probe refuses and so installs unencrypted: a display with neither a UEFI
+GOP framebuffer simple-framebuffer can describe nor a td driver, and a
+keyboard td's kernel has no driver for (USB keyboards on ports served by
+OHCI or UHCI controllers, companions included, and I2C-HID and Bluetooth
+keyboards); and a keymap
+other than US. Activation leaves the selectors as they are: the
+installed selector on an unencrypted volume makes no TPM contact, and
+the live selector caps as MEDIA.md says.
 
 ## Authentication and recovery
 
@@ -759,10 +1032,18 @@ same-uid process may impersonate the trusted UI or approve a request.
    half; the recovery flow with its confirmed reseal; and the
    `qemu-boot-encrypted` oracle.
 7. Activate the device-bound tier as the installer default on machines with
-   a usable TPM 2.0 whose selector console accepts keyboard input, amending
-   INSTALLER.md's disclosures in the same landing. A platform without such a
-   console is not activated until the selector gains one. Automatic login
-   remains and stays disclosed.
+   a usable TPM 2.0 whose live system shows a keyboard console ("Keyboard
+   console", "Activation"), amending INSTALLER.md's disclosures in the
+   same landing. A machine without both installs unencrypted, disclosed.
+   Automatic login remains and stays disclosed. Its commits, in order:
+   this specification; the kernel's firmware framebuffer and the
+   `console=tty0` prefix; td-init's secret-line on both consoles with
+   td-boot's mirrored lines, carrying UNSAFE.md §3's amendment, which
+   then becomes current; the installer's keyboard-console probe, inert:
+   recorded in the plan and shown on the review, not yet acting; and the
+   activation, which deletes the storage operand, makes the default,
+   changes the review, td-authd's consent summary and INSTALLER.md's
+   disclosures, and adds its oracle legs.
 8. In successive increments, add authenticated firmware entry, TPM PIN
    release and update policies, FIDO2 primary/recovery, the verified account
    handoff and the re-encrypting upgrade. Exercise them together before
@@ -960,6 +1241,62 @@ nor the recovery flow's `cryptsetup open` with the recovery key.
 Instead, td-protector's cryptsetup runner tests pin that each argument
 list is spelled exactly, that a child gets no environment, and that no
 key appears in argv.
+
+Increment 7's evidence ("Keyboard console", "Activation") extends both
+oracles. `qemu-boot-live`, which attaches no TPM, keeps proving the live
+selector's skip, and from activation its review must name unencrypted
+storage for want of a TPM. td-init's tests drive the two-line order
+through scripted lines (the first to complete is read, a partial entry
+on the other is discarded, a skipped line, no line, end of input on
+either, a line whose prompt write would block or is short finished on
+`POLLOUT` while the other reads, a hard write error dropping a line,
+one terminal under two names saved and restored once), and the
+keyboard-console probe's tests run over fixture sysfs trees (a bound and
+an unbound fbcon, a dummy console alone, key bitmaps with and without
+each needed bit, interior zero words, over-long and malformed
+attributes).
+
+- **Default wizard.** `qemu-boot-encrypted` gains a leg that boots the
+  production live medium over USB with the swtpm, a display device and
+  the PS/2 keyboard attached, and drives td-setup with physical keys as
+  `qemu-boot-live` does. The review must name device-bound storage with
+  its disclosures, td-authd's consent summary the same storage, and the
+  completion page must show the key. The host learns the key only from
+  that page's pixels, by QMP `screendump`, never from a console or an
+  evidence line. Its reference glyphs are the ten digits drawn by
+  td-ui's own rasterizer (`Face` over the `jetbrains-mono-nerd-font`
+  recipe's face, in the style and cell size the page draws the key in),
+  as `qemu-boot-live` already draws the status bar's expected text
+  (`update::BarText`); each digit cell must match exactly one of them.
+  It types the key back with physical keys. A misread fails closed: a
+  cell matching no digit, or more than one, fails the leg before
+  anything is typed, and a wrong digit is refused by td-setup's group
+  check or by the service as 17, recovery key mismatch, so the leg fails
+  and the installation never completes on a misread key. The installed
+  disk then boots through firmware twice with nothing typed, as "First
+  boot" and "Second boot" require.
+- **Storage choice without the operand.** `qemu-install-encrypted`'s
+  guest drives the service with no operand. With the swtpm and a display
+  device attached its plans are device-bound and its legs run as above.
+  Its no-TPM leg requires an unencrypted review naming the missing TPM in
+  place of the operand's refusal. Two legs with the swtpm require an
+  unencrypted review naming the missing keyboard console, and install
+  unencrypted: one with no display device (`-vga none` and no other, for
+  QEMU's default VGA would give OVMF a GOP and simpledrm a framebuffer),
+  so that no framebuffer console binds, and one with a display device
+  but no keyboard, its
+  machine `q35,i8042=off` (which the host QEMU 10.2.1 accepts) with no
+  USB or virtio keyboard attached.
+- **Recovery on the VT.** The changed-initramfs leg attaches a display
+  device and answers its three secret-line prompts and the reseal
+  question on the VT, through QMP key events to the PS/2 keyboard
+  (`input-send-event`), typing nothing on the serial line. Its serial
+  capture must hold the entry line and every prompt, which shows the
+  serial line was offered each, and never the key. The other
+  changed-chain legs answer on the serial line with the VT idle, as now.
+- **Prefix.** Every existing `qemu-boot-encrypted` leg keeps passing
+  with `console=tty0` in the built-in prefix, its serial capture and
+  typing unchanged.
 
 For the protected tier, require a real encrypted read/write roundtrip and
 reboot persistence; wrong PIN, missing token and changed boot measurements

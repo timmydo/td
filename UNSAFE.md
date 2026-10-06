@@ -413,6 +413,36 @@ from elsewhere that kills the applet while echo is off leaves the console
 silent until something sets it again, in the selector at most until `kexec`
 or reset.
 
+Planned, not current: `td-install/ENCRYPTION.md` increment 7 ("Keyboard
+console") puts secret-line on two fixed lines, `/dev/console` and the
+first virtual terminal, `/dev/tty1`, opened `O_NONBLOCK` so that no
+write waits on a line stopped by flow control, and needs these changes
+here, which its secret-line commit makes in this section, current from
+then. `poll(2)` becomes the ELEVENTH syscall: in one loop the applet
+waits for the first line to complete a canonical record and finishes
+each line's queued prompt bytes as the line accepts them. Its one
+wrapper is pinned whole: at most two descriptors, each a line the
+applet holds, events `POLLIN`, or `POLLIN` with `POLLOUT` for a line
+with queued bytes and nothing else, a timeout of -1, and the kernel's
+8-byte `struct pollfd` (an `int` descriptor and two `short`s) pinned by
+a size check as the termios length is, since the kernel writes `revents` back
+through that pointer. `TCFLSH` (0x540b) with `TCIFLUSH` (0) becomes a
+pinned request, its argument fixed by the wrapper: a non-draining input
+flush. It replaces `TCSETSF`, whose drain would hold the applet on a
+stopped line: echo-off becomes `TCSETS` with its readback and then that
+flush, and the restore of every line the applet did not read is
+`TCSETS` with its readback and then that flush, which discards what was
+typed there with echo off. `TCSETSF` then has no caller and leaves the
+roster, so it stays at six requests. Both new wrappers' one caller is
+the applet, through `term.rs` as the termios wrappers are, so
+`secretline.rs` still names nothing in `sys`. Which terminal
+`/dev/console` is comes from `/sys/class/tty/console/active`, read with
+std, never from an ioctl (`TIOCGDEV` stays off the roster), and termios
+is saved once per distinct terminal. The implementing commit also
+corrects `td-init/src/getty.rs`'s `drain` comment, which calls `TCFLSH`
+"a FIFTH ioctl request" its own amendment would add: `TCFLSH` is then
+pinned and `TCSETSF` gone, and the six requests stay six.
+
 `TCGETS`/`TCSETS` arrived with the `getty` applet, which is what took the
 LAST busybox name off the image — the tty setup half of the login chain,
 where `login` and `su` had already moved to td-login and `sh` to td-sh. What
