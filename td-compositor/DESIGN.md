@@ -5677,7 +5677,8 @@ opened and closed attention lifetime. Held keys, repeats and a second
 device pressing an already-held logical key cannot select an operation; a key held only by
 a security key's own keyboard does not count as held (below). Ordinary
 control, Wayland and portal input APIs cannot construct that physical
-selection. The screen accepts no credential bytes. For a write, root
+selection. The screen accepts no credential bytes but a login-key PIN
+step's, in the PIN field ("The PIN field" below). For a write, root
 returns the complete canonical target and role, which must be a Set
 operation for the configured owner. The client presents that exact
 description and requires the same presentation and commit receipts as
@@ -5918,9 +5919,13 @@ checks root's descriptions without the record or the device:
   it.
 
 A refusal ends the paired generation, as a secret operation's changed
-request does. A step that asks for a PIN (`0c`) is cancelled (`15`)
-with `NOT AVAILABLE IN THIS BUILD` until the PIN field (below) replaces
-that path; production reaches none. An end (`0d`, `0e`) carries a typed
+request does. Root's `0c` for the presented step that asks for a PIN
+opens the PIN field (below), and a PIN step's successor (under `04`,
+`03` or an end) or its commit is admitted only after this client sent
+that step's `1c`: root moves past a PIN step only once it has the PIN.
+A `0c` after the `1c`, for a step that asks none or for one not yet
+presented is a violation. Production reaches no PIN step. An end
+(`0d`, `0e`) carries a typed
 kind and detail, shown as TOKEN-LOGIN.md's "Failure texts" says. The
 client accepts exactly the ends root's supervisor can produce where it
 stands, and anything else is a violation: kind and detail outside that
@@ -5952,19 +5957,158 @@ own request's ceiling, so only a two-ceremony login prompt may show more
 than 120 seconds.
 
 Host tests drive every operation's whole status sequence against a
-scripted authority, a PIN step's `0c` and `1c` being the PIN field's; a
-changed nonce or kind; skipped, repeated and unpresented steps; the
-authorizing key's reuse; a commit before the last step; cancellation at
-each stage; a successor root read as it stopped; every end kind and its
-text; exactly root's reachable ends, at every point of every operation;
-the client's own cancellation's text; and the ceilings.
+scripted authority, each PIN step's `0c`, the person's typing and its
+`1c` included; a changed nonce or kind; skipped, repeated and
+unpresented steps; the authorizing key's reuse; a commit before the last
+step; cancellation at each stage, the PIN field's among them; a
+successor root read as it stopped; every end kind and its text; exactly
+root's reachable ends, at every point of every operation; the client's
+own cancellation's text; and the ceilings.
 Device-dispatcher tests cover the screen's choices through `read_device`,
 one operation per lifetime, their refusal outside attention and from
 a security key's own keyboard, and none before the screen is on glass.
 
+#### The PIN field
+
+TOKEN-LOGIN.md's PIN entry, inert in production: no production
+operation reaches a PIN step, since root refuses every one that writes
+and nothing sends an unlock's `1b`.
+
+It opens when root answers a poll with `0c` for the current step, which
+must ask for a PIN (consent's `asks_pin`) and have this client's
+presentation receipt, and only once. First the client checks its own
+process as td-secret's login worker checks itself
+(`store::require_protected_memory`): `/proc/swaps` lists no active swap,
+or is absent because swap is compiled out, and `/proc/self/limits` gives
+a zero core-dump soft limit. Both are bounded safe `std` reads; no
+syscall is added. A refusal cancels (`15`) and shows `PIN ENTRY NEEDS NO
+SWAP AND NO CORE DUMPS`; no field opens.
+
+The field is drawn beneath the presented step's prompt, which stays on
+the screen pixel for pixel as presented, every row of it (the operation,
+the key's fingerprint, its remaining attempts, the time line), so the
+person sees what the PIN is for while typing it; the prompt also stays
+the retained request its successor must follow. The prompt's rows are
+centred and never move: a row gap below the last of them, in the
+prompt's font and scale, comes `ENTER THE PIN FOR THIS KEY`, then a row
+gap and one row of square masks, three prompt pixels a side at a
+four-pixel advance, so all 63 fit one row from 320 pixels wide; a row
+gap's margin stays below. `TOUCH YOUR KEY` later takes the first row's
+place. The scene holds only the count, never a byte, so no glyph of a
+typed character can be drawn. A new prompt, a notice, draining or
+closing replaces it.
+
+Where the band the prompt leaves free beneath it cannot hold the field
+whole, 31 pixels at the prompt's single scale and 62 at its double, the
+field is never squeezed, scrolled or drawn over the prompt. Instead a
+PIN step's prompt is refused when it is prepared, as one too tall for
+the output is: the step is never presented, so the client cancels with
+`THE OPERATION FAILED` before any receipt, and root never reaches its
+`0c`, so no PIN reaches the key (the worker has already read its
+retries to describe the step). Opening the field checks the band
+again as a backstop. No PIN step's prompt fits 320x200 at all, so none
+is shown there; at 320x240 and 1280x800 every PIN step shown holds the
+field; at 800x600 the five tallest, removals of five keys or more, are
+refused at presentation, and the widest login prompt is shown at
+1024x768.
+
+Keys reach it only from the evdev adapter, as a selection does, and only
+after the lifetime's operation was chosen, so the press that chose types
+nothing: a fresh press, from a device secure attention reads, of a key no
+other such device holds. Repeats never type, a security key's own
+keyboard types, erases and submits nothing and its Shift is no Shift
+(its Escape still cancels), and automation, control, Wayland and bridge
+input cannot reach it. The keymap is `us`: printable ASCII only, Space
+included, at Shift's level while a read device holds Shift; the keypad
+types its NumLock character whatever Shift and NumLock say; Caps Lock is
+ignored, and under Control, Alt or Super nothing types, erases or
+submits. Backspace erases one byte; Enter (either) submits once the
+field holds at least four bytes, and before that does nothing; a 64th
+byte refuses, and every other key is ignored. Escape cancels the whole
+operation. Keys pressed before the field opens are dropped, not held for
+it: the person types once its screen asks.
+
+The field takes keys only once its own paint is on glass, as a prompt's
+confirmation does. Opening it answers with that paint's
+`NoticePresentation`; the worker waits for it on the
+`PresentationClock`, outside the runtime lock and bounded as a prompt's
+presentation is, and then, only while that field is still on the
+screen, the runtime reads the monotonic time it completed. Until then no
+key types, whatever its time; afterwards a press types only when its
+evdev timestamp is after that completion, so a press queued before the
+field opened, or delivered late in a batch, is dropped. A wait that
+fails or a field withdrawn meanwhile closes it, and a paint that fails
+as it opens or after a key takes it off the screen and closes it.
+
+The PIN lives in the attempt's fixed 64-byte buffer, zeroed with
+`fill(0)` and `black_box`, td-authd's `Cleared` idiom, with no
+`unsafe`. It is never put in a `String` or `Vec`, and the key type's
+`Debug` hides its byte. The buffer is zeroed as the PIN is copied out,
+on Escape, on the client's own cancellation, at the attempt's deadline,
+at any end root reports, on a violation, when the send fails and when it
+is dropped. The authority worker takes a submitted PIN at its next poll,
+within its 250 ms tick: it writes `1c`, the step's canonical description
+and the PIN into a fixed request buffer and zeroes the field as it
+copies. The channel's `Exchange` sends and receives separately, so the
+request is zeroed as soon as its write returns, whether it succeeded or
+not, before root's `9c` is awaited, and again when dropped. Both the
+input thread and the authority worker take the field's lock before the
+runtime's, and nothing takes them the other way.
+
+The take and cancellation race on the attempt's one state. The take
+moves it from active to sending in a single compare-exchange, and
+Escape's mark is one atomic change of the same state, so exactly one
+comes first. A cancellation first leaves nothing copied. One after the
+take is checked again immediately before the write: the request is
+zeroed unsent, and the next poll cancels (`15`); the deadline passing
+there does the same and times out. The residual is a cancellation after
+that check: the PIN was committed to the write, and root gets the `15`
+next, exactly as for an Escape just after the send. Root drops a PIN
+whose operation was cancelled; the key may still have been asked for it
+once.
+
+Root answers `9c 00`, and the field gives way to `TOUCH YOUR KEY`, or
+`9c 01`: its operation had ended or its deadline passed, the PIN was
+dropped, and the end follows. Anything else is a violation. A wrong PIN
+is the worker's typed failure, so root ends the operation with kind
+`01` and the screen shows `WRONG PIN`; nothing retries, and another
+attempt is a new operation from a new chord. The field shares the
+attempt's lifetime, the operation's ceiling: its deadline zeroes the
+field, cancels and shows `TIMED OUT`, and a key after it types nothing.
+A paint that fails to open the field or show the touch request cancels
+with `THE OPERATION FAILED`; one that fails after a key zeroes the field
+and cancels the attempt, which shows nothing more.
+
+Host tests cover the `0c`, typing, `1c` and touch sequence and its exact
+bytes; no PIN taken or sent before root's `0c`; a successor or commit
+before the `1c`, and a second `0c` or another answer to it, refused;
+`9c 01`; a wrong PIN; the deadline while typing; the memory check's
+refusal and its parser; the buffer zero after every way out, a dropped
+buffer and request observed through a test-only drop hook; the request
+zero between the scripted wire's write and its read; Escape and the
+deadline between the take and the write, sending nothing, and Escape
+after the write, followed by `15`; a field whose paint is queued behind
+a flip taking no key until it lands, then a late batch typing only its
+press after the landing; a failed paint closing the field; a PIN step
+too tall for its field never presented; the field's bounds; two PINs of
+one length painting the same pixels; and the presented prompt's pixels
+on glass unchanged by the field and by typing. Paint tests take every
+PIN step consent accepts, each at its widest: none fits 320x200; at
+320x240 and 1280x800 every one shown holds the field, its prompt rows
+and their row gap are the presented prompt's bytes, and the whole frame
+equals an independent drawing of the prompt, the field's row and masks
+alone, for every length and the touch row, inside a row gap's margin.
+They also cover the refusal at preparation where the band is too small,
+the five at 800x600, the paint's backstop, a step that asks no PIN, and
+a 64th mask. Device-dispatcher tests
+drive the keymap, Shift, the keypad, Space, Backspace, Enter, Escape,
+repeats, a second keyboard's held key, the bounds and Enter while too
+short through `read_device`, and a security key's own keyboard typing
+nothing but cancelling.
+
 ### Session lock and login-key entry (target)
 
-Partly implemented: items 1, 3 and 4 are "Login-key operations" above.
+Partly implemented: items 1 to 4 are "Login-key operations" above.
 [td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier, including when the session locks and what
 clients receive while locked ("Session lock"). The rules in this section
@@ -5976,7 +6120,8 @@ excluded from every selection, confirmation and field below.
    screen. Still to come: a disclosure's fresh Enter confirms its
    operation (TOKEN-LOGIN.md increment 5), and on the lock surface the
    chord opens a login unlock with no selection at all.
-2. **The PIN field (3).** "The screen accepts no credential bytes" gains
+2. **The PIN field (3).** Implemented, inert: "The PIN field" above.
+   "The screen accepts no credential bytes" gains
    one exception. The field opens only after the current step has its
    presentation receipt and root has asked for that step's PIN. It reads
    only fresh physical evdev key presses from admitted devices that secure
@@ -6034,7 +6179,8 @@ excluded from every selection, confirmation and field below.
    than about three seconds are certain to be detected; TOKEN-LOGIN.md
    discloses that limit.
 
-The current profile has no lock and no PIN field.
+The current profile has no lock, and no production operation reaches
+the PIN field.
 
 ### Immutable prompt presentation
 

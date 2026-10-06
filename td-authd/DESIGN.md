@@ -1714,8 +1714,11 @@ Implemented, inert: the consent operations and step admission
 deadlines of amendments 2, 5 and 6 ("Login-key operation supervision"
 below). The paired compositor sends `1b` for a first enrollment and an
 addition, which a production build refuses as it refuses every login
-operation that may write, and nothing sends an unlock's `1b` or any
-`1c`, so nothing in production starts the worker. Login state (1),
+operation that may write, and nothing sends an unlock's `1b`, so
+nothing in production starts the worker. Its PIN field sends `1c` only
+after this supervisor's `91 0c` for a presented PIN step, which no
+production operation reaches (`td-compositor/DESIGN.md`, "The PIN
+field"). Login state (1),
 revocation (7) and update consent (8) are not implemented.
 [`td-login/TOKEN-LOGIN.md`](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier. "Session lock" there is the compositor's

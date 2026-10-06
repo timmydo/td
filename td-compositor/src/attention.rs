@@ -33,6 +33,25 @@ pub(crate) enum Notice {
     Uncertain(&'static [&'static str]),
 }
 
+/// The PIN field beneath a presented PIN step's prompt, or the touch
+/// request that follows it: a count of bytes typed, never a byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Field {
+    Pin(u8),
+    Touch,
+}
+
+/// The field's rows (td-login/TOKEN-LOGIN.md, "PIN entry, presence and
+/// retries").
+const PIN_PROMPT: &str = "ENTER THE PIN FOR THIS KEY";
+const TOUCH_PROMPT: &str = "TOUCH YOUR KEY";
+/// The most masks the field shows: FIDO's longest PIN.
+const MASKS: usize = 63;
+/// A mask's side and advance in the prompt's font pixels, so that every
+/// mask fits one row inside the narrowest prompt's margins.
+const MASK_SIDE: usize = 3;
+const MASK_ADVANCE: usize = 4;
+
 /// A store operation's or installation review's ceiling, in seconds; a
 /// login operation's is its own (td-authd's `login_ceiling`).
 const OPERATION_SECONDS: u64 = 120;
@@ -43,6 +62,21 @@ pub(crate) struct Prepared {
     request: Request,
     pixels: Vec<u8>,
     geometry: (usize, usize, usize),
+    /// The prompt's scale and the foot of its last row: the field goes in
+    /// the band below, which the prompt leaves free.
+    scale: usize,
+    foot: usize,
+    /// A PIN step's field rows, rasterized with the prompt's font.
+    field_rows: Option<FieldRows>,
+}
+
+/// Each field row's ink as offsets from the row's origin, and the rows'
+/// height.
+#[derive(Debug)]
+struct FieldRows {
+    height: usize,
+    pin: Vec<(usize, usize)>,
+    touch: Vec<(usize, usize)>,
 }
 
 impl Prepared {
@@ -163,11 +197,29 @@ impl Prepared {
                 }
             }
         }
-        Ok(Self {
+        let field_rows = if request.login_step().is_some_and(|step| step.asks_pin()) {
+            Some(FieldRows {
+                height: cell_height,
+                pin: ink(&font, PIN_PROMPT, scale)?,
+                touch: ink(&font, TOUCH_PROMPT, scale)?,
+            })
+        } else {
+            None
+        };
+        let prepared = Self {
             request,
             pixels,
             geometry: (width, height, stride),
-        })
+            scale,
+            foot: top + text_height,
+            field_rows,
+        };
+        // A PIN step whose field could not open beneath it is not shown, so
+        // its operation fails before any PIN reaches the key.
+        if prepared.field_rows.is_some() && !prepared.holds_field() {
+            return Err("output cannot hold the PIN field beneath this prompt".into());
+        }
+        Ok(prepared)
     }
 
     pub fn request(&self) -> &Request {
@@ -181,6 +233,97 @@ impl Prepared {
         frame.copy_from_slice(&self.pixels);
         true
     }
+
+    /// Where the field goes: a row gap below the prompt's last row, its
+    /// text row's top and its masks row's, with a row gap's margin below.
+    /// None for a step that asks no PIN, or where the band the prompt
+    /// leaves free cannot hold the field whole with all 63 masks: the
+    /// prompt is never moved, shrunk or overdrawn to make room.
+    fn field_layout(&self) -> Option<(&FieldRows, usize, usize)> {
+        let rows = self.field_rows.as_ref()?;
+        let (width, height, _) = self.geometry;
+        let gap = 4 * self.scale;
+        let text = self.foot.checked_add(gap)?;
+        let masks = text.checked_add(rows.height)?.checked_add(gap)?;
+        let bottom = masks
+            .checked_add(MASK_SIDE * self.scale)?
+            .checked_add(gap)?;
+        let row = MASKS
+            .checked_mul(MASK_ADVANCE * self.scale)?
+            .checked_add(48)?;
+        (bottom <= height && row <= width).then_some((rows, text, masks))
+    }
+
+    /// Whether the band beneath this prompt holds the PIN field.
+    pub fn holds_field(&self) -> bool {
+        self.field_layout().is_some()
+    }
+
+    /// The prompt exactly as presented, with `field` beneath it: the PIN
+    /// field's row and one square mask per byte typed, or the touch
+    /// request.
+    pub fn paint_field(
+        &self,
+        frame: &mut [u8],
+        width: usize,
+        height: usize,
+        stride: usize,
+        field: Field,
+    ) -> bool {
+        let Some((rows, text, masks)) = self.field_layout() else {
+            return false;
+        };
+        let (ink, count) = match field {
+            Field::Pin(count) => (&rows.pin, usize::from(count)),
+            Field::Touch => (&rows.touch, 0),
+        };
+        if count > MASKS || !self.paint(frame, width, height, stride) {
+            return false;
+        }
+        let white = [0xff, 0xff, 0xff, 0];
+        for (x, y) in ink {
+            ui::fill(
+                frame,
+                width,
+                height,
+                stride,
+                (24 + x, text + y, self.scale, self.scale),
+                white,
+            );
+        }
+        let side = MASK_SIDE * self.scale;
+        for column in 0..count {
+            ui::fill(
+                frame,
+                width,
+                height,
+                stride,
+                (24 + column * MASK_ADVANCE * self.scale, masks, side, side),
+                white,
+            );
+        }
+        true
+    }
+}
+
+/// `text`'s ink in the prompt's font at `scale`: each set font pixel's
+/// offset from the row's origin.
+fn ink(font: &crate::font::Font, text: &str, scale: usize) -> Result<Vec<(usize, usize)>, String> {
+    let mut ink = Vec::new();
+    for (column, character) in text.chars().enumerate() {
+        if !font.covers(character) {
+            return Err("PIN field contains an unsupported glyph".into());
+        }
+        let glyph = font.index(character);
+        for y in 0..font.height() {
+            for x in 0..font.width() {
+                if font.pixel(glyph, x, y) {
+                    ink.push(((column * font.width() + x) * scale, y * scale));
+                }
+            }
+        }
+    }
+    Ok(ink)
 }
 
 /// Display-only pixels: ordinary scene rendering never calls this painter.
@@ -431,9 +574,11 @@ mod tests {
 
     /// Consent keeps every login row within `PROMPT_COLUMNS`, this renderer's
     /// columns at its narrowest accepted width, so wrapping never splits a
-    /// fingerprint; the widest login prompt is shown whole from 800x600.
+    /// fingerprint. The widest login prompt asks for a PIN, and at 800x600
+    /// its field would not fit beneath it, so it is shown, with room for
+    /// its field, at 1024x768.
     #[test]
-    fn login_rows_fit_the_narrowest_prompt_and_an_800_by_600_output() {
+    fn login_rows_fit_the_narrowest_prompt_and_the_tallest_refuse_800_by_600() {
         use crate::authority::consent::{LoginStep, Slot, LOGIN_KEYS, PROMPT_COLUMNS};
         let font = crate::font::pinned().unwrap();
         assert_eq!((320 - 48) / font.width(), PROMPT_COLUMNS);
@@ -459,7 +604,15 @@ mod tests {
         .unwrap();
         assert!(Prepared::with_time(widest.clone(), 320, 480, 1280, Some(120)).is_ok());
         assert!(Prepared::with_time(widest.clone(), 319, 480, 1276, Some(120)).is_err());
-        assert!(Prepared::with_time(widest, 800, 600, 3200, Some(120)).is_ok());
+        assert_eq!(
+            Prepared::with_time(widest.clone(), 800, 600, 3200, Some(120))
+                .err()
+                .unwrap(),
+            "output cannot hold the PIN field beneath this prompt"
+        );
+        assert!(Prepared::with_time(widest, 1024, 768, 4096, Some(120))
+            .unwrap()
+            .holds_field());
     }
 
     /// A login prompt's time budget is its operation's ceiling, up to 240
@@ -759,5 +912,227 @@ mod tests {
                 "D: REMOVE KEYS"
             ]
         );
+    }
+
+    // The PIN field.
+
+    /// Every login PIN step consent accepts, each operation's at its
+    /// widest: the largest account, fingerprints and retries, every count
+    /// of keys before and after, and every removal of a leading run.
+    fn pin_steps() -> Vec<Request> {
+        use crate::authority::consent::{LoginStep, Slot, LOGIN_KEYS};
+        let key = [0xff; 4];
+        let steps = [
+            LoginStep::Authorize { key, retries: 255 },
+            LoginStep::Create { retries: 255 },
+            LoginStep::Prove { key, retries: 255 },
+            LoginStep::Repeat { key, retries: 255 },
+            LoginStep::Unlock { key, retries: 255 },
+        ];
+        let mut operations = Vec::new();
+        for before in 0..=LOGIN_KEYS {
+            for after in 0..=LOGIN_KEYS {
+                for step in steps {
+                    let account = 65533;
+                    operations.push(Operation::LoginUnlock {
+                        account,
+                        before,
+                        after,
+                        step,
+                    });
+                    operations.push(Operation::LoginAdd {
+                        account,
+                        before,
+                        after,
+                        step,
+                    });
+                    for created in 1..=2 {
+                        operations.push(Operation::LoginEnroll {
+                            account,
+                            before,
+                            after,
+                            key: created,
+                            step,
+                        });
+                    }
+                    for removed in 1..=before {
+                        operations.push(Operation::LoginRemove {
+                            account,
+                            before,
+                            after,
+                            removed: (1..=removed)
+                                .map(|position| Slot { position, key })
+                                .collect(),
+                            step,
+                        });
+                    }
+                }
+            }
+        }
+        let requests: Vec<Request> = operations
+            .into_iter()
+            .filter_map(|operation| Request::new([1; 32], 65533, operation).ok())
+            .collect();
+        assert!(requests
+            .iter()
+            .all(|request| request.login_step().is_some_and(LoginStep::asks_pin)));
+        requests
+    }
+
+    /// The prompt with its whole time line, the longest a login prompt shows.
+    fn pin_prompt(request: &Request, width: usize, height: usize) -> Option<Prepared> {
+        let ceiling = request.login_ceiling().unwrap().as_secs();
+        Prepared::with_time(request.clone(), width, height, width * 4, Some(ceiling)).ok()
+    }
+
+    /// The field drawn independently of `paint_field`: the prompt's pixels,
+    /// then the row in the prompt's font and the masks, a row gap below the
+    /// prompt's last row.
+    fn expected_field(prompt: &Prepared, field: Field) -> Vec<u8> {
+        let (width, height, stride) = prompt.geometry;
+        let font = crate::font::pinned().unwrap();
+        let scale = prompt.scale;
+        let mut expected = prompt.pixels.clone();
+        let white = [0xff, 0xff, 0xff, 0];
+        let text = prompt.foot + 4 * scale;
+        let (line, count) = match field {
+            Field::Pin(count) => ("ENTER THE PIN FOR THIS KEY", usize::from(count)),
+            Field::Touch => ("TOUCH YOUR KEY", 0),
+        };
+        for (column, character) in line.chars().enumerate() {
+            let glyph = font.index(character);
+            for y in 0..font.height() {
+                for x in 0..font.width() {
+                    if font.pixel(glyph, x, y) {
+                        let left = 24 + (column * font.width() + x) * scale;
+                        let rect = (left, text + y * scale, scale, scale);
+                        ui::fill(&mut expected, width, height, stride, rect, white);
+                    }
+                }
+            }
+        }
+        let masks = text + font.height() * scale + 4 * scale;
+        for column in 0..count {
+            let rect = (24 + column * 4 * scale, masks, 3 * scale, 3 * scale);
+            ui::fill(&mut expected, width, height, stride, rect, white);
+        }
+        expected
+    }
+
+    /// The field goes beneath the presented step's prompt and leaves it
+    /// exactly as presented: every prompt row, the operation, the key's
+    /// fingerprint, its retries and the time line, keeps its pixels. No
+    /// PIN step's prompt fits 320x200, so none is shown there; at 320x240,
+    /// the narrowest output that shows one, and at 1280x800 every PIN step
+    /// shown holds the field, the tallest included, and at 1280x800 every
+    /// one is shown.
+    #[test]
+    fn the_pin_field_leaves_the_prompt_untouched_beneath_every_pin_step() {
+        let steps = pin_steps();
+        assert!(steps
+            .iter()
+            .all(|step| pin_prompt(step, 320, 200).is_none()));
+        for (width, height) in [(320, 240), (1280, 800)] {
+            let prompts: Vec<Prepared> = steps
+                .iter()
+                .filter_map(|step| pin_prompt(step, width, height))
+                .collect();
+            assert!(prompts.iter().all(Prepared::holds_field));
+            if width == 1280 {
+                assert_eq!(prompts.len(), steps.len());
+            }
+            let tallest = prompts.iter().max_by_key(|prompt| prompt.foot).unwrap();
+            let gap = 4 * tallest.scale;
+            for field in (0..=63).map(Field::Pin).chain([Field::Touch]) {
+                let mut painted = vec![0; width * 4 * height];
+                assert!(tallest.paint_field(&mut painted, width, height, width * 4, field));
+                // The prompt's rows, and the row gap below them, untouched.
+                let rows = (tallest.foot + gap) * width * 4;
+                assert!(painted[..rows] == tallest.pixels[..rows], "{field:?}");
+                // Beneath them only the field's row and its masks.
+                assert!(painted == expected_field(tallest, field), "{field:?}");
+                // A row gap's margin below the field, and 24 pixels right.
+                let ink = |x: usize, y: usize| painted[(y * width + x) * 4] == 0xff;
+                let margin = height - gap;
+                assert!((margin..height).all(|y| (0..width).all(|x| !ink(x, y))));
+                assert!((0..height).all(|y| (width - 24..width).all(|x| !ink(x, y))));
+            }
+            // Each step's prompt with its widest field.
+            for prompt in &prompts {
+                let mut painted = vec![0; width * 4 * height];
+                assert!(prompt.paint_field(&mut painted, width, height, width * 4, Field::Pin(63)));
+                assert!(painted == expected_field(prompt, Field::Pin(63)));
+            }
+        }
+        // At 320x240 the PIN steps shown leave a 32-pixel band, one more
+        // than the field needs; taller ones are refused whole, as before.
+        let shown: Vec<Prepared> = steps
+            .iter()
+            .filter_map(|step| pin_prompt(step, 320, 240))
+            .collect();
+        assert!(shown.iter().all(|prompt| 240 - prompt.foot == 32));
+        assert!(shown.len() < steps.len());
+    }
+
+    /// Where the band beneath a PIN step's prompt cannot hold the field
+    /// whole, the prompt is not shown at all, so the operation fails before
+    /// any PIN reaches the key; the field is never squeezed and
+    /// the prompt never moves. The paint keeps the check as a backstop. A
+    /// step that asks no PIN has no field.
+    #[test]
+    fn a_pin_step_without_room_for_its_field_is_not_presented() {
+        const NO_FIELD: &str = "output cannot hold the PIN field beneath this prompt";
+        const NO_PROMPT: &str = "output cannot hold every trusted prompt argument";
+        let steps = pin_steps();
+        let widest = steps.iter().max_by_key(|step| step.lines().len()).unwrap();
+        let ceiling = widest.login_ceiling().unwrap().as_secs();
+        let (mut held, mut refused) = (0, 0);
+        for height in 200..=600 {
+            match Prepared::with_time(widest.clone(), 320, height, 1280, Some(ceiling)) {
+                Ok(prompt) => {
+                    assert!(height - prompt.foot >= 4 + 16 + 4 + 3 + 4, "{height}");
+                    assert!(prompt.holds_field());
+                    held += 1;
+                }
+                Err(error) if error == NO_FIELD => refused += 1,
+                Err(error) => assert_eq!(error, NO_PROMPT),
+            }
+        }
+        assert!(held > 0 && refused > 0);
+        // At 800x600 the five tallest, removals of five keys or more, are
+        // refused for their field; every other is shown with room for it.
+        let refused: Vec<&Request> = steps
+            .iter()
+            .filter(|step| {
+                let ceiling = step.login_ceiling().unwrap().as_secs();
+                match Prepared::with_time((*step).clone(), 800, 600, 3200, Some(ceiling)) {
+                    Ok(prompt) => {
+                        assert!(prompt.holds_field());
+                        false
+                    }
+                    Err(error) => {
+                        assert_eq!(error, NO_FIELD);
+                        true
+                    }
+                }
+            })
+            .collect();
+        assert_eq!(refused.len(), 5);
+        assert!(refused.iter().all(|step| matches!(
+            step.operation(),
+            Operation::LoginRemove { removed, .. } if removed.len() >= 5
+        )));
+        // The backstop: a prompt whose band is too small paints no field.
+        let mut prompt = pin_prompt(&steps[0], 800, 600).unwrap();
+        let mut painted = vec![0; 800 * 600 * 4];
+        assert!(prompt.paint_field(&mut painted, 800, 600, 3200, Field::Pin(63)));
+        // More masks than a PIN has bytes are refused.
+        assert!(!prompt.paint_field(&mut painted, 800, 600, 3200, Field::Pin(64)));
+        prompt.foot = 600 - 61;
+        assert!(!prompt.holds_field());
+        assert!(!prompt.paint_field(&mut painted, 800, 600, 3200, Field::Touch));
+        let set = Prepared::new(request("main"), 800, 600, 3200).unwrap();
+        assert!(!set.holds_field());
+        assert!(!set.paint_field(&mut painted, 800, 600, 3200, Field::Touch));
     }
 }

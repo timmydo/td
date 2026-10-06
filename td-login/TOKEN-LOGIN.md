@@ -12,7 +12,9 @@ unlocks, enrolls, adds and removes keys against the record
 `1b` and `1c`. The compositor's key-management screen sends `1b` for a
 first enrollment and an addition, which a production td-authd refuses
 before starting anything; it refuses removal itself, having no key list
-yet, and nothing sends an unlock's `1b` or any `1c`. So nothing
+yet, and nothing sends an unlock's `1b`. Its PIN field sends `1c` only
+when root asks for a PIN at a presented PIN step, which no production
+operation reaches. So nothing
 in production starts the worker or uses its `login_record` and
 `login_store` modules ("The login record"), its login identify,
 PIN-retry, assertion and creation steps ("Token profile"), or td-authd's
@@ -32,8 +34,9 @@ private client's login-key operations have landed too
 (`td-compositor/DESIGN.md`, "Login-key operations"): the `K` screen,
 each operation's descriptions checked step by step, its commit and the
 failure texts ("Failure texts"). Production reaches only their refusals.
-The PIN field and the lock surface have not landed, and nothing else
-below is implemented.
+The PIN field has landed as well ("PIN entry, presence and retries"),
+inert, since production never reaches a PIN step. The lock surface has
+not landed, and nothing else below is implemented.
 Until the increments at the end land, `THREAT-MODEL.md` §3 is the
 complete current behaviour: the installed account logs in automatically
 and the session never locks. No document, UI or release
@@ -410,6 +413,44 @@ retired after its PIN-token request. It never enters a log, argv, the
 environment, a file, the framebuffer, an automation capture or a
 diagnostic.
 
+**PIN memory.** The compositor holds a PIN only in its field's fixed
+64-byte buffer, never in a growable string or vector and never in
+formatted output, and zeroes that buffer on every way out: as the PIN is
+copied into the `1c` request, on Escape, on its own cancellation, at the
+attempt's deadline, at any end root reports, on a protocol violation,
+when the send fails and when the buffer is dropped. The `1c` request is
+written from a fixed buffer of its own, zeroed as soon as the write
+returns, whether it succeeded or not, before root's answer is awaited.
+The field opens only after the compositor checks its own process as
+td-secret's worker checks itself: no active swap in `/proc/swaps` and a
+zero core-dump soft limit in `/proc/self/limits`. A refusal cancels the
+operation before any field opens. A zero `RLIMIT_CORE` does not stop a
+core dump piped to a `core_pattern` handler, and td-secret's worker
+shares that gap; neither check reads `core_pattern`. The keycodes of the
+presses that type a PIN still pass through the input reader's ordinary
+buffers, as any key press does, and each byte the keymap gives one
+passes, unzeroed, through the input thread's stack as the key it hands
+the field (`FieldKey::Byte` inside the dispatcher's decision).
+
+The PIN field is drawn beneath the presented step's prompt, which stays
+on the screen exactly as presented, so the person sees which operation
+and which key, its fingerprint and remaining attempts, the PIN is for
+while typing it. Its rows are in the prompt's font; the memory check's
+refusal is a chrome row ("Failure texts" gives its width):
+
+| When | Shows |
+| --- | --- |
+| root asks for the presented step's PIN | beneath the prompt, `ENTER THE PIN FOR THIS KEY`, then one mask per byte typed |
+| the PIN was sent | beneath the prompt, `TOUCH YOUR KEY` |
+| the memory check refuses | `PIN ENTRY NEEDS NO SWAP AND NO CORE DUMPS` |
+
+The field never shows a typed character: it is drawn from a count. It
+takes only presses made after its own paint was on glass. Where the band
+the prompt leaves free beneath it cannot hold the field, the PIN step's
+prompt is not presented and the operation fails (`THE OPERATION
+FAILED`) before any receipt and before any PIN reaches the key, rather
+than move, shrink or cover the prompt.
+
 Every creation, proof, repeat, authorization and unlock assertion requires
 user presence; after the PIN is submitted the prompt says TOUCH YOUR KEY.
 Only identify and probe are silent.
@@ -482,7 +523,11 @@ Kinds `0a` to `0c` show the unavailable state's own texts ("The login
 record"), split after the colon. A cancellation shows nothing new: the
 person chose it, or the compositor did and said why, withdrawing any
 prompt: `TIMED OUT` when the attempt's own deadline passed, `THE
-OPERATION FAILED` when a presentation did. An end td-authd
+OPERATION FAILED` when a presentation did (a PIN step with no room for
+its field is not presented), or the paint that opens a PIN field or
+shows its touch request, and the memory check's text when
+it refused a PIN field ("PIN entry, presence and retries"). An end
+td-authd
 reports uncertain (`91 0e`, only after a write's acknowledged commit
 round) shows `RESULT UNCERTAIN` above its kind's rows, or alone for kind
 `0e`; nothing is retried, and from increment 4 the screen re-reads the
@@ -965,9 +1010,24 @@ proves and the oracle that shows it.
      end kind against a scripted authority, and device-dispatcher tests
      the selections, their refusal outside attention and from an
      excluded keyboard. Production root refuses `1`, `2` and `A`, and
-     `D` is refused locally until increment 4's key list. A step that
-     asks for a PIN is cancelled, with `NOT AVAILABLE IN THIS BUILD`,
-     until the PIN field lands; the lock surface follows it.
+     `D` is refused locally until increment 4's key list.
+   - The PIN field has landed (`td-compositor/DESIGN.md`, "The PIN
+     field"): root's `0c` for the presented PIN step opens it once the
+     compositor's own memory check passes; it takes fresh presses from
+     devices secure attention reads, made after its own paint was on
+     glass, through the `us` keymap with Shift, 4 to 63 printable bytes,
+     shows only masks beneath the step's prompt, which stays as
+     presented, and Enter sends `1c` from a buffer zeroed as soon as it
+     is written, with Escape before the final check sending nothing; a PIN
+     step with no room for its field is never presented; the client
+     admits a PIN step's successor or commit only after its own `1c`.
+     Host tests drive the
+     whole status sequence of every operation with its `0c` and `1c`,
+     the zeroing on each way out, the deadline while typing, the memory
+     check's refusal and a wrong PIN against a scripted authority, and
+     device-dispatcher tests the keymap, repeats, the bounds and the
+     excluded keyboard. It is inert: production root refuses every
+     operation that would reach a PIN step. The lock surface follows.
 4. **Locked boot and session lock:** request `1a` and login state at
    Prepare, with the enrolled key list and the primary username,
    `Super+l`, attention `L`, lid close, resume detection, unlock

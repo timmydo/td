@@ -150,6 +150,98 @@ const TOUCHPAD_PX_PER_MM: i64 = 16;
 /// taken as 64 mm, and Y is scaled by X's units, assuming square units.
 const TOUCHPAD_SPAN_PX: i64 = 1024;
 const MAX_XKB_EVDEV_KEY: u16 = 247;
+const KEY_EQUAL: u16 = 13;
+const KEY_LEFTBRACE: u16 = 26;
+const KEY_RIGHTBRACE: u16 = 27;
+const KEY_SEMICOLON: u16 = 39;
+const KEY_APOSTROPHE: u16 = 40;
+const KEY_GRAVE: u16 = 41;
+const KEY_BACKSLASH: u16 = 43;
+const KEY_COMMA: u16 = 51;
+const KEY_DOT: u16 = 52;
+const KEY_KPASTERISK: u16 = 55;
+const KEY_KP7: u16 = 71;
+const KEY_KP8: u16 = 72;
+const KEY_KP9: u16 = 73;
+const KEY_KPMINUS: u16 = 74;
+const KEY_KP4: u16 = 75;
+const KEY_KP5: u16 = 76;
+const KEY_KP6: u16 = 77;
+const KEY_KPPLUS: u16 = 78;
+const KEY_KP1: u16 = 79;
+const KEY_KP2: u16 = 80;
+const KEY_KP3: u16 = 81;
+const KEY_KP0: u16 = 82;
+const KEY_KPDOT: u16 = 83;
+const KEY_KPSLASH: u16 = 98;
+/// The PIN field's keymap, `us`: each key's byte, then its byte with Shift.
+/// The keypad gives its NumLock character whatever Shift and NumLock say.
+/// Every byte is printable ASCII; no other key types.
+const PIN_KEYS: &[(u16, u8, u8)] = &[
+    (KEY_GRAVE, b'`', b'~'),
+    (KEY_1, b'1', b'!'),
+    (KEY_2, b'2', b'@'),
+    (KEY_3, b'3', b'#'),
+    (KEY_4, b'4', b'$'),
+    (KEY_5, b'5', b'%'),
+    (KEY_6, b'6', b'^'),
+    (KEY_7, b'7', b'&'),
+    (KEY_8, b'8', b'*'),
+    (KEY_9, b'9', b'('),
+    (KEY_0, b'0', b')'),
+    (KEY_MINUS, b'-', b'_'),
+    (KEY_EQUAL, b'=', b'+'),
+    (KEY_Q, b'q', b'Q'),
+    (KEY_W, b'w', b'W'),
+    (KEY_E, b'e', b'E'),
+    (KEY_R, b'r', b'R'),
+    (KEY_T, b't', b'T'),
+    (KEY_Y, b'y', b'Y'),
+    (KEY_U, b'u', b'U'),
+    (KEY_I, b'i', b'I'),
+    (KEY_O, b'o', b'O'),
+    (KEY_P, b'p', b'P'),
+    (KEY_LEFTBRACE, b'[', b'{'),
+    (KEY_RIGHTBRACE, b']', b'}'),
+    (KEY_BACKSLASH, b'\\', b'|'),
+    (KEY_A, b'a', b'A'),
+    (KEY_S, b's', b'S'),
+    (KEY_D, b'd', b'D'),
+    (KEY_F, b'f', b'F'),
+    (KEY_G, b'g', b'G'),
+    (KEY_H, b'h', b'H'),
+    (KEY_J, b'j', b'J'),
+    (KEY_K, b'k', b'K'),
+    (KEY_L, b'l', b'L'),
+    (KEY_SEMICOLON, b';', b':'),
+    (KEY_APOSTROPHE, b'\'', b'"'),
+    (KEY_Z, b'z', b'Z'),
+    (KEY_X, b'x', b'X'),
+    (KEY_C, b'c', b'C'),
+    (KEY_V, b'v', b'V'),
+    (KEY_B, b'b', b'B'),
+    (KEY_N, b'n', b'N'),
+    (KEY_M, b'm', b'M'),
+    (KEY_COMMA, b',', b'<'),
+    (KEY_DOT, b'.', b'>'),
+    (KEY_SLASH, b'/', b'?'),
+    (KEY_SPACE, b' ', b' '),
+    (KEY_KP0, b'0', b'0'),
+    (KEY_KP1, b'1', b'1'),
+    (KEY_KP2, b'2', b'2'),
+    (KEY_KP3, b'3', b'3'),
+    (KEY_KP4, b'4', b'4'),
+    (KEY_KP5, b'5', b'5'),
+    (KEY_KP6, b'6', b'6'),
+    (KEY_KP7, b'7', b'7'),
+    (KEY_KP8, b'8', b'8'),
+    (KEY_KP9, b'9', b'9'),
+    (KEY_KPDOT, b'.', b'.'),
+    (KEY_KPSLASH, b'/', b'/'),
+    (KEY_KPASTERISK, b'*', b'*'),
+    (KEY_KPMINUS, b'-', b'-'),
+    (KEY_KPPLUS, b'+', b'+'),
+];
 const KEY_RELEASE: i32 = 0;
 const KEY_PRESS: i32 = 1;
 const KEY_REPEAT: i32 = 2;
@@ -229,6 +321,9 @@ struct KeyDecision {
     /// A screen of the attention lifetime that selects nothing yet.
     notice: Option<crate::attention::Notice>,
     confirm_install: Option<u128>,
+    /// A key for the PIN field and its evdev time. The attempt takes it only
+    /// while its field is open and was on glass before the press.
+    field: Option<(crate::secret_client::FieldKey, u128)>,
     draining: bool,
     command: Option<Command>,
     launcher: Option<LauncherAction>,
@@ -250,6 +345,7 @@ impl KeyBindings {
             secret: None,
             notice: None,
             confirm_install: None,
+            field: None,
             draining: false,
             command: None,
             launcher: None,
@@ -281,6 +377,9 @@ impl KeyBindings {
             // An excluded device is tracked above so the drain completes, and
             // its Escape still cancels; it never selects or confirms.
             let readable = !self.attention_excluded.contains(&device);
+            // Only a press after this lifetime's operation was chosen can
+            // type: never the press that chose it.
+            let chosen = self.secret_selected;
             if self.attention == AttentionState::Open
                 && readable
                 && !self.secret_selected
@@ -289,6 +388,14 @@ impl KeyBindings {
             {
                 self.select(event.code, &mut decision);
                 self.secret_selected |= decision.secret.is_some();
+            }
+            if self.attention == AttentionState::Open
+                && readable
+                && chosen
+                && !attention_held
+                && event.value == KEY_PRESS
+            {
+                decision.field = self.field_key(event.code).map(|key| (key, event.timestamp));
             }
             if self.attention == AttentionState::Open
                 && readable
@@ -535,6 +642,27 @@ impl KeyBindings {
             }
             _ => None,
         };
+    }
+
+    /// A fresh press for the PIN field, from a device secure attention
+    /// reads: Enter submits, Backspace erases one byte, and a key of the
+    /// `us` keymap types its byte, at Shift's level when a read device holds
+    /// Shift. Under Control, Alt or Super nothing types; Caps Lock and every
+    /// other key type nothing. Escape is the drain's.
+    fn field_key(&self, code: u16) -> Option<crate::secret_client::FieldKey> {
+        use crate::secret_client::FieldKey;
+        let held = |left, right| self.attention_pressed(left) || self.attention_pressed(right);
+        if held(KEY_LEFTCTRL, KEY_RIGHTCTRL)
+            || held(KEY_LEFTALT, KEY_RIGHTALT)
+            || held(KEY_LEFTMETA, KEY_RIGHTMETA)
+        {
+            return None;
+        }
+        match code {
+            KEY_ENTER | KEY_KPENTER => Some(FieldKey::Submit),
+            KEY_BACKSPACE => Some(FieldKey::Erase),
+            _ => pin_byte(code, held(KEY_LEFTSHIFT, KEY_RIGHTSHIFT)).map(FieldKey::Byte),
+        }
     }
 
     fn forward(&mut self, physical: (usize, u16), event: Event) -> Option<KeyInput> {
@@ -1199,6 +1327,14 @@ trait InputTarget {
     fn secret_request(&mut self, _role: crate::secret_client::Selection) -> Result<(), String> {
         Err("secret requests unavailable on this input target".into())
     }
+    /// A key for the PIN field; a target with no attempt takes none.
+    fn pin_key(
+        &mut self,
+        _key: crate::secret_client::FieldKey,
+        _timestamp: u128,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// Shows an attention screen that selects nothing yet, answering with
     /// its paint, or none when it failed; a screen not shown selects
     /// nothing.
@@ -1539,6 +1675,16 @@ impl InputTarget for LiveInputTarget {
     fn confirm_install(&mut self, timestamp: u128) -> Result<(), String> {
         if let Some(attempt) = &self.secret_attempt {
             attempt.confirm_install(&EvdevOrigin { _private: () }, timestamp)?;
+        }
+        Ok(())
+    }
+    fn pin_key(
+        &mut self,
+        key: crate::secret_client::FieldKey,
+        timestamp: u128,
+    ) -> Result<(), String> {
+        if let Some(attempt) = &self.secret_attempt {
+            attempt.field_key(&EvdevOrigin { _private: () }, key, timestamp)?;
         }
         Ok(())
     }
@@ -1899,6 +2045,14 @@ fn digit(code: u16) -> Option<u8> {
     u8::try_from(code.checked_sub(KEY_1)?.checked_add(1)?).ok()
 }
 
+/// The PIN field's byte for `code`, or none for a key that types nothing.
+fn pin_byte(code: u16, shift: bool) -> Option<u8> {
+    PIN_KEYS
+        .iter()
+        .find(|(key, ..)| *key == code)
+        .map(|(_, plain, shifted)| if shift { *shifted } else { *plain })
+}
+
 fn launcher_character(code: u16) -> Option<char> {
     match code {
         KEY_A => Some('a'),
@@ -2110,6 +2264,7 @@ fn apply_locked<T: InputTarget>(
         && decision.secret.is_none()
         && decision.notice.is_none()
         && decision.confirm_install.is_none()
+        && decision.field.is_none()
         && decision.command.is_none()
         && decision.launcher.is_none()
         && decision.help.is_none()
@@ -2212,6 +2367,9 @@ fn deliver_key_decision<T: InputTarget>(
     }
     if let Some(timestamp) = decision.confirm_install {
         runtime.confirm_install(timestamp)?;
+    }
+    if let Some((key, timestamp)) = decision.field {
+        runtime.pin_key(key, timestamp)?;
     }
     if let Some(notice) = decision.notice {
         // Fails closed: a screen the person cannot see selects nothing more
@@ -4409,6 +4567,13 @@ mod tests {
         launched: Vec<LaunchRequest>,
         help_actions: Vec<HelpAction>,
         help: crate::help::Help,
+        /// The attempt's own PIN field model, which the tests open.
+        field: crate::secret_client::PinField,
+        /// The masked length shown after each key that changed the field.
+        field_lengths: Vec<usize>,
+        /// Every key offered to the field, open or not.
+        field_keys: usize,
+        field_times: Vec<u128>,
     }
 
     impl RecordingTarget {
@@ -4433,6 +4598,19 @@ mod tests {
             Ok(())
         }
 
+        fn pin_key(
+            &mut self,
+            key: crate::secret_client::FieldKey,
+            timestamp: u128,
+        ) -> Result<(), String> {
+            self.field_keys += 1;
+            self.field_times.push(timestamp);
+            if let Some(length) = self.field.key(key) {
+                self.field_lengths.push(length);
+            }
+            Ok(())
+        }
+
         fn attention_notice(
             &mut self,
             notice: crate::attention::Notice,
@@ -4453,6 +4631,8 @@ mod tests {
 
         fn drain_attention(&mut self) -> Result<(), String> {
             self.draining_events += 1;
+            // As the live target's cancellation of its attempt does.
+            self.field.close();
             match self.draining_error.take() {
                 Some(error) => Err(error),
                 None => Ok(()),
@@ -8874,5 +9054,270 @@ mod tests {
             target.lock().unwrap().secret_roles,
             [Selection::Login(LoginSelection::Enroll(1))]
         );
+    }
+
+    // The PIN field.
+
+    /// Attention open and `K` then `1` chosen, with the target's field
+    /// open as root's `0c` opens the attempt's; `excluded` are security
+    /// keys' own keyboards.
+    fn pin_field(excluded: &[usize]) -> (Mutex<RecordingTarget>, Mutex<KeyBindings>) {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings {
+            attention_enabled: true,
+            attention_excluded: excluded.iter().copied().collect(),
+            ..KeyBindings::default()
+        });
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        read_reports(&target, &bindings, 0, &presses(&[KEY_K, KEY_1], 20));
+        {
+            let mut target = target.lock().unwrap();
+            assert_eq!(target.secret_roles.len(), 1);
+            // Neither the menu's choice nor the screen's typed anything.
+            assert_eq!(target.field_keys, 0);
+            target.field.open();
+        }
+        (target, bindings)
+    }
+
+    fn typed(target: &Mutex<RecordingTarget>) -> Vec<u8> {
+        target.lock().unwrap().field.typed().to_vec()
+    }
+
+    /// `codes` pressed and released while `modifier` is held.
+    fn with_held(modifier: u16, codes: &[u16], from: u32) -> Vec<Event> {
+        let mut events = vec![at_millis(key(modifier, KEY_PRESS), from), syn(from)];
+        events.extend(presses(codes, from + 1));
+        let end = from + 1 + 2 * u32::try_from(codes.len()).unwrap();
+        events.extend([at_millis(key(modifier, KEY_RELEASE), end), syn(end)]);
+        events
+    }
+
+    #[test]
+    fn the_pin_field_types_the_us_keymap() {
+        let (target, bindings) = pin_field(&[]);
+        let forwarded = target.lock().unwrap().keys.len();
+        let read = |events: &[Event]| read_reports(&target, &bindings, 0, events);
+        read(&presses(&[KEY_A, KEY_1, KEY_SPACE, KEY_SLASH], 30));
+        assert_eq!(typed(&target), b"a1 /");
+        // Each with its press's evdev time, which the attempt compares with
+        // its field's presentation.
+        assert_eq!(
+            target.lock().unwrap().field_times,
+            [30, 32, 34, 36].map(|millis: u128| millis * 1_000_000)
+        );
+        // Shift's level, from either Shift.
+        read(&with_held(
+            KEY_LEFTSHIFT,
+            &[KEY_A, KEY_1, KEY_SLASH, KEY_APOSTROPHE],
+            40,
+        ));
+        read(&with_held(KEY_RIGHTSHIFT, &[KEY_GRAVE, KEY_EQUAL], 60));
+        assert_eq!(typed(&target), b"a1 /A!?\"~+");
+        // The keypad's characters whatever Shift and NumLock say.
+        read(&presses(&[KEY_KP7, KEY_KPDOT], 80));
+        read(&presses(&[KEY_NUMLOCK, KEY_KP0], 90));
+        read(&with_held(KEY_LEFTSHIFT, &[KEY_KP3, KEY_KPPLUS], 100));
+        assert_eq!(typed(&target), b"a1 /A!?\"~+7.03+");
+        // Caps Lock changes no case, and keys outside the map type nothing.
+        read(&presses(&[KEY_CAPSLOCK, KEY_B, KEY_UP, KEY_LEFTMETA], 120));
+        assert_eq!(typed(&target), b"a1 /A!?\"~+7.03+b");
+        // Under Control, Alt or Super nothing types, erases or submits.
+        for (modifier, from) in [
+            (KEY_LEFTCTRL, 140),
+            (KEY_RIGHTALT, 160),
+            (KEY_LEFTMETA, 180),
+        ] {
+            read(&with_held(
+                modifier,
+                &[KEY_C, KEY_BACKSPACE, KEY_ENTER],
+                from,
+            ));
+        }
+        assert_eq!(typed(&target), b"a1 /A!?\"~+7.03+b");
+        // Backspace erases one byte a press; Enter submits.
+        read(&presses(&[KEY_BACKSPACE, KEY_BACKSPACE, KEY_KPENTER], 200));
+        let target = target.lock().unwrap();
+        assert_eq!(target.field.typed(), b"a1 /A!?\"~+7.03");
+        assert!(target.field.submitted());
+        // Each change showed only its masked length.
+        assert_eq!(
+            target.field_lengths,
+            (1..=16).chain([15, 14]).collect::<Vec<_>>()
+        );
+        // Nothing of it reached a client.
+        assert_eq!(target.keys.len(), forwarded);
+    }
+
+    #[test]
+    fn the_pin_field_takes_four_to_sixty_three_bytes() {
+        let (target, bindings) = pin_field(&[]);
+        let read = |events: &[Event]| read_reports(&target, &bindings, 0, events);
+        // Enter on three bytes does nothing.
+        read(&presses(&[KEY_1, KEY_2, KEY_3, KEY_ENTER], 30));
+        assert_eq!(typed(&target), b"123");
+        assert!(!target.lock().unwrap().field.submitted());
+        // A 64th byte refuses.
+        read(&presses(&[KEY_9; 61], 40));
+        assert_eq!(typed(&target).len(), 63);
+        read(&presses(&[KEY_0], 200));
+        assert_eq!(typed(&target).len(), 63);
+        assert_eq!(
+            target.lock().unwrap().field_lengths,
+            (1..=63).collect::<Vec<_>>()
+        );
+        read(&presses(&[KEY_ENTER], 210));
+        assert!(target.lock().unwrap().field.submitted());
+        // After Enter nothing types or erases.
+        read(&presses(&[KEY_BACKSPACE, KEY_5], 220));
+        assert_eq!(typed(&target).len(), 63);
+        // Four bytes are enough.
+        let (target, bindings) = pin_field(&[]);
+        read_reports(
+            &target,
+            &bindings,
+            0,
+            &presses(&[KEY_1, KEY_2, KEY_3, KEY_4, KEY_ENTER], 30),
+        );
+        assert!(target.lock().unwrap().field.submitted());
+    }
+
+    /// Only a fresh press types: a key's repeats and a second keyboard's
+    /// press of a key the first holds type nothing, Backspace's included.
+    #[test]
+    fn a_held_key_types_once() {
+        let (target, bindings) = pin_field(&[]);
+        let held = |code: u16, from: u32| {
+            let mut events = vec![at_millis(key(code, KEY_PRESS), from), syn(from)];
+            for time in from + 1..from + 10 {
+                events.extend([at_millis(key(code, KEY_REPEAT), time), syn(time)]);
+            }
+            events.extend([at_millis(key(code, KEY_RELEASE), from + 10), syn(from + 10)]);
+            events
+        };
+        read_reports(&target, &bindings, 0, &held(KEY_7, 30));
+        read_reports(&target, &bindings, 0, &presses(&[KEY_1, KEY_2], 50));
+        read_reports(&target, &bindings, 0, &held(KEY_BACKSPACE, 60));
+        assert_eq!(typed(&target), b"71");
+        // Two keyboards at once, so neither reader's end releases its keys.
+        let (mut first_resync, mut second_resync) = (|| None, || None);
+        let mut first = DeviceState::new(None, AbsoluteKind::Tablet, &mut first_resync, true);
+        let mut second = DeviceState::new(None, AbsoluteKind::Tablet, &mut second_resync, true);
+        apply_device_event(&target, key(KEY_8, KEY_PRESS), 0, &bindings, &mut first).unwrap();
+        for value in [KEY_PRESS, KEY_RELEASE] {
+            apply_device_event(&target, key(KEY_8, value), 2, &bindings, &mut second).unwrap();
+        }
+        apply_device_event(&target, key(KEY_8, KEY_RELEASE), 0, &bindings, &mut first).unwrap();
+        assert_eq!(typed(&target), b"718");
+        assert_eq!(target.lock().unwrap().field_keys, 5);
+    }
+
+    /// A security key's own keyboard types nothing into the field, submits
+    /// and erases nothing, and its Shift is no Shift; its Escape cancels.
+    #[test]
+    fn a_security_keys_keyboard_types_no_pin() {
+        const KEY: usize = 1;
+        let (target, bindings) = pin_field(&[KEY]);
+        // A touch: modhex and Enter, and a Shift.
+        read_reports(
+            &target,
+            &bindings,
+            KEY,
+            &presses(&[KEY_C, KEY_B, KEY_D, KEY_E, KEY_ENTER], 30),
+        );
+        read_reports(
+            &target,
+            &bindings,
+            KEY,
+            &with_held(KEY_LEFTSHIFT, &[KEY_F], 40),
+        );
+        assert_eq!(target.lock().unwrap().field_keys, 0);
+        read_reports(
+            &target,
+            &bindings,
+            0,
+            &presses(&[KEY_1, KEY_2, KEY_3, KEY_4], 50),
+        );
+        // Its held Shift does not shift the keyboard's key, and the
+        // keyboard's held Shift does: both devices at once.
+        let (mut keyboard_resync, mut key_resync) = (|| None, || None);
+        let mut keyboard = DeviceState::new(None, AbsoluteKind::Tablet, &mut keyboard_resync, true);
+        let mut token = DeviceState::new(None, AbsoluteKind::Tablet, &mut key_resync, true);
+        let mut apply = |code, value, device| {
+            let state = if device == KEY {
+                &mut token
+            } else {
+                &mut keyboard
+            };
+            apply_device_event(&target, key(code, value), device, &bindings, state).unwrap();
+        };
+        apply(KEY_LEFTSHIFT, KEY_PRESS, KEY);
+        apply(KEY_A, KEY_PRESS, 0);
+        apply(KEY_A, KEY_RELEASE, 0);
+        apply(KEY_LEFTSHIFT, KEY_RELEASE, KEY);
+        apply(KEY_RIGHTSHIFT, KEY_PRESS, 0);
+        apply(KEY_A, KEY_PRESS, 0);
+        apply(KEY_A, KEY_RELEASE, 0);
+        apply(KEY_RIGHTSHIFT, KEY_RELEASE, 0);
+        apply(KEY_BACKSPACE, KEY_PRESS, 0);
+        apply(KEY_BACKSPACE, KEY_RELEASE, 0);
+        read_reports(
+            &target,
+            &bindings,
+            KEY,
+            &presses(&[KEY_BACKSPACE, KEY_ENTER], 70),
+        );
+        {
+            let target = target.lock().unwrap();
+            assert_eq!(target.field.typed(), b"1234a");
+            assert!(!target.field.submitted());
+            assert_eq!(target.field_keys, 7);
+        }
+        // Its Escape cancels: attention drains and the field is gone.
+        read_reports(&target, &bindings, KEY, &presses(&[KEY_ESC], 80));
+        let target = target.lock().unwrap();
+        assert_eq!(target.draining_events, 1);
+        assert!(!target.field.is_open() && target.field.typed().is_empty());
+        assert_eq!(target.field_keys, 7);
+    }
+
+    /// Escape cancels the whole operation: it drains, offers the field
+    /// nothing, and nothing types afterwards.
+    #[test]
+    fn escape_cancels_the_pin_field() {
+        let (target, bindings) = pin_field(&[]);
+        read_reports(
+            &target,
+            &bindings,
+            0,
+            &presses(&[KEY_1, KEY_2, KEY_ESC, KEY_3], 30),
+        );
+        let target = target.lock().unwrap();
+        assert_eq!(target.draining_events, 1);
+        assert_eq!(target.field_keys, 2);
+        assert!(!target.field.is_open() && target.field.typed().is_empty());
+        assert!(bindings.lock().unwrap().attention == AttentionState::Closed);
+    }
+
+    /// Keys reach the field only in an attention lifetime whose operation
+    /// was chosen: outside attention they are a client's, and on the menu
+    /// or the key-management screen they choose.
+    #[test]
+    fn only_a_chosen_operation_takes_pin_keys() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = attention_bindings(None);
+        target.lock().unwrap().field.open();
+        read_reports(&target, &bindings, 0, &presses(&[KEY_1, KEY_ENTER], 10));
+        read_reports(&target, &bindings, 0, &chord_reports(20));
+        read_reports(
+            &target,
+            &bindings,
+            0,
+            &presses(&[KEY_Q, KEY_K, KEY_Z, KEY_A], 30),
+        );
+        let target = target.lock().unwrap();
+        assert_eq!(target.secret_roles.len(), 1);
+        assert_eq!(target.field_keys, 0);
+        assert!(target.field.typed().is_empty());
     }
 }

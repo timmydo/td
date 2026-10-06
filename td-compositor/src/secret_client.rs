@@ -1,6 +1,6 @@
 //! Private session protocol and a physical attention lifetime.
 
-use crate::attention::Notice;
+use crate::attention::{Field, Notice};
 use crate::authority::consent::{
     Admitted, Enrollment, Fingerprint, LoginStep, Operation, Platform, Recovery, Request, Role,
     Slot, LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_TWO_CEREMONIES,
@@ -9,16 +9,262 @@ use crate::authority::Exchange;
 use crate::input::EvdevOrigin;
 use crate::runtime::Runtime;
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 const ACTIVE: u8 = 0;
 const CANCELLED: u8 = 1;
 const COMMITTED: u8 = 2;
+/// A submitted PIN taken for its `1c`: cancellation marked after this is
+/// honoured up to the write, and after it is a `15` like Escape's.
+const SENDING: u8 = 4;
 
 /// A store operation's or an installation review's attention lifetime.
 const SECRET_LIFETIME: Duration = Duration::from_secs(120);
+
+/// FIDO's PIN profile (td-login/TOKEN-LOGIN.md, "Token profile"): 4 to 63
+/// printable ASCII bytes, so each byte is one code point.
+const PIN_SHORTEST: usize = 4;
+const PIN_LONGEST: usize = 63;
+/// The PIN field's fixed buffer.
+const PIN_CAPACITY: usize = 64;
+/// `1c` as written: its tag, the length byte, the longest description that
+/// byte counts, and the longest PIN.
+const PIN_REQUEST: usize = 2 + 255 + PIN_LONGEST;
+/// `/proc/swaps` and `/proc/self/limits` are read up to this many bytes.
+const PROC_TEXT: u64 = 64 * 1024;
+
+/// Why a PIN field did not open: this process's memory could reach swap or
+/// a core dump.
+const UNPROTECTED: &[&str] = &["PIN ENTRY NEEDS NO SWAP AND NO CORE DUMPS"];
+
+/// One fresh physical key press for the PIN field, already mapped through
+/// its keymap. Its `Debug` never shows a byte.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum FieldKey {
+    Byte(u8),
+    Erase,
+    Submit,
+}
+
+impl std::fmt::Debug for FieldKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Byte(_) => "Byte(..)",
+            Self::Erase => "Erase",
+            Self::Submit => "Submit",
+        })
+    }
+}
+
+/// A PIN as it is typed: a fixed buffer, zeroed on every exit and when
+/// dropped. Never cloned, formatted or moved into a `String` or `Vec`.
+struct PinBuffer {
+    bytes: [u8; PIN_CAPACITY],
+    length: usize,
+}
+
+impl PinBuffer {
+    /// A 64th byte refuses.
+    fn push(&mut self, byte: u8) -> bool {
+        if self.length >= PIN_LONGEST {
+            return false;
+        }
+        let Some(slot) = self.bytes.get_mut(self.length) else {
+            return false;
+        };
+        *slot = byte;
+        self.length += 1;
+        true
+    }
+
+    fn pop(&mut self) -> bool {
+        let Some(last) = self.length.checked_sub(1) else {
+            return false;
+        };
+        if let Some(slot) = self.bytes.get_mut(last) {
+            *slot = 0;
+        }
+        self.length = last;
+        true
+    }
+
+    fn clear(&mut self) {
+        self.bytes.fill(0);
+        std::hint::black_box(&mut self.bytes);
+        self.length = 0;
+    }
+}
+
+impl Default for PinBuffer {
+    fn default() -> Self {
+        Self {
+            bytes: [0; PIN_CAPACITY],
+            length: 0,
+        }
+    }
+}
+
+impl Drop for PinBuffer {
+    fn drop(&mut self) {
+        self.clear();
+        #[cfg(test)]
+        tests::dropped(&self.bytes);
+    }
+}
+
+/// The PIN field's state: open for a presented PIN step root asked a PIN
+/// for, until its PIN is submitted and taken, or it closes.
+#[derive(Default)]
+pub(crate) struct PinField {
+    open: bool,
+    submitted: bool,
+    /// When the field's own paint was seen on glass: only a press made
+    /// after it may type.
+    shown: Option<u128>,
+    pin: PinBuffer,
+}
+
+impl PinField {
+    pub fn open(&mut self) {
+        self.pin.clear();
+        self.open = true;
+        self.submitted = false;
+        self.shown = None;
+    }
+
+    pub fn close(&mut self) {
+        self.pin.clear();
+        self.open = false;
+        self.submitted = false;
+        self.shown = None;
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// One key while the field is open and not yet submitted: the masked
+    /// length to show when the bytes changed. A byte outside printable
+    /// ASCII, a 64th byte, Backspace on nothing and an Enter before four
+    /// bytes change nothing.
+    pub fn key(&mut self, key: FieldKey) -> Option<usize> {
+        if !self.open || self.submitted {
+            return None;
+        }
+        let changed = match key {
+            FieldKey::Byte(byte) => (0x20..=0x7e).contains(&byte) && self.pin.push(byte),
+            FieldKey::Erase => self.pin.pop(),
+            FieldKey::Submit => {
+                self.submitted = self.pin.length >= PIN_SHORTEST;
+                false
+            }
+        };
+        changed.then_some(self.pin.length)
+    }
+
+    /// A submitted PIN copied into `into` and zeroed here, closing the
+    /// field: its length.
+    fn take(&mut self, into: &mut [u8]) -> Option<usize> {
+        if !self.open || !self.submitted {
+            return None;
+        }
+        let length = self.pin.length;
+        let taken = match (into.get_mut(..length), self.pin.bytes.get(..length)) {
+            (Some(into), Some(pin)) => {
+                into.copy_from_slice(pin);
+                Some(length)
+            }
+            _ => None,
+        };
+        self.close();
+        taken
+    }
+
+    #[cfg(test)]
+    pub fn typed(&self) -> &[u8] {
+        self.pin.bytes.get(..self.pin.length).unwrap_or(&[])
+    }
+
+    #[cfg(test)]
+    pub fn submitted(&self) -> bool {
+        self.submitted
+    }
+
+    #[cfg(test)]
+    fn raw(&self) -> [u8; PIN_CAPACITY] {
+        self.pin.bytes
+    }
+}
+
+/// `1c` as it is written, PIN included: a fixed buffer zeroed when dropped.
+struct PinRequest {
+    bytes: [u8; PIN_REQUEST],
+}
+
+impl PinRequest {
+    fn clear(&mut self) {
+        self.bytes.fill(0);
+        std::hint::black_box(&mut self.bytes);
+        #[cfg(test)]
+        tests::request_cleared(&self.bytes);
+    }
+}
+
+impl Drop for PinRequest {
+    fn drop(&mut self) {
+        self.clear();
+        #[cfg(test)]
+        tests::dropped(&self.bytes);
+    }
+}
+
+/// td-secret's PIN-holder check (`store::require_protected_memory`), for
+/// this process: no active swap and a zero core-dump soft limit.
+fn protected_memory() -> Result<(), String> {
+    memory_state(proc_text("/proc/swaps"), proc_text("/proc/self/limits"))
+}
+
+fn proc_text(path: &str) -> io::Result<String> {
+    let mut text = String::new();
+    File::open(path)?
+        .take(PROC_TEXT + 1)
+        .read_to_string(&mut text)?;
+    if u64::try_from(text.len()).map_or(true, |length| length > PROC_TEXT) {
+        return Err(io::Error::other("oversized process table"));
+    }
+    Ok(text)
+}
+
+fn memory_state(swaps: io::Result<String>, limits: io::Result<String>) -> Result<(), String> {
+    match swaps {
+        // Linux registers /proc/swaps only when CONFIG_SWAP is enabled.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+        Ok(swaps) => {
+            if swaps.lines().next().is_none()
+                || swaps.lines().skip(1).any(|line| !line.trim().is_empty())
+            {
+                return Err("a PIN needs swap to be disabled".into());
+            }
+        }
+    }
+    let limits = limits.map_err(|error| error.to_string())?;
+    let core = limits
+        .lines()
+        .find_map(|line| line.strip_prefix("Max core file size"));
+    if core.and_then(|line| line.split_whitespace().next()) != Some("0") {
+        return Err("a PIN needs a zero core-dump soft limit".into());
+    }
+    Ok(())
+}
+
+fn asks_pin(request: &Request) -> bool {
+    request.login_step().is_some_and(LoginStep::asks_pin)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Selection {
@@ -260,6 +506,9 @@ pub(crate) struct Attempt {
     deadline: Option<Instant>,
     presentation: Mutex<Option<(Request, u128)>>,
     confirmed: AtomicBool,
+    /// The PIN field, shared by the evdev adapter that types into it and
+    /// the authority worker that sends what it holds.
+    field: Mutex<PinField>,
 }
 
 impl Attempt {
@@ -277,12 +526,179 @@ impl Attempt {
             state: AtomicU8::new(ACTIVE),
             presentation: Mutex::new(None),
             confirmed: AtomicBool::new(false),
+            field: Mutex::new(PinField::default()),
         })
     }
 
     /// Input records cancellation before waiting for painting or channel I/O.
+    /// Escape's cancellation zeroes the PIN field too. The mark is one
+    /// atomic change of the state `take_pin` moves to `SENDING`, so exactly
+    /// one of them comes first.
     pub fn cancel(&self) {
         self.state.fetch_or(CANCELLED, Ordering::SeqCst);
+        self.close_field();
+    }
+
+    /// Closes the PIN field, zeroing it, whatever a panicking holder left.
+    fn close_field(&self) {
+        self.field
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .close();
+    }
+
+    /// Opens the PIN field beneath `step`, the presented PIN step root asked
+    /// a PIN for, and waits for its paint to be on glass: until then no key
+    /// types, and afterwards only a press made after it.
+    fn open_field(&self, step: &Request) -> Result<(), String> {
+        let presentation = {
+            let mut field = self.field.lock().unwrap_or_else(PoisonError::into_inner);
+            if !self.active() {
+                field.close();
+                return Err("physical attention was cancelled".into());
+            }
+            field.open();
+            let shown = self
+                .runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())
+                .and_then(|mut runtime| {
+                    runtime.show_attention_field(&self.origin, step, Field::Pin(0))
+                });
+            match shown {
+                Ok(presentation) => presentation,
+                Err(error) => {
+                    field.close();
+                    return Err(error);
+                }
+            }
+        };
+        // Outside both locks, since the completion is delivered under the
+        // runtime's; bounded as a prompt's presentation is.
+        let completed = Instant::now()
+            .checked_add(crate::runtime::ATTENTION_PRESENTATION_DEADLINE)
+            .into_iter()
+            .chain(self.deadline)
+            .min()
+            .ok_or_else(|| "physical secret operation expired".to_string())
+            .and_then(|deadline| presentation.wait(deadline));
+        let mut field = self.field.lock().unwrap_or_else(PoisonError::into_inner);
+        let completed = completed.and_then(|()| {
+            self.runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?
+                .finish_field_presentation(&presentation, step)
+        });
+        match completed {
+            Ok(completed) if field.is_open() && self.active() => {
+                field.shown = Some(completed);
+                Ok(())
+            }
+            Ok(_) => {
+                field.close();
+                Err("physical attention was cancelled".into())
+            }
+            Err(error) => {
+                field.close();
+                Err(error)
+            }
+        }
+    }
+
+    /// One key for the PIN field, which only the evdev adapter can offer,
+    /// pressed at `timestamp`. A field the person cannot see takes nothing
+    /// more: a failed repaint zeroes it and cancels the attempt.
+    pub fn field_key(
+        &self,
+        _origin: &EvdevOrigin,
+        key: FieldKey,
+        timestamp: u128,
+    ) -> Result<(), String> {
+        let mut field = self.field.lock().unwrap_or_else(PoisonError::into_inner);
+        if !field.is_open() {
+            return Ok(());
+        }
+        if !self.active() {
+            field.close();
+            return Ok(());
+        }
+        // A press from before the field was on glass, queued or delivered
+        // late, was not made at it: the rule a prompt's confirmation keeps.
+        if !field.shown.is_some_and(|completed| timestamp > completed) {
+            return Ok(());
+        }
+        let Some(length) = field.key(key) else {
+            return Ok(());
+        };
+        let shown = u8::try_from(length)
+            .map_err(|_| "PIN field length overflow".to_string())
+            .and_then(|length| {
+                self.runtime
+                    .lock()
+                    .map_err(|_| "runtime lock poisoned".to_string())?
+                    .update_attention_field(&self.origin, Field::Pin(length))
+            });
+        if shown.is_err() {
+            field.close();
+            self.state.fetch_or(CANCELLED, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// A submitted PIN copied into `into` and zeroed in the field: its
+    /// length. The attempt moves from `ACTIVE` to `SENDING` first, in the
+    /// one compare-exchange cancellation's mark races: a cancellation that
+    /// came first leaves nothing copied, and one after it is honoured by
+    /// `sending` up to the write. `finish_sending` ends the send.
+    fn take_pin(&self, into: &mut [u8]) -> Option<usize> {
+        let mut field = self.field.lock().unwrap_or_else(PoisonError::into_inner);
+        if !field.is_open() || !field.submitted {
+            return None;
+        }
+        if self.expired()
+            || self
+                .state
+                .compare_exchange(ACTIVE, SENDING, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            field.close();
+            return None;
+        }
+        let taken = field.take(into);
+        if taken.is_none() {
+            self.finish_sending();
+        }
+        taken
+    }
+
+    /// Whether a taken PIN may still be written: no cancellation since the
+    /// take, and the deadline not passed.
+    fn sending(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == SENDING && !self.expired()
+    }
+
+    /// Back to `ACTIVE` after a send, unless cancellation marked it.
+    fn finish_sending(&self) {
+        let _ = self
+            .state
+            .compare_exchange(SENDING, ACTIVE, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// After the PIN: the key wants its touch.
+    fn show_touch(&self, step: &Request) -> Result<(), String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .show_attention_field(&self.origin, step, Field::Touch)
+            .map(|_| ())
+    }
+
+    #[cfg(test)]
+    fn field_raw(&self) -> [u8; PIN_CAPACITY] {
+        self.field
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .raw()
     }
 
     fn expired(&self) -> bool {
@@ -422,15 +838,39 @@ struct LoginPending {
     last: bool,
     /// An addition's authorizing key, which its new key's steps never name.
     authorizer: Option<Fingerprint>,
+    /// The current PIN step's field has opened.
+    field: bool,
+    /// The current PIN step's `1c` was sent: only then may its successor or
+    /// its commit follow.
+    pin_sent: bool,
     committed: bool,
     cancelled: bool,
 }
 
-#[derive(Default)]
+/// However the operation leaves this client, its PIN field is zeroed.
+impl Drop for LoginPending {
+    fn drop(&mut self) {
+        self.attempt.close_field();
+    }
+}
+
 pub(crate) struct Client {
     pending: Option<Pending>,
     login: Option<LoginPending>,
     inspection: Option<Inspection>,
+    /// The check before a PIN field opens.
+    memory: fn() -> Result<(), String>,
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            login: None,
+            inspection: None,
+            memory: protected_memory,
+        }
+    }
 }
 
 impl Client {
@@ -476,6 +916,8 @@ impl Client {
             receipt: None,
             last: false,
             authorizer: None,
+            field: false,
+            pin_sent: false,
             committed: false,
             cancelled: false,
         });
@@ -483,6 +925,7 @@ impl Client {
     }
 
     fn tick_login(&mut self, wire: &mut impl Exchange) -> Result<(), String> {
+        let memory = self.memory;
         let Some(login) = &mut self.login else {
             return Ok(());
         };
@@ -552,15 +995,21 @@ impl Client {
                     _ => login.abandon(wire)?,
                 }
             }
-            // No PIN field yet: nothing in production reaches a PIN step.
-            0x0c if presented
-                && open
-                && description.login_step().is_some_and(LoginStep::asks_pin) =>
-            {
-                login.cancel(wire)?;
-                login.attempt.notice(Notice::NotAvailable)?;
+            // Root waits for the presented PIN step's PIN: the field opens,
+            // and once the person submits it the PIN goes as `1c`. Nothing
+            // in production reaches a PIN step.
+            0x0c if presented && open && asks_pin(&description) && !login.pin_sent => {
+                if login.field {
+                    login.send_pin(wire, &description)?;
+                } else {
+                    login.open_field(wire, memory, &description)?;
+                }
             }
-            0x05 if login.last && presented && open => {
+            0x05 if login.last
+                && presented
+                && open
+                && (login.pin_sent || !asks_pin(&description)) =>
+            {
                 // This CAS chooses between physical cancellation and consent.
                 if login.attempt.commit() {
                     login.committed = true;
@@ -655,7 +1104,14 @@ impl Client {
             return self.poll_inspection(wire);
         }
         if self.login.is_some() {
-            return self.tick_login(wire);
+            let result = self.tick_login(wire);
+            // A violation ends the generation: nothing typed outlives it.
+            if result.is_err() {
+                if let Some(login) = &self.login {
+                    login.attempt.close_field();
+                }
+            }
+            return result;
         }
         let Some(pending) = &mut self.pending else {
             return Ok(());
@@ -778,9 +1234,93 @@ impl Pending {
 
 impl LoginPending {
     fn cancel(&mut self, wire: &mut impl Exchange) -> Result<(), String> {
+        self.attempt.close_field();
         cancel(wire, &self.nonce)?;
         self.cancelled = true;
         Ok(())
+    }
+
+    /// Opens the presented PIN step's field, once this process's memory is
+    /// checked as td-secret's worker checks its own: a PIN must reach
+    /// neither swap nor a core dump. A refusal cancels and says why.
+    fn open_field(
+        &mut self,
+        wire: &mut impl Exchange,
+        memory: fn() -> Result<(), String>,
+        step: &Request,
+    ) -> Result<(), String> {
+        if memory().is_err() {
+            self.cancel(wire)?;
+            return self.attempt.notice(Notice::Login(UNPROTECTED));
+        }
+        if self.attempt.open_field(step).is_err() {
+            return self.abandon(wire);
+        }
+        self.field = true;
+        Ok(())
+    }
+
+    /// Sends the submitted PIN as `1c` with `step`, its PIN step, from a
+    /// buffer zeroed as soon as the write returns, before root's answer is
+    /// awaited; nothing until the person submits one. A cancellation or
+    /// the deadline before the final check drops it unsent, and the next
+    /// poll cancels; one after that check is a `15` that follows the PIN,
+    /// as an Escape just after the write would be.
+    fn send_pin(&mut self, wire: &mut impl Exchange, step: &Request) -> Result<(), String> {
+        let description = step.encode();
+        let length = u8::try_from(description.len())
+            .map_err(|_| "login description exceeds a PIN request".to_string())?;
+        let start = description.len().saturating_add(2);
+        let mut request = PinRequest {
+            bytes: [0; PIN_REQUEST],
+        };
+        request
+            .bytes
+            .get_mut(..start)
+            .and_then(|head| head.split_first_chunk_mut::<2>())
+            .ok_or("invalid PIN request")
+            .map(|(tag, rest)| {
+                *tag = [0x1c, length];
+                rest.copy_from_slice(&description);
+            })?;
+        let into = request
+            .bytes
+            .get_mut(start..)
+            .ok_or("invalid PIN request")?;
+        let Some(pin) = self.attempt.take_pin(into) else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        tests::pin_taken();
+        let sent = match start
+            .checked_add(pin)
+            .and_then(|end| request.bytes.get(..end))
+        {
+            // Checked again immediately before the write.
+            Some(bytes) if self.attempt.sending() => Some(wire.send(bytes)),
+            Some(_) => None,
+            None => Some(Err("invalid PIN request".to_string())),
+        };
+        request.clear();
+        self.attempt.finish_sending();
+        let Some(sent) = sent else {
+            return Ok(());
+        };
+        sent?;
+        self.pin_sent = true;
+        let answer = wire.receive()?;
+        match answer.as_slice() {
+            [0x9c, 0] => {
+                if self.attempt.show_touch(step).is_err() {
+                    self.abandon(wire)?;
+                }
+                Ok(())
+            }
+            // Root's operation had ended, or its deadline passed: the PIN
+            // was dropped, and the end follows.
+            [0x9c, 1] => Ok(()),
+            _ => Err("invalid login PIN acknowledgement".into()),
+        }
     }
 
     /// This client's own cancellation, which withdraws any prompt and says
@@ -839,6 +1379,10 @@ impl LoginPending {
         if !matches!(status, 0x03 | 0x04 | 0x0d | 0x0e) || self.receipt.as_ref() != Some(current) {
             return Err("login status changed a step that was not presented".into());
         }
+        // Root moves past a PIN step only once it has the PIN.
+        if asks_pin(current) && !self.pin_sent {
+            return Err("login status passed a PIN step before its PIN".into());
+        }
         let admitted = current.login_successor(description)?;
         match description.login_step() {
             Some(LoginStep::Authorize { key, .. }) => self.authorizer = Some(key),
@@ -854,6 +1398,8 @@ impl LoginPending {
         self.last = admitted == Admitted::Last;
         self.request = Some(description.clone());
         self.receipt = None;
+        self.field = false;
+        self.pin_sent = false;
         Ok(())
     }
 }
@@ -871,9 +1417,74 @@ fn cancel(wire: &mut impl Exchange, nonce: &[u8; 32]) -> Result<(), String> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
+    use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
+
+    thread_local! {
+        /// Each PIN buffer and `1c` request as it was dropped, after its
+        /// zeroing: whether every byte was zero.
+        static DROPPED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+        /// The scripted wire's writes and reads, and each `1c` request's
+        /// zeroing between them.
+        static WIRE: RefCell<Vec<WireEvent>> = const { RefCell::new(Vec::new()) };
+        /// Run once a PIN is taken, before the check that precedes its
+        /// write: a person pressing Escape in between.
+        static TAKEN: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum WireEvent {
+        Sent(Vec<u8>),
+        /// A `1c` request zeroed: whether every byte was zero.
+        Cleared(bool),
+        Received,
+    }
+
+    pub(super) fn request_cleared(bytes: &[u8]) {
+        let zero = bytes.iter().all(|byte| *byte == 0);
+        WIRE.with(|wire| wire.borrow_mut().push(WireEvent::Cleared(zero)));
+    }
+
+    pub(super) fn pin_taken() {
+        if let Some(hook) = TAKEN.with(|taken| taken.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    fn wire_events() -> Vec<WireEvent> {
+        WIRE.with(|wire| std::mem::take(&mut *wire.borrow_mut()))
+    }
+
+    /// Each `1c` written: what followed it until the next write.
+    fn after_pins(events: &[WireEvent]) -> Vec<Vec<WireEvent>> {
+        events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, WireEvent::Sent(bytes) if bytes.first() == Some(&0x1c)))
+            .map(|(at, _)| {
+                events[at + 1..]
+                    .iter()
+                    .take_while(|event| !matches!(event, WireEvent::Sent(_)))
+                    .cloned()
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The drop hook: what a dropped PIN holder left behind.
+    pub(super) fn dropped(bytes: &[u8]) {
+        DROPPED.with(|dropped| {
+            dropped
+                .borrow_mut()
+                .push(bytes.iter().all(|byte| *byte == 0))
+        });
+    }
+
+    fn drops() -> Vec<bool> {
+        DROPPED.with(|dropped| std::mem::take(&mut *dropped.borrow_mut()))
+    }
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     struct Screen {
@@ -913,11 +1524,67 @@ mod tests {
     struct Wire {
         replies: VecDeque<Vec<u8>>,
         calls: Vec<Vec<u8>>,
+        /// A person at the attention screen: once a PIN field is open and
+        /// empty, they type `PIN` into it and press Enter.
+        typist: Option<Arc<Attempt>>,
     }
     impl Exchange for Wire {
-        fn exchange(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
             self.calls.push(bytes.to_vec());
-            self.replies.pop_front().ok_or("uncertain delivery".into())
+            WIRE.with(|wire| wire.borrow_mut().push(WireEvent::Sent(bytes.to_vec())));
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<Vec<u8>, String> {
+            WIRE.with(|wire| wire.borrow_mut().push(WireEvent::Received));
+            let reply = self.replies.pop_front().ok_or("uncertain delivery")?;
+            if let Some(attempt) = &self.typist {
+                let empty = {
+                    let field = attempt.field.lock().unwrap();
+                    field.is_open() && field.typed().is_empty() && !field.submitted()
+                };
+                if empty {
+                    type_pin(attempt, PIN);
+                }
+            }
+            Ok(reply)
+        }
+    }
+    /// The PIN the tests' person types.
+    const PIN: &[u8] = b"1234";
+    /// A press's evdev time: just after its field was on glass, or before
+    /// any field was.
+    fn pressed(attempt: &Attempt) -> u128 {
+        attempt
+            .field
+            .lock()
+            .unwrap()
+            .shown
+            .map_or(0, |shown| shown + 1)
+    }
+    /// `pin`'s keys, then Enter, as the evdev adapter offers them.
+    fn type_pin(attempt: &Attempt, pin: &[u8]) {
+        for byte in pin {
+            attempt
+                .field_key(
+                    &crate::input::test_origin(),
+                    FieldKey::Byte(*byte),
+                    pressed(attempt),
+                )
+                .unwrap();
+        }
+        attempt
+            .field_key(
+                &crate::input::test_origin(),
+                FieldKey::Submit,
+                pressed(attempt),
+            )
+            .unwrap();
+    }
+    /// A client whose memory check passes, whatever this host's swap.
+    fn login_client() -> Client {
+        Client {
+            memory: || Ok(()),
+            ..Client::default()
         }
     }
     fn request() -> Request {
@@ -937,6 +1604,14 @@ mod tests {
         Wire {
             replies: replies.into(),
             calls: Vec::new(),
+            typist: None,
+        }
+    }
+    /// `replies`, with a person at `screen` who types the PIN.
+    fn typing(replies: Vec<Vec<u8>>, screen: &Screen) -> Wire {
+        Wire {
+            typist: Some(Arc::clone(&screen.attempt)),
+            ..wire(replies)
         }
     }
 
@@ -1154,8 +1829,11 @@ mod tests {
             attempt: &'a Attempt,
         }
         impl Exchange for CancelOnCommit<'_> {
-            fn exchange(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
-                let response = self.wire.exchange(bytes)?;
+            fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+                self.wire.send(bytes)
+            }
+            fn receive(&mut self) -> Result<Vec<u8>, String> {
+                let response = self.wire.receive()?;
                 if response.starts_with(&[0x91, 5]) {
                     self.attempt.cancel();
                 }
@@ -1666,6 +2344,26 @@ mod tests {
         fn shown(&self) -> Option<Notice> {
             self.attempt.runtime.lock().unwrap().attention_shown()
         }
+        /// The PIN field or touch request over the retained prompt.
+        fn field(&self) -> Option<Field> {
+            self.attempt.runtime.lock().unwrap().attention_field_shown()
+        }
+        /// A login attempt whose lifetime ends `after` from now.
+        fn expiring(selection: LoginSelection, after: Duration) -> (Self, Instant) {
+            let mut screen = Self::login(selection.clone());
+            let deadline = Instant::now() + after;
+            screen.attempt = Arc::new(Attempt {
+                origin: crate::input::test_origin(),
+                runtime: Arc::clone(&screen.attempt.runtime),
+                selection: Selection::Login(selection),
+                state: AtomicU8::new(ACTIVE),
+                deadline: Some(deadline),
+                presentation: Mutex::new(None),
+                confirmed: AtomicBool::new(false),
+                field: Mutex::new(PinField::default()),
+            });
+            (screen, deadline)
+        }
     }
 
     fn login(operation: Operation) -> Request {
@@ -1784,11 +2482,22 @@ mod tests {
         [&[0x15][..], &NONCE].concat()
     }
 
+    /// `step`'s `1c` carrying `pin`.
+    fn pin_request(step: &Request, pin: &[u8]) -> Vec<u8> {
+        let encoded = step.encode();
+        [
+            &[0x1c, u8::try_from(encoded.len()).unwrap()][..],
+            &encoded,
+            pin,
+        ]
+        .concat()
+    }
+
     /// Root's statuses for `presented` steps, from the start: the first
     /// while root waits for the worker to repeat it, then each presented,
-    /// acknowledged and worked on, and the client's requests they draw.
-    /// A PIN step's `0c` and `1c` arrive with the PIN field; here the
-    /// worker goes straight to work.
+    /// acknowledged and worked on, and the client's requests they draw. A
+    /// PIN step's field opens at its first `0c`; the person types the PIN
+    /// before the next, which the client answers with `1c`.
     fn presented(selection: &LoginSelection, count: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         let steps = steps(selection);
         let mut replies = vec![started(), vec![0x91, 0x0b], status(3, &steps[0])];
@@ -1798,15 +2507,21 @@ mod tests {
             vec![0x11],
         ];
         for step in steps.iter().take(count) {
-            replies.extend([status(4, step), vec![0x93], status(3, step)]);
-            calls.extend([vec![0x11], description(&[0x13], step), vec![0x11]]);
+            replies.extend([status(4, step), vec![0x93]]);
+            calls.extend([vec![0x11], description(&[0x13], step)]);
+            if asks_pin(step) {
+                replies.extend([status(0x0c, step), status(0x0c, step), vec![0x9c, 0]]);
+                calls.extend([vec![0x11], vec![0x11], pin_request(step, PIN)]);
+            }
+            replies.push(status(3, step));
+            calls.push(vec![0x11]);
         }
         (replies, calls)
     }
 
     fn drive(screen: &Screen, replies: Vec<Vec<u8>>) -> (Client, Wire, Result<(), String>) {
-        let mut wire = wire(replies);
-        let mut client = Client::default();
+        let mut wire = typing(replies, screen);
+        let mut client = login_client();
         let mut result = client.start(&mut wire, Arc::clone(&screen.attempt));
         while result.is_ok() && client.login.is_some() && !wire.replies.is_empty() {
             result = client.tick(&mut wire);
@@ -1845,7 +2560,12 @@ mod tests {
             assert!(client.login.is_none());
             assert_eq!(wire.calls, calls, "{selection:?}");
             assert_eq!(sent(&wire, 0x13), steps.len());
+            // One `1c` for each PIN step, and only for those.
+            let pins = steps.iter().filter(|step| asks_pin(step)).count();
+            assert!(pins > 0);
+            assert_eq!(sent(&wire, 0x1c), pins, "{selection:?}");
             assert_eq!(screen.shown(), Some(Notice::Login(selection.success())));
+            assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
         }
     }
 
@@ -2119,8 +2839,11 @@ mod tests {
         at: usize,
     }
     impl Exchange for CancelAt<'_> {
-        fn exchange(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
-            let response = self.wire.exchange(bytes)?;
+        fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+            self.wire.send(bytes)
+        }
+        fn receive(&mut self) -> Result<Vec<u8>, String> {
+            let response = self.wire.receive()?;
             if self.wire.calls.len() == self.at {
                 self.attempt.cancel();
             }
@@ -2145,7 +2868,19 @@ mod tests {
         let presentation = after_presentation.len();
         after_presentation.extend([vec![0x95, 0], end(&identify)]);
         at_commit.extend([vec![0x95, 0], end(&last)]);
+        // As the PIN field opens, and once the PIN is typed and submitted
+        // but not yet sent.
+        let mut at_field = presented(&unlock, 1).0;
+        at_field.extend([status(4, &last), vec![0x93], status(0x0c, &last)]);
+        let field = at_field.len();
+        let mut at_typed = at_field.clone();
+        at_field.extend([vec![0x95, 0], end(&last)]);
+        at_typed.push(status(0x0c, &last));
+        let typed = at_typed.len();
+        at_typed.extend([vec![0x95, 0], end(&last)]);
         for (replies, at) in [
+            (at_field, field),
+            (at_typed, typed),
             (
                 vec![
                     started(),
@@ -2169,18 +2904,18 @@ mod tests {
         ] {
             let screen = Screen::login(unlock.clone());
             let mut wire = CancelAt {
-                wire: wire(replies),
+                wire: typing(replies, &screen),
                 attempt: &screen.attempt,
                 at,
             };
-            let mut client = Client::default();
+            let mut client = login_client();
             client
                 .start(&mut wire, Arc::clone(&screen.attempt))
                 .unwrap();
             while client.login.is_some() {
                 client.tick(&mut wire).unwrap();
             }
-            assert!(wire.wire.replies.is_empty());
+            assert!(wire.wire.replies.is_empty(), "{at}");
             assert_eq!(sent(&wire.wire, 0x15), 1);
             assert_eq!(sent(&wire.wire, 0x14), 0);
             assert_eq!(
@@ -2192,25 +2927,10 @@ mod tests {
                 1
             );
             assert!(!screen.attempt.commit());
+            // Escape's PIN, typed or not, went nowhere and is gone.
+            assert_eq!(sent(&wire.wire, 0x1c), usize::from(at == commit));
+            assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
         }
-        // Root wants a PIN, which this build cannot take: the client
-        // cancels, says so, and the cancellation's end adds nothing.
-        let screen = Screen::login(unlock.clone());
-        let mut replies = presented(&unlock, 2).0;
-        replies.pop();
-        replies.extend([
-            status(0x0c, &last),
-            vec![0x95, 0],
-            status(3, &last),
-            end(&last),
-        ]);
-        let (client, wire, result) = drive(&screen, replies);
-        assert_eq!(result, Ok(()));
-        assert!(client.login.is_none());
-        assert_eq!(sent(&wire, 0x15), 1);
-        assert_eq!(sent(&wire, 0x1c), 0);
-        assert_eq!(sent(&wire, 0x14), 0);
-        assert_eq!(screen.shown(), Some(Notice::NotAvailable));
         // Not for a step that asks none, nor before that step's own
         // presentation.
         for wants in [status(0x0c, &identify), status(0x0c, &last)] {
@@ -2378,7 +3098,7 @@ mod tests {
         ]);
         let mut client = Client {
             login: Some(login.clone()),
-            ..Client::default()
+            ..login_client()
         };
         let result = client.tick(&mut wire);
         (client, result)
@@ -2578,7 +3298,7 @@ mod tests {
                 attempt: &screen.attempt,
                 at,
             };
-            let mut client = Client::default();
+            let mut client = login_client();
             client
                 .start(&mut wire, Arc::clone(&screen.attempt))
                 .unwrap();
@@ -2625,17 +3345,7 @@ mod tests {
         let unlock = LoginSelection::Unlock;
         let steps = steps(&unlock);
         let end = [&ended(0x0d, 0x80, 0)[..], &steps[0].encode()].concat();
-        let mut screen = Screen::login(unlock.clone());
-        let deadline = Instant::now() + Duration::from_millis(1500);
-        screen.attempt = Arc::new(Attempt {
-            origin: crate::input::test_origin(),
-            runtime: Arc::clone(&screen.attempt.runtime),
-            selection: Selection::Login(unlock.clone()),
-            state: AtomicU8::new(ACTIVE),
-            deadline: Some(deadline),
-            presentation: Mutex::new(None),
-            confirmed: AtomicBool::new(false),
-        });
+        let (screen, deadline) = Screen::expiring(unlock.clone(), Duration::from_millis(1500));
         let (mut client, _, result) = drive(&screen, presented(&unlock, 1).0);
         assert_eq!(result, Ok(()));
         // The prompt is up.
@@ -2655,8 +3365,11 @@ mod tests {
             at: usize,
         }
         impl Exchange for FailAt<'_> {
-            fn exchange(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
-                let response = self.wire.exchange(bytes)?;
+            fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+                self.wire.send(bytes)
+            }
+            fn receive(&mut self) -> Result<Vec<u8>, String> {
+                let response = self.wire.receive()?;
                 if self.wire.calls.len() == self.at {
                     self.runtime.lock().unwrap().fail_next_repaint();
                 }
@@ -2677,7 +3390,7 @@ mod tests {
             runtime: &screen.attempt.runtime,
             at: 4,
         };
-        let mut client = Client::default();
+        let mut client = login_client();
         client
             .start(&mut wire, Arc::clone(&screen.attempt))
             .unwrap();
@@ -2797,7 +3510,7 @@ mod tests {
     fn a_login_operation_occupies_the_client() {
         let screen = Screen::login(LoginSelection::Unlock);
         let mut wire = wire(vec![started()]);
-        let mut client = Client::default();
+        let mut client = login_client();
         client
             .start(&mut wire, Arc::clone(&screen.attempt))
             .unwrap();
@@ -2805,5 +3518,802 @@ mod tests {
         client.start(&mut wire, Arc::clone(&other.attempt)).unwrap();
         assert_eq!(wire.calls.len(), 1);
         assert_eq!(other.shown(), Some(Notice::Busy));
+    }
+
+    // The PIN field.
+
+    /// An unlock driven to root's first `0c` for its PIN step, with no
+    /// one typing yet, and `then` queued after it.
+    fn at_pin(screen: &Screen, then: Vec<Vec<u8>>) -> (Client, Wire) {
+        let unlock = LoginSelection::Unlock;
+        let last = steps(&unlock)[1].clone();
+        let mut replies = presented(&unlock, 1).0;
+        replies.extend([status(4, &last), vec![0x93], status(0x0c, &last)]);
+        let mut wire = wire(replies);
+        let mut client = login_client();
+        client
+            .start(&mut wire, Arc::clone(&screen.attempt))
+            .unwrap();
+        while !wire.replies.is_empty() {
+            client.tick(&mut wire).unwrap();
+        }
+        wire.replies.extend(then);
+        (client, wire)
+    }
+
+    fn type_bytes(screen: &Screen, bytes: &[u8]) {
+        for byte in bytes {
+            screen
+                .attempt
+                .field_key(
+                    &crate::input::test_origin(),
+                    FieldKey::Byte(*byte),
+                    pressed(&screen.attempt),
+                )
+                .unwrap();
+        }
+    }
+
+    fn unlock_pin_step() -> Request {
+        steps(&LoginSelection::Unlock)[1].clone()
+    }
+
+    #[test]
+    fn root_asking_for_a_pin_opens_the_field_and_the_pin_goes_once_as_1c() {
+        let last = unlock_pin_step();
+        let screen = Screen::login(LoginSelection::Unlock);
+        let (mut client, mut wire) = at_pin(&screen, vec![status(0x0c, &last)]);
+        // The field is up over the presented step, empty; nothing is sent.
+        assert_eq!(screen.field(), Some(Field::Pin(0)));
+        assert_eq!(screen.shown(), None);
+        assert_eq!(sent(&wire, 0x1c), 0);
+        // Typing shows one mask per byte; root asking again sends nothing
+        // before Enter.
+        type_bytes(&screen, b"9a ~");
+        assert_eq!(screen.field(), Some(Field::Pin(4)));
+        client.tick(&mut wire).unwrap();
+        assert_eq!(sent(&wire, 0x1c), 0);
+        screen
+            .attempt
+            .field_key(
+                &crate::input::test_origin(),
+                FieldKey::Submit,
+                pressed(&screen.attempt),
+            )
+            .unwrap();
+        wire.replies
+            .extend([status(0x0c, &last), vec![0x9c, 0], status(3, &last)]);
+        drops();
+        client.tick(&mut wire).unwrap();
+        // The exact `1c`, written from a buffer zeroed once it was; the
+        // field zeroed as the PIN left it; then the touch request.
+        assert_eq!(wire.calls.last(), Some(&pin_request(&last, b"9a ~")));
+        assert_eq!(drops(), [true]);
+        assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+        assert_eq!(screen.field(), Some(Field::Touch));
+        // The field is closed: nothing types, and root's work goes on.
+        type_bytes(&screen, b"5678");
+        assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+        client.tick(&mut wire).unwrap();
+        wire.replies.extend([
+            status(5, &last),
+            vec![0x94],
+            status(3, &last),
+            status(6, &last),
+        ]);
+        while client.login.is_some() {
+            client.tick(&mut wire).unwrap();
+        }
+        assert_eq!(sent(&wire, 0x1c), 1);
+        assert_eq!(sent(&wire, 0x14), 1);
+        assert_eq!(screen.shown(), Some(Notice::Login(&["SESSION UNLOCKED"])));
+    }
+
+    /// Typing before root asks for the PIN reaches no field, and an Enter
+    /// then submits nothing: no `1c` precedes root's `0c`.
+    #[test]
+    fn no_pin_is_taken_or_sent_before_root_asks_for_it() {
+        let unlock = LoginSelection::Unlock;
+        let last = unlock_pin_step();
+        let screen = Screen::login(unlock.clone());
+        let mut replies = presented(&unlock, 1).0;
+        replies.extend([status(4, &last), vec![0x93]]);
+        let mut wire = wire(replies);
+        let mut client = login_client();
+        client
+            .start(&mut wire, Arc::clone(&screen.attempt))
+            .unwrap();
+        while !wire.replies.is_empty() {
+            client.tick(&mut wire).unwrap();
+        }
+        // The prompt is presented and acknowledged; root has not asked.
+        type_pin(&screen.attempt, b"1234");
+        assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+        assert_eq!(screen.field(), None);
+        wire.replies
+            .extend([status(3, &last), status(0x0c, &last), status(0x0c, &last)]);
+        while !wire.replies.is_empty() {
+            client.tick(&mut wire).unwrap();
+        }
+        // The field opened empty, and that early Enter submitted nothing.
+        assert_eq!(sent(&wire, 0x1c), 0);
+        assert_eq!(screen.field(), Some(Field::Pin(0)));
+        // A `0c` for a step that asks none, or for one not yet presented,
+        // opens nothing (`cancellation_at_each_stage_...`).
+    }
+
+    /// Root moves past a PIN step only once it has the PIN, so a successor
+    /// or a commit before this client's `1c` is a violation.
+    #[test]
+    fn a_pin_steps_successor_or_commit_needs_its_1c() {
+        let add = LoginSelection::Add;
+        let add_steps = steps(&add);
+        let (authorize, connect) = (&add_steps[1], &add_steps[2]);
+        for (field, next) in [
+            // As root asks, with the field open, or before it asks at all.
+            (true, status(4, connect)),
+            (true, status(3, connect)),
+            (false, status(4, connect)),
+            (
+                false,
+                [&ended(0x0d, 0x08, 0)[..], &connect.encode()].concat(),
+            ),
+        ] {
+            let screen = Screen::login(add.clone());
+            let mut replies = presented(&add, 1).0;
+            replies.extend([status(4, authorize), vec![0x93]]);
+            if field {
+                replies.push(status(0x0c, authorize));
+            }
+            replies.push(next);
+            let mut wire = wire(replies);
+            let mut client = login_client();
+            client
+                .start(&mut wire, Arc::clone(&screen.attempt))
+                .unwrap();
+            let mut result = Ok(());
+            while result.is_ok() && !wire.replies.is_empty() {
+                if field && wire.replies.len() == 1 {
+                    type_bytes(&screen, b"1234");
+                }
+                result = client.tick(&mut wire);
+            }
+            assert_eq!(
+                result,
+                Err("login status passed a PIN step before its PIN".into())
+            );
+            assert_eq!(sent(&wire, 0x13), 2);
+            assert_eq!(sent(&wire, 0x1c), 0);
+            // A violation leaves nothing typed behind.
+            assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+        }
+        // The unlock step is the last: its commit waits for its PIN too.
+        for asked in [false, true] {
+            let last = unlock_pin_step();
+            let screen = Screen::login(LoginSelection::Unlock);
+            let mut replies = presented(&LoginSelection::Unlock, 1).0;
+            replies.extend([status(4, &last), vec![0x93]]);
+            if asked {
+                replies.push(status(0x0c, &last));
+            }
+            replies.push(status(5, &last));
+            let (_, wire, result) = drive(&screen, replies);
+            assert_eq!(result, Err("out-of-order login operation status".into()));
+            assert_eq!(sent(&wire, 0x14), 0);
+            assert_eq!(sent(&wire, 0x1c), 0);
+        }
+        // After its `1c` the successor is admitted and presented.
+        let screen = Screen::login(add.clone());
+        let mut replies = presented(&add, 2).0;
+        replies.extend([status(4, connect), vec![0x93]]);
+        let (client, wire, result) = drive(&screen, replies);
+        assert_eq!(result, Ok(()));
+        assert_eq!(sent(&wire, 0x13), 3);
+        assert_eq!(
+            client.login.as_ref().unwrap().receipt.as_ref(),
+            Some(connect)
+        );
+        // Its prompt replaced the touch request.
+        assert_eq!(screen.field(), None);
+    }
+
+    /// Root asks once per PIN step: a second `0c` after this client's `1c`,
+    /// or any answer to `1c` but root's two, is a violation.
+    #[test]
+    fn a_pin_is_answered_only_as_root_answers_one() {
+        let last = unlock_pin_step();
+        let screen = Screen::login(LoginSelection::Unlock);
+        let mut replies = presented(&LoginSelection::Unlock, 2).0;
+        replies.push(status(0x0c, &last));
+        let (_, wire, result) = drive(&screen, replies);
+        assert_eq!(result, Err("out-of-order login operation status".into()));
+        assert_eq!(sent(&wire, 0x1c), 1);
+        for answer in [vec![0x9c], vec![0x9c, 2], vec![0x9c, 0, 0], vec![0x93]] {
+            let screen = Screen::login(LoginSelection::Unlock);
+            let (mut client, mut wire) = at_pin(&screen, vec![status(0x0c, &last), answer]);
+            type_pin(&screen.attempt, b"1234");
+            assert_eq!(
+                client.tick(&mut wire),
+                Err("invalid login PIN acknowledgement".into())
+            );
+            assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+        }
+    }
+
+    /// Root that ended the operation, or whose deadline passed, as the PIN
+    /// arrived answers `9c 01` and drops it; its end follows.
+    #[test]
+    fn a_pin_root_could_not_take_is_followed_by_its_end() {
+        let last = unlock_pin_step();
+        let screen = Screen::login(LoginSelection::Unlock);
+        let (mut client, mut wire) = at_pin(
+            &screen,
+            vec![
+                status(0x0c, &last),
+                vec![0x9c, 1],
+                [&ended(0x0d, 0x08, 0)[..], &last.encode()].concat(),
+            ],
+        );
+        type_pin(&screen.attempt, b"1234");
+        while client.login.is_some() {
+            client.tick(&mut wire).unwrap();
+        }
+        assert_eq!(sent(&wire, 0x1c), 1);
+        assert_eq!(sent(&wire, 0x15), 0);
+        assert_eq!(screen.shown(), Some(Notice::Login(&["TIMED OUT"])));
+        assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+    }
+
+    /// A wrong PIN is the worker's typed failure, so root ends the
+    /// operation: WRONG PIN, and nothing retries. Another attempt is a new
+    /// operation from a new chord.
+    #[test]
+    fn a_wrong_pin_ends_the_operation() {
+        for (selection, count) in [
+            (LoginSelection::Unlock, 2),
+            (LoginSelection::Add, 2),
+            (LoginSelection::Enroll(1), 2),
+        ] {
+            let steps = steps(&selection);
+            let step = &steps[count - 1];
+            assert!(asks_pin(step));
+            let screen = Screen::login(selection.clone());
+            let mut replies = presented(&selection, count).0;
+            replies.push([&ended(0x0d, 0x01, 7)[..], &step.encode()].concat());
+            let (client, wire, result) = drive(&screen, replies);
+            assert_eq!(result, Ok(()), "{selection:?}");
+            assert!(client.login.is_none());
+            assert_eq!(sent(&wire, 0x1c), 1);
+            assert_eq!(sent(&wire, 0x14), 0);
+            assert_eq!(sent(&wire, 0x15), 0);
+            assert_eq!(screen.shown(), Some(Notice::Login(&["WRONG PIN"])));
+            assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+        }
+    }
+
+    /// The PIN field shares the attempt's lifetime: its deadline while
+    /// typing zeroes the field, cancels and says TIMED OUT, and a key after
+    /// it types nothing.
+    #[test]
+    fn a_deadline_while_typing_zeroes_the_field_and_times_out() {
+        for tick in [true, false] {
+            let last = unlock_pin_step();
+            let (screen, deadline) =
+                Screen::expiring(LoginSelection::Unlock, Duration::from_millis(2000));
+            let (mut client, _) = at_pin(&screen, vec![]);
+            type_bytes(&screen, b"12");
+            assert_ne!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if tick {
+                // Zeroed by the client's own cancellation, before root's
+                // end arrives.
+                let mut expired = wire(vec![vec![0x95, 0], status(3, &last)]);
+                client.tick(&mut expired).unwrap();
+                assert!(client.login.as_ref().unwrap().cancelled);
+                assert_eq!(expired.calls, [cancelled(), vec![0x11]]);
+                assert_eq!(screen.shown(), Some(Notice::Login(&["TIMED OUT"])));
+                assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+                let end = [&ended(0x0d, 0x80, 0)[..], &last.encode()].concat();
+                client.tick(&mut wire(vec![end])).unwrap();
+                assert!(client.login.is_none());
+                assert_eq!(screen.shown(), Some(Notice::Login(&["TIMED OUT"])));
+            } else {
+                type_bytes(&screen, b"3");
+                assert_eq!(screen.field(), Some(Field::Pin(2)));
+            }
+            assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+        }
+    }
+
+    /// At the PIN step with `pin` typed and submitted, root asking for it.
+    fn submitted(screen: &Screen, pin: &[u8]) -> (Client, Wire) {
+        let (client, mut wire) = at_pin(screen, vec![]);
+        type_pin(&screen.attempt, pin);
+        wire.replies.push_back(status(0x0c, &unlock_pin_step()));
+        (client, wire)
+    }
+
+    /// The `1c` request is zeroed as soon as its write returns, before
+    /// root's answer is read, and again when dropped.
+    #[test]
+    fn the_pin_request_is_zeroed_before_roots_answer_is_read() {
+        let screen = Screen::login(LoginSelection::Unlock);
+        let (mut client, mut wire) = submitted(&screen, b"4321");
+        wire.replies.push_back(vec![0x9c, 0]);
+        wire_events();
+        client.tick(&mut wire).unwrap();
+        assert_eq!(sent(&wire, 0x1c), 1);
+        let after = after_pins(&wire_events());
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0][..2],
+            [WireEvent::Cleared(true), WireEvent::Received]
+        );
+        assert_eq!(screen.field(), Some(Field::Touch));
+    }
+
+    /// Escape after the PIN was taken but before its write: the check
+    /// immediately before the write drops it unsent and zeroed, and the
+    /// next poll cancels.
+    #[test]
+    fn escape_between_the_take_and_the_write_sends_no_pin() {
+        let last = unlock_pin_step();
+        let screen = Screen::login(LoginSelection::Unlock);
+        let (mut client, mut wire) = submitted(&screen, b"4321");
+        let attempt = Arc::clone(&screen.attempt);
+        TAKEN.with(|taken| *taken.borrow_mut() = Some(Box::new(move || attempt.cancel())));
+        wire_events();
+        drops();
+        client.tick(&mut wire).unwrap();
+        assert_eq!(sent(&wire, 0x1c), 0);
+        assert!(!wire_events()
+            .iter()
+            .any(|event| matches!(event, WireEvent::Sent(bytes) if bytes.first() == Some(&0x1c))));
+        assert_eq!(drops(), [true]);
+        assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+        // Cancelled, as Escape's mark says: the next poll sends `15`.
+        let end = [&ended(0x0d, 0x80, 0)[..], &last.encode()].concat();
+        wire.replies.extend([vec![0x95, 0], end]);
+        let before = wire.calls.len();
+        client.tick(&mut wire).unwrap();
+        assert_eq!(wire.calls[before..], [cancelled(), vec![0x11]]);
+        assert!(client.login.is_none());
+        assert_eq!(sent(&wire, 0x1c), 0);
+    }
+
+    /// The deadline passing between the take and the write drops the PIN
+    /// unsent too, and the attempt times out.
+    #[test]
+    fn a_deadline_between_the_take_and_the_write_sends_no_pin() {
+        let last = unlock_pin_step();
+        let (screen, deadline) =
+            Screen::expiring(LoginSelection::Unlock, Duration::from_millis(2000));
+        let (mut client, mut wire) = submitted(&screen, b"4321");
+        TAKEN.with(|taken| {
+            *taken.borrow_mut() = Some(Box::new(move || {
+                while Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }))
+        });
+        client.tick(&mut wire).unwrap();
+        assert_eq!(sent(&wire, 0x1c), 0);
+        let end = [&ended(0x0d, 0x80, 0)[..], &last.encode()].concat();
+        wire.replies.extend([vec![0x95, 0], end]);
+        client.tick(&mut wire).unwrap();
+        assert!(client.login.is_none());
+        assert_eq!(sent(&wire, 0x1c), 0);
+        assert_eq!(screen.shown(), Some(Notice::Login(&["TIMED OUT"])));
+    }
+
+    /// Escape that comes after the write loses the race: the PIN was
+    /// committed to the send, and root gets `15` next, as for an Escape
+    /// just after it.
+    #[test]
+    fn escape_after_the_write_is_a_cancellation_that_follows_the_pin() {
+        let last = unlock_pin_step();
+        let screen = Screen::login(LoginSelection::Unlock);
+        let (mut client, inner) = submitted(&screen, b"4321");
+        let at = inner.calls.len() + 2;
+        let mut wire = CancelAt {
+            wire: inner,
+            attempt: &screen.attempt,
+            at,
+        };
+        wire.wire.replies.push_back(vec![0x9c, 0]);
+        client.tick(&mut wire).unwrap();
+        assert_eq!(sent(&wire.wire, 0x1c), 1);
+        let end = [&ended(0x0d, 0x80, 0)[..], &last.encode()].concat();
+        wire.wire.replies.extend([vec![0x95, 0], end]);
+        let before = wire.wire.calls.len();
+        client.tick(&mut wire).unwrap();
+        assert_eq!(wire.wire.calls[before..], [cancelled(), vec![0x11]]);
+        assert!(client.login.is_none());
+        assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+    }
+
+    /// A field whose paint is still queued behind a flip takes no key. Once
+    /// on glass, a batch delivered late drops the press stamped before the
+    /// field was on glass and types the one after.
+    #[test]
+    fn the_field_takes_only_presses_made_after_its_paint_is_on_glass() {
+        let (chain, _log) = crate::drm::testing::chain(800, 600);
+        let runtime = Arc::new(Mutex::new(Runtime::new(chain)));
+        let held = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let display = {
+            let (runtime, held, stop) =
+                (Arc::clone(&runtime), Arc::clone(&held), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    if !held.load(Ordering::SeqCst) {
+                        let mut runtime = runtime.lock().unwrap();
+                        if let Some(frame) = runtime.frame_in_flight() {
+                            runtime
+                                .output_event(crate::output::OutputEvent::Presented(frame))
+                                .unwrap();
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        {
+            let mut runtime = runtime.lock().unwrap();
+            runtime.enable_attention(true);
+            runtime
+                .attention(&crate::input::test_origin(), true)
+                .unwrap();
+        }
+        let unlock = LoginSelection::Unlock;
+        let attempt = Attempt::new(
+            crate::input::test_origin(),
+            Arc::clone(&runtime),
+            Selection::Login(unlock.clone()),
+        );
+        let steps = steps(&unlock);
+        attempt.present(steps[0].clone()).unwrap();
+        attempt.present(steps[1].clone()).unwrap();
+        held.store(true, Ordering::SeqCst);
+        let opening = {
+            let attempt = Arc::clone(&attempt);
+            let step = steps[1].clone();
+            std::thread::spawn(move || attempt.open_field(&step))
+        };
+        while runtime.lock().unwrap().attention_field_shown() != Some(Field::Pin(0)) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let press = |byte: u8, timestamp: u128| {
+            attempt
+                .field_key(
+                    &crate::input::test_origin(),
+                    FieldKey::Byte(byte),
+                    timestamp,
+                )
+                .unwrap();
+        };
+        // Queued: the field is open but not on glass, so nothing types,
+        // however late its press.
+        press(b'1', u128::MAX);
+        assert!(attempt.field.lock().unwrap().is_open());
+        assert!(attempt.field.lock().unwrap().typed().is_empty());
+        held.store(false, Ordering::SeqCst);
+        opening.join().unwrap().unwrap();
+        // A delayed batch: the press stamped when the paint landed, not
+        // after it, is dropped; the one after it types.
+        let shown = attempt.field.lock().unwrap().shown.unwrap();
+        press(b'2', shown);
+        press(b'3', shown + 1);
+        assert_eq!(attempt.field.lock().unwrap().typed(), b"3");
+        stop.store(true, Ordering::SeqCst);
+        display.join().unwrap();
+    }
+
+    /// A PIN step whose field would not fit beneath its prompt is not
+    /// presented: at 800x600 the removal of eight keys fails at its prompt,
+    /// before any receipt, so no PIN reaches the key.
+    #[test]
+    fn a_pin_step_without_room_for_its_field_is_never_presented() {
+        use crate::authority::consent::{Slot, LOGIN_KEYS};
+        let removal = |step| {
+            Request::new(
+                NONCE,
+                1000,
+                Operation::LoginRemove {
+                    account: 1000,
+                    before: LOGIN_KEYS,
+                    after: 0,
+                    removed: (1..=LOGIN_KEYS)
+                        .map(|position| Slot {
+                            position,
+                            key: [0xa1; 4],
+                        })
+                        .collect(),
+                    step,
+                },
+            )
+            .unwrap()
+        };
+        let screen = Screen::login(LoginSelection::Unlock);
+        let authorize = removal(LoginStep::Authorize {
+            key: [0xa1; 4],
+            retries: 8,
+        });
+        assert_eq!(
+            screen.attempt.present(authorize).unwrap_err(),
+            "output cannot hold the PIN field beneath this prompt"
+        );
+        // The same operation's silent first step, which asks no PIN, is
+        // shown at that size.
+        let screen = Screen::login(LoginSelection::Unlock);
+        assert!(screen.attempt.present(removal(LoginStep::Identify)).is_ok());
+    }
+
+    /// A paint that fails as the field opens takes it off the screen and
+    /// closes it: the prompt alone stays, and no key types.
+    #[test]
+    fn a_field_whose_paint_fails_is_closed() {
+        let screen = Screen::login(LoginSelection::Unlock);
+        let steps = steps(&LoginSelection::Unlock);
+        screen.attempt.present(steps[0].clone()).unwrap();
+        screen.attempt.present(steps[1].clone()).unwrap();
+        screen.attempt.runtime.lock().unwrap().fail_next_repaint();
+        assert!(screen.attempt.open_field(&steps[1]).is_err());
+        assert_eq!(screen.field(), None);
+        assert!(!screen.attempt.field.lock().unwrap().is_open());
+        type_bytes(&screen, b"12");
+        assert!(screen.attempt.field.lock().unwrap().typed().is_empty());
+        // A key's failed repaint closes it too.
+        screen.attempt.open_field(&steps[1]).unwrap();
+        screen.attempt.runtime.lock().unwrap().fail_next_repaint();
+        type_bytes(&screen, b"1");
+        assert_eq!(screen.field(), None);
+        assert!(!screen.attempt.field.lock().unwrap().is_open());
+        assert!(!screen.attempt.active());
+    }
+
+    /// Before a field opens the client checks this process as td-secret's
+    /// worker checks its own: a failure cancels, opens nothing and says why.
+    #[test]
+    fn swap_or_core_dumps_refuse_the_field() {
+        let unlock = LoginSelection::Unlock;
+        let last = unlock_pin_step();
+        let screen = Screen::login(unlock.clone());
+        let mut replies = presented(&unlock, 1).0;
+        replies.extend([
+            status(4, &last),
+            vec![0x93],
+            status(0x0c, &last),
+            vec![0x95, 0],
+            status(3, &last),
+            [&ended(0x0d, 0x80, 0)[..], &last.encode()].concat(),
+        ]);
+        let mut wire = typing(replies, &screen);
+        let mut client = Client {
+            memory: || Err("active swap".into()),
+            ..Client::default()
+        };
+        client
+            .start(&mut wire, Arc::clone(&screen.attempt))
+            .unwrap();
+        while client.login.is_some() {
+            client.tick(&mut wire).unwrap();
+        }
+        assert!(wire.replies.is_empty());
+        assert_eq!(sent(&wire, 0x15), 1);
+        assert_eq!(sent(&wire, 0x1c), 0);
+        assert_eq!(screen.field(), None);
+        // The cancellation's end adds nothing to the reason.
+        assert_eq!(screen.shown(), Some(Notice::Login(UNPROTECTED)));
+        assert!(UNPROTECTED
+            .iter()
+            .all(|row| row.len() <= crate::attention::layout(320, 200).1
+                && row.bytes().all(crate::ui::is_mapped)));
+    }
+
+    #[test]
+    fn the_memory_check_is_td_secrets() {
+        let header = "Filename Type Size Used Priority\n";
+        let limits = "Max core file size        0                    unlimited            bytes\n";
+        let swaps = |text: &str| Ok(text.to_string());
+        assert!(memory_state(swaps(header), swaps(limits)).is_ok());
+        assert!(memory_state(swaps(&format!("{header}\n  \n")), swaps(limits)).is_ok());
+        // Swap compiled out.
+        assert!(memory_state(Err(io::ErrorKind::NotFound.into()), swaps(limits)).is_ok());
+        for refused in [
+            swaps(&format!("{header}/swapfile file 1048572 0 -2\n")),
+            swaps(""),
+            Err(io::ErrorKind::PermissionDenied.into()),
+        ] {
+            assert!(memory_state(refused, swaps(limits)).is_err());
+        }
+        for refused in [
+            "Max core file size        1                    unlimited            bytes\n",
+            "Max core file size        unlimited            unlimited            bytes\n",
+            "Max open files            0                    0                    files\n",
+            "",
+        ] {
+            assert!(
+                memory_state(swaps(header), swaps(refused)).is_err(),
+                "{refused}"
+            );
+        }
+        assert!(memory_state(swaps(header), Err(io::ErrorKind::NotFound.into())).is_err());
+        // The client's own check reads this process's tables.
+        assert_eq!((Client::default().memory)(), protected_memory());
+    }
+
+    /// Every way out of the field leaves its buffer zero: the send, Escape,
+    /// the client's cancellation, root's end, a violation, a failed send
+    /// and a drop.
+    #[test]
+    fn every_exit_from_the_field_zeroes_it() {
+        let last = unlock_pin_step();
+        let zero = [0; PIN_CAPACITY];
+        // Escape while typing.
+        let screen = Screen::login(LoginSelection::Unlock);
+        let _open = at_pin(&screen, vec![]);
+        type_bytes(&screen, b"4321");
+        assert_ne!(screen.attempt.field_raw(), zero);
+        screen.attempt.cancel();
+        assert_eq!(screen.attempt.field_raw(), zero);
+        // Root ends the operation while the person types.
+        let screen = Screen::login(LoginSelection::Unlock);
+        let (mut client, mut wire) = at_pin(
+            &screen,
+            vec![[&ended(0x0d, 0x07, 0)[..], &last.encode()].concat()],
+        );
+        type_bytes(&screen, b"4321");
+        client.tick(&mut wire).unwrap();
+        assert!(client.login.is_none());
+        assert_eq!(screen.attempt.field_raw(), zero);
+        // A violation while the person types.
+        let screen = Screen::login(LoginSelection::Unlock);
+        let (mut client, mut wire) = at_pin(&screen, vec![status(4, &last)]);
+        type_bytes(&screen, b"4321");
+        assert!(client.tick(&mut wire).is_err());
+        assert_eq!(screen.attempt.field_raw(), zero);
+        // The client's own cancellation: the touch request fails to paint.
+        let screen = Screen::login(LoginSelection::Unlock);
+        let (mut client, mut wire) = at_pin(
+            &screen,
+            vec![status(0x0c, &last), vec![0x9c, 0], vec![0x95, 0]],
+        );
+        type_pin(&screen.attempt, b"4321");
+        screen.attempt.runtime.lock().unwrap().fail_next_repaint();
+        client.tick(&mut wire).unwrap();
+        assert_eq!(sent(&wire, 0x15), 1);
+        assert!(client.login.as_ref().unwrap().cancelled);
+        assert_eq!(screen.attempt.field_raw(), zero);
+        assert_eq!(
+            screen.shown(),
+            Some(Notice::Login(&["THE OPERATION FAILED"]))
+        );
+        // A send that fails: the field and the request are both zeroed.
+        let screen = Screen::login(LoginSelection::Unlock);
+        let (mut client, mut wire) = at_pin(&screen, vec![status(0x0c, &last)]);
+        type_pin(&screen.attempt, b"4321");
+        drops();
+        assert_eq!(client.tick(&mut wire), Err("uncertain delivery".into()));
+        assert_eq!(wire.calls.last(), Some(&pin_request(&last, b"4321")));
+        assert_eq!(drops(), [true]);
+        assert_eq!(screen.attempt.field_raw(), zero);
+        // A drop.
+        let mut field = PinField::default();
+        field.open();
+        assert_eq!(field.key(FieldKey::Byte(b'7')), Some(1));
+        drops();
+        drop(field);
+        assert_eq!(drops(), [true]);
+        // The send itself is `root_asking_for_a_pin_opens_the_field_...`.
+    }
+
+    /// The field's bounds: printable ASCII, 4 to 63 bytes, Backspace one
+    /// byte at a time, nothing after Enter.
+    #[test]
+    fn the_field_takes_fidos_pin_profile() {
+        let mut field = PinField::default();
+        assert_eq!(field.key(FieldKey::Byte(b'1')), None);
+        field.open();
+        for byte in [0x1f, 0x7f, 0x80, 0xff] {
+            assert_eq!(field.key(FieldKey::Byte(byte)), None);
+        }
+        assert_eq!(field.key(FieldKey::Erase), None);
+        for count in 1..=PIN_LONGEST {
+            assert_eq!(field.key(FieldKey::Byte(b'~')), Some(count));
+        }
+        // A 64th byte refuses.
+        assert_eq!(field.key(FieldKey::Byte(b' ')), None);
+        assert_eq!(field.typed().len(), PIN_LONGEST);
+        assert_eq!(field.key(FieldKey::Erase), Some(PIN_LONGEST - 1));
+        assert_eq!(field.raw()[PIN_LONGEST - 1], 0);
+        field.open();
+        for (index, byte) in b"abc".iter().enumerate() {
+            assert_eq!(field.key(FieldKey::Byte(*byte)), Some(index + 1));
+        }
+        // Too short: Enter does nothing.
+        assert_eq!(field.key(FieldKey::Submit), None);
+        assert!(!field.submitted());
+        let mut taken = [0; PIN_CAPACITY];
+        assert_eq!(field.take(&mut taken), None);
+        assert_eq!(field.key(FieldKey::Byte(b'd')), Some(4));
+        assert_eq!(field.key(FieldKey::Submit), None);
+        assert!(field.submitted());
+        assert_eq!(field.key(FieldKey::Byte(b'e')), None);
+        assert_eq!(field.key(FieldKey::Erase), None);
+        assert_eq!(field.take(&mut taken[..3]), None);
+        assert!(!field.is_open());
+        assert_eq!(field.raw(), [0; PIN_CAPACITY]);
+        field.open();
+        type_into(&mut field, b"abcd");
+        assert_eq!(field.take(&mut taken), Some(4));
+        assert_eq!(&taken[..4], b"abcd");
+        assert_eq!(field.raw(), [0; PIN_CAPACITY]);
+        assert_eq!(format!("{:?}", FieldKey::Byte(b'7')), "Byte(..)");
+    }
+
+    fn type_into(field: &mut PinField, bytes: &[u8]) {
+        for byte in bytes {
+            field.key(FieldKey::Byte(*byte));
+        }
+        field.key(FieldKey::Submit);
+    }
+
+    /// The field's screen is drawn from a count: two PINs of one length
+    /// paint the same pixels, and another length does not.
+    /// On glass: the field opens beneath the presented step's prompt, whose
+    /// pixels stay exactly as presented, and typing changes only the
+    /// field's band.
+    #[test]
+    fn the_field_leaves_the_presented_prompt_on_glass() {
+        let unlock = LoginSelection::Unlock;
+        let last = unlock_pin_step();
+        let screen = Screen::login(unlock.clone());
+        let mut replies = presented(&unlock, 1).0;
+        replies.extend([status(4, &last), vec![0x93]]);
+        let mut wire = wire(replies);
+        let mut client = login_client();
+        client
+            .start(&mut wire, Arc::clone(&screen.attempt))
+            .unwrap();
+        while !wire.replies.is_empty() {
+            client.tick(&mut wire).unwrap();
+        }
+        let prompt = std::fs::read(&screen.path).unwrap();
+        assert_eq!(prompt.len(), 3200 * 600);
+        wire.replies.push_back(status(0x0c, &last));
+        client.tick(&mut wire).unwrap();
+        assert_eq!(screen.field(), Some(Field::Pin(0)));
+        type_bytes(&screen, b"12345");
+        let field = std::fs::read(&screen.path).unwrap();
+        // The prompt's last ink row, then its row gap: all untouched.
+        let background = &prompt[..4];
+        let foot = prompt
+            .chunks(3200)
+            .rposition(|row| row.chunks(4).any(|pixel| pixel != background))
+            .unwrap();
+        let kept = (foot + 1 + 8) * 3200;
+        assert!(field[..kept] == prompt[..kept]);
+        assert!(field[kept..] != prompt[kept..]);
+    }
+
+    #[test]
+    fn the_field_paints_a_count_never_a_character() {
+        let painted = |pin: &[u8]| {
+            let screen = Screen::login(LoginSelection::Unlock);
+            let _open = at_pin(&screen, vec![]);
+            type_bytes(&screen, pin);
+            assert_eq!(
+                screen.field(),
+                Some(Field::Pin(u8::try_from(pin.len()).unwrap()))
+            );
+            std::fs::read(&screen.path).unwrap()
+        };
+        let first = painted(b"ab3#");
+        assert_eq!(first, painted(b"ZZ9 "));
+        assert_eq!(first, painted(b"}~!."));
+        assert_ne!(first, painted(b"ab3"));
     }
 }

@@ -864,6 +864,10 @@ pub struct Scene {
     attention_request: Option<crate::attention::Prepared>,
     attention_request_attempted: bool,
     attention_notice: crate::attention::Notice,
+    /// The PIN field, or its touch request, drawn over the retained prompt
+    /// of the PIN step it answers, which stays the one its successor
+    /// follows.
+    attention_field: Option<crate::attention::Field>,
     status: String,
     text: crate::text::Text,
 }
@@ -904,6 +908,7 @@ impl Scene {
             attention_request: None,
             attention_request_attempted: false,
             attention_notice: crate::attention::Notice::Menu,
+            attention_field: None,
             status: String::new(),
             text: crate::text::Text::default(),
         }
@@ -3190,6 +3195,7 @@ impl Scene {
 
     pub(crate) fn set_attention(&mut self, visible: bool) {
         self.attention_request = None;
+        self.attention_field = None;
         self.attention = visible;
         self.attention_draining = false;
         if visible && !self.attention_request_attempted {
@@ -3207,6 +3213,7 @@ impl Scene {
 
     pub(crate) fn drain_attention(&mut self) {
         self.attention_request = None;
+        self.attention_field = None;
         self.attention_draining = true;
     }
 
@@ -3218,7 +3225,35 @@ impl Scene {
 
     pub(crate) fn set_attention_notice(&mut self, notice: crate::attention::Notice) {
         self.attention_request = None;
+        self.attention_field = None;
         self.attention_notice = notice;
+    }
+
+    /// Draws `field` beneath the retained prompt, which stays retained and
+    /// is drawn exactly as presented: refused where the prompt leaves no
+    /// room for it.
+    pub(crate) fn set_attention_field(
+        &mut self,
+        field: crate::attention::Field,
+    ) -> Result<(), String> {
+        if !self
+            .attention_request
+            .as_ref()
+            .is_some_and(crate::attention::Prepared::holds_field)
+        {
+            return Err("the PIN field does not fit beneath its prompt".into());
+        }
+        self.attention_field = Some(field);
+        Ok(())
+    }
+
+    /// Back to the prompt alone, which stays retained.
+    pub(crate) fn clear_attention_field(&mut self) {
+        self.attention_field = None;
+    }
+
+    pub(crate) fn attention_field(&self) -> Option<crate::attention::Field> {
+        self.attention_field
     }
 
     #[cfg(test)]
@@ -3243,6 +3278,8 @@ impl Scene {
         if !self.attention || self.attention_draining {
             return Err("trusted prompt requires active attention".into());
         }
+        // A new prompt, or none, replaces a PIN field.
+        self.attention_field = None;
         if self.attention_request_attempted {
             // A login step's successor carries device data root admits, so
             // only its shape is checked here; an enrollment's is derived.
@@ -3265,6 +3302,7 @@ impl Scene {
 
     pub(crate) fn discard_attention_request(&mut self) {
         self.attention_request = None;
+        self.attention_field = None;
     }
 
     pub(crate) fn attention_request(&self) -> Option<&crate::authority::consent::Request> {
@@ -3282,7 +3320,11 @@ impl Scene {
     ) -> Result<(), String> {
         if self.attention {
             if let Some(request) = &self.attention_request {
-                return if request.paint(frame, width, height, stride) {
+                let painted = match self.attention_field {
+                    Some(field) => request.paint_field(frame, width, height, stride, field),
+                    None => request.paint(frame, width, height, stride),
+                };
+                return if painted {
                     Ok(())
                 } else {
                     Err("trusted prompt raster does not match output target".into())

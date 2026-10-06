@@ -2092,8 +2092,9 @@ requests `1b` and `1c` (`td-authd/DESIGN.md`, "Login-key operation
 supervision"), but nothing in production starts it: the compositor
 sends `1b` only for a first enrollment or an addition, which a
 production td-authd refuses before starting anything, as it refuses
-removal, and nothing sends an unlock's `1b` or any `1c`. It reaches the
-command line only
+removal, and nothing sends an unlock's `1b`; the compositor's PIN field
+sends `1c` only at a PIN step, which no production operation reaches.
+It reaches the command line only
 through `run`, keeps the unlock worker's root startup, unnamed
 socketpair, descriptor inventory and bounded framing, and uses its
 `10`/`11` presentation and `12`/`13` commit rounds. It neither reads nor

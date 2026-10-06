@@ -186,13 +186,24 @@ fn check_status(status: &str) -> Result<(), String> {
 }
 
 pub(crate) trait Exchange {
-    fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, String>;
+    /// Writes one request and returns once it is written, so a caller
+    /// holding a secret in it can zero it before awaiting the answer.
+    fn send(&mut self, request: &[u8]) -> Result<(), String>;
+    fn receive(&mut self) -> Result<Vec<u8>, String>;
+
+    fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, String> {
+        self.send(request)?;
+        self.receive()
+    }
 }
 
 impl Exchange for channel::Channel {
-    fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, String> {
-        self.send(request).map_err(|e| e.to_string())?;
-        self.receive().map_err(|e| e.to_string())
+    fn send(&mut self, request: &[u8]) -> Result<(), String> {
+        channel::Channel::send(self, request).map_err(|e| e.to_string())
+    }
+
+    fn receive(&mut self) -> Result<Vec<u8>, String> {
+        channel::Channel::receive(self).map_err(|e| e.to_string())
     }
 }
 
@@ -322,8 +333,11 @@ mod tests {
         answers: VecDeque<Vec<u8>>,
     }
     impl Exchange for Wire {
-        fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, String> {
+        fn send(&mut self, request: &[u8]) -> Result<(), String> {
             self.requests.push(request.to_vec());
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<Vec<u8>, String> {
             self.answers.pop_front().ok_or("unexpected request".into())
         }
     }
@@ -511,9 +525,12 @@ mod tests {
     fn worker_never_retries_a_request_after_uncertain_delivery() {
         struct Broken(std::rc::Rc<std::cell::Cell<usize>>);
         impl Exchange for Broken {
-            fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, String> {
+            fn send(&mut self, request: &[u8]) -> Result<(), String> {
                 assert_eq!(request, [1]);
                 self.0.set(self.0.get() + 1);
+                Ok(())
+            }
+            fn receive(&mut self) -> Result<Vec<u8>, String> {
                 Err("response lost after delivery".into())
             }
         }

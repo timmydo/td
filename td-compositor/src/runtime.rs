@@ -159,6 +159,12 @@ impl AttentionPresentation {
     }
 }
 
+/// When a presentation known to be on glass completed: read only after its
+/// paint is on glass, so input stamped before it cannot answer it.
+fn presentation_completed() -> Result<u128, String> {
+    crate::sys::monotonic_time()
+}
+
 /// An attention screen handed to the output: shown once the first paint
 /// made after it was set is on glass. Each such paint renders it until the
 /// screen changes again, and before an operation is chosen only the input
@@ -171,6 +177,11 @@ pub(crate) struct NoticePresentation {
 impl NoticePresentation {
     pub fn on_glass(&self) -> bool {
         self.clock.reached(self.epoch)
+    }
+
+    /// Wait, WITHOUT the runtime lock, for the screen to be on glass.
+    pub fn wait(&self, deadline: Instant) -> Result<(), String> {
+        self.clock.wait_for(self.epoch, deadline)
     }
 
     #[cfg(test)]
@@ -2816,11 +2827,36 @@ impl Runtime {
         if !self.attention_request_visible(&presentation.request) {
             return Err("trusted prompt was withdrawn before it was presented".into());
         }
-        let completed = crate::sys::monotonic_time()?;
+        let completed = presentation_completed()?;
         Ok(PresentedRequest {
             request: presentation.request,
             completed,
         })
+    }
+
+    /// When the PIN field `presentation` showed beneath `step`, once waited
+    /// for, completed: read as a prompt's is, after its paint is known to
+    /// be on glass, and only while that field is STILL on the screen.
+    pub(crate) fn finish_field_presentation(
+        &self,
+        presentation: &NoticePresentation,
+        step: &crate::authority::consent::Request,
+    ) -> Result<u128, String> {
+        if self.on_glass < presentation.epoch {
+            return Err("the PIN field has not reached the screen".into());
+        }
+        if !self.attention_enabled
+            || !self.scene.attention_visible()
+            || self.scene.attention_draining()
+            || self.scene.attention_request() != Some(step)
+            || !matches!(
+                self.scene.attention_field(),
+                Some(crate::attention::Field::Pin(_))
+            )
+        {
+            return Err("the PIN field was withdrawn before it was presented".into());
+        }
+        presentation_completed()
     }
 
     /// Withdraw a prompt whose paint did not reach the screen in time, or
@@ -2848,12 +2884,77 @@ impl Runtime {
         self.attention_enabled
             && self.scene.attention_visible()
             && !self.scene.attention_draining()
+            && self.scene.attention_field().is_none()
             && self.scene.attention_request() == Some(request)
     }
 
     #[cfg(test)]
     pub(crate) fn attention_shown(&self) -> Option<crate::attention::Notice> {
         self.scene.attention_shown()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attention_field_shown(&self) -> Option<crate::attention::Field> {
+        self.scene
+            .attention_visible()
+            .then(|| self.scene.attention_field())
+            .flatten()
+    }
+
+    /// Show the PIN field, or the touch request that follows it, beneath
+    /// `step`, the presented PIN step root asked a PIN for, which stays the
+    /// retained prompt its successor follows. Only a count reaches the
+    /// field's screen. Answered with the paint that shows it, as a notice
+    /// is, so that keys wait for it to be on glass; a paint that fails
+    /// takes the field off the screen again.
+    pub(crate) fn show_attention_field(
+        &mut self,
+        _origin: &crate::input::EvdevOrigin,
+        step: &crate::authority::consent::Request,
+        field: crate::attention::Field,
+    ) -> Result<NoticePresentation, String> {
+        if !self.attention_enabled
+            || !self.scene.attention_visible()
+            || self.scene.attention_draining()
+            || self.scene.attention_request() != Some(step)
+        {
+            return Err("the PIN field needs its presented step on the attention screen".into());
+        }
+        let epoch = self.paints.checked_add(1).ok_or("paint epochs exhausted")?;
+        self.paint_attention_field(field)?;
+        Ok(NoticePresentation {
+            epoch,
+            clock: Arc::clone(&self.presented),
+        })
+    }
+
+    fn paint_attention_field(&mut self, field: crate::attention::Field) -> Result<(), String> {
+        self.scene.set_attention_field(field)?;
+        self.owed_damage = Damage::Whole;
+        let painted = self.repaint();
+        if painted.is_err() {
+            self.scene.clear_attention_field();
+        }
+        painted
+    }
+
+    /// The open PIN field's masks after a key.
+    pub(crate) fn update_attention_field(
+        &mut self,
+        _origin: &crate::input::EvdevOrigin,
+        field: crate::attention::Field,
+    ) -> Result<(), String> {
+        if !self.attention_enabled
+            || !self.scene.attention_visible()
+            || self.scene.attention_draining()
+            || !matches!(
+                self.scene.attention_field(),
+                Some(crate::attention::Field::Pin(_))
+            )
+        {
+            return Err("no PIN field is open on the attention screen".into());
+        }
+        self.paint_attention_field(field)
     }
 
     /// Show `notice` on the attention screen. With a flip in flight the
