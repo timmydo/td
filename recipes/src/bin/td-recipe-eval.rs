@@ -721,8 +721,9 @@ mod tests {
         // Claude Code 2.1.260 native Linux x86-64 binary, IANA timezone
         // data 2026d, and the Nerd Fonts v3.5.1 JetBrains Mono release with
         // nine licence notices + cryptsetup 2.8.8 with json-c 0.18, popt 1.19
-        // and LVM2 2.03.43 (the LUKS2 userspace and its static libraries).
-        assert_eq!(pins.len(), 78);
+        // and LVM2 2.03.43 (the LUKS2 userspace and its static libraries) +
+        // gawk 5.4.1 (the build-only awk after rust-toolchain).
+        assert_eq!(pins.len(), 79);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "ca-certificates-source"));
         assert!(pins.iter().any(|pin| pin.key == "tzdata-source"));

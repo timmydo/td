@@ -11402,8 +11402,8 @@ chmod 755 '{}'
     /// beside a reached entry too, so the gate runs every check.
     #[test]
     fn a_recipe_source_reaches_the_checks_of_its_readers() {
-        // uutils is in no check's owner closure, only in rust-toolchain's
-        // declared builds.
+        // uutils is in one check's owner closure, the build-only gawk's
+        // (its post-Rust tool farm), and in rust-toolchain's declared builds.
         for scope in [
             "recipes/src/recipes/uutils.rs",
             "recipes/locks/uutils/Cargo.lock",
@@ -11411,7 +11411,7 @@ chmod 755 '{}'
             let reach = checks_reaching(&[scope]).expect(scope);
             assert_eq!(
                 reach.keys().map(String::as_str).collect::<Vec<_>>(),
-                ["rust-toolchain"]
+                ["gawk-x86-64-self-test", "rust-toolchain"]
             );
             assert!(reach["rust-toolchain"].contains(scope), "{reach:?}");
         }

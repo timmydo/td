@@ -202,6 +202,16 @@ const PINS: &[PinDef] = &[
         file: "gawk-3.0.4.tar.gz",
     },
     PinDef {
+        key: "gawk-x86-64-self-source",
+        aliases: &[],
+        // GNU awk 5.4.1, the build-only awk after rust-toolchain. The tarball's
+        // detached signature verifies against the GNU keyring (Arnold Robbins,
+        // D1967C63788713177D861ED7DF597815937EC0D2).
+        url: "https://ftp.gnu.org/gnu/gawk/gawk-5.4.1.tar.gz",
+        sha256: "8b3b0ea83930311a3f30905d3ce898d32c6103c2fe20d6a90b40341171b174de",
+        file: "gawk-5.4.1.tar.gz",
+    },
+    PinDef {
         key: "grep-mesboot0-source",
         aliases: &[],
         // GNU grep 2.4 — the tcc-era grep provider (re #469). The exact version
@@ -813,7 +823,8 @@ mod tests {
         // Fonts v3.5.1 JetBrains Mono release ten pinned upstream data pins:
         // the archive and nine licence notices. cryptsetup 2.8.8 with json-c
         // 0.18, popt 1.19 and LVM2 2.03.43 add the LUKS2 userspace closure.
-        assert_eq!(all().len(), 78);
+        // gawk 5.4.1 is the build-only awk after rust-toolchain.
+        assert_eq!(all().len(), 79);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

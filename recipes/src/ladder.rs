@@ -632,6 +632,66 @@ pub fn post_bootstrap_path() -> String {
     "{in:busybox-x86-64}/bin".into()
 }
 
+/// The shell beyond rust-toolchain: td-sh, built by direct rustc from the
+/// stage2 toolchain, so no recipe that uses it can be on its own input path.
+pub const POST_RUST_SH: &str = "{in:td-sh}/bin/td-sh";
+
+/// The post-Rust build userland: the tool names gawk's build and the
+/// zlib/make/libressl-class farms call, each with exactly one td provider.
+/// td-txt, td-util and uutils dispatch on argv[0]. Not yet here, for the
+/// farms that still link them from BusyBox: egrep, fgrep, od and tar. `awk`
+/// is per recipe (`post_rust_tool_farm`): the awk that builds gawk cannot be
+/// gawk.
+const POST_RUST_TOOLS: &[(&str, &str, &[&str])] = &[
+    ("td-sh", "{in:td-sh}/bin/td-sh", &["sh"]),
+    ("td-txt", "{in:td-txt}/bin/td-txt", &["grep", "sed"]),
+    (
+        "td-util",
+        "{in:td-util}/bin/td-util",
+        &[
+            "cmp", "diff", "find", "gunzip", "gzip", "test", "which", "xargs", "zcat",
+        ],
+    ),
+    (
+        "uutils",
+        "{in:uutils}/bin/coreutils",
+        &[
+            "basename", "cat", "chmod", "cp", "cut", "date", "dirname", "echo", "env", "expr",
+            "false", "head", "install", "ln", "ls", "mkdir", "mktemp", "mv", "printf", "pwd",
+            "readlink", "rm", "rmdir", "sleep", "sort", "tail", "tee", "touch", "tr", "true",
+            "uname", "uniq", "wc",
+        ],
+    ),
+];
+
+/// The `{tools}` farm for a post-Rust build: `POST_RUST_TOOLS`, plus `awk`
+/// from `awk` (an `{in:...}` executable). Put `{tools}` on PATH ahead of the
+/// recipe's toolchain directories.
+pub fn post_rust_tool_farm(awk: &str) -> Step {
+    let mut links: Vec<(String, String)> = POST_RUST_TOOLS
+        .iter()
+        .flat_map(|(_, target, names)| {
+            names
+                .iter()
+                .map(move |name| ((*name).to_string(), (*target).to_string()))
+        })
+        .collect();
+    links.push(("awk".into(), awk.into()));
+    Step::ToolFarm { links }
+}
+
+/// The inputs `post_rust_tool_farm` links to, in lockstep with it: the
+/// providers, then `awk_input`, then the recipe's own `extras`. Pair with
+/// `Recipe::native_inputs`.
+pub fn post_rust_inputs<'a>(awk_input: &'a str, extras: &[&'a str]) -> Vec<&'a str> {
+    POST_RUST_TOOLS
+        .iter()
+        .map(|(input, _, _)| *input)
+        .chain(std::iter::once(awk_input))
+        .chain(extras.iter().copied())
+        .collect()
+}
+
 /// The exact line the bootable-kernel rung's busybox `/init` prints on ttyS0 once
 /// the kernel has reached userspace, and that the host-side `qemu-boot` tool asserts
 /// on. SINGLE SOURCE OF TRUTH shared by the `/init` script, both initramfs shape
@@ -1798,8 +1858,15 @@ mod tests {
         // The frozen UAPI input is a fixed-output source governed by the seed
         // provenance gate, not a catalog recipe this exception table can name.
         ("make-x86-64-self", "make-x86-64"),
+        // The build-only gawk every later post-Rust build takes its awk from.
+        // Its own configure needs an awk and its build a make, and both of
+        // the post-Rust ones would be built with it, so it takes the root's
+        // gawk and the bootstrap Make, once, as make-x86-64-self does.
+        ("gawk-x86-64-self", "gawk-mesboot"),
+        ("gawk-x86-64-self", "make-x86-64"),
     ];
-    const RECIPE_SHEBANG_INTERPRETERS: &[&str] = &[super::SH, super::POST_BOOTSTRAP_SH];
+    const RECIPE_SHEBANG_INTERPRETERS: &[&str] =
+        &[super::SH, super::POST_BOOTSTRAP_SH, super::POST_RUST_SH];
     const GUEST_LITERAL_SHEBANGS: &[(&str, &str)] = &[
         ("linux-x86-64", "{root}/initramfs/init"),
         ("kexec-spike-x86-64", "{root}/inner-init"),
@@ -2231,13 +2298,23 @@ mod tests {
         recipe: &Recipe,
         links: &[(String, String)],
     ) -> Option<(&'static str, String)> {
-        let declared = recipe
-            .native_inputs
-            .as_ref()
-            .is_some_and(|inputs| inputs.iter().any(|i| i == "busybox-x86-64"));
+        // A farm may name find/xargs only as a link to a declared multicall
+        // that serves them itself, never as a link to a host path.
+        const MULTICALLS: &[(&str, &str)] = &[
+            ("busybox-x86-64", "{in:busybox-x86-64}/bin/busybox"),
+            ("td-util", "{in:td-util}/bin/td-util"),
+        ];
+        let declared = |input: &str| {
+            recipe
+                .native_inputs
+                .as_ref()
+                .is_some_and(|inputs| inputs.iter().any(|i| i == input))
+        };
         for (name, target) in links {
-            let excused =
-                declared && !name.contains('/') && target == "{in:busybox-x86-64}/bin/busybox";
+            let excused = !name.contains('/')
+                && MULTICALLS
+                    .iter()
+                    .any(|(input, multicall)| target == multicall && declared(input));
             for cmd in HOST_TOOLS {
                 if invokes(name, cmd) && !excused {
                     return Some((cmd, name.clone()));
