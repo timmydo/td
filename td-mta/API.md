@@ -6356,6 +6356,42 @@ separate. Other shapes/masks/limits and native allocation, stack/RSS,
 header/header:* rendering, full request-to-composition admission and
 current authenticated publication remain unqualified.
 
+### 1.148 Retain whole selected subParts composition
+
+M06eq adds §1.147's subparts::retained facade over the original shared
+fixed Window and retention core. Only the original selected Serialized
+may begin fresh whole retention. Advanced cursors, completed emitted-only
+owners, passive views and unselected collections cannot recover missing
+prefixes. Immutable outer/structural Selection and selected metadata
+survive complete passive values, consuming retention and original release.
+
+Poll uses the same framing turn and prepaid five-domain costs as streamed
+composition; no extra transition fee or classification walk is added.
+Exact output capacity completes; shorter windows return the original
+ResponseCapacity stickily and expose no whole bytes. Spare output remains
+untouched. Root-only output when subParts is omitted and original tree
+output when selected retain §1.147's byte semantics. Outer NONE succeeds
+in an empty window without work; constructor and consuming owners remain
+fresh in both job/pin domains. Original completed polls are inert, while
+explicit checks and consuming completion/release still enforce deadlines.
+Cursor plus HeaderBudget fits 1 KiB; Retained fits 768 bytes. The caller's
+output window remains separately admitted cold storage, not cursor state.
+
+Eight units and eight compile-fail guards pin complete byte/selection/
+pointer custody, a literal root-only empty-metadata oracle, exact/short
+windows, fresh capacity precedence, post-copy expiry, all completed-owner
+fresh checks/releases, outer NONE and per-turn streamed debit parity.
+Eight Rust allocation intervals cover omitted root/lists, outer NONE,
+selected multipart tree, copied-prefix expiry, consuming completion
+expiry, Retained release expiry, short capacity and constructor expiry.
+Original collection, file, output and refusal preparation stay cold.
+Clock expiry transitions in the three post-construction refusals remain
+inside the measured intervals.
+Validate all sixteen snapshots before comparing pairs; earlier 233
+intervals remain separate. Other shapes/masks/limits, native allocation,
+stack/RSS, header/header:* rendering, full request admission/wiring and
+current authenticated publication remain unqualified.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

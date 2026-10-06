@@ -1,4 +1,5 @@
 //! Explicit subParts selection shares bounded framing and original custody.
+pub mod retained;
 
 use super::super::super::{Serialized, View};
 use super::super::Error;

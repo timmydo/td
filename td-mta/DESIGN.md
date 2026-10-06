@@ -985,6 +985,16 @@ metadata flags. Both freshness domains remain enforced. API §1.147
 qualifies eight Rust intervals; header rendering, whole admitted request
 wiring and authenticated publication remain later.
 
+M06eq retains complete selected subParts composition in the original
+shared fixed Window. Original fresh selected collection custody begins
+retention; advanced/emitted-only/passive inputs cannot recreate a lost
+prefix. Selection, metadata and original pointers survive whole values
+and consuming release. Short capacity and explicitly checked expiry in
+either freshness domain hide whole success stickily. Completed passive
+values survive expiry until a check or consuming operation. API §1.148
+scopes eight Rust intervals. Header rendering, full admitted request
+wiring and authenticated publication remain later.
+
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot
 select bodyStructure. They remain public facades over the same shared

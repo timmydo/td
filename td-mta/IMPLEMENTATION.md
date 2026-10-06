@@ -2454,6 +2454,14 @@ Initial independently landable increments:
   §1.147. Header/header:* rendering, full admitted request wiring and
   authenticated publication remain later.
 
+- **M06eq — whole selected subParts retention:** retain requested
+  structural/outer output in the original fixed Window under fresh
+  selected collection custody. Preserve all immutable labels, original
+  pointers and exact streamed debit parity; refuse partial whole success
+  on short capacity or expired owners. Eight units, eight guards and
+  eight Rust intervals qualify API §1.148. Header rendering, full admitted
+  request wiring and authenticated publication remain later.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

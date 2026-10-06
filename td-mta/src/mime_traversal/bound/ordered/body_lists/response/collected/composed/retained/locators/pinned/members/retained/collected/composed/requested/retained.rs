@@ -41,10 +41,20 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm, 'z>
         output: &'z mut [u8],
         now: Tick,
     ) -> Result<Self, Error> {
+        Self::with_sub_parts(source, properties, true, output, now)
+    }
+    pub(in super::super::super::super::super) fn with_sub_parts(
+        source: Serialized<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>,
+        properties: Properties,
+        sub_parts: bool,
+        output: &'z mut [u8],
+        now: Tick,
+    ) -> Result<Self, Error> {
         Ok(Self {
             inner: shared::Cursor::with_frame(
                 source,
-                super::framing::Frame::requested(properties.body_structure, properties.bits()),
+                super::framing::Frame::requested(properties.body_structure, properties.bits())
+                    .with_sub_parts(sub_parts),
                 output,
                 now,
             )?,

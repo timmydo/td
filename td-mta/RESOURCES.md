@@ -2624,6 +2624,16 @@ constructor-refusal setup cold and in-interval expiry transitions counted;
 earlier 225 remain separate. Native allocation, stack/RSS, header rendering,
 whole request admission and authenticated publication remain later.
 
+M06eq keeps selected subParts retention Cursor plus HeaderBudget within
+1 KiB and Retained within 768 bytes; caller output remains separately
+admitted cold storage. Reuse the same Window, bounded framing and five
+cost domains; exact capacity completes and short windows never expose
+whole output. API §1.148 qualifies eight Rust intervals with original
+storage/output/refusal preparation cold. Clock expiry transitions remain
+inside measured intervals; earlier 233 remain separate. Native
+allocation, stack/RSS, full request admission and authenticated
+publication remain unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

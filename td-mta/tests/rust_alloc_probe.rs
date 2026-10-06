@@ -12512,6 +12512,18 @@ fn selected_subparts_composition() {
     }
 }
 
+fn selected_subparts_retention() {
+    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed::requested::subparts::retained;
+    let mut samples = [COUNTERS.snapshot(); 16];
+    let mut slots = samples.iter_mut();
+    retained::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|sample| !sample.invalid));
+    for [before, after] in samples.as_chunks::<2>().0 {
+        assert_eq!(before, after, "selected subParts retention allocated");
+    }
+}
+
 fn whole_source_bound_members() {
     use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained;
     let mut samples = [COUNTERS.snapshot(); 16];
@@ -13034,6 +13046,7 @@ fn main() {
     body_property_json_arguments();
     body_property_requests();
     selected_subparts_composition();
+    selected_subparts_retention();
     whole_source_bound_members();
     collected_source_bound_members();
     composed_source_bound_members();
