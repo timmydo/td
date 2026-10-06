@@ -3210,6 +3210,12 @@ impl Scene {
         self.attention_draining = true;
     }
 
+    /// The notice the attention screen shows while no prompt is up.
+    #[cfg(test)]
+    pub(crate) fn attention_shown(&self) -> Option<crate::attention::Notice> {
+        (self.attention && self.attention_request.is_none()).then_some(self.attention_notice)
+    }
+
     pub(crate) fn set_attention_notice(&mut self, notice: crate::attention::Notice) {
         self.attention_request = None;
         self.attention_notice = notice;
@@ -3238,14 +3244,16 @@ impl Scene {
             return Err("trusted prompt requires active attention".into());
         }
         if self.attention_request_attempted {
-            let following = self
-                .attention_request()
-                .map(|previous| previous.following_enrollment_step())
-                .transpose()?
-                .flatten();
+            // A login step's successor carries device data root admits, so
+            // only its shape is checked here; an enrollment's is derived.
+            let follows = match self.attention_request() {
+                Some(previous) if previous.is_login() => previous.login_successor(&request).is_ok(),
+                Some(previous) => previous.following_enrollment_step()?.as_ref() == Some(&request),
+                None => false,
+            };
             self.attention_request = None;
-            if following.as_ref() != Some(&request) {
-                return Err("trusted prompt must follow the exact enrollment step".into());
+            if !follows {
+                return Err("trusted prompt must follow the exact operation step".into());
             }
         }
         self.attention_request_attempted = true;
@@ -9847,5 +9855,63 @@ mod tests {
         assert_ne!(display, ordinary);
         assert_eq!(&display[..4], &[0x28, 0x20, 0x18, 0]);
         assert_eq!(&display[display.len() - 4..], &[0x28, 0x20, 0x18, 0]);
+    }
+
+    /// A login prompt is replaced only by its step's one legal successor,
+    /// under consent's shape check; anything else consumes the slot.
+    #[test]
+    fn a_login_prompt_admits_only_its_successor() {
+        use crate::authority::consent::{LoginStep, Operation, Request};
+        let step = |step| {
+            Request::new(
+                [7; 32],
+                1000,
+                Operation::LoginUnlock {
+                    account: 1000,
+                    before: 2,
+                    after: 2,
+                    step,
+                },
+            )
+            .unwrap()
+        };
+        let unlock = step(LoginStep::Unlock {
+            key: [1; 4],
+            retries: 8,
+        });
+        for (next, admitted) in [
+            (unlock.clone(), true),
+            (
+                step(LoginStep::Unlock {
+                    key: [1; 4],
+                    retries: 0,
+                }),
+                false,
+            ),
+            (step(LoginStep::Identify), false),
+        ] {
+            let mut scene = Scene::new();
+            scene.set_attention(true);
+            scene
+                .prepare_attention_request_with_time(
+                    step(LoginStep::Identify),
+                    800,
+                    600,
+                    3200,
+                    Some(120),
+                )
+                .unwrap();
+            assert_eq!(
+                scene
+                    .prepare_attention_request_with_time(next, 800, 600, 3200, Some(119))
+                    .is_ok(),
+                admitted
+            );
+            // The unlock step is the operation's last: nothing follows it,
+            // and a refused successor leaves no predecessor to retry.
+            assert!(scene
+                .prepare_attention_request_with_time(unlock.clone(), 800, 600, 3200, Some(118))
+                .is_err());
+        }
     }
 }

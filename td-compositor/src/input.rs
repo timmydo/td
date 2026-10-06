@@ -189,7 +189,18 @@ struct KeyBindings {
     /// but never selects or confirms with: a security key's own keyboard
     /// (`security_key_keyboard`).
     attention_excluded: BTreeSet<usize>,
+    /// One operation per attention lifetime: set once one is selected, or
+    /// once a refusal or a failed screen consumed the lifetime.
     secret_selected: bool,
+    /// The key-management screen `K` opens within an attention lifetime.
+    login_screen: LoginScreen,
+    /// That screen's latest paint: a choice on it waits until it is on
+    /// glass, as a prompt's consent waits for its receipt.
+    login_shown: Option<crate::runtime::NoticePresentation>,
+    /// The enrolled keys in canonical slot order, which removal digits name.
+    /// Request `1a` supplies them from TOKEN-LOGIN.md's increment 4; until
+    /// then nothing does, and `D` refuses locally.
+    enrolled: Option<Vec<crate::authority::consent::Fingerprint>>,
     cutoff: Option<u128>,
     pressed: BTreeSet<(usize, u16)>,
     forwarded: BTreeSet<(usize, u16)>,
@@ -203,10 +214,20 @@ struct KeyBindings {
     pointer_forwarded: BTreeSet<u16>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum LoginScreen {
+    #[default]
+    Closed,
+    Menu,
+    Removing(crate::secret_client::Removal),
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct KeyDecision {
     attention: Option<bool>,
     secret: Option<crate::secret_client::Selection>,
+    /// A screen of the attention lifetime that selects nothing yet.
+    notice: Option<crate::attention::Notice>,
     confirm_install: Option<u128>,
     draining: bool,
     command: Option<Command>,
@@ -227,6 +248,7 @@ impl KeyBindings {
         let mut decision = KeyDecision {
             attention: None,
             secret: None,
+            notice: None,
             confirm_install: None,
             draining: false,
             command: None,
@@ -265,28 +287,13 @@ impl KeyBindings {
                 && !attention_held
                 && event.value == KEY_PRESS
             {
-                decision.secret = match event.code {
-                    KEY_W => Some(crate::secret_client::Selection::Write),
-                    KEY_I => Some(crate::secret_client::Selection::Install),
-                    KEY_U => Some(crate::secret_client::Selection::Unlock(
-                        crate::authority::consent::Role::Primary,
-                    )),
-                    KEY_R => Some(crate::secret_client::Selection::Unlock(
-                        crate::authority::consent::Role::Recovery,
-                    )),
-                    KEY_E => Some(crate::secret_client::Selection::Enroll(
-                        crate::authority::consent::Recovery::SecondToken,
-                    )),
-                    KEY_X => Some(crate::secret_client::Selection::Enroll(
-                        crate::authority::consent::Recovery::Unrecoverable,
-                    )),
-                    _ => None,
-                };
+                self.select(event.code, &mut decision);
                 self.secret_selected |= decision.secret.is_some();
             }
             if self.attention == AttentionState::Open
                 && readable
                 && self.secret_selected
+                && decision.secret.is_none()
                 && !attention_held
                 && event.value == KEY_PRESS
                 && event.code == KEY_ENTER
@@ -313,6 +320,8 @@ impl KeyBindings {
         {
             self.attention = AttentionState::Open;
             self.secret_selected = false;
+            self.login_screen = LoginScreen::Closed;
+            self.login_shown = None;
             self.forwarded.clear();
             self.pointer_forwarded.clear();
             self.consumed.clear();
@@ -463,6 +472,69 @@ impl KeyBindings {
             decision.forward = self.forward(physical, event);
         }
         decision
+    }
+
+    /// A fresh physical press on the open attention screen, from a device it
+    /// reads, before the lifetime's one operation: a menu selection, `K`'s
+    /// key-management screen, or a choice on that screen.
+    fn select(&mut self, code: u16, decision: &mut KeyDecision) {
+        use crate::attention::Notice;
+        use crate::authority::consent::{Recovery, Role};
+        use crate::secret_client::{LoginSelection, Removal, Selection};
+        // Nothing on a screen the person may not see yet is a choice.
+        if self.login_screen != LoginScreen::Closed
+            && !self
+                .login_shown
+                .as_ref()
+                .is_some_and(crate::runtime::NoticePresentation::on_glass)
+        {
+            return;
+        }
+        if let LoginScreen::Removing(removal) = &mut self.login_screen {
+            if code == KEY_ENTER {
+                decision.secret = removal.selection().map(Selection::Login);
+            } else if digit(code).is_some_and(|position| removal.toggle(position)) {
+                decision.notice = Some(removal.shown());
+            }
+            return;
+        }
+        if self.login_screen == LoginScreen::Menu {
+            decision.secret = match code {
+                KEY_1 => Some(Selection::Login(LoginSelection::Enroll(1))),
+                KEY_2 => Some(Selection::Login(LoginSelection::Enroll(2))),
+                KEY_A => Some(Selection::Login(LoginSelection::Add)),
+                KEY_D => {
+                    match self.enrolled.clone().and_then(Removal::new) {
+                        Some(removal) => {
+                            decision.notice = Some(removal.shown());
+                            self.login_screen = LoginScreen::Removing(removal);
+                        }
+                        // No key list yet: refused here, and nothing is sent.
+                        None => {
+                            decision.notice = Some(Notice::NotAvailable);
+                            self.secret_selected = true;
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            };
+            return;
+        }
+        decision.secret = match code {
+            KEY_W => Some(Selection::Write),
+            KEY_I => Some(Selection::Install),
+            KEY_U => Some(Selection::Unlock(Role::Primary)),
+            KEY_R => Some(Selection::Unlock(Role::Recovery)),
+            KEY_E => Some(Selection::Enroll(Recovery::SecondToken)),
+            KEY_X => Some(Selection::Enroll(Recovery::Unrecoverable)),
+            KEY_K => {
+                self.login_screen = LoginScreen::Menu;
+                decision.notice = Some(Notice::LoginKeys);
+                None
+            }
+            _ => None,
+        };
     }
 
     fn forward(&mut self, physical: (usize, u16), event: Event) -> Option<KeyInput> {
@@ -1127,6 +1199,15 @@ trait InputTarget {
     fn secret_request(&mut self, _role: crate::secret_client::Selection) -> Result<(), String> {
         Err("secret requests unavailable on this input target".into())
     }
+    /// Shows an attention screen that selects nothing yet, answering with
+    /// its paint, or none when it failed; a screen not shown selects
+    /// nothing.
+    fn attention_notice(
+        &mut self,
+        _notice: crate::attention::Notice,
+    ) -> Option<crate::runtime::NoticePresentation> {
+        None
+    }
     fn attention_closed(&mut self) {}
 
     fn attention(&mut self, visible: bool) -> Result<u128, String>;
@@ -1484,6 +1565,23 @@ impl InputTarget for LiveInputTarget {
         Ok(())
     }
 
+    fn attention_notice(
+        &mut self,
+        notice: crate::attention::Notice,
+    ) -> Option<crate::runtime::NoticePresentation> {
+        let shown = self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())
+            .and_then(|mut runtime| {
+                runtime.attention_notice(&EvdevOrigin { _private: () }, notice)
+            });
+        if let Err(error) = &shown {
+            let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
+        }
+        shown.ok()
+    }
+
     fn attention_closed(&mut self) {
         self.secret_attempt = None;
     }
@@ -1793,6 +1891,14 @@ fn workspace(code: u16) -> Option<u8> {
     }
 }
 
+/// A removal digit's key position, 1 through 8, from the main row.
+fn digit(code: u16) -> Option<u8> {
+    if !(KEY_1..=KEY_8).contains(&code) {
+        return None;
+    }
+    u8::try_from(code.checked_sub(KEY_1)?.checked_add(1)?).ok()
+}
+
 fn launcher_character(code: u16) -> Option<char> {
     match code {
         KEY_A => Some('a'),
@@ -2002,6 +2108,7 @@ fn apply_locked<T: InputTarget>(
     if !decision.draining
         && decision.attention.is_none()
         && decision.secret.is_none()
+        && decision.notice.is_none()
         && decision.confirm_install.is_none()
         && decision.command.is_none()
         && decision.launcher.is_none()
@@ -2105,6 +2212,14 @@ fn deliver_key_decision<T: InputTarget>(
     }
     if let Some(timestamp) = decision.confirm_install {
         runtime.confirm_install(timestamp)?;
+    }
+    if let Some(notice) = decision.notice {
+        // Fails closed: a screen the person cannot see selects nothing more
+        // in this lifetime, and capture stays until Escape drains it.
+        match runtime.attention_notice(notice) {
+            Some(shown) => bindings.login_shown = Some(shown),
+            None => bindings.secret_selected = true,
+        }
     }
     if let Some(role) = decision.secret {
         runtime.secret_request(role)?;
@@ -4262,6 +4377,12 @@ mod tests {
     struct RecordingTarget {
         attention_events: Vec<bool>,
         secret_roles: Vec<crate::secret_client::Selection>,
+        notices: Vec<crate::attention::Notice>,
+        /// The attention screens fail to paint.
+        notice_fails: bool,
+        /// The attention screens' paints are owed, not yet on glass.
+        notices_owed: bool,
+        clock: Arc<crate::runtime::PresentationClock>,
         confirmations: Vec<u128>,
         attention_cutoff: u128,
         attention_error: Option<String>,
@@ -4310,6 +4431,24 @@ mod tests {
         fn secret_request(&mut self, role: crate::secret_client::Selection) -> Result<(), String> {
             self.secret_roles.push(role);
             Ok(())
+        }
+
+        fn attention_notice(
+            &mut self,
+            notice: crate::attention::Notice,
+        ) -> Option<crate::runtime::NoticePresentation> {
+            self.notices.push(notice);
+            if self.notice_fails {
+                return None;
+            }
+            let epoch = u64::try_from(self.notices.len()).unwrap();
+            if !self.notices_owed {
+                self.clock.publish_for_test(epoch);
+            }
+            Some(crate::runtime::NoticePresentation::for_test(
+                &self.clock,
+                epoch,
+            ))
         }
 
         fn drain_attention(&mut self) -> Result<(), String> {
@@ -8385,5 +8524,355 @@ mod tests {
         release_device(&target, 7, &bindings, 1).unwrap();
         assert!(bindings.lock().unwrap().pointer_pending.is_empty());
         assert_eq!(target.lock().unwrap().attention_events, [true, false]);
+    }
+
+    /// Each code pressed and released as its own report, from `from`
+    /// milliseconds, so no key is held across another.
+    fn presses(codes: &[u16], from: u32) -> Vec<Event> {
+        codes
+            .iter()
+            .zip((from..).step_by(2))
+            .flat_map(|(code, time)| {
+                [
+                    at_millis(key(*code, KEY_PRESS), time),
+                    syn(time),
+                    at_millis(key(*code, KEY_RELEASE), time + 1),
+                    syn(time + 1),
+                ]
+            })
+            .collect()
+    }
+
+    /// Ctrl+Alt+Esc, each change its own report, opening attention.
+    fn chord_reports(from: u32) -> Vec<Event> {
+        [
+            (KEY_LEFTCTRL, KEY_PRESS),
+            (KEY_LEFTALT, KEY_PRESS),
+            (KEY_ESC, KEY_PRESS),
+            (KEY_ESC, KEY_RELEASE),
+            (KEY_LEFTCTRL, KEY_RELEASE),
+            (KEY_LEFTALT, KEY_RELEASE),
+        ]
+        .into_iter()
+        .zip(from..)
+        .flat_map(|((code, value), time)| [at_millis(key(code, value), time), syn(time)])
+        .collect()
+    }
+
+    /// The whole device dispatcher: these reports, read from `device`.
+    fn read_reports(
+        target: &Mutex<RecordingTarget>,
+        bindings: &Mutex<KeyBindings>,
+        device: usize,
+        events: &[Event],
+    ) {
+        let data = events.iter().copied().flat_map(encode).collect();
+        read_device(
+            Path::new("event-test"),
+            &mut ChunkedReader::new(data, Vec::new()),
+            device,
+            target,
+            bindings,
+            None,
+            &mut || None,
+        )
+        .unwrap();
+    }
+
+    fn attention_bindings(enrolled: Option<Vec<[u8; 4]>>) -> Mutex<KeyBindings> {
+        Mutex::new(KeyBindings {
+            attention_enabled: true,
+            enrolled,
+            ..KeyBindings::default()
+        })
+    }
+
+    const ENROLLED: [[u8; 4]; 3] = [[0xa1; 4], [0xa2; 4], [0xa3; 4]];
+
+    #[test]
+    fn key_management_selects_one_login_operation_per_lifetime() {
+        use crate::attention::Notice;
+        use crate::secret_client::{LoginSelection, Selection};
+        for (code, selected) in [
+            (KEY_1, LoginSelection::Enroll(1)),
+            (KEY_2, LoginSelection::Enroll(2)),
+            (KEY_A, LoginSelection::Add),
+        ] {
+            let target = Mutex::new(RecordingTarget::default());
+            let bindings = attention_bindings(None);
+            // Outside attention these are ordinary keys.
+            read_reports(&target, &bindings, 0, &presses(&[KEY_K, code], 1));
+            {
+                let target = target.lock().unwrap();
+                assert!(target.secret_roles.is_empty() && target.notices.is_empty());
+                assert_eq!(target.keys.len(), 4);
+            }
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            let typed = target.lock().unwrap().keys.len();
+            // The menu does not take the key-management screen's keys.
+            read_reports(&target, &bindings, 0, &presses(&[code], 20));
+            assert!(target.lock().unwrap().secret_roles.is_empty());
+            read_reports(&target, &bindings, 0, &presses(&[KEY_K, code], 30));
+            // One operation: nothing else selects in this lifetime.
+            read_reports(
+                &target,
+                &bindings,
+                0,
+                &presses(&[KEY_1, KEY_2, KEY_A, KEY_D, KEY_K, KEY_U, KEY_I], 40),
+            );
+            let target = target.lock().unwrap();
+            assert_eq!(target.attention_events, [true]);
+            assert_eq!(target.notices, [Notice::LoginKeys]);
+            assert_eq!(target.secret_roles, [Selection::Login(selected)]);
+            assert_eq!(target.keys.len(), typed);
+        }
+    }
+
+    #[test]
+    fn a_new_lifetime_starts_at_the_menu_again() {
+        use crate::attention::Notice;
+        use crate::secret_client::{LoginSelection, Selection};
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = attention_bindings(None);
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        read_reports(&target, &bindings, 0, &presses(&[KEY_K, KEY_A], 20));
+        read_reports(&target, &bindings, 0, &presses(&[KEY_ESC], 30));
+        assert!(bindings.lock().unwrap().attention == AttentionState::Closed);
+        // A fresh report after the close's cutoff, then a new lifetime whose
+        // `1` is not the key-management screen's until `K` opens it again.
+        let mut reopen = vec![syn(40)];
+        reopen.extend(chord_reports(41));
+        reopen.extend(presses(&[KEY_1, KEY_K, KEY_1], 50));
+        read_reports(&target, &bindings, 0, &reopen);
+        let target = target.lock().unwrap();
+        assert_eq!(target.attention_events, [true, false, true]);
+        assert_eq!(target.notices, [Notice::LoginKeys, Notice::LoginKeys]);
+        assert_eq!(
+            target.secret_roles,
+            [
+                Selection::Login(LoginSelection::Add),
+                Selection::Login(LoginSelection::Enroll(1))
+            ]
+        );
+    }
+
+    #[test]
+    fn removal_without_a_key_list_is_refused_locally_and_ends_the_choice() {
+        use crate::attention::Notice;
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = attention_bindings(None);
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        read_reports(
+            &target,
+            &bindings,
+            0,
+            &presses(&[KEY_K, KEY_D, KEY_1, KEY_ENTER, KEY_A, KEY_2, KEY_U], 20),
+        );
+        let target = target.lock().unwrap();
+        assert_eq!(target.notices, [Notice::LoginKeys, Notice::NotAvailable]);
+        assert!(target.secret_roles.is_empty());
+    }
+
+    #[test]
+    fn removal_digits_choose_a_set_that_enter_selects() {
+        use crate::attention::Notice;
+        use crate::authority::consent::Slot;
+        use crate::secret_client::{LoginSelection, Selection};
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = attention_bindings(Some(ENROLLED.to_vec()));
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        // Enter on an empty set selects nothing; 4, 9 and 0 name no key.
+        read_reports(
+            &target,
+            &bindings,
+            0,
+            &presses(
+                &[
+                    KEY_K, KEY_D, KEY_ENTER, KEY_1, KEY_3, KEY_4, KEY_9, KEY_0, KEY_1, KEY_1,
+                ],
+                20,
+            ),
+        );
+        {
+            let target = target.lock().unwrap();
+            let removing = |chosen| Notice::Removing { keys: 3, chosen };
+            assert_eq!(
+                target.notices,
+                [
+                    Notice::LoginKeys,
+                    removing(0),
+                    removing(0b001),
+                    removing(0b101),
+                    removing(0b100),
+                    removing(0b101),
+                ]
+            );
+            assert!(target.secret_roles.is_empty());
+        }
+        read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER], 90));
+        // Selected: nothing more selects, and Enter now only confirms.
+        read_reports(&target, &bindings, 0, &presses(&[KEY_2, KEY_ENTER], 100));
+        let target = target.lock().unwrap();
+        assert_eq!(
+            target.secret_roles,
+            [Selection::Login(LoginSelection::Remove(vec![
+                Slot {
+                    position: 1,
+                    key: ENROLLED[0],
+                },
+                Slot {
+                    position: 3,
+                    key: ENROLLED[2],
+                },
+            ]))]
+        );
+        assert_eq!(target.notices.len(), 6);
+        assert_eq!(target.confirmations, [102_000_000]);
+    }
+
+    #[test]
+    fn a_security_keys_keyboard_cannot_choose_a_login_operation() {
+        use crate::attention::Notice;
+        use crate::authority::consent::Slot;
+        use crate::secret_client::{LoginSelection, Selection};
+        const KEY: usize = 1;
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings {
+            attention_enabled: true,
+            attention_excluded: BTreeSet::from([KEY]),
+            enrolled: Some(ENROLLED.to_vec()),
+            ..KeyBindings::default()
+        });
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        read_reports(&target, &bindings, KEY, &presses(&[KEY_K, KEY_1], 20));
+        assert!(target.lock().unwrap().notices.is_empty());
+        read_reports(&target, &bindings, 0, &presses(&[KEY_K], 30));
+        read_reports(
+            &target,
+            &bindings,
+            KEY,
+            &presses(&[KEY_1, KEY_2, KEY_A, KEY_D], 40),
+        );
+        assert_eq!(target.lock().unwrap().notices, [Notice::LoginKeys]);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_D], 50));
+        read_reports(&target, &bindings, KEY, &presses(&[KEY_2, KEY_ENTER], 60));
+        read_reports(&target, &bindings, 0, &presses(&[KEY_2], 70));
+        read_reports(&target, &bindings, KEY, &presses(&[KEY_ENTER], 80));
+        {
+            let target = target.lock().unwrap();
+            assert!(target.secret_roles.is_empty());
+            assert_eq!(
+                target.notices,
+                [
+                    Notice::LoginKeys,
+                    Notice::Removing { keys: 3, chosen: 0 },
+                    Notice::Removing {
+                        keys: 3,
+                        chosen: 0b010
+                    },
+                ]
+            );
+        }
+        read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER], 90));
+        assert_eq!(
+            target.lock().unwrap().secret_roles,
+            [Selection::Login(LoginSelection::Remove(vec![Slot {
+                position: 2,
+                key: ENROLLED[1],
+            }]))]
+        );
+    }
+
+    #[test]
+    fn an_unpainted_key_management_screen_selects_nothing() {
+        use crate::attention::Notice;
+        let target = Mutex::new(RecordingTarget {
+            notice_fails: true,
+            ..RecordingTarget::default()
+        });
+        let bindings = attention_bindings(Some(ENROLLED.to_vec()));
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        let typed = target.lock().unwrap().keys.len();
+        read_reports(
+            &target,
+            &bindings,
+            0,
+            &presses(&[KEY_K, KEY_1, KEY_A, KEY_D, KEY_U], 20),
+        );
+        let target = target.lock().unwrap();
+        assert_eq!(target.notices, [Notice::LoginKeys]);
+        assert!(target.secret_roles.is_empty());
+        // Capture stays: the keys reached no client.
+        assert_eq!(target.keys.len(), typed);
+        assert!(bindings.lock().unwrap().attention == AttentionState::Open);
+    }
+
+    /// A key-management screen whose paint is owed, its flip not yet
+    /// complete, takes no choice: `K` then `1` before the screen reaches
+    /// glass selects nothing, and the same press once it has selects.
+    #[test]
+    fn a_key_management_screen_not_yet_on_glass_selects_nothing() {
+        use crate::attention::Notice;
+        use crate::authority::consent::Slot;
+        use crate::secret_client::{LoginSelection, Selection};
+        let target = Mutex::new(RecordingTarget {
+            notices_owed: true,
+            ..RecordingTarget::default()
+        });
+        let bindings = attention_bindings(Some(ENROLLED.to_vec()));
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        read_reports(&target, &bindings, 0, &presses(&[KEY_K, KEY_1, KEY_D], 20));
+        {
+            let target = target.lock().unwrap();
+            assert_eq!(target.notices, [Notice::LoginKeys]);
+            assert!(target.secret_roles.is_empty());
+        }
+        let clock = Arc::clone(&target.lock().unwrap().clock);
+        clock.publish_for_test(1);
+        // On glass: `D` opens removal, whose own screen is owed in turn.
+        read_reports(
+            &target,
+            &bindings,
+            0,
+            &presses(&[KEY_D, KEY_2, KEY_ENTER], 30),
+        );
+        {
+            let target = target.lock().unwrap();
+            assert_eq!(
+                target.notices,
+                [Notice::LoginKeys, Notice::Removing { keys: 3, chosen: 0 }]
+            );
+            assert!(target.secret_roles.is_empty());
+        }
+        clock.publish_for_test(2);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_2], 40));
+        // Enter waits for the screen showing the choice it would send.
+        read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER], 50));
+        assert!(target.lock().unwrap().secret_roles.is_empty());
+        clock.publish_for_test(3);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER], 60));
+        assert_eq!(
+            target.lock().unwrap().secret_roles,
+            [Selection::Login(LoginSelection::Remove(vec![Slot {
+                position: 2,
+                key: ENROLLED[1],
+            }]))]
+        );
+        // And for a choice made on the first screen.
+        let target = Mutex::new(RecordingTarget {
+            notices_owed: true,
+            ..RecordingTarget::default()
+        });
+        let bindings = attention_bindings(None);
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        read_reports(&target, &bindings, 0, &presses(&[KEY_K, KEY_1], 20));
+        assert!(target.lock().unwrap().secret_roles.is_empty());
+        let clock = Arc::clone(&target.lock().unwrap().clock);
+        clock.publish_for_test(1);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_1], 30));
+        assert_eq!(
+            target.lock().unwrap().secret_roles,
+            [Selection::Login(LoginSelection::Enroll(1))]
+        );
     }
 }

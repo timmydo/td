@@ -5671,9 +5671,10 @@ capture or synthetic-input portal is implemented by this increment.
 A fresh physical U selects primary unlock, R recovery unlock, E enrollment
 with a second recovery token, X explicit unrecoverability, and W the ready
 credential write queued through `td-secret set`; I selects a queued system
-installation. Only one selection is allowed per successfully opened and
-closed attention lifetime. Held keys, repeats and a second device pressing
-an already-held logical key cannot select an operation; a key held only by
+installation, and K opens the key-management screen ("Login-key
+operations" below). Only one operation is selected per successfully
+opened and closed attention lifetime. Held keys, repeats and a second
+device pressing an already-held logical key cannot select an operation; a key held only by
 a security key's own keyboard does not count as held (below). Ordinary
 control, Wayland and portal input APIs cannot construct that physical
 selection. The screen accepts no credential bytes. For a write, root
@@ -5706,8 +5707,9 @@ also refuses, or an oversized read declares nothing. Symlinks (`driver`,
 256 entries is not read. Report descriptors are world-readable in sysfs,
 so this is plain file reads and no new syscall.
 
-An excluded device's keys never select (U, R, E, X, W, I) and never
-confirm (Enter). Its held keys neither stop another keyboard's fresh press
+An excluded device's keys never select (U, R, E, X, W, I, K, and the
+key-management screen's 1, 2, A, D, digits and Enter) and never confirm
+(Enter). Its held keys neither stop another keyboard's fresh press
 of the same key nor count as modifiers while attention is up. Its presses
 and releases are still tracked, so the release drain waits for them, and
 its Escape still cancels, so no capture outlives the person's way out.
@@ -5733,7 +5735,9 @@ inserted later adds no keyboard at all.
 The device dispatcher treats a secret selection as work even when that
 key produces no ordinary key, modifier or pointer delivery. Its device-event
 regression exercises all six selections through the complete adapter,
-including refusal outside attention and one selection per lifetime.
+including refusal outside attention and one selection per lifetime, and
+the key-management screen's through `read_device`, including refusal from
+a security key's own keyboard.
 The optional `qemu-secret --tpm` desktop case in `td-secret/DESIGN.md`
 executes this dispatcher with a UHID keyboard and the real paired authority,
 framebuffer presentation, token workers and public credential client.
@@ -5768,8 +5772,9 @@ The receipt is the prompt's OWN paint reaching the screen:
 The request fixes owner, nonce, platform and recovery policy throughout the
 operation. The two-token path presents creation and proof for each token;
 the unrecoverable path ends after primary proof. Both tokens must be ready
-before starting. Every prompt includes the remaining 120-second overall
-budget when shown, without renewing that deadline. This is a time snapshot,
+before starting. Every prompt includes the remaining overall budget when
+shown (120 seconds; a login operation's own ceiling, below), without
+renewing that deadline. This is a time snapshot,
 not a live countdown. Hardware timing remains unverified by host/VM fixtures.
 
 The physical attempt records cancellation atomically before waiting for the
@@ -5857,22 +5862,120 @@ installation; the root controller retains the transaction until completion.
 This confirmation does not authorize any secret-store operation or enroll or
 rotate a signing key. The installation protocol is in td-authd/DESIGN.md.
 
+### Login-key operations
+
+TOKEN-LOGIN.md's key management starts on the attention menu, inert in
+production. A fresh physical K, before the lifetime's operation, opens
+the key-management screen: `1` enrolls one key, `2` two, `A` adds a key
+and `D` removes keys. On that screen the menu's own letters select
+nothing, and Escape still cancels. Each choice is the lifetime's one
+operation, read under the menu's rules (a fresh press, from a device
+secure attention reads, of a key no other such device holds), so a
+security key's own keyboard neither opens the screen nor chooses on it.
+A screen that fails to paint consumes the lifetime instead: a choice
+the person cannot see is no choice. Nor is one on a screen still on its
+way: each key-management screen names the paint that shows it, the
+first from its setting, as a prompt's presentation does, and a press on
+it chooses nothing until that paint is on glass. With a flip in flight
+the repaint is only owed, so `K` then `1` faster than the flip selects
+nothing; the same `1` once the screen is shown selects. Unlike a
+prompt's confirmation, the gate is read when a press is processed, not
+against its timestamp: where a paint presents synchronously (fbdev), a
+`1` queued in the same read as `K` selects. That is typeahead from a
+device secure attention reads, not an unseen screen.
+
+`D` needs the enrolled key list, which td-authd's `1a` answer supplies
+from TOKEN-LOGIN.md's increment 4 (`td-authd/DESIGN.md`, amendment 1).
+Until then the compositor has none, so `D` shows `NOT AVAILABLE IN THIS
+BUILD`, sends nothing and ends the choice. With a list, the screen shows
+`REMOVE: PRESS 1 TO N THEN ENTER` and the chosen positions; digit 1 to
+N toggles that position, and Enter selects the nonempty set in position
+order, each slot with its listed fingerprint. Tests supply a list.
+
+The private client sends the choice as `1b`: `07` unlock, `08 01` or
+`08 02` first enrollment, `09` addition, or `0a`, a count and that many
+position-and-fingerprint slots for a removal, exactly as td-authd's
+`login::Selection` decodes it. Root's refusal in this build, `9b 00`,
+shows `NOT AVAILABLE IN THIS BUILD`; `9b 01` keeps the nonce, and no
+description exists until the worker's baseline (`91 0b`). The client
+checks root's descriptions without the record or the device:
+
+- the first must pass consent's `login_start` and keep the `1b` nonce,
+  owner and account 1000, the selected operation with its key count or
+  removal slots, and its ceiling; it may arrive while root waits for the
+  worker (`03`), to present (`04`) or with an end;
+- each later change is admitted only after its predecessor's
+  presentation receipt and only through `login_successor`, with `04`,
+  an end, or `03`: root that read the next invitation and then stopped,
+  at its deadline or on a cancellation, describes that step while it
+  reaps the worker. Presenting it still needs `04` and committing it a
+  receipt, so admitting it under `03` lets nothing through;
+- in an addition, the new key's prove, repeat and probe never name the
+  key the authorize step named: a rule spanning more than one step,
+  which consent leaves to its reader;
+- the commit (`05`) is legal only for a presented step that
+  `login_successor` admitted as `Last`, and success (`06`) only after
+  it.
+
+A refusal ends the paired generation, as a secret operation's changed
+request does. A step that asks for a PIN (`0c`) is cancelled (`15`)
+with `NOT AVAILABLE IN THIS BUILD` until the PIN field (below) replaces
+that path; production reaches none. An end (`0d`, `0e`) carries a typed
+kind and detail, shown as TOKEN-LOGIN.md's "Failure texts" says. The
+client accepts exactly the ends root's supervisor can produce where it
+stands, and anything else is a violation: kind and detail outside that
+table; an uncertain end before a write's acknowledged commit or a
+certain one after it; kind `0e` under `0d`; `80` before its own `15`;
+`81`, `82` or `83` other than for an addition, a first enrollment or a
+removal, or once a description exists; no description once one was
+given; and after the commit any step but the committed one. Escape's
+cancellation shows nothing new, since the screen is closing. The
+client's own says why and withdraws the prompt: `TIMED OUT` once the
+attempt's deadline has passed (it always passes before root's), `THE
+OPERATION FAILED` when a presentation failed.
+
+Attention-screen rows are the chrome font's, 5x7 from 24 pixels in,
+doubled only on an output of at least 800x600 as a prompt's Unifont
+is, and 18 scaled pixels apart. The first row keeps its long-standing
+place, `(height - 248) / 2`, wherever the whole block, the last row's
+foot included, fits below it, so the boot oracles' rows do not move (on
+1280x800 the title at 276, the notice at 312 and `I` at 456); only an
+output too short for that moves the block up, as little as makes it
+fit. A row wider than the output's columns, its width less 48 over the
+scaled advance, wraps at a space; a row that fits is drawn as it is.
+
+The attempt's lifetime is td-authd's ceiling for the selected operation
+(`login_ceiling`: 120 seconds for an unlock, a removal and a one-key
+enrollment, 240 for an addition and a two-key enrollment), fixed at the
+selection and never renewed. A prompt's time line accepts at most its
+own request's ceiling, so only a two-ceremony login prompt may show more
+than 120 seconds.
+
+Host tests drive every operation's whole status sequence against a
+scripted authority, a PIN step's `0c` and `1c` being the PIN field's; a
+changed nonce or kind; skipped, repeated and unpresented steps; the
+authorizing key's reuse; a commit before the last step; cancellation at
+each stage; a successor root read as it stopped; every end kind and its
+text; exactly root's reachable ends, at every point of every operation;
+the client's own cancellation's text; and the ceilings.
+Device-dispatcher tests cover the screen's choices through `read_device`,
+one operation per lifetime, their refusal outside attention and from
+a security key's own keyboard, and none before the screen is on glass.
+
 ### Session lock and login-key entry (target)
 
-Not implemented. [td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md)
+Partly implemented: items 1, 3 and 4 are "Login-key operations" above.
+[td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier, including when the session locks and what
 clients receive while locked ("Session lock"). The rules in this section
 change as follows; increment numbers are TOKEN-LOGIN.md's. A security key's
 own keyboard ("Physical secure attention") is already excluded, and stays
 excluded from every selection, confirmation and field below.
 
-1. **One operation per lifetime (3).** "Only one selection is allowed per
-   attention lifetime" becomes one operation per lifetime. `K` opens a
-   key-management screen whose own physical keys (`2`, `1`, `A`, `D`, the
-   digits naming keys, and a disclosure's fresh Enter) select and confirm
-   that one operation. On the lock surface the chord opens a login unlock
-   with no selection at all. Until activation the key-management
-   selections show `NOT AVAILABLE IN THIS BUILD`.
+1. **One operation per lifetime (3).** Implemented for the key-management
+   screen. Still to come: a disclosure's fresh Enter confirms its
+   operation (TOKEN-LOGIN.md increment 5), and on the lock surface the
+   chord opens a login unlock with no selection at all.
 2. **The PIN field (3).** "The screen accepts no credential bytes" gains
    one exception. The field opens only after the current step has its
    presentation receipt and root has asked for that step's PIN. It reads
@@ -5890,13 +5993,10 @@ excluded from every selection, confirmation and field below.
    finish, never complete one.
    The PIN reaches root through the paired client in a clearing owner and
    is never painted, logged or retained after sending.
-3. **Successors (3).** "Unlock has no successor" holds for the
-   application-store unlock only. Login operations present each next step
-   that td-authd admits, under its device-data rule; owner and nonce stay
-   fixed.
-4. **Lifetime (3).** A login operation's attention lifetime is td-authd's
-   ceiling for that operation instead of 120 seconds, never renewed, and
-   every prompt shows the remaining time.
+3. **Successors (3).** Implemented: "Unlock has no successor" holds for
+   the application-store unlock only ("Immutable prompt presentation").
+4. **Lifetime (3).** Implemented: a login operation's attention lifetime
+   is td-authd's ceiling for it, never renewed.
 5. **Lock state (4).** The compositor learns the login state as
    td-authd/DESIGN.md's login-state amendment specifies. What a locked
    session shows and delivers is TOKEN-LOGIN.md's; here, the lock surface
@@ -5934,8 +6034,7 @@ excluded from every selection, confirmation and field below.
    than about three seconds are certain to be detected; TOKEN-LOGIN.md
    discloses that limit.
 
-The current profile has none of this: no lock, no PIN field, and one
-selection per lifetime.
+The current profile has no lock and no PIN field.
 
 ### Immutable prompt presentation
 
@@ -5944,8 +6043,8 @@ operation: enrollment with an encoded platform profile, explicit recovery
 policy and proof step, session unlock with a token role, one credential write
 with the exact application name, credential name, external application UID and
 requester UID, a whole-disk installation's fixed summary with escaped disk
-labels, or one step of a login-key operation, which td-authd does not yet
-send (td-authd/DESIGN.md). Its private fields preserve construction checks.
+labels, or one step of a login-key operation (td-authd/DESIGN.md). Its
+private fields preserve construction checks.
 Decoding validates bounded canonical framing and identities; it does not
 authenticate a sender, prove nonce freshness or admit an operation. The
 authority must supply fresh entropy and independently admitted identities over
@@ -5961,8 +6060,11 @@ exact output geometry. A mismatched render target fails before backend submissio
 `present_attention_request` requires the physical-input origin witness,
 active paired attention outside cancellation drain and no compound commit.
 The first request consumes the presentation slot. Only its exact next
-enrollment step may replace it; owner, nonce, platform and recovery remain
-fixed. Unlock has no successor. It installs the prepared frame,
+enrollment step may replace it, owner, nonce, platform and recovery
+fixed, or a login step's one legal successor under consent's
+`login_successor`, which fixes nonce, owner and operation; the device
+data in it is root's to admit. An application-store unlock has no
+successor. It installs the prepared frame,
 owes the entire output and repaints, naming the paint epoch that shows it.
 A `PresentedRequest` containing the exact description is returned only once
 that epoch is on glass (the receipt rules below). A failed paint, or one
@@ -5982,8 +6084,9 @@ refuses before submission releases its frame state under either backend.
 
 This receipt records a completed paint, not live authorization. The private
 session client retains it only for the exact outstanding description and
-accepts each next enrollment step only after its predecessor was presented.
-Only the final proof permits the private execution acknowledgement; it is
+accepts each next enrollment or login step only after its predecessor was
+presented ("Login-key operations" above). Only the final proof, or a login
+operation's last step, permits the private execution acknowledgement; it is
 not another user prompt or token touch. Cancellation, expiration and channel
 loss prevent further acknowledgement. The private root workers independently
 check that sequence under `td-secret/DESIGN.md`. A handed-out receipt does

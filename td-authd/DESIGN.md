@@ -1059,8 +1059,9 @@ step outside its operation's list refuses. The widest login value, a
 removal of eight keys at its authorize step, is 98 bytes.
 
 Step admission has two parts. The descriptions alone decide a step's
-shape, which a reader without the record or the device, the compositor
-among them (TOKEN-LOGIN.md increment 3), can check; root's record and the
+shape, which a reader without the record or the device can check, as
+the compositor's private client does (`td-compositor/DESIGN.md`,
+"Login-key operations"); root's record and the
 worker's report decide its fingerprints. `Request::login_start` is the
 first presentation's shape: a login operation's first step (identify, or
 connect for an enrollment's first key, never a later key's).
@@ -1711,10 +1712,11 @@ staged into the target authority recipe.
 Implemented, inert: the consent operations and step admission
 (amendments 3 and 4), and the worker supervision, requests and
 deadlines of amendments 2, 5 and 6 ("Login-key operation supervision"
-below). No paired compositor sends `1b` or `1c` yet, and a production
-build refuses every login operation that may write, so nothing in
-production starts the worker. Login state (1), revocation (7) and update
-consent (8) are not implemented.
+below). The paired compositor sends `1b` for a first enrollment and an
+addition, which a production build refuses as it refuses every login
+operation that may write, and nothing sends an unlock's `1b` or any
+`1c`, so nothing in production starts the worker. Login state (1),
+revocation (7) and update consent (8) are not implemented.
 [`td-login/TOKEN-LOGIN.md`](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier. "Session lock" there is the compositor's
 display and input lock; it is unrelated to this document's secret-session
@@ -1730,6 +1732,15 @@ TOKEN-LOGIN.md's.
    The answer also carries the revocation status of amendment 7. Only
    td-authd decides that a session unlocks: on a login unlock's observed
    success.
+
+   An enrolled answer also carries the record's slot count and each
+   slot's four-byte fingerprint in canonical slot order, as
+   `inspect-login` reports them: the key list whose positions the
+   key-management screen's removal digits name, and the shape of the
+   worker's baseline (`18 01`, `td-secret/DESIGN.md`). Every answer, in
+   every state, carries the validated primary username, which the lock
+   surface shows. Increment 4 implements both; until then the compositor
+   has no key list and refuses removal locally, sending nothing.
 
    Root first applies the same predicate firstboot and td-login use:
    `/var/lib/td/login` opens as a valid root:root mode-0700 directory and
@@ -1805,7 +1816,8 @@ TOKEN-LOGIN.md's.
    exact current description followed by one PIN. Root forwards that PIN to
    the worker as one bounded frame in a clearing owner and keeps no copy.
    Both peers ship atomically, without negotiation, as earlier additions
-   did; the compositor first sends these requests in increment 3. Until
+   did; the compositor's private client sends `1b` from increment 3,
+   and its PIN field `1c`. Until
    activation, `1b` refuses enrollment, addition and removal in a
    production build, and an unlock refuses while no record exists. Host
    child fixtures and the ignored root session fixture drive both requests
@@ -1984,7 +1996,8 @@ Until activation (TOKEN-LOGIN.md increment 5) `login::WRITES` is false in
 every production build: `1b` answers `9b 00` for an enrollment, addition
 or removal before starting anything. Test builds set it, so host fixtures
 drive every operation. An unlock is wired, and ends as NO RECORD while no
-record exists; no production compositor sends `1b`.
+record exists; the production compositor sends `1b` only for a first
+enrollment or an addition, which this refuses, and never for an unlock.
 
 Host tests drive the controller and the paired Session against scripted
 exec children playing the worker's frames: each operation's exact step

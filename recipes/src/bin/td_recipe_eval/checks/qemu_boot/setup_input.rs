@@ -964,9 +964,10 @@ mod tests {
             assert!(attention.contains(&format!("=> \"{notice}\",")), "{notice}");
         }
         for line in [
-            // The menu's rows.
+            // The menu's rows: 36 apart at the doubled scale.
             "let top = height.saturating_sub(248) / 2;",
-            "top.saturating_add(index.saturating_mul(36)),",
+            "let pitch = 18 * scale;",
+            "top.saturating_add(index.saturating_mul(pitch)),",
             // The prompt's layout: doubled Unifont rows 4 doubled pixels
             // apart, centred, from 24 pixels in, above the countdown.
             "let scale = if width >= 800 && height >= 600 { 2 } else { 1 };",
@@ -975,7 +976,11 @@ mod tests {
             "24 + (column + indent) * cell_width + x * scale,",
             "lines.push(format!(\"TIME LEFT WHEN SHOWN: {seconds} {unit}\"));",
             "let unit = if seconds == 1 { \"SECOND\" } else { \"SECONDS\" };",
-            "if !(1..=120).contains(&seconds) {",
+            // A disk installation's budget is the non-login ceiling, which
+            // `countdown_matches` spans.
+            "const OPERATION_SECONDS: u64 = 120;",
+            ".map_or(OPERATION_SECONDS, |ceiling| ceiling.as_secs());",
+            "if !(1..=ceiling).contains(&seconds) {",
             "[0x28, 0x20, 0x18, 0],",
         ] {
             assert!(attention.contains(line), "{line}");

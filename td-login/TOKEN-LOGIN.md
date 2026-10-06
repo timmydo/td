@@ -5,11 +5,14 @@ td-compositor and td-login implement it together; this document owns the
 tier's rules, and each component document states the amendments its own
 contract needs. **Only the record codec, the record store, the consent
 descriptions, the CTAP login primitives, the root worker and td-authd's
-supervision of it are implemented**, inert: td-secret's private
-`login-operation` worker unlocks, enrolls, adds and removes keys against
-the record ("Placement"), and td-authd starts and drives it on the
-paired requests `1b` and `1c`, but no compositor sends them and a
-production td-authd refuses enrollment, addition and removal. So nothing
+supervision of it and the compositor's client of that supervision are
+implemented**, inert: td-secret's private `login-operation` worker
+unlocks, enrolls, adds and removes keys against the record
+("Placement"), and td-authd starts and drives it on the paired requests
+`1b` and `1c`. The compositor's key-management screen sends `1b` for a
+first enrollment and an addition, which a production td-authd refuses
+before starting anything; it refuses removal itself, having no key list
+yet, and nothing sends an unlock's `1b` or any `1c`. So nothing
 in production starts the worker or uses its `login_record` and
 `login_store` modules ("The login record"), its login identify,
 PIN-retry, assertion and creation steps ("Token profile"), or td-authd's
@@ -21,11 +24,16 @@ refuses every write that would leave a record ("Versions"). Its
 `qemu-secret` guests, standing in for that marker, run it over UHID
 virtual keys through every case increment 2 lists, including power cuts
 inside its writes on a disposable disk ("Evidence"): increment 2 is
-complete. Of increment 3, only the compositor's exclusion of a security
+complete. Of increment 3, the compositor's exclusion of a security
 key's own keyboard from secure attention has landed, and it is live: it
 narrows the existing attention selections and confirmation and needs no
-record (`td-compositor/DESIGN.md`, "Physical secure attention"). Nothing
-else below is implemented.
+record (`td-compositor/DESIGN.md`, "Physical secure attention"). The
+private client's login-key operations have landed too
+(`td-compositor/DESIGN.md`, "Login-key operations"): the `K` screen,
+each operation's descriptions checked step by step, its commit and the
+failure texts ("Failure texts"). Production reaches only their refusals.
+The PIN field and the lock surface have not landed, and nothing else
+below is implemented.
 Until the increments at the end land, `THREAT-MODEL.md` §3 is the
 complete current behaviour: the installed account logs in automatically
 and the session never locks. No document, UI or release
@@ -420,12 +428,76 @@ follows:
 | PIN invalid | WRONG PIN | the operation ends |
 | PIN auth blocked | REMOVE AND REINSERT THIS KEY | no PIN until power-cycled |
 | PIN blocked | PIN BLOCKED; USE ANOTHER KEY | only a reset, which erases it |
-| any other | the operation failed | no retry |
+| any other | THE OPERATION FAILED | no retry |
 
 A reset erases every credential on the key, its login credential
 included. td never infers a remaining count from a status. Every new
 attempt is a new operation from a new chord with a new nonce. A blocked
 key stays in the record until another key removes it.
+
+## Failure texts
+
+An operation that ends without success shows one text on the trusted
+screen, chosen by td-authd's typed kind and detail
+(`td-authd/DESIGN.md`, "Login-key operation supervision"), never by
+diagnostic text. These texts are the compositor's chrome rows, not a
+trusted prompt's: its 5x7 font from 24 pixels in, doubled only on an
+output of at least 800x600 as a prompt's is, so even the smallest output
+a prompt takes, 320 pixels wide, gives a row 45 columns. Every text here
+fits that whole, the longer ones as two rows, split here by `/`;
+the compositor wraps any wider chrome row at a space rather than
+clip it (`td-compositor/DESIGN.md`, "Login-key operations"). The PIN
+table above uses the first three and `0f`'s.
+
+| Kind | Detail | Shows |
+| --- | --- | --- |
+| `01` WRONG PIN | any | `WRONG PIN`, without the count |
+| `02` PIN AUTH BLOCKED | | `REMOVE AND REINSERT THIS KEY` |
+| `03` PIN BLOCKED | | `PIN BLOCKED; USE ANOTHER KEY` |
+| `04` NOT ENROLLED | | `THIS KEY IS NOT ENROLLED HERE` |
+| `05` ONE KEY | | `CONNECT EXACTLY ONE KEY` |
+| `06` KEY REFUSED | `01` | `KEY HAS NO HMAC-SECRET` |
+| | `02` | `KEY ALWAYS REQUIRES UV` |
+| | `03` | `KEY CANNOT HOLD A PIN` |
+| | `04` | `SET A PIN WITH ANOTHER TOOL` |
+| | `05` | `KEY CANNOT LIST ENROLLED KEYS` |
+| | `06` | `KEY CANNOT BE SELECTED` |
+| `07` DENIED | | `TOUCH DENIED` |
+| `08` TIMEOUT | | `TIMED OUT` |
+| `09` NO RECORD | | `NO LOGIN KEYS ENROLLED` |
+| `0a` DIRECTORY DAMAGED | | `LOGIN KEY STATE UNAVAILABLE:` / `DIRECTORY DAMAGED` |
+| `0b` RECORD DAMAGED | | `LOGIN KEY STATE UNAVAILABLE:` / `RECORD DAMAGED` |
+| `0c` STATE COULD NOT BE READ | | `LOGIN KEY STATE UNAVAILABLE:` / `STATE COULD NOT BE READ` |
+| `0d` RECORD CHANGED | | `KEYS CHANGED; NOTHING WRITTEN` |
+| `0e` UNCERTAIN | `01` to `05` | `RESULT UNCERTAIN` |
+| `0f` FAILED, `10` INTERNAL | | `THE OPERATION FAILED` |
+| `11` EXCLUDED | | `KEY ALREADY ENROLLED` |
+| `12` VERSION | | `A RETAINED SYSTEM CANNOT READ KEYS` |
+| `80` cancelled | | nothing |
+| `81` eight keys | | `EIGHT KEYS ALREADY ENROLLED` |
+| `82` already enrolled | | `LOGIN KEYS ALREADY ENROLLED` |
+| `83` slots not the record's | | `KEY LIST CHANGED; REOPEN` |
+
+Kinds `0a` to `0c` show the unavailable state's own texts ("The login
+record"), split after the colon. A cancellation shows nothing new: the
+person chose it, or the compositor did and said why, withdrawing any
+prompt: `TIMED OUT` when the attempt's own deadline passed, `THE
+OPERATION FAILED` when a presentation did. An end td-authd
+reports uncertain (`91 0e`, only after a write's acknowledged commit
+round) shows `RESULT UNCERTAIN` above its kind's rows, or alone for kind
+`0e`; nothing is retried, and from increment 4 the screen re-reads the
+state through `1a`. Any other kind
+or detail, or an end td-authd could not have reported, is a protocol
+violation that ends the paired generation: an uncertain end before such
+a commit or a certain one after it; kind `0e` in a certain end; `80`
+before the compositor's own `15`; `81`, `82` or `83` except for an
+addition, a first enrollment or a removal respectively, before any
+description (td-authd refuses those at the worker's baseline); and an
+end without a description once one was given, or after a commit with
+another than the committed step's. td-authd's refusal in this build
+(`9b 00`), and a selection the compositor cannot yet serve, show `NOT
+AVAILABLE IN THIS BUILD`. Success shows `SESSION UNLOCKED`, `LOGIN KEYS
+ENROLLED`, `LOGIN KEY ADDED` or `LOGIN KEYS REMOVED`.
 
 ## Session lock
 
@@ -582,6 +654,14 @@ canonical slot order and shows each one's fingerprint, the first four
 bytes of the credential ID's SHA-256 as in `PORTABLE.md`, and the cap of
 eight. The configured human is the only principal; td-authd refuses any
 other.
+
+That list is td-authd's: its enrolled `1a` answer carries the slot
+count and each slot's fingerprint in canonical order, as `inspect-login`
+reports them, and every `1a` answer carries the validated primary
+username (`td-authd/DESIGN.md`, amendment 1). Increment 4 implements
+it. Until then the compositor has no list, so `D` shows `NOT AVAILABLE
+IN THIS BUILD` and sends nothing; its digits and request are tested
+against a list the tests supply.
 
 **First enrollment** applies only to an unenrolled account and is
 authorized by the physical selection alone: no key exists yet, and a person
@@ -873,8 +953,24 @@ proves and the oracle that shows it.
      must read through the same exclusion when they land. The hardware
      record of an OTP touch on the attention screen ("Evidence") is still
      owed.
+   - The private client's login-key operations have landed, with the
+     `K` screen's `1`, `2`, `A` and `D` selections read through that
+     exclusion and one operation per attention lifetime: `1b` for each
+     operation; each description admitted by consent's `login_start` and
+     `login_successor` after its predecessor's receipt, with the
+     addition's authorizing key never named by its new key; the commit
+     only after the last step; the operation's ceiling as the attempt's
+     lifetime; and the failure texts. Host tests drive every operation's
+     status sequence, its refusals, cancellation at each stage and every
+     end kind against a scripted authority, and device-dispatcher tests
+     the selections, their refusal outside attention and from an
+     excluded keyboard. Production root refuses `1`, `2` and `A`, and
+     `D` is refused locally until increment 4's key list. A step that
+     asks for a PIN is cancelled, with `NOT AVAILABLE IN THIS BUILD`,
+     until the PIN field lands; the lock surface follows it.
 4. **Locked boot and session lock:** request `1a` and login state at
-   Prepare, `Super+l`, attention `L`, lid close, resume detection, unlock
+   Prepare, with the enrolled key list and the primary username,
+   `Super+l`, attention `L`, lid close, resume detection, unlock
    end to end, firstboot's directory and temporaries, the unavailable
    state, firstboot's boot-time render of the enforced SSH form for the
    enrolled and unavailable states, td-login's console refusal with

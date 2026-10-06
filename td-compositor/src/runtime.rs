@@ -104,6 +104,18 @@ impl PresentationClock {
         }
     }
 
+    /// Whether paint `epoch` is on glass, without waiting.
+    fn reached(&self, epoch: u64) -> bool {
+        self.presented
+            .lock()
+            .is_ok_and(|presented| *presented >= epoch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, epoch: u64) {
+        self.publish(epoch);
+    }
+
     /// Block until paint `epoch` is on glass, or `deadline` passes.
     fn wait_for(&self, epoch: u64, deadline: Instant) -> Result<(), String> {
         let mut presented = self
@@ -144,6 +156,29 @@ impl AttentionPresentation {
     /// prompt unless it was withdrawn, which the finish checks.
     pub fn wait(&self, deadline: Instant) -> Result<(), String> {
         self.clock.wait_for(self.epoch, deadline)
+    }
+}
+
+/// An attention screen handed to the output: shown once the first paint
+/// made after it was set is on glass. Each such paint renders it until the
+/// screen changes again, and before an operation is chosen only the input
+/// thread changes it, so a choice on it waits for `on_glass`.
+pub(crate) struct NoticePresentation {
+    epoch: u64,
+    clock: Arc<PresentationClock>,
+}
+
+impl NoticePresentation {
+    pub fn on_glass(&self) -> bool {
+        self.clock.reached(self.epoch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(clock: &Arc<PresentationClock>, epoch: u64) -> Self {
+        Self {
+            epoch,
+            clock: Arc::clone(clock),
+        }
     }
 }
 
@@ -2816,20 +2851,33 @@ impl Runtime {
             && self.scene.attention_request() == Some(request)
     }
 
+    #[cfg(test)]
+    pub(crate) fn attention_shown(&self) -> Option<crate::attention::Notice> {
+        self.scene.attention_shown()
+    }
+
+    /// Show `notice` on the attention screen. With a flip in flight the
+    /// paint is owed, so the screen is on glass only at the epoch named
+    /// here, before the repaint, as a prompt's is.
     pub(crate) fn attention_notice(
         &mut self,
         _origin: &crate::input::EvdevOrigin,
         notice: crate::attention::Notice,
-    ) -> Result<(), String> {
+    ) -> Result<NoticePresentation, String> {
         if !self.attention_enabled
             || !self.scene.attention_visible()
             || self.scene.attention_draining()
         {
             return Err("secret notice requires active physical attention".into());
         }
+        let epoch = self.paints.checked_add(1).ok_or("paint epochs exhausted")?;
         self.scene.set_attention_notice(notice);
         self.owed_damage = Damage::Whole;
-        self.repaint()
+        self.repaint()?;
+        Ok(NoticePresentation {
+            epoch,
+            clock: Arc::clone(&self.presented),
+        })
     }
 
     pub(crate) fn drain_attention(
@@ -6906,6 +6954,32 @@ mod tests {
         presentation.wait(Instant::now()).unwrap();
         let receipt = runtime.finish_attention_presentation(presentation).unwrap();
         assert_eq!(receipt.into_request(), request);
+    }
+
+    /// An attention screen set while a flip is in flight is owed, and on
+    /// glass only once its own paint completes, not the earlier flip.
+    #[test]
+    fn an_attention_screen_is_on_glass_only_with_its_own_frame() {
+        let (chain, _log) = crate::drm::testing::chain(800, 600);
+        let mut runtime = Runtime::new(chain);
+        let origin = crate::input::test_origin();
+        runtime.enable_attention(true);
+        runtime.attention(&origin, true).unwrap();
+        let overlay = runtime.frame_in_flight().unwrap();
+        let shown = runtime
+            .attention_notice(&origin, crate::attention::Notice::LoginKeys)
+            .unwrap();
+        assert!(!shown.on_glass());
+        runtime
+            .output_event(OutputEvent::Presented(overlay))
+            .unwrap();
+        assert!(!shown.on_glass(), "the overlay's completion stood in");
+        let screen = runtime.frame_in_flight().unwrap();
+        assert_ne!(screen, overlay);
+        runtime
+            .output_event(OutputEvent::Presented(screen))
+            .unwrap();
+        assert!(shown.on_glass());
     }
 
     /// A prompt withdrawn while its frame is in flight is no receipt, and

@@ -588,6 +588,7 @@ fn glyph(byte: u8) -> [u8; GLYPH_HEIGHT] {
         b'8' => [14, 17, 17, 14, 17, 17, 14],
         b'9' => [14, 17, 17, 15, 1, 1, 14],
         b':' => [0, 4, 4, 0, 4, 4, 0],
+        b';' => [0, 4, 4, 0, 4, 4, 8],
         b'-' => [0, 0, 0, 31, 0, 0, 0],
         b'+' => [0, 4, 4, 31, 4, 4, 0],
         b'/' => [1, 2, 2, 4, 8, 8, 16],
@@ -863,7 +864,7 @@ mod tests {
         // `is_mapped`, not a length. `glyph` returns `[u8; GLYPH_HEIGHT]`, so
         // asserting its `len()` was a tautology wearing this test's name —
         // which is how the missing period got past it.
-        for byte in b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 :-+/_?." {
+        for byte in b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 :;-+/_?." {
             assert!(is_mapped(*byte), "{:?} has no glyph", *byte as char);
         }
         // The fallback is its own shape and `?` is NOT it. This line used to
