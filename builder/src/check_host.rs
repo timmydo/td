@@ -1151,6 +1151,12 @@ fn serve_with_budget(runtime: &Path, budget: HostBudget) -> Result<(), String> {
     {
         return Err("another per-user check host is already running".to_string());
     }
+    let records = runtime.join(REQUEST_TMP_RECORDS);
+    ensure_private_dir(&records)?;
+    // Listed now, under the lifetime lock and before any request this host
+    // records; swept once the socket is up, since a starting client waits
+    // only START_TIMEOUT for it and a large leftover tree takes longer.
+    let leftovers = request_tmp_records(&records);
     let token_dir = runtime.join("memory-tokens-v1");
     let pool = TokenPool::create(&token_dir, &budget)?;
     let socket = runtime.join(SOCKET_NAME);
@@ -1172,6 +1178,14 @@ fn serve_with_budget(runtime: &Path, budget: HostBudget) -> Result<(), String> {
         budget.reserve_bytes / check_memory::GIB,
         budget.token_count
     );
+    if !leftovers.is_empty() {
+        if let Err(e) = std::thread::Builder::new()
+            .name("td-check-host-sweep".to_string())
+            .spawn(move || sweep_request_tmps(leftovers))
+        {
+            eprintln!("td-builder: spawn request TMPDIR sweep: {e}");
+        }
+    }
 
     let (send, recv) = std::sync::mpsc::sync_channel::<Job>(WORKER_THREADS);
     let recv = Arc::new(Mutex::new(recv));
@@ -1762,7 +1776,11 @@ fn run_request(
     stream
         .set_read_timeout(Some(Duration::from_millis(20)))
         .map_err(|e| format!("reset check-host client poll timeout: {e}"))?;
-    let scratch = RequestTmp::new(&request.env)?;
+    let scratch = RequestTmp::new(
+        &request.env,
+        Path::new(&request.cwd),
+        &runtime.join(REQUEST_TMP_RECORDS),
+    )?;
     // Each request supplies a procfs descriptor to its pinned executable.
     // Use it for the supervisor, then have that exact process re-exec itself
     // after installing the PID namespace. A client that disconnects closes
@@ -2104,22 +2122,34 @@ fn descendant_pids(root: u32) -> Vec<u32> {
 /// temporary path named from the pid alone would otherwise be another
 /// request's. (A sandboxed gate already has a private /tmp of its own.)
 ///
-/// It is made 0700 under the client's TMPDIR, else /tmp, and named as short
-/// as it can be, `td.` and a serial: every byte added is one fewer for a
-/// Unix socket path a test makes under it (`sun_path` holds 107). One host
-/// serves a user, so its serial is unique among its requests; a name taken
-/// (another user's, or one a host killed outright left) is stepped past.
-/// The host removes it once the request's child is reaped or its namespace
-/// torn down, a cancelled request's included. A descendant still dying
-/// after a cancel can recreate a file the removal missed, and a host killed
-/// outright leaves the directory: such a leftover is what that process would
-/// have left in /tmp before.
+/// It is made 0700 under the client's TMPDIR (a relative one taken from the
+/// request's working directory, where the client would have resolved it),
+/// else /tmp, and named as short as it can be, `td.` and a serial: every
+/// byte added is one fewer for a Unix socket path a test makes under it
+/// (`sun_path` holds 107). One host serves a user, so its serial is unique
+/// among its requests; a name taken (another user's, or the user's own) is
+/// stepped past. The host removes it once the request's child is reaped or
+/// its namespace torn down, a cancelled request's included. A descendant
+/// still dying after a cancel can recreate a file the removal missed.
+///
+/// Each one is recorded in the host's private runtime, after it is made and
+/// until it is removed, so one a host left (killed, or exiting with requests
+/// in flight, or failing a removal) is removed by the next host
+/// (`request_tmp_records`, `sweep_request_tmps`).
 struct RequestTmp {
     path: PathBuf,
     /// Whether it lies under the client's own TMPDIR, the client's choice of
     /// filesystem, rather than under /tmp for want of one.
     chosen: bool,
+    record: PathBuf,
 }
+
+/// The runtime directory naming each request TMPDIR a host has made and not
+/// yet removed: one file per directory, holding its device and inode
+/// numbers on a line and then its absolute path (`record_bytes`).
+const REQUEST_TMP_RECORDS: &str = "request-tmp-v1";
+const REQUEST_TMP_RECORD_LIMIT: u64 = 4096;
+static REQUEST_TMP_SERIAL: AtomicUsize = AtomicUsize::new(0);
 
 /// Names the TMPDIR the host set under /tmp for a client that set none, so a
 /// reader that takes a set TMPDIR as the user's choice (td-install's test
@@ -2129,24 +2159,64 @@ struct RequestTmp {
 const REQUEST_TMPDIR_ENV: &str = "TD_CHECK_HOST_TMPDIR";
 
 impl RequestTmp {
-    fn new(env: &[(OsString, OsString)]) -> Result<Self, String> {
-        static SERIAL: AtomicUsize = AtomicUsize::new(0);
+    fn new(env: &[(OsString, OsString)], cwd: &Path, records: &Path) -> Result<Self, String> {
         let client = env
             .iter()
             .rev()
             .find(|(key, _)| key == "TMPDIR")
             .map(|(_, value)| PathBuf::from(value))
+            .filter(|base| !base.as_os_str().is_empty())
+            .map(|base| cwd.join(base))
+            // A relative one under a relative cwd would be the host's.
             .filter(|base| base.is_absolute());
         let chosen = client.is_some();
         let base = client.unwrap_or_else(|| PathBuf::from("/tmp"));
         for _ in 0..1024 {
-            let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+            let serial = REQUEST_TMP_SERIAL.fetch_add(1, Ordering::Relaxed);
             let path = base.join(format!("td.{serial}"));
             match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-                Ok(()) => return Ok(Self { path, chosen }),
+                Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(format!("create {}: {e}", path.display())),
             }
+            // Made before it is recorded: a host dying between the two leaves
+            // a directory unrecorded, never a record of one it did not make.
+            // A record name an earlier host's kept record holds (its pid
+            // reused) is stepped past like a taken directory, the record left.
+            let record = records.join(format!("{}.{serial}", std::process::id()));
+            let made = match std::fs::symlink_metadata(&path) {
+                Ok(made) => made,
+                Err(e) => {
+                    let _ = std::fs::remove_dir(&path);
+                    return Err(format!("inspect {}: {e}", path.display()));
+                }
+            };
+            let mut file = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&record)
+            {
+                Ok(file) => file,
+                Err(e) => {
+                    let _ = std::fs::remove_dir(&path);
+                    if e.kind() == io::ErrorKind::AlreadyExists {
+                        continue;
+                    }
+                    return Err(format!("record {}: {e}", record.display()));
+                }
+            };
+            if let Err(e) = file.write_all(&record_bytes(&made, &path)) {
+                // This record is this call's own: it is the one removed.
+                let _ = std::fs::remove_dir(&path);
+                let _ = std::fs::remove_file(&record);
+                return Err(format!("record {}: {e}", record.display()));
+            }
+            return Ok(Self {
+                path,
+                chosen,
+                record,
+            });
         }
         Err(format!(
             "no free request temporary directory name in {}",
@@ -2157,8 +2227,156 @@ impl RequestTmp {
 
 impl Drop for RequestTmp {
     fn drop(&mut self) {
-        if let Err(e) = crate::sandbox::remove_scratch_tree(&self.path) {
-            eprintln!("td-builder: check host left {}: {e}", self.path.display());
+        match crate::sandbox::remove_scratch_tree(&self.path) {
+            // Kept on a failure, for the next host's start to retry.
+            Err(e) => eprintln!("td-builder: check host left {}: {e}", self.path.display()),
+            Ok(()) => {
+                if let Err(e) = std::fs::remove_file(&self.record) {
+                    if e.kind() != io::ErrorKind::NotFound {
+                        eprintln!("td-builder: remove {}: {e}", self.record.display());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn record_bytes(made: &std::fs::Metadata, path: &Path) -> Vec<u8> {
+    let mut bytes = format!("{} {}\n", made.dev(), made.ino()).into_bytes();
+    bytes.extend_from_slice(path.as_os_str().as_bytes());
+    bytes
+}
+
+/// A record's directory identity and path, if it is one `record_bytes` wrote.
+fn parse_record(bytes: &[u8]) -> Option<((u64, u64), PathBuf)> {
+    let newline = bytes.iter().position(|&b| b == b'\n')?;
+    let (head, path) = (bytes.get(..newline)?, bytes.get(newline + 1..)?);
+    let (dev, ino) = std::str::from_utf8(head).ok()?.split_once(' ')?;
+    let identity = (dev.parse().ok()?, ino.parse().ok()?);
+    Some((identity, PathBuf::from(OsStr::from_bytes(path))))
+}
+
+/// What a record says now.
+enum Recorded {
+    /// The recorded directory is still there and still the one recorded.
+    Left((u64, u64), PathBuf),
+    /// Nothing to remove (gone) or nothing to trust (foreign); the record is
+    /// to be dropped, what it names left.
+    Drop(String),
+    /// Could not be read or inspected; kept, for a later try.
+    Unknown(String),
+}
+
+/// Inspect one record. The runtime is writable to what the host runs, and a
+/// path can come to name another directory (an ancestor link retargeted, or
+/// the user's own made after a removal), so the path alone proves nothing:
+/// only an absolute `td.N` that is still the recorded directory (device and
+/// inode), a directory and not a link, owned by this uid, is `Left`. An
+/// empty record is a host that died writing it.
+fn inspect_record(record: &Path, uid: Option<u32>) -> Recorded {
+    let mut bytes = Vec::new();
+    if let Err(e) = std::fs::File::open(record)
+        .and_then(|file| file.take(REQUEST_TMP_RECORD_LIMIT).read_to_end(&mut bytes))
+    {
+        return Recorded::Unknown(format!("read {}: {e}", record.display()));
+    }
+    let Some((identity, path)) = parse_record(&bytes) else {
+        return Recorded::Drop(format!("{} is not a record", record.display()));
+    };
+    let named = path.is_absolute()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("td."))
+            .is_some_and(|serial| serial.parse::<usize>().is_ok());
+    if !named {
+        return Recorded::Drop(format!("{} names {path:?}", record.display()));
+    }
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata)
+            if metadata.is_dir()
+                && Some(metadata.uid()) == uid
+                && (metadata.dev(), metadata.ino()) == identity =>
+        {
+            Recorded::Left(identity, path)
+        }
+        Ok(_) => Recorded::Drop(format!(
+            "{} is no longer the directory {} recorded",
+            path.display(),
+            record.display()
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Recorded::Drop(format!("{} is gone", path.display()))
+        }
+        Err(e) => Recorded::Unknown(format!("inspect {}: {e}", path.display())),
+    }
+}
+
+fn drop_record(record: &Path, why: &str) {
+    eprintln!("td-builder: {why}; dropped {}", record.display());
+    if let Err(e) = std::fs::remove_file(record) {
+        if e.kind() != io::ErrorKind::NotFound {
+            eprintln!("td-builder: remove {}: {e}", record.display());
+        }
+    }
+}
+
+/// The request TMPDIRs an earlier host recorded and left, each still the
+/// directory recorded; every other record is dropped here. Run under the
+/// lifetime lock before this host records anything, so none is a request
+/// of this one's (one of the last host's can at most still be dying, its
+/// processes killed by its exit). Each one returned exists, and this host's
+/// requests step past an existing name, so none of them can take its path
+/// before `sweep_request_tmps` removes it, unless something else (the user,
+/// a tmpfiles cleaner) removes it first; a record whose directory had gone
+/// could otherwise name a live request's, its inode reused.
+fn request_tmp_records(records: &Path) -> Vec<(PathBuf, (u64, u64))> {
+    let entries = match std::fs::read_dir(records) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("td-builder: read {}: {e}", records.display());
+            return Vec::new();
+        }
+    };
+    let uid = std::fs::metadata("/proc/self").map(|m| m.uid()).ok();
+    let mut left = Vec::new();
+    for entry in entries {
+        let record = match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                eprintln!("td-builder: read {}: {e}", records.display());
+                break;
+            }
+        };
+        match inspect_record(&record, uid) {
+            Recorded::Left(identity, _) => left.push((record, identity)),
+            Recorded::Drop(why) => drop_record(&record, &why),
+            Recorded::Unknown(why) => eprintln!("td-builder: {why}; kept"),
+        }
+    }
+    left
+}
+
+/// Remove each listed TMPDIR, checked again as it is reached, then its
+/// record; a removal that fails keeps its record for the next host. The
+/// identity is checked and the tree removed by path, so a writer able to
+/// swap an ancestor between the two can still redirect it; what can write
+/// the runtime can already do more.
+fn sweep_request_tmps(left: Vec<(PathBuf, (u64, u64))>) {
+    let uid = std::fs::metadata("/proc/self").map(|m| m.uid()).ok();
+    for (record, listed) in left {
+        match inspect_record(&record, uid) {
+            Recorded::Left(identity, path) if identity == listed => {
+                match crate::sandbox::remove_scratch_tree(&path) {
+                    Ok(()) => drop_record(&record, &format!("removed {}", path.display())),
+                    Err(e) => eprintln!("td-builder: earlier host left {}: {e}", path.display()),
+                }
+            }
+            Recorded::Left(_, path) => {
+                drop_record(&record, &format!("{} was rewritten", path.display()))
+            }
+            Recorded::Drop(why) => drop_record(&record, &why),
+            Recorded::Unknown(why) => eprintln!("td-builder: {why}; kept"),
         }
     }
 }
@@ -2516,25 +2734,184 @@ mod request_tmp_tests {
         dir
     }
 
+    fn records(dir: &Path) -> PathBuf {
+        let records = dir.join("records");
+        std::fs::create_dir(&records).unwrap();
+        records
+    }
+
+    fn tmpdir(value: &Path) -> Vec<(OsString, OsString)> {
+        vec![(OsString::from("TMPDIR"), value.as_os_str().to_owned())]
+    }
+
     #[test]
     fn a_request_tmp_lies_under_the_clients_tmpdir_and_is_its_own() {
         let dir = base("under");
+        let records = records(&dir);
         let env = vec![
-            (OsString::from("TMPDIR"), OsString::from("relative")),
+            (OsString::from("TMPDIR"), OsString::from("/nonexistent")),
             (OsString::from("TMPDIR"), dir.clone().into_os_string()),
         ];
-        let one = RequestTmp::new(&env).unwrap();
-        let two = RequestTmp::new(&env).unwrap();
+        let one = RequestTmp::new(&env, Path::new("/"), &records).unwrap();
+        let two = RequestTmp::new(&env, Path::new("/"), &records).unwrap();
         assert_eq!(one.path.parent(), Some(dir.as_path()));
         assert!(one.chosen, "under the client's TMPDIR");
         assert_ne!(one.path, two.path);
         let mode = std::fs::metadata(&one.path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
-        let none =
-            RequestTmp::new(&[(OsString::from("TMPDIR"), OsString::from("relative"))]).unwrap();
+        // A relative TMPDIR is the client's, from its working directory.
+        std::fs::create_dir(dir.join("relative")).unwrap();
+        let relative = RequestTmp::new(&tmpdir(Path::new("relative")), &dir, &records).unwrap();
+        assert_eq!(relative.path.parent(), Some(dir.join("relative").as_path()));
+        assert!(relative.chosen, "under the client's relative TMPDIR");
+        let hosts =
+            RequestTmp::new(&tmpdir(Path::new("relative")), Path::new("."), &records).unwrap();
+        assert!(!hosts.chosen && hosts.path.starts_with("/tmp"));
+        let none = RequestTmp::new(&tmpdir(Path::new("")), &dir, &records).unwrap();
         assert_eq!(none.path.parent(), Some(Path::new("/tmp")));
         assert!(!none.chosen, "under /tmp for want of one");
-        drop((one, two, none));
+        let unset = RequestTmp::new(&[], &dir, &records).unwrap();
+        assert!(!unset.chosen && unset.path.starts_with("/tmp"));
+        drop((one, two, relative, hosts, none, unset));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_request_tmp_is_recorded_until_it_is_removed() {
+        let dir = base("recorded");
+        let records = records(&dir);
+        let scratch = RequestTmp::new(&tmpdir(&dir), Path::new("/"), &records).unwrap();
+        let made = std::fs::symlink_metadata(&scratch.path).unwrap();
+        assert_eq!(
+            parse_record(&std::fs::read(&scratch.record).unwrap()),
+            Some(((made.dev(), made.ino()), scratch.path.clone()))
+        );
+        let mode = std::fs::metadata(&scratch.record)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let record = scratch.record.clone();
+        drop(scratch);
+        assert!(!record.exists(), "a removed TMPDIR's record stays");
+        assert_eq!(std::fs::read_dir(&records).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A record an earlier host with this pid kept is stepped past and left.
+    #[test]
+    fn a_kept_record_of_the_same_name_is_left_alone() {
+        let dir = base("kept");
+        let records = records(&dir);
+        let next = REQUEST_TMP_SERIAL.load(Ordering::Relaxed);
+        let kept: Vec<_> = (next..next + 64)
+            .map(|serial| records.join(format!("{}.{serial}", std::process::id())))
+            .collect();
+        for record in &kept {
+            std::fs::write(record, b"/elsewhere/td.1").unwrap();
+        }
+        let scratch = RequestTmp::new(&tmpdir(&dir), Path::new("/"), &records).unwrap();
+        assert!(!kept.contains(&scratch.record));
+        drop(scratch);
+        for record in &kept {
+            assert_eq!(std::fs::read(record).unwrap(), b"/elsewhere/td.1");
+        }
+        let made: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            made,
+            [OsString::from("records")],
+            "a stepped-past TMPDIR stayed"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A removal that fails, here a parent the user may not write, keeps its
+    /// record, for the next start to retry.
+    #[test]
+    fn a_failed_removal_keeps_its_record() {
+        if std::fs::metadata("/proc/self").unwrap().uid() == 0 {
+            return; // root writes a 0555 parent.
+        }
+        let dir = base("failed");
+        let records = records(&dir);
+        let parent = dir.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let scratch = RequestTmp::new(&tmpdir(&parent), Path::new("/"), &records).unwrap();
+        let record = scratch.record.clone();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        drop(scratch);
+        assert!(record.exists(), "a failed removal dropped its record");
+        sweep_request_tmps(request_tmp_records(&records));
+        assert!(record.exists(), "a failed sweep dropped its record");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        sweep_request_tmps(request_tmp_records(&records));
+        assert!(!record.exists());
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What a host killed with requests in flight leaves, the next removes;
+    /// a record that is not this user's request TMPDIR is dropped and what
+    /// it names left.
+    #[test]
+    fn the_next_host_sweeps_what_a_dead_host_left() {
+        let dir = base("swept");
+        let records = records(&dir);
+        let left = RequestTmp::new(&tmpdir(&dir), Path::new("/"), &records).unwrap();
+        let path = left.path.clone();
+        let sealed = path.join("sealed");
+        std::fs::create_dir_all(sealed.join("inner")).unwrap();
+        std::fs::write(sealed.join("inner/file"), b"x").unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::mem::forget(left);
+        let record = |name: &str, path: &Path| {
+            let made = std::fs::symlink_metadata(path).unwrap();
+            std::fs::write(records.join(name), record_bytes(&made, path)).unwrap();
+        };
+        // A td.N that has gone since: its record is dropped.
+        let gone = dir.join("td.999999");
+        std::fs::create_dir(&gone).unwrap();
+        record("1.1", &gone);
+        std::fs::remove_dir(&gone).unwrap();
+        let keep = dir.join("keep");
+        std::fs::create_dir(&keep).unwrap();
+        record("1.2", &keep);
+        std::fs::write(records.join("1.3"), b"1 2\ntd.7").unwrap();
+        // A link named td.N is not a directory the host made.
+        let target = dir.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("file"), b"x").unwrap();
+        let link = dir.join("td.888888");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        record("1.4", &link);
+        std::fs::write(records.join("1.5"), b"").unwrap();
+        // A td.N made again after the recorded one went (the recorded one
+        // moved aside, so the new one cannot reuse its inode) is not it.
+        let again = dir.join("td.777777");
+        std::fs::create_dir(&again).unwrap();
+        record("1.6", &again);
+        std::fs::rename(&again, dir.join("moved")).unwrap();
+        std::fs::create_dir(&again).unwrap();
+        std::fs::write(again.join("users"), b"x").unwrap();
+        // The listing drops every record but the live tree's at once, before
+        // the host serves, so a gone td.N's path cannot be a request's yet.
+        let listed = request_tmp_records(&records);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(std::fs::read_dir(&records).unwrap().count(), 1);
+        assert!(path.exists(), "the listing removed a tree");
+        sweep_request_tmps(listed);
+        assert!(!path.exists(), "{} was left behind", path.display());
+        assert!(keep.is_dir(), "a directory not named td.N was removed");
+        assert!(target.join("file").exists() && link.is_symlink());
+        assert!(again.join("users").exists(), "a remade td.N was removed");
+        assert_eq!(
+            std::fs::read_dir(&records).unwrap().count(),
+            0,
+            "every record but a failed removal's is dropped"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2547,8 +2924,8 @@ mod request_tmp_tests {
         let outside = dir.join("store-file");
         std::fs::write(&outside, b"store").unwrap();
         std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let env = vec![(OsString::from("TMPDIR"), dir.clone().into_os_string())];
-        let scratch = RequestTmp::new(&env).unwrap();
+        let records = records(&dir);
+        let scratch = RequestTmp::new(&tmpdir(&dir), Path::new("/"), &records).unwrap();
         let path = scratch.path.clone();
         let sealed = path.join("sealed");
         std::fs::create_dir_all(sealed.join("inner")).unwrap();
