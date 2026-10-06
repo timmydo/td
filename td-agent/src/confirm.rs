@@ -22,6 +22,8 @@ pub enum Act {
     AlwaysDenyHere,
     AlwaysDenyEverywhere,
     AlwaysAllowHere,
+    /// A cold-resume card's other answer: send it whole.
+    Resend,
 }
 
 /// What a question is for.
@@ -41,6 +43,20 @@ pub enum Purpose {
     /// Deleting, or archiving, this conversation though its repository
     /// workspace reports work that would be lost (DESIGN.md §7).
     Remove(Id),
+    /// How this conversation's turn `turn` resumes cold (DESIGN.md §14).
+    Resume { conversation: Id, turn: u64 },
+}
+
+impl Purpose {
+    /// A conversation's card's: the conversation and the call or turn it
+    /// is asked for.
+    pub fn card(&self) -> Option<(&Id, u64)> {
+        match self {
+            Self::Approve { conversation, call } => Some((conversation, *call)),
+            Self::Resume { conversation, turn } => Some((conversation, *turn)),
+            Self::Delete(_) | Self::Admit { .. } | Self::Remove(_) => None,
+        }
+    }
 }
 
 /// What an input came to.
@@ -69,6 +85,9 @@ pub const ALWAYS_ALLOW_HERE: &str = "Always allow here";
 /// A crossing card's "always" answers.
 pub const ALWAYS_DENY: &str = "Always deny";
 pub const ALWAYS_ALLOW: &str = "Always allow";
+/// The cold-resume card's answers.
+pub const COMPACT_FIRST: &str = "Compact first";
+pub const RESEND: &str = "Resend whole";
 /// The admission card's title and its action's label.
 pub const ADMIT_TITLE: &str = "Admit remotes";
 pub const ADMIT: &str = "Admit";
@@ -173,7 +192,10 @@ fn crossed(op: crate::rules::Crossed, to: &str) -> Vec<String> {
 fn place(surface: Surface, body: Rect, purpose: &Purpose) -> Rect {
     let (columns, rows) = match purpose {
         Purpose::Delete(_) => (64, 10),
-        Purpose::Approve { .. } | Purpose::Admit { .. } | Purpose::Remove(_) => (100, 24),
+        Purpose::Approve { .. }
+        | Purpose::Admit { .. }
+        | Purpose::Remove(_)
+        | Purpose::Resume { .. } => (100, 24),
     };
     let scale = surface.scale.value();
     let pixels = |logical: usize| u32::try_from(logical.saturating_mul(scale)).unwrap_or(u32::MAX);
@@ -276,6 +298,33 @@ impl Confirm {
         })
     }
 
+    /// The cold-resume card of `conversation`'s turn `turn` (DESIGN.md
+    /// §14): compact first, its action, or resend whole; Cancel stops the
+    /// turn.
+    pub fn resume(
+        surface: Surface,
+        body: Rect,
+        conversation: Id,
+        turn: u64,
+        title: &str,
+        details: &[String],
+        revision: u64,
+    ) -> Result<Self, String> {
+        let mut details: Vec<&str> = details.iter().map(String::as_str).collect();
+        details.push("Cancel stops the turn, sending nothing; C-r asks again.");
+        let model = Model::new(title, COMPACT_FIRST, &details, Act::Confirm, revision)
+            .and_then(|m| m.with_alternate(RESEND, Act::Resend))
+            .map_err(|e| format!("the cold-resume card: {e}"))?;
+        let purpose = Purpose::Resume { conversation, turn };
+        let dialog = Controller::new(model, surface, place(surface, body, &purpose), None)
+            .map_err(|e| format!("the cold-resume card: {e}"))?;
+        Ok(Self {
+            purpose,
+            dialog,
+            revision,
+        })
+    }
+
     /// The card asking whether conversation `id`, titled `title`, is
     /// deleted, or archived when `archive`, though its workspace reports
     /// `lost`, a line a worktree.
@@ -361,7 +410,10 @@ impl Confirm {
         match self.dialog.focus() {
             confirmations::Focus::Details => "details",
             confirmations::Focus::Cancel => "cancel",
-            confirmations::Focus::Alternate => "always deny here",
+            confirmations::Focus::Alternate => match self.purpose {
+                Purpose::Resume { .. } => "resend whole",
+                _ => "always deny here",
+            },
             confirmations::Focus::Further => "always deny everywhere",
             confirmations::Focus::Extra => "always allow here",
             confirmations::Focus::Confirm => match self.purpose {
@@ -369,6 +421,7 @@ impl Confirm {
                 Purpose::Approve { .. } => "allow",
                 Purpose::Admit { .. } => "admit",
                 Purpose::Remove(_) => "remove",
+                Purpose::Resume { .. } => "compact first",
             },
         }
     }

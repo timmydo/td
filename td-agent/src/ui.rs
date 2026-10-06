@@ -126,11 +126,15 @@ impl RowState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Card {
     pub conversation: Id,
+    /// The call it asks about, or a cold-resume card's turn.
     pub call: u64,
     pub title: String,
     pub details: Vec<String>,
     /// What its "always" answers would remember, when it offers them.
     pub always: Option<crate::rules::Offer>,
+    /// A cold-resume card (DESIGN.md §14), answered compact first, resend
+    /// whole or neither, not allow or deny.
+    pub resume: bool,
 }
 
 /// The human's answer to a card (DESIGN.md §11): allow or deny this once,
@@ -277,6 +281,13 @@ pub enum Request {
     /// Compact the open conversation, with a focus for its summary
     /// (DESIGN.md §14).
     Compact(Option<String>),
+    /// The human's answer to `conversation`'s cold-resume card for turn
+    /// `turn` (DESIGN.md §14).
+    Resume {
+        conversation: Id,
+        turn: u64,
+        choice: crate::protocol::Resumed,
+    },
     /// Undo the open conversation's step snapshotted at this place.
     Undo(u64),
     /// Redo it.
@@ -1377,11 +1388,7 @@ impl App {
         // One shown for the same call is closed, so what the human
         // answers is the card they see.
         let shown = self.confirm.as_ref().is_some_and(|confirm| {
-            confirm.purpose()
-                == &confirm::Purpose::Approve {
-                    conversation: card.conversation.clone(),
-                    call: card.call,
-                }
+            confirm.purpose().card() == Some((&card.conversation, card.call))
         });
         if shown {
             self.close_confirm();
@@ -1402,18 +1409,12 @@ impl App {
             return;
         }
         self.cards.retain(|c| !gone(c));
-        let shown = self
-            .confirm
-            .as_ref()
-            .is_some_and(|confirm| match confirm.purpose() {
-                confirm::Purpose::Approve {
-                    conversation: of,
-                    call: n,
-                } => of == conversation && call.is_none_or(|call| call == *n),
-                confirm::Purpose::Delete(_)
-                | confirm::Purpose::Admit { .. }
-                | confirm::Purpose::Remove(_) => false,
-            });
+        let shown = self.confirm.as_ref().is_some_and(|confirm| {
+            confirm
+                .purpose()
+                .card()
+                .is_some_and(|(of, n)| of == conversation && call.is_none_or(|call| call == n))
+        });
         if shown {
             self.close_confirm();
         }
@@ -1474,16 +1475,29 @@ impl App {
         self.cancel_pointer();
         self.press = None;
         self.confirm_revision = self.confirm_revision.wrapping_add(1);
-        match Confirm::approve(
-            self.surface,
-            body(self.surface),
-            card.conversation.clone(),
-            card.call,
-            &card.title,
-            &card.details,
-            card.always.as_ref(),
-            self.confirm_revision,
-        ) {
+        let opened = if card.resume {
+            Confirm::resume(
+                self.surface,
+                body(self.surface),
+                card.conversation.clone(),
+                card.call,
+                &card.title,
+                &card.details,
+                self.confirm_revision,
+            )
+        } else {
+            Confirm::approve(
+                self.surface,
+                body(self.surface),
+                card.conversation.clone(),
+                card.call,
+                &card.title,
+                &card.details,
+                card.always.as_ref(),
+                self.confirm_revision,
+            )
+        };
+        match opened {
             Ok(confirm) => {
                 self.confirm = Some(confirm);
                 self.card_shown = Some(Instant::now());
@@ -1533,6 +1547,19 @@ impl App {
             conversation,
             call,
             answer,
+        });
+        self.refresh_list();
+    }
+
+    /// The human's answer to a cold-resume card, sent and the card
+    /// forgotten.
+    fn resume(&mut self, conversation: Id, turn: u64, choice: crate::protocol::Resumed) {
+        self.cards
+            .retain(|c| (&c.conversation, c.call) != (&conversation, turn));
+        self.requests.push(Request::Resume {
+            conversation,
+            turn,
+            choice,
         });
         self.refresh_list();
     }
@@ -1702,7 +1729,9 @@ impl App {
             Update::Up(Up::Event(event)) => self.event(event),
             // The window hands cards to `ask` and `withdraw`.
             // The window says what the breaker did.
-            Update::Up(Up::Ask { .. } | Up::Withdraw { .. } | Up::Brake { .. }) => {}
+            Update::Up(
+                Up::Ask { .. } | Up::Resume { .. } | Up::Withdraw { .. } | Up::Brake { .. },
+            ) => {}
             Update::Up(Up::Delivered { .. }) => {
                 if let Some(row) = self.active_row() {
                     row.activity = now;
@@ -2662,7 +2691,7 @@ impl App {
                     ),
                     // A tool's card stays the conversation's, shown again
                     // when there is room (`offer`).
-                    confirm::Purpose::Approve { .. } => "the window is now too small for the card, which waits until there is room for it: nothing was decided".to_string(),
+                    confirm::Purpose::Approve { .. } | confirm::Purpose::Resume { .. } => "the window is now too small for the card, which waits until there is room for it: nothing was decided".to_string(),
                     confirm::Purpose::Delete(_) => "the window is now too small for the question, which is closed: nothing was deleted".to_string(),
                     // Asked again when there is room (`offer`), which says
                     // nothing more meanwhile.
@@ -3989,6 +4018,7 @@ impl App {
             confirm::Purpose::Approve { .. }
                 | confirm::Purpose::Admit { .. }
                 | confirm::Purpose::Remove(_)
+                | confirm::Purpose::Resume { .. }
         ) && self
             .card_shown
             .is_some_and(|shown| shown.elapsed() < self.settle);
@@ -4024,6 +4054,9 @@ impl App {
                     )),
                     confirm::Purpose::Delete(_) => {}
                     confirm::Purpose::Remove(id) => self.answer_removal(id, false),
+                    confirm::Purpose::Resume { conversation, turn } => {
+                        self.resume(conversation, turn, crate::protocol::Resumed::Stop)
+                    }
                 }
                 self.close_confirm();
             }
@@ -4037,6 +4070,16 @@ impl App {
             }
             confirm::Reply::Confirmed(confirm::Purpose::Approve { conversation, call }, act) => {
                 self.decide(conversation, call, Some(act));
+                self.close_confirm();
+            }
+            confirm::Reply::Confirmed(confirm::Purpose::Resume { conversation, turn }, act) => {
+                // Nothing unforeseen is taken for a paid answer.
+                let choice = match act {
+                    confirm::Act::Confirm => crate::protocol::Resumed::Compact,
+                    confirm::Act::Resend => crate::protocol::Resumed::Resend,
+                    _ => crate::protocol::Resumed::Stop,
+                };
+                self.resume(conversation, turn, choice);
                 self.close_confirm();
             }
             confirm::Reply::Confirmed(confirm::Purpose::Admit { template, remotes }, _) => {
@@ -5452,6 +5495,58 @@ pub mod tests {
             calls: Vec::new(),
             incomplete,
         }
+    }
+
+    /// A cold-resume card is answered compact first, its action, resend
+    /// whole, or neither, its Cancel (DESIGN.md §14).
+    #[test]
+    fn a_cold_resume_card_is_answered_three_ways() {
+        use crate::protocol::Resumed;
+        let card = |turn| Card {
+            conversation: id(1),
+            call: turn,
+            title: "Resume cold".into(),
+            details: vec!["Resend whole: at most $0.30.".into()],
+            always: None,
+            resume: true,
+        };
+        let mut app = app();
+        app.settle = Duration::ZERO;
+        let mut answered = Vec::new();
+        for (turn, focus) in [(2, "compact first"), (3, "resend whole"), (4, "cancel")] {
+            app.ask(card(turn));
+            assert!(matches!(
+                app.confirm().map(|c| c.purpose()),
+                Some(confirm::Purpose::Resume { turn: t, .. }) if *t == turn
+            ));
+            for _ in 0..8 {
+                if app.confirm().is_some_and(|c| c.focus() == focus) {
+                    break;
+                }
+                key(&mut app, "Tab");
+            }
+            assert_eq!(app.confirm().map(|c| c.focus()), Some(focus));
+            key(&mut app, "Return");
+            assert!(app.confirm().is_none());
+            answered.extend(app.take_requests());
+        }
+        let resumed = |turn, choice| Request::Resume {
+            conversation: id(1),
+            turn,
+            choice,
+        };
+        assert_eq!(
+            answered,
+            [
+                resumed(2, Resumed::Compact),
+                resumed(3, Resumed::Resend),
+                resumed(4, Resumed::Stop)
+            ]
+        );
+        // Withdrawn, as when the turn is interrupted, it closes.
+        app.ask(card(5));
+        app.withdraw(&id(1), Some(5));
+        assert!(app.confirm().is_none() && app.cards().is_empty());
     }
 
     /// The human's compaction marks no message running or unanswered,
@@ -6909,6 +7004,7 @@ pub mod tests {
             title: "Run a command".into(),
             details: vec!["make".into()],
             always: None,
+            resume: false,
         });
         assert!(app.confirm().is_none());
         app.reshow_workspace(&id(1), &trusted);
@@ -7310,6 +7406,7 @@ pub mod tests {
             title: "Run a command".into(),
             details: vec!["make".into()],
             always: None,
+            resume: false,
         });
         assert!(app.confirm().is_none());
         key(&mut app, "Down");
@@ -7790,6 +7887,7 @@ pub mod tests {
             title: "Run a command".into(),
             details: vec!["In the workspace:".into(), "make".into()],
             always: None,
+            resume: false,
         };
         let decided = |conversation: u8, call: u64, allow: bool| Request::Decide {
             conversation: id(conversation),
@@ -7909,6 +8007,7 @@ pub mod tests {
                 call: 4,
                 title: "Run a command".into(),
                 details: vec!["cargo test".into()],
+                resume: false,
                 always: Some(crate::rules::Offer::Rules(crate::rules::Always {
                     allow: true,
                     bodies: bodies.clone(),
@@ -7962,6 +8061,7 @@ pub mod tests {
                 call: 4,
                 title: "Send a message to another conversation".into(),
                 details: vec!["hello".into()],
+                resume: false,
                 always: Some(crate::rules::Offer::Crossing {
                     op: crate::rules::Crossed::Message,
                     to: to.clone(),
@@ -7996,6 +8096,7 @@ pub mod tests {
             title: "Run a command".into(),
             details: vec!["make".into()],
             always: None,
+            resume: false,
         });
         for chord in ["Tab", "Space", "Return", "Escape"] {
             key(&mut app, chord);

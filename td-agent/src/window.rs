@@ -357,6 +357,14 @@ impl Session {
                     call,
                     answer,
                 } => self.decide(&conversation, call, answer),
+                // To whichever conversation asked, as a decision is.
+                Request::Resume {
+                    conversation,
+                    turn,
+                    choice,
+                } => self
+                    .supervisor
+                    .answer(&conversation, &Down::Resumed { turn, choice }),
                 Request::SetDefault(model) => self.set_default(model),
                 Request::SetMode { conversation, mode } => self.set_mode(&conversation, mode),
                 Request::Trust {
@@ -729,6 +737,22 @@ impl Session {
                         title: title.clone(),
                         details: details.clone(),
                         always: always.clone(),
+                        resume: false,
+                    });
+                    continue;
+                }
+                Update::Up(Up::Resume {
+                    turn,
+                    title,
+                    details,
+                }) => {
+                    self.app.ask(Card {
+                        conversation: id.clone(),
+                        call: *turn,
+                        title: title.clone(),
+                        details: details.clone(),
+                        always: None,
+                        resume: true,
                     });
                     continue;
                 }

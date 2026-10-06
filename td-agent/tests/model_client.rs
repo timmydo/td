@@ -269,6 +269,26 @@ impl Harness {
         }
     }
 
+    /// What the process said until it asked how to resume cold: the
+    /// card's turn, title and details.
+    fn until_resume(&mut self) -> (u64, String, Vec<String>) {
+        loop {
+            let up = self.next();
+            if self.hear(&up) {
+                continue;
+            }
+            match up {
+                Up::Resume {
+                    turn,
+                    title,
+                    details,
+                } => return (turn, title, details),
+                Up::Event(event) => self.heard.push(event),
+                _ => {}
+            }
+        }
+    }
+
     /// What the process said until it withdrew a card: its call.
     fn until_withdrawn(&mut self) -> u64 {
         loop {
@@ -6110,4 +6130,201 @@ fn a_compaction_with_nothing_to_summarize_asks_nothing() {
         "{outcome}"
     );
     assert_eq!(h.mock.requests().len(), before);
+}
+
+/// A conversation of about 52,000 tokens, its last request just made,
+/// with a priced models list and `client`: past `cold_resume_tokens`,
+/// far from `compact_at`.
+fn resumable(tag: &str, script: Vec<Reply>, client: Client) -> Harness {
+    resumable_with(tag, script, vec![Reply::sse("compact-summary.sse")], client)
+}
+
+/// `resumable`, its summary requests answered with `summary`.
+fn resumable_with(tag: &str, script: Vec<Reply>, summary: Vec<Reply>, client: Client) -> Harness {
+    let h = Harness::new(tag, Role::Conversation, script);
+    h.mock.route(
+        "Write a title for the conversation",
+        vec![Reply::ok("title.json")],
+    );
+    h.mock
+        .route("This conversation is being compacted", summary);
+    let (mut conversation, mut h) = h.close();
+    read_two(&mut conversation, 10_000, 200_000);
+    drop(conversation);
+    Models::from_provider(&fixture("models.json"))
+        .unwrap()
+        .save(h.state.root())
+        .unwrap();
+    h.reopen();
+    let _ = h.turn();
+    h.setup(client);
+    h
+}
+
+/// Resuming cold (DESIGN.md §14): a turn's first request past
+/// `cache_ttl`, its prompt past `cold_resume_tokens`, asks on a card
+/// with both estimates; "compact first" summarizes and then sends the
+/// compacted prompt, the person's choice logged as a notice.
+#[test]
+fn a_cold_resumption_asks_and_compacts_first_when_told() {
+    let mut h = resumable(
+        "cold-compact",
+        vec![Reply::sse("stream-sonnet.sse")],
+        Client {
+            cache_ttl: 0,
+            compact_keep_tokens: 1_000,
+            ..Client::default()
+        },
+    );
+    let before = h.mock.requests().len();
+    h.say("Go on.");
+    let (turn, title, details) = h.until_resume();
+    assert_eq!(title, "Resume cold");
+    assert!(details[0].contains("past cache_ttl's 0s"), "{details:?}");
+    assert!(
+        details[1].starts_with("Resend whole: at most $"),
+        "{details:?}"
+    );
+    assert!(
+        details[2].starts_with("Compact first: at most $"),
+        "{details:?}"
+    );
+    assert_eq!(h.mock.requests().len(), before, "nothing sent while asked");
+    h.down(&Down::Resumed {
+        turn,
+        choice: td_agent::protocol::Resumed::Compact,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        Kind::Notice { text } if text.contains("the person chose to compact first")
+    )));
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), before + 2);
+    assert!(requests[before]
+        .text()
+        .contains("This conversation is being compacted"));
+    let last = requests[before + 1].text();
+    assert!(last.contains("SUMMARY: both files were read"), "{last}");
+}
+
+/// The other answers: "resend whole" sends it as it is; neither, or an
+/// interrupt while asked, sends nothing and may be asked again; with
+/// `cold_resume_tokens = "none"`, or within `cache_ttl`, nothing is
+/// asked.
+#[test]
+fn a_cold_resumption_resends_stops_or_is_not_asked() {
+    use td_agent::protocol::Resumed;
+    let cold = Client {
+        cache_ttl: 0,
+        ..Client::default()
+    };
+    // A turn of two steps is asked once, before its first.
+    let mut h = resumable(
+        "cold-resend",
+        vec![
+            Reply::sse("stream-tool-todo.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+        cold.clone(),
+    );
+    let before = h.mock.requests().len();
+    h.say("Go on.");
+    let (turn, _, _) = h.until_resume();
+    h.down(&Down::Resumed {
+        turn,
+        choice: Resumed::Resend,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(!kinds(&events).contains(&"compaction"));
+    assert_eq!(h.mock.requests().len(), before + 2);
+    let mut h = resumable("cold-stop", Vec::new(), cold.clone());
+    let before = h.mock.requests().len();
+    h.say("Go on.");
+    let (turn, _, _) = h.until_resume();
+    h.down(&Down::Resumed {
+        turn,
+        choice: Resumed::Stop,
+    });
+    let (_, outcome, retry) = h.turn();
+    assert!(outcome.starts_with("not resumed"), "{outcome}");
+    assert!(retry);
+    assert_eq!(h.mock.requests().len(), before);
+    let mut h = resumable("cold-interrupt", Vec::new(), cold);
+    h.say("Go on.");
+    let (turn, _, _) = h.until_resume();
+    h.down(&Down::Interrupt);
+    assert_eq!(h.until_withdrawn(), turn);
+    let (_, outcome, retry) = h.turn();
+    assert!(outcome.starts_with("interrupted while asked"), "{outcome}");
+    assert!(retry);
+    for (tag, client) in [
+        (
+            "cold-never",
+            Client {
+                cache_ttl: 0,
+                cold_resume_tokens: None,
+                ..Client::default()
+            },
+        ),
+        ("cold-warm", Client::default()),
+        // Past `compact_at`, it compacts whatever the answer.
+        (
+            "cold-past",
+            Client {
+                cache_ttl: 0,
+                compact_at: 25,
+                compact_keep_tokens: 1_000,
+                ..Client::default()
+            },
+        ),
+    ] {
+        let mut h = resumable(tag, vec![Reply::sse("stream-sonnet.sse")], client);
+        h.say("Go on.");
+        let (_, outcome, _) = h.turn();
+        assert_eq!(outcome, "replied", "{tag}: {}", h.said());
+    }
+}
+
+/// Compact first that cannot be done says why on the card, and one that
+/// fails stops the turn to be asked again (DESIGN.md §14).
+#[test]
+fn a_cold_compaction_that_cannot_be_or_fails_is_said() {
+    let mut h = resumable(
+        "cold-unlisted",
+        Vec::new(),
+        Client {
+            cache_ttl: 0,
+            compact_model: Some("nobody/unlisted".into()),
+            ..Client::default()
+        },
+    );
+    h.say("Go on.");
+    let (_, _, details) = h.until_resume();
+    assert!(
+        details[2].starts_with("Compact first: cannot be asked, as "),
+        "{details:?}"
+    );
+    assert!(details[2].contains("nobody/unlisted"), "{details:?}");
+    let mut h = resumable_with(
+        "cold-failed",
+        Vec::new(),
+        vec![Reply::status(400, "error-context.json")],
+        Client {
+            cache_ttl: 0,
+            compact_keep_tokens: 1_000,
+            ..Client::default()
+        },
+    );
+    h.say("Go on.");
+    let (turn, _, _) = h.until_resume();
+    h.down(&Down::Resumed {
+        turn,
+        choice: td_agent::protocol::Resumed::Compact,
+    });
+    let (_, outcome, retry) = h.turn();
+    assert!(outcome.contains("could not be compacted"), "{outcome}");
+    assert!(retry);
 }

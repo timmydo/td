@@ -4592,6 +4592,33 @@ still be asked again after one; one that could not be says why in a
 notice of td-agent's, one cut short by a restart says so, and one that
 stood says no more than its summary.
 
+**As built (increment 16, resuming cold).** Before a turn's first
+request, when its estimated prompt is past `cold_resume_tokens` but not
+past `compact_at` or the context (past them it is compacted or stopped
+whatever the answer), no request has yet been made for the turn, and the
+log's last turn request, the only kind that warms the cache it reads, is
+more than `cache_ttl` seconds old (or `cache_ttl` is 0), the
+conversation process sends the window a `resume` frame and waits,
+hearing the window meanwhile, as it does on a call's card. The card says
+how long ago that request was and the prompt's size, and gives both
+estimates as §5 reserves them: resending, the prompt and the turn's
+`max_tokens` at the conversation model's rates; compacting first, the
+summary of the whole view at `compact_model`'s with its bound, and then
+the prefix, the carried state, the summary and the tail,
+`compact_keep_tokens` or the last step if larger, at the conversation
+model's; an estimate the models list cannot price says so, and a summary
+model that cannot be asked says why. Its action is Compact first, its
+other answer Resend whole, and Cancel stops the turn, sending nothing,
+to be asked again with C-r; an interrupt withdraws the card and ends the
+turn so too. The window's `resumed` frame answers it, and the choice is
+logged as a notice, which no request sends, so requests stay a function
+of the log. Compacting first prunes what can be pruned and asks for the
+summary as a compaction past `compact_at` does, its failure stopping the
+turn to be asked again. Nothing is remembered: the next turn that
+resumes cold asks again, and a turn's later steps never ask. A turn
+another conversation's message or a background process's end starts asks
+as the human's own does, and waits for the human.
+
 **Resuming cold.** A long conversation left long enough for the
 provider's cache to expire costs its whole context again at the
 uncached rate on its next request, which compacting first with a
@@ -4680,8 +4707,9 @@ default; `jev_threshold`'s is calibrated (§11):
   at most two decimal places, `compact_keep_tokens`, from 1,000 to
   1,000,000, and `compact_model`; defaults `true`, 0.8, 20,000 and the
   conversation's model (§14)
-- `cache_ttl` (later, with increment 16), a whole number of seconds,
-  and `cold_resume_tokens`, or `none`; defaults 300 and 32,000 (§14)
+- `cache_ttl`, a whole number of seconds up to 86,400, 0 taking every
+  resumption as cold, and `cold_resume_tokens`, from 1,000 to
+  10,000,000, or `none`; defaults 300 and 32,000 (§14)
 
 There is no `limits` key until §8's limits land. `orchestrator_model`
 is retired, since there is no orchestrator (§3): a file that still sets

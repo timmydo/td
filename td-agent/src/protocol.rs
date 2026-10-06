@@ -18,6 +18,35 @@ pub const MAX_TEXT: usize = 128 * 1024;
 /// A delivery id's length: 16 bytes in hexadecimal.
 pub const DELIVERY_LEN: usize = 32;
 
+/// The human's answer to a cold-resume card (DESIGN.md §14).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Resumed {
+    /// Send the whole context, at the uncached rate.
+    Resend,
+    /// Compact with `compact_model` first, then send.
+    Compact,
+    /// Neither: the turn stops, to be asked again.
+    Stop,
+}
+
+impl Resumed {
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Resend => "resend",
+            Self::Compact => "compact",
+            Self::Stop => "stop",
+        }
+    }
+    fn parse(word: &str) -> Option<Self> {
+        match word {
+            "resend" => Some(Self::Resend),
+            "compact" => Some(Self::Compact),
+            "stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+}
+
 /// From the window to a conversation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Down {
@@ -79,6 +108,8 @@ pub enum Down {
         model: Option<String>,
         effort: Option<String>,
     },
+    /// The human's answer to the cold-resume card of turn `turn`.
+    Resumed { turn: u64, choice: Resumed },
     /// The human's decision on the card the conversation asked for call
     /// `call` (its `ToolCall`'s sequence number), and, for an "always"
     /// answer, what it added to the human's rules, which the approval's
@@ -194,6 +225,15 @@ pub enum Up {
         title: String,
         details: Vec<String>,
         always: Option<crate::rules::Offer>,
+    },
+    /// A cold-resume card for the human (DESIGN.md §14): turn `turn`'s
+    /// first request finds the provider's cache likely expired, as
+    /// `title` and `details` say with both estimates. The window answers
+    /// with `Resumed`, or the card is withdrawn as `call` `turn`.
+    Resume {
+        turn: u64,
+        title: String,
+        details: Vec<String>,
     },
     /// The card for `call` is no longer asked: the turn was interrupted,
     /// or the window closed, before the human decided it.
@@ -527,6 +567,13 @@ impl Down {
                     ("effort".into(), optional(effort)),
                 ],
             ),
+            Self::Resumed { turn, choice } => typed(
+                "resumed",
+                vec![
+                    ("turn".into(), Json::from(*turn)),
+                    ("choice".into(), Json::Str(choice.word().into())),
+                ],
+            ),
             Self::Decision {
                 call,
                 allow,
@@ -712,6 +759,14 @@ impl Down {
                     text: string(&value, "text")?,
                 })
             }
+            Some("resumed") => Ok(Self::Resumed {
+                turn: number(&value, "turn")?,
+                choice: value
+                    .get("choice")
+                    .and_then(Json::as_str)
+                    .and_then(Resumed::parse)
+                    .ok_or("a resumption with no choice")?,
+            }),
             Some("decision") => Ok(Self::Decision {
                 call: number(&value, "call")?,
                 allow: value
@@ -861,6 +916,21 @@ impl Up {
                     ),
                 ],
             ),
+            Self::Resume {
+                turn,
+                title,
+                details,
+            } => typed(
+                "resume",
+                vec![
+                    ("turn".into(), Json::from(*turn)),
+                    ("title".into(), Json::Str(title.clone())),
+                    (
+                        "details".into(),
+                        Json::Arr(details.iter().cloned().map(Json::Str).collect()),
+                    ),
+                ],
+            ),
             Self::Ask {
                 call,
                 title,
@@ -961,6 +1031,21 @@ impl Up {
             },
             Some("query") => Self::Query {
                 id: number(&value, "id")?,
+            },
+            Some("resume") => Self::Resume {
+                turn: number(&value, "turn")?,
+                title: string(&value, "title")?,
+                details: value
+                    .get("details")
+                    .and_then(Json::as_arr)
+                    .ok_or("no details")?
+                    .iter()
+                    .map(|line| {
+                        line.as_str()
+                            .map(str::to_string)
+                            .ok_or("a detail not a string")
+                    })
+                    .collect::<Result<_, _>>()?,
             },
             Some("ask") => Self::Ask {
                 call: number(&value, "call")?,
@@ -1161,6 +1246,11 @@ mod tests {
         assert!(bytes.len() <= crate::frame::MAX_FRAME, "{}", bytes.len());
         assert_eq!(Down::decode(&bytes).unwrap(), down);
         for up in [
+            Up::Resume {
+                turn: 3,
+                title: "Resume cold".into(),
+                details: vec!["one".into(), "two".into()],
+            },
             Up::Hello {
                 title: "Orchestrator".into(),
                 torn: Some(3),
@@ -1313,6 +1403,18 @@ mod tests {
             Down::Pause { paused: true },
             Down::ClearTodo,
             Down::Compact { focus: None },
+            Down::Resumed {
+                turn: 4,
+                choice: Resumed::Resend,
+            },
+            Down::Resumed {
+                turn: 4,
+                choice: Resumed::Compact,
+            },
+            Down::Resumed {
+                turn: 4,
+                choice: Resumed::Stop,
+            },
             Down::Compact {
                 focus: Some("the failing test".into()),
             },

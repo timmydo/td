@@ -71,6 +71,12 @@ pub struct Client {
     /// The model that writes a compaction's summary; the conversation's
     /// own when none.
     pub compact_model: Option<String>,
+    /// How long, in seconds, a provider's prompt cache is taken to last
+    /// (DESIGN.md §14).
+    pub cache_ttl: u64,
+    /// The estimated prompt past which a turn resuming after `cache_ttl`
+    /// first asks the human; none never asks.
+    pub cold_resume_tokens: Option<u64>,
     /// The bytes of each background process's output kept.
     pub background_output_bytes: u64,
 }
@@ -103,6 +109,8 @@ impl Default for Client {
             compact_at: DEFAULT_COMPACT_AT,
             compact_keep_tokens: DEFAULT_COMPACT_KEEP_TOKENS,
             compact_model: None,
+            cache_ttl: DEFAULT_CACHE_TTL,
+            cold_resume_tokens: Some(DEFAULT_COLD_RESUME_TOKENS),
             background_output_bytes: DEFAULT_BACKGROUND_OUTPUT_BYTES,
         }
     }
@@ -244,6 +252,12 @@ impl Client {
                 "compact_model".into(),
                 self.compact_model.clone().map_or(Json::Null, Json::Str),
             ),
+            ("cache_ttl".into(), Json::from(self.cache_ttl)),
+            (
+                "cold_resume_tokens".into(),
+                self.cold_resume_tokens
+                    .map_or(Json::Str("none".into()), Json::from),
+            ),
             (
                 "background_output_bytes".into(),
                 Json::from(self.background_output_bytes),
@@ -335,6 +349,22 @@ impl Client {
                     "compact_model",
                     id.as_str().ok_or("compact_model is not text")?,
                 )?),
+            },
+            cache_ttl: match value.get("cache_ttl") {
+                None => DEFAULT_CACHE_TTL,
+                Some(n) => n
+                    .as_u64()
+                    .filter(|n| CACHE_TTL.contains(n))
+                    .ok_or("cache_ttl is out of range")?,
+            },
+            cold_resume_tokens: match value.get("cold_resume_tokens") {
+                None => Some(DEFAULT_COLD_RESUME_TOKENS),
+                Some(Json::Str(none)) if none == "none" => None,
+                Some(n) => Some(
+                    n.as_u64()
+                        .filter(|n| COLD_RESUME_TOKENS.contains(n))
+                        .ok_or("cold_resume_tokens is out of range")?,
+                ),
             },
             max_background: match value.get("max_background") {
                 None => DEFAULT_MAX_BACKGROUND,
@@ -434,6 +464,13 @@ const JEV_THRESHOLD_SHIPPED: u16 = 775;
 /// `compact_keep_tokens`'s default, and what it may be.
 const DEFAULT_COMPACT_KEEP_TOKENS: u64 = 20_000;
 const COMPACT_KEEP_TOKENS: std::ops::RangeInclusive<u64> = 1_000..=1_000_000;
+/// `cache_ttl`'s default, Anthropic's ephemeral cache's lifetime, and
+/// what it may be: 0 takes every resumption as cold.
+const DEFAULT_CACHE_TTL: u64 = 300;
+const CACHE_TTL: std::ops::RangeInclusive<u64> = 0..=86_400;
+/// `cold_resume_tokens`'s default, and what it may be.
+const DEFAULT_COLD_RESUME_TOKENS: u64 = 32_000;
+const COLD_RESUME_TOKENS: std::ops::RangeInclusive<u64> = 1_000..=10_000_000;
 /// `compact_at`'s default, in percent.
 const DEFAULT_COMPACT_AT: u8 = 80;
 /// What `compact_at` may be, in percent.
@@ -496,6 +533,15 @@ fn data_collection(text: &str) -> Result<bool, String> {
             "`data_collection` is `deny` or `allow`, not {other:?}"
         )),
     }
+}
+
+/// Why a `cold_resume_tokens` value is refused.
+fn cold_resume_refused(value: &Toml) -> String {
+    format!(
+        "`cold_resume_tokens` is a whole number from {} to {}, or \"none\"; not {value:?}",
+        COLD_RESUME_TOKENS.start(),
+        COLD_RESUME_TOKENS.end()
+    )
 }
 
 /// A cost limit: credits, a whole or decimal number of at least zero, or
@@ -578,6 +624,8 @@ const KEYS: &[(&str, Use)] = &[
     ("compact_at", Use::Read),
     ("compact_keep_tokens", Use::Read),
     ("compact_model", Use::Read),
+    ("cache_ttl", Use::Read),
+    ("cold_resume_tokens", Use::Read),
 ];
 
 /// Keys no longer read, accepted with a note of why, so a file written
@@ -1053,6 +1101,32 @@ pub fn parse(text: &str) -> Result<Config, String> {
     {
         config.client.compact_model = Some(model_id("compact_model", id)?);
     }
+    if let Some(value) = table.get("cache_ttl") {
+        config.client.cache_ttl = match value {
+            Toml::Int(n) => u64::try_from(*n).ok(),
+            _ => None,
+        }
+        .filter(|n| CACHE_TTL.contains(n))
+        .ok_or_else(|| {
+            format!(
+                "`cache_ttl` is a whole number of seconds from {} to {}, not {value:?}",
+                CACHE_TTL.start(),
+                CACHE_TTL.end()
+            )
+        })?;
+    }
+    if let Some(value) = table.get("cold_resume_tokens") {
+        config.client.cold_resume_tokens = match value {
+            Toml::Str(none) if none == "none" => None,
+            Toml::Int(n) => Some(
+                u64::try_from(*n)
+                    .ok()
+                    .filter(|n| COLD_RESUME_TOKENS.contains(n))
+                    .ok_or_else(|| cold_resume_refused(value))?,
+            ),
+            _ => return Err(cold_resume_refused(value)),
+        };
+    }
     if let Some(value) = table.get("max_background") {
         config.client.max_background = match value {
             Toml::Int(n) => u32::try_from(*n).ok(),
@@ -1371,6 +1445,31 @@ mod tests {
         assert_eq!(client.compact_model.as_deref(), Some("a/cheap"));
         assert_eq!(Client::from_json(&client.to_json()).unwrap(), client);
         assert!(client.wanted().contains(&"a/cheap".to_string()));
+        // Resuming cold: defaults, a value, `none`, carried, and an older
+        // client's absent keys defaulted.
+        assert_eq!(
+            (default.cache_ttl, default.cold_resume_tokens),
+            (300, Some(32_000))
+        );
+        let client = parse("cache_ttl = 0\ncold_resume_tokens = 50000\n")
+            .unwrap()
+            .client;
+        assert_eq!(
+            (client.cache_ttl, client.cold_resume_tokens),
+            (0, Some(50_000))
+        );
+        assert_eq!(Client::from_json(&client.to_json()).unwrap(), client);
+        let never = parse("cold_resume_tokens = \"none\"\n").unwrap().client;
+        assert_eq!(never.cold_resume_tokens, None);
+        assert_eq!(Client::from_json(&never.to_json()).unwrap(), never);
+        let mut older = never.to_json();
+        older.remove("cache_ttl");
+        older.remove("cold_resume_tokens");
+        let older = Client::from_json(&older).unwrap();
+        assert_eq!(
+            (older.cache_ttl, older.cold_resume_tokens),
+            (300, Some(32_000))
+        );
         for (text, why) in [
             (
                 "compact_keep_tokens = 999",
@@ -1381,6 +1480,22 @@ mod tests {
                 "`compact_keep_tokens` is a whole number",
             ),
             ("compact_model = \"a b\"", "`compact_model` must be"),
+            (
+                "cache_ttl = 86401",
+                "`cache_ttl` is a whole number of seconds",
+            ),
+            (
+                "cache_ttl = \"300\"",
+                "`cache_ttl` is a whole number of seconds",
+            ),
+            (
+                "cold_resume_tokens = 999",
+                "`cold_resume_tokens` is a whole number",
+            ),
+            (
+                "cold_resume_tokens = \"never\"",
+                "`cold_resume_tokens` is a whole number",
+            ),
         ] {
             let refused = parse(text).unwrap_err();
             assert!(refused.contains(why), "{text}: {refused}");

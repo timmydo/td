@@ -57,7 +57,7 @@ use crate::host;
 use crate::key::Secret;
 use crate::models::{Model, Models};
 use crate::output;
-use crate::protocol::{Down, Fetched as Stored, Up, MAX_TEXT};
+use crate::protocol::{Down, Fetched as Stored, Resumed, Up, MAX_TEXT};
 use crate::shell;
 use crate::snapshot;
 use crate::sse::{self, Fault};
@@ -950,7 +950,10 @@ impl Session {
                 // for.
                 // A decision that comes after its call gave up is not
                 // waited for either.
+                // A cold-resume answer that comes after its turn gave up
+                // waiting is not waited for either.
                 Down::Reservation { .. }
+                | Down::Resumed { .. }
                 | Down::Interrupt
                 | Down::Sent { .. }
                 | Down::States { .. }
@@ -1346,6 +1349,7 @@ impl Session {
         // Compaction prunes, then summarizes, once a request, and a
         // context-length refusal is asked again once (DESIGN.md §14).
         let (mut stage, mut refused_context) = (Stage::Whole, false);
+        let mut cold_asked = false;
         loop {
             // A checkout done while a request waited to be asked again is
             // taken up before it is, its worktrees bound for this step's
@@ -1380,6 +1384,27 @@ impl Session {
             };
             let (mut head, mut body) = build(max_tokens)?;
             let estimate = client::estimate(events, body.len() as u64);
+            // Resuming cold asks first, once a turn (DESIGN.md §14).
+            if !cold_asked && stage == Stage::Whole {
+                cold_asked = true;
+                match self.resume_cold(
+                    turn,
+                    &client,
+                    &key,
+                    &name,
+                    model.as_ref(),
+                    estimate,
+                    max_tokens,
+                    prefix_text,
+                )? {
+                    Cold::Warm | Cold::Resend => {}
+                    Cold::Compacted => {
+                        stage = Stage::Summarized;
+                        continue;
+                    }
+                    Cold::Stop(outcome) => return Ok(outcome),
+                }
+            }
             if let Some(context) = model.as_ref().and_then(|m| m.context_length) {
                 if let Some(room) = compact::past(estimate, max_tokens, context, client.compact_at)
                 {
@@ -1593,26 +1618,10 @@ impl Session {
                 "the conversation could not be compacted: {why}"
             )))
         };
-        let (setting, name) = match &client.compact_model {
-            Some(name) => ("`compact_model`", name.clone()),
-            None => ("the conversation's model", model_name.to_string()),
-        };
-        let model = match self.model(setting, &name, client) {
-            Ok(model) => model,
+        let (name, model, bound) = match self.summary_model(client, model_name, context) {
+            Ok(summary) => summary,
             Err(why) => return not(why),
         };
-        if model.as_ref().is_some_and(|m| !m.supports("max_tokens")) {
-            return not(format!("{name} takes no max_tokens"));
-        }
-        let bound = context
-            .map_or(client::MAX_TOKENS, |c| (c / 10).max(1))
-            .min(
-                model
-                    .as_ref()
-                    .and_then(|m| m.max_completion_tokens)
-                    .unwrap_or(u64::MAX),
-            )
-            .min(client::MAX_REPLY / 8);
         let events = self.conversation.events();
         let (prefix, prefix_text) = client::current_prefix(events, self.conversation.prefix_file());
         let prefix_text = prefix_text.to_string();
@@ -1807,6 +1816,224 @@ impl Session {
             Some(why) => not(why),
             None => Ok(Ok(())),
         }
+    }
+
+    /// The model a summary is asked of, `compact_model` or the
+    /// conversation's `model_name`, its entry, and its reply's bound: a
+    /// tenth of the conversation model's `context`, at most the summary
+    /// model's largest completion and 65,536.
+    fn summary_model(
+        &self,
+        client: &Client,
+        model_name: &str,
+        context: Option<u64>,
+    ) -> Result<(String, Option<Model>, u64), String> {
+        let (setting, name) = match &client.compact_model {
+            Some(name) => ("`compact_model`", name.clone()),
+            None => ("the conversation's model", model_name.to_string()),
+        };
+        let model = self.model(setting, &name, client)?;
+        if model.as_ref().is_some_and(|m| !m.supports("max_tokens")) {
+            return Err(format!("{name} takes no max_tokens"));
+        }
+        let bound = context
+            .map_or(client::MAX_TOKENS, |c| (c / 10).max(1))
+            .min(
+                model
+                    .as_ref()
+                    .and_then(|m| m.max_completion_tokens)
+                    .unwrap_or(u64::MAX),
+            )
+            .min(client::MAX_REPLY / 8);
+        Ok((name, model, bound))
+    }
+
+    /// Before turn `turn`'s first request, when the conversation's last
+    /// request is older than `cache_ttl` and the prompt's `estimate` is
+    /// past `cold_resume_tokens`, asks the human on a card whether to
+    /// resend it whole or compact first, with both estimates as §5
+    /// reserves them (DESIGN.md §14), and waits however long it takes,
+    /// hearing the window meanwhile. The answer is logged as a notice,
+    /// which no request sends, and holds for this turn alone.
+    #[allow(clippy::too_many_arguments)]
+    fn resume_cold(
+        &mut self,
+        turn: u64,
+        client: &Client,
+        key: &Secret,
+        name: &str,
+        model: Option<&Model>,
+        estimate: u64,
+        max_tokens: u64,
+        prefix_text: &str,
+    ) -> Result<Cold, String> {
+        let Some(threshold) = client.cold_resume_tokens else {
+            return Ok(Cold::Warm);
+        };
+        if estimate <= threshold {
+            return Ok(Cold::Warm);
+        }
+        let context = model.and_then(|m| m.context_length);
+        // Past `compact_at`, or the context, it is compacted or stopped
+        // whatever the answer: nothing to ask.
+        if context.is_some_and(|c| {
+            estimate >= c || compact::past(estimate, max_tokens, c, client.compact_at).is_some()
+        }) {
+            return Ok(Cold::Warm);
+        }
+        let events = self.conversation.events();
+        // Not this turn's first request.
+        if events
+            .iter()
+            .rev()
+            .find_map(|e| match e.kind {
+                Kind::Request { turn, .. } => Some(turn),
+                _ => None,
+            })
+            .is_some_and(|of| of == turn)
+        {
+            return Ok(Cold::Warm);
+        }
+        // The last turn request's, which alone warms the cache this one
+        // reads; none, and nothing was ever cached.
+        let Some(at) = events.iter().rev().find_map(|e| match e.kind {
+            Kind::Request {
+                purpose: Purpose::Turn,
+                ..
+            } => Some(e.time),
+            _ => None,
+        }) else {
+            return Ok(Cold::Warm);
+        };
+        let idle = crate::store::now().saturating_sub(at);
+        // A `cache_ttl` of 0 takes every resumption as cold.
+        if client.cache_ttl > 0 && idle <= client.cache_ttl {
+            return Ok(Cold::Warm);
+        }
+        let pricing = model.and_then(|m| m.pricing);
+        let resend = pricing.map(|p| p.reserve(estimate, max_tokens));
+        // The summary given the whole view, then the compacted prompt:
+        // the prefix, the carried state, the summary and the kept tail.
+        let shown = |amount: Option<u64>| {
+            amount.map_or_else(
+                || "unknown, as the models list gives no price".to_string(),
+                cost::show,
+            )
+        };
+        let compacting = match self.summary_model(client, name, context) {
+            Ok((summary_name, summary, bound)) => {
+                let carried = (compact::carried(events, 0, u64::MAX, "").len() as u64).div_ceil(4);
+                // The tail keeps at least the last step, this turn's
+                // message.
+                // From the last message that answers no call, as
+                // `summarize` keeps the last step.
+                let view = client::view(events, client::timed(prefix_text));
+                let start = view
+                    .iter()
+                    .rposition(|(_, m)| !m.starts_with("{\"role\":\"tool\""))
+                    .unwrap_or(0);
+                let last = view
+                    .get(start..)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|(_, m)| m.len() as u64)
+                    .sum::<u64>()
+                    .div_ceil(4);
+                let after = (prefix_text.len() as u64).div_ceil(4)
+                    + carried
+                    + bound
+                    + client.compact_keep_tokens.max(last);
+                let cost = match (summary.as_ref().and_then(|m| m.pricing), pricing) {
+                    (Some(s), Some(p)) => Some(
+                        s.reserve(estimate, bound)
+                            .saturating_add(p.reserve(after, max_tokens)),
+                    ),
+                    _ => None,
+                };
+                format!(
+                    "{}: at most {}, a summary by {summary_name} and then the compacted prompt.",
+                    crate::confirm::COMPACT_FIRST,
+                    shown(cost)
+                )
+            }
+            Err(why) => format!(
+                "{}: cannot be asked, as {why}.",
+                crate::confirm::COMPACT_FIRST
+            ),
+        };
+        let details = vec![
+            format!(
+                "This conversation's last request was {} ago, past cache_ttl's {}s: the provider's prompt cache has likely expired, so its next request, about {estimate} tokens, is charged whole at the uncached rate.",
+                ago(idle),
+                client.cache_ttl
+            ),
+            format!("{}: at most {}.", crate::confirm::RESEND, shown(resend)),
+            compacting,
+        ];
+        self.send(&Up::Resume {
+            turn,
+            title: "Resume cold".into(),
+            details,
+        });
+        let answer = loop {
+            if self.gone || self.interrupt {
+                break None;
+            }
+            match self.inbox.recv() {
+                Ok(Inbound::Down(Down::Resumed { turn: of, choice })) if of == turn => {
+                    break Some(choice)
+                }
+                // A card already answered or withdrawn.
+                Ok(Inbound::Down(Down::Resumed { .. })) => {}
+                Ok(Inbound::Down(Down::Interrupt)) => self.interrupt = true,
+                Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
+                Ok(Inbound::Down(down)) => self.later(down),
+                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
+                Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Broken(why)) => {
+                    eprintln!("td-agent: the window: {why}");
+                    self.gone = true;
+                }
+                Ok(Inbound::Closed) | Err(_) => self.gone = true,
+            }
+        };
+        let Some(choice) = answer else {
+            self.send(&Up::Withdraw { call: turn });
+            let why = if self.gone {
+                "the window closed"
+            } else {
+                "interrupted"
+            };
+            return Ok(Cold::Stop(Outcome::again(format!(
+                "{why} while asked how to resume cold; nothing was sent"
+            ))));
+        };
+        let chose = match choice {
+            Resumed::Resend => "to resend it whole",
+            Resumed::Compact => "to compact first",
+            Resumed::Stop => "neither",
+        };
+        self.log(Kind::Notice {
+            text: format!(
+                "resuming cold, {} after the last request: the person chose {chose}",
+                ago(idle)
+            ),
+        })?;
+        Ok(match choice {
+            Resumed::Resend => Cold::Resend,
+            Resumed::Stop => Cold::Stop(Outcome::again(
+                "not resumed: the person chose neither to resend nor to compact; C-r asks again",
+            )),
+            Resumed::Compact => {
+                self.prune(0)?;
+                // Asked again, it asks again how to resume.
+                match self.summarize(turn, client, key, name, context, max_tokens, None)? {
+                    Ok(()) => Cold::Compacted,
+                    Err(why) => Cold::Stop(Outcome::again(why)),
+                }
+            }
+        })
     }
 
     /// The human's compaction (DESIGN.md §14), an effect of its own:
@@ -4870,6 +5097,28 @@ fn failed_cost(failure: &Failure, reserved: u64) -> (Option<client::Usage>, (u64
             _ => (*usage, (reserved, Basis::Reserved)),
         },
         _ => (None, (0, Basis::Nothing)),
+    }
+}
+
+/// How a turn's first request resumes (`Session::resume_cold`).
+enum Cold {
+    /// Not cold, or not asked about: as ever.
+    Warm,
+    /// Sent whole, as the person chose.
+    Resend,
+    /// Compacted first, as the person chose.
+    Compacted,
+    /// Not sent: the turn ends so.
+    Stop(Outcome),
+}
+
+/// `seconds` for a person: in seconds, minutes, hours or days.
+fn ago(seconds: u64) -> String {
+    match seconds {
+        0..=119 => format!("{seconds} seconds"),
+        120..=7_199 => format!("{} minutes", seconds / 60),
+        7_200..=172_799 => format!("{} hours", seconds / 3_600),
+        _ => format!("{} days", seconds / 86_400),
     }
 }
 
