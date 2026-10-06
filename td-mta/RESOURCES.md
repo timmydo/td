@@ -2268,6 +2268,22 @@ Seven compile-fail guards pin exclusive owners and reject passive
 completed visitation as constructor input. These checks do not qualify
 native stack or RSS.
 
+M06dr body metadata composition uses 64 inline parent ordinals with no
+recursive traversal or growing storage. Cursor plus HeaderBudget fits
+1 KiB; exclusive Composed fits 256 bytes. Caller output is separately
+admitted. Each active nonempty-output turn funds at most one step, one
+record and 64 new wire bytes; retained generated input incurs no source
+or I/O charge. Empty output freshly admits without debit/progress; cached
+Complete is inert. No additional allowance or normalization buffer enters.
+
+Eight measured Rust allocation trials preserve the earlier 41: healthy
+tree/list release, partial expiry, completed-owner expiry, empty-output
+expiry, partial/complete forgetting and constructor expiry. All backing
+storage precedes counting. Units cover output widths, exact capacity,
+original owner identity, every prefix and quota cutoff, and depth 64;
+five compile-fail guards reject copying, cloning and passive substitution.
+These fixtures do not qualify native stack, RSS or full JMAP responses.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

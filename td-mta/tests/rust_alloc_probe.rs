@@ -5480,7 +5480,7 @@ fn ordered_mime_classification() {
     let mut retained_output = [0; 256];
     let mut collection_output = [[0; 256]; 3];
     let before = COUNTERS.snapshot();
-    for trial in 0..41 {
+    for trial in 0..49 {
         let mut work = Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
             Charge {
@@ -5766,6 +5766,75 @@ fn ordered_mime_classification() {
                 }
                 let mut serialized = response.finish(Tick(1)).unwrap();
                 assert_eq!(serialized.value().unwrap().fragments.len(), 3);
+                if trial >= 41 {
+                    use td_mta::mime_traversal::bound::ordered::body_lists::response::collected::composed::{Cursor as Composition, Mode, Status as CompositionStatus};
+                    let mode = if trial == 42 {
+                        Mode::Lists
+                    } else {
+                        Mode::Structure
+                    };
+                    if trial == 48 {
+                        assert_eq!(
+                            Composition::new(serialized, mode, Tick(100)).err(),
+                            Some(Error::Admission(td_mta::nfc::Error::Work(Stop::Deadline)))
+                        );
+                        continue;
+                    }
+                    let mut cursor = Composition::new(serialized, mode, Tick(1)).unwrap();
+                    if trial == 45 {
+                        assert_eq!(
+                            cursor.poll(Tick(100), &mut []).err(),
+                            Some(Error::Admission(td_mta::nfc::Error::Work(Stop::Deadline)))
+                        );
+                        assert!(cursor.value().is_none());
+                        assert_eq!(
+                            cursor.finish(Tick(1)).err(),
+                            Some(Error::Admission(td_mta::nfc::Error::Work(Stop::Deadline)))
+                        );
+                        continue;
+                    }
+                    if trial == 43 || trial == 46 {
+                        cursor.poll(Tick(1), &mut json_output).unwrap();
+                        if trial == 43 {
+                            assert_eq!(
+                                cursor.finish(Tick(100)).err(),
+                                Some(Error::Admission(td_mta::nfc::Error::Work(Stop::Deadline)))
+                            );
+                        } else {
+                            forget(cursor);
+                        }
+                        continue;
+                    }
+                    let mut done = false;
+                    for _ in 0..100000 {
+                        if cursor.poll(Tick(1), &mut json_output).unwrap().status
+                            == CompositionStatus::Complete
+                        {
+                            done = true;
+                            break;
+                        }
+                    }
+                    assert!(done);
+                    if trial == 47 {
+                        forget(cursor);
+                        continue;
+                    }
+                    let mut composed = cursor.finish(Tick(1)).unwrap();
+                    if trial == 44 {
+                        let error = composed.check_deadline(Tick(100)).unwrap_err();
+                        assert!(composed.value().is_none());
+                        assert_eq!(composed.finish(Tick(1)).err(), Some(error));
+                        continue;
+                    }
+                    let ((actual, view), work, budget) = composed.finish(Tick(1)).unwrap();
+                    assert_eq!(actual, mode);
+                    assert_eq!(view.fragments.len(), 3);
+                    assert_eq!(
+                        (std::ptr::from_mut(work), std::ptr::from_mut(budget)),
+                        (pointers.0, pointers.1)
+                    );
+                    continue;
+                }
                 if trial == 36 {
                     let error = serialized.check_deadline(Tick(100)).unwrap_err();
                     assert!(serialized.value().is_none());

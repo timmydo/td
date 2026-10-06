@@ -717,6 +717,18 @@ The collection adds no normalization, metadata parser, JSON serializer,
 source authority or publication algorithm. Enclosing body-list/tree
 composition, braces, locators and publication remain later boundaries.
 
+M06dr consumes exclusive whole Serialized ownership to compose either
+original bodyStructure metadata or original selected body-list members.
+It never reconstructs authority from passive fragments or visitation.
+Generated fragments are copied unchanged; original preorder/depth/parent
+identity drives a fixed 64-frame iterative tree. Original allowances
+fund bounded control and every newly emitted byte, with no source/I/O
+replay charge. Fresh complete consumption yields exclusive Composed,
+which proves emission only. Whole fixed retention must construct its own
+fresh composer from Serialized; an advanced composer or Composed cannot
+prove that an omitted prefix was retained. Locators, property selection
+and complete response publication remain subsequent boundaries.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

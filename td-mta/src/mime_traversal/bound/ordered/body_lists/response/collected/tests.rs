@@ -15,7 +15,7 @@ use crate::{
 fn forget<T>(value: T) {
     std::mem::forget(value);
 }
-fn exercise<T>(
+pub(super) fn exercise<T>(
     source: &[u8],
     base: u64,
     f: impl FnOnce(Collecting<'_, '_, '_, '_, '_>, &mut Storage, &mut Scratch) -> T,
@@ -32,7 +32,7 @@ fn exercise<T>(
         std::ptr::from_mut(&mut budget),
     );
     let original_tables = (parts.as_ptr(), nodes.as_ptr());
-    let mut outputs = [[0xa5; 512]; 4];
+    let mut outputs = [[0xa5; 512]; 8];
     let original_windows = outputs.each_ref().map(|o| o.as_ptr());
     let mut cells = outputs.each_mut().map(|o| Cell::new(o));
     let selected = selection(
@@ -79,7 +79,7 @@ fn exercise<T>(
     }
     f(owner, &mut storage, &mut scratch)
 }
-fn drain(child: &mut Child<'_, '_, '_>) -> usize {
+pub(super) fn drain(child: &mut Child<'_, '_, '_>) -> usize {
     for turn in 1..100000 {
         if child.poll(Tick(1)).unwrap() == Status::Complete {
             return turn;

@@ -5210,6 +5210,35 @@ with no additional heap arena or source-sized internal storage. Seven
 additional Rust allocation trials preserve the previous 34 intervals;
 native-stack and RSS qualification remain separate.
 
+### 1.123 Original body metadata composition
+
+M06dr adds response::collected::composed. Cursor::new consumes only live
+Serialized ownership, freshly admitted; passive View cannot substitute.
+Mode::Structure emits the bodyStructure member with original preorder
+fragments and iterative subParts. Mode::Lists emits textBody, htmlBody,
+attachments and hasAttachment from original selected leaf ordinals.
+These are provisional metadata members: authenticated blob locators,
+request property selection and complete JMAP publication remain pending.
+
+Each nonempty-output turn funds at most one interpretation step, one
+record and 64 newly emitted wire bytes in the original work/header
+owners. Generated retained fragments incur no source or I/O debit.
+Empty output freshly admits without progress or debit; cached Complete
+is inert. Sticky refusal hides values. Explicit checks and consuming
+finish freshly admit; only complete emission creates exclusive Composed.
+Its finish returns original owners and passive collection evidence.
+Composed proves emission completion, not retained composition bytes.
+
+Structure uses 64 fixed parent ordinals and original depth-one root
+identity, without recursion. Leaves have null subParts; original traversal
+rejects childless multipart input before collection can exist. Complete is reported with the final byte, including
+an exactly filled caller output window. Cursor plus HeaderBudget fits
+1 KiB; Composed fits 256 bytes. Eight units cover tree/list bytes, widths,
+exact fit, every prefix and five quota cutoffs, fresh final consumption
+and maximum depth. Five compile-fail guards pin exclusivity and reject
+passive input. Eight additional measured Rust allocation trials preserve
+all earlier 41. Native-stack and RSS qualification remain separate.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

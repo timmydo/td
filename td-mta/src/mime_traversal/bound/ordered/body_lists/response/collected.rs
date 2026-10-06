@@ -1,4 +1,5 @@
 //! Retain every original fragment before granting whole serialization ownership.
+pub mod composed;
 use super::{json::retained, Error, Part, Projected, Projecting, Selected, View as ListsView};
 pub use crate::mime_traversal::Status;
 use crate::{

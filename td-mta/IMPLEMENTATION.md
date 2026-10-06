@@ -2181,6 +2181,17 @@ Initial independently landable increments:
   seven additional measured Rust-allocation intervals. Body-list/tree
   composition, locators and publication remain subsequent work.
 
+- **M06dr — original body metadata member composition:** consume exclusive
+  Serialized and emit original bodyStructure or selected text/html/
+  attachment members. Use fixed iterative parent ordinals, original
+  depth-one root and unchanged retained fragments. Fund every generated
+  wire byte and bounded control in original owners. Pin literal tree/list
+  output, exact final-byte completion, small output windows, every
+  progress prefix, all five quota cutoffs and depth 64; add five exclusive/
+  passive-input doctests and eight measured allocation intervals. Complete
+  Composed proves emission; fixed retention, authenticated locators,
+  request property selection and publication remain subsequent work.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
