@@ -802,6 +802,7 @@ mod tests {
             [2; 32],
             uuid,
             crate::installation_plan::Storage::Unencrypted,
+            crate::installation_plan::Basis::default(),
             settings,
         )
         .unwrap();
@@ -870,6 +871,7 @@ mod tests {
             [2; 32],
             uuid,
             crate::installation_plan::Storage::Unencrypted,
+            crate::installation_plan::Basis::default(),
             settings,
         )
         .unwrap();

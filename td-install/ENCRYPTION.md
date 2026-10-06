@@ -707,9 +707,12 @@ and takes the same steps.
 
 ## Activation
 
-This section is increment 7's target; none of it is implemented, and
-until it lands `td-install serve` follows its storage operand
-("Device-bound formatting").
+This section is increment 7's target. The two probes and their record
+are current: `td-install serve` runs both at every start and records
+them in every plan, and the review shows them (INSTALLER.md "Storage
+choice"), but nothing acts on them. Until the activation commit lands,
+storage follows the storage operand ("Device-bound formatting"), and a
+device-bound service still refuses to start without a usable TPM.
 
 At activation `serve` takes no storage operand. Once its admission
 checks pass and before its greeting, it runs two probes, each once, and
@@ -717,23 +720,34 @@ records both outcomes in every plan (INSTALLER.md "Storage choice"):
 
 - the TPM probe as today: PCR_Read of PCRs 4 and 9 in the SHA-256 bank
   answers that bank, and neither value is zero. It now records rather
-  than refuses.
+  than refuses, and runs under a 3-second deadline, so that a slow TPM
+  cannot outlast the installer's ten-second greeting wait: a read still
+  unanswered then is abandoned and recorded as not passed. (Before
+  activation the deadline applies to a service without the operand; a
+  device-bound service waits for the read and refuses on its failure.)
 - the keyboard-console probe of the running live system, through sysfs:
   some `/sys/class/vtconsole/vtcon*` whose `name` reads exactly
-  `(S) frame buffer device` and a newline and whose `bind` reads `1` and
-  a newline (fbcon is bound to the VT; Linux 7.1.4's `vt.c` prints a
-  built-in console driver's name that way), and some
+  `(M) frame buffer device` and a newline and whose `bind` reads `1` and
+  a newline (fbcon is bound to the VT; Linux 7.1.4's `vt.c` prints `(M)`
+  for every driver `do_register_con_driver` registers, fbcon built in
+  included, and `(S)` only for the boot console, such as `(S) dummy
+  device`), and some
   `/sys/class/input/input*` whose `capabilities/key` bitmap sets
   `KEY_ENTER` (28) and `KEY_1` to `KEY_0` (2 to 11), the keys an entry
   needs. That bitmap is Linux 7.1.4's `input_print_bitmap` on a 64-bit
   kernel: one to twelve words (`KEY_MAX` is 767), each 1 to 16 lowercase
-  hexadecimal digits without `0x`, separated by single spaces and ended
-  by one newline; the most significant word comes first, leading zero
-  words are omitted, a later zero word is written `0`, the last word
-  holds bits 0 to 63, and an empty bitmap is `0` alone. Each attribute
-  is read up to 4096 bytes, one sysfs page; one that is missing, longer,
-  unreadable or outside those grammars is malformed and counts as
-  absent, never present, and a listing that fails fails the probe.
+  hexadecimal digits without `0x` and, as `%lx` writes them, without a
+  leading zero digit, separated by single spaces and ended by one
+  newline; the most significant word comes first, leading zero words
+  are omitted, a later zero word is written `0`, the last word holds
+  bits 0 to 63, and an empty bitmap is `0` alone. The needed keys must
+  all be set on one device. Each attribute is read up to 4096 bytes,
+  one sysfs page; one that is missing, longer, unreadable or outside
+  those grammars is malformed and counts as absent, never present, and
+  a listing that fails, or that holds more than 64 `vtconsole` or 4096
+  `input` entries, fails the probe. Power and sleep buttons, lid
+  switches and the PC speaker advertise none of the needed keys, so
+  they never pass it.
 
 Every plan of that service names device-bound storage when both probes
 passed and unencrypted storage otherwise. Neither outcome refuses a

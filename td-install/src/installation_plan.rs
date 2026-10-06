@@ -1,9 +1,9 @@
 //! Immutable review data, not a device claim, authenticated source or consent.
 
 /// Input admission ceiling, checked before parsing or allocating fields.
-/// The largest current valid encoding is 1192 bytes.
+/// The largest current valid encoding is 1193 bytes.
 pub const MAX_BYTES: usize = 2048;
-const MAGIC: &[u8; 8] = b"TDPLAN02";
+const MAGIC: &[u8; 8] = b"TDPLAN03";
 const CANDIDATES_MAGIC: &[u8; 8] = b"TDCAND01";
 const ZONES_MAGIC: &[u8; 8] = b"TDZONE01";
 pub const MAX_CANDIDATES: usize = 64;
@@ -21,7 +21,7 @@ const ENCODED_BYTES: usize = 8
     + 32
     + 16
     + DESTINATION_BYTES
-    + 1
+    + 2
     + 4 * 2
     + USERNAME_BYTES
     + HOSTNAME_BYTES
@@ -338,10 +338,49 @@ impl Storage {
     }
 }
 
+/// What the service's own probes found when it started (ENCRYPTION.md
+/// "Activation"): a usable TPM 2.0, and a keyboard console. Every plan of
+/// that service records it; no request carries it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Basis {
+    tpm: bool,
+    keyboard_console: bool,
+}
+
+impl Basis {
+    pub const fn new(tpm: bool, keyboard_console: bool) -> Self {
+        Self {
+            tpm,
+            keyboard_console,
+        }
+    }
+    /// The TPM probe passed: PCRs 4 and 9 read, measured, from the SHA-256
+    /// bank.
+    pub fn tpm(self) -> bool {
+        self.tpm
+    }
+    /// The keyboard-console probe passed: fbcon bound to the VT, and an
+    /// input device advertising Enter and the top-row digits.
+    pub fn keyboard_console(self) -> bool {
+        self.keyboard_console
+    }
+
+    fn code(self) -> u8 {
+        u8::from(self.tpm) | (u8::from(self.keyboard_console) << 1)
+    }
+
+    fn from_code(code: u8) -> Result<Self, String> {
+        if code & !0b11 != 0 {
+            return Err("invalid plan storage basis".into());
+        }
+        Ok(Self::new(code & 1 != 0, code & 2 != 0))
+    }
+}
+
 /// One proposed whole-disk, automatic-login installation, with the storage
-/// the service chose. A fresh nonce distinguishes otherwise equal proposals.
-/// Equality binds all fields; cloning copies a proposal and never creates
-/// another authorization.
+/// the service chose and the basis its probes found. A fresh nonce
+/// distinguishes otherwise equal proposals. Equality binds all fields;
+/// cloning copies a proposal and never creates another authorization.
 ///
 /// ```compile_fail,E0616
 /// fn change(plan: &mut td_install::installation_plan::Plan) {
@@ -355,6 +394,7 @@ pub struct Plan {
     deployment: [u8; 32],
     volume_uuid: [u8; 16],
     storage: Storage,
+    basis: Basis,
     settings: Settings,
 }
 
@@ -367,6 +407,7 @@ impl Plan {
         deployment: [u8; 32],
         volume_uuid: [u8; 16],
         storage: Storage,
+        basis: Basis,
         settings: Settings,
     ) -> Result<Self, String> {
         if nonce == [0; 32]
@@ -381,6 +422,7 @@ impl Plan {
             deployment,
             volume_uuid,
             storage,
+            basis,
             settings,
         })
     }
@@ -421,6 +463,9 @@ impl Plan {
     pub fn storage(&self) -> Storage {
         self.storage
     }
+    pub fn basis(&self) -> Basis {
+        self.basis
+    }
     pub fn settings(&self) -> &Settings {
         &self.settings
     }
@@ -432,8 +477,13 @@ impl Plan {
         out.extend_from_slice(&self.nonce);
         out.extend_from_slice(&self.deployment);
         out.extend_from_slice(&self.volume_uuid);
-        // The storage byte follows the destination's removable flag.
-        put_destination_with(&mut out, &self.destination, &[self.storage.code()]);
+        // The storage and basis bytes follow the destination's removable
+        // flag.
+        put_destination_with(
+            &mut out,
+            &self.destination,
+            &[self.storage.code(), self.basis.code()],
+        );
         put_settings(&mut out, &self.settings);
         out
     }
@@ -449,13 +499,21 @@ impl Plan {
         let nonce = r.array()?;
         let deployment = r.array()?;
         let uuid = r.array()?;
-        let (destination, storage) = read_destination_with(&mut r, |r| {
-            let [code] = r.array()?;
-            Storage::from_code(code)
+        let (destination, (storage, basis)) = read_destination_with(&mut r, |r| {
+            let [storage, basis] = r.array()?;
+            Ok((Storage::from_code(storage)?, Basis::from_code(basis)?))
         })?;
         let settings = read_settings(&mut r)?;
         r.finish()?;
-        Self::new(nonce, destination, deployment, uuid, storage, settings)
+        Self::new(
+            nonce,
+            destination,
+            deployment,
+            uuid,
+            storage,
+            basis,
+            settings,
+        )
     }
 }
 
@@ -483,7 +541,7 @@ pub(crate) fn put_destination(out: &mut Vec<u8>, disk: &Destination) {
 }
 
 /// The destination with `after_removable` between its fixed fields and its
-/// names, where the plan carries its storage byte.
+/// names, where the plan carries its storage and basis bytes.
 fn put_destination_with(out: &mut Vec<u8>, disk: &Destination, after_removable: &[u8]) {
     out.extend_from_slice(&disk.major.to_be_bytes());
     out.extend_from_slice(&disk.minor.to_be_bytes());

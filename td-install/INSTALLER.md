@@ -352,8 +352,9 @@ which is sent after that withdraw. Leaving settings before a review arrives
 drops a proposal not yet sent and releases one that arrives later.
 
 The pure review page renders one immutable `Plan` proposal. It shows the
-complete escaped disk identity and all four selected settings across bounded
-detail pages. The destructive-loss and unencrypted automatic-login notices
+complete escaped disk identity, all four selected settings and the
+plan's storage basis ("Storage choice") across bounded detail pages. The
+destructive-loss and unencrypted automatic-login notices
 remain visible on every page. A device-bound review, which only a service
 started with the storage operand makes ("Device-bound records"), shows in
 place of the unencrypted notice that storage is encrypted to this
@@ -509,7 +510,8 @@ activate the service or provide the review/consent sequence.
 ## Immutable review data
 
 The `td-install` Rust library exports `installation_plan::{Plan,
-Destination, DestinationObservation, Settings, Storage, Candidates, Zones}`
+Destination, DestinationObservation, Settings, Storage, Basis, Candidates,
+Zones}`
 and the `installation_protocol` messages described below. Both are pure data
 prerequisites for the service and UI, with no CLI, device access, filesystem
 access, entropy generation, transport or installation execution. The Cargo
@@ -552,8 +554,9 @@ shared references or copied scalar values. Equality compares every
 field, including optional labels and nonce. A clone is the same
 proposal, never a fresh consent or retry. The record describes whole-
 disk erasure and automatic login, which are not caller-selectable flags,
-and a storage byte naming the storage the service's own operand chose
-("Device-bound records"); a request cannot choose it.
+a storage byte naming the storage the service's own operand chose
+("Device-bound records") and a basis byte recording what the service's
+own probes found ("Storage choice"); a request carries neither.
 
 The public `DestinationObservation` names each unvalidated input field;
 `Destination::new` validates and copies it. Construction and decoding admit
@@ -580,19 +583,21 @@ representations and trailing bytes. The complete framing is checked
 before allocating field strings. No native-endian numbers, JSON numeric
 rounding or path resolution enters the codec. The field order is:
 
-- Eight bytes `TDPLAN02`, nonce (32), deployment digest (32), UUID (16).
+- Eight bytes `TDPLAN03`, nonce (32), deployment digest (32), UUID (16).
 - Big-endian major/minor (u32 each), sequence/capacity (u64 each), sector
-  size (u32), removable (one byte, exactly zero or one) and storage (one
-  byte, 0 unencrypted or 1 device-bound).
+  size (u32), removable (one byte, exactly zero or one), storage (one
+  byte, 0 unencrypted or 1 device-bound) and basis (one byte, bit 0 the
+  TPM probe and bit 1 the keyboard-console probe, any other bit
+  refused).
 - Kernel name, then model, serial and WWID. Each optional label starts with
   a zero/one presence byte; only a present label has a string payload.
 - Username, hostname, keyboard and timezone, in that order.
 
 Every string has a big-endian u16 byte count followed by exactly its
 bytes (UTF-8 for labels, ASCII for names and choices). The current
-maximal admitted record is 1192 bytes. The storage byte sits inside the
-destination's fixed fields, so a candidates record and a propose
-request, which carry the destination alone, have none. UUID bytes are in
+maximal admitted record is 1193 bytes. The storage and basis bytes sit
+inside the destination's fixed fields, so a candidates record and a
+propose request, which carry the destination alone, have neither. UUID bytes are in
 textual/network order, with version 4 and the RFC variant bits checked;
 any 32-byte deployment digest is representable, including all zeroes. A
 digest is a full-width hash value, not a reserved nonce sentinel; only
@@ -633,7 +638,7 @@ mismatch, and an ending complete, for its nonce; any other answer ends its
 connection, and with it, until an installation starts, the review and
 claim.
 
-Both ends first send and require the eight bytes `TDINS05\n`. Any change to
+Both ends first send and require the eight bytes `TDINS06\n`. Any change to
 a message or its bytes changes this greeting; there is no negotiation. Each
 message then travels in one frame: a big-endian u32 length and that many
 payload bytes. `payload_len` admits a nonzero length within the direction's
@@ -654,7 +659,7 @@ Requests carry no path, executable, mount option, source or consent:
   plan carries the service's observation, never UI-supplied values. The
   service chooses the nonce and volume UUID, authenticates the source,
   claims the disk and checks that the disk holds the deployment.
-- `0x03` execute: the complete `TDPLAN02` record the installer reviewed. It
+- `0x03` execute: the complete `TDPLAN03` record the installer reviewed. It
   asks the service to seek consent for the review it retains, and is
   refused unless the record equals that review. Equality is a
   precondition, never consent: consent reaches root only from the
@@ -675,7 +680,7 @@ Requests carry no path, executable, mount option, source or consent:
 Replies set the high bit, so no request decodes as a reply or the reverse:
 
 - `0x81` destinations: a `TDCAND01` record.
-- `0x82` reviewed: the service's `TDPLAN02` record, made while it holds
+- `0x82` reviewed: the service's `TDPLAN03` record, made while it holds
   the destination claim. Its nonce names the review.
 - `0x83` status: a state byte, then for every state but idle the nonzero
   review nonce, then for running, failed and abandoned one detail code.
@@ -760,7 +765,9 @@ ENCRYPTION.md increment 5, as the greeting `TDINS05\n`, the consent
 channel's `TDINA02\n` and the plan's magic `TDPLAN02`; the earlier
 versions are refused, not negotiated. `TDINS05` is `TDINS04` (power off,
 request `0x08`, included) with the additions below, so the recovery
-requests take the next free tags.
+requests take the next free tags. Increment 7's probe commit then made
+them `TDINS06` and `TDPLAN03` with the plan's basis byte ("Storage
+choice"); `TDINA02` is unchanged.
 
 - The plan gains one storage byte after the removable flag: 0 unencrypted
   or 1 device-bound, any other value refused. The service sets it from
@@ -829,23 +836,39 @@ the service with the operand.
 
 ### Storage choice
 
-This section is ENCRYPTION.md increment 7's target; none of it is
+This section is ENCRYPTION.md increment 7's target. Its first paragraph,
+the probes and their record, is current; the rest is not yet
 implemented. Today the operand below chooses storage and td-authd
 declines a device-bound review.
 
-Increment 7's probe commit gives the plan one byte after the storage
-byte, the storage basis: bit 0 set when the service's TPM probe passed
-and bit 1 when its keyboard-console probe passed (ENCRYPTION.md
-"Activation" defines both), any other bit refused. The plan's magic
-becomes `TDPLAN03`, its maximal record 1193 bytes, and the greeting
-`TDINS06`, the earlier versions refused rather than negotiated; a
-propose request carries no basis, as it carries no storage. The consent
-channel's review report keeps its storage byte alone and its `TDINA02`.
-In that commit `serve` runs both probes at every start, once each, after
-admission and before its greeting, and records them in every plan, and
-the review page shows the basis on a detail row. Nothing acts on them:
-storage still follows the operand, and a device-bound service still
-refuses to start without a usable TPM.
+The plan carries one byte after the storage byte, the storage basis: bit
+0 set when the service's TPM probe passed and bit 1 when its
+keyboard-console probe passed (ENCRYPTION.md "Activation" defines both),
+any other bit refused. The plan's magic is `TDPLAN03`, its maximal
+record 1193 bytes, and the greeting `TDINS06`, the earlier versions
+refused rather than negotiated; a propose request carries no basis, as
+it carries no storage. The consent channel's review report keeps its
+storage byte alone and its `TDINA02`. `serve` runs both probes at every
+start, once each, after admission and before its greeting, writes the
+cause of each that fails to standard error, and records them in every
+plan, and the review page shows the basis on a detail row worded as
+findings, never as storage (`Probes: usable TPM 2.0 found` or `not
+found`, `keyboard console found` or `not found`). Nothing acts on them:
+storage still follows the operand, the review's warnings are its
+storage's alone, and a device-bound service still refuses to start
+without a usable TPM. A service without the operand, td-authd's, now
+reaches the TPM for that one read, under a 3-second deadline
+(`TPM_PROBE_DEADLINE`) so that a slow TPM, whose command the kernel may
+retry for minutes, cannot outlast the installer's ten-second greeting
+wait: a missing device, a failed read or a read still unanswered at the
+deadline is recorded as not passed, with its cause on standard error,
+and never refused. A late read is abandoned on its own thread, never
+waited for, and that service makes no further TPM use, since only a
+device-bound execution would. The kernel's wait for a TPM command takes
+no signal, so with a wedged TPM that service's process cannot exit until
+the read returns, up to the kernel's two-minute command duration;
+td-authd does not wait on it, but admits no new wizard connection while
+the old service is still stopping, so a reconnect can wait that long.
 
 The activation commit deletes the operand. Every plan then names
 device-bound storage exactly when its basis has both bits, and
@@ -933,15 +956,18 @@ The leading `--storage device-bound` operand, the only storage operand,
 makes every installation of this service device-bound
 ([ENCRYPTION.md](ENCRYPTION.md) "Device-bound formatting", which owns its
 activation boundary); without it, storage is unencrypted. td-authd never
-passes it. With it, serve opens the TPM once the admission checks above
+passes it. Every serve opens the TPM once the admission checks above
 pass, so a misplaced start never reaches it, and before sending a byte,
-and refuses to start, with a diagnostic, unless it is usable: PCR_Read of
-PCRs 4 and 9 in the SHA-256 bank answers that bank, and neither value is
-zero. That read is td-protector's observed policy, made once on a fresh
-client and never retried; the probe seals nothing, and the TPM's state
-may change before execution, which seals under its own policy. Every plan
-the service reviews then names device-bound storage, and its execution
-formats it encrypted (DESIGN.md "Device-bound formatting"). Increment
+and probes whether it is usable: PCR_Read of PCRs 4 and 9 in the SHA-256
+bank answers that bank, and neither value is zero. That read is
+td-protector's observed policy, made once on a fresh client and never
+retried; the probe seals nothing, and the TPM's state may change before
+execution, which seals under its own policy. Every plan records the
+outcome ("Storage choice"); without the operand the read has a deadline
+there. With the operand it has none, as before, and serve refuses to
+start, with a diagnostic, unless the TPM is usable; every plan the service
+reviews then names device-bound storage, and its execution formats it
+encrypted (DESIGN.md "Device-bound formatting"). Increment
 7's activation deletes the operand, and the service then chooses
 storage from its own probes ("Storage choice").
 

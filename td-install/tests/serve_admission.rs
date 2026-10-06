@@ -123,13 +123,16 @@ fn a_misplaced_serve_exits_without_a_byte() -> Res<()> {
         Some(&mut ours),
     )?;
     assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     if root {
-        // Admitted: it greets, then ends when the installer closes unanswered.
-        assert_eq!(sent, b"TDINS05\n");
+        // Admitted: it probes, whatever it finds greets, then ends when the
+        // installer closes unanswered.
+        assert_eq!(sent, b"TDINS06\n");
     } else {
         assert!(sent.is_empty(), "{sent:?}");
-        assert!(String::from_utf8_lossy(&output.stderr)
-            .contains("serve requires the installation authority"));
+        assert!(stderr.contains("serve requires the installation authority"));
+        // A misplaced start probes nothing.
+        assert!(!stderr.contains("probe"), "{output:?}");
     }
     Ok(())
 }

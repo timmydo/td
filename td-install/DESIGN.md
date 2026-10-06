@@ -296,7 +296,8 @@ whether two files are the same and an unreadable path is not one of them.
 
 Two opens lie outside the three, the lint below and `compiled_files()`,
 because they are not this crate's source but siblings the binary links as
-rlibs. The device-bound service's TPM probe and its execution's seal and
+rlibs. The service's TPM probe, which every `serve` runs once admitted
+(INSTALLER.md "Storage choice"), and a device-bound execution's seal and
 check (D8) call td-tpm's `Device::open`, which opens the fixed path
 `/dev/tpmrm0` read-write with `O_NOFOLLOW`, refuses anything but a
 character device, and names the TPM resource manager in its error. The
@@ -343,7 +344,11 @@ directory on each entry's error rather than hand a bare `ReadDir` back.
 `paths::read_dir_bounded` consumes that iterator for block inventory, names
 opening and per-entry errors, and refuses an excess entry instead of
 truncating the observation. `paths::read_bounded` similarly names read
-errors and rejects attributes exceeding their byte limit.
+errors and rejects attributes exceeding their byte limit. The
+keyboard-console probe (ENCRYPTION.md "Activation") reads sysfs through
+the same two wrappers: its listings of `/sys/class/vtconsole` and
+`/sys/class/input` and each attribute, one page at most, opened
+close-on-exec by std and closed when read.
 
 ### Installation signing identity
 

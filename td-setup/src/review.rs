@@ -1,7 +1,7 @@
 //! Pure review of one immutable installation proposal. The service must
 //! authenticate the source, hold the disk claim and obtain trusted consent.
 
-use td_install::installation_plan::{Plan, Storage};
+use td_install::installation_plan::{Basis, Plan, Storage};
 use td_ui::chrome::{Block, Status, BLOCK_SCALARS, ROW};
 use td_ui::raster::{
     text_run, Composition, Draw, GlyphStyle, Primitive, Rect, Surface, CHROME, INK,
@@ -41,6 +41,19 @@ fn warnings(storage: Storage) -> &'static [&'static str] {
         Storage::Unencrypted => UNENCRYPTED,
         Storage::DeviceBound => DEVICE_BOUND,
     }
+}
+
+/// The detail row naming what the service's probes found, worded as
+/// findings so that it never reads as the storage. Storage does not follow
+/// it yet: the warnings are the storage's alone (td-install/INSTALLER.md
+/// "Storage choice").
+fn basis_line(basis: Basis) -> String {
+    let found = |passed: bool| if passed { "found" } else { "not found" };
+    format!(
+        "Probes: usable TPM 2.0 {}, keyboard console {}",
+        found(basis.tpm()),
+        found(basis.keyboard_console()),
+    )
 }
 
 /// One bounded page of the proposed disk and settings. The page does not
@@ -90,6 +103,7 @@ impl ReviewPage {
                 format!("Time zone: {}", safe_label(settings.timezone())),
                 "| Time zone: ",
             ),
+            (basis_line(plan.basis()), "| Probes: "),
         ] {
             push_lines_with(&mut lines, &line, columns, continuation);
         }
@@ -245,10 +259,10 @@ mod tests {
     }
 
     fn plan(serial: &str) -> Plan {
-        stored(serial, Storage::Unencrypted)
+        stored(serial, Storage::Unencrypted, Basis::default())
     }
 
-    fn stored(serial: &str, storage: Storage) -> Plan {
+    fn stored(serial: &str, storage: Storage, basis: Basis) -> Plan {
         let disk = Destination::new(DestinationObservation {
             name: "nvme0n1",
             major: 259,
@@ -266,7 +280,7 @@ mod tests {
         let mut uuid = [0u8; 16];
         *uuid.get_mut(6).unwrap() = 0x40;
         *uuid.get_mut(8).unwrap() = 0x80;
-        Plan::new([1; 32], disk, [2; 32], uuid, storage, settings).unwrap()
+        Plan::new([1; 32], disk, [2; 32], uuid, storage, basis, settings).unwrap()
     }
 
     fn surface(width: usize, height: usize) -> Surface {
@@ -328,6 +342,7 @@ mod tests {
             "tdhost",
             "Keyboard layout: us",
             "America/Los_Angeles",
+            "Probes: usable TPM 2.0 not found, keyboard console not found",
         ] {
             assert!(details.contains(expected), "missing {expected}");
         }
@@ -351,7 +366,7 @@ mod tests {
             assert!(warning.chars().count() <= columns, "{warning}");
         }
         assert!(UNENCRYPTED.len().max(DEVICE_BOUND.len()) <= WARNING_ROWS);
-        let plan = stored("SERIAL", Storage::DeviceBound);
+        let plan = stored("SERIAL", Storage::DeviceBound, Basis::new(true, true));
         let view = ReviewPage::new(screen, &plan, 0)
             .unwrap()
             .with_notice(Some("trusted consent is unavailable"));
@@ -372,5 +387,55 @@ mod tests {
         assert!(glyphs.contains("does not protect a lost computer"));
         assert_eq!(notice, "trusted consent is unavailable");
         assert!(ReviewPage::new(surface(752, 479), &plan, 0).is_none());
+    }
+
+    /// Every basis is named on a detail row, painted, and changes nothing
+    /// else: the warnings stay the storage's.
+    #[test]
+    fn the_basis_is_a_detail_row_and_changes_no_warning() {
+        let screen = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
+        for storage in Storage::ALL {
+            for (tpm, console, line) in [
+                (
+                    false,
+                    false,
+                    "Probes: usable TPM 2.0 not found, keyboard console not found",
+                ),
+                (
+                    true,
+                    false,
+                    "Probes: usable TPM 2.0 found, keyboard console not found",
+                ),
+                (
+                    false,
+                    true,
+                    "Probes: usable TPM 2.0 not found, keyboard console found",
+                ),
+                (
+                    true,
+                    true,
+                    "Probes: usable TPM 2.0 found, keyboard console found",
+                ),
+            ] {
+                let plan = stored("SERIAL", *storage, Basis::new(tpm, console));
+                let (_, pages) = ReviewPage::new(screen, &plan, 0).unwrap().position();
+                let mut found = false;
+                for index in 0..pages {
+                    let view = ReviewPage::new(screen, &plan, index).unwrap();
+                    assert_eq!(view.warnings, warnings(*storage));
+                    if view.detail.lines().any(|detail| detail == line) {
+                        let mut glyphs = String::new();
+                        view.emit(screen.bounds(), &mut |draw| {
+                            if let Primitive::Glyph { scalar, .. } = draw.primitive {
+                                glyphs.push(scalar);
+                            }
+                        });
+                        assert!(glyphs.contains(line), "{line}");
+                        found = true;
+                    }
+                }
+                assert!(found, "{line}");
+            }
+        }
     }
 }

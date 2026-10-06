@@ -107,7 +107,7 @@ fn source_inventory_and_toolkit_access_are_closed() {
                 .replace("td_install::installation_protocol::", "")
         } else if name == "lib.rs" {
             text.replacen(
-                "use td_install::installation_plan::{Destination, DestinationObservation, Plan, Settings, Storage};",
+                "use td_install::installation_plan::{\n    Basis, Destination, DestinationObservation, Plan, Settings, Storage,\n};",
                 "",
                 1,
             )

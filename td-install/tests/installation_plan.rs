@@ -6,8 +6,8 @@
 )]
 
 use td_install::installation_plan::{
-    Candidates, Destination, DestinationObservation, Plan, Settings, Storage, Zones, MAX_BYTES,
-    MAX_CANDIDATES, MAX_CANDIDATE_BYTES, MAX_ZONES, MAX_ZONE_BYTES,
+    Basis, Candidates, Destination, DestinationObservation, Plan, Settings, Storage, Zones,
+    MAX_BYTES, MAX_CANDIDATES, MAX_CANDIDATE_BYTES, MAX_ZONES, MAX_ZONE_BYTES,
 };
 
 fn observed_destination(
@@ -58,6 +58,7 @@ fn plan() -> Plan {
         [2; 32],
         uuid(),
         Storage::Unencrypted,
+        Basis::default(),
         settings(),
     )
     .unwrap()
@@ -240,6 +241,7 @@ fn deployment_id_requires_exact_lowercase_manifest_digest() {
         [0xab; 32],
         uuid(),
         Storage::Unencrypted,
+        Basis::default(),
         settings(),
     )
     .unwrap();
@@ -260,21 +262,23 @@ fn deployment_id_requires_exact_lowercase_manifest_digest() {
 #[test]
 fn wire_order_is_independently_specified_and_lossless() {
     let p = plan();
-    let mut bytes = b"TDPLAN02".to_vec();
+    let mut bytes = b"TDPLAN03".to_vec();
     bytes.extend([1; 32]);
     bytes.extend([2; 32]);
     bytes.extend(uuid());
     bytes.extend([0, 0, 1, 3, 0, 0, 0, 3]);
     bytes.extend([0, 0, 0, 0, 0, 0, 0, 27]);
     bytes.extend([0, 0, 0, 1, 128, 0, 0, 0]);
-    // Sector size, removable, then the storage byte.
+    // Sector size, removable, then the storage and basis bytes.
     bytes.extend([0, 0, 16, 0, 0]);
-    bytes.push(0);
+    bytes.extend([0, 0]);
     bytes.extend(b"\0\x07nvme0n1\x01\0\x07Model A\x01\0\x09serial-42\0");
     bytes.extend(b"\0\x05alice\0\x09td-laptop\0\x02us\0\x07Etc/UTC");
     assert_eq!(p.encode(), bytes);
     assert_eq!(Plan::decode(&bytes).unwrap(), p);
     assert_eq!(p.storage(), Storage::Unencrypted);
+    assert_eq!(p.basis(), Basis::default());
+    assert!(!p.basis().tpm() && !p.basis().keyboard_console());
     assert_eq!(p.destination().number(), (259, 3));
     assert_eq!(p.destination().sequence(), 27);
     assert_eq!(p.destination().capacity(), 6 << 30);
@@ -310,9 +314,14 @@ fn every_truncation_and_extension_refuses() {
         Plan::decode(&oversized).unwrap_err(),
         "installation plan exceeds wire bound"
     );
-    let mut wrong_version = bytes;
-    wrong_version[7] = b'3';
-    assert!(Plan::decode(&wrong_version).is_err());
+    for version in [b'2', b'4'] {
+        let mut wrong_version = bytes.clone();
+        wrong_version[7] = version;
+        assert_eq!(
+            Plan::decode(&wrong_version).unwrap_err(),
+            "unsupported installation plan version"
+        );
+    }
 }
 
 #[test]
@@ -324,6 +333,7 @@ fn storage_is_one_byte_after_the_removable_flag() {
         [2; 32],
         uuid(),
         Storage::DeviceBound,
+        Basis::default(),
         settings(),
     )
     .unwrap();
@@ -350,19 +360,88 @@ fn storage_is_one_byte_after_the_removable_flag() {
     }
 }
 
+/// The basis is one byte after the storage byte: bit 0 the TPM probe, bit
+/// 1 the keyboard-console probe, every other bit refused. It is
+/// independent of the storage.
 #[test]
-fn the_record_before_storage_is_refused() {
-    // A TDPLAN01 record: the same fields with no storage byte.
+fn the_basis_is_one_byte_after_the_storage_byte() {
+    let at = 8 + 32 + 32 + 16 + 4 + 4 + 8 + 8 + 4 + 1 + 1;
+    for storage in Storage::ALL {
+        for (tpm, console, code) in [
+            (false, false, 0),
+            (true, false, 1),
+            (false, true, 2),
+            (true, true, 3),
+        ] {
+            let basis = Basis::new(tpm, console);
+            assert_eq!((basis.tpm(), basis.keyboard_console()), (tpm, console));
+            let p = Plan::new(
+                [1; 32],
+                destination(),
+                [2; 32],
+                uuid(),
+                *storage,
+                basis,
+                settings(),
+            )
+            .unwrap();
+            let bytes = p.encode();
+            assert_eq!(bytes[at], code);
+            let mut differs = bytes.clone();
+            differs[at] = 0;
+            let plain = Plan::new(
+                [1; 32],
+                destination(),
+                [2; 32],
+                uuid(),
+                *storage,
+                Basis::default(),
+                settings(),
+            )
+            .unwrap();
+            assert_eq!(differs, plain.encode());
+            assert_eq!(p == plain, code == 0);
+            let decoded = Plan::decode(&bytes).unwrap();
+            assert_eq!(decoded, p);
+            assert_eq!(decoded.basis(), basis);
+            assert_eq!(decoded.storage(), *storage);
+            for other in 4..=255 {
+                let mut other_bytes = bytes.clone();
+                other_bytes[at] = other;
+                assert_eq!(
+                    Plan::decode(&other_bytes).unwrap_err(),
+                    "invalid plan storage basis",
+                    "{other}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_records_before_the_basis_are_refused() {
+    let removable = 8 + 32 + 32 + 16 + 4 + 4 + 8 + 8 + 4;
+    // A TDPLAN02 record: the same fields with no basis byte.
     let mut old = plan().encode();
-    old.remove(8 + 32 + 32 + 16 + 4 + 4 + 8 + 8 + 4 + 1);
-    old[7] = b'1';
+    old.remove(removable + 2);
+    old[7] = b'2';
     assert_eq!(
         Plan::decode(&old).unwrap_err(),
         "unsupported installation plan version"
     );
     // Under the current magic its missing byte misreads the name length.
-    old[7] = b'2';
+    old[7] = b'3';
     assert!(Plan::decode(&old).is_err());
+    // A TDPLAN01 record: no storage byte either.
+    let mut older = plan().encode();
+    older.drain(removable + 1..removable + 3);
+    older[7] = b'1';
+    assert_eq!(
+        Plan::decode(&older).unwrap_err(),
+        "unsupported installation plan version"
+    );
+    older[7] = b'3';
+    assert!(Plan::decode(&older).is_err());
 }
 
 #[test]
@@ -394,7 +473,16 @@ fn retained_plan_owns_settings_and_labels() {
     )
     .unwrap();
     let s = Settings::new(&username, "host", "us", "Etc/UTC").unwrap();
-    let p = Plan::new([1; 32], d, [2; 32], uuid(), Storage::Unencrypted, s).unwrap();
+    let p = Plan::new(
+        [1; 32],
+        d,
+        [2; 32],
+        uuid(),
+        Storage::Unencrypted,
+        Basis::default(),
+        s,
+    )
+    .unwrap();
     let original = p.encode();
     label.clear();
     username.clear();
@@ -423,8 +511,17 @@ fn boundaries_and_missing_labels_remain_distinct() {
         &"z".repeat(64),
     )
     .unwrap();
-    let p = Plan::new([255; 32], d, [0; 32], uuid(), Storage::Unencrypted, s).unwrap();
-    assert_eq!(p.encode().len(), 1192);
+    let p = Plan::new(
+        [255; 32],
+        d,
+        [0; 32],
+        uuid(),
+        Storage::DeviceBound,
+        Basis::new(true, true),
+        s,
+    )
+    .unwrap();
+    assert_eq!(p.encode().len(), 1193);
     assert!(p.encode().len() <= MAX_BYTES);
     assert_eq!(Plan::decode(&p.encode()).unwrap(), p);
     for model in [
@@ -444,6 +541,7 @@ fn boundaries_and_missing_labels_remain_distinct() {
             [2; 32],
             uuid(),
             Storage::Unencrypted,
+            Basis::default(),
             settings(),
         )
         .unwrap();
@@ -494,6 +592,7 @@ fn malformed_observations_and_choices_refuse() {
         [2; 32],
         uuid(),
         Storage::Unencrypted,
+        Basis::default(),
         settings()
     )
     .is_err());
@@ -506,6 +605,7 @@ fn malformed_observations_and_choices_refuse() {
             [2; 32],
             bad,
             Storage::Unencrypted,
+            Basis::default(),
             settings()
         )
         .is_err());
@@ -558,6 +658,7 @@ fn generated_uuid_text_maps_to_the_plan_network_byte_order() {
         [2; 32],
         uuid,
         Storage::Unencrypted,
+        Basis::default(),
         settings(),
     )
     .unwrap();

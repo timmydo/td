@@ -6,7 +6,7 @@
 )]
 
 use td_install::installation_plan::{
-    Candidates, Destination, DestinationObservation, Plan, Settings, Storage, Zones,
+    Basis, Candidates, Destination, DestinationObservation, Plan, Settings, Storage, Zones,
     MAX_CANDIDATES, MAX_CANDIDATE_BYTES, MAX_ZONES,
 };
 use td_install::installation_protocol::{
@@ -52,19 +52,21 @@ fn plan() -> Plan {
         [2; 32],
         uuid(),
         Storage::Unencrypted,
+        Basis::new(true, false),
         settings(),
     )
     .unwrap()
 }
 fn plan_bytes() -> Vec<u8> {
-    let mut bytes = b"TDPLAN02".to_vec();
+    let mut bytes = b"TDPLAN03".to_vec();
     bytes.extend([1; 32]);
     bytes.extend([2; 32]);
     bytes.extend(uuid());
-    // The storage byte follows the destination's removable flag.
+    // The storage and basis bytes follow the destination's removable flag:
+    // unencrypted, with a usable TPM and no keyboard console.
     let (fixed, names) = DESTINATION.split_at(29);
     bytes.extend(fixed);
-    bytes.push(0);
+    bytes.extend([0, 1]);
     bytes.extend(names);
     bytes.extend(SETTINGS);
     bytes
@@ -126,7 +128,7 @@ fn replies() -> Vec<Reply> {
 
 #[test]
 fn wire_bytes_are_independently_specified() {
-    assert_eq!(GREETING, b"TDINS05\n");
+    assert_eq!(GREETING, b"TDINS06\n");
     let mut propose = vec![0x02];
     propose.extend(DESTINATION);
     propose.extend(SETTINGS);
@@ -348,15 +350,16 @@ fn maximal_messages_fit_their_direction_bounds() {
         [0; 32],
         uuid(),
         Storage::Unencrypted,
+        Basis::new(true, true),
         settings,
     )
     .unwrap();
     let execute = Request::Execute(plan.clone());
-    assert_eq!(execute.encode().len(), 1193);
+    assert_eq!(execute.encode().len(), 1194);
     assert!(execute.encode().len() <= MAX_REQUEST_BYTES);
     assert_eq!(Request::decode(&execute.encode()).unwrap(), execute);
     let reviewed = Reply::Reviewed(Box::new(plan));
-    assert_eq!(reviewed.encode().len(), 1193);
+    assert_eq!(reviewed.encode().len(), 1194);
     assert_eq!(Reply::decode(&reviewed.encode()).unwrap(), reviewed);
     let status = Reply::Status(State::Running(nonce(), Phase::VerifyingBoot));
     assert_eq!(status.encode().len(), 35);
@@ -545,14 +548,15 @@ fn directions_are_disjoint() {
 
 #[test]
 fn only_this_version_is_admitted() {
-    assert!(check_greeting(b"TDINS05\n").is_ok());
+    assert!(check_greeting(b"TDINS06\n").is_ok());
     for other in [
+        b"TDINS05\n",
         b"TDINS04\n",
         b"TDINS03\n",
         b"TDINS02\n",
         b"TDAT001\n",
         b"TDUPD01\n",
-        b"TDINS05\0",
+        b"TDINS06\0",
     ] {
         assert_eq!(
             check_greeting(other).unwrap_err(),

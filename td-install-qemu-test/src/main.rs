@@ -516,12 +516,13 @@ fn observed_destination(device: &str) -> Result<Vec<u8>, String> {
 /// shipped decoder against bytes that its own codec did not produce.
 fn observed_plan(device: &str, deployment: [u8; 32]) -> Result<Vec<u8>, String> {
     let destination = observed_destination(device)?;
-    // The plan's storage byte, unencrypted, follows the removable flag.
+    // The plan's storage byte, unencrypted, and its basis byte, no probe
+    // passed, follow the removable flag.
     let (fixed, names) = destination
         .split_at_checked(4 + 4 + 8 + 8 + 4 + 1)
         .ok_or("observed destination is truncated")?;
     let mut bytes = Vec::with_capacity(256);
-    bytes.extend_from_slice(b"TDPLAN02");
+    bytes.extend_from_slice(b"TDPLAN03");
     bytes.extend_from_slice(&[1; 32]);
     bytes.extend_from_slice(&deployment);
     let mut uuid = [0; 16];
@@ -529,7 +530,7 @@ fn observed_plan(device: &str, deployment: [u8; 32]) -> Result<Vec<u8>, String> 
     *uuid.get_mut(8).ok_or("fixture UUID has no variant byte")? = 0x80;
     bytes.extend_from_slice(&uuid);
     bytes.extend_from_slice(fixed);
-    bytes.push(0);
+    bytes.extend_from_slice(&[0, 0]);
     bytes.extend_from_slice(names);
     for choice in ["alice", "td-qemu-installed", "us", "Europe/London"] {
         put_plan_text(&mut bytes, choice)?;

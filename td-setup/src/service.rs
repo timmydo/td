@@ -559,7 +559,7 @@ pub(crate) mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
     use std::time::Instant;
-    use td_install::installation_plan::{Candidates, DestinationObservation, Zones};
+    use td_install::installation_plan::{Basis, Candidates, DestinationObservation, Zones};
 
     pub(crate) fn disk() -> Destination {
         Destination::new(DestinationObservation {
@@ -605,6 +605,7 @@ pub(crate) mod tests {
             [9; 32],
             uuid,
             storage,
+            Basis::default(),
             settings.clone(),
         )
         .unwrap()

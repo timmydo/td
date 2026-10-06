@@ -10,7 +10,7 @@ use crate::installation_plan::{
 
 /// Sent and required by both ends before the first frame. A change to any
 /// message or its bytes changes the greeting; there is no negotiation.
-pub const GREETING: &[u8; 8] = b"TDINS05\n";
+pub const GREETING: &[u8; 8] = b"TDINS06\n";
 /// Root admits only this much from the unprivileged side.
 pub const MAX_REQUEST_BYTES: usize = 1 + MAX_BYTES;
 pub const MAX_REPLY_BYTES: usize = 1 + if MAX_CANDIDATE_BYTES > MAX_ZONE_BYTES {

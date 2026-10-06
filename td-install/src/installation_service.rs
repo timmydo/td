@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::installation_consent::{self as consent, Answer, Ended, NoConsent, Outcome, Report};
-use crate::installation_plan::{Candidates, Destination, Plan, Settings, Storage, Zones};
+use crate::installation_plan::{Basis, Candidates, Destination, Plan, Settings, Storage, Zones};
 use crate::installation_protocol::{
     check_greeting, frame, payload_len, scrub, Abandon, Ending, Failure, Phase, RecoveryDigits,
     Refusal, Reply, Request, ReviewNonce, State, GREETING, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
@@ -44,6 +44,9 @@ pub(crate) trait Host {
     /// The storage every plan of this service names: its caller's operand,
     /// never a request's.
     fn storage(&self) -> Storage;
+    /// What the service's own probes found when it started; every plan
+    /// records it, and storage does not follow it yet.
+    fn basis(&self) -> Basis;
 }
 
 /// What became of a recovery key handed to the service.
@@ -344,6 +347,7 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             deployment,
             uuid,
             self.host.storage(),
+            self.host.basis(),
             settings,
         )
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -978,6 +982,7 @@ mod tests {
         drawn: u8,
         end: Result<(), Refusal>,
         storage: Storage,
+        basis: Basis,
     }
     impl Fake {
         fn new() -> Self {
@@ -994,6 +999,7 @@ mod tests {
                 drawn: 0,
                 end: Ok(()),
                 storage: Storage::Unencrypted,
+                basis: Basis::default(),
             }
         }
         fn call(&self, name: &'static str) {
@@ -1064,6 +1070,9 @@ mod tests {
         }
         fn storage(&self) -> Storage {
             self.storage
+        }
+        fn basis(&self) -> Basis {
+            self.basis
         }
     }
 
@@ -1383,6 +1392,7 @@ mod tests {
             [0xab; 32],
             uuid,
             Storage::Unencrypted,
+            Basis::default(),
             settings(),
         )
         .unwrap()
@@ -2050,6 +2060,29 @@ mod tests {
         }
     }
 
+    /// The host's basis is recorded in every review and changes nothing
+    /// else: the storage stays the host's, whatever the probes found, and
+    /// the consent channel's review is the same.
+    #[test]
+    fn the_service_basis_is_recorded_and_inert() {
+        for storage in Storage::ALL {
+            let mut reviews = Vec::new();
+            for (tpm, console) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut fake = Fake::new();
+                fake.storage = *storage;
+                fake.basis = Basis::new(tpm, console);
+                let mut service = Service::new(fake);
+                let plan = reviewed(&mut service);
+                assert_eq!(plan.basis(), Basis::new(tpm, console));
+                assert_eq!(plan.storage(), *storage);
+                reviews.push(
+                    consent::Report::Review(Box::new(consent_review(&plan).unwrap())).encode(),
+                );
+            }
+            assert!(reviews.windows(2).all(|pair| pair[0] == pair[1]));
+        }
+    }
+
     /// The consent channel's review carries the plan's storage.
     #[test]
     fn the_consent_review_carries_the_storage() {
@@ -2062,6 +2095,7 @@ mod tests {
             *plan.deployment(),
             *plan.volume_uuid(),
             Storage::DeviceBound,
+            Basis::default(),
             plan.settings().clone(),
         )
         .unwrap();

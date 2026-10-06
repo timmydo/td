@@ -813,6 +813,8 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 catalog: None,
                 booted: PathBuf::from(BOOTED_DEPLOYMENT),
                 storage,
+                // Serve's probes set it once admitted.
+                basis: installation_plan::Basis::default(),
             };
             if [
                 &host.td_boot,
@@ -1046,6 +1048,8 @@ struct LiveHost {
     booted: PathBuf,
     /// The caller's storage operand; every plan names it.
     storage: installation_plan::Storage,
+    /// What serve's probes found at its start; every plan records it.
+    basis: installation_plan::Basis,
 }
 
 // Whatever the catalog reader admits, the protocol's record carries.
@@ -1230,23 +1234,439 @@ impl installation_service::Host for LiveHost {
     fn storage(&self) -> installation_plan::Storage {
         self.storage
     }
+
+    fn basis(&self) -> installation_plan::Basis {
+        self.basis
+    }
 }
 
-/// Device-bound storage needs a usable TPM 2.0 (ENCRYPTION.md "Device-bound
-/// default"): `open` reaches the resource manager, and one PCR_Read answers
-/// the SHA-256 bank for PCRs 4 and 9, neither unmeasured. td-protector's
-/// observed policy is exactly that read and refusal; the policy itself is
-/// dropped, since nothing is sealed to it here. There is no fallback.
-fn probe_tpm<T: td_tpm::Transport>(open: impl FnOnce() -> Result<T, String>) -> io::Result<()> {
-    let unusable = |error: String| {
-        invalid(format!(
-            "no usable TPM 2.0 for device-bound storage: {error}"
-        ))
-    };
-    let transport = open().map_err(unusable)?;
-    td_protector::observed_policy(&mut td_tpm::Client::new(transport))
-        .map(drop)
-        .map_err(unusable)
+/// Whether this machine has a usable TPM 2.0 (ENCRYPTION.md "Device-bound
+/// default", "Activation"): `open` reaches the resource manager, and one
+/// PCR_Read answers the SHA-256 bank for PCRs 4 and 9, neither unmeasured.
+/// td-protector's observed policy is exactly that read and refusal; the
+/// policy itself is dropped, since nothing is sealed to it here. Serve
+/// runs it once at every start: a device-bound service refuses to start
+/// on its failure, and every service records its outcome in the basis.
+/// `Err` is the cause, which the caller words.
+fn probe_tpm<T: td_tpm::Transport>(open: impl FnOnce() -> Result<T, String>) -> Result<(), String> {
+    let transport = open()?;
+    td_protector::observed_policy(&mut td_tpm::Client::new(transport)).map(drop)
+}
+
+/// How long a service without the storage operand waits for its TPM
+/// probe. Its installer allows the greeting ten seconds, and a TPM
+/// command the kernel retries can take minutes.
+const TPM_PROBE_DEADLINE: Duration = Duration::from_secs(3);
+
+/// `probe` on a thread of its own, its outcome if it ends within
+/// `deadline` and a refusal otherwise. A probe that is late is abandoned,
+/// never joined; such a service makes no further TPM use, since only a
+/// device-bound execution would, and the caller probes without a deadline
+/// for that.
+fn probe_within(
+    deadline: Duration,
+    probe: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<(), String> {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    let (send, receive) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("tpm-probe".into())
+        .spawn(move || {
+            let _ = send.send(probe());
+        })
+        .map_err(|error| format!("start the probe: {error}"))?;
+    match receive.recv_timeout(deadline) {
+        Ok(outcome) => outcome,
+        Err(RecvTimeoutError::Timeout) => {
+            Err(format!("no answer within {} s", deadline.as_secs_f64()))
+        }
+        Err(RecvTimeoutError::Disconnected) => Err("the probe ended without an outcome".into()),
+    }
+}
+
+/// The keyboard-console probe of the running live system (ENCRYPTION.md
+/// "Activation"), through the sysfs mounted at `sys`: some
+/// `class/vtconsole/vtcon*` names fbcon and is bound, and some
+/// `class/input/input*` advertises Enter and the top-row digits. Power and
+/// sleep buttons, lid switches and the PC speaker advertise none of those
+/// keys, so they never pass. `Err` says why it did not pass; a listing
+/// that fails fails the probe, and an attribute that is missing,
+/// unreadable, over one page or malformed counts as absent.
+mod keyboard_console {
+    use super::paths;
+    use std::path::{Path, PathBuf};
+
+    /// One sysfs page, the most any attribute read here takes.
+    const PAGE: usize = 4096;
+    /// Listing bounds, far above what the kernel makes (`MAX_NR_CON` is
+    /// 16); a class over its bound fails the probe.
+    const MAX_VTCONSOLES: usize = 64;
+    const MAX_INPUT_ENTRIES: usize = 4096;
+    /// fbcon's `name`, as Linux 7.1.4's `vt.c` prints it. `(M)` marks a
+    /// driver registered through `do_register_con_driver`, as fbcon always
+    /// is, built in or not; only the boot console prints `(S)`.
+    const FRAMEBUFFER: &[u8] = b"(M) frame buffer device\n";
+    const BOUND: &[u8] = b"1\n";
+    /// `KEY_MAX` is 767: twelve 64-bit words.
+    const MAX_WORDS: usize = 12;
+    /// `KEY_ENTER` (28) and `KEY_1` to `KEY_0` (2 to 11), all in the
+    /// lowest word.
+    const NEEDED: u64 = (1 << 28) | (0x3ff << 2);
+
+    pub fn probe(sys: &Path) -> Result<(), String> {
+        let class = sys.join("class");
+        let consoles = listing(&class.join("vtconsole"), "vtcon", MAX_VTCONSOLES)?;
+        if !consoles.iter().any(|console| framebuffer_bound(console)) {
+            return Err("no framebuffer console is bound to the VT".into());
+        }
+        let inputs = listing(&class.join("input"), "input", MAX_INPUT_ENTRIES)?;
+        if !inputs.iter().any(|input| {
+            attribute(&input.join("capabilities/key"))
+                .and_then(|bitmap| lowest_word(&bitmap))
+                .is_some_and(|word| word & NEEDED == NEEDED)
+        }) {
+            return Err("no input device advertises Enter and the top-row digits".into());
+        }
+        Ok(())
+    }
+
+    /// The entries of `dir` named `prefix*`.
+    fn listing(dir: &Path, prefix: &str, limit: usize) -> Result<Vec<PathBuf>, String> {
+        let entries = paths::read_dir_bounded(dir, limit).map_err(|error| error.to_string())?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .is_some_and(|name| name.as_encoded_bytes().starts_with(prefix.as_bytes()))
+            })
+            .collect())
+    }
+
+    /// An attribute's bytes, or nothing where it cannot be read whole.
+    fn attribute(path: &Path) -> Option<Vec<u8>> {
+        paths::read_bounded(path, PAGE).ok()
+    }
+
+    fn framebuffer_bound(console: &Path) -> bool {
+        attribute(&console.join("name")).is_some_and(|name| name == FRAMEBUFFER)
+            && attribute(&console.join("bind")).is_some_and(|bind| bind == BOUND)
+    }
+
+    /// The word holding bits 0 to 63 of a bitmap as Linux 7.1.4's
+    /// `input_print_bitmap` writes it on a 64-bit kernel, or nothing when
+    /// `text` is not exactly that: one to twelve `%lx` words, most
+    /// significant first and leading zero words omitted, separated by
+    /// single spaces and ended by one newline; an empty bitmap is `0`.
+    fn lowest_word(text: &[u8]) -> Option<u64> {
+        let body = text.strip_suffix(b"\n")?;
+        let mut lowest = None;
+        for (index, word) in body.split(|byte| *byte == b' ').enumerate() {
+            if index >= MAX_WORDS || word.is_empty() || word.len() > 16 {
+                return None;
+            }
+            // `%lx` writes no leading zero but in a zero word itself.
+            if word.len() > 1 && word.first() == Some(&b'0') {
+                return None;
+            }
+            let mut value = 0u64;
+            for byte in word {
+                let digit = match byte {
+                    b'0'..=b'9' => byte - b'0',
+                    b'a'..=b'f' => byte - b'a' + 10,
+                    _ => return None,
+                };
+                value = (value << 4) | u64::from(digit);
+            }
+            // A leading zero word is omitted unless it is the whole bitmap.
+            if index == 0 && value == 0 && body.len() > 1 {
+                return None;
+            }
+            lowest = Some(value);
+        }
+        lowest
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::fs;
+
+        // Captured from a td guest: `td-recipe-eval run system-x86-64`
+        // (the stock VM profile, `-M pc` with virtio-vga, a virtio
+        // tablet and the i8042 PS/2 ports) running this branch's
+        // linux-x86-64, read with `cat -A` from the serial shell.
+        /// `/sys/class/vtconsole/vtcon0/name`; its `bind` read `1\n`.
+        const GUEST_FBCON: &[u8] = b"(M) frame buffer device\n";
+        /// `/sys/class/vtconsole/vtcon1/name`; its `bind` read `0\n`.
+        const GUEST_DUMMY: &[u8] = b"(M) dummy device\n";
+        /// input2, `AT Translated Set 2 keyboard`.
+        const KEYBOARD: &str = "402000007 ff803078f800d001 feffffdfffcfffff fffffffffffffffe\n";
+        /// input0, `Power Button`: `KEY_POWER` (116) and `KEY_WAKEUP`
+        /// (143).
+        const POWER: &str = "8000 10000000000000 0\n";
+        /// input1, `QEMU Virtio Tablet`: buttons alone.
+        const TABLET: &str = "30400 1f0000 0 0 0 0\n";
+        /// input4, `ImExPS/2 Generic Explorer Mouse`.
+        const MOUSE: &str = "1f0000 0 0 0 0\n";
+
+        /// A fixture sysfs root, removed on drop.
+        struct Sys(PathBuf);
+        impl Drop for Sys {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        impl Sys {
+            fn new() -> Self {
+                let root = crate::scratch::path("sysfs");
+                fs::create_dir_all(root.join("class/vtconsole")).unwrap();
+                fs::create_dir_all(root.join("class/input")).unwrap();
+                Self(root)
+            }
+            fn console(&self, entry: &str, name: &[u8], bind: &[u8]) -> &Self {
+                let dir = self.0.join("class/vtconsole").join(entry);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("name"), name).unwrap();
+                fs::write(dir.join("bind"), bind).unwrap();
+                self
+            }
+            fn fbcon(&self) -> &Self {
+                self.console("vtcon0", b"(S) dummy device\n", b"0\n")
+                    .console("vtcon1", FRAMEBUFFER, BOUND)
+            }
+            fn input(&self, entry: &str, key: Option<&[u8]>) -> &Self {
+                let dir = self.0.join("class/input").join(entry);
+                fs::create_dir_all(dir.join("capabilities")).unwrap();
+                if let Some(key) = key {
+                    fs::write(dir.join("capabilities/key"), key).unwrap();
+                }
+                self
+            }
+            fn probe(&self) -> Result<(), String> {
+                probe(&self.0)
+            }
+        }
+
+        #[test]
+        fn a_bound_fbcon_and_a_keyboard_pass() {
+            let sys = Sys::new();
+            sys.fbcon()
+                .input("input0", Some(POWER.as_bytes()))
+                .input("input3", Some(KEYBOARD.as_bytes()));
+            sys.probe().unwrap();
+            // A bitmap of the needed keys alone passes.
+            let sys = Sys::new();
+            sys.fbcon().input("input1", Some(b"10000ffc\n"));
+            sys.probe().unwrap();
+        }
+
+        /// The td guest's tree as captured passes; without its keyboard,
+        /// or with fbcon unbound, it does not.
+        #[test]
+        fn a_captured_td_guest_passes() {
+            let guest = |fbcon_bind: &[u8], keyboard: bool| {
+                let sys = Sys::new();
+                sys.console("vtcon0", GUEST_FBCON, fbcon_bind)
+                    .console("vtcon1", GUEST_DUMMY, b"0\n")
+                    .input("input0", Some(POWER.as_bytes()))
+                    .input("input1", Some(TABLET.as_bytes()))
+                    .input("input4", Some(MOUSE.as_bytes()));
+                if keyboard {
+                    sys.input("input2", Some(KEYBOARD.as_bytes()));
+                }
+                sys.probe()
+            };
+            assert_eq!(GUEST_FBCON, FRAMEBUFFER);
+            guest(b"1\n", true).unwrap();
+            assert_eq!(
+                guest(b"1\n", false),
+                Err("no input device advertises Enter and the top-row digits".into())
+            );
+            assert_eq!(
+                guest(b"0\n", true),
+                Err("no framebuffer console is bound to the VT".into())
+            );
+            for bitmap in [POWER, TABLET, MOUSE] {
+                assert_eq!(
+                    lowest_word(bitmap.as_bytes()).map(|w| w & NEEDED == NEEDED),
+                    Some(false)
+                );
+            }
+            assert_eq!(
+                lowest_word(KEYBOARD.as_bytes()),
+                Some(0xffff_ffff_ffff_fffe)
+            );
+        }
+
+        #[test]
+        fn the_console_half_needs_fbcon_named_and_bound() {
+            for (name, bind) in [
+                // Unbound fbcon.
+                (FRAMEBUFFER, b"0\n".as_slice()),
+                // The dummy console alone.
+                (b"(S) dummy device\n".as_slice(), b"1\n".as_slice()),
+                // fbcon spelled otherwise, the boot console's `(S)`
+                // included.
+                (b"(S) frame buffer device\n", BOUND),
+                (b"(M) frame buffer device", BOUND),
+                (b"(M) frame buffer device\n\n", BOUND),
+                (b"(M) frame buffer\n", BOUND),
+                (FRAMEBUFFER, b"1"),
+                (FRAMEBUFFER, b"1\n\n"),
+                (FRAMEBUFFER, b" 1\n"),
+            ] {
+                let sys = Sys::new();
+                sys.console("vtcon0", name, bind)
+                    .input("input0", Some(KEYBOARD.as_bytes()));
+                assert_eq!(
+                    sys.probe(),
+                    Err("no framebuffer console is bound to the VT".into()),
+                    "{name:?} {bind:?}"
+                );
+            }
+            // A missing or over-long attribute counts as absent.
+            let sys = Sys::new();
+            sys.console("vtcon0", FRAMEBUFFER, BOUND)
+                .input("input0", Some(KEYBOARD.as_bytes()));
+            fs::remove_file(sys.0.join("class/vtconsole/vtcon0/bind")).unwrap();
+            assert!(sys.probe().is_err());
+            let mut long = FRAMEBUFFER.to_vec();
+            long.resize(PAGE + 1, b' ');
+            let sys = Sys::new();
+            sys.console("vtcon0", &long, BOUND)
+                .input("input0", Some(KEYBOARD.as_bytes()));
+            assert!(sys.probe().is_err());
+            // Only `vtcon*` entries are read.
+            let sys = Sys::new();
+            sys.console("fbcon", FRAMEBUFFER, BOUND)
+                .input("input0", Some(KEYBOARD.as_bytes()));
+            assert!(sys.probe().is_err());
+        }
+
+        #[test]
+        fn the_keyboard_half_needs_enter_and_every_top_row_digit() {
+            let needed = 0x1000_0ffcu64;
+            for bit in [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 28] {
+                let word = needed & !(1 << bit);
+                let sys = Sys::new();
+                sys.fbcon()
+                    .input("input0", Some(format!("{word:x}\n").as_bytes()))
+                    .input("input1", Some(POWER.as_bytes()));
+                assert_eq!(
+                    sys.probe(),
+                    Err("no input device advertises Enter and the top-row digits".into()),
+                    "{bit}"
+                );
+            }
+            // Keys in a higher word never stand in for the lowest word's.
+            let sys = Sys::new();
+            sys.fbcon().input("input0", Some(b"10000ffc 0\n"));
+            assert!(sys.probe().is_err());
+            // Enter and the digits on two devices are not one keyboard.
+            let sys = Sys::new();
+            sys.fbcon()
+                .input("input0", Some(b"10000000\n"))
+                .input("input1", Some(b"ffc\n"));
+            assert!(sys.probe().is_err());
+            // A device without the attribute, and entries not `input*`.
+            let sys = Sys::new();
+            sys.fbcon()
+                .input("input0", None)
+                .input("event0", Some(b"10000ffc\n"));
+            assert!(sys.probe().is_err());
+            // A lid switch and the PC speaker advertise no keys.
+            let sys = Sys::new();
+            sys.fbcon()
+                .input("input1", Some(b"0\n"))
+                .input("input2", Some(b"0\n"));
+            assert!(sys.probe().is_err());
+        }
+
+        #[test]
+        fn an_empty_or_missing_class_fails_the_probe() {
+            let sys = Sys::new();
+            sys.fbcon();
+            assert!(sys.probe().is_err());
+            fs::remove_dir(sys.0.join("class/input")).unwrap();
+            assert!(sys.probe().is_err());
+            let sys = Sys::new();
+            sys.input("input0", Some(KEYBOARD.as_bytes()));
+            assert!(sys.probe().is_err());
+            fs::remove_dir(sys.0.join("class/vtconsole")).unwrap();
+            assert!(sys.probe().is_err());
+        }
+
+        #[test]
+        fn the_bitmap_is_input_print_bitmap_exactly() {
+            for (text, lowest) in [
+                ("0\n", 0),
+                ("1\n", 1),
+                ("ffffffffffffffff\n", u64::MAX),
+                // A later zero word is `0`; the last word is the lowest.
+                ("1 0\n", 0),
+                ("1 0 0 10000ffc\n", 0x1000_0ffc),
+                (KEYBOARD, 0xffff_ffff_ffff_fffe),
+                (POWER, 0),
+            ] {
+                assert_eq!(lowest_word(text.as_bytes()), Some(lowest), "{text:?}");
+            }
+            let twelve = "1 ".repeat(11) + "10000ffc\n";
+            assert_eq!(lowest_word(twelve.as_bytes()), Some(0x1000_0ffc));
+            let thirteen = "1 ".repeat(12) + "10000ffc\n";
+            for text in [
+                thirteen.as_str(),
+                "",
+                "\n",
+                "10000ffc",
+                "10000ffc\n\n",
+                "10000ffc \n",
+                " 10000ffc\n",
+                "1  10000ffc\n",
+                "1\t10000ffc\n",
+                "1\n10000ffc\n",
+                // Leading zero words and digits are never written.
+                "0 10000ffc\n",
+                "00\n",
+                "1 00\n",
+                "010000ffc\n",
+                // Upper case, a prefix, a word over 64 bits.
+                "10000FFC\n",
+                "0x10000ffc\n",
+                "1ffffffffffffffff\n",
+                "-1\n",
+                "10000ffg\n",
+            ] {
+                assert_eq!(lowest_word(text.as_bytes()), None, "{text:?}");
+            }
+        }
+
+        #[test]
+        fn a_malformed_bitmap_counts_as_absent() {
+            for key in [
+                b"10000FFC\n".as_slice(),
+                b"0 10000ffc\n",
+                b"10000ffc",
+                b"010000ffc\n",
+            ] {
+                let sys = Sys::new();
+                sys.fbcon().input("input0", Some(key));
+                assert!(sys.probe().is_err(), "{key:?}");
+            }
+            // An over-long attribute, its first page well formed.
+            let mut long = b"10000ffc\n".to_vec();
+            long.resize(PAGE + 1, b'\n');
+            let sys = Sys::new();
+            sys.fbcon().input("input0", Some(&long));
+            assert!(sys.probe().is_err());
+            // A malformed device does not hide a well-formed one.
+            let sys = Sys::new();
+            sys.fbcon()
+                .input("input0", Some(b"10000FFC\n"))
+                .input("input1", Some(b"10000ffc\n"));
+            sys.probe().unwrap();
+        }
+    }
 }
 
 /// td-svc's control verb for an ending.
@@ -2029,7 +2449,7 @@ fn unix_stream_in(table: impl io::BufRead, inode: u64) -> io::Result<bool> {
     Ok(listed)
 }
 
-fn run_serve(host: LiveHost) -> io::Result<()> {
+fn run_serve(mut host: LiveHost) -> io::Result<()> {
     use std::os::fd::AsFd;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
@@ -2081,12 +2501,42 @@ fn run_serve(host: LiveHost) -> io::Result<()> {
     // Nothing serve runs writes to stdout: every child's is piped or null.
     let stdout = File::from(io::stdout().as_fd().try_clone_to_owned()?);
     let (stream, consent) = admit_serve(euid, stdin, stdout)?;
-    // After admission, so a misplaced start never opens the TPM, and before
-    // a byte: a device-bound service without a usable TPM refuses to start
-    // rather than serve unencrypted plans.
-    if host.storage == installation_plan::Storage::DeviceBound {
-        probe_tpm(td_tpm::Device::open)?;
-    }
+    // After admission, so a misplaced start never opens the TPM or reads
+    // sysfs, and before a byte: each probe once, recorded in every plan
+    // (INSTALLER.md "Storage choice"). Only the operand chooses storage,
+    // so a device-bound service without a usable TPM still refuses to
+    // start rather than serve unencrypted plans.
+    let tpm = if host.storage == installation_plan::Storage::DeviceBound {
+        probe_tpm(td_tpm::Device::open).map_err(|error| {
+            invalid(format!(
+                "no usable TPM 2.0 for device-bound storage: {error}"
+            ))
+        })?;
+        true
+    } else {
+        // Bounded, so a slow TPM cannot outlast the installer's greeting.
+        match probe_within(TPM_PROBE_DEADLINE, || probe_tpm(td_tpm::Device::open)) {
+            Ok(()) => true,
+            Err(error) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "td-install serve: TPM probe: no usable TPM 2.0: {error}"
+                );
+                false
+            }
+        }
+    };
+    let console = match keyboard_console::probe(Path::new("/sys")) {
+        Ok(()) => true,
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "td-install serve: keyboard-console probe: {error}"
+            );
+            false
+        }
+    };
+    host.basis = installation_plan::Basis::new(tpm, console);
     let execution = LiveExecution::for_host(&host);
     installation_service::serve(
         stream,
@@ -4791,6 +5241,7 @@ mod tests {
             Vec::new(),
             b"TDPLAN01".to_vec(),
             b"TDPLAN02".to_vec(),
+            b"TDPLAN03".to_vec(),
             vec![0; installation_plan::MAX_BYTES + 1],
         ] {
             let mut output = Vec::new();
@@ -4821,6 +5272,7 @@ mod tests {
                 catalog: None,
                 booted: PathBuf::from(BOOTED_DEPLOYMENT),
                 storage: installation_plan::Storage::Unencrypted,
+                basis: installation_plan::Basis::default(),
             })
         );
         for count in 1..full.len() {
@@ -4954,7 +5406,7 @@ mod tests {
     fn probe(
         opened: bool,
         replies: Vec<Result<Vec<u8>, String>>,
-    ) -> (io::Result<()>, Vec<Vec<u8>>) {
+    ) -> (Result<(), String>, Vec<Vec<u8>>) {
         let sent = std::rc::Rc::default();
         let tpm = ScriptedTpm {
             replies,
@@ -4969,6 +5421,33 @@ mod tests {
         });
         let sent = sent.borrow().clone();
         (outcome, sent)
+    }
+
+    /// A bounded probe answers with the probe's own outcome, or, for one
+    /// that blocks, a refusal at its deadline without waiting for it.
+    #[test]
+    fn a_bounded_probe_answers_by_its_deadline() {
+        let deadline = Duration::from_millis(200);
+        assert_eq!(probe_within(deadline, || Ok(())), Ok(()));
+        assert_eq!(
+            probe_within(deadline, || Err("refused".into())),
+            Err("refused".into())
+        );
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let start = std::time::Instant::now();
+        let outcome = probe_within(deadline, move || {
+            // Blocks until the test ends; the probe is abandoned.
+            let _ = blocked.recv();
+            Ok(())
+        });
+        let waited = start.elapsed();
+        assert_eq!(outcome, Err("no answer within 0.2 s".into()));
+        assert!(
+            waited >= deadline && waited < Duration::from_secs(2),
+            "{waited:?}"
+        );
+        drop(release);
+        assert_eq!(TPM_PROBE_DEADLINE, Duration::from_secs(3));
     }
 
     #[test]
@@ -4987,12 +5466,8 @@ mod tests {
         let (outcome, sent) = probe(true, vec![Ok(pcrs_reply(0x000b, &measured))]);
         outcome.unwrap();
         assert_eq!(sent, [read.clone()]);
-        let refused = |outcome: io::Result<()>, cause: &str| {
-            let error = outcome.unwrap_err().to_string();
-            assert!(
-                error.starts_with("no usable TPM 2.0 for device-bound storage: "),
-                "{error}"
-            );
+        let refused = |outcome: Result<(), String>, cause: &str| {
+            let error = outcome.unwrap_err();
             assert!(error.contains(cause), "{error}: {cause}");
         };
         // No device: nothing is sent.
@@ -5308,6 +5783,7 @@ mod tests {
             catalog: None,
             booted: PathBuf::from(BOOTED_DEPLOYMENT),
             storage: installation_plan::Storage::Unencrypted,
+            basis: installation_plan::Basis::default(),
         };
         for (choice, expected) in [
             (["alice", "td-laptop", "us", "Europe/London"], Ok(())),
@@ -5458,6 +5934,7 @@ mod tests {
             [0xab; 32],
             uuid,
             installation_plan::Storage::Unencrypted,
+            installation_plan::Basis::default(),
             settings,
         )
         .unwrap();
@@ -5519,6 +5996,7 @@ mod tests {
             [0xab; 32],
             uuid,
             installation_plan::Storage::Unencrypted,
+            installation_plan::Basis::default(),
             settings,
         )
         .unwrap();
@@ -11458,6 +11936,7 @@ mod tests {
                 deployment,
                 uuid,
                 installation_plan::Storage::Unencrypted,
+                installation_plan::Basis::default(),
                 settings,
             )
             .unwrap();
@@ -11533,6 +12012,7 @@ mod tests {
             *reviewed.deployment(),
             *reviewed.volume_uuid(),
             installation_plan::Storage::DeviceBound,
+            installation_plan::Basis::default(),
             reviewed.settings().clone(),
         )
         .unwrap();
@@ -11728,6 +12208,7 @@ mod tests {
             catalog: None,
             booted: execution.booted.clone(),
             storage: installation_plan::Storage::Unencrypted,
+            basis: installation_plan::Basis::default(),
         };
         let fit = |host: &mut LiveHost| host.check_fit(&fixture.plan);
         assert_eq!(fit(&mut host), Ok(()));
@@ -11932,6 +12413,7 @@ mod tests {
             catalog: None,
             booted: execution.booted.clone(),
             storage: installation_plan::Storage::Unencrypted,
+            basis: installation_plan::Basis::default(),
         };
         assert_eq!(host.authenticate_source(), Ok(*fixture.plan.deployment()));
         std::fs::write(&execution.booted, format!("{}\n", "cd".repeat(32))).unwrap();
@@ -11961,6 +12443,7 @@ mod tests {
             catalog: None,
             booted: execution.booted.clone(),
             storage: installation_plan::Storage::Unencrypted,
+            basis: installation_plan::Basis::default(),
         };
         assert_eq!(host.candidates(), Err(Refusal::DiscoveryFailed));
     }
