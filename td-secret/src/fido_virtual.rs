@@ -1,7 +1,8 @@
 //! Test-only CTAP 2.1 authenticator for td's subset, behind the transaction
 //! Channel in process or, in a guest, `fido_uhid`'s HID device. It decrypts
-//! and verifies every PIN-protocol message itself. No attestation chain,
-//! real presence or persistence.
+//! and verifies every PIN-protocol message itself. No attestation chain or
+//! real presence; a persistent key keeps its `State` in a file, saved before
+//! each reply that changed it, so a guest's key survives a cold boot.
 
 use crate::fido_cbor::{self as cbor, Encoder, Value};
 use crate::fido_ctap::RP_ID;
@@ -11,6 +12,11 @@ use crate::fido_p256::{fixture_scalar, PublicKey, SecretScalar};
 use crate::fido_transaction::Channel;
 use crate::{crypto, fido_aes};
 use std::collections::VecDeque;
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -40,6 +46,8 @@ const PUAT_REQUIRED: u8 = 0x36;
 const REQUEST_TOO_LARGE: u8 = 0x39;
 const INVALID_SUBCOMMAND: u8 = 0x3e;
 const UNAUTHORIZED_PERMISSION: u8 = 0x40;
+/// CTAP2_ERR_OTHER: a persistent key that could not save its state.
+const OTHER: u8 = 0x7f;
 
 // pinUvAuthToken permissions.
 const MAKE_CREDENTIAL: u64 = 1;
@@ -179,6 +187,14 @@ struct Authenticator {
     transcript: Vec<(Vec<u8>, Vec<u8>)>,
     /// The scripted presence delays, read without the lock.
     touch: Arc<Touch>,
+    /// A persistent key's state file, the first save that failed, whether
+    /// one failed after its rename, a fault a test set for the next save,
+    /// and the alarm that refuses every save once the guest is being cut.
+    file: Option<PathBuf>,
+    unsaved: Option<String>,
+    poisoned: bool,
+    fault: Option<Fault>,
+    frozen: Option<fn(&str)>,
 }
 
 /// Whether a scripted presence delay runs now, and how long all of them
@@ -199,10 +215,9 @@ pub(crate) struct Virtual {
 
 impl Virtual {
     pub(crate) fn new(config: Config, pin: Option<&[u8]>, seed: &str) -> Self {
-        let touch = Arc::new(Touch::default());
-        let inner = Arc::new(Mutex::new(Authenticator {
+        Self::with(
             config,
-            state: State {
+            State {
                 pin: pin.map(<[u8]>::to_vec),
                 retries: MAX_RETRIES,
                 counter: 0,
@@ -210,6 +225,43 @@ impl Virtual {
                 seed: seed.as_bytes().to_vec(),
                 draws: 0,
             },
+            None,
+        )
+    }
+
+    /// A new key whose state lives in `file`, which must not exist yet: the
+    /// state is saved now and after every request or edit that changes it,
+    /// before the reply, as a real key's flash write precedes its reply.
+    pub(crate) fn persistent(
+        config: Config,
+        pin: Option<&[u8]>,
+        seed: &str,
+        file: &Path,
+    ) -> Result<Self, String> {
+        let key = Self::new(config, pin, seed);
+        if fs::symlink_metadata(file).is_ok() {
+            return Err(format!("virtual key state {} exists", file.display()));
+        }
+        let state = key.state();
+        save(file, &state, None).map_err(|error| match error {
+            Unsaved::Before(error) | Unsaved::After(error) => error,
+        })?;
+        key.lock().file = Some(file.to_path_buf());
+        Ok(key)
+    }
+
+    /// The persistent key saved in `file`, as a cold boot finds it: its
+    /// volatile PIN-token, agreement and consecutive-failure state is gone.
+    pub(crate) fn restore(config: Config, file: &Path) -> Result<Self, Damage> {
+        let state = load(file)?;
+        Ok(Self::with(config, state, Some(file.to_path_buf())))
+    }
+
+    fn with(config: Config, state: State, file: Option<PathBuf>) -> Self {
+        let touch = Arc::new(Touch::default());
+        let inner = Arc::new(Mutex::new(Authenticator {
+            config,
+            state,
             script: Script::default(),
             agreement: None,
             token: None,
@@ -218,8 +270,39 @@ impl Virtual {
             injected: VecDeque::new(),
             transcript: Vec::new(),
             touch: Arc::clone(&touch),
+            file,
+            unsaved: None,
+            poisoned: false,
+            fault: None,
+            frozen: None,
         }));
         Self { inner, touch }
+    }
+
+    /// The save that poisoned a persistent key, else its first failed save;
+    /// either answered its request with CTAP2_ERR_OTHER
+    /// (`Authenticator::persist`).
+    pub(crate) fn saved(&self) -> Result<(), String> {
+        let inner = self.lock();
+        match (&inner.unsaved, inner.poisoned) {
+            (None, _) => Ok(()),
+            (Some(error), false) => Err(error.clone()),
+            (Some(error), true) => Err(format!(
+                "{error}; poisoned after its rename, the key refuses every request"
+            )),
+        }
+    }
+
+    /// Makes the next save fail at `fault`.
+    pub(crate) fn fail_next_save(&self, fault: Fault) {
+        self.lock().fault = Some(fault);
+    }
+
+    /// From now on every save is refused before it writes anything, and
+    /// `alarm` is told: a guest cut must see no key sync after its write
+    /// began.
+    pub(crate) fn freeze(&self, alarm: fn(&str)) {
+        self.lock().frozen = Some(alarm);
     }
 
     fn lock(&self) -> MutexGuard<'_, Authenticator> {
@@ -243,8 +326,18 @@ impl Virtual {
         self.lock().state.clone()
     }
 
+    /// A test's edit, saved as a request's change is; a poisoned key takes
+    /// none.
     pub(crate) fn with_state(&self, change: impl FnOnce(&mut State)) {
-        change(&mut self.lock().state);
+        let mut inner = self.lock();
+        if inner.poisoned {
+            return;
+        }
+        let before = inner.file.is_some().then(|| inner.state.clone());
+        change(&mut inner.state);
+        if let Some(before) = before {
+            inner.persist(before);
+        }
     }
 
     pub(crate) fn script(&self, script: Script) {
@@ -444,13 +537,69 @@ fn agreement_key(cose: &Value<'_>) -> Option<PublicKey> {
 }
 
 impl Authenticator {
+    /// A poisoned key answers every request with CTAP2_ERR_OTHER.
     fn handle(&mut self, request: &[u8]) -> Vec<u8> {
-        let reply = match self.dispatch(request) {
-            Ok(body) => [&[0][..], &body].concat(),
-            Err(status) => vec![status],
+        let reply = if self.poisoned {
+            vec![OTHER]
+        } else {
+            let before = self.file.is_some().then(|| self.state.clone());
+            let reply = match self.dispatch(request) {
+                Ok(body) => [&[0][..], &body].concat(),
+                Err(status) => vec![status],
+            };
+            let saved = match before {
+                Some(before) => self.persist(before),
+                None => true,
+            };
+            if saved {
+                reply
+            } else {
+                vec![OTHER]
+            }
         };
         self.transcript.push((request.to_vec(), reply.clone()));
         reply
+    }
+
+    /// Saves a persistent key's changed state, and says whether it did.
+    /// A save refused or failed before the rename leaves the file as it
+    /// was, so the state goes back to `before`, and the agreement key and
+    /// PIN token, which may come from draws it rewinds, go too: no rewound
+    /// draw stays in use, and none reached a reply. The consecutive-failure
+    /// count and a consumed injected draw stay. A failure after the rename
+    /// leaves the file holding the new state or the old, unknown which, so
+    /// the key is poisoned: it keeps the new state in memory and refuses
+    /// every request from then on.
+    fn persist(&mut self, before: State) -> bool {
+        let Some(file) = self.file.clone() else {
+            return true;
+        };
+        if self.state == before {
+            return true;
+        }
+        let result = match self.frozen {
+            Some(alarm) => {
+                let refused = "virtual key save refused: the guest is being cut".to_string();
+                alarm(&refused);
+                Err(Unsaved::Before(refused))
+            }
+            None => save(&file, &self.state, self.fault.take()),
+        };
+        match result {
+            Ok(()) => true,
+            Err(Unsaved::Before(error)) => {
+                self.state = before;
+                self.agreement = None;
+                self.token = None;
+                self.unsaved.get_or_insert(error);
+                false
+            }
+            Err(Unsaved::After(error)) => {
+                self.poisoned = true;
+                self.unsaved = Some(error);
+                false
+            }
+        }
     }
 
     fn dispatch(&mut self, request: &[u8]) -> Result<Vec<u8>, u8> {
@@ -992,6 +1141,279 @@ fn sign(key: &SecretScalar, data: &[u8], hash: &[u8]) -> Vec<u8> {
         &[b"public-pin-signature".as_slice(), &digest].concat(),
     ));
     key.sign(&digest, &nonce).unwrap()
+}
+
+/// A persistent key's state file (td-secret/DESIGN.md, "Virtual
+/// authenticator"): this magic, the body's u32 length, the body and the
+/// SHA-256 of everything before it. Integers are big-endian.
+const MAGIC: &[u8; 8] = b"TDVKEY01";
+const MAX_FILE: usize = 64 * 1024;
+const MAX_CREDENTIALS: usize = 32;
+/// td-secret's CTAP credential bound, as the login record's.
+const MAX_ID: usize = 1024;
+const DIGEST: usize = 32;
+const HEADER: usize = MAGIC.len() + 4;
+
+/// Why a state file was refused: a damaged file never loads, and decoding
+/// never panics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Damage {
+    Unreadable(String),
+    Oversized,
+    Magic,
+    /// Shorter than its header, its declared body or a field.
+    Truncated,
+    /// Longer than its declared body, or a body with bytes past its fields.
+    Trailing,
+    Digest,
+    /// A field outside its bounds, by name.
+    Field(&'static str),
+}
+
+impl fmt::Display for Damage {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unreadable(error) => write!(out, "unreadable: {error}"),
+            Self::Oversized => write!(out, "larger than {MAX_FILE} bytes"),
+            Self::Magic => write!(out, "not a virtual key state"),
+            Self::Truncated => write!(out, "truncated"),
+            Self::Trailing => write!(out, "trailing bytes"),
+            Self::Digest => write!(out, "digest mismatch"),
+            Self::Field(name) => write!(out, "{name} out of bounds"),
+        }
+    }
+}
+
+/// The state's bytes; only a state that decodes back to itself encodes.
+fn encode(state: &State) -> Result<Vec<u8>, Damage> {
+    let short = |name, length: usize| u8::try_from(length).map_err(|_| Damage::Field(name));
+    let mut body = Vec::new();
+    match &state.pin {
+        None => body.push(0),
+        Some(pin) => {
+            body.extend([1, short("pin", pin.len())?]);
+            body.extend(pin);
+        }
+    }
+    body.push(state.retries);
+    body.extend(state.counter.to_be_bytes());
+    body.extend(state.draws.to_be_bytes());
+    body.push(short("seed", state.seed.len())?);
+    body.extend(&state.seed);
+    body.push(short("credentials", state.credentials.len())?);
+    for credential in &state.credentials {
+        let length =
+            u16::try_from(credential.id.len()).map_err(|_| Damage::Field("credential ID"))?;
+        body.extend(length.to_be_bytes());
+        body.extend(&credential.id);
+        body.extend(credential.private);
+        match &credential.hmac {
+            None => body.push(0),
+            Some((with_uv, without_uv)) => {
+                body.push(1);
+                body.extend(with_uv);
+                body.extend(without_uv);
+            }
+        }
+        body.push(credential.protect);
+    }
+    let length = u32::try_from(body.len()).map_err(|_| Damage::Oversized)?;
+    let mut bytes = MAGIC.to_vec();
+    bytes.extend(length.to_be_bytes());
+    bytes.extend(body);
+    let digest = crypto::digest(&bytes);
+    bytes.extend(digest);
+    if decode(&bytes)? != *state {
+        return Err(Damage::Field("state"));
+    }
+    Ok(bytes)
+}
+
+/// Fields read in order; running short is truncation.
+struct Fields<'a>(&'a [u8]);
+
+impl<'a> Fields<'a> {
+    fn take(&mut self, length: usize) -> Result<&'a [u8], Damage> {
+        let (head, rest) = self.0.split_at_checked(length).ok_or(Damage::Truncated)?;
+        self.0 = rest;
+        Ok(head)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], Damage> {
+        self.take(N)?.try_into().map_err(|_| Damage::Truncated)
+    }
+
+    fn byte(&mut self) -> Result<u8, Damage> {
+        let [byte] = self.array()?;
+        Ok(byte)
+    }
+
+    fn flag(&mut self, name: &'static str) -> Result<bool, Damage> {
+        match self.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Damage::Field(name)),
+        }
+    }
+}
+
+fn decode(bytes: &[u8]) -> Result<State, Damage> {
+    if bytes.len() > MAX_FILE {
+        return Err(Damage::Oversized);
+    }
+    let mut fields = Fields(bytes);
+    if fields.take(MAGIC.len())? != MAGIC {
+        return Err(Damage::Magic);
+    }
+    let length =
+        usize::try_from(u32::from_be_bytes(fields.array()?)).map_err(|_| Damage::Oversized)?;
+    let total = HEADER
+        .checked_add(length)
+        .and_then(|framed| framed.checked_add(DIGEST))
+        .ok_or(Damage::Oversized)?;
+    if bytes.len() < total {
+        return Err(Damage::Truncated);
+    }
+    if bytes.len() > total {
+        return Err(Damage::Trailing);
+    }
+    let (framed, digest) = bytes
+        .split_at_checked(HEADER + length)
+        .ok_or(Damage::Truncated)?;
+    if crypto::digest(framed) != digest {
+        return Err(Damage::Digest);
+    }
+    let mut body = Fields(framed.get(HEADER..).ok_or(Damage::Truncated)?);
+    let pin = if body.flag("pin flag")? {
+        let length = body.byte()?;
+        Some(body.take(usize::from(length))?.to_vec())
+    } else {
+        None
+    };
+    let retries = body.byte()?;
+    if retries > MAX_RETRIES {
+        return Err(Damage::Field("retries"));
+    }
+    let counter = u32::from_be_bytes(body.array()?);
+    let draws = u64::from_be_bytes(body.array()?);
+    let length = body.byte()?;
+    let seed = body.take(usize::from(length))?.to_vec();
+    let count = usize::from(body.byte()?);
+    if count > MAX_CREDENTIALS {
+        return Err(Damage::Field("credentials"));
+    }
+    let mut credentials: Vec<Credential> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let length = usize::from(u16::from_be_bytes(body.array()?));
+        if !(1..=MAX_ID).contains(&length) {
+            return Err(Damage::Field("credential ID"));
+        }
+        let id = body.take(length)?.to_vec();
+        if credentials.iter().any(|credential| credential.id == id) {
+            return Err(Damage::Field("duplicate credential"));
+        }
+        let private = body.array()?;
+        if SecretScalar::from_bytes(Box::new(private)).is_err() {
+            return Err(Damage::Field("credential key"));
+        }
+        let hmac = if body.flag("hmac-secret flag")? {
+            Some((body.array()?, body.array()?))
+        } else {
+            None
+        };
+        let protect = body.byte()?;
+        if !(1..=3).contains(&protect) {
+            return Err(Damage::Field("credProtect"));
+        }
+        credentials.push(Credential {
+            id,
+            private,
+            hmac,
+            protect,
+        });
+    }
+    if !body.0.is_empty() {
+        return Err(Damage::Trailing);
+    }
+    Ok(State {
+        pin,
+        retries,
+        counter,
+        credentials,
+        seed,
+        draws,
+    })
+}
+
+/// Where a test makes a persistent key's next save fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fault {
+    /// Just before the rename: the file keeps the old state.
+    Unpublished,
+    /// Just after the rename, in place of the directory sync.
+    Published,
+}
+
+/// A failed save: before the rename the file still holds the old state;
+/// after it the name holds the new one, its durability unknown.
+#[derive(Debug, PartialEq, Eq)]
+enum Unsaved {
+    Before(String),
+    After(String),
+}
+
+/// Writes `file` whole and durably: a sibling `.next` file, synced, renamed
+/// over it, and the directory synced.
+fn save(file: &Path, state: &State, fault: Option<Fault>) -> Result<(), Unsaved> {
+    let bytes = encode(state)
+        .map_err(|damage| Unsaved::Before(format!("encode virtual key state: {damage}")))?;
+    let directory = file
+        .parent()
+        .ok_or_else(|| Unsaved::Before("virtual key state names no directory".into()))?;
+    let mut next = file.as_os_str().to_owned();
+    next.push(".next");
+    let next = PathBuf::from(next);
+    let failed = |what: &'static str| {
+        let file = file.display().to_string();
+        move |error: std::io::Error| format!("{what} virtual key state {file}: {error}")
+    };
+    let mut out = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&next)
+        .map_err(failed("create"))
+        .map_err(Unsaved::Before)?;
+    out.write_all(&bytes)
+        .and_then(|()| out.sync_all())
+        .map_err(failed("write and sync"))
+        .map_err(Unsaved::Before)?;
+    drop(out);
+    if fault == Some(Fault::Unpublished) {
+        return Err(Unsaved::Before("injected failure before the rename".into()));
+    }
+    // rename(2) either replaces the name or leaves it.
+    fs::rename(&next, file)
+        .map_err(failed("rename"))
+        .map_err(Unsaved::Before)?;
+    if fault == Some(Fault::Published) {
+        return Err(Unsaved::After("injected failure after the rename".into()));
+    }
+    File::open(directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(failed("sync the directory of"))
+        .map_err(Unsaved::After)
+}
+
+/// Reads at most one byte past the bound, so an oversized file is refused
+/// without being read whole.
+fn load(file: &Path) -> Result<State, Damage> {
+    let mut bytes = Vec::new();
+    File::open(file)
+        .and_then(|opened| opened.take(MAX_FILE as u64 + 1).read_to_end(&mut bytes))
+        .map_err(|error| Damage::Unreadable(format!("{}: {error}", file.display())))?;
+    decode(&bytes)
 }
 
 #[cfg(test)]
@@ -2195,5 +2617,263 @@ mod tests {
                 )))
             );
         }
+    }
+
+    /// A private directory for state files, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("td-virtual-key-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A file with this body, framed and digested as `encode` frames it.
+    fn framed(body: &[u8]) -> Vec<u8> {
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend((body.len() as u32).to_be_bytes());
+        bytes.extend(body);
+        let digest = crypto::digest(&bytes);
+        bytes.extend(digest);
+        bytes
+    }
+
+    fn body(bytes: &[u8]) -> Vec<u8> {
+        bytes[HEADER..bytes.len() - DIGEST].to_vec()
+    }
+
+    #[test]
+    fn a_restored_key_keeps_credentials_secrets_pin_and_retries_but_not_volatile_state() {
+        let scratch = Scratch::new("restore");
+        let file = scratch.0.join("key");
+        let key = Virtual::persistent(Config::default(), Some(PIN), "restore", &file).unwrap();
+        assert_eq!(
+            Virtual::restore(Config::default(), &file).unwrap().state(),
+            key.state()
+        );
+        // Never over an existing key.
+        assert!(Virtual::persistent(Config::default(), Some(PIN), "again", &file).is_err());
+        let created = create(&key, &[], 4).unwrap();
+        let before = login(&key, &created, PIN, &mut Vec::new()).unwrap();
+        // Every change is on disk before its reply.
+        assert_eq!(load(&file).unwrap(), key.state());
+        let mut shown = Vec::new();
+        for _ in 0..3 {
+            assert!(login(&key, &created, WRONG, &mut shown).is_err());
+        }
+        assert_eq!(shown, [8, 7, 6]);
+        // PIN AUTH BLOCKED is volatile: a cold boot is a power cycle.
+        assert!(login(&key, &created, PIN, &mut Vec::new()).is_err());
+        let state = key.state();
+        drop(key);
+        let restored = Virtual::restore(Config::default(), &file).unwrap();
+        assert_eq!(restored.state(), state);
+        assert_eq!(restored.state().retries, 5);
+        let mut shown = Vec::new();
+        let after = login(&restored, &created, PIN, &mut shown).unwrap();
+        assert_eq!(shown, [5]);
+        assert_eq!(after.bytes(), before.bytes());
+        // The signature counter goes on from where it was saved.
+        assert!(restored.state().counter > state.counter);
+        assert_eq!(load(&file).unwrap(), restored.state());
+        // A test's edit is saved too.
+        restored.with_state(|state| state.retries = 2);
+        assert_eq!(load(&file).unwrap().retries, 2);
+        assert!(restored.saved().is_ok());
+        assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_save_that_fails_answers_other_and_keeps_the_state_it_had() {
+        let scratch = Scratch::new("unsaved");
+        let file = scratch.0.join("key");
+        let key = Virtual::persistent(Config::default(), Some(PIN), "unsaved", &file).unwrap();
+        let state = key.state();
+        fs::remove_dir_all(&scratch.0).unwrap();
+        assert_eq!(
+            create(&key, &[], 5).err(),
+            Some(failed(Status::Other(OTHER)))
+        );
+        assert_eq!(key.state(), state);
+        assert!(key.saved().unwrap_err().contains("virtual key state"));
+        // A request that changes nothing saves nothing and still answers.
+        assert_eq!(key.exchange(&[4])[0], 0);
+    }
+
+    /// getKeyAgreement for protocol 2, which draws the agreement key.
+    const AGREE: &[u8] = &[6, 0xa2, 1, 2, 2, 2];
+
+    #[test]
+    fn a_save_failing_before_its_rename_undoes_the_state_and_the_key_goes_on() {
+        let scratch = Scratch::new("unpublished");
+        let file = scratch.0.join("key");
+        let key = Virtual::persistent(Config::default(), Some(PIN), "unpublished", &file).unwrap();
+        let state = key.state();
+        key.fail_next_save(Fault::Unpublished);
+        assert_eq!(key.exchange(AGREE), [OTHER]);
+        assert_eq!(key.state(), state);
+        assert_eq!(load(&file).unwrap(), state);
+        assert!(key.saved().unwrap_err().contains("before the rename"));
+        // The agreement key went with its rewound draw: it is drawn again,
+        // once, and saved.
+        assert_eq!(key.exchange(AGREE)[0], 0);
+        assert_eq!(key.state().draws, state.draws + 1);
+        assert_eq!(load(&file).unwrap(), key.state());
+    }
+
+    #[test]
+    fn a_save_failing_after_its_rename_poisons_the_key() {
+        let scratch = Scratch::new("published");
+        let file = scratch.0.join("key");
+        let key = Virtual::persistent(Config::default(), Some(PIN), "published", &file).unwrap();
+        let before = key.state();
+        key.fail_next_save(Fault::Published);
+        assert_eq!(key.exchange(AGREE), [OTHER]);
+        // The name holds the new state, and so does the key.
+        let state = key.state();
+        assert_ne!(state, before);
+        assert_eq!(load(&file).unwrap(), state);
+        // Every further request and edit is refused and changes nothing.
+        for request in [&[4][..], AGREE, &[6, 0xa2, 1, 2, 2, 1]] {
+            assert_eq!(key.exchange(request), [OTHER]);
+        }
+        key.with_state(|state| state.retries = 1);
+        assert_eq!(key.state(), state);
+        assert_eq!(load(&file).unwrap(), state);
+        assert!(key
+            .saved()
+            .unwrap_err()
+            .contains("the key refuses every request"));
+        assert_eq!(
+            Virtual::restore(Config::default(), &file).unwrap().state(),
+            state
+        );
+    }
+
+    static ALARMS: AtomicU64 = AtomicU64::new(0);
+
+    fn alarm(_: &str) {
+        ALARMS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_frozen_key_refuses_every_save_before_writing_and_raises_its_alarm() {
+        let scratch = Scratch::new("frozen");
+        let file = scratch.0.join("key");
+        let key = Virtual::persistent(Config::default(), Some(PIN), "frozen", &file).unwrap();
+        let (state, bytes) = (key.state(), fs::read(&file).unwrap());
+        key.freeze(alarm);
+        assert_eq!(key.exchange(AGREE), [OTHER]);
+        assert_eq!(ALARMS.load(Ordering::SeqCst), 1);
+        assert_eq!(key.state(), state);
+        assert_eq!(fs::read(&file).unwrap(), bytes);
+        assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 1);
+        assert!(key.saved().unwrap_err().contains("being cut"));
+        // A request that changes nothing writes nothing and still answers.
+        assert_eq!(key.exchange(&[4])[0], 0);
+        assert_eq!(ALARMS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn damaged_state_files_are_refused_and_never_panic() {
+        let key = Virtual::new(Config::default(), Some(PIN), "damage");
+        create(&key, &[], 6).unwrap();
+        create(&key, &[], 7).unwrap();
+        let state = key.state();
+        let bytes = encode(&state).unwrap();
+        assert_eq!(decode(&bytes).unwrap(), state);
+        assert_eq!(framed(&body(&bytes)), bytes);
+        // Every truncation, every flipped bit and a trailing byte.
+        for length in 0..bytes.len() {
+            assert_eq!(decode(&bytes[..length]), Err(Damage::Truncated), "{length}");
+        }
+        for index in 0..bytes.len() {
+            for bit in 0..8 {
+                let mut flipped = bytes.clone();
+                flipped[index] ^= 1 << bit;
+                assert!(decode(&flipped).is_err(), "{index} {bit}");
+            }
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(decode(&trailing), Err(Damage::Trailing));
+        let mut magic = bytes.clone();
+        magic[7] = b'2';
+        assert_eq!(decode(&magic), Err(Damage::Magic));
+        let mut oversized = bytes.clone();
+        oversized.resize(MAX_FILE + 1, 0);
+        assert_eq!(decode(&oversized), Err(Damage::Oversized));
+        let mut declared = bytes.clone();
+        declared[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(decode(&declared), Err(Damage::Truncated));
+
+        // Files whose digest holds but whose fields are out of bounds: the
+        // PIN, retries, counter, draws and seed, then the credentials.
+        let body = body(&bytes);
+        let retries = 2 + PIN.len();
+        let count = retries + 1 + 4 + 8 + 1 + state.seed.len();
+        let first = count + 1;
+        let private = first + 2 + state.credentials[0].id.len();
+        let hmac = private + 32;
+        let protect = hmac + 1 + 64;
+        let edits: &[(usize, &[u8], Damage)] = &[
+            (0, &[2], Damage::Field("pin flag")),
+            (retries, &[MAX_RETRIES + 1], Damage::Field("retries")),
+            (
+                count,
+                &[MAX_CREDENTIALS as u8 + 1],
+                Damage::Field("credentials"),
+            ),
+            (first, &[0, 0], Damage::Field("credential ID")),
+            (first, &[4, 1], Damage::Field("credential ID")),
+            (private, &[0xff; 32], Damage::Field("credential key")),
+            (private, &[0; 32], Damage::Field("credential key")),
+            (hmac, &[2], Damage::Field("hmac-secret flag")),
+            (protect, &[0], Damage::Field("credProtect")),
+            (protect, &[4], Damage::Field("credProtect")),
+        ];
+        for (at, edit, damage) in edits {
+            let mut changed = body.clone();
+            changed[*at..*at + edit.len()].copy_from_slice(edit);
+            assert_eq!(decode(&framed(&changed)), Err(damage.clone()), "{at}");
+        }
+        // The first credential twice.
+        let second = protect + 1;
+        let mut duplicate = body.clone();
+        duplicate.splice(second..second, body[first..second].to_vec());
+        duplicate[count] = 3;
+        assert_eq!(
+            decode(&framed(&duplicate)),
+            Err(Damage::Field("duplicate credential"))
+        );
+        // A body longer than its fields, and one that runs out.
+        let mut long = body.clone();
+        long.push(0);
+        assert_eq!(decode(&framed(&long)), Err(Damage::Trailing));
+        assert_eq!(
+            decode(&framed(&body[..body.len() - 1])),
+            Err(Damage::Truncated)
+        );
+        // A state outside the bounds never encodes.
+        let mut wide = state.clone();
+        wide.seed = vec![0; 256];
+        assert_eq!(encode(&wide), Err(Damage::Field("seed")));
+        let mut spent = state;
+        spent.retries = MAX_RETRIES + 1;
+        assert_eq!(encode(&spent), Err(Damage::Field("retries")));
+        assert!(matches!(
+            load(Path::new("/nonexistent/td-virtual-key")),
+            Err(Damage::Unreadable(_))
+        ));
     }
 }

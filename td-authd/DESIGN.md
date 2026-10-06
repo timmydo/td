@@ -1511,8 +1511,10 @@ stands in for the completion reply. Pinned-emulator tests in
 The same command then runs seven fresh, diskless, TPM-free guests of
 td-secret's login-key worker over UHID virtual keys, with the same
 bound, selection and passing summary (`td-secret/DESIGN.md`, "Login-key
-worker guests"). They play root themselves; td-authd's supervision of
-that worker is not among them.
+worker guests"), and one more booted twelve times on a disposable disk,
+ten of them killed by the host inside or just after a record write
+(`td-secret/DESIGN.md`, "Login power-cut guests"). They play root
+themselves; td-authd's supervision of that worker is not among them.
 
 The optional `qemu-secret --tpm /absolute/path/to/swtpm` mode adds four
 TPM device cases and the eleven HID guests `td-secret/DESIGN.md`

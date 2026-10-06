@@ -14,7 +14,8 @@ td-authd's login consent operations and step admission
 (`td-authd/DESIGN.md`). No deployment carries the tier marker yet, so
 the worker reads no record version for either retained deployment and
 refuses every write that would leave a record ("Versions"). Its
-`qemu-secret` guests run it over UHID virtual keys ("Evidence"), standing
+`qemu-secret` guests run it over UHID virtual keys, including across
+power cuts inside its writes on a disposable disk ("Evidence"), standing
 in for that marker. Nothing else below is implemented.
 Until the increments at the end land, `THREAT-MODEL.md` §3 is the
 complete current behaviour: the installed account logs in automatically
@@ -706,13 +707,14 @@ implements:
 It signs with test-only ECDSA over td-secret's private P-256 arithmetic;
 host tests check its signatures and PIN-protocol messages against the
 existing committed independent vectors. Its state persists on the
-disposable disk so a key keeps its credentials across cold boots. The
+disposable disk, saved before each reply that changed it, so a key
+keeps its credentials across cold boots, hard kills included; a damaged
+state file is refused by type, never loaded. The
 authenticator logic is a test-only core (`td-secret/DESIGN.md`,
 "Virtual authenticator") that host tests drive in process and that a
 test-only UHID binding presents in a guest as a hidraw FIDO device
 speaking CTAPHID, with keepalives within the 100 ms ceiling while the
 key works, UPNEEDED during a scripted touch ("UHID binding").
-Persistence on the disposable disk comes with the power-cut increment.
 
 Seven `qemu-secret` guests, none with a TPM, run the root worker's own
 operation over the production discovery, Session and HID worker with
@@ -725,19 +727,47 @@ record, no key and two keys; one-key enrollment whose record a fresh
 worker then unlocks, and removal of the last key; two-key enrollment
 across a device swap; addition across a swap and removal of the
 authorizing key; a slow touch held by keepalives; and a credProtect
-default refused at the probe. The rest of increment 2's guest list has
-no guest yet. Host tests of the worker's operation over virtual keys
-cover additions to eight, a too-small list, a tampered verifier or
-public key, a replayed (stale) signature, a changed baseline and an
-incompatible version. Denied presence and `alwaysUv` are covered only
-at the transaction and virtual-key layer, and the bytes of the worker's
-DENIED and KEY REFUSED `02` frames are pinned, but no worker operation
-meets either. Leftover temporaries are covered by the record store's
-host tests.
-Power cuts are not covered: the host tests inject a failure at each
-publication and removal stage, which models neither power loss nor
-cold-boot durability, so a missing fsync could pass them. They remain
-unproven until the power-cut increment's guests.
+default refused at the probe. Host tests of the worker's operation over
+virtual keys cover additions to eight, a too-small list, a tampered
+verifier or public key, a replayed (stale) signature, a changed
+baseline and an incompatible version. Denied presence and `alwaysUv`
+are covered only at the transaction and virtual-key layer, and the
+bytes of the worker's DENIED and KEY REFUSED `02` frames are pinned, but
+no worker operation meets either.
+
+An eighth TPM-free guest, `login-powercut` (`td-secret/DESIGN.md`,
+"Login power-cut guests"), boots twelve times on one disposable disk
+whose Btrfs `@var` holds the record and both persistent keys. Ten boots
+each make one write through the worker and are killed by the host, a
+SIGKILL of QEMU, at a store stage inside it: first enrollment at the
+temporary's creation, its sync and the rename, an addition at the
+write, just before the rename and after the directory sync, and the
+removal of every key before the unlink, after it and after the
+directory sync; one more after an enrollment's success. Each next boot
+finds the old record or the whole new one, as that stage requires,
+never an unavailable state; an unlink done or not; a synced temporary
+holding the whole new record, ignored by the read and removed by the
+next write; and a record written in an earlier boot unlocked by each
+persisted key it lists, a key it does not list being NOT ENROLLED. A
+cut during first enrollment therefore left the machine unenrolled or
+completely enrolled. Btrfs is mounted so that only a sync makes a
+change durable within a boot, and the cuts just after the rename and
+the unlink, before the directory sync, must lose them, while the same
+writes cut after that sync must keep them: that is how a missing
+directory sync would be caught. Those two controls rest on stated
+premises, that nothing syncs `@var` between the change and the kill,
+which the fixture enforces for its own keys, and that the pinned
+kernel's rename and unlink do not sync the Btrfs log, so a red there
+after a kernel bump is a premise to investigate before a store
+regression. The temporary's sync is tested too, since the synced
+temporary must survive whole; what cannot be shown on Btrfs is that a
+published record would be torn without it. A QEMU kill keeps the host's
+page cache, so these guests prove crash consistency of the store's
+syncs, not that a sync reached stable media: a missing write-cache
+flush, torn or reordered sectors and host power loss are not covered,
+and I/O in flight at the kill may land or not. Firstboot's own
+temporary cleanup is increment 4's. The rest of increment 2's guest
+list has no guest yet.
 
 The stock VM stays unenrolled: no recipe or firstboot path writes a record,
 and its valid, empty directory is decided unenrolled without any helper,
@@ -790,8 +820,9 @@ proves and the oracle that shows it.
      refusals, tampered verifier or public key, replayed assertion, changed
      baseline, incompatible record version; guest power cuts before and
      after publication leaving one whole record and no unenrolled machine
-     locked; leftover temporaries ignored and removed. Seven guests
-     covering the cases "Evidence" names have landed; the rest remain.
+     locked; leftover temporaries ignored and removed. Eight guests
+     covering the cases "Evidence" names have landed, the power cuts and
+     temporaries among them; the rest remain.
 3. **Compositor trusted PIN entry and lock surface**, driven by fixtures
    and not yet activated by a record; the compositor sends `1b` and `1c`.
    - Native compositor and device-dispatcher tests: lock rendering excludes

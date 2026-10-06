@@ -112,6 +112,45 @@ pub const LOGIN_CASES: &[(&str, &str)] = &[
         "login_operation::tests::vm::qemu_login_worker_refuses_a_key_whose_credprotect_default_fails_the_probe",
     ),
 ];
+/// The login record store across power cuts: one TPM-free guest test,
+/// booted once per phase, in this order, on one disposable disk.
+pub const LOGIN_CUT_CASE: (&str, &str) = (
+    "login-powercut",
+    "login_operation::tests::vm::qemu_login_record_survives_power_cuts_inside_its_writes",
+);
+pub const LOGIN_CUT: &str = "TD-LOGIN-CUT";
+/// A clean setup, ten boots each checking the cut before it and then cut
+/// inside or just after its own write, and a clean final check.
+pub const LOGIN_CUT_PHASES: &[&str] = &[
+    "setup",
+    "enroll-created",
+    "enroll-synced",
+    "enroll-renamed",
+    "enroll-committed",
+    "add-written",
+    "add-attempted",
+    "add-synced",
+    "remove-attempted",
+    "remove-unlinked",
+    "remove-synced",
+    "final",
+];
+
+/// The one power-cut phase the command line names.
+pub fn login_cut_phase(cmdline: &str) -> Result<&str, String> {
+    let mut phases = cmdline
+        .split_ascii_whitespace()
+        .filter_map(|token| token.strip_prefix("td.login-cut="));
+    let phase = phases
+        .next()
+        .filter(|phase| LOGIN_CUT_PHASES.contains(phase))
+        .ok_or("unknown or missing login power-cut phase")?;
+    if phases.next().is_some() {
+        return Err("duplicate login power-cut phase".into());
+    }
+    Ok(phase)
+}
+
 pub const SYSTEM_TEST: &str =
     "fido_device::vm_tests::desktop::system::qemu_installed_system_secret_lifecycle";
 pub const SYSTEM_PASS: &str = "TD-SECRET-SYSTEM-PASS";
@@ -191,10 +230,16 @@ fn run() -> Result<(), String> {
                 .iter()
                 .chain(FIDO_CASES)
                 .chain(LOGIN_CASES)
+                .chain(std::iter::once(&LOGIN_CUT_CASE))
                 .map(|(name, test)| (*name, *test, "/bin/td-secret-tests")),
         )
         .find(|(name, _, _)| *name == selected)
         .ok_or_else(|| "unknown VM case".to_string())?;
+    if selected == LOGIN_CUT_CASE.0 {
+        let cmdline =
+            fs::read_to_string("/proc/cmdline").map_err(|e| format!("read command line: {e}"))?;
+        login_cut_phase(&cmdline)?;
+    }
     let log = File::create("/run/test.log").map_err(|e| format!("test log: {e}"))?;
     let errors = log
         .try_clone()

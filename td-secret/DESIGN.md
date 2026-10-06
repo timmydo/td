@@ -1865,7 +1865,10 @@ leaves a later read with the old record or the whole new one, and a
 later write succeeds. Private `ReadStage` hooks after the
 inspection and after the read let tests swap the inode, change its mode
 or append to it, each of which reads as unreadable; a test-only
-descriptor root stands for a lost or replaced `/proc`.
+descriptor root stands for a lost or replaced `/proc`. These injected
+failures model neither power loss nor durability; the power-cut guests
+("Login power-cut guests") cut a guest at the same stages and read what
+a cold boot finds.
 
 ## Login CTAP primitives
 
@@ -1987,12 +1990,58 @@ credential secret. It does not reproduce the makeCredential replies,
 whose credential ID and key it draws itself. It does not model
 attestation chains or certificates, real presence, resident credentials,
 built-in UV, credProtect requested by the client, PIN setting or change,
-reset, largeBlobs or persistence across processes, and passing against
-it proves no hardware's behaviour. A key is one shared, locked state, so
-a clone serves it from another thread; `touching` says whether a request
-is inside its scripted presence delay. This core is the authenticator
-logic TOKEN-LOGIN.md's Evidence names; persistence on the disposable
-disk comes with the power-cut increment.
+reset or largeBlobs, and passing against it proves no hardware's
+behaviour. A key is one shared, locked state, so a clone serves it from
+another thread; `touching` says whether a request is inside its
+scripted presence delay. This core is the authenticator logic
+TOKEN-LOGIN.md's Evidence names.
+
+A persistent key (`Virtual::persistent`, `Virtual::restore`) keeps its
+`State` in a file, so a guest's key keeps its credentials across a cold
+boot: the PIN, the retry count, the signature counter, the random seed
+and draw count, and each credential's ID, private scalar, both
+hmac-secret randoms and credProtect level. The PIN token, key agreement
+and consecutive-failure count are volatile, as a power cycle clears
+them, and the configuration is the test's, as a key's model is. Creating
+one refuses an existing file. The state is saved after every request and
+every test edit that changed it, before the reply, as a real key's flash
+write precedes its reply: a sibling `.next` file is written and synced,
+renamed over the file and the directory synced. Only a persistent key
+copies its state to compare. A failed save answers CTAP2_ERR_OTHER and
+is kept for `saved`, which the guests check. One that failed before the
+rename left the file as it was, so the key's `State` goes back to it,
+and the agreement key and PIN token go too, since they may come from
+draws it rewinds: no rewound draw stays in use, and none reached a
+reply. The volatile consecutive-failure count and a consumed injected
+draw are not restored. One that failed after the rename, at the
+directory sync, leaves the name holding the new state or the old with no
+telling which, so the key is poisoned: it keeps the new state, answers
+every later request with CTAP2_ERR_OTHER, takes no test edit, and
+`saved` says so, so memory and disk never silently diverge. A test
+injects either failure into the next save (`fail_next_save`). `freeze`
+refuses every later save before it writes anything and calls an alarm,
+which the power-cut guest uses. The file is the magic `TDVKEY01`, the
+body's u32 length, the body and the SHA-256 of all before it, integers
+big-endian. The body is, in order: a PIN flag byte, then if set a u8
+length and the PIN; the retries (u8); the signature counter (u32); the
+draw count (u64); a u8 length and the seed; the credential count (u8, at
+most 32); and per credential a u16 ID length (1 to 1024), the ID, the
+32-byte private scalar, an hmac-secret flag byte, then if set the
+32-byte UV and non-UV randoms, and the credProtect level (u8). A file
+over 64 KiB, a wrong magic, a length that disagrees with the file, a
+digest mismatch, a short field, bytes past the last one, a flag other
+than 0 or 1, retries above eight, an empty, oversized or repeated
+credential ID, an invalid P-256 scalar or a credProtect level outside 1
+to 3 is a typed `Damage`, never a panic; a guest fails naming the key
+and the damage. Only a state that decodes back to itself encodes. Host
+tests restore a key with its credentials, secrets, PIN and spent retries
+but not its PIN AUTH BLOCKED state, check that each change is on disk
+before its reply, refuse every truncation, every flipped bit and each
+out-of-bounds field of a digest-valid file, and answer a failed save
+with ERR_OTHER: before the rename with the file's old state and a key
+that goes on, drawing its agreement key again; after it with the file's
+new state and a poisoned key that refuses every request and edit;
+frozen, with no write and the alarm raised.
 
 ### UHID binding
 
@@ -2363,11 +2412,136 @@ the new key in that order.
 | `login-keepalive` | a three-second scripted touch on the unlock assertion: the Session waits through UPNEEDED keepalives and unlocks. Over the touch's measured length, at most one keepalive per period plus two, at least one per observed longest silence less two, and no request silent for a second |
 | `login-probe` | a key whose default credProtect hides its credential from a silent assertion is KEY REFUSED `06` at the probe, and nothing is published |
 
-A record written in one guest's step is read back in its next; across
-cold boots it is not, since keys and records do not yet persist on a
-disk (the power-cut increment). Every operation kind, unlock,
+A record written in one guest's step is read back in its next; these
+diskless guests keep nothing across boots, which the power-cut guest
+below does. Every operation kind, unlock,
 enrollment, addition and removal, crosses the kernel's HID path. The
 acknowledgements are simulated root, the keys are software, and USB
 metadata and presence are fixtures: this proves no USB controller,
 YubiKey behaviour, physical presence or touch timing, and no td-authd
 supervision, which is a later increment.
+
+### Login power-cut guests
+
+The same command then boots one more TPM-free guest, `login-powercut`,
+twelve times in order on one fresh 256 MiB raw disk, each boot naming
+its phase as `td.login-cut=PHASE`, which the fixture init requires to be
+exactly one listed phase. Its one ignored test,
+`qemu_login_record_survives_power_cuts_inside_its_writes`, runs the
+worker as the guests above do, with the record at the production
+`/var/lib/td/login/1000` on a Btrfs `@var` subvolume of that disk,
+mounted with production's `nosuid,nodev` and `commit=300`. Two
+persistent virtual keys ("Virtual authenticator") live beside it in a
+root-only fixture directory, outside the login directory. Each cut boot
+replaces the worker's store write (`Context::write`) with one that
+first saves a ledger, the record's old and new digests and the
+publication's temporary name, durably in that fixture directory, then
+calls the store's `publish_at` or `remove_at`; at the boot's stage the
+hook writes `TD-LOGIN-CUT PHASE` to `/dev/console` and parks without
+returning, and the host, seeing the line, SIGKILLs QEMU, as
+`qemu-secret-system --powercuts` does. A boot cut after its write
+commits names its phase once the worker has sent its success frame and
+exited `operate`.
+
+| Phase | The boot's write, cut at |
+| --- | --- |
+| `setup` | none: makes the volume, the login directory as firstboot will, the blank keys and the ledger, unmounts and powers off |
+| `enroll-created`, `enroll-synced`, `enroll-renamed`, `enroll-committed` | a one-key enrollment of the first key, over no record: `Created`, `FileSynced`, `Renamed`, after the success frame |
+| `add-written`, `add-attempted`, `add-synced` | the second key added by the first, across the gated swap: `Written`, `RenameAttempted`, `DirectorySynced` |
+| `remove-attempted`, `remove-unlinked`, `remove-synced` | both keys removed, authorized by the first, which unlinks the record: `UnlinkAttempted`, `Unlinked`, `DirectorySynced` |
+| `final` | none: checks the last cut and both keys, unmounts and powers off |
+
+So every publication stage is cut once, over no record or over one, and
+every removal stage. Each boot after setup restores both keys from the
+disk, a damaged state file failing the guest by name, and requires the
+ledger to name the phase before its own. Then what that cut left must
+be what its stage leaves:
+
+- before the temporary's sync (`Created`, `Written`) the old record or
+  none, and at most that write's temporary;
+- from the temporary's sync to the directory's (`FileSynced`,
+  `RenameAttempted`, `Renamed`) the old record or none, and exactly that
+  temporary, whose bytes are the whole new record;
+- before the removal's directory sync (`UnlinkAttempted`, `Unlinked`)
+  the old record, and no temporary;
+- after the directory sync, or after the commit, the new record or none,
+  and no temporary.
+
+The record must read as enrolled with exactly the expected digest, or
+as unenrolled, never unavailable, and no other name may exist. Every
+key holding a credential the surviving record lists then unlocks it,
+and a key holding only others is NOT ENROLLED; then the boot makes its
+own write, whose start removes any leftover temporary with a directory
+sync, which the next boot's exact names confirm. The final boot requires
+no record and no name, and the first key holding four credentials and
+the second three: each made in a boot later cut, saved before its
+reply. A host test requires that each listed stage is one its write
+reaches, that the publication and removal stages are each cut exactly
+once, and that the ledger round-trips and refuses malformed text; the
+recipe's tests require its phase list to be the guest's boots, in order.
+
+An addition's write first requires that its swap was gated, as above,
+and that the authorizing key served its two sessions. Once the ledger
+is saved, every key is frozen ("Virtual authenticator"): a key save
+from then until the kill is refused before it writes anything and puts
+a failure line on the console, which fails the cut. No key request is
+expected then, since every token session ends before the commit round.
+
+The host kill ends QEMU, not the host: every write the guest's block
+layer submitted and QEMU completed is in the host's page cache, since
+the disk uses QEMU's default writeback cache, and survives. What the
+guest had not yet submitted is lost; I/O submitted but not completed at
+the kill may land or not. With `commit=300` an unsynced change stays in
+guest memory: Btrfs commits its running transaction every 300 seconds,
+longer than any boot's 180-second bound, and otherwise when something
+syncs, or a fsync falls back to a full commit, or memory or space runs
+short. That is what makes a missing sync visible.
+
+The `Renamed` and `Unlinked` cuts are the controls, each paired with the
+cut of the same write after its directory sync: `enroll-renamed` with
+`enroll-committed`, and `remove-unlinked` with `remove-synced`. In the
+first of each pair the rename or unlink has been made but the directory
+not synced, and the guest requires the old state back; in the second it
+requires the new one. So the store's directory sync is what made the
+change durable, and a store without it would lose a committed write in
+a crash. The controls rest on two premises:
+
+- nothing syncs a file on `@var` between the change and the kill. Only
+  `cut`'s console write and its park run in that window; the fixture's
+  ledger and key syncs all come before the change, the store's own syncs
+  before it too, and the freeze above refuses any key save after. Their
+  order is what makes them harmless: a sync before the change can only
+  make earlier state durable;
+- the kernel's rename and unlink do not sync the Btrfs log tree. On the
+  pinned 7.1 kernel a rename of an inode already logged in the running
+  transaction, as the synced temporary is, only updates the log tree in
+  memory (`btrfs_log_new_name`), and an unlink of an inode not logged is
+  memory-only. Some kernels from about 4.20 to 5.11 synced the log on
+  such a rename.
+
+Btrfs may commit early in principle, but within this window nothing
+asks it to: no sync runs, the transaction is seconds old, and the guest
+holds a few kilobytes of dirty data. A red at `enroll-renamed` or
+`remove-unlinked` after a kernel bump is therefore a changed premise to
+investigate, not by itself proof of a store regression; it is loud,
+never hidden.
+
+The temporary's own sync is tested as well: the `FileSynced`,
+`RenameAttempted` and `Renamed` cuts require the temporary to survive
+whole, which it would not without that sync. What the guests cannot show
+is that a published record would be torn without it, since a Btrfs
+directory sync may log the renamed file's contents with its name. Nor
+can a kill show that a sync reached stable media: the host keeps its
+page cache and QEMU's flushes to the host file are never put to the
+test, so a missing cache flush, reordered or torn sectors and host power
+loss are outside it. Production mounts `@var` with the default 30-second
+commit, which only narrows a window the store never relies on.
+
+The disk and its scratch directory are removed when the run ends. Each
+boot holds the 180-second bound. Setup and the final check require the
+one-test passing summary and a clean exit; each cut requires exactly
+one cut line, its own, a SIGKILL the host sent and saw reaped, and no
+passing summary, fixture success line, failure line or panic. The keys,
+root and presence are the fixtures above; this proves crash consistency
+of the store's own writes on Btrfs in a guest, not firstboot's
+temporary cleanup, which is increment 4's.

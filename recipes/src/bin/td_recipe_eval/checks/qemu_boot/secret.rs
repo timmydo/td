@@ -249,10 +249,11 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
             let built = output(runner, name)?;
             files.push((destination, built.join("bin").join(name)));
         }
-        let btrfs = output(runner, "btrfs-progs-x86-64")?;
-        files.push(("bin/btrfs", btrfs.join("bin/btrfs")));
-        files.push(("bin/mkfs.btrfs", btrfs.join("bin/mkfs.btrfs")));
     }
+    // The login power-cut guest's volume, and the TPM cold-store guests'.
+    let btrfs = output(runner, "btrfs-progs-x86-64")?;
+    files.push(("bin/btrfs", btrfs.join("bin/btrfs")));
+    files.push(("bin/mkfs.btrfs", btrfs.join("bin/mkfs.btrfs")));
     let mut contents = Vec::new();
     for (name, path) in &files {
         contents.push((
@@ -329,26 +330,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
             (false, _, _) => None,
             _ => return Err("missing TPM fixture configuration".into()),
         };
-        let mut entries: Vec<Entry<'_>> = contents
-            .iter()
-            .map(|(name, bytes)| Entry {
-                name,
-                mode: 0o755,
-                kind: Kind::File(bytes),
-            })
-            .collect();
-        entries.push(Entry {
-            name: "case",
-            mode: 0o444,
-            kind: Kind::File(name.as_bytes()),
-        });
-        let archive = runner.scratch_dir().join(format!("secret-{name}.cpio"));
-        let mut file =
-            File::create(&archive).map_err(|e| format!("create fixture archive: {e}"))?;
-        file.write_all(&base)
-            .and_then(|_| file.write_all(&cpio::build(&entries).map_err(std::io::Error::other)?))
-            .map_err(|e| format!("write fixture archive: {e}"))?;
-        drop(file);
+        let archive = case_archive(runner, &base, &contents, name)?;
         println!("[qemu-secret] {name}: {test}");
         let result = boot_with_timeout(
             &qemu,
@@ -422,8 +404,10 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
             result.elapsed.as_secs_f64()
         );
     }
+    run_powercuts(runner, &qemu, &kernel, &base, &contents)?;
     println!("PASS: secret authority VM cases ({} fresh guests); credential intake, inspection and relocking; no token or TPM release claim", fixture::CASES.len());
     println!("PASS: login-key worker over UHID virtual keys ({} fresh guests); production discovery, HID worker and operation lock for unlock, one- and two-key enrollment, addition and removal; wrong PIN, PIN AUTH BLOCKED until reinsertion, PIN BLOCKED, no key, two keys, a stranger key, a credProtect probe refusal and keepalives through a slow touch; simulated root acknowledgements and tier marker, no TPM, physical-presence or YubiKey claim", fixture::LOGIN_CASES.len());
+    println!("PASS: login record across abrupt QEMU kills ({} cold boots of one disposable Btrfs @var); cuts at every publication and removal stage and after a commit leave the old record or the whole new one, an unlink done or not, synced temporaries removed by the next write, and a rename or unlink before its directory sync lost; persistent virtual keys unlock whichever record survived; guest crash only, host storage retained, no host-power-loss, write-cache flush or torn-sector claim", fixture::LOGIN_CUT_PHASES.len());
     if tpm.is_some() {
         println!("PASS: TPM guest device, persistent sealed key, cold reopen, changed PCR and different TPM refusal; fixture measurements only, no FIDO2 or measured-deployment claim");
         println!("PASS: virtual credential creation, proof, recovery exclusion and both recovery policies; fresh assertion before TPM unseal, replay and wrong-key refusal; no physical presence or session-release claim");
@@ -431,6 +415,143 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
         println!("PASS: production private enrollment, unlock and named-write workers; both recovery policies, commit cancellation, locked writes and credential readback; simulated parent acknowledgements, no desktop or physical-presence claim");
         println!("PASS: production compositor attention, root authority, public sealed-descriptor credential write and generation relocking through virtual keyboard/token devices; jailed application portal retrieval, application isolation and locked refusal; no physical-presence claim");
         println!("PASS: cold Btrfs @var credential-store reopen with retained TPM state under both recovery policies; unchanged bundle, locked jailed retrieval, fresh primary or recovery assertion and per-application readback with the primary token absent during recovery; no power-loss or physical-presence claim");
+    }
+    Ok(())
+}
+
+/// The base initramfs, the guest files, and the case the fixture runs.
+fn case_archive(
+    runner: &RecipeCheckRunner,
+    base: &[u8],
+    contents: &[(&str, Vec<u8>)],
+    name: &str,
+) -> Result<PathBuf, String> {
+    let mut entries: Vec<Entry<'_>> = contents
+        .iter()
+        .map(|(name, bytes)| Entry {
+            name,
+            mode: 0o755,
+            kind: Kind::File(bytes),
+        })
+        .collect();
+    entries.push(Entry {
+        name: "case",
+        mode: 0o444,
+        kind: Kind::File(name.as_bytes()),
+    });
+    let archive = runner.scratch_dir().join(format!("secret-{name}.cpio"));
+    let mut file = File::create(&archive).map_err(|e| format!("create fixture archive: {e}"))?;
+    file.write_all(base)
+        .and_then(|_| file.write_all(&cpio::build(&entries).map_err(std::io::Error::other)?))
+        .map_err(|e| format!("write fixture archive: {e}"))?;
+    Ok(archive)
+}
+
+/// A cut phase ends on its own marker, killed by the host; setup and the
+/// final check end as every other guest does.
+fn powercut_result(result: &BootResult, phase: &str) -> Result<(), String> {
+    let cut = format!("{} {phase}", fixture::LOGIN_CUT);
+    let cuts = |line: &&str| line.starts_with(fixture::LOGIN_CUT);
+    let ended = if is_cut(phase) {
+        result.marker_killed
+            && !result.exited_clean
+            && result.console.lines().filter(cuts).count() == 1
+            && result.console.lines().any(|line| line == cut)
+            && !result
+                .console
+                .lines()
+                .any(|line| line.starts_with(fixture::PASS) || line.starts_with("test result:"))
+    } else {
+        result.exited_clean
+            && !result.marker_killed
+            && !result.console.lines().any(|line| cuts(&line))
+    };
+    if !result.evidence.target
+        || !ended
+        || result.evidence.kernel_panic
+        || result
+            .console
+            .lines()
+            .any(|line| line.starts_with(fixture::FAIL))
+    {
+        return Err(format!(
+            "login power-cut {phase} failed: {}\n{}",
+            result.reason,
+            tail(&result.console, 80)
+        ));
+    }
+    Ok(())
+}
+
+fn is_cut(phase: &str) -> bool {
+    !matches!(phase, "setup" | "final")
+}
+
+/// One guest, booted once per phase on one fresh disk. Each cut phase is
+/// killed with SIGKILL when the guest names it, inside or just after its
+/// write; the next boot finds what the disk kept.
+fn run_powercuts(
+    runner: &RecipeCheckRunner,
+    qemu: &str,
+    kernel: &Path,
+    base: &[u8],
+    contents: &[(&str, Vec<u8>)],
+) -> Result<(), String> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let scratch = Scratch {
+        dir: create_qmp_scratch_dir(&env::temp_dir(), &SEQ)?,
+    };
+    let disk = scratch.dir.join("login.img");
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&disk)
+        .and_then(|file| file.set_len(256 * 1024 * 1024))
+        .map_err(|e| format!("create login power-cut disk: {e}"))?;
+    let (name, test) = fixture::LOGIN_CUT_CASE;
+    let archive = case_archive(runner, base, contents, name)?;
+    for phase in fixture::LOGIN_CUT_PHASES {
+        let cut = is_cut(phase);
+        let marker = if cut {
+            format!("{} {phase}", fixture::LOGIN_CUT)
+        } else {
+            fixture::PASS.to_string()
+        };
+        let tokens = format!("td.hid-fixture=1 td.login-cut={phase}");
+        println!("[qemu-secret] {name} {phase}: {test}");
+        let result = boot_with_timeout(
+            qemu,
+            kernel,
+            &archive,
+            BootPlan {
+                disk: Some(BootDisk::new(&disk, false)),
+                mem: "512",
+                target_marker: &marker,
+                kill_on_marker: cut,
+                extra_append: &tokens,
+                user_net: false,
+                audio: false,
+                physical_input: false,
+                capture_firefox_audio: false,
+                tpm_socket: None,
+                screen: None,
+                shell: None,
+            },
+            runner.scratch_dir(),
+            Duration::from_secs(180),
+        )?;
+        fs::write(
+            runner
+                .scratch_dir()
+                .join(format!("secret-{name}-{phase}.log")),
+            &result.console,
+        )
+        .map_err(|e| format!("save login power-cut console: {e}"))?;
+        powercut_result(&result, phase)?;
+        println!(
+            "[qemu-secret] {name} {phase} passed in {:.2}s",
+            result.elapsed.as_secs_f64()
+        );
     }
     Ok(())
 }
@@ -715,22 +836,131 @@ mod tests {
                 "{name}"
             );
         }
-        // The module's every guest is on the roster, and only those.
+        // The module's every guest is on a roster, and only those.
         assert_eq!(
             source.matches("#[ignore = ").count(),
-            fixture::LOGIN_CASES.len()
+            fixture::LOGIN_CASES.len() + 1
         );
         let all: std::collections::BTreeSet<_> = fixture::CASES
             .iter()
             .chain(fixture::TPM_CASES)
             .chain(fixture::FIDO_CASES)
             .chain(fixture::LOGIN_CASES)
+            .chain(std::iter::once(&fixture::LOGIN_CUT_CASE))
             .map(|(name, _)| name)
             .collect();
-        assert_eq!(all.len(), 4 + 4 + 11 + 7);
+        assert_eq!(all.len(), 4 + 4 + 11 + 7 + 1);
         assert!(fixture::LOGIN_CASES
             .iter()
             .all(|(name, _)| name.starts_with("login-")));
+    }
+
+    #[test]
+    fn login_power_cut_phases_are_the_guests_boots_in_order() {
+        let (name, test) = fixture::LOGIN_CUT_CASE;
+        assert_eq!(name, "login-powercut");
+        let source = include_str!("../../../../../../td-secret/src/login_vm.rs");
+        let function = test.strip_prefix("login_operation::tests::vm::").unwrap();
+        let body = source
+            .split(&format!("fn {function}() -> Result<(), String> {{"))
+            .nth(1)
+            .unwrap();
+        assert!(body
+            .trim_start()
+            .starts_with(&format!("guard(\"{name}\");")));
+        // The guest's boots, between its setup and final check.
+        let table = source
+            .split("const BOOTS: &[Boot] = &[")
+            .nth(1)
+            .and_then(|rest| rest.split("\n];").next())
+            .unwrap();
+        let boots: Vec<&str> = table
+            .split("phase: \"")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap())
+            .collect();
+        let phases = fixture::LOGIN_CUT_PHASES;
+        assert_eq!(phases.first(), Some(&"setup"));
+        assert_eq!(phases.last(), Some(&"final"));
+        assert_eq!(boots, phases[1..phases.len() - 1]);
+        assert_eq!(phases.iter().filter(|phase| is_cut(phase)).count(), 10);
+        for phase in phases {
+            assert_eq!(
+                fixture::login_cut_phase(&format!("console=ttyS0 td.login-cut={phase}")),
+                Ok(*phase)
+            );
+        }
+        for cmdline in [
+            "",
+            "td.login-cut=unknown",
+            "td.login-cut=setup td.login-cut=setup",
+            "td.login-cut=setup td.login-cut=final",
+            "td.login-cut=",
+        ] {
+            assert!(fixture::login_cut_phase(cmdline).is_err(), "{cmdline}");
+        }
+    }
+
+    #[test]
+    fn a_login_cut_requires_an_observed_kill_at_its_own_marker() {
+        let cut = || BootResult {
+            evidence: ConsoleEvidence {
+                target: true,
+                ..ConsoleEvidence::default()
+            },
+            exited_clean: false,
+            marker_killed: true,
+            reason: String::new(),
+            console: format!("boot\n{} add-written\n", fixture::LOGIN_CUT),
+            elapsed: Duration::from_secs(1),
+            firefox_audio: FirefoxAudioCapture::NotRequested,
+        };
+        assert!(powercut_result(&cut(), "add-written").is_ok());
+        for case in 0..10 {
+            let mut result = cut();
+            match case {
+                0 => result.evidence.target = false,
+                1 => result.marker_killed = false,
+                2 => result.exited_clean = true,
+                3 => result.evidence.kernel_panic = true,
+                4 => result.console.clear(),
+                5 => result
+                    .console
+                    .push_str(&format!("{} add-written\n", fixture::LOGIN_CUT)),
+                6 => result
+                    .console
+                    .push_str(&format!("{} add-synced\n", fixture::LOGIN_CUT)),
+                7 => result.console.push_str(&format!("{}\n", fixture::PASS)),
+                8 => result
+                    .console
+                    .push_str("test result: ok. 1 passed; 0 failed;\n"),
+                _ => result
+                    .console
+                    .push_str(&format!("{}: refused\n", fixture::FAIL)),
+            }
+            assert!(
+                powercut_result(&result, "add-written").is_err(),
+                "case {case}"
+            );
+        }
+        assert!(powercut_result(&cut(), "add-synced").is_err());
+        // Setup and the final check end cleanly, with no cut.
+        assert!(powercut_result(&cut(), "setup").is_err());
+        let clean = || BootResult {
+            exited_clean: true,
+            marker_killed: false,
+            console: format!("{}\n", fixture::PASS),
+            ..cut()
+        };
+        for phase in ["setup", "final"] {
+            assert!(powercut_result(&clean(), phase).is_ok());
+            let mut result = clean();
+            result
+                .console
+                .push_str(&format!("{} {phase}\n", fixture::LOGIN_CUT));
+            assert!(powercut_result(&result, phase).is_err());
+        }
+        assert!(powercut_result(&clean(), "enroll-created").is_err());
     }
 
     #[test]
