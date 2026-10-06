@@ -12401,6 +12401,17 @@ fn composed_source_bound_members() {
         );
     }
 }
+fn retained_source_bound_composition() {
+    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained::collected::composed::retained;
+    let mut samples = [COUNTERS.snapshot(); 16];
+    let mut slots = samples.iter_mut();
+    retained::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|sample| !sample.invalid));
+    for [before, after] in samples.as_chunks::<2>().0 {
+        assert_eq!(before, after, "retained source-bound composition allocated");
+    }
+}
 
 fn store_pinned_blobs() {
     let mut samples = [COUNTERS.snapshot(); 40];
@@ -12812,6 +12823,7 @@ fn main() {
     whole_source_bound_members();
     collected_source_bound_members();
     composed_source_bound_members();
+    retained_source_bound_composition();
     mime_base64();
     mime_qp();
     mime_qp_input();

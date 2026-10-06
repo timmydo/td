@@ -810,6 +810,16 @@ fresh release; emitted prefixes remain provisional. Whole response
 retention, request selection and current access/publication follow.
 Only the eight allocation intervals in API §1.131 are qualified.
 
+M06ea retains whole source-bound Structure/Lists property members in a
+separately admitted fixed window. It starts only from original complete
+collection, privately creates the fresh composer and reuses td-json
+Window; only successful reported bytes advance, with no additional work
+fees. Original collection and actual descriptor remain held through
+fresh complete Retained and final release. Capacity/deadline failures
+are sticky; whole output stays provisional through current authenticated
+publication. Only API §1.132's eight allocation intervals are qualified.
+Whole ledger admission, request selection and publication remain later.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

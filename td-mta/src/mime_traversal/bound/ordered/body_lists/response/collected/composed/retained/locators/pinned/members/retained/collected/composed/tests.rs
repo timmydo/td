@@ -8,8 +8,8 @@ use crate::{
     ports::{BlobReader, Clock, Error as PolicyError, Time},
 };
 use std::sync::atomic::{AtomicU64, Ordering};
-const SIMPLE: &[u8] = b"\r\nabc\r\n";
-fn with_collection<T>(
+pub(super) const SIMPLE: &[u8] = b"\r\nabc\r\n";
+pub(super) fn with_collection<T>(
     source: &[u8],
     base: u64,
     clock: &dyn Clock,
@@ -35,7 +35,7 @@ fn with_collection<T>(
         run(collecting.finish(Tick(1)).unwrap())
     })
 }
-fn costs(cursor: &Cursor<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_, '_>) -> [u64; 5] {
+pub(super) fn costs(cursor: &Cursor<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_, '_>) -> [u64; 5] {
     let s = &cursor
         .source
         .source
@@ -54,7 +54,7 @@ fn costs(cursor: &Cursor<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_, '_>) -> [u64; 5
         w.output_bytes,
     ]
 }
-fn drain(
+pub(super) fn drain(
     cursor: &mut Cursor<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_, '_>,
     width: usize,
 ) -> Result<Vec<u8>, Error> {
@@ -110,7 +110,7 @@ fn expected(source: &[u8], mode: Mode, fragments: &[Cell<'_>]) -> String {
         )
     }
 }
-fn deadline(actual: bool) -> Error {
+pub(super) fn deadline(actual: bool) -> Error {
     if actual {
         Error::Parent(PolicyError::Deadline)
     } else {

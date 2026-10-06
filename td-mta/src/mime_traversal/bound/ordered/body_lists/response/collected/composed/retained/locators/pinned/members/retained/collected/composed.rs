@@ -1,4 +1,5 @@
 //! Original source-bound whole members share the bounded tree/list frame.
+pub mod retained;
 use super::super::super::super::super::Error as OriginalError;
 use super::{Error, Serialized, View};
 use crate::mime_traversal::bound::ordered::body_lists::response::collected::composed::framing::{

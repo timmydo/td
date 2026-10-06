@@ -2438,6 +2438,23 @@ eight each binding, member emission, whole retention and collection
 intervals remain separate. Native/stack/RSS and complete request
 admission/authorized publication remain open.
 
+M06ea whole source-bound tree/list retention overlaps original complete
+collection, source/fragments and member cells, original actual pin and
+the separately admitted whole generated property-member window. No new
+source/I/O or output/work fee accompanies retention; the private fresh
+composer funds each turn. Cursor plus HeaderBudget fits 1 KiB; Retained
+fits 768 bytes. These compiled caps are not full-ledger or stack proofs.
+Eight sequential Rust allocation intervals measure near-u64 digest
+Structure, zero-base digest Lists, actual-pin expiry after a copied
+prefix, completed Cursor/Retained expiry, released Serialized explicit
+check expiry, empty-window capacity refusal and constructor pin expiry.
+Original matching/collection/backing and whole output preparation stay
+cold; descriptor teardown is counted, pooled view/scratch lease, cell
+array and fixture cleanup stay outside. API §1.132 lists unmeasured
+variants. Earlier 105 intervals remain separate evidence. Native
+allocation, worker stack/RSS, full request admission, selection and
+current authorized publication remain open.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no
