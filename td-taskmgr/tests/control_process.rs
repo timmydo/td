@@ -8,7 +8,7 @@
 )]
 
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -29,14 +29,28 @@ mod native_compositor;
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
-        let path = Path::new("/tmp").join(format!(
-            "td-taskmgr-process-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Self(path)
+        // Concurrent hosted checks run in their own PID namespaces, so the
+        // pid alone can repeat: only a directory this call created is ours.
+        let mut taken = 0;
+        loop {
+            let path = Path::new("/tmp").join(format!(
+                "td-taskmgr-process-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && taken < 1024 => {
+                    taken += 1;
+                }
+                created => {
+                    created.unwrap();
+                    // The create's mode is filtered by the umask.
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    return Self(path);
+                }
+            }
+        }
     }
 }
 impl Drop for Directory {

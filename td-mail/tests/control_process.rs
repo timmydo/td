@@ -29,16 +29,25 @@ mod native_compositor;
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
-        let path = Path::new("/tmp").join(format!(
-            "td-mail-process-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .unwrap();
-        Self(path)
+        // Concurrent hosted checks run in their own PID namespaces, so the
+        // pid alone can repeat: only a directory this call created is ours.
+        let mut taken = 0;
+        loop {
+            let path = Path::new("/tmp").join(format!(
+                "td-mail-process-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && taken < 1024 => {
+                    taken += 1;
+                }
+                created => {
+                    created.unwrap();
+                    return Self(path);
+                }
+            }
+        }
     }
 }
 impl Drop for Directory {

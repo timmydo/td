@@ -425,13 +425,25 @@ mod tests {
 
     #[test]
     fn check_binds_exact_settings_versions_and_file_trust() {
-        let root = Path::new("/tmp").join(format!(
-            "td-vm-settings-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        // Concurrent hosted checks run in their own PID namespaces, so the
+        // pid alone can repeat: take the first name this test creates.
+        let root = (0..1024)
+            .map(|_| {
+                Path::new("/tmp").join(format!(
+                    "td-vm-settings-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ))
+            })
+            .find(
+                |root| match fs::DirBuilder::new().mode(0o700).create(root) {
+                    Ok(()) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    Err(e) => panic!("{}: {e}", root.display()),
+                },
+            )
+            .expect("no free settings test directory name in /tmp");
         for path in [
-            root.clone(),
             root.join("workspace"),
             root.join("claude"),
             root.join("bin"),

@@ -604,12 +604,25 @@ mod tests {
         }
         let uid = fs::metadata("/proc/self").unwrap().uid();
         // OpenSSH StrictModes deliberately rejects /tmp even for private children.
-        let root = PathBuf::from(std::env::var_os("HOME").expect("host HOME")).join(format!(
-            ".td-vm-clone-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        // Concurrent hosted checks run in their own PID namespaces over the one
+        // HOME, so the pid alone can repeat: take the first name this creates.
+        let home = PathBuf::from(std::env::var_os("HOME").expect("host HOME"));
+        let root = (0..1024)
+            .map(|_| {
+                home.join(format!(
+                    ".td-vm-clone-test-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ))
+            })
+            .find(
+                |root| match fs::DirBuilder::new().mode(0o700).create(root) {
+                    Ok(()) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    Err(e) => panic!("{}: {e}", root.display()),
+                },
+            )
+            .expect("no free clone test directory name in HOME");
         let mut f = Fixture { root, server: None };
         let keygen = program("ssh-keygen");
         let git_bin = program("git");
