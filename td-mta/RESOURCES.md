@@ -2566,6 +2566,17 @@ counted descriptor teardown; earlier 185 remain separate. Native
 allocation, stack/RSS, configurable subParts selection and full
 admission/publication remain unqualified.
 
+M06el decoded body-part property recognition keeps Cursor within 192
+bytes and Property within 64 bytes. The existing header selector owns
+parameterized syntax; standard fields prepay one static-table row per
+poll with at most eleven byte visits and one record, followed after
+twelve misses by one terminal record with zero byte visits. Long non-header
+keys use constant table work with no copied key. API §1.143 qualifies
+eight enumerated Rust intervals with long key/refusal-state setup cold;
+earlier 193 remain separate. Native allocation, stack/RSS, request
+aggregation/admission and current authenticated publication remain
+unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

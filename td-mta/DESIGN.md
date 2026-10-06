@@ -930,6 +930,16 @@ scaffold; configurable headers/header:*/subParts selection, request
 parsing/defaults, full admission and current authenticated publication
 remain later.
 
+M06el decoded body-part key recognition distinguishes all twelve
+standard EmailBodyPart fields and reuses the existing bounded header
+selector in BodyPart context. Result tags and borrowed header plans
+remain passive; unknown keys stay for the enclosing dispatcher, never
+become ALL. API §1.143 scopes bounded paid comparisons and eight Rust
+allocation intervals. JSON/argument parsing, defaults, duplicate policy,
+full selection aggregation and configurable header/subParts composition
+remain later; this recognition does not change the provisional
+structural scaffold or grant current publication authority.
+
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot
 select bodyStructure. They remain public facades over the same shared

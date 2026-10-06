@@ -2404,6 +2404,17 @@ Initial independently landable increments:
   headers/header:*/subParts selection, request parsing/defaults, full
   admission and current authenticated publication remain later.
 
+- **M06el — decoded body-part property names:** recognize all twelve
+  standard fields and borrowed parameterized header plans through the
+  existing BodyPart header selector. Case-sensitive tags, unknown-key
+  separation, bounded prepaid rows, exact sticky work errors and passive
+  inert completion are implemented. Eight units, two guards and eight
+  Rust intervals qualify API §1.143. JSON/argument parsing, defaults,
+  duplicate handling, bodyProperties aggregation and configurable
+  header/subParts rendering remain later. The existing structural
+  scaffold stays provisional and current authenticated publication
+  remains deferred.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

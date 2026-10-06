@@ -47,6 +47,10 @@ use measured_store_fs as store_fs;
 // Expand at this root to retain production child paths and restricted visibility.
 include!("../src/mime_probe_modules.rs");
 
+#[path = "../src/body_property.rs"]
+#[allow(unused)] // The production library remains the lint authority.
+mod body_property;
+
 fn forwarding() {
     let before = COUNTERS.snapshot();
     let mut bytes = Vec::<u8>::with_capacity(black_box(16));
@@ -12419,6 +12423,17 @@ fn composed_selected_source_bound_part_fields() {
     }
 }
 
+fn body_property_names() {
+    let mut samples = [COUNTERS.snapshot(); 16];
+    let mut slots = samples.iter_mut();
+    body_property::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|sample| !sample.invalid));
+    for [before, after] in samples.as_chunks::<2>().0 {
+        assert_eq!(before, after, "body property names allocated");
+    }
+}
+
 fn requested_composed_selected_source_bound_part_fields() {
     use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::selected::retained::collected::composed::requested;
     let mut samples = [COUNTERS.snapshot(); 16];
@@ -12966,6 +12981,7 @@ fn main() {
     composed_selected_source_bound_part_fields();
     requested_composed_selected_source_bound_part_fields();
     retained_requested_composed_selected_source_bound_part_fields();
+    body_property_names();
     whole_source_bound_members();
     collected_source_bound_members();
     composed_source_bound_members();

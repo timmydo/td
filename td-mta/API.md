@@ -6078,6 +6078,52 @@ admission remain unqualified. The fixed subParts scaffold is provisional;
 configurable headers/header:*/subParts selection, request bodyProperties
 parsing/defaults and current authenticated publication remain later.
 
+### 1.143 Decoded body-part property names
+
+M06el adds `body_property::Cursor` over one immutable decoded request
+key. Recognize the twelve standard EmailBodyPart names as distinct Field
+values: partId, blobId, size, headers, name, type, charset, disposition,
+cid, language, location and subParts. Matching is case-sensitive.
+Delegate parameterized `header:NAME[:asFORM][:all]` to §1.28's existing
+selector in BodyPart context, preserving the original borrowed key/name,
+capitalization, forms, occurrence policy and malformed/forbidden errors.
+Email convenience aliases are not body-part properties. Unknown names
+return Complete(None) for the enclosing dispatcher to reject; never
+reinterpret them as ALL.
+
+A constructor borrows the key and performs no work. Each poll delegates
+one existing bounded header turn or prepays one standard-field table
+comparison. After twelve misses, a separate terminal turn spends one
+record and zero byte visits before returning Complete(None). Header turns retain §1.28's at-most-184 byte visits and 32
+records; standard turns spend one record and at most eleven byte visits,
+with no output/unlink charge. Different-length comparisons spend no byte
+visits. Unknown long non-header keys inspect only the existing bounded
+prefix and constant table, with no rescan or second key copy. Work
+refusals are sticky across fresh meters; completed recognition is an
+inert passive result, not a freshness or publication capability. Error
+variants and their Display text reuse the header selector: standard-row
+work/state errors also say header property; no new error ABI is added.
+
+Cursor is non-Copy/non-Clone and fits 192 bytes; Property fits 64 bytes.
+Eight units and two compile-fail guards pin literal field tags,
+case/unknown/alias rejection, borrowed header spelling and exact
+header-selector turn/cost parity, malformed/forbidden forms, independent
+standard comparison debits, exact byte/record limits, deadline phases,
+long header loans and constant-cost long unknown keys.
+
+Eight sequential Rust allocation intervals cover all twelve standard
+names, a 64 KiB parameterized header name, a long unknown Unicode key,
+malformed suffix, forbidden form, standard-row record refusal,
+header-name byte refusal and standard-row deadline refusal. Long keys
+and refusal-state preparation are cold. No native allocation, stack/RSS,
+whole request admission or authenticated publication claim follows.
+Earlier 193 intervals remain separate. JSON decoding and argument-shape
+validation, absent/null defaults, duplicate handling, complete
+bodyProperties aggregation, configurable header/subParts rendering and
+selection-to-composition wiring remain later. Recognition of
+headers/subParts does not change §1.140–1.142's provisional structural
+scaffold.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
