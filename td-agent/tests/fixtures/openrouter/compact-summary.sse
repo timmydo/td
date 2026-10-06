@@ -1,0 +1,8 @@
+data: {"id":"gen-1759400002-Cm1pAcT2sUm3","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400002,"choices":[{"index":0,"delta":{"role":"assistant","content":"SUMMARY: both files were read; "},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400002-Cm1pAcT2sUm3","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400002,"choices":[{"index":0,"delta":{"role":"assistant","content":"new.txt is the one that matters (#6)."},"finish_reason":"stop","native_finish_reason":"end_turn","logprobs":null}]}
+
+data: {"id":"gen-1759400002-Cm1pAcT2sUm3","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400002,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null,"native_finish_reason":null,"logprobs":null}],"usage":{"prompt_tokens":67012,"completion_tokens":21,"total_tokens":67033,"cost":0.201351,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0,"audio_tokens":0},"cost_details":{"upstream_inference_cost":null},"completion_tokens_details":{"reasoning_tokens":0,"image_tokens":0}}}
+
+data: [DONE]
+

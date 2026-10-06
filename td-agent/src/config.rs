@@ -66,6 +66,11 @@ pub struct Client {
     /// The share of a model's context, in percent, past which a request
     /// compacts first.
     pub compact_at: u8,
+    /// The most tokens of a compacted conversation's recent tail.
+    pub compact_keep_tokens: u64,
+    /// The model that writes a compaction's summary; the conversation's
+    /// own when none.
+    pub compact_model: Option<String>,
     /// The bytes of each background process's output kept.
     pub background_output_bytes: u64,
 }
@@ -96,6 +101,8 @@ impl Default for Client {
             max_background: DEFAULT_MAX_BACKGROUND,
             auto_compact: true,
             compact_at: DEFAULT_COMPACT_AT,
+            compact_keep_tokens: DEFAULT_COMPACT_KEEP_TOKENS,
+            compact_model: None,
             background_output_bytes: DEFAULT_BACKGROUND_OUTPUT_BYTES,
         }
     }
@@ -149,7 +156,10 @@ impl Client {
             &self.title_model,
             &self.classifier_model,
             &self.classifier_fast_model,
-        ] {
+        ]
+        .into_iter()
+        .chain(&self.compact_model)
+        {
             if !wanted.contains(id) {
                 wanted.push(id.clone());
             }
@@ -227,6 +237,14 @@ impl Client {
             ("auto_compact".into(), Json::Bool(self.auto_compact)),
             ("compact_at".into(), Json::from(u64::from(self.compact_at))),
             (
+                "compact_keep_tokens".into(),
+                Json::from(self.compact_keep_tokens),
+            ),
+            (
+                "compact_model".into(),
+                self.compact_model.clone().map_or(Json::Null, Json::Str),
+            ),
+            (
                 "background_output_bytes".into(),
                 Json::from(self.background_output_bytes),
             ),
@@ -303,6 +321,20 @@ impl Client {
                     .and_then(|n| u8::try_from(n).ok())
                     .filter(|n| COMPACT_AT.contains(n))
                     .ok_or("compact_at is out of range")?,
+            },
+            compact_keep_tokens: match value.get("compact_keep_tokens") {
+                None => DEFAULT_COMPACT_KEEP_TOKENS,
+                Some(n) => n
+                    .as_u64()
+                    .filter(|n| COMPACT_KEEP_TOKENS.contains(n))
+                    .ok_or("compact_keep_tokens is out of range")?,
+            },
+            compact_model: match value.get("compact_model") {
+                None | Some(Json::Null) => None,
+                Some(id) => Some(model_id(
+                    "compact_model",
+                    id.as_str().ok_or("compact_model is not text")?,
+                )?),
             },
             max_background: match value.get("max_background") {
                 None => DEFAULT_MAX_BACKGROUND,
@@ -399,6 +431,9 @@ pub(crate) fn effort(text: &str) -> Result<String, String> {
 /// nearest such case Jev answered `matches` to (DESIGN.md §11; the
 /// commit that set it records the counts).
 const JEV_THRESHOLD_SHIPPED: u16 = 775;
+/// `compact_keep_tokens`'s default, and what it may be.
+const DEFAULT_COMPACT_KEEP_TOKENS: u64 = 20_000;
+const COMPACT_KEEP_TOKENS: std::ops::RangeInclusive<u64> = 1_000..=1_000_000;
 /// `compact_at`'s default, in percent.
 const DEFAULT_COMPACT_AT: u8 = 80;
 /// What `compact_at` may be, in percent.
@@ -541,8 +576,8 @@ const KEYS: &[(&str, Use)] = &[
     ("background_output_bytes", Use::Read),
     ("auto_compact", Use::Read),
     ("compact_at", Use::Read),
-    ("compact_keep_tokens", Use::Later(16)),
-    ("compact_model", Use::Later(16)),
+    ("compact_keep_tokens", Use::Read),
+    ("compact_model", Use::Read),
 ];
 
 /// Keys no longer read, accepted with a note of why, so a file written
@@ -998,6 +1033,26 @@ pub fn parse(text: &str) -> Result<Config, String> {
     if let Some(value) = table.get("compact_at") {
         config.client.compact_at = compact_at(value)?;
     }
+    if let Some(value) = table.get("compact_keep_tokens") {
+        config.client.compact_keep_tokens = match value {
+            Toml::Int(n) => u64::try_from(*n).ok(),
+            _ => None,
+        }
+        .filter(|n| COMPACT_KEEP_TOKENS.contains(n))
+        .ok_or_else(|| {
+            format!(
+                "`compact_keep_tokens` is a whole number from {} to {}, not {value:?}",
+                COMPACT_KEEP_TOKENS.start(),
+                COMPACT_KEEP_TOKENS.end()
+            )
+        })?;
+    }
+    if let Some(id) = table
+        .optional_str("compact_model")
+        .map_err(|e| e.to_string())?
+    {
+        config.client.compact_model = Some(model_id("compact_model", id)?);
+    }
     if let Some(value) = table.get("max_background") {
         config.client.max_background = match value {
             Toml::Int(n) => u32::try_from(*n).ok(),
@@ -1304,6 +1359,32 @@ mod tests {
         let older = Client::from_json(&older).unwrap();
         assert!(older.auto_compact);
         assert_eq!(older.compact_at, 80);
+        let default = Config::default().client;
+        assert_eq!(
+            (default.compact_keep_tokens, default.compact_model),
+            (20_000, None)
+        );
+        let client = parse("compact_keep_tokens = 8000\ncompact_model = \"a/cheap\"\n")
+            .unwrap()
+            .client;
+        assert_eq!(client.compact_keep_tokens, 8000);
+        assert_eq!(client.compact_model.as_deref(), Some("a/cheap"));
+        assert_eq!(Client::from_json(&client.to_json()).unwrap(), client);
+        assert!(client.wanted().contains(&"a/cheap".to_string()));
+        for (text, why) in [
+            (
+                "compact_keep_tokens = 999",
+                "`compact_keep_tokens` is a whole number",
+            ),
+            (
+                "compact_keep_tokens = \"9\"",
+                "`compact_keep_tokens` is a whole number",
+            ),
+            ("compact_model = \"a b\"", "`compact_model` must be"),
+        ] {
+            let refused = parse(text).unwrap_err();
+            assert!(refused.contains(why), "{text}: {refused}");
+        }
         for (text, percent) in [("1", 100), ("1.0", 100), ("0.1", 10), ("0.95", 95)] {
             assert_eq!(
                 parse(&format!("compact_at = {text}"))

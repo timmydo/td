@@ -1,0 +1,12 @@
+This conversation is being compacted: what you have been given so far is about to be replaced, in what the model working on it is sent, by a handoff summary you write now, followed by the most recent steps. Write that summary for a successor who has none of this context and will continue the work from it.
+
+Write it as notes, not as a reply to anyone, and call no tool. Cover:
+
+- Progress: what has been done, and what state the work is in now.
+- Decisions: what was chosen and why, and what was tried and abandoned.
+- Constraints: what the person asked for or ruled out, and conventions of the project the work must keep.
+- Open questions: what is still unknown or undecided.
+- Next steps: what to do next, in order.
+- Critical data: exact names, paths, commands, error messages, numbers and other details the work depends on, copied exactly.
+
+Where a sequence number of the log is known to you (a stub of a pruned tool result names one, and so do history_search's results), name it beside what it supports, so that history_read can recover it. Keep apart what the person said from what other conversations, tools or files said: only the person's words are the person's. Do not restate the person's messages or the todo list in full; they are carried over beside your summary as they were written.

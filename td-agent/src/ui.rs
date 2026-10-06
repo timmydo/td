@@ -1886,6 +1886,41 @@ impl App {
             Kind::Request {
                 purpose, reserved, ..
             } => self.meter.requests.push((event.seq, purpose, reserved)),
+            // A compaction's summary, expandable at its divider.
+            Kind::Assistant {
+                request,
+                content,
+                finish,
+                incomplete,
+                calls,
+                ..
+            } if self.meter.request(request).map(|r| r.0) == Some(Purpose::Compact) => {
+                // As `compact::in_force` decides whether it stands.
+                let stands = !incomplete
+                    && finish == "stop"
+                    && calls.is_empty()
+                    && content.as_deref().is_some_and(|c| !c.trim().is_empty());
+                let (status, said) = if stands {
+                    (
+                        ("compacted", Tone::Neutral),
+                        "from here the model's view begins with this summary, the state carried over and its most recent steps",
+                    )
+                } else {
+                    (
+                        ("not compacted", Tone::Bad),
+                        "this summary does not stand; the model's view is as it was",
+                    )
+                };
+                let pushed = Message::new("td-agent")
+                    .and_then(|m| m.status(status.0, status.1))
+                    .and_then(|m| m.text(said))
+                    .and_then(|m| m.section("summary", content.as_deref().unwrap_or_default(), true))
+                    .map_err(|e| e.to_string())
+                    .and_then(|m| self.push_message(m));
+                if let Err(e) = pushed {
+                    self.note(format!("the transcript refused a summary: {e}"));
+                }
+            }
             Kind::Assistant {
                 request,
                 content,
@@ -2117,7 +2152,14 @@ impl App {
             }
             // A divider where the model's view was compacted; the
             // transcript above it stays whole (DESIGN.md §14).
-            Kind::Compaction { pruned } => self.notice_message(&format!(
+            Kind::Compaction {
+                summary: Some(asked),
+                ..
+            } => self.notice_message(&format!(
+                "compacting: a handoff summary is asked for, to stand in the model's view for what came before #{}; the transcript keeps it all",
+                asked.tail
+            )),
+            Kind::Compaction { pruned, .. } => self.notice_message(&format!(
                 "compacted: from here the model is sent {} older tool results as stubs, which history_read resolves",
                 pruned.len()
             )),
@@ -2253,7 +2295,10 @@ impl App {
     /// message, which the request's first delta starts (DESIGN.md §4).
     /// Once the transcript cannot draw it, the rest waits for the log.
     fn delta(&mut self, request: u64, reasoning: &str, content: &str) {
-        if (reasoning.is_empty() && content.is_empty()) || self.undrawn == Some(request) {
+        // A compaction's summary is shown whole, folded, when it comes.
+        let summary = self.meter.request(request).map(|r| r.0) == Some(Purpose::Compact);
+        if (reasoning.is_empty() && content.is_empty()) || self.undrawn == Some(request) || summary
+        {
             return;
         }
         let drawn = match self.streaming.filter(|s| s.request == request) {
@@ -5284,6 +5329,46 @@ pub mod tests {
             calls: Vec::new(),
             incomplete,
         }
+    }
+
+    /// A compaction's summary is not drawn as it streams; it arrives
+    /// folded, marked as standing only when it does (DESIGN.md §14).
+    #[test]
+    fn a_summary_is_shown_folded_once_whole() {
+        let mut app = app();
+        turn(&mut app, 1, "hello");
+        let compact = |reserved| Kind::Request {
+            turn: 2,
+            purpose: Purpose::Compact,
+            prefix: 0,
+            head: String::new(),
+            bytes: 0,
+            reserved,
+        };
+        app.update(at(3, compact(900)), 0);
+        app.update(delta(3, "", "SUMMARY: so far"), 0);
+        assert_eq!(app.transcript().len(), 1, "nothing drawn as it comes");
+        app.update(at(4, reply(3, "", "SUMMARY: so far", false)), 0);
+        assert_eq!(app.transcript().len(), 2);
+        let shown = app.transcript().message(1).unwrap();
+        assert_eq!(shown.section_text(1), Some("SUMMARY: so far"));
+        let shown = text(&app);
+        assert!(
+            shown.contains("compacted") && !shown.contains("not compacted"),
+            "{shown}"
+        );
+        app.update(at(5, compact(900)), 0);
+        // Whole, but cut short at its `max_tokens`.
+        let mut cut = reply(5, "", "SUMMARY: half", false);
+        if let Kind::Assistant { finish, .. } = &mut cut {
+            *finish = "length".into();
+        }
+        app.update(at(6, cut), 0);
+        let last = app.transcript().message(2).unwrap();
+        assert_eq!(
+            last.section_text(0),
+            Some("this summary does not stand; the model's view is as it was")
+        );
     }
 
     /// Deltas draw the reply into one message as they come; the logged

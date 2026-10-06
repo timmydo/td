@@ -228,6 +228,38 @@ pub fn timed(prefix: &str) -> bool {
 /// model's: its reasoning details may lack the signature that closes
 /// them, and its tool calls never ran.
 pub fn messages(events: &[Event], timed: bool) -> Vec<String> {
+    view(events, timed).into_iter().map(|(_, m)| m).collect()
+}
+
+/// What a request at the end of `events` sends after its prefix, each
+/// message with the sequence number of the event it comes from: after a
+/// compaction's summary in force (DESIGN.md §14), the notice, summary
+/// and carried state, numbered as the compaction, and then the events
+/// from the summary's tail on; otherwise every message.
+pub fn view(events: &[Event], timed: bool) -> Vec<(u64, String)> {
+    let force = crate::compact::in_force(events);
+    let mut out = Vec::new();
+    if let Some(force) = &force {
+        let before = events.get(..force.index).unwrap_or_default();
+        out.push((
+            force.seq,
+            crate::prompt::message(
+                "user",
+                &crate::compact::carried(before, force.seq, force.tail, force.text),
+            ),
+        ));
+    }
+    let tail = force.map_or(0, |f| f.tail);
+    out.extend(
+        all_messages(events, timed)
+            .into_iter()
+            .filter(|(seq, _)| *seq >= tail),
+    );
+    out
+}
+
+/// Every message the log's events make, numbered by event.
+fn all_messages(events: &[Event], timed: bool) -> Vec<(u64, String)> {
     let at = |time: u64| {
         if timed {
             format!("{}\n", received(time))
@@ -246,13 +278,16 @@ pub fn messages(events: &[Event], timed: bool) -> Vec<String> {
     for event in events {
         match &event.kind {
             Kind::Request { purpose, .. } => purposes.push((event.seq, *purpose)),
-            Kind::User { text, .. } => out.push(crate::prompt::message(
-                "user",
-                &format!("{}{text}", at(event.time)),
+            Kind::User { text, .. } => out.push((
+                event.seq,
+                crate::prompt::message("user", &format!("{}{text}", at(event.time))),
             )),
-            Kind::Notification { text } => out.push(crate::prompt::message(
-                "user",
-                &format!("{}{NOTIFICATION}\n{text}", at(event.time)),
+            Kind::Notification { text } => out.push((
+                event.seq,
+                crate::prompt::message(
+                    "user",
+                    &format!("{}{NOTIFICATION}\n{text}", at(event.time)),
+                ),
             )),
             Kind::Process {
                 number, command, ..
@@ -274,9 +309,12 @@ pub fn messages(events: &[Event], timed: bool) -> Vec<String> {
                         "\nthe last of its output, made visible, follows; process_output reads it all\n{tail}"
                     ));
                 }
-                out.push(crate::prompt::message(
-                    "user",
-                    &format!("{}{NOTIFICATION}\n{text}", at(event.time)),
+                out.push((
+                    event.seq,
+                    crate::prompt::message(
+                        "user",
+                        &format!("{}{NOTIFICATION}\n{text}", at(event.time)),
+                    ),
                 ))
             }
             Kind::Message {
@@ -285,12 +323,15 @@ pub fn messages(events: &[Event], timed: bool) -> Vec<String> {
                 text,
                 status,
                 ..
-            } => out.push(crate::prompt::message(
-                "user",
-                &format!(
-                    "{}{}\n{text}",
-                    at(event.time),
-                    label(from, *role, status.as_deref())
+            } => out.push((
+                event.seq,
+                crate::prompt::message(
+                    "user",
+                    &format!(
+                        "{}{}\n{text}",
+                        at(event.time),
+                        label(from, *role, status.as_deref())
+                    ),
                 ),
             )),
             Kind::Assistant {
@@ -348,7 +389,7 @@ pub fn messages(events: &[Event], timed: bool) -> Vec<String> {
                     message.push_str(details);
                 }
                 message.push('}');
-                out.push(message);
+                out.push((event.seq, message));
             }
             Kind::ToolResult {
                 reply,
@@ -363,14 +404,15 @@ pub fn messages(events: &[Event], timed: bool) -> Vec<String> {
                 } else {
                     content.clone()
                 };
-                out.push(
+                out.push((
+                    event.seq,
                     Json::Obj(vec![
                         ("role".into(), Json::Str("tool".into())),
                         ("tool_call_id".into(), Json::Str(id.clone())),
                         ("content".into(), Json::Str(content)),
                     ])
                     .to_string(),
-                )
+                ))
             }
             _ => {}
         }
@@ -463,6 +505,33 @@ pub fn body(events: &[Event], index: usize, prefix_file: &str) -> Result<String,
     match purpose {
         // A side request's head holds its whole body.
         Purpose::Title | Purpose::Classify => Ok(format!("{{{head}}}")),
+        // A summary's: from the compaction just before it.
+        Purpose::Compact => {
+            let before = events.get(..index).unwrap_or_default();
+            let Some((compaction, earlier)) = before.split_last() else {
+                return Err(format!("request {} follows nothing", event.seq));
+            };
+            let Kind::Compaction {
+                summary: Some(asked),
+                ..
+            } = &compaction.kind
+            else {
+                return Err(format!(
+                    "request {} follows no compaction asking for a summary",
+                    event.seq
+                ));
+            };
+            let prefix = prefix_text(earlier, prefix_file, *prefix)
+                .ok_or_else(|| format!("request {} names no prefix {prefix}", event.seq))?;
+            compact_body(
+                head,
+                prefix,
+                &view(earlier, timed(prefix)),
+                crate::compact::in_force(earlier).is_some(),
+                asked.from,
+                asked.focus.as_deref(),
+            )
+        }
         Purpose::Turn => {
             let before = events.get(..index).unwrap_or_default();
             let prefix = prefix_text(before, prefix_file, *prefix)
@@ -470,6 +539,45 @@ pub fn body(events: &[Event], index: usize, prefix_file: &str) -> Result<String,
             turn_body(head, prefix, &messages(before, timed(prefix)))
         }
     }
+}
+
+/// A compaction's summary request (DESIGN.md §14): the prefix, the view
+/// from the event `from` on (all of it when 0), an earlier summary's
+/// message kept before it when `summarized`, and the summary prompt.
+pub fn compact_body(
+    head: &str,
+    prefix: &str,
+    view: &[(u64, String)],
+    summarized: bool,
+    from: u64,
+    focus: Option<&str>,
+) -> Result<String, String> {
+    let start = if from == 0 {
+        0
+    } else {
+        view.iter()
+            .position(|(seq, _)| *seq == from)
+            .ok_or_else(|| format!("the conversation's view has no event {from}"))?
+    };
+    let kept = if summarized && start > 0 {
+        view.first()
+            .into_iter()
+            .chain(view.get(start..).unwrap_or_default())
+            .map(|(_, m)| m.clone())
+            .collect()
+    } else {
+        view.get(start..)
+            .unwrap_or_default()
+            .iter()
+            .map(|(_, m)| m.clone())
+            .collect::<Vec<String>>()
+    };
+    let mut messages: Vec<String> = kept;
+    messages.push(crate::prompt::message(
+        "user",
+        &crate::compact::request_prompt((from != 0).then_some(from), focus),
+    ));
+    turn_body(head, prefix, &messages)
 }
 
 /// The prompt's tokens as DESIGN.md §14 estimates them: what the last
@@ -1687,7 +1795,13 @@ mod tests {
         assert_eq!(estimate(&events, 40_000), 2100 + 9000);
         // A compaction's view is estimated afresh, from its bytes.
         let mut compacted = events.clone();
-        compacted.push(event(4, Kind::Compaction { pruned: vec![2] }));
+        compacted.push(event(
+            4,
+            Kind::Compaction {
+                pruned: vec![2],
+                summary: None,
+            },
+        ));
         assert_eq!(estimate(&compacted, 5000), 1250);
         // A failed request's report, its reply incomplete or absent,
         // leaves the estimate as it was: a retry sends the same head.

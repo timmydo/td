@@ -297,7 +297,7 @@ pub fn render(event: &Event) -> String {
         Kind::Restore { step, undo: false } => {
             format!("the person redid the step snapshotted at #{step}")
         }
-        Kind::Compaction { pruned } => compacted(pruned),
+        Kind::Compaction { pruned, summary } => compacted(pruned, summary.as_ref()),
         Kind::Pause { paused: true } => "the person paused this conversation".into(),
         Kind::Pause { paused: false } => "the person resumed this conversation".into(),
         Kind::Choice { model, effort } => format!(
@@ -316,11 +316,17 @@ pub fn render(event: &Event) -> String {
 }
 
 /// What a compaction says of itself.
-fn compacted(pruned: &[u64]) -> String {
-    format!(
-        "the conversation was compacted: {} older tool results are sent from here on as stubs that name where history_read finds them",
-        pruned.len()
-    )
+fn compacted(pruned: &[u64], summary: Option<&crate::store::Summarize>) -> String {
+    match summary {
+        Some(asked) => format!(
+            "the conversation was compacted: a handoff summary was asked for, to stand, once answered, for what came before #{} in what the model is sent",
+            asked.tail
+        ),
+        None => format!(
+            "the conversation was compacted: {} older tool results are sent from here on as stubs that name where history_read finds them",
+            pruned.len()
+        ),
+    }
 }
 
 /// What `history_search` searches of an event, by kind.
@@ -344,7 +350,9 @@ fn searchable(event: &Event) -> Vec<(Searchable, String)> {
                 format!("{}\n{text}", message(from, *role, status.as_deref(), *held)),
             )]
         }
-        Kind::Compaction { pruned } => vec![(Searchable::Compaction, compacted(pruned))],
+        Kind::Compaction { pruned, summary } => {
+            vec![(Searchable::Compaction, compacted(pruned, summary.as_ref()))]
+        }
         // A notification is found as a notice is: `kinds` names both.
         Kind::Notice { text } | Kind::Notification { text } => {
             vec![(Searchable::Notice, text.clone())]
@@ -571,13 +579,22 @@ mod tests {
         let compaction = Event {
             seq: 9,
             time: 0,
-            kind: Kind::Compaction { pruned: vec![3, 5] },
+            kind: Kind::Compaction {
+                pruned: vec![3, 5],
+                summary: None,
+            },
         };
         assert_eq!(
             searchable(&compaction),
-            [(Searchable::Compaction, compacted(&[3, 5]))]
+            [(Searchable::Compaction, compacted(&[3, 5], None))]
         );
-        assert!(compacted(&[3, 5]).contains("2 older tool results"));
+        assert!(compacted(&[3, 5], None).contains("2 older tool results"));
+        let asked = crate::store::Summarize {
+            from: 0,
+            tail: 7,
+            focus: None,
+        };
+        assert!(compacted(&[], Some(&asked)).contains("what came before #7"));
     }
 
     fn event(seq: u64, kind: Kind) -> Event {

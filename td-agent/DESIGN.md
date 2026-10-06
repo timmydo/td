@@ -4469,24 +4469,27 @@ the conversation was compacted at a sequence number and that
 summary; the carried state; and the recent tail. The carried state is
 copied verbatim from the log, never summarized, and every item keeps the
 source label it had (the human, another conversation, a schedule), so
-nothing becomes the human's by being carried:
+nothing becomes the human's by being carried. Every carried line is
+marked as carried, the summary's too, so that no carried text can stand
+where td-agent's own labels do:
 
 - the task: the conversation's first message, with its source, up to a
   bound;
-- the human's messages since the conversation began, in order, the
-  newest kept within 16 KiB, and the sequence numbers of any older ones
-  left out;
+- the human's messages before the recent tail, in order, the newest
+  kept within 16 KiB, and the sequence numbers of any older ones left
+  out;
 - the current todo list (§12);
-- the workspace's worktrees with their branches and states, and the
-  background processes with theirs.
+- the workspace's worktrees, each with the tree its last step's
+  snapshot recorded (the log keeps no branch, and the view is the
+  log's), and the background processes with their states.
 
 The summary and the todo list are labelled as the model's own notes, not
 instructions. The recent tail is the latest steps that fit both
-`compact_keep_tokens` (default 20,000) and what the budget leaves after
-the prefix, the notice, the summary, the carried state and `max_tokens`,
-and always at least the last step; it is cut at a step boundary so that
-no tool call loses its result and no assistant message its
-`reasoning_details`. If not even the last step fits, compaction fails
+`compact_keep_tokens` (default 20,000) and what `compact_at` leaves
+after the prefix, the notice, the summary, the carried state and
+`max_tokens`, and always at least the last step; it is cut at a step
+boundary so that no tool call loses its result and no assistant message
+its `reasoning_details`. If not even the last step fits, compaction fails
 (below). After any compaction the prompt estimate restarts from the
 rebuilt view. The read-before-write digests of §12 are the conversation
 process's, not the context's, so they survive compaction; the model
@@ -4502,24 +4505,64 @@ prunes, when they free at least 20,000 tokens, and is built again; with
 `auto_compact = false` the turn stops there and says why. The selection
 walks the log from its end, a quarter of a token a byte of what each
 event sends (a reply only when a turn's and whole, as a request sends
-it), and takes each result older than the most recent 40,000 tokens
-whose stub is shorter than it and which a turn request answered whole
-has sent: a result the model has not seen, a refused request
-notwithstanding, is never pruned. From that event on, a request sends
-each pruned result as `[The result of <tool> for <path>, <n> bytes, was
-pruned when the conversation was compacted; history_read from <seq>
-reads it.]`, the tool's name and the call's `path` made visible and cut
-to 200 characters, so every request remains a pure function of the log;
-the estimate restarts from the rebuilt body's bytes. A refusal of status
-413, or of 400 whose message speaks of a context length or window, a
-prompt too long or an input token count, prunes what can be, whatever it
-frees, and asks the request again, once; with nothing to prune, refused
-again, or with `auto_compact = false`, the turn stops with the
-provider's words. A compaction is found by `history_search` as its kind.
-The transcript marks the event with a notice. The handoff summary, a
-summary when pruning leaves the request past `compact_at`, is this
-increment's next step; until then such a request is sent as before if
-the context holds it.
+it), and takes each result, of those the view still sends, older than
+the most recent 40,000 tokens whose stub is shorter than it and which a
+turn request answered whole has sent: a result the model has not seen, a
+refused request notwithstanding, is never pruned. From that event on, a
+request sends each pruned result as `[The result of <tool> for <path>,
+<n> bytes, was pruned when the conversation was compacted; history_read
+from <seq> reads it.]`, the tool's name and the call's `path` made
+visible and cut to 200 characters, so every request remains a pure
+function of the log; the estimate restarts from the rebuilt body's
+bytes. A refusal of status 413, or of 400 whose message speaks of a
+context length or window, a prompt too long or an input token count,
+prunes what can be, whatever it frees, and asks the request again, once;
+with nothing to prune, refused again, or with `auto_compact = false`,
+the turn stops with the provider's words. A compaction is found by
+`history_search` as its kind. The transcript marks the event with a
+notice.
+
+**As built (increment 16, the summary).** When pruning leaves a request
+past `compact_at`, or frees too little to be done, or a context refusal
+finds nothing to prune, the conversation asks for the handoff summary,
+once a request: of `compact_model`, or the conversation's model when
+that is unset, streamed within a turn's budget and interruptible as a
+turn's request is but not drawn as it comes, its `max_tokens` a tenth of
+the conversation model's context, at most the summary model's largest
+completion and 65,536. Its body is the turn's own head and prefix, with
+the tools, so a provider's cache of the prefix serves it, then the view,
+its oldest steps left out until it fits the summary model's context
+beside that bound, then `prompt/compact.txt` as a user message, told
+from which event the view was left out and, compacting by hand, the
+person's focus. It logs a `compaction` naming that event (`from`), the
+recent tail's first event (`tail`) and the focus, then the request, of
+purpose `compact`, and its reply as an `assistant` event that no turn
+sends, so the summary is the log's and the request is rebuilt from it as
+a turn's is. The tail is the latest steps, each beginning at a message
+that answers no call, within `compact_keep_tokens` and what the context
+leaves after the prefix, the carried state, the summary's bound and the
+turn's `max_tokens`, and at least the last step, all within `compact_at`
+as the request after it is checked. A summary asked for while one is in
+force keeps that one's message before what is left when steps are left
+out. The request is not sent when the log could not hold it and its
+reply. Once the reply is whole, finished (`stop`), calling nothing and
+not empty, a request sends, after the prefix, one user message of
+td-agent's: the notice of the compaction's sequence number, the summary
+labelled as the model's own notes, and the carried state, every line
+td-agent carries begun `| ` so that none starts a line td-agent's own
+labels stand at, then the events from the tail on. The carried state is
+drawn from the log before the compaction: the first message with its
+source, cut at 8 KiB with the rest named; the person's messages before
+the tail, the newest within 16 KiB, the others' sequence numbers named;
+the todo list, labelled as the model's notes; each worktree's checkout
+and the tree its last step snapshot recorded (the log keeps no branch or
+commit); and the background processes with their states. Pruning
+considers only what that view sends. A summary that fails, is cut short
+or calls tools, comes back empty, cannot fit its last step, or leaves
+the view still past `compact_at` stops the turn and says why; a later
+summary that fails leaves an earlier one in force. The transcript
+notices the compaction asking for it and shows the summary folded where
+it arrives, marked as not standing when it does not.
 
 **Resuming cold.** A long conversation left long enough for the
 provider's cache to expire costs its whole context again at the
@@ -4606,9 +4649,9 @@ default; `jev_threshold`'s is calibrated (§11):
   `background_output_bytes`, from 64 KiB to 1 GiB; defaults 4 and
   16 MiB (§12)
 - `auto_compact`, `compact_at`, a share of the context from 0.1 to 1 in
-  at most two decimal places, `compact_keep_tokens` and
-  `compact_model`; defaults `true`, 0.8, 20,000 and the conversation's
-  model (§14)
+  at most two decimal places, `compact_keep_tokens`, from 1,000 to
+  1,000,000, and `compact_model`; defaults `true`, 0.8, 20,000 and the
+  conversation's model (§14)
 - `cache_ttl` (later, with increment 16), a whole number of seconds,
   and `cold_resume_tokens`, or `none`; defaults 300 and 32,000 (§14)
 

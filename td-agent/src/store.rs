@@ -1038,6 +1038,18 @@ impl Effect {
     }
 }
 
+/// What a compaction's summary is asked of and keeps (DESIGN.md §14).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Summarize {
+    /// The first event of the view the summary request is given, the
+    /// oldest before it left out to fit; 0 when none was.
+    pub from: u64,
+    /// The first event of the recent tail the view keeps after it.
+    pub tail: u64,
+    /// What the person asked the summary to keep, compacting by hand.
+    pub focus: Option<String>,
+}
+
 /// What a model request was for (DESIGN.md §5, §13).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Purpose {
@@ -1048,6 +1060,9 @@ pub enum Purpose {
     /// One of the classifier's stages on a pending action (DESIGN.md
     /// §11): Jev's, or the reasoning stage's, as its head's model says.
     Classify,
+    /// A compaction's handoff summary (DESIGN.md §14), its body the
+    /// view the compaction before it names and the summary prompt.
+    Compact,
 }
 
 impl Purpose {
@@ -1056,6 +1071,7 @@ impl Purpose {
             Self::Turn => "turn",
             Self::Title => "title",
             Self::Classify => "classify",
+            Self::Compact => "compact",
         }
     }
     fn parse(word: &str) -> Option<Self> {
@@ -1063,6 +1079,7 @@ impl Purpose {
             "turn" => Some(Self::Turn),
             "title" => Some(Self::Title),
             "classify" => Some(Self::Classify),
+            "compact" => Some(Self::Compact),
             _ => None,
         }
     }
@@ -1431,8 +1448,12 @@ pub enum Kind {
         digest: Option<String>,
     },
     /// A compaction (DESIGN.md §14): the tool results it pruned, sent as
-    /// stubs from here on.
-    Compaction { pruned: Vec<u64> },
+    /// stubs from here on, and the summary it asks for, if any, of the
+    /// `compact` request that follows it.
+    Compaction {
+        pruned: Vec<u64>,
+        summary: Option<Summarize>,
+    },
     /// The todo list as written, whole (DESIGN.md §12); `cleared` when the
     /// human cleared it from the window.
     Todo { items: Vec<TodoItem>, cleared: bool },
@@ -1737,12 +1758,22 @@ impl Event {
                     put("held", Json::Str(held.word().into()));
                 }
             }
-            Kind::Compaction { pruned } => {
+            Kind::Compaction { pruned, summary } => {
                 put("kind", Json::Str("compaction".into()));
                 put(
                     "pruned",
                     Json::Arr(pruned.iter().map(|n| Json::from(*n)).collect()),
                 );
+                if let Some(summary) = summary {
+                    let mut asked = vec![
+                        ("from".into(), Json::from(summary.from)),
+                        ("tail".into(), Json::from(summary.tail)),
+                    ];
+                    if let Some(focus) = &summary.focus {
+                        asked.push(("focus".into(), Json::Str(focus.clone())));
+                    }
+                    put("summary", Json::Obj(asked));
+                }
             }
             Kind::Pause { paused } => {
                 put("kind", Json::Str("pause".into()));
@@ -2014,6 +2045,25 @@ impl Event {
                     .iter()
                     .map(|n| n.as_u64().ok_or("a pruned result that is no number"))
                     .collect::<Result<_, _>>()?,
+                summary: match value.get("summary") {
+                    None => None,
+                    Some(asked) => Some(Summarize {
+                        from: asked
+                            .get("from")
+                            .and_then(Json::as_u64)
+                            .ok_or("a summary from no event")?,
+                        tail: asked
+                            .get("tail")
+                            .and_then(Json::as_u64)
+                            .ok_or("a summary with no tail")?,
+                        focus: match asked.get("focus") {
+                            None => None,
+                            Some(focus) => {
+                                Some(focus.as_str().ok_or("a focus that is no text")?.to_string())
+                            }
+                        },
+                    }),
+                },
             },
             Some("pause") => Kind::Pause {
                 paused: value

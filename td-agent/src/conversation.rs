@@ -1379,9 +1379,9 @@ impl Session {
             }
         }
         let mut attempt = 0u32;
-        // Compaction runs once a request, and a context-length refusal is
-        // asked again once (DESIGN.md §14).
-        let (mut compacted, mut refused_context) = (false, false);
+        // Compaction prunes, then summarizes, once a request, and a
+        // context-length refusal is asked again once (DESIGN.md §14).
+        let (mut stage, mut refused_context) = (Stage::Whole, false);
         loop {
             // A checkout done while a request waited to be asked again is
             // taken up before it is, its worktrees bound for this step's
@@ -1421,18 +1421,34 @@ impl Session {
             let (mut head, mut body) = build(max_tokens)?;
             let estimate = client::estimate(events, body.len() as u64);
             if let Some(context) = model.as_ref().and_then(|m| m.context_length) {
-                let past = compact::past(estimate, max_tokens, context, client.compact_at);
-                if let (false, Some(room)) = (compacted, past) {
+                if let Some(room) = compact::past(estimate, max_tokens, context, client.compact_at)
+                {
                     if !client.auto_compact {
                         return Ok(Outcome::stop(format!(
                             "the conversation is about {estimate} tokens, which with its reply's {room} is past compact_at, {}% of {name}'s context of {context}; auto_compact is off, so start another conversation",
                             client.compact_at
                         )));
                     }
-                    compacted = true;
-                    if self.prune(compact::MINIMUM_TOKENS)? {
-                        continue;
+                    // Pruning first; a summary when that is not enough.
+                    if stage == Stage::Whole {
+                        stage = Stage::Pruned;
+                        if self.prune(compact::MINIMUM_TOKENS)? {
+                            continue;
+                        }
                     }
+                    if stage == Stage::Summarized {
+                        return Ok(Outcome::stop(format!(
+                            "the conversation is about {estimate} tokens compacted, which with its reply's {room} is still past compact_at, {}% of {name}'s context of {context}; start another conversation",
+                            client.compact_at
+                        )));
+                    }
+                    stage = Stage::Summarized;
+                    if let Err(why) =
+                        self.summarize(turn, &client, &key, &name, Some(context), max_tokens, None)?
+                    {
+                        return Ok(Outcome::stop(why));
+                    }
+                    continue;
                 }
                 if estimate >= context {
                     return Ok(Outcome::stop(format!(
@@ -1554,9 +1570,20 @@ impl Session {
                 {
                     self.settle(request.seq, None, (0, Basis::Nothing), outcome.clone())?;
                     self.spent(id, 0);
-                    (compacted, refused_context) = (true, true);
-                    if !self.prune(0)? {
+                    refused_context = true;
+                    // What can be pruned is; with nothing, a summary.
+                    if self.prune(0)? {
+                        stage = stage.max(Stage::Pruned);
+                    } else if stage == Stage::Summarized {
                         return Ok(Outcome::stop(outcome));
+                    } else {
+                        stage = Stage::Summarized;
+                        let context = model.as_ref().and_then(|m| m.context_length);
+                        if let Err(why) =
+                            self.summarize(turn, &client, &key, &name, context, max_tokens, None)?
+                        {
+                            return Ok(Outcome::stop(format!("{outcome}; {why}")));
+                        }
                     }
                 }
                 Failure::Stop { .. } => {
@@ -1579,6 +1606,244 @@ impl Session {
         }
     }
 
+    /// A compaction's handoff summary (DESIGN.md §14), asked of
+    /// `compact_model` or the conversation's `model`, its reply bounded
+    /// to a tenth of the conversation model's `context`: a compaction
+    /// naming what it is given and the tail kept after it, the `compact`
+    /// request, and its reply, logged. The view is the pruned one, its
+    /// oldest steps left out until it fits the summary model's context
+    /// beside the reply; the tail is the latest steps within
+    /// `compact_keep_tokens` and what the context leaves after the
+    /// prefix, the summary, the carried state and the turn's
+    /// `max_tokens`, and at least the last step. Why it could not be,
+    /// for the turn to stop with.
+    #[allow(clippy::too_many_arguments)]
+    fn summarize(
+        &mut self,
+        turn: u64,
+        client: &Client,
+        key: &Secret,
+        model_name: &str,
+        context: Option<u64>,
+        max_tokens: u64,
+        focus: Option<String>,
+    ) -> Result<Result<(), String>, String> {
+        let not = |why: String| {
+            Ok(Err(format!(
+                "the conversation could not be compacted: {why}"
+            )))
+        };
+        let (setting, name) = match &client.compact_model {
+            Some(name) => ("`compact_model`", name.clone()),
+            None => ("the conversation's model", model_name.to_string()),
+        };
+        let model = match self.model(setting, &name, client) {
+            Ok(model) => model,
+            Err(why) => return not(why),
+        };
+        if model.as_ref().is_some_and(|m| !m.supports("max_tokens")) {
+            return not(format!("{name} takes no max_tokens"));
+        }
+        let bound = context
+            .map_or(client::MAX_TOKENS, |c| (c / 10).max(1))
+            .min(
+                model
+                    .as_ref()
+                    .and_then(|m| m.max_completion_tokens)
+                    .unwrap_or(u64::MAX),
+            )
+            .min(client::MAX_REPLY / 8);
+        let events = self.conversation.events();
+        let (prefix, prefix_text) = client::current_prefix(events, self.conversation.prefix_file());
+        let prefix_text = prefix_text.to_string();
+        let view = client::view(events, client::timed(&prefix_text));
+        let summarized = compact::in_force(events).is_some();
+        // Each step begins at a message that answers no call.
+        let starts: Vec<usize> = view
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, m))| !m.starts_with("{\"role\":\"tool\""))
+            .map(|(i, _)| i)
+            .collect();
+        let tokens = |from: usize| -> u64 {
+            view.get(from..)
+                .unwrap_or_default()
+                .iter()
+                .map(|(_, m)| m.len() as u64)
+                .sum::<u64>()
+                .div_ceil(4)
+        };
+        // The tail: never the carried state of a summary before.
+        let candidates: Vec<usize> = starts
+            .iter()
+            .copied()
+            .filter(|i| !summarized || *i > 0)
+            .collect();
+        let Some(&last) = candidates.last() else {
+            return not("it has no step to keep".into());
+        };
+        let carried = (compact::carried(events, 0, u64::MAX, "").len() as u64).div_ceil(4);
+        // Within `compact_at`, as the request after it is checked.
+        let room = context.map(|c| {
+            let threshold = compact::threshold(c, client.compact_at);
+            threshold.saturating_sub(
+                (prefix_text.len() as u64).div_ceil(4)
+                    + carried
+                    + bound
+                    + compact::reply_room(max_tokens, c, threshold),
+            )
+        });
+        if room.is_some_and(|room| tokens(last) > room) {
+            return not(
+                "its last step alone does not fit within compact_at beside a summary".into(),
+            );
+        }
+        let keep = client.compact_keep_tokens.min(room.unwrap_or(u64::MAX));
+        let mut tail = last;
+        for &start in candidates.iter().rev().skip(1) {
+            if tokens(start) > keep {
+                break;
+            }
+            tail = start;
+        }
+        let tail = view.get(tail).map_or(0, |(seq, _)| *seq);
+        // What the summary is given: the oldest steps left out to fit.
+        let head = client::head(&Params {
+            model: &name,
+            max_tokens: bound,
+            effort: None,
+            client,
+            cache: true,
+        });
+        let fits = |body: &str| {
+            model
+                .as_ref()
+                .and_then(|m| m.context_length)
+                .is_none_or(|c| (body.len() as u64).div_ceil(4).saturating_add(bound) <= c)
+        };
+        // Left out from the oldest step on, an earlier summary's message
+        // kept before what is left.
+        // With a summary in force, index 1 would leave nothing out.
+        let points = std::iter::once(0).chain(
+            candidates
+                .iter()
+                .skip(usize::from(!summarized))
+                .filter(|&&i| !(summarized && i == 1))
+                .filter_map(|&i| view.get(i).map(|(seq, _)| *seq)),
+        );
+        let mut given = None;
+        for from in points {
+            let body = client::compact_body(
+                &head,
+                &prefix_text,
+                &view,
+                summarized,
+                from,
+                focus.as_deref(),
+            )?;
+            if fits(&body) {
+                given = Some((body, from));
+                break;
+            }
+        }
+        let Some((body, from)) = given else {
+            return not(format!("not even its last step fits {name}'s context"));
+        };
+        let pricing = model.as_ref().and_then(|m| m.pricing);
+        let reserved = pricing.map_or(0, |p| p.reserve((body.len() as u64).div_ceil(4), bound));
+        let within = cost::within(
+            "max_cost_per_turn",
+            client.limits.turn,
+            accounts::turn_spent(events, turn),
+            reserved,
+        )
+        .and_then(|()| {
+            cost::within(
+                "max_cost_per_conversation",
+                client.limits.conversation,
+                accounts::spent(events),
+                reserved,
+            )
+        });
+        if let Err(why) = within {
+            return not(why);
+        }
+        let id = match self.reserve(reserved) {
+            Ok(id) => id,
+            Err(why) => return not(why),
+        };
+        if self.interrupt {
+            self.spent(id, 0);
+            return not("interrupted before its summary was asked for".into());
+        }
+        // Room for the compaction, the request and its reply, if only cut
+        // short, as a turn's request checks.
+        let records = (body.len() as u64).saturating_add(client::MAX_REPLY.saturating_mul(2));
+        if !self.conversation.has_room_for(records) {
+            self.spent(id, 0);
+            return not("the conversation's log is full".into());
+        }
+        self.log(Kind::Compaction {
+            pruned: Vec::new(),
+            summary: Some(crate::store::Summarize { from, tail, focus }),
+        })?;
+        let request = self.log(Kind::Request {
+            turn,
+            purpose: Purpose::Compact,
+            prefix,
+            head,
+            bytes: body.len() as u64,
+            reserved,
+        })?;
+        self.sync()?;
+        // Streamed as a turn's is, within its budget and interruptible;
+        // the window does not draw it as it comes.
+        let failed = match self.stream(request.seq, client, key, body) {
+            Streamed::Replied(completion) => {
+                let cost = charge(completion.usage, pricing, reserved);
+                let text = completion.content.clone().unwrap_or_default();
+                // Only a summary finished whole, calling nothing, stands.
+                let unfinished = (completion.finish != "stop" || !completion.calls.is_empty())
+                    .then(|| match completion.calls.is_empty() {
+                        true => format!("its summary did not finish (`{}`)", completion.finish),
+                        false => "its summary asked for tools".to_string(),
+                    });
+                let empty = text.trim().is_empty();
+                self.log(Kind::Assistant {
+                    request: request.seq,
+                    content: Some(text),
+                    reasoning: completion.reasoning.clone(),
+                    details: None,
+                    finish: completion.finish.clone(),
+                    incomplete: false,
+                    calls: Vec::new(),
+                })?;
+                let failed =
+                    unfinished.or_else(|| empty.then(|| "its summary came back empty".to_string()));
+                let outcome = failed.clone().unwrap_or_else(|| "summarized".to_string());
+                self.settle(request.seq, completion.usage, cost, outcome)?;
+                self.spent(id, cost.0);
+                failed
+            }
+            Streamed::Failed { failure, partial } => {
+                // A summary cut short is the log's, and never in force.
+                if let Some(partial) = partial {
+                    self.partial(request.seq, partial)?;
+                }
+                let (usage, cost) = failed_cost(&failure, reserved);
+                let outcome = failure.outcome();
+                self.settle(request.seq, usage, cost, outcome.clone())?;
+                self.spent(id, cost.0);
+                Some(format!("its summary request {outcome}"))
+            }
+        };
+        self.sync()?;
+        match failed {
+            Some(why) => not(why),
+            None => Ok(Ok(())),
+        }
+    }
+
     /// Logs a compaction pruning what `compact::prunable` gives when it
     /// frees at least `minimum` tokens: whether it did.
     fn prune(&mut self, minimum: u64) -> Result<bool, String> {
@@ -1587,7 +1852,10 @@ impl Session {
         if pruned.is_empty() {
             return Ok(false);
         }
-        self.log(Kind::Compaction { pruned })?;
+        self.log(Kind::Compaction {
+            pruned,
+            summary: None,
+        })?;
         self.sync()?;
         Ok(true)
     }
@@ -4504,7 +4772,9 @@ impl Session {
 /// else its reservation; a refused one nothing.
 fn failed_cost(failure: &Failure, reserved: u64) -> (Option<client::Usage>, (u64, Basis)) {
     match failure {
-        Failure::Retryable { usage, .. } => match usage {
+        // Interrupted mid-stream, a provider may have billed the prompt
+        // and what it sent, as a turn's request is charged.
+        Failure::Retryable { usage, .. } | Failure::Interrupted { usage } => match usage {
             Some(client::Usage {
                 cost: Some(cost), ..
             }) => (*usage, (*cost, Basis::Reported)),
@@ -4512,6 +4782,15 @@ fn failed_cost(failure: &Failure, reserved: u64) -> (Option<client::Usage>, (u64
         },
         _ => (None, (0, Basis::Nothing)),
     }
+}
+
+/// How far a request's compaction has gone (DESIGN.md §14): pruning
+/// first, then a summary, each at most once a request.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Stage {
+    Whole,
+    Pruned,
+    Summarized,
 }
 
 /// The todo list as `events` last wrote it.

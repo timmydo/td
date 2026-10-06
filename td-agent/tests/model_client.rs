@@ -5613,7 +5613,7 @@ fn a_request_past_compact_at_prunes_old_tool_results_first() {
     let pruned: Vec<&Vec<u64>> = events
         .iter()
         .filter_map(|e| match &e.kind {
-            Kind::Compaction { pruned } => Some(pruned),
+            Kind::Compaction { pruned, .. } => Some(pruned),
             _ => None,
         })
         .collect();
@@ -5690,16 +5690,315 @@ fn a_context_length_refusal_prunes_and_asks_again_once() {
     assert_eq!(turns.len(), 2);
     assert_eq!(tool_results(&turns[0])[0], "o".repeat(120_000));
     assert!(tool_results(&turns[1])[0].contains(&format!("history_read from {old} reads it")));
-    // Refused again with nothing left to prune: the turn stops, its
-    // request asked once more and no further.
+    // Refused again with nothing left to prune: a summary is asked for,
+    // and refused too, the turn stops and says both.
     h.say("And again.");
     let (events, outcome, _) = h.turn();
     assert!(outcome.contains("maximum context length"), "{outcome}");
+    assert!(
+        outcome.contains("could not be compacted: its summary request"),
+        "{outcome}"
+    );
     assert_eq!(
         kinds(&events)
             .into_iter()
             .filter(|k| ["request", "compaction"].contains(k))
             .collect::<Vec<_>>(),
-        ["request"]
+        ["request", "compaction", "request"]
     );
+}
+
+/// A conversation whose log is a small old read and a large recent one,
+/// past 80% of a 100,000 context that pruning cannot bring under it.
+fn past_pruning(tag: &str, script: Vec<Reply>, summary: Vec<Reply>) -> (Harness, u64) {
+    let h = Harness::new(tag, Role::Conversation, script);
+    h.mock.route(
+        "Write a title for the conversation",
+        vec![Reply::ok("title.json")],
+    );
+    h.mock
+        .route("This conversation is being compacted", summary);
+    let (mut conversation, mut h) = h.close();
+    // 2,500 tokens old, too few to prune; 65,000 recent.
+    let old = read_two(&mut conversation, 10_000, 260_000);
+    drop(conversation);
+    let list = String::from_utf8(fixture("models.json"))
+        .unwrap()
+        .replace(r#""context_length":200000"#, r#""context_length":100000"#);
+    Models::from_provider(list.as_bytes())
+        .unwrap()
+        .save(h.state.root())
+        .unwrap();
+    h.reopen();
+    // The turn read back, as the window hears it.
+    let _ = h.turn();
+    h.setup(Client::default());
+    (h, old)
+}
+
+/// When pruning leaves a request past `compact_at`, a handoff summary is
+/// asked for, bounded to a tenth of the context and not streamed; the
+/// turn's request then sends the notice, the summary and the carried
+/// state, and the recent tail, and each request is a function of the
+/// log (DESIGN.md §14).
+#[test]
+fn a_request_pruning_cannot_bring_under_compact_at_is_summarized() {
+    let (mut h, _) = past_pruning(
+        "compact-summary",
+        vec![Reply::sse("stream-sonnet.sse")],
+        vec![Reply::sse("compact-summary.sse")],
+    );
+    h.say("Go on.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let summary = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Kind::Compaction {
+                summary: Some(s), ..
+            } => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!((summary.from, summary.focus.as_deref()), (0, None));
+    let requests = h.mock.requests();
+    let asked = requests
+        .iter()
+        .find(|r| r.text().contains("This conversation is being compacted"))
+        .unwrap()
+        .text();
+    let head = td_json::parse_slice(asked.as_bytes()).unwrap();
+    assert_eq!(
+        head.get("max_tokens").and_then(td_json::Json::as_u64),
+        Some(10_000)
+    );
+    assert_eq!(
+        head.get("stream").and_then(td_json::Json::as_bool),
+        Some(true)
+    );
+    assert!(asked.contains(&"n".repeat(260_000)));
+    let turn = requests
+        .iter()
+        .rfind(|r| r.text().contains("Go on.") && !r.text().contains("being compacted"))
+        .unwrap()
+        .text();
+    assert!(turn.contains("SUMMARY: both files were read"), "{turn}");
+    assert!(turn.contains("[The task: the conversation's first message"));
+    assert!(!turn.contains(&"n".repeat(1000)));
+    // Each request as the log rebuilds it.
+    let (conversation, _) = h.close();
+    let sent: Vec<String> = requests.iter().map(|r| r.text()).collect();
+    for (at, event) in conversation.events().iter().enumerate() {
+        if let Kind::Request {
+            purpose: Purpose::Compact | Purpose::Turn,
+            ..
+        } = &event.kind
+        {
+            if event.seq < summary.tail {
+                continue;
+            }
+            let body =
+                td_agent::client::body(conversation.events(), at, conversation.prefix_file())
+                    .unwrap();
+            assert!(
+                sent.contains(&body),
+                "request {} rebuilt differs",
+                event.seq
+            );
+        }
+    }
+}
+
+/// A summary request refused stops the turn and says why; a summary
+/// past what the context holds once carried stops it too, and nothing
+/// is cut silently (DESIGN.md §14).
+#[test]
+fn a_compaction_that_fails_stops_the_turn() {
+    let (mut h, _) = past_pruning(
+        "compact-refused-summary",
+        Vec::new(),
+        vec![Reply::status(402, "error-402.json")],
+    );
+    h.say("Go on.");
+    let (events, outcome, _) = h.turn();
+    assert!(
+        outcome.contains("could not be compacted: its summary request"),
+        "{outcome}"
+    );
+    assert!(kinds(&events).contains(&"compaction"));
+    // A summary of 300,000 bytes leaves the view past `compact_at`.
+    let (mut h, _) = past_pruning(
+        "compact-long-summary",
+        Vec::new(),
+        vec![summary_stream(&"s".repeat(300_000), "stop")],
+    );
+    h.say("Go on.");
+    let (_, outcome, _) = h.turn();
+    assert!(
+        outcome.contains("compacted, which with its reply's"),
+        "{outcome}"
+    );
+    assert!(outcome.contains("is still past compact_at"), "{outcome}");
+    // Summarized, and refused for its context all the same: the turn
+    // stops with the provider's words, summarized once.
+    let (mut h, _) = past_pruning(
+        "compact-summarized-refused",
+        vec![
+            Reply::status(400, "error-context.json"),
+            Reply::status(400, "error-context.json"),
+        ],
+        vec![
+            Reply::sse("compact-summary.sse"),
+            Reply::sse("compact-summary.sse"),
+        ],
+    );
+    h.say("Go on.");
+    let (events, outcome, _) = h.turn();
+    assert!(outcome.contains("maximum context length"), "{outcome}");
+    let summaries = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                Kind::Compaction {
+                    summary: Some(_),
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(summaries, 1);
+}
+
+/// A streamed summary of `text`, finished with `finish`.
+fn summary_stream(text: &str, finish: &str) -> Reply {
+    let chunk = |content: &str, finish: Option<&str>| {
+        let finish = finish.map_or("null".to_string(), |f| format!("\"{f}\""));
+        format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"{content}\"}},\"finish_reason\":{finish}}}]}}\n\n"
+        )
+    };
+    // In events within the stream reader's bound.
+    let pieces: String = text
+        .as_bytes()
+        .chunks(50_000)
+        .map(|c| chunk(std::str::from_utf8(c).unwrap(), None))
+        .collect();
+    let body = format!(
+        "{pieces}{}data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"cost\":0.001}}}}\n\ndata: [DONE]\n\n",
+        chunk("", Some(finish))
+    );
+    Reply::Http {
+        status: 200,
+        headers: vec![("content-type".into(), "text/event-stream".into())],
+        body: body.into_bytes(),
+    }
+}
+
+/// The tail is fitted within `compact_at`, as the request after the
+/// summary is checked: kept tokens however many leave out a recent step
+/// that would bring it back past (DESIGN.md §14).
+#[test]
+fn a_summarys_tail_is_fitted_within_compact_at() {
+    let (mut h, _) = past_pruning(
+        "compact-tail-within",
+        vec![Reply::sse("stream-sonnet.sse")],
+        vec![Reply::sse("compact-summary.sse")],
+    );
+    h.setup(Client {
+        compact_keep_tokens: 1_000_000,
+        ..Client::default()
+    });
+    h.say("Go on.");
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let last = h.mock.requests().last().unwrap().text();
+    assert!(!last.contains(&"n".repeat(260_000)));
+}
+
+/// An interrupt closes a summary's stream: the turn stops, the summary
+/// is not in force, and its reservation is charged as a turn's request
+/// interrupted is, since a provider may bill what it began (DESIGN.md
+/// §14, §5).
+#[test]
+fn an_interrupt_during_a_summary_charges_it_and_stops() {
+    let (mut h, _) = past_pruning(
+        "compact-interrupted",
+        Vec::new(),
+        vec![Reply::sse("compact-summary.sse")
+            .cut_after("both files were read")
+            .tail(Tail::Open)],
+    );
+    h.say("Go on.");
+    h.until_text();
+    h.down(&Down::Interrupt);
+    let (events, outcome, _) = h.turn();
+    assert!(outcome.contains("could not be compacted"), "{outcome}");
+    h.mock.wait_closed(1);
+    let reserved = h.reserved.last().unwrap().1;
+    assert!(reserved > 0);
+    assert!(usage(&events).contains(&(reserved, Basis::Reserved)));
+    let (conversation, _) = h.close();
+    assert!(td_agent::compact::in_force(conversation.events()).is_none());
+}
+
+/// A summary that does not finish, cut short at its `max_tokens`, does
+/// not stand: the turn stops and says so, and the view is as it was
+/// (DESIGN.md §14).
+#[test]
+fn a_summary_cut_short_does_not_stand() {
+    let (mut h, _) = past_pruning(
+        "compact-cut-summary",
+        Vec::new(),
+        vec![summary_stream("SUMMARY: half", "length")],
+    );
+    h.say("Go on.");
+    let (_, outcome, _) = h.turn();
+    assert!(
+        outcome.contains("could not be compacted: its summary did not finish (`length`)"),
+        "{outcome}"
+    );
+    let (conversation, _) = h.close();
+    assert!(td_agent::compact::in_force(conversation.events()).is_none());
+}
+
+/// A context refusal with nothing to prune summarizes, and the request
+/// asked again with the summary is answered (DESIGN.md §14).
+#[test]
+fn a_context_refusal_with_nothing_to_prune_is_summarized_and_asked_again() {
+    let h = Harness::new(
+        "compact-refused-summarized",
+        Role::Conversation,
+        vec![
+            Reply::status(400, "error-context.json"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.mock.route(
+        "Write a title for the conversation",
+        vec![Reply::ok("title.json")],
+    );
+    h.mock.route(
+        "This conversation is being compacted",
+        vec![Reply::sse("compact-summary.sse")],
+    );
+    let (mut conversation, mut h) = h.close();
+    // Small enough that nothing is old enough to prune.
+    read_two(&mut conversation, 10_000, 20_000);
+    drop(conversation);
+    h.reopen();
+    let _ = h.turn();
+    h.setup(Client::default());
+    h.say("Go on.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(
+        kinds(&events)
+            .into_iter()
+            .filter(|k| ["request", "compaction"].contains(k))
+            .collect::<Vec<_>>(),
+        ["request", "compaction", "request", "request"]
+    );
+    let last = h.mock.requests().last().unwrap().text();
+    assert!(last.contains("SUMMARY: both files were read"), "{last}");
 }
