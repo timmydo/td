@@ -2641,9 +2641,23 @@ Raw/string projection stays bounded and literal copies are at most 64 prepaid
 wire bytes. No source/field/value/output storage grows. API §1.149 scopes
 eight Rust intervals with source/budget/output preparation cold and
 construction/polling/consuming refusals measured. Earlier 241 intervals remain
-separate on the accepted retention parent. Native allocation, stack/RSS,
-fixed-window retention, selected body-part header wiring and full original
-pin/request/publication admission remain unqualified.
+separate on the accepted retention parent. M06es below qualifies whole-array
+fixed-window retention. Native allocation, stack/RSS, selected body-part
+header
+wiring and full original pin/request/publication admission remain unqualified.
+
+M06es bounds the fixed-window whole-header Cursor plus HeaderBudget to
+640 bytes. Caller output is distinct fixed cold storage; retained values borrow
+its original prefix and leave spare capacity untouched. Scanner/Raw/JSON
+bounds and all charges match streamed emission. Fresh admission precedes
+capacity; a full healthy Window may mask the next source refusal without
+refunding original charges. No field table, decoded
+string or growing output is added. API §1.150 scopes eight Rust allocation
+intervals with source/budget/output preparation cold and construction,
+polling and consuming refusals measured. Earlier 249 intervals remain
+separate on the accepted streamed-header parent. Native allocation, stack/RSS,
+header selection/forms, full original pin/request/publication admission
+remain unqualified.
 
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future

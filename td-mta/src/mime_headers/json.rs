@@ -1,4 +1,5 @@
 //! Source-ordered EmailHeader objects from one resident authorized header section.
+pub mod retained;
 use super::{End, Field, Scanner};
 pub use crate::json_string::{Progress, Status};
 use crate::{
@@ -26,6 +27,7 @@ pub enum Error {
     Json(json_string::Error),
     Admission(nfc::Error),
     Truncated,
+    ResponseCapacity,
     InvalidState,
 }
 impl std::fmt::Display for Error {
@@ -36,6 +38,7 @@ impl std::fmt::Display for Error {
             Self::Json(e) => write!(f, "header array JSON string: {e}"),
             Self::Admission(e) => write!(f, "header array admission: {e}"),
             Self::Truncated => f.write_str("incomplete resident header array"),
+            Self::ResponseCapacity => f.write_str("retained header array capacity"),
             Self::InvalidState => f.write_str("invalid header array state"),
         }
     }

@@ -6439,10 +6439,57 @@ incomplete prefix, wire refusal, header-limit refusal, unfinished expiry and
 completed release expiry. Source/budget/output preparation stays cold;
 constructor, polling and consuming refusals remain measured. Validate all
 sixteen counter snapshots before comparing pairs. Earlier 241 intervals stay
-separate on the accepted retention parent. Fixed-window retention,
-configurable body-part header composition, original pin/admitted request
+separate on the accepted retention parent. M06es below qualifies whole-array
+fixed-window retention. Configurable body-part header composition, original
+pin/admitted request
 integration, authenticated publication, native allocation and stack/RSS
 qualification remain later.
+
+### 1.150 Whole resident header-array retention
+
+M06es adds mime_headers::json::retained::Cursor. Construct its own fresh
+resident header-array cursor from the original caller-authorized Input and
+exclusive original Meter/HeaderBudget, plus one distinct caller-reserved
+fixed Window. An advanced streamed cursor or emitted-only Completion cannot
+start whole retention. Reuse the original bounded scanner/Raw/JSON turns and
+all charges. The window records only reported writes without growing or
+reconstructing a lost prefix. Exact capacity completes; short capacity refuses
+ResponseCapacity stickily, hides whole output and retires the original owner.
+All copied bytes remain provisional until healthy whole completion.
+
+Fresh original admission precedes capacity refusal, including empty or full
+unfinished windows. After healthy admission, a full Window refuses capacity
+before the next producer turn, even if that turn would write no bytes and
+reveal an incomplete source. For prefix A:a CRLF B:b, a window ending exactly
+after the first object refuses ResponseCapacity; one spare byte permits the
+scanner turn and reveals Truncated. Neither refusal refunds work already paid,
+and this owner cannot grow its window or restart an emitted prefix.
+
+Completed polls remain inert. Construction, unfinished turns, explicit checks
+and consuming finish retain supplied job deadlines and original interpretation
+admission. An explicit failed check hides completed values. Fresh finish
+returns passive Retained bytes, End and encoding diagnostic together with the
+exact original budget Completion. Neither passive value grants original pin,
+source or publication authority; the caller still brackets turns with fresh
+clock/cancellation and original pin checks. Retained bytes occupy only the
+original output identity and leave spare capacity untouched. Cursor plus
+HeaderBudget fits 640 bytes; output storage remains separate and cold.
+
+Seven units and four compile-fail guards pin literal ordered/case-preserving
+Raw JSON, exact/spare and every short window, empty/encoding diagnostics,
+original prefix/wire refusals and capacity/source ordering, all unfinished
+deadline cuts including full windows, exact-window completed polls,
+checks/release, expired premature finish, budget pointer handoff and
+streamed byte/cost
+parity. Eight Rust allocation intervals cover empty EOF, ordered folded Raw,
+malformed Raw, incomplete prefix, short window, constructor expiry,
+empty-window unfinished expiry and completed release expiry. Original
+source, budgets and
+fixed output are prepared cold; construction/polling/consuming refusals are
+measured. Validate sixteen snapshots before comparing pairs; earlier 249
+intervals remain separate on the accepted streamed-header parent. Other header
+selection/forms, original pin/full admitted request wiring, authenticated
+publication, native allocation and stack/RSS remain unqualified.
 
 ## 2. Read views and change history
 

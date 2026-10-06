@@ -2468,8 +2468,18 @@ Initial independently landable increments:
   growing header table or decoded string. Keep original budget leases and
   fresh handoff, sticky prefix/admission refusals and bounded turns. Nine
   units, four guards and eight Rust intervals qualify API §1.149.
-  Fixed-window retention, selected body-part header wiring and original
-  pin/authenticated publication admission remain later.
+  M06es below qualifies whole-array fixed-window retention; selected body-part
+  header wiring and original pin/authenticated publication admission remain
+  later.
+
+- **M06es — retained resident header arrays:** construct a fresh original
+  streamed header-array owner inside one caller-reserved fixed Window. Keep
+  literal ordered Raw bytes, metadata labels and original output/budget
+  identities; exact capacity completes and short windows refuse stickily.
+  Completed polling is inert; explicit checks and consuming release stay
+  fresh. Seven units, four compile-fail guards and eight Rust allocation
+  intervals cover the bounded whole-output scope. Original pin, selected
+  header/request wiring, authenticated publication and native/RSS remain later.
 
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement

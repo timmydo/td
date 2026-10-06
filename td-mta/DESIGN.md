@@ -1002,9 +1002,22 @@ filtering/replacement policy. Original job and interpretation budgets move
 exclusively between scanning and projection. Emitted fragments remain
 provisional; fresh complete handoff returns only the original budgets and
 passive header boundary/diagnostic. API §1.149 scopes its bounded cursor and
-eight Rust allocation intervals. Fixed-window retention, configurable
-body-part header wiring and original pin/authenticated publication admission
-remain later.
+eight Rust allocation intervals. M06es below qualifies whole-array retention;
+configurable body-part header wiring and original pin/authenticated publication
+admission remain later.
+
+M06es retains a whole resident header array in one original caller-reserved
+fixed Window by constructing its own fresh streamed header owner. Advanced
+streams and emitted-only completions cannot reconstruct an already-lost
+prefix. Fresh admission precedes capacity refusal; a full healthy Window
+refuses before the next producer turn can expose a source failure, with no
+refund of paid work. Capacity refusal is sticky and retires original budget
+custody;
+whole passive bytes require healthy completion. Exact capacity preserves
+original Raw/order/case semantics and all streamed charges. Completed polls
+remain inert; explicit checked expiry hides values and consuming finish
+requires fresh original job/interpretation admission. Passive retained bytes
+and budget Completion grant no original pin or publication authority.
 
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot
