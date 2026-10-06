@@ -125,6 +125,23 @@ const INPUT_PROP_DIRECT: usize = 1;
 const SYSFS_INPUT: &str = "/sys/class/input";
 /// A sysfs attribute is at most one page; anything longer is not one.
 const SYSFS_BITMAP_BYTES: u64 = 4096;
+/// The kernel's `HID_MAX_DESCRIPTOR_SIZE`; a longer read is not a descriptor.
+const REPORT_DESCRIPTOR_BYTES: u64 = 4096;
+/// Levels walked up from an input device to its USB device. Five hub tiers
+/// and the controller path sit well inside it.
+const SYSFS_ANCESTOR_LIMIT: usize = 32;
+/// Entries read from one USB device or interface directory.
+const SYSFS_DIRECTORY_ENTRIES: usize = 256;
+/// The FIDO Alliance usage page a CTAP HID interface declares.
+const FIDO_USAGE_PAGE: u32 = 0xf1d0;
+/// Short-item prefixes with the size bits cleared: the global Usage Page,
+/// and the local Usage, Usage Minimum and Usage Maximum, whose four-byte
+/// (extended) form carries a page in its high half (HID 1.11 §6.2.2.8).
+const HID_USAGE_PAGE: u8 = 0x04;
+const HID_EXTENDED_USAGES: &[u8] = &[0x08, 0x18, 0x28];
+/// Any prefix with these four bits set frames a long item, as the kernel's
+/// `fetch_item` reads it; the specification defines only `0xfe`.
+const HID_LONG_ITEM: u8 = 0xf0;
 /// Touchpad gain with no acceleration curve: one millimetre of finger travel
 /// is 16 pixels, so a 60-70 mm pad crosses about 1000 px per stroke while a
 /// pixel stays a sixteenth of a millimetre.
@@ -168,6 +185,10 @@ enum AttentionState {
 struct KeyBindings {
     attention_enabled: bool,
     attention: AttentionState,
+    /// Devices whose keys secure attention drains, and whose Escape cancels,
+    /// but never selects or confirms with: a security key's own keyboard
+    /// (`security_key_keyboard`).
+    attention_excluded: BTreeSet<usize>,
     secret_selected: bool,
     cutoff: Option<u128>,
     pressed: BTreeSet<(usize, u16)>,
@@ -225,6 +246,7 @@ impl KeyBindings {
         let physical = (device, event.code);
         let before = self.modifiers();
         let logical_pressed = self.pressed(event.code);
+        let attention_held = self.attention_pressed(event.code);
         let changed = if event.value == KEY_PRESS {
             self.pressed.insert(physical)
         } else {
@@ -234,9 +256,13 @@ impl KeyBindings {
             return decision;
         }
         if self.attention != AttentionState::Closed {
+            // An excluded device is tracked above so the drain completes, and
+            // its Escape still cancels; it never selects or confirms.
+            let readable = !self.attention_excluded.contains(&device);
             if self.attention == AttentionState::Open
+                && readable
                 && !self.secret_selected
-                && !logical_pressed
+                && !attention_held
                 && event.value == KEY_PRESS
             {
                 decision.secret = match event.code {
@@ -259,8 +285,9 @@ impl KeyBindings {
                 self.secret_selected |= decision.secret.is_some();
             }
             if self.attention == AttentionState::Open
+                && readable
                 && self.secret_selected
-                && !logical_pressed
+                && !attention_held
                 && event.value == KEY_PRESS
                 && event.code == KEY_ENTER
             {
@@ -456,6 +483,13 @@ impl KeyBindings {
         self.pressed.iter().any(|(_, pressed)| *pressed == code)
     }
 
+    /// Held on a device secure attention reads.
+    fn attention_pressed(&self, code: u16) -> bool {
+        self.pressed
+            .iter()
+            .any(|(device, pressed)| *pressed == code && !self.attention_excluded.contains(device))
+    }
+
     fn settle_launcher(&mut self, visible: Option<bool>) {
         if let Some(visible) = visible {
             self.launcher_open = visible;
@@ -469,17 +503,27 @@ impl KeyBindings {
     }
 
     fn modifiers(&self) -> ModifierState {
+        // In attention an excluded device's modifiers are drained, not read;
+        // that branch is for the PIN field's Shift. A value taken while Closed
+        // is not comparable with one taken while Open.
+        let held = |code| {
+            if self.attention == AttentionState::Closed {
+                self.pressed(code)
+            } else {
+                self.attention_pressed(code)
+            }
+        };
         let mut depressed = 0;
-        if self.pressed(KEY_LEFTSHIFT) || self.pressed(KEY_RIGHTSHIFT) {
+        if held(KEY_LEFTSHIFT) || held(KEY_RIGHTSHIFT) {
             depressed |= MOD_SHIFT;
         }
-        if self.pressed(KEY_LEFTCTRL) || self.pressed(KEY_RIGHTCTRL) {
+        if held(KEY_LEFTCTRL) || held(KEY_RIGHTCTRL) {
             depressed |= MOD_CONTROL;
         }
-        if self.pressed(KEY_LEFTALT) || self.pressed(KEY_RIGHTALT) {
+        if held(KEY_LEFTALT) || held(KEY_RIGHTALT) {
             depressed |= MOD_ALT;
         }
-        if self.pressed(KEY_LEFTMETA) || self.pressed(KEY_RIGHTMETA) {
+        if held(KEY_LEFTMETA) || held(KEY_RIGHTMETA) {
             depressed |= MOD_LOGO;
         }
         let mut locked = 0;
@@ -747,6 +791,127 @@ fn absolute_kind(sysfs: &Path, node: &Path) -> AbsoluteKind {
         read_bitmap(&device.join("properties")).as_deref(),
         read_bitmap(&device.join("capabilities").join("key")).as_deref(),
     )
+}
+
+/// Whether a node shares its USB device with a FIDO interface: a security
+/// key's own OTP keyboard, whose touch types modhex and Enter. Read from
+/// sysfs with plain file reads. Anything unreadable, and a node with no USB
+/// device above it (PS/2, UHID, virtio), answers `false`: it stays admitted.
+fn security_key_keyboard(sysfs: &Path, node: &Path) -> bool {
+    let Some(name) = node.file_name() else {
+        return false;
+    };
+    usb_device(&sysfs.join(name).join("device")).is_some_and(|usb| shares_fido_interface(&usb))
+}
+
+/// The nearest ancestor of an input device carrying `idVendor` and `busnum`:
+/// the USB device, not the interface or HID device below it, and not a hub
+/// above it, which is a USB device of its own and is never reached.
+fn usb_device(input: &Path) -> Option<PathBuf> {
+    let mut at = fs::canonicalize(input).ok()?;
+    for _ in 0..SYSFS_ANCESTOR_LIMIT {
+        // Nothing at or above `/sys/devices` is a USB device.
+        if at.file_name()? == "devices" {
+            return None;
+        }
+        if at.join("idVendor").is_file() && at.join("busnum").is_file() {
+            return Some(at);
+        }
+        at = at.parent()?.to_path_buf();
+    }
+    None
+}
+
+/// Whether any interface of a USB device (`1-2:1.0` under `1-2`) has a HID
+/// child whose report descriptor declares the FIDO usage page.
+fn shares_fido_interface(usb: &Path) -> bool {
+    let Some(name) = usb.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let prefix = format!("{name}:");
+    let Some(interfaces) = sysfs_directories(usb) else {
+        return false;
+    };
+    interfaces
+        .iter()
+        .filter(|(interface, _)| interface.starts_with(&prefix))
+        .any(|(_, interface)| {
+            sysfs_directories(interface).is_some_and(|children| {
+                children.iter().any(|(_, child)| {
+                    read_report_descriptor(&child.join("report_descriptor"))
+                        .and_then(|descriptor| declares_fido_page(&descriptor))
+                        == Some(true)
+                })
+            })
+        })
+}
+
+/// A sysfs directory's real subdirectories. Symlinks (`driver`, `subsystem`,
+/// `port`) lead out of the device's own subtree and are skipped. More than
+/// `SYSFS_DIRECTORY_ENTRIES` entries is not a device directory.
+fn sysfs_directories(directory: &Path) -> Option<Vec<(String, PathBuf)>> {
+    let mut directories = Vec::new();
+    for (index, entry) in fs::read_dir(directory).ok()?.enumerate() {
+        if index >= SYSFS_DIRECTORY_ENTRIES {
+            return None;
+        }
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_dir() {
+            continue;
+        }
+        if let Ok(name) = entry.file_name().into_string() {
+            directories.push((name, entry.path()));
+        }
+    }
+    Some(directories)
+}
+
+fn read_report_descriptor(path: &Path) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(REPORT_DESCRIPTOR_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (u64::try_from(bytes.len()).ok()? <= REPORT_DESCRIPTOR_BYTES).then_some(bytes)
+}
+
+/// Walk a HID report descriptor's items and say whether one declares the
+/// FIDO usage page: a Usage Page item (`0x05`/`0x06`/`0x07`, one, two or four
+/// data bytes, the whole value compared), or a four-byte extended Usage,
+/// Usage Minimum or Usage Maximum whose high half names the page. A long
+/// item (prefix `0xf0`-`0xff`, size, tag, data) is skipped whole: the
+/// kernel refuses a descriptor holding one, and skipping can only exclude
+/// more. `None` for a truncated item, which the kernel refuses as well.
+fn declares_fido_page(descriptor: &[u8]) -> Option<bool> {
+    let mut declared = false;
+    let mut rest = descriptor;
+    while let Some((&prefix, tail)) = rest.split_first() {
+        if prefix & HID_LONG_ITEM == HID_LONG_ITEM {
+            let (&size, tail) = tail.split_first()?;
+            let (_tag, tail) = tail.split_first()?;
+            rest = tail.get(usize::from(size)..)?;
+            continue;
+        }
+        let size = match prefix & 0x03 {
+            3 => 4,
+            size => usize::from(size),
+        };
+        let data = tail.get(..size)?;
+        rest = tail.get(size..)?;
+        // Little-endian, at most four bytes.
+        let value = data
+            .iter()
+            .rev()
+            .fold(0u32, |value, byte| value << 8 | u32::from(*byte));
+        let kind = prefix & 0xfc;
+        if kind == HID_USAGE_PAGE {
+            declared |= value == FIDO_USAGE_PAGE;
+        } else if size == 4 && HID_EXTENDED_USAGES.contains(&kind) {
+            declared |= value >> 16 == FIDO_USAGE_PAGE;
+        }
+    }
+    Some(declared)
 }
 
 /// One touchpad axis: the value a report last NAMED since open or the last
@@ -2393,6 +2558,23 @@ fn absolute_axes(device: &File) -> Option<AbsoluteAxes> {
     AbsoluteAxes::declared(x, y)
 }
 
+/// The roster indices secure attention never selects or confirms with, each
+/// named once.
+fn attention_exclusions<T>(sysfs: &Path, devices: &[(PathBuf, T)]) -> BTreeSet<usize> {
+    let mut excluded = BTreeSet::new();
+    for (device, (path, _)) in devices.iter().enumerate() {
+        if security_key_keyboard(sysfs, path) {
+            eprintln!(
+                "td-compositor: {} shares a USB device with a FIDO interface; \
+                 secure attention never selects or confirms with it",
+                path.display()
+            );
+            excluded.insert(device);
+        }
+    }
+    excluded
+}
+
 pub fn start(
     input_dir: &Path,
     runtime: Arc<Mutex<Runtime>>,
@@ -2404,8 +2586,15 @@ pub fn start(
         .lock()
         .map_err(|_| "runtime lock poisoned".to_string())?
         .attention_enabled();
+    // Decided once against the fixed roster, as admission is.
+    let attention_excluded = if attention_enabled {
+        attention_exclusions(Path::new(SYSFS_INPUT), &devices)
+    } else {
+        BTreeSet::new()
+    };
     let bindings = Arc::new(Mutex::new(KeyBindings {
         attention_enabled,
+        attention_excluded,
         ..KeyBindings::default()
     }));
     let target = Arc::new(Mutex::new(LiveInputTarget {
@@ -3769,6 +3958,286 @@ mod tests {
         assert_eq!(kind("/"), AbsoluteKind::Tablet);
     }
 
+    /// A boot keyboard: Generic Desktop, Keyboard, modifiers and six keys.
+    const KEYBOARD_DESCRIPTOR: &[u8] = &[
+        0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00, 0x25,
+        0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x06, 0x75, 0x08, 0x26, 0xff, 0x00, 0x05,
+        0x07, 0x19, 0x00, 0x2a, 0xff, 0x00, 0x81, 0x00, 0xc0,
+    ];
+    /// A YubiKey's FIDO interface: Usage Page 0xf1d0 in its two-byte form,
+    /// CTAPHID usage, 64-byte input and output reports.
+    const FIDO_DESCRIPTOR: &[u8] = &[
+        0x06, 0xd0, 0xf1, 0x09, 0x01, 0xa1, 0x01, 0x09, 0x20, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75,
+        0x08, 0x95, 0x40, 0x81, 0x02, 0x09, 0x21, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95,
+        0x40, 0x91, 0x02, 0xc0,
+    ];
+    /// The same interface with no Usage Page item: every usage, the
+    /// collection's included, is a singleton range of four-byte extended
+    /// Usage Minimum and Maximum naming page 0xf1d0 in its high half.
+    const RANGED_FIDO_DESCRIPTOR: &[u8] = &[
+        0x1b, 0x01, 0x00, 0xd0, 0xf1, 0x2b, 0x01, 0x00, 0xd0, 0xf1, 0xa1, 0x01, 0x1b, 0x20, 0x00,
+        0xd0, 0xf1, 0x2b, 0x20, 0x00, 0xd0, 0xf1, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95,
+        0x40, 0x81, 0x02, 0x1b, 0x21, 0x00, 0xd0, 0xf1, 0x2b, 0x21, 0x00, 0xd0, 0xf1, 0x91, 0x02,
+        0xc0,
+    ];
+
+    #[test]
+    fn a_usage_page_is_read_from_whole_items_in_every_size() {
+        let fido = |bytes: &[u8]| declares_fido_page(bytes);
+        assert_eq!(fido(FIDO_DESCRIPTOR), Some(true));
+        assert_eq!(fido(KEYBOARD_DESCRIPTOR), Some(false));
+        assert_eq!(fido(&[]), Some(false));
+        // Two- and four-byte forms, little-endian, zero-extended.
+        assert_eq!(fido(&[0x06, 0xd0, 0xf1]), Some(true));
+        assert_eq!(fido(&[0x07, 0xd0, 0xf1, 0x00, 0x00]), Some(true));
+        assert_eq!(fido(&[0x07, 0x00, 0x00, 0xd0, 0xf1]), Some(false));
+        assert_eq!(fido(&[0x07, 0xd0, 0xf1, 0x01, 0x00]), Some(false));
+        assert_eq!(fido(&[0x06, 0xf1, 0xd0]), Some(false));
+        // A one-byte page cannot name it, and is stepped over whole.
+        assert_eq!(fido(&[0x05, 0xd0]), Some(false));
+        assert_eq!(fido(&[0x05, 0xf1]), Some(false));
+        assert_eq!(fido(&[0x05, 0x01, 0x06, 0xd0, 0xf1]), Some(true));
+        // A four-byte extended Usage carries the page in its high half; a
+        // two-byte Usage is a usage within the current page, not a page.
+        assert_eq!(fido(&[0x0b, 0x01, 0x00, 0xd0, 0xf1]), Some(true));
+        assert_eq!(fido(&[0x0a, 0xd0, 0xf1]), Some(false));
+        // Usage Minimum and Maximum carry it the same way, each alone.
+        assert_eq!(fido(RANGED_FIDO_DESCRIPTOR), Some(true));
+        assert_eq!(fido(&[0x1b, 0x01, 0x00, 0xd0, 0xf1]), Some(true));
+        assert_eq!(fido(&[0x2b, 0x01, 0x00, 0xd0, 0xf1]), Some(true));
+        assert_eq!(fido(&[0x1a, 0xd0, 0xf1, 0x2a, 0xd0, 0xf1]), Some(false));
+        // Other four-byte locals and globals name no page in their high half.
+        assert_eq!(fido(&[0x3b, 0x01, 0x00, 0xd0, 0xf1]), Some(false));
+        assert_eq!(fido(&[0x17, 0x01, 0x00, 0xd0, 0xf1]), Some(false));
+        // Data bytes are never prefixes: a Logical Minimum whose data looks
+        // like the page item, and long items carrying it.
+        assert_eq!(fido(&[0x17, 0x06, 0xd0, 0xf1, 0x00]), Some(false));
+        assert_eq!(fido(&[0xfe, 0x03, 0x00, 0x06, 0xd0, 0xf1]), Some(false));
+        assert_eq!(
+            fido(&[0xfe, 0x02, 0x00, 0xaa, 0xbb, 0x06, 0xd0, 0xf1]),
+            Some(true)
+        );
+        assert_eq!(fido(&[0xfe, 0x00, 0x00, 0x06, 0xd0, 0xf1]), Some(true));
+        // Every 0xf* prefix frames a long item, as the kernel reads it.
+        assert_eq!(fido(&[0xf1, 0x03, 0x00, 0x06, 0xd0, 0xf1]), Some(false));
+        assert_eq!(fido(&[0xf4, 0x00, 0x00, 0x06, 0xd0, 0xf1]), Some(true));
+        // Truncated items refuse the whole descriptor, even after a match.
+        for truncated in [
+            &[0x06, 0xd0][..],
+            &[0x07, 0xd0, 0xf1, 0x00],
+            &[0x05],
+            &[0xfe],
+            &[0xfe, 0x05],
+            &[0xfe, 0x05, 0x00, 0x01, 0x02],
+            &[0x06, 0xd0, 0xf1, 0x06, 0xd0],
+            &[0x1b, 0x01, 0x00, 0xd0],
+            &[0xf7, 0x02, 0x00, 0x01],
+        ] {
+            assert_eq!(fido(truncated), None, "{truncated:02x?}");
+        }
+    }
+
+    /// A temporary sysfs: `devices/...` trees and `class/input/eventN/device`
+    /// links into them, as the kernel lays them out.
+    struct SysfsTree(PathBuf);
+
+    impl Drop for SysfsTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl SysfsTree {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "td-input-usb-{}-{}",
+                std::process::id(),
+                TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+            )))
+        }
+
+        fn class(&self) -> PathBuf {
+            self.0.join("class").join("input")
+        }
+
+        /// A directory under `devices`, with `idVendor` and `busnum` when it
+        /// is a USB device.
+        fn device(&self, path: &str, usb: bool) -> PathBuf {
+            let directory = self.0.join("devices").join(path);
+            std::fs::create_dir_all(&directory).unwrap();
+            if usb {
+                std::fs::write(directory.join("idVendor"), "1050\n").unwrap();
+                std::fs::write(directory.join("busnum"), "1\n").unwrap();
+            }
+            directory
+        }
+
+        /// A HID device under an interface, with its descriptor.
+        fn hid(&self, interface: &str, name: &str, descriptor: &[u8]) -> PathBuf {
+            let hid = self.device(&format!("{interface}/{name}"), false);
+            std::fs::write(hid.join("report_descriptor"), descriptor).unwrap();
+            hid
+        }
+
+        /// `eventN` whose `device` link names `input` under `devices`.
+        fn event(&self, event: &str, input: &str) {
+            let input = self.device(input, false);
+            let node = self.class().join(event);
+            std::fs::create_dir_all(&node).unwrap();
+            std::os::unix::fs::symlink(input, node.join("device")).unwrap();
+        }
+
+        fn excluded(&self, event: &str) -> bool {
+            security_key_keyboard(&self.class(), &Path::new("/dev/input").join(event))
+        }
+    }
+
+    const HUB: &str = "pci0000:00/0000:00:14.0/usb1";
+
+    /// A YubiKey-shaped composite at `port`: an OTP keyboard interface with an
+    /// input node, and a FIDO interface beside it with none.
+    fn security_key(tree: &SysfsTree, at: &str, event: &str, fido: &[u8]) {
+        let device = format!("{HUB}/{at}");
+        let port = at.rsplit('/').next().unwrap();
+        tree.device(&device, true);
+        let keyboard = format!("{device}/{port}:1.0");
+        tree.hid(&keyboard, "0003:1050:0407.0001", KEYBOARD_DESCRIPTOR);
+        tree.event(
+            event,
+            &format!("{keyboard}/0003:1050:0407.0001/input/input5"),
+        );
+        tree.hid(&format!("{device}/{port}:1.1"), "0003:1050:0407.0002", fido);
+    }
+
+    #[test]
+    fn a_security_keys_own_keyboard_is_found_from_its_usb_device() {
+        let tree = SysfsTree::new();
+        tree.device(HUB, true);
+        security_key(&tree, "1-2", "event5", FIDO_DESCRIPTOR);
+        assert!(tree.excluded("event5"));
+
+        // A plain keyboard, whose interface carries a symlink to the key's
+        // FIDO HID device: links lead out of a device and are not followed.
+        tree.device(&format!("{HUB}/1-3"), true);
+        let plain = format!("{HUB}/1-3/1-3:1.0");
+        tree.hid(&plain, "0003:046d:c31c.0003", KEYBOARD_DESCRIPTOR);
+        tree.event(
+            "event6",
+            &format!("{plain}/0003:046d:c31c.0003/input/input6"),
+        );
+        std::os::unix::fs::symlink(
+            tree.0
+                .join("devices")
+                .join(HUB)
+                .join("1-2/1-2:1.1/0003:1050:0407.0002"),
+            tree.0
+                .join("devices")
+                .join(&plain)
+                .join("0003:1050:0407.0099"),
+        )
+        .unwrap();
+        assert!(!tree.excluded("event6"));
+
+        // Behind a hub, a keyboard beside a key is its own USB device; the
+        // key at the next port is still found. Each resolves to its own
+        // port: a walk that overshot to the hub would lose event8's key.
+        tree.device(&format!("{HUB}/1-4"), true);
+        tree.device(&format!("{HUB}/1-4/1-4:1.0"), false);
+        let behind = format!("{HUB}/1-4/1-4.1");
+        tree.device(&behind, true);
+        tree.hid(
+            &format!("{behind}/1-4.1:1.0"),
+            "0003:046d:c31c.0004",
+            KEYBOARD_DESCRIPTOR,
+        );
+        tree.event(
+            "event7",
+            &format!("{behind}/1-4.1:1.0/0003:046d:c31c.0004/input/input7"),
+        );
+        security_key(&tree, "1-4/1-4.2", "event8", FIDO_DESCRIPTOR);
+        assert!(!tree.excluded("event7"));
+        assert!(tree.excluded("event8"));
+        let devices = tree.0.join("devices").canonicalize().unwrap().join(HUB);
+        for (event, port) in [("event7", "1-4/1-4.1"), ("event8", "1-4/1-4.2")] {
+            assert_eq!(
+                usb_device(&tree.class().join(event).join("device")),
+                Some(devices.join(port)),
+                "{event}"
+            );
+        }
+
+        // No USB device above: PS/2, and a UHID device declaring the page.
+        tree.event("event1", "platform/i8042/serio0/input/input1");
+        assert!(!tree.excluded("event1"));
+        let uhid = tree.hid("virtual/misc/uhid", "0003:1050:0407.0007", FIDO_DESCRIPTOR);
+        tree.event(
+            "event9",
+            "virtual/misc/uhid/0003:1050:0407.0007/input/input9",
+        );
+        assert!(uhid.join("report_descriptor").is_file());
+        assert!(!tree.excluded("event9"));
+
+        // Unreadable ancestry admits: no node, no link, a dangling link.
+        assert!(!tree.excluded("event20"));
+        std::fs::create_dir_all(tree.class().join("event21")).unwrap();
+        assert!(!tree.excluded("event21"));
+        std::fs::create_dir_all(tree.class().join("event22")).unwrap();
+        std::os::unix::fs::symlink(
+            tree.0.join("devices/gone"),
+            tree.class().join("event22").join("device"),
+        )
+        .unwrap();
+        assert!(!tree.excluded("event22"));
+        assert!(!security_key_keyboard(&tree.class(), Path::new("/")));
+    }
+
+    #[test]
+    fn a_descriptor_that_is_truncated_or_oversized_declares_nothing() {
+        let tree = SysfsTree::new();
+        tree.device(HUB, true);
+        let bound = usize::try_from(REPORT_DESCRIPTOR_BYTES).unwrap();
+        let padded = |length: usize| {
+            let mut bytes = FIDO_DESCRIPTOR.to_vec();
+            bytes.resize(length, 0xc0);
+            bytes
+        };
+        security_key(&tree, "1-2", "event5", &padded(bound));
+        security_key(&tree, "1-3", "event6", &padded(bound + 1));
+        security_key(&tree, "1-4", "event7", &[0x06, 0xd0, 0xf1, 0x26, 0xff]);
+        security_key(
+            &tree,
+            "1-5",
+            "event8",
+            &[0x06, 0xd0, 0xf1, 0xfe, 0x04, 0x00],
+        );
+        security_key(
+            &tree,
+            "1-6",
+            "event9",
+            &[0xfe, 0x01, 0x00, 0x00, 0x07, 0xd0, 0xf1, 0x00, 0x00],
+        );
+        assert!(tree.excluded("event5"));
+        assert!(!tree.excluded("event6"));
+        assert!(!tree.excluded("event7"));
+        assert!(!tree.excluded("event8"));
+        assert!(tree.excluded("event9"));
+        // A complete descriptor declaring the page only through extended
+        // usage ranges is found; an empty one, as a HID device whose driver
+        // has not probed reads, declares nothing.
+        security_key(&tree, "1-7", "event10", RANGED_FIDO_DESCRIPTOR);
+        security_key(&tree, "1-8", "event11", &[]);
+        assert!(tree.excluded("event10"));
+        assert!(!tree.excluded("event11"));
+        let roster: Vec<(PathBuf, ())> = ["event5", "event6", "event9"]
+            .iter()
+            .map(|event| (Path::new("/dev/input").join(event), ()))
+            .collect();
+        assert_eq!(
+            attention_exclusions(&tree.class(), &roster),
+            BTreeSet::from([0, 2])
+        );
+    }
+
     fn press(bindings: &mut KeyBindings, code: u16) -> Option<Command> {
         bindings.feed(key(code, KEY_PRESS)).command
     }
@@ -3793,6 +4262,7 @@ mod tests {
     struct RecordingTarget {
         attention_events: Vec<bool>,
         secret_roles: Vec<crate::secret_client::Selection>,
+        confirmations: Vec<u128>,
         attention_cutoff: u128,
         attention_error: Option<String>,
         draining_events: usize,
@@ -3832,6 +4302,11 @@ mod tests {
     }
 
     impl InputTarget for RecordingTarget {
+        fn confirm_install(&mut self, timestamp: u128) -> Result<(), String> {
+            self.confirmations.push(timestamp);
+            Ok(())
+        }
+
         fn secret_request(&mut self, role: crate::secret_client::Selection) -> Result<(), String> {
             self.secret_roles.push(role);
             Ok(())
@@ -6987,6 +7462,174 @@ mod tests {
             assert_eq!(target.attention_events, [true]);
             assert_eq!(target.secret_roles, [selected]);
         }
+    }
+
+    #[test]
+    fn a_security_keys_keyboard_can_still_cancel_attention() {
+        const KEY: usize = 1;
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings {
+            attention_enabled: true,
+            attention_excluded: BTreeSet::from([KEY]),
+            ..KeyBindings::default()
+        });
+        let mut resync = || None;
+        // A lone keyboard carrying a FIDO interface opens attention, as
+        // outside it is an ordinary keyboard, and must be able to leave.
+        let mut token = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, true);
+        for event in [
+            key(KEY_LEFTCTRL, KEY_PRESS),
+            key(KEY_LEFTALT, KEY_PRESS),
+            key(KEY_ESC, KEY_PRESS),
+            key(KEY_ESC, KEY_RELEASE),
+            key(KEY_LEFTCTRL, KEY_RELEASE),
+            key(KEY_LEFTALT, KEY_RELEASE),
+        ] {
+            apply_device_event(&target, event, KEY, &bindings, &mut token).unwrap();
+        }
+        assert!(bindings.lock().unwrap().attention == AttentionState::Open);
+        assert_eq!(target.lock().unwrap().attention_events, [true]);
+        apply_device_event(&target, key(KEY_ESC, KEY_PRESS), KEY, &bindings, &mut token).unwrap();
+        assert!(bindings.lock().unwrap().attention == AttentionState::Draining);
+        assert_eq!(target.lock().unwrap().draining_events, 1);
+        apply_device_event(
+            &target,
+            key(KEY_ESC, KEY_RELEASE),
+            KEY,
+            &bindings,
+            &mut token,
+        )
+        .unwrap();
+        assert!(bindings.lock().unwrap().attention == AttentionState::Closed);
+        let target = target.lock().unwrap();
+        assert_eq!(target.attention_events, [true, false]);
+        assert!(target.secret_roles.is_empty());
+    }
+
+    #[test]
+    fn a_security_keys_keyboard_never_selects_or_confirms_and_still_drains() {
+        use crate::authority::consent::Role;
+        use crate::secret_client::Selection;
+        const KEY: usize = 1;
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings {
+            attention_enabled: true,
+            attention_excluded: BTreeSet::from([KEY]),
+            ..KeyBindings::default()
+        });
+        let (mut keyboard_resync, mut key_resync) = (|| None, || None);
+        let mut keyboard = DeviceState::new(None, AbsoluteKind::Tablet, &mut keyboard_resync, true);
+        let mut token = DeviceState::new(None, AbsoluteKind::Tablet, &mut key_resync, true);
+        // Outside attention it is an ordinary keyboard.
+        for code in [KEY_U, KEY_ENTER] {
+            for value in [KEY_PRESS, KEY_RELEASE] {
+                apply_device_event(&target, key(code, value), KEY, &bindings, &mut token).unwrap();
+            }
+        }
+        {
+            let target = target.lock().unwrap();
+            let typed: Vec<_> = target.keys.iter().map(|input| input.key).collect();
+            let (u, enter) = (u32::from(KEY_U), u32::from(KEY_ENTER));
+            assert_eq!(typed, [u, u, enter, enter]);
+            assert!(target.secret_roles.is_empty());
+        }
+        for event in [
+            key(KEY_LEFTCTRL, KEY_PRESS),
+            key(KEY_LEFTALT, KEY_PRESS),
+            key(KEY_ESC, KEY_PRESS),
+            key(KEY_ESC, KEY_RELEASE),
+            key(KEY_LEFTCTRL, KEY_RELEASE),
+            key(KEY_LEFTALT, KEY_RELEASE),
+        ] {
+            apply_device_event(&target, event, 0, &bindings, &mut keyboard).unwrap();
+        }
+        let typed = target.lock().unwrap().keys.len();
+        // A touch types modhex and Enter: nothing is selected or confirmed.
+        for code in [KEY_U, KEY_R, KEY_E, KEY_X, KEY_W, KEY_I, KEY_ENTER] {
+            for value in [KEY_PRESS, KEY_RELEASE] {
+                apply_device_event(&target, key(code, value), KEY, &bindings, &mut token).unwrap();
+            }
+        }
+        {
+            let target = target.lock().unwrap();
+            assert!(target.secret_roles.is_empty());
+            assert!(target.confirmations.is_empty());
+        }
+        // Its Shift is no modifier here; the keyboard's is.
+        apply_device_event(
+            &target,
+            key(KEY_LEFTSHIFT, KEY_PRESS),
+            KEY,
+            &bindings,
+            &mut token,
+        )
+        .unwrap();
+        assert_eq!(
+            bindings.lock().unwrap().modifiers().depressed & MOD_SHIFT,
+            0
+        );
+        apply_device_event(
+            &target,
+            key(KEY_RIGHTSHIFT, KEY_PRESS),
+            0,
+            &bindings,
+            &mut keyboard,
+        )
+        .unwrap();
+        assert_eq!(
+            bindings.lock().unwrap().modifiers().depressed & MOD_SHIFT,
+            MOD_SHIFT
+        );
+        for (device, state) in [(KEY, &mut token), (0, &mut keyboard)] {
+            let shift = if device == KEY {
+                KEY_LEFTSHIFT
+            } else {
+                KEY_RIGHTSHIFT
+            };
+            apply_device_event(&target, key(shift, KEY_RELEASE), device, &bindings, state).unwrap();
+        }
+        // Its held U does not stand in the keyboard's way.
+        apply_device_event(&target, key(KEY_U, KEY_PRESS), KEY, &bindings, &mut token).unwrap();
+        for value in [KEY_PRESS, KEY_RELEASE] {
+            apply_device_event(&target, key(KEY_U, value), 0, &bindings, &mut keyboard).unwrap();
+        }
+        apply_device_event(&target, key(KEY_U, KEY_RELEASE), KEY, &bindings, &mut token).unwrap();
+        {
+            let target = target.lock().unwrap();
+            assert_eq!(target.secret_roles, [Selection::Unlock(Role::Primary)]);
+            assert!(target.confirmations.is_empty());
+        }
+        // Its Enter cannot confirm the selection; the keyboard's does.
+        for value in [KEY_PRESS, KEY_RELEASE] {
+            apply_device_event(&target, key(KEY_ENTER, value), KEY, &bindings, &mut token).unwrap();
+        }
+        assert!(target.lock().unwrap().confirmations.is_empty());
+        let enter = Event {
+            timestamp: 7,
+            ..key(KEY_ENTER, KEY_PRESS)
+        };
+        apply_device_event(&target, enter, 0, &bindings, &mut keyboard).unwrap();
+        apply_device_event(
+            &target,
+            key(KEY_ENTER, KEY_RELEASE),
+            0,
+            &bindings,
+            &mut keyboard,
+        )
+        .unwrap();
+        assert_eq!(target.lock().unwrap().confirmations, [7]);
+        // Its held key still holds the drain open.
+        apply_device_event(&target, key(KEY_E, KEY_PRESS), KEY, &bindings, &mut token).unwrap();
+        for value in [KEY_PRESS, KEY_RELEASE] {
+            apply_device_event(&target, key(KEY_ESC, value), 0, &bindings, &mut keyboard).unwrap();
+        }
+        assert_eq!(target.lock().unwrap().attention_events, [true]);
+        apply_device_event(&target, key(KEY_E, KEY_RELEASE), KEY, &bindings, &mut token).unwrap();
+        let target = target.lock().unwrap();
+        assert_eq!(target.attention_events, [true, false]);
+        assert_eq!(target.keys.len(), typed);
+        assert_eq!(target.secret_roles, [Selection::Unlock(Role::Primary)]);
+        assert_eq!(target.confirmations, [7]);
     }
 
     #[test]

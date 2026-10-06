@@ -5618,7 +5618,8 @@ client directory. A bare readiness filename without a directory is refused.
 The trusted input boundary includes every evdev device admitted at startup,
 including USB HID keyboards and pointers. USB provenance is not device
 attestation. A composite token's separate OTP keyboard interface is an input
-device and can type into the focused application; the FIDO hidraw interface
+device and can type into the focused application, though not into secure
+attention ("A security key's own keyboard" below); the FIDO hidraw interface
 is separate, remains root-only, and supplies no keyboard events itself.
 A malicious admitted keyboard can synthesize the attention chord. This
 profile trusts attached input hardware and root's device provisioning; it
@@ -5670,16 +5671,64 @@ capture or synthetic-input portal is implemented by this increment.
 A fresh physical U selects primary unlock, R recovery unlock, E enrollment
 with a second recovery token, X explicit unrecoverability, and W the ready
 credential write queued through `td-secret set`; I selects a queued system
-installation. Only one
-selection is allowed per successfully opened and closed attention lifetime.
-Held keys, repeats and a second device pressing an already-held logical key
-cannot select an operation. Ordinary control, Wayland and portal input APIs
-cannot construct that physical selection. The screen accepts no credential
-bytes. For a write, root returns the complete canonical target and role,
-which must be a Set operation for the configured owner. The client presents
-that exact description and requires the same presentation and commit
-receipts as unlock. No ready write produces a notice, never a retry or an
-automatic enrollment/unlock. Success displays CREDENTIAL STORED.
+installation. Only one selection is allowed per successfully opened and
+closed attention lifetime. Held keys, repeats and a second device pressing
+an already-held logical key cannot select an operation; a key held only by
+a security key's own keyboard does not count as held (below). Ordinary
+control, Wayland and portal input APIs cannot construct that physical
+selection. The screen accepts no credential bytes. For a write, root
+returns the complete canonical target and role, which must be a Set
+operation for the configured owner. The client presents that exact
+description and requires the same presentation and commit receipts as
+unlock. No ready write produces a notice, never a retry or an automatic
+enrollment/unlock. Success displays CREDENTIAL STORED.
+
+**A security key's own keyboard.** A composite key's OTP interface, touched
+by accident, types modhex letters (among them `e`, `i`, `r` and `u`) and
+Enter, which could otherwise pick an operation or confirm one. So at
+startup the paired profile finds each admitted node's USB device: it
+canonicalizes `/sys/class/input/eventN/device` and walks up to the nearest
+ancestor carrying both `idVendor` and `busnum`, so a hub above the device
+is never reached, stopping at `/sys/devices` or after 32 levels. If any of
+that device's interfaces (`1-2:1.1` under `1-2`) has a HID child whose
+`report_descriptor` declares the FIDO usage page 0xf1d0, the node is
+excluded from secure-attention selection and confirmation, and startup
+logs it once. The descriptor is read up to the kernel's 4096-byte
+`HID_MAX_DESCRIPTOR_SIZE` and walked item by item. A Usage Page short item
+with one, two or four data bytes whose whole value is 0xf1d0 declares it,
+as does a four-byte (extended) Usage, Usage Minimum or Usage Maximum whose
+high half names the page (HID 1.11 section 6.2.2.8). Every prefix from
+0xf0 to 0xff frames a long item, as the kernel's item reader frames it;
+the kernel then refuses the descriptor, while this walk skips the item and
+reads on, which can only exclude more. A truncated item, which the kernel
+also refuses, or an oversized read declares nothing. Symlinks (`driver`,
+`port`) are not followed and a directory of more than
+256 entries is not read. Report descriptors are world-readable in sysfs,
+so this is plain file reads and no new syscall.
+
+An excluded device's keys never select (U, R, E, X, W, I) and never
+confirm (Enter). Its held keys neither stop another keyboard's fresh press
+of the same key nor count as modifiers while attention is up. Its presses
+and releases are still tracked, so the release drain waits for them, and
+its Escape still cancels, so no capture outlives the person's way out.
+The chord itself is read as before. Outside attention it is an ordinary
+keyboard. A keyboard that itself carries a FIDO interface is excluded
+whole, and another keyboard must select.
+
+The residual is a trusted-device one. A node whose USB ancestry cannot be
+read, or that has no USB device above it (PS/2, UHID, virtio), is admitted
+as before. A classic Bluetooth keyboard behind a USB adapter resolves to
+the adapter, which has no FIDO interface, so it is admitted too; a BLE
+keyboard (connected through UHID) or one behind a UART or SDIO adapter has
+no USB device above it; a FIDO token reached over Bluetooth is admitted
+either way. So is a key whose descriptor is unreadable, oversized,
+malformed or empty (a HID device whose driver has not probed by compositor
+startup reads as zero bytes), and one whose FIDO function is not a HID
+interface of the same USB device. UHID devices have no USB parent, so no
+guest can show the exclusion; host tests over hand-built sysfs trees are
+its present evidence, and the hardware record TOKEN-LOGIN.md's "Evidence"
+requires, not yet made, is still owed. The fixed startup roster means a key
+inserted later adds no keyboard at all.
 
 The device dispatcher treats a secret selection as work even when that
 key produces no ordinary key, modifier or pointer delivery. Its device-event
@@ -5813,7 +5862,9 @@ rotate a signing key. The installation protocol is in td-authd/DESIGN.md.
 Not implemented. [td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier, including when the session locks and what
 clients receive while locked ("Session lock"). The rules in this section
-change as follows; increment numbers are TOKEN-LOGIN.md's.
+change as follows; increment numbers are TOKEN-LOGIN.md's. A security key's
+own keyboard ("Physical secure attention") is already excluded, and stays
+excluded from every selection, confirmation and field below.
 
 1. **One operation per lifetime (3).** "Only one selection is allowed per
    attention lifetime" becomes one operation per lifetime. `K` opens a
@@ -5825,35 +5876,28 @@ change as follows; increment numbers are TOKEN-LOGIN.md's.
 2. **The PIN field (3).** "The screen accepts no credential bytes" gains
    one exception. The field opens only after the current step has its
    presentation receipt and root has asked for that step's PIN. It reads
-   only fresh physical evdev key presses from admitted devices, never
-   injected, automation, control or bridge input, held keys or repeats.
+   only fresh physical evdev key presses from admitted devices that secure
+   attention reads, never a security key's own keyboard, injected,
+   automation, control or bridge input, held keys or repeats.
    Keys map through the `us` keymap; Shift is honoured as the level
    modifier inside the field, while Control, Alt, Super, Caps Lock and
    chords are ignored. Echo is one mask dot per byte; Backspace edits,
    Enter submits, Escape cancels, a 64th byte refuses, and nothing pastes.
+   A security key's own keyboard types nothing into the field and cannot
+   submit it, but its Escape cancels the step, as it cancels attention:
+   cancelling is a denial, not a grant. A static password typed in scancode
+   mode can include Escape, so a touch can end a step the person meant to
+   finish, never complete one.
    The PIN reaches root through the paired client in a clearing owner and
    is never painted, logged or retained after sending.
-3. **The token's own keyboard (3).** At startup the compositor records each
-   admitted keyboard's USB device from sysfs. A keyboard whose USB device
-   also exposes a HID interface whose report descriptor declares the FIDO
-   usage page 0xf1d0 is excluded from all secure-attention input: every
-   selection, every confirmation and the PIN field. A composite key's OTP
-   interface, touched by accident, types modhex letters (among them `d`,
-   `e`, `i`, `k`, `l`, `r`, `u`) and Enter, which could otherwise pick an
-   operation, confirm a disclosure or spend a PIN retry. This also covers
-   the existing selections above. It stays an ordinary keyboard elsewhere.
-   Report descriptors are world-readable in sysfs, so this needs no new
-   syscall. A keyboard whose USB ancestry cannot be read is still admitted,
-   a stated trusted-device residual. The fixed startup roster means a key
-   inserted later adds no keyboard at all.
-4. **Successors (3).** "Unlock has no successor" holds for the
+3. **Successors (3).** "Unlock has no successor" holds for the
    application-store unlock only. Login operations present each next step
    that td-authd admits, under its device-data rule; owner and nonce stay
    fixed.
-5. **Lifetime (3).** A login operation's attention lifetime is td-authd's
+4. **Lifetime (3).** A login operation's attention lifetime is td-authd's
    ceiling for that operation instead of 120 seconds, never renewed, and
    every prompt shows the remaining time.
-6. **Lock state (4).** The compositor learns the login state as
+5. **Lock state (4).** The compositor learns the login state as
    td-authd/DESIGN.md's login-state amendment specifies. What a locked
    session shows and delivers is TOKEN-LOGIN.md's; here, the lock surface
    is drawn by display rendering alone, like the attention screen, and a
@@ -5863,10 +5907,10 @@ change as follows; increment numbers are TOKEN-LOGIN.md's.
    consumed with no effect and reaches no client, a lid close or resume
    does nothing, and `L` shows `NO LOGIN KEYS ENROLLED` on the
    attention screen.
-7. **Lid switch (4).** The startup roster admits the ACPI lid switch's
+6. **Lid switch (4).** The startup roster admits the ACPI lid switch's
    evdev node, a switch-only device reporting `SW_LID`. Its close event
    locks; nothing else is read from it.
-8. **Resume (4).** The kernel does not repeat an unchanged switch state, so
+7. **Resume (4).** The kernel does not repeat an unchanged switch state, so
    a lid close cannot be relied on to precede every suspend. The compositor
    detects resume itself: it compares how far the boot-time clock in
    `/proc/uptime`, which counts suspended time, and `std::time::Instant`

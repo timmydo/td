@@ -21,7 +21,11 @@ refuses every write that would leave a record ("Versions"). Its
 `qemu-secret` guests, standing in for that marker, run it over UHID
 virtual keys through every case increment 2 lists, including power cuts
 inside its writes on a disposable disk ("Evidence"): increment 2 is
-complete. Nothing else below is implemented.
+complete. Of increment 3, only the compositor's exclusion of a security
+key's own keyboard from secure attention has landed, and it is live: it
+narrows the existing attention selections and confirmation and needs no
+record (`td-compositor/DESIGN.md`, "Physical secure attention"). Nothing
+else below is implemented.
 Until the increments at the end land, `THREAT-MODEL.md` §3 is the
 complete current behaviour: the installed account logs in automatically
 and the session never locks. No document, UI or release
@@ -806,11 +810,16 @@ operator's device.
 ## Increments
 
 Each is independently landable. None is expected to need new `unsafe`;
-one that turns out to amends `UNSAFE.md` in the same landing. Increments 2
-to 4 land inert. No production path reads the login state until
-increment 4, which also makes firstboot ensure the directory, so its
-absence, itself a damaged directory, never meets a production reader.
-From then on behaviour changes only when a record or an invalid
+one that turns out to amends `UNSAFE.md` in the same landing. Increments
+2 to 4 land inert, except increment 3's exclusion of a security key's
+own keyboard from secure attention, which is live on every machine with
+or without a record: it denies a security key's own keyboard every
+selection and confirmation, and the only selection it newly admits is
+another keyboard's fresh press of a key the security key's keyboard
+holds. No production path reads the login state until increment 4, which
+also makes firstboot ensure the directory, so its absence, itself a
+damaged directory, never meets a production reader. From then on, that
+exclusion apart, behaviour changes only when a record or an invalid
 directory exists, which no production path creates, and the state is
 decided by the directory-and-name check before any helper runs, so no
 helper failure can change an unenrolled machine. Each lists what it
@@ -849,12 +858,21 @@ proves and the oracle that shows it.
      client pixels and cursors; the PIN field takes only physical keys,
      handles Shift, and refuses injected, automation, control and bridge
      input; the OTP-keyboard exclusion from every attention selection,
-     confirmation and the PIN field over recorded sysfs trees (UHID devices
+     confirmation and the PIN field over hand-built sysfs trees (UHID devices
      have no USB parent, so the guest cannot show it); the K, A, D, 1 and 2
      selections against a scripted authority, and their refusal by the
      production one; the chained login lifetime.
    - A desktop guest with a UHID keyboard drives PIN entry against the
      worker with a seeded record, with framebuffer bitmap checks.
+   - The OTP-keyboard exclusion has landed for the existing selections and
+     Enter confirmation: host tests over hand-built sysfs trees (a
+     composite key, a plain keyboard, a keyboard behind a hub beside a key, nodes
+     with no USB parent, a FIDO page named only by extended usage ranges,
+     truncated, oversized, long-item and empty descriptors)
+     and device-dispatcher tests. The PIN field and the `K` selections
+     must read through the same exclusion when they land. The hardware
+     record of an OTP touch on the attention screen ("Evidence") is still
+     owed.
 4. **Locked boot and session lock:** request `1a` and login state at
    Prepare, `Super+l`, attention `L`, lid close, resume detection, unlock
    end to end, firstboot's directory and temporaries, the unavailable

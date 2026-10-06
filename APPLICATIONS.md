@@ -8706,9 +8706,10 @@ target; the proposed randomized-key mechanism is not implemented. The kernel now
 USB HID and hidraw. The root-only worker implements the narrow CTAP HID
 transport described in `td-secret/DESIGN.md`; it does not grant consent.
 USB keyboard interfaces follow the compositor's seat-assigned startup
-roster, including the separate OTP interface of a composite token.
-Physical input hardware remains trusted; keyboard events never prove a
-FIDO assertion.
+roster, including the separate OTP interface of a composite token, which
+secure attention never selects or confirms with (`td-compositor/DESIGN.md`,
+"Physical secure attention"). Physical input hardware remains trusted;
+keyboard events never prove a FIDO assertion.
 
 #### Threats a consent dialog invites
 
