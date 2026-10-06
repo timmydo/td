@@ -18,6 +18,7 @@ enum Property {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Phase {
     Prepare,
+    AfterStructure,
     StartPart,
     Fragment,
     Subparts,
@@ -56,6 +57,7 @@ pub(crate) struct Frame {
     after: Phase,
     credit: u8,
     properties: u8,
+    follow_lists: bool,
 }
 impl Frame {
     pub(crate) fn new(mode: Mode) -> Self {
@@ -72,6 +74,7 @@ impl Frame {
             after: Phase::Complete,
             credit: 0,
             properties: 15,
+            follow_lists: false,
         }
     }
     pub(crate) fn selected_lists(properties: u8) -> Self {
@@ -80,6 +83,15 @@ impl Frame {
         if frame.properties == 0 {
             frame.phase = Phase::Complete;
         }
+        frame
+    }
+    pub(crate) fn requested(structure: bool, properties: u8) -> Self {
+        if !structure {
+            return Self::selected_lists(properties);
+        }
+        let mut frame = Self::new(Mode::Structure);
+        frame.properties = properties & 15;
+        frame.follow_lists = frame.properties != 0;
         frame
     }
     fn next_property(&self, after: Option<List>) -> Option<Property> {
@@ -126,6 +138,8 @@ impl Frame {
             ),
         }
     }
+    // Legacy label only; combined requested frames use mode as the active walk.
+    // Requested wrappers expose immutable Properties and discard this value.
     pub(crate) fn mode(&self) -> Mode {
         self.mode
     }
@@ -179,6 +193,10 @@ impl Frame {
                     self.begin_property(source, property, true);
                 }
             },
+            Phase::AfterStructure => {
+                let property = self.next_property(None).ok_or(Error::InvalidState)?;
+                self.begin_property(source, property, false);
+            }
             Phase::StartPart => {
                 let part = source.node(self.index)?;
                 if self.mode == Mode::Structure {
@@ -308,6 +326,11 @@ impl Frame {
                 self.offset = end;
                 if end == length {
                     self.phase = self.after;
+                    if self.phase == Phase::Complete && self.follow_lists {
+                        self.follow_lists = false;
+                        self.mode = Mode::Lists;
+                        self.phase = Phase::AfterStructure;
+                    }
                 }
             }
             Phase::Complete => {}

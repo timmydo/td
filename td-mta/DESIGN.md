@@ -840,6 +840,23 @@ fee; unfinished freshness precedes capacity and all refusals are sticky.
 Only API §1.134's eight intervals are allocation-qualified. Whole ledger
 admission, wider request routing and current publication remain later.
 
+M06ed routes pure requested bodyStructure and list properties through
+the same bounded Frame, retaining original collection and actual pin.
+Tree first then selected lists yields canonical keys and separators;
+single-mode legacy bytes/turns/funding remain unchanged. Exclusive
+requested Composed carries selection through fresh original release.
+Only API §1.135's eight intervals are allocation-qualified. Whole
+requested retention, per-part bodyProperties, JSON request decoding,
+full admission and authorized publication remain later.
+
+The four-list-only selected source-bound adapters retain a narrower type
+contract than requested tree/list selection: their Properties cannot
+select bodyStructure. They remain public facades over the same shared
+Frame and retention core, with no independent polling or capacity engine.
+The broader requested facade keeps its immutable five-property label;
+the Frame's mode is an internal active walk, a legacy constructor label
+only. These are selection types, not JSON request default policy.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

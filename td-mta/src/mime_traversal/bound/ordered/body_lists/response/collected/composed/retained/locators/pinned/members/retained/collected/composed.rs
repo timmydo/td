@@ -1,4 +1,5 @@
 //! Original source-bound whole members share the bounded tree/list frame.
+pub mod requested;
 pub mod retained;
 pub mod selected;
 use super::super::super::super::super::Error as OriginalError;

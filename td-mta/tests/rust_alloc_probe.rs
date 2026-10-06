@@ -12424,6 +12424,18 @@ fn selected_source_bound_lists() {
     }
 }
 
+fn requested_source_bound_properties() {
+    use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained::collected::composed::requested;
+    let mut samples = [COUNTERS.snapshot(); 16];
+    let mut slots = samples.iter_mut();
+    requested::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|sample| !sample.invalid));
+    for [before, after] in samples.as_chunks::<2>().0 {
+        assert_eq!(before, after, "requested source-bound properties allocated");
+    }
+}
+
 fn retained_selected_source_bound_lists() {
     use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained::collected::composed::selected::retained;
     let mut samples = [COUNTERS.snapshot(); 16];
@@ -12852,6 +12864,7 @@ fn main() {
     retained_source_bound_composition();
     selected_source_bound_lists();
     retained_selected_source_bound_lists();
+    requested_source_bound_properties();
     mime_base64();
     mime_qp();
     mime_qp_input();

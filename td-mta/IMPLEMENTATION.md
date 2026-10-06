@@ -2316,6 +2316,16 @@ Initial independently landable increments:
   guards and eight scoped Rust allocation intervals. Wider routing,
   full admission and authorized publication remain later (API §1.134).
 
+- **M06ed — requested source-bound tree/list property routing:** emit
+  a pure five-key caller selection through one shared bounded Frame,
+  preserving source collection and actual pin through fresh exclusive
+  release. Keep single-mode legacy bytes/turns/funding, canonical
+  tree-then-list keys, empty/inert completion and sticky fences. Pin
+  all 32 SIMPLE subsets plus representative digest/bases, six compile
+  guards and eight scoped allocation intervals (API §1.135). Whole
+  requested retention, per-part properties, request JSON decoding,
+  full admission and authenticated publication follow.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

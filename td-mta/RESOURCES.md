@@ -2486,6 +2486,13 @@ expiry. Original preparation and enclosing resources stay outside;
 descriptor teardown is counted. API §1.134 states exact scope and
 unmeasured variants. Native/stack/RSS/full admission remain unqualified.
 
+M06ed requested tree/list routing preserves the compiled 1 KiB Cursor
+plus HeaderBudget/output cap and 768-byte Composed cap. API §1.135
+names eight Rust allocation intervals, including near-u64 tree+textBody
+and empty selection, with original preparation/enclosing resources
+outside and descriptor teardown counted. Earlier 129 intervals remain
+separate; native/stack/RSS/full admission are unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no
