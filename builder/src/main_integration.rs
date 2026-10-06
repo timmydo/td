@@ -1,11 +1,14 @@
 //! `td-builder main-integration`: the integration tier's runner on main.
 //! No branch's `ready` boots the qemu oracles (`affected::boot_path` only
-//! names a boot-path change), so this is where they run: after landings,
-//! on the newest `origin/main`, in a worktree of its own.
+//! names a boot-path change), nor runs a recipe check whose key differs
+//! from a pass on record only in the builder engine or evaluator, so this
+//! is where they run: after landings, on the newest `origin/main`, in a
+//! worktree of its own.
 //!
 //! `run` fetches the remote's main, and when its head has no verdict yet
 //! resets the runner's detached worktree to it and runs that commit's own
-//! `td-builder check integration` there. Heads that land while a run is
+//! `td-builder check recipe-checks integration` there: every recipe check,
+//! then the oracles. Heads that land while a run is
 //! going are not queued: the next pass takes whatever is newest, so a burst
 //! of landings costs one run, and a red one is bisected by whoever heals it
 //! (`ci/revert-suspect.sh`). A run killed by a signal records no verdict and
@@ -413,8 +416,11 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// The caller's environment, less what would aim the tier somewhere other
 /// than the runner's tree: a target directory (the tree's own `target/` is
 /// the cache that makes the next run cheap), the caller's rustc flags, a
-/// recipe-check scope, a `TD_CHECK_FULL` that would boot past the memo
-/// every run, and git's repository overrides.
+/// recipe-check scope, a branch run's deferral of engine-only recipe
+/// checks (main is where they run), a gate-disable list that could drop
+/// the recipe gate and leave a green with nothing checked, a
+/// `TD_CHECK_FULL` that would boot past the memo every run, and git's
+/// repository overrides.
 fn scrub(cmd: &mut Command) -> &mut Command {
     for var in [
         "CARGO_TARGET_DIR",
@@ -423,6 +429,8 @@ fn scrub(cmd: &mut Command) -> &mut Command {
         "TD_CHECK_FULL",
         "CARGO_BUILD_TARGET_DIR",
         crate::check_loop::CHECK_SCOPE_ENV,
+        crate::check_loop::CHECK_DEFER_ENV,
+        "TD_CHECK_DISABLE",
         "GIT_DIR",
         "GIT_WORK_TREE",
         "GIT_INDEX_FILE",
@@ -474,11 +482,14 @@ fn run_tier(tree: &Path, log: &Path) -> Result<Option<i32>, String> {
         // is not a verdict.
         return Ok(built);
     }
-    child(
-        Command::new(tree.join("target/release/td-builder"))
-            .args(["check", crate::integration::GOAL]),
-    )
+    child(Command::new(tree.join("target/release/td-builder")).args(TIER_ARGS))
 }
+
+/// What a run asks the head's builder: every recipe check, unscoped and
+/// undeferred, which a branch's `ready` leaves to main when only the
+/// builder engine or evaluator changed since a check's last pass, then the
+/// qemu oracles, which run only once the gates pass.
+const TIER_ARGS: &[&str] = &["check", "recipe-checks", crate::integration::GOAL];
 
 /// What one pass did.
 #[derive(Debug, PartialEq)]
@@ -735,6 +746,33 @@ mod tests {
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// Main runs every recipe check in full before the oracles: the recipe
+    /// gate is named, so its failure reds the run, and nothing the caller
+    /// exported may scope or defer it.
+    #[test]
+    fn the_tier_runs_every_recipe_check_then_the_oracles() {
+        assert_eq!(TIER_ARGS, &["check", "recipe-checks", "integration"]);
+        let mut cmd = Command::new("true");
+        cmd.env(crate::check_loop::CHECK_DEFER_ENV, "1")
+            .env(crate::check_loop::CHECK_SCOPE_ENV, "td-sh")
+            .env("TD_CHECK_DISABLE", "recipe-checks")
+            .env("TD_CHECK_FULL", "1");
+        scrub(&mut cmd);
+        let removed: Vec<&OsStr> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k)
+            .collect();
+        for var in [
+            crate::check_loop::CHECK_DEFER_ENV,
+            crate::check_loop::CHECK_SCOPE_ENV,
+            "TD_CHECK_DISABLE",
+            "TD_CHECK_FULL",
+        ] {
+            assert!(removed.contains(&OsStr::new(var)), "{var} not scrubbed");
+        }
     }
 
     #[test]

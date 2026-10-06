@@ -147,6 +147,48 @@ and records them; the summary shows the last run's. A small check's
 time is mostly `build`: re-planning and staging its whole closure from
 stage0, already-built rungs included.
 
+A branch's `ready` leaves to main the recipe checks only main's churn
+re-keys. `affected-checks --run` sets `TD_CHECK_DEFER_ENGINE`, and a
+check whose key differs from a pass on record here only in its
+`builder-engine` or `evaluator` component, both of which every check's
+key holds, does not run: it prints `[td-check-memo:deferred]` with the
+components that changed, the gate counts and names it as deferred to
+main beside its memo answers, and the history records it as `deferred`,
+not as a run. Every pass of the check is weighed, not only the last
+used, since worktrees on other bases record passes of the same check in
+the shared memo; only a well-formed pass whose components hash to the
+key it is filed under counts. A change to anything else the check reads
+— its script, a recipe in its closure or the sources it embeds, a lock,
+a local source, the seed patches — runs it, as does a check with no
+such pass. The evaluator's own sources key a check in two
+parts: `evaluator-checks`, what is a check's own content though every
+key holds it — the Rust check bodies under
+`recipes/src/bin/td_recipe_eval/checks/`, the source and OSTree pins
+(which a recipe's build JSON names only by key), a recipe file the
+evaluator's code reads, and a crate file the shared modules compile in,
+such as the TZif reader tzdata#1 asserts — which never defers, and
+`evaluator`, the rest of its code, which may. The builder-engine
+component also hides the seed tables td-builder compiles in, among them
+`seed/bootstrap-root.txt`, the root every post-cut check builds on, so
+a branch whose diff touches `seed/` defers nothing, and the selection
+says so; the same changes arriving from main are main's to run. So a
+branch that touches only the builder engine, the evaluator's shared
+code or the engine crate runs none of the checks they alone reach, and
+one that changes a recipe or a check's body still runs the checks that
+reach it whatever main did to the engine since. Weighing passes is not
+a use of them, so gc-store still expires them; the pass that defers is
+stamped as one, as a memo hit's is. main-integration runs every recipe
+check undeferred (below); on the check host's machine its passes are
+what the next branch compares with, while a runner on a host of its own
+still covers main but leaves the branches' memo to their own runs. The
+flag is part of the
+verdict-journal key, so a deferring pass is never what a full `--resume`
+finds; `TD_CHECK_FULL` runs every check here, deferral included, and
+nothing but `affected-checks --run` sets the flag. The cost is that an
+engine or evaluator change that breaks a recipe check is found on main,
+after it lands; run `td-builder check recipe-checks` before pushing one
+that expects to.
+
 The gate starts its checks longest first, by each check's median executed
 time in that history (`check-history --durations`), with a check that has
 none starting before every recorded one: the gate ends when its longest
@@ -171,7 +213,8 @@ TD_CHECK_FULL=1 td-builder ready
 ```
 
 The variable set to any value, the way `td-builder check --resume` reads it
-to rerun gates it has a passing record for. A forced rerun forgets the
+to rerun gates it has a passing record for; it also runs the checks a
+branch run would defer to main. A forced rerun forgets the
 recorded pass before it runs, so a failure leaves nothing to answer from.
 `td-recipe-eval clear-store` drops the memos with the rest of the ladder work
 dir.
@@ -428,9 +471,17 @@ is recorded, not between.
 It belongs to main. On a provisioned host (qemu, OVMF, and `/dev/kvm`
 for the user), `td-builder main-integration run`, started from any
 checkout of the repository, fetches `origin/main` five minutes after
-each pass and runs that head's own `td-builder check integration` in a
-detached worktree of its own, under `~/.local/state/td/main-integration`
-(or `TD_MAIN_INTEGRATION_DIR`). Heads that land during a run are not
+each pass and runs that head's own `td-builder check recipe-checks
+integration` in a detached worktree of its own, under
+`~/.local/state/td/main-integration` (or `TD_MAIN_INTEGRATION_DIR`):
+every recipe check, unscoped and with the deferral flag scrubbed, then
+the oracles once the gates pass. A failed recipe check reds the head
+and the oracles do not boot. The runner invokes each head's builder
+with the tier arguments and scrubbed environment of the runner's own
+build, so a landing that changes those in `main_integration.rs` takes
+effect only from a runner built with it: stop the runner; if main's
+newest head already has a verdict from it, run `run --once --again`;
+then start `run` again. Heads that land during a run are not
 queued: the next run takes the newest, so a burst of landings costs one
 run. Each head's verdict and log are kept there; a red run prints the
 commits since the last green one as suspects. A run killed by a signal

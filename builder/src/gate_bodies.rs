@@ -1864,12 +1864,14 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
     let mut failures = 0usize;
     let mut memoized = 0usize;
     let mut skipped: Vec<String> = Vec::new();
+    let mut deferred: Vec<String> = Vec::new();
     let mut timed: Vec<(String, std::time::Duration)> = Vec::new();
     for ((spec, index), (outcome, took)) in work.iter().zip(results) {
         ran += 1;
         match outcome {
             CheckOutcome::Passed => timed.push((format!("{spec}#{index}"), took)),
             CheckOutcome::Memoized => memoized += 1,
+            CheckOutcome::Deferred => deferred.push(format!("{spec}#{index}")),
             CheckOutcome::HostGap => skipped.push(format!("{spec}#{index}")),
             CheckOutcome::Failed => {
                 failures += 1;
@@ -1881,7 +1883,8 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
     if let Some(line) = slowest_checks(&timed, SLOWEST_SHOWN) {
         println!("{line}");
     }
-    let (report, verdict) = recipe_checks_verdict(ran, failures, &skipped, memoized, &unreached);
+    let (report, verdict) =
+        recipe_checks_verdict(ran, failures, &skipped, memoized, &deferred, &unreached);
     for line in report {
         println!("{line}");
     }
@@ -1893,9 +1896,9 @@ const SLOWEST_SHOWN: usize = 8;
 
 /// The `shown` longest of the checks that executed, longest first with their
 /// wall time, so the summary says what held the gate up without reading
-/// every block, and the sum over all of them. Memo answers and host skips are
-/// left out by the caller: they say nothing about what a check costs. None
-/// when nothing executed.
+/// every block, and the sum over all of them. Memo answers, deferrals and
+/// host skips are left out by the caller: they say nothing about what a
+/// check costs. None when nothing executed.
 fn slowest_checks(timed: &[(String, std::time::Duration)], shown: usize) -> Option<String> {
     let mut by_time: Vec<&(String, std::time::Duration)> = timed.iter().collect();
     by_time.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -1935,6 +1938,7 @@ fn recipe_checks_verdict(
     failures: usize,
     skipped: &[String],
     memoized: usize,
+    deferred: &[String],
     unreached: &[String],
 ) -> (Vec<String>, Result<(), String>) {
     // The caveat rides the FAIL arm too: "1 of 25 failed" alongside 20 silent
@@ -1958,6 +1962,16 @@ fn recipe_checks_verdict(
              them again"
         )
     });
+    // A deferral proved nothing here, so each is named, on the FAIL arm too.
+    let deferred_note = (!deferred.is_empty()).then(|| {
+        format!(
+            ">> recipe-checks: {} of {ran} check(s) deferred to main — each passed here \
+             before and only the builder engine or evaluator changed since; main-integration \
+             runs them in full, TD_CHECK_FULL=1 runs them here: {}",
+            deferred.len(),
+            deferred.join(" ")
+        )
+    });
     // The checks a scope left out are named here, beside the verdict — the
     // top of a long log says only how many it runs — and on the FAIL arm too:
     // "1 of 3 failed" over 41 unreached reads as a suite of three.
@@ -1974,6 +1988,7 @@ fn recipe_checks_verdict(
             caveat
                 .into_iter()
                 .chain(memo_note)
+                .chain(deferred_note)
                 .chain(unreached_note)
                 .collect(),
             Err(format!(
@@ -2002,12 +2017,21 @@ fn recipe_checks_verdict(
     // a full one — and prose coupling is what broke twice (#268, #315).
     let mut lines: Vec<String> = caveat.into_iter().collect();
     lines.extend(memo_note);
+    lines.extend(deferred_note);
     lines.extend(unreached_note);
-    let fresh = ran.saturating_sub(skipped.len()).saturating_sub(memoized);
-    let memo_note = if memoized != 0 {
-        format!(" ({memoized} memoized)")
-    } else {
+    let fresh = ran
+        .saturating_sub(skipped.len())
+        .saturating_sub(memoized)
+        .saturating_sub(deferred.len());
+    let answered: Vec<String> = [(memoized, "memoized"), (deferred.len(), "deferred to main")]
+        .iter()
+        .filter(|(n, _)| *n != 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect();
+    let memo_note = if answered.is_empty() {
         String::new()
+    } else {
+        format!(" ({})", answered.join(", "))
     };
     lines.push(format!(
         "PASS: recipe-checks - ran {fresh} of {ran}{memo_note} recipe-owned /td/store check(s) from the Rust recipe catalog; package behavior/repro assertions live with the package recipes."
@@ -2059,6 +2083,10 @@ enum CheckOutcome {
     /// pass and reported apart, so a run that re-ran nothing cannot read as
     /// one that re-proved everything.
     Memoized,
+    /// A branch run's deferral to main: it passed here before and only the
+    /// builder engine or the evaluator changed since, so it did not run.
+    /// Reported apart from a pass and named, since it re-proved nothing.
+    Deferred,
     Failed,
     HostGap,
 }
@@ -2085,33 +2113,50 @@ const RECIPE_CHECK_OUTPUT_BYTES: usize = 1024 * 1024;
 struct CapturedCheckOutput {
     bytes: Vec<u8>,
     truncated: bool,
-    saw_sentinel: bool,
+    /// Per sentinel asked for, in order: whether the stream carried it.
+    saw: Vec<bool>,
+}
+
+impl CapturedCheckOutput {
+    fn saw(&self, i: usize) -> bool {
+        self.saw.get(i).copied().unwrap_or(false)
+    }
 }
 
 fn capture_check_output(
     mut reader: impl std::io::Read,
-    sentinel: Option<&[u8]>,
+    sentinels: &[&[u8]],
     limit: usize,
 ) -> CapturedCheckOutput {
     let mut tail = std::collections::VecDeque::with_capacity(limit);
     let mut chunk = [0u8; 8192];
     let mut scan_tail = Vec::new();
     let mut truncated = false;
-    let mut saw_sentinel = false;
+    let mut saw = vec![false; sentinels.len()];
+    // What a scan carries over a read boundary: one byte short of the
+    // longest needle.
+    let carry = sentinels
+        .iter()
+        .map(|needle| needle.len().saturating_sub(1))
+        .max()
+        .unwrap_or(0);
     loop {
         let count = match reader.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(count) => count,
         };
         let bytes = chunk.get(..count).unwrap_or(&[]);
-        if let Some(needle) = sentinel.filter(|needle| !needle.is_empty()) {
+        if !sentinels.is_empty() {
             let mut scan = Vec::with_capacity(scan_tail.len().saturating_add(bytes.len()));
             scan.extend_from_slice(&scan_tail);
             scan.extend_from_slice(bytes);
-            if scan.windows(needle.len()).any(|window| window == needle) {
-                saw_sentinel = true;
+            for (needle, seen) in sentinels.iter().zip(saw.iter_mut()) {
+                if !needle.is_empty() && scan.windows(needle.len()).any(|window| window == *needle)
+                {
+                    *seen = true;
+                }
             }
-            let keep = needle.len().saturating_sub(1).min(scan.len());
+            let keep = carry.min(scan.len());
             scan_tail.clear();
             scan_tail.extend_from_slice(scan.get(scan.len().saturating_sub(keep)..).unwrap_or(&[]));
         }
@@ -2128,7 +2173,7 @@ fn capture_check_output(
     CapturedCheckOutput {
         bytes: tail.into_iter().collect(),
         truncated,
-        saw_sentinel,
+        saw,
     }
 }
 
@@ -2164,6 +2209,11 @@ fn report_finished_check(
                 CheckOutcome::Memoized => println!(
                     "================ recipe-check {spec}#{index}: PASS (memoized: unchanged \
                      since it last passed here; {took}) ================"
+                ),
+                CheckOutcome::Deferred => println!(
+                    "================ recipe-check {spec}#{index}: DEFERRED to main (only the \
+                     builder engine or evaluator changed since a pass here; {took}) \
+                     ================"
                 ),
                 CheckOutcome::HostGap => println!(
                     "================ recipe-check {spec}#{index}: SKIPPED (unprovisioned \
@@ -2540,15 +2590,19 @@ fn run_recipe_check(
     // past a live child that `Drop` neither kills nor waits for. `EAGAIN` from
     // clone is reachable at width 4 under exactly the memory pressure this change
     // creates. Failing to spawn costs this check's stdout, nothing more.
-    // stdout is scanned for the MEMO sentinel as stderr is for the host-gap
-    // one: a check that answered from its verdict memo says so there.
+    // stdout is scanned for the MEMO and DEFERRED sentinels as stderr is for
+    // the host-gap one: a check that answered from its verdict memo, or that
+    // a branch run left to main, says so there.
     let stdout_reader = child.stdout.take().and_then(|out| {
         std::thread::Builder::new()
             .name("recipe-check-stdout".to_string())
             .spawn(move || {
                 capture_check_output(
                     out,
-                    Some(td_engine::exit::CHECK_MEMO_SENTINEL.as_bytes()),
+                    &[
+                        td_engine::exit::CHECK_MEMO_SENTINEL.as_bytes(),
+                        td_engine::exit::CHECK_DEFERRED_SENTINEL.as_bytes(),
+                    ],
                     RECIPE_CHECK_OUTPUT_BYTES,
                 )
             })
@@ -2558,12 +2612,12 @@ fn run_recipe_check(
         CapturedCheckOutput {
             bytes: Vec::new(),
             truncated: false,
-            saw_sentinel: false,
+            saw: Vec::new(),
         },
         |err| {
             capture_check_output(
                 BufReader::new(err),
-                Some(crate::check_loop::UNPROVISIONED_SENTINEL.as_bytes()),
+                &[crate::check_loop::UNPROVISIONED_SENTINEL.as_bytes()],
                 RECIPE_CHECK_OUTPUT_BYTES,
             )
         },
@@ -2571,10 +2625,11 @@ fn run_recipe_check(
     // Joined BEFORE the wait, so the child is never reaped with its stdout pipe
     // still filling. The two bounded tails are concatenated rather than
     // interleaved in time order.
-    let mut memoized = false;
+    let (mut memoized, mut deferred) = (false, false);
     if let Some(handle) = stdout_reader {
         if let Ok(mut stdout) = handle.join() {
-            memoized = stdout.saw_sentinel;
+            memoized = stdout.saw(0);
+            deferred = stdout.saw(1);
             stderr.bytes.append(&mut stdout.bytes);
             stderr.truncated |= stdout.truncated;
         }
@@ -2582,15 +2637,17 @@ fn run_recipe_check(
     let status = child
         .wait()
         .map_err(|e| format!("FAIL: wait check-run {spec}: {e}"))?;
-    // The memo sentinel counts only on a SUCCESS: a check that printed it and
-    // then failed, failed.
+    // The memo and deferral sentinels count only on a SUCCESS: a check that
+    // printed one and then failed, failed.
     let outcome = if status.success() {
         if memoized {
             CheckOutcome::Memoized
+        } else if deferred {
+            CheckOutcome::Deferred
         } else {
             CheckOutcome::Passed
         }
-    } else if td_engine::exit::host_gap_from_parts(status.code(), stderr.saw_sentinel) {
+    } else if td_engine::exit::host_gap_from_parts(status.code(), stderr.saw(0)) {
         CheckOutcome::HostGap
     } else {
         CheckOutcome::Failed
@@ -4449,13 +4506,29 @@ mod tests {
         input.extend_from_slice(&vec![b'y'; 64]);
         let captured = capture_check_output(
             input.as_slice(),
-            Some(crate::check_loop::UNPROVISIONED_SENTINEL.as_bytes()),
+            &[crate::check_loop::UNPROVISIONED_SENTINEL.as_bytes()],
             128,
         );
         assert!(captured.truncated);
-        assert!(captured.saw_sentinel);
+        assert!(captured.saw(0));
         assert_eq!(captured.bytes.len(), 128);
         assert!(captured.bytes.ends_with(&vec![b'y'; 64]));
+
+        // Several needles, each told apart, a short one split as well as a
+        // long one; one absent stays unseen.
+        let memo = td_engine::exit::CHECK_MEMO_SENTINEL.as_bytes();
+        let deferred = td_engine::exit::CHECK_DEFERRED_SENTINEL.as_bytes();
+        let mut input = vec![b'x'; 8190];
+        input.extend_from_slice(deferred);
+        input.extend_from_slice(&vec![b'y'; 64]);
+        let captured = capture_check_output(input.as_slice(), &[memo, deferred, b"ab"], 128);
+        assert_eq!(captured.saw, vec![false, true, false]);
+        assert!(!captured.saw(7), "an index past the needles is unseen");
+        let mut input = vec![b'x'; 8191];
+        input.extend_from_slice(b"ab");
+        let captured = capture_check_output(input.as_slice(), &[memo, b"ab"], 16);
+        assert_eq!(captured.saw, vec![false, true]);
+        assert!(capture_check_output(&b"zz"[..], &[], 8).saw.is_empty());
     }
 
     // The pool's contract, which the verdict rests on: every work item yields
@@ -4545,12 +4618,12 @@ mod tests {
         let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
 
         // A real failure outranks any number of skips.
-        let (_, v) = recipe_checks_verdict(25, 1, &s(&["a#1"]), 0, &[]);
+        let (_, v) = recipe_checks_verdict(25, 1, &s(&["a#1"]), 0, &[], &[]);
         assert!(v.unwrap_err().starts_with("FAIL: "));
 
         // Nothing ran anywhere here → the gate's own tolerated skip, tagged so
         // `cli` maps it to 69 + sentinel rather than a bare failure.
-        let (_, v) = recipe_checks_verdict(3, 0, &s(&["a#1", "b#1", "c#1"]), 0, &[]);
+        let (_, v) = recipe_checks_verdict(3, 0, &s(&["a#1", "b#1", "c#1"]), 0, &[], &[]);
         let err = v.unwrap_err();
         assert!(err.starts_with(UNPROVISIONED_TAG), "{err:?}");
         assert!(err.contains("a#1 b#1 c#1"), "names them: {err:?}");
@@ -4558,17 +4631,17 @@ mod tests {
 
         // A failure does not excuse dropping the caveat: "1 of 25 failed" over
         // 20 silent skips reads as though 24 checks vouched for the tree.
-        let (lines, v) = recipe_checks_verdict(25, 1, &s(&["a#1", "b#1"]), 0, &[]);
+        let (lines, v) = recipe_checks_verdict(25, 1, &s(&["a#1", "b#1"]), 0, &[], &[]);
         assert!(v.is_err() && lines.len() == 1, "{lines:?}");
         assert!(lines[0].contains(crate::check_loop::GATES_SKIPPED_SENTINEL));
         assert!(lines[0].contains("a#1 b#1"));
 
         // Nothing ran at all is never a pass.
-        let (_, v) = recipe_checks_verdict(0, 0, &[], 0, &[]);
+        let (_, v) = recipe_checks_verdict(0, 0, &[], 0, &[], &[]);
         assert!(v.is_err(), "0 checks must not report green");
 
         // Partial → green, but the caveat comes FIRST and names every skip.
-        let (lines, v) = recipe_checks_verdict(3, 0, &s(&["b#1"]), 0, &[]);
+        let (lines, v) = recipe_checks_verdict(3, 0, &s(&["b#1"]), 0, &[], &[]);
         assert!(v.is_ok());
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains("NOT full coverage") && lines[0].contains("b#1"));
@@ -4582,7 +4655,7 @@ mod tests {
         assert!(lines[1].starts_with("PASS: ") && lines[1].contains("ran 2 of 3"));
 
         // Clean run → one PASS line, no caveat.
-        let (lines, v) = recipe_checks_verdict(3, 0, &[], 0, &[]);
+        let (lines, v) = recipe_checks_verdict(3, 0, &[], 0, &[], &[]);
         assert!(v.is_ok() && lines.len() == 1 && lines[0].starts_with("PASS: "));
         assert!(
             !lines[0].contains(crate::check_loop::GATES_SKIPPED_SENTINEL),
@@ -4594,7 +4667,7 @@ mod tests {
     #[test]
     fn a_scoped_run_names_the_checks_it_did_not_reach() {
         let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
-        let (lines, v) = recipe_checks_verdict(9, 0, &[], 0, &s(&["x#1", "y#2"]));
+        let (lines, v) = recipe_checks_verdict(9, 0, &[], 0, &[], &s(&["x#1", "y#2"]));
         assert!(v.is_ok());
         assert!(
             lines
@@ -4605,12 +4678,12 @@ mod tests {
         assert!(lines
             .last()
             .is_some_and(|l| l.starts_with("PASS: recipe-checks - ran 9 of 9")));
-        let (lines, _) = recipe_checks_verdict(9, 0, &[], 0, &[]);
+        let (lines, _) = recipe_checks_verdict(9, 0, &[], 0, &[], &[]);
         assert!(
             !lines.iter().any(|l| l.contains("not reached")),
             "{lines:?}"
         );
-        let (lines, v) = recipe_checks_verdict(9, 1, &[], 0, &s(&["x#1"]));
+        let (lines, v) = recipe_checks_verdict(9, 1, &[], 0, &[], &s(&["x#1"]));
         assert!(v.is_err());
         assert!(
             lines
@@ -4648,21 +4721,21 @@ mod tests {
     /// everything from the memo cannot read as one that re-proved it all.
     #[test]
     fn recipe_checks_reports_memoized_passes_apart() {
-        let (lines, v) = recipe_checks_verdict(44, 0, &[], 41, &[]);
+        let (lines, v) = recipe_checks_verdict(44, 0, &[], 41, &[], &[]);
         assert!(v.is_ok());
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains("41 of 44") && lines[0].contains("TD_CHECK_FULL=1"));
         assert!(lines[1].starts_with("PASS: ") && lines[1].contains("ran 3 of 44 (41 memoized)"));
         // All memoized is still green: every check has a pass on record for
         // exactly these inputs.
-        let (lines, v) = recipe_checks_verdict(3, 0, &[], 3, &[]);
+        let (lines, v) = recipe_checks_verdict(3, 0, &[], 3, &[], &[]);
         assert!(
             v.is_ok() && lines[1].contains("ran 0 of 3 (3 memoized)"),
             "{lines:?}"
         );
         // A failure still outranks it, and the count of what ran is honest
         // beside a skip.
-        let (lines, v) = recipe_checks_verdict(3, 1, &[], 2, &[]);
+        let (lines, v) = recipe_checks_verdict(3, 1, &[], 2, &[], &[]);
         assert!(
             lines
                 .iter()
@@ -4671,7 +4744,7 @@ mod tests {
         );
         assert!(v.is_err());
         let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
-        let (lines, v) = recipe_checks_verdict(4, 0, &s(&["a#1"]), 2, &[]);
+        let (lines, v) = recipe_checks_verdict(4, 0, &s(&["a#1"]), 2, &[], &[]);
         assert!(
             v.is_ok()
                 && lines
@@ -4722,7 +4795,66 @@ mod tests {
             run(&write("plain", "echo PASS; exit 0")),
             CheckOutcome::Passed
         ));
+        let deferred = td_engine::exit::CHECK_DEFERRED_SENTINEL;
+        assert!(matches!(
+            run(&write(
+                "deferred",
+                &format!("echo '{deferred} spec#1: deferred to main'; exit 0")
+            )),
+            CheckOutcome::Deferred
+        ));
+        assert!(matches!(
+            run(&write(
+                "deferredfail",
+                &format!("echo '{deferred}'; exit 1")
+            )),
+            CheckOutcome::Failed
+        ));
+        assert!(matches!(
+            run(&write(
+                "deferrederr",
+                &format!("echo '{deferred}' >&2; exit 0")
+            )),
+            CheckOutcome::Passed
+        ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deferral is green, like a memo answer, but named: on its own line,
+    /// in the PASS line's count, and beside a failure.
+    #[test]
+    fn recipe_checks_names_deferred_checks_apart() {
+        let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        let (lines, v) = recipe_checks_verdict(5, 0, &[], 1, &s(&["a#1", "b#2"]), &[]);
+        assert!(v.is_ok(), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("2 of 5 check(s) deferred to main") && l.ends_with("a#1 b#2")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .last()
+                .is_some_and(|l| l.contains("ran 2 of 5 (1 memoized, 2 deferred to main)")),
+            "{lines:?}"
+        );
+        let (lines, v) = recipe_checks_verdict(2, 0, &[], 0, &s(&["a#1", "b#2"]), &[]);
+        assert!(
+            v.is_ok()
+                && lines
+                    .last()
+                    .is_some_and(|l| l.contains("ran 0 of 2 (2 deferred to main)")),
+            "{lines:?}"
+        );
+        let (lines, v) = recipe_checks_verdict(3, 1, &[], 0, &s(&["a#1"]), &[]);
+        assert!(v.is_err());
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("deferred to main") && l.ends_with("a#1")),
+            "a failure beside a deferral still names it: {lines:?}"
+        );
     }
 
     /// The skip verdict is EVIDENCE, not the exit code alone: a 69 without the

@@ -60,6 +60,18 @@ pub fn unprovisioned_exit() -> std::process::ExitCode {
 /// above.
 pub const CHECK_MEMO_SENTINEL: &str = "[td-check-memo:pass]";
 
+/// The stdout token a `check-run` prints when a branch run defers the check
+/// to main instead of running it: it passed here before, and only the
+/// builder engine or the evaluator changed since. The gate counts it apart
+/// from a run and from a memo answer, naming each.
+pub const CHECK_DEFERRED_SENTINEL: &str = "[td-check-memo:deferred]";
+
+/// A branch run's mark, set to anything, under which a recipe check whose
+/// key changed since its last pass only in its `builder-engine` or
+/// `evaluator` component is deferred to main: the builder sets and forwards
+/// it, the evaluator's check runner reads it.
+pub const CHECK_DEFER_ENV: &str = "TD_CHECK_DEFER_ENGINE";
+
 /// Did a child actually report a host gap? BOTH halves are required. The code
 /// alone is not proof — a tolerating caller re-emits the sentinel for whatever
 /// it believes, so accepting a bare 69 lets any other failure mint a skip and

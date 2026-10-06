@@ -1967,6 +1967,22 @@ fn format_output(
                     crate::check_loop::CHECK_SCOPE_ENV
                 ));
             }
+            if runs_recipe_checks(&sel.targets) {
+                if defers_engine(changed) {
+                    o.push_str(&format!(
+                        "  recipe-checks defers to main each check whose key differs from a \
+                         pass here only in the builder engine or evaluator ({} on the \
+                         command above)\n",
+                        td_engine::exit::CHECK_DEFER_ENV
+                    ));
+                } else {
+                    o.push_str(
+                        "  recipe-checks defers nothing: the change touches seed/, whose tables \
+                         a check's key holds only in its builder-engine component \
+                         (its patches have their own)\n",
+                    );
+                }
+            }
         }
     }
     // What a selection that runs the gates leaves to main, said where
@@ -3516,6 +3532,12 @@ fn run_self_check(root: &Path, targets: &[String], changed: &[String]) -> i32 {
     cmd.env_remove(crate::check_loop::CHECK_SCOPE_ENV);
     if let Some(scope) = check_scope(root, changed, targets) {
         cmd.env(crate::check_loop::CHECK_SCOPE_ENV, scope.join(" "));
+    }
+    // A branch run: an engine-only recipe check is left to main-integration,
+    // unless the branch itself changed what that component hides.
+    cmd.env_remove(td_engine::exit::CHECK_DEFER_ENV);
+    if defers_engine(changed) {
+        cmd.env(td_engine::exit::CHECK_DEFER_ENV, "1");
     }
     cmd.status().ok().and_then(|s| s.code()).unwrap_or(1)
 }
@@ -5342,8 +5364,10 @@ fn close_over_readers(selected: &mut Vec<String>, readers: &[(String, Vec<String
 /// list would outgrow `SCOPE_PATHS_MAX`: a crate covers every path under
 /// it, and `recipes` alone is a miss.
 fn check_scope(root: &Path, changed: &[String], targets: &[String]) -> Option<Vec<String>> {
-    let runs_recipe_checks = targets.iter().any(|t| t == "check" || t == "recipe-checks");
-    if !runs_recipe_checks || changed.is_empty() || changed.iter().any(|p| p.contains("..")) {
+    if !runs_recipe_checks(targets)
+        || changed.is_empty()
+        || changed.iter().any(|p| p.contains(".."))
+    {
         return None;
     }
     let roster = discover_gate_crates(root).ok()?;
@@ -5376,6 +5400,22 @@ fn check_scope(root: &Path, changed: &[String], targets: &[String]) -> Option<Ve
     crates.sort();
     crates.dedup();
     Some(crates)
+}
+
+/// Whether `targets` run the recipe-checks gate: named, or in `check`.
+fn runs_recipe_checks(targets: &[String]) -> bool {
+    targets.iter().any(|t| t == "check" || t == "recipe-checks")
+}
+
+/// Whether a branch run over `changed` may defer engine-only recipe checks
+/// to main. Not when the branch itself changes the seed tables td-builder
+/// compiles in: the bootstrap root every post-cut check builds on reaches
+/// a check's key only inside its `builder-engine` component. The
+/// evaluator keeps a check's own content in a component of its own
+/// (`evaluator-checks`), which never defers, so it needs no path here; the
+/// same seed changes arriving from main are main's to run.
+fn defers_engine(changed: &[String]) -> bool {
+    !changed.iter().any(|p| p.starts_with("seed/"))
 }
 
 /// Where the recipe sources live, which the evaluator maps to the checks
@@ -6579,6 +6619,41 @@ mod tests {
             "{out}"
         );
         assert!(!path_output(&root, "check.sh").contains("recipe-checks scope"));
+        // A run of the recipe gate says it defers engine-only checks to main,
+        // scoped or not; one that does not run it says nothing of it.
+        assert!(out.contains("  recipe-checks defers to main"), "{out}");
+        assert!(
+            out.contains("(TD_CHECK_DEFER_ENGINE on the command above)"),
+            "{out}"
+        );
+        assert!(runs_recipe_checks(&paths(&["check-engine", "check"])));
+        assert!(runs_recipe_checks(&paths(&["recipe-checks"])));
+        assert!(!runs_recipe_checks(&paths(&["check-engine"])));
+        // A branch that changes the seed tables the builder-engine component
+        // hides defers nothing; the evaluator keeps check content in a
+        // component of its own, so its paths need no guard here.
+        assert!(defers_engine(&paths(&[
+            "builder/src/store.rs",
+            "engine/src/nar.rs",
+            "recipes/src/bin/td_recipe_eval/check_runner.rs",
+            "recipes/src/bin/td_recipe_eval/checks/tzdata.rs",
+            "recipes/src/recipes/gcc-14.rs",
+            "td-sh/src/lib.rs",
+        ])));
+        for blocking in [
+            "seed/bootstrap-root.txt",
+            "seed/seed-digests.txt",
+            "seed/local-source-roster.txt",
+        ] {
+            assert!(
+                !defers_engine(&paths(&["builder/src/store.rs", blocking])),
+                "{blocking}"
+            );
+        }
+        let pin = path_output(&root, "seed/bootstrap-root.txt");
+        assert!(pin.contains(" recipe-checks "), "{pin}");
+        assert!(pin.contains("  recipe-checks defers nothing"), "{pin}");
+        assert!(!pin.contains("TD_CHECK_DEFER_ENGINE"), "{pin}");
     }
 
     /// A target the manifest declares outside the walked directories is read
@@ -11828,6 +11903,8 @@ mod tests {
         // What a selection that runs the gates without the integration tier
         // says it leaves to main.
         let deferred = format!("  {}", crate::integration::deferred_note());
+        // What a selection that runs the recipe gate says it leaves to main.
+        let defers = "  recipe-checks defers to main each check whose key differs from a pass here only in the builder engine or evaluator (TD_CHECK_DEFER_ENGINE on the command above)";
         let expect = |lines: &[&str]| -> String {
             let mut s = lines.join("\n");
             s.push('\n');
@@ -11847,6 +11924,7 @@ mod tests {
                 // No crate leg observes main.rs: the workspace legs alone.
                 "  rustfmt --check (every Rust file) + cargo test + clippy --frozen --workspace (builder/recipes/engine)",
                 "  td-builder check check-engine check",
+                defers,
                 &deferred,
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
@@ -11872,6 +11950,7 @@ mod tests {
                 "  for f in start build-qcow build-iso test-iso host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done",
                 &full_cargo,
                 "  td-builder check check",
+                defers,
                 &deferred,
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
@@ -11902,6 +11981,7 @@ mod tests {
                 "  rustfmt --check (every Rust file) + cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-review/Cargo.toml -- --include-ignored",
                 "  td-builder check check recipe-checks",
                 "  recipe-checks scope: td-review/src/land.rs (TD_CHECK_SCOPE on the command above)",
+                defers,
                 &deferred,
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
@@ -11940,6 +12020,7 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  td-builder check check",
+                defers,
                 &deferred,
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",

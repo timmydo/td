@@ -11,12 +11,13 @@
 //! Deterministic by construction: the registry is sorted by stem, never
 //! `read_dir` order. Pure `std` — the crate stays dependency-free.
 //!
-//! Also fingerprints the evaluator's OWN sources into
-//! `TD_EVALUATOR_SOURCE_FINGERPRINT` for the check verdict key, so the key
-//! names the logic that runs rather than whatever the tree holds when a check
-//! starts (see `evaluator_source_fingerprint`), less the host-only boot
-//! harnesses, which `TD_EVALUATOR_HOST_SOURCE_FINGERPRINT` holds for the
-//! integration oracles' key (`HOST_CHECK_SOURCES`).
+//! Also fingerprints the evaluator's OWN sources for the check verdict key,
+//! so the key names the logic that runs rather than whatever the tree holds
+//! when a check starts (see `evaluator_source_fingerprint`): what is a
+//! check's own content into `TD_EVALUATOR_CHECK_SOURCE_FINGERPRINT`, the
+//! shared code into `TD_EVALUATOR_SOURCE_FINGERPRINT`, and the host-only boot
+//! harnesses into `TD_EVALUATOR_HOST_SOURCE_FINGERPRINT`, which only the
+//! integration oracles' key holds (`HOST_CHECK_SOURCES`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -349,26 +350,64 @@ fn main() -> Result<(), Box<dyn Error>> {
     writeln!(out, "    ]")?;
     writeln!(out, "}}")?;
 
-    let (fingerprint, host_fingerprint, fingerprinted) =
-        evaluator_source_fingerprint(Path::new(&manifest_dir), &shared_files, &per_recipe)?;
+    let fingerprints = evaluator_source_fingerprint(
+        Path::new(&manifest_dir),
+        &shared_files,
+        &per_recipe,
+        &evaluator_files,
+    )?;
     writeln!(
         out,
-        "/// The repository-relative files `TD_EVALUATOR_SOURCE_FINGERPRINT` covers."
+        "/// The repository-relative files `TD_EVALUATOR_SOURCE_FINGERPRINT` and"
+    )?;
+    writeln!(
+        out,
+        "/// `TD_EVALUATOR_CHECK_SOURCE_FINGERPRINT` cover between them."
     )?;
     writeln!(out, "#[cfg(test)]")?;
     writeln!(
         out,
         "pub fn evaluator_fingerprint_files() -> &'static [&'static str] {{"
     )?;
-    let list: Vec<String> = fingerprinted.iter().map(|f| format!("{f:?}")).collect();
+    let list: Vec<String> = fingerprints
+        .listed
+        .iter()
+        .map(|f| format!("{f:?}"))
+        .collect();
+    writeln!(out, "    &[{}]", list.join(", "))?;
+    writeln!(out, "}}")?;
+    writeln!(
+        out,
+        "/// The files `TD_EVALUATOR_CHECK_SOURCE_FINGERPRINT` alone covers."
+    )?;
+    writeln!(out, "#[cfg(test)]")?;
+    writeln!(
+        out,
+        "pub fn evaluator_check_fingerprint_files() -> &'static [&'static str] {{"
+    )?;
+    let list: Vec<String> = fingerprints
+        .check_listed
+        .iter()
+        .map(|f| format!("{f:?}"))
+        .collect();
     writeln!(out, "    &[{}]", list.join(", "))?;
     writeln!(out, "}}")?;
 
     let out_path = PathBuf::from(env::var("OUT_DIR")?).join("registry.rs");
     fs::write(&out_path, out)?;
 
-    println!("cargo:rustc-env=TD_EVALUATOR_SOURCE_FINGERPRINT={fingerprint}");
-    println!("cargo:rustc-env=TD_EVALUATOR_HOST_SOURCE_FINGERPRINT={host_fingerprint}");
+    println!(
+        "cargo:rustc-env=TD_EVALUATOR_SOURCE_FINGERPRINT={}",
+        fingerprints.shared
+    );
+    println!(
+        "cargo:rustc-env=TD_EVALUATOR_CHECK_SOURCE_FINGERPRINT={}",
+        fingerprints.checks
+    );
+    println!(
+        "cargo:rustc-env=TD_EVALUATOR_HOST_SOURCE_FINGERPRINT={}",
+        fingerprints.host
+    );
     Ok(())
 }
 
@@ -724,11 +763,22 @@ fn shared_file_entry(repo: &Path, file: &str) -> Result<String, Box<dyn Error>> 
 /// skipped, file or directory alike; any other symlink is an error, since
 /// the walk does not follow one and skipping it would fingerprint less than
 /// the compiler reads.
+///
+/// Split three ways. The boot harnesses (`HOST_CHECK_SOURCES`) go to the
+/// oracles' key alone. What is a check's own content though every check's
+/// key holds it — the check bodies under `CHECK_BODIES`, the source pins
+/// (`PIN_TABLES`), a recipe file, fixture or probe the evaluator reads
+/// (`evaluator_reads` under `RECIPE_EMBED_DIRS`; that set also names
+/// evaluator modules, which are shared code), and what a shared module
+/// compiles in from a crate (tzdata#1 asserts td-civil's and td-install's)
+/// — goes to `checks`, which a branch run never defers. The rest is the
+/// evaluator's shared code, which it may.
 fn evaluator_source_fingerprint(
     manifest_dir: &Path,
     shared_embeds: &[String],
     per_recipe: &BTreeSet<String>,
-) -> Result<(String, String, Vec<String>), Box<dyn Error>> {
+    evaluator_reads: &BTreeSet<String>,
+) -> Result<EvaluatorFingerprints, Box<dyn Error>> {
     let root = manifest_dir
         .parent()
         .ok_or("recipes crate has no parent directory")?;
@@ -758,6 +808,7 @@ fn evaluator_source_fingerprint(
     }
     // An entry is a file path, or a bare crate directory whose sources an
     // embedded file reads further (`shared_file_entry`).
+    let mut compiled_in: BTreeSet<PathBuf> = BTreeSet::new();
     for entry in shared_embeds {
         let mut embedded = Vec::new();
         if entry.contains('/') {
@@ -777,13 +828,16 @@ fn evaluator_source_fingerprint(
                 .into());
             }
         }
+        compiled_in.extend(embedded.iter().cloned());
         files.extend(embedded);
     }
     files.sort();
     files.dedup();
     let mut h = sha256::Sha256::new();
+    let mut checks = sha256::Sha256::new();
     let mut host = sha256::Sha256::new();
     let mut listed = Vec::with_capacity(files.len());
+    let mut check_listed = Vec::new();
     for file in &files {
         let rel = file
             .strip_prefix(root)?
@@ -797,6 +851,15 @@ fn evaluator_source_fingerprint(
             .map_err(|e| format!("fingerprint {}: {e}", file.display()))?;
         let into = if is_host_check_source(rel) {
             &mut host
+        } else if rel.starts_with(CHECK_BODIES)
+            || PIN_TABLES.contains(&rel)
+            || (evaluator_reads.contains(rel)
+                && RECIPE_EMBED_DIRS.iter().any(|dir| rel.starts_with(dir)))
+            || compiled_in.contains(file)
+        {
+            listed.push(rel.to_string());
+            check_listed.push(rel.to_string());
+            &mut checks
         } else {
             listed.push(rel.to_string());
             &mut h
@@ -806,11 +869,32 @@ fn evaluator_source_fingerprint(
         into.update(digest.as_bytes());
         into.update(b"\n");
     }
-    Ok((
-        sha256::to_base16(&h.finalize()),
-        sha256::to_base16(&host.finalize()),
+    Ok(EvaluatorFingerprints {
+        shared: sha256::to_base16(&h.finalize()),
+        checks: sha256::to_base16(&checks.finalize()),
+        host: sha256::to_base16(&host.finalize()),
         listed,
-    ))
+        check_listed,
+    })
+}
+
+/// Where the evaluator's Rust check bodies live (`checks/mod.rs` dispatches
+/// to them); the boot harnesses beside them are `HOST_CHECK_SOURCES`.
+const CHECK_BODIES: &str = "recipes/src/bin/td_recipe_eval/checks/";
+
+/// The source and OSTree pins: the URL, digest and commit a recipe builds
+/// from, which its build JSON names only by key, so they reach a check's
+/// key only through the evaluator's sources.
+const PIN_TABLES: &[&str] = &["recipes/src/source_pins.rs", "recipes/src/ostree_pins.rs"];
+
+/// The evaluator fingerprint's three parts (`evaluator_source_fingerprint`),
+/// with the files the recipe-check parts cover: all, and `checks`' alone.
+struct EvaluatorFingerprints {
+    shared: String,
+    checks: String,
+    host: String,
+    listed: Vec<String>,
+    check_listed: Vec<String>,
 }
 
 fn walk_sources(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {

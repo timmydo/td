@@ -147,12 +147,35 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         memo_hit("", &phases);
         return Ok(());
     }
+    // A branch run leaves to main a check whose only change since a pass
+    // here is the builder engine or the evaluator: main's integration runs
+    // it in full, and records the pass the next branch compares with.
+    if !bypassed && check_defer_engine() {
+        if let Some((age, was)) = runner.deferring_pass(stem, index, &key, &components) {
+            phases.key = started.elapsed();
+            let why = format!(
+                "deferred to main: since a pass here{age}: {}",
+                component_changes(&was, &components, MISS_CHANGES_SHOWN)
+            );
+            say_deferred(stem, index, &why);
+            runner.record_check_history(
+                stem,
+                index,
+                "deferred",
+                entered.elapsed(),
+                &key,
+                &why,
+                &phases,
+            );
+            return Ok(());
+        }
+    }
+    let last = (!bypassed).then(|| runner.last_check_pass(stem, index, &key));
     // Why this check runs rather than answering from a pass on record: the
     // line that explains a surprising rerun, and the history keeps it.
-    let why = if bypassed {
-        format!("{CHECK_FULL_ENV} is set")
-    } else {
-        runner.explain_verdict_miss(stem, index, &key, &components)
+    let why = match &last {
+        Some(last) => explain_last_pass(last, &components),
+        None => format!("{CHECK_FULL_ENV} is set"),
     };
     println!(
         "   [memo] {stem}#{index} runs (key {}): {why}",
@@ -277,6 +300,40 @@ pub(crate) const CHECK_FULL_ENV: &str = "TD_CHECK_FULL";
 
 fn check_memo_bypassed() -> bool {
     env::var_os(CHECK_FULL_ENV).is_some()
+}
+
+/// `TD_CHECK_DEFER_ENGINE` (td_engine::exit), set to anything, is a branch
+/// run's: a check whose key differs from a pass on record here only in its
+/// `builder-engine` or `evaluator` component is deferred to main rather
+/// than run (`deferring_pass`). `TD_CHECK_FULL` overrides it.
+fn check_defer_engine() -> bool {
+    env::var_os(td_engine::exit::CHECK_DEFER_ENV).is_some()
+}
+
+/// The key components a branch run defers to main: what every check's key
+/// holds, so a change to either alone re-keys every check.
+const DEFERRED_COMPONENTS: &[&str] = &["builder-engine", "evaluator"];
+
+/// Whether `now` differs from a recorded pass's components `was` in at least
+/// one component, and only in the deferred ones. A component new or gone
+/// counts as a change to that name.
+fn engine_only_change(was: &[(String, String)], now: &[(String, String)]) -> bool {
+    let old: BTreeMap<&str, &str> = was.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
+    let new: BTreeMap<&str, &str> = now.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
+    let mut changed = old
+        .keys()
+        .chain(new.keys())
+        .filter(|name| old.get(*name) != new.get(*name))
+        .peekable();
+    changed.peek().is_some() && changed.all(|name| DEFERRED_COMPONENTS.contains(name))
+}
+
+fn say_deferred(stem: &str, index: usize, why: &str) {
+    println!(
+        "{} {stem}#{index}: {why}; main runs it in full, \
+         {CHECK_FULL_ENV}=1 runs it here",
+        td_engine::exit::CHECK_DEFERRED_SENTINEL,
+    );
 }
 
 /// Reap dead peers' abandoned scratch, then report whether STEM#INDEX is already
@@ -2733,6 +2790,7 @@ fn summarize_check_history(text: &str, only: &[String], now: u64) -> Vec<String>
     struct Runs {
         executed: Vec<f64>,
         memo: usize,
+        deferred: usize,
         failed: usize,
         unprovisioned: usize,
         last: Option<(u64, String, String, String)>,
@@ -2764,6 +2822,8 @@ fn summarize_check_history(text: &str, only: &[String], now: u64) -> Vec<String>
         let runs = by_check.entry(check).or_default();
         match outcome.as_str() {
             "memo" => runs.memo += 1,
+            // A branch run's deferral to main ran nothing either.
+            "deferred" => runs.deferred += 1,
             // A host gap ran nothing: no part of the check's cost.
             "host-gap" => runs.unprovisioned += 1,
             "fail" => {
@@ -2819,9 +2879,14 @@ fn summarize_check_history(text: &str, only: &[String], now: u64) -> Vec<String>
                 total,
                 format!(
                     "{check}: {n} executed ({} failed, {total:.0}s in all, median {median:.1}s, \
-                     longest {longest:.1}s), {} from the memo{}{last}",
+                     longest {longest:.1}s), {} from the memo{}{}{last}",
                     runs.failed,
                     runs.memo,
+                    if runs.deferred > 0 {
+                        format!(", {} deferred to main", runs.deferred)
+                    } else {
+                        String::new()
+                    },
                     if runs.unprovisioned > 0 {
                         format!(", {} unprovisioned", runs.unprovisioned)
                     } else {
@@ -2845,9 +2910,9 @@ fn recorded_history_line(args: &[String], at: u64) -> Result<String, String> {
     let [check, outcome, secs] = args else {
         return Err("usage: check-history --record CHECK OUTCOME SECS".to_string());
     };
-    if !["pass", "fail", "host-gap", "memo"].contains(&outcome.as_str()) {
+    if !["pass", "fail", "host-gap", "memo", "deferred"].contains(&outcome.as_str()) {
         return Err(format!(
-            "check-history --record: outcome `{outcome}` is not pass, fail, host-gap or memo"
+            "check-history --record: outcome `{outcome}` is not pass, fail, host-gap, memo or deferred"
         ));
     }
     let took = secs
@@ -2856,6 +2921,58 @@ fn recorded_history_line(args: &[String], at: u64) -> Result<String, String> {
         .and_then(|s| std::time::Duration::try_from_secs_f64(s).ok())
         .ok_or_else(|| format!("check-history --record: `{secs}` is not seconds"))?;
     Ok(check_history_line(at, check, outcome, took, "", "", ""))
+}
+
+/// The pass a check's key is compared with when the memo misses.
+enum LastPass {
+    /// No check has recorded a pass here.
+    NoMemoDir,
+    /// This check has none under another key.
+    None,
+    /// The memo dir, or the pass in it, could not be read: why.
+    Unreadable(String),
+    /// The pass's file name, `, last used Ns ago`, and the components it
+    /// recorded (empty for a pass written before they were).
+    Recorded {
+        name: String,
+        age: String,
+        was: Vec<(String, String)>,
+    },
+}
+
+/// `, last used Ns ago` for a pass last used at `when`, or nothing for a
+/// time ahead of the clock.
+fn used_ago(when: std::time::SystemTime) -> String {
+    std::time::SystemTime::now()
+        .duration_since(when)
+        .map_or(String::new(), |d| {
+            format!(", last used {}s ago", d.as_secs())
+        })
+}
+
+/// Whether a recorded pass's `text` is a well-formed pass for `key`, the
+/// key its file is named by, and its components `was` hash to that key:
+/// only then may it stand in for a run. A memo the normal lookup would
+/// refuse still explains a miss, but defers nothing.
+fn pass_vouches(text: &str, key: &str, was: &[(String, String)]) -> bool {
+    parse_check_verdict_memo(text, key) && !was.is_empty() && verdict_key_of(was) == key
+}
+
+/// Why a key has no recorded pass, for the log: the components that differ
+/// from `last`, or that there is none.
+fn explain_last_pass(last: &LastPass, now: &[(String, String)]) -> String {
+    match last {
+        LastPass::NoMemoDir => "no pass recorded here for any check yet".to_string(),
+        LastPass::None => "no earlier pass of this check recorded here".to_string(),
+        LastPass::Unreadable(why) => why.clone(),
+        LastPass::Recorded { name, age, was, .. } if was.is_empty() => {
+            format!("the last pass here ({name}{age}) predates recorded key components")
+        }
+        LastPass::Recorded { age, was, .. } => format!(
+            "since the last pass here{age}: {}",
+            component_changes(was, now, MISS_CHANGES_SHOWN)
+        ),
+    }
 }
 
 /// What changed between the components of a recorded pass (`was`) and this
@@ -5138,8 +5255,11 @@ impl RecipeCheckRunner {
     /// (its JSON) and `sources STEM` (`catalog::recipe_source_digest`, the
     /// recipe files and embeds its evaluation reads); `builder-engine`;
     /// `seed-patches`; `lock PATH` and `local-source PATH` per repo input;
-    /// and `evaluator`, the evaluator's own sources less the per-recipe
-    /// files. In this order, the closure's in stem order.
+    /// and the evaluator's own sources less the per-recipe files, in two
+    /// parts: `evaluator-checks`, a check's own content (check bodies,
+    /// source and OSTree pins, evaluator-read recipe files, crate files the
+    /// shared modules compile in), and `evaluator`, the rest. In this order,
+    /// the closure's in stem order.
     fn check_verdict_components(
         &self,
         stem: &str,
@@ -5217,6 +5337,15 @@ impl RecipeCheckRunner {
                 digest_of(|h| hash_local_source(h, &self.root, rel))?,
             ));
         }
+        // The evaluator's sources in two parts: what is a check's own
+        // content though every key holds it (check bodies, source and OSTree
+        // pins, recipe files the evaluator reads, crate files the shared
+        // modules compile in), which a branch run never defers, and its
+        // shared code, which it may.
+        out.push((
+            "evaluator-checks".to_string(),
+            env!("TD_EVALUATOR_CHECK_SOURCE_FINGERPRINT").to_string(),
+        ));
         out.push((
             "evaluator".to_string(),
             env!("TD_EVALUATOR_SOURCE_FINGERPRINT").to_string(),
@@ -5333,10 +5462,10 @@ impl RecipeCheckRunner {
     }
 
     /// Append one run of STEM#INDEX to the check history
-    /// (`check_history_path`): when it ended, its outcome (`memo`, `pass`,
-    /// `fail`, `host-gap`), its wall time, its key's prefix, and why it ran
-    /// when it did. Best-effort: a history that cannot be written fails no
-    /// check, and says so.
+    /// (`check_history_path`): when it ended, its outcome (`memo`,
+    /// `deferred`, `pass`, `fail`, `host-gap`), its wall time, its key's
+    /// prefix, and why it ran when it did. Best-effort: a history that
+    /// cannot be written fails no check, and says so.
     fn record_check_history(
         &self,
         stem: &str,
@@ -5374,16 +5503,90 @@ impl RecipeCheckRunner {
         key: &str,
         components: &[(String, String)],
     ) -> String {
+        explain_last_pass(&self.last_check_pass(stem, index, key), components)
+    }
+
+    /// The pass of STEM#INDEX this host last used under a key other than
+    /// `key`, with the components it recorded: what a miss is explained
+    /// against.
+    fn last_check_pass(&self, stem: &str, index: usize, key: &str) -> LastPass {
+        let passes = match self.other_check_passes(stem, index, key) {
+            Ok(passes) => passes,
+            Err(why) => return why,
+        };
+        // The same mtime breaks by path, so the choice is not the
+        // directory's order.
+        let Some((when, path, _)) = passes.into_iter().max() else {
+            return LastPass::None;
+        };
+        let age = used_ago(when);
+        let text = match td_engine::cache_use::read_to_string_leaving_no_use(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                return LastPass::Unreadable(format!(
+                    "the last pass here ({}) is unreadable: {e}",
+                    path.display()
+                ))
+            }
+        };
+        let was = parse_check_verdict_components(&text);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        LastPass::Recorded { name, age, was }
+    }
+
+    /// The most recently used pass of STEM#INDEX here that vouches for the
+    /// key it is filed under (`pass_vouches`) and differs from `components`
+    /// only in the deferred ones, as (when last used, its components): what
+    /// lets a branch run defer the check. Every pass on record is weighed,
+    /// not only the last used, since worktrees on other bases record passes
+    /// of the same check in the shared memo between two runs of this one.
+    fn deferring_pass(
+        &self,
+        stem: &str,
+        index: usize,
+        key: &str,
+        components: &[(String, String)],
+    ) -> Option<(String, Vec<(String, String)>)> {
+        let mut passes = self.other_check_passes(stem, index, key).ok()?;
+        passes.sort_unstable_by(|a, b| b.cmp(a));
+        // Weighing a pass is not a use, or gc-store could never expire the
+        // check's others; the pass that defers is one, as a memo hit is.
+        passes.into_iter().find_map(|(when, path, other_key)| {
+            let text = td_engine::cache_use::read_to_string_leaving_no_use(&path).ok()?;
+            let was = parse_check_verdict_components(&text);
+            if !(pass_vouches(&text, &other_key, &was) && engine_only_change(&was, components)) {
+                return None;
+            }
+            td_engine::cache_use::stamp(&path);
+            Some((used_ago(when), was))
+        })
+    }
+
+    /// Every pass of STEM#INDEX on record here under a key other than `key`,
+    /// as (last used, path, its key); a memo dir it cannot list is the
+    /// `LastPass` that says so.
+    fn other_check_passes(
+        &self,
+        stem: &str,
+        index: usize,
+        key: &str,
+    ) -> Result<Vec<(std::time::SystemTime, PathBuf, String)>, LastPass> {
         let dir = self.lw.join("check-memo");
         let prefix = format!("{}.{index}.", sanitize_target_for_filename(stem));
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return "no pass recorded here for any check yet".to_string()
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(LastPass::NoMemoDir),
+            Err(e) => {
+                return Err(LastPass::Unreadable(format!(
+                    "memo dir {} unreadable: {e}",
+                    dir.display()
+                )))
             }
-            Err(e) => return format!("memo dir {} unreadable: {e}", dir.display()),
         };
-        let mut last: Option<(std::time::SystemTime, PathBuf)> = None;
+        let mut passes = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -5391,42 +5594,15 @@ impl RecipeCheckRunner {
                 .strip_prefix(&prefix)
                 .and_then(|r| r.strip_suffix(".pass"));
             // A longer stem sharing the prefix leaves a dot in the remainder.
-            if other_key.is_none_or(|k| k == key || k.contains('.')) {
+            let Some(other_key) = other_key.filter(|k| *k != key && !k.contains('.')) else {
                 continue;
-            }
+            };
             let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
                 continue;
             };
-            // The same mtime breaks by path, so the choice is not the
-            // directory's order.
-            let candidate = (modified, entry.path());
-            if last.as_ref().is_none_or(|l| candidate > *l) {
-                last = Some(candidate);
-            }
+            passes.push((modified, entry.path(), other_key.to_string()));
         }
-        let Some((when, path)) = last else {
-            return "no earlier pass of this check recorded here".to_string();
-        };
-        let age = std::time::SystemTime::now()
-            .duration_since(when)
-            .map_or(String::new(), |d| {
-                format!(", last used {}s ago", d.as_secs())
-            });
-        let was = match fs::read_to_string(&path) {
-            Ok(text) => parse_check_verdict_components(&text),
-            Err(e) => return format!("the last pass here ({}) is unreadable: {e}", path.display()),
-        };
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-        if was.is_empty() {
-            return format!(
-                "the last pass here ({}{age}) predates recorded key components",
-                name.unwrap_or_default()
-            );
-        }
-        format!(
-            "since the last pass here{age}: {}",
-            component_changes(&was, components, MISS_CHANGES_SHOWN)
-        )
+        Ok(passes)
     }
 
     /// A memo HIT: the recorded plan for `fingerprint` is present and every
@@ -12032,6 +12208,81 @@ chmod 755 '{}'
         assert!(runner
             .explain_verdict_miss("td-sh-test", 2, "k2", &now)
             .starts_with("no earlier pass of this check"));
+
+        // Only a well-formed pass whose components hash to the key its file
+        // is named by may vouch for a deferral; any other still explains.
+        let pass = c(&[("check", "1"), ("evaluator", "4")]);
+        let moved = c(&[("check", "1"), ("evaluator", "y")]);
+        let defers = |key: &str| {
+            runner
+                .deferring_pass("td-sh-test", 3, key, &moved)
+                .map(|(_, was)| was)
+        };
+        assert_eq!(defers("k2"), None);
+        let real = verdict_key_of(&pass);
+        runner
+            .write_check_verdict_memo("td-sh-test", 3, &real, &pass)
+            .unwrap();
+        assert_eq!(defers("k2"), Some(pass.clone()));
+        // Its own key's file is the memo's question, not a deferral's.
+        assert_eq!(defers(&real), None);
+        let path = runner.check_verdict_memo_path("td-sh-test", 3, &real);
+        // Components that do not hash to the file's key.
+        let forged = c(&[("check", "1"), ("evaluator", "z")]);
+        fs::write(&path, serialize_check_verdict_memo(&real, &forged)).unwrap();
+        assert_eq!(defers("k2"), None);
+        // A header naming another key, or no verdict line.
+        fs::write(&path, serialize_check_verdict_memo("other", &pass)).unwrap();
+        assert_eq!(defers("k2"), None);
+        let headless = serialize_check_verdict_memo(&real, &pass).replace("verdict pass\n", "");
+        fs::write(&path, headless).unwrap();
+        assert_eq!(defers("k2"), None);
+        assert!(
+            runner
+                .explain_verdict_miss("td-sh-test", 3, "k2", &now)
+                .starts_with("since the last pass here"),
+            "an unvouched pass still explains the miss"
+        );
+
+        // A sibling worktree's newer pass under other check content neither
+        // defers nor hides an older pass that does; the miss is explained
+        // against the newer.
+        runner
+            .write_check_verdict_memo("td-sh-test", 3, &real, &pass)
+            .unwrap();
+        let sibling = c(&[("check", "9"), ("evaluator", "y")]);
+        let sibling_key = verdict_key_of(&sibling);
+        runner
+            .write_check_verdict_memo("td-sh-test", 3, &sibling_key, &sibling)
+            .unwrap();
+        let sibling_path = runner.check_verdict_memo_path("td-sh-test", 3, &sibling_key);
+        let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 30);
+        fs::File::options()
+            .write(true)
+            .open(&sibling_path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+                    .set_accessed(long_ago),
+            )
+            .unwrap();
+        let real_path = runner.check_verdict_memo_path("td-sh-test", 3, &real);
+        fs::File::options()
+            .write(true)
+            .open(&real_path)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        assert_eq!(defers("k2"), Some(pass.clone()));
+        assert!(runner
+            .explain_verdict_miss("td-sh-test", 3, "k2", &moved)
+            .ends_with("changed check"));
+        // Weighing and explaining are not a use, so gc-store may still
+        // expire the sibling; the pass that defers is stamped as one.
+        let times = |p: &Path| fs::metadata(p).unwrap();
+        assert_eq!(times(&sibling_path).accessed().unwrap(), long_ago);
+        assert!(times(&real_path).modified().unwrap() > long_ago);
         let _ = fs::remove_dir_all(&lw);
     }
 
@@ -12361,6 +12612,17 @@ chmod 755 '{}'
         let names: Vec<&str> = parts.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names.first(), Some(&"check"));
         assert_eq!(names.last(), Some(&"evaluator"));
+        // The check-content part of the evaluator stands apart, so a branch
+        // run's deferral cannot pass over it.
+        assert_eq!(
+            names.get(names.len().saturating_sub(2)),
+            Some(&"evaluator-checks")
+        );
+        assert!(!DEFERRED_COMPONENTS.contains(&"evaluator-checks"));
+        assert_ne!(
+            env!("TD_EVALUATOR_CHECK_SOURCE_FINGERPRINT"),
+            env!("TD_EVALUATOR_SOURCE_FINGERPRINT")
+        );
         assert!(
             !names.contains(&"host-evaluator"),
             "a recipe check runs no boot harness: {names:?}"
@@ -12641,6 +12903,86 @@ chmod 755 '{}'
         append_check_history(&path, "2\n").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "1\n2\n");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_branch_defers_only_a_change_confined_to_the_engine_and_evaluator() {
+        let c = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(n, d)| (n.to_string(), d.to_string()))
+                .collect()
+        };
+        let was = c(&[
+            ("check", "1"),
+            ("recipe uutils", "2"),
+            ("builder-engine", "3"),
+            ("evaluator", "4"),
+        ]);
+        let engine = c(&[
+            ("check", "1"),
+            ("recipe uutils", "2"),
+            ("builder-engine", "x"),
+            ("evaluator", "4"),
+        ]);
+        let both = c(&[
+            ("check", "1"),
+            ("recipe uutils", "2"),
+            ("builder-engine", "x"),
+            ("evaluator", "y"),
+        ]);
+        assert!(engine_only_change(&was, &engine));
+        assert!(engine_only_change(&was, &both));
+        // Nothing changed is a memo question, not a deferral.
+        assert!(!engine_only_change(&was, &was));
+        // Any other component beside them runs the check.
+        let recipe = c(&[
+            ("check", "1"),
+            ("recipe uutils", "z"),
+            ("builder-engine", "x"),
+            ("evaluator", "4"),
+        ]);
+        assert!(!engine_only_change(&was, &recipe));
+        let script = c(&[
+            ("check", "9"),
+            ("recipe uutils", "2"),
+            ("builder-engine", "3"),
+            ("evaluator", "4"),
+        ]);
+        assert!(!engine_only_change(&was, &script));
+        // A component new or gone is a change to it.
+        let mut grown = engine.clone();
+        grown.push(("local-source td-sh".to_string(), "5".to_string()));
+        assert!(!engine_only_change(&was, &grown));
+        let shrunk = c(&[("check", "1"), ("builder-engine", "x"), ("evaluator", "4")]);
+        assert!(!engine_only_change(&was, &shrunk));
+        // A pass written before components were recorded cannot vouch.
+        assert!(!engine_only_change(&[], &engine));
+
+        let secs = std::time::Duration::from_secs_f64;
+        let mut text = check_history_line(100, "a#1", "pass", secs(10.0), "k", "", "");
+        text.push_str(&check_history_line(
+            110,
+            "a#1",
+            "deferred",
+            secs(0.5),
+            "k2",
+            "deferred to main",
+            "",
+        ));
+        let rows = summarize_check_history(&text, &[], 200);
+        assert!(
+            rows[0].starts_with("a#1: 1 executed (0 failed, 10s in all"),
+            "a deferral is no run: {rows:?}"
+        );
+        assert!(
+            rows[0].contains("0 from the memo, 1 deferred to main;"),
+            "{rows:?}"
+        );
+        assert_eq!(
+            check_history_durations(&text).get("a#1").copied(),
+            Some(10.0)
+        );
     }
 
     #[test]

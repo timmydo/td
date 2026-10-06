@@ -731,6 +731,51 @@ mod named_dirs_tests {
         assert!(named_dirs("no-such-recipe").is_empty());
     }
 
+    /// The evaluator's check-content part holds what a check asserts or
+    /// builds from though every key holds it — a check body, the source
+    /// pins, a recipe file the evaluator reads, a crate file a shared module
+    /// compiles in (tzdata#1 asserts td-civil's TZif reader) — and its
+    /// shared code stays out of it, since a branch run may defer a change to
+    /// that alone.
+    #[test]
+    fn the_check_content_part_of_the_evaluator_stands_apart() {
+        let checks = registry::evaluator_check_fingerprint_files();
+        let all = registry::evaluator_fingerprint_files();
+        for content in [
+            "recipes/src/bin/td_recipe_eval/checks/tzdata.rs",
+            "recipes/src/bin/td_recipe_eval/checks/rust_toolchain.rs",
+            "recipes/src/recipes/jetbrains-mono-nerd-font.rs",
+            "recipes/src/source_pins.rs",
+            "recipes/src/ostree_pins.rs",
+        ] {
+            assert!(checks.contains(&content), "{content} not check content");
+        }
+        // Every crate file a shared module compiles in, a directory entry by
+        // its sources.
+        assert!(!shared_embeds().is_empty());
+        for embed in shared_embeds() {
+            let content = if embed.contains('/') {
+                checks.contains(embed)
+            } else {
+                let src = format!("{embed}/src/");
+                checks.iter().any(|f| f.starts_with(&src))
+            };
+            assert!(content, "shared embed {embed} not check content");
+        }
+        for shared in [
+            "recipes/src/types.rs",
+            "recipes/src/catalog.rs",
+            "recipes/src/bin/td_recipe_eval/check_runner.rs",
+            "engine/src/sha256.rs",
+        ] {
+            assert!(all.contains(&shared), "{shared} not fingerprinted");
+            assert!(!checks.contains(&shared), "{shared} is check content");
+        }
+        // The boot harnesses are the oracles' alone.
+        assert!(!checks.contains(&"recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs"));
+        assert!(checks.iter().all(|f| all.contains(f)));
+    }
+
     /// Every check's verdict key holds the evaluator fingerprint, so what
     /// every recipe compiles in belongs to it: the shared modules, each
     /// shared embed (a directory by its sources), and a recipe file the

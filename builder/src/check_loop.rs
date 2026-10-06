@@ -65,22 +65,36 @@ pub(crate) fn check_scope(full: bool, scope: Option<&str>) -> Option<Vec<String>
     (!dirs.is_empty()).then_some(dirs)
 }
 
+/// A branch run's mark (td_engine::exit): `affected-checks --run`, and so
+/// `ready`, sets it; main-integration scrubs it, and `TD_CHECK_FULL`
+/// overrides it.
+pub const CHECK_DEFER_ENV: &str = td_engine::exit::CHECK_DEFER_ENV;
+
+/// Whether this run defers engine-only recipe checks to main.
+pub(crate) fn check_defers(full: bool, defer: bool) -> bool {
+    !full && defer
+}
+
 /// The verdict journal key for a run under `scope`: the tree key alone for
 /// an unscoped run, and sha256 over the tree key and the scope for a scoped
 /// one. A scoped recipe-checks PASS proves less than the gate's name says,
 /// so it must not be what an unscoped `--resume` on the same tree finds
-/// (review's finding); the same scope on the same tree still finds it.
-fn scoped_tree_key(key: &str, scope: Option<&[String]>) -> String {
-    match scope {
-        None => key.to_string(),
-        Some(dirs) => {
-            let mut h = crate::sha256::Sha256::new();
-            h.update(key.as_bytes());
-            h.update(b"\0scope\0");
-            h.update(dirs.join(" ").as_bytes());
-            crate::sha256::to_base16(&h.finalize())
-        }
+/// (review's finding); the same scope on the same tree still finds it. A
+/// run that defers proves less in the same way, so it keys apart too.
+fn scoped_tree_key(key: &str, scope: Option<&[String]>, defers: bool) -> String {
+    if scope.is_none() && !defers {
+        return key.to_string();
     }
+    let mut h = crate::sha256::Sha256::new();
+    h.update(key.as_bytes());
+    if let Some(dirs) = scope {
+        h.update(b"\0scope\0");
+        h.update(dirs.join(" ").as_bytes());
+    }
+    if defers {
+        h.update(b"\0defers-engine\0");
+    }
+    crate::sha256::to_base16(&h.finalize())
 }
 
 /// The error-string half of the same signal, and the exit that prints the
@@ -1551,8 +1565,15 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     // a recipe check run in full rather than answer from its verdict memo
     // (check_runner.rs), the same knob that ignores --resume below. So is
     // TD_CHECK_SCOPE, the paths (or crates) a change is confined to, which
-    // the recipe-checks gate narrows its list by (gate_bodies.rs).
-    for k in ["TD_CHECK_DISABLE", "TD_CHECK_FULL", CHECK_SCOPE_ENV] {
+    // the recipe-checks gate narrows its list by (gate_bodies.rs), and
+    // TD_CHECK_DEFER_ENGINE, a branch run's mark that leaves engine-only
+    // recipe checks to main (check_runner.rs).
+    for k in [
+        "TD_CHECK_DISABLE",
+        "TD_CHECK_FULL",
+        CHECK_SCOPE_ENV,
+        CHECK_DEFER_ENV,
+    ] {
         if let Ok(v) = std::env::var(k) {
             child_envs.push((k.to_string(), v));
         }
@@ -1569,8 +1590,15 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
         std::env::var_os("TD_CHECK_FULL").is_some(),
         std::env::var(CHECK_SCOPE_ENV).ok().as_deref(),
     );
+    let defers = check_defers(
+        std::env::var_os("TD_CHECK_FULL").is_some(),
+        std::env::var_os(CHECK_DEFER_ENV).is_some(),
+    );
     match tree_key(&root, Path::new(&tb)) {
-        Some(key) => child_envs.push((s("TD_CHECK_TREE"), scoped_tree_key(&key, scope.as_deref()))),
+        Some(key) => child_envs.push((
+            s("TD_CHECK_TREE"),
+            scoped_tree_key(&key, scope.as_deref(), defers),
+        )),
         None if resume => {
             return Err(fatal(
                 "--resume needs a git working tree and a readable gate runner to key the verdict journal, and `git` or reading the runner failed here — cannot prove the tree is unchanged, refusing to skip",
@@ -2117,12 +2145,32 @@ mod scope_key_tests {
     #[test]
     fn a_scoped_run_keys_its_journal_apart() {
         let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
-        assert_eq!(scoped_tree_key("abc", None), "abc");
-        let sh = scoped_tree_key("abc", Some(&s(&["td-sh"])));
+        assert_eq!(scoped_tree_key("abc", None, false), "abc");
+        let sh = scoped_tree_key("abc", Some(&s(&["td-sh"])), false);
         assert_ne!(sh, "abc");
-        assert_ne!(sh, scoped_tree_key("abc", Some(&s(&["td-sh", "td-txt"]))));
-        assert_ne!(sh, scoped_tree_key("abd", Some(&s(&["td-sh"]))));
-        assert_eq!(sh, scoped_tree_key("abc", Some(&s(&["td-sh"]))));
+        assert_ne!(
+            sh,
+            scoped_tree_key("abc", Some(&s(&["td-sh", "td-txt"])), false)
+        );
+        assert_ne!(sh, scoped_tree_key("abd", Some(&s(&["td-sh"])), false));
+        assert_eq!(sh, scoped_tree_key("abc", Some(&s(&["td-sh"])), false));
+        // The scoped key is the one journaled before deferral existed.
+        let mut h = crate::sha256::Sha256::new();
+        h.update(b"abc\0scope\0td-sh");
+        assert_eq!(sh, crate::sha256::to_base16(&h.finalize()));
+        // A deferring run keys apart from a full one, scoped or not, and
+        // from the same scope run in full.
+        let deferring = scoped_tree_key("abc", None, true);
+        assert_ne!(deferring, "abc");
+        assert_ne!(deferring, sh);
+        let both = scoped_tree_key("abc", Some(&s(&["td-sh"])), true);
+        assert_ne!(both, sh);
+        assert_ne!(both, deferring);
+        assert_eq!(both, scoped_tree_key("abc", Some(&s(&["td-sh"])), true));
+        // TD_CHECK_FULL runs every check, so it never defers.
+        assert!(check_defers(false, true));
+        assert!(!check_defers(true, true));
+        assert!(!check_defers(false, false));
         assert_eq!(
             check_scope(false, Some("td-sh td-portal")),
             Some(s(&["td-sh", "td-portal"]))
