@@ -2308,6 +2308,14 @@ Initial independently landable increments:
   enumerated allocation intervals; selected retention, broader request
   routing/bodyProperties and authenticated publication follow.
 
+- **M06ec — whole requested source-bound list retention:** use shared
+  fixed windows, preserving original collection, selection and actual
+  pin through fresh complete owners. Empty selection accepts zero
+  capacity. Pin per-turn five-cost/byte parity, exact-fit/short capacity
+  and sticky freshness boundaries; add eight units, six compile-fail
+  guards and eight scoped Rust allocation intervals. Wider routing,
+  full admission and authorized publication remain later (API §1.134).
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

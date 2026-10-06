@@ -830,6 +830,16 @@ Composed carries selection and original collection through release.
 Only API §1.133's eight allocation intervals are measured. Whole selected
 retention, broader request routing and current publication remain later.
 
+M06ec shares the existing source-bound retention core to retain whole
+requested list members from a fresh
+original Serialized and Properties into the shared Window. Empty
+selection freshly completes into zero capacity. Original collection,
+selection and actual pin remain exclusive through Retained and fresh
+release. Advance only successful reported bytes with no additional work
+fee; unfinished freshness precedes capacity and all refusals are sticky.
+Only API §1.134's eight intervals are allocation-qualified. Whole ledger
+admission, wider request routing and current publication remain later.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

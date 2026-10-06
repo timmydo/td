@@ -1,4 +1,5 @@
 //! Requested list-property members under original collection and pin custody.
+pub mod retained;
 use super::{Error, Progress, Serialized, View};
 use crate::mime_traversal::bound::ordered::body_lists::response::collected::composed::framing;
 use crate::{nfc::HeaderBudget, ports::Tick};

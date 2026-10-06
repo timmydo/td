@@ -2473,6 +2473,19 @@ fixture cleanup stay outside. API §1.133 lists unmeasured variants.
 Earlier 113 intervals remain separate. Native/stack/RSS, full request
 admission, selected retention/routing and current publication remain open.
 
+M06ec source-bound selected retention adds a compiled Cursor plus
+HeaderBudget cap of 1 KiB and Retained cap of 768 bytes. Whole output
+remains separately caller-owned/admitted. The cursor holds the original
+source-bound composer, shared Window and pure selection; retention adds
+no interpretation, record, wire or source/I/O debit to selected emission.
+Its eight allocation intervals
+measure near-u64 textBody, empty selection into zero capacity, copied
+prefix actual expiry, completed Cursor/Retained expiry, explicit checked
+released Serialized expiry, nonempty zero capacity and constructor pin
+expiry. Original preparation and enclosing resources stay outside;
+descriptor teardown is counted. API §1.134 states exact scope and
+unmeasured variants. Native/stack/RSS/full admission remain unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

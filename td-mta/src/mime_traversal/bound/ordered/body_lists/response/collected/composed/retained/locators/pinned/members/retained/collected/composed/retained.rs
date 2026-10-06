@@ -47,10 +47,22 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm, 'z>
         output: &'z mut [u8],
         now: Tick,
     ) -> Result<Self, Error> {
+        Self::with_frame(source, super::framing::Frame::new(mode), output, now)
+    }
+    pub(super) fn with_frame(
+        source: Serialized<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k, 's, 'm>,
+        frame: super::framing::Frame,
+        output: &'z mut [u8],
+        now: Tick,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            composer: super::Cursor::new(source, mode, now)?,
+            composer: super::Cursor::with_frame(source, frame, now)?,
             window: Window::new(output),
         })
+    }
+    #[cfg(test)]
+    pub(super) fn costs(&self) -> [u64; 5] {
+        super::tests::costs(&self.composer)
     }
     pub fn value(&self) -> Option<ViewBytes<'_, 'm, 'o>> {
         let (mode, original) = self.composer.value()?;

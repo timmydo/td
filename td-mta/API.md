@@ -5645,6 +5645,50 @@ polls and explicit completed-owner checks are not independently
 allocation-qualified. Earlier 113 intervals remain separate evidence.
 Native/stack/RSS, full admission and current publication remain open.
 
+### 1.134 Whole requested source-bound list retention
+
+M06ec adds
+`mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained::collected::composed::selected::retained`
+beside the source-bound list selector.
+Only original complete Serialized and pure Properties start a fresh
+selected frame through the shared source-bound retention core and
+td-json Window. Advanced or emitted-only
+owners cannot retain a missing prefix. Exclusive Cursor retains original
+collection, actual pin and caller-owned output; ViewBytes holds the
+selection, complete provisional members and passive original view.
+Successful reported bytes alone advance the window. Exact fit completes
+on the last selected copy. Empty selection freshly admits and completes
+into even a zero-byte window without charge. Cached completion is inert;
+explicit checks and consuming finishes freshly validate both original
+job and actual pin, including empty selections.
+
+Fresh admission precedes capacity on unfinished turns. Capacity, funding
+and pin errors stay sticky and hide the whole value. Retention adds no
+interpretation, record, wire or source/I/O debit to selected emission.
+Fresh finish yields exclusive Retained; fresh release returns original
+Serialized, unchanged Properties and complete borrowed bytes. Released
+bytes remain passive. These are selected property members, not complete
+JMAP objects or authorization. bodyStructure routing, per-part
+bodyProperties, JSON request parsing, full admission and current
+publication remain later.
+
+Cursor plus HeaderBudget fits 1 KiB; Retained fits 768 bytes. Compiled
+caps are not stack or admission-ledger proofs. Eight sequential Rust
+allocation intervals measure near-u64 digest textBody, zero-base empty
+selection into zero capacity, actual pin expiry after a copied prefix,
+completed Cursor expiry, Retained expiry, explicitly checked released
+Serialized expiry, nonempty zero-window capacity and constructor pin
+expiry. Original mapping/matching/collection, backing, verification,
+filesystem and output preparation stay cold. Descriptor teardown is
+counted; pooled view/scratch lease, cells and fixture cleanup remain
+outside. Only these eight intervals are measured; other subsets,
+capacities/sources, supplied-Tick expiry, funding refusal, premature
+finish, cached Complete polls, post-turn pin expiry, clock Invalid/Busy
+and explicit completed-owner checks remain allocation-unqualified.
+Earlier 121
+intervals are separate evidence. Native allocation, stack/RSS, full
+admission and authorized publication remain unqualified.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
