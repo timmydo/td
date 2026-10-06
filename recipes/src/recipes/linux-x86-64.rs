@@ -463,7 +463,20 @@ pub fn recipe() -> Recipe {
     //    Kconfig default. td-compositor drives the card itself and keeps
     //    /dev/fb0 only as its fallback on a machine without one. The VT/fbcon
     //    console shows until the compositor takes the card and again after it
-    //    exits (drm_lastclose); ttyS0 remains the boot and recovery console.
+    //    exits (drm_lastclose); ttyS0 remains /dev/console.
+    //
+    //    FIRMWARE FRAMEBUFFER (td-install/ENCRYPTION.md "Keyboard console"):
+    //    SYSFB_SIMPLEFB offers a UEFI GOP framebuffer as a simple-framebuffer
+    //    device and DRM_SIMPLEDRM drives it, so fbcon draws the VT on a display
+    //    td has no driver for. sysfb_init is a device initcall in
+    //    drivers/firmware, linked after drivers/gpu, and virtio-gpu and i915
+    //    disable sysfb when they probe, so where they drive the display
+    //    simpledrm never binds and their card stays card0. DRM_EFIDRM and
+    //    DRM_VESADRM require SYSFB_SIMPLEFB off; they, and the legacy efifb and
+    //    vesafb that would take a mode simple-framebuffer cannot describe, are
+    //    guarded unset so simpledrm is the one driver of a UEFI GOP
+    //    framebuffer (FB_VGA16 and FB_UVESA, off by allnoconfig, are not
+    //    guarded; they serve only non-UEFI boots).
     //
     //    SANDBOXED APPLICATIONS (APPLICATIONS.md §0): the namespace, seccomp and
     //    cgroup symbols td-jail needs. Every one of them is PROMPTED, so allnoconfig
@@ -651,6 +664,8 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_DRM_VIRTIO_GPU_KMS[ =]/d; \
                   /^#? *CONFIG_DRM_FBDEV_EMULATION[ =]/d; \
                   /^#? *CONFIG_DRM_CLIENT_DEFAULT_FBDEV[ =]/d; \
+                  /^#? *CONFIG_SYSFB_SIMPLEFB[ =]/d; \
+                  /^#? *CONFIG_DRM_SIMPLEDRM[ =]/d; \
                   /^#? *CONFIG_SECURITY_DMESG_RESTRICT[ =]/d; \
                   /^#? *CONFIG_ACPI[ =]/d; \
                   /^#? *CONFIG_CMDLINE_BOOL[ =]/d; \
@@ -826,6 +841,8 @@ pub fn recipe() -> Recipe {
                    'CONFIG_DRM_VIRTIO_GPU_KMS=y' \
                    'CONFIG_DRM_FBDEV_EMULATION=y' \
                    'CONFIG_DRM_CLIENT_DEFAULT_FBDEV=y' \
+                   'CONFIG_SYSFB_SIMPLEFB=y' \
+                   'CONFIG_DRM_SIMPLEDRM=y' \
                    '# CONFIG_SECURITY_DMESG_RESTRICT is not set' \
                    'CONFIG_ACPI=y' \
                    'CONFIG_EFI=y' \
@@ -996,6 +1013,12 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_DRM_VIRTIO_GPU_KMS=y' .config || { echo 'DRM_VIRTIO_GPU_KMS off — virtio-gpu has no scanout' >&2; exit 1; }; \
                  grep -q '^CONFIG_DRM_FBDEV_EMULATION=y' .config || { echo 'DRM_FBDEV_EMULATION off — td-compositor has no /dev/fb0 software scanout' >&2; exit 1; }; \
                  grep -q '^CONFIG_DRM_CLIENT_DEFAULT_FBDEV=y' .config || { echo 'DRM_CLIENT_DEFAULT_FBDEV off — the selected virtio DRM client will not create fb0' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SYSFB_SIMPLEFB=y' .config || { echo 'SYSFB_SIMPLEFB off — a UEFI GOP framebuffer is not offered as a simple-framebuffer device, so the selector has no keyboard console on a display td has no driver for' >&2; exit 1; }; \
+                 grep -q '^CONFIG_DRM_SIMPLEDRM=y' .config || { echo 'DRM_SIMPLEDRM off — nothing drives the firmware framebuffer, so fbcon has no display before or without a native driver' >&2; exit 1; }; \
+                 if grep -q '^CONFIG_DRM_EFIDRM=' .config; then echo 'DRM_EFIDRM set — it requires SYSFB_SIMPLEFB off; simpledrm is the one firmware framebuffer driver' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_DRM_VESADRM=' .config; then echo 'DRM_VESADRM set — it requires SYSFB_SIMPLEFB off; simpledrm is the one firmware framebuffer driver' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_FB_EFI=' .config; then echo 'FB_EFI set — legacy efifb would take a GOP mode simple-framebuffer cannot describe; simpledrm is the one firmware framebuffer driver' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_FB_VESA=' .config; then echo 'FB_VESA set — legacy vesafb would take a VBE mode simple-framebuffer cannot describe; simpledrm is the one firmware framebuffer driver' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_KEXEC=y' .config; then echo 'KEXEC (legacy segment-based kexec_load) on — only KEXEC_FILE is used; the legacy syscall is kept off to not widen the surface' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_KEXEC_SIG=y' .config; then echo 'KEXEC_SIG on — would demand a trusted-keyring signature policy td does not ship' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_RANDOMIZE_BASE=y' .config; then echo 'RANDOMIZE_BASE (KASLR) on — pinned off for a deterministic kexec boot' >&2; exit 1; fi; \
@@ -1442,6 +1465,51 @@ mod tests {
         }
         assert!(text.contains("'# CONFIG_NVME_MULTIPATH is not set'"));
         assert!(text.contains("grep -q '^# CONFIG_NVME_MULTIPATH is not set' .config"));
+    }
+
+    /// ENCRYPTION.md "Keyboard console": simpledrm over sysfb's
+    /// simple-framebuffer is the one UEFI GOP framebuffer driver, and the
+    /// built-in command line puts the VT before the serial console.
+    #[test]
+    fn firmware_framebuffer_and_vt_console_prefix_are_pinned_and_checked() {
+        let text = recipe()
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv.join("\n")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for symbol in ["SYSFB_SIMPLEFB", "DRM_SIMPLEDRM"] {
+            let stale = format!("/^#? *CONFIG_{symbol}[ =]/d;");
+            assert_eq!(text.matches(&stale).count(), 1, "{symbol}");
+            assert_eq!(
+                text.matches(&format!("'CONFIG_{symbol}=y'")).count(),
+                1,
+                "{symbol}"
+            );
+            assert!(
+                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config ||")),
+                "{symbol}"
+            );
+        }
+        // Unavailable beside SYSFB_SIMPLEFB (EFIDRM, VESADRM) or off by
+        // allnoconfig (efifb, vesafb): never written, refused if set.
+        for symbol in ["DRM_EFIDRM", "DRM_VESADRM", "FB_EFI", "FB_VESA"] {
+            assert!(!text.contains(&format!("'CONFIG_{symbol}=")), "{symbol}");
+            assert!(
+                text.contains(&format!(
+                    "if grep -q '^CONFIG_{symbol}=' .config; then echo '{symbol} set"
+                )),
+                "{symbol}"
+            );
+        }
+        let cmdline = format!("{:?}", crate::ladder::efi_default_cmdline());
+        assert!(cmdline.contains("console=tty0 console=ttyS0,115200"));
+        assert!(text.contains(&format!("'CONFIG_CMDLINE={cmdline}'")));
+        assert!(text.contains(&format!("grep -Fxq 'CONFIG_CMDLINE={cmdline}' .config")));
     }
 
     #[test]

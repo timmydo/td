@@ -21,14 +21,13 @@ It creates the private human runtime `/run/user/1000` and the compositor's
 `/run/td-compositor/1000` below root-owned parents. It validates the
 framebuffer, the DRM card `/dev/dri/card0` and the evdev nodes as character
 devices, assigns them to compositor UID/GID 993 with mode 0600, and verifies
-the result. The human cannot open those devices. The card is optional. A
-machine whose only display is a firmware framebuffer has none, and it boots
-with `card=none` on the ready line. Once the kernel builds in simpledrm
-(td-install/ENCRYPTION.md increment 7, "Keyboard console"), a UEFI GOP
-display is itself a card, simpledrm's `card0`, and a machine has none
-only when its display has neither a UEFI GOP framebuffer
-simple-framebuffer can describe nor a td driver, or when it has no
-display at all. A card that appears after assignment
+the result. The human cannot open those devices. The card is optional: a
+framebuffer with no card boots with `card=none` on the ready line. The
+kernel builds in simpledrm (td-install/ENCRYPTION.md "Keyboard
+console"), so a UEFI GOP display is itself a card, simpledrm's `card0`,
+and a machine has none only when its display has neither a UEFI GOP
+framebuffer simple-framebuffer can describe nor a td driver, or when it
+has no display at all. A card that appears after assignment
 is not taken as assigned: the compositor cannot open it until the next
 assignment.
 The render node is not the display, and seatd leaves it alone.
@@ -82,9 +81,9 @@ second unsafe exception for the client half of wl_shm.
 
 The image drives QEMU's virtio-gpu card, `/dev/dri/card0`, through the KMS
 backend of section 4, and falls back to the fbdev backend only on a machine
-with no card. Increment 7 of td-install/ENCRYPTION.md ("Keyboard console")
-builds in the firmware framebuffer: a UEFI GOP display td has no driver
-for becomes simpledrm's `card0`, which the KMS backend drives as any card,
+with no card. The kernel builds in the firmware framebuffer
+(td-install/ENCRYPTION.md "Keyboard console"): a UEFI GOP display td has
+no driver for becomes simpledrm's `card0`, which the KMS backend drives as any card,
 one connector at the firmware's mode, its flips completed by the atomic
 helpers' substitute vblank events since it has none. virtio-gpu and i915
 disable the firmware framebuffer before it registers, so where they drive
@@ -1032,9 +1031,10 @@ holding bytes no shadow describes.
 The compositor is not the only writer of that device. Under the fbdev backend
 it deliberately does not take the VT, and the boot profile keeps fbcon there on
 purpose so a recovery console stays reachable; owning the `/dev/fb0` node
-through td-seatd does not stop a writer inside the kernel. Increment 7's
-`console=tty0` makes the kernel print its own messages on the VT too, not
-only what is written to it; under fbdev they are one more foreign write
+through td-seatd does not stop a writer inside the kernel. The built-in
+`console=tty0` (td-install/ENCRYPTION.md "Keyboard console") makes the
+kernel print its own messages on the VT too, not only what is written
+to it; under fbdev they are one more foreign write
 the bound below heals, and under KMS they land, as fbcon's other damage
 does, in a buffer nothing scans out. Every paint used to rewrite the
 whole image and so healed foreign pixels for free, where a shadow copy

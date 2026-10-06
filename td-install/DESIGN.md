@@ -1398,11 +1398,11 @@ reader admits at most 96 sections, 64 KiB of headers and a 256 MiB file. It
 is a format check, not a complete PE loader or signature verifier.
 The signed selector packaging and full system firmware oracle remain
 required. The stub has a built-in command line naming
-`initrd=/EFI/BOOT/INITRD`, `console=ttyS0,115200`, `rdinit=/init`,
-and `panic=-1`. ENCRYPTION.md increment 7 ("Keyboard console") puts
-`console=tty0` before `console=ttyS0,115200`, so kernel messages also
-reach the VT while `/dev/console` stays `ttyS0`; until that commit the
-line names the serial console alone. `CONFIG_CMDLINE_OVERRIDE` stays
+`initrd=/EFI/BOOT/INITRD`, `console=tty0`, `console=ttyS0,115200`,
+`rdinit=/init`, and `panic=-1`. Linux makes the last `console=`
+`/dev/console`, so kernel messages reach both the VT and the serial
+line while `/dev/console` stays `ttyS0` (ENCRYPTION.md "Keyboard
+console"). `CONFIG_CMDLINE_OVERRIDE` stays
 off so firmware, direct-kernel tests and kexec can supplement those
 defaults. `INITRD` is
 an 8.3 name on the same FAT filesystem as `BOOTX64.EFI`. Linux's EFI
@@ -1418,11 +1418,14 @@ prefix therefore contains no audit token. Firmware boots without an explicit
 policy retain Linux's initialized but disabled audit default; initialization
 can still permit unconditional seccomp diagnostics. The selector's
 keyboard console is no longer deferred: increment 7 specifies it
-(ENCRYPTION.md "Keyboard console"), with the firmware framebuffer in the
-kernel, td-boot's lines mirrored to the VT and the recovery prompt on
-both consoles, and the installer encrypts only where the live system
-shows one ("Activation"). Until those commits land, the selector's
-console is the serial line alone. What stays deferred is a display with
+(ENCRYPTION.md "Keyboard console"). The kernel carries the firmware
+framebuffer (simpledrm over sysfb's simple-framebuffer) and the prefix's
+`console=tty0`, so a UEFI GOP display shows the kernel's messages even
+where td has no driver for it. td-boot's lines mirrored to the VT, the
+recovery prompt on both consoles, and an installer that encrypts only
+where the live system shows a keyboard console ("Activation") remain
+increment 7's target; until those commits land, the selector's prompts
+are on the serial line alone. What stays deferred is a display with
 neither a UEFI GOP framebuffer nor a td driver, a keyboard td's kernel
 has no driver for (USB keyboards on ports served by OHCI or UHCI
 controllers, companions included, and I2C-HID and Bluetooth keyboards),
@@ -1432,8 +1435,8 @@ on `ttyS0`, so a machine without a serial port has none.
 Each kernel entry prepends the built-in prefix; selector-to-deployment
 kexec therefore adds a second copy. The current short profile arguments
 fit, but this consumes part of both td-boot's 2048-byte command-line bound
-and the kernel's 2048-byte buffer; increment 7's `console=tty0` adds 13
-bytes to each copy. Future argument expansion must reserve room for that
+and the kernel's 2048-byte buffer: each copy is 79 bytes, 13 of them
+`console=tty0 `. Future argument expansion must reserve room for that
 second prefix rather than relying on kernel truncation.
 
 The x86 kernel recipe discards the inherited EFI initrd configuration-table

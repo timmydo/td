@@ -186,12 +186,14 @@ so that most firmware updates are intended to keep releasing.
 
 When release fails, the selector enters a recovery flow on its console. It
 never falls back to plaintext, retries with weaker policy, or skips the
-volume. Today that console is the serial console the selector's
-built-in command line names (DESIGN.md "Full-system volume consumers").
-Increment 7's target adds the keyboard console ("Keyboard console"): the
-same prompt on the serial line and on the screen's virtual terminal,
-read from whichever completes an entry first; until it lands, a machine
-without a serial console shows the prompt nowhere. The selector reads the
+volume. Today that console is the serial console, which the selector's
+built-in command line makes `/dev/console` (DESIGN.md "Full-system
+volume consumers"); the screen's virtual terminal shows the kernel's
+messages but not the prompt. Increment 7's target completes the keyboard
+console ("Keyboard console"): the same prompt on the serial line and on
+the screen's virtual terminal, read from whichever completes an entry
+first; until it lands, a machine without a serial console shows the
+prompt nowhere. The selector reads the
 recovery key through td-init's secret-line applet with echo off, so its
 digits are never echoed; a console server or BMC recorder on the serial
 line may still log what is typed, which the review discloses. The applet,
@@ -504,29 +506,33 @@ live selector's cap is the one change a live boot shows.
 
 ## Keyboard console
 
-This section is increment 7's target; none of it is implemented. It
-gives the selector's recovery flow a screen and keyboard beside the
-serial line, which stays.
+This section is increment 7's target. It gives the selector's recovery
+flow a screen and keyboard beside the serial line, which stays. Its
+first two paragraphs, the command line and the firmware framebuffer, are
+current; the rest is not yet implemented.
 
 The built-in command line (DESIGN.md "Full-system volume consumers")
-gains `console=tty0` before `console=ttyS0,115200`. Linux writes its
+names `console=tty0` before `console=ttyS0,115200`. Linux writes its
 messages to every console the command line names and makes the last one
 `/dev/console`, so kernel messages reach both the foreground virtual
 terminal (VT) and the serial line, while `/dev/console`, and with it the
 standard streams of both initramfs' init, stays `ttyS0`: serial
 diagnostics and the oracles' console capture and typing are unchanged.
 The prefix appears once per kernel entry, so the selector-to-deployment
-`kexec` carries its 13 added bytes twice, inside the command-line budget
-DESIGN.md states.
+`kexec` carries `console=tty0 `, 13 bytes with its separator, twice,
+inside the command-line budget DESIGN.md states.
 
-The kernel gains the firmware framebuffer: `CONFIG_SYSFB_SIMPLEFB`
+The kernel carries the firmware framebuffer: `CONFIG_SYSFB_SIMPLEFB`
 presents a UEFI GOP framebuffer whose pixel format simple-framebuffer can
 describe as a `simple-framebuffer` device, and `CONFIG_DRM_SIMPLEDRM`
 drives it with DRM's fbdev emulation, so fbcon draws the VT on any such
 display before, or without, a native driver. Both are pinned and guarded
 over the resolved configuration as the other console and display symbols
 are (the linux-x86-64 recipe); Linux 7.1.4's `DRM_EFIDRM` and
-`DRM_VESADRM` require `SYSFB_SIMPLEFB` off, so neither is built. A native
+`DRM_VESADRM` require `SYSFB_SIMPLEFB` off, so neither is built, and
+the legacy `FB_EFI` and `FB_VESA`, which would take a mode
+simple-framebuffer cannot describe, stay off; the recipe refuses any of
+the four set. A native
 driver takes the display over. In Linux 7.1.4 `sysfb_init` is a device
 initcall in `drivers/firmware`, linked after the GPU drivers, and
 virtio-gpu (as virtio-vga) and i915 remove a conflicting firmware

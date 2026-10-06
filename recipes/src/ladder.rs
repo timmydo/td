@@ -19,7 +19,8 @@ pub fn efi_default_cmdline() -> String {
     // Linux's EFI loader normalizes slashes; td-boot refuses backslashes.
     let path = EFI_INITRD_PATH.replace('\\', "/");
     // A built-in audit=0 would permanently defeat a caller's later audit=1.
-    format!("initrd={path} console=ttyS0,115200 rdinit=/init panic=-1")
+    // The last console= is /dev/console, so tty0 only adds the VT to printk.
+    format!("initrd={path} console=tty0 console=ttyS0,115200 rdinit=/init panic=-1")
 }
 
 pub const TD_APPLICATION_PACKAGE_ROOT: &str = "/td/store";
@@ -3701,6 +3702,26 @@ mod tests {
                 .all(|b| (b' '..=b'~').contains(&b) && !matches!(b, b'\\' | b'\"' | b'\'')),
             "{line}"
         );
+    }
+
+    #[test]
+    fn efi_defaults_print_on_the_vt_and_keep_ttys0_as_dev_console() {
+        let line = super::efi_default_cmdline();
+        let consoles: Vec<&str> = line
+            .split_ascii_whitespace()
+            .filter(|token| token.starts_with("console="))
+            .collect();
+        // Linux makes the last console= /dev/console (ENCRYPTION.md
+        // "Keyboard console"); the VT only gains kernel messages.
+        assert_eq!(consoles, ["console=tty0", "console=ttyS0,115200"], "{line}");
+        assert_eq!(
+            line,
+            "initrd=/EFI/BOOT/INITRD console=tty0 console=ttyS0,115200 rdinit=/init panic=-1"
+        );
+        // Each kernel entry prepends the prefix, so the deployment kernel's
+        // command line after kexec carries it twice inside td-boot's and the
+        // kernel's 2048-byte bounds; keep both copies within an eighth.
+        assert!(2 * line.len() < 2048 / 8, "{} bytes", line.len());
     }
 
     #[test]
