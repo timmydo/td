@@ -1630,7 +1630,16 @@ pub fn run(
         key: key.clone(),
         client: client.clone(),
     };
-    let supervisor = Supervisor::new(program, state.root().to_path_buf(), setup);
+    let mut supervisor = Supervisor::new(program, state.root().to_path_buf(), setup);
+    // The human's rules: a file that cannot be read is said, and every
+    // conversation asks before each call that acts (DESIGN.md §11).
+    let rules = state.load_rules();
+    if let Err(e) = &rules {
+        let said = format!("your rules could not be read, so every call that changes a workspace or runs a command asks: {e}");
+        eprintln!("td-agent: {said}");
+        app.note(said);
+    }
+    supervisor.repolicy(rules);
     let fetcher = match Fetcher::start(
         client.base_url.clone(),
         key.as_ref().ok().cloned(),

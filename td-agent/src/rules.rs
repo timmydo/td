@@ -268,6 +268,130 @@ impl Read {
     }
 }
 
+/// The human's rules, in the state directory (DESIGN.md §11).
+pub const HUMAN_FILE: &str = "rules";
+/// The largest file of the human's rules, and the most rules in it.
+pub const MAX_HUMAN_FILE: usize = 256 * 1024;
+pub const MAX_HUMAN_RULES: usize = 4096;
+/// The longest workspace key.
+pub const MAX_KEY: usize = 4096;
+/// The header of the rules for every workspace.
+pub const EVERYWHERE: &str = "everywhere";
+
+/// Where one of the human's rules applies.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Scope {
+    /// The workspace with this key (`Workspace::key`), its forks
+    /// included.
+    Workspace(String),
+    /// Every workspace, present and future.
+    Everywhere,
+}
+
+/// One of the human's rules.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Human {
+    pub scope: Scope,
+    pub rule: Rule,
+}
+
+/// The human's rules file: a header, `[everywhere]` or `[<workspace>]`,
+/// then that scope's rules, one a line, as a repository's are written
+/// but allow rules among them; blank lines and `#` comments skipped.
+pub fn parse_human(text: &str) -> Result<Vec<Human>, String> {
+    if text.len() > MAX_HUMAN_FILE {
+        return Err(format!("past {MAX_HUMAN_FILE} bytes"));
+    }
+    let mut scope = None;
+    let mut rules = Vec::new();
+    for (at, line) in text.lines().enumerate() {
+        // Comments too: a control escapes to six bytes on the wire.
+        if line.chars().any(|c| c.is_control() && c != '\t') {
+            return Err(format!("line {}: a control character", at + 1));
+        }
+        let line = line.trim_matches([' ', '\t']);
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(key) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            scope = Some(if key == EVERYWHERE {
+                Scope::Everywhere
+            } else {
+                Scope::Workspace(
+                    workspace_key(key).map_err(|why| format!("line {}: {why}", at + 1))?,
+                )
+            });
+            continue;
+        }
+        let Some(scope) = scope.clone() else {
+            return Err(format!(
+                "line {}: a rule before any [workspace] or [everywhere]",
+                at + 1
+            ));
+        };
+        let rule = Rule::parse(line).map_err(|why| format!("line {}: {why}", at + 1))?;
+        if rule.effect == Effect::Allow && scope == Scope::Everywhere {
+            return Err(format!(
+                "line {}: an allow is for one workspace, not every one",
+                at + 1
+            ));
+        }
+        if rules.len() == MAX_HUMAN_RULES {
+            return Err(format!("more than {MAX_HUMAN_RULES} rules"));
+        }
+        rules.push(Human { scope, rule });
+    }
+    Ok(rules)
+}
+
+/// `key` as a header names a workspace, as `Workspace::key` writes one:
+/// `workspace <name>`, `conversation <id>` or `directory <path>`, so a
+/// mistyped header is refused, not a scope no workspace has.
+pub fn workspace_key(key: &str) -> Result<String, String> {
+    if key.len() > MAX_KEY || key.chars().any(char::is_control) {
+        return Err("a workspace header past its bound".into());
+    }
+    let known = match key.split_once(' ') {
+        Some(("workspace", name)) => crate::workspace::workspace_name(name),
+        Some(("conversation", id)) => crate::store::Id::parse(id).is_some(),
+        Some(("directory", path)) => crate::workspace::escaped_path(path),
+        _ => false,
+    };
+    if !known {
+        return Err(
+            "a header that is neither [everywhere] nor a workspace's: [workspace <name>], [conversation <id>] or [directory <path>]"
+                .into(),
+        );
+    }
+    Ok(key.to_string())
+}
+
+/// `rules` as the human's file holds them: each scope's under its
+/// header, in the order each first appears.
+pub fn human_text(rules: &[Human]) -> String {
+    let mut text = String::from(
+        "# Your td-agent rules: a card's \"always\" answers add them, and you may\n# remove one by deleting its line. A [workspace] header is a workspace's\n# key; [everywhere] holds the denies for every workspace.\n",
+    );
+    let mut scopes: Vec<&Scope> = Vec::new();
+    for one in rules {
+        if !scopes.contains(&&one.scope) {
+            scopes.push(&one.scope);
+        }
+    }
+    for scope in scopes {
+        text.push('\n');
+        match scope {
+            Scope::Everywhere => text.push_str(&format!("[{EVERYWHERE}]\n")),
+            Scope::Workspace(key) => text.push_str(&format!("[{key}]\n")),
+        }
+        for one in rules.iter().filter(|one| &one.scope == scope) {
+            text.push_str(&one.rule.text());
+            text.push('\n');
+        }
+    }
+    text
+}
+
 /// A word of a command as the shell would pass it, or none when an
 /// expansion or a glob decides it.
 pub type Word = Option<String>;
@@ -532,6 +656,9 @@ struct Splitter {
     target: bool,
     /// Whether the last segment ended with an operator that needs another.
     joined: bool,
+    /// Whether this segment holds a redirection: with no words it still
+    /// opens or truncates a file, so it is kept, and no allow matches it.
+    redirected: bool,
 }
 
 impl Splitter {
@@ -714,6 +841,7 @@ impl Splitter {
             return None;
         }
         self.target = true;
+        self.redirected = true;
         Some(())
     }
 
@@ -741,7 +869,7 @@ impl Splitter {
             return None;
         }
         let words = std::mem::take(&mut self.words);
-        if words.is_empty() {
+        if words.is_empty() && !self.redirected {
             if self.joined || joined {
                 return None;
             }
@@ -749,6 +877,7 @@ impl Splitter {
             self.segments.push(words);
         }
         self.joined = joined;
+        self.redirected = false;
         Some(())
     }
 }
@@ -768,6 +897,9 @@ pub enum Verdict {
     /// The human decides, and why the rules ask, a clause the card
     /// puts after "Asked because".
     Ask(String),
+    /// One of the human's allow rules lets it run without a card, and
+    /// why.
+    Allow(String),
     /// The rules say nothing; the table decides.
     Table,
 }
@@ -838,7 +970,7 @@ fn past_options(segment: &[Word]) -> Vec<Word> {
 /// rules files that could not be read, each where from and why: a deny
 /// wins, then an ask; a command the matcher cannot see into asks while
 /// any shell deny or ask exists, and an acting call asks while a file
-/// is unread.
+/// is unread; then an allow, which only the human's rules hold.
 pub fn judge(
     rules: &[Sourced],
     unread: &[(String, String)],
@@ -878,8 +1010,15 @@ pub fn judge(
     }
     if acts {
         if let Some((from, why)) = unread.first() {
-            return Verdict::Ask(format!("the rules of {from} could not be read: {why}"));
+            return Verdict::Ask(format!("{from} could not be read: {why}"));
         }
+    }
+    if let Some(one) = said(Effect::Allow) {
+        return Verdict::Allow(format!(
+            "the rule `{}` of {} allows it",
+            one.rule.text(),
+            one.from
+        ));
     }
     Verdict::Table
 }
@@ -904,6 +1043,12 @@ mod tests {
 
     #[test]
     fn a_command_splits_at_every_operator_and_drops_redirections() {
+        // Redirections alone after an operator: a segment with no words.
+        assert_eq!(
+            split("a | > f").segments,
+            vec![vec![Some("a".into())], Vec::new()]
+        );
+        assert!(!split("a | > f").opaque);
         assert_eq!(
             words("cargo build && cargo test || echo failed; ls | wc -l & true"),
             known(&[
@@ -1161,6 +1306,18 @@ mod tests {
             "shell",
             Some(&parsed("cargo test; sh -c x"))
         ));
+        // A segment of redirections alone still writes a file, and no
+        // allow with words matches it.
+        assert_eq!(
+            split("cargo test; > notes.txt").segments,
+            vec![vec![Some("cargo".into()), Some("test".into())], Vec::new()]
+        );
+        assert!(!matches(
+            &allow,
+            "shell",
+            Some(&parsed("cargo test; > notes.txt"))
+        ));
+        assert!(!matches(&allow, "shell", Some(&parsed("> notes.txt"))));
         // A rule with no words takes every call to its tool; an allow
         // still none that is opaque.
         let any = rule("deny shell");
@@ -1301,7 +1458,7 @@ mod tests {
         );
         // An unread file asks for every call that acts, not for reads.
         let unread = [(
-            "the repository at /w/x".to_string(),
+            "the rules of the repository at /w/x".to_string(),
             "line 1: names no tool".to_string(),
         )];
         assert_eq!(
@@ -1315,9 +1472,113 @@ mod tests {
             judge(&[], &unread, "read_file", None, false),
             Verdict::Table
         );
+        // The human's allow, after every deny and ask, and never for a
+        // command the matcher cannot see into.
+        let yours = |line: &str| Sourced {
+            rule: rule(line),
+            from: "your rules for this workspace".into(),
+        };
+        assert_eq!(
+            judge(
+                &[yours("allow shell cargo test")],
+                &[],
+                "shell",
+                Some("cargo test -p x"),
+                true
+            ),
+            Verdict::Allow(
+                "the rule `allow shell cargo test` of your rules for this workspace allows it"
+                    .into()
+            )
+        );
+        assert!(matches!(
+            judge(
+                &[yours("allow shell cargo"), from("ask shell cargo publish")],
+                &[],
+                "shell",
+                Some("cargo publish"),
+                true
+            ),
+            Verdict::Ask(_)
+        ));
+        assert!(matches!(
+            judge(
+                &[
+                    yours("allow shell cargo"),
+                    yours("deny shell cargo publish")
+                ],
+                &[],
+                "shell",
+                Some("cargo publish"),
+                true
+            ),
+            Verdict::Deny(_)
+        ));
+        assert_eq!(
+            judge(
+                &[yours("allow shell cargo")],
+                &[],
+                "shell",
+                Some("cargo $(rm x)"),
+                true
+            ),
+            Verdict::Table
+        );
+        assert!(matches!(
+            judge(
+                &[yours("allow write_file")],
+                &unread,
+                "write_file",
+                None,
+                true
+            ),
+            Verdict::Ask(_)
+        ));
         assert_eq!(
             judge(&[from("deny read_file")], &[], "read_file", None, false),
             Verdict::Deny("the rule `deny read_file` of the repository at /w/td denies it".into())
         );
+    }
+    #[test]
+    fn the_humans_rules_file_reads_back_as_written() {
+        let text = "# mine\n[workspace td-1-ab]\nallow shell cargo test\n deny write_file\n\n[everywhere]\ndeny shell rm\n[directory /home/u/my%20notes]\nask glob\n";
+        let rules = parse_human(text).unwrap();
+        let scopes: Vec<&Scope> = rules.iter().map(|one| &one.scope).collect();
+        let td = Scope::Workspace("workspace td-1-ab".into());
+        assert_eq!(
+            scopes,
+            [
+                &td,
+                &td,
+                &Scope::Everywhere,
+                &Scope::Workspace("directory /home/u/my%20notes".into())
+            ]
+        );
+        assert_eq!(parse_human(&human_text(&rules)).unwrap(), rules);
+        for (text, why) in [
+            (
+                "allow glob\n",
+                "line 1: a rule before any [workspace] or [everywhere]",
+            ),
+            (
+                "[everywhere]\nallow glob\n",
+                "line 2: an allow is for one workspace, not every one",
+            ),
+            ("[]\n", "line 1: a header that is neither [everywhere] nor a workspace's: [workspace <name>], [conversation <id>] or [directory <path>]"),
+            ("[ everywhere]\ndeny glob\n", "line 1: a header that is neither [everywhere] nor a workspace's: [workspace <name>], [conversation <id>] or [directory <path>]"),
+            ("[Everywhere]\ndeny glob\n", "line 1: a header that is neither [everywhere] nor a workspace's: [workspace <name>], [conversation <id>] or [directory <path>]"),
+            ("[workspace td-1-ab ]\ndeny glob\n", "line 1: a header that is neither [everywhere] nor a workspace's: [workspace <name>], [conversation <id>] or [directory <path>]"),
+            ("[conversation 12]\ndeny glob\n", "line 1: a header that is neither [everywhere] nor a workspace's: [workspace <name>], [conversation <id>] or [directory <path>]"),
+            ("[directory /home/u/my notes]\ndeny glob\n", "line 1: a header that is neither [everywhere] nor a workspace's: [workspace <name>], [conversation <id>] or [directory <path>]"),
+            ("[directory notes]\ndeny glob\n", "line 1: a header that is neither [everywhere] nor a workspace's: [workspace <name>], [conversation <id>] or [directory <path>]"),
+            ("# a \u{1b}[1m comment\n", "line 1: a control character"),
+            (
+                "[workspace w]\nallow shell 'x'\n",
+                "line 2: word 3 holds what the shell would read, not pass",
+            ),
+        ] {
+            assert_eq!(parse_human(text).unwrap_err(), why, "{text:?}");
+        }
+        assert!(parse_human(&"#".repeat(MAX_HUMAN_FILE + 1)).is_err());
     }
 }

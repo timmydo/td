@@ -369,6 +369,7 @@ pub fn serve_in(
         checked: VecDeque::new(),
         processes: BTreeMap::new(),
         exited: VecDeque::new(),
+        human: (0, Ok(Vec::new())),
     };
     // What this conversation read or wrote before, so a replacement of an
     // unchanged file needs no read again.
@@ -658,6 +659,9 @@ struct Session {
     /// Background processes that ended, by number with how, kept until a
     /// turn's next step or the turn's end (`between`).
     exited: VecDeque<End>,
+    /// The human's rules as the window last sent them, with their
+    /// version, or why they could not be read (DESIGN.md §11).
+    human: (u64, Result<Vec<crate::rules::Human>, String>),
 }
 
 /// A remote whose remote-tracking refs could not be set to `tried`, and
@@ -768,6 +772,7 @@ impl Session {
             };
             match down {
                 Down::Setup { key, client } => self.setup = Some((key, client)),
+                Down::Policy { version, rules } => self.policy(version, rules),
                 Down::User { delivery, text } => self.user(delivery, text)?,
                 Down::Message {
                     delivery,
@@ -1090,8 +1095,16 @@ impl Session {
     fn later(&mut self, down: Down) {
         match down {
             Down::Kill { number } => self.killed_by_person(number),
+            Down::Policy { version, rules } => self.policy(version, rules),
             down => self.queue.push_back(down),
         }
+    }
+
+    /// The human's rules, `version` of them, as the window sent them:
+    /// taken at once, from the next decision on.
+    fn policy(&mut self, version: u64, rules: Result<String, String>) {
+        let rules = rules.and_then(|text| crate::rules::parse_human(&text));
+        self.human = (version, rules);
     }
 
     /// The person killed background process `number` from the window:
@@ -2147,6 +2160,30 @@ impl Session {
     fn rules(&self) -> (Vec<crate::rules::Sourced>, Vec<(String, String)>) {
         let mut found = Vec::new();
         let mut unread = Vec::new();
+        let meta = self.conversation.meta();
+        let here = meta
+            .workspace
+            .as_ref()
+            .map(|workspace| crate::rules::Scope::Workspace(workspace.key(&meta.id)));
+        match &self.human.1 {
+            Ok(rules) => found.extend(
+                rules
+                    .iter()
+                    .filter(|one| {
+                        one.scope == crate::rules::Scope::Everywhere
+                            || Some(&one.scope) == here.as_ref()
+                    })
+                    .map(|one| crate::rules::Sourced {
+                        rule: one.rule.clone(),
+                        from: if one.scope == crate::rules::Scope::Everywhere {
+                            "your rules for every workspace".into()
+                        } else {
+                            "your rules for this workspace".into()
+                        },
+                    }),
+            ),
+            Err(why) => unread.push(("your rules".to_string(), tools::visible(why))),
+        }
         for one in self.conversation.instructions() {
             let from = format!(
                 "the repository at {}",
@@ -2160,7 +2197,9 @@ impl Session {
                         from: from.clone(),
                     }))
                 }
-                crate::rules::Read::Unread { why } => unread.push((from, why.clone())),
+                crate::rules::Read::Unread { why } => {
+                    unread.push((format!("the rules of {from}"), why.clone()))
+                }
             }
         }
         (found, unread)
@@ -2322,6 +2361,7 @@ impl Session {
         };
         let (rules, unread) = self.rules();
         let mut asked = None;
+        let mut allowed = None;
         match crate::rules::judge(&rules, &unread, name, command, acts) {
             crate::rules::Verdict::Deny(why) => {
                 let why = tools::visible(&why);
@@ -2335,6 +2375,7 @@ impl Session {
                 return failed(format!("not run: {why}. That is the workspace's answer: do not try to reach the same result another way. Say what you needed it for and ask the person how they would like to go on"));
             }
             crate::rules::Verdict::Ask(why) => asked = Some(tools::visible(&why)),
+            crate::rules::Verdict::Allow(why) => allowed = Some(tools::visible(&why)),
             crate::rules::Verdict::Table => {}
         }
         // Before any card: the person is not asked about a call that
@@ -2371,7 +2412,7 @@ impl Session {
                 ));
             }
         }
-        if acts || repeated || asked.is_some() {
+        if (acts && allowed.is_none()) || repeated || asked.is_some() {
             let (title, mut details) = tools::card(&call);
             if repeated {
                 details.insert(0, REPEATED.into());
@@ -2385,6 +2426,14 @@ impl Session {
                 Some(false) => return failed(CALL_REFUSED.into()),
                 None => return failed(CALL_UNDECIDED.into()),
             }
+        } else if let Some(why) = allowed.filter(|_| acts) {
+            self.log(Kind::Approval {
+                call: started,
+                outcome: "allow".into(),
+                by: "rule".into(),
+                probabilities: None,
+                reason: Some(why),
+            })?;
         }
         // An interrupt that came with the decision, or before it: nothing
         // starts.

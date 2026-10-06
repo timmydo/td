@@ -282,7 +282,57 @@ const MAX_RECORD: usize = 16 * 1024;
 
 /// A workspace name td-agent makes: lower-case letters, digits and `-`,
 /// not starting or ending with `-`.
-fn workspace_name(name: &str) -> bool {
+/// `path`'s bytes as a key holds them: printable ASCII but `%`, `[` and
+/// `]` as they are, every other byte as `%XX`, so two paths never share
+/// a key.
+fn escaped(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::new();
+    for b in path.as_os_str().as_bytes() {
+        if kept(*b) {
+            out.push(char::from(*b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Whether `escaped` writes byte `b` as it is.
+fn kept(b: u8) -> bool {
+    b.is_ascii_graphic() && !matches!(b, b'%' | b'[' | b']')
+}
+
+/// Whether `text` is a path as `escaped` writes one, and so a directory's
+/// key could hold it: absolute, and no byte written another way.
+pub(crate) fn escaped_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'/') {
+        return false;
+    }
+    let mut at = 0;
+    while let Some(&b) = bytes.get(at) {
+        if b == b'%' {
+            let hex = |at: usize| {
+                bytes
+                    .get(at)
+                    .filter(|h| h.is_ascii_digit() || (b'A'..=b'F').contains(h))
+                    .and_then(|h| char::from(*h).to_digit(16))
+            };
+            match (hex(at + 1), hex(at + 2)) {
+                (Some(high), Some(low)) if !kept((high * 16 + low) as u8) => at += 3,
+                _ => return false,
+            }
+        } else if kept(b) {
+            at += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn workspace_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_WORKSPACE_NAME
         && !name.starts_with('-')
@@ -543,6 +593,18 @@ impl Workspace {
             Self::Directory(path) => path.display().to_string(),
             Self::Template(name) => format!("template {name}"),
             Self::Repositories(repositories) => format!("template {}", repositories.template),
+        }
+    }
+
+    /// The key the human's rules for this workspace are kept under
+    /// (DESIGN.md §11), conversation `id`'s: a repository workspace's
+    /// name, which its forks share, a directory's path, or a scratch
+    /// directory's conversation.
+    pub fn key(&self, id: &Id) -> String {
+        match self {
+            Self::Scratch | Self::Template(_) => format!("conversation {}", id.as_str()),
+            Self::Directory(path) => format!("directory {}", escaped(path)),
+            Self::Repositories(repositories) => format!("workspace {}", repositories.name),
         }
     }
 
@@ -1287,6 +1349,74 @@ mod tests {
                 })
                 .collect(),
             shared: None,
+        }
+    }
+
+    /// A workspace's key for the human's rules: a scratch one's
+    /// conversation, a directory's path made visible, a repository
+    /// workspace's name, which its forks share; each one a header can
+    /// hold.
+    #[test]
+    fn each_workspace_has_a_key_for_the_humans_rules() {
+        let id = Id::random().unwrap();
+        let other = Id::random().unwrap();
+        assert_eq!(
+            Workspace::Scratch.key(&id),
+            format!("conversation {}", id.as_str())
+        );
+        assert_ne!(Workspace::Scratch.key(&id), Workspace::Scratch.key(&other));
+        assert_eq!(
+            Workspace::Template("notes".into()).key(&id),
+            Workspace::Scratch.key(&id)
+        );
+        // Escaped so no two paths share one: a tab, the text naming it,
+        // a space and a byte that is not UTF-8.
+        assert_eq!(
+            Workspace::Directory("/home/u/my\tnotes".into()).key(&id),
+            "directory /home/u/my%09notes"
+        );
+        assert_eq!(
+            Workspace::Directory("/home/u/my%09notes".into()).key(&id),
+            "directory /home/u/my%2509notes"
+        );
+        assert_eq!(
+            Workspace::Directory("/a b]".into()).key(&id),
+            "directory /a%20b%5D"
+        );
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            Workspace::Directory(std::ffi::OsStr::from_bytes(b"/x\xff").into()).key(&id),
+            "directory /x%FF"
+        );
+        // A directory header is only a path as a key writes it.
+        for (path, ok) in [
+            ("/a%20b%5D", true),
+            ("/x%FF%25", true),
+            ("/a b", false),
+            ("/a%20", true),
+            ("/a%2f", false),
+            ("/a%41", false),
+            ("/a%2", false),
+            ("/a]", false),
+            ("/é", false),
+            ("a", false),
+        ] {
+            assert_eq!(escaped_path(path), ok, "{path}");
+        }
+        let repositories = Workspace::Repositories(Repositories {
+            template: "td".into(),
+            name: "td-1-ab".into(),
+            entries: Vec::new(),
+        });
+        assert_eq!(repositories.key(&id), "workspace td-1-ab");
+        assert_eq!(repositories.key(&id), repositories.key(&other));
+        for workspace in [
+            Workspace::Scratch,
+            Workspace::Directory("/a b".into()),
+            repositories,
+        ] {
+            let key = workspace.key(&id);
+            assert_eq!(crate::rules::workspace_key(&key).unwrap(), key);
         }
     }
 

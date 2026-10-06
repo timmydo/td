@@ -139,6 +139,8 @@ pub struct Supervisor {
     state: PathBuf,
     /// What every child is sent first.
     setup: Down,
+    /// What every child is sent second: the human's rules.
+    policy: Down,
     children: Vec<Running>,
     open: Option<Id>,
     /// Children whose socketpair was closed, by conversation, reaped as
@@ -159,6 +161,12 @@ impl Supervisor {
             program,
             state,
             setup,
+            // Until the window reads the human's rules, none are known,
+            // so every call that acts asks.
+            policy: Down::Policy {
+                version: 0,
+                rules: Err("not read yet".into()),
+            },
             children: Vec::new(),
             open: None,
             retiring: Vec::new(),
@@ -217,7 +225,7 @@ impl Supervisor {
                 return Err(e);
             }
         };
-        greet(&mut writer, &self.setup, &pending, &[]);
+        greet(&mut writer, &self.setup, &self.policy, &pending, &[]);
         self.children.push(Running {
             id: id.clone(),
             child,
@@ -294,6 +302,28 @@ impl Supervisor {
             *held = client;
         }
         self.resend_setup();
+    }
+
+    /// The human's rules, read again: every child is sent them, now or
+    /// when it starts, numbered one past the last (DESIGN.md §3, §11).
+    pub fn repolicy(&mut self, rules: Result<String, String>) {
+        let version = match &self.policy {
+            Down::Policy { version, .. } => version.saturating_add(1),
+            _ => 1,
+        };
+        self.policy = Down::Policy { version, rules };
+        if self.policy.encode().len() > frame::MAX_FRAME {
+            self.policy = Down::Policy {
+                version,
+                rules: Err("the file is too large to send".into()),
+            };
+        }
+        let bytes = self.policy.encode();
+        for running in self.children.iter_mut().filter(|r| !r.failed) {
+            if frame::write(&mut running.writer, &bytes).is_err() {
+                let _ = running.writer.shutdown(std::net::Shutdown::Both);
+            }
+        }
     }
 
     fn resend_setup(&mut self) {
@@ -378,7 +408,7 @@ impl Supervisor {
                 return Err(e);
             }
         };
-        greet(&mut writer, &self.setup, &pending, &[]);
+        greet(&mut writer, &self.setup, &self.policy, &pending, &[]);
         self.children.push(Running {
             id: id.clone(),
             child,
@@ -628,6 +658,7 @@ impl Supervisor {
                 greet(
                     &mut running.writer,
                     &self.setup,
+                    &self.policy,
                     &running.pending,
                     &running.deliveries,
                 );
@@ -839,10 +870,12 @@ fn listen(ours: &UnixStream) -> Result<Receiver<Incoming>, String> {
 fn greet(
     writer: &mut UnixStream,
     setup: &Down,
+    policy: &Down,
     pending: &[(String, String)],
     deliveries: &[(String, Down)],
 ) {
     let downs = std::iter::once(setup.encode())
+        .chain(std::iter::once(policy.encode()))
         .chain(pending.iter().map(|(delivery, text)| {
             Down::User {
                 delivery: delivery.clone(),
@@ -896,5 +929,38 @@ mod background_tests {
         // A replayed end after a restart reset the count stays at none.
         assert_eq!(background(0, &end), 0);
         assert_eq!(background(3, &Kind::Pause { paused: true }), 3);
+    }
+
+    /// The human's rules as children are sent them: none known until
+    /// the window reads them, so every call that acts asks; each read
+    /// numbered one past the last; one too large for a frame sent as
+    /// an error, not as a frame no child could take.
+    #[test]
+    fn the_policy_is_unread_until_read_and_never_past_a_frame() {
+        let setup = Down::Pause { paused: false };
+        let mut supervisor = Supervisor::new("td-agent".into(), "/nonexistent".into(), setup);
+        assert_eq!(
+            supervisor.policy,
+            Down::Policy {
+                version: 0,
+                rules: Err("not read yet".into()),
+            }
+        );
+        supervisor.repolicy(Ok("[everywhere]\ndeny shell rm\n".into()));
+        assert_eq!(
+            supervisor.policy,
+            Down::Policy {
+                version: 1,
+                rules: Ok("[everywhere]\ndeny shell rm\n".into()),
+            }
+        );
+        supervisor.repolicy(Ok("\u{1}".repeat(crate::rules::MAX_HUMAN_FILE)));
+        assert_eq!(
+            supervisor.policy,
+            Down::Policy {
+                version: 2,
+                rules: Err("the file is too large to send".into()),
+            }
+        );
     }
 }

@@ -3231,8 +3231,37 @@ word as its argument: one written without `=` that the matcher does not
 know to take none. The shell's joining of `\` and a newline is undone
 first, and a newline after `&&`, `||` or `|` continues the command. A
 command the matcher cannot see into asks while any shell deny or ask
-rule exists, not only a deny. Until modes land, every call that acts
-still takes the `ask` column's card.
+rule exists, not only a deny. A segment of redirections alone, such
+as `> notes.txt`, is kept as a segment with no words, which no rule
+with words matches. Until modes land, every call that acts and no
+allow of the human's matches still takes the `ask` column's card.
+
+**As built (increment 13, the human's rules).** The human's rules are
+the state directory's `rules`, read when the window starts: a header,
+`[everywhere]` or `[<workspace>]`, then that scope's rules one a line as
+a repository's are written, an `allow` among them only under a
+workspace's header; blank lines and `#` comments are skipped, and a
+control character other than a tab, in a comment too, refuses the file;
+at most 256 KiB and 4,096 rules. A workspace's key, and so its header,
+is `workspace <name>` for a repository workspace, whose forks share its
+name, `directory <path>` for a directory, each byte of its path but
+printable ASCII other than `%`, `[` and `]` written `%XX`, and
+`conversation <id>` for a scratch one; a header of no such form refuses
+the file, so a mistyped one is not a scope no workspace has. The window
+sends every conversation the file whole as a numbered policy (`{"type":
+"policy", "version", "rules"}`, or `"error"` for why it could not be
+read), second on the socketpair after `setup` and again on every change,
+and the conversation takes it at once, a turn under way or not. Until
+the window has read the file, and when it cannot be read or would not
+fit one frame, the policy is an error: it is said in the window, and
+every conversation then asks before each call that acts. A conversation
+judges its workspace's rules and the ones for every workspace with its
+repositories', in the order above: a deny wins, then an ask, then the
+asks for an opaque command and an unread file, then the human's allow,
+which runs a call that acts with no card, its approval logged `by`
+`rule` with the rule as the reason. A repeated call still goes to the
+human. Until the cards' "always" answers write the file, the human edits
+it, and it is read again when the window starts.
 
 **Repetition.** Three consecutive calls of one tool with identical
 arguments go to the human whatever the table says, as opencode's

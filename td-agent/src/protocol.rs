@@ -54,6 +54,14 @@ pub enum Down {
     /// The human killed background process `number` (DESIGN.md §12):
     /// acted on as soon as it is heard, a turn under way or not.
     Kill { number: u64 },
+    /// The human's rules file (DESIGN.md §11), whole, or why it could not
+    /// be read, numbered so a change is known: second on every
+    /// socketpair, after `Setup`, and again on every change, acted on as
+    /// soon as it is heard.
+    Policy {
+        version: u64,
+        rules: Result<String, String>,
+    },
     /// Undo, or redo, the step snapshotted at `step` (DESIGN.md §12).
     Restore { step: u64, undo: bool },
     /// The human chose the conversation's model and reasoning effort,
@@ -458,6 +466,16 @@ impl Down {
             Self::Pause { paused } => typed("pause", vec![("paused".into(), Json::Bool(*paused))]),
             Self::ClearTodo => typed("clear_todo", Vec::new()),
             Self::Kill { number } => typed("kill", vec![("number".into(), Json::from(*number))]),
+            Self::Policy { version, rules } => typed(
+                "policy",
+                vec![
+                    ("version".into(), Json::from(*version)),
+                    match rules {
+                        Ok(text) => ("rules".into(), Json::Str(text.clone())),
+                        Err(why) => ("error".into(), Json::Str(why.clone())),
+                    },
+                ],
+            ),
             Self::Restore { step, undo } => typed(
                 "restore",
                 vec![
@@ -581,6 +599,26 @@ impl Down {
                     .ok_or("no paused")?,
             }),
             Some("clear_todo") => Ok(Self::ClearTodo),
+            Some("policy") => Ok(Self::Policy {
+                version: value
+                    .get("version")
+                    .and_then(Json::as_u64)
+                    .ok_or("a policy with no version")?,
+                rules: match (value.get("rules"), value.get("error")) {
+                    (Some(text), None) => {
+                        let text = text.as_str().ok_or("a policy whose rules are not text")?;
+                        if text.len() > crate::rules::MAX_HUMAN_FILE {
+                            return Err("a policy past its bound".into());
+                        }
+                        Ok(text.to_string())
+                    }
+                    (None, Some(why)) => Err(why
+                        .as_str()
+                        .ok_or("a policy whose error is not text")?
+                        .to_string()),
+                    _ => return Err("a policy with neither rules nor an error".into()),
+                },
+            }),
             Some("kill") => Ok(Self::Kill {
                 number: value
                     .get("number")
@@ -1130,6 +1168,14 @@ mod tests {
             Down::Pause { paused: true },
             Down::ClearTodo,
             Down::Kill { number: 3 },
+            Down::Policy {
+                version: 2,
+                rules: Ok("[everywhere]\ndeny shell rm\n".into()),
+            },
+            Down::Policy {
+                version: 3,
+                rules: Err("rules: line 1: names no tool".into()),
+            },
             Down::Restore {
                 step: 7,
                 undo: true,

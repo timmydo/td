@@ -541,6 +541,20 @@ impl StateDir {
             .collect()
     }
 
+    /// The human's rules file (DESIGN.md §11), whole, empty when there is
+    /// none; a file `rules::parse_human` refuses is refused, and why.
+    pub fn load_rules(&self) -> Result<String, String> {
+        let path = self.root.join(crate::rules::HUMAN_FILE);
+        let bytes = match read_bounded(&path, crate::rules::MAX_HUMAN_FILE as u64) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+            read => read.map_err(|e| format!("{}: {e}", path.display()))?,
+        };
+        let text =
+            String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))?;
+        crate::rules::parse_human(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(text)
+    }
+
     /// Moves the remotes file aside, to `remotes.set-aside-<time>`, after
     /// it could not be read: no remote in it is admitted, and a card can
     /// admit again. Where it went.
@@ -3551,6 +3565,27 @@ pub mod tests {
         )
         .unwrap();
         assert!(Conversation::open(&state, &id, None, LOCK_WAIT).is_err());
+    }
+
+    #[test]
+    fn the_humans_rules_are_read_whole_or_refused() {
+        let scratch = Scratch::new("human-rules");
+        let state = scratch.state();
+        assert_eq!(state.load_rules().unwrap(), "");
+        let path = state.root().join(crate::rules::HUMAN_FILE);
+        let text = "[everywhere]\ndeny shell rm\n";
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(state.load_rules().unwrap(), text);
+        std::fs::write(&path, "[everywhere]\nallow shell ls\n").unwrap();
+        let e = state.load_rules().unwrap_err();
+        assert!(
+            e.ends_with("line 2: an allow is for one workspace, not every one"),
+            "{e}"
+        );
+        std::fs::write(&path, vec![b'#'; crate::rules::MAX_HUMAN_FILE + 1]).unwrap();
+        assert!(state.load_rules().is_err());
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(state.load_rules().unwrap_err().ends_with("is not UTF-8"));
     }
 
     #[test]

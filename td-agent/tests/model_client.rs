@@ -1362,6 +1362,97 @@ fn call_record(events: &[Event], id: &str) -> u64 {
         .unwrap()
 }
 
+/// The human's rules come with the window's policy (DESIGN.md §11): an
+/// allow for this workspace runs a command with no card, logged as the
+/// rule's; another workspace's allow and a deny for every workspace
+/// apply as theirs do, the latest policy taken.
+#[test]
+fn the_humans_rules_allow_a_command_here_and_deny_one_everywhere() {
+    let mut h = Harness::new_in(
+        "yours",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client::default());
+    let here = format!("conversation {}", h.id.as_str());
+    // Another workspace's allow is not this one's.
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok("[workspace td-1]\nallow shell rm\n".into()),
+    });
+    h.down(&Down::Policy {
+        version: 2,
+        rules: Ok(format!(
+            "[workspace td-1]\nallow shell rm\n[{here}]\nallow shell rm -f\n"
+        )),
+    });
+    h.say("Tidy the notes.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let ran = results(&events);
+    assert_eq!(ran.len(), 2, "{ran:?}");
+    // It ran with no card, and so came to the jail, which is not here.
+    assert!(ran[1].1.starts_with("error: the jail: "), "{ran:?}");
+    let shell = call_record(&events, "toolu_shell_01");
+    assert_eq!(
+        approvals(&events),
+        [(
+            shell,
+            "allow".to_string(),
+            "rule".to_string(),
+            Some(
+                "the rule `allow shell rm -f` of your rules for this workspace allows it"
+                    .to_string()
+            )
+        )]
+    );
+    // A deny for every workspace wins over the allow here.
+    h.down(&Down::Policy {
+        version: 3,
+        rules: Ok(format!(
+            "[{here}]\nallow shell rm -f\n[everywhere]\ndeny shell rm\n"
+        )),
+    });
+    h.say("Again.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let results = results(&events);
+    let denied = "the rule `deny shell rm` of your rules for every workspace denies it";
+    assert!(
+        results
+            .iter()
+            .any(|r| r.1.starts_with(&format!("error: not run: {denied}"))),
+        "{results:?}"
+    );
+    // Rules the window could not read: the read still runs, and the
+    // command, though the file allowed it, waits for the person.
+    h.down(&Down::Policy {
+        version: 4,
+        rules: Err("rules: line 2: names no tool".into()),
+    });
+    h.say("Once more.");
+    let (call, title, details) = h.until_ask();
+    assert_eq!(title, "Run a command");
+    assert_eq!(
+        details[0],
+        "Asked because your rules could not be read: rules: line 2: names no tool."
+    );
+    assert_eq!(call, call_record(&h.heard, "toolu_shell_01"));
+    h.down(&Down::Decision { call, allow: false });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+}
+
 /// A third call in a row to one tool with the same arguments goes to the
 /// person, though a read asks nothing; the first two ran, and the
 /// approval says why it was asked. Other arguments start a run anew,
