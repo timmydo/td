@@ -5508,6 +5508,51 @@ allocation qualification. Native allocation, stack/RSS, complete job
 admission and publication remain open. Earlier 65 metadata/locator and
 eight each binding, emission and whole-retention intervals are separate.
 
+### 1.131 Original source-bound whole tree/list emission
+
+M06dz adds pinned::members::retained::collected::composed. Cursor consumes
+only original Serialized, selecting Structure or Lists, and retains
+that whole collection and actual descriptor throughout emission.
+The existing metadata composer and this source-bound composer share
+one crate-private bounded Frame and source adapters. Framing, checked
+ordinal/depth/parent walk, ordered list membership, commas, braces,
+subParts and hasAttachment remain one implementation. The old metadata
+API and its byte/funding behavior remain unchanged; its prior inline
+framing mechanism is deleted in the same increment.
+
+The new adapter copies only whole source-bound Cell members, requiring
+original part/fragment/candidate/member ordinal agreement. Each poll
+funds one original interpretation step with carried control-record
+credit and at most 64 generated output bytes before copying, with no
+source/I/O debit. Fresh original-job and actual-pin checks precede work;
+the actual pin is sampled directly afterward even if original work
+refused, and its error wins. Empty output freshly admits without charge
+or progress; cached Complete is inert. Failure hides values; every copied
+prefix remains provisional and must be discarded on refusal.
+
+Fresh complete finish creates exclusive Composed, which retains original
+Serialized and Mode through explicit admission and fresh low-level
+release. Emission completion proves neither retained whole wire bytes
+nor current access/publication authority. Whole response retention,
+request property selection and authenticated publication still follow.
+
+Cursor plus HeaderBudget and 64 output bytes fit 1 KiB; Composed fits
+768 bytes. These caps do not reserve a whole ledger or qualify stack.
+Eight Rust allocation intervals cover near-u64 digest-tree Structure,
+zero-base digest Lists, actual-pin-clock expiry after a copied prefix,
+completed Cursor expiry, Composed expiry, explicitly checked released
+Serialized expiry, wire refusal and constructor pin expiry. Setup,
+original mapping/matching/whole member collection and backing stay cold;
+descriptor teardown is counted, enclosing pooled view/scratch lease,
+cell-array and fixture cleanup remain outside. Only those intervals are
+qualified. Supplied-Tick expiry, interpretation/record refusal, post-turn
+pin expiry including simultaneous quota failure, premature finish,
+empty/cached polls, clock Invalid/Busy and other tree/list variants are
+not independently allocation-qualified. Earlier 65 metadata/locator and
+eight each binding, member emission, whole retention and collection
+intervals remain separate evidence. Native/stack/RSS and complete job
+admission/current publication remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

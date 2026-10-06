@@ -2273,6 +2273,18 @@ Initial independently landable increments:
   Qualify eight enumerated Rust allocation intervals; composition,
   request selection and current authorized publication remain later.
 
+- **M06dz — original source-bound whole tree/list emission:** consume
+  original complete Serialized and preserve actual pin custody through
+  bounded Structure/Lists emission. Share one checked Frame with the
+  existing metadata composer, deleting its old inline mechanism while
+  preserving its API/bytes/costs. Fund original output/interpretation
+  work and directly sample the actual pin after every turn, including
+  quota refusal. Keep exclusive Composed through fresh collection
+  release. Pin literal tree/list bytes, original owner/backing custody,
+  selected prefix/final expiry, cutoff and post-turn precedence cases.
+  Qualify eight enumerated Rust allocation intervals; whole retention,
+  request property selection and current publication remain later.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

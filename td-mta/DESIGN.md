@@ -800,6 +800,16 @@ release. Cells remain provisional; composition, request selection and
 current access policy/publication still follow. Only the eight allocation
 intervals named in API §1.130 are qualified.
 
+M06dz emits original source-bound whole tree/list members while keeping
+every collected member and the actual pin. One shared bounded Frame
+serves the existing metadata adapter and the new source-bound adapter;
+its ordinal/depth/parent walk and list framing remain identical. Every
+turn funds original work and samples the actual pin after work even on
+quota refusal. Exclusive Composed preserves collection custody through
+fresh release; emitted prefixes remain provisional. Whole response
+retention, request selection and current access/publication follow.
+Only the eight allocation intervals in API §1.131 are qualified.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

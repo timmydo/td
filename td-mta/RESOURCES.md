@@ -2420,6 +2420,24 @@ metadata/locator and eight each source-binding, emission and whole
 retention intervals remain separate. Native/stack/RSS and complete
 admission/publication qualification remain open.
 
+M06dz source-bound whole tree/list emission shares bounded framing with
+metadata emission and retains original Serialized, all source-bound
+member cells and actual descriptor. Every turn funds one original
+interpretation step with carried control-record credit and at most 64
+new wire bytes, with no source/I/O debit. Cursor plus HeaderBudget and
+64 output bytes fit 1 KiB; Composed fits 768 bytes. These size envelopes
+do not prove whole-ledger or worker-stack bounds. Eight sequential Rust
+allocation intervals measure digest-tree Structure and digest Lists,
+actual-pin-clock expiry after a copied prefix, completed Cursor/Composed
+expiry, released Serialized explicit-check expiry, wire refusal and
+constructor expiry. Original mapping/matching/collection, backing and
+file setup stay cold; descriptor teardown is counted, enclosing pooled
+view/scratch lease, cell array and fixture cleanup stay outside.
+API §1.131 lists unmeasured variants. Existing 65 metadata/locator and
+eight each binding, member emission, whole retention and collection
+intervals remain separate. Native/stack/RSS and complete request
+admission/authorized publication remain open.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

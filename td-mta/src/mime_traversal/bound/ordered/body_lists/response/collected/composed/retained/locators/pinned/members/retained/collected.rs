@@ -1,4 +1,5 @@
 //! Collect every original source-bound member while retaining the actual pin.
+pub mod composed;
 use super::super::super::super::Error as OriginalError;
 use super::{Bound, Cursor, Error, RetainStatus, View as MemberView};
 use crate::{admission::work::Charge, nfc::HeaderBudget, ports::Tick};
