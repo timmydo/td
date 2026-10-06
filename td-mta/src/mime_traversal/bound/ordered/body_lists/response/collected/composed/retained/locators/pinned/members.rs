@@ -1,5 +1,6 @@
 //! Source-bound part members; current access authorization and publication follow.
 pub mod retained;
+pub mod selected;
 use super::{Bound, Error};
 use crate::{admission::work::Charge, nfc::HeaderBudget, ports::Tick};
 pub use td_json::string::{Progress, Status};
@@ -21,6 +22,7 @@ pub struct Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> {
     position: usize,
     total: usize,
     credit: u8,
+    selection: Option<selected::Index>,
     failure: Option<Error>,
 }
 impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> {
@@ -36,6 +38,7 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 
             position: 0,
             total: 0,
             credit: 0,
+            selection: None,
             failure: None,
         };
         let total = cursor
@@ -97,7 +100,10 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 
         result
     }
     pub fn value(&self) -> Option<u16> {
-        if self.failure.is_some() || self.position != self.total {
+        if self.failure.is_some()
+            || self.position != self.total
+            || self.selection.as_ref().is_some_and(|index| !index.ready())
+        {
             return None;
         }
         self.source.value()?;
@@ -137,12 +143,51 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 
         self.outcome(result)
     }
     fn step(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
+        if self.selection.as_ref().is_some_and(|index| !index.ready()) {
+            return self.index_step(now);
+        }
         let written = self
             .total
             .checked_sub(self.position)
             .ok_or(Error::InvalidState)?
             .min(output.len())
             .min(64);
+        self.charge(now, 1, written)?;
+        let segments = self.segments()?;
+        let mut position = self.position;
+        if let Some(index) = self.selection.as_ref() {
+            for destination in output.get_mut(..written).ok_or(Error::InvalidState)? {
+                *destination = index.byte_at(position, segments)?;
+                position = position.checked_add(1).ok_or(Error::InvalidState)?;
+            }
+        } else {
+            for destination in output.get_mut(..written).ok_or(Error::InvalidState)? {
+                let mut offset = position;
+                let mut byte = None;
+                for segment in segments {
+                    if let Some(found) = segment.get(offset) {
+                        byte = Some(*found);
+                        break;
+                    }
+                    offset = offset
+                        .checked_sub(segment.len())
+                        .ok_or(Error::InvalidState)?;
+                }
+                *destination = byte.ok_or(Error::InvalidState)?;
+                position = position.checked_add(1).ok_or(Error::InvalidState)?;
+            }
+        }
+        self.position = position;
+        Ok(Progress {
+            written,
+            status: if self.position == self.total {
+                Status::Complete
+            } else {
+                Status::Yield
+            },
+        })
+    }
+    fn charge(&mut self, now: Tick, steps: u64, written: usize) -> Result<(), Error> {
         let structure = &mut self
             .source
             .original
@@ -153,7 +198,7 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 
             .structure;
         structure
             .budget
-            .charge(structure.work, now, 0, 1, &mut self.credit)
+            .charge(structure.work, now, 0, steps, &mut self.credit)
             .map_err(|error| Error::Original(super::super::Error::Admission(error)))?;
         structure
             .work
@@ -170,31 +215,37 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 
                     error,
                 )))
             })?;
+        Ok(())
+    }
+    fn index_step(&mut self, now: Tick) -> Result<Progress, Error> {
+        let index = self.selection.as_ref().ok_or(Error::InvalidState)?;
+        let fragment = self
+            .segments()?
+            .into_iter()
+            .next()
+            .ok_or(Error::InvalidState)?;
+        let count = index.remaining(fragment)?.min(64);
+        self.charge(
+            now,
+            u64::try_from(count).map_err(|_| Error::InvalidState)?,
+            0,
+        )?;
+        let mut index = self.selection.take().ok_or(Error::InvalidState)?;
         let segments = self.segments()?;
-        let mut position = self.position;
-        for destination in output.get_mut(..written).ok_or(Error::InvalidState)? {
-            let mut offset = position;
-            let mut byte = None;
-            for segment in segments {
-                if let Some(found) = segment.get(offset) {
-                    byte = Some(*found);
-                    break;
-                }
-                offset = offset
-                    .checked_sub(segment.len())
-                    .ok_or(Error::InvalidState)?;
-            }
-            *destination = byte.ok_or(Error::InvalidState)?;
-            position = position.checked_add(1).ok_or(Error::InvalidState)?;
-        }
-        self.position = position;
-        Ok(Progress {
-            written,
-            status: if self.position == self.total {
-                Status::Complete
+        let result = index.scan(segments, count).and_then(|()| {
+            if index.ready() {
+                Ok(Some(index.total(segments)?))
             } else {
-                Status::Yield
-            },
+                Ok(None)
+            }
+        });
+        self.selection = Some(index);
+        if let Some(total) = result? {
+            self.total = total;
+        }
+        Ok(Progress {
+            written: 0,
+            status: Status::Yield,
         })
     }
     pub fn finish(

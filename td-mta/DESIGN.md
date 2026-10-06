@@ -858,6 +858,16 @@ unfinished checks before capacity and sticky hiding. Only API §1.136's
 eight intervals are qualified. Per-part properties, request JSON
 parsing, whole admission and current publication remain later.
 
+M06ef selects ten existing source-bound part fields while retaining the
+original Bound, ordinal and actual descriptor. ALL preserves original
+emission; NONE freshly completes without work. Partial selections use a
+fixed bounded, funded index of original generated metadata, not a JSON
+request/source parser or reconstructed owner. Preserve selected strings,
+arrays, blob wire/null and canonical commas; freshly finalize both owners.
+Only API §1.137's eight intervals are allocation-qualified. Whole selected
+retention/collection/tree integration, headers/subParts, JSON requests,
+full admission and authenticated publication remain later.
+
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot
 select bodyStructure. They remain public facades over the same shared

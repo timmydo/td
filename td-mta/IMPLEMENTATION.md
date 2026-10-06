@@ -2336,6 +2336,18 @@ Initial independently landable increments:
   Per-part properties, JSON decoding, full admission and current
   authenticated publication remain later.
 
+- **M06ef — original source-bound part-field selection:** select ten
+  existing metadata/locator fields under original Bound and actual pin.
+  Preserve ALL bytes/turns/five fees and freshly complete NONE without
+  work; fund a fixed bounded metadata index for partial selections.
+  Preserve canonical commas, strings/arrays and blob wire/null. Keep
+  selection through fresh exclusive Member and original Bound release.
+  Pin all 1024 masks in the small generated-member index and exercise
+  representative source-bound selections, funding, freshness and original
+  custody. Add six compile-fail guards and eight scoped Rust allocation
+  intervals (API §1.137). Whole selected retention/collection/tree,
+  headers/subParts, request parsing and current publication follow.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

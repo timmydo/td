@@ -77,6 +77,7 @@ fn exact_and_spare_windows_preserve_original_members_and_descriptor_custody() {
                         assert_eq!(view.members, expected);
                         assert_eq!(view.members.as_ptr(), output_ptr);
                         let retained = cursor.finish(Tick(1)).unwrap();
+                        assert_eq!(retained.value().unwrap().properties, properties);
                         assert_eq!(retained.value().unwrap().members, expected);
                         let (serialized, actual, members) = retained.finish(Tick(1)).unwrap();
                         assert_eq!(actual, properties);

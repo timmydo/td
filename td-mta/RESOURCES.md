@@ -2500,6 +2500,19 @@ intervals, with cold original preparation/enclosing resources excluded
 and descriptor teardown counted. Earlier 137 intervals remain separate;
 native allocation, stack/RSS/full admission remain unqualified.
 
+M06ef source-bound part-field selection keeps the original
+Bound/ordinal, fixed nine-span index and pure Properties. The shared
+base Cursor also carries optional inline index state on legacy ALL
+paths. Cursor plus HeaderBudget, 64 output bytes and five segment
+references fits 1 KiB; Member fits 768 bytes. Whole backing/output
+remains separately caller-owned/admitted. Index at most 64 generated
+bytes per turn with exact interpretation and record/control funding;
+copy at most 64 bytes with exact wire debit and no source/I/O work. API
+§1.137 qualifies eight enumerated Rust allocation intervals with cold
+original preparation and counted descriptor teardown; earlier 145
+intervals remain separate. Native/stack/RSS/full admission and complete
+request/publication paths remain unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no
