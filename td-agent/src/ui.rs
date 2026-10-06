@@ -298,6 +298,9 @@ pub enum Request {
     Output { id: Id, number: u64 },
     /// Make this the default model, from Conversation → Default model….
     SetDefault(String),
+    /// Put conversation `conversation`'s workspace in this mode, from
+    /// Conversation → Auto mode in this workspace (DESIGN.md §11).
+    SetMode { conversation: Id, mode: Mode },
     /// Read what this conversation's workspace card shows; the session
     /// answers through `show_workspace` (DESIGN.md §7).
     Workspace(Id),
@@ -558,7 +561,12 @@ pub struct App {
     focus: Focus,
     focused: bool,
     capture: Option<Capture>,
+    /// The configuration's mode, a workspace's own when the human's rules
+    /// set none.
     mode: Mode,
+    /// Each workspace's mode as the human's rules set it, by its key;
+    /// none while the rules cannot be read, every workspace then `ask`.
+    modes: Option<Vec<(String, Mode)>>,
     /// td-agent's notes, which the Messages window shows.
     log: crate::notes::Log,
     /// Each row's workspace as the list's third column names it.
@@ -675,6 +683,10 @@ pub struct App {
     /// cleared before each, so a choice through another path (the
     /// control seam's) never reaches the window.
     keys_chosen: bool,
+    /// An input of `input_live` is being handled: only the human's own
+    /// pointer or keyboard sets a workspace's mode (DESIGN.md §11), never
+    /// the control seam.
+    live: bool,
     /// The key dialog while it is open, modal over the window.
     dialog: Option<KeyDialog>,
     /// Where the key file is, as the dialog says it; none when there is
@@ -730,6 +742,7 @@ impl App {
             focused: true,
             capture: None,
             mode,
+            modes: Some(Vec::new()),
             log: crate::notes::Log::default(),
             labels: Vec::new(),
             show_archived: false,
@@ -788,6 +801,7 @@ impl App {
             menu: menu::menu(surface, menu::State::default(), 1)
                 .map_err(|e| format!("the menu: {e}"))?,
             keys_chosen: false,
+            live: false,
             dialog: None,
             key_path: None,
             keyed: true,
@@ -964,9 +978,47 @@ impl App {
         format!(
             "{state}{retry}{keyless}{unread}{card} | {model} {effort} | {context} | cost {}{today}{credit} | mode {} | no limits | {} background",
             of(self.meter.spent, self.limits.conversation),
-            self.mode.word(),
+            self.shown_mode().word(),
             self.processes.values().map(Vec::len).sum::<usize>()
         )
+    }
+
+    /// Each workspace's mode as the human's rules set it, or none while
+    /// they cannot be read.
+    pub fn set_modes(&mut self, modes: Option<Vec<(String, Mode)>>) {
+        self.modes = modes;
+        self.touch();
+    }
+
+    /// The mode the status row says: the open conversation's workspace's,
+    /// `ask` for one with no workspace, the configuration's with none
+    /// open.
+    fn shown_mode(&self) -> Mode {
+        let open = self
+            .active
+            .as_ref()
+            .and_then(|id| self.rows.iter().find(|r| &r.id == id));
+        match open {
+            Some(row) if row.workspace.is_none() => Mode::Ask,
+            _ => self.workspace_mode().unwrap_or(self.mode),
+        }
+    }
+
+    /// The open conversation's workspace's mode: the human's rules', else
+    /// the configuration's, `ask` while the rules cannot be read; none
+    /// with no workspace open.
+    fn workspace_mode(&self) -> Option<Mode> {
+        let id = self.active.as_ref()?;
+        let row = self.rows.iter().find(|r| &r.id == id)?;
+        let key = row.workspace.as_ref()?.key(id);
+        Some(match &self.modes {
+            None => Mode::Ask,
+            Some(modes) => modes
+                .iter()
+                .rev()
+                .find(|(of, _)| of == &key)
+                .map_or(self.mode, |(_, mode)| *mode),
+        })
     }
 
     /// The open conversation's model: the human's choice, else the
@@ -2750,7 +2802,9 @@ impl App {
     /// only a choice made inside this call is reported.
     pub fn input_live(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) -> bool {
         self.keys_chosen = false;
+        self.live = true;
         self.input(input, clipboard);
+        self.live = false;
         std::mem::take(&mut self.keys_chosen)
     }
 
@@ -3001,6 +3055,20 @@ impl App {
             menu::Action::Model => self.open_picker(),
             menu::Action::Delete => self.open_delete(),
             menu::Action::DefaultModel => self.open_default_picker(),
+            menu::Action::AutoMode => {
+                if let (true, Some(id), Some(mode)) =
+                    (self.live, self.active.clone(), self.workspace_mode())
+                {
+                    let mode = match mode {
+                        Mode::Auto => Mode::Ask,
+                        Mode::Ask => Mode::Auto,
+                    };
+                    self.requests.push(Request::SetMode {
+                        conversation: id,
+                        mode,
+                    });
+                }
+            }
             menu::Action::Effort(level) => self.choose(self.wanted().0, Some(level.to_string())),
             // The list is the window's: `input_live` reports the choice.
             menu::Action::Keys => self.keys_chosen = true,
@@ -3239,6 +3307,7 @@ impl App {
             effort: self.effort(),
             reasoning: self.reasoning(model),
             show_archived: self.show_archived,
+            auto: self.workspace_mode().map(|mode| mode == Mode::Auto),
         };
         match menu::menu(self.surface, state, revision) {
             Ok(menu) => {
@@ -4597,7 +4666,7 @@ pub mod tests {
         let mut app = app();
         assert_eq!(
             app.status_line(),
-            "starting | m/default medium | ctx 0/200k | cost $0.0000 | mode auto | no limits | 0 background"
+            "starting | m/default medium | ctx 0/200k | cost $0.0000 | mode ask | no limits | 0 background"
         );
         app.update(
             Update::Up(Up::Hello {
@@ -4619,7 +4688,7 @@ pub mod tests {
         assert_eq!(
             app.status_line(),
             "idle | 1 new message: C-S-m | m/default medium | ctx 0/200k | cost $0.0000 \
-             | today $0.2500 | credit $7.5000 | mode auto | no limits | 0 background"
+             | today $0.2500 | credit $7.5000 | mode ask | no limits | 0 background"
         );
         // Each total against its limit, where one is set.
         app.set_limits(cost::Limits::default());
@@ -6249,6 +6318,38 @@ pub mod tests {
         assert!(!key_live(&mut app, "Right"));
     }
 
+    /// Conversation → Auto mode in this workspace by the live keyboard
+    /// asks for the mode; through the control seam's keys, nothing.
+    #[test]
+    fn only_the_live_keyboard_sets_a_workspaces_mode() {
+        use td_ui::driven;
+        let mut app = app();
+        app.add_row(Row {
+            workspace: Some(Workspace::Scratch),
+            ..row(9, 1)
+        });
+        app.set_active(id(9));
+        const CHORDS: &[&str] = &["F10", "Right", "Down", "Down", "Return"];
+        let hex = |text: &str| -> String { text.bytes().map(|b| format!("{b:02x}")).collect() };
+        let mut remote = crate::control::Remote { app: &mut app };
+        for (n, chord) in CHORDS.iter().enumerate() {
+            let line = format!("1\t{n}\tkey\t{}", hex(chord));
+            driven::request(&mut remote, line.as_bytes());
+        }
+        assert!(!app.menu_open());
+        assert!(app.take_requests().is_empty());
+        for chord in CHORDS {
+            key_live(&mut app, chord);
+        }
+        assert_eq!(
+            app.take_requests(),
+            [Request::SetMode {
+                conversation: id(9),
+                mode: Mode::Ask
+            }]
+        );
+    }
+
     /// Help → Keys through the control seam's keys or pointer chooses the
     /// item, but the window's next input reports no choice: only one made
     /// inside `input_live` is, and the seam delivers through `input`.
@@ -6795,6 +6896,67 @@ pub mod tests {
             "{}",
             app.status_line()
         );
+    }
+
+    /// The status row says the open conversation's workspace's mode:
+    /// the human's rules', else the configuration's, `ask` while the
+    /// rules cannot be read; Conversation > Auto mode in this workspace
+    /// asks the window for the other one.
+    #[test]
+    fn the_status_row_says_the_workspaces_mode_and_the_menu_changes_it() {
+        let mut app = app();
+        assert!(
+            app.status_line().contains("| mode ask |"),
+            "{}",
+            app.status_line()
+        );
+        app.add_row(Row {
+            workspace: Some(Workspace::Scratch),
+            ..row(9, 1)
+        });
+        app.set_active(id(9));
+        let key = Workspace::Scratch.key(&id(9));
+        assert!(app.status_line().contains("| mode auto |"));
+        app.set_modes(Some(vec![(key.clone(), Mode::Ask)]));
+        assert!(
+            app.status_line().contains("| mode ask |"),
+            "{}",
+            app.status_line()
+        );
+        // Not the control seam's.
+        app.menu_action(menu::Action::AutoMode);
+        assert!(app.take_requests().is_empty());
+        app.live = true;
+        app.menu_action(menu::Action::AutoMode);
+        assert_eq!(
+            app.take_requests(),
+            [Request::SetMode {
+                conversation: id(9),
+                mode: Mode::Auto
+            }]
+        );
+        app.set_modes(Some(vec![(key, Mode::Auto)]));
+        app.menu_action(menu::Action::AutoMode);
+        assert_eq!(
+            app.take_requests(),
+            [Request::SetMode {
+                conversation: id(9),
+                mode: Mode::Ask
+            }]
+        );
+        app.set_modes(None);
+        assert!(app.status_line().contains("| mode ask |"));
+        // No workspace: `ask`, and nothing to set.
+        app.set_modes(Some(Vec::new()));
+        app.add_row(row(8, 2));
+        app.set_active(id(8));
+        assert!(
+            app.status_line().contains("| mode ask |"),
+            "{}",
+            app.status_line()
+        );
+        app.menu_action(menu::Action::AutoMode);
+        assert!(app.take_requests().is_empty());
     }
 
     #[test]

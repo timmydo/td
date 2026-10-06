@@ -228,6 +228,9 @@ pub struct Session {
     /// What each failing background fetch, or base, last said, so it is
     /// said once until it changes or mends.
     troubles: std::collections::BTreeMap<String, String>,
+    /// The configuration's mode, a workspace's own when the human's rules
+    /// set none (DESIGN.md §11).
+    mode: crate::config::Mode,
 }
 
 /// A deletion of a repository workspace's conversation under way
@@ -329,6 +332,7 @@ impl Session {
                     answer,
                 } => self.decide(&conversation, call, answer),
                 Request::SetDefault(model) => self.set_default(model),
+                Request::SetMode { conversation, mode } => self.set_mode(&conversation, mode),
                 Request::Quit => self.quit = true,
             }
         }
@@ -387,13 +391,44 @@ impl Session {
             },
         );
         if remembered {
-            let rules = self.state.load_rules();
-            if let Err(e) = &rules {
+            self.repolicy();
+        }
+    }
+
+    /// The human's rules read again and sent to every conversation with
+    /// the configuration's mode, and each workspace's mode to the status
+    /// row (DESIGN.md §11): a file that cannot be read is said, and every
+    /// conversation asks before each call that acts.
+    fn repolicy(&mut self) {
+        let rules = self.state.load_rules();
+        match &rules {
+            Ok(text) => self.app.set_modes(
+                crate::rules::parse_policy(text)
+                    .ok()
+                    .map(|policy| policy.modes),
+            ),
+            Err(e) => {
                 let said = format!("your rules could not be read, so every call that changes a workspace or runs a command asks: {e}");
                 eprintln!("td-agent: {said}");
                 self.app.note(said);
+                self.app.set_modes(None);
             }
-            self.supervisor.repolicy(rules);
+        }
+        self.supervisor.repolicy(rules, self.mode);
+    }
+
+    /// Puts `conversation`'s workspace in `mode`, in the human's rules
+    /// (DESIGN.md §11), and sends every conversation the rules.
+    fn set_mode(&mut self, conversation: &Id, mode: crate::config::Mode) {
+        match set_mode(&self.state, conversation, mode) {
+            Ok(()) => {
+                self.app
+                    .note(format!("this workspace is now in {} mode", mode.word()));
+                self.repolicy();
+            }
+            Err(e) => self
+                .app
+                .note(format!("the workspace's mode is unchanged: {e}")),
         }
     }
 
@@ -1012,7 +1047,7 @@ impl Session {
         }
         match forget_rules(&self.state, ruled.as_deref(), id) {
             Ok(false) => {}
-            Ok(true) => self.supervisor.repolicy(self.state.load_rules()),
+            Ok(true) => self.repolicy(),
             Err(e) => {
                 eprintln!("td-agent: forgetting the rules for {id}: {e}");
                 said.push_str(&format!("; its rules stay in your rules file: {e}"));
@@ -1708,16 +1743,7 @@ pub fn run(
         key: key.clone(),
         client: client.clone(),
     };
-    let mut supervisor = Supervisor::new(program, state.root().to_path_buf(), setup);
-    // The human's rules: a file that cannot be read is said, and every
-    // conversation asks before each call that acts (DESIGN.md §11).
-    let rules = state.load_rules();
-    if let Err(e) = &rules {
-        let said = format!("your rules could not be read, so every call that changes a workspace or runs a command asks: {e}");
-        eprintln!("td-agent: {said}");
-        app.note(said);
-    }
-    supervisor.repolicy(rules);
+    let supervisor = Supervisor::new(program, state.root().to_path_buf(), setup);
     let fetcher = match Fetcher::start(
         client.base_url.clone(),
         key.as_ref().ok().cloned(),
@@ -1790,7 +1816,10 @@ pub fn run(
         refreshing: Vec::new(),
         heads: crate::upstream::Heads::default(),
         troubles: std::collections::BTreeMap::new(),
+        mode: config.mode,
     };
+    // Before any conversation starts.
+    session.repolicy();
     // What removals a crash cut short left (`removal::sweep`).
     if let Ok(data) = &session.data {
         let mut doomed = vec![data.join("ws")];
@@ -1864,6 +1893,18 @@ fn remember(
     Ok(format!("{} in your rules for {whose}", rules.join(", ")))
 }
 
+/// Puts `conversation`'s workspace in `mode` in the human's rules.
+fn set_mode(state: &StateDir, conversation: &Id, mode: crate::config::Mode) -> Result<(), String> {
+    let (metas, _) = state.list();
+    let workspace = metas
+        .into_iter()
+        .find(|meta| &meta.id == conversation)
+        .and_then(|meta| meta.workspace)
+        .ok_or("its conversation has no workspace")?;
+    let text = crate::rules::set_mode(&state.load_rules()?, &workspace.key(conversation), mode)?;
+    state.save_rules(&text)
+}
+
 /// Takes what deleted conversation `id` leaves out of the human's rules,
 /// its workspace `key`'s sections and its crossings: whether there were
 /// any.
@@ -1905,7 +1946,7 @@ fn remember_crossing(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::{default_model, forget_rules, names, remember, remember_crossing};
+    use super::{default_model, forget_rules, names, remember, remember_crossing, set_mode};
     use crate::workspace::Workspace;
 
     /// A card's "always" answer adds its rules under the conversation's
@@ -1976,6 +2017,18 @@ mod tests {
             remember_crossing(&state, &id, true, crate::rules::Crossed::Read, id.as_str()).is_err()
         );
         assert!(remember_crossing(&state, &id, true, crate::rules::Crossed::Read, "x").is_err());
+        // A workspace's mode, set and set again, one line.
+        set_mode(&state, &id, crate::config::Mode::Auto).unwrap();
+        set_mode(&state, &id, crate::config::Mode::Ask).unwrap();
+        assert!(set_mode(&state, &stranger, crate::config::Mode::Auto).is_err());
+        let policy = crate::rules::parse_policy(&state.load_rules().unwrap()).unwrap();
+        assert_eq!(
+            policy.modes,
+            [(
+                "directory /home/u/my%20notes".to_string(),
+                crate::config::Mode::Ask
+            )]
+        );
         assert!(!forget_rules(&state, Some("workspace td-1-ab"), &stranger).unwrap());
         assert!(forget_rules(&state, Some("directory /home/u/my%20notes"), &id).unwrap());
         assert_eq!(

@@ -67,6 +67,9 @@ pub enum Action {
     ShowOutput,
     /// A background process's row menu: kill it.
     KillProcess,
+    /// Put the open conversation's workspace in `auto` mode, or back in
+    /// `ask` (DESIGN.md §11).
+    AutoMode,
 }
 
 /// The File menu's items: label, the chord shown beside it (one that
@@ -96,6 +99,9 @@ pub const DELETE: &str = "Delete conversation\u{2026}";
 /// The Conversation menu's item, checked while archived conversations
 /// show in the list.
 pub const SHOW_ARCHIVED: &str = "Show archived";
+/// The Conversation menu's item, checked while the open conversation's
+/// workspace is in `auto` mode.
+pub const AUTO_MODE: &str = "Auto mode in this workspace";
 /// The row menu's items.
 pub const ARCHIVE: &str = "Archive";
 pub const UNARCHIVE: &str = "Unarchive";
@@ -114,6 +120,9 @@ pub struct State<'a> {
     pub effort: &'a str,
     pub reasoning: bool,
     pub show_archived: bool,
+    /// Whether the open conversation's workspace is in `auto` mode; none
+    /// without one.
+    pub auto: Option<bool>,
 }
 
 pub type Menu = Controller<'static, Action, u64>;
@@ -168,6 +177,16 @@ pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, m
         parent: Some(conversation),
         row: row(WORKSPACE, crate::card::CHORD, state.workspace, false),
         item: Item::Action(Action::Workspace),
+    });
+    nodes.push(Node {
+        parent: Some(conversation),
+        row: row(
+            AUTO_MODE,
+            "",
+            state.auto.is_some(),
+            state.auto == Some(true),
+        ),
+        item: Item::Action(Action::AutoMode),
     });
     nodes.push(Node {
         parent: Some(conversation),
@@ -288,6 +307,7 @@ mod tests {
         effort: "high",
         reasoning: true,
         show_archived: false,
+        auto: None,
     };
 
     fn surface() -> Surface {

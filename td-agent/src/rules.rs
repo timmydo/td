@@ -372,12 +372,38 @@ impl Crossing {
     }
 }
 
-/// The human's rules file, read: the rules for tool calls, and the
-/// standing answers for crossings.
+/// The human's rules file, read: the rules for tool calls, the standing
+/// answers for crossings, and each workspace's mode, by its key.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Policy {
     pub rules: Vec<Human>,
     pub crossings: Vec<Crossing>,
+    pub modes: Vec<(String, crate::config::Mode)>,
+}
+
+impl Policy {
+    /// Workspace `key`'s mode, as its last `mode` line sets it.
+    pub fn mode(&self, key: &str) -> Option<crate::config::Mode> {
+        self.modes
+            .iter()
+            .rev()
+            .find(|(of, _)| of == key)
+            .map(|(_, mode)| *mode)
+    }
+}
+
+/// A `mode` line's mode, `mode ask` or `mode auto`; none for a line that
+/// is not one.
+fn mode_line(line: &str) -> Option<Result<crate::config::Mode, String>> {
+    let mut words = line.split([' ', '\t']).filter(|w| !w.is_empty());
+    if words.next() != Some("mode") {
+        return None;
+    }
+    Some(match (words.next(), words.next()) {
+        (Some("ask"), None) => Ok(crate::config::Mode::Ask),
+        (Some("auto"), None) => Ok(crate::config::Mode::Auto),
+        _ => Err("a mode is `mode ask` or `mode auto`".into()),
+    })
 }
 
 /// The human's rules file's rules for tool calls (`parse_policy`).
@@ -395,8 +421,9 @@ enum Section {
 /// The human's rules file: a header, `[everywhere]`, `[<workspace>]` or
 /// `[crossings]`, then that section's lines, one a line: a workspace's
 /// or every workspace's rules as a repository's are written but allow
-/// rules among them, or crossings as `Crossing::parse` reads them; blank
-/// lines and `#` comments skipped.
+/// rules among them, a workspace's `mode ask` or `mode auto`, or
+/// crossings as `Crossing::parse` reads them; blank lines and `#`
+/// comments skipped.
 pub fn parse_policy(text: &str) -> Result<Policy, String> {
     if text.len() > MAX_HUMAN_FILE {
         return Err(format!("past {MAX_HUMAN_FILE} bytes"));
@@ -404,6 +431,7 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
     let mut section = None;
     let mut rules = Vec::new();
     let mut crossings = Vec::new();
+    let mut modes = Vec::new();
     for (at, line) in text.lines().enumerate() {
         // Comments too: a control escapes to six bytes on the wire.
         if line.chars().any(|c| c.is_control() && c != '\t') {
@@ -423,7 +451,7 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
             });
             continue;
         }
-        if rules.len() + crossings.len() == MAX_HUMAN_RULES {
+        if rules.len() + crossings.len() + modes.len() == MAX_HUMAN_RULES {
             return Err(format!("more than {MAX_HUMAN_RULES} rules"));
         }
         let scope = match section.clone() {
@@ -440,6 +468,17 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
             }
             Some(Section::Scope(scope)) => scope,
         };
+        if let Some(mode) = mode_line(line) {
+            let mode = mode.map_err(|why| format!("line {}: {why}", at + 1))?;
+            let Scope::Workspace(key) = scope else {
+                return Err(format!(
+                    "line {}: a mode is for one workspace, not every one",
+                    at + 1
+                ));
+            };
+            modes.push((key, mode));
+            continue;
+        }
         let rule = Rule::parse(line).map_err(|why| format!("line {}: {why}", at + 1))?;
         if rule.effect == Effect::Allow && scope == Scope::Everywhere {
             return Err(format!(
@@ -449,7 +488,33 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
         }
         rules.push(Human { scope, rule });
     }
-    Ok(Policy { rules, crossings })
+    Ok(Policy {
+        rules,
+        crossings,
+        modes,
+    })
+}
+
+/// `text`, the human's rules file, with workspace `key` in `mode`: each
+/// `mode` line under its header taken out, then one added below the
+/// file's last header when that is its, else under a new one, every
+/// other line kept. Refused when `text` is, or the result would be.
+pub fn set_mode(text: &str, key: &str, mode: crate::config::Mode) -> Result<String, String> {
+    parse_policy(text)?;
+    let header = format!("[{}]", workspace_key(key)?);
+    let mut kept = String::new();
+    let mut under = false;
+    for line in text.lines() {
+        let trimmed = line.trim_matches([' ', '\t']);
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            under = trimmed == header;
+        } else if under && mode_line(trimmed).is_some() {
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    append(&kept, &header, &[format!("mode {}", mode.word())])
 }
 
 /// What the human's standing answers say of conversation `from` doing
@@ -690,6 +755,12 @@ pub fn forget(text: &str, key: Option<&str>, id: &str) -> Result<Option<String>,
         let drop = if trimmed.starts_with('[') && trimmed.ends_with(']') {
             dropping = header.as_deref() == Some(trimmed);
             crossing = trimmed == crossings;
+            // The blank line that parted it from the one before goes too.
+            if dropping {
+                while out.ends_with("\n\n") {
+                    out.pop();
+                }
+            }
             dropping
         } else {
             dropping
@@ -2111,6 +2182,56 @@ mod tests {
             forget(&text, None, &a).unwrap().unwrap(),
             format!("[crossings]\nallow read {b} {c}\n")
         );
+    }
+
+    /// A workspace's mode: its last `mode` line, under its own header
+    /// only; setting it replaces each line there and keeps the rest.
+    #[test]
+    fn a_workspaces_mode_is_its_last_mode_line() {
+        use crate::config::Mode;
+        let text = "[workspace td-1-ab]\nmode auto\ndeny glob\n[workspace td-2-cd]\nmode ask\n[workspace td-1-ab]\nmode  ask\n";
+        let policy = parse_policy(text).unwrap();
+        assert_eq!(policy.mode("workspace td-1-ab"), Some(Mode::Ask));
+        assert_eq!(policy.mode("workspace td-2-cd"), Some(Mode::Ask));
+        assert_eq!(policy.mode("workspace td-3-ef"), None);
+        assert_eq!(policy.rules.len(), 1);
+        for (wrong, why) in [
+            (
+                "[everywhere]\nmode auto\n",
+                "line 2: a mode is for one workspace, not every one",
+            ),
+            (
+                "[workspace w]\nmode on\n",
+                "line 2: a mode is `mode ask` or `mode auto`",
+            ),
+            (
+                "[workspace w]\nmode auto ask\n",
+                "line 2: a mode is `mode ask` or `mode auto`",
+            ),
+        ] {
+            assert_eq!(parse_policy(wrong).unwrap_err(), why, "{wrong}");
+        }
+        assert!(parse_policy("[crossings]\nmode auto\n").is_err());
+        let set = set_mode(text, "workspace td-1-ab", Mode::Auto).unwrap();
+        assert_eq!(
+            set,
+            "[workspace td-1-ab]\ndeny glob\n[workspace td-2-cd]\nmode ask\n[workspace td-1-ab]\nmode auto\n"
+        );
+        assert_eq!(
+            parse_policy(&set).unwrap().mode("workspace td-1-ab"),
+            Some(Mode::Auto)
+        );
+        assert_eq!(
+            set_mode("", "workspace td-3-ef", Mode::Ask).unwrap(),
+            "[workspace td-3-ef]\nmode ask\n"
+        );
+        assert!(set_mode("", "everywhere", Mode::Auto).is_err());
+        assert!(set_mode("[x]\n", "workspace td-3-ef", Mode::Auto).is_err());
+        // A deleted workspace's mode goes with its section.
+        let gone = forget(&set, Some("workspace td-1-ab"), &"a".repeat(32))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_policy(&gone).unwrap().mode("workspace td-1-ab"), None);
     }
 
     /// The human's crossings: read in their section, each a pair and a

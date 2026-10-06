@@ -1272,6 +1272,7 @@ pub fn card(call: &Call) -> (String, Vec<String>) {
 }
 
 /// What a crossing would do with the other conversation.
+#[derive(Clone, Copy)]
 pub enum Reach<'a> {
     Message(&'a str),
     Search(&'a str),

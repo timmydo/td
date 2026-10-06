@@ -1395,10 +1395,12 @@ fn the_humans_rules_allow_a_command_here_and_deny_one_everywhere() {
     // Another workspace's allow is not this one's.
     h.down(&Down::Policy {
         version: 1,
+        mode: td_agent::config::Mode::Auto,
         rules: Ok("[workspace td-1]\nallow shell rm\n".into()),
     });
     h.down(&Down::Policy {
         version: 2,
+        mode: td_agent::config::Mode::Auto,
         rules: Ok(format!(
             "[workspace td-1]\nallow shell rm\n[{here}]\nallow shell rm -f\n"
         )),
@@ -1426,6 +1428,7 @@ fn the_humans_rules_allow_a_command_here_and_deny_one_everywhere() {
     // A deny for every workspace wins over the allow here.
     h.down(&Down::Policy {
         version: 3,
+        mode: td_agent::config::Mode::Auto,
         rules: Ok(format!(
             "[{here}]\nallow shell rm -f\n[everywhere]\ndeny shell rm\n"
         )),
@@ -1445,6 +1448,7 @@ fn the_humans_rules_allow_a_command_here_and_deny_one_everywhere() {
     // command, though the file allowed it, waits for the person.
     h.down(&Down::Policy {
         version: 4,
+        mode: td_agent::config::Mode::Auto,
         rules: Err("rules: line 2: names no tool".into()),
     });
     h.say("Once more.");
@@ -1462,6 +1466,91 @@ fn the_humans_rules_allow_a_command_here_and_deny_one_everywhere() {
     });
     let (_, outcome, _) = h.turn();
     assert_eq!(outcome, "replied", "{}", h.said());
+}
+
+/// A workspace's mode (DESIGN.md §11): in `auto`, the configuration's, a
+/// command inside the jail runs with no card, its approval the mode's;
+/// the human's rules putting this workspace in `ask` bring the card back,
+/// and putting it in `auto` while the card waits takes the card back
+/// and runs the command.
+#[test]
+fn auto_mode_runs_a_command_inside_the_jail_and_ask_mode_asks() {
+    use td_agent::config::Mode;
+    let mut h = Harness::new_in(
+        "auto-mode",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client::default());
+    let here = format!("conversation {}", h.id.as_str());
+    let auto = "the workspace is in auto mode, where a call inside the jail runs";
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: Mode::Auto,
+    });
+    h.say("Tidy the notes.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let ran = results(&events);
+    assert!(
+        ran.iter().any(|r| r.1.starts_with("error: the jail: ")),
+        "{ran:?}"
+    );
+    let shell = call_record(&events, "toolu_shell_01");
+    assert_eq!(
+        approvals(&events),
+        [(shell, "allow".into(), "mode".into(), Some(auto.into()))]
+    );
+
+    h.down(&Down::Policy {
+        version: 2,
+        rules: Ok(format!("[{here}]\nmode ask\n")),
+        mode: Mode::Auto,
+    });
+    h.say("Again.");
+    let (call, title, _) = h.until_ask();
+    assert_eq!(title, "Run a command");
+    h.down(&Down::Policy {
+        version: 3,
+        rules: Ok(format!("[{here}]\nmode ask\nmode auto\n")),
+        mode: Mode::Ask,
+    });
+    assert_eq!(h.until_withdrawn(), call);
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(
+        approvals(&events),
+        [(call, "allow".into(), "mode".into(), Some(auto.into()))]
+    );
+
+    // An ask of the human's holds in `auto` mode.
+    h.down(&Down::Policy {
+        version: 4,
+        rules: Ok(format!("[{here}]\nmode auto\nask shell\n")),
+        mode: Mode::Ask,
+    });
+    h.say("Once more.");
+    let (call, _, details) = h.until_ask();
+    assert!(details[0].starts_with("Asked because "), "{details:?}");
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(approvals(&events)[0].2, "human");
 }
 
 /// A card offers its "always" answers (DESIGN.md §11), and the human's
@@ -1491,6 +1580,7 @@ fn a_card_offers_always_and_a_rule_written_while_it_waits_decides_it() {
     let policy = |version: u64, rules: &str| Down::Policy {
         version,
         rules: Ok(rules.into()),
+        mode: td_agent::config::Mode::Ask,
     };
     h.say("Tidy the notes.");
     let (call, _, _) = h.until_ask();
@@ -1576,6 +1666,12 @@ fn a_third_identical_call_in_a_row_goes_to_the_person() {
         ],
     );
     h.setup(Client::default());
+    // Repetition goes to the person in `auto` mode too.
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
     h.say("Read the notes.");
     let (call, title, details) = h.until_ask();
     assert_eq!(title, "Read a file");
@@ -2003,6 +2099,12 @@ fn a_repositorys_rules_ask_for_a_read_and_refuse_a_command() {
     };
     while !matches!(h.next(), Up::Fetch { .. }) {}
     h.setup(Client::default());
+    // A repository's ask and deny hold in `auto` mode.
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
     h.down(&fetched);
     while !matches!(h.next(), Up::Prepared { .. }) {}
     h.say("Tidy the notes.");
@@ -3822,6 +3924,7 @@ fn a_run_of_messages_on_a_standing_answer_goes_back_to_the_person() {
     let me = h.id.as_str().to_string();
     h.down(&Down::Policy {
         version: 1,
+        mode: td_agent::config::Mode::Auto,
         rules: Ok(format!("[crossings]\nallow message {me} {other}\n")),
     });
     h.say("Tell the other conversation.");
@@ -3904,6 +4007,7 @@ fn a_crossing_answered_for_good_holds_one_way_only() {
     let allowed = format!("allow read {me} {other}");
     h.down(&Down::Policy {
         version: 1,
+        mode: td_agent::config::Mode::Auto,
         rules: Ok(format!("[crossings]\n{allowed}\n")),
     });
     h.say("What did the other conversation say?");
@@ -3928,6 +4032,7 @@ fn a_crossing_answered_for_good_holds_one_way_only() {
 
     h.down(&Down::Policy {
         version: 2,
+        mode: td_agent::config::Mode::Auto,
         rules: Ok(format!("[crossings]\nallow read {other} {me}\n")),
     });
     h.say("And again?");
@@ -3942,6 +4047,7 @@ fn a_crossing_answered_for_good_holds_one_way_only() {
     let denied = format!("deny read {me} {other}");
     h.down(&Down::Policy {
         version: 3,
+        mode: td_agent::config::Mode::Auto,
         rules: Ok(format!("[crossings]\n{denied}\n")),
     });
     assert_eq!(h.until_withdrawn(), call);
@@ -3987,6 +4093,7 @@ fn a_crossing_answered_for_good_holds_one_way_only() {
     // Rules unread: the card says so and offers nothing to keep.
     h.down(&Down::Policy {
         version: 4,
+        mode: td_agent::config::Mode::Auto,
         rules: Err("rules: line 1: names no tool".into()),
     });
     h.say("And now?");

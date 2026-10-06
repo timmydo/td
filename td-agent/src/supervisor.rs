@@ -166,6 +166,7 @@ impl Supervisor {
             policy: Down::Policy {
                 version: 0,
                 rules: Err("not read yet".into()),
+                mode: crate::config::Mode::Ask,
             },
             children: Vec::new(),
             open: None,
@@ -304,18 +305,24 @@ impl Supervisor {
         self.resend_setup();
     }
 
-    /// The human's rules, read again: every child is sent them, now or
-    /// when it starts, numbered one past the last (DESIGN.md §3, §11).
-    pub fn repolicy(&mut self, rules: Result<String, String>) {
+    /// The human's rules, read again, and the configuration's `mode`:
+    /// every child is sent them, now or when it starts, numbered one past
+    /// the last (DESIGN.md §3, §11).
+    pub fn repolicy(&mut self, rules: Result<String, String>, mode: crate::config::Mode) {
         let version = match &self.policy {
             Down::Policy { version, .. } => version.saturating_add(1),
             _ => 1,
         };
-        self.policy = Down::Policy { version, rules };
+        self.policy = Down::Policy {
+            version,
+            rules,
+            mode,
+        };
         if self.policy.encode().len() > frame::MAX_FRAME {
             self.policy = Down::Policy {
                 version,
                 rules: Err("the file is too large to send".into()),
+                mode,
             };
         }
         let bytes = self.policy.encode();
@@ -939,27 +946,31 @@ mod background_tests {
     fn the_policy_is_unread_until_read_and_never_past_a_frame() {
         let setup = Down::Pause { paused: false };
         let mut supervisor = Supervisor::new("td-agent".into(), "/nonexistent".into(), setup);
+        use crate::config::Mode;
         assert_eq!(
             supervisor.policy,
             Down::Policy {
                 version: 0,
                 rules: Err("not read yet".into()),
+                mode: Mode::Ask,
             }
         );
-        supervisor.repolicy(Ok("[everywhere]\ndeny shell rm\n".into()));
+        supervisor.repolicy(Ok("[everywhere]\ndeny shell rm\n".into()), Mode::Auto);
         assert_eq!(
             supervisor.policy,
             Down::Policy {
                 version: 1,
                 rules: Ok("[everywhere]\ndeny shell rm\n".into()),
+                mode: Mode::Auto,
             }
         );
-        supervisor.repolicy(Ok("\u{1}".repeat(crate::rules::MAX_HUMAN_FILE)));
+        supervisor.repolicy(Ok("\u{1}".repeat(crate::rules::MAX_HUMAN_FILE)), Mode::Auto);
         assert_eq!(
             supervisor.policy,
             Down::Policy {
                 version: 2,
                 rules: Err("the file is too large to send".into()),
+                mode: Mode::Auto,
             }
         );
     }

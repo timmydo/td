@@ -64,6 +64,9 @@ pub enum Down {
     Policy {
         version: u64,
         rules: Result<String, String>,
+        /// The configuration's mode, a workspace's own when the file
+        /// sets none.
+        mode: crate::config::Mode,
     },
     /// Undo, or redo, the step snapshotted at `step` (DESIGN.md §12).
     Restore { step: u64, undo: bool },
@@ -477,10 +480,15 @@ impl Down {
             Self::Pause { paused } => typed("pause", vec![("paused".into(), Json::Bool(*paused))]),
             Self::ClearTodo => typed("clear_todo", Vec::new()),
             Self::Kill { number } => typed("kill", vec![("number".into(), Json::from(*number))]),
-            Self::Policy { version, rules } => typed(
+            Self::Policy {
+                version,
+                rules,
+                mode,
+            } => typed(
                 "policy",
                 vec![
                     ("version".into(), Json::from(*version)),
+                    ("mode".into(), Json::Str(mode.word().into())),
                     match rules {
                         Ok(text) => ("rules".into(), Json::Str(text.clone())),
                         Err(why) => ("error".into(), Json::Str(why.clone())),
@@ -620,6 +628,11 @@ impl Down {
                     .get("version")
                     .and_then(Json::as_u64)
                     .ok_or("a policy with no version")?,
+                mode: match value.get("mode").and_then(Json::as_str) {
+                    Some("ask") => crate::config::Mode::Ask,
+                    Some("auto") => crate::config::Mode::Auto,
+                    _ => return Err("a policy with no mode".into()),
+                },
                 rules: match (value.get("rules"), value.get("error")) {
                     (Some(text), None) => {
                         let text = text.as_str().ok_or("a policy whose rules are not text")?;
@@ -1264,10 +1277,12 @@ mod tests {
             Down::Policy {
                 version: 2,
                 rules: Ok("[everywhere]\ndeny shell rm\n".into()),
+                mode: crate::config::Mode::Auto,
             },
             Down::Policy {
                 version: 3,
                 rules: Err("rules: line 1: names no tool".into()),
+                mode: crate::config::Mode::Ask,
             },
             Down::Restore {
                 step: 7,

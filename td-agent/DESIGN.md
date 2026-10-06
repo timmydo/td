@@ -1654,9 +1654,10 @@ ones and read as false. New events:
   cleared it.
 - `pause`: the human paused or resumed the conversation.
 - `approval`: the decision on a call, by whom (`human`; `td-agent` when
-  a card was withdrawn; `rule` when a rule refused it, from increment
-  13), and Jev's probabilities and the reason; the history tools show
-  only its outcome and who decided.
+  a card was withdrawn; from increment 13, `rule` when a rule refused or
+  allowed it and `mode` when `auto` mode ran it), and Jev's
+  probabilities and the reason; the history tools show only its outcome
+  and who decided.
 
 An `assistant` event carries its `tool_calls` (id, tool and the
 arguments as the model wrote them) when it made any. On load, every
@@ -3241,8 +3242,9 @@ first, and a newline after `&&`, `||` or `|` continues the command. A
 command the matcher cannot see into asks while any shell deny or ask
 rule exists, not only a deny. A segment of redirections alone, such
 as `> notes.txt`, is kept as a segment with no words, which no rule
-with words matches. Until modes land, every call that acts and no
-allow of the human's matches still takes the `ask` column's card.
+with words matches. A call that acts and that no allow of the human's
+matches takes its workspace's mode's column (As built (increment 13,
+modes)).
 
 **As built (increment 13, the human's rules).** The human's rules are
 the state directory's `rules`, read when the window starts: a header,
@@ -3323,6 +3325,36 @@ conversation's process names, and only for a conversation still there,
 and the card's wait, and the check before the crossing runs, take a
 changed policy as a tool call's do. Deleting a conversation takes every
 crossing to or from it out of the file.
+
+**As built (increment 13, modes).** A workspace's mode is a `mode ask`
+or `mode auto` line under its header in the human's rules file, the last
+one counting, and the configuration's `mode` where there is none;
+`[everywhere]` and `[crossings]` hold none. The window sends the
+configuration's mode with each policy, and the conversation judges by
+its workspace's: in `auto`, a call that acts runs with no card once no
+deny, ask, unread file, repetition or allow has decided it, since each
+such call runs inside the jail, its approval logged `by` `mode` with the
+reason. A crossing is never the mode's: in `auto` the table gives it to
+the classifier, which until it lands is the human, so it keeps its card.
+A card that waits when the workspace goes to `auto` is taken back and
+its call runs, as a rule's allow would. A call the mode or a rule let
+run, the person not having answered it, is judged again when a policy
+comes before it starts, from the one it was judged by: a deny refuses
+it, and a card goes to the person. With the human's rules unread, or no
+workspace, the mode is `ask`. Only the human sets a mode: Conversation >
+Auto mode in this workspace, checked while it is in `auto` and offered
+only with a workspace open, writes the line, every earlier `mode` line
+under that header taken out and every other line kept, and the window
+sends every conversation the file again. The item asks only when td-ui's
+window's own pointer or keyboard chose it, as Help > Keys shows only
+then: the control socket's keys and pointer reach it and choose nothing,
+and nothing of a conversation's process asks for it. The status row's
+`mode` says the open conversation's workspace's mode, `ask` for a
+conversation with no workspace and while the human's rules cannot be
+read, and the configuration's with none open. A deleted conversation's
+workspace's mode goes with its section, but a directory's, which
+outlives its conversations as its rules do; the blank line before a
+section that goes goes with it.
 
 **Repetition.** Three consecutive calls of one tool with identical
 arguments go to the human whatever the table says, as opencode's
@@ -3458,7 +3490,8 @@ workspace's jail and the git worker may do, grant nothing beyond the
 human's own authority, and carry no secure-attention claim. An action
 needing elevation is out of td-agent's reach by design.
 
-**As built (increment 10).** There is only `ask` mode, and the human
+**As built (increment 10).** There is only `ask` mode (modes come with
+increment 13), and the human
 rows that arise are a workspace's `write_file`, `edit_file`, `sed` and
 `shell`, and every conversation's crossings (§3, As built (peers)). For
 each, the conversation process sends the window `{"type":
