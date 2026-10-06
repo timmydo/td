@@ -138,6 +138,12 @@ pub enum Up {
     Title {
         title: String,
     },
+    /// The classifier's circuit breaker tripped (DESIGN.md §11): the
+    /// window puts the conversation's workspace in `ask` mode, which is
+    /// all it may ask for, and says why.
+    Brake {
+        why: String,
+    },
     /// A message the conversation refused, and why.
     Refused {
         delivery: String,
@@ -766,6 +772,7 @@ impl Up {
             Self::Title { title } => {
                 typed("title", vec![("title".into(), Json::Str(title.clone()))])
             }
+            Self::Brake { why } => typed("brake", vec![("why".into(), Json::Str(why.clone()))]),
             Self::Refused { delivery, reason } => typed(
                 "refused",
                 vec![
@@ -905,6 +912,9 @@ impl Up {
             },
             Some("title") => Self::Title {
                 title: string(&value, "title")?,
+            },
+            Some("brake") => Self::Brake {
+                why: string(&value, "why")?,
             },
             Some("refused") => Self::Refused {
                 delivery: string(&value, "delivery")?,
@@ -1214,6 +1224,9 @@ mod tests {
                 delivery: delivery.clone(),
             },
             Up::Title { title: "x".into() },
+            Up::Brake {
+                why: "it did not allow 3 actions in a row".into(),
+            },
             Up::Refused {
                 delivery,
                 reason: "too long".into(),

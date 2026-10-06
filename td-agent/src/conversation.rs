@@ -156,6 +156,48 @@ const CALL_REFUSED: &str = "not run: the person refused this call. That is their
 /// The most messages to one conversation a standing answer sends, since
 /// the human last wrote here, before each further one asks.
 const MESSAGES_UNASKED: usize = 3;
+
+/// The circuit breaker's bounds (DESIGN.md §11): verdicts of the
+/// classifier's that did not allow, in a row and in all.
+const BRAKE_RUN: usize = 3;
+const BRAKE_ALL: usize = 20;
+/// How the log says the breaker tripped, which also marks where its
+/// count starts again.
+const BRAKED: &str = "the classifier's circuit breaker put this workspace in ask mode: ";
+
+/// Why the circuit breaker trips on `events`, if it does: its count of
+/// the classifier's verdicts since it last tripped.
+fn tripped(events: &[Event]) -> Option<String> {
+    let start = events
+        .iter()
+        .rposition(|e| matches!(&e.kind, Kind::Notice { text } if text.starts_with(BRAKED)))
+        .map_or(0, |at| at + 1);
+    let (mut run, mut all) = (0, 0);
+    for event in events.get(start..).unwrap_or_default() {
+        match &event.kind {
+            Kind::Approval { outcome, by, .. } if by == "classifier" => {
+                if outcome == "allow" {
+                    run = 0;
+                } else {
+                    run += 1;
+                    all += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    if run >= BRAKE_RUN {
+        Some(format!(
+            "the classifier did not allow {run} actions in a row"
+        ))
+    } else if all >= BRAKE_ALL {
+        Some(format!(
+            "the classifier did not allow {all} actions since its breaker last tripped"
+        ))
+    } else {
+        None
+    }
+}
 /// Why such a message is asked.
 const UNASKED: &str = "this conversation has sent that one 3 messages or more since you last wrote here, and two conversations can keep messaging each other on standing answers";
 
@@ -467,6 +509,7 @@ pub fn serve_in(
         exited: VecDeque::new(),
         human: (0, Ok(crate::rules::Policy::default())),
         mode: crate::config::Mode::Ask,
+        braked: false,
     };
     // What this conversation read or wrote before, so a replacement of an
     // unchanged file needs no read again.
@@ -762,6 +805,9 @@ struct Session {
     /// The configuration's mode, as the window last sent it: a
     /// workspace's own when the human's rules set none (DESIGN.md §11).
     mode: crate::config::Mode,
+    /// The circuit breaker tripped since the window last sent a policy:
+    /// the workspace is in `ask` mode until the policy that says so.
+    braked: bool,
 }
 
 /// A remote whose remote-tracking refs could not be set to `tried`, and
@@ -1214,11 +1260,27 @@ impl Session {
         let rules = rules.and_then(|text| crate::rules::parse_policy(&text));
         self.human = (version, rules);
         self.mode = mode;
+        // The breaker holds until a policy the window read puts this
+        // workspace in `ask`: one sent before it wrote that, or none
+        // when it could not, leaves it held.
+        if self.braked && self.human.1.is_ok() && self.configured_mode() == crate::config::Mode::Ask
+        {
+            self.braked = false;
+        }
     }
 
     /// This conversation's workspace's mode: the human's rules', else the
     /// configuration's; `ask` with the rules unread or no workspace.
     fn workspace_mode(&self) -> crate::config::Mode {
+        if self.braked {
+            return crate::config::Mode::Ask;
+        }
+        self.configured_mode()
+    }
+
+    /// This conversation's workspace's mode as the policy sets it, the
+    /// breaker aside.
+    fn configured_mode(&self) -> crate::config::Mode {
         let meta = self.conversation.meta();
         match (&self.human.1, &meta.workspace) {
             (Ok(policy), Some(workspace)) => {
@@ -3354,13 +3416,18 @@ impl Session {
                         allowed = Some(("classifier", outcome.probabilities, Some(outcome.reason)));
                         None
                     } else {
-                        self.log(Kind::Approval {
-                            call: started,
-                            outcome: "ask".into(),
-                            by: "classifier".into(),
-                            probabilities: outcome.probabilities.clone(),
-                            reason: Some(outcome.reason.clone()),
-                        })?;
+                        // A verdict is logged, and counted by the breaker;
+                        // a classifier not asked gave none.
+                        if outcome.asked {
+                            self.log(Kind::Approval {
+                                call: started,
+                                outcome: "ask".into(),
+                                by: "classifier".into(),
+                                probabilities: outcome.probabilities.clone(),
+                                reason: Some(outcome.reason.clone()),
+                            })?;
+                            self.brake()?;
+                        }
                         jev = outcome.probabilities;
                         Some(Some(format!(
                             "the classifier did not allow it: {}",
@@ -4015,6 +4082,23 @@ impl Session {
         Ok(())
     }
 
+    /// The circuit breaker (DESIGN.md §11), after a verdict of the
+    /// classifier's that did not allow: three such in a row since its
+    /// last allow, or twenty, counted since the breaker last tripped, put
+    /// the workspace in `ask` mode, said in the log and asked of the
+    /// window. Only the human puts it back in `auto`.
+    fn brake(&mut self) -> Result<(), String> {
+        let Some(why) = tripped(self.conversation.events()) else {
+            return Ok(());
+        };
+        self.log(Kind::Notice {
+            text: format!("{BRAKED}{why}; only you can put it back in auto mode"),
+        })?;
+        self.braked = true;
+        self.send(&Up::Brake { why });
+        Ok(())
+    }
+
     /// The classifier on this conversation reaching conversation `to` as
     /// `reach` says (DESIGN.md §11): Jev and the reasoning stage asked at
     /// once, each request reserved, logged and settled as a title's is,
@@ -4022,6 +4106,7 @@ impl Session {
     /// leaves the action to the human, said in the outcome's reason.
     fn classify(&mut self, to: &store::Meta, reach: Reach) -> Result<classifier::Outcome, String> {
         let refused = |reason: String| classifier::Outcome {
+            asked: false,
             allow: false,
             probabilities: None,
             reason,
@@ -5275,6 +5360,60 @@ mod tests {
                     .collect(),
             },
         }
+    }
+
+    /// The breaker trips on three of the classifier's verdicts in a row
+    /// that did not allow, a human's answer not breaking the run and the
+    /// classifier's allow breaking it, or on twenty in all; it counts
+    /// again from where it last tripped.
+    #[test]
+    fn the_breaker_trips_on_three_in_a_row_or_twenty_in_all() {
+        let verdict = |seq: u64, outcome: &str, by: &str| Event {
+            seq,
+            time: 0,
+            kind: Kind::Approval {
+                call: seq,
+                outcome: outcome.into(),
+                by: by.into(),
+                probabilities: None,
+                reason: None,
+            },
+        };
+        let mut events = vec![
+            verdict(1, "ask", "classifier"),
+            verdict(2, "allow", "human"),
+            verdict(3, "ask", "classifier"),
+        ];
+        assert_eq!(tripped(&events), None);
+        events.push(verdict(4, "allow", "classifier"));
+        events.push(verdict(5, "ask", "classifier"));
+        events.push(verdict(6, "ask", "classifier"));
+        assert_eq!(tripped(&events), None);
+        events.push(verdict(7, "ask", "classifier"));
+        assert_eq!(
+            tripped(&events).as_deref(),
+            Some("the classifier did not allow 3 actions in a row")
+        );
+        events.push(Event {
+            seq: 8,
+            time: 0,
+            kind: Kind::Notice {
+                text: format!("{BRAKED}x"),
+            },
+        });
+        assert_eq!(tripped(&events), None);
+        // Twenty, never three in a row.
+        let mut seq = 9;
+        for _ in 0..10 {
+            for outcome in ["ask", "ask", "allow"] {
+                events.push(verdict(seq, outcome, "classifier"));
+                seq += 1;
+            }
+        }
+        assert_eq!(
+            tripped(&events).as_deref(),
+            Some("the classifier did not allow 20 actions since its breaker last tripped")
+        );
     }
 
     /// Messages to one conversation that started, counted back to the

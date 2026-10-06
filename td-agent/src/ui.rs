@@ -1690,7 +1690,8 @@ impl App {
             }
             Update::Up(Up::Event(event)) => self.event(event),
             // The window hands cards to `ask` and `withdraw`.
-            Update::Up(Up::Ask { .. } | Up::Withdraw { .. }) => {}
+            // The window says what the breaker did.
+            Update::Up(Up::Ask { .. } | Up::Withdraw { .. } | Up::Brake { .. }) => {}
             Update::Up(Up::Delivered { .. }) => {
                 if let Some(row) = self.active_row() {
                     row.activity = now;

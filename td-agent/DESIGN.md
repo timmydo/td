@@ -236,10 +236,12 @@ jail instances.
 **State shared across conversations** is the window process's: the
 human's rules, `deny everywhere` included, and each repository's
 `.td-agent/rules` as the git worker read them (§11); each workspace's
-mode, circuit-breaker counts and whether it has dropped to `ask`, which
-span a workspace's conversation and its forks; admitted remotes and
-allowlists; and every protected entry of the git chain, which it creates
-itself (§8). Conversation processes report verdicts to it and it pushes
+mode, kept in the human's rules file, and whether it has dropped to
+`ask` (as built, each conversation counts the circuit breaker's verdicts
+in its own log and asks the window to drop its workspace: §11, As built
+(increment 13, the circuit breaker)); admitted remotes and allowlists;
+and every protected entry of the git chain, which it creates itself
+(§8). Conversation processes report verdicts to it and it pushes
 every change down the socketpairs as a numbered policy version; a
 conversation process applies a change before its next decision, decides
 again any approval still pending under the version it arrived in, and
@@ -3410,6 +3412,32 @@ mode while `jev_required` is `false`. `jev_threshold` has no shipped
 value until increment 13's calibration records one, so Jev allows
 nothing until the human sets one.
 
+**As built (increment 13, the circuit breaker).** The breaker counts the
+classifier's verdicts, the approvals logged `by` `classifier`, in the
+conversation's own log: a classifier that was not asked, for want of a
+key, Jev while required, a price or room under a limit, gives no
+verdict, logs none and is not counted, so a workspace whose classifier
+cannot run is not dropped for it; one that was asked and failed, a
+stage's outage included, did not allow and is counted. After a verdict
+that did not allow, three such since the classifier's last allow, or
+twenty in all, counted since the breaker last tripped, trip it; the
+human's answers on the cards neither break the run nor count. Tripping
+logs a notice that says why and that only the human puts the workspace
+back in `auto`, which also marks where the count starts again; no other
+notice starts as it does, none carrying model text. The conversation
+then judges as in `ask` mode until a policy the window read puts its
+workspace in `ask`, and asks the window, with `Up::Brake`, to put it
+there, which the window writes to the human's rules file as the menu
+does and says so; when it cannot write it, it says that and puts the
+workspace in `ask` in every policy it sends, a conversation started
+again included, until the human chooses its mode or the window is
+started again; the hold is in its memory, not the file it could not
+write, and a hold it cannot apply leaves every conversation's rules
+unread, so every call asks. The window takes nothing else from it. The
+count is one conversation's: a directory workspace's other conversations
+keep their own, so twenty is counted per conversation, not per
+workspace, until the window keeps the counts.
+
 **Repetition.** Three consecutive calls of one tool with identical
 arguments go to the human whatever the table says, as opencode's
 `doom_loop` does: a loop is a symptom worth a person's look.
@@ -3501,7 +3529,8 @@ increment that lands the classifier records it.
 **Outcome.** A refusal by the human reaches the acting model as the tool's
 result with an instruction not to work around it. The circuit breaker
 counts only actions the table gives the classifier: after three
-consecutive such actions it did not allow, or twenty in a workspace, the
+consecutive such actions it did not allow, or twenty in a workspace (as
+built, in a conversation), the
 workspace drops to `ask` mode and says why; a human allow does not reset
 the run, and only the human restores `auto`. Every verdict, with Jev's
 probabilities, is in the log.

@@ -71,6 +71,8 @@ struct Harness {
     deltas: Vec<(u64, String, String)>,
     /// Events `until_text` heard, which the next `turn` begins with.
     heard: Vec<Event>,
+    /// Why each trip of the classifier's breaker was asked for.
+    brakes: Vec<String>,
     /// What the last card `until_ask` heard offered to remember.
     always: Option<td_agent::rules::Offer>,
     stderr: PathBuf,
@@ -138,6 +140,7 @@ impl Harness {
             spent: Vec::new(),
             sent: Vec::new(),
             deltas: Vec::new(),
+            brakes: Vec::new(),
             heard: Vec::new(),
             always: None,
             stderr,
@@ -200,6 +203,7 @@ impl Harness {
                 id: *id,
                 states: Vec::new(),
             }),
+            Up::Brake { why } => self.brakes.push(why.clone()),
             Up::Delta {
                 request,
                 reasoning,
@@ -4469,6 +4473,134 @@ fn a_repeated_crossing_and_a_waiting_one_stay_with_the_person() {
     assert_eq!(asked(&h), 2);
 }
 
+/// The classifier's circuit breaker (DESIGN.md §11): three crossings it
+/// does not allow in a row, each refused on its card, put the workspace
+/// in `ask` mode, said in the log and asked of the window; the next
+/// crossing goes to the person without the classifier being asked.
+#[test]
+fn three_crossings_the_classifier_does_not_allow_trip_its_breaker() {
+    let mut script = vec![
+        Reply::sse("stream-tool-read-other.sse"),
+        Reply::sse("stream-sonnet.sse"),
+        Reply::ok("title.json"),
+    ];
+    for _ in 0..4 {
+        script.push(Reply::sse("stream-tool-read-other.sse"));
+        script.push(Reply::sse("stream-sonnet.sse"));
+    }
+    let mut h = Harness::new_in(
+        "classifier-brake",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        script,
+    );
+    h.mock.route(
+        "typesafe/jev",
+        vec![
+            Reply::ok("jev-exceeds.json"),
+            Reply::ok("jev-exceeds.json"),
+            Reply::ok("jev-exceeds.json"),
+            Reply::ok("jev-matches.json"),
+        ],
+    );
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![Reply::ok("classifier-allow.json"); 4],
+    );
+    let other = Id::parse(&"b".repeat(32)).unwrap();
+    drop(
+        Conversation::open(
+            &h.state,
+            &other,
+            Some(Role::Conversation),
+            Duration::from_secs(3),
+        )
+        .unwrap(),
+    );
+    h.setup(Client {
+        allow_data_collection: true,
+        jev_threshold: Some(900),
+        ..Client::default()
+    });
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    for n in 0..3 {
+        h.say(&format!("Read it, {n}."));
+        let (call, _, details) = h.until_ask();
+        assert!(
+            details[0].starts_with("Asked because the classifier did not allow it: "),
+            "{details:?}"
+        );
+        h.down(&Down::Decision {
+            call,
+            allow: false,
+            always: None,
+        });
+        let (events, outcome, _) = h.turn();
+        assert_eq!(outcome, "replied", "{}", h.said());
+        let tripped = events.iter().any(|e| {
+            matches!(&e.kind, Kind::Notice { text }
+                if text.starts_with("the classifier's circuit breaker put this workspace in ask mode: "))
+        });
+        assert_eq!(tripped, n == 2, "{n}");
+    }
+    assert_eq!(
+        h.brakes,
+        ["the classifier did not allow 3 actions in a row"]
+    );
+    // The next goes to the person, the classifier not asked, a policy
+    // sent before the window wrote `ask` holding nothing back.
+    h.down(&Down::Policy {
+        version: 2,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    h.say("Read it once more.");
+    let (call, _, details) = h.until_ask();
+    assert!(!details[0].starts_with("Asked because"), "{details:?}");
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let jev = |h: &Harness| {
+        h.mock
+            .requests()
+            .iter()
+            .filter(|r| r.text().contains("typesafe/jev"))
+            .count()
+    };
+    assert_eq!(jev(&h), 3);
+    // The window's `ask`, then the human's `auto`: the classifier again.
+    let here = format!("conversation {}", h.id.as_str());
+    h.down(&Down::Policy {
+        version: 3,
+        rules: Ok(format!("[{here}]\nmode ask\n")),
+        mode: td_agent::config::Mode::Auto,
+    });
+    h.down(&Down::Policy {
+        version: 4,
+        rules: Ok(format!("[{here}]\nmode auto\n")),
+        mode: td_agent::config::Mode::Auto,
+    });
+    h.say("Read it now.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(jev(&h), 4);
+    assert_eq!(
+        approvals(&events)
+            .last()
+            .map(|a| (a.1.clone(), a.2.clone())),
+        Some(("allow".to_string(), "classifier".to_string()))
+    );
+}
+
 /// With Jev unavailable, `data_collection` being `deny`: a crossing is
 /// the person's while Jev is required, and the reasoning stage's alone
 /// when not; nothing is asked of Jev either way.
@@ -4518,8 +4650,15 @@ fn without_jev_the_classifier_allows_only_when_jev_is_not_required() {
         allow: false,
         always: None,
     });
-    let (_, outcome, _) = h.turn();
+    let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied", "{}", h.said());
+    // Not asked, the classifier gave no verdict, which its breaker would
+    // count.
+    assert!(
+        approvals(&events).iter().all(|a| a.2 == "human"),
+        "{:?}",
+        approvals(&events)
+    );
     // The process takes a new setup as it comes.
     h.setup(Client {
         jev_required: false,

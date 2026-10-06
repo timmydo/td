@@ -388,6 +388,9 @@ pub enum Fast {
 /// probabilities when it answered, and why.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Outcome {
+    /// Whether either stage was asked: an outcome of neither is no
+    /// verdict, and the circuit breaker does not count it.
+    pub asked: bool,
     pub allow: bool,
     pub probabilities: Option<String>,
     pub reason: String,
@@ -423,6 +426,7 @@ pub fn combine(
         Err(why) => (false, format!("the reasoning stage gave no answer: {why}")),
     };
     Outcome {
+        asked: true,
         allow: jev_allows && reasoning_allows,
         probabilities: match fast {
             Fast::Answered(jev) => Some(jev.shown()),

@@ -231,6 +231,10 @@ pub struct Session {
     /// The configuration's mode, a workspace's own when the human's rules
     /// set none (DESIGN.md §11).
     mode: crate::config::Mode,
+    /// The keys of the workspaces the classifier's breaker dropped to
+    /// `ask` whose mode could not be written: sent in `ask` until the
+    /// human chooses their mode.
+    held: Vec<String>,
 }
 
 /// A deletion of a repository workspace's conversation under way
@@ -400,7 +404,9 @@ impl Session {
     /// row (DESIGN.md §11): a file that cannot be read is said, and every
     /// conversation asks before each call that acts.
     fn repolicy(&mut self) {
-        let rules = self.state.load_rules();
+        // A workspace the breaker dropped whose mode could not be
+        // written is sent in `ask` all the same.
+        let rules = held(self.state.load_rules(), &self.held);
         match &rules {
             Ok(text) => self.app.set_modes(
                 crate::rules::parse_policy(text)
@@ -422,6 +428,10 @@ impl Session {
     fn set_mode(&mut self, conversation: &Id, mode: crate::config::Mode) {
         match set_mode(&self.state, conversation, mode) {
             Ok(()) => {
+                // The human's own choice ends any breaker's hold.
+                if let Ok(key) = workspace_key(&self.state, conversation) {
+                    self.held.retain(|held| held != &key);
+                }
                 self.app
                     .note(format!("this workspace is now in {} mode", mode.word()));
                 self.repolicy();
@@ -653,6 +663,28 @@ impl Session {
                 Update::Up(Up::Withdraw { call }) => {
                     self.app.withdraw(&id, Some(*call));
                     continue;
+                }
+                // The classifier's breaker: only ever `ask` (DESIGN.md
+                // §11).
+                Update::Up(Up::Brake { why }) => {
+                    let why = crate::tools::visible(why);
+                    match set_mode(&self.state, &id, crate::config::Mode::Ask) {
+                        Ok(()) => {
+                            self.app.note(format!("the classifier's circuit breaker tripped ({why}), so this conversation's workspace is in ask mode; only you can put it back in auto mode"));
+                            self.repolicy();
+                        }
+                        // Held in `ask` in what every conversation is sent
+                        // until the human chooses its mode.
+                        Err(e) => {
+                            if let Ok(key) = workspace_key(&self.state, &id) {
+                                if !self.held.contains(&key) {
+                                    self.held.push(key);
+                                }
+                            }
+                            self.app.note(format!("the classifier's circuit breaker tripped ({why}), but its workspace's mode could not be written: {e}; it is held in ask mode until you choose its mode"));
+                            self.repolicy();
+                        }
+                    }
                 }
                 // A process started again asks nothing yet.
                 Update::Up(Up::Hello { .. }) => self.app.withdraw(&id, None),
@@ -1818,6 +1850,7 @@ pub fn run(
         heads: crate::upstream::Heads::default(),
         troubles: std::collections::BTreeMap::new(),
         mode: config.mode,
+        held: Vec::new(),
     };
     // Before any conversation starts.
     session.repolicy();
@@ -1896,14 +1929,30 @@ fn remember(
 
 /// Puts `conversation`'s workspace in `mode` in the human's rules.
 fn set_mode(state: &StateDir, conversation: &Id, mode: crate::config::Mode) -> Result<(), String> {
+    let key = workspace_key(state, conversation)?;
+    let text = crate::rules::set_mode(&state.load_rules()?, &key, mode)?;
+    state.save_rules(&text)
+}
+
+/// The human's rules as read, with each workspace of `keys` put in
+/// `ask` mode; refused when they are, or such a line cannot be added.
+fn held(rules: Result<String, String>, keys: &[String]) -> Result<String, String> {
+    rules.and_then(|text| {
+        keys.iter().try_fold(text, |text, key| {
+            crate::rules::set_mode(&text, key, crate::config::Mode::Ask)
+        })
+    })
+}
+
+/// `conversation`'s workspace's key, as its record names the workspace.
+fn workspace_key(state: &StateDir, conversation: &Id) -> Result<String, String> {
     let (metas, _) = state.list();
     let workspace = metas
         .into_iter()
         .find(|meta| &meta.id == conversation)
         .and_then(|meta| meta.workspace)
         .ok_or("its conversation has no workspace")?;
-    let text = crate::rules::set_mode(&state.load_rules()?, &workspace.key(conversation), mode)?;
-    state.save_rules(&text)
+    Ok(workspace.key(conversation))
 }
 
 /// Takes what deleted conversation `id` leaves out of the human's rules,
@@ -1947,7 +1996,7 @@ fn remember_crossing(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::{default_model, forget_rules, names, remember, remember_crossing, set_mode};
+    use super::{default_model, forget_rules, held, names, remember, remember_crossing, set_mode};
     use crate::workspace::Workspace;
 
     /// A card's "always" answer adds its rules under the conversation's
@@ -2018,6 +2067,18 @@ mod tests {
             remember_crossing(&state, &id, true, crate::rules::Crossed::Read, id.as_str()).is_err()
         );
         assert!(remember_crossing(&state, &id, true, crate::rules::Crossed::Read, "x").is_err());
+        // A workspace the breaker holds is sent in `ask`, the file as it
+        // was; a file not read stays refused.
+        let file = "[workspace td-1-ab]\nmode auto\n".to_string();
+        let sent = held(Ok(file.clone()), &["workspace td-1-ab".to_string()]).unwrap();
+        assert_eq!(
+            crate::rules::parse_policy(&sent)
+                .unwrap()
+                .mode("workspace td-1-ab"),
+            Some(crate::config::Mode::Ask)
+        );
+        assert_eq!(held(Ok(file.clone()), &[]).unwrap(), file);
+        assert!(held(Err("unread".into()), &["workspace td-1-ab".to_string()]).is_err());
         // A workspace's mode, set and set again, one line.
         set_mode(&state, &id, crate::config::Mode::Auto).unwrap();
         set_mode(&state, &id, crate::config::Mode::Ask).unwrap();
