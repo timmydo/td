@@ -12489,6 +12489,17 @@ fn body_property_json_arguments() {
     }
 }
 
+fn body_property_requests() {
+    let mut samples = [COUNTERS.snapshot(); 16];
+    let mut slots = samples.iter_mut();
+    body_properties::request::probe_allocations(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|sample| !sample.invalid));
+    for [before, after] in samples.as_chunks::<2>().0 {
+        assert_eq!(before, after, "body property requests allocated");
+    }
+}
+
 fn whole_source_bound_members() {
     use mime_traversal::bound::ordered::body_lists::response::collected::composed::retained::locators::pinned::members::retained;
     let mut samples = [COUNTERS.snapshot(); 16];
@@ -13009,6 +13020,7 @@ fn main() {
     body_property_names();
     body_property_selections();
     body_property_json_arguments();
+    body_property_requests();
     whole_source_bound_members();
     collected_source_bound_members();
     composed_source_bound_members();

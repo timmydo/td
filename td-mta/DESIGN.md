@@ -961,6 +961,16 @@ not a persistent request-arena pool. API §1.145 defines exact turn and
 EOF costs and the eight isolated Rust intervals. Full request decoding,
 composition wiring/admission and authenticated publication remain later.
 
+M06eo joins admitted JSON fragment decoding and original BodyPart
+semantic selection through a single passive request cursor. No whole
+view escapes between stages; omission alone immediately selects the
+ten-field default. Transfer complete decoded key loans without copying
+or adding a second parser turn. Original sticky errors, exact debits,
+first header loans and caller storage stay intact. API §1.146 scopes
+the eight Rust intervals and fixed cursor footprint. Whole request
+framing, configurable composition/admission and authenticated
+publication remain later.
+
 The four-list-only selected source-bound adapters retain a narrower type
 contract than requested tree/list selection: their Properties cannot
 select bodyStructure. They remain public facades over the same shared

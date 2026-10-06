@@ -2603,6 +2603,16 @@ Consumed cells must be reconstructed after decoded loans end. API
 stay separate. Native allocation, stack/RSS, full request admission and
 current authenticated publication remain unqualified.
 
+M06eo's joined argument/semantic selection Cursor fits 512 bytes. Text
+capacities, key-reference slots and header cells remain separately
+caller-owned/admitted. Each turn forwards one original parser poll;
+paid JSON EOF transfers decoded loans without key scans/copies or a
+second charged turn. Original maxima are 184 input visits, 32 records
+and four output bytes. Default completion does no work. API §1.146
+qualifies eight Rust intervals; earlier 217 remain separate. Native
+allocation, stack/RSS, whole request admission and current authenticated
+publication remain unqualified.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

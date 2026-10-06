@@ -2436,6 +2436,16 @@ Initial independently landable increments:
   two guards and eight Rust allocation intervals are scoped by API
   §1.145; full request admission/composition/publication remain later.
 
+- **M06eo — joined bodyProperties request selection:** connect bounded
+  JSON fragment decoding to original semantic aggregation over caller
+  storage. Omitted/default and explicit empty stay distinct; decoded
+  keys transfer without copying, and no whole View escapes before
+  semantic completion. Forward one original poll/debit per turn and
+  retain exact sticky errors. Ten units, two guards and eight Rust
+  intervals qualify API §1.146. Whole request framing/admission,
+  configurable composition wiring and authenticated publication remain
+  later.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

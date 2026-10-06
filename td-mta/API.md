@@ -6255,6 +6255,51 @@ allocation, stack/RSS, complete request UTF-8 validation/admission,
 selection-to-composition wiring and current authenticated publication
 remain unqualified.
 
+### 1.146 Decode and select one bodyProperties argument
+
+M06eo adds body_properties::request::Cursor, a facade joining §1.145's
+JSON argument decoder with §1.144's semantic selection over the same
+caller-owned text cells, decoded-key slots and header cells. None is
+immediately complete with the literal ten-field DEFAULT and an empty
+header prefix. Explicit [] remains complete NONE after its paid JSON
+EOF. Null, unknown names, Email aliases and malformed/forbidden header
+forms refuse whole success; the original parsers own each error.
+
+Each poll executes one original JSON or semantic-selection poll, with
+identical debits and bounds: at most 184 input visits, 32 records and
+four output bytes. After successful paid JSON EOF, finish the decoder
+and transfer its borrowed key prefix into the original selector without
+copying or scanning keys. An empty selector is immediately complete;
+otherwise recognition begins on the next turn. There is no extra
+transition fee or hidden second parser poll. Original exact key spelling,
+first duplicate header loan and selected cell prefix survive.
+
+Only complete semantic value/finish exposes the private-field View;
+JSON-only success is insufficient. First Json(error), Selection(error)
+or InvalidState remains exact and sticky across meters. Incomplete
+finish refuses InvalidState. Cached complete polls are passive/inert,
+including after deadline, and confer no job freshness/publication
+permission. Default fills no cells and consumes no work. Cursor is
+non-Copy/non-Clone and fits 512 bytes. Text capacities, key slots and
+header cells remain separately admitted cold storage; all decoded loans
+and stale tail lifetime rules in §1.144–1.145 still apply.
+
+Ten units and two guards pin literal default/empty/null choices,
+escaped metadata/structural fields and first header pointers, complete
+per-turn parity with both original stages, exact sticky syntax/capacity
+and semantic errors, every deadline cut, exact/one-short input/record/
+output limits, premature finish, cached complete views and a 64 KiB
+header loan. Eight sequential Rust allocation intervals cover paired
+omitted/explicit-empty completion, all twelve fields, long duplicate
+headers, null syntax refusal, unknown semantic refusal, header capacity
+refusal, isolated duplicate-comparison record refusal and semantic-start
+deadline refusal. All sixteen snapshots must be valid; caller text,
+source and refusal-state preparation stay cold. Earlier 217 intervals
+remain separate. Other masks/shapes/limits, incomplete finish and
+repeated cached polls remain allocation-unqualified. Native allocation,
+stack/RSS, whole request framing/admission, configurable composition
+wiring and current authenticated publication remain unqualified.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
