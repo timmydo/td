@@ -2170,6 +2170,17 @@ Initial independently landable increments:
   doctests and seven measured zero-allocation trials. Whole body-list/tree
   composition, locators and publication remain subsequent work.
 
+- **M06dq — whole original fragment collection:** consume original selected
+  ownership and exactly one distinct fixed cell/window per ordinal. Bind
+  private metadata/retention phases to that cell; only fresh complete child
+  consumption stores it and clears whole abandonment. Create exclusive
+  Serialized after all original ordinals; passive fragments/visitation
+  cannot substitute. Pin original backing, selection, preorder and owners,
+  every first-child prefix and all five quota cutoffs, capacity, reused/extra
+  cells, stale whole completion, seven exclusivity/constructor doctests and
+  seven additional measured Rust-allocation intervals. Body-list/tree
+  composition, locators and publication remain subsequent work.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

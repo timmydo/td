@@ -5175,6 +5175,41 @@ body-list/tree composition must wrap the live retention handoff and its
 original replay owner. Braces, locators, subparts, property selection
 and whole-response publication remain external.
 
+### 1.122 Whole original fragment collection
+
+M06dq adds response::collected. Cell::new binds one separately admitted
+caller output window. Collecting::new consumes only the original
+Selected owner and exactly one cell per original ordinal, freshly
+admitting before capacity inspection. Too few cells refuse
+ResponseCapacity; surplus cells refuse InvalidState. Completed Projected
+visitation and passive fragments cannot construct this owner. Cells are
+private storage, never authority.
+
+next binds original metadata replay and fresh fragment retention to that
+ordinal's cell. One child serially uses the original metadata backing
+and Scratch; its phases cannot escape to skip retention. Only fresh
+complete Child::finish stores its fragment and clears whole-collection
+abandonment. The same original admission owners fund control steps and
+the stored-cell record. No fragment wire byte is charged again by
+collection. Refusal, premature finish or safe forgetting retires the
+whole collection, including a completed child. Reused cells and extra
+next calls refuse stickily.
+
+Fresh whole finish creates exclusive Serialized only after every
+original ordinal has been retained. Its passive View contains original
+selection and cells in original preorder, with each complete fragment's
+descriptor/node. Explicit checks and consuming finish freshly admit,
+hide values after refusal and return the original work/header owners.
+Complete bytes remain provisional: braces, subparts, body-list/tree
+composition, authenticated locators, request property selection and
+publication are later boundaries.
+
+Collecting plus Child and HeaderBudget has a compiled 8 KiB ceiling;
+Serialized fits 256 bytes. Caller cells/windows are separately admitted,
+with no additional heap arena or source-sized internal storage. Seven
+additional Rust allocation trials preserve the previous 34 intervals;
+native-stack and RSS qualification remain separate.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -5478,8 +5478,9 @@ fn ordered_mime_classification() {
     let mut membership = [0; 8];
     let mut json_output = [0; 8];
     let mut retained_output = [0; 256];
+    let mut collection_output = [[0; 256]; 3];
     let before = COUNTERS.snapshot();
-    for trial in 0..34 {
+    for trial in 0..41 {
         let mut work = Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
             Charge {
@@ -5674,6 +5675,111 @@ fn ordered_mime_classification() {
             }
             assert!(done);
             let mut selected = selection.finish(Tick(1)).unwrap();
+            if trial >= 34 {
+                use td_mta::mime_traversal::bound::ordered::body_lists::response::collected::{
+                    Cell, Collecting,
+                };
+                let mut cells = collection_output.each_mut().map(|output| {
+                    Cell::new(output.get_mut(..if trial == 37 { 0 } else { 256 }).unwrap())
+                });
+                if trial == 40 {
+                    assert_eq!(
+                        Collecting::new(selected, &mut cells, Tick(100)).err(),
+                        Some(Error::Admission(td_mta::nfc::Error::Work(Stop::Deadline)))
+                    );
+                    assert_eq!(work.stopped(), Some(Stop::Deadline));
+                    continue;
+                }
+                let mut response = Collecting::new(selected, &mut cells, Tick(1)).unwrap();
+                let mut stopped = false;
+                for _ in 0..3 {
+                    let mut child = response
+                        .next(
+                            label_json::Backing {
+                                headers: mime_part_headers::Backing {
+                                    heads: &mut heads,
+                                    charset: &mut charset,
+                                    filename: &mut filename,
+                                },
+                                labels: td_mta::mime_label_fields::json::Backing {
+                                    content_id: &mut id,
+                                    content_language: &mut language,
+                                },
+                                content_location: &mut location,
+                            },
+                            &mut scratch,
+                            Tick(1),
+                        )
+                        .unwrap();
+                    if trial == 35 || trial == 38 {
+                        child.poll(Tick(1)).unwrap();
+                        if trial == 35 {
+                            assert_eq!(
+                                child.finish(Tick(100)).err(),
+                                Some(Error::Metadata(label_json::Error::Headers(
+                                    mime_part_headers::Error::Admission(td_mta::nfc::Error::Work(
+                                        Stop::Deadline
+                                    ))
+                                )))
+                            );
+                        } else {
+                            forget(child);
+                        }
+                        stopped = true;
+                        break;
+                    }
+                    let mut done = false;
+                    let mut refused = None;
+                    for _ in 0..100000 {
+                        match child.poll(Tick(1)) {
+                            Ok(Status::Complete) => {
+                                done = true;
+                                break;
+                            }
+                            Ok(Status::Yield) => {}
+                            Err(error) => {
+                                refused = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(error) = refused {
+                        assert_eq!(trial, 37);
+                        assert_eq!(error, Error::ResponseCapacity);
+                        assert!(child.value().is_none());
+                        assert_eq!(child.finish(Tick(1)).err(), Some(error));
+                        stopped = true;
+                        break;
+                    }
+                    assert!(done);
+                    if trial == 39 {
+                        forget(child);
+                        stopped = true;
+                        break;
+                    }
+                    child.finish(Tick(1)).unwrap();
+                }
+                if stopped {
+                    assert!(response.completed().is_err());
+                    assert!(response.finish(Tick(1)).is_err());
+                    continue;
+                }
+                let mut serialized = response.finish(Tick(1)).unwrap();
+                assert_eq!(serialized.value().unwrap().fragments.len(), 3);
+                if trial == 36 {
+                    let error = serialized.check_deadline(Tick(100)).unwrap_err();
+                    assert!(serialized.value().is_none());
+                    assert_eq!(serialized.finish(Tick(1)).err(), Some(error));
+                    continue;
+                }
+                let (view, work, budget) = serialized.finish(Tick(1)).unwrap();
+                assert!(view.fragments.iter().all(|cell| cell.value().is_some()));
+                assert_eq!(
+                    (std::ptr::from_mut(work), std::ptr::from_mut(budget)),
+                    (pointers.0, pointers.1)
+                );
+                continue;
+            }
             if trial >= 14 {
                 if trial == 20 {
                     assert_eq!(

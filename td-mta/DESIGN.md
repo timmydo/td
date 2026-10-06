@@ -704,6 +704,19 @@ without retention; later whole composition must consume the live
 retention path to prove storage. No new parser, arena allocation,
 allowance or source identity enters.
 
+M06dq wraps original selected replay, metadata framing and fixed
+retention in one whole collection. Exactly one separately admitted
+cell/window belongs to each original ordinal. Its child cannot detach
+either phase; only a fresh whole retained handoff stores that cell and
+clears collection abandonment. Retained passive bytes and Projected
+visitation cannot reconstruct this proof. Whole Serialized completion
+preserves original selection, preorder fragments and original
+work/header owners through fresh checks/consumption. Control steps and
+cell records use the original allowances, with no repeated wire debit.
+The collection adds no normalization, metadata parser, JSON serializer,
+source authority or publication algorithm. Enclosing body-list/tree
+composition, braces, locators and publication remain later boundaries.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

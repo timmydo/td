@@ -1,4 +1,5 @@
 //! Replay original selected part metadata in preorder for response composition.
+pub mod collected;
 pub mod json;
 use super::{Selected, View};
 use crate::{

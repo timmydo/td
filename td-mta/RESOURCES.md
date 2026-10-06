@@ -2247,6 +2247,27 @@ prefix, escaped/long-raw capacity cuts and sticky resource refusal. Full
 midstream windows preserve deadline priority. These checks do not
 qualify native stack or RSS.
 
+M06dq whole fragment collection uses one separately admitted Cell and
+output window per original ordinal. Metadata and framing/retention
+phases are serial and cannot escape their original slot. Collecting plus
+Child and HeaderBudget fits a compiled 8 KiB ceiling; Serialized fits
+256 bytes. Cell size is compile-checked at 128 bytes. Original
+allowances fund two steps and three records per slot, including the
+stored-cell record, with no source/I/O/wire debit. Collection does not
+copy or charge fragment bytes again. No source-sized internal buffer or
+heap is introduced.
+
+Rust allocation qualification preserves all 34 earlier trials and adds
+seven collection trials: healthy original release, partial deadline,
+completed-owner deadline, capacity, partial/complete safe forgetting and
+constructor expiry. All cell output storage exists before counting.
+Units pin original preorder/selection/backing/owners, every first-child
+progress prefix, every cutoff of five original counters,
+incomplete/extra/reused cells, capacity and fresh whole completion.
+Seven compile-fail guards pin exclusive owners and reject passive
+completed visitation as constructor input. These checks do not qualify
+native stack or RSS.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no
