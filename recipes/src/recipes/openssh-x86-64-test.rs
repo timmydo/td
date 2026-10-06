@@ -1,10 +1,10 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 pub fn recipe() -> Recipe {
     let openssh = "{in:openssh-x86-64}";
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let path = format!("{openssh}/bin:{{tools}}:{}", post_bootstrap_path());
+    let path = format!("{openssh}/bin:{{tools}}");
     let binaries = [
         format!("{openssh}/bin/ssh"),
         format!("{openssh}/bin/sshd"),
@@ -22,6 +22,7 @@ pub fn recipe() -> Recipe {
     let server_config = super::system_x86_64::ssh_policy::config("alice");
 
     let mut steps = vec![
+        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
         Step::Require {
             paths: binaries.to_vec(),
             exec: true,
@@ -46,7 +47,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "for binary in {}; do \
@@ -82,7 +83,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "v=$('{openssh}/bin/ssh' -V 2>&1) || exit 1; \
@@ -115,7 +116,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "for user in alice tester root; do \
@@ -149,12 +150,14 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("openssh-x86-64-test", "1.0")
-        .native_inputs(&[
-            "openssh-x86-64",
-            "glibc-x86-64",
-            "binutils-x86-64-self",
-            "busybox-x86-64",
-        ])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &[
+                "openssh-x86-64",
+                "glibc-x86-64",
+                "binutils-x86-64-self",
+            ],
+        ))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -177,10 +180,14 @@ mod tests {
             recipe.native_inputs.as_deref(),
             Some(
                 [
+                    "td-sh",
+                    "td-txt",
+                    "td-util",
+                    "uutils",
+                    "gawk-x86-64-self",
                     "openssh-x86-64",
                     "glibc-x86-64",
                     "binutils-x86-64-self",
-                    "busybox-x86-64",
                 ]
                 .map(str::to_string)
                 .as_slice()

@@ -1,4 +1,6 @@
-use crate::ladder::{post_bootstrap_path, split_target_debug, unpack_into, POST_BOOTSTRAP_SH};
+use crate::ladder::{
+    post_rust_inputs, post_rust_tool_farm, split_target_debug, unpack_into, POST_RUST_SH,
+};
 use crate::types::{Recipe, Step};
 
 // OpenSSH Portable supplies td's SSH client and daemon from one pinned source.
@@ -32,23 +34,13 @@ pub fn recipe() -> Recipe {
     let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
     let sbin = "{in:binutils-x86-64-self}/bin";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
-    let path = format!("{{root}}/wb:{{tools}}:{sbin}:{}", post_bootstrap_path());
+    let path = format!("{{root}}/wb:{{tools}}:{sbin}");
 
     let mut steps = unpack_into("openssh-x86-64-source", "{src}");
-    steps.push(Step::ToolFarm {
-        links: [
-            "awk", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "diff", "dirname",
-            "echo", "egrep", "env", "expr", "false", "find", "grep", "head", "install", "ln", "ls",
-            "mkdir", "mktemp", "mv", "printf", "pwd", "rm", "rmdir", "sed", "sort", "tail", "tee",
-            "test", "touch", "tr", "true", "uname", "wc", "which", "xargs",
-        ]
-        .iter()
-        .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))
-        .collect(),
-    });
+    steps.push(post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
-        shell: POST_BOOTSTRAP_SH.into(),
+        shell: POST_RUST_SH.into(),
     });
     steps.push(Step::WriteFile {
         path: "{src}/auth-passwd.c".into(),
@@ -61,7 +53,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/wb/cc".into(),
         content: format!(
-            "#!{POST_BOOTSTRAP_SH}\n\
+            "#!{POST_RUST_SH}\n\
              exec \"{sgcc}\" -isystem \"{xglibc}/include\" \
              -B\"{sbin}/\" -B\"{xglibc}/lib\" \
              -L\"{xglibc}/lib\" \"$@\" \
@@ -78,7 +70,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}/build",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "{src}/configure",
                 "--build=x86_64-pc-linux-gnu",
                 "--host=x86_64-pc-linux-gnu",
@@ -113,8 +105,8 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("PATH", &path)
-        .env("CONFIG_SHELL", POST_BOOTSTRAP_SH)
-        .env("SHELL", POST_BOOTSTRAP_SH)
+        .env("CONFIG_SHELL", POST_RUST_SH)
+        .env("SHELL", POST_RUST_SH)
         .env("CC", "{root}/wb/cc")
         .env("AR", "{in:binutils-x86-64-self}/bin/ar")
         .env("RANLIB", "{in:binutils-x86-64-self}/bin/ranlib")
@@ -129,7 +121,7 @@ pub fn recipe() -> Recipe {
             &[
                 "{in:make-x86-64-self}/bin/make",
                 "-j{jobs}",
-                &format!("SHELL={POST_BOOTSTRAP_SH}"),
+                &format!("SHELL={POST_RUST_SH}"),
                 "ssh",
                 "sshd",
                 "sshd-session",
@@ -138,7 +130,7 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("PATH", &path)
-        .env("SHELL", POST_BOOTSTRAP_SH)
+        .env("SHELL", POST_RUST_SH)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     for dir in ["{out}/bin", "{out}/libexec"] {
@@ -172,13 +164,15 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("openssh-x86-64", "10.5p1")
         .source_input("openssh-x86-64-source")
-        .native_inputs(&[
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-            "make-x86-64-self",
-            "busybox-x86-64",
-        ])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &[
+                "gcc-x86-64-self",
+                "binutils-x86-64-self",
+                "glibc-x86-64",
+                "make-x86-64-self",
+            ],
+        ))
         .steps(steps)
 }
 
@@ -194,11 +188,15 @@ mod tests {
             recipe.native_inputs.as_deref(),
             Some(
                 [
+                    "td-sh",
+                    "td-txt",
+                    "td-util",
+                    "uutils",
+                    "gawk-x86-64-self",
                     "gcc-x86-64-self",
                     "binutils-x86-64-self",
                     "glibc-x86-64",
                     "make-x86-64-self",
-                    "busybox-x86-64",
                 ]
                 .map(str::to_string)
                 .as_slice()

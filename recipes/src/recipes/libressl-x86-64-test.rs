@@ -1,4 +1,4 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // Behavioral validation for the static TLS foundation. The test links a fresh
@@ -12,9 +12,9 @@ pub fn recipe() -> Recipe {
     let sbin = "{in:binutils-x86-64-self}/bin";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let tls = "{in:libressl-x86-64}";
-    let path = format!("{{tools}}:{sbin}:{}", post_bootstrap_path());
+    let path = format!("{{tools}}:{sbin}");
 
-    let mut steps = Vec::new();
+    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
     for (name, archive, source, comp_dir_pattern, compat_members) in [
         (
             "crypto",
@@ -46,7 +46,7 @@ pub fn recipe() -> Recipe {
             Step::run(
                 &format!("{{root}}/archive/{name}"),
                 &[
-                    POST_BOOTSTRAP_SH,
+                    POST_RUST_SH,
                     "-c",
                     &format!(
                         "found_source=0; objects=0; \
@@ -77,7 +77,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 "for archive in '{in:libressl-x86-64}/lib/libcrypto.a' '{in:libressl-x86-64}/lib/libssl.a'; do \
                      if grep -a -Fq '/gnu/store' \"$archive\"; then echo 'LibreSSL archive retains a foreign store reference' >&2; exit 1; fi; \
@@ -289,7 +289,7 @@ int main(void) {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 "actual=$('{root}/tls-test') || { echo 'LibreSSL verified-handshake probe failed' >&2; exit 1; }; \
                  [ \"$actual\" = 'LibreSSL 4.3.2 verified TLS handshake OK' ] || { echo \"unexpected LibreSSL result: $actual\" >&2; exit 1; }",
@@ -311,13 +311,15 @@ int main(void) {
     });
 
     Recipe::mesboot("libressl-x86-64-test", "1.0")
-        .native_inputs(&[
-            "libressl-x86-64",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-            "busybox-x86-64",
-        ])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &[
+                "libressl-x86-64",
+                "gcc-x86-64-self",
+                "binutils-x86-64-self",
+                "glibc-x86-64",
+            ],
+        ))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -340,11 +342,15 @@ mod tests {
             recipe.native_inputs.as_deref(),
             Some(
                 [
+                    "td-sh",
+                    "td-txt",
+                    "td-util",
+                    "uutils",
+                    "gawk-x86-64-self",
                     "libressl-x86-64",
                     "gcc-x86-64-self",
                     "binutils-x86-64-self",
                     "glibc-x86-64",
-                    "busybox-x86-64",
                 ]
                 .map(str::to_string)
                 .as_slice()

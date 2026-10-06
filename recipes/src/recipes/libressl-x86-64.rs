@@ -1,4 +1,6 @@
-use crate::ladder::{post_bootstrap_path, split_target_debug, unpack_into, POST_BOOTSTRAP_SH};
+use crate::ladder::{
+    post_rust_inputs, post_rust_tool_farm, split_target_debug, unpack_into, POST_RUST_SH,
+};
 use crate::types::{Recipe, Step, TextEdit};
 
 // LibreSSL 4.3.2 provides the OpenSSL-compatible TLS surface curl and Git will
@@ -18,28 +20,17 @@ pub fn recipe() -> Recipe {
     let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
     let sbin = "{in:binutils-x86-64-self}/bin";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
-    let path = format!("{{root}}/wb:{{tools}}:{sbin}:{}", post_bootstrap_path());
+    let path = format!("{{root}}/wb:{{tools}}:{sbin}");
 
     let mut steps = unpack_into("libressl-x86-64-source", "{src}");
     // GNU libtool expands the convenience libcompat.a into libcrypto.a by
-    // walking its extraction directory with `find`. Autoconf and libtool also
-    // use utilities that the installed post-bootstrap BusyBox farm deliberately
-    // omits. Expose the reviewed multicall applets explicitly; without `find`,
-    // libtool still exits successfully but silently emits an incomplete archive.
-    steps.push(Step::ToolFarm {
-        links: [
-            "awk", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "diff", "dirname",
-            "echo", "env", "expr", "false", "find", "grep", "head", "install", "ln", "ls", "mkdir",
-            "mktemp", "mv", "printf", "pwd", "rm", "rmdir", "sed", "sort", "tail", "tee", "test",
-            "touch", "tr", "true", "uname", "wc", "which", "xargs",
-        ]
-        .iter()
-        .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))
-        .collect(),
-    });
+    // walking its extraction directory with `find`, which the farm serves;
+    // without it libtool still exits successfully but silently emits an
+    // incomplete archive.
+    steps.push(post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
-        shell: POST_BOOTSTRAP_SH.into(),
+        shell: POST_RUST_SH.into(),
     });
 
     // Libtool's generated x86-64 ABI probe names /usr/bin/file directly. The
@@ -56,7 +47,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/wb/file".into(),
         content: format!(
-            "#!{POST_BOOTSTRAP_SH}\n\
+            "#!{POST_RUST_SH}\n\
              h=$('{sbin}/readelf' -h \"$1\") || exit 1\n\
              case \"$h\" in\n\
              *'Class:'*'ELF64'*) printf '%s\\n' 'ELF 64-bit LSB relocatable';;\n\
@@ -69,7 +60,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/wb/cc".into(),
         content: format!(
-            "#!{POST_BOOTSTRAP_SH}\n\
+            "#!{POST_RUST_SH}\n\
              exec \"{sgcc}\" -static -isystem \"{xglibc}/include\" \
              -B\"{sbin}/\" -B\"{xglibc}/lib\" \
              -L\"{xglibc}/lib\" -static-libgcc \"$@\" \
@@ -84,7 +75,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "./configure",
                 "--build=x86_64-pc-linux-gnu",
                 "--host=x86_64-pc-linux-gnu",
@@ -98,8 +89,8 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("PATH", &path)
-        .env("CONFIG_SHELL", POST_BOOTSTRAP_SH)
-        .env("SHELL", POST_BOOTSTRAP_SH)
+        .env("CONFIG_SHELL", POST_RUST_SH)
+        .env("SHELL", POST_RUST_SH)
         .env("CC", "{root}/wb/cc")
         .env("CCAS", "{root}/wb/cc")
         .env("AR", "{in:binutils-x86-64-self}/bin/ar")
@@ -122,12 +113,12 @@ pub fn recipe() -> Recipe {
                     "-C",
                     dir,
                     target,
-                    &format!("SHELL={POST_BOOTSTRAP_SH}"),
+                    &format!("SHELL={POST_RUST_SH}"),
                 ],
             )
             .env("PATH", &path)
-            .env("CONFIG_SHELL", POST_BOOTSTRAP_SH)
-            .env("SHELL", POST_BOOTSTRAP_SH)
+            .env("CONFIG_SHELL", POST_RUST_SH)
+            .env("SHELL", POST_RUST_SH)
             .env("SOURCE_DATE_EPOCH", "1"),
         );
     }
@@ -153,12 +144,12 @@ pub fn recipe() -> Recipe {
                 "include/openssl",
                 "install-data-am",
                 "prefix={out}",
-                &format!("SHELL={POST_BOOTSTRAP_SH}"),
+                &format!("SHELL={POST_RUST_SH}"),
             ],
         )
         .env("PATH", &path)
-        .env("CONFIG_SHELL", POST_BOOTSTRAP_SH)
-        .env("SHELL", POST_BOOTSTRAP_SH)
+        .env("CONFIG_SHELL", POST_RUST_SH)
+        .env("SHELL", POST_RUST_SH)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     // The system image invokes this exact source-built program to mint the
@@ -173,12 +164,12 @@ pub fn recipe() -> Recipe {
                 "apps/openssl",
                 "install-exec-am",
                 "prefix={out}",
-                &format!("SHELL={POST_BOOTSTRAP_SH}"),
+                &format!("SHELL={POST_RUST_SH}"),
             ],
         )
         .env("PATH", &path)
-        .env("CONFIG_SHELL", POST_BOOTSTRAP_SH)
-        .env("SHELL", POST_BOOTSTRAP_SH)
+        .env("CONFIG_SHELL", POST_RUST_SH)
+        .env("SHELL", POST_RUST_SH)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(split_target_debug("{out}"));
@@ -197,33 +188,39 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("libressl-x86-64", "4.3.2")
         .source_input("libressl-x86-64-source")
-        .native_inputs(&[
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-            "make-x86-64-self",
-            "busybox-x86-64",
-        ])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &[
+                "gcc-x86-64-self",
+                "binutils-x86-64-self",
+                "glibc-x86-64",
+                "make-x86-64-self",
+            ],
+        ))
         .steps(steps)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{recipe, POST_BOOTSTRAP_SH};
+    use super::{recipe, POST_RUST_SH};
     use crate::types::Step;
 
     #[test]
-    fn portable_static_build_uses_only_post_bootstrap_inputs() {
+    fn portable_static_build_uses_only_post_rust_inputs() {
         let recipe = recipe();
         assert_eq!(
             recipe.native_inputs.as_deref(),
             Some(
                 [
+                    "td-sh",
+                    "td-txt",
+                    "td-util",
+                    "uutils",
+                    "gawk-x86-64-self",
                     "gcc-x86-64-self",
                     "binutils-x86-64-self",
                     "glibc-x86-64",
                     "make-x86-64-self",
-                    "busybox-x86-64",
                 ]
                 .map(str::to_string)
                 .as_slice()
@@ -247,19 +244,19 @@ mod tests {
             vec![
                 format!(
                     "{{in:make-x86-64-self}}/bin/make -j{{jobs}} -C crypto libcrypto.la \
-                     SHELL={POST_BOOTSTRAP_SH}"
+                     SHELL={POST_RUST_SH}"
                 ),
                 format!(
                     "{{in:make-x86-64-self}}/bin/make -j{{jobs}} -C ssl remove_bs_objects \
-                     SHELL={POST_BOOTSTRAP_SH}"
+                     SHELL={POST_RUST_SH}"
                 ),
                 format!(
                     "{{in:make-x86-64-self}}/bin/make -C include/openssl install-data-am \
-                     prefix={{out}} SHELL={POST_BOOTSTRAP_SH}"
+                     prefix={{out}} SHELL={POST_RUST_SH}"
                 ),
                 format!(
                     "{{in:make-x86-64-self}}/bin/make -j{{jobs}} -C apps/openssl \
-                     install-exec-am prefix={{out}} SHELL={POST_BOOTSTRAP_SH}"
+                     install-exec-am prefix={{out}} SHELL={POST_RUST_SH}"
                 ),
             ]
         );

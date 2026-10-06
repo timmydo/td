@@ -1,4 +1,4 @@
-use crate::ladder::{post_bootstrap_path, unpack_into, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, unpack_into, POST_RUST_SH};
 use crate::types::{Recipe, Step};
 
 // Static libcurl for Git's HTTP and HTTPS transports. This is intentionally a
@@ -10,28 +10,18 @@ pub fn recipe() -> Recipe {
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let tls = "{in:libressl-x86-64}";
     let zlib = "{in:zlib-x86-64-self}";
-    let path = format!("{{root}}/wb:{{tools}}:{sbin}:{}", post_bootstrap_path());
+    let path = format!("{{root}}/wb:{{tools}}:{sbin}");
 
     let mut steps = unpack_into("curl-x86-64-source", "{src}");
-    steps.push(Step::ToolFarm {
-        links: [
-            "awk", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "diff", "dirname",
-            "echo", "env", "expr", "false", "find", "grep", "head", "install", "ln", "ls", "mkdir",
-            "mktemp", "mv", "printf", "pwd", "rm", "rmdir", "sed", "sort", "tail", "tee", "test",
-            "touch", "tr", "true", "uname", "uniq", "wc", "which", "xargs",
-        ]
-        .iter()
-        .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))
-        .collect(),
-    });
+    steps.push(post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
-        shell: POST_BOOTSTRAP_SH.into(),
+        shell: POST_RUST_SH.into(),
     });
     steps.push(Step::WriteFile {
         path: "{root}/wb/cc".into(),
         content: format!(
-            "#!{POST_BOOTSTRAP_SH}\n\
+            "#!{POST_RUST_SH}\n\
              exec \"{sgcc}\" -static -isystem \"{xglibc}/include\" \
              -B\"{sbin}/\" -B\"{xglibc}/lib\" \
              -L\"{xglibc}/lib\" -static-libgcc \"$@\" \
@@ -49,7 +39,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "./configure",
                 "--build=x86_64-pc-linux-gnu",
                 "--host=x86_64-pc-linux-gnu",
@@ -115,8 +105,8 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("PATH", &path)
-        .env("CONFIG_SHELL", POST_BOOTSTRAP_SH)
-        .env("SHELL", POST_BOOTSTRAP_SH)
+        .env("CONFIG_SHELL", POST_RUST_SH)
+        .env("SHELL", POST_RUST_SH)
         .env("CC", "{root}/wb/cc")
         .env("AR", "{in:binutils-x86-64-self}/bin/ar")
         .env("RANLIB", "{in:binutils-x86-64-self}/bin/ranlib")
@@ -135,12 +125,12 @@ pub fn recipe() -> Recipe {
                 "-C",
                 "lib",
                 "libcurl.la",
-                &format!("SHELL={POST_BOOTSTRAP_SH}"),
+                &format!("SHELL={POST_RUST_SH}"),
             ],
         )
         .env("PATH", &path)
-        .env("CONFIG_SHELL", POST_BOOTSTRAP_SH)
-        .env("SHELL", POST_BOOTSTRAP_SH)
+        .env("CONFIG_SHELL", POST_RUST_SH)
+        .env("SHELL", POST_RUST_SH)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(Step::MkDir {
@@ -188,15 +178,17 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("curl-x86-64", "8.21.0")
         .source_input("curl-x86-64-source")
-        .native_inputs(&[
-            "libressl-x86-64",
-            "zlib-x86-64-self",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-            "make-x86-64-self",
-            "busybox-x86-64",
-        ])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &[
+                "libressl-x86-64",
+                "zlib-x86-64-self",
+                "gcc-x86-64-self",
+                "binutils-x86-64-self",
+                "glibc-x86-64",
+                "make-x86-64-self",
+            ],
+        ))
         .steps(steps)
 }
 
@@ -212,13 +204,17 @@ mod tests {
             recipe.native_inputs.as_deref(),
             Some(
                 [
+                    "td-sh",
+                    "td-txt",
+                    "td-util",
+                    "uutils",
+                    "gawk-x86-64-self",
                     "libressl-x86-64",
                     "zlib-x86-64-self",
                     "gcc-x86-64-self",
                     "binutils-x86-64-self",
                     "glibc-x86-64",
                     "make-x86-64-self",
-                    "busybox-x86-64",
                 ]
                 .map(str::to_string)
                 .as_slice()
