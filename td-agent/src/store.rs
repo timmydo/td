@@ -555,6 +555,13 @@ impl StateDir {
         Ok(text)
     }
 
+    /// Replaces the human's rules file with `text`, which
+    /// `rules::parse_human` must take.
+    pub fn save_rules(&self, text: &str) -> Result<(), String> {
+        crate::rules::parse_human(text)?;
+        replace(&self.root, crate::rules::HUMAN_FILE, text.as_bytes())
+    }
+
     /// Moves the remotes file aside, to `remotes.set-aside-<time>`, after
     /// it could not be read: no remote in it is admitted, and a card can
     /// admit again. Where it went.

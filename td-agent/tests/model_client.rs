@@ -71,6 +71,8 @@ struct Harness {
     deltas: Vec<(u64, String, String)>,
     /// Events `until_text` heard, which the next `turn` begins with.
     heard: Vec<Event>,
+    /// What the last card `until_ask` heard offered to remember.
+    always: Option<td_agent::rules::Always>,
     stderr: PathBuf,
 }
 
@@ -137,6 +139,7 @@ impl Harness {
             sent: Vec::new(),
             deltas: Vec::new(),
             heard: Vec::new(),
+            always: None,
             stderr,
         };
         assert!(matches!(harness.next(), Up::Hello { .. }));
@@ -251,7 +254,11 @@ impl Harness {
                     call,
                     title,
                     details,
-                } => return (call, title, details),
+                    always,
+                } => {
+                    self.always = always;
+                    return (call, title, details);
+                }
                 Up::Event(event) => self.heard.push(event),
                 _ => {}
             }
@@ -1448,9 +1455,107 @@ fn the_humans_rules_allow_a_command_here_and_deny_one_everywhere() {
         "Asked because your rules could not be read: rules: line 2: names no tool."
     );
     assert_eq!(call, call_record(&h.heard, "toolu_shell_01"));
-    h.down(&Down::Decision { call, allow: false });
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
     let (_, outcome, _) = h.turn();
     assert_eq!(outcome, "replied", "{}", h.said());
+}
+
+/// A card offers its "always" answers (DESIGN.md §11), and the human's
+/// rules changing while it waits decide it: a deny for this workspace
+/// takes it back and refuses the call, another workspace's leaving it be;
+/// an allow takes it back and runs the call. A decision that remembered
+/// says what in its approval.
+#[test]
+fn a_card_offers_always_and_a_rule_written_while_it_waits_decides_it() {
+    let mut h = Harness::new_in(
+        "always",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client::default());
+    let here = format!("conversation {}", h.id.as_str());
+    let policy = |version: u64, rules: &str| Down::Policy {
+        version,
+        rules: Ok(rules.into()),
+    };
+    h.say("Tidy the notes.");
+    let (call, _, _) = h.until_ask();
+    assert_eq!(
+        h.always,
+        Some(td_agent::rules::Always {
+            allow: true,
+            bodies: vec!["shell rm".into()],
+        })
+    );
+    h.down(&policy(1, "[workspace td-1]\ndeny shell rm\n"));
+    h.down(&policy(2, &format!("[{here}]\ndeny shell rm\n")));
+    assert_eq!(h.until_withdrawn(), call);
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let denied = "the rule `deny shell rm` of your rules for this workspace denies it";
+    let ran = results(&events);
+    assert!(
+        ran.iter()
+            .any(|r| r.1.starts_with(&format!("error: not run: {denied}"))),
+        "{ran:?}"
+    );
+    assert_eq!(
+        approvals(&events),
+        [(call, "deny".into(), "rule".into(), Some(denied.into()))]
+    );
+
+    h.down(&policy(3, ""));
+    h.say("Again.");
+    let (call, _, _) = h.until_ask();
+    h.down(&policy(4, &format!("[{here}]\nallow shell rm -f\n")));
+    assert_eq!(h.until_withdrawn(), call);
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let ran = results(&events);
+    assert!(
+        ran.iter().any(|r| r.1.starts_with("error: the jail: ")),
+        "{ran:?}"
+    );
+    let allowed = "the rule `allow shell rm -f` of your rules for this workspace allows it";
+    assert_eq!(
+        approvals(&events),
+        [(call, "allow".into(), "rule".into(), Some(allowed.into()))]
+    );
+
+    h.down(&policy(5, ""));
+    h.say("Once more.");
+    let (call, _, _) = h.until_ask();
+    let remembered = "`deny shell rm` in your rules for this workspace";
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: Some(remembered.into()),
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(
+        approvals(&events),
+        [(
+            call,
+            "deny".into(),
+            "human".into(),
+            Some(format!("always: {remembered}"))
+        )]
+    );
 }
 
 /// A third call in a row to one tool with the same arguments goes to the
@@ -1484,7 +1589,11 @@ fn a_third_identical_call_in_a_row_goes_to_the_person() {
     let read = results(&h.heard);
     assert_eq!(read.len(), 2, "{read:?}");
     assert_eq!(call, call_record(&h.heard, "toolu_read_03"));
-    h.down(&Down::Decision { call, allow: false });
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
     let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied");
     let results = results(&events);
@@ -1554,8 +1663,13 @@ fn a_workspace_command_waits_for_the_person_and_a_refusal_is_its_answer() {
     h.down(&Down::Decision {
         call: call + 1000,
         allow: true,
+        always: None,
     });
-    h.down(&Down::Decision { call, allow: false });
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
     let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied");
     let results = results(&events);
@@ -1684,7 +1798,11 @@ fn an_allowed_command_runs_and_an_interrupt_withdraws_the_card() {
     h.setup(Client::default());
     h.say("Tidy the notes.");
     let (call, _, _) = h.until_ask();
-    h.down(&Down::Decision { call, allow: true });
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
     let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied");
     let first = results(&events);
@@ -1895,7 +2013,20 @@ fn a_repositorys_rules_ask_for_a_read_and_refuse_a_command() {
         format!("Asked because the rule `ask read_file` of the repository at {checkout} asks.")
     );
     assert_eq!(call, call_record(&h.heard, "toolu_read_01"));
-    h.down(&Down::Decision { call, allow: true });
+    // A rule asked, so an allow would not spare the next card: only the
+    // denies are offered.
+    assert_eq!(
+        h.always,
+        Some(td_agent::rules::Always {
+            allow: false,
+            bodies: vec!["read_file".into()],
+        })
+    );
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
     let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied", "{}", h.said());
     let denied = format!("the rule `deny shell rm` of the repository at {checkout} denies it");
@@ -2253,7 +2384,11 @@ fn a_step_that_may_change_files_is_snapshotted_or_says_why_not_once() {
     // One that runs a command is snapshotted first: with no jail, said.
     let refuse = |h: &mut Harness| {
         let (call, _, _) = h.until_ask();
-        h.down(&Down::Decision { call, allow: false });
+        h.down(&Down::Decision {
+            call,
+            allow: false,
+            always: None,
+        });
         h.turn()
     };
     h.say("Tidy the notes.");
@@ -2420,7 +2555,11 @@ fn an_allowed_command_runs_in_the_workspace_jail() {
     h.say("Make the notes.");
     let (call, _, details) = h.until_ask();
     assert_eq!(details[1], "printf made > notes.txt && cat notes.txt");
-    h.down(&Down::Decision { call, allow: true });
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
     let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied", "{}", h.said());
     let results = results(&events);
@@ -2476,7 +2615,11 @@ fn a_tool_host_that_does_not_answer_is_torn_down_at_the_deadline() {
     h.say("Stop.");
     let (call, _, _) = h.until_ask();
     let asked = Instant::now();
-    h.down(&Down::Decision { call, allow: true });
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
     // The harness waits at most TIMEOUT for each message, longer than the
     // call's 0.1 s and the 15 s grace together.
     let (events, outcome, _) = h.turn();
@@ -2513,7 +2656,11 @@ fn a_background_process_the_person_kills_ends_and_wakes_nothing() {
     });
     h.say("Build in the background.");
     let (call, _, _) = h.until_ask();
-    h.down(&Down::Decision { call, allow: true });
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
     let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied", "{}", h.said());
     assert!(results(&events)[0].1.starts_with("started p1 "));
@@ -2579,7 +2726,11 @@ fn a_background_commands_output_is_kept_and_read_by_offset() {
     h.say("Run them.");
     for _ in 0..2 {
         let (call, _, _) = h.until_ask();
-        h.down(&Down::Decision { call, allow: true });
+        h.down(&Down::Decision {
+            call,
+            allow: true,
+            always: None,
+        });
     }
     let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied", "{}", h.said());
@@ -2718,7 +2869,11 @@ fn a_background_command_runs_on_until_it_ends_or_is_killed() {
         let (call, title, details) = h.until_ask();
         assert_eq!(title, "Run a command in the background");
         assert_eq!(details[1], command);
-        h.down(&Down::Decision { call, allow: true });
+        h.down(&Down::Decision {
+            call,
+            allow: true,
+            always: None,
+        });
     }
     let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied", "{}", h.said());
@@ -2811,7 +2966,11 @@ fn a_background_command_runs_on_until_it_ends_or_is_killed() {
     h.say("Again.");
     for _ in 0..2 {
         let (call, _, _) = h.until_ask();
-        h.down(&Down::Decision { call, allow: true });
+        h.down(&Down::Decision {
+            call,
+            allow: true,
+            always: None,
+        });
     }
     let (events, _, _) = h.turn();
     assert!(results(&events)[0].1.starts_with("started p3 "));
@@ -3456,6 +3615,7 @@ fn a_message_between_two_conversations_wakes_the_receiver() {
                         &Down::Decision {
                             call: *call,
                             allow: true,
+                            always: None,
                         },
                     );
                 }
@@ -3605,7 +3765,11 @@ fn a_crossing_asks_the_person_and_a_refusal_is_the_calls_result() {
             "Please summarise the sparse checkout notes.".to_string(),
         ]
     );
-    h.down(&Down::Decision { call, allow: false });
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
     let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied");
     let results = results(&events);
@@ -3678,7 +3842,11 @@ fn a_read_of_another_log_asks_the_person_first() {
             "{details:?}"
         );
         assert!(details[2].contains("model provider"), "{details:?}");
-        h.down(&Down::Decision { call, allow });
+        h.down(&Down::Decision {
+            call,
+            allow,
+            always: None,
+        });
         let (events, outcome, _) = h.turn();
         assert_eq!(outcome, "replied");
         let results = results(&events);
@@ -3758,7 +3926,11 @@ fn an_interrupt_between_calls_answers_the_rest_as_not_run() {
     let (outcome, retry) = loop {
         let up = h.next();
         if let Up::Ask { call, .. } = up {
-            h.down(&Down::Decision { call, allow: true });
+            h.down(&Down::Decision {
+                call,
+                allow: true,
+                always: None,
+            });
             continue;
         }
         if let Up::Send { id, .. } = up {

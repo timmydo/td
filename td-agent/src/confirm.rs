@@ -14,9 +14,15 @@ use td_ui::CELL_WIDTH;
 use crate::store::Id;
 use crate::workspace::Workspace;
 
-/// The dialog's one action.
+/// The dialog's actions: its one confirmation, and a card's "always"
+/// answers (DESIGN.md §11).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Act;
+pub enum Act {
+    Confirm,
+    AlwaysDenyHere,
+    AlwaysDenyEverywhere,
+    AlwaysAllowHere,
+}
 
 /// What a question is for.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,15 +54,18 @@ pub enum Reply {
     /// Closed without the human's choice, the window having lost the
     /// keyboard: a card is asked again when it comes back.
     SetAside,
-    /// The human chose the action.
-    Confirmed(Purpose),
+    /// The human chose an action.
+    Confirmed(Purpose, Act),
 }
 
 /// The deletion question's title and its action's label.
 pub const TITLE: &str = "Delete conversation";
 pub const DELETE: &str = "Delete";
-/// A card's action's label.
+/// A card's action's label, and its "always" answers'.
 pub const ALLOW: &str = "Allow";
+pub const ALWAYS_DENY_HERE: &str = "Always deny here";
+pub const ALWAYS_DENY_EVERYWHERE: &str = "Always deny everywhere";
+pub const ALWAYS_ALLOW_HERE: &str = "Always allow here";
 /// The admission card's title and its action's label.
 pub const ADMIT_TITLE: &str = "Admit remotes";
 pub const ADMIT: &str = "Admit";
@@ -99,6 +108,44 @@ fn worked(workspace: Option<&Workspace>) -> String {
     }
 }
 
+/// What a card's "always" answers would add to the human's rules, as its
+/// last lines say, and why an allow for an interpreter or build tool is
+/// broad (DESIGN.md §11).
+fn remembered(always: &crate::rules::Always) -> Vec<String> {
+    // A line a rule, so none passes the dialog's bound on a line.
+    let rules = |lines: &mut Vec<String>, effect: &str| {
+        lines.extend(
+            always
+                .bodies
+                .iter()
+                .map(|body| format!("    {effect} {body}")),
+        );
+    };
+    let mut lines = Vec::new();
+    if always.allow {
+        lines.push(format!(
+            "{ALWAYS_ALLOW_HERE} adds to your rules for this workspace, so a call they cover runs with no card:"
+        ));
+        rules(&mut lines, "allow");
+        let broad: Vec<&str> = always
+            .bodies
+            .iter()
+            .filter_map(|body| crate::rules::broad(body))
+            .collect();
+        if !broad.is_empty() {
+            lines.push(format!(
+                "An allow for {} is broad: what it runs is this workspace's own code, which the model can change.",
+                broad.join(", ")
+            ));
+        }
+    }
+    lines.push(format!(
+        "{ALWAYS_DENY_HERE} adds to your rules for this workspace, and {ALWAYS_DENY_EVERYWHERE} to your rules for every workspace:"
+    ));
+    rules(&mut lines, "deny");
+    lines
+}
+
 /// The dialog's place: at most 64 cells by 10 rows, centred in `body`.
 /// A card's is larger, at most 100 cells by 24 rows, so more of the
 /// action shows at once.
@@ -138,7 +185,7 @@ impl Confirm {
         if !worked.is_empty() {
             details.push(&worked);
         }
-        let model = Model::new(TITLE, DELETE, &details, Act, revision)
+        let model = Model::new(TITLE, DELETE, &details, Act::Confirm, revision)
             .map_err(|e| format!("the deletion question: {e}"))?;
         let purpose = Purpose::Delete(id);
         let dialog = Controller::new(model, surface, place(surface, body, &purpose), None)
@@ -151,7 +198,9 @@ impl Confirm {
     }
 
     /// The card for call `call` of `conversation`: may it run, as `title`
-    /// and `details` say?
+    /// and `details` say? With `always`, its "always" answers too, and
+    /// what each would add to the human's rules.
+    #[allow(clippy::too_many_arguments)]
     pub fn approve(
         surface: Surface,
         body: Rect,
@@ -159,11 +208,28 @@ impl Confirm {
         call: u64,
         title: &str,
         details: &[String],
+        always: Option<&crate::rules::Always>,
         revision: u64,
     ) -> Result<Self, String> {
-        let details: Vec<&str> = details.iter().map(String::as_str).collect();
-        let model = Model::new(title, ALLOW, &details, Act, revision)
+        let remembered = always.map(remembered).unwrap_or_default();
+        let details: Vec<&str> = details
+            .iter()
+            .chain(&remembered)
+            .map(String::as_str)
+            .collect();
+        let mut model = Model::new(title, ALLOW, &details, Act::Confirm, revision)
             .map_err(|e| format!("the card: {e}"))?;
+        if let Some(always) = always {
+            model = model
+                .with_alternate(ALWAYS_DENY_HERE, Act::AlwaysDenyHere)
+                .and_then(|m| m.with_further(ALWAYS_DENY_EVERYWHERE, Act::AlwaysDenyEverywhere))
+                .map_err(|e| format!("the card: {e}"))?;
+            if always.allow {
+                model = model
+                    .with_extra(ALWAYS_ALLOW_HERE, Act::AlwaysAllowHere)
+                    .map_err(|e| format!("the card: {e}"))?;
+            }
+        }
         let purpose = Purpose::Approve { conversation, call };
         let dialog = Controller::new(model, surface, place(surface, body, &purpose), None)
             .map_err(|e| format!("the card: {e}"))?;
@@ -202,7 +268,7 @@ impl Confirm {
             "Each worktree's answer comes from git inside the workspace, which the model could have changed: td-agent can know no more than it says.",
         );
         details.push("Cancel keeps the conversation and its workspace as they are.");
-        let model = Model::new(card, action, &details, Act, revision)
+        let model = Model::new(card, action, &details, Act::Confirm, revision)
             .map_err(|e| format!("the loss card: {e}"))?;
         let purpose = Purpose::Remove(id);
         let dialog = Controller::new(model, surface, place(surface, body, &purpose), None)
@@ -236,7 +302,7 @@ impl Confirm {
             "Admitted, td-agent's git clones and fetches each for you, outside any jail and with your git credentials, bypassing the egress relay that holds the workspace's own network. Each stays admitted, with or without a final .git, for every later workspace: td-agent keeps them in the `remotes` file of its state directory, beside `remotes` in the configuration.",
         );
         details.push("Cancel makes nothing.");
-        let model = Model::new(ADMIT_TITLE, ADMIT, &details, Act, revision)
+        let model = Model::new(ADMIT_TITLE, ADMIT, &details, Act::Confirm, revision)
             .map_err(|e| format!("the admission card: {e}"))?;
         let purpose = Purpose::Admit { template, remotes };
         let dialog = Controller::new(model, surface, place(surface, body, &purpose), None)
@@ -253,16 +319,16 @@ impl Confirm {
         &self.purpose
     }
 
-    /// Where its keyboard is: `details`, `cancel`, or its action, `delete`,
-    /// `allow`, `admit` or `remove`.
+    /// Where its keyboard is: `details`, `cancel`, a card's "always"
+    /// answer, or its action, `delete`, `allow`, `admit` or `remove`.
     pub fn focus(&self) -> &'static str {
         match self.dialog.focus() {
             confirmations::Focus::Details => "details",
             confirmations::Focus::Cancel => "cancel",
-            confirmations::Focus::Alternate
-            | confirmations::Focus::Further
-            | confirmations::Focus::Extra
-            | confirmations::Focus::Confirm => match self.purpose {
+            confirmations::Focus::Alternate => "always deny here",
+            confirmations::Focus::Further => "always deny everywhere",
+            confirmations::Focus::Extra => "always allow here",
+            confirmations::Focus::Confirm => match self.purpose {
                 Purpose::Delete(_) => "delete",
                 Purpose::Approve { .. } => "allow",
                 Purpose::Admit { .. } => "admit",
@@ -323,9 +389,9 @@ impl Confirm {
             Outcome::Ignored | Outcome::Consumed => Reply::Stay(false),
             Outcome::Changed => Reply::Stay(true),
             Outcome::Closed {
-                choice: Choice::Confirmed(Act),
+                choice: Choice::Confirmed(act),
                 ..
-            } => Reply::Confirmed(self.purpose.clone()),
+            } => Reply::Confirmed(self.purpose.clone(), act),
             Outcome::Closed { .. } if lost => Reply::SetAside,
             Outcome::Closed { .. } => Reply::Closed,
         }
@@ -391,11 +457,107 @@ mod tests {
         assert_eq!(confirm.focus(), "admit");
         assert_eq!(
             key(&mut confirm, "Return"),
-            Reply::Confirmed(Purpose::Admit {
-                template: "td".into(),
-                remotes: vec!["https://example.org/a/td".into()],
-            })
+            Reply::Confirmed(
+                Purpose::Admit {
+                    template: "td".into(),
+                    remotes: vec!["https://example.org/a/td".into()],
+                },
+                Act::Confirm
+            )
         );
+    }
+
+    /// A card offering "always" answers: Cancel first, the denies next,
+    /// the allows last and farthest from it, each confirming its own act;
+    /// the lines below say what each adds, and that an allow for a build
+    /// tool is broad. With no allow offered, only the denies.
+    #[test]
+    fn a_card_offers_its_always_answers_denies_first() {
+        let surface = Surface::new(1024, 640, Scale::default()).unwrap();
+        let id = Id::parse(&"c".repeat(32)).unwrap();
+        let card = |allow: bool| {
+            let always = crate::rules::Always {
+                allow,
+                bodies: vec!["shell cargo test".into(), "shell rm".into()],
+            };
+            Confirm::approve(
+                surface,
+                surface.bounds(),
+                id.clone(),
+                4,
+                "Run a command",
+                &["cargo test && rm x".into()],
+                Some(&always),
+                3,
+            )
+            .unwrap()
+        };
+        let approve = Purpose::Approve {
+            conversation: id.clone(),
+            call: 4,
+        };
+        for (tabs, focus, act) in [
+            (1, "always deny here", Act::AlwaysDenyHere),
+            (2, "always deny everywhere", Act::AlwaysDenyEverywhere),
+            (3, "always allow here", Act::AlwaysAllowHere),
+            (4, "allow", Act::Confirm),
+        ] {
+            let mut confirm = card(true);
+            assert_eq!(confirm.focus(), "cancel");
+            for _ in 0..tabs {
+                key(&mut confirm, "Tab");
+            }
+            assert_eq!(confirm.focus(), focus);
+            assert_eq!(
+                key(&mut confirm, "Return"),
+                Reply::Confirmed(approve.clone(), act)
+            );
+        }
+        let mut confirm = card(false);
+        for _ in 0..3 {
+            key(&mut confirm, "Tab");
+        }
+        assert_eq!(confirm.focus(), "allow");
+        let always = crate::rules::Always {
+            allow: true,
+            bodies: vec!["shell cargo test".into(), "shell rm".into()],
+        };
+        assert_eq!(
+            remembered(&always),
+            [
+                "Always allow here adds to your rules for this workspace, so a call they cover runs with no card:",
+                "    allow shell cargo test",
+                "    allow shell rm",
+                "An allow for cargo is broad: what it runs is this workspace's own code, which the model can change.",
+                "Always deny here adds to your rules for this workspace, and Always deny everywhere to your rules for every workspace:",
+                "    deny shell cargo test",
+                "    deny shell rm",
+            ]
+        );
+        let denies = remembered(&crate::rules::Always {
+            allow: false,
+            ..always
+        });
+        assert_eq!(denies.len(), 3);
+        // The most a card offers, each rule its longest, still shows.
+        let longest = crate::rules::Always {
+            allow: true,
+            bodies: (0..crate::rules::MAX_BODIES)
+                .map(|n| format!("shell {n}{}", "x".repeat(crate::rules::MAX_LINE - 12)))
+                .collect(),
+        };
+        crate::rules::Always::checked(true, longest.bodies.clone()).unwrap();
+        Confirm::approve(
+            surface,
+            surface.bounds(),
+            id.clone(),
+            4,
+            "Run a command",
+            &["x".into()],
+            Some(&longest),
+            3,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -434,14 +596,20 @@ mod tests {
         confirm.input(&Input::CancelPointer);
         assert_ne!(
             confirm.input(&pointer(PointerPhase::Release)),
-            Reply::Confirmed(Purpose::Delete(Id::parse(&"c".repeat(32)).unwrap()))
+            Reply::Confirmed(
+                Purpose::Delete(Id::parse(&"c".repeat(32)).unwrap()),
+                Act::Confirm
+            )
         );
         // Pressed and released over it, it confirms.
         let mut confirm = open();
         confirm.input(&pointer(PointerPhase::Press));
         assert_eq!(
             confirm.input(&pointer(PointerPhase::Release)),
-            Reply::Confirmed(Purpose::Delete(Id::parse(&"c".repeat(32)).unwrap()))
+            Reply::Confirmed(
+                Purpose::Delete(Id::parse(&"c".repeat(32)).unwrap()),
+                Act::Confirm
+            )
         );
     }
 
@@ -452,7 +620,10 @@ mod tests {
         assert_eq!(confirm.focus(), "delete");
         assert_eq!(
             key(&mut confirm, "Return"),
-            Reply::Confirmed(Purpose::Delete(Id::parse(&"c".repeat(32)).unwrap()))
+            Reply::Confirmed(
+                Purpose::Delete(Id::parse(&"c".repeat(32)).unwrap()),
+                Act::Confirm
+            )
         );
     }
 }

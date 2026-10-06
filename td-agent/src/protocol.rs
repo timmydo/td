@@ -9,6 +9,9 @@ use crate::key::Secret;
 use crate::store::{Event, Id, Role};
 use td_json::Json;
 
+/// The longest text of what an "always" answer remembered.
+pub const MAX_REMEMBERED: usize = 8 * 1024;
+
 /// The longest message a human sends in one go. JSON escaping can make it
 /// six times longer on the wire, which `frame::MAX_FRAME` holds.
 pub const MAX_TEXT: usize = 128 * 1024;
@@ -71,8 +74,14 @@ pub enum Down {
         effort: Option<String>,
     },
     /// The human's decision on the card the conversation asked for call
-    /// `call` (its `ToolCall`'s sequence number).
-    Decision { call: u64, allow: bool },
+    /// `call` (its `ToolCall`'s sequence number), and, for an "always"
+    /// answer, what it added to the human's rules, which the approval's
+    /// reason says.
+    Decision {
+        call: u64,
+        allow: bool,
+        always: Option<String>,
+    },
     /// The answer to a `Fetch` of `remote`: the store fetched and each
     /// base resolved, or why not.
     Fetched {
@@ -164,11 +173,13 @@ pub enum Up {
     },
     /// A card for the human (DESIGN.md §11): may call `call` (its
     /// `ToolCall`'s sequence number) run, as `title` and `details` say?
-    /// The window answers with `Decision`.
+    /// The window answers with `Decision`. `always` is what its "always"
+    /// answers would remember, when it offers them.
     Ask {
         call: u64,
         title: String,
         details: Vec<String>,
+        always: Option<crate::rules::Always>,
     },
     /// The card for `call` is no longer asked: the turn was interrupted,
     /// or the window closed, before the human decided it.
@@ -490,11 +501,16 @@ impl Down {
                     ("effort".into(), optional(effort)),
                 ],
             ),
-            Self::Decision { call, allow } => typed(
+            Self::Decision {
+                call,
+                allow,
+                always,
+            } => typed(
                 "decision",
                 vec![
                     ("call".into(), Json::from(*call)),
                     ("allow".into(), Json::Bool(*allow)),
+                    ("always".into(), optional(always)),
                 ],
             ),
             Self::Fetched { remote, result } => {
@@ -662,6 +678,12 @@ impl Down {
                     .get("allow")
                     .and_then(Json::as_bool)
                     .ok_or("no allow")?,
+                always: match maybe(&value, "always")? {
+                    Some(text) if text.len() > MAX_REMEMBERED => {
+                        return Err("a decision whose remembered rules are past their bound".into())
+                    }
+                    always => always,
+                },
             }),
             Some("fetched") => Ok(Self::Fetched {
                 remote: string(&value, "remote")?,
@@ -800,17 +822,30 @@ impl Up {
                 call,
                 title,
                 details,
-            } => typed(
-                "ask",
-                vec![
+                always,
+            } => {
+                let mut members = vec![
                     ("call".into(), Json::from(*call)),
                     ("title".into(), Json::Str(title.clone())),
                     (
                         "details".into(),
                         Json::Arr(details.iter().cloned().map(Json::Str).collect()),
                     ),
-                ],
-            ),
+                ];
+                if let Some(always) = always {
+                    members.push((
+                        "always".into(),
+                        Json::Obj(vec![
+                            ("allow".into(), Json::Bool(always.allow)),
+                            (
+                                "rules".into(),
+                                Json::Arr(always.bodies.iter().cloned().map(Json::Str).collect()),
+                            ),
+                        ]),
+                    ));
+                }
+                typed("ask", members)
+            }
             Self::Withdraw { call } => typed("withdraw", vec![("call".into(), Json::from(*call))]),
         }
     }
@@ -886,6 +921,16 @@ impl Up {
                             .ok_or("a detail not a string")
                     })
                     .collect::<Result<_, _>>()?,
+                always: match value.get("always") {
+                    None => None,
+                    Some(always) => Some(crate::rules::Always::checked(
+                        always
+                            .get("allow")
+                            .and_then(Json::as_bool)
+                            .ok_or("always without allow")?,
+                        strings(always, "rules")?,
+                    )?),
+                },
             },
             Some("withdraw") => Self::Withdraw {
                 call: number(&value, "call")?,
@@ -1091,6 +1136,16 @@ mod tests {
                 call: 9,
                 title: "Run a command?".into(),
                 details: vec!["In /w:".into(), "cargo test".into()],
+                always: None,
+            },
+            Up::Ask {
+                call: 10,
+                title: "Run a command?".into(),
+                details: vec!["cargo test && rm x".into()],
+                always: Some(crate::rules::Always {
+                    allow: true,
+                    bodies: vec!["shell cargo test".into(), "shell rm".into()],
+                }),
             },
             Up::Withdraw { call: 9 },
             Up::Event(Event {
@@ -1187,10 +1242,12 @@ mod tests {
             Down::Decision {
                 call: 7,
                 allow: true,
+                always: None,
             },
             Down::Decision {
                 call: 8,
                 allow: false,
+                always: Some("`deny shell rm` in your rules for every workspace".into()),
             },
             Down::Choose {
                 model: Some("openai/gpt-6".into()),

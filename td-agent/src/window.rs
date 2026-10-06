@@ -35,7 +35,7 @@ use crate::post::{Outbox, Post};
 use crate::protocol::{Down, Up};
 use crate::store::{self, Event, Id, Kind, Role, StateDir};
 use crate::supervisor::{Opened, Supervisor, Update};
-use crate::ui::{App, Card, Request, Row, RowState};
+use crate::ui::{Answer, App, Card, Request, Row, RowState};
 use crate::workspace::{self, Places, Workspace};
 
 /// The longest a turn waits before polling the conversation again.
@@ -326,13 +326,59 @@ impl Session {
                 Request::Decide {
                     conversation,
                     call,
-                    allow,
-                } => self
-                    .supervisor
-                    .answer(&conversation, &Down::Decision { call, allow }),
+                    answer,
+                } => self.decide(&conversation, call, answer),
                 Request::SetDefault(model) => self.set_default(model),
                 Request::Quit => self.quit = true,
             }
+        }
+    }
+
+    /// The human's answer to `conversation`'s card for `call`, sent to it
+    /// whichever conversation is open; one whose process has gone asks
+    /// again from nothing. An "always" answer is added to the human's
+    /// rules first, and every conversation is sent them after the
+    /// decision, so the card's own is decided by the human (DESIGN.md
+    /// §11); one that cannot be added is said, and the answer holds once.
+    fn decide(&mut self, conversation: &Id, call: u64, answer: Answer) {
+        let (allow, always) = match answer {
+            Answer::Once(allow) => (allow, None),
+            Answer::Always {
+                allow,
+                everywhere,
+                bodies,
+            } => match remember(&self.state, conversation, allow, everywhere, &bodies) {
+                Ok(said) => {
+                    self.app.note(format!("remembered {said}"));
+                    (allow, Some(said))
+                }
+                Err(e) => {
+                    let said = format!(
+                        "your answer holds this once; it could not be added to your rules: {e}"
+                    );
+                    eprintln!("td-agent: {said}");
+                    self.app.note(said);
+                    (allow, None)
+                }
+            },
+        };
+        let remembered = always.is_some();
+        self.supervisor.answer(
+            conversation,
+            &Down::Decision {
+                call,
+                allow,
+                always,
+            },
+        );
+        if remembered {
+            let rules = self.state.load_rules();
+            if let Err(e) = &rules {
+                let said = format!("your rules could not be read, so every call that changes a workspace or runs a command asks: {e}");
+                eprintln!("td-agent: {said}");
+                self.app.note(said);
+            }
+            self.supervisor.repolicy(rules);
         }
     }
 
@@ -543,12 +589,14 @@ impl Session {
                     call,
                     title,
                     details,
+                    always,
                 }) => {
                     self.app.ask(Card {
                         conversation: id.clone(),
                         call: *call,
                         title: title.clone(),
                         details: details.clone(),
+                        always: always.clone(),
                     });
                     continue;
                 }
@@ -913,6 +961,12 @@ impl Session {
     /// human's messages they had not taken, opening the next when
     /// `was_open`; whether it is deleted.
     fn delete_now(&mut self, id: &Id, was_open: bool, held: Vec<(String, String)>) -> bool {
+        // The workspace's own rules go with it; a directory is the
+        // human's, and others may work in it.
+        let ruled = match self.state.workspace(id) {
+            Ok(Some(crate::workspace::Workspace::Directory(_))) | Ok(None) | Err(_) => None,
+            Ok(Some(workspace)) => Some(workspace.key(id)),
+        };
         let unremoved = match self.state.delete(id) {
             Ok(unremoved) => unremoved,
             Err(e) => {
@@ -939,6 +993,18 @@ impl Session {
         if let Err(e) = self.post.forget(id) {
             eprintln!("td-agent: the outbox: {e}");
             said.push_str(&format!("; the outbox: {e}"));
+        }
+        if let Some(key) = ruled {
+            match forget_rules(&self.state, &key) {
+                Ok(false) => {}
+                Ok(true) => self.supervisor.repolicy(self.state.load_rules()),
+                Err(e) => {
+                    eprintln!("td-agent: forgetting the rules for {key}: {e}");
+                    said.push_str(&format!(
+                        "; its workspace's rules stay in your rules file: {e}"
+                    ));
+                }
+            }
         }
         self.app.remove_row(id);
         self.app.note(said);
@@ -1746,11 +1812,102 @@ pub fn run(
     td_ui::window::run(&mut session, stream, std::env::temp_dir(), typeface)
 }
 
+/// Adds `bodies`, as allows or denies, to the human's rules for
+/// `conversation`'s workspace, or for every workspace: what was added,
+/// as the approval's reason says it.
+fn remember(
+    state: &StateDir,
+    conversation: &Id,
+    allow: bool,
+    everywhere: bool,
+    bodies: &[String],
+) -> Result<String, String> {
+    let scope = if everywhere {
+        crate::rules::Scope::Everywhere
+    } else {
+        let (metas, _) = state.list();
+        let workspace = metas
+            .into_iter()
+            .find(|meta| &meta.id == conversation)
+            .and_then(|meta| meta.workspace)
+            .ok_or("its conversation has no workspace")?;
+        crate::rules::Scope::Workspace(workspace.key(conversation))
+    };
+    let effect = if allow {
+        crate::rules::Effect::Allow
+    } else {
+        crate::rules::Effect::Deny
+    };
+    let text = crate::rules::add(&state.load_rules()?, &scope, effect, bodies)?;
+    state.save_rules(&text)?;
+    let rules: Vec<String> = bodies
+        .iter()
+        .map(|body| format!("`{} {body}`", effect.name()))
+        .collect();
+    let whose = if everywhere {
+        "every workspace"
+    } else {
+        "this workspace"
+    };
+    Ok(format!("{} in your rules for {whose}", rules.join(", ")))
+}
+
+/// Takes the sections for workspace `key` out of the human's rules:
+/// whether there were any.
+fn forget_rules(state: &StateDir, key: &str) -> Result<bool, String> {
+    match crate::rules::without(&state.load_rules()?, key)? {
+        Some(text) => state.save_rules(&text).map(|()| true),
+        None => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::{default_model, names};
+    use super::{default_model, forget_rules, names, remember};
     use crate::workspace::Workspace;
+
+    /// A card's "always" answer adds its rules under the conversation's
+    /// workspace's header, or every workspace's, and says what it added;
+    /// never an allow for every workspace, nor into a file refused.
+    #[test]
+    fn an_always_answer_is_added_to_the_humans_rules() {
+        let scratch = crate::store::tests::Scratch::new("remember");
+        let state = scratch.state();
+        let id = crate::store::Id::random().unwrap();
+        let workspace = Workspace::Directory("/home/u/my notes".into());
+        crate::store::Conversation::create(
+            &state,
+            &id,
+            crate::store::Role::Conversation,
+            Some(workspace),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let bodies = vec!["shell cargo test".to_string(), "shell rm".to_string()];
+        assert_eq!(
+            remember(&state, &id, true, false, &bodies).unwrap(),
+            "`allow shell cargo test`, `allow shell rm` in your rules for this workspace"
+        );
+        assert_eq!(
+            remember(&state, &id, false, true, bodies.get(1..).unwrap()).unwrap(),
+            "`deny shell rm` in your rules for every workspace"
+        );
+        let text = "[directory /home/u/my%20notes]\nallow shell cargo test\nallow shell rm\n\n[everywhere]\ndeny shell rm\n";
+        assert_eq!(state.load_rules().unwrap(), text);
+        assert!(remember(&state, &id, true, true, &bodies).is_err());
+        let other = crate::store::Id::random().unwrap();
+        assert!(remember(&state, &other, false, false, &bodies).is_err());
+        assert_eq!(state.load_rules().unwrap(), text);
+        assert!(!forget_rules(&state, "workspace td-1-ab").unwrap());
+        assert!(forget_rules(&state, "directory /home/u/my%20notes").unwrap());
+        assert_eq!(state.load_rules().unwrap(), "[everywhere]\ndeny shell rm\n");
+        let path = state.root().join(crate::rules::HUMAN_FILE);
+        std::fs::write(&path, "[x]\n").unwrap();
+        assert!(remember(&state, &id, false, true, &bodies).is_err());
+        assert!(forget_rules(&state, "workspace td-1-ab").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[x]\n");
+    }
 
     #[test]
     fn a_conversation_asks_only_what_its_record_names() {

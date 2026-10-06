@@ -3217,7 +3217,13 @@ first which rule asks and the approval logged with that reason. A deny
 or ask matches a command word by its name after any `/`, so `/bin/rm` is
 `rm`, and one on `git` reads past git's options before the subcommand,
 so `git --no-pager push` is `git push`; an allow matches the command
-word as written, so `./git` is not `git`. The words after it match word
+word as written, so `./git` is not `git`, and a command runs on the
+human's allows only when each of its segments starts with one of them,
+so `allow shell cargo test` and `allow shell cargo fmt` together cover
+`cargo test && cargo fmt`. Composed so, one allowed program can feed
+another through a pipe, `curl ... | git apply` running on an allow for
+each: an allow for a program that does what its input says means more
+for it. The words after it match word
 for word, and a word an expansion or a glob decides (`$X`, `*.o`, a
 leading `~`) matches none. Besides the set above, the matcher treats as
 opaque what it reads as compound (a reserved word such as `if`, `{` or
@@ -3260,8 +3266,42 @@ repositories', in the order above: a deny wins, then an ask, then the
 asks for an opaque command and an unread file, then the human's allow,
 which runs a call that acts with no card, its approval logged `by`
 `rule` with the rule as the reason. A repeated call still goes to the
-human. Until the cards' "always" answers write the file, the human edits
-it, and it is read again when the window starts.
+human. The cards' "always" answers write the file; the human may edit it
+too, and it is read again when the window starts.
+
+**As built (increment 13, card answers).** A card for a workspace's call
+offers its "always" answers with what they would remember (`{"type":
+"ask", ..., "always": {"allow", "rules"}}`): the tool alone, or for each
+segment of a command its program and, for a program whose second word
+names what it does (`git`, `cargo`, `make` and the like), that
+subcommand, at most 8. A crossing's card offers none yet. It offers no
+allow for a command the matcher cannot see into, a segment of
+redirections alone, or such a program with no subcommand to name, nor
+for a word quoted with a space or tab in it, which would read back as
+two, so that no allow is broader than the program and subcommand; and
+none while a rule or an unread file asks, since an allow would not run
+the call before them. A command the matcher cannot split offers nothing.
+The card's rows run Cancel, `Always deny here`, `Always deny
+everywhere`, `Always allow here`, then `Allow`, the allows farthest from
+Cancel, and its last lines say what each adds, a rule a line so that no
+line passes the dialog's bound, and, for an interpreter or build tool,
+that an allow for it is broad. The window adds an "always" answer to the
+file itself, the workspace's key taken from the conversation's record
+rather than its process: below the file's last header when that is the
+scope's, else under a new one at its end, every other line kept, a rule
+the scope holds not added again. It sends the decision with what it
+remembered, which the approval's reason names (`always: …`), and then
+the file to every conversation, so the card's own call is decided by the
+human. One it cannot add, the file unread say, is said in the window,
+and the answer holds once. A card that waits when the policy changes is
+judged again: a rule that now refuses its call, or now lets it run,
+withdraws it, and its approval is the rule's; a policy taken after the
+decision and before the call starts is judged too, and only a deny in it
+then refuses the call, the decision standing otherwise; an allow's
+reason names at most three of the rules that let a call run. Deleting a
+conversation takes its workspace's sections out of the file, a scratch
+or repository workspace being its own; a directory's stay, the directory
+being the human's.
 
 **Repetition.** Three consecutive calls of one tool with identical
 arguments go to the human whatever the table says, as opencode's
@@ -3425,8 +3465,8 @@ decide it. Losing the keyboard sets the card aside, deciding nothing,
 and it comes back with the keyboard. Another conversation's card waits,
 its row saying `asks you`, until that conversation is opened; one the
 window cannot draw, in a window too small, waits and says so once. The
-choices are allow once and deny; the "always" choices come with rules
-(increment 13). An interrupt, or the window closing, withdraws the card
+choices are allow once and deny, and from increment 13 the "always"
+choices (§11, As built (increment 13, card answers)). An interrupt, or the window closing, withdraws the card
 (`{"type": "withdraw", "call"}`) and the call is answered as not run, as
 is an allowed call whose interrupt came with its decision; a
 conversation process that restarts, fails or is deleted takes its cards

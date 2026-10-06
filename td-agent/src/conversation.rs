@@ -152,6 +152,45 @@ const MAX_LISTED: usize = 200;
 const CALL_SKIPPED: &str = "not run: the person interrupted the turn before this call ran";
 /// What a call the human refused is answered with (DESIGN.md §11).
 const CALL_REFUSED: &str = "not run: the person refused this call. That is their answer: do not try to reach the same result another way. Say what you needed it for and ask how they would like to go on";
+/// Why a call a card waited on runs with no answer, its rules having
+/// changed so that none asks.
+const RULES_CHANGED: &str = "the rules that asked about it changed";
+
+/// What a call refused by a rule is answered with: `why`, and that it
+/// is the workspace's answer.
+fn ruled(why: &str) -> String {
+    format!("not run: {why}. That is the workspace's answer: do not try to reach the same result another way. Say what you needed it for and ask the person how they would like to go on")
+}
+
+/// A host call as the rules judge it.
+struct Judged<'a> {
+    name: &'a str,
+    command: Option<&'a str>,
+    acts: bool,
+    repeated: bool,
+}
+
+/// What the rules make of a host call.
+enum Ruling {
+    /// A rule refuses it, and why.
+    Deny(String),
+    /// The human decides; why, when a rule or an unread file asks.
+    Card(Option<String>),
+    /// It runs with no card; the allow rule that lets it, for a call
+    /// that acts.
+    Run(Option<String>),
+}
+
+/// How a card was decided.
+enum Decided {
+    Allowed,
+    Refused,
+    /// The turn ended, or the window closed, first.
+    Undecided,
+    /// The human's rules changed while it waited, and one refuses it.
+    Ruled(String),
+}
+
 /// What a call is answered with when the turn ended before the human
 /// decided it.
 const CALL_UNDECIDED: &str =
@@ -2359,24 +2398,22 @@ impl Session {
             }
             _ => None,
         };
-        let (rules, unread) = self.rules();
-        let mut asked = None;
-        let mut allowed = None;
-        match crate::rules::judge(&rules, &unread, name, command, acts) {
-            crate::rules::Verdict::Deny(why) => {
-                let why = tools::visible(&why);
-                self.log(Kind::Approval {
-                    call: started,
-                    outcome: "deny".into(),
-                    by: "rule".into(),
-                    probabilities: None,
-                    reason: Some(why.clone()),
-                })?;
-                return failed(format!("not run: {why}. That is the workspace's answer: do not try to reach the same result another way. Say what you needed it for and ask the person how they would like to go on"));
-            }
-            crate::rules::Verdict::Ask(why) => asked = Some(tools::visible(&why)),
-            crate::rules::Verdict::Allow(why) => allowed = Some(tools::visible(&why)),
-            crate::rules::Verdict::Table => {}
+        let judged = Judged {
+            name,
+            command,
+            acts,
+            repeated,
+        };
+        let ruling = self.ruling(&judged);
+        if let Ruling::Deny(why) = &ruling {
+            self.log(Kind::Approval {
+                call: started,
+                outcome: "deny".into(),
+                by: "rule".into(),
+                probabilities: None,
+                reason: Some(why.clone()),
+            })?;
+            return failed(ruled(why));
         }
         // Before any card: the person is not asked about a call that
         // cannot run yet.
@@ -2412,34 +2449,65 @@ impl Session {
                 ));
             }
         }
-        if (acts && allowed.is_none()) || repeated || asked.is_some() {
-            let (title, mut details) = tools::card(&call);
-            if repeated {
-                details.insert(0, REPEATED.into());
+        match ruling {
+            Ruling::Card(asked) => {
+                let (title, mut details) = tools::card(&call);
+                if repeated {
+                    details.insert(0, REPEATED.into());
+                }
+                if let Some(why) = &asked {
+                    details.insert(0, format!("Asked because {why}."));
+                }
+                // What the card's "always" answers would remember: no
+                // allow while a rule or an unread file asks, as one
+                // would not run the call before them.
+                let always = self
+                    .conversation
+                    .meta()
+                    .workspace
+                    .as_ref()
+                    .and_then(|_| crate::rules::proposals(name, command))
+                    .map(|always| crate::rules::Always {
+                        allow: always.allow && asked.is_none(),
+                        ..always
+                    });
+                let why = asked.as_deref().or(repeated.then_some("repeated"));
+                match self.decide(started, title, details, why, always, Some(&judged))? {
+                    Decided::Allowed => {}
+                    Decided::Refused => return failed(CALL_REFUSED.into()),
+                    Decided::Undecided => return failed(CALL_UNDECIDED.into()),
+                    Decided::Ruled(why) => return failed(ruled(&why)),
+                }
             }
-            if let Some(why) = &asked {
-                details.insert(0, format!("Asked because {why}."));
+            Ruling::Run(Some(why)) => {
+                self.log(Kind::Approval {
+                    call: started,
+                    outcome: "allow".into(),
+                    by: "rule".into(),
+                    probabilities: None,
+                    reason: Some(why),
+                })?;
             }
-            let why = asked.as_deref().or(repeated.then_some("repeated"));
-            match self.decide(started, title, details, why)? {
-                Some(true) => {}
-                Some(false) => return failed(CALL_REFUSED.into()),
-                None => return failed(CALL_UNDECIDED.into()),
-            }
-        } else if let Some(why) = allowed.filter(|_| acts) {
-            self.log(Kind::Approval {
-                call: started,
-                outcome: "allow".into(),
-                by: "rule".into(),
-                probabilities: None,
-                reason: Some(why),
-            })?;
+            Ruling::Run(None) | Ruling::Deny(_) => {}
         }
         // An interrupt that came with the decision, or before it: nothing
-        // starts.
+        // starts; nor does a call a policy that came since refuses.
+        let decided_at = self.human.0;
         self.hear();
         if self.interrupt {
             return failed(CALL_SKIPPED.into());
+        }
+        if self.human.0 != decided_at {
+            if let Ruling::Deny(why) = self.ruling(&judged) {
+                self.log(Kind::Approval {
+                    call: started,
+                    outcome: "deny".into(),
+                    by: "rule".into(),
+                    probabilities: None,
+                    reason: Some(why.clone()),
+                })?;
+                return failed(ruled(&why));
+            }
         }
         let call = self.bench.with_digest(call);
         let mut client = match self.bench.take(&call) {
@@ -2849,22 +2917,37 @@ impl Session {
         title: String,
         details: Vec<String>,
         why: Option<&str>,
-    ) -> Result<Option<bool>, String> {
+        always: Option<crate::rules::Always>,
+        judged: Option<&Judged<'_>>,
+    ) -> Result<Decided, String> {
         self.send(&Up::Ask {
             call: started,
             title,
             details,
+            always,
         });
-        let allow = loop {
+        let answer = loop {
             if self.gone || self.interrupt {
                 break None;
             }
             match self.inbox.recv() {
-                Ok(Inbound::Down(Down::Decision { call, allow })) if call == started => {
-                    break Some(allow)
-                }
+                Ok(Inbound::Down(Down::Decision {
+                    call,
+                    allow,
+                    always,
+                })) if call == started => break Some(Ok((allow, always))),
                 // A card already answered or withdrawn.
                 Ok(Inbound::Down(Down::Decision { .. })) => {}
+                // The human's rules changed while the card waited: one
+                // that now decides the call takes the card back.
+                Ok(Inbound::Down(Down::Policy { version, rules })) => {
+                    self.policy(version, rules);
+                    match judged.map(|judged| self.ruling(judged)) {
+                        Some(Ruling::Deny(why)) => break Some(Err(Err(why))),
+                        Some(Ruling::Run(why)) => break Some(Err(Ok(why))),
+                        Some(Ruling::Card(_)) | None => {}
+                    }
+                }
                 Ok(Inbound::Down(Down::Interrupt)) => self.interrupt = true,
                 Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
                 Ok(Inbound::Down(down)) => self.later(down),
@@ -2878,9 +2961,26 @@ impl Session {
                 Ok(Inbound::Closed) | Err(_) => self.gone = true,
             }
         };
-        let (outcome, by, reason) = match allow {
-            Some(true) => ("allow", "human", why.map(str::to_string)),
-            Some(false) => ("deny", "human", why.map(str::to_string)),
+        let human = |always: Option<String>| match (why, always) {
+            (why, None) => why.map(str::to_string),
+            (None, Some(always)) => Some(format!("always: {always}")),
+            (Some(why), Some(always)) => Some(format!("{why}; always: {always}")),
+        };
+        let (outcome, by, reason, decided) = match answer {
+            Some(Ok((true, always))) => ("allow", "human", human(always), Decided::Allowed),
+            Some(Ok((false, always))) => ("deny", "human", human(always), Decided::Refused),
+            Some(Err(ruling)) => {
+                self.send(&Up::Withdraw { call: started });
+                match ruling {
+                    Err(why) => ("deny", "rule", Some(why.clone()), Decided::Ruled(why)),
+                    Ok(why) => (
+                        "allow",
+                        "rule",
+                        Some(why.unwrap_or_else(|| RULES_CHANGED.into())),
+                        Decided::Allowed,
+                    ),
+                }
+            }
             None => {
                 self.send(&Up::Withdraw { call: started });
                 let why = if self.gone {
@@ -2888,7 +2988,12 @@ impl Session {
                 } else {
                     "the turn was interrupted"
                 };
-                ("withdrawn", "td-agent", Some(why.to_string()))
+                (
+                    "withdrawn",
+                    "td-agent",
+                    Some(why.to_string()),
+                    Decided::Undecided,
+                )
             }
         };
         self.log(Kind::Approval {
@@ -2898,7 +3003,24 @@ impl Session {
             probabilities: None,
             reason,
         })?;
-        Ok(allow)
+        Ok(decided)
+    }
+
+    /// What the rules make of a call to `judged.name` (DESIGN.md §11): a
+    /// deny refuses it; an ask, an unread file, a call that acts with no
+    /// allow for it, or a repeated one puts it on a card; else it runs.
+    fn ruling(&self, judged: &Judged<'_>) -> Ruling {
+        let (rules, unread) = self.rules();
+        match crate::rules::judge(&rules, &unread, judged.name, judged.command, judged.acts) {
+            crate::rules::Verdict::Deny(why) => Ruling::Deny(tools::visible(&why)),
+            crate::rules::Verdict::Ask(why) => Ruling::Card(Some(tools::visible(&why))),
+            _ if judged.repeated => Ruling::Card(None),
+            crate::rules::Verdict::Allow(why) => {
+                Ruling::Run(judged.acts.then(|| tools::visible(&why)))
+            }
+            crate::rules::Verdict::Table if judged.acts => Ruling::Card(None),
+            crate::rules::Verdict::Table => Ruling::Run(None),
+        }
     }
 
     /// Runs one call, the `ToolCall` record `started`: the tool's answer,
@@ -2994,10 +3116,10 @@ impl Session {
             return Ok(Err(format!("there is no conversation {target}")));
         };
         let (title, details) = tools::crossing_card(target, &meta.title, reach);
-        match self.decide(started, title, details, None)? {
-            Some(true) => {}
-            Some(false) => return Ok(Err(CALL_REFUSED.into())),
-            None => return Ok(Err(CALL_UNDECIDED.into())),
+        match self.decide(started, title, details, None, None, None)? {
+            Decided::Allowed => {}
+            Decided::Refused | Decided::Ruled(_) => return Ok(Err(CALL_REFUSED.into())),
+            Decided::Undecided => return Ok(Err(CALL_UNDECIDED.into())),
         }
         // An interrupt that came with the decision, or before it.
         self.hear();

@@ -392,6 +392,222 @@ pub fn human_text(rules: &[Human]) -> String {
     text
 }
 
+/// The most rules one card's "always" answer writes.
+pub const MAX_BODIES: usize = 8;
+
+/// Programs whose second word names what they do, so an "always" answer
+/// takes it with the program: `cargo test`, not every `cargo`.
+const SUBCOMMANDED: &[&str] = &[
+    "apt",
+    "bundle",
+    "cargo",
+    "dnf",
+    "docker",
+    "dotnet",
+    "gh",
+    "git",
+    "go",
+    "guix",
+    "just",
+    "kubectl",
+    "make",
+    "nix",
+    "npm",
+    "pip",
+    "pip3",
+    "pnpm",
+    "podman",
+    "poetry",
+    "rustup",
+    "systemctl",
+    "uv",
+    "yarn",
+];
+
+/// Interpreters and build tools: what they run is the workspace's code,
+/// so an allow for one is broad (DESIGN.md §11).
+const BROAD: &[&str] = &[
+    "bash", "bun", "bundle", "cargo", "cc", "clang", "cmake", "dash", "deno", "dotnet", "gcc",
+    "go", "gradle", "java", "just", "make", "meson", "mvn", "ninja", "node", "npm", "npx", "perl",
+    "php", "pnpm", "poetry", "pytest", "python", "python3", "rake", "ruby", "rustc", "sh", "tox",
+    "uv", "yarn", "zsh",
+];
+
+/// What a card's "always" answers would write: each rule's tool and
+/// words, `shell cargo test`, as an allow or a deny, and whether an
+/// allow is offered at all.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Always {
+    pub allow: bool,
+    pub bodies: Vec<String>,
+}
+
+impl Always {
+    /// `bodies` as a card may offer them: one to `MAX_BODIES`, each once,
+    /// each a rule's tool and words as `Rule::text` writes them.
+    pub fn checked(allow: bool, bodies: Vec<String>) -> Result<Self, String> {
+        if bodies.is_empty() || bodies.len() > MAX_BODIES {
+            return Err(format!("from one to {MAX_BODIES} rules to remember"));
+        }
+        for (at, body) in bodies.iter().enumerate() {
+            let line = format!("deny {body}");
+            if Rule::parse(&line)?.text() != line {
+                return Err(format!(
+                    "a rule to remember not as a rule writes it: {body:?}"
+                ));
+            }
+            if bodies
+                .get(..at)
+                .is_some_and(|earlier| earlier.contains(body))
+            {
+                return Err(format!("a rule to remember twice: {body:?}"));
+            }
+        }
+        Ok(Self { allow, bodies })
+    }
+}
+
+/// Whether `word` reads as a subcommand: lower case, a letter first.
+fn subcommand(word: &str) -> bool {
+    word.starts_with(|c: char| c.is_ascii_lowercase())
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// What a card for a call to `tool`, running `command` when it is
+/// `shell`, offers to remember (DESIGN.md §11): the tool alone, or for
+/// each segment of a command its program and, for a program in
+/// `SUBCOMMANDED`, its subcommand. No allow for a command the matcher
+/// cannot see into, a segment of redirections alone, or a subcommanded
+/// program with no subcommand to name; nothing for a command with no
+/// program a rule can name.
+pub fn proposals(tool: &str, command: Option<&str>) -> Option<Always> {
+    if !TOOLS.contains(&tool) {
+        return None;
+    }
+    if tool == "shell" && command.is_none() {
+        return None;
+    }
+    let Some(command) = command.filter(|_| tool == "shell") else {
+        return Some(Always {
+            allow: true,
+            bodies: vec![tool.to_string()],
+        });
+    };
+    let parsed = split(command);
+    let mut allow = !parsed.opaque && !parsed.segments.is_empty();
+    let mut bodies: Vec<String> = Vec::new();
+    for words in &parsed.segments {
+        // A word with a space or tab, quoted, would read back as two.
+        let one = |word: &str| !word.contains([' ', '\t']);
+        let Some(Some(word)) = words
+            .first()
+            .filter(|word| word.as_deref().is_some_and(one))
+        else {
+            allow = false;
+            continue;
+        };
+        let mut body = format!("shell {word}");
+        if SUBCOMMANDED.contains(&program(word)) {
+            match words.get(1) {
+                Some(Some(sub)) if subcommand(sub) && one(sub) => {
+                    body.push(' ');
+                    body.push_str(sub);
+                }
+                // `git -C x push` or `make` alone: a rule for the
+                // program alone would allow every subcommand.
+                _ => allow = false,
+            }
+        }
+        if Rule::parse(&format!("deny {body}")).is_err() {
+            allow = false;
+            continue;
+        }
+        if !bodies.contains(&body) {
+            bodies.push(body);
+        }
+    }
+    Always::checked(allow, bodies).ok()
+}
+
+/// The program of `body`, a rule's tool and words, when an allow for it
+/// is broad: an interpreter or build tool.
+pub fn broad(body: &str) -> Option<&str> {
+    let word = body.strip_prefix("shell ")?.split(' ').next()?;
+    BROAD.contains(&program(word)).then_some(word)
+}
+
+/// `text`, the human's rules file, without each section under the
+/// header of workspace `key`, a deleted conversation's own, so a later
+/// workspace that came to share its key takes none of its rules; `None`
+/// when it holds none. Refused when `text` is.
+pub fn without(text: &str, key: &str) -> Result<Option<String>, String> {
+    parse_human(text)?;
+    let header = format!("[{key}]");
+    let mut out = String::new();
+    let mut dropping = false;
+    let mut dropped = false;
+    for line in text.lines() {
+        let trimmed = line.trim_matches([' ', '\t']);
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            dropping = trimmed == header;
+            dropped |= dropping;
+        }
+        if !dropping {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !dropped {
+        return Ok(None);
+    }
+    parse_human(&out)?;
+    Ok(Some(out))
+}
+
+/// `text`, the human's rules file, with `effect` rules for `bodies`
+/// added under `scope`: below the file's last header when that is
+/// `scope`'s, else under a new one at its end, so every line already
+/// there stays as it is. A rule the scope already holds is not added
+/// again. Refused when `text` is, or the result would be.
+pub fn add(text: &str, scope: &Scope, effect: Effect, bodies: &[String]) -> Result<String, String> {
+    let rules = parse_human(text)?;
+    let header = match scope {
+        Scope::Everywhere => format!("[{EVERYWHERE}]"),
+        Scope::Workspace(key) => format!("[{}]", workspace_key(key)?),
+    };
+    let mut out = text.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    let last = text
+        .lines()
+        .rev()
+        .map(|line| line.trim_matches([' ', '\t']))
+        .find(|line| line.starts_with('[') && line.ends_with(']'));
+    let mut headed = last == Some(header.as_str());
+    for body in bodies {
+        let rule = Rule::parse(&format!("{} {body}", effect.name()))?;
+        let held = |one: &Human| &one.scope == scope && one.rule == rule;
+        if rules.iter().any(held) {
+            continue;
+        }
+        if !headed {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&header);
+            out.push('\n');
+            headed = true;
+        }
+        out.push_str(&rule.text());
+        out.push('\n');
+    }
+    parse_human(&out)?;
+    Ok(out)
+}
+
 /// A word of a command as the shell would pass it, or none when an
 /// expansion or a glob decides it.
 pub type Word = Option<String>;
@@ -1013,14 +1229,58 @@ pub fn judge(
             return Verdict::Ask(format!("{from} could not be read: {why}"));
         }
     }
-    if let Some(one) = said(Effect::Allow) {
-        return Verdict::Allow(format!(
-            "the rule `{}` of {} allows it",
-            one.rule.text(),
-            one.from
-        ));
+    if let Some(ones) = allowed(rules, tool, parsed.as_ref()) {
+        // At most `NAMED` named, so the reason stays short however
+        // many segments a command has.
+        let mut named: Vec<String> = ones
+            .iter()
+            .take(NAMED)
+            .map(|one| format!("`{}` of {}", one.rule.text(), one.from))
+            .collect();
+        if ones.len() > NAMED {
+            named.push(format!("{} more", ones.len() - NAMED));
+        }
+        return Verdict::Allow(match named.as_slice() {
+            [one] => format!("the rule {one} allows it"),
+            _ => format!("the rules {} allow it", named.join(", ")),
+        });
     }
     Verdict::Table
+}
+
+/// The most allow rules an allow's reason names.
+const NAMED: usize = 3;
+
+/// The allow rules that let a call to `tool` run, `command` its shell
+/// command as `split` read it: one for the whole tool, or for a command
+/// the matcher can see into, one for each segment, every segment
+/// covered, so `cargo test && cargo fmt` runs on `allow shell cargo
+/// test` and `allow shell cargo fmt` together.
+fn allowed<'a>(
+    rules: &'a [Sourced],
+    tool: &str,
+    command: Option<&Parsed>,
+) -> Option<Vec<&'a Sourced>> {
+    let allows = rules
+        .iter()
+        .filter(|one| one.rule.effect == Effect::Allow && one.rule.tool == tool);
+    if let Some(one) = allows
+        .clone()
+        .find(|one| one.rule.prefix.is_empty() && matches(&one.rule, tool, command))
+    {
+        return Some(vec![one]);
+    }
+    let parsed = command.filter(|parsed| !parsed.opaque && !parsed.segments.is_empty())?;
+    let mut used: Vec<&Sourced> = Vec::new();
+    for segment in &parsed.segments {
+        let one = allows.clone().find(|one| {
+            !one.rule.prefix.is_empty() && starts(&one.rule.prefix, segment, Effect::Allow)
+        })?;
+        if !used.iter().any(|u| std::ptr::eq(*u, one)) {
+            used.push(one);
+        }
+    }
+    Some(used)
 }
 
 #[cfg(test)]
@@ -1472,6 +1732,47 @@ mod tests {
             judge(&[], &unread, "read_file", None, false),
             Verdict::Table
         );
+        // Allows compose: each segment covered by one of them.
+        let both = [
+            Sourced {
+                rule: rule("allow shell cargo test"),
+                from: "A".into(),
+            },
+            Sourced {
+                rule: rule("allow shell cargo fmt"),
+                from: "B".into(),
+            },
+        ];
+        assert_eq!(
+            judge(
+                &both,
+                &[],
+                "shell",
+                Some("cargo test -p x && cargo fmt; cargo test"),
+                true
+            ),
+            Verdict::Allow(
+                "the rules `allow shell cargo test` of A, `allow shell cargo fmt` of B allow it"
+                    .into()
+            )
+        );
+        assert_eq!(
+            judge(&both, &[], "shell", Some("cargo test && cargo build"), true),
+            Verdict::Table
+        );
+        let many: Vec<Sourced> = (0..5)
+            .map(|n| Sourced {
+                rule: rule(&format!("allow shell p{n}")),
+                from: "A".into(),
+            })
+            .collect();
+        assert_eq!(
+            judge(&many, &[], "shell", Some("p0; p1; p2; p3; p4"), true),
+            Verdict::Allow(
+                "the rules `allow shell p0` of A, `allow shell p1` of A, `allow shell p2` of A, 2 more allow it"
+                    .into()
+            )
+        );
         // The human's allow, after every deny and ask, and never for a
         // command the matcher cannot see into.
         let yours = |line: &str| Sourced {
@@ -1539,6 +1840,140 @@ mod tests {
             Verdict::Deny("the rule `deny read_file` of the repository at /w/td denies it".into())
         );
     }
+    /// What a card offers to remember: the tool alone, or each segment's
+    /// program with a subcommanded one's subcommand; no allow for what
+    /// the matcher cannot see into or a rule could not name narrowly.
+    #[test]
+    fn a_card_offers_to_remember_each_programs_rule() {
+        let offer = |tool: &str, command: Option<&str>| proposals(tool, command);
+        let always = |allow: bool, bodies: &[&str]| {
+            Some(Always {
+                allow,
+                bodies: bodies.iter().map(|b| b.to_string()).collect(),
+            })
+        };
+        assert_eq!(offer("write_file", None), always(true, &["write_file"]));
+        assert_eq!(
+            offer(
+                "shell",
+                Some("cargo test -p x && cargo fmt --check | tee log")
+            ),
+            always(true, &["shell cargo test", "shell cargo fmt", "shell tee"])
+        );
+        assert_eq!(
+            offer("shell", Some("rm -f a; rm b")),
+            always(true, &["shell rm"])
+        );
+        assert_eq!(
+            offer("shell", Some("./build.sh")),
+            always(true, &["shell ./build.sh"])
+        );
+        // A subcommanded program with none named, or an option first.
+        assert_eq!(offer("shell", Some("make")), always(false, &["shell make"]));
+        assert_eq!(
+            offer("shell", Some("git -C sub push")),
+            always(false, &["shell git"])
+        );
+        assert_eq!(
+            offer("shell", Some("git Push")),
+            always(false, &["shell git"])
+        );
+        // Opaque: only the denies of the programs it names, and nothing
+        // for one the matcher cannot split.
+        assert_eq!(
+            offer("shell", Some("sh -c 'rm x'")),
+            always(false, &["shell sh"])
+        );
+        assert_eq!(offer("shell", Some("echo $(rm x)")), None);
+        assert_eq!(
+            offer("shell", Some("ls; > notes.txt")),
+            always(false, &["shell ls"])
+        );
+        assert_eq!(offer("shell", Some("\"$x\"")), None);
+        // A quoted word with a space would read back as two.
+        assert_eq!(
+            offer("shell", Some("'git push' x; ls")),
+            always(false, &["shell ls"])
+        );
+        assert_eq!(offer("shell", Some("> f")), None);
+        assert_eq!(offer("push", None), None);
+        assert_eq!(offer("shell", None), None);
+        // A quoted program with its option: no allow past program and
+        // subcommand.
+        assert_eq!(offer("shell", Some("'git --no-pager' status")), None);
+        let many: Vec<String> = (0..=MAX_BODIES).map(|n| format!("p{n}")).collect();
+        assert_eq!(offer("shell", Some(&many.join("; "))), None);
+        assert_eq!(broad("shell cargo test"), Some("cargo"));
+        assert_eq!(broad("shell /usr/bin/python3"), Some("/usr/bin/python3"));
+        assert_eq!(broad("shell rm"), None);
+        assert_eq!(broad("write_file"), None);
+    }
+
+    #[test]
+    fn what_a_card_offers_crosses_only_as_rules_write_it() {
+        let bodies = |b: &[&str]| b.iter().map(|b| b.to_string()).collect::<Vec<_>>();
+        assert!(Always::checked(true, bodies(&["shell cargo test", "glob"])).is_ok());
+        for wrong in [
+            bodies(&[]),
+            bodies(&["shell  cargo"]),
+            bodies(&["shell cargo test", "shell cargo test"]),
+            bodies(&["allow shell"]),
+            bodies(&["shell $x"]),
+            bodies(&["write_file x"]),
+            (0..=MAX_BODIES).map(|n| format!("shell p{n}")).collect(),
+        ] {
+            assert!(Always::checked(true, wrong.clone()).is_err(), "{wrong:?}");
+        }
+    }
+
+    /// A deleted conversation's workspace's sections go, every other line
+    /// staying; a file with none is left as it is.
+    #[test]
+    fn a_deleted_workspaces_rules_go_with_it() {
+        let text = "# mine\n[workspace td-1-ab]\nallow shell cargo test\n\n[everywhere]\ndeny shell rm\n[workspace td-1-ab]\n# again\ndeny glob\n[workspace td-2-cd]\nask glob\n";
+        assert_eq!(
+            without(text, "workspace td-1-ab").unwrap().unwrap(),
+            "# mine\n[everywhere]\ndeny shell rm\n[workspace td-2-cd]\nask glob\n"
+        );
+        assert_eq!(without(text, "workspace td-3-ef").unwrap(), None);
+        assert!(without("[x]\n", "workspace td-1-ab").is_err());
+    }
+
+    /// An "always" answer adds its rules without disturbing the human's
+    /// file: below the last header when it is the scope's, else under a
+    /// new one; a rule already held is not added again.
+    #[test]
+    fn an_always_answer_adds_its_rules_and_keeps_every_line() {
+        let here = Scope::Workspace("workspace td-1-ab".into());
+        let cargo = vec!["shell cargo test".to_string()];
+        let first = add("", &here, Effect::Allow, &cargo).unwrap();
+        assert_eq!(first, "[workspace td-1-ab]\nallow shell cargo test\n");
+        let fmt = vec![
+            "shell cargo fmt".to_string(),
+            "shell cargo test".to_string(),
+        ];
+        assert_eq!(
+            add(&first, &here, Effect::Allow, &fmt).unwrap(),
+            "[workspace td-1-ab]\nallow shell cargo test\nallow shell cargo fmt\n"
+        );
+        let mine = "# mine\n[workspace td-1-ab]\nallow shell cargo test # kept?\n";
+        assert!(add(mine, &here, Effect::Allow, &cargo).is_err());
+        let mine = "# mine\n[workspace td-1-ab]\n  allow shell cargo test";
+        assert_eq!(
+            add(mine, &here, Effect::Allow, &cargo).unwrap(),
+            format!("{mine}\n")
+        );
+        let both = add(mine, &Scope::Everywhere, Effect::Deny, &["shell rm".into()]).unwrap();
+        assert_eq!(both, format!("{mine}\n\n[everywhere]\ndeny shell rm\n"));
+        assert_eq!(
+            add(&both, &here, Effect::Deny, &["shell rm".into()]).unwrap(),
+            format!("{both}\n[workspace td-1-ab]\ndeny shell rm\n")
+        );
+        // Never an allow for every workspace, nor into a file refused.
+        assert!(add("", &Scope::Everywhere, Effect::Allow, &cargo).is_err());
+        assert!(add("[x]\n", &here, Effect::Deny, &cargo).is_err());
+    }
+
     #[test]
     fn the_humans_rules_file_reads_back_as_written() {
         let text = "# mine\n[workspace td-1-ab]\nallow shell cargo test\n deny write_file\n\n[everywhere]\ndeny shell rm\n[directory /home/u/my%20notes]\nask glob\n";

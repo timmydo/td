@@ -129,6 +129,21 @@ pub struct Card {
     pub call: u64,
     pub title: String,
     pub details: Vec<String>,
+    /// What its "always" answers would remember, when it offers them.
+    pub always: Option<crate::rules::Always>,
+}
+
+/// The human's answer to a card (DESIGN.md §11): allow or deny this once,
+/// or always, the rules for `bodies` added to their rules for this
+/// workspace, or for every workspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Answer {
+    Once(bool),
+    Always {
+        allow: bool,
+        everywhere: bool,
+        bodies: Vec<String>,
+    },
 }
 
 /// What the list says of a conversation that asks the human.
@@ -293,7 +308,7 @@ pub enum Request {
     Decide {
         conversation: Id,
         call: u64,
-        allow: bool,
+        answer: Answer,
     },
     /// Close the window, from File → Quit.
     Quit,
@@ -1271,6 +1286,18 @@ impl App {
     /// once if it is the open conversation's and nothing else is modal,
     /// else when it is.
     pub fn ask(&mut self, card: Card) {
+        // One shown for the same call is closed, so what the human
+        // answers is the card they see.
+        let shown = self.confirm.as_ref().is_some_and(|confirm| {
+            confirm.purpose()
+                == &confirm::Purpose::Approve {
+                    conversation: card.conversation.clone(),
+                    call: card.call,
+                }
+        });
+        if shown {
+            self.close_confirm();
+        }
         self.cards
             .retain(|c| (&c.conversation, c.call) != (&card.conversation, card.call));
         self.cards.push(card);
@@ -1366,6 +1393,7 @@ impl App {
             card.call,
             &card.title,
             &card.details,
+            card.always.as_ref(),
             self.confirm_revision,
         ) {
             Ok(confirm) => {
@@ -1387,14 +1415,31 @@ impl App {
         }
     }
 
-    /// The human's decision on a card, sent and the card forgotten.
-    fn decide(&mut self, conversation: Id, call: u64, allow: bool) {
+    /// The human's decision on a card, sent and the card forgotten: `act`
+    /// its action, or none for Cancel.
+    fn decide(&mut self, conversation: Id, call: u64, act: Option<confirm::Act>) {
+        let always = self
+            .cards
+            .iter()
+            .find(|c| (&c.conversation, c.call) == (&conversation, call))
+            .and_then(|c| c.always.clone());
+        let answer = match (act, always) {
+            (None, _) => Answer::Once(false),
+            (Some(confirm::Act::Confirm), _) => Answer::Once(true),
+            (Some(act), Some(always)) => Answer::Always {
+                allow: act == confirm::Act::AlwaysAllowHere && always.allow,
+                everywhere: act == confirm::Act::AlwaysDenyEverywhere,
+                bodies: always.bodies,
+            },
+            // An "always" action on a card that offered none.
+            (Some(act), None) => Answer::Once(act == confirm::Act::AlwaysAllowHere),
+        };
         self.cards
             .retain(|c| (&c.conversation, c.call) != (&conversation, call));
         self.requests.push(Request::Decide {
             conversation,
             call,
-            allow,
+            answer,
         });
         self.refresh_list();
     }
@@ -3684,7 +3729,7 @@ impl App {
             confirm::Reply::Closed => {
                 match purpose {
                     confirm::Purpose::Approve { conversation, call } => {
-                        self.decide(conversation, call, false)
+                        self.decide(conversation, call, None)
                     }
                     confirm::Purpose::Admit { template, .. } => self.note(format!(
                         "no conversation from template {template:?}: its remotes were not admitted"
@@ -3694,19 +3739,19 @@ impl App {
                 }
                 self.close_confirm();
             }
-            confirm::Reply::Confirmed(confirm::Purpose::Remove(id)) => {
+            confirm::Reply::Confirmed(confirm::Purpose::Remove(id), _) => {
                 self.answer_removal(id, true);
                 self.close_confirm();
             }
-            confirm::Reply::Confirmed(confirm::Purpose::Delete(id)) => {
+            confirm::Reply::Confirmed(confirm::Purpose::Delete(id), _) => {
                 self.close_confirm();
                 self.requests.push(Request::Delete(id));
             }
-            confirm::Reply::Confirmed(confirm::Purpose::Approve { conversation, call }) => {
-                self.decide(conversation, call, true);
+            confirm::Reply::Confirmed(confirm::Purpose::Approve { conversation, call }, act) => {
+                self.decide(conversation, call, Some(act));
                 self.close_confirm();
             }
-            confirm::Reply::Confirmed(confirm::Purpose::Admit { template, remotes }) => {
+            confirm::Reply::Confirmed(confirm::Purpose::Admit { template, remotes }, _) => {
                 self.close_confirm();
                 self.requests.push(Request::Admit { template, remotes });
             }
@@ -6704,6 +6749,7 @@ pub mod tests {
             call: 4,
             title: "Run a command".into(),
             details: vec!["make".into()],
+            always: None,
         });
         assert!(app.confirm().is_none());
         key(&mut app, "Down");
@@ -7114,11 +7160,12 @@ pub mod tests {
             call,
             title: "Run a command".into(),
             details: vec!["In the workspace:".into(), "make".into()],
+            always: None,
         };
         let decided = |conversation: u8, call: u64, allow: bool| Request::Decide {
             conversation: id(conversation),
             call,
-            allow,
+            answer: Answer::Once(allow),
         };
         let shown = |app: &App| match app.confirm().map(Confirm::purpose) {
             Some(confirm::Purpose::Approve { conversation, call }) => {
@@ -7192,6 +7239,68 @@ pub mod tests {
         assert_eq!(shown(&app), Some((id(3), 12)));
     }
 
+    /// A card's "always" answers go to the window with what they would
+    /// remember: each deny here or everywhere, and the allow here.
+    #[test]
+    fn a_cards_always_answers_carry_what_they_remember() {
+        let bodies = vec!["shell cargo test".to_string()];
+        for (tabs, answer) in [
+            (0, Answer::Once(false)),
+            (
+                1,
+                Answer::Always {
+                    allow: false,
+                    everywhere: false,
+                    bodies: bodies.clone(),
+                },
+            ),
+            (
+                2,
+                Answer::Always {
+                    allow: false,
+                    everywhere: true,
+                    bodies: bodies.clone(),
+                },
+            ),
+            (
+                3,
+                Answer::Always {
+                    allow: true,
+                    everywhere: false,
+                    bodies: bodies.clone(),
+                },
+            ),
+            (4, Answer::Once(true)),
+        ] {
+            let mut app = app();
+            app.settle = Duration::ZERO;
+            app.set_active(id(2));
+            app.ask(Card {
+                conversation: id(2),
+                call: 4,
+                title: "Run a command".into(),
+                details: vec!["cargo test".into()],
+                always: Some(crate::rules::Always {
+                    allow: true,
+                    bodies: bodies.clone(),
+                }),
+            });
+            for _ in 0..tabs {
+                key(&mut app, "Tab");
+            }
+            key(&mut app, "Return");
+            assert_eq!(
+                app.take_requests(),
+                [Request::Decide {
+                    conversation: id(2),
+                    call: 4,
+                    answer
+                }],
+                "{tabs}"
+            );
+        }
+    }
+
     /// A card that comes while the human types takes no key at first: what
     /// was meant for the composer neither refuses nor allows it.
     #[test]
@@ -7204,6 +7313,7 @@ pub mod tests {
             call: 4,
             title: "Run a command".into(),
             details: vec!["make".into()],
+            always: None,
         });
         for chord in ["Tab", "Space", "Return", "Escape"] {
             key(&mut app, chord);
@@ -7217,7 +7327,7 @@ pub mod tests {
             [Request::Decide {
                 conversation: id(2),
                 call: 4,
-                allow: false
+                answer: Answer::Once(false)
             }]
         );
     }
