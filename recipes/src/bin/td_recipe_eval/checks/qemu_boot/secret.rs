@@ -406,7 +406,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
     }
     run_powercuts(runner, &qemu, &kernel, &base, &contents)?;
     println!("PASS: secret authority VM cases ({} fresh guests); credential intake, inspection, relocking and login-worker supervision; no token or TPM release claim", fixture::CASES.len());
-    println!("PASS: login-key worker over UHID virtual keys ({} fresh guests); production discovery, HID worker and operation lock for unlock, one- and two-key enrollment, addition and removal; wrong PIN, PIN AUTH BLOCKED until reinsertion, PIN BLOCKED, no key, two keys, a stranger key, a credProtect probe refusal and keepalives through a slow touch; simulated root acknowledgements and tier marker, no TPM, physical-presence or YubiKey claim", fixture::LOGIN_CASES.len());
+    println!("PASS: login-key worker over UHID virtual keys ({} fresh guests); production discovery, HID worker and operation lock for unlock, one- and two-key enrollment, addition and removal; additions to eight and a ninth refused; wrong PIN, PIN AUTH BLOCKED until reinsertion, PIN BLOCKED, no key, two keys, a stranger key, denied presence, alwaysUv, a list too small and a credProtect probe refusal; a tampered verifier or public key and a stale signature; a record changed before token I/O or at the commit and an unshared record version, with no write; keepalives through a slow touch; simulated root acknowledgements and tier marker, no TPM, physical-presence or YubiKey claim", fixture::LOGIN_CASES.len());
     println!("PASS: login record across abrupt QEMU kills ({} cold boots of one disposable Btrfs @var); cuts at every publication and removal stage and after a commit leave the old record or the whole new one, an unlink done or not, synced temporaries removed by the next write, and a rename or unlink before its directory sync lost; persistent virtual keys unlock whichever record survived; guest crash only, host storage retained, no host-power-loss, write-cache flush or torn-sector claim", fixture::LOGIN_CUT_PHASES.len());
     if tpm.is_some() {
         println!("PASS: TPM guest device, persistent sealed key, cold reopen, changed PCR and different TPM refusal; fixture measurements only, no FIDO2 or measured-deployment claim");
@@ -827,6 +827,10 @@ mod tests {
                 "login-add-remove",
                 "login-keepalive",
                 "login-probe",
+                "login-refusals",
+                "login-verify",
+                "login-changed",
+                "login-eight",
             ]
         );
         let source = include_str!("../../../../../../td-secret/src/login_vm.rs");
@@ -853,7 +857,7 @@ mod tests {
             .chain(std::iter::once(&fixture::LOGIN_CUT_CASE))
             .map(|(name, _)| name)
             .collect();
-        assert_eq!(all.len(), 5 + 4 + 11 + 7 + 1);
+        assert_eq!(all.len(), 5 + 4 + 11 + 11 + 1);
         assert!(fixture::LOGIN_CASES
             .iter()
             .all(|(name, _)| name.starts_with("login-")));

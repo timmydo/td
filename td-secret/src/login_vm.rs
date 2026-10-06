@@ -10,7 +10,7 @@
 use super::*;
 use crate::fido_device::Device;
 use crate::fido_uhid::{guard, Plugged, Served, KEEPALIVE_PERIOD};
-use crate::fido_virtual::Presence;
+use std::cell::Cell;
 use std::os::unix::fs::FileTypeExt;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -719,6 +719,444 @@ fn qemu_login_worker_refuses_a_key_whose_credprotect_default_fails_the_probe() {
     assert!(names().is_empty());
     // Create and prove, repeat, and the probe that did not select it.
     assert_eq!(plugged.remove().channels, 3);
+    finish();
+}
+
+#[test]
+#[ignore = "requires qemu-secret with a disposable guest and UHID"]
+fn qemu_login_worker_ends_on_denied_presence_always_uv_and_a_list_too_small() {
+    guard("login-refusals");
+    prepare();
+    let denied = Script {
+        presence: Presence::Denied,
+        ..Script::default()
+    };
+    let make = |step| enrolling(1, 1, step);
+    let connected = vec![
+        vec![0x18, 0],
+        invitation(0x10, &login(make(LoginStep::Connect))),
+    ];
+    // alwaysUv true: KEY REFUSED 02 at the new key's getInfo, before any PIN.
+    let strict = Virtual::new(
+        Config {
+            always_uv: Some(true),
+            ..Config::default()
+        },
+        Some(PIN),
+        "always-uv",
+    );
+    let plugged = Plugged::insert(&strict, NAME);
+    let refused = Failure::Refused(LoginRefusal::AlwaysUv);
+    assert_eq!(
+        physical(begins(make(LoginStep::Connect))),
+        (Err(refused), failed(connected.clone(), refused))
+    );
+    assert_eq!(refused.frame(), [0x15, 6, 2]);
+    assert_eq!(pin_tokens(&strict), 0);
+    assert!(sent(&strict, 1, 1).is_empty());
+    assert_eq!(plugged.remove().channels, 1);
+    assert!(names().is_empty());
+    // Presence denied at the creation, after its PIN: DENIED, no credential,
+    // and the key's count still 8.
+    let new = blank("denied-create");
+    new.script(denied);
+    let plugged = Plugged::insert(&new, NAME);
+    let mut frames = connected.clone();
+    frames.push(invitation(
+        0x10,
+        &login(make(LoginStep::Create { retries: 8 })),
+    ));
+    assert_eq!(
+        physical(begins(make(LoginStep::Connect))),
+        (Err(Failure::Denied), failed(frames, Failure::Denied))
+    );
+    assert_eq!(Failure::Denied.frame(), [0x15, 7]);
+    assert!(new.state().credentials.is_empty());
+    assert_eq!(new.state().retries, 8);
+    assert_eq!(plugged.remove().channels, 1);
+    assert!(names().is_empty());
+    // alwaysUv false is admitted: the key enrolls and its record unlocks.
+    let relaxed = Virtual::new(
+        Config {
+            always_uv: Some(false),
+            ..Config::default()
+        },
+        Some(PIN),
+        "never-uv",
+    );
+    let plugged = Plugged::insert(&relaxed, NAME);
+    let (result, seen) = physical(begins(make(LoginStep::Connect)));
+    assert_eq!(result, Ok(()));
+    let key = fingerprint(&newest(&relaxed));
+    let mut frames = connected;
+    frames.extend(ceremony(make, key));
+    assert_eq!(seen, committed(frames, make(LoginStep::Probe { key })));
+    assert_eq!(physical(pin(PIN)), (Ok(()), succeeded(&[key], key, 8)));
+    // Presence denied at its unlock assertion, after the PIN: DENIED;
+    // granted again, the key unlocks, its count reported 8 again.
+    relaxed.script(denied);
+    assert_eq!(
+        physical(pin(PIN)),
+        (
+            Err(Failure::Denied),
+            failed(through_unlock(&[key], key, 8), Failure::Denied)
+        )
+    );
+    assert_eq!(relaxed.state().retries, 8);
+    relaxed.script(Script::default());
+    assert_eq!(physical(pin(PIN)), (Ok(()), succeeded(&[key], key, 8)));
+    // The enrolled key reconfigured to require UV everywhere, as a real
+    // key's tool can: KEY REFUSED 02 at the unlock's identify, no PIN step.
+    relaxed.configure(|config| config.always_uv = Some(true));
+    let tokens = pin_tokens(&relaxed);
+    let refused = Failure::Refused(LoginRefusal::AlwaysUv);
+    assert_eq!(
+        physical(pin(PIN)),
+        (
+            Err(refused),
+            failed(
+                vec![baseline(&[key]), invitation(0x10, &identify(1))],
+                refused
+            )
+        )
+    );
+    assert_eq!(pin_tokens(&relaxed), tokens);
+    // Create and prove, repeat, probe; three unlocks of two sessions each;
+    // the refused identify.
+    assert_eq!(plugged.remove().channels, 3 + 3 * 2 + 1);
+    // A new key whose list cannot hold the record's two exclusions: KEY
+    // REFUSED 05 after the gated swap, before any PIN, the record untouched.
+    let (one, two) = (Key::new(80), Key::new(81));
+    let bytes = record(&[&one, &two], None, None);
+    seed(&bytes);
+    let order = fingerprints();
+    let small = Virtual::new(
+        Config {
+            max_list: Some(1),
+            ..Config::default()
+        },
+        Some(PIN),
+        "small",
+    );
+    let port: Port = Arc::new(Mutex::new(Some(Plugged::insert(&one.device, NAME))));
+    let (changed, polls) = (Swapped::default(), Polls::default());
+    let connect = login(adding(2, LoginStep::Connect));
+    let plan = Plan {
+        operation: Some(adding(2, LoginStep::Identify)),
+        pin: Some(pin_frame(PIN)),
+        ..swap(&port, &changed, &polls, connect, &small)
+    };
+    let refused = Failure::Refused(LoginRefusal::ListTooSmall);
+    assert_eq!(
+        watched(plan, &polls),
+        (
+            Err(refused),
+            failed(authorized_addition(&order, one.fingerprint()), refused)
+        )
+    );
+    assert_eq!(refused.frame(), [0x15, 6, 5]);
+    // Identify and authorize on the enrolled key; one session on the new.
+    assert_eq!(swapped(&changed).channels, 2);
+    let plugged = port.lock().unwrap().take().unwrap();
+    assert_eq!(plugged.remove().channels, 1);
+    assert_eq!(pin_tokens(&small), 0);
+    assert!(small.state().credentials.is_empty());
+    assert_eq!(fs::read(directory().join("1000")).unwrap(), bytes);
+    finish();
+}
+
+#[test]
+#[ignore = "requires qemu-secret with a disposable guest and UHID"]
+fn qemu_login_worker_never_unlocks_a_tampered_record_or_a_stale_signature() {
+    guard("login-verify");
+    prepare();
+    let (key, other) = (Key::new(82), Key::new(83));
+    let order = [key.fingerprint()];
+    let refused = failed(
+        through_unlock(&order, key.fingerprint(), 8),
+        Failure::Failed,
+    );
+    let mut flipped = key.output;
+    flipped[0] ^= 1;
+    let plugged = Plugged::insert(&key.device, NAME);
+    // The production record rewritten between operations with a verifier,
+    // then a public key, that are not the key's: its assertion verifies or
+    // its output matches, but never both, and it is FAILED after the PIN.
+    for bytes in [
+        record(&[&key], Some(flipped), None),
+        record(&[&key], None, Some(&other)),
+    ] {
+        seed(&bytes);
+        assert_eq!(physical(pin(PIN)), (Err(Failure::Failed), refused.clone()));
+        assert_eq!(fs::read(directory().join("1000")).unwrap(), bytes);
+    }
+    seed(&record(&[&key], None, None));
+    assert_eq!(
+        physical(pin(PIN)),
+        (Ok(()), succeeded(&order, key.fingerprint(), 8))
+    );
+    // A signature over other data, here this operation's identify's.
+    key.device.script(Script {
+        signing: Signing::Stale,
+        ..Script::default()
+    });
+    assert_eq!(physical(pin(PIN)), (Err(Failure::Failed), refused.clone()));
+    // A replay: this assertion's data signed over the client-data hash the
+    // key signed in an earlier unlock, which the worker's fresh challenge
+    // no longer matches.
+    key.device.script(Script {
+        signing: Signing::Replayed,
+        ..Script::default()
+    });
+    assert_eq!(physical(pin(PIN)), (Err(Failure::Failed), refused));
+    // Every PIN was right; each refusal is the record's or the signature's.
+    assert_eq!(key.device.state().retries, 8);
+    // Five operations of an identify and an assertion session each.
+    assert_eq!(plugged.remove().channels, 5 * 2);
+    finish();
+}
+
+#[test]
+#[ignore = "requires qemu-secret with a disposable guest and UHID"]
+fn qemu_login_worker_refuses_a_changed_record_or_an_unshared_version_without_writing() {
+    guard("login-changed");
+    prepare();
+    let (one, two, other) = (Key::new(84), Key::new(85), Key::new(86));
+    let bytes = record(&[&one, &two], None, None);
+    let changed = record(&[&one, &two, &other], None, None);
+    let dir = directory().to_path_buf();
+    let held = || fs::read(directory().join("1000")).ok();
+    // The worker's store write, counted: no change below may attempt one.
+    let writes = Cell::new(0);
+    let counted = |store: &Store, baseline: Baseline, change: Change<'_>| {
+        writes.set(writes.get() + 1);
+        write(store, baseline, change)
+    };
+    let counting = |plan| operated(plan, &Polls::default(), &writing(&counted));
+    seed(&bytes);
+    let order = fingerprints();
+    // Changed between the baseline frame and the description: RECORD
+    // CHANGED at the first step, before any token I/O.
+    let plugged = Plugged::insert(&one.device, NAME);
+    let plan = Plan {
+        change: Some((dir.clone(), Some(changed.clone()), At::Baseline)),
+        ..pin(PIN)
+    };
+    assert_eq!(
+        counting(plan),
+        (
+            Err(Failure::Changed),
+            failed(
+                vec![baseline(&order), invitation(0x10, &identify(2))],
+                Failure::Changed
+            )
+        )
+    );
+    assert_eq!(Failure::Changed.frame(), [0x15, 0x0d]);
+    assert_eq!(plugged.remove(), Served::default());
+    assert_eq!(held(), Some(changed.clone()));
+    // An addition whose record is replaced at its commit round: the whole
+    // ceremony, then RECORD CHANGED with no write attempted.
+    seed(&bytes);
+    let new = blank("changed-late");
+    let port: Port = Arc::new(Mutex::new(Some(Plugged::insert(&one.device, NAME))));
+    let (swapping, polls) = (Swapped::default(), Polls::default());
+    let connect = login(adding(2, LoginStep::Connect));
+    let plan = Plan {
+        operation: Some(adding(2, LoginStep::Identify)),
+        pin: Some(pin_frame(PIN)),
+        change: Some((dir.clone(), Some(changed.clone()), At::Commit)),
+        ..swap(&port, &swapping, &polls, connect, &new)
+    };
+    let (result, seen) = operated(plan, &polls, &writing(&counted));
+    assert_eq!(result, Err(Failure::Changed));
+    let mut frames = addition(&order, one.fingerprint(), fingerprint(&newest(&new)));
+    frames.pop();
+    assert_eq!(seen, failed(frames, Failure::Changed));
+    assert_eq!(swapped(&swapping).channels, 2);
+    let plugged = port.lock().unwrap().take().unwrap();
+    assert_eq!(plugged.remove().channels, 3);
+    assert_eq!(held(), Some(changed.clone()));
+    // A removal whose record is removed at its commit round.
+    seed(&bytes);
+    let at = order
+        .iter()
+        .position(|key| *key == two.fingerprint())
+        .unwrap() as u8
+        + 1;
+    let removed = slots(&order, &[at]);
+    let plugged = Plugged::insert(&one.device, NAME);
+    let plan = Plan {
+        change: Some((dir.clone(), None, At::Commit)),
+        ..begins(removing(2, &removed, LoginStep::Identify))
+    };
+    let (result, seen) = counting(plan);
+    assert_eq!(result, Err(Failure::Changed));
+    let mut frames = removal(&order, &removed, one.fingerprint());
+    frames.pop();
+    assert_eq!(seen, failed(frames, Failure::Changed));
+    assert_eq!(plugged.remove().channels, 2);
+    assert!(names().is_empty());
+    // A first enrollment over a record that appeared at its commit round.
+    let key = blank("changed-enroll");
+    let plugged = Plugged::insert(&key, NAME);
+    let make = |step| enrolling(1, 1, step);
+    let plan = Plan {
+        change: Some((dir.clone(), Some(bytes.clone()), At::Commit)),
+        ..begins(make(LoginStep::Connect))
+    };
+    let (result, seen) = counting(plan);
+    assert_eq!(result, Err(Failure::Changed));
+    let new = fingerprint(&newest(&key));
+    let mut frames = vec![
+        vec![0x18, 0],
+        invitation(0x10, &login(make(LoginStep::Connect))),
+    ];
+    frames.extend(ceremony(make, new));
+    let mut frames = committed(frames, make(LoginStep::Probe { key: new }));
+    frames.pop();
+    assert_eq!(seen, failed(frames, Failure::Changed));
+    assert_eq!(plugged.remove().channels, 3);
+    assert_eq!(held(), Some(bytes.clone()));
+    assert_eq!(writes.get(), 0);
+    // No record version this build and both retained deployments read:
+    // VERSION for an addition, a removal that leaves a key and a first
+    // enrollment, before any token I/O.
+    let one_key = record(&[&one], None, None);
+    let partial = removing(2, &removed, LoginStep::Identify);
+    let plugged = Plugged::insert(&one.device, NAME);
+    // Production's own empty sets first.
+    let pairs: &[(&[u8], &[u8])] = &[
+        (&[], &[]),
+        (&[], &[VERSION]),
+        (&[VERSION], &[]),
+        (&[2], &[2]),
+        (&[VERSION], &[2]),
+    ];
+    for &(current, previous) in pairs {
+        for (seeded, plan, frame) in [
+            (
+                Some(&one_key),
+                begins(adding(1, LoginStep::Identify)),
+                baseline(&[one.fingerprint()]),
+            ),
+            (Some(&bytes), begins(partial.clone()), baseline(&order)),
+            (None, begins(make(LoginStep::Connect)), vec![0x18, 0]),
+        ] {
+            replace(directory(), seeded.map(Vec::as_slice));
+            let context = Context {
+                current,
+                previous,
+                ..writing(&counted)
+            };
+            assert_eq!(
+                operated(plan, &Polls::default(), &context),
+                (Err(Failure::Version), vec![frame, vec![0x15, 0x12]])
+            );
+            assert_eq!(writes.get(), 0);
+            assert_eq!(fs::read(directory().join("1000")).ok().as_ref(), seeded);
+        }
+    }
+    // Removing every key writes no version, so it unlinks the record even
+    // with none read: the one write of this guest.
+    replace(directory(), Some(&bytes));
+    let context = Context {
+        current: &[],
+        previous: &[],
+        ..writing(&counted)
+    };
+    let every = slots(&order, &[1, 2]);
+    assert_eq!(
+        operated(
+            begins(removing(2, &every, LoginStep::Identify)),
+            &Polls::default(),
+            &context
+        ),
+        (Ok(()), removal(&order, &every, one.fingerprint()))
+    );
+    assert_eq!(writes.get(), 1);
+    assert!(matches!(state(), State::Unenrolled));
+    assert!(names().is_empty());
+    // Only the last removal opened sessions.
+    assert_eq!(plugged.remove().channels, 2);
+    finish();
+}
+
+#[test]
+#[ignore = "requires qemu-secret with a disposable guest and UHID"]
+fn qemu_login_worker_adds_keys_to_eight_and_refuses_a_ninth_before_any_token() {
+    guard("login-eight");
+    prepare();
+    let first = Key::new(87);
+    seed(&record(&[&first], None, None));
+    // Each addition is authorized by the key added before it, still in,
+    // which a gated swap then replaces with the next.
+    let port: Port = Arc::new(Mutex::new(Some(Plugged::insert(&first.device, NAME))));
+    let mut by = first.fingerprint();
+    let mut keys = vec![(first.device.clone(), first.id.clone())];
+    for count in 1..8u8 {
+        let order = fingerprints();
+        let new = blank(&format!("added-{count}"));
+        let (changed, polls) = (Swapped::default(), Polls::default());
+        let connect = login(adding(count, LoginStep::Connect));
+        let plan = Plan {
+            operation: Some(adding(count, LoginStep::Identify)),
+            pin: Some(pin_frame(PIN)),
+            ..swap(&port, &changed, &polls, connect, &new)
+        };
+        let (result, seen) = watched(plan, &polls);
+        assert_eq!(result, Ok(()), "{count}");
+        let id = newest(&new);
+        assert_eq!(seen, addition(&order, by, fingerprint(&id)), "{count}");
+        // The authorizer's identify and authorize, after its own create and
+        // prove, repeat and probe when it was added.
+        let authorized = if count == 1 { 2 } else { 3 + 2 };
+        assert_eq!(swapped(&changed).channels, authorized, "{count}");
+        by = fingerprint(&id);
+        keys.push((new, id));
+        let mut expected: Vec<Vec<u8>> = keys.iter().map(|(_, id)| id.clone()).collect();
+        expected.sort();
+        assert_eq!(stored(), Some(expected), "{count}");
+    }
+    let last = port.lock().unwrap().take().unwrap();
+    assert_eq!(last.remove().channels, 3);
+    // Every key unlocks the eight-key record.
+    let order = fingerprints();
+    assert_eq!(order.len(), 8);
+    for (device, id) in &keys {
+        let plugged = Plugged::insert(device, NAME);
+        assert_eq!(
+            physical(pin(PIN)),
+            (Ok(()), succeeded(&order, fingerprint(id), 8))
+        );
+        assert_eq!(plugged.remove().channels, 2);
+    }
+    // At eight no addition can be described: root sends none, or one that
+    // does not match the baseline, and the worker touches no key.
+    assert!(Request::new(NONCE, UID, adding(8, LoginStep::Identify)).is_err());
+    let ninth = blank("ninth");
+    let plugged = Plugged::insert(&ninth, NAME);
+    for plan in [
+        Plan {
+            description: Some(login(adding(7, LoginStep::Identify)).encode()),
+            ..pin(PIN)
+        },
+        Plan {
+            description: Some(Vec::new()),
+            ..pin(PIN)
+        },
+    ] {
+        assert_eq!(
+            physical(plan),
+            (
+                Err(Failure::Internal),
+                vec![baseline(&order), Failure::Internal.frame()]
+            )
+        );
+    }
+    assert_eq!(plugged.remove(), Served::default());
+    assert!(ninth.transcript().is_empty());
+    assert_eq!(fingerprints(), order);
     finish();
 }
 

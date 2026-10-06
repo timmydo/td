@@ -151,8 +151,15 @@ pub(crate) enum Output {
 pub(crate) enum Signing {
     #[default]
     Valid,
-    /// The previous assertion's signature, replayed.
+    /// The previous assertion's signature, replayed: a signature over other
+    /// data, whatever the assertion it came from.
     Stale,
+    /// The current authenticator data signed over the client-data hash of
+    /// the last earlier assertion that asked for presence: valid exactly
+    /// when the client sent that hash again, so a challenge reused across
+    /// operations passes and a fresh one fails. With no earlier hash it
+    /// signs the current one.
+    Replayed,
     /// A key that is not the credential's.
     Foreign,
 }
@@ -183,6 +190,9 @@ struct Authenticator {
     token: Option<Token>,
     failures: u8,
     last_signature: Option<Vec<u8>>,
+    /// The client-data hash of the last assertion that asked for presence,
+    /// as one recorded off the wire: a power cycle keeps it.
+    presence_hash: Option<Vec<u8>>,
     injected: VecDeque<Vec<u8>>,
     transcript: Vec<(Vec<u8>, Vec<u8>)>,
     /// The scripted presence delays, read without the lock.
@@ -267,6 +277,7 @@ impl Virtual {
             token: None,
             failures: 0,
             last_signature: None,
+            presence_hash: None,
             injected: VecDeque::new(),
             transcript: Vec::new(),
             touch: Arc::clone(&touch),
@@ -342,6 +353,12 @@ impl Virtual {
 
     pub(crate) fn script(&self, script: Script) {
         self.lock().script = script;
+    }
+
+    /// Changes the getInfo claims and fixed behaviour between operations, as
+    /// a real key's configuration tool can, such as toggling alwaysUv.
+    pub(crate) fn configure(&self, change: impl FnOnce(&mut Config)) {
+        change(&mut self.lock().config);
     }
 
     /// Replaces the next random draw, which must have this length.
@@ -1065,7 +1082,7 @@ impl Authenticator {
                 out.bytes(secret)
             }));
         }
-        let signature = self.signature(index, &data, hash);
+        let signature = self.signature(index, &data, hash, up);
         let id = self.state.credentials[index].id.clone();
         Ok(build(|out| {
             out.head(5, 3)?;
@@ -1116,15 +1133,24 @@ impl Authenticator {
         Ok(Some(self.seal(&shared, &output)))
     }
 
-    fn signature(&mut self, index: usize, data: &[u8], hash: &[u8]) -> Vec<u8> {
+    fn signature(&mut self, index: usize, data: &[u8], hash: &[u8], up: bool) -> Vec<u8> {
         let private = match self.script.signing {
             Signing::Foreign => fixture_scalar(&crypto::digest(b"foreign signer")),
-            Signing::Valid | Signing::Stale => self.state.credentials[index].private,
+            Signing::Valid | Signing::Stale | Signing::Replayed => {
+                self.state.credentials[index].private
+            }
         };
+        let signed = match (self.script.signing, &self.presence_hash) {
+            (Signing::Replayed, Some(earlier)) => earlier.clone(),
+            _ => hash.to_vec(),
+        };
+        if up {
+            self.presence_hash = Some(hash.to_vec());
+        }
         let fresh = sign(
             &SecretScalar::from_bytes(Box::new(private)).unwrap(),
             data,
-            hash,
+            &signed,
         );
         let previous = self.last_signature.replace(fresh.clone());
         match (self.script.signing, previous) {
@@ -1513,6 +1539,23 @@ mod tests {
                 shown.push(count);
                 Ok((pin(guess)?, [0x11; 32]))
             },
+            &mut entropy(),
+        )
+    }
+
+    /// `login` with the right PIN over this client-data hash.
+    fn login_over(
+        key: &Virtual,
+        credential: &EnrolledCredential,
+        hash: [u8; 32],
+    ) -> Result<HmacOutput, LoginError> {
+        Transaction::new(key.link()).unwrap().login_assertion(
+            LoginAssertion {
+                credential: credential.id(),
+                key: key_of(credential.cose()),
+                salt: SALT,
+            },
+            &mut |_, _| Ok((pin(PIN)?, hash)),
             &mut entropy(),
         )
     }
@@ -2598,6 +2641,17 @@ mod tests {
             });
             assert_eq!(login(&key, &created, PIN, &mut Vec::new()).err(), mismatch);
         }
+        // A replay signs the current data over the last presence hash: it
+        // verifies only when the client sends that hash again.
+        key.script(Script::default());
+        assert!(login_over(&key, &created, [0x31; 32]).is_ok());
+        key.script(Script {
+            signing: Signing::Replayed,
+            ..Script::default()
+        });
+        assert_eq!(login_over(&key, &created, [0x32; 32]).err(), mismatch);
+        assert!(login_over(&key, &created, [0x32; 32]).is_ok());
+        key.script(Script::default());
 
         for backup in [0x08, 0x18] {
             key.script(Script {

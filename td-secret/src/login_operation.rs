@@ -1105,7 +1105,7 @@ mod tests {
     use crate::crypto;
     use crate::fido_cbor::{self as cbor, Value};
     use crate::fido_ctap::fingerprint;
-    use crate::fido_virtual::{Config, Link, Output, Script, Signing, Virtual};
+    use crate::fido_virtual::{Config, Link, Output, Presence, Script, Signing, Virtual};
     use crate::login_record::{READS, VERSION};
     use std::fs::{self, OpenOptions, Permissions};
     use std::io::Write;
@@ -1124,7 +1124,12 @@ mod tests {
 
     /// A deterministic counter: draw N is SHA-256 of N, big-endian.
     fn entropy() -> impl FnMut(&mut [u8]) -> Result<(), String> {
-        let mut count = 0u32;
+        entropy_after(0)
+    }
+
+    /// `entropy`, its first draw `start + 1`: another operation's.
+    fn entropy_after(start: u32) -> impl FnMut(&mut [u8]) -> Result<(), String> {
+        let mut count = start;
         move |out| {
             for chunk in out.chunks_mut(32) {
                 count += 1;
@@ -1952,11 +1957,23 @@ mod tests {
         plan: Plan,
         time: Duration,
     ) -> (Result<(), Failure>, Vec<Vec<u8>>, Duration) {
+        drawn(context, keys, plan, time, 0)
+    }
+
+    /// `timed`, the worker's draws starting after `start`.
+    fn drawn(
+        context: &Context<'_>,
+        keys: &mut Keys<'_>,
+        plan: Plan,
+        time: Duration,
+        start: u32,
+    ) -> (Result<(), Failure>, Vec<Vec<u8>>, Duration) {
         let (worker, parent) = UnixStream::pair().unwrap();
         let root = std::thread::spawn(move || root(parent, plan));
         let started = Instant::now();
         let mut wire = Wire::new(worker, started + time).unwrap();
-        let result = operate(&mut wire, context, keys, &mut entropy(), || Ok(()));
+        let mut entropy = entropy_after(start);
+        let result = operate(&mut wire, context, keys, &mut entropy, || Ok(()));
         let took = started.elapsed();
         drop(wire);
         (result, root.join().unwrap(), took)
@@ -2241,7 +2258,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture.seed(&record(&[&key], None, None));
         assert_eq!(unlock(&fixture, &[&key.device], pin(PIN)).0, Ok(()));
-        // The key replays its previous signature over the fresh hash.
+        // A signature over other data, here this operation's identify's.
         key.device.script(Script {
             signing: Signing::Stale,
             ..Script::default()
@@ -2249,6 +2266,54 @@ mod tests {
         let (result, seen) = unlock(&fixture, &[&key.device], pin(PIN));
         assert_eq!(result, Err(Failure::Failed));
         assert_eq!(seen, refused);
+        // A replay: this assertion's data signed over the earlier unlock's
+        // client-data hash, in an operation drawing its own challenge.
+        key.device.script(Script {
+            signing: Signing::Replayed,
+            ..Script::default()
+        });
+        let (result, seen, _) = drawn(
+            &fixture.context(),
+            &mut Keys::all(&[&key.device]),
+            pin(PIN),
+            TIME,
+            1000,
+        );
+        assert_eq!(result, Err(Failure::Failed));
+        assert_eq!(seen, refused);
+    }
+
+    #[test]
+    fn each_unlock_signs_a_challenge_of_its_own_so_a_replay_fails() {
+        let key = Key::new(16);
+        let fixture = Fixture::new();
+        fixture.seed(&record(&[&key], None, None));
+        let order = [key.fingerprint()];
+        let unlocked = succeeded(&order, key.fingerprint(), 8);
+        let after = |start| {
+            let mut keys = Keys::all(&[&key.device]);
+            let (result, seen, _) = drawn(&fixture.context(), &mut keys, pin(PIN), TIME, start);
+            (result, seen)
+        };
+        assert_eq!(after(0), (Ok(()), unlocked.clone()));
+        key.device.script(Script {
+            signing: Signing::Replayed,
+            ..Script::default()
+        });
+        // The same draws, as a worker whose challenge was not fresh would
+        // make: the earlier unlock's signed hash verifies again.
+        assert_eq!(after(0), (Ok(()), unlocked));
+        // The operation's own draws: it no longer does.
+        assert_eq!(
+            after(1000),
+            (
+                Err(Failure::Failed),
+                failed(
+                    through_unlock(&order, key.fingerprint(), 8),
+                    Failure::Failed
+                )
+            )
+        );
     }
 
     #[test]
@@ -2812,6 +2877,7 @@ mod tests {
         // that does not match, and no key is touched.
         let order = fixture.fingerprints();
         assert_eq!(order.len(), 8);
+        assert!(Request::new(NONCE, UID, adding(8, LoginStep::Identify)).is_err());
         let ninth = blank("ninth");
         let start = (first.device.transcript().len(), ninth.transcript().len());
         for plan in [
@@ -3146,6 +3212,99 @@ mod tests {
     }
 
     #[test]
+    fn denied_presence_and_always_uv_end_the_operation_with_their_kinds() {
+        let denied = Script {
+            presence: Presence::Denied,
+            ..Script::default()
+        };
+        let make = |step| enrolling(1, 1, step);
+        let connected = vec![
+            vec![0x18, 0],
+            invitation(0x10, &login(make(LoginStep::Connect))),
+        ];
+        // alwaysUv is refused at the new key's getInfo, before any PIN.
+        let fixture = Fixture::new();
+        let strict = Virtual::new(
+            Config {
+                always_uv: Some(true),
+                ..Config::default()
+            },
+            Some(PIN),
+            "always-uv",
+        );
+        let (result, seen) = unlock(&fixture, &[&strict], begins(make(LoginStep::Connect)));
+        let refused = Failure::Refused(LoginRefusal::AlwaysUv);
+        assert_eq!(result, Err(refused));
+        assert_eq!(seen, failed(connected.clone(), refused));
+        assert_eq!(seen.last(), Some(&vec![0x15, 6, 2]));
+        assert_eq!(pin_tokens(&strict), 0);
+        assert!(sent(&strict, 1, 1).is_empty());
+        assert!(fixture.names().is_empty());
+        // Presence denied at the creation, after its PIN: no credential, and
+        // the key's count still 8.
+        let new = blank("denied-create");
+        new.script(denied);
+        let (result, seen) = unlock(&fixture, &[&new], begins(make(LoginStep::Connect)));
+        assert_eq!(result, Err(Failure::Denied));
+        let mut frames = connected.clone();
+        frames.push(invitation(
+            0x10,
+            &login(make(LoginStep::Create { retries: 8 })),
+        ));
+        assert_eq!(seen, failed(frames, Failure::Denied));
+        assert_eq!(seen.last(), Some(&vec![0x15, 7]));
+        assert!(new.state().credentials.is_empty());
+        assert_eq!(new.state().retries, 8);
+        assert!(fixture.names().is_empty());
+        // alwaysUv advertised false is admitted: the key enrolls.
+        let relaxed = Virtual::new(
+            Config {
+                always_uv: Some(false),
+                ..Config::default()
+            },
+            Some(PIN),
+            "never-uv",
+        );
+        let (result, seen) = unlock(&fixture, &[&relaxed], begins(make(LoginStep::Connect)));
+        assert_eq!(result, Ok(()));
+        let key = fingerprint(&newest(&relaxed));
+        let mut frames = connected;
+        frames.extend(ceremony(make, key));
+        assert_eq!(seen, committed(frames, make(LoginStep::Probe { key })));
+        // Presence denied at its unlock assertion, after the PIN: DENIED,
+        // the count reported 8 again; granted, the key unlocks.
+        relaxed.script(denied);
+        let (result, seen) = unlock(&fixture, &[&relaxed], pin(PIN));
+        assert_eq!(result, Err(Failure::Denied));
+        assert_eq!(
+            seen,
+            failed(through_unlock(&[key], key, 8), Failure::Denied)
+        );
+        assert_eq!(relaxed.state().retries, 8);
+        relaxed.script(Script::default());
+        let (result, seen) = unlock(&fixture, &[&relaxed], pin(PIN));
+        assert_eq!(result, Ok(()));
+        assert_eq!(seen, succeeded(&[key], key, 8));
+        // The enrolled key later configured to require UV everywhere is
+        // refused at the unlock's identify, before any PIN step.
+        relaxed.configure(|config| config.always_uv = Some(true));
+        let tokens = pin_tokens(&relaxed);
+        let (result, seen) = unlock(&fixture, &[&relaxed], pin(PIN));
+        assert_eq!(result, Err(refused));
+        assert_eq!(
+            seen,
+            [
+                baseline(&[key]),
+                invitation(0x10, &identify(1)),
+                vec![0x15, 6, 2]
+            ]
+        );
+        assert_eq!(pin_tokens(&relaxed), tokens);
+        relaxed.configure(|config| config.always_uv = Some(false));
+        assert_eq!(unlock(&fixture, &[&relaxed], pin(PIN)).0, Ok(()));
+    }
+
+    #[test]
     fn a_key_whose_list_cannot_hold_the_exclusions_is_refused_before_a_pin() {
         let (one, two) = (Key::new(50), Key::new(51));
         let fixture = Fixture::new();
@@ -3335,7 +3494,19 @@ mod tests {
         let (key, other) = (Key::new(57), Key::new(58));
         let one = record(&[&key], None, None);
         let two = record(&[&key, &other], None, None);
-        for (current, previous) in [(&[][..], &[1][..]), (&[1], &[]), (&[2], &[2]), (&[1], &[2])] {
+        let writes = std::cell::Cell::new(0);
+        let counted = |store: &Store, baseline: Baseline, change: Change<'_>| {
+            writes.set(writes.get() + 1);
+            write(store, baseline, change)
+        };
+        // Production's own empty sets first.
+        for (current, previous) in [
+            (&[][..], &[][..]),
+            (&[], &[VERSION]),
+            (&[VERSION], &[]),
+            (&[2], &[2]),
+            (&[VERSION], &[2]),
+        ] {
             let start = key.device.transcript().len();
             // An addition, a removal that leaves a key, and a first enrollment.
             let fixture = Fixture::new();
@@ -3364,11 +3535,13 @@ mod tests {
                 let context = Context {
                     current,
                     previous,
+                    write: &counted,
                     ..fixture.context()
                 };
                 let (result, seen) = run(&context, &mut Keys::all(&[&key.device]), plan, TIME);
                 assert_eq!(result, Err(Failure::Version));
                 assert_eq!(seen, [frame, Failure::Version.frame()]);
+                assert_eq!(writes.get(), 0);
                 assert_eq!(fixture.bytes(), bytes);
             }
             assert_eq!(key.device.transcript().len(), start);

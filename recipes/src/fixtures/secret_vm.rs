@@ -115,6 +115,22 @@ pub const LOGIN_CASES: &[(&str, &str)] = &[
         "login-probe",
         "login_operation::tests::vm::qemu_login_worker_refuses_a_key_whose_credprotect_default_fails_the_probe",
     ),
+    (
+        "login-refusals",
+        "login_operation::tests::vm::qemu_login_worker_ends_on_denied_presence_always_uv_and_a_list_too_small",
+    ),
+    (
+        "login-verify",
+        "login_operation::tests::vm::qemu_login_worker_never_unlocks_a_tampered_record_or_a_stale_signature",
+    ),
+    (
+        "login-changed",
+        "login_operation::tests::vm::qemu_login_worker_refuses_a_changed_record_or_an_unshared_version_without_writing",
+    ),
+    (
+        "login-eight",
+        "login_operation::tests::vm::qemu_login_worker_adds_keys_to_eight_and_refuses_a_ninth_before_any_token",
+    ),
 ];
 /// The login record store across power cuts: one TPM-free guest test,
 /// booted once per phase, in this order, on one disposable disk.

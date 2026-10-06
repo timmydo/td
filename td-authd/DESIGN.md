@@ -1501,10 +1501,12 @@ Rust fixture init; it is not an input to the distribution image. Host QEMU
 is an execution oracle only, as for `qemu-boot-system`, and is required.
 This command runs outside the host-free recipe-check sandbox.
 
-Four fresh, diskless guests exercise the existing root-only cases:
+Five fresh, diskless guests exercise the existing root-only cases:
 public `td-secret set` descriptor intake for both token roles, refusal of
 nonhuman callers, preparation and generation-exit relocking, read-only
-store inspection, and cleanup after the production worker refuses. Each
+store inspection, cleanup after the production worker refuses, and the
+login worker's supervision (`supervise-login`, "Login-key operation
+supervision" below). Each
 guest has private account files and tmpfs runtime state, no network, TPM,
 token, or persistent disk, and a 180-second host deadline. The fixture
 selects exactly one named ignored test, requires its successful exit and
@@ -1517,11 +1519,12 @@ unseal, or a credential-store write. The public intake fixture explicitly
 stands in for the completion reply. Pinned-emulator tests in
 `td-secret/DESIGN.md` cover the separate cryptographic store operations.
 
-The same command then runs seven fresh, diskless, TPM-free guests of
-td-secret's login-key worker over UHID virtual keys, with the same
-bound, selection and passing summary (`td-secret/DESIGN.md`, "Login-key
-worker guests"), and one more booted twelve times on a disposable disk,
-ten of them killed by the host inside or just after a record write
+The same command then runs eleven fresh, diskless, TPM-free guests of
+td-secret's login-key worker over UHID virtual keys, every non-power-cut
+worker case TOKEN-LOGIN.md's increment 2 lists, with the same bound,
+selection and passing summary (`td-secret/DESIGN.md`, "Login-key worker
+guests"), and one more booted twelve times on a disposable disk, ten of
+them killed by the host inside or just after a record write
 (`td-secret/DESIGN.md`, "Login power-cut guests"). They play root
 themselves; td-authd's supervision of that worker is not among them.
 

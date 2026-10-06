@@ -1977,7 +1977,12 @@ PIN AUTH BLOCKED until `power_cycle`, zero is PIN BLOCKED, which a power
 cycle does not clear, and a correct PIN restores both. A default
 credProtect level 3 hides its credentials from any assertion without
 UV. Scripts add presence delay, denial and timeout, a wrong secret, a
-stale or foreign signature and signed backup flags. Its state is a
+stale signature (the key's previous one, over other data), a foreign
+signature, a replay (the current data signed over the client-data hash
+of the key's last earlier assertion that asked for presence, which
+verifies exactly when the client sends that hash again) and signed
+backup flags, and a test may change a key's configuration between
+operations, as a key's own tool toggles `alwaysUv`. Its state is a
 plain clonable struct; randomness is SHA-256 over a seed and a count,
 or bytes a test injects.
 
@@ -2332,50 +2337,58 @@ step's key as the created credential as td-authd will, and asserting
 every frame root sees and the store afterwards. Unlock tests cover each
 slot of a three-key record, whose two hashes match the identify and
 exact unlock steps; a wrong PIN with a falling count and a later
-success; PIN AUTH BLOCKED after three and no PIN step until
-reinsertion; PIN BLOCKED and no PIN step after; a key not in the record;
-zero and two devices; a tampered verifier and public key; a stale
-signature; no record, a damaged record and directory; the record changed
-after the baseline and during the ceremony; root never acknowledging;
-root cancelling at the PIN step; descriptions that do not match the
-account or baseline; PIN frames outside their bounds, none of which
-reaches the key; a PIN sent as the description or in place of each
-acknowledgement; and a memory refusal before the baseline. Write tests
-cover a one-key enrollment, whose create, prove, repeat and probe hashes
-each bind their exact step and whose record its key then unlocks; a
-two-key enrollment that waits through the previous key and an empty
+success; PIN AUTH BLOCKED after three and no PIN step until reinsertion;
+PIN BLOCKED and no PIN step after; a key not in the record; zero and two
+devices; a tampered verifier and public key; a signature over other
+data, the identify's; a replay over an earlier unlock's client-data
+hash, refused in an operation drawing its own challenge and admitted
+when the draws repeat, so the refusal shows the challenge is fresh; an
+enrolled key later configured with `alwaysUv`, KEY REFUSED `02` at the
+identify with no PIN step; no record, a damaged record and directory;
+the record changed after the baseline and during the ceremony; root
+never acknowledging; root cancelling at the PIN step; descriptions that
+do not match the account or baseline; PIN frames outside their bounds,
+none of which reaches the key; a PIN sent as the description or in place
+of each acknowledgement; and a memory refusal before the baseline. Write
+tests cover a one-key enrollment, whose create, prove, repeat and probe
+hashes each bind their exact step and whose record its key then unlocks;
+a two-key enrollment that waits through the previous key and an empty
 port, excludes the first credential and publishes both; several keys at
 a connect step and a key that never comes; the same key offered twice;
 additions to eight, whose authorization binds the record, each new key
 then unlocking, and the ninth refused before any token; removal of one
 key, of several including the authorizing one, and of the last, which
 unlinks the record even with no deployment marked; a credProtect default
-failing the probe; a list too small for the exclusions; an enrolled key
-offered as the new one; a repeat with a different output; the record
+failing the probe; an `alwaysUv` key refused as KEY REFUSED `02` before
+any PIN, and one advertising it false enrolling; presence denied at a
+creation and at an unlock's assertion, each after its PIN, as DENIED
+with no retry spent; a list too small for the exclusions; an enrolled
+key offered as the new one; a repeat with a different output; the record
 changed before any token I/O and at the commit, with no write attempted;
-every version refusal; a failure injected at each publication and
-removal stage, rejected as FAILED or reported UNCERTAIN with each re-read
-detail, and a concurrent change rejected as RECORD CHANGED; root
-cancelling at the connect, create, repeat and commit steps; a wrong
-PIN while authorizing and while creating; a PIN wait ended at its
-session's deadline well before the operation's, and a PIN within the
-session unlocking; a key stalling a session's initialization to its
-deadline (TIMEOUT) and one failing it at once (FAILED); a commit round
-refused under its margin at the invitation, for a write and an unlock,
-and, run alone, after a late acknowledgement, with no write attempted;
-each timing test leaves the work it expects to finish tens of seconds,
-and root sends a held PIN only if the worker has not ended first; a
-directory that cannot be opened at the commit (its unavailable kind,
-no write); and an addition's probe sending the new record's batches to
-a key whose list holds two IDs. Operation tests cover the PIN frame's
-bounds, its wait past a frame time, its operation deadline, and an
-open session bounding every wait without narrowing the operation's.
-Clearing a dropped PIN, or any frame, is by construction, which a source
-test pins; safe code cannot observe freed memory.
+every version refusal, production's own empty read sets among them, with
+the store's write never called; a failure injected at each publication
+and removal stage, rejected as FAILED or reported UNCERTAIN with each
+re-read detail, and a concurrent change rejected as RECORD CHANGED; root
+cancelling at the connect, create, repeat and commit steps; a wrong PIN
+while authorizing and while creating; a PIN wait ended at its session's
+deadline well before the operation's, and a PIN within the session
+unlocking; a key stalling a session's initialization to its deadline
+(TIMEOUT) and one failing it at once (FAILED); a commit round refused
+under its margin at the invitation, for a write and an unlock, and, run
+alone, after a late acknowledgement, with no write attempted; each
+timing test leaves the work it expects to finish tens of seconds, and
+root sends a held PIN only if the worker has not ended first; a
+directory that cannot be opened at the commit (its unavailable kind, no
+write); and an addition's probe sending the new record's batches to a
+key whose list holds two IDs. Operation tests cover the PIN frame's
+bounds, its wait past a frame time, its operation deadline, and an open
+session bounding every wait without narrowing the operation's. Clearing
+a dropped PIN, or any frame, is by construction, which a source test
+pins; safe code cannot observe freed memory.
 
 ### Login-key worker guests
 
-`td-recipe-eval qemu-secret` runs seven more fresh, diskless guests, with
+`td-recipe-eval qemu-secret` runs eleven more fresh, diskless guests, with
 or without `--tpm`, since none needs a TPM. Each boots the same kernel
 and fixture init as the authority cases with `td.hid-fixture=1`, selects
 one ignored test of `login_vm.rs`, a module of the worker's tests, and
@@ -2389,11 +2402,14 @@ kernel entropy and the protected-memory check, against virtual keys
 `Plugged` presents through UHID. Root is the host tests' own over a
 socketpair `Wire`, and every frame it sees is asserted as the host tests
 assert it. The record is the production `/var/lib/td/login/1000`, the
-directory made root's with mode 0700 as firstboot will. The one
-departure from `run` is the versions: both retained deployments read
-this build's, standing for increment 4's tier marker, since production
-still refuses every write that leaves a record. After each operation the
-lock is root's, mode 0600 and free.
+directory made root's with mode 0700 as firstboot will. The departure
+from `run` is the versions: both retained deployments read this
+build's, standing for increment 4's tier marker, since production still
+refuses every write that leaves a record; `login-changed` also runs
+production's own empty read sets and others that share no version, and
+departs once more, wrapping the store's write in a counter that its
+refusals must leave at zero.
+After each operation the lock is root's, mode 0600 and free.
 
 A swap follows the worker, not a clock. Root's hook at the connect step
 runs before its acknowledgement, so no discovery for the new key has
@@ -2415,6 +2431,10 @@ the new key in that order.
 | `login-add-remove` | an addition authorized by the enrolled key, then the same gated swap to the new key; the new key unlocks and removes the authorizing one, which then is NOT ENROLLED |
 | `login-keepalive` | a three-second scripted touch on the unlock assertion: the Session waits through UPNEEDED keepalives and unlocks. Over the touch's measured length, at most one keepalive per period plus two, at least one per observed longest silence less two, and no request silent for a second |
 | `login-probe` | a key whose default credProtect hides its credential from a silent assertion is KEY REFUSED `06` at the probe, and nothing is published |
+| `login-refusals` | a key advertising `alwaysUv` is KEY REFUSED `02` at its one session, before any PIN step or makeCredential; presence denied at a creation, after its PIN, is DENIED with no credential made; a key advertising `alwaysUv` false enrolls and unlocks, is DENIED when it denies presence at the unlock assertion, unlocks again with its count reported 8, and once reconfigured to advertise `alwaysUv` true is KEY REFUSED `02` at the unlock's identify with no PIN step; a new key whose list cannot hold a two-key record's exclusions is KEY REFUSED `05` after the gated swap, before any PIN, the record unchanged |
+| `login-verify` | the production record rewritten between operations with a slot verifier, then a public key, not the key's; a signature over other data, the identify's; and a replay, the current data signed over the client-data hash of an earlier unlock, which the worker's fresh challenge does not match: each FAILED after a right PIN, as a valid record before the signature cases unlocks |
+| `login-changed` | the record replaced between the baseline frame and the description: RECORD CHANGED at the first step with no report to the key; replaced at an addition's commit round, removed at a removal's, and appearing at a first enrollment's: RECORD CHANGED after the whole ceremony, the store's write never called; VERSION before any token I/O for an addition, a removal that leaves a key and a first enrollment, under production's own empty read sets and four pairs that share no version, the counted write never called; removing every key under empty read sets unlinks the record, the guest's one write |
+| `login-eight` | seven additions over gated swaps, each authorized by the key added before it, to eight keys, each of which then unlocks; a ninth refused as INTERNAL from root's description, no report reaching the plugged key |
 
 A record written in one guest's step is read back in its next; these
 diskless guests keep nothing across boots, which the power-cut guest

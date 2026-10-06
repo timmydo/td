@@ -18,9 +18,10 @@ login consent operations, step admission and supervision
 deployment carries the tier marker yet, so the worker reads no record
 version for either retained deployment and
 refuses every write that would leave a record ("Versions"). Its
-`qemu-secret` guests run it over UHID virtual keys, including across
-power cuts inside its writes on a disposable disk ("Evidence"), standing
-in for that marker. Nothing else below is implemented.
+`qemu-secret` guests, standing in for that marker, run it over UHID
+virtual keys through every case increment 2 lists, including power cuts
+inside its writes on a disposable disk ("Evidence"): increment 2 is
+complete. Nothing else below is implemented.
 Until the increments at the end land, `THREAT-MODEL.md` §3 is the
 complete current behaviour: the installed account logs in automatically
 and the session never locks. No document, UI or release
@@ -706,8 +707,9 @@ implements:
   PIN-authorized modes with distinct UV and non-UV hmac-secret outputs;
 - a retry counter starting at eight, the three-consecutive-failure block
   until simulated reinsertion, and a blocked state at zero;
-- scripted presence delay and denial, keepalives, a wrong secret and a
-  stale signature.
+- scripted presence delay and denial, keepalives, a wrong secret, a
+  signature over other data and a replay over an earlier assertion's
+  client-data hash, and a configuration changed between operations.
 
 It signs with test-only ECDSA over td-secret's private P-256 arithmetic;
 host tests check its signatures and PIN-protocol messages against the
@@ -721,7 +723,7 @@ test-only UHID binding presents in a guest as a hidraw FIDO device
 speaking CTAPHID, with keepalives within the 100 ms ceiling while the
 key works, UPNEEDED during a scripted touch ("UHID binding").
 
-Seven `qemu-secret` guests, none with a TPM, run the root worker's own
+Eleven `qemu-secret` guests, none with a TPM, run the root worker's own
 operation over the production discovery, Session and HID worker with
 its operation lock, against those devices, with simulated root
 acknowledgements and both retained deployments taken to read this
@@ -731,16 +733,25 @@ BLOCKED cleared only by reinsertion, PIN BLOCKED, a key not in the
 record, no key and two keys; one-key enrollment whose record a fresh
 worker then unlocks, and removal of the last key; two-key enrollment
 across a device swap; addition across a swap and removal of the
-authorizing key; a slow touch held by keepalives; and a credProtect
-default refused at the probe. Host tests of the worker's operation over
-virtual keys cover additions to eight, a too-small list, a tampered
-verifier or public key, a replayed (stale) signature, a changed
-baseline and an incompatible version. Denied presence and `alwaysUv`
-are covered only at the transaction and virtual-key layer, and the
-bytes of the worker's DENIED and KEY REFUSED `02` frames are pinned, but
-no worker operation meets either.
+authorizing key; additions to eight across swaps, each key then
+unlocking, and a ninth refused before any token; a slow touch held by
+keepalives; a credProtect default refused at the probe; `alwaysUv` true
+refused before any PIN at enrollment and at an enrolled key's unlock,
+and false admitted; presence denied at a
+creation and at an unlock, each DENIED after its PIN; a list too small
+for the exclusions refused before any PIN; a tampered verifier and a
+tampered public key, each written to the production record, a
+signature over other data and a replayed assertion, the current data
+signed over an earlier unlock's client-data hash, each FAILED, the last
+because each challenge is fresh; a record changed after the
+baseline, before any token I/O and at the commit round, RECORD CHANGED
+with no write attempted; and an incompatible record version refused
+before any token, while removing every key under no shared version
+still unlinks the record. Host tests of the worker's operation over
+in-process virtual keys cover the same cases but the keepalives, which
+only a HID device sends.
 
-An eighth TPM-free guest, `login-powercut` (`td-secret/DESIGN.md`,
+A twelfth TPM-free guest, `login-powercut` (`td-secret/DESIGN.md`,
 "Login power-cut guests"), boots twelve times on one disposable disk
 whose Btrfs `@var` holds the record and both persistent keys. Ten boots
 each make one write through the worker and are killed by the host, a
@@ -771,8 +782,7 @@ page cache, so these guests prove crash consistency of the store's
 syncs, not that a sync reached stable media: a missing write-cache
 flush, torn or reordered sectors and host power loss are not covered,
 and I/O in flight at the kill may land or not. Firstboot's own
-temporary cleanup is increment 4's. The rest of increment 2's guest
-list has no guest yet.
+temporary cleanup is increment 4's.
 
 The stock VM stays unenrolled: no recipe or firstboot path writes a record,
 and its valid, empty directory is decided unenrolled without any helper,
@@ -822,17 +832,17 @@ proves and the oracle that shows it.
      unlock with each key; wrong PIN with a falling count, auth-blocked,
      blocked, unenrolled key, no key, two keys, denied presence, `alwaysUv`
      true refused and false admitted, credProtect and too-small list
-     refusals, tampered verifier or public key, replayed assertion, changed
-     baseline, incompatible record version; guest power cuts before and
+     refusals, tampered verifier or public key, replayed assertion (a
+     signature over an earlier unlock's challenge), changed baseline,
+     incompatible record version; guest power cuts before and
      after publication leaving one whole record and no unenrolled machine
-     locked; leftover temporaries ignored and removed. Eight guests
-     covering the cases "Evidence" names have landed, the power cuts and
-     temporaries among them; the rest remain.
+     locked; leftover temporaries ignored and removed. Twelve guests
+     covering every case above have landed ("Evidence"), the power cuts
+     and temporaries among them.
    - td-authd's supervision with `1b` and `1c` has landed: host child
      fixtures over scripted workers, and the root session fixture, the
      `supervise-login` authority case of `qemu-secret`, against the
-     production worker's refusals. With the remaining worker guests
-     above, this increment is not yet complete.
+     production worker's refusals. This increment is complete.
 3. **Compositor trusted PIN entry and lock surface**, driven by fixtures
    and not yet activated by a record; the compositor sends `1b` and `1c`.
    - Native compositor and device-dispatcher tests: lock rendering excludes
