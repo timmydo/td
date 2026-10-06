@@ -168,6 +168,12 @@ pub const BINDINGS: &[Binding] = &[
         help: "Conversation > Default model...: open the picker for the model new conversations, and those with no model of their own, use.",
     },
     Binding {
+        name: "compact-conversation",
+        chord: None,
+        arguments: "",
+        help: "Conversation > Compact conversation: compact the open conversation, as /compact in the composer does with no focus.",
+    },
+    Binding {
         name: "delete-conversation",
         chord: None,
         arguments: "",
@@ -223,6 +229,7 @@ impl Controller for Remote<'_> {
                 | "model"
                 | "export-diagnostics"
                 | "delete-conversation"
+                | "compact-conversation"
                 | "default-model"
                 | "show-archived"
         ) {
@@ -231,6 +238,7 @@ impl Controller for Remote<'_> {
                 "set-key" => self.app.open_key_dialog(),
                 "model" => self.app.open_picker(),
                 "delete-conversation" => self.app.open_delete(),
+                "compact-conversation" => self.app.compact(None),
                 "default-model" => self.app.open_default_picker(),
                 "show-archived" => self.app.toggle_archived(),
                 _ => self.app.export_diagnostics(),

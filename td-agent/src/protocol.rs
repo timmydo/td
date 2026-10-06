@@ -54,6 +54,9 @@ pub enum Down {
     Pause { paused: bool },
     /// The human cleared the todo list.
     ClearTodo,
+    /// The human asked to compact the conversation (DESIGN.md §14), with
+    /// what the summary should keep in particular.
+    Compact { focus: Option<String> },
     /// The human killed background process `number` (DESIGN.md §12):
     /// acted on as soon as it is heard, a turn under way or not.
     Kill { number: u64 },
@@ -122,13 +125,15 @@ pub enum Up {
     /// file's text, none when that is past `MAX_TEXT`. Escaped, that
     /// takes at most six times `MAX_TEXT` of the frame, which leaves the
     /// rest, a quarter, for the title and interrupted ids. Every event of
-    /// its log follows, in order, then each new one as it is appended.
+    /// its log follows, in order, then each new one as it is appended:
+    /// `last` is the last one it replays, 0 for none.
     Hello {
         title: String,
         torn: Option<u64>,
         interrupted: Vec<u64>,
         paused: bool,
         prefix: Option<String>,
+        last: u64,
     },
     Event(Event),
     /// The message with this delivery id is logged and synced.
@@ -485,6 +490,13 @@ impl Down {
             ),
             Self::Pause { paused } => typed("pause", vec![("paused".into(), Json::Bool(*paused))]),
             Self::ClearTodo => typed("clear_todo", Vec::new()),
+            Self::Compact { focus } => typed(
+                "compact",
+                focus
+                    .iter()
+                    .map(|f| ("focus".into(), Json::Str(f.clone())))
+                    .collect(),
+            ),
             Self::Kill { number } => typed("kill", vec![("number".into(), Json::from(*number))]),
             Self::Policy {
                 version,
@@ -632,6 +644,12 @@ impl Down {
                     .ok_or("no paused")?,
             }),
             Some("clear_todo") => Ok(Self::ClearTodo),
+            Some("compact") => Ok(Self::Compact {
+                focus: value
+                    .get("focus")
+                    .and_then(Json::as_str)
+                    .map(str::to_string),
+            }),
             Some("policy") => Ok(Self::Policy {
                 version: value
                     .get("version")
@@ -748,6 +766,7 @@ impl Up {
                 interrupted,
                 paused,
                 prefix,
+                last,
             } => typed(
                 "hello",
                 vec![
@@ -762,6 +781,7 @@ impl Up {
                         "prefix".into(),
                         prefix.as_ref().map_or(Json::Null, |p| Json::Str(p.clone())),
                     ),
+                    ("last".into(), Json::from(*last)),
                 ],
             ),
             Self::Event(event) => typed("event", vec![("event".into(), event.to_json())]),
@@ -903,6 +923,7 @@ impl Up {
                     Some(Json::Str(prefix)) => Some(prefix.clone()),
                     _ => return Err("no prefix".into()),
                 },
+                last: value.get("last").and_then(Json::as_u64).ok_or("no last")?,
             },
             Some("event") => Self::Event(Event::from_json(
                 value.get("event").ok_or("an event message with no event")?,
@@ -1146,6 +1167,7 @@ mod tests {
                 interrupted: vec![2, 5],
                 paused: false,
                 prefix: Some("\u{1}".repeat(MAX_TEXT)),
+                last: 7,
             },
             Up::Hello {
                 title: "t".into(),
@@ -1153,6 +1175,7 @@ mod tests {
                 interrupted: vec![],
                 paused: true,
                 prefix: None,
+                last: 0,
             },
             Up::Send {
                 id: 4,
@@ -1289,6 +1312,10 @@ mod tests {
             },
             Down::Pause { paused: true },
             Down::ClearTodo,
+            Down::Compact { focus: None },
+            Down::Compact {
+                focus: Some("the failing test".into()),
+            },
             Down::Kill { number: 3 },
             Down::Policy {
                 version: 2,

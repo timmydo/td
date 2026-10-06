@@ -13,7 +13,7 @@
 
 use std::collections::HashSet;
 
-use crate::store::{Event, Held, Kind};
+use crate::store::{Effect, Event, Held, Kind};
 
 /// The turns messages may start between two of the human's messages.
 pub const BUDGET: usize = 20;
@@ -42,11 +42,12 @@ pub fn spent(events: &[Event]) -> usize {
             Kind::Message { status: None, .. } | Kind::Ended { .. } => {
                 wakers.insert(event.seq);
             }
-            // Noted as started whether or not it counts, so a turn asked
-            // again never does.
-            Kind::Started { of, .. }
-                if started.insert(of) && wakers.contains(&of) && event.seq > seq =>
-            {
+            // A turn, noted as started whether or not it counts, so a turn
+            // asked again never does; a compaction starts none.
+            Kind::Started {
+                effect: Effect::Turn,
+                of,
+            } if started.insert(of) && wakers.contains(&of) && event.seq > seq => {
                 count += 1;
             }
             _ => {}
@@ -115,6 +116,24 @@ mod tests {
                 of,
             },
         )
+    }
+
+    /// The human's compaction, though of a message, starts no turn: it
+    /// neither counts nor keeps the message's turn from counting.
+    #[test]
+    fn a_compaction_is_no_messages_turn() {
+        let mut events = vec![message(1, 100, None, None)];
+        events.push(event(
+            2,
+            101,
+            Kind::Started {
+                effect: Effect::Compact,
+                of: 1,
+            },
+        ));
+        assert_eq!(spent(&events), 0);
+        events.push(started(3, 102, 1));
+        assert_eq!(spent(&events), 1);
     }
 
     #[test]

@@ -521,6 +521,7 @@ pub fn serve_in(
         interrupted: load.interrupted,
         paused: session.conversation.meta().paused,
         prefix: hello_prefix(session.conversation.prefix_file()),
+        last: session.conversation.events().last().map_or(0, |e| e.seq),
     });
     for event in session.conversation.events().to_vec() {
         session.send(&Up::Event(event));
@@ -935,6 +936,7 @@ impl Session {
                 Down::Retry => self.retry()?,
                 Down::Pause { paused } => self.pause(paused)?,
                 Down::ClearTodo => self.clear_todo()?,
+                Down::Compact { focus } => self.compact(focus)?,
                 Down::Kill { number } => self.killed_by_person(number),
                 Down::Restore { step, undo } => self.restore(step, undo)?,
                 Down::Choose { model, effort } => self.choose(model, effort)?,
@@ -1329,55 +1331,17 @@ impl Session {
 
     /// The turn's exchange with the model, retrying a rate limit.
     fn exchange(&mut self, turn: u64) -> Result<Outcome, String> {
-        let Some((key, client)) = self.setup.clone() else {
-            return Ok(Outcome::stop(NO_SETTINGS));
-        };
-        let key = match key {
-            Ok(key) => key,
+        let Asking {
+            key,
+            client,
+            name,
+            reasoning_effort,
+            model,
+        } = match self.asking()? {
+            Ok(asking) => asking,
             Err(why) => return Ok(Outcome::stop(why)),
         };
-        // The human's choice for this conversation, else the default:
-        // the configuration's, or the window's (§4).
-        let meta = self.conversation.meta();
-        let (chosen, chosen_effort) = (meta.model.clone(), meta.effort.clone());
-        let setting = if chosen.is_some() { CHOSEN } else { DEFAULT };
-        let name = chosen.unwrap_or_else(|| client.model.clone());
-        let reasoning_effort = chosen_effort.unwrap_or_else(|| client.reasoning_effort.clone());
-        let model = match self.model(setting, &name, &client) {
-            Ok(model) => model,
-            Err(why) => return Ok(Outcome::stop(why)),
-        };
-        // Every request carries the tools and `max_tokens`, which bounds
-        // what it may cost, and `require_parameters` would route one to no
-        // provider of a model that does not list both (§5).
-        if let Some(missing) = model
-            .as_ref()
-            .and_then(|m| ["tools", "max_tokens"].into_iter().find(|p| !m.supports(p)))
-        {
-            return Ok(Outcome::stop(format!(
-                "{name} takes no {missing} (the provider's models list gives it no `{missing}` parameter); set {setting} to a model that does"
-            )));
-        }
         let pricing = model.as_ref().and_then(|m| m.pricing);
-        // The prefix this program writes; a conversation begun by another
-        // (one from before the conversation tools, say), or whose shared
-        // directories changed, takes it as an event, at the cost of one
-        // cache miss. A workspace conversation's first request takes one,
-        // since its creation does not know the shared directories.
-        let expected = match self.expected_prefix(&client) {
-            Ok(expected) => expected,
-            Err(why) => return Ok(Outcome::stop(why)),
-        };
-        if client::current_prefix(self.conversation.events(), self.conversation.prefix_file()).1
-            != expected
-        {
-            // One past the log's line ends the turn, not the process.
-            if let Err(why) = self.log(Kind::Prefix { text: expected }) {
-                return Ok(Outcome::stop(format!(
-                    "the conversation's prefix could not be logged: {why}"
-                )));
-            }
-        }
         let mut attempt = 0u32;
         // Compaction prunes, then summarizes, once a request, and a
         // context-length refusal is asked again once (DESIGN.md §14).
@@ -1398,11 +1362,7 @@ impl Session {
             let prefix_text = prefix_text.to_string();
             let prefix_text = prefix_text.as_str();
             let messages = client::messages(events, client::timed(prefix_text));
-            let mut max_tokens = model
-                .as_ref()
-                .and_then(|m| m.max_completion_tokens)
-                .map_or(client::MAX_TOKENS, |m| m.min(client::MAX_TOKENS))
-                .max(1);
+            let mut max_tokens = max_tokens(model.as_ref());
             let effort = model
                 .as_ref()
                 .is_none_or(|m| m.supports("reasoning"))
@@ -1706,6 +1666,11 @@ impl Session {
             }
             tail = start;
         }
+        // With a summary in force, it lies before the tail, but asking
+        // again for one of it alone is paid for only for a new focus.
+        if candidates.first() == Some(&tail) && (!summarized || focus.is_none()) {
+            return not("there is nothing before its most recent steps to summarize".into());
+        }
         let tail = view.get(tail).map_or(0, |(seq, _)| *seq);
         // What the summary is given: the oldest steps left out to fit.
         let head = client::head(&Params {
@@ -1842,6 +1807,122 @@ impl Session {
             Some(why) => not(why),
             None => Ok(Ok(())),
         }
+    }
+
+    /// The human's compaction (DESIGN.md §14), an effect of its own:
+    /// what can be pruned is, and then a summary is asked for with the
+    /// human's `focus`, ended in the log as a turn is.
+    fn compact(&mut self, focus: Option<String>) -> Result<(), String> {
+        let of = self.conversation.events().last().map_or(0, |e| e.seq);
+        let started = self.log(Kind::Started {
+            effect: Effect::Compact,
+            of,
+        })?;
+        self.sync()?;
+        self.interrupt = false;
+        let outcome = self.compacting(started.seq, focus)?;
+        self.log(Kind::Finished {
+            started: started.seq,
+            outcome,
+            retry: false,
+        })?;
+        self.sync()
+    }
+
+    /// The human's compaction's work: its outcome.
+    fn compacting(&mut self, turn: u64, focus: Option<String>) -> Result<String, String> {
+        if focus
+            .as_ref()
+            .is_some_and(|f| f.len() > compact::FOCUS_BYTES)
+        {
+            return Ok(format!(
+                "the conversation could not be compacted: a focus is at most {} bytes",
+                compact::FOCUS_BYTES
+            ));
+        }
+        let asking = match self.asking()? {
+            Ok(asking) => asking,
+            Err(why) => return Ok(format!("the conversation could not be compacted: {why}")),
+        };
+        let max_tokens = max_tokens(asking.model.as_ref());
+        let context = asking.model.as_ref().and_then(|m| m.context_length);
+        let pruned = self.prune(0)?;
+        Ok(
+            match self.summarize(
+                turn,
+                &asking.client,
+                &asking.key,
+                &asking.name,
+                context,
+                max_tokens,
+                focus,
+            )? {
+                Ok(()) => "compacted".into(),
+                Err(why) if pruned => format!("{why}; its older tool results were pruned"),
+                Err(why) => why,
+            },
+        )
+    }
+
+    /// What a request is asked with: the key, the settings, the
+    /// conversation's model and effort, its entry in the models list,
+    /// and its prefix logged when it changed; or why it cannot be.
+    fn asking(&mut self) -> Result<Result<Asking, String>, String> {
+        let Some((key, client)) = self.setup.clone() else {
+            return Ok(Err(NO_SETTINGS.into()));
+        };
+        let key = match key {
+            Ok(key) => key,
+            Err(why) => return Ok(Err(why)),
+        };
+        // The human's choice for this conversation, else the default:
+        // the configuration's, or the window's (§4).
+        let meta = self.conversation.meta();
+        let (chosen, chosen_effort) = (meta.model.clone(), meta.effort.clone());
+        let setting = if chosen.is_some() { CHOSEN } else { DEFAULT };
+        let name = chosen.unwrap_or_else(|| client.model.clone());
+        let reasoning_effort = chosen_effort.unwrap_or_else(|| client.reasoning_effort.clone());
+        let model = match self.model(setting, &name, &client) {
+            Ok(model) => model,
+            Err(why) => return Ok(Err(why)),
+        };
+        // Every request carries the tools and `max_tokens`, which bounds
+        // what it may cost, and `require_parameters` would route one to no
+        // provider of a model that does not list both (§5).
+        if let Some(missing) = model
+            .as_ref()
+            .and_then(|m| ["tools", "max_tokens"].into_iter().find(|p| !m.supports(p)))
+        {
+            return Ok(Err(format!(
+                "{name} takes no {missing} (the provider's models list gives it no `{missing}` parameter); set {setting} to a model that does"
+            )));
+        }
+        // The prefix this program writes; a conversation begun by another
+        // (one from before the conversation tools, say), or whose shared
+        // directories changed, takes it as an event, at the cost of one
+        // cache miss. A workspace conversation's first request takes one,
+        // since its creation does not know the shared directories.
+        let expected = match self.expected_prefix(&client) {
+            Ok(expected) => expected,
+            Err(why) => return Ok(Err(why)),
+        };
+        if client::current_prefix(self.conversation.events(), self.conversation.prefix_file()).1
+            != expected
+        {
+            // One past the log's line ends the turn, not the process.
+            if let Err(why) = self.log(Kind::Prefix { text: expected }) {
+                return Ok(Err(format!(
+                    "the conversation's prefix could not be logged: {why}"
+                )));
+            }
+        }
+        Ok(Ok(Asking {
+            key,
+            client,
+            name,
+            reasoning_effort,
+            model,
+        }))
     }
 
     /// Logs a compaction pruning what `compact::prunable` gives when it
@@ -4029,7 +4110,15 @@ impl Session {
         let events = self.conversation.events();
         let since = events
             .iter()
-            .rposition(|e| matches!(e.kind, Kind::Started { .. }))
+            .rposition(|e| {
+                matches!(
+                    e.kind,
+                    Kind::Started {
+                        effect: Effect::Turn,
+                        ..
+                    }
+                )
+            })
             .map_or(0, |at| at + 1);
         let mut newest = None;
         let mut counts = false;
@@ -4782,6 +4871,24 @@ fn failed_cost(failure: &Failure, reserved: u64) -> (Option<client::Usage>, (u64
         },
         _ => (None, (0, Basis::Nothing)),
     }
+}
+
+/// What a request is asked with (`Session::asking`).
+struct Asking {
+    key: Secret,
+    client: Client,
+    name: String,
+    reasoning_effort: String,
+    model: Option<Model>,
+}
+
+/// A turn request's `max_tokens`: the model's largest completion, at
+/// most `client::MAX_TOKENS`.
+fn max_tokens(model: Option<&Model>) -> u64 {
+    model
+        .and_then(|m| m.max_completion_tokens)
+        .map_or(client::MAX_TOKENS, |m| m.min(client::MAX_TOKENS))
+        .max(1)
 }
 
 /// How far a request's compaction has gone (DESIGN.md §14): pruning

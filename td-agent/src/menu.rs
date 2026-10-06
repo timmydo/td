@@ -70,6 +70,9 @@ pub enum Action {
     /// Put the open conversation's workspace in `auto` mode, or back in
     /// `ask` (DESIGN.md §11).
     AutoMode,
+    /// Compact the open conversation, as `/compact` does (DESIGN.md
+    /// §14).
+    Compact,
 }
 
 /// The File menu's items: label, the chord shown beside it (one that
@@ -88,6 +91,8 @@ pub const HELP: &[(&str, &str, Action)] = &[(keys::ITEM, keys::CHORD, Action::Ke
 
 /// The Conversation menu's item that opens the model picker.
 pub const MODEL: &str = "Model\u{2026}";
+/// The Conversation menu's item that compacts the open one.
+pub const COMPACT: &str = "Compact conversation";
 /// The Conversation menu's item that opens the workspace card.
 pub const WORKSPACE: &str = "Workspace card\u{2026}";
 /// The Conversation menu's submenu of efforts.
@@ -192,6 +197,11 @@ pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, m
         parent: Some(conversation),
         row: row(DEFAULT_MODEL, "", true, false),
         item: Item::Action(Action::DefaultModel),
+    });
+    nodes.push(Node {
+        parent: Some(conversation),
+        row: row(COMPACT, "", state.open, false),
+        item: Item::Action(Action::Compact),
     });
     nodes.push(Node {
         parent: Some(conversation),

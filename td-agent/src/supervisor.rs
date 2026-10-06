@@ -104,6 +104,13 @@ struct Running {
     /// Its background processes running, by its log: none survives it,
     /// so it is kept while any runs (DESIGN.md §12).
     background: u32,
+    /// Compactions asked of it and not yet heard started: a turn under
+    /// way when one was asked may end first, so it is kept until they
+    /// are (DESIGN.md §14).
+    compacting: u32,
+    /// The last event its log replayed: a compaction's start no later
+    /// is one from before, not one asked of it.
+    replayed: u64,
 }
 
 impl Running {
@@ -118,6 +125,7 @@ impl Running {
             || !self.preparing.is_empty()
             || self.restoring > 0
             || self.background > 0
+            || self.compacting > 0
             || !self.pending.is_empty()
             || !self.deliveries.is_empty()
     }
@@ -240,6 +248,8 @@ impl Supervisor {
             preparing: Vec::new(),
             restoring: 0,
             background: 0,
+            compacting: 0,
+            replayed: 0,
             resuming: false,
             waking: false,
         });
@@ -437,6 +447,8 @@ impl Supervisor {
             preparing: Vec::new(),
             restoring: 0,
             background: 0,
+            compacting: 0,
+            replayed: 0,
             resuming: false,
             waking: false,
         });
@@ -551,6 +563,21 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Asks the open conversation to compact itself, as the human did
+    /// (DESIGN.md §14), with `focus` for its summary.
+    pub fn compact(&mut self, focus: Option<String>) -> Result<(), String> {
+        let running = self.opened().ok_or("no conversation is open")?;
+        if running.failed {
+            return Err("the conversation's process failed; open it again to restart it".into());
+        }
+        if frame::write(&mut running.writer, &Down::Compact { focus }.encode()).is_err() {
+            let _ = running.writer.shutdown(std::net::Shutdown::Both);
+        }
+        // Kept from now, whatever turn ends first, until its `started`.
+        running.compacting = running.compacting.saturating_add(1);
+        Ok(())
+    }
+
     /// Asks the open conversation to interrupt its turn.
     pub fn interrupt(&mut self) -> Result<(), String> {
         let running = self.opened().ok_or("no conversation is open")?;
@@ -650,6 +677,8 @@ impl Supervisor {
             let _ = running.child.wait();
             running.busy = None;
             running.waking = false;
+            // What it was asked to compact went with it.
+            running.compacting = 0;
             // Its process gone, nothing is half written by it any more,
             // and the new one is not asked again; its background
             // processes went with it.
@@ -771,10 +800,13 @@ fn drain(running: &mut Running, updates: &mut Vec<(Id, Update)>) -> Option<Strin
                             running.deliveries.retain(|(d, _)| d != delivery);
                             running.restarts = 0;
                         }
-                        Up::Hello { .. } => {
+                        Up::Hello { last, .. } => {
                             running.busy = None;
                             running.resuming = false;
                             running.waking = false;
+                            // A compaction asked before its hello is still
+                            // to come: `restart` cleared those of the last.
+                            running.replayed = *last;
                             // Its log, replayed next, counts them again.
                             running.background = 0;
                             // A process started again asks again.
@@ -792,12 +824,13 @@ fn drain(running: &mut Running, updates: &mut Vec<(Id, Update)>) -> Option<Strin
                             // Logged after any turn it starts, whose start
                             // has marked the child busy.
                             Kind::Pause { paused: false } => running.resuming = false,
-                            Kind::Started {
-                                effect: Effect::Turn,
-                                ..
-                            } => {
+                            // A turn's, or the human's compaction's.
+                            Kind::Started { effect, .. } => {
                                 running.busy = Some(event.seq);
                                 running.waking = false;
+                                if effect == Effect::Compact && event.seq > running.replayed {
+                                    running.compacting = running.compacting.saturating_sub(1);
+                                }
                             }
                             Kind::Finished { started, .. } | Kind::Interrupted { started }
                                 if running.busy == Some(started) =>

@@ -13,7 +13,7 @@
 //! tune itself against the classifier.
 
 use crate::client;
-use crate::store::{Event, Held, Kind, Role};
+use crate::store::{Effect, Event, Held, Kind, Role};
 
 /// The most a page may take once escaped as a JSON string, which a log
 /// line and a request carry it as: a page is cut shorter rather than
@@ -181,7 +181,14 @@ pub fn render(event: &Event) -> String {
             held,
             ..
         } => format!("{}\n{text}", message(from, *role, status.as_deref(), *held)),
-        Kind::Started { of, .. } => format!("a turn began, for #{of}"),
+        Kind::Started {
+            effect: Effect::Turn,
+            of,
+        } => format!("a turn began, for #{of}"),
+        Kind::Started {
+            effect: Effect::Compact,
+            ..
+        } => "the person compacted the conversation".to_string(),
         Kind::Finished {
             started, outcome, ..
         } => format!("#{started} ended: {outcome}"),
@@ -629,6 +636,27 @@ mod tests {
                 digest: None,
             },
         )
+    }
+
+    /// The model reads a compaction as the person's, not as a turn.
+    #[test]
+    fn a_compaction_reads_as_the_persons() {
+        let turn = event(
+            2,
+            Kind::Started {
+                effect: Effect::Turn,
+                of: 1,
+            },
+        );
+        assert!(render(&turn).ends_with("\na turn began, for #1\n"));
+        let compaction = event(
+            3,
+            Kind::Started {
+                effect: Effect::Compact,
+                of: 2,
+            },
+        );
+        assert!(render(&compaction).ends_with("\nthe person compacted the conversation\n"));
     }
 
     #[test]

@@ -1020,21 +1020,28 @@ pub fn title(text: &str) -> String {
 
 /// The effect a `Started` record opens: a turn, started when a user
 /// message is logged and finished when its reply is (DESIGN.md §6,
-/// Recovery). A model request is the other effect, opened by its own
+/// Recovery), or the human's compaction, of the log up to the event it
+/// names (§14). A model request is the other effect, opened by its own
 /// `Request` record, which carries what the request was.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Effect {
     Turn,
+    Compact,
 }
 
 impl Effect {
     fn word(self) -> &'static str {
         match self {
             Self::Turn => "turn",
+            Self::Compact => "compact",
         }
     }
     fn parse(word: &str) -> Option<Self> {
-        (word == "turn").then_some(Self::Turn)
+        match word {
+            "turn" => Some(Self::Turn),
+            "compact" => Some(Self::Compact),
+            _ => None,
+        }
     }
 }
 
@@ -2365,7 +2372,10 @@ impl Conversation {
         for event in &self.events {
             match &event.kind {
                 Kind::User { .. } | Kind::Message { held: None, .. } => users.push(event.seq),
-                Kind::Started { of, .. } => users.retain(|seq| seq != of),
+                Kind::Started {
+                    effect: Effect::Turn,
+                    of,
+                } => users.retain(|seq| seq != of),
                 _ => {}
             }
         }
@@ -3012,6 +3022,47 @@ pub mod tests {
         let (conversation, load) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
         assert_eq!(load, Load::default());
         assert_eq!(conversation.events().len(), 4);
+    }
+
+    /// A compaction names an event, but is no turn of it: a message whose
+    /// only start is a compaction's is given its turn on reopening.
+    #[test]
+    fn a_compaction_is_no_turn_of_the_message_it_names() {
+        let scratch = Scratch::new("compact-unturned");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        {
+            let (mut conversation, _) =
+                Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
+            conversation.append(user("kept")).unwrap();
+            conversation
+                .append(Kind::Started {
+                    effect: Effect::Compact,
+                    of: 1,
+                })
+                .unwrap();
+            conversation
+                .append(Kind::Finished {
+                    started: 2,
+                    outcome: "compacted".into(),
+                    retry: false,
+                })
+                .unwrap();
+            conversation.sync().unwrap();
+        }
+        let (conversation, load) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert!(
+            conversation.events().iter().any(|e| matches!(
+                e.kind,
+                Kind::Started {
+                    effect: Effect::Turn,
+                    of: 1
+                }
+            )),
+            "{:?}",
+            conversation.events()
+        );
+        assert_eq!(load.interrupted, [4]);
     }
 
     #[test]

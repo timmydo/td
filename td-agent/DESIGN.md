@@ -4564,6 +4564,34 @@ summary that fails leaves an earlier one in force. The transcript
 notices the compaction asking for it and shows the summary folded where
 it arrives, marked as not standing when it does not.
 
+**As built (increment 16, by hand).** `/compact`, alone or followed by a
+focus of at most 2 KiB, sent from the composer is the human's command,
+never a message; Conversation > Compact conversation is the button,
+without a focus, and the control seam's `compact-conversation` action
+chooses it. The window asks the open conversation's process, which logs
+an effect of its own, a `started` record of effect `compact` naming the
+log's last event, prunes what can be pruned whatever `compact_at` says,
+asks for the summary with the focus, and logs the effect `finished` with
+`compacted` or why it could not be (and that older tool results were
+pruned, when they were), never to be asked again; `history_read` shows
+the model that the person compacted it. The window keeps the process
+from the ask until the effect starts, a turn under way ending first or
+not, and then until it ends, as for a turn; `compact` is the window's
+frame for it, and `hello` names the last event its replay holds
+(`last`), so that a compaction's start replayed from before is not taken
+for the one asked; and an interrupt reaches the summary's stream as it
+does a turn's. It does not resume a paused conversation, and it starts
+no turn of a message held meanwhile, which the resumption still takes
+up. A conversation with nothing before its most recent steps is not
+compacted, by hand or past `compact_at`, and no summary is asked for;
+with a summary in force and every step since kept, that summary is
+summarized again only for a new focus. Another conversation's message
+reading `/compact` is a message: only the window sends the command. The
+transcript marks no message for a compaction, and a failed turn may
+still be asked again after one; one that could not be says why in a
+notice of td-agent's, one cut short by a restart says so, and one that
+stood says no more than its summary.
+
 **Resuming cold.** A long conversation left long enough for the
 provider's cache to expire costs its whole context again at the
 uncached rate on its next request, which compacting first with a

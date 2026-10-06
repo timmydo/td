@@ -913,6 +913,66 @@ fn a_message_sent_just_before_switching_away_runs_its_turn() {
     assert!(supervisor.background().is_empty());
 }
 
+/// A compaction asked while a turn runs, the human then switching away,
+/// is run: the process is kept past the turn's end until the
+/// compaction it was asked has started and ended (DESIGN.md §14).
+#[test]
+fn a_compaction_asked_during_a_turn_runs_after_a_switch() {
+    let scratch = Scratch::new("switch-compact");
+    let state = scratch.state();
+    let keyed = Down::Setup {
+        key: Ok(td_agent::key::Secret::new("sk-or-test".into())),
+        client: Box::new(Client {
+            limits: td_agent::cost::Limits {
+                turn: None,
+                conversation: None,
+                day: None,
+            },
+            ..Client::default()
+        }),
+    };
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyed);
+    let (a, b) = (Id::random().unwrap(), Id::random().unwrap());
+    supervisor
+        .open(a.clone(), Some(Role::Conversation))
+        .unwrap();
+    supervisor.send("hello".into()).unwrap();
+    supervisor.compact(None).unwrap();
+    supervisor
+        .open(b.clone(), Some(Role::Conversation))
+        .unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let mut outcomes = Vec::new();
+    while outcomes.len() < 2 {
+        assert!(Instant::now() < deadline, "heard only {outcomes:?}");
+        for (of, update) in supervisor.poll() {
+            match update {
+                Update::Up(Up::Reserve { id, .. }) if of == a => supervisor.answer(
+                    &a,
+                    &Down::Reservation {
+                        id,
+                        refusal: Some("refused by the test".into()),
+                    },
+                ),
+                Update::Up(Up::Event(event)) if of == a => {
+                    if let Kind::Finished { outcome, .. } = event.kind {
+                        outcomes.push(outcome);
+                    }
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(outcomes[0], "refused by the test");
+    assert!(
+        outcomes[1].starts_with("the conversation could not be compacted"),
+        "{outcomes:?}"
+    );
+    supervisor.poll();
+    assert!(supervisor.background().is_empty());
+}
+
 /// Deleting a conversation (DESIGN.md §4): its live process is ended and
 /// waited for, so its lock is free and its directory goes; the list no
 /// longer holds it, and a second delete has nothing to remove.

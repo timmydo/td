@@ -302,6 +302,11 @@ impl Session {
                         self.app.note(e);
                     }
                 }
+                Request::Compact(focus) => {
+                    if let Err(e) = self.supervisor.compact(focus) {
+                        self.app.note(e);
+                    }
+                }
                 Request::ClearTodo => {
                     if let Err(e) = self.supervisor.tell(&Down::ClearTodo) {
                         self.app.note(e);

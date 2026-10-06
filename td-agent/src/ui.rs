@@ -274,6 +274,9 @@ pub enum Request {
     Pause(bool),
     /// Clear the open conversation's todo list.
     ClearTodo,
+    /// Compact the open conversation, with a focus for its summary
+    /// (DESIGN.md §14).
+    Compact(Option<String>),
     /// Undo the open conversation's step snapshotted at this place.
     Undo(u64),
     /// Redo it.
@@ -1595,13 +1598,10 @@ impl App {
         };
         let mut notice = None;
         let state = match update {
+            // A turn's start, or the human's compaction's.
             Update::Up(Up::Event(Event {
                 seq,
-                kind:
-                    Kind::Started {
-                        effect: crate::store::Effect::Turn,
-                        ..
-                    },
+                kind: Kind::Started { .. },
                 ..
             })) => {
                 self.background_turns.retain(|(turn_of, _)| turn_of != id);
@@ -1800,9 +1800,18 @@ impl App {
                     Err(e) => self.note(format!("the transcript refused a message: {e}")),
                 }
             }
-            Kind::Started { of, .. } => {
+            Kind::Started { effect, of } => {
+                // A compaction is of no message the transcript shows: 0,
+                // which no event is.
+                let of = match effect {
+                    crate::store::Effect::Turn => of,
+                    crate::store::Effect::Compact => 0,
+                };
                 self.turns.push((event.seq, of));
-                self.meter.retry = false;
+                // A compaction leaves a failed turn's retry as it was.
+                if of != 0 {
+                    self.meter.retry = false;
+                }
                 if let Some(row) = self.active_row() {
                     row.state = RowState::Running;
                 }
@@ -1829,7 +1838,13 @@ impl App {
                     }
                     return self.touch();
                 }
-                self.meter.retry = retry;
+                let compaction = self
+                    .turns
+                    .iter()
+                    .any(|(turn, of)| *turn == started && *of == 0);
+                if !compaction {
+                    self.meter.retry = retry;
+                }
                 if let Some(row) = self.active_row() {
                     if row.state == RowState::Running {
                         row.state = RowState::Idle;
@@ -1848,14 +1863,20 @@ impl App {
                 if let Some(index) = message_of(&self.messages, &self.turns, started) {
                     let _ = self.transcript.set_status(index, Some(status));
                 }
-                if outcome != "replied" && outcome != "no model" {
+                // The summary says a compaction that stood; one that did
+                // not says why here.
+                let said = outcome == "replied"
+                    || outcome == "no model"
+                    || (compaction && outcome == "compacted");
+                if !said {
                     let text = if retry {
                         format!("{outcome}\nC-r asks again.")
                     } else {
                         outcome
                     };
+                    let effect = if compaction { "compaction" } else { "turn" };
                     let pushed = Message::new("td-agent")
-                        .and_then(|m| m.status("turn", Tone::Neutral))
+                        .and_then(|m| m.status(effect, Tone::Neutral))
                         .and_then(|m| m.text(&text))
                         .map_err(|e| e.to_string())
                         .and_then(|m| self.push_message(m));
@@ -1881,6 +1902,23 @@ impl App {
                     let _ = self
                         .transcript
                         .set_status(index, Some(("interrupted", Tone::Bad)));
+                }
+                // A compaction cut short is said, as no message shows it.
+                if self
+                    .turns
+                    .iter()
+                    .any(|(turn, of)| *turn == started && *of == 0)
+                {
+                    let pushed = Message::new("td-agent")
+                        .and_then(|m| m.status("compaction", Tone::Neutral))
+                        .and_then(|m| {
+                            m.text("the compaction was cut short by a restart; nothing it asked for stands")
+                        })
+                        .map_err(|e| e.to_string())
+                        .and_then(|m| self.push_message(m));
+                    if let Err(e) = pushed {
+                        self.note(format!("the transcript refused a notice: {e}"));
+                    }
                 }
             }
             Kind::Request {
@@ -2867,9 +2905,48 @@ impl App {
             );
             return;
         }
+        // `/compact` is the human's command, not a message (DESIGN.md §14).
+        if let Some(focus) = crate::compact::command(&text) {
+            if focus
+                .as_ref()
+                .is_some_and(|f| f.len() > crate::compact::FOCUS_BYTES)
+            {
+                self.note(format!(
+                    "a compaction's focus is at most {} KiB",
+                    crate::compact::FOCUS_BYTES / 1024
+                ));
+                return;
+            }
+            if self.active.is_none() {
+                self.note("no conversation is open");
+                return;
+            }
+            self.composer.fresh();
+            self.apply_focus();
+            self.compact(focus);
+            return;
+        }
         self.composer.fresh();
         self.apply_focus();
         self.requests.push(Request::Send(text));
+        self.touch();
+    }
+
+    /// Asks the open conversation to compact itself, from the composer or
+    /// the Conversation menu.
+    pub fn compact(&mut self, focus: Option<String>) {
+        if self.active.is_none() {
+            self.note("no conversation is open");
+            return;
+        }
+        if self.active_failed() {
+            self.note(
+                "the conversation's process failed; open it again (Return on its row) to retry",
+            );
+            return;
+        }
+        self.requests.push(Request::Compact(focus));
+        self.note("compacting");
         self.touch();
     }
 
@@ -3132,6 +3209,7 @@ impl App {
             menu::Action::Quit => self.requests.push(Request::Quit),
             menu::Action::Model => self.open_picker(),
             menu::Action::Delete => self.open_delete(),
+            menu::Action::Compact => self.compact(None),
             menu::Action::DefaultModel => self.open_default_picker(),
             menu::Action::AutoMode => {
                 if let (true, Some(id), Some(mode)) =
@@ -4805,6 +4883,7 @@ pub mod tests {
                 interrupted: vec![],
                 paused: false,
                 prefix: Some(String::new()),
+                last: 0,
             }),
             0,
         );
@@ -4840,6 +4919,48 @@ pub mod tests {
             "{}",
             text(&app)
         );
+    }
+
+    /// `/compact` in the composer, with or without a focus, and the
+    /// Conversation menu's item ask the open conversation to compact;
+    /// anything else is a message, and a focus past its bound is kept
+    /// in the composer (DESIGN.md §14).
+    #[test]
+    fn compact_is_asked_from_the_composer_and_the_menu() {
+        // With none open, the command is kept in the composer.
+        let surface = Surface::new(1024, 640, Scale::default()).unwrap();
+        let mut bare = App::new(surface, None, Mode::Auto).unwrap();
+        assert!(bare.composer.insert("/compact").unwrap());
+        key(&mut bare, "Return");
+        assert!(bare.take_requests().is_empty());
+        assert_eq!(bare.composed(), "/compact");
+        let mut app = app();
+        app.add_row(row(9, 1));
+        app.set_active(id(9));
+        assert!(app
+            .composer
+            .insert("/compact keep the failing test")
+            .unwrap());
+        key(&mut app, "Return");
+        assert_eq!(
+            app.take_requests(),
+            [Request::Compact(Some("keep the failing test".into()))]
+        );
+        assert_eq!(app.composed(), "");
+        assert!(app.composer.insert("/compact").unwrap());
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [Request::Compact(None)]);
+        assert!(app.composer.insert("/compacting").unwrap());
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [Request::Send("/compacting".into())]);
+        let long = format!("/compact {}", "f".repeat(crate::compact::FOCUS_BYTES + 1));
+        assert!(app.composer.insert(&long).unwrap());
+        key(&mut app, "Return");
+        assert!(app.take_requests().is_empty());
+        assert_eq!(app.composed(), long);
+        app.composer.fresh();
+        app.menu_action(menu::Action::Compact);
+        assert_eq!(app.take_requests(), [Request::Compact(None)]);
     }
 
     #[test]
@@ -4914,6 +5035,7 @@ pub mod tests {
                 interrupted: vec![2],
                 paused: false,
                 prefix: Some(String::new()),
+                last: 0,
             }),
             0,
         );
@@ -4935,6 +5057,7 @@ pub mod tests {
                 interrupted: vec![],
                 paused: false,
                 prefix,
+                last: 0,
             })
         };
         let prefix = crate::prompt::prefix(0);
@@ -5329,6 +5452,99 @@ pub mod tests {
             calls: Vec::new(),
             incomplete,
         }
+    }
+
+    /// The human's compaction marks no message running or unanswered,
+    /// though it names one; one that stood says nothing more than its
+    /// summary, and one that could not be says why.
+    #[test]
+    fn a_compaction_is_no_messages_turn() {
+        let mut app = app();
+        turn(&mut app, 1, "hello");
+        app.update(
+            at(
+                3,
+                Kind::Finished {
+                    started: 2,
+                    outcome: "replied".into(),
+                    retry: false,
+                },
+            ),
+            0,
+        );
+        let compaction = || Kind::Started {
+            effect: crate::store::Effect::Compact,
+            of: 1,
+        };
+        app.update(at(4, compaction()), 0);
+        // The row runs; the message stays as its turn left it.
+        assert!(text(&app).contains("you  replied"), "{}", text(&app));
+        app.update(
+            at(
+                5,
+                Kind::Finished {
+                    started: 4,
+                    outcome: "compacted".into(),
+                    retry: false,
+                },
+            ),
+            0,
+        );
+        assert_eq!(app.transcript().len(), 1, "{}", text(&app));
+        app.update(at(6, compaction()), 0);
+        app.update(
+            at(
+                7,
+                Kind::Finished {
+                    started: 6,
+                    outcome: "the conversation could not be compacted: why".into(),
+                    retry: false,
+                },
+            ),
+            0,
+        );
+        assert_eq!(app.transcript().len(), 2);
+        let shown = text(&app);
+        assert!(shown.contains("could not be compacted: why"), "{shown}");
+        assert!(
+            shown.contains("compaction") && !shown.contains("not answered"),
+            "{shown}"
+        );
+        // A failed turn's retry outlasts a compaction, and one cut short
+        // by a restart is said.
+        turn(&mut app, 8, "again");
+        app.update(
+            at(
+                10,
+                Kind::Finished {
+                    started: 9,
+                    outcome: "error 502: bad gateway".into(),
+                    retry: true,
+                },
+            ),
+            0,
+        );
+        app.update(at(11, compaction()), 0);
+        app.update(
+            at(
+                12,
+                Kind::Finished {
+                    started: 11,
+                    outcome: "compacted".into(),
+                    retry: false,
+                },
+            ),
+            0,
+        );
+        app.update(at(13, compaction()), 0);
+        app.update(at(14, Kind::Interrupted { started: 13 }), 0);
+        assert!(
+            text(&app).contains("the compaction was cut short by a restart"),
+            "{}",
+            text(&app)
+        );
+        key(&mut app, "C-r");
+        assert_eq!(app.take_requests(), [Request::Retry]);
     }
 
     /// A compaction's summary is not drawn as it streams; it arrives
@@ -5873,6 +6089,7 @@ pub mod tests {
                 interrupted: Vec::new(),
                 paused: false,
                 prefix: Some(String::new()),
+                last: 0,
             }),
             0,
         );
@@ -6286,6 +6503,7 @@ pub mod tests {
                 interrupted: Vec::new(),
                 paused: false,
                 prefix: Some(String::new()),
+                last: 0,
             }),
             0,
         );

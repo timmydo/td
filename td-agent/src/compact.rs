@@ -113,6 +113,20 @@ fn quoted(text: &str) -> String {
     out
 }
 
+/// The most a compaction's focus may be.
+pub const FOCUS_BYTES: usize = 2 * 1024;
+
+/// The composer's `/compact`, alone or followed by a focus, when `text`
+/// is that command: the focus, if any.
+pub fn command(text: &str) -> Option<Option<String>> {
+    let rest = text.trim().strip_prefix("/compact")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let focus = rest.trim();
+    Some((!focus.is_empty()).then(|| focus.to_string()))
+}
+
 /// What a request is sent in place of the log before a summary's tail:
 /// the notice that the conversation was compacted at `at`, the summary,
 /// labelled as the model's own notes, and the state carried over from
@@ -829,6 +843,20 @@ mod tests {
         assert_eq!(rebuilt, sent);
         assert!(sent.contains("SUMMARY: the build fails in link."));
         assert!(!sent.contains("Also the docs.") && sent.contains("Next."));
+    }
+
+    /// The composer's command, with or without a focus; anything else is
+    /// a message.
+    #[test]
+    fn the_composer_command_is_compact_and_its_focus() {
+        assert_eq!(command("/compact"), Some(None));
+        assert_eq!(command("  /compact  \n"), Some(None));
+        assert_eq!(
+            command("/compact keep the failing\ntest names "),
+            Some(Some("keep the failing\ntest names".into()))
+        );
+        assert_eq!(command("/compacted"), None);
+        assert_eq!(command("please /compact"), None);
     }
 
     /// A request is past `compact_at` with its reply's room, that room

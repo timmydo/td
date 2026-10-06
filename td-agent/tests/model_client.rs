@@ -3501,6 +3501,11 @@ fn a_paused_conversation_holds_messages_until_it_is_resumed() {
         }
     ));
     assert!(h.mock.requests().is_empty());
+    // The human's compaction meanwhile starts no turn of it, and leaves
+    // it held for the turn its resumption starts.
+    h.down(&Down::Compact { focus: None });
+    let (_, outcome, _) = h.turn();
+    assert!(outcome.contains("could not be compacted"), "{outcome}");
     // Resumed: the held message starts its turn.
     h.down(&Down::Pause { paused: false });
     let (events, outcome, _) = h.turn();
@@ -5988,7 +5993,11 @@ fn a_context_refusal_with_nothing_to_prune_is_summarized_and_asked_again() {
     drop(conversation);
     h.reopen();
     let _ = h.turn();
-    h.setup(Client::default());
+    // Kept to its least, so that steps lie before the tail.
+    h.setup(Client {
+        compact_keep_tokens: 1_000,
+        ..Client::default()
+    });
     h.say("Go on.");
     let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied", "{}", h.said());
@@ -6001,4 +6010,104 @@ fn a_context_refusal_with_nothing_to_prune_is_summarized_and_asked_again() {
     );
     let last = h.mock.requests().last().unwrap().text();
     assert!(last.contains("SUMMARY: both files were read"), "{last}");
+}
+
+/// The human compacts with a focus (DESIGN.md §14): an effect of its
+/// own, its summary asked for with the focus though the conversation is
+/// far from `compact_at`, ended "compacted"; the next turn is sent the
+/// summary.
+#[test]
+fn the_human_compacts_with_a_focus() {
+    let h = Harness::new(
+        "compact-by-hand",
+        Role::Conversation,
+        vec![Reply::sse("stream-sonnet.sse")],
+    );
+    h.mock.route(
+        "Write a title for the conversation",
+        vec![Reply::ok("title.json")],
+    );
+    h.mock.route(
+        "This conversation is being compacted",
+        vec![
+            Reply::sse("compact-summary.sse"),
+            Reply::sse("compact-summary.sse"),
+        ],
+    );
+    let (mut conversation, mut h) = h.close();
+    read_two(&mut conversation, 10_000, 20_000);
+    drop(conversation);
+    h.reopen();
+    let _ = h.turn();
+    h.setup(Client {
+        compact_keep_tokens: 1_000,
+        ..Client::default()
+    });
+    h.down(&Down::Compact {
+        focus: Some("what new.txt says".into()),
+    });
+    let (events, outcome, retry) = h.turn();
+    assert_eq!(outcome, "compacted", "{}", h.said());
+    assert!(!retry);
+    assert!(events.iter().any(|e| matches!(
+        e.kind,
+        Kind::Started {
+            effect: td_agent::store::Effect::Compact,
+            ..
+        }
+    )));
+    let asked = h.mock.requests().last().unwrap().text();
+    assert!(
+        asked.contains("keep in particular: what new.txt says"),
+        "{asked}"
+    );
+    h.say("Go on.");
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let last = h.mock.requests().last().unwrap().text();
+    assert!(last.contains("SUMMARY: both files were read"), "{last}");
+    // The summary in force alone before the tail, every step since kept:
+    // asked again only for a new focus.
+    h.setup(Client {
+        compact_keep_tokens: 1_000_000,
+        ..Client::default()
+    });
+    let before = h.mock.requests().len();
+    h.down(&Down::Compact { focus: None });
+    let (_, outcome, _) = h.turn();
+    assert!(
+        outcome.contains("there is nothing before its most recent steps"),
+        "{outcome}"
+    );
+    assert_eq!(h.mock.requests().len(), before);
+    h.down(&Down::Compact {
+        focus: Some("the reply".into()),
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "compacted", "{}", h.said());
+    let asked = h.mock.requests().last().unwrap().text();
+    assert!(asked.contains("SUMMARY: both files were read"), "{asked}");
+}
+
+/// With nothing before its most recent steps, a compaction asks for no
+/// summary and says why.
+#[test]
+fn a_compaction_with_nothing_to_summarize_asks_nothing() {
+    let mut h = Harness::new(
+        "compact-nothing",
+        Role::Orchestrator,
+        vec![Reply::sse("stream-sonnet.sse")],
+    );
+    h.setup(Client::default());
+    h.say("What is a sparse checkout?");
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let before = h.mock.requests().len();
+    h.down(&Down::Compact { focus: None });
+    let (_, outcome, _) = h.turn();
+    assert!(
+        outcome.contains("there is nothing before its most recent steps to summarize"),
+        "{outcome}"
+    );
+    assert_eq!(h.mock.requests().len(), before);
 }
