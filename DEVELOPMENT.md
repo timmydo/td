@@ -378,6 +378,23 @@ scoped pass is journaled under its scope, so
 one. `TD_CHECK_FULL` runs every check in full, scope or not, and
 `td-builder check recipe-checks` on its own has no scope.
 
+A flat recipe definition at `recipes/src/recipes/<stem>.rs` also runs
+the builder/recipes/engine workspace legs and repository formatting,
+without unchanged standalone crate legs. Its stem starts with a lowercase
+ASCII letter and contains only lowercase ASCII letters, digits and `-`;
+`crate`, `self` and `super` remain unrecognized. Recipe-checks still follows
+the recipe-source scope above and validates the affected target builds.
+Beside a crate change, the definition retains the workspace legs and that crate's reader
+closure, including for a crate normally exempt from workspace checks.
+Shared recipe machinery, nested paths and unrecognized filenames retain
+the full Cargo preflight. If any standalone crate names the recipe-definition
+directory or recipe directory fragments outside line comments in its scanned
+sources, or outside `#` comments in its manifest, the full Cargo preflight
+remains required; the roster reader graph does not model that cross-boundary
+read. Every manifest-declared target file
+is inspected, including paths spelled through `..`, custom build scripts,
+and single-quoted target paths.
+
 The system-level qemu oracles are a separate tier, `td-builder check
 integration`, which `check` alone does not include. It runs on the host,
 never in the gate sandbox: it warms the system image's inputs, then runs
