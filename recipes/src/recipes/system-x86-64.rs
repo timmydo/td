@@ -5778,6 +5778,47 @@ mod tests {
             })
     }
 
+    /// td-secret's login worker relies on td-svc to serialize it across
+    /// td-authd processes (td-secret/DESIGN.md, "Login-key worker"): only
+    /// one unit runs the serving authority, the pair-exec unit whose leaf
+    /// td-svc kills and drains before the next generation.
+    #[test]
+    fn only_the_wayland_pair_runs_the_serving_authority() {
+        let serving: Vec<(String, Vec<(String, String)>)> = parse_td_svc_conf()
+            .into_iter()
+            .filter(|(_, keys)| {
+                keys.iter()
+                    .any(|(_, value)| value.contains("terminal-serve"))
+            })
+            .collect();
+        let [(name, keys)] = serving.as_slice() else {
+            panic!("exactly one unit serves the authority: {serving:?}")
+        };
+        assert_eq!(name, "wayland");
+        let values = |key: &str| -> Vec<&str> {
+            keys.iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, value)| value.as_str())
+                .collect()
+        };
+        assert_eq!(values("type"), ["daemon"]);
+        assert_eq!(values("cgroup"), ["service"]);
+        let [exec] = values("exec")[..] else {
+            panic!("one exec")
+        };
+        assert!(exec.starts_with("/bin/td-authd terminal-serve "));
+        let [peer] = values("pair-exec")[..] else {
+            panic!("one pair-exec")
+        };
+        assert!(!peer.contains("terminal-serve"));
+        // Only the exec serves; no other key of the unit names it.
+        let named = keys
+            .iter()
+            .filter(|(_, value)| value.contains("terminal-serve"))
+            .count();
+        assert_eq!(named, 1);
+    }
+
     /// Everything a unit declares it starts after.
     fn unit_after(name: &str) -> Vec<String> {
         unit_key(name, "after")

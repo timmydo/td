@@ -724,12 +724,13 @@ impl Profile {
 
     /// An ID this key could not identify cannot be its credential and is left out;
     /// the rest must fit the advertised limits whole, one entry when absent.
+    /// The client-data hash comes after the PIN prompt, as for a login
+    /// assertion: `bind` adds it, and its value never changes the size.
     pub(super) fn login_enrollment(
         self,
-        challenge: [u8; 32],
         user: [u8; 32],
         excluded: &[&[u8]],
-    ) -> Result<KeyRequest<Creation>, LoginFailure> {
+    ) -> Result<KeyRequest<UnboundCreation>, LoginFailure> {
         if !self.can_enroll {
             return Err("login token does not advertise ES256 creation"
                 .to_string()
@@ -759,13 +760,22 @@ impl Profile {
         if excluded.len() > self.advertised_list.unwrap_or(1) {
             return Err(refused());
         }
-        let intent = self.creation(LOGIN_LABEL, challenge, user, &excluded)?;
+        let intent = self.creation(LOGIN_LABEL, [0; 32], user, &excluded)?;
         // Validated IDs leave the message limit as the only encoding failure.
         if !intent.excluded.is_empty() && intent.encode(&self, &self.auth_placeholder().0).is_err()
         {
             return Err(refused());
         }
-        Ok(self.creation_request(intent)?)
+        let KeyRequest {
+            profile,
+            intent,
+            bytes,
+        } = self.creation_request(intent)?;
+        Ok(KeyRequest {
+            profile,
+            intent: UnboundCreation(intent),
+            bytes,
+        })
     }
 
     fn auth_placeholder(&self) -> Secret {
@@ -814,6 +824,25 @@ impl Profile {
         })
     }
 }
+/// A login creation awaiting its client-data hash; its key-agreement
+/// request is already final.
+pub(super) struct UnboundCreation(Creation);
+impl KeyRequest<UnboundCreation> {
+    pub(super) fn bind(self, challenge: [u8; 32]) -> KeyRequest<Creation> {
+        let Self {
+            profile,
+            intent: UnboundCreation(mut intent),
+            bytes,
+        } = self;
+        intent.challenge = challenge;
+        KeyRequest {
+            profile,
+            intent,
+            bytes,
+        }
+    }
+}
+
 impl PinRequest<Creation> {
     pub(super) fn make(self, response: &[u8]) -> Result<MakeRequest, String> {
         let auth = self.authorize(response)?;
@@ -846,6 +875,27 @@ impl MakeRequest {
         if challenge == self.intent.challenge {
             return Err("portable enrollment proof requires a fresh challenge".into());
         }
+        let (credential, key) = self.created(response, salt)?;
+        let state = self
+            .profile
+            .assertion(&credential.id.0, key, challenge, salt)?;
+        Ok(EnrollmentProof { state, credential })
+    }
+
+    /// A login creation's proof, whose client-data hash its own PIN prompt
+    /// supplies: `LoginProof::bind` adds it once the prove step is presented.
+    pub(super) fn login_proof(self, response: &[u8], salt: [u8; 32]) -> Result<LoginProof, String> {
+        let (credential, key) = self.created(response, salt)?;
+        let creation = self.intent.challenge;
+        let state = self.profile.login_assertion(&credential.id.0, key, salt)?;
+        Ok(LoginProof {
+            proof: EnrollmentProof { state, credential },
+            creation,
+        })
+    }
+
+    /// The new credential and its key, from the makeCredential reply.
+    fn created(&self, response: &[u8], salt: [u8; 32]) -> Result<(Credential, PublicKey), String> {
         // maxMsgSize limits token input, not an attestation-bearing output.
         let value = response_value(response, cbor::MAX_BYTES)?;
         if let Some(enterprise) = value.get(&Value::Unsigned(4))? {
@@ -932,8 +982,33 @@ impl MakeRequest {
             cose: Secret(tail.get(..key_len).ok_or("credential key extent")?.into()),
             salt,
         };
-        let state = self.profile.assertion(id, key, challenge, salt)?;
-        Ok(EnrollmentProof { state, credential })
+        Ok((credential, key))
+    }
+}
+
+/// A login proof awaiting its client-data hash, which must differ from the
+/// creation's.
+pub(super) struct LoginProof {
+    proof: EnrollmentProof<KeyRequest<Unbound>>,
+    creation: [u8; 32],
+}
+impl LoginProof {
+    pub(super) fn bytes(&self) -> &[u8] {
+        self.proof.state.bytes()
+    }
+    /// The credential just created, which the prove step names.
+    pub(super) fn credential(&self) -> &[u8] {
+        &self.proof.credential.id.0
+    }
+    pub(super) fn bind(self, challenge: [u8; 32]) -> Result<EnrollmentProof<KeyRequest>, String> {
+        if challenge == self.creation {
+            return Err("login enrollment proof requires a fresh challenge".into());
+        }
+        let EnrollmentProof { state, credential } = self.proof;
+        Ok(EnrollmentProof {
+            state: state.bind(challenge)?,
+            credential,
+        })
     }
 }
 
@@ -2236,12 +2311,11 @@ mod tests {
                 );
                 let request = Profile::parse_login(&info)
                     .unwrap()
-                    .login_enrollment(
-                        fixture(label, "create_challenge").try_into().unwrap(),
-                        fixture(label, "user").try_into().unwrap(),
-                        excluded,
-                    )
+                    .login_enrollment(fixture(label, "user").try_into().unwrap(), excluded)
                     .unwrap();
+                assert_eq!(request.bytes(), fixture(label, "key_request"));
+                // The hash arrives after the prompt and changes no request before it.
+                let request = request.bind(fixture(label, "create_challenge").try_into().unwrap());
                 assert_eq!(request.bytes(), fixture(label, "key_request"));
                 let mut calls = 0;
                 let pending = request
@@ -2532,14 +2606,13 @@ mod tests {
     #[test]
     fn login_exclusions_must_fit_the_advertised_limits_whole() {
         let label = "p2-scoped";
-        let challenge = fixture(label, "create_challenge").try_into().unwrap();
         let user = fixture(label, "user").try_into().unwrap();
         let ids: Vec<Vec<u8>> = (1..=8).map(|i| vec![i; 64]).collect();
         let refs: Vec<&[u8]> = ids.iter().map(Vec::as_slice).collect();
         let create = |info: Info, excluded: &[&[u8]]| {
             Profile::parse_login(&info_with(label, info))
                 .unwrap()
-                .login_enrollment(challenge, user, excluded)
+                .login_enrollment(user, excluded)
         };
         let too_small = Some(LoginFailure::Refused(LoginRefusal::ListTooSmall));
         assert!(create(Info::default(), &[]).is_ok());
@@ -2557,7 +2630,7 @@ mod tests {
             }
         }
         // Unidentifiable IDs are left out; the count rule applies to the rest.
-        let kept = |request: KeyRequest<Creation>| request.intent.excluded.len();
+        let kept = |request: KeyRequest<UnboundCreation>| request.intent.0.excluded.len();
         let short_ids = || Info {
             max_id: Some(63),
             ..Info::default()
@@ -2577,7 +2650,7 @@ mod tests {
         assert!(!sized.identifiable(&long[0]) && sized.identifiable(&[9; 200]));
         assert_eq!(
             sized
-                .login_enrollment(challenge, user, &[&long[0], &long[1]])
+                .login_enrollment(user, &[&long[0], &long[1]])
                 .map(kept),
             Ok(0)
         );
@@ -2597,15 +2670,12 @@ mod tests {
         ))
         .unwrap();
         small.max_message = 400;
-        assert_eq!(
-            small.login_enrollment(challenge, user, &refs[..3]).err(),
-            too_small
-        );
+        assert_eq!(small.login_enrollment(user, &refs[..3]).err(), too_small);
         // Without exclusions a size failure is not a list refusal.
         let mut tiny = Profile::parse_login(&info_with(label, Info::default())).unwrap();
         tiny.max_message = 100;
         assert!(matches!(
-            tiny.login_enrollment(challenge, user, &[]),
+            tiny.login_enrollment(user, &[]),
             Err(LoginFailure::Protocol(_))
         ));
         for excluded in [&[b"".as_slice()][..], &[b"same", b"same"]] {
@@ -2626,7 +2696,7 @@ mod tests {
         assert!(matches!(
             Profile::parse_login(&algorithms)
                 .unwrap()
-                .login_enrollment(challenge, user, &[]),
+                .login_enrollment(user, &[]),
             Err(LoginFailure::Protocol(_))
         ));
     }

@@ -21,7 +21,6 @@ const OPERATION: &[u8] = b"td-login/operation/v1\0";
 
 /// A proved key and its PIN-verified hmac-secret output, which the caller
 /// still owns and clears. No Debug: it borrows that secret.
-#[allow(dead_code, reason = "the login writes arrive in C7")]
 pub(super) struct NewKey<'a> {
     pub credential: Vec<u8>,
     pub key: PublicKey,
@@ -39,7 +38,6 @@ pub(super) struct Slot {
 }
 
 impl Slot {
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
     fn derive(uid: u32, id: &[u8; 32], new: NewKey<'_>) -> Result<Self> {
         let derived = verifier(uid, id, &new.credential, new.output)?;
         Ok(Self {
@@ -71,7 +69,6 @@ impl Slot {
 pub(super) struct Record {
     uid: u32,
     id: [u8; 32],
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
     version: u8,
     slots: Vec<Slot>,
     digest: [u8; 32],
@@ -79,7 +76,6 @@ pub(super) struct Record {
 
 impl Record {
     /// First enrollment: every verifier binds this record's UID and ID.
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
     pub fn enroll(uid: u32, id: [u8; 32], version: u8, keys: Vec<NewKey<'_>>) -> Result<Self> {
         if !(1..=MAX_SLOTS).contains(&keys.len()) {
             return Err("login record requires one through eight keys".into());
@@ -92,7 +88,6 @@ impl Record {
     }
 
     /// Adds one proved key, keeping the UID, ID and every enrolled slot.
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
     pub fn with_key(self, version: u8, key: NewKey<'_>) -> Result<Self> {
         let Self {
             uid, id, mut slots, ..
@@ -109,7 +104,6 @@ impl Record {
 
     /// Removes a nonempty set of enrolled keys, keeping the UID and ID.
     /// Removing every key refuses: the store unlinks the record instead.
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
     pub fn without(self, version: u8, credentials: &[&[u8]]) -> Result<Self> {
         if credentials.is_empty() {
             return Err("no login key selected for removal".into());
@@ -133,7 +127,6 @@ impl Record {
         Self::assemble(uid, id, version, kept)
     }
 
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
     fn assemble(uid: u32, id: [u8; 32], version: u8, mut slots: Vec<Slot>) -> Result<Self> {
         if !READS.contains(&version) {
             return Err("unknown login record version".into());
@@ -151,17 +144,16 @@ impl Record {
         Ok(record)
     }
 
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
     pub fn uid(&self) -> u32 {
         self.uid
     }
 
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
+    #[cfg(test)]
     pub fn id(&self) -> &[u8; 32] {
         &self.id
     }
 
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
+    #[cfg(test)]
     pub fn version(&self) -> u8 {
         self.version
     }
@@ -174,7 +166,6 @@ impl Record {
         self.slots.iter().find(|slot| slot.credential == credential)
     }
 
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
     pub fn encode(&self) -> Result<Vec<u8>> {
         validate(&self.slots)?;
         let mut out = Vec::with_capacity(MAX_RECORD);
@@ -280,13 +271,11 @@ fn validate(slots: &[Slot]) -> Result<()> {
 }
 
 /// The lowest version this build and both retained deployments read.
-#[allow(dead_code, reason = "the login writes arrive in C7")]
 pub(super) fn write_version(current: &[u8], previous: &[u8]) -> Result<u8> {
     lowest_common(READS, current, previous)
         .ok_or_else(|| "no login record version both deployments read".into())
 }
 
-#[allow(dead_code, reason = "the login writes arrive in C7")]
 fn lowest_common(own: &[u8], current: &[u8], previous: &[u8]) -> Option<u8> {
     own.iter()
         .copied()
@@ -329,15 +318,10 @@ fn check(stored: &[u8; 32], derived: &Verifier) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Phase {
     Identify = 1,
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
     Authorize = 2,
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
     Create = 3,
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
     Prove = 4,
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
     Repeat = 5,
-    #[allow(dead_code, reason = "the login writes arrive in C7")]
     Probe = 6,
     Unlock = 7,
     // 8 is reserved: consent's connect step sends no assertion.

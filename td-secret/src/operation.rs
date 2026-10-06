@@ -19,6 +19,9 @@ pub(super) const OPERATION_TIME: Duration = fido_device::MAX_LIFETIME;
 pub(super) struct Wire {
     stream: UnixStream,
     deadline: Instant,
+    /// The open token session's deadline, which bounds every wait while it
+    /// is open without narrowing the operation's.
+    session: Option<Instant>,
     /// A frame or the operation ran out of time; nothing else sets it.
     expired: bool,
 }
@@ -33,6 +36,24 @@ impl Wire {
         self.expired
     }
 
+    /// Narrows the operation deadline once the operation is known; never extends it.
+    pub(super) fn limit(&mut self, deadline: Instant) {
+        self.deadline = self.deadline.min(deadline);
+    }
+
+    /// Bounds every wait by a token session's deadline while it is open;
+    /// none once it has ended.
+    pub(super) fn session(&mut self, deadline: Option<Instant>) {
+        self.session = deadline;
+    }
+
+    /// What the next wait may last until: the operation deadline, or an
+    /// open session's if that is earlier.
+    pub(super) fn bound(&self) -> Instant {
+        self.session
+            .map_or(self.deadline, |session| session.min(self.deadline))
+    }
+
     pub(super) fn new(stream: UnixStream, deadline: Instant) -> Result<Self, String> {
         stream
             .set_nonblocking(false)
@@ -40,12 +61,13 @@ impl Wire {
         Ok(Self {
             stream,
             deadline,
+            session: None,
             expired: false,
         })
     }
 
     fn frame_remaining(&mut self, deadline: Instant) -> Result<Duration, String> {
-        let result = remaining(self.deadline).and_then(|_| {
+        let result = remaining(self.bound()).and_then(|_| {
             remaining(deadline).map_err(|_| "private operation frame timed out".into())
         });
         self.expired |= result.is_err();
@@ -55,7 +77,7 @@ impl Wire {
     fn frame_deadline(&self) -> Result<Instant, String> {
         Instant::now()
             .checked_add(FRAME_TIME)
-            .map(|deadline| deadline.min(self.deadline))
+            .map(|deadline| deadline.min(self.bound()))
             .ok_or_else(|| "operation deadline overflow".into())
     }
 
@@ -123,11 +145,12 @@ impl Wire {
     }
 
     /// One PIN frame. A person types it, so its header waits for the
-    /// operation deadline rather than a frame's; the rest then has one frame
-    /// time. The bytes stay in clearing owners and never enter a diagnostic.
+    /// operation deadline, or an open session's, rather than a frame's; the
+    /// rest then has one frame time. The bytes stay in clearing owners and
+    /// never enter a diagnostic.
     pub(super) fn receive_pin(&mut self) -> Result<Pin, String> {
         let mut header = [0; 2];
-        self.read(&mut header, self.deadline)?;
+        self.read(&mut header, self.bound())?;
         let length = usize::from(u16::from_be_bytes(header));
         if !(2..=PIN_FRAME).contains(&length) {
             return Err("invalid operation PIN frame length".into());
@@ -674,6 +697,43 @@ mod tests {
             "private token operation expired"
         );
         assert!(wire.expired());
+    }
+
+    #[test]
+    fn an_open_session_bounds_every_wait_without_narrowing_the_operation() {
+        let (child, mut parent) = UnixStream::pair().unwrap();
+        let operation = Instant::now() + FRAME_TIME * 2;
+        let mut wire = Wire::new(child, operation).unwrap();
+        let session = Instant::now() + Duration::from_millis(50);
+        wire.session(Some(session));
+        assert_eq!(wire.bound(), session);
+        assert_eq!(wire.deadline(), operation);
+        assert_eq!(
+            wire.receive_pin().err().unwrap(),
+            "private token operation expired"
+        );
+        assert!(wire.expired());
+        assert_eq!(
+            wire.receive().err().unwrap(),
+            "private token operation expired"
+        );
+        assert!(wire.send(&[0x15]).is_err());
+        // Once the session ends, the operation deadline bounds waits again.
+        wire.session(None);
+        assert_eq!(wire.bound(), operation);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            parent
+                .write_all(&[0, 5, PIN, b'1', b'2', b'3', b'4'])
+                .unwrap();
+            parent
+        });
+        assert!(wire.receive_pin().is_ok());
+        assert!(wire.send(&[0x14]).is_ok());
+        drop(sender.join().unwrap());
+        // A session past the operation deadline never extends it.
+        wire.session(Some(operation + FRAME_TIME));
+        assert_eq!(wire.bound(), operation);
     }
 
     #[test]

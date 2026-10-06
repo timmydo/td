@@ -1752,9 +1752,9 @@ a token-bound secret operation.
 `login_record.rs` is the first piece of
 [../td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md)'s root login
 worker. TOKEN-LOGIN.md, "The login record" and "Token profile", owns the
-bytes; this module implements them. The worker's unlock ("Login-key
-worker" below) decodes, checks and hashes; building a record waits for
-the writes, and those items carry dead-code allowances until then. It
+bytes; this module implements them. The worker ("Login-key worker"
+below) decodes, checks and hashes records, and builds the ones its
+writes publish. It
 reads no file, token or entropy: the worker supplies the record bytes,
 hmac-secret outputs and the 32 random bytes of each client-data hash.
 
@@ -1795,11 +1795,11 @@ verifiers, fingerprints and every phase's client-data hash with Python's
 
 `login_store.rs` is the second piece of the root login worker: it
 reads the login state and publishes or removes the record, as
-TOKEN-LOGIN.md, "The login record", specifies. The worker's unlock reads;
-publication and removal wait for the writes and carry dead-code
-allowances until then. It
+TOKEN-LOGIN.md, "The login record", specifies, for the worker's reads
+and writes. It
 uses only std filesystem calls, adds no `unsafe` and no syscall surface,
-and takes no lock: the worker's operation lock serializes writers.
+and takes no lock: td-authd's single operation slot serializes writers
+("Login-key worker").
 
 `Store::open` walks the directory path (`/var/lib/td/login` in
 production) from `/` one component at a time, each opened with
@@ -1851,9 +1851,11 @@ any it leaves. A record for another UID is rejected. The
 store writes the record in the version it was built with, which the
 caller chose with `write_version`; it never picks one. Private `Stage`
 hooks after each step let tests inject a failure or a concurrent change
-at every point: each publication and removal stage, from an absent and a
-present record, leaves a later read with the old record or the whole new
-one, and a later write succeeds. Private `ReadStage` hooks after the
+at every point; the worker's tests reach them only through test-only
+`publish_at` and `remove_at`, which name each stage. Each
+publication and removal stage, from an absent and a present record,
+leaves a later read with the old record or the whole new one, and a
+later write succeeds. Private `ReadStage` hooks after the
 inspection and after the read let tests swap the inode, change its mode
 or append to it, each of which reads as unreadable; a test-only
 descriptor root stands for a lost or replaced `/proc`.
@@ -1862,9 +1864,8 @@ descriptor root stands for a lost or replaced `/proc`.
 
 The third piece of the root login worker is the protocol steps
 TOKEN-LOGIN.md's "Token profile" names, in `fido_ctap.rs`, `fido_pin.rs`
-and `fido_transaction.rs`; the worker's unlock calls identify and the
-login assertion, and creation waits for the writes. That section's "Wire
-choices" owns the bytes.
+and `fido_transaction.rs`; the worker calls identify, the login
+assertion and creation. That section's "Wire choices" owns the bytes.
 
 `IdentifyRequest` builds the silent getAssertion over one batch of
 nonempty, distinct IDs, bounded like the assertion request, and `select`
@@ -1893,9 +1894,9 @@ any status but success or NO_CREDENTIALS is typed as for the notebook,
 and `select` decides the rest, so only a bare NO_CREDENTIALS moves to the
 next batch.
 `login_assertion` and `login_create` run the notebook's key-agreement,
-PIN-token, creation and proof sequence, shared as `authorized_assertion`
-and `create_and_prove`, and query getPINRetries after key agreement and
-before each prompt, which receives the purpose and the count. Zero ends
+PIN-token, creation and proof sequence, the assertion shared as
+`authorized_assertion`, and query getPINRetries after key agreement and
+before each prompt, which receives the step and the count. Zero ends
 as `Status::PinBlocked`, whatever the power-cycle state, and otherwise a
 power-cycle state as `Status::PinAuthBlocked`, with no prompt; device
 statuses stay typed as for the notebook. A login assertion's
@@ -1904,10 +1905,19 @@ only once getPINRetries has answered, so `login_assertion` takes the
 credential, key and salt (`LoginAssertion`) and its prompt returns the
 PIN with the hash: `Profile::login_assertion` checks the credential
 before any request and sends the same key agreement, and
-`KeyRequest::bind` adds the hash after the prompt. The requests and their
-order are the notebook's, and the committed transcripts pass unchanged.
-`login_create` still takes its hashes first; the writes bind their PIN
-steps the same way. A failure is `LoginError::Refused` or
+`KeyRequest::bind` adds the hash after the prompt. `login_create` binds
+both of its hashes the same way, taking only the user handle, salt and
+exclusions (`LoginCreation`): `Profile::login_enrollment` returns an
+`UnboundCreation` whose key-agreement request is final and whose `bind`
+adds the creation's hash after its prompt, and
+`MakeRequest::login_proof` returns a `LoginProof` whose prompt
+(`LoginPin::Proof`) names the credential just created, which the prove
+step shows, and whose `bind` refuses the creation's hash. Its sequence is
+`create_and_prove`'s, written out with the two binds; the notebook's
+`create_and_prove` and `MakeRequest::proof` are unchanged but for
+sharing the reply checks. The requests and their order are the
+notebook's, and the committed transcripts pass unchanged. A failure is
+`LoginError::Refused` or
 `LoginError::Failed` around the notebook's `Error`. A login assertion
 refuses signed backup flags, as a proof does.
 
@@ -1980,18 +1990,18 @@ with the power-cut increment.
 ## Login-key worker
 
 `login-operation --uid UID` is TOKEN-LOGIN.md's root worker, in
-`login_operation.rs`. It implements session unlock only; first
-enrollment, addition and removal follow, and nothing in production starts
-it: td-authd's `TDLA003` supervision is a later increment. It reaches
-the command line only through `run`, keeps the unlock worker's root
-startup, unnamed socketpair, descriptor inventory and bounded framing,
-and uses its `10`/`11` presentation and `12`/`13` commit rounds. It
-neither reads nor clears an application-store key.
+`login_operation.rs`: session unlock, first enrollment, key addition
+and key removal. Nothing in production starts it: td-authd's `TDLA003`
+supervision is a later increment. It reaches the command line only
+through `run`, keeps the unlock worker's root startup, unnamed
+socketpair, descriptor inventory and bounded framing, and uses its
+`10`/`11` presentation and `12`/`13` commit rounds. It neither reads nor
+clears an application-store key.
 
 Its frames, in hex: the worker sends `18` the baseline, `10` and `12`
 invitations, `14` success and `15` a failure; root sends the
-description, `11` and `13` acknowledgements and `16` a PIN. `17` stays
-store inspection's.
+description, `11` and `13` acknowledgements and `16` a PIN after each
+PIN step's acknowledgement. `17` stays store inspection's.
 
 1. After startup it requires no active swap and a zero core-dump soft
    limit, as the named-write worker does, since it will hold a PIN and an
@@ -2003,41 +2013,135 @@ store inspection's.
    `begin_login` and `admit_login_step` take. An unavailable state sends
    its failure instead, so no description is ever admitted against it.
    The worker keeps the record it read, and checks against that.
-2. Root's first frame is the TDCONS01 description. Another owner, an
-   operation other than login unlock, or one that `begin_login` refuses
-   against the worker's own baseline or does not reproduce, is INTERNAL;
-   an unenrolled baseline is NO RECORD.
-3. It presents that identify step, then reads the record again: if it no
-   longer reads as the baseline, an unavailable state included, it fails
-   as RECORD CHANGED. Exactly one FIDO device must be connected; the
-   worker does not wait for one (ONE KEY). Identify runs over the slots'
-   credential IDs in record order with the identify-phase hash of the
-   description and 32 fresh kernel-random bytes. No selection is NOT
-   ENROLLED.
-4. Discovery must again find that one device, and a second session runs
-   the selected slot's login assertion with its salt and key. After key
-   agreement and getPINRetries the worker builds the unlock step from the
-   slot's fingerprint and the reported count, requires its own
-   `admit_login_step` to answer `Last`, presents it, and takes one PIN
-   frame: `16` and 4 to 63 bytes, at most 64 bytes in all. A person types
-   it, so its header waits for the operation deadline rather than a frame
-   time; the rest then has one frame time. A longer header refuses before
-   its payload is read. The bytes stay in clearing owners and never enter
-   a diagnostic. Only then is the unlock-phase hash computed, over that
-   exact step, so the signature binds the count shown. Every other frame
-   the worker reads, the description and each acknowledgement, is also
-   read into clearing storage, so a PIN root sends out of order is zeroed
-   when the worker refuses it.
-5. The primitives verify the assertion (RP hash, UP, UV, the one allowed
-   credential, the slot key's signature, no signed backup flags), then
-   `Record::check` compares the slot's verifier in constant time and the
-   output is dropped. A mismatch, a stale or foreign signature included,
-   is FAILED. Nothing is retried.
-6. The record must read as the baseline once more, then the commit round
-   over the unlock step precedes `14`. Root must also observe a
-   successful exit.
+2. Root's first frame is the TDCONS01 description of a login operation
+   for this account. Another owner or operation, or one that
+   `begin_login` refuses against the worker's own baseline or does not
+   reproduce, is INTERNAL. An unlock, addition or removal against an
+   unenrolled baseline is NO RECORD; an enrollment against an enrolled
+   one is INTERNAL, since root was shown the record. An addition to eight
+   keys has no encoding (its before count is one to seven), so root
+   refuses it from the baseline's count and sends no description; any
+   description it sends instead is INTERNAL, before any token I/O. The description fixes the
+   deadline (below). A write that leaves a record then takes its version
+   from `write_version` over the record versions the current and
+   previous deployments read, and fails as VERSION when there is none,
+   before any presentation; removing every key writes none. No
+   deployment carries the tier marker yet, so `run` passes empty read
+   sets and every such write refuses until increment 4 reads the marker.
+3. It presents root's own first step (identify, or an enrollment's
+   first connect), then reads the record again: if it no longer reads as
+   the baseline, an unavailable state included, it fails as RECORD
+   CHANGED, before any token I/O.
+4. An unlock, addition or removal identifies the key. Exactly one FIDO
+   device must be connected; the worker does not wait for one (ONE KEY).
+   Identify runs over the slots' credential IDs in record order with the
+   identify-phase hash of the identify step and 32 fresh kernel-random
+   bytes. No selection is NOT ENROLLED. Discovery must again find that
+   one device, and a second session runs the selected slot's login
+   assertion with its salt and key. After key agreement and
+   getPINRetries the worker builds the unlock step, or for an addition or
+   removal the authorize step, from the slot's fingerprint and the
+   reported count, presents it, and takes one PIN frame: `16` and 4 to 63
+   bytes, at most 64 bytes in all. A person types it, so its header waits
+   for the operation deadline rather than a frame time; the rest then has
+   one frame time. A longer header refuses before its payload is read.
+   The bytes stay in clearing owners and never enter a diagnostic. Only
+   then is the step's hash computed, over that exact step, so the
+   signature binds the count shown; an authorize hash also binds the
+   record's ID and the digest of its exact bytes. Every other frame the
+   worker reads, the description and each acknowledgement, is also read
+   into clearing storage, so a PIN root sends out of order is zeroed when
+   the worker refuses it. The primitives verify the assertion (RP hash,
+   UP, UV, the one allowed credential, the slot key's signature, no
+   signed backup flags), then `Record::check` compares the slot's
+   verifier in constant time and the output is dropped. A mismatch, a
+   stale or foreign signature included, is FAILED. Nothing is retried.
+5. A new key, each of a first enrollment's in turn or an addition's after
+   its authorization, begins at a connect step: root's own first step
+   for an enrollment's first key, otherwise one the worker presents. The
+   person needs time to change keys, so the worker then polls discovery
+   every 100 ms within the deadline until exactly one device is
+   connected and it is not the device the previous session used, the
+   authorizing key or the previous new key; none, or that device alone,
+   waits, and several refuse as ONE KEY. A key removed and inserted again
+   is a new device, which its exclusion then refuses. On that device:
+   - one session creates and proves the credential: `login_create` with
+     a fresh user handle and salt, excluding every enrolled credential
+     and every credential created earlier in this operation. After its
+     key agreement and getPINRetries the worker presents the create step
+     with that count, takes its PIN and only then computes the creation's
+     hash over that step; after makeCredential, the proof's key agreement
+     and its own getPINRetries, the prove step names the new credential's
+     fingerprint and that count, and binds the proof's hash the same way.
+     CREDENTIAL_EXCLUDED is EXCLUDED, and a key whose list or message size
+     cannot hold the exclusions is KEY REFUSED `05` before any PIN;
+   - a second session's login assertion, presented as the repeat step,
+     must reproduce the proof's hmac-secret output, compared in constant
+     time, or the operation is FAILED;
+   - the worker presents the probe step, then a third session's silent
+     identify, under the probe-phase hash of that step, must select the
+     new credential. It runs over the excluded credentials and the new
+     one in record order, batched by the key's list limit as an unlock's
+     identify is, so the key meets the batches an unlock of the record
+     holding it would send: for an addition, exactly that record's; for a
+     one-key enrollment, the new credential alone; for a two-key
+     enrollment's second key, both, while the first key's probe cannot
+     yet name the second's credential. Anything else is KEY REFUSED `06`:
+     a key whose default credProtect level hides the credential from a
+     silent assertion could never be selected by an unlock.
 
-The failure frame is `15`, a kind byte, and for two kinds one detail
+   Discovery must find the same device before the repeat and before the
+   probe (ONE KEY). Every key is created, proved, repeated and probed
+   before anything is published.
+6. Every presented step is built from consent's types and admitted by
+   the worker's own `admit_login_step` exactly as root admits it, with
+   the baseline's fingerprints and, from the prove step to the probe,
+   the created credential's fingerprint; it must answer `Next`, or `Last`
+   for the operation's final step (unlock's unlock, a removal's
+   authorize, the last new key's probe). The commit round runs only over
+   a step admitted `Last`, and only with five seconds of the operation
+   deadline left (`COMMIT_MARGIN`) when the worker sends its invitation
+   and again when root's acknowledgement arrives; otherwise the worker
+   reports TIMEOUT before any write, so a write and its success frame
+   finish while root, whose deadline started slightly earlier, still
+   waits. An unlock's record must read as the baseline before its commit
+   round, and `14` follows the round. A write's commit round comes first;
+   then the store must open and the record read as the baseline: a store
+   that cannot be opened reports its unavailable kind, and a different
+   state RECORD CHANGED, without attempting the write. Then the store
+   publishes, against the baseline, `Record::enroll` (a fresh record ID),
+   `with_key` or `without` in the chosen version, or unlinks the record
+   when a removal leaves no key. Root must also observe a successful
+   exit.
+
+A write's outcome, never retried:
+
+- **Committed** sends `14`.
+- **Rejected** left the record name untouched. The worker re-reads it: a
+  record that still reads as the baseline makes the failure FAILED, a
+  local store failure such as an unremovable temporary, a failed write or
+  fsync, or missing entropy; any other state, an unavailable one
+  included, is RECORD CHANGED, since the record changed under the write.
+  The re-read, not the store's diagnostic text, selects the kind.
+- **Uncertain** means the rename or unlink was attempted. The worker
+  re-reads and reports UNCERTAIN with what it found: `01` no record, `02`
+  the baseline record, `03` the record this write built, `04` another
+  record, or `05` an unavailable state. What `01` means depends on the
+  operation: after a first enrollment the baseline was no record, so it
+  is the baseline unchanged; after removing every key, which builds no
+  record, it is the write's own result; after an addition or a partial
+  removal it is another state. Root re-reads the state, as after any
+  operation.
+
+Root's acknowledgement of a write's commit round (`13`) is where the
+write may begin. From then on, root treats any outcome but `14` followed
+by a successful exit, a failure frame of any kind, a lost channel, a
+failed exit or its own deadline, as UNCERTAIN, not failed, and re-reads
+the login state; the frame's kind and detail only explain it. Before
+`13` nothing was written. An unlock writes nothing, so its non-success
+is a failure either way.
+
+The failure frame is `15`, a kind byte, and for three kinds one detail
 byte:
 
 | Byte | Kind | Detail |
@@ -2046,8 +2150,8 @@ byte:
 | `02` | PIN AUTH BLOCKED: reinsert the key | |
 | `03` | PIN BLOCKED | |
 | `04` | NOT ENROLLED: identify found no slot | |
-| `05` | ONE KEY: none or several devices, or a device other than the identified one | |
-| `06` | KEY REFUSED | `01` no hmac-secret, `02` `alwaysUv`, `03` no PIN support, `04` no PIN set, `05` list too small |
+| `05` | ONE KEY: none or several devices, or a device other than this key's sessions' | |
+| `06` | KEY REFUSED | `01` no hmac-secret, `02` `alwaysUv`, `03` no PIN support, `04` no PIN set, `05` list too small, `06` the probe did not select the new credential |
 | `07` | DENIED: presence refused | |
 | `08` | TIMEOUT | |
 | `09` | NO RECORD | |
@@ -2055,35 +2159,85 @@ byte:
 | `0b` | RECORD DAMAGED | |
 | `0c` | STATE COULD NOT BE READ | |
 | `0d` | RECORD CHANGED since the baseline | |
-| `0e` | UNCERTAIN: reserved for a write | |
-| `0f` | FAILED: any other token or verification failure | |
+| `0e` | UNCERTAIN: a write's outcome | what the re-read found, as above |
+| `0f` | FAILED: any other token, verification or store failure | |
 | `10` | INTERNAL: root's frames, the channel, entropy or unprotected memory | |
+| `11` | EXCLUDED: the key already holds an enrolled credential or one created earlier in this operation | |
+| `12` | VERSION: no record version this build and both retained deployments read | |
 
 Typed statuses select the kind, never diagnostic text. PIN_INVALID is
 WRONG PIN only after this operation's PIN step; td never infers what
 remains. PIN_AUTH_BLOCKED and PIN_BLOCKED are their kinds, and a
 reported power-cycle state or zero count ends as one of them before any
-PIN step, as TOKEN-LOGIN.md's table says. OPERATION_DENIED is DENIED;
-the touch and action timeouts, an expired frame and the operation
-deadline are TIMEOUT; any other token, transport or verification failure
-is FAILED, or TIMEOUT once the deadline has passed. Root may be gone, so
-the frame is best effort, and none is sent after the operation deadline,
-which root's own deadline has already ended.
+PIN step, as TOKEN-LOGIN.md's table says. OPERATION_DENIED is DENIED and
+CREDENTIAL_EXCLUDED is EXCLUDED; the touch and action timeouts, an
+expired frame and the operation deadline are TIMEOUT; any other token,
+transport or verification failure is FAILED, or TIMEOUT once the
+deadline, or the open session's, has passed: a key that stalls a
+session's initialization until the session deadline is TIMEOUT, though
+the operation has time left. Root may be gone, so the frame is best
+effort, and
+none is sent after the operation deadline, which root's own deadline has
+already ended.
 
-The operation deadline is fixed at startup: 120 seconds for unlock,
-td-authd's ceiling for that ceremony, which equals the transport's
-two-minute session lifetime, so each session opens under it. A session's
-HID worker holds `/run/td-fido/operation.lock` only while that session is
-open; the unlock publishes nothing and holds no lock between its two
-sessions.
+The operation deadline counts from startup. The worker starts under the
+longest, 240 seconds, and narrows it once the description names the
+operation: 120 seconds for an unlock, a removal and a one-key
+enrollment, 240 for an addition and a two-key enrollment, td-authd's
+ceilings. Each session opens with a deadline of at most the transport's
+two-minute lifetime (`fido_device::MAX_LIFETIME`) and never past the
+operation's, so the HID worker's own watchdog never cuts a session the
+worker still waits on. While a session is open, its deadline also bounds
+every wait on root, each presentation's acknowledgement and each PIN, so
+a PIN cannot arrive for a session that has already expired; the wait
+ends at the session deadline as TIMEOUT, and the operation deadline is
+not narrowed for the waits outside any session, such as a connect
+step's.
+
+The worker holds no lock across its sessions. Each session's HID worker
+takes `/run/td-fido/operation.lock` with a nonblocking `flock` on its own
+open file description, so a lock the login worker held for its lifetime
+would refuse its own sessions as busy; sharing it would change the
+transport for nothing the operation slot does not already give. Writers
+are serialized by td-authd instead. Only this worker publishes or
+removes a record (firstboot removes only temporaries, before td-authd
+starts). Within one td-authd, its single operation slot, shared with
+the store's workers, runs one operation at a time, and its supervision
+kills and reaps a cancelled or failed child before it admits another
+(`td-authd/DESIGN.md`, "Private token child supervision" and its login
+amendment 2). Across td-authd processes the guarantee is td-svc's, and
+this design depends on it: td-authd's serving instance
+(`terminal-serve`), the one that starts workers, runs only as the
+`wayland` unit's `exec`, one instance, a `cgroup=service` pair-exec unit,
+which a test of the system recipe's unit table pins, and the worker it
+starts stays in that unit's leaf. Other units run `/bin/td-authd` for
+other purposes. When either peer of the pair exits,
+td-authd crashing included, td-svc writes the leaf's `cgroup.kill`,
+which kills every process in it, the worker too, and starts the next
+generation only once `cgroup.events` reports the leaf empty, as it does
+for any launch of a pair, a restarted td-svc included
+(`td-svc/DESIGN.md`, "Paired daemons and private descriptors"). A
+worker past its commit acknowledgement when its td-authd dies is
+therefore killed, possibly mid-write, and a new td-authd can start no
+worker until it is gone, so no two login workers overlap; root re-reads
+whatever the killed write left, as for any uncertain write. td-authd
+launched outside that unit, by root, is outside this guarantee. The
+baseline comparisons, the worker's before token I/O and before
+publication and the store's before the temporary and after its fsync,
+bound what such an overlap or any writer outside td's path, such as root
+or someone holding the disk, can do unseen, which TOKEN-LOGIN.md does
+not claim to stop: a change between the store's last comparison and the
+rename is not seen.
 
 Discovery and sessions go through a private `Devices` trait: production
 uses the root USB transport, and host tests use in-process virtual keys
-over a real socketpair, playing root with consent's own `begin_login`
-and `admit_login_step` and asserting every frame root sees. They cover
-unlock with each slot of a three-key record, whose two hashes match the
-identify and exact unlock steps; a wrong PIN with a falling count and a
-later success; PIN AUTH BLOCKED after three and no PIN step until
+over a real socketpair behind scripted device nodes, playing root with
+consent's own `begin_login` and `admit_login_step`, taking each prove
+step's key as the created credential as td-authd will, and asserting
+every frame root sees and the store afterwards. Unlock tests cover each
+slot of a three-key record, whose two hashes match the identify and
+exact unlock steps; a wrong PIN with a falling count and a later
+success; PIN AUTH BLOCKED after three and no PIN step until
 reinsertion; PIN BLOCKED and no PIN step after; a key not in the record;
 zero and two devices; a tampered verifier and public key; a stale
 signature; no record, a damaged record and directory; the record changed
@@ -2091,8 +2245,35 @@ after the baseline and during the ceremony; root never acknowledging;
 root cancelling at the PIN step; descriptions that do not match the
 account or baseline; PIN frames outside their bounds, none of which
 reaches the key; a PIN sent as the description or in place of each
-acknowledgement; and a memory refusal before the baseline. Operation
-tests cover the PIN frame's bounds, its wait past a frame time and its
-operation deadline. Clearing a dropped PIN, or any frame, is by
-construction, which a source test pins; safe code cannot observe freed
-memory.
+acknowledgement; and a memory refusal before the baseline. Write tests
+cover a one-key enrollment, whose create, prove, repeat and probe hashes
+each bind their exact step and whose record its key then unlocks; a
+two-key enrollment that waits through the previous key and an empty
+port, excludes the first credential and publishes both; several keys at
+a connect step and a key that never comes; the same key offered twice;
+additions to eight, whose authorization binds the record, each new key
+then unlocking, and the ninth refused before any token; removal of one
+key, of several including the authorizing one, and of the last, which
+unlinks the record even with no deployment marked; a credProtect default
+failing the probe; a list too small for the exclusions; an enrolled key
+offered as the new one; a repeat with a different output; the record
+changed before any token I/O and at the commit, with no write attempted;
+every version refusal; a failure injected at each publication and
+removal stage, rejected as FAILED or reported UNCERTAIN with each re-read
+detail, and a concurrent change rejected as RECORD CHANGED; root
+cancelling at the connect, create, repeat and commit steps; a wrong
+PIN while authorizing and while creating; a PIN wait ended at its
+session's deadline well before the operation's, and a PIN within the
+session unlocking; a key stalling a session's initialization to its
+deadline (TIMEOUT) and one failing it at once (FAILED); a commit round
+refused under its margin at the invitation, for a write and an unlock,
+and, run alone, after a late acknowledgement, with no write attempted;
+each timing test leaves the work it expects to finish tens of seconds,
+and root sends a held PIN only if the worker has not ended first; a
+directory that cannot be opened at the commit (its unavailable kind,
+no write); and an addition's probe sending the new record's batches to
+a key whose list holds two IDs. Operation tests cover the PIN frame's
+bounds, its wait past a frame time, its operation deadline, and an
+open session bounding every wait without narrowing the operation's.
+Clearing a dropped PIN, or any frame, is by construction, which a source
+test pins; safe code cannot observe freed memory.

@@ -963,7 +963,8 @@ mod tests {
     use crate::fido_pin::{EnrolledCredential, HmacOutput, Pin};
     use crate::fido_transaction::tests::fixture;
     use crate::fido_transaction::{
-        Assertion, Enrollment, Error, LoginAssertion, LoginError, Status, Transaction,
+        Assertion, Enrollment, Error, LoginAssertion, LoginCreation, LoginError, LoginPin, Status,
+        Transaction,
     };
     use crate::login_record::{NewKey, Record, VERSION};
     use std::time::Instant;
@@ -1018,14 +1019,18 @@ mod tests {
         seed: u8,
     ) -> Result<EnrolledCredential, LoginError> {
         Transaction::new(key.link()).unwrap().login_create(
-            Enrollment {
-                challenge: [seed; 32],
+            LoginCreation {
                 user: [seed ^ 0x55; 32],
-                proof_challenge: [seed ^ 0xaa; 32],
                 salt: SALT,
                 excluded,
             },
-            &mut |_, _| pin(PIN),
+            &mut |step, _| {
+                let hash = match step {
+                    LoginPin::Creation => [seed; 32],
+                    LoginPin::Proof(_) => [seed ^ 0xaa; 32],
+                };
+                Ok((pin(PIN)?, hash))
+            },
             &mut entropy(),
         )
     }

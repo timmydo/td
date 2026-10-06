@@ -112,6 +112,20 @@ pub(super) struct Enrollment<'a> {
     pub salt: [u8; 32],
     pub excluded: &'a [&'a [u8]],
 }
+/// A new login credential. Its two client-data hashes come from the PIN
+/// prompts, each bound to the step presented with that step's retries.
+pub(super) struct LoginCreation<'a> {
+    pub user: [u8; 32],
+    pub salt: [u8; 32],
+    pub excluded: &'a [&'a [u8]],
+}
+/// The PIN step a login creation's prompt presents; the proof names the
+/// credential just created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LoginPin<'a> {
+    Creation,
+    Proof(&'a [u8]),
+}
 
 fn status(reply: &Message) -> Result<u8, Error> {
     reply
@@ -341,9 +355,8 @@ impl<C: Channel> Transaction<C> {
     /// getPINRetries immediately before each prompt; a key with none left gets no prompt.
     fn login_pin<T>(
         &mut self,
-        purpose: PinPurpose,
         retries: &RetriesRequest,
-        prompt: &mut impl FnMut(PinPurpose, u8) -> Result<T, String>,
+        prompt: impl FnOnce(u8) -> Result<T, String>,
     ) -> Result<T, Error> {
         let reply = self.command(retries.bytes())?;
         let claim = self.transition(retries.parse(reply.as_ref()))?;
@@ -354,7 +367,7 @@ impl<C: Channel> Transaction<C> {
         if claim.power_cycle {
             return Err(Error::Status(Status::PinAuthBlocked));
         }
-        let pin = prompt(purpose, claim.count);
+        let pin = prompt(claim.count);
         self.check()?;
         pin.map_err(|_| Error::PinInput)
     }
@@ -447,7 +460,8 @@ impl<C: Channel> Transaction<C> {
         let request =
             self.transition(profile.login_assertion(intent.credential, intent.key, intent.salt))?;
         let reply = self.command(request.bytes())?;
-        let (pin, challenge) = self.login_pin(PinPurpose::Assertion, &retries, prompt)?;
+        let (pin, challenge) =
+            self.login_pin(&retries, |count| prompt(PinPurpose::Assertion, count))?;
         let request = self.transition(request.bind(challenge))?;
         let output = self.pin_assertion(request, reply, pin, entropy)?;
         if output.info.backup_eligible || output.info.backed_up {
@@ -457,30 +471,50 @@ impl<C: Channel> Transaction<C> {
         Ok(output)
     }
 
-    /// Creation with login labels and a whole exclusion list, then its proof.
+    /// Creation with login labels and a whole exclusion list, then its proof:
+    /// the notebook's requests in its order, each hash bound only once its
+    /// PIN step's prompt has presented that step with the reported retries.
     pub(super) fn login_create(
         mut self,
-        intent: Enrollment<'_>,
-        prompt: &mut impl FnMut(PinPurpose, u8) -> Result<Pin, String>,
+        intent: LoginCreation<'_>,
+        prompt: &mut impl FnMut(LoginPin<'_>, u8) -> Result<(Pin, [u8; 32]), String>,
         entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
     ) -> Result<EnrolledCredential, LoginError> {
         self.check()?;
-        if intent.challenge == intent.proof_challenge {
-            return Err(Error::Protocol("login proof reuses creation challenge".into()).into());
-        }
         let profile = self.login_profile()?;
         let retries = self.transition(profile.retries())?;
-        let request = self.login_transition(profile.login_enrollment(
-            intent.challenge,
-            intent.user,
-            intent.excluded,
-        ))?;
-        let output = self.create_and_prove(
-            request,
-            &intent,
-            &mut |run, purpose| run.login_pin(purpose, &retries, prompt),
-            entropy,
-        )?;
+        let request =
+            self.login_transition(profile.login_enrollment(intent.user, intent.excluded))?;
+        let reply = self.command(request.bytes())?;
+        let (pin, challenge) =
+            self.login_pin(&retries, |count| prompt(LoginPin::Creation, count))?;
+        let request = request.bind(challenge);
+        let request = self.with_entropy(entropy, |entropy| {
+            request.with_pin(reply.as_ref(), pin, &mut |bytes| entropy(bytes))
+        })?;
+        drop(reply);
+        let reply = self.command(request.bytes())?;
+        let request = self.transition(request.make(reply.as_ref()))?;
+        drop(reply);
+        let reply = self.command(request.bytes())?;
+        let request = self.transition(request.login_proof(reply.as_ref(), intent.salt))?;
+        drop(reply);
+        let reply = self.command(request.bytes())?;
+        let (pin, challenge) = self.login_pin(&retries, |count| {
+            prompt(LoginPin::Proof(request.credential()), count)
+        })?;
+        let request = self.transition(request.bind(challenge))?;
+        let request = self.with_entropy(entropy, |entropy| {
+            request.with_pin(reply.as_ref(), pin, &mut |bytes| entropy(bytes))
+        })?;
+        drop(reply);
+        let reply = self.command(request.bytes())?;
+        let request = self.with_entropy(entropy, |entropy| {
+            request.finish(reply.as_ref(), &mut |bytes| entropy(bytes))
+        })?;
+        drop(reply);
+        let reply = self.command(request.bytes())?;
+        let output = self.transition(request.finish(reply.as_ref()))?;
         self.check()?;
         Ok(output)
     }
@@ -642,6 +676,20 @@ pub(crate) mod tests {
             },
             challenge,
         )
+    }
+    /// The fixture creation as a login intent; `creation_prompt` returns its hashes.
+    pub(crate) fn login_creation(label: &str) -> LoginCreation<'static> {
+        let Enrollment {
+            user,
+            salt,
+            excluded,
+            ..
+        } = enrollment(label);
+        LoginCreation {
+            user,
+            salt,
+            excluded,
+        }
     }
     pub(crate) fn enrollment(label: &str) -> Enrollment<'static> {
         Enrollment {
@@ -1461,6 +1509,31 @@ pub(crate) mod tests {
         )
     }
 
+    /// `login_prompt` for a creation: the creation's and the proof's fixture
+    /// hashes, each with the PIN; a proof's prompt must name the new credential.
+    fn creation_prompt(
+        label: &str,
+        trace: &Rc<Trace>,
+    ) -> (impl FnMut(LoginPin<'_>, u8) -> Hashed + use<>, Prompted) {
+        let (mut prompt, seen) = login_prompt(label, trace);
+        let Enrollment {
+            challenge,
+            proof_challenge,
+            ..
+        } = enrollment(label);
+        let credential = fixture(label, "credential_id");
+        (
+            move |step: LoginPin<'_>, left| match step {
+                LoginPin::Creation => Ok((prompt(PinPurpose::Creation, left)?, challenge)),
+                LoginPin::Proof(id) => {
+                    assert_eq!(id, credential);
+                    Ok((prompt(PinPurpose::EnrollmentProof, left)?, proof_challenge))
+                }
+            },
+            seen,
+        )
+    }
+
     #[test]
     fn login_assertion_queries_retries_immediately_before_its_one_prompt() {
         for label in LABELS {
@@ -1622,8 +1695,8 @@ pub(crate) mod tests {
                     },
                 );
                 let (channel, trace) = Script::steps(login_create_steps(label, info, make));
-                let (mut prompt, seen) = login_prompt(label, &trace);
-                let mut intent = enrollment(label);
+                let (mut prompt, seen) = creation_prompt(label, &trace);
+                let mut intent = login_creation(label);
                 intent.excluded = excluded;
                 let output = Transaction::new(channel)
                     .unwrap()
@@ -1649,11 +1722,15 @@ pub(crate) mod tests {
         steps[6].1 = login_fixture("retries", "zero");
         steps.truncate(7);
         let (channel, trace) = Script::steps(steps);
-        let (mut prompt, seen) = login_prompt(label, &trace);
+        let (mut prompt, seen) = creation_prompt(label, &trace);
         assert_eq!(
             Transaction::new(channel)
                 .unwrap()
-                .login_create(enrollment(label), &mut prompt, &mut entropy(label, true))
+                .login_create(
+                    login_creation(label),
+                    &mut prompt,
+                    &mut entropy(label, true)
+                )
                 .err(),
             Some(LoginError::Failed(Error::Status(Status::PinBlocked)))
         );
@@ -1721,7 +1798,7 @@ pub(crate) mod tests {
         ]) {
             let info = info_with(label, info);
             let (channel, trace) = Script::steps(vec![(vec![4], info.clone())]);
-            let mut intent = enrollment(label);
+            let mut intent = login_creation(label);
             intent.excluded = excluded;
             let refused = Some(LoginError::Refused(refusal));
             assert_eq!(
@@ -1754,17 +1831,32 @@ pub(crate) mod tests {
             );
             assert_eq!(trace.commands.get(), 1);
         }
-        let (channel, trace) = Script::steps(vec![]);
-        let mut intent = enrollment(label);
-        intent.proof_challenge = intent.challenge;
-        assert!(matches!(
-            Transaction::new(channel).unwrap().login_create(
-                intent,
-                &mut |_, _| panic!("unexpected prompt"),
-                &mut |_| panic!("unexpected entropy")
-            ),
-            Err(LoginError::Failed(Error::Protocol(_)))
-        ));
-        assert_eq!(trace.commands.get(), 0);
+        // A proof hash equal to the creation's refuses before its PIN is used.
+        let mut steps = login_create_steps(label, fixture(label, "info"), "login_make_request");
+        steps.truncate(7);
+        let (channel, trace) = Script::steps(steps);
+        let (mut prompt, seen) = login_prompt(label, &trace);
+        let challenge = enrollment(label).challenge;
+        assert_eq!(
+            Transaction::new(channel)
+                .unwrap()
+                .login_create(
+                    login_creation(label),
+                    &mut |step, left| {
+                        let purpose = match step {
+                            LoginPin::Creation => PinPurpose::Creation,
+                            LoginPin::Proof(_) => PinPurpose::EnrollmentProof,
+                        };
+                        Ok((prompt(purpose, left)?, challenge))
+                    },
+                    &mut entropy(label, true)
+                )
+                .err(),
+            Some(LoginError::Failed(Error::Protocol(
+                "login enrollment proof requires a fresh challenge".into()
+            )))
+        );
+        assert_eq!(seen.borrow().len(), 2);
+        assert_eq!(trace.commands.get(), 7);
     }
 }

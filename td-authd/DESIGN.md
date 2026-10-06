@@ -1711,7 +1711,19 @@ TOKEN-LOGIN.md's.
    teardown. It shares the single operation slot. Its baseline (`18`),
    PIN (`16`) and typed failure (`15`) frames, and the commit round an
    unlock also runs, are `td-secret/DESIGN.md`'s, "Login-key worker"; the
-   worker's unlock is implemented in `login_operation.rs`, inert.
+   worker's unlock, first enrollment, addition and removal are
+   implemented in `login_operation.rs`, inert. The slot is what
+   serializes the worker's writes to the login store: each of the
+   worker's token sessions holds `/run/td-fido/operation.lock` only for
+   that session. Across td-authd processes the worker depends on td-svc:
+   it stays in the `wayland` unit's leaf, and td-svc kills that leaf
+   when td-authd exits and starts no new generation until it is empty.
+   Root's acknowledgement of a write's commit round (`13`) is where the
+   write may begin: from then on any outcome but `14` with a successful
+   exit, whether a typed failure, a lost channel, a failed exit or root's
+   own deadline, is UNCERTAIN, not failed, and root re-reads the login
+   state before showing a result. An unlock writes nothing, so its
+   non-success after `13` is a failure.
 3. **Consent operations (2).** Implemented, inert: `consent.rs` has tags
    7 to 10, login unlock, first enrollment, key addition and key removal.
    Each carries its step, the key count before and after and the

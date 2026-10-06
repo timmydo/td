@@ -4,14 +4,17 @@ This is the normative target for td's login-key tier. td-authd, td-secret,
 td-compositor and td-login implement it together; this document owns the
 tier's rules, and each component document states the amendments its own
 contract needs. **Only the record codec, the record store, the consent
-descriptions, the CTAP login primitives and the root worker's unlock are
+descriptions, the CTAP login primitives and the root worker are
 implemented**, inert: td-secret's private `login-operation` worker
-unlocks against the record ("Placement"), but nothing starts it, so
-nothing in production uses its `login_record` and `login_store` modules
-("The login record"), its login identify, PIN-retry, assertion and
-creation steps ("Token profile"), or td-authd's login consent operations
-and step admission (`td-authd/DESIGN.md`). The worker's enrollment,
-addition and removal are not implemented, nor is anything else below.
+unlocks, enrolls, adds and removes keys against the record
+("Placement"), but nothing starts it, so nothing in production uses its
+`login_record` and `login_store` modules ("The login record"), its login
+identify, PIN-retry, assertion and creation steps ("Token profile"), or
+td-authd's login consent operations and step admission
+(`td-authd/DESIGN.md`). No deployment carries the tier marker yet, so
+the worker reads no record version for either retained deployment and
+refuses every write that would leave a record ("Versions"). Nothing else
+below is implemented.
 Until the increments at the end land, `THREAT-MODEL.md` §3 is the
 complete current behaviour: the installed account logs in automatically
 and the session never locks. No document, UI or release
@@ -83,9 +86,11 @@ and revocation are specified as planned changes in `td-authd/DESIGN.md`,
 
 **td-secret**'s worker owns all CTAP2 traffic. It reuses `PORTABLE.md`'s
 PIN-authorized hmac-secret flow, transaction runner and P-256 verification
-over the root-only USB transport, serialized by
+over the root-only USB transport, each token session serialized by
 `/run/td-fido/operation.lock` (`td-secret/DESIGN.md`, "USB token
-transport"). That is the exclusive mediation §L.1 requires: raw token nodes
+transport"); td-authd's single operation slot, not that lock, covers the
+gaps between one operation's sessions ("The login record", below). That
+is the exclusive mediation §L.1 requires: raw token nodes
 stay root-only, td-owned workers serialize, and every assertion is bound to
 one presented operation. The worker verifies assertions and publishes the
 record; td-authd trusts its success frame only together with its observed
@@ -236,9 +241,18 @@ cleanup removes any it leaves. Once it is attempted, any failure,
 including the rename or unlink itself, the directory fsync or the
 closing check that the name holds the published file or is gone, is
 uncertain. An uncertain outcome
-is re-read and reported, never retried. The store takes no lock of its
-own: only the worker writes, serialized by `/run/td-fido/operation.lock`
-and td-authd's operation slot.
+is re-read and reported, never retried. Once td-authd acknowledges a
+write's commit round, the write may have begun: any outcome but the
+success frame and a successful exit, a typed failure included, is
+uncertain to td-authd, which re-reads the login state. The worker
+starts that round only with five seconds of its deadline left, and
+refuses before writing if they are gone when the acknowledgement
+arrives. The store takes no lock of its own: only the worker writes,
+td-authd's single operation slot runs one worker at a time, and td-svc
+kills a worker whose td-authd has died before it starts another
+td-authd. `/run/td-fido/operation.lock` serializes each of the worker's
+token sessions, not the operation (`td-secret/DESIGN.md`, "Login-key
+worker").
 
 ## Token profile
 
@@ -293,7 +307,9 @@ No phase may use it.
 - **New key.** It begins at a connect step: the screen asks the person to
   connect the new key alone, removing the authorizing or previous key, and
   no assertion is sent until exactly one device is present, whose PIN
-  retries the create step then shows. Creation's exclusion list holds
+  retries the create step then shows. The worker waits for that, within
+  the deadline, while no device or only the authorizing or previous
+  key's device is connected, and refuses several. Creation's exclusion list holds
   every enrolled credential and every key already proved in this
   operation that the connected key could identify (Wire choices, below),
   and must fit the key's advertised list and size limits whole, as
@@ -304,7 +320,13 @@ No phase may use it.
   key is still the connected device, the worker runs the identify probe
   for the new credential and refuses the operation unless the probe finds
   it, so a credential that a later unlock could not select never enters
-  the record. Each slot's salt is fresh. In a two-key enrollment the
+  the record. The probe names the excluded credentials too, in record
+  order and batched as an unlock's identify is, so an addition's key
+  meets exactly the batches an unlock of the new record sends. A
+  two-key enrollment's primary is probed before the backup's credential
+  exists, so its probe cannot include it; and no test key yet mishandles
+  a foreign ID in an allow list, so that refusal path is untested. Each
+  slot's salt is fresh. In a two-key enrollment the
   backup is kept distinct from the primary by this exclusion list and the
   record's refusal of duplicate credentials, not by td-authd's step
   admission, which sees only the current key's credential and an empty

@@ -214,11 +214,11 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("operation.rs")),
-            0x63b7e28b777306cd
+            0x5f22633580b007c5
         );
         assert_eq!(
             fingerprint(include_str!("login_operation.rs")),
-            0x43c67b9c95ce722d
+            0xc3fd7c74eeb201ed
         );
         assert_eq!(
             fingerprint(include_str!("write_operation.rs")),
