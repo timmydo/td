@@ -130,16 +130,16 @@ fn peer(denied: bool, placement_denied: bool) {
     if denied {
         if let Ok(mut connection) = connection {
             if let Ok(version) = connection.receive() {
-                assert_eq!(version, b"TDLA002\n");
-                let _ = connection.send(b"TDLA002\n");
+                assert_eq!(version, b"TDLA003\n");
+                let _ = connection.send(b"TDLA003\n");
                 assert!(connection.receive().is_err());
             }
         }
         return;
     }
     let mut connection = connection.unwrap();
-    assert_eq!(connection.receive().unwrap(), b"TDLA002\n");
-    connection.send(b"TDLA002\n").unwrap();
+    assert_eq!(connection.receive().unwrap(), b"TDLA003\n");
+    connection.send(b"TDLA003\n").unwrap();
     assert_eq!(connection.receive().unwrap(), [0x80]);
     connection.send(&[3]).unwrap();
     assert_eq!(connection.receive().unwrap(), [0x83]);

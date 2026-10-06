@@ -2,6 +2,7 @@
 
 use crate::consent::{Recovery, Request as Description, Role};
 use crate::inspection::{Event as InspectionEvent, Inspection};
+use crate::login::{Login, Pin, Selection};
 use crate::unlock::{Event, Unlock};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -20,6 +21,10 @@ pub(crate) enum Request {
     Presented(Description),
     Commit(Description),
     Cancel([u8; 32]),
+    /// `1b`: a login-key operation.
+    Login(Selection),
+    /// `1c`: the presented PIN step's description and its PIN.
+    Pin(Box<Description>, Pin),
 }
 
 impl Request {
@@ -42,6 +47,16 @@ impl Request {
                     return Err("zero cancellation nonce".into());
                 }
                 Ok(Self::Cancel(nonce))
+            }
+            [0x1b, rest @ ..] => Ok(Self::Login(Selection::decode(rest)?)),
+            [0x1c, length, rest @ ..] => {
+                let (description, pin) = rest
+                    .split_at_checked(usize::from(*length))
+                    .ok_or("truncated login PIN request")?;
+                Ok(Self::Pin(
+                    Box::new(Description::decode(description)?),
+                    Pin::new(pin)?,
+                ))
             }
             _ => Err("invalid secret session request".into()),
         }
@@ -67,13 +82,25 @@ enum Active {
     Secret(Box<Unlock>),
     Install(Box<crate::deployment::Installation>),
     DiskInstall(Box<crate::disk_install::Installation>),
+    /// A login-key worker shares the one operation slot.
+    Login(Box<Login>),
 }
 impl Active {
-    fn request(&self) -> &Description {
+    /// None only for a login operation awaiting its worker's baseline.
+    fn description(&self) -> Option<&Description> {
         match self {
-            Self::Secret(op) => op.request(),
-            Self::Install(op) => op.request(),
-            Self::DiskInstall(op) => op.request(),
+            Self::Secret(op) => Some(op.request()),
+            Self::Install(op) => Some(op.request()),
+            Self::DiskInstall(op) => Some(op.request()),
+            Self::Login(op) => op.request(),
+        }
+    }
+    fn nonce(&self) -> &[u8; 32] {
+        match self {
+            Self::Secret(op) => op.request().nonce(),
+            Self::Install(op) => op.request().nonce(),
+            Self::DiskInstall(op) => op.request().nonce(),
+            Self::Login(op) => op.nonce(),
         }
     }
     fn presented(&mut self, request: &Description) -> Result<(), String> {
@@ -81,6 +108,7 @@ impl Active {
             Self::Secret(op) => op.presented(request),
             Self::Install(op) => op.presented(request),
             Self::DiskInstall(op) => op.presented(request),
+            Self::Login(op) => op.presented(request),
         }
     }
     fn commit(&mut self, request: &Description) -> Result<(), String> {
@@ -88,6 +116,7 @@ impl Active {
             Self::Secret(op) => op.commit(request),
             Self::Install(op) => op.commit(request),
             Self::DiskInstall(op) => op.commit(request),
+            Self::Login(op) => op.commit(request),
         }
     }
     fn cancel(&mut self, reason: &str) -> Result<(), String> {
@@ -95,6 +124,8 @@ impl Active {
             Self::Secret(op) => op.cancel(reason),
             Self::Install(op) => op.cancel(reason),
             Self::DiskInstall(op) => op.cancel(reason),
+            // Every login cancellation is the person's: kill, reap, no relock.
+            Self::Login(op) => op.cancel(),
         }
     }
     fn poll(&mut self) -> Result<Event, String> {
@@ -102,6 +133,7 @@ impl Active {
             Self::Secret(op) => op.poll(),
             Self::Install(op) => op.poll(),
             Self::DiskInstall(op) => op.poll(),
+            Self::Login(op) => op.poll(),
         }
     }
     fn reap_for_teardown(self) -> Result<(), String> {
@@ -110,6 +142,7 @@ impl Active {
             Self::Install(op) => op.reap_for_teardown(),
             // The setup intake owns the service and stops it at teardown.
             Self::DiskInstall(_) => Ok(()),
+            Self::Login(op) => op.reap_for_teardown(),
         }
     }
 }
@@ -282,6 +315,19 @@ impl Session {
             Request::Install => self.begin_install(),
             Request::Begin(role) => self.begin(Start::Unlock(role), begin),
             Request::Enroll(recovery) => self.begin(Start::Enroll(recovery), begin),
+            Request::Login(selection) => {
+                self.begin_login(selection, crate::login::WRITES, Login::start)
+            }
+            Request::Pin(description, pin) => {
+                let Some(Active::Login(operation)) = &mut self.operation else {
+                    return Err("no login operation takes a PIN".into());
+                };
+                if !operation.pin(&description, pin)? {
+                    return Ok(vec![0x9c, 1]);
+                }
+                self.event = Some(Event::Waiting);
+                Ok(vec![0x9c, 0])
+            }
             Request::Presented(description) => {
                 self.operation
                     .as_mut()
@@ -356,12 +402,12 @@ impl Session {
             }
             Request::Cancel(nonce) => {
                 let operation = self.operation.as_mut().ok_or("no active operation")?;
-                if operation.request().nonce() != &nonce {
+                if operation.nonce() != &nonce {
                     return Err("stale consent cancellation".into());
                 }
                 match &self.event {
                     Some(Event::Complete) => Ok(vec![0x95, 1]),
-                    Some(Event::Failed(_)) => Ok(vec![0x95, 2]),
+                    Some(Event::Failed(_) | Event::Ended(_)) => Ok(vec![0x95, 2]),
                     _ => {
                         operation.cancel("physical attention cancelled")?;
                         self.event = Some(Event::Waiting);
@@ -488,6 +534,33 @@ impl Session {
         Ok(answer)
     }
 
+    /// A login operation from the worker's baseline on. Until activation a
+    /// production build refuses every one that may write (`active` false)
+    /// before any worker starts.
+    fn begin_login(
+        &mut self,
+        selection: Selection,
+        active: bool,
+        start: impl FnOnce(u32, Selection) -> Result<Login, String>,
+    ) -> Result<Vec<u8>, String> {
+        if selection.writes() && !active {
+            return Ok(vec![0x9b, 0]);
+        }
+        if !self.prepared
+            || self.cleanup.is_some()
+            || self.operation.is_some()
+            || self.inspection.is_some()
+        {
+            return Err("secret session is not ready for a login operation".into());
+        }
+        let operation = start(self.owner, selection)?;
+        let mut answer = vec![0x9b, 1];
+        answer.extend_from_slice(operation.nonce());
+        self.operation = Some(Active::Login(Box::new(operation)));
+        self.event = Some(Event::Waiting);
+        Ok(answer)
+    }
+
     /// Terminal traffic also advances watchdogs without consuming events.
     pub fn tick(&mut self) -> Result<(), String> {
         if let Some(intake) = &mut self.intake {
@@ -570,15 +643,26 @@ impl Session {
             .event
             .as_ref()
             .ok_or("missing secret operation event")?;
-        answer.push(match event {
-            Event::Waiting => 3,
-            Event::Present(_) => 4,
-            Event::Commit(_) => 5,
-            Event::Complete => 6,
-            Event::Failed(_) => 7,
-        });
-        answer.extend_from_slice(&operation.request().encode());
-        if matches!(event, Event::Complete | Event::Failed(_)) {
+        let description = operation.description();
+        match (event, description) {
+            // A login operation before its worker's baseline.
+            (Event::Waiting, None) => answer.push(0x0b),
+            (Event::Waiting, Some(_)) => answer.push(3),
+            (Event::Present(_), _) => answer.push(4),
+            (Event::Commit(_), _) => answer.push(5),
+            (Event::Complete, _) => answer.push(6),
+            (Event::Failed(_), _) => answer.push(7),
+            (Event::Pin(_), _) => answer.push(0x0c),
+            (Event::Ended(end), _) => answer.extend_from_slice(&[
+                if end.uncertain { 0x0e } else { 0x0d },
+                end.kind,
+                end.detail,
+            ]),
+        }
+        if let Some(description) = description {
+            answer.extend_from_slice(&description.encode());
+        }
+        if matches!(event, Event::Complete | Event::Failed(_) | Event::Ended(_)) {
             if self.writing {
                 if let Some(intake) = &mut self.intake {
                     intake.finish(matches!(event, Event::Complete));

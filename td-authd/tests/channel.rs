@@ -70,6 +70,12 @@ fn peer_fixture() {
         wait_closed(&mut stream);
         return;
     }
+    if mode == "replacement-payload" {
+        sys::prepare(&stream).unwrap();
+        stream.write_all(b"\x161234567").unwrap();
+        wait_closed(&mut stream);
+        return;
+    }
     let mut channel = Channel::connect(stream.try_clone().unwrap(), uid(), uid()).unwrap();
     match mode.as_str() {
         "worker" => {
@@ -103,6 +109,19 @@ fn peer_fixture() {
             assert_eq!(channel.receive().unwrap(), b"oversize");
             stream.write_all(&4097u32.to_be_bytes()).unwrap();
             wait_closed(&mut stream);
+        }
+        "secret-partial" => {
+            assert_eq!(channel.receive().unwrap(), b"secret-partial");
+            stream
+                .write_all(&[0, 0, 0, 8, 0x16, b'1', b'2', b'3'])
+                .unwrap();
+            wait_closed(&mut stream);
+        }
+        "secret-swap" => {
+            assert_eq!(channel.receive().unwrap(), b"secret-swap");
+            stream.write_all(&[0, 0, 0, 8]).unwrap();
+            let mut child = spawn(stream.try_clone().unwrap(), "replacement-payload");
+            assert!(child.0.wait().unwrap().success());
         }
         "partial" => {
             assert_eq!(channel.receive().unwrap(), b"partial");
@@ -308,4 +327,22 @@ fn a_worker_after_greeting_keeps_the_same_process_sender_pin() {
     }
     drop(channel);
     assert!(child.0.wait().unwrap().success());
+}
+
+#[test]
+fn a_refused_receive_leaves_no_plaintext_behind() {
+    // Part of a frame, then its deadline; all of it, from a sender that is
+    // not the pinned peer.
+    for (mode, why) in [("secret-partial", ""), ("secret-swap", "sender changed")] {
+        let (mut channel, mut child) = connected(mode);
+        channel.send(mode.as_bytes()).unwrap();
+        let mut message = Cleared(Vec::new());
+        let error = channel.receive_into(&mut message).unwrap_err();
+        assert!(error.to_string().contains(why), "{mode}: {error}");
+        // The buffer the bytes were read into is still the one inspected.
+        assert_eq!(message.0.len(), 8, "{mode}");
+        assert_eq!(message.0, [0; 8], "{mode}");
+        assert!(channel.closed);
+        assert!(child.0.wait().unwrap().success());
+    }
 }

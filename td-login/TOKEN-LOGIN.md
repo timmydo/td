@@ -4,15 +4,19 @@ This is the normative target for td's login-key tier. td-authd, td-secret,
 td-compositor and td-login implement it together; this document owns the
 tier's rules, and each component document states the amendments its own
 contract needs. **Only the record codec, the record store, the consent
-descriptions, the CTAP login primitives and the root worker are
-implemented**, inert: td-secret's private `login-operation` worker
-unlocks, enrolls, adds and removes keys against the record
-("Placement"), but nothing starts it, so nothing in production uses its
-`login_record` and `login_store` modules ("The login record"), its login
-identify, PIN-retry, assertion and creation steps ("Token profile"), or
-td-authd's login consent operations and step admission
-(`td-authd/DESIGN.md`). No deployment carries the tier marker yet, so
-the worker reads no record version for either retained deployment and
+descriptions, the CTAP login primitives, the root worker and td-authd's
+supervision of it are implemented**, inert: td-secret's private
+`login-operation` worker unlocks, enrolls, adds and removes keys against
+the record ("Placement"), and td-authd starts and drives it on the
+paired requests `1b` and `1c`, but no compositor sends them and a
+production td-authd refuses enrollment, addition and removal. So nothing
+in production starts the worker or uses its `login_record` and
+`login_store` modules ("The login record"), its login identify,
+PIN-retry, assertion and creation steps ("Token profile"), or td-authd's
+login consent operations, step admission and supervision
+(`td-authd/DESIGN.md`, "Login-key operation supervision"). No
+deployment carries the tier marker yet, so the worker reads no record
+version for either retained deployment and
 refuses every write that would leave a record ("Versions"). Its
 `qemu-secret` guests run it over UHID virtual keys, including across
 power cuts inside its writes on a disposable disk ("Evidence"), standing
@@ -249,7 +253,8 @@ success frame and a successful exit, a typed failure included, is
 uncertain to td-authd, which re-reads the login state. The worker
 starts that round only with five seconds of its deadline left, and
 refuses before writing if they are gone when the acknowledgement
-arrives. The store takes no lock of its own: only the worker writes,
+arrives; a success td-authd has not seen by its own deadline is
+uncertain to it. The store takes no lock of its own: only the worker writes,
 td-authd's single operation slot runs one worker at a time, and td-svc
 kills a worker whose td-authd has died before it starts another
 td-authd. `/run/td-fido/operation.lock` serializes each of the worker's
@@ -823,6 +828,11 @@ proves and the oracle that shows it.
      locked; leftover temporaries ignored and removed. Eight guests
      covering the cases "Evidence" names have landed, the power cuts and
      temporaries among them; the rest remain.
+   - td-authd's supervision with `1b` and `1c` has landed: host child
+     fixtures over scripted workers, and the root session fixture, the
+     `supervise-login` authority case of `qemu-secret`, against the
+     production worker's refusals. With the remaining worker guests
+     above, this increment is not yet complete.
 3. **Compositor trusted PIN entry and lock surface**, driven by fixtures
    and not yet activated by a record; the compositor sends `1b` and `1c`.
    - Native compositor and device-dispatcher tests: lock rendering excludes

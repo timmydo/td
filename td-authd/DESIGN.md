@@ -165,10 +165,14 @@ its own ancillary identity. This relies on Linux AF_UNIX delivering
 stateless sender credentials and pidfds on every fragment, including a
 partial read of one socket buffer; it is a hard kernel dependency, not a
 portable stream API. Any protocol, identity, transport or liveness failure
-permanently closes the channel. There is no reconnect on an existing
-endpoint. Completion observed after the deadline is refused even if the last
-bytes arrived before it: success is bounded by observation, not kernel
-arrival time. A send error may follow partial or complete delivery, as with
+permanently closes the channel, and a receive that fails, partway through
+a frame or after all of it, first zeroes the bytes it read, since a request
+may carry a PIN. There is no reconnect on an existing endpoint.
+A frame whose completion this channel observes after its deadline is
+refused even if the last bytes arrived before it: success is bounded by
+observation, not kernel arrival time. This rule is the channel's own; the
+login supervisor's last look at its operation deadline ("Login-key
+operation supervision") concerns the private worker, not this channel. A send error may follow partial or complete delivery, as with
 any stream; it is never permission to retry an operation.
 
 All installed descriptors are owned before an ancillary-policy refusal. The
@@ -565,7 +569,7 @@ Channel's CLOEXEC clone would leak authority. All subsequently created channel
 descriptors are CLOEXEC. The daemon never passes an inherited root log
 descriptor to a user program.
 
-Before validation both ends exchange the framed `TDLA002` protocol greeting
+Before validation both ends exchange the framed `TDLA003` protocol greeting
 with a final newline. After successful validation the authority sends `80`;
 only then may the peer submit requests. The earlier transport greeting in
 Channel pins the sender before the protocol greeting or any spawn.
@@ -678,8 +682,10 @@ td-dua finds there is data it lists and measures, never runs.
 
 An authority older than one of requests `07` through `0b` closes the
 entire launch channel on it; its paired compositor then restarts. The image ships
-both peers atomically. The exact new record is additive within TDLA002, without
-negotiation or mixed-version compatibility.
+both peers atomically. Those records were additive within TDLA002, without
+negotiation or mixed-version compatibility. The login requests `1b` and `1c`
+came with the bump to TDLA003 instead, because `1c` carries a PIN; both peers
+again ship together, without negotiation.
 
 For terminal requests it execs `/bin/td-term run --socket
 /run/td-compositor/UID/wayland-0 --ready-socket
@@ -1228,11 +1234,14 @@ runtime key.
 
 After root startup, sender-pidfd greeting and the existing immutable
 account/ledger admission, the paired authority owns exactly one Session
-for the configured human UID 1000. Its TDLA002 protocol has the exact
+for the configured human UID 1000. Its TDLA003 protocol has the exact
 requests below; the existing terminal client does not send them yet.
 No new socket or public listener is created. Only the pinned compositor
-process may send these records. None contains a credential, token
-assertion, private worker round, caller-selected executable or path.
+process may send these records. None but `1c` contains a credential,
+and none contains a token assertion, private worker round,
+caller-selected executable or path. The login requests `1b` and `1c`
+("Login-key operation supervision" below) share this Session, and `1c`
+carries one PIN.
 
 | Request | Response |
 | --- | --- |
@@ -1246,7 +1255,7 @@ assertion, private worker round, caller-selected executable or path.
 
 Session status is 0 unprepared, 1 preparing, 2 idle, 3 operation waiting,
 4 presentation required, 5 commit required, 6 completed, or 7 failed
-and successfully relocked. Idle does not assert locked state: a
+and successfully relocked; `0b` to `0e` are a login operation's. Idle does not assert locked state: a
 completed unlock leaves its released key until generation cleanup.
 Statuses 3 through 7 include exactly the retained public description.
 Polling a terminal status retires that one operation; a lost response
@@ -1671,8 +1680,13 @@ staged into the target authority recipe.
 
 ## Login keys and session lock (target)
 
-Not implemented, except the consent codec and its pure step admission
-(amendments 3 and 4), which nothing calls yet.
+Implemented, inert: the consent operations and step admission
+(amendments 3 and 4), and the worker supervision, requests and
+deadlines of amendments 2, 5 and 6 ("Login-key operation supervision"
+below). No paired compositor sends `1b` or `1c` yet, and a production
+build refuses every login operation that may write, so nothing in
+production starts the worker. Login state (1), revocation (7) and update
+consent (8) are not implemented.
 [`td-login/TOKEN-LOGIN.md`](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier. "Session lock" there is the compositor's
 display and input lock; it is unrelated to this document's secret-session
@@ -1731,7 +1745,10 @@ TOKEN-LOGIN.md's.
    exit, whether a typed failure, a lost channel, a failed exit or root's
    own deadline, is UNCERTAIN, not failed, and root re-reads the login
    state before showing a result. An unlock writes nothing, so its
-   non-success after `13` is a failure.
+   non-success after `13` is a failure. The re-read is amendment 1's: the
+   compositor's `1a` after every login operation refreshes root's cached
+   state. Until `1a` lands in increment 4, root reports the uncertain end
+   (`91 0e`) and reads no login state of its own.
 3. **Consent operations (2).** Implemented, inert: `consent.rs` has tags
    7 to 10, login unlock, first enrollment, key addition and key removal.
    Each carries its step, the key count before and after and the
@@ -1750,8 +1767,8 @@ TOKEN-LOGIN.md's.
    and a retry count only as one nonzero byte displayed as a device
    claim. Any other difference cancels the
    child. A commit frame is accepted only after the operation's final
-   step. `begin_login` and `admit_login_step` are those checks; the
-   supervision that applies them is not implemented.
+   step. `begin_login` and `admit_login_step` are those checks, and
+   `login.rs` applies them.
 5. **Requests and version (2).** The paired protocol becomes `TDLA003`,
    because TDLA002 states that no record contains a credential. Request
    `1b` selects a login operation (unlock, one-key or two-key first
@@ -1765,12 +1782,19 @@ TOKEN-LOGIN.md's.
    child fixtures and the ignored root session fixture drive both requests
    through the real paired Session, as they do for secret operations.
    Request `1a` lands with login state in increment 4, and tests that treat
-   `1a` as unknown change with it.
+   `1a` as unknown change with it. The worker's baseline, not root, tells
+   it that no record exists: an unlock against an unenrolled baseline ends
+   as NO RECORD before any description.
 6. **Deadlines (2).** The fixed 120-second ceiling becomes 120 seconds per
    key ceremony, fixed when the operation starts and never renewed: unlock,
    removal and one-key enrollment 120 seconds, addition and two-key
    enrollment 240. Each token transaction keeps the transport's own
-   two-minute bound. Physical timing is activation evidence.
+   two-minute bound. Physical timing is activation evidence. Root's
+   deadline counts from just before it spawns the worker, so it ends a
+   moment before the worker's, which counts from the worker's startup.
+   The worker's commit margin makes it likely, not certain, that a write
+   and its success frame land within it; a success root has not seen by
+   its deadline is uncertain (below).
 7. **Revocation (5).** Root performs TOKEN-LOGIN.md's "Cutover" whenever
    the login state, reduced to unenrolled or enforced (enrolled or
    unavailable), differs from the root-owned mode-0600 volatile record
@@ -1832,3 +1856,121 @@ TOKEN-LOGIN.md's.
 
 TOKEN-LOGIN.md, "Placement", owns the rule that only physical input starts
 a login operation.
+
+### Login-key operation supervision
+
+`login.rs` is root's side of the worker's frames (`td-secret/DESIGN.md`,
+"Login-key worker"). It owns one fixed `/bin/td-secret login-operation
+--uid 1000` child, launched as the token workers are (empty environment,
+`/` cwd, null stdout and stderr, a private stdin socketpair, the
+authority's process group), over their nonblocking framed endpoint and
+its five-second partial-frame deadline. It generates the operation's
+nonce and accepts no caller-selected executable, path, account or
+argument. The paired requests are:
+
+| Request | Response |
+| --- | --- |
+| `1b 07` unlock; `1b 08 01` or `1b 08 02` one- or two-key first enrollment; `1b 09` addition; `1b 0a N` and N slots, each a position and a four-byte fingerprint, positions strictly increasing within 1 to 8 | `9b 01` and the 32-byte nonce: started; `9b 00`: refused in this build |
+| `1c`, one length byte, the current step's canonical description, then the PIN (4 to 63 printable ASCII bytes) | `9c 00` PIN queued; `9c 01` the operation had already ended, or root's deadline has passed, which ends it as TIMEOUT: the PIN is dropped |
+
+`1b` needs completed preparation and an empty operation slot, as `12`
+does, or it ends the generation. The login operation then holds the
+single slot until its terminal status is polled: no unlock, enrollment,
+write, installation, inspection or second login begins beside it, and it
+begins beside none of them. Poll `11` answers:
+
+- `91 0b`: waiting for the worker's baseline, with no description yet;
+- `91 03`, `91 04` or `91 05` and the current description: the worker at
+  work, a presentation required, a commit required;
+- `91 0c` and the description: the presented PIN step waits for `1c`;
+- `91 06` and the final description: the worker sent `14` and root
+  observed its successful exit;
+- `91 0d KIND DETAIL`, then the current description if one exists: the
+  operation ended and wrote nothing;
+- `91 0e KIND DETAIL` and the description: uncertain (amendment 2).
+
+KIND is the worker's failure kind with its detail byte, zero when the
+kind has none, or root's own: `08` TIMEOUT for root's deadline or an
+expired acknowledgement window; `09` NO RECORD when an unlock, addition
+or removal meets an unenrolled baseline; `10` INTERNAL for a malformed,
+unexpected or out-of-order frame, a stale acknowledgement or PIN, a lost
+channel or a failed exit; and four kinds the worker never sends, `80`
+cancelled, `81` an addition to a record that already holds eight keys,
+`82` a first enrollment over an enrolled record and `83` removal slots
+that are not the record's. A terminal status is delivered once and
+retires the operation. `15` with the operation's nonce cancels it as it
+does a secret operation (`95 00`, or `95 01` completed, `95 02` already
+ended); a stale acknowledgement or PIN, as for secret operations, also
+ends the generation.
+
+Root reads the baseline (`18`) first, and the baseline, not the request,
+fixes the counts. An unlock, addition or removal against an unenrolled
+baseline, an enrollment against an enrolled one, an addition at eight
+keys, which consent cannot encode, and a removal set `begin_login`
+refuses each end before root sends a description, so the worker reaches
+no presentation or token I/O. Otherwise root sends `begin_login`'s first
+step and requires the worker's first `10` to repeat it exactly; it admits
+each later `10` with `admit_login_step` against the baseline, taking a
+prove step's fingerprint as the created credential and keeping it through
+repeat and probe. A `12` is accepted only after a step admitted `Last`
+and only for that exact description, and `14` only after root's `13`.
+Any other frame, a malformed baseline or failure frame, a second
+baseline, a frame while root waits for the compositor, a frame before
+root has written a PIN it accepted, an UNCERTAIN failure before a
+write's `13` or in an unlock, or any byte after `14` included, ends the operation as INTERNAL;
+the worker's typed `15` ends it with its kind at any point before `14`.
+Success needs `14`, then the worker's successful exit and the clean end
+of its channel. Root answers the compositor's `13` and `14` with `11` and
+`13` as for secret operations, within three seconds of the invitation
+against the worker's five, and after a PIN step's `11` it sends one `16`
+frame from the `1c` that names that step. The PIN stays in a clearing
+owner from decoding to the queued frame; root zeroes the received
+request and the written frame and never formats it, `Debug` included.
+The shared channel reads every request into a buffer it zeroes when the
+receive fails, partway or after the whole frame, so a refused `1c` leaves
+no PIN behind either. A `1c` that arrives at or after root's deadline is
+answered `9c 01`: the operation ends as TIMEOUT and the generation
+continues, since a person may submit just after root's last poll.
+
+A cancel, and every refusal or violation, kills and reaps the worker and
+runs no `lock-session`: a login operation releases nothing, so nothing
+relocks and an application-store release is untouched. Generation
+teardown reaps a live login worker before its own cleanup, as it does
+every worker. Root's deadline is the selected operation's ceiling,
+amendment 6, fixed when it spawns the worker; waiting for a PIN spends
+that deadline, not the acknowledgement window. The first poll that finds
+the deadline passed makes one last look. It first zeroes and discards
+every frame root still has queued, a PIN included, so nothing more
+reaches the worker; it then reads what the worker has already written,
+without blocking, and checks once for the worker's exit. Only a `14`,
+successful exit and clean end all seen by then complete the operation,
+and a worker's typed `15` seen then keeps its kind; anything else,
+including a malformed frame or an expired frame window in that look,
+ends it as TIMEOUT, uncertain after a write's `13`.
+The worker starts a commit round only with five seconds of its own
+deadline left and refuses a late acknowledgement, which makes a late
+`14` unlikely but cannot exclude one.
+
+Until activation (TOKEN-LOGIN.md increment 5) `login::WRITES` is false in
+every production build: `1b` answers `9b 00` for an enrollment, addition
+or removal before starting anything. Test builds set it, so host fixtures
+drive every operation. An unlock is wired, and ends as NO RECORD while no
+record exists; no production compositor sends `1b`.
+
+Host tests drive the controller and the paired Session against scripted
+exec children playing the worker's frames: each operation's exact step
+sequence, the PIN relay, success only with `14` and a successful exit,
+each refusal from the baseline with the worker killed before any step,
+uncertainty after a write's `13` for a typed failure, a lost channel, a
+failed exit, root's deadline and a cancel, an unlock's failure after `13`
+staying a failure, malformed and out-of-order frames, stale
+acknowledgements and PINs, the slot, teardown and the production
+refusal. The ignored root fixture
+`session::tests::root_login_supervision_meets_the_production_worker`,
+qemu-secret's `supervise-login` authority case, runs the production worker through
+the real Session in the disposable root VM: a missing login directory's
+typed refusal before any baseline, NO RECORD from an unenrolled baseline
+for an unlock and an addition, and a one-key enrollment whose first step
+reaches the worker, which refuses it as VERSION while no deployment
+carries the tier marker. No token takes part; the worker's own guests
+cover token I/O with simulated root acknowledgements.

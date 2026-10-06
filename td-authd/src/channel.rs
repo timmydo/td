@@ -85,6 +85,13 @@ impl Channel {
     }
 
     pub fn receive(&mut self) -> io::Result<Vec<u8>> {
+        let mut message = Cleared(Vec::new());
+        self.receive_into(&mut message)?;
+        Ok(std::mem::take(&mut message.0))
+    }
+
+    /// A refused receive zeroes what it read: a request may carry a PIN.
+    fn receive_into(&mut self, message: &mut Cleared) -> io::Result<()> {
         let result = (|| {
             self.live()?;
             let deadline = deadline()?;
@@ -94,11 +101,13 @@ impl Channel {
             if length > MAX_MESSAGE {
                 return Err(io::Error::other("authority message exceeds 4096 bytes"));
             }
-            let mut message = vec![0u8; length];
-            self.read(&mut message, deadline)?;
-            self.live()?;
-            Ok(message)
+            *message = Cleared(vec![0u8; length]);
+            self.read(&mut message.0, deadline)?;
+            self.live()
         })();
+        if result.is_err() {
+            message.0.fill(0);
+        }
         self.finish(result)
     }
 
@@ -184,6 +193,16 @@ impl Channel {
         }
         remaining(deadline)?;
         Ok(())
+    }
+}
+
+/// Received bytes, zeroed when dropped; never reallocated.
+struct Cleared(Vec<u8>);
+
+impl Drop for Cleared {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        std::hint::black_box(&mut self.0);
     }
 }
 

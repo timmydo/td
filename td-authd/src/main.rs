@@ -16,6 +16,7 @@ mod inspection;
 #[path = "../../td-install/src/installation_consent.rs"]
 mod installation_consent;
 mod launch;
+mod login;
 mod mount_sys;
 mod portal_files;
 mod primary_account;

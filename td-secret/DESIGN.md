@@ -2082,8 +2082,11 @@ itself after 170 seconds, inside the guest's bound.
 
 `login-operation --uid UID` is TOKEN-LOGIN.md's root worker, in
 `login_operation.rs`: session unlock, first enrollment, key addition
-and key removal. Nothing in production starts it: td-authd's `TDLA003`
-supervision is a later increment. It reaches the command line only
+and key removal. td-authd supervises it on the paired `TDLA003`
+requests `1b` and `1c` (`td-authd/DESIGN.md`, "Login-key operation
+supervision"), but nothing in production starts it: no compositor sends
+them, and a production td-authd refuses enrollment, addition and
+removal. It reaches the command line only
 through `run`, keeps the unlock worker's root startup, unnamed
 socketpair, descriptor inventory and bounded framing, and uses its
 `10`/`11` presentation and `12`/`13` commit rounds. It neither reads nor
@@ -2193,9 +2196,10 @@ PIN step's acknowledgement. `17` stays store inspection's.
    a step admitted `Last`, and only with five seconds of the operation
    deadline left (`COMMIT_MARGIN`) when the worker sends its invitation
    and again when root's acknowledgement arrives; otherwise the worker
-   reports TIMEOUT before any write, so a write and its success frame
-   finish while root, whose deadline started slightly earlier, still
-   waits. An unlock's record must read as the baseline before its commit
+   reports TIMEOUT before any write. That makes it likely that a write
+   and its success frame finish while root, whose deadline started
+   slightly earlier, still waits; a success root has not seen by its
+   deadline is uncertain to it. An unlock's record must read as the baseline before its commit
    round, and `14` follows the round. A write's commit round comes first;
    then the store must open and the record read as the baseline: a store
    that cannot be opened reports its unavailable kind, and a different
@@ -2419,7 +2423,9 @@ enrollment, addition and removal, crosses the kernel's HID path. The
 acknowledgements are simulated root, the keys are software, and USB
 metadata and presence are fixtures: this proves no USB controller,
 YubiKey behaviour, physical presence or touch timing, and no td-authd
-supervision, which is a later increment.
+supervision. td-authd's host tests drive its supervision against
+scripted workers, and its `supervise-login` authority case runs this worker's
+refusals through the real paired Session.
 
 ### Login power-cut guests
 

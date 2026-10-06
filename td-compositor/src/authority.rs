@@ -23,7 +23,7 @@ use std::os::unix::fs::MetadataExt;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
-const VERSION: &[u8] = b"TDLA002\n";
+const VERSION: &[u8] = b"TDLA003\n";
 const CAPACITY: usize = 16;
 const QUEUE_CAPACITY: usize = 1;
 const TICK: Duration = Duration::from_millis(250);

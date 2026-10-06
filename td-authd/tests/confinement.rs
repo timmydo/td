@@ -36,6 +36,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "disk_install.rs",
             "inspection.rs",
             "launch.rs",
+            "login.rs",
             "main.rs",
             "mount_sys.rs",
             "portal_files.rs",
@@ -66,6 +67,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("sys.rs", 4),
         ("launch.rs", 0),
         ("unlock.rs", 0),
+        ("login.rs", 0),
         ("session.rs", 0),
         ("secret_intake.rs", 0),
         ("secret_request.rs", 0),
@@ -100,6 +102,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "launch.rs"
                     | "application.rs"
                     | "unlock.rs"
+                    | "login.rs"
                     | "session.rs"
                     | "inspection.rs"
                     | "application_shell.rs"
@@ -126,8 +129,34 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0x371a2ece39912dc8,
+        0xaa06bfa9fb9de6f8,
         "private unlock supervisor changed"
+    );
+    let login = include_str!("../src/login.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    // Writes stay out of production until activation; a login cancel kills
+    // and reaps the one fixed worker and never relocks the secret session.
+    assert_eq!(
+        login
+            .matches("pub(crate) const WRITES: bool = cfg!(test);")
+            .count(),
+        1
+    );
+    // In login.rs: the `const WRITES` definition and Login::start's check.
+    assert_eq!(login.matches("WRITES").count(), 2);
+    assert_eq!(
+        login.matches("command(\"login-operation\", owner)").count(),
+        1
+    );
+    for forbidden in ["lock-session", "Command::new(", "unlock-operation", "/bin/"] {
+        assert!(!login.contains(forbidden), "login.rs: {forbidden}");
+    }
+    assert_eq!(
+        fingerprint(login),
+        0x2a778eaad8d73fe2,
+        "login worker supervisor changed"
     );
     assert_eq!(
         fingerprint(
@@ -136,8 +165,14 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0xe12ed70b61fadfac,
+        0x25f3c4bc5793e778,
         "paired secret controller changed"
+    );
+    assert_eq!(
+        include_str!("../src/session.rs")
+            .matches("crate::login::WRITES")
+            .count(),
+        1
     );
     assert_eq!(
         fingerprint(
@@ -319,6 +354,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(launch.matches(".stdin(Stdio::null())").count(), 1);
     assert_eq!(launch.matches(".stdout(Stdio::null())").count(), 1);
     assert_eq!(launch.matches(".stderr(Stdio::null())").count(), 1);
+    // A PIN request lives on only in its clearing owner.
+    assert_eq!(launch.matches("bytes.fill(0);").count(), 1);
     assert_eq!(fingerprint(launch), LAUNCH_FINGERPRINT);
     let main = include_str!("../src/main.rs");
     assert!(main.starts_with("#![deny(unsafe_code)]"));
@@ -493,12 +530,12 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0x948bc212a33ae744,
+        0x3602ee6c2f3d26fc,
         "main.rs: production startup changed"
     );
     assert_eq!(
         fingerprint(channel),
-        0xbad9a1ce43bb1449,
+        0xdf20e4130b2d96e2,
         "channel.rs: production startup changed"
     );
 }
@@ -511,7 +548,7 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LAUNCH_FINGERPRINT: u64 = 0x4cf7afc522464d2b;
+const LAUNCH_FINGERPRINT: u64 = 0x29d12118312e8df1;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;

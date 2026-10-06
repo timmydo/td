@@ -5481,7 +5481,7 @@ the compositor unsuccessfully so paired supervision replaces the generation.
 The original stdin remains open and private for the compositor's lifetime.
 Authority-mode launch requests never reach CommandSpawner; all ordinary
 terminal processes are created by the root authority through td-login. The
-task variant is a distinct `TDLA002` request and carries no directory bytes.
+task variant is a distinct paired-protocol request and carries no directory bytes.
 After td-login drops credentials, the authority's terminal-exec stage resolves
 the validated primary account and selects `/home/NAME/src/td-vm/work`. The
 compositor neither reads nor removes human-owned readiness paths. It observes

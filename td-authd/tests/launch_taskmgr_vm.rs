@@ -170,8 +170,8 @@ pub(super) fn run() {
 }
 pub(super) fn peer() {
     let mut connection = channel::Channel::from_stdin(0).unwrap();
-    assert_eq!(connection.receive().unwrap(), b"TDLA002\n");
-    connection.send(b"TDLA002\n").unwrap();
+    assert_eq!(connection.receive().unwrap(), b"TDLA003\n");
+    connection.send(b"TDLA003\n").unwrap();
     assert_eq!(connection.receive().unwrap(), [0x80]);
     connection.send(&[7]).unwrap();
     assert_eq!(

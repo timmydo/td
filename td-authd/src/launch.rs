@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 const LIMIT: usize = 16;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
-const VERSION: &[u8] = b"TDLA002\n";
+const VERSION: &[u8] = b"TDLA003\n";
 
 pub(crate) struct Config {
     user: String,
@@ -481,7 +481,9 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             Ok(Request::Poll(handle))
         }
         [3] => Ok(Request::Heartbeat),
-        [0x10..=0x19, ..] => Ok(Request::Secret(crate::session::Request::decode(bytes)?)),
+        [0x10..=0x19 | 0x1b | 0x1c, ..] => {
+            Ok(Request::Secret(crate::session::Request::decode(bytes)?))
+        }
         _ => Err("invalid terminal authority request".into()),
     }
 }
@@ -560,7 +562,11 @@ pub(crate) fn serve(mut channel: Channel, config: Config) -> Result<(), String> 
     let mut secrets = crate::session::Session::new(config.owner)?;
     let result = (|| -> Result<(), String> {
         loop {
-            let request = request(&channel.receive().map_err(|e| e.to_string())?)?;
+            let mut bytes = channel.receive().map_err(|e| e.to_string())?;
+            let decoded = request(&bytes);
+            // A PIN request's bytes live on only in its clearing owner.
+            bytes.fill(0);
+            let request = decoded?;
             let answer = match request {
                 Request::Secret(request) => secrets.answer(request)?,
                 request => {
@@ -605,7 +611,19 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         request(&[0x19])?,
         Request::Secret(crate::session::Request::Install)
     );
+    assert_eq!(
+        request(&[0x1b, 7])?,
+        Request::Secret(crate::session::Request::Login(
+            crate::login::Selection::Unlock
+        ))
+    );
+    assert!(matches!(
+        request(&[&[0x1c, 0][..], b"1234"].concat()),
+        Err(reason) if !reason.contains("1234")
+    ));
+    // Login state is increment 4's.
     assert!(request(&[0x1a]).is_err());
+    assert!(request(&[0x1d]).is_err());
     assert!(request(&[0x16, 2]).is_err());
     Ok(())
 }

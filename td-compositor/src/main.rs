@@ -1081,9 +1081,9 @@ mod confinement {
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0x7a15adf0c47257bb;
+    const AUTHORITY_FINGERPRINT: u64 = 0xf07be5905f6da96;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
-    const AUTH_CHANNEL_FINGERPRINT: u64 = 0xbad9a1ce43bb1449;
+    const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
     const AUTH_CHANNEL: &str = include_str!("../../td-authd/src/channel.rs");
     const AUTH_SYS: &str = include_str!("../../td-authd/src/sys.rs");

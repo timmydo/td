@@ -22,6 +22,10 @@ pub const CASES: &[(&str, &str)] = &[
         "supervise",
         "unlock::tests::root_supervisor_relocks_after_the_production_worker_refuses",
     ),
+    (
+        "supervise-login",
+        "session::tests::root_login_supervision_meets_the_production_worker",
+    ),
 ];
 pub const TPM_CASES: &[(&str, &str)] = &[
     (

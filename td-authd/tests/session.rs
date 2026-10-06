@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 use super::*;
 use crate::consent::Operation;
+use crate::login::{Login, Pin, Selection};
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
@@ -866,4 +867,375 @@ fn an_installer_lost_before_enter_fails_the_prompt_not_the_generation() {
     let mut rest = [0; 1];
     assert!(service.read(&mut rest).is_err());
     session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+fn login_step(before: u8, step: crate::consent::LoginStep) -> Description {
+    Description::new(
+        [42; 32],
+        1000,
+        Operation::LoginUnlock {
+            account: 1000,
+            before,
+            after: before,
+            step,
+        },
+    )
+    .unwrap()
+}
+
+/// Polls past the statuses that need no answer: a login operation before
+/// its baseline, and a worker at work.
+fn login_event(session: &mut Session) -> Vec<u8> {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = session.answer(Request::Poll).unwrap();
+        if ![0x0b, 3].contains(&reply[1]) {
+            return reply;
+        }
+        assert!(Instant::now() < until, "login operation stalled");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Answers every presentation, PIN step and commit until the operation ends.
+fn login_end(session: &mut Session) -> Vec<u8> {
+    loop {
+        let reply = login_event(session);
+        let description = || Description::decode(&reply[2..]).unwrap();
+        match reply[1] {
+            4 => assert_eq!(
+                session.answer(Request::Presented(description())).unwrap(),
+                [0x93]
+            ),
+            0x0c => assert_eq!(
+                session
+                    .answer(Request::Pin(
+                        Box::new(description()),
+                        Pin::new(b"1234").unwrap()
+                    ))
+                    .unwrap(),
+                [0x9c, 0]
+            ),
+            5 => assert_eq!(
+                session.answer(Request::Commit(description())).unwrap(),
+                [0x94]
+            ),
+            _ => return reply,
+        }
+    }
+}
+
+/// Presents every step until the PIN step: its description.
+fn login_pin_step(session: &mut Session) -> Description {
+    loop {
+        let reply = login_event(session);
+        let description = Description::decode(&reply[2..]).unwrap();
+        if reply[1] == 0x0c {
+            return description;
+        }
+        assert_eq!(reply[1], 4);
+        session.answer(Request::Presented(description)).unwrap();
+    }
+}
+
+fn begin_login(session: &mut Session, selection: Selection, script: &'static str) {
+    let answer = session
+        .begin_login(selection, true, |owner, selection| {
+            assert_eq!(owner, 1000);
+            Login::scripted(selection, script)
+        })
+        .unwrap();
+    assert_eq!(answer, [&[0x9b, 1][..], &[42; 32]].concat());
+}
+
+#[test]
+fn login_requests_have_one_encoding_and_a_pin_never_prints() {
+    assert_eq!(
+        Request::decode(&[0x1b, 8, 2]).unwrap(),
+        Request::Login(Selection::Enroll(2))
+    );
+    let unlock = login_step(
+        2,
+        crate::consent::LoginStep::Unlock {
+            key: [0xa1; 4],
+            retries: 8,
+        },
+    );
+    let encoded = unlock.encode();
+    let mut bytes = vec![0x1c, encoded.len() as u8];
+    bytes.extend_from_slice(&encoded);
+    bytes.extend_from_slice(b"1234");
+    let request = Request::decode(&bytes).unwrap();
+    assert_eq!(
+        request,
+        Request::Pin(Box::new(unlock.clone()), Pin::new(b"1234").unwrap())
+    );
+    assert!(format!("{request:?}").ends_with(", Pin(..))"));
+    for bad in [
+        vec![0x1b],
+        vec![0x1b, 8, 3],
+        vec![0x1c],
+        vec![0x1c, 0xff],
+        bytes[..bytes.len() - 1].to_vec(),
+        [&bytes[..], b"\n"].concat(),
+        [&[0x1c, encoded.len() as u8 + 1][..], &encoded, b"1234"].concat(),
+    ] {
+        assert!(Request::decode(&bad).is_err());
+    }
+}
+
+#[test]
+fn a_login_unlock_runs_through_the_paired_session() {
+    use crate::consent::LoginStep;
+    let mut session = Session::new(1000).unwrap();
+    prepare(&mut session);
+    begin_login(&mut session, Selection::Unlock, "unlock");
+    let identify = login_step(2, LoginStep::Identify);
+    let unlock = login_step(
+        2,
+        LoginStep::Unlock {
+            key: [0xa1; 4],
+            retries: 8,
+        },
+    );
+    let with = |status: u8, description: &Description| {
+        [&[0x91, status][..], &description.encode()].concat()
+    };
+    assert_eq!(login_event(&mut session), with(4, &identify));
+    assert_eq!(
+        session.answer(Request::Presented(identify)).unwrap(),
+        [0x93]
+    );
+    assert_eq!(login_event(&mut session), with(4, &unlock));
+    assert_eq!(
+        session.answer(Request::Presented(unlock.clone())).unwrap(),
+        [0x93]
+    );
+    assert_eq!(login_event(&mut session), with(0x0c, &unlock));
+    assert_eq!(
+        session
+            .answer(Request::Pin(
+                Box::new(unlock.clone()),
+                Pin::new(b"1234").unwrap()
+            ))
+            .unwrap(),
+        [0x9c, 0]
+    );
+    assert_eq!(login_event(&mut session), with(5, &unlock));
+    assert_eq!(
+        session.answer(Request::Commit(unlock.clone())).unwrap(),
+        [0x94]
+    );
+    assert_eq!(login_event(&mut session), with(6, &unlock));
+    assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
+    assert!(session.operation.is_none() && session.cleanup.is_none());
+}
+
+#[test]
+fn login_ends_are_typed_and_a_cancel_relocks_nothing() {
+    use crate::consent::LoginStep;
+    let mut session = Session::new(1000).unwrap();
+    prepare(&mut session);
+    // Refused from the baseline: no description, then idle.
+    begin_login(&mut session, Selection::Add, "baseline-eight");
+    assert_eq!(login_end(&mut session), [0x91, 0x0d, 0x81, 0]);
+    assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
+    // A lost channel after a write's commit acknowledgement is uncertain.
+    begin_login(&mut session, Selection::Add, "add-lost");
+    let probe = Description::new(
+        [42; 32],
+        1000,
+        Operation::LoginAdd {
+            account: 1000,
+            before: 1,
+            after: 2,
+            step: LoginStep::Probe { key: [0x4e; 4] },
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        login_end(&mut session),
+        [&[0x91, 0x0e, 0x10, 0][..], &probe.encode()].concat()
+    );
+    assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
+    // The person cancels at the PIN step: killed, reaped, nothing relocked.
+    begin_login(&mut session, Selection::Unlock, "stall-pin");
+    let unlock = login_pin_step(&mut session);
+    assert_eq!(
+        session.answer(Request::Cancel([42; 32])).unwrap(),
+        [0x95, 0]
+    );
+    assert_eq!(
+        login_end(&mut session),
+        [&[0x91, 0x0d, 0x80, 0][..], &unlock.encode()].concat()
+    );
+    assert!(session.cleanup.is_none() && session.prepared);
+    assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
+    // A PIN for no login operation, or a cancel for another, ends the
+    // generation.
+    assert!(session
+        .answer(Request::Pin(Box::new(unlock), Pin::new(b"1234").unwrap()))
+        .is_err());
+    let mut session = Session::new(1000).unwrap();
+    prepare(&mut session);
+    begin_login(&mut session, Selection::Unlock, "stall-pin");
+    login_pin_step(&mut session);
+    assert!(session.answer(Request::Cancel([7; 32])).is_err());
+}
+
+#[test]
+fn a_pin_past_the_deadline_is_dropped_and_the_generation_lives_on() {
+    let mut session = Session::new(1000).unwrap();
+    prepare(&mut session);
+    begin_login(&mut session, Selection::Unlock, "stall-pin");
+    let unlock = login_pin_step(&mut session);
+    match session.operation.as_mut().unwrap() {
+        Active::Login(op) => op.expire(),
+        _ => panic!("expected a login worker"),
+    }
+    assert_eq!(
+        session
+            .answer(Request::Pin(
+                Box::new(unlock.clone()),
+                Pin::new(b"1234").unwrap()
+            ))
+            .unwrap(),
+        [0x9c, 1]
+    );
+    assert_eq!(
+        login_end(&mut session),
+        [&[0x91, 0x0d, 0x08, 0][..], &unlock.encode()].concat()
+    );
+    assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
+}
+
+#[test]
+fn production_refuses_login_writes_before_any_worker_starts() {
+    let mut session = Session::new(1000).unwrap();
+    prepare(&mut session);
+    for selection in [
+        Selection::Enroll(1),
+        Selection::Enroll(2),
+        Selection::Add,
+        Selection::Remove(vec![crate::consent::Slot {
+            position: 1,
+            key: [1; 4],
+        }]),
+    ] {
+        assert_eq!(
+            session
+                .begin_login(selection, false, |_, _| panic!("a login write started"))
+                .unwrap(),
+            [0x9b, 0]
+        );
+        assert!(session.operation.is_none());
+    }
+    // An unlock is wired; with no record it refuses from the baseline.
+    let answer = session
+        .begin_login(Selection::Unlock, false, |_, selection| {
+            Login::scripted(selection, "baseline-none")
+        })
+        .unwrap();
+    assert_eq!(answer[..2], [0x9b, 1]);
+    assert_eq!(login_end(&mut session), [0x91, 0x0d, 0x09, 0]);
+}
+
+#[test]
+fn a_login_operation_occupies_the_one_operation_slot() {
+    let mut session = Session::new(1000).unwrap();
+    assert!(session
+        .begin_login(Selection::Unlock, true, |_, _| panic!("unprepared"))
+        .is_err());
+    prepare(&mut session);
+    begin_login(&mut session, Selection::Unlock, "silent");
+    assert!(session
+        .begin_login(Selection::Unlock, true, |_, _| panic!("second login"))
+        .is_err());
+    assert!(session
+        .answer_with(
+            Request::Begin(Role::Primary),
+            cleanup_command,
+            unexpected_begin
+        )
+        .is_err());
+    assert!(session.inspect_with(|_| panic!("inspection")).is_err());
+    assert_eq!(session.begin_write().unwrap(), [0x98, 0]);
+    assert_eq!(session.begin_install().unwrap(), [0x99, 0]);
+    // Teardown reaps the worker before the generation's own cleanup.
+    let pid = match session.operation.as_ref().unwrap() {
+        Active::Login(op) => op.fixture_pid().unwrap(),
+        _ => panic!("expected a login worker"),
+    };
+    session
+        .close_with(|_| {
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+            fixture("cleanup_child")
+        })
+        .unwrap();
+    assert!(session.operation.is_none());
+    // And a secret operation keeps a login out.
+    let mut session = Session::new(1000).unwrap();
+    prepare(&mut session);
+    session.operation = Some(Active::Secret(Box::new(
+        Unlock::fixture(description(), fixture("silent_unlock_child")).unwrap(),
+    )));
+    session.event = Some(Event::Waiting);
+    assert!(session
+        .begin_login(Selection::Unlock, true, |_, _| panic!(
+            "login beside unlock"
+        ))
+        .is_err());
+}
+
+#[test]
+#[ignore = "requires the explicitly marked disposable root VM and production td-secret"]
+fn root_login_supervision_meets_the_production_worker() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::{fs, path::Path};
+    assert!(fs::read_to_string("/proc/cmdline")
+        .unwrap()
+        .split_whitespace()
+        .any(|word| word == "td.operation-fixture=1"));
+    assert!(fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .is_some_and(|ids| ids.split_whitespace().collect::<Vec<_>>() == ["0"; 4]));
+    let directory = Path::new("/var/lib/td/login");
+    assert!(!directory.exists());
+    let mut session = Session::new(1000).unwrap();
+    session.answer(Request::Prepare).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while session.answer(Request::Poll).unwrap() != [0x91, 2] {
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(1));
+    }
+    let end = |session: &mut Session, selection| {
+        let answer = session.answer(Request::Login(selection)).unwrap();
+        assert_eq!((answer.len(), &answer[..2]), (34, &[0x9b, 1][..]));
+        login_end(session)
+    };
+    // No directory: the worker's own typed refusal, before any baseline.
+    assert_eq!(end(&mut session, Selection::Unlock), [0x91, 0x0d, 0x0a, 0]);
+    fs::create_dir_all(directory).unwrap();
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    // Unenrolled: root refuses these from the worker's baseline.
+    assert_eq!(end(&mut session, Selection::Unlock), [0x91, 0x0d, 0x09, 0]);
+    assert_eq!(end(&mut session, Selection::Add), [0x91, 0x0d, 0x09, 0]);
+    // Root's first step reaches the worker, which refuses to write while no
+    // deployment carries the tier marker.
+    let reply = end(&mut session, Selection::Enroll(1));
+    assert_eq!(reply[..4], [0x91, 0x0d, 0x12, 0]);
+    assert_eq!(
+        Description::decode(&reply[4..]).unwrap().operation(),
+        &Operation::LoginEnroll {
+            account: 1000,
+            before: 0,
+            after: 1,
+            key: 1,
+            step: crate::consent::LoginStep::Connect,
+        }
+    );
+    assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
+    session.close().unwrap();
 }

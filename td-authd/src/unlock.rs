@@ -15,13 +15,15 @@ const ACK_TIME: Duration = Duration::from_secs(3);
 const LIFETIME: Duration = Duration::from_secs(120);
 const CLEANUP_TIME: Duration = Duration::from_secs(2);
 
-fn deadline_after(duration: Duration) -> Result<Instant, String> {
+pub(crate) fn deadline_after(duration: Duration) -> Result<Instant, String> {
     Instant::now()
         .checked_add(duration)
         .ok_or_else(|| "unlock deadline overflow".into())
 }
 
-struct Wire {
+/// One private worker's framed endpoint: the token workers' and the login
+/// worker's alike.
+pub(crate) struct Wire {
     stream: UnixStream,
     input: Vec<u8>,
     output: Vec<u8>,
@@ -30,7 +32,7 @@ struct Wire {
 }
 
 impl Wire {
-    fn new(stream: UnixStream) -> Result<Self, String> {
+    pub(crate) fn new(stream: UnixStream) -> Result<Self, String> {
         stream.set_nonblocking(true).map_err(|e| e.to_string())?;
         Ok(Self {
             stream,
@@ -41,11 +43,11 @@ impl Wire {
         })
     }
 
-    fn queue(&mut self, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) fn queue(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.queue_bounded(bytes, LIMIT)
     }
 
-    fn queue_bounded(&mut self, bytes: &[u8], limit: usize) -> Result<(), String> {
+    pub(crate) fn queue_bounded(&mut self, bytes: &[u8], limit: usize) -> Result<(), String> {
         if !self.output.is_empty() || bytes.is_empty() || bytes.len() > limit {
             return Err("invalid private unlock send".into());
         }
@@ -86,7 +88,39 @@ impl Wire {
         Ok(Some(result))
     }
 
-    fn poll(&mut self) -> Result<Option<Vec<u8>>, String> {
+    /// Whether every queued frame has been written.
+    pub(crate) fn idle(&self) -> bool {
+        self.output.is_empty()
+    }
+
+    /// Zeroes and drops every queued frame, written in part or not at all.
+    pub(crate) fn discard(&mut self) {
+        self.output.fill(0);
+        self.output.clear();
+        self.sent = 0;
+        self.deadline = None;
+    }
+
+    /// After the worker's final frame: true at a clean end of the channel,
+    /// false while it is open and silent. Any further byte is refused.
+    pub(crate) fn finished(&mut self) -> Result<bool, String> {
+        if !self.input.is_empty() {
+            return Err("private worker wrote after its final frame".into());
+        }
+        let mut byte = [0];
+        for _ in 0..4 {
+            match self.stream.read(&mut byte) {
+                Ok(0) => return Ok(true),
+                Ok(_) => return Err("private worker wrote after its final frame".into()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(format!("read private worker: {error}")),
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn poll(&mut self) -> Result<Option<Vec<u8>>, String> {
         if self
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -155,6 +189,10 @@ pub(crate) enum Event {
     Commit(Request),
     Complete,
     Failed(String),
+    /// A presented login PIN step waits for its PIN.
+    Pin(Request),
+    /// A login operation's typed end without success.
+    Ended(crate::login::End),
 }
 
 #[derive(PartialEq, Eq)]
@@ -194,7 +232,7 @@ fn sanitized(command: &mut Command) -> &mut Command {
         .stderr(Stdio::null())
 }
 
-fn command(verb: &str, owner: u32) -> Command {
+pub(crate) fn command(verb: &str, owner: u32) -> Command {
     let mut command = Command::new("/bin/td-secret");
     sanitized(&mut command).args([verb, "--uid", &owner.to_string()]);
     command
@@ -548,6 +586,22 @@ impl Drop for Unlock {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+#[cfg(test)]
+impl Wire {
+    /// Writes what is queued without reading anything.
+    pub(crate) fn flush(&mut self) -> Result<(), String> {
+        let pending = self.output.get(self.sent..).ok_or("invalid send cursor")?;
+        (&self.stream)
+            .write_all(pending)
+            .map_err(|e| e.to_string())?;
+        self.output.fill(0);
+        self.output.clear();
+        self.sent = 0;
+        self.deadline = None;
+        Ok(())
     }
 }
 
