@@ -43,6 +43,8 @@ mod fido_pin;
 mod fido_transaction;
 #[allow(dead_code, reason = "login record codec staged for the login worker")]
 mod login_record;
+#[allow(dead_code, reason = "login record store staged for the login worker")]
+mod login_store;
 #[path = "../../td-busd/src/message.rs"]
 #[allow(dead_code, reason = "shared bounded D-Bus codec")]
 mod message;
@@ -307,6 +309,7 @@ mod confinement {
             ("fido_pin.rs", include_str!("fido_pin.rs")),
             ("fido_transaction.rs", include_str!("fido_transaction.rs")),
             ("login_record.rs", include_str!("login_record.rs")),
+            ("login_store.rs", include_str!("login_store.rs")),
             ("pin_sys.rs", include_str!("pin_sys.rs")),
             ("pin_terminal.rs", include_str!("pin_terminal.rs")),
             ("token_check.rs", include_str!("token_check.rs")),
@@ -436,6 +439,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "fido_transaction.rs",
                 "lib.rs",
                 "login_record.rs",
+                "login_store.rs",
                 "main.rs",
                 "operation.rs",
                 "pin_sys.rs",

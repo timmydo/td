@@ -3,10 +3,11 @@
 This is the normative target for td's login-key tier. td-authd, td-secret,
 td-compositor and td-login implement it together; this document owns the
 tier's rules, and each component document states the amendments its own
-contract needs. **Only the record codec and the consent descriptions are
-implemented**, inert: no caller uses td-secret's private `login_record`
-module ("The login record") or td-authd's login consent operations and
-step admission (`td-authd/DESIGN.md`). Nothing else below is
+contract needs. **Only the record codec, the record store and the
+consent descriptions are implemented**, inert: no caller uses td-secret's
+private `login_record` and `login_store` modules ("The login record") or
+td-authd's login consent operations and step admission
+(`td-authd/DESIGN.md`). Nothing else below is
 implemented. Until the increments at the end land, `THREAT-MODEL.md` §3
 is the complete current behaviour: the installed account logs in
 automatically and the session never locks. No document, UI or release
@@ -123,15 +124,18 @@ bytes can make an unenrolled machine look enrolled or the reverse
 (`td-authd/DESIGN.md`, login-state amendment). Unavailable has three typed
 causes, each with its screen text:
 
-- a damaged directory (a wrong owner or mode, or a non-directory at that
-  path): `LOGIN KEY STATE UNAVAILABLE: DIRECTORY DAMAGED`;
+- a damaged directory (a wrong owner, group or mode, a non-directory or
+  nothing at that path, or a symbolic link at or above it):
+  `LOGIN KEY STATE UNAVAILABLE: DIRECTORY DAMAGED`;
 - a damaged record (the name exists, but is not a regular single-link
   root:root mode-0600 file, or its bytes are truncated, malformed, of an
   unknown version or for another UID): `LOGIN KEY STATE UNAVAILABLE:
   RECORD DAMAGED`;
-- a record whose name exists but which td-authd's read-only helper could
-  not read in time: `LOGIN KEY STATE UNAVAILABLE: STATE COULD NOT BE
-  READ`. It is transient: the compositor asks again until it resolves.
+- a state that could not be read: td-authd's read-only helper did not
+  answer in time, or a read met an I/O error, other than the damage
+  above, or saw the record change while reading it: `LOGIN KEY STATE
+  UNAVAILABLE: STATE COULD NOT BE READ`. It is transient: the compositor
+  asks again until it resolves.
 
 Unavailable keeps every refusal of the enrolled state in force (td-login's,
 SSH's enforced form, the update-consent rule) and the compositor stays
@@ -201,16 +205,31 @@ it is enrolled here. The record is not authenticated against a writer.
 Root or anyone who can write the disk can replace or remove it, and an old
 copy in a snapshot, backup or restored `@var` re-admits the keys it lists.
 
-Publication writes an exclusive temporary file named with a fixed prefix
-in the same directory, fsyncs it, renames it over the record and fsyncs
-the directory. Removing the last key unlinks the record and fsyncs the
+Publication writes an exclusive (`O_EXCL`) mode-0600 temporary file in
+the same directory, named `tmp-` and 32 lowercase hex digits from 16
+random bytes, fsyncs it, renames it over the record and fsyncs the
+directory. Removing the last key unlinks the record and fsyncs the
 directory. Readers look up only the exact record name and ignore every
-other entry; the next worker, before its own publication, and firstboot
-remove leftover temporaries. A power cut during first enrollment therefore
-leaves the machine unenrolled or completely enrolled, never locked without
-a record. The worker compares the record's bytes with the baseline it
-presented before any token I/O and again before publication, refusing a
-change. An uncertain outcome is re-read and reported, never retried.
+other entry. Before each publication or removal the worker, and firstboot
+at boot, unlink every entry whose name begins with `tmp-` and no other,
+so `cutover-reboot` (`td-authd/DESIGN.md`) is never touched; a prefixed
+entry that cannot be unlinked, such as a directory, refuses the write. A
+power cut during first enrollment therefore leaves the machine unenrolled
+or completely enrolled, never locked without a record. The worker
+compares the record's bytes with the baseline it presented before any
+token I/O and again before publication, refusing a change: the baseline
+is the record's absence or the SHA-256 of its exact bytes, and the record
+must read as that again before the write starts and after the temporary
+is fsynced; an unavailable state never matches. A failure before the
+rename or unlink is attempted changes nothing at the record name; the
+worker removes its own temporary best effort, and the next write's
+cleanup removes any it leaves. Once it is attempted, any failure,
+including the rename or unlink itself, the directory fsync or the
+closing check that the name holds the published file or is gone, is
+uncertain. An uncertain outcome
+is re-read and reported, never retried. The store takes no lock of its
+own: only the worker writes, serialized by `/run/td-fido/operation.lock`
+and td-authd's operation slot.
 
 ## Token profile
 
@@ -631,7 +650,10 @@ operator's device.
 
 Each is independently landable. None is expected to need new `unsafe`;
 one that turns out to amends `UNSAFE.md` in the same landing. Increments 2
-to 4 land inert: they change behaviour only when a record or an invalid
+to 4 land inert. No production path reads the login state until
+increment 4, which also makes firstboot ensure the directory, so its
+absence, itself a damaged directory, never meets a production reader.
+From then on behaviour changes only when a record or an invalid
 directory exists, which no production path creates, and the state is
 decided by the directory-and-name check before any helper runs, so no
 helper failure can change an unenrolled machine. Each lists what it

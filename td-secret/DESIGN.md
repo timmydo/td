@@ -1788,3 +1788,68 @@ uses, as `PORTABLE.md` requires.
 verifiers, fingerprints and every phase's client-data hash with Python's
 `hashlib`, `hmac` and its own integer P-256 arithmetic; the committed
 `tests/login_record_vectors.txt` is what the tests read.
+
+## Login record store
+
+`login_store.rs` is the second inert piece of the root login worker: it
+reads the login state and publishes or removes the record, as
+TOKEN-LOGIN.md, "The login record", specifies; nothing calls it yet. It
+uses only std filesystem calls, adds no `unsafe` and no syscall surface,
+and takes no lock: the worker's operation lock serializes writers.
+
+`Store::open` walks the directory path (`/var/lib/td/login` in
+production) from `/` one component at a time, each opened with
+`O_DIRECTORY | O_NOFOLLOW` through the previous one's `/proc/self/fd`
+path, so a link anywhere on the path refuses, and keeps the leaf's
+descriptor. The expected owner is a parameter, root:root in production
+and the test's own IDs in tests. The directory must have that UID and
+GID, mode exactly 0700 and a nonzero link count, rechecked on every read
+and write, so a directory removed under a held descriptor never reads
+as empty. A missing component, a link or a non-directory on the path is
+a damaged directory, but only while the parent's descriptor path still
+names the parent (same device and inode); otherwise, and for any other
+open or inspection failure, it is unreadable. Only the leaf's metadata
+is checked, as for the application store.
+
+A read looks up only `<uid>`, in decimal. A missing name is unenrolled
+only if the directory's `/proc/self/fd` path then still names the held
+directory, so a store that later loses or over-mounts `/proc` reads
+unreadable, never unenrolled; temporary cleanup makes the same check
+before it lists the directory.
+The name is inspected before it is opened, so a FIFO or device is never
+opened: anything but a regular, single-link, mode-0600 file of the
+expected owner, or a size above `login_record::MAX_RECORD`, is a damaged
+record. The file is then opened `O_NOFOLLOW | O_NONBLOCK`, must be the
+inode inspected and pass the same owner, mode, link and size checks
+through its descriptor, is read through a `MAX_RECORD + 1` bound, and
+must keep its inode, size, mtime and ctime across the read; a failure at
+any of these steps is a race and reads as unreadable, and the next read
+shows what the name settled on. The bytes decode with the
+expected UID, and a refusal is a damaged record. `State::Enrolled` keeps
+the decoded record and so its exact-bytes digest. `State::baseline` is
+`Absent` or `Digest` for the two valid states and none for unavailable,
+so no write starts from an unavailable state.
+
+Publication and removal first unlink every `tmp-` entry, syncing the
+directory if any went, and compare the current state with the baseline.
+Publication then creates `tmp-` and 32 hex digits from 16 caller-supplied
+random bytes with `O_CREAT | O_EXCL | O_NOFOLLOW`, sets mode 0600 against
+the umask, admits its owner, mode and links, writes, fsyncs, compares the
+baseline again, checks the name still holds its inode, renames over the
+record, fsyncs the directory, rechecks the directory and checks the
+record name holds that inode. Removal refuses an `Absent` baseline, then
+unlinks, fsyncs the directory, rechecks it and its descriptor path, and
+checks the name is gone. The outcome is `Committed`; `Rejected` before
+the rename or unlink is attempted; or `Uncertain` from then on. A
+rejected publication removes its temporary, best effort and only while
+its name still holds the file created; the next write's cleanup removes
+any it leaves. A record for another UID is rejected. The
+store writes the record in the version it was built with, which the
+caller chose with `write_version`; it never picks one. Private `Stage`
+hooks after each step let tests inject a failure or a concurrent change
+at every point: each publication and removal stage, from an absent and a
+present record, leaves a later read with the old record or the whole new
+one, and a later write succeeds. Private `ReadStage` hooks after the
+inspection and after the read let tests swap the inode, change its mode
+or append to it, each of which reads as unreadable; a test-only
+descriptor root stands for a lost or replaced `/proc`.
