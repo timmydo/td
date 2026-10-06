@@ -674,6 +674,22 @@ its window is reused; Projected alone contains no retained part metadata or
 serialization proof. Copied cells and previously emitted metadata remain
 provisional through final whole-job admission.
 
+M06do wraps a live complete replay Part atomically in fixed metadata
+member framing before window reuse. Its parent remains abandoned until
+fresh whole serialization finish; refusal, premature finish or safe
+forgetting retires visitation. It frames selected scalar fields through
+the shared JSON string engine, copies only privately retained complete
+CID/language/location JSON, and uses original allowances for scalar
+rereads, bounded control steps and every wire byte of the new fragment,
+including copied retained metadata. Apply final charset
+defaults/non-text absence, preserve selected label spelling, and enforce
+the JMAP unsigned-size ceiling. No new normalization, field selection,
+metadata arena, source authority or parsing algorithm enters. The member
+fragment excludes braces, blob IDs and subparts; tree/body-list
+composition, property selection, locators and publication remain later
+boundaries. Completion returns passive descriptor/node evidence and
+original owners, not a publication capability.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

@@ -5093,6 +5093,52 @@ are layout ceilings, not native stack or RSS measurements. Whole metadata
 retention, JSON structure framing, authenticated locators and final response
 publication remain subsequent boundaries.
 
+### 1.120 Original replay metadata JSON member framing
+
+M06do adds response::json::Cursor::new. It consumes only a live response::Part
+with a fresh Tick and requires healthy complete metadata. It retains that
+child's original descriptor, classified node, immutable windows, work/header
+owners, scratch and parent abandonment latch. No passive metadata view,
+replacement field, source or allowance can construct it.
+
+poll returns bounded Progress into caller output. The fixed member sequence
+is partId, size, type, charset, name, disposition, cid, language, location,
+without enclosing braces. Multipart partId is null; other IDs are quoted
+original decimal preorder ordinals. size is the descriptor's exact decoded
+size, checked against JMAP's 2^53-1 UnsignedInt ceiling. Absent charset
+defaults to us-ascii when Content-Type is absent or text/* has no selected
+label; absent non-text labels are null. A selected valid charset label keeps
+its original spelling. Other optional absent metadata is null; present empty
+strings stay present.
+Type, charset, filename and disposition use the shared JSON string frame over
+already selected metadata, preserving its normalization and control policy.
+CID, language and location copy only this child's complete retained JSON.
+Every wire byte of this new fragment, including copied retained JSON,
+consumes original output allowance before copying. Retained metadata output
+and subsequent fragment emission are distinct operations. Metadata scalar
+reads, bounded text-type inspection and fixed control work spend the original
+HeaderBudget, with no reset. Generated digits/defaults are not source I/O.
+Child string-source refusals map to Admission; framing-state faults retain
+Serialization context.
+
+One turn polls at most one scalar (four bytes), inspects at most five text-
+type bytes, or copies at most 64 bytes. At most 21 interpretation steps and
+two records are charged per turn. Empty output
+performs fresh zero-count admission without progress or positive charge.
+Cached Complete is inert; explicit check_deadline and consuming finish
+freshly admit, including after Complete. Any refusal hides value and latches
+the parent's first error. Premature finish and safe abandonment also retire
+the parent. Only successful fresh whole-fragment finish advances its ordinal
+and returns passive End plus the original work/header/scratch owners.
+
+The three constructor/exclusivity doctests and allocation probe pin this
+boundary. Cursor plus HeaderBudget has a compiled 1 KiB layout ceiling.
+Emitted bytes remain provisional through whole-job publication and are not
+wiped. This fragment is not a complete EmailBodyPart: braces, blobId,
+subParts, requested-property selection, raw headers, body-list/tree
+composition, authenticated locators and final response publication remain
+subsequent work. Projected continues to prove visitation alone.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

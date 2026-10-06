@@ -18,6 +18,7 @@ pub enum Error {
     Metadata(label_json::Error),
     Classification(mime_body_lists::Error),
     BodyLists(mime_body_lists::Error),
+    Serialization(td_json::string::Error<nfc::Error>),
     Admission(nfc::Error),
     NodeCapacity,
     PartOrdinal,
@@ -32,6 +33,7 @@ impl std::fmt::Display for Error {
             Self::Metadata(error) => write!(f, "bound MIME part metadata: {error}"),
             Self::Classification(error) => write!(f, "bound MIME classification: {error}"),
             Self::BodyLists(error) => write!(f, "bound MIME body lists: {error}"),
+            Self::Serialization(error) => write!(f, "bound MIME response JSON: {error}"),
             Self::Admission(error) => write!(f, "bound MIME structure admission: {error}"),
             Self::NodeCapacity => f.write_str("bound MIME classification node capacity"),
             Self::PartOrdinal => f.write_str("invalid bound MIME part ordinal"),
@@ -48,6 +50,7 @@ impl std::error::Error for Error {
             Self::Metadata(error) => Some(error),
             Self::Classification(error) => Some(error),
             Self::BodyLists(error) => Some(error),
+            Self::Serialization(error) => Some(error),
             Self::Admission(error) => Some(error),
             _ => None,
         }

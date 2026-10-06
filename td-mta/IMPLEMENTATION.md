@@ -2147,6 +2147,18 @@ Initial independently landable increments:
   extra/forgotten parts, capacity and measured zero Rust allocation.
   JSON structure framing, authenticated locators and publication remain next.
 
+- **M06do — original replay metadata member framing:** consume only a live
+  complete replay Part, retaining its abandonment latch until fresh whole
+  JSON finish. Frame selected scalars with shared fixed string framing and
+  copy privately retained label/location JSON. Charge every wire byte of the
+  new fragment under original work/header owners, including metadata copies.
+  Apply final charset mapping and unsigned-size bounds; preserve descriptor
+  size and decimal preorder IDs. Pin short/empty and wide drains, all UTF-8
+  widths, measured per-turn limits, every digest-child prefix and original
+  resource cutoff, exclusive constructors and measured zero Rust allocation.
+  The fixed fragment omits braces, locators, subparts and property selection;
+  body-list/tree composition and whole-job publication remain next.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

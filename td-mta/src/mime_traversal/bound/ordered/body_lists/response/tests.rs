@@ -11,7 +11,7 @@ use crate::{
     mime_traversal::Part as Descriptor,
 };
 
-fn selection<'a, 'w, 'n>(
+pub(super) fn selection<'a, 'w, 'n>(
     source: &'a [u8],
     base: u64,
     parts: &'w mut [Descriptor],

@@ -5440,7 +5440,10 @@ fn ordered_mime_classification() {
         mime_traversal::{
             bound::{
                 ordered::{
-                    body_lists::{response::Projecting, Selecting},
+                    body_lists::{
+                        response::{json, Projecting},
+                        Selecting,
+                    },
                     Classifying,
                 },
                 Cursor, Error,
@@ -5473,8 +5476,9 @@ fn ordered_mime_classification() {
     let mut html = [0; 8];
     let mut attachments = [0; 8];
     let mut membership = [0; 8];
+    let mut json_output = [0; 8];
     let before = COUNTERS.snapshot();
-    for trial in 0..21 {
+    for trial in 0..27 {
         let mut work = Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
             Charge {
@@ -5742,6 +5746,60 @@ fn ordered_mime_classification() {
                     }
                     assert!(complete);
                     assert!(part.value().is_some());
+                    if trial >= 21 {
+                        if trial == 26 {
+                            assert!(json::Cursor::new(part, Tick(100)).is_err());
+                            stopped = true;
+                            break;
+                        }
+                        let mut json = json::Cursor::new(part, Tick(1)).unwrap();
+                        if trial == 22 {
+                            json.poll(Tick(1), &mut json_output).unwrap();
+                            assert!(json.finish(Tick(100)).is_err());
+                            stopped = true;
+                            break;
+                        }
+                        if trial == 24 {
+                            json.poll(Tick(1), &mut json_output).unwrap();
+                            forget(json);
+                            stopped = true;
+                            break;
+                        }
+                        let mut done = false;
+                        for _ in 0..100000 {
+                            if json.poll(Tick(1), &mut json_output).unwrap().status
+                                == json::Status::Complete
+                            {
+                                done = true;
+                                break;
+                            }
+                        }
+                        assert!(done);
+                        assert_eq!(json.value().unwrap().part.ordinal, ordinal);
+                        if trial == 23 {
+                            let error = json.check_deadline(Tick(100)).unwrap_err();
+                            assert!(json.value().is_none());
+                            assert_eq!(json.finish(Tick(1)).err(), Some(error));
+                            stopped = true;
+                            break;
+                        }
+                        if trial == 25 {
+                            forget(json);
+                            stopped = true;
+                            break;
+                        }
+                        let (end, work, budget, scratch) = json.finish(Tick(1)).unwrap();
+                        assert_eq!(end.part.ordinal, ordinal);
+                        assert_eq!(
+                            (
+                                std::ptr::from_mut(work),
+                                std::ptr::from_mut(budget),
+                                std::ptr::from_mut(scratch)
+                            ),
+                            pointers
+                        );
+                        continue;
+                    }
                     let (view, work, budget, scratch) = part.finish(Tick(1)).unwrap();
                     assert_eq!(view.part.ordinal, ordinal);
                     assert_eq!(

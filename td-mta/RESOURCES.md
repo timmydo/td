@@ -2201,6 +2201,33 @@ refusals, location capacity, abandonment and constructor refusal. All backing
 exists before counting. This remains Rust allocation evidence; native-stack
 and RSS qualification are separate.
 
+M06do metadata member framing consumes the live original replay child before
+its caller window can be reused. The metadata parser and JSON framer never
+coexist as live cursors. JSON Cursor plus HeaderBudget has a compiled 1 KiB
+layout ceiling, including one shared six-byte string-frame buffer and a
+20-byte primitive decimal buffer. It uses no heap or source-sized storage.
+The previously admitted metadata windows and Scratch remain borrowed.
+
+Every turn reads at most one UTF-8 scalar (four bytes), inspects at most five
+text-type bytes, copies at most 64 bytes, or performs a fixed transition.
+Measured turns consume at most five source/I/O bytes, 21 interpretation
+steps, two records and 64 output bytes. Generated digits/defaults are not
+source I/O. Primitive u64 formatting has a
+precharged 20-digit bound. Original work/header owners pay for scalar rereads
+and control work. Every byte of the new wire fragment is charged before
+copying, including retained CID/language/location JSON from its original
+producer. Metadata retention and fragment emission are separate operations.
+No repeated parsing, renewed allowance or new arena is introduced.
+
+The dedicated Rust allocation probe preserves all 21 previous ordered MIME
+trials and adds six JSON trials: healthy original owner release, partial and
+complete deadline refusal, partial and complete safe forgetting, and fresh
+constructor refusal. Caller output and metadata storage precede counting.
+Units cover every digest-child serialization prefix and original quota
+cutoff, short/wide drains, long retained JSON, all scalar widths, exact wire
+debits, final charset mapping and unsigned-size bounds. These are Rust-heap
+and compiler layout checks, not native-stack or RSS qualification.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no
