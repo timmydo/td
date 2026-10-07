@@ -1357,6 +1357,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "netup",
     "busd",
     "fetchd",
+    "egressd",
     "mail-fetch",
     "news-fetch",
     "firefox-files",
@@ -1642,6 +1643,21 @@ fn build_td_svc_conf() -> String {
          after=seat,netup\n\
          requires=seat\n\
          ready=/bin/td-login exec-primary -- /bin/td-fetchd probe /run/user/{ui_uid}/td-fetch/socket\n\
+         ready-timeout=30\n\
+         restart=always\n\
+         \n\
+         # The egress relay (td-agent/DESIGN.md §10): td-egressd's socket in a\n\
+         # directory of its own under the UI user's runtime directory, where\n\
+         # td-agent looks for it; a workspace's commands reach the network\n\
+         # through it, per connection, as its policy and the person allow.\n\
+         # Authenticated by its mode alone, as the fetch service's is.\n\
+         [egressd]\n\
+         type=daemon\n\
+         cgroup=session\n\
+         exec=/bin/td-login exec-primary -- /bin/td-egressd run --socket /run/user/{ui_uid}/td-egress/socket\n\
+         after=seat,netup\n\
+         requires=seat\n\
+         ready=/bin/td-login exec-primary -- /bin/td-egressd probe /run/user/{ui_uid}/td-egress/socket\n\
          ready-timeout=30\n\
          restart=always\n\
          \n\
@@ -4442,6 +4458,19 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-review}/bin/td-review".into(),
         link: "{root}/real-root/bin/td-review".into(),
     });
+    // td-agent, the coding agent's window (td-agent/DESIGN.md §8): a static
+    // system-tree program of td's account that runs its tools through
+    // `/bin/td-jail --workspace` and `/bin/td-txt`, its workspaces' network
+    // through the egress relay below, and its model requests through the
+    // fetch service.
+    steps.push(Step::CopyTree {
+        from: "{in:td-agent}".into(),
+        dest: "{root}/real-root{in:td-agent}".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-agent}/bin/td-agent".into(),
+        link: "{root}/real-root/bin/td-agent".into(),
+    });
     // td-term, the terminal (td-term/DESIGN.md): a static system-tree program
     // the session starts and the launcher opens, and its compiled terminfo
     // entry, a data package `/etc/terminfo` names.
@@ -4845,6 +4874,12 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     steps.push(Step::Symlink {
         target: "{in:td-net}/bin/td-net".into(),
         link: "{root}/real-root/bin/td-fetchd".into(),
+    });
+    // /bin/td-egressd — the egress relay (td-agent/DESIGN.md §10), the same
+    // multicall's applet, named in full by the egressd unit.
+    steps.push(Step::Symlink {
+        target: "{in:td-net}/bin/td-net".into(),
+        link: "{root}/real-root/bin/td-egressd".into(),
     });
     // The explicit source-cache consumer shares the already shipped multicall.
     steps.push(Step::Symlink {
@@ -5651,6 +5686,7 @@ pub fn recipe() -> Recipe {
             "td-profiler",
             "td-taskmgr",
             "td-review",
+            "td-agent",
             "td-term",
             "td-term-terminfo",
             "td-photo",
@@ -7532,6 +7568,7 @@ mod tests {
             ("td-term", "td-term"),
             ("td-taskmgr", "td-taskmgr"),
             ("td-review", "td-review"),
+            ("td-agent", "td-agent"),
             ("td-photo", "td-photo"),
             ("td-editor", "td-editor"),
             ("td-pass", "td-pass"),
@@ -8239,6 +8276,7 @@ mod tests {
             ("netup", vec!["rootcheck"]),
             ("busd", vec!["seat"]),
             ("fetchd", vec!["seat", "netup"]),
+            ("egressd", vec!["seat", "netup"]),
             ("mail-fetch", vec!["td-firstboot", "netup"]),
             ("news-fetch", vec!["td-firstboot", "netup"]),
             ("firefox-files", vec!["td-firstboot"]),
@@ -14663,6 +14701,56 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             native_inputs.iter().any(|input| input == "td-taskmgr"),
             "td-taskmgr must be a declared native input"
         );
+    }
+
+    #[test]
+    fn td_agent_is_packed_beside_its_jail_its_tools_and_its_relay() {
+        let steps = real_root_steps(&SYSTEM).unwrap();
+        assert!(
+            steps.iter().any(|step| matches!(
+                step,
+                Step::CopyTree { from, dest }
+                    if from == "{in:td-agent}"
+                        && dest == "{root}/real-root{in:td-agent}"
+            )),
+            "td-agent must be CopyTree'd into the immutable root"
+        );
+        for (target, link) in [
+            ("{in:td-agent}/bin/td-agent", "/bin/td-agent"),
+            ("{in:td-jail}/bin/td-jail", "/bin/td-jail"),
+            ("{in:td-txt}/bin/td-txt", "/bin/td-txt"),
+            ("{in:td-net}/bin/td-net", "/bin/td-egressd"),
+        ] {
+            assert!(
+                steps.iter().any(|step| matches!(
+                    step,
+                    Step::Symlink { target: t, link: l }
+                        if t == target && *l == format!("{{root}}/real-root{link}")
+                )),
+                "{link} must name {target}"
+            );
+        }
+        let native_inputs = recipe().native_inputs.expect("system native inputs");
+        for input in ["td-agent", "td-jail", "td-txt", "td-net", "git-x86-64"] {
+            assert!(
+                native_inputs.iter().any(|i| i == input),
+                "{input} must be a declared native input: td-agent runs it"
+            );
+        }
+        // The relay where td-agent looks for it, under the UI user's runtime
+        // directory, as the fetch service's socket is.
+        assert_eq!(
+            unit_key("egressd", "exec").as_deref(),
+            Some(
+                "/bin/td-login exec-primary -- /bin/td-egressd run --socket /run/user/1000/td-egress/socket"
+            )
+        );
+        assert_eq!(
+            unit_key("egressd", "ready").as_deref(),
+            Some("/bin/td-login exec-primary -- /bin/td-egressd probe /run/user/1000/td-egress/socket")
+        );
+        assert_eq!(unit_key("egressd", "requires").as_deref(), Some("seat"));
+        assert_eq!(unit_key("egressd", "restart").as_deref(), Some("always"));
     }
 
     #[test]

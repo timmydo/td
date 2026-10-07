@@ -501,6 +501,7 @@ mod tests {
             [
                 "engine",
                 "net",
+                "td-agent",
                 "td-authd",
                 "td-boot",
                 "td-busd",

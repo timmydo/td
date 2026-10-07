@@ -43,7 +43,8 @@ built, so a workspace's commands reach its allowlist, or anywhere under
 the allowlist waits on the person's card in `ask`, and on the
 classifier in `auto` (§10, §11). Where building
 an increment settled a point the design left open, the section says so
-under "As built". No recipe names td-agent yet. The decisions below that
+under "As built". The `td-agent` recipe builds it for the image (§17).
+The decisions below that
 were the user's to make were made on 2026-10-01, 2026-10-02 and
 2026-10-04:
 
@@ -73,7 +74,8 @@ were the user's to make were made on 2026-10-01, 2026-10-02 and
   auto-compaction, and messages between conversations (§3, §12, §14);
   scheduled messages are designed now and built later (§3).
 - **Development cost:** an edit confined to `td-agent/` selects td-agent's
-  own tests and lints and nothing else in the gate until packaging (§17).
+  own tests and lints, the workspace pass, and its recipe's checks, as
+  any packaged program's does (§17).
 - **Auto mode:** the jail bounds what runs unreviewed; actions that cross a
   boundary go to a classifier pairing TypeSafe's Jev decision model on
   OpenRouter with a reasoning model; an action runs only when both allow,
@@ -3927,8 +3929,11 @@ until the link's 30 minutes pass, what it sent standing in the way.
 As built (the relay): `td-egressd` (net/src/egress.rs) and
 APPLICATIONS.md §W.8 item 6, which states its protocol, deadlines and
 predicate. `td-net launch` serves it for td-agent alone, at
-`td-egress/socket` under the runtime directory it gives td-agent; on td
-its unit comes with the packaging (§18, 17). td-agent's links reach it
+`td-egress/socket` under the runtime directory it gives td-agent. On td
+the `egressd` unit runs it as td's account, at
+`/run/user/1000/td-egress/socket`, after `netup` as the fetch service
+is, from the `/bin/td-egressd` link to the shipped td-net. td-agent's
+links reach it
 (As built (the proxy)).
 
 ## 11. Approval
@@ -5708,41 +5713,31 @@ roster crates a diff touches and every crate that reads them. Measured on
   workspace pass while its only outgoing edge is exactly `td-crypto`. A
   builder test holds that no recipe and no seed roster names it.
 
-td-agent is laid out to get td-mta's treatment, and the crate increment
-gave it that: `WORKSPACE_EXEMPT` in `affected.rs` lists each exempt crate
-with its sorted, pinned edges, and
-`workspace_exemption_requires_no_distribution_recipe` holds every crate on
-it to no recipe and no seed roster. `td-builder affected-checks --path
-td-agent/src/main.rs` selects the format check and td-agent's test and
-clippy commands, and no check target. It is laid out for that as
-follows:
+td-agent had td-mta's treatment until its packaging: `WORKSPACE_EXEMPT`
+in `affected.rs` lists each exempt crate with its sorted, pinned edges,
+and `workspace_exemption_requires_no_distribution_recipe` holds every
+crate on it to no recipe and no seed roster. The packaging made a recipe
+name td-agent and took it off the list, as planned. It is now routed as
+td-review is:
 
-- no crate depends on it, so a td-agent change selects td-agent alone; a
-  change to a crate it reads selects td-agent as well, as it should;
-- no recipe, recipe test or seed roster names it until packaging;
-- its outgoing edges are pinned: exactly `td-civil`, `td-compositor`,
-  `td-fetch-client`, `td-fs`, `td-json`, `td-test-compositor`, `td-toml`
-  and `td-ui` (its dependencies). `td-test-compositor` joined when the
-  native harness left the copy in `tests/support` for the shared crate;
-  `td-civil` joined when the history's UTC stamps left a copied
-  calendar; `td-fs` when the store's atomic replace became td-fs's;
-  `td-compositor` joined with the window increment, which
-  declared `native-compositor-tests`, since that opt-in adds the edge;
-  `td-json` and `td-toml` joined when JSON and TOML left the copied
-  modules for crates of their own, and `td-fetch-client` replaced
-  `td-news` when `td_fetch` did, retiring the test that read td-news's
-  copy.
-  The pinned set lives in `affected.rs` beside td-mta's, and a diff whose
-  edges differ from it takes the workspace pass, because the builder's
-  reader-set assertions name td-agent once it reads td-ui;
-- the crate increment adds a `td-agent/` arm to `map_path` selecting only
-  the `cargo-test` preflight; generalizes the workspace exemption and its
-  guarding test from td-mta to a list of exempt crates, each with its
-  pinned edges; and asserts that `td-agent/src/` selects no target. A diff
-  confined to td-agent then runs the format check and td-agent's own
-  tests and clippy. Packaging makes a recipe name td-agent, which the
-  guarding test refuses until the packaging increment removes td-agent
-  from the list;
+- `recipes/src/recipes/td-agent.rs` builds it as a static target recipe
+  over its own tree with its path dependencies staged beside it (the
+  six it reads, td-compositor, whose font and wire sources td-ui
+  mounts, engine, whose SHA-256 td-agent mounts, and
+  td-test-compositor, which cargo reads to resolve the lock), with no
+  feature enabled, so `test-key-root` never ships; a test holds the
+  staged trees to exactly the manifest's path dependencies and every
+  tree their files name by `#[path]` or an `include` macro;
+  `seed/local-source-roster.txt` names its tree and siblings;
+- `td-agent-test` is its realized-output check: the binary exists, is
+  static, and answers `--help`, `review --help` and `calibrate --help`,
+  which read no state, configuration or key; the window and the model
+  need a compositor and a network, which the boot oracle has;
+- its `map_path` arm selects the `cargo-test` preflight and the `check`
+  and `recipe-checks` targets, and a td-agent change takes the
+  workspace pass with its own tests and clippy;
+- the profiler's Rust roster names it, so the image carries its debug
+  companion;
 - its gate metadata is `clippy-all-targets` and `trusted-test-root`, the
   latter because its control-socket tests bind under owner-checked
   fixtures as td-ui's do. `native-compositor-tests`, which adds a

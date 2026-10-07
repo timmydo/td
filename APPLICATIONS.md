@@ -10205,7 +10205,9 @@ webpki-roots, and no decoder. So:
    under the launch's runtime directory, beside `td-fetch/socket`,
    with the same 0600 socket in a 0700 directory, the same bind and the
    same end with the launched program; `td-net launch` serves it only
-   for td-agent. Its protocol is one request per connection, a
+   for td-agent. On td the `egressd` unit serves it as td's account at
+   `/run/user/1000/td-egress/socket`, beside the fetch service's, where
+   no jail binds it either. Its protocol is one request per connection, a
    `td-egress 1` line and either `probe` or `connect HOST PORT`, a host
    being an IPv4 address, an IPv6 address bare or in brackets, or a DNS
    name of letters, digits and hyphens whose last label is not a number,
@@ -10257,7 +10259,7 @@ webpki-roots, and no decoder. So:
    address connected to is one checked. The relay sees TLS as
    ciphertext, so td-agent's policy is by host name, and a host that
    fronts other domains carries them. On td the relay is served by
-   td-agent's unit, which its packaging adds.
+   the `egressd` unit (item 6).
 
 **Sequencing.** (1) The fetch service, proven in the boot with the
 current pinned `tn` and `tmc` switched to it: the last pin bump. (2) The

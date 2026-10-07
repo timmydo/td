@@ -1558,12 +1558,14 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // td-agent the same way until its packaging increment: no recipe, recipe
-    // test or seed roster names it, and nothing reads it, so its own tests
-    // and lints are all a confined edit can break (td-agent/DESIGN.md §17).
-    // `WORKSPACE_EXEMPT` pins the crates it reads.
+    // td-agent is a static target recipe packed into the image with a
+    // realized-output check (td-agent-test), as td-review is: the host
+    // preflight holds its tests and lints, recipe-checks the static link and
+    // its help modes (td-agent/DESIGN.md §17).
     if p.starts_with("td-agent/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
@@ -3172,6 +3174,19 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "td-review/tests/land.rs",
         "td-review/Cargo.toml",
         "td-review/Cargo.lock",
+    ] {
+        assert_preflight!(path, "cargo-test");
+        assert_target!(path, "recipe-checks");
+        assert_target!(path, "check");
+    }
+    // td-agent likewise: a static target recipe with a realized-output check,
+    // td-agent-test (td-agent/DESIGN.md §17).
+    for path in [
+        "td-agent/src/main.rs",
+        "td-agent/src/window.rs",
+        "td-agent/tests/model_client.rs",
+        "td-agent/Cargo.toml",
+        "td-agent/Cargo.lock",
     ] {
         assert_preflight!(path, "cargo-test");
         assert_target!(path, "recipe-checks");
@@ -5187,30 +5202,12 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// leaves the list in the landing that makes a recipe name it; a crate that
 /// gains a reader is no longer alone after reader closure, so it takes the
 /// whole list without the list changing. td-mta reads td-crypto, td-header,
-/// td-json, td-mime and td-nfc, its direct dependencies. td-agent reads td-civil,
-/// td-fetch-client, td-fs, td-json, td-toml and td-ui, its dependencies,
-/// td-test-compositor, the native harness its tests depend on, and
-/// td-compositor, the test tool its `native-compositor-tests` opt-in builds
-/// (td-agent/DESIGN.md §17).
-const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[
-    (
-        "td-agent",
-        &[
-            "td-civil",
-            "td-compositor",
-            "td-fetch-client",
-            "td-fs",
-            "td-json",
-            "td-test-compositor",
-            "td-toml",
-            "td-ui",
-        ],
-    ),
-    (
-        "td-mta",
-        &["td-crypto", "td-header", "td-json", "td-mime", "td-nfc"],
-    ),
-];
+/// td-json, td-mime and td-nfc, its direct dependencies. td-agent left the
+/// list with its packaging (td-agent/DESIGN.md §17).
+const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[(
+    "td-mta",
+    &["td-crypto", "td-header", "td-json", "td-mime", "td-nfc"],
+)];
 
 /// The subset of the derived command list a diff over `changed` can actually
 /// invalidate.
@@ -10129,7 +10126,7 @@ mod tests {
         assert!(!recipes.is_empty());
         let roster = std::fs::read_to_string(root.join("seed/local-source-roster.txt")).unwrap();
         let names: Vec<&str> = WORKSPACE_EXEMPT.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, ["td-agent", "td-mta"]);
+        assert_eq!(names, ["td-mta"]);
         let texts: Vec<(PathBuf, String)> = recipes
             .into_iter()
             .map(|path| {
@@ -10196,183 +10193,6 @@ mod tests {
         for (name, edges) in WORKSPACE_EXEMPT {
             assert!(edges.windows(2).all(|w| w[0] < w[1]), "{name}: {edges:?}");
         }
-    }
-
-    /// td-agent's own commands and the format check, and no target, for every
-    /// path inside it, while its edges are the pinned ones (DESIGN.md §17).
-    #[test]
-    fn agent_only_changes_run_own_tests_and_lints_without_distro_checks() {
-        let root = repo_root();
-        let Ok(roster) = discover_gate_crates(&root) else {
-            eprintln!("SKIP: no roster crates (builder-only sandbox)");
-            return;
-        };
-        if !roster.iter().any(|c| c.name == "td-agent") {
-            eprintln!("SKIP: td-agent is not on this roster");
-            return;
-        }
-        for path in [
-            "td-agent/src/x.rs",
-            "td-agent/src/main.rs",
-            "td-agent/tests/model_client.rs",
-            "td-agent/Cargo.toml",
-            "td-agent/Cargo.lock",
-        ] {
-            let selection = compute_selection(&root, &[path.to_string()]);
-            assert!(
-                selection.targets.is_empty(),
-                "{path}: {:?}",
-                selection.targets
-            );
-            assert_eq!(selection.preflights, ["cargo-test"], "{path}");
-            let commands = cargo_test_cmds(&root, &[path.to_string()]).unwrap();
-            assert!(commands.first().is_some_and(|c| is_format_check(c)));
-            let (format, own): (Vec<&String>, Vec<&String>) =
-                commands.iter().partition(|c| is_format_check(c));
-            assert_eq!(format.len(), 1, "{path}: {commands:?}");
-            assert!(
-                own.iter()
-                    .all(|c| cmd_manifest_crate(c) == Some("td-agent")),
-                "{path}: {commands:?}"
-            );
-            for action in ["cargo test", "cargo clippy"] {
-                assert!(
-                    own.iter().any(|c| c.contains(action)),
-                    "{path}: no {action}: {commands:?}"
-                );
-            }
-            let output = path_output(&root, path);
-            assert!(output.contains("--manifest-path td-agent/Cargo.toml"));
-            assert!(!output.contains("--workspace"), "{output}");
-            assert!(!output.contains("td-builder check"), "{output}");
-            assert!(!output.contains("discovered crate"), "{output}");
-        }
-        for path in [
-            "td-agent-extra/src/main.rs",
-            "td-agent/../td-sh/src/main.rs",
-        ] {
-            assert_eq!(
-                cargo_test_cmds(&root, &[path.to_string()]).unwrap(),
-                gate_cmds()
-            );
-            assert!(path_output(&root, path).contains("td-builder check"));
-        }
-        // A crate td-agent reads brings td-agent with it, and so the
-        // workspace pass.
-        let ui = cargo_test_cmds(&root, &["td-ui/src/messages.rs".to_string()]).unwrap();
-        assert!(ui.iter().any(|c| c.contains("--workspace")));
-        assert!(ui.iter().any(|c| cmd_manifest_crate(c) == Some("td-agent")));
-        // Together with td-mta it is two crates, and no exemption.
-        let both = cargo_test_cmds(
-            &root,
-            &[
-                "td-agent/src/main.rs".to_string(),
-                "td-mta/src/lib.rs".to_string(),
-            ],
-        )
-        .unwrap();
-        assert!(both.iter().any(|c| c.contains("--workspace")));
-        // A builder file beside either exempt crate keeps the workspace legs
-        // that file alone would take, and the crate's own.
-        for one in ["td-agent/src/main.rs", "td-mta/src/lib.rs"] {
-            let mixed = cargo_test_cmds(
-                &root,
-                &[one.to_string(), "builder/src/ready.rs".to_string()],
-            )
-            .unwrap();
-            for action in ["cargo test", "cargo clippy"] {
-                assert!(
-                    mixed
-                        .iter()
-                        .any(|c| c.contains(action) && c.contains("--workspace")),
-                    "{one}: no workspace {action}: {mixed:?}"
-                );
-            }
-            let owner = one.split('/').next();
-            assert!(mixed.iter().any(|c| cmd_manifest_crate(c) == owner));
-        }
-    }
-
-    /// An edge td-agent gains or loses is a graph the workspace's reader
-    /// assertions have not seen: the whole list runs.
-    #[test]
-    fn agent_source_graph_changes_restore_workspace_coverage() {
-        struct Fixture(PathBuf);
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let fixture =
-            Fixture(std::env::temp_dir().join(format!("td-agent-graph-{}", std::process::id())));
-        let root = fixture.0.clone();
-        std::fs::remove_dir_all(&root).ok();
-        let deps = |names: &[&str]| -> String {
-            let mut manifest = String::from(
-                "[package]\nname = \"td-agent\"\n\n\
-                 [package.metadata.td-gate]\nnative-compositor-tests = true\n\n\
-                 [dependencies]\n",
-            );
-            let line = |name: &str| format!("{name} = {{ path = \"../{name}\" }}\n");
-            for name in names.iter().filter(|name| **name != "td-test-compositor") {
-                manifest.push_str(&line(name));
-            }
-            if names.contains(&"td-test-compositor") {
-                manifest.push_str("\n[dev-dependencies]\n");
-                manifest.push_str(&line("td-test-compositor"));
-            }
-            manifest
-        };
-        let all_deps = [
-            "td-civil",
-            "td-fetch-client",
-            "td-fs",
-            "td-json",
-            "td-test-compositor",
-            "td-toml",
-            "td-ui",
-        ];
-        for name in [
-            "td-agent",
-            "td-civil",
-            "td-compositor",
-            "td-fetch-client",
-            "td-fs",
-            "td-json",
-            "td-news",
-            "td-test-compositor",
-            "td-toml",
-            "td-ui",
-        ] {
-            let base = root.join(name);
-            std::fs::create_dir_all(base.join("src")).unwrap();
-            let manifest = if name == "td-agent" {
-                deps(&all_deps)
-            } else {
-                format!("[package]\nname = \"{name}\"\n")
-            };
-            std::fs::write(base.join("Cargo.toml"), manifest).unwrap();
-            std::fs::write(base.join("src/lib.rs"), "").unwrap();
-        }
-        let changed = ["td-agent/src/lib.rs".to_string()];
-        let all = cargo_test_cmds_all(&root).unwrap();
-        let narrowed = cargo_test_cmds(&root, &changed).unwrap();
-        // The format check, then td-agent's test, native and clippy legs.
-        assert_eq!(narrowed.len(), 4, "{narrowed:?}");
-        assert!(narrowed
-            .iter()
-            .all(|c| is_format_check(c) || cmd_manifest_crate(c) == Some("td-agent")));
-        // Another crate read: the workspace's assertions would name it.
-        std::fs::write(
-            root.join("td-agent/src/lib.rs"),
-            "const NEWS: &str = \"../td-news/src/main.rs\";\n",
-        )
-        .unwrap();
-        assert_eq!(cargo_test_cmds(&root, &changed).unwrap(), all);
-        // An edge lost is a changed set too.
-        std::fs::write(root.join("td-agent/src/lib.rs"), "").unwrap();
-        std::fs::write(root.join("td-agent/Cargo.toml"), deps(&all_deps[..5])).unwrap();
-        assert_eq!(cargo_test_cmds(&root, &changed).unwrap(), all);
     }
 
     /// The rendered line and the executed list come from one call, so the dry

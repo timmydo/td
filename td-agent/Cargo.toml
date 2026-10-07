@@ -19,16 +19,14 @@ license = "MIT"
 [features]
 test-key-root = []
 
-# Its own tests and lints and nothing else of the gate while no recipe names
-# it (DESIGN.md §17; the pinned edges live in builder/src/affected.rs). The
+# The `td-agent` recipe builds it for the image (DESIGN.md §17). The
 # control socket's tests bind under owner-checked fixtures, as td-ui's do.
 [package.metadata.td-gate]
 clippy-all-targets = true
 trusted-test-root = true
 # The window is a live Wayland client; its native cases launch it under
 # the real headless compositor (tests/control_process.rs). This
-# opt-in builds that binary for the gate and adds it as a test-only edge,
-# which builder/src/affected.rs pins beside its other edges.
+# opt-in builds that binary for the gate and adds it as a test-only edge.
 native-compositor-tests = true
 # Those cases build td-agent again with the feature, in a target of their
 # own, and run as `native_compositor::fixture::`.

@@ -259,10 +259,11 @@ them). A program
 that depends on td-ui is built by a cargo recipe that stages sibling source
 trees (`local_source_trees`, the td-net shape); a flat-staged direct-rustc
 recipe cannot link a second crate. td-portal, td-taskmgr, td-editor,
-td-news, td-mail, td-review, td-setup and td-term are built that way:
+td-news, td-mail, td-review, td-agent, td-setup and td-term are built
+that way:
 each stages `td-ui`, and `td-compositor` because td-ui mounts the font
-and wire modules from it, beside its own tree. td-portal and td-setup stage
-further siblings of their own. In the other direction the compositor's
+and wire modules from it, beside its own tree. td-portal, td-setup and
+td-agent stage further siblings of their own. In the other direction the compositor's
 flat recipe stages td-ui's five outline-face modules beside its own, since
 its chrome mounts them, and `tests/fonts/mod.rs` as `tests/fonts.rs` for its
 session-tests build, so an edit to that test encoder changes the

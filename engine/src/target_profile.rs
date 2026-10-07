@@ -93,6 +93,7 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "fd",
     "ripgrep",
     "rust-toolchain",
+    "td-agent",
     "td-audio",
     "td-authd",
     "td-boot",
