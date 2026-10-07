@@ -552,8 +552,9 @@ that store. The synchronous core accepts prepared bounded sources; it must
 not hold its global writer while an untrusted network peer supplies bytes.
 Also complete mutation/queue policy, quota/result reconciliation,
 guarded-stack and combined
-native/RSS qualification, maximum-WAL mapped-memory/recovery/checkpoint
-qualification, full crash/fault matrix, history maintenance and operational
+native/RSS qualification, the full 8 GiB database checkpoint, normal WAL
+admission scheduling and portable maximum-WAL resource qualification,
+the full crash/fault matrix, history maintenance and operational
 inspection/backup/restore. No legacy store migration is required.
 SQLite durability alone grants neither authorization nor a memory qualification.
 

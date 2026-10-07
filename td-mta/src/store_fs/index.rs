@@ -44,6 +44,9 @@ mod backup;
 #[cfg(test)]
 #[path = "index/crash_tests.rs"]
 mod crash_tests;
+#[cfg(test)]
+#[path = "index/wal_qualification.rs"]
+mod wal_qualification;
 pub use backup::{BackupError, BackupReceipt};
 
 /// Borrowed stream for one new body. Its claimed length and digest come from

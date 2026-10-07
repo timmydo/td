@@ -2613,8 +2613,19 @@ including its sorting scratch. The 9 MiB individual cap admits that request;
 the other native requested allocations must remain strictly below 8347480
 bytes under the unchanged shared 16 MiB hard limit.
 This is request arithmetic, not measured allocator overhead or a reservation
-for idle schemas/page caches. Maximum-WAL mapped-memory,
-recovery and checkpoint qualification remain pending. Startup avoids a full
+for idle schemas/page caches. The explicit ignored near-ceiling qualification
+in STORAGE.md passed a 17280796192-byte WAL, 32 bytes below this limit,
+through child SIGKILL, reopen/recovery, and TRUNCATE checkpoint. It ran with
+eight readers plus the writer present before the crash and for checkpoint;
+recovery begins on the first reopened connection, before the other readers
+can be created. The fixture checks the 34 MiB SHM file bound and keeps the
+9 MiB individual/16 MiB process-wide SQLite requested-allocation caps.
+Its largest reported child `VmHWM` sample was 39480 KiB, while the
+separate recovery process reported 48244 KiB after checkpoint. Those
+observations do not establish a transient RSS ceiling, native stack peak,
+combined 128 MiB service overlap, or an 8 GiB database checkpoint. The
+test-only producer bypasses normal WAL admission scheduling to reach the
+physical bound; the database is about 32 MiB. Startup avoids a full
 integrity scan; explicit validate_integrity maintenance owns quick_check and
 foreign_key_check with a physical-cap-sized finite VM allowance and the
 caller's deadline.

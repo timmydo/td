@@ -638,6 +638,52 @@ passed in 83.14 seconds with the shared 16 MiB limit unchanged. This qualifies t
 specific failure boundary, not maximum-WAL mapped memory, native stack/RSS,
 the complete 8 GiB database, or combined service overlap.
 
+The separate ignored `maximum_wal_crash_recovery_and_checkpoint` fixture
+qualifies the near-ceiling WAL path. Its test-only producer bypasses normal
+`reserve_wal` admission so it can reach the physical limit with a small
+database: it commits a valid 32 MiB body, checkpoints, holds an old read
+snapshot, then alternates changed 64 KiB rows in separate commits using one
+bounded UPDATE statement per row. It finishes with a metadata commit and
+parks all nine native connections. The producer checks the 34 MiB SHM file
+bound. The parent kills that exact child with SIGKILL, checks the complete
+aligned WAL, and reopens the store. Recovery occurs while the first
+connection opens; all eight readers plus the writer are present for the
+subsequent TRUNCATE checkpoint. The parent verifies the final metadata
+commit and full body through the recovered WAL, then checks the zero-length
+WAL, integrity, metadata and body after checkpoint. The test also checks
+the 8 GiB database bound, but its database is only about
+32 MiB; an 8 GiB checkpoint and normal reservation scheduling remain
+unqualified. The producer changes normally immutable body chunks and
+`created_at` without advancing the account sequence; its final state is
+valid for this physical WAL oracle but cannot come from the public API.
+The snapshot begins at an empty WAL. With automatic checkpointing disabled,
+the test does not qualify a reader pinned inside a large WAL.
+
+After the optimized build above, run this fixture explicitly with the same
+`td_mta_lib_test` executable. Use a private disk-backed TMPDIR with at least
+40 GiB free and an outer 45-minute timeout; ordinary gates leave it ignored.
+The resource observations require Linux `/proc/self/smaps_rollup` and
+`/proc/self/status`; missing probes fail the qualification:
+
+```text
+TMPDIR=/path/on/disk timeout --kill-after=5s 2700 target/release/td-builder run-capped "$td_mta_lib_test" --ignored --exact store_fs::index::wal_qualification::maximum_wal_crash_recovery_and_checkpoint --nocapture --test-threads=1
+```
+
+Require exit status zero and exactly one passed test. If external termination
+prevents cleanup, confirm that invocation and its descendants have exited
+before removing only its printed private root. On the x86-64 GNU host with
+rustc 1.99.0-nightly (6f72b5dd5), Linux 7.0.14 and btrfs, the test wrote
+4194368 valid frames in a 17280796192-byte WAL, the largest whole-frame
+WAL under the 17280796224-byte admission ceiling (a 32-byte gap).
+Recovery open took 21.01 seconds, the
+pre-checkpoint read through the recovered WAL took 0.535 seconds, and the
+checkpoint took 10.94 seconds; the complete test passed in 222.03 seconds.
+The 9 MiB individual and 16 MiB process-wide SQLite requested-allocation
+caps were unchanged. The largest reported child `VmHWM` sample was
+39480 KiB; the parent reported 48244 KiB after checkpoint. These are
+separate-process observations, not a whole-service memory peak or a bound
+on transient RSS.
+
 Creation is exclusive but not crash-atomic. A failed initial creation can
 leave an incomplete database or a complete durable database whose startup
 validation or connection-pool preparation exceeded the deadline. Neither

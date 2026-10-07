@@ -6532,7 +6532,10 @@ The fixed WAL ceiling is 17280796224 bytes; recovery can reread that entire
 WAL, and a checkpoint can copy up to the 8 GiB database ceiling. These native
 operations cannot be interrupted at an application chunk boundary. Deadline
 checks before and after do not promise a 60-second checkpoint or a 2 GiB I/O
-ceiling. Large-WAL recovery and checkpoint resource qualification is pending.
+ceiling. STORAGE.md records x86-64 GNU near-ceiling WAL crash recovery and
+checkpoint with a small database. The full 8 GiB database checkpoint,
+normal WAL-admission scheduling, portable qualification, and combined
+service resources remain pending.
 Blob deletion is part of the metadata transaction; existing views retain the
 old body through WAL. Committed bodies need no external-file collector.
 Provisional ingress preparation is implemented by the separate IngressSpool
