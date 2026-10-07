@@ -438,7 +438,8 @@ impl Session {
                     }
                 }
                 Request::SaveKey { secret, replace } => self.save_key(&secret, replace),
-                Request::Export => self.export(),
+                Request::Export => self.export(None),
+                Request::ExportConversation(id) => self.export(Some(id)),
                 Request::Workspace(id) => {
                     let record = self.card_record(&id);
                     self.app.show_workspace(&id, &record);
@@ -1882,10 +1883,11 @@ impl Session {
         true
     }
 
-    /// Starts the diagnostics export (DESIGN.md §4) on a thread, into
+    /// Starts the diagnostics export (DESIGN.md §4), of every
+    /// conversation or of `conversation` alone, on a thread, into
     /// `~/Downloads`, else the home directory: never where a workspace
-    /// reaches, since the archive holds every conversation's log.
-    fn export(&mut self) {
+    /// reaches, since the archive holds conversations' logs.
+    fn export(&mut self, conversation: Option<Id>) {
         if self.export.is_some() {
             return self.app.note("a diagnostics export is already under way");
         }
@@ -1933,6 +1935,7 @@ impl Session {
             key_file: self.key_path.clone(),
             keys,
             key_problem,
+            conversation,
         };
         let (send, receive) = mpsc::channel();
         let spawned = std::thread::Builder::new()
@@ -1964,8 +1967,13 @@ impl Session {
         self.export = None;
         let note = match result {
             Ok(exported) => {
+                let holds = if exported.one {
+                    "that conversation's files"
+                } else {
+                    "your conversations"
+                };
                 let mut note = format!(
-                    "diagnostics written to {} ({} files, {} left out, as its MANIFEST lists); it holds your conversations and configuration, never the key file: read it before sharing",
+                    "diagnostics written to {} ({} files, {} left out, as its MANIFEST lists); it holds {holds} and your configuration, never the key file: read it before sharing",
                     exported.path.display(),
                     exported.files,
                     exported.left_out,

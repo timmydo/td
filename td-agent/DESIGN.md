@@ -909,12 +909,14 @@ and `note`, the newest note whole on one line.
 **As built (row menus).** A right press on a conversation's row (td-ui's
 `Context`, td-ui/DESIGN.md, "Widget window") opens its row menu at the
 pointer: `Archive`, or `Unarchive` for an archived conversation, then
-`Delete…`, which puts the deletion question of that row's conversation,
-open or not. `S-F10` opens a row's menu under its row, at the list's
-corner when the row is out of view: with the list focused, the selected
-row's, so the keyboard reaches an archived conversation, and otherwise
-the open conversation's; it closes an open row menu as `F10` closes the
-bar's. The list keeps the row selected through updates, so the
+`Diagnostics`, a submenu whose `Export this conversation` writes that
+conversation's diagnostics archive (As built (the diagnostics export),
+below), then `Delete…`, which puts the deletion question of that row's
+conversation, open or not. `S-F10` opens a row's menu under its row, at
+the list's corner when the row is out of view: with the list focused,
+the selected row's, so the keyboard reaches an archived conversation,
+and otherwise the open conversation's; it closes an open row menu as
+`F10` closes the bar's. The list keeps the row selected through updates, so the
 keyboard's place holds until the human moves it or opens another
 conversation. A right press elsewhere opens nothing, and opening a row's
 menu does not open its conversation. The row menu is td-ui's shared menu
@@ -1158,6 +1160,23 @@ keeps that bears on what it did, and never the key file.
   how many files it took and left out, and to read it before sharing.
   One runs at a time. The driven actions gain `export-diagnostics`,
   which has no chord.
+- **One conversation's.** A row menu's Diagnostics → `Export this
+  conversation` (As built (row menus)) writes the same archive scoped to
+  that conversation, open or not: of the state directory it takes only
+  `conversations/<id>/` and `outbox/<id>/` (the messages queued for it;
+  its own unsent ones are in their receivers' and in its log), each when
+  present, under the same rules and key checks, beside the
+  configuration and the manifest, whose `scope:` line names the
+  conversation and says no other's files and none of the state
+  directory's shared ones are taken (the whole export's says the whole
+  state directory). Each step to them is checked as the whole walk
+  checks a directory it enters: a link, or the key's directory under
+  another name, is left out, said why, and a conversation that is not
+  there is said not to be. It is named `td-agent-conversation-<id>-<UTC
+  time>.tar`, and its members lie under that name. It shares the whole
+  export's one-at-a-time thread, place and notices, the notice saying
+  it holds that conversation's files; through the control seam it is
+  reached by `row-menu` and the menu's keys.
 
 ## 5. Model client
 

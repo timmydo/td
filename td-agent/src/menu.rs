@@ -57,6 +57,8 @@ pub enum Action {
     Keys,
     /// Ask whether to delete the open conversation.
     Delete,
+    /// Write the diagnostics archive of the row's conversation alone.
+    ExportRow,
     /// Choose the model new conversations start with.
     DefaultModel,
     /// Show archived conversations in the list, or hide them again.
@@ -117,6 +119,9 @@ pub const AUTO_MODE: &str = "Auto mode in this workspace";
 pub const ARCHIVE: &str = "Archive";
 pub const UNARCHIVE: &str = "Unarchive";
 pub const DELETE_ROW: &str = "Delete\u{2026}";
+/// The row menu's submenu of diagnostics, and its item.
+pub const DIAGNOSTICS_ROW: &str = "Diagnostics";
+pub const EXPORT_ROW: &str = "Export this conversation";
 pub const SHOW_OUTPUT: &str = "Show output";
 pub const KILL_PROCESS: &str = "Kill";
 
@@ -238,7 +243,8 @@ pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, m
 }
 
 /// A conversation's row menu over `surface` at `revision`, closed:
-/// Archive, or Unarchive for an archived conversation, then Delete….
+/// Archive, or Unarchive for an archived conversation, then Diagnostics,
+/// whose item exports this conversation's, then Delete….
 pub fn row(surface: Surface, archived: bool, revision: u64) -> Result<Menu, menus::Error> {
     let item = |label, action| Node {
         parent: None,
@@ -255,11 +261,30 @@ pub fn row(surface: Surface, archived: bool, revision: u64) -> Result<Menu, menu
     } else {
         item(ARCHIVE, Action::Archive)
     };
+    let diagnostics = Node {
+        parent: None,
+        row: Row {
+            label: DIAGNOSTICS_ROW,
+            shortcut: "",
+            enabled: true,
+            checked: false,
+        },
+        item: Item::Submenu,
+    };
+    let export = Node {
+        parent: Some(1),
+        ..item(EXPORT_ROW, Action::ExportRow)
+    };
     Controller::new(
         Model::new(
             Kind::Context,
             revision,
-            &[first, item(DELETE_ROW, Action::DeleteRow)],
+            &[
+                first,
+                diagnostics,
+                export,
+                item(DELETE_ROW, Action::DeleteRow),
+            ],
         )?,
         surface,
         Fit::Adaptive,
@@ -450,6 +475,14 @@ mod tests {
             assert_eq!(key(&mut menu, "Return"), Outcome::Activated(first));
             menu.open_context(300, 200).unwrap();
             assert_eq!(key(&mut menu, "Down"), Outcome::Changed);
+            assert_eq!(key(&mut menu, "Right"), Outcome::Changed);
+            assert_eq!(
+                key(&mut menu, "Return"),
+                Outcome::Activated(Action::ExportRow)
+            );
+            menu.open_context(300, 200).unwrap();
+            assert_eq!(key(&mut menu, "Down"), Outcome::Changed);
+            assert_eq!(key(&mut menu, "Down"), Outcome::Changed);
             assert_eq!(
                 key(&mut menu, "Return"),
                 Outcome::Activated(Action::DeleteRow)
@@ -461,7 +494,7 @@ mod tests {
             .iter()
             .map(|node| node.row.label)
             .collect();
-        assert_eq!(labels, [UNARCHIVE, DELETE_ROW]);
+        assert_eq!(labels, [UNARCHIVE, DIAGNOSTICS_ROW, EXPORT_ROW, DELETE_ROW]);
         // A background process's: Show output, then Kill.
         let labels: Vec<&str> = nodes(&process(surface(), 1).unwrap())
             .iter()

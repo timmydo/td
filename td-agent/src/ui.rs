@@ -320,6 +320,9 @@ pub enum Request {
     SaveKey { secret: Secret, replace: bool },
     /// Write the diagnostics archive, from File → Export diagnostics.
     Export,
+    /// Write one conversation's diagnostics archive, from its row's
+    /// menu's Diagnostics.
+    ExportConversation(Id),
     /// Delete this conversation for good, as the human confirmed.
     Delete(Id),
     /// Archive this conversation, or bring it back, from its row's menu.
@@ -3376,6 +3379,12 @@ impl App {
             menu::Action::DeleteRow => {
                 if let Some(id) = self.menu_row.take() {
                     self.ask_delete(id);
+                }
+            }
+            menu::Action::ExportRow => {
+                if let Some(id) = self.menu_row.take() {
+                    self.requests.push(Request::ExportConversation(id));
+                    self.touch();
                 }
             }
             menu::Action::ShowOutput => {
@@ -6994,8 +7003,18 @@ pub mod tests {
                 archived: false
             }]
         );
+        // Its Diagnostics exports that conversation's alone.
         let at = row_at(&app, 3);
         context(&mut app, at);
+        key(&mut app, "Down");
+        key(&mut app, "Right");
+        assert!(text(&app).contains(menu::EXPORT_ROW), "{}", text(&app));
+        key(&mut app, "Return");
+        assert!(!app.menu_open());
+        assert_eq!(app.take_requests(), [Request::ExportConversation(id(3))]);
+        let at = row_at(&app, 3);
+        context(&mut app, at);
+        key(&mut app, "Down");
         key(&mut app, "Down");
         key(&mut app, "Return");
         assert!(matches!(

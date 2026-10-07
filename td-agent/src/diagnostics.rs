@@ -80,6 +80,36 @@ pub struct Sources {
     /// Why the stored key could not be read to look for, when it could
     /// not.
     pub key_problem: Option<String>,
+    /// One conversation's export: only its directory and its queued
+    /// messages are taken from the state directory, and the archive is
+    /// named for it.
+    pub conversation: Option<crate::store::Id>,
+}
+
+/// The archive's name, and its members' top directory.
+fn top(sources: &Sources) -> String {
+    match &sources.conversation {
+        Some(id) => format!("td-agent-conversation-{}", id.as_str()),
+        None => TOP.to_string(),
+    }
+}
+
+/// The state directories that hold one conversation's files.
+const CONVERSATION_DIRS: &[&str] = &["conversations", "outbox"];
+
+/// Whether a scoped walk may start at `path`: absent, no; a directory,
+/// not a link and not the key's, yes; anything else is why not.
+fn start(path: &Path, never: &Never) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.to_string()),
+        Ok(m) if m.file_type().is_symlink() => Err("a link".into()),
+        Ok(m) if !m.is_dir() => Err("not a directory".into()),
+        Ok(m) if Some(identity(&m)) == never.directory => {
+            Err("it is the configuration directory, which holds the key".into())
+        }
+        Ok(_) => Ok(true),
+    }
 }
 
 /// What an export made.
@@ -88,6 +118,8 @@ pub struct Exported {
     pub path: PathBuf,
     pub files: usize,
     pub left_out: usize,
+    /// Whether it is one conversation's.
+    pub one: bool,
     /// What did not go as asked: why the archive is not compressed, or
     /// that the uncompressed one could not be removed.
     pub remark: Option<String>,
@@ -115,7 +147,7 @@ fn export_within(
         .chars()
         .filter(|c| !matches!(c, '-' | ':'))
         .collect();
-    let base = free_name(into, &stamp, compressors)?;
+    let base = free_name(into, &top(sources), &stamp, compressors)?;
     let archive = with_suffix(&base, "tar");
     let part = with_suffix(&archive, PART);
     let file = create(&part)?;
@@ -137,6 +169,7 @@ fn export_within(
         path,
         files,
         left_out,
+        one: sources.conversation.is_some(),
         remark,
     })
 }
@@ -151,11 +184,16 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 /// The first name in `into` for this export that no file, finished or
 /// partial, compressed or not, already has.
-fn free_name(into: &Path, stamp: &str, compressors: &[Compressor]) -> Result<PathBuf, String> {
+fn free_name(
+    into: &Path,
+    top: &str,
+    stamp: &str,
+    compressors: &[Compressor],
+) -> Result<PathBuf, String> {
     (0..100)
         .map(|n| match n {
-            0 => into.join(format!("{TOP}-{stamp}")),
-            n => into.join(format!("{TOP}-{stamp}-{n}")),
+            0 => into.join(format!("{top}-{stamp}")),
+            n => into.join(format!("{top}-{stamp}-{n}")),
         })
         .find(|base| {
             let tar = with_suffix(base, "tar");
@@ -285,6 +323,7 @@ fn write(
     limits: Limits,
 ) -> Result<(usize, usize), String> {
     let never = Never::of(sources);
+    let top = top(sources);
     let mut walk = Walk {
         found: Vec::new(),
         left_out: Vec::new(),
@@ -296,7 +335,34 @@ fn write(
             "state/".into(),
             "it is the configuration directory, which holds the key".into(),
         )),
-        _ => descend(&sources.state, "state", 0, &never, &mut walk),
+        _ => match &sources.conversation {
+            None => descend(&sources.state, "state", 0, &never, &mut walk),
+            // Its own directories alone, as the whole export names them;
+            // one it has none of is not there to take.
+            Some(id) => {
+                for dir in CONVERSATION_DIRS {
+                    let parent = sources.state.join(dir);
+                    let path = parent.join(id.as_str());
+                    let name = format!("state/{dir}/{}", id.as_str());
+                    // Each step a directory of its own, as the whole
+                    // walk would reach it: no link, never the key's.
+                    let reached = start(&parent, &never).and_then(|found| match found {
+                        true => start(&path, &never),
+                        false => Ok(false),
+                    });
+                    match reached {
+                        Ok(true) => descend(&path, &name, 2, &never, &mut walk),
+                        // A conversation always has its directory; its
+                        // queued messages only while there are some.
+                        Ok(false) if *dir == "conversations" => walk
+                            .left_out
+                            .push((format!("{name}/"), "no such conversation".into())),
+                        Ok(false) => {}
+                        Err(why) => walk.left_out.push((format!("{name}/"), why)),
+                    }
+                }
+            }
+        },
     }
     walk.found.sort_by(|a, b| a.name.cmp(&b.name));
     if let Some(config) = &sources.config {
@@ -333,7 +399,7 @@ fn write(
             left_out.push((found.name, "it holds the API key".into()));
             continue;
         }
-        let header = match header(&format!("{TOP}/{}", found.name), bytes.len() as u64, mtime) {
+        let header = match header(&format!("{top}/{}", found.name), bytes.len() as u64, mtime) {
             Ok(header) => header,
             Err(e) => {
                 left_out.push((found.name, e));
@@ -346,7 +412,7 @@ fn write(
     }
     left_out.sort();
     let manifest = manifest(sources, now, &taken, &left_out, beyond);
-    let header = header(&format!("{TOP}/MANIFEST"), manifest.len() as u64, now)?;
+    let header = header(&format!("{top}/MANIFEST"), manifest.len() as u64, now)?;
     entry(&mut out, &header, manifest.as_bytes())?;
     out.write_all(&[ZEROS, ZEROS].concat())
         .map_err(|e| e.to_string())?;
@@ -493,10 +559,17 @@ fn manifest(
         .map(|text| text.trim().to_string())
         .unwrap_or_else(|_| "unknown".into());
     let mut text = format!(
-        "td-agent diagnostics\nversion: {}\nmade: {}\nkernel: {kernel}\nstate: {}\nconfig: {} (copied as written: read it before sharing)\n",
+        "td-agent diagnostics\nversion: {}\nmade: {}\nkernel: {kernel}\nstate: {}\nscope: {}\nconfig: {} (copied as written: read it before sharing)\n",
         env!("CARGO_PKG_VERSION"),
         crate::history::utc(now),
         sources.state.display(),
+        sources.conversation.as_ref().map_or_else(
+            || "the whole state directory".to_string(),
+            |id| format!(
+                "conversation {0}: its state/conversations/{0}/ and the messages queued for it in state/outbox/{0}/; no other conversation's files and none of the state directory's shared ones",
+                id.as_str()
+            )
+        ),
         sources
             .config
             .as_ref()
@@ -703,6 +776,14 @@ mod tests {
         out
     }
 
+    fn manifest_of_named(path: &Path, top: &str) -> String {
+        let bytes = std::fs::read(path).unwrap();
+        let members = members(&bytes);
+        let (name, body) = members.last().unwrap();
+        assert_eq!(name, &format!("{top}/MANIFEST"));
+        String::from_utf8(body.clone()).unwrap()
+    }
+
     fn manifest_of(path: &Path) -> String {
         let bytes = std::fs::read(path).unwrap();
         let members = members(&bytes);
@@ -744,6 +825,7 @@ mod tests {
             key_file: Some(key_file),
             keys: vec![Secret::new(KEY.into())],
             key_problem: None,
+            conversation: None,
         }
     }
 
@@ -817,6 +899,126 @@ mod tests {
         assert_eq!(
             again.path,
             out.join("td-agent-diagnostics-20261003T040000Z-1.tar")
+        );
+    }
+
+    /// One conversation's export takes its directory and its queued
+    /// messages, the configuration and the manifest, and nothing else of
+    /// the state; it is named for the conversation, and a file holding
+    /// the key is left out as in the whole one.
+    #[test]
+    fn one_conversations_archive_holds_its_own_files_alone() {
+        let scratch = Scratch::new("diagnostics-conversation");
+        let mut sources = sources(&scratch);
+        let id = "a".repeat(32);
+        let conversation = sources.state.join("conversations").join(&id);
+        std::fs::write(conversation.join("leaky"), format!("x {KEY} y")).unwrap();
+        let other = sources.state.join("conversations").join("b".repeat(32));
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("log"), "other").unwrap();
+        sources.conversation = Some(crate::store::Id::parse(&id).unwrap());
+        let out = out(&scratch, "out");
+        let exported = export(&sources, &out, NOW, &[]).unwrap();
+        let top = format!("td-agent-conversation-{id}");
+        assert_eq!(
+            exported.path,
+            out.join(format!("{top}-20261003T040000Z.tar"))
+        );
+        let bytes = std::fs::read(&exported.path).unwrap();
+        assert!(!holds(&bytes, KEY.as_bytes()), "the key is in the archive");
+        let members = members(&bytes);
+        let names: Vec<String> = members.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(
+            names,
+            [
+                format!("{top}/state/conversations/{id}/log"),
+                format!("{top}/state/conversations/{id}/meta"),
+                format!("{top}/state/outbox/{id}/{:020}-{}", 7, "d".repeat(32)),
+                format!("{top}/config"),
+                format!("{top}/MANIFEST"),
+            ]
+        );
+        let manifest = String::from_utf8(members[4].1.clone()).unwrap();
+        assert!(
+            manifest.contains(&format!("scope: conversation {id}: ")),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains(&format!(
+                "state/conversations/{id}/leaky: it holds the API key"
+            )),
+            "{manifest}"
+        );
+        // One with no queued messages has none to take.
+        let lone = "c".repeat(32);
+        let dir = sources.state.join("conversations").join(&lone);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("log"), "lone").unwrap();
+        sources.conversation = Some(crate::store::Id::parse(&lone).unwrap());
+        let exported = export(&sources, &out, NOW, &[]).unwrap();
+        assert_eq!((exported.files, exported.left_out), (2, 0));
+        // One that is not there is said not to be.
+        let gone = "e".repeat(32);
+        sources.conversation = Some(crate::store::Id::parse(&gone).unwrap());
+        let exported = export(&sources, &out, NOW, &[]).unwrap();
+        assert_eq!((exported.files, exported.left_out), (1, 1));
+        let manifest = manifest_of_named(&exported.path, &format!("td-agent-conversation-{gone}"));
+        assert!(
+            manifest.contains(&format!(
+                "state/conversations/{gone}/: no such conversation"
+            )),
+            "{manifest}"
+        );
+    }
+
+    /// A scoped walk starts only where the whole one would reach: a
+    /// linked `outbox` (here to the jail directories, which hold the
+    /// human's work) or a conversation directory that is the key's
+    /// directory under another name is left out, said why.
+    #[test]
+    fn one_conversations_walk_follows_no_link_and_never_the_key_directory() {
+        let scratch = Scratch::new("diagnostics-conversation-links");
+        let mut sources = sources(&scratch);
+        let id = "a".repeat(32);
+        let outbox = sources.state.join("outbox");
+        std::fs::remove_dir_all(&outbox).unwrap();
+        let aside = sources.state.join("jail");
+        std::fs::create_dir_all(aside.join(&id)).unwrap();
+        std::fs::write(aside.join(&id).join("work"), "the human's").unwrap();
+        symlink(&aside, &outbox).unwrap();
+        sources.conversation = Some(crate::store::Id::parse(&id).unwrap());
+        let out = out(&scratch, "out");
+        let exported = export(&sources, &out, NOW, &[]).unwrap();
+        let top = format!("td-agent-conversation-{id}");
+        let bytes = std::fs::read(&exported.path).unwrap();
+        assert!(!holds(&bytes, b"the human's"), "the link was followed");
+        let manifest = manifest_of_named(&exported.path, &top);
+        assert!(
+            manifest.contains(&format!("state/outbox/{id}/: a link")),
+            "{manifest}"
+        );
+        // The conversation directory the key's directory, renamed in.
+        let key_directory = sources
+            .key_file
+            .as_ref()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let conversation = sources.state.join("conversations").join(&id);
+        std::fs::remove_dir_all(&conversation).unwrap();
+        std::fs::rename(&key_directory, &conversation).unwrap();
+        sources.key_file = Some(conversation.join(crate::key::FILE));
+        sources.keys = Vec::new();
+        let again = export(&sources, &out, NOW, &[]).unwrap();
+        let bytes = std::fs::read(&again.path).unwrap();
+        assert!(!holds(&bytes, KEY.as_bytes()), "the key is in the archive");
+        let manifest = manifest_of_named(&again.path, &top);
+        assert!(
+            manifest.contains(&format!(
+                "state/conversations/{id}/: it is the configuration directory"
+            )),
+            "{manifest}"
         );
     }
 
