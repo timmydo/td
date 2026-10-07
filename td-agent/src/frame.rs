@@ -36,6 +36,12 @@ impl std::fmt::Display for Error {
 /// a reader never sees a header without the bytes it promises unless the
 /// stream breaks.
 pub fn write<W: Write + ?Sized>(stream: &mut W, payload: &[u8]) -> io::Result<()> {
+    stream.write_all(&encode(payload)?)?;
+    stream.flush()
+}
+
+/// `payload` as one frame's bytes, its length first.
+pub fn encode(payload: &[u8]) -> io::Result<Vec<u8>> {
     if payload.len() > MAX_FRAME {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -47,8 +53,7 @@ pub fn write<W: Write + ?Sized>(stream: &mut W, payload: &[u8]) -> io::Result<()
     let mut bytes = Vec::with_capacity(payload.len().saturating_add(4));
     bytes.extend_from_slice(&length.to_be_bytes());
     bytes.extend_from_slice(payload);
-    stream.write_all(&bytes)?;
-    stream.flush()
+    Ok(bytes)
 }
 
 /// The next frame, or `None` when the stream ends cleanly between frames.

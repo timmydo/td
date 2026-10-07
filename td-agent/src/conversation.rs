@@ -2619,7 +2619,8 @@ impl Session {
                 return Err(CALL_UNANSWERED.into());
             }
             match client.next_reply(HOST_POLL) {
-                None | Some(Ok(host::Up::Output { .. })) => {}
+                // A link's frame goes to its links, never here.
+                None | Some(Ok(host::Up::Output { .. } | host::Up::Link(_))) => {}
                 Some(Err(why)) => return Err(why),
                 Some(Ok(host::Up::Done { outcome, .. })) => {
                     self.bench.keep(&call, client);
@@ -3623,6 +3624,12 @@ impl Session {
             return Ok(crate::prompt::prefix(meta.created));
         };
         let state = StateDir::at(self.state.clone());
+        // The network its commands reach, as the settings give it now.
+        self.bench.set_network(crate::egress::Egress {
+            network: client.network_for(workspace),
+            allowlist: client.network_allowlist.clone(),
+            relay: crate::egress::relay_here(),
+        });
         let policy = self
             .bench
             .prepare(
@@ -3856,7 +3863,8 @@ impl Session {
                 return failed(CALL_UNANSWERED.into());
             }
             match client.next_reply(HOST_POLL) {
-                None | Some(Ok(host::Up::Output { .. })) => {}
+                // A link's frame goes to its links, never here.
+                None | Some(Ok(host::Up::Output { .. } | host::Up::Link(_))) => {}
                 // The instance is gone, and with it the call.
                 Some(Err(why)) => return failed(why),
                 Some(Ok(host::Up::Done { outcome, .. })) => {

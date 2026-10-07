@@ -28,16 +28,23 @@ pub struct Config {
     /// the first root: a repository workspace's first worktree, which
     /// may not be bound yet.
     pub directory: Option<PathBuf>,
+    /// Whether this instance serves the network proxy (DESIGN.md §10),
+    /// and its commands are pointed at it.
+    pub proxy: bool,
 }
 
 impl Config {
     /// `--root DIR` (repeated), `--txt PATH` and `--directory DIR`, each
-    /// absolute.
+    /// absolute, and `--proxy`.
     pub fn parse(args: &[String]) -> Result<Self, String> {
-        let usage = "usage: td-agent tool-host [--txt ABSOLUTE-PATH] [--directory ABSOLUTE-DIR] [--root ABSOLUTE-DIR]...";
+        let usage = "usage: td-agent tool-host [--proxy] [--txt ABSOLUTE-PATH] [--directory ABSOLUTE-DIR] [--root ABSOLUTE-DIR]...";
         let mut config = Self::default();
         let mut rest = args.iter();
         while let Some(flag) = rest.next() {
+            if flag == "--proxy" {
+                config.proxy = true;
+                continue;
+            }
             let value = PathBuf::from(rest.next().ok_or(usage)?);
             if !value.is_absolute() {
                 return Err(format!("{} is not an absolute path", value.display()));
@@ -151,6 +158,12 @@ pub fn serve(
     config: Config,
 ) -> Result<(), String> {
     let (outbox, frames) = mpsc::sync_channel::<Up>(OUTBOX);
+    // Before any call, so a command never runs pointed at a proxy that is
+    // not there.
+    let proxy = match config.proxy {
+        true => Some(crate::proxy::start(outbox.clone(), crate::proxy::PORT)?.0),
+        false => None,
+    };
     // One writer, so a call's output frames come before its end.
     let writer = std::thread::Builder::new()
         .spawn(move || {
@@ -169,6 +182,11 @@ pub fn serve(
             Err(e) => break Err(format!("the conversation's frames: {e}")),
         };
         match Down::decode(&bytes) {
+            Ok(Down::Link(link)) => {
+                if let Some(proxy) = &proxy {
+                    proxy.down(link);
+                }
+            }
             Ok(Down::Cancel { id }) => {
                 if let Some(flag) = running.lock().ok().and_then(|r| r.get(&id).cloned()) {
                     flag.store(true, Ordering::Relaxed);
@@ -248,6 +266,9 @@ pub fn serve(
     cancel_all(&running);
     for thread in threads {
         let _ = thread.join();
+    }
+    if let Some(proxy) = &proxy {
+        proxy.stop();
     }
     drop(outbox);
     let _ = writer.join();
@@ -393,7 +414,12 @@ fn act(
             if !dir.is_dir() {
                 return Err(format!("`workdir` {} is not a directory", dir.display()));
             }
-            let exit = shell::run(shell::shell(command, &dir), timeout, cancel, sink)?;
+            let exit = shell::run(
+                shell::shell(command, &dir, config.proxy),
+                timeout,
+                cancel,
+                sink,
+            )?;
             Ok(Done {
                 text: exit.render(),
                 kept: Some(exit.output.text()),
@@ -414,7 +440,12 @@ fn act(
             if !dir.is_dir() {
                 return Err(format!("`workdir` {} is not a directory", dir.display()));
             }
-            let exit = shell::run_whole(shell::shell(command, &dir), timeout, cancel, sink)?;
+            let exit = shell::run_whole(
+                shell::shell(command, &dir, config.proxy),
+                timeout,
+                cancel,
+                sink,
+            )?;
             let mut text = exit.status();
             if exit.cut {
                 text.push_str(shell::CUT_NOTE);
@@ -891,6 +922,7 @@ mod tests {
             roots: vec![other.clone()],
             txt: None,
             directory: Some("/w/not-yet".into()),
+            proxy: false,
         });
         let id = client
             .call(Call::Shell {
@@ -913,6 +945,7 @@ mod tests {
             roots: vec![other.clone(), "/w/ready".into()],
             txt: None,
             directory: Some("/w/ready".into()),
+            proxy: false,
         });
         let config = Config::parse(&["--directory".into(), "/w/ready".into()]).unwrap();
         assert_eq!(config.directory, Some(PathBuf::from("/w/ready")));

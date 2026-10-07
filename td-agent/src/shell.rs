@@ -363,14 +363,18 @@ fn run_draining(
     })
 }
 
-/// A `shell` call: `sh -c command` in `workdir`.
-pub fn shell(command: &str, workdir: &Path) -> Command {
+/// A `shell` call: `sh -c command` in `workdir`, pointed at the network
+/// proxy when `proxy` says this instance serves one (DESIGN.md §10).
+pub fn shell(command: &str, workdir: &Path, proxy: bool) -> Command {
     let mut sh = Command::new("sh");
     sh.arg("-c")
         .arg(command)
         .current_dir(workdir)
         .env_clear()
         .envs(environment());
+    if proxy {
+        sh.envs(crate::proxy::environment());
+    }
     sh
 }
 
@@ -536,7 +540,7 @@ mod tests {
     fn quick(command: &str) -> Exit {
         let never = AtomicBool::new(false);
         run(
-            shell(command, &std::env::temp_dir()),
+            shell(command, &std::env::temp_dir(), false),
             Duration::from_secs(10),
             &never,
             &mut |_| {},
@@ -561,7 +565,7 @@ mod tests {
         let never = AtomicBool::new(false);
         let mut seen = Vec::new();
         let exit = run(
-            shell("echo started; exec sleep 30", &std::env::temp_dir()),
+            shell("echo started; exec sleep 30", &std::env::temp_dir(), false),
             Duration::from_millis(300),
             &never,
             &mut |chunk| seen.extend_from_slice(chunk),
@@ -574,7 +578,7 @@ mod tests {
         assert!(exit.status().starts_with("timed out after"));
         let cancelled = AtomicBool::new(true);
         let exit = run(
-            shell("exec sleep 30", &std::env::temp_dir()),
+            shell("exec sleep 30", &std::env::temp_dir(), false),
             Duration::from_secs(30),
             &cancelled,
             &mut |_| {},
@@ -598,7 +602,7 @@ mod tests {
         let never = AtomicBool::new(false);
         let started = Instant::now();
         let exit = run(
-            shell("while :; do echo y; done", &std::env::temp_dir()),
+            shell("while :; do echo y; done", &std::env::temp_dir(), false),
             Duration::from_millis(300),
             &never,
             &mut |_| {},
@@ -608,7 +612,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         let cancelled = AtomicBool::new(true);
         let exit = run(
-            shell("while :; do echo y; done", &std::env::temp_dir()),
+            shell("while :; do echo y; done", &std::env::temp_dir(), false),
             Duration::from_secs(30),
             &cancelled,
             &mut |_| {},

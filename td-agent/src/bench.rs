@@ -29,6 +29,9 @@ pub struct Bench {
     policy: Option<(Vec<Shared>, Vec<PathBuf>, Policy, PathBuf)>,
     /// The file tools' instance, between calls.
     files: Option<Client>,
+    /// What a command's instance reaches the network by (DESIGN.md §10),
+    /// none when its policy is `off`.
+    egress: Option<crate::egress::Egress>,
     digests: BTreeMap<String, String>,
 }
 
@@ -123,7 +126,19 @@ impl Bench {
             .policy
             .as_ref()
             .ok_or("the workspace is not prepared")?;
-        jail::launch(programs, policy, specs)
+        // Only a command's instance runs what would reach the network.
+        let egress = match call {
+            Call::Shell { .. } | Call::Background { .. } => self.egress.clone(),
+            _ => None,
+        };
+        jail::launch_linked(programs, policy, specs, egress)
+    }
+
+    /// The network a command's instance is given: `network`, the
+    /// allowlist it is judged by, and the relay it goes out through; `off`
+    /// gives none, and no proxy.
+    pub fn set_network(&mut self, egress: crate::egress::Egress) {
+        self.egress = (egress.network != crate::config::Network::Off).then_some(egress);
     }
 
     /// Keeps the file tools' instance for the next call; a fresh one is

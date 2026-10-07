@@ -36,9 +36,12 @@ asynchronously, step snapshots with undo, and notifications (§7, §9,
 cards, modes, the two-stage classifier with its calibrated threshold,
 the circuit breaker and the trust mark (§11); and increment 16,
 compaction, by hand and past `compact_at`, and the card that asks how to
-resume a conversation whose cache has gone cold (§14). Increments 14 and
-15, the push and fetch tools and the network, are not yet built, so a
-model cannot push and nothing leaves a workspace's jail. Where building
+resume a conversation whose cache has gone cold (§14). Increment 14,
+the push and fetch tools, is built; increment 15, the network, is built
+but for its crossings and network rules, so a workspace's commands
+reach its allowlist, or anywhere under `open`, through its proxy and
+the egress relay, and a destination off the allowlist is refused rather
+than asked about (§10). Where building
 an increment settled a point the design left open, the section says so
 under "As built". No recipe names td-agent yet. The decisions below that
 were the user's to make were made on 2026-10-01, 2026-10-02 and
@@ -3652,6 +3655,99 @@ never widens what its conversations reach. A template made in the
 window names no policy of its own. The status row's `network` item
 says the open conversation's workspace's, `off` for a conversation with
 no workspace, and `network`'s with none open.
+
+As built (the proxy). A conversation hands its `Bench` the workspace's
+`egress::Egress` (its policy, the allowlist and the relay's socket,
+`td-egress/socket` under `XDG_RUNTIME_DIR` when it is there) each time
+it works out its prefix; `off` gives none. Only a `shell` call's or a
+background process's fresh instance is given it: td-jail starts that
+tool host with `--proxy`, and the tool host binds `127.0.0.1:3128`
+(`proxy::PORT`) before it serves a call, failing whole if it cannot,
+and sets each command's `http_proxy`, `https_proxy` and `all_proxy`,
+both cases, to `http://127.0.0.1:3128` and `no_proxy`/`NO_PROXY` to
+`localhost,127.0.0.1,::1`. The file tools' instance, and every instance
+of an `off` workspace, has no proxy and no variables.
+
+The proxy (`src/proxy.rs`) reads a request head of at most 16 KiB
+within 30 seconds: `CONNECT host:port` for a tunnel, or an absolute
+`http://` URL; any other form is answered 400, HTTP/2 505, and a
+loopback or unspecified host, `localhost` and `*.localhost` included,
+403 before anything goes up. A plain request's connection carries that
+request alone, so a later one on it never reaches the first one's
+destination with its own headers: the request line becomes the path,
+the `Host` header the URL's authority, the `Proxy-`, `Connection` and
+`Keep-Alive` headers are dropped and `Connection: close` added, and
+the body is carried as far as its `Content-Length` says and no
+further, what follows it read only to see the client end; a body of no
+stated length (`Transfer-Encoding`) is refused 501, so a chunked upload
+over plain `http://` (a large push to an http remote) does not go, and
+two lengths, a folded header line or a header name with space in it are
+refused 400. A client that wants a second request opens a second
+connection, as clients do when a response says `close`. Each connection is then a link
+(`host::Link`) over the instance's pipe: `Open` up with the host and
+port as the client gave them, then `Opened` or `Refused` down, then
+`Bytes` either way, at most 32 KiB each and sent as a binary frame (a
+zero byte, a kind byte, the link's id, the bytes) beside the calls'
+JSON ones, `Took` either way as bytes are delivered, and `Shut`. Each
+direction sends at most 256 KiB past the other end's `Took`
+(`host::Credit`), so a slow reader holds its own link and never the
+pipe; td-agent shuts a link whose tool host sends past it. A tool host
+holds at most 32 links, each until both its directions have ended,
+the client's end waking the side that waits on td-agent; a link waits
+at most 30 minutes to be opened, and a refused one is answered 403 with
+td-agent's reason, which a client shows (git: `remote: td-agent:
+other.test:80 is not on this workspace's allowlist`). When its input
+ends, the tool host stops the proxy, which sends nothing more and
+lets go of every link, so the host finishes.
+
+td-agent's side (`src/egress.rs`) is fed by the client's reader thread,
+so a link's frames never wait on the conversation, and writes down
+through the one writer the calls use, `egress::Pipe`: each frame is
+written whole within 30 seconds however slowly the tool host reads (the
+jailed pipe's writes return each second to look at the deadline); once
+one fails every later one, a call's or a cancel's included, fails at
+once; and a call's or a cancel's frame goes before any link's waiting,
+so it waits at most for the one frame being written, 30 seconds, and
+then its own, a minute at worst; a link's frame kept waiting by calls
+past its 30 seconds breaks the pipe, as a slow one does, rather than
+being dropped and its link left waiting on it. A tool host that
+stops reading costs the conversation a failed instance and never a held
+thread. (An unjailed tool host's pipe, the development path, has no
+write timeout, so a frame's deadline is looked at only between writes.) It takes every `Open` frame
+as the jail's: ids must rise, so none is reused; it judges the
+destination on the reader thread, so a refusal costs no thread: `open`
+admits any host, `allowlist` a host and port on the workspace's list,
+compared after the configuration's normalization (case, a trailing dot,
+IPv6 brackets), and either refuses what is not a host; and at most 40
+links hold a thread, the proxy's 32 and room for threads still
+finishing links that ended, each counted until its thread ends however
+its link ended, so opening and shutting links at any pace holds no more. A
+link's sender lives only in its place, so giving the place up ends the
+thread writing to the relay. A refusal's reason is cut to the 1 KiB a
+`Refused` frame carries. An admitted
+link is opened through the relay, `connect HOST PORT`, an IPv6 host in
+brackets; the relay's refusal comes back as the link's reason, and with
+no relay socket every link is refused saying td-agent was not launched
+by td-net. Until the crossings land, a destination off the allowlist is
+refused, not asked.
+
+What remains of this as built: a background process's link frames
+share its reply queue's reader with its output, so a conversation that
+stops draining a background process's output stalls that process's
+network too; a link's frames share the tool host's outbox with a call's
+live output, which is dropped when the outbox is full, so heavy network
+traffic thins a running command's live output (its kept output is
+whole); a background process keeps the network it started with, so
+narrowing a workspace's policy reaches its next command and not one
+already running; the relay is one pool for every conversation, 64
+connections at once, which one workspace's links, 32 to an instance,
+can fill for as long as they are used; and the allowlist bounds the
+connection's destination, not the origin a shared front serves, which
+a tunnel's TLS names in its SNI (a plain request's `Host` is its URL's);
+and a link has no half-close, so a client that shuts its sending side
+to say it is done ends the link, its answer with it: a tunnel's, and a
+plain request's too, whose client's end is read for so that one that
+leaves frees its place.
 
 As built (the relay): `td-egressd` (net/src/egress.rs) and
 APPLICATIONS.md §W.8 item 6, which states its protocol, deadlines and

@@ -265,23 +265,43 @@ fn write_spec(dir: &Path, text: &str) -> Result<PathBuf, String> {
 /// this process: td-jail ties itself to the thread that starts it, so a
 /// conversation launches from its main thread (§8).
 pub fn launch(programs: &Programs, policy: &Policy, spec_dir: &Path) -> Result<Client, String> {
+    launch_linked(programs, policy, spec_dir, None)
+}
+
+/// `launch`, the tool host serving the network proxy when `egress` is
+/// given, whose links it judges and opens (DESIGN.md §10).
+pub fn launch_linked(
+    programs: &Programs,
+    policy: &Policy,
+    spec_dir: &Path,
+    egress: Option<crate::egress::Egress>,
+) -> Result<Client, String> {
     let policy = Policy {
         home: private_dir(&policy.home)?,
         ..policy.clone()
     };
     let spec = write_spec(spec_dir, &spec_text(programs, &policy, &host_path())?)?;
-    let launched = start(programs, &policy, &spec);
+    let launched = start(programs, &policy, &spec, egress);
     if launched.is_err() {
         let _ = fs::remove_file(&spec);
     }
     launched
 }
 
-fn start(programs: &Programs, policy: &Policy, spec: &Path) -> Result<Client, String> {
+fn start(
+    programs: &Programs,
+    policy: &Policy,
+    spec: &Path,
+    egress: Option<crate::egress::Egress>,
+) -> Result<Client, String> {
     let (ours, theirs) = UnixStream::pair().map_err(|e| format!("the jail's channel: {e}"))?;
     let channel = |e: io::Error| format!("the jail's channel: {e}");
     let theirs_in = theirs.try_clone().map_err(channel)?;
     let reader = ours.try_clone().map_err(channel)?;
+    // Each write returns within a step, so `egress::Pipe` holds a frame to
+    // its deadline however slowly a tool host reads.
+    ours.set_write_timeout(Some(crate::egress::PIPE_STEP))
+        .map_err(channel)?;
     let mut command = Command::new(&programs.jail);
     // td-jail gives the instance its own fixed environment; nothing of
     // this process's reaches even its outer stages.
@@ -293,6 +313,9 @@ fn start(programs: &Programs, policy: &Policy, spec: &Path) -> Result<Client, St
         .arg("tool-host")
         .arg("--txt")
         .arg(Programs::inside(&programs.txt)?);
+    if egress.is_some() {
+        command.arg("--proxy");
+    }
     if let Some(directory) = &policy.directory {
         command.arg("--directory").arg(directory);
     }
@@ -317,7 +340,7 @@ fn start(programs: &Programs, policy: &Policy, spec: &Path) -> Result<Client, St
     if reading.is_none() {
         tail.end();
     }
-    Ok(Client::over(reader, ours).owning(child, spec.to_path_buf(), tail))
+    Ok(Client::linked(reader, ours, egress).owning(child, spec.to_path_buf(), tail))
 }
 
 /// Runs `task` in a maintenance instance of `policy` (DESIGN.md §9), its

@@ -249,6 +249,100 @@ fn plain(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+/// A command's network goes through its instance's proxy (DESIGN.md
+/// §10): the proxy variables point at it, a destination on the allowlist
+/// goes to the egress relay, here a stand-in, named as asked and its
+/// request rewritten to its path, and one off it is refused with the
+/// reason; an instance with no network has no proxy and no variables.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL, TD_AGENT_TXT and a host git"]
+fn a_commands_network_goes_through_the_proxy_to_the_relay() {
+    use std::io::{Read, Write};
+    use td_agent::config::{Destination, Network};
+    use td_agent::egress::Egress;
+    if bound_git().is_none() {
+        eprintln!("no host git a jail binds: skipped");
+        return;
+    }
+    let scratch = Scratch::new("proxy");
+    let relay = std::env::temp_dir().join(format!(
+        "td-agent-relay-{}-{}",
+        std::process::id(),
+        td_agent::store::random_hex(4).unwrap()
+    ));
+    let listener = std::os::unix::net::UnixListener::bind(&relay).unwrap();
+    let (tell, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let until = |stream: &mut std::os::unix::net::UnixStream, end: &[u8]| {
+            let mut got = Vec::new();
+            let mut byte = [0u8; 1];
+            while !got.ends_with(end) && stream.read(&mut byte).unwrap_or(0) == 1 {
+                got.extend_from_slice(&byte);
+            }
+            String::from_utf8_lossy(&got).into_owned()
+        };
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let head = until(&mut stream, b"\n\n");
+            stream.write_all(b"td-egress 1\nok\n\n").unwrap();
+            let request = until(&mut stream, b"\r\n\r\n");
+            let _ = tell.send((head, request));
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    let egress = Egress {
+        network: Network::Allowlist,
+        allowlist: vec![Destination::parse("example.test:80").unwrap()],
+        relay: Some(relay.clone()),
+    };
+    let mut client = jail::launch_linked(
+        &programs(),
+        &scratch.policy(),
+        &scratch.0.join("jail"),
+        Some(egress),
+    )
+    .unwrap();
+    let said = shell(
+        &mut client,
+        "echo $https_proxy $NO_PROXY; git ls-remote http://example.test/repo.git 2>&1; \
+         git ls-remote http://other.test/repo.git 2>&1",
+    );
+    assert!(
+        said.contains("http://127.0.0.1:3128 localhost,127.0.0.1,::1"),
+        "{said}"
+    );
+    let (head, request) = heard.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(head, "td-egress 1\nconnect example.test 80\n\n");
+    assert!(
+        request.starts_with("GET /repo.git/info/refs?service=git-upload-pack HTTP/1.1\r\n"),
+        "{request}"
+    );
+    assert!(request.contains("Host: example.test\r\n"), "{request}");
+    assert!(
+        !request.to_ascii_lowercase().contains("proxy-"),
+        "{request}"
+    );
+    // The relay's 404, as the client says it.
+    assert!(
+        said.contains("repository 'http://example.test/repo.git/' not found"),
+        "{said}"
+    );
+    assert!(
+        said.contains("other.test:80 is not on this workspace's allowlist"),
+        "{said}"
+    );
+    assert!(said.contains("403"), "{said}");
+    // The second never reached the relay.
+    assert!(heard.recv_timeout(Duration::from_millis(300)).is_err());
+    drop(client);
+    let mut plain = jail::launch(&programs(), &scratch.policy(), &scratch.0.join("jail")).unwrap();
+    let said = shell(&mut plain, "echo \"[$https_proxy$HTTP_PROXY]\"");
+    assert!(said.contains("[]"), "{said}");
+    let _ = std::fs::remove_file(&relay);
+}
+
 /// The host's git as an instance sees it: where `git` on PATH resolves,
 /// when that is a system tree the jail binds.
 fn bound_git() -> Option<PathBuf> {

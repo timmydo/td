@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::frame;
@@ -29,6 +29,21 @@ pub const MAX_CALLS: usize = 16;
 pub const OUTPUT_CHUNK: usize = 32 * 1024;
 /// The most replies read ahead of the conversation taking them.
 const REPLY_QUEUE: usize = 64;
+/// The most bytes of one `Link::Bytes`.
+pub const LINK_CHUNK: usize = 32 * 1024;
+/// The most bytes either end of a link sends ahead of the other end's
+/// `Took` (DESIGN.md §10).
+pub const LINK_WINDOW: u64 = 256 * 1024;
+/// The most links one tool host holds open at once.
+pub const MAX_LINKS: usize = 32;
+/// The longest host a link's `Open` names, and the longest reason a
+/// `Refused` gives.
+const MAX_LINK_HOST: usize = 255;
+pub const MAX_LINK_WHY: usize = 1024;
+/// A binary frame's first byte, which no JSON text begins with, and its
+/// one kind: a link's bytes.
+const BINARY: u8 = 0;
+const BINARY_BYTES: u8 = 1;
 
 /// A tool call, as the tool host performs it (§12).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,6 +117,193 @@ pub enum Call {
     },
 }
 
+/// A proxied connection's frame (DESIGN.md §10), over the same pipe as
+/// calls: the tool host's proxy opens a link and td-agent decides it,
+/// then bytes go both ways, each end sending at most `LINK_WINDOW` past
+/// what the other has said it `Took`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Link {
+    /// Up: the proxy took a connection for `host:port`.
+    Open { link: u64, host: String, port: u16 },
+    /// Down: td-agent opened it through the egress relay.
+    Opened { link: u64 },
+    /// Down: td-agent did not, and why.
+    Refused { link: u64, why: String },
+    /// Either way: bytes, at most `LINK_CHUNK`.
+    Bytes { link: u64, data: Vec<u8> },
+    /// Either way: this end is done with the link.
+    Shut { link: u64 },
+    /// Either way: this end delivered `bytes` of the other's.
+    Took { link: u64, bytes: u64 },
+}
+
+impl Link {
+    pub fn id(&self) -> u64 {
+        match self {
+            Self::Open { link, .. }
+            | Self::Opened { link }
+            | Self::Refused { link, .. }
+            | Self::Bytes { link, .. }
+            | Self::Shut { link }
+            | Self::Took { link, .. } => *link,
+        }
+    }
+
+    /// A link's bytes as a binary frame, its other frames as JSON.
+    fn encode(&self) -> Vec<u8> {
+        let number = |n: u64| Json::Num(n.to_string());
+        let json = match self {
+            Self::Bytes { link, data } => {
+                let mut bytes = Vec::with_capacity(data.len().saturating_add(10));
+                bytes.push(BINARY);
+                bytes.push(BINARY_BYTES);
+                bytes.extend_from_slice(&link.to_be_bytes());
+                bytes.extend_from_slice(data);
+                return bytes;
+            }
+            Self::Open { link, host, port } => vec![
+                ("link".into(), Json::Str("open".into())),
+                ("id".into(), number(*link)),
+                ("host".into(), Json::Str(host.clone())),
+                ("port".into(), number(u64::from(*port))),
+            ],
+            Self::Opened { link } => vec![
+                ("link".into(), Json::Str("opened".into())),
+                ("id".into(), number(*link)),
+            ],
+            Self::Refused { link, why } => vec![
+                ("link".into(), Json::Str("refused".into())),
+                ("id".into(), number(*link)),
+                ("why".into(), Json::Str(why.clone())),
+            ],
+            Self::Shut { link } => vec![
+                ("link".into(), Json::Str("shut".into())),
+                ("id".into(), number(*link)),
+            ],
+            Self::Took { link, bytes } => vec![
+                ("link".into(), Json::Str("took".into())),
+                ("id".into(), number(*link)),
+                ("bytes".into(), number(*bytes)),
+            ],
+        };
+        Json::Obj(json).to_string().into_bytes()
+    }
+
+    /// A binary frame: a link's bytes, within `LINK_CHUNK`.
+    fn decode_binary(bytes: &[u8]) -> Result<Self, String> {
+        let (Some(&BINARY_BYTES), Some(id), Some(data)) =
+            (bytes.get(1), bytes.get(2..10), bytes.get(10..))
+        else {
+            return Err("a binary frame that is no link's bytes".into());
+        };
+        if data.is_empty() || data.len() > LINK_CHUNK {
+            return Err(format!("a link's bytes are 1 to {LINK_CHUNK}"));
+        }
+        let mut link = [0u8; 8];
+        link.copy_from_slice(id);
+        Ok(Self::Bytes {
+            link: u64::from_be_bytes(link),
+            data: data.to_vec(),
+        })
+    }
+
+    fn decode_json(value: &Json) -> Result<Self, String> {
+        let link = id_of(value, "id")?;
+        let kind = value.get("link").and_then(Json::as_str).unwrap_or_default();
+        Ok(match kind {
+            "open" => {
+                let host = value
+                    .get("host")
+                    .and_then(Json::as_str)
+                    .filter(|host| !host.is_empty() && host.len() <= MAX_LINK_HOST)
+                    .ok_or("a link's open names no host")?;
+                let port = value
+                    .get("port")
+                    .and_then(Json::as_u64)
+                    .and_then(|port| u16::try_from(port).ok())
+                    .filter(|port| *port != 0)
+                    .ok_or("a link's open names no port")?;
+                Self::Open {
+                    link,
+                    host: host.into(),
+                    port,
+                }
+            }
+            "opened" => Self::Opened { link },
+            "refused" => Self::Refused {
+                link,
+                why: value
+                    .get("why")
+                    .and_then(Json::as_str)
+                    .filter(|why| why.len() <= MAX_LINK_WHY)
+                    .ok_or("a link's refusal says no why")?
+                    .into(),
+            },
+            "shut" => Self::Shut { link },
+            "took" => Self::Took {
+                link,
+                bytes: id_of(value, "bytes")?,
+            },
+            other => return Err(format!("no link frame {other:?}")),
+        })
+    }
+}
+
+/// How many bytes one direction of a link has sent that the other end
+/// has not yet taken: a sender waits while `LINK_WINDOW` would be passed,
+/// until the link closes.
+pub struct Credit {
+    state: Mutex<(u64, bool)>,
+    wake: Condvar,
+}
+
+impl Default for Credit {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new((0, false)),
+            wake: Condvar::new(),
+        }
+    }
+}
+
+impl Credit {
+    /// Takes room for `n` bytes, waiting for it; false once closed.
+    pub fn take(&self, n: u64) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        loop {
+            if state.1 {
+                return false;
+            }
+            if state.0.saturating_add(n) <= LINK_WINDOW {
+                state.0 = state.0.saturating_add(n);
+                return true;
+            }
+            state = match self.wake.wait(state) {
+                Ok(state) => state,
+                Err(_) => return false,
+            };
+        }
+    }
+
+    /// The other end took `n` bytes.
+    pub fn give(&self, n: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.0 = state.0.saturating_sub(n);
+        }
+        self.wake.notify_all();
+    }
+
+    /// No more is sent: a waiting sender is let go.
+    pub fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.1 = true;
+        }
+        self.wake.notify_all();
+    }
+}
+
 /// From a conversation to its tool host.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Down {
@@ -114,6 +316,8 @@ pub enum Down {
     Cancel {
         id: u64,
     },
+    /// A link's: `Opened`, `Refused`, `Bytes`, `Shut` or `Took`.
+    Link(Link),
 }
 
 /// What a call came to.
@@ -139,6 +343,8 @@ pub enum Up {
         id: u64,
         outcome: Result<Done, String>,
     },
+    /// A link's: `Open`, `Bytes`, `Shut` or `Took`.
+    Link(Link),
 }
 
 fn opt_str(value: Option<&str>) -> Json {
@@ -411,12 +617,22 @@ impl Down {
                 ("args".into(), call.args()),
             ]),
             Self::Cancel { id } => Json::Obj(vec![("cancel".into(), Json::Num(id.to_string()))]),
+            Self::Link(link) => return link.encode(),
         };
         json.to_string().into_bytes()
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.first() == Some(&BINARY) {
+            return Link::decode_binary(bytes).map(Self::Link);
+        }
         let value = td_json::parse_slice(bytes).map_err(|e| e.to_string())?;
+        if value.get("link").is_some() {
+            return match Link::decode_json(&value)? {
+                Link::Open { .. } => Err("an open goes up, not down".into()),
+                link => Ok(Self::Link(link)),
+            };
+        }
         if value.get("cancel").is_some() {
             return Ok(Self::Cancel {
                 id: id_of(&value, "cancel")?,
@@ -454,13 +670,25 @@ impl Up {
                 }
                 Json::Obj(pairs)
             }
+            Self::Link(link) => return link.encode(),
         };
         json.to_string().into_bytes()
     }
 
     /// A reply, read as the untrusted data it is: well formed or refused.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.first() == Some(&BINARY) {
+            return Link::decode_binary(bytes).map(Self::Link);
+        }
         let value = td_json::parse_slice(bytes).map_err(|e| e.to_string())?;
+        if value.get("link").is_some() {
+            return match Link::decode_json(&value)? {
+                Link::Opened { .. } | Link::Refused { .. } => {
+                    Err("an opening's answer goes down, not up".into())
+                }
+                link => Ok(Self::Link(link)),
+            };
+        }
         let text = |name: &str| value.get(name).and_then(Json::as_str).map(String::from);
         if value.get("output").is_some() {
             return Ok(Self::Output {
@@ -485,7 +713,7 @@ impl Up {
 /// on a thread that reads them, and only replies to calls in flight are
 /// passed on.
 pub struct Client {
-    writer: Box<dyn Write + Send>,
+    writer: Arc<crate::egress::Pipe>,
     replies: Receiver<Result<Up, String>>,
     next: u64,
     open: BTreeSet<u64>,
@@ -505,29 +733,51 @@ const FAILURE_WAIT: Duration = Duration::from_secs(2);
 const DROP_WAIT: Duration = Duration::from_secs(5);
 
 impl Client {
-    /// Speaks to a tool host over `reader` and `writer`.
-    pub fn over(
+    /// Speaks to a tool host over `reader` and `writer`, with no links:
+    /// a link the host opens is refused.
+    pub fn over(reader: impl Read + Send + 'static, writer: impl Write + Send + 'static) -> Self {
+        Self::linked(reader, writer, None)
+    }
+
+    /// Speaks to a tool host over `reader` and `writer`, its links judged
+    /// and opened by `egress` (DESIGN.md §10), or refused without one.
+    pub fn linked(
         mut reader: impl Read + Send + 'static,
         writer: impl Write + Send + 'static,
+        egress: Option<crate::egress::Egress>,
     ) -> Self {
+        let writer = crate::egress::Pipe::new(writer, crate::egress::PIPE_WRITE);
+        let links = crate::egress::Links::new(egress, Arc::clone(&writer));
         // Bounded, so a tool host that floods is held at the pipe, not in
         // this process's memory.
         let (send, replies) = mpsc::sync_channel(REPLY_QUEUE);
-        std::thread::spawn(move || loop {
-            let reply = match frame::read(&mut reader) {
-                Ok(None) => return,
-                Ok(Some(bytes)) => Up::decode(&bytes),
-                Err(e) => {
-                    let _ = send.send(Err(format!("the tool host: {e}")));
-                    return;
+        std::thread::spawn(move || {
+            loop {
+                let reply = match frame::read(&mut reader) {
+                    Ok(None) => break,
+                    Ok(Some(bytes)) => Up::decode(&bytes),
+                    Err(e) => {
+                        let _ = send.send(Err(format!("the tool host: {e}")));
+                        break;
+                    }
+                };
+                // A link's frame is never a call's reply, and never waits
+                // for the conversation to take one.
+                let reply = match reply {
+                    Ok(Up::Link(link)) => {
+                        links.up(link);
+                        continue;
+                    }
+                    other => other,
+                };
+                if send.send(reply).is_err() {
+                    break;
                 }
-            };
-            if send.send(reply).is_err() {
-                return;
             }
+            links.close_all();
         });
         Self {
-            writer: Box::new(writer),
+            writer,
             replies,
             next: 1,
             open: BTreeSet::new(),
@@ -609,7 +859,7 @@ impl Client {
     pub fn call(&mut self, call: Call) -> Result<u64, String> {
         let id = self.next;
         self.next = self.next.saturating_add(1);
-        let sent = frame::write(&mut self.writer, &Down::Call { id, call }.encode());
+        let sent = self.write(&Down::Call { id, call }.encode());
         sent.map_err(|e| self.failed(format!("the tool host: {e}")))?;
         self.open.insert(id);
         Ok(id)
@@ -617,8 +867,13 @@ impl Client {
 
     /// Asks for call `id` to end early.
     pub fn cancel(&mut self, id: u64) -> Result<(), String> {
-        let sent = frame::write(&mut self.writer, &Down::Cancel { id }.encode());
+        let sent = self.write(&Down::Cancel { id }.encode());
         sent.map_err(|e| self.failed(format!("the tool host: {e}")))
+    }
+
+    /// Writes one frame down, the links' frames waiting their turn.
+    fn write(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.writer.frame(bytes)
     }
 
     /// The next reply to a call in flight, waiting at most `wait`; none when
@@ -679,6 +934,119 @@ impl Drop for Client {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// Every link frame crosses whole, each in its direction, a link's
+    /// bytes as a binary frame; the wrong direction's, bytes past
+    /// `LINK_CHUNK` or none, and an open with no host or port are refused.
+    #[test]
+    fn link_frames_round_trip_each_its_way() {
+        let ups = [
+            Link::Open {
+                link: 7,
+                host: "static.crates.io".into(),
+                port: 443,
+            },
+            Link::Bytes {
+                link: u64::MAX,
+                data: vec![0, 1, 2, b'{'],
+            },
+            Link::Shut { link: 3 },
+            Link::Took {
+                link: 3,
+                bytes: 1 << 40,
+            },
+        ];
+        for link in ups {
+            let bytes = Up::Link(link.clone()).encode();
+            assert_eq!(Up::decode(&bytes), Ok(Up::Link(link.clone())), "{link:?}");
+        }
+        let downs = [
+            Link::Opened { link: 7 },
+            Link::Refused {
+                link: 7,
+                why: "not on the allowlist".into(),
+            },
+            Link::Bytes {
+                link: 9,
+                data: vec![b'x'; LINK_CHUNK],
+            },
+            Link::Shut { link: 9 },
+            Link::Took { link: 9, bytes: 5 },
+        ];
+        for link in downs {
+            let bytes = Down::Link(link.clone()).encode();
+            assert_eq!(
+                Down::decode(&bytes),
+                Ok(Down::Link(link.clone())),
+                "{link:?}"
+            );
+        }
+        assert_eq!(
+            Up::Link(Link::Bytes {
+                link: 1,
+                data: b"a".to_vec()
+            })
+            .encode(),
+            [0, 1, 0, 0, 0, 0, 0, 0, 0, 1, b'a']
+        );
+        let opened = Down::Link(Link::Opened { link: 1 }).encode();
+        assert!(Up::decode(&opened).is_err());
+        let open = Up::Link(Link::Open {
+            link: 1,
+            host: "h".into(),
+            port: 1,
+        })
+        .encode();
+        assert!(Down::decode(&open).is_err());
+        for bad in [
+            vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 1],
+            vec![0, 2, 0, 0, 0, 0, 0, 0, 0, 1, b'a'],
+            vec![0, 1, 0, 0],
+            [
+                vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 1],
+                vec![b'x'; LINK_CHUNK + 1],
+            ]
+            .concat(),
+            br#"{"link":"open","id":1,"host":"","port":443}"#.to_vec(),
+            br#"{"link":"open","id":1,"host":"h","port":0}"#.to_vec(),
+            br#"{"link":"open","id":1,"host":"h","port":65536}"#.to_vec(),
+            br#"{"link":"open","id":1,"port":443}"#.to_vec(),
+            br#"{"link":"wave","id":1}"#.to_vec(),
+            br#"{"link":"shut"}"#.to_vec(),
+        ] {
+            assert!(Up::decode(&bad).is_err(), "{bad:?}");
+        }
+        let long = format!(
+            r#"{{"link":"open","id":1,"host":"{}","port":443}}"#,
+            "h".repeat(MAX_LINK_HOST + 1)
+        );
+        assert!(Up::decode(long.as_bytes()).is_err());
+    }
+
+    /// A sender waits while the window would be passed, goes on when the
+    /// other end takes, and is let go when the link closes.
+    #[test]
+    fn credit_holds_a_sender_to_the_window() {
+        let credit = Arc::new(Credit::default());
+        assert!(credit.take(LINK_WINDOW));
+        let (tell, told) = mpsc::channel();
+        let waiting = Arc::clone(&credit);
+        std::thread::spawn(move || {
+            let _ = tell.send(waiting.take(1));
+        });
+        assert!(told.recv_timeout(Duration::from_millis(200)).is_err());
+        credit.give(1);
+        assert_eq!(told.recv_timeout(Duration::from_secs(5)), Ok(true));
+        let (tell, told) = mpsc::channel();
+        let waiting = Arc::clone(&credit);
+        std::thread::spawn(move || {
+            let _ = tell.send(waiting.take(1));
+        });
+        assert!(told.recv_timeout(Duration::from_millis(200)).is_err());
+        credit.close();
+        assert_eq!(told.recv_timeout(Duration::from_secs(5)), Ok(false));
+        assert!(!credit.take(0));
+    }
 
     #[test]
     fn calls_and_replies_round_trip() {
