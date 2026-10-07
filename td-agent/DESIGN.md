@@ -3634,6 +3634,13 @@ with a destination-carrying sibling. It sees only ciphertext for TLS
 destinations, so policy is by host name, as in Claude Code's and Codex's
 proxies, and a host that fronts other domains is a residual risk.
 
+As built (the relay): `td-egressd` (net/src/egress.rs) and
+APPLICATIONS.md §W.8 item 6, which states its protocol, deadlines and
+predicate. `td-net launch` serves it for td-agent alone, at
+`td-egress/socket` under the runtime directory it gives td-agent; on td
+its unit comes with the packaging (§18, 17). Nothing calls it yet: the
+proxy and the policies are the increment's later commits.
+
 ## 11. Approval
 
 The tier an action gets is decided by which boundary it crosses. It is never

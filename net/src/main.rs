@@ -31,6 +31,7 @@
 // and by operators per tools/resolve-toolchain.sh. Invoking a bare
 // `td-net` with no applet selector is a usage error (exit 2) by design.
 mod deploy;
+mod egress;
 mod feed;
 mod fetch;
 mod fetchd;
@@ -102,6 +103,7 @@ fn main() {
         "td-subst" => subst::run(&args),
         "td-deploy" => deploy::run(&args),
         "td-fetchd" => fetchd::run(&args),
+        "td-egressd" => egress::run(&args),
         "td-launch" => launch::run(&args),
         // An application's name, linked to this binary: that application,
         // beside this binary, with a fetch service of its own (launch.rs).
@@ -118,10 +120,11 @@ fn main() {
                 Some("subst") => "td-subst",
                 Some("deploy") => "td-deploy",
                 Some("fetchd") => "td-fetchd",
+                Some("egressd") => "td-egressd",
                 Some("launch") => "td-launch",
                 _ => {
                     eprintln!(
-                        "usage: td-net <fetch|feed|subst|deploy|fetchd|launch> ...\n  \
+                        "usage: td-net <fetch|feed|subst|deploy|fetchd|egressd|launch> ...\n  \
                          (or invoke via the td-fetch / td-feed / td-subst / td-deploy / \
                          td-fetchd applet links)"
                     );
@@ -136,6 +139,7 @@ fn main() {
                 "td-feed" => feed::run(&argv),
                 "td-deploy" => deploy::run(&argv),
                 "td-fetchd" => fetchd::run(&argv),
+                "td-egressd" => egress::run(&argv),
                 "td-launch" => launch::run(&argv),
                 _ => subst::run(&argv),
             }

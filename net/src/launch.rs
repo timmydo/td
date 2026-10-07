@@ -28,7 +28,10 @@
 // `./install-apps` put them there, in `TD_AGENT_JAIL` and `TD_AGENT_TXT`:
 // its workspace jail and the td-txt its tools run. One that is not there
 // is removed from the environment the program inherits, so a variable
-// left in the caller's shell never pairs it with another build's.
+// left in the caller's shell never pairs it with another build's. For
+// td-agent it serves the egress relay too, td-egressd, at
+// `td-egress/socket` in the same runtime directory: the one way its
+// workspaces' proxied connections leave (td-agent/DESIGN.md §10).
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -50,6 +53,11 @@ fn companions(name: &str) -> &'static [(&'static str, &'static str)] {
         "td-agent" => &[("td-jail", "TD_AGENT_JAIL"), ("td-txt", "TD_AGENT_TXT")],
         _ => &[],
     }
+}
+
+/// Whether `name` is given the egress relay beside its fetch service.
+fn relays(name: &str) -> bool {
+    name == "td-agent"
 }
 
 /// Every launched program's companions, each once, in order: what
@@ -102,7 +110,7 @@ pub fn run(args: &[String]) {
         Some("--companions") if args.len() == 2 => list("--companions", &all_companions()),
         Some(program) if program.contains('/') => {
             let rest = args.get(2..).unwrap_or(&[]);
-            say(launch_here(Path::new(program), rest, &[], true))
+            say(launch_here(Path::new(program), rest, &[], false, true))
         }
         _ => {
             eprintln!(
@@ -124,7 +132,7 @@ pub fn run_named(name: &str, args: &[String]) {
         .and_then(|exe| {
             let program = beside(&exe, name)?;
             let named = companions_beside(&exe, name)?;
-            launch_here(&program, args, &named, false)
+            launch_here(&program, args, &named, relays(name), false)
         });
     std::process::exit(say(launched));
 }
@@ -219,6 +227,7 @@ fn launch_here(
     program: &Path,
     args: &[String],
     named: &[(&str, Option<PathBuf>)],
+    egress: bool,
     loud: bool,
 ) -> Result<(), String> {
     let (runtime, display) = session(
@@ -226,7 +235,15 @@ fn launch_here(
         nonempty("WAYLAND_SOCKET").as_deref(),
         nonempty("WAYLAND_DISPLAY").as_deref(),
     )?;
-    launch(program, args, named, &runtime, display.as_deref(), loud)
+    launch(
+        program,
+        args,
+        named,
+        &runtime,
+        display.as_deref(),
+        egress,
+        loud,
+    )
 }
 
 /// A nonempty environment value, an empty one reading as unset.
@@ -320,12 +337,29 @@ fn sweep(base: &Path, proc: &Path) {
     }
 }
 
-/// Starts this binary's service at `socket`, to end when this process's
+/// A service this binary serves for a launch: its applet's name and how
+/// it is probed.
+struct Service {
+    applet: &'static str,
+    probe: fn(&Path, Duration) -> Result<(), String>,
+}
+
+const FETCHD: Service = Service {
+    applet: "td-fetchd",
+    probe: crate::fetchd::probe_within,
+};
+const EGRESSD: Service = Service {
+    applet: "td-egressd",
+    probe: crate::egress::probe_within,
+};
+
+/// Starts this binary's `service` at `socket`, to end when this process's
 /// pid is no longer its parent, and waits for its probe; the child is
 /// killed when it does not answer.
-fn start_service(socket: &Path) -> Result<Child, String> {
+fn start_service(service: &Service, socket: &Path) -> Result<Child, String> {
+    let applet = service.applet;
     let mut child = Command::new(SELF)
-        .arg0("td-fetchd")
+        .arg0(applet)
         .args(["run", "--exit-with-parent"])
         .arg(std::process::id().to_string())
         .arg("--socket")
@@ -333,21 +367,21 @@ fn start_service(socket: &Path) -> Result<Child, String> {
         .stdin(Stdio::null())
         .process_group(0)
         .spawn()
-        .map_err(|e| format!("cannot start td-fetchd: {e}"))?;
+        .map_err(|e| format!("cannot start {applet}: {e}"))?;
     let deadline = Instant::now() + SERVICE_START;
     loop {
-        let said = match crate::fetchd::probe_within(socket, PROBE_BUDGET) {
+        let said = match (service.probe)(socket, PROBE_BUDGET) {
             Ok(()) => return Ok(child),
             Err(said) => said,
         };
         let failed = match child.try_wait() {
-            Ok(Some(status)) => Some(format!("td-fetchd exited before serving ({status})")),
+            Ok(Some(status)) => Some(format!("{applet} exited before serving ({status})")),
             Ok(None) if Instant::now() >= deadline => Some(format!(
-                "td-fetchd did not answer its probe within {} s: {said}",
+                "{applet} did not answer its probe within {} s: {said}",
                 SERVICE_START.as_secs()
             )),
             Ok(None) => None,
-            Err(e) => Some(format!("waiting for td-fetchd: {e}")),
+            Err(e) => Some(format!("waiting for {applet}: {e}")),
         };
         if let Some(failed) = failed {
             let _ = child.kill();
@@ -358,26 +392,39 @@ fn start_service(socket: &Path) -> Result<Child, String> {
     }
 }
 
-/// Serve the fetch socket in a runtime directory of this launch's under
-/// `runtime` and become `program` with `args`; returns only when it could
-/// not, the service stopped and the directory removed.
+/// Serve the fetch socket, and the egress relay's when `egress` says so,
+/// in a runtime directory of this launch's under `runtime` and become
+/// `program` with `args`; returns only when it could not, the services
+/// stopped and the directory removed.
 fn launch(
     program: &Path,
     args: &[String],
     named: &[(&str, Option<PathBuf>)],
     runtime: &Path,
     display: Option<&Path>,
+    egress: bool,
     loud: bool,
 ) -> Result<(), String> {
     let private = private_runtime(runtime, Path::new("/proc"))?;
     let socket = socket_under(&private);
-    let mut service = match start_service(&socket) {
-        Ok(service) => service,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&private);
-            return Err(e);
+    let mut services = Vec::new();
+    let mut wanted = vec![(FETCHD, socket.clone())];
+    if egress {
+        wanted.push((EGRESSD, private.join("td-egress").join("socket")));
+    }
+    for (service, at) in &wanted {
+        match start_service(service, at) {
+            Ok(child) => services.push(child),
+            Err(e) => {
+                for mut child in services {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                let _ = std::fs::remove_dir_all(&private);
+                return Err(e);
+            }
         }
-    };
+    }
     if loud {
         eprintln!(
             "td-launch: serving the fetch socket at {}",
@@ -396,8 +443,10 @@ fn launch(
         command.env("WAYLAND_DISPLAY", display);
     }
     let e = command.exec();
-    let _ = service.kill();
-    let _ = service.wait();
+    for mut child in services {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     let _ = std::fs::remove_dir_all(&private);
     Err(format!("cannot run {}: {e}", program.display()))
 }

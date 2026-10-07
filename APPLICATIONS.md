@@ -10179,6 +10179,68 @@ webpki-roots, and no decoder. So:
    control plane" are amended by the landing that ships the applet, in
    that landing.
 
+6. **The egress relay, td-fetchd's destination-carrying sibling.**
+   td-agent's workspaces reach the network only through a proxy its
+   tool host serves inside the jail, whose connections td-agent judges
+   against the workspace's policy and opens through `td-egressd`, an
+   applet of the same `td-net` tier (td-agent/DESIGN.md §10). It is
+   not a grant: no jail binds its socket, and no package's `sockets=`
+   names it. The relay answers td-agent alone, at `td-egress/socket`
+   under the launch's runtime directory, beside `td-fetch/socket`,
+   with the same 0600 socket in a 0700 directory, the same bind and the
+   same end with the launched program; `td-net launch` serves it only
+   for td-agent. Its protocol is one request per connection, a
+   `td-egress 1` line and either `probe` or `connect HOST PORT`, a host
+   being an IPv4 address, an IPv6 address bare or in brackets, or a DNS
+   name of letters, digits and hyphens, and a port one to five digits;
+   the answer is `ok` or `error malformed|refused|transport: why`. After
+   `ok` the connection carries the destination's bytes both ways until
+   either side ends or fails, five minutes pass with no byte moved
+   either way, or an hour passes; then both connections are shut whole,
+   so a protocol that half-closes one direction and goes on in the
+   other is not carried. Each read and each write waits only as long as
+   those deadlines allow: a destination or client that stops reading
+   while nothing moves the other way is let go at the idle deadline,
+   and one that stops reading while the other way keeps moving, at the
+   total.
+
+   A name is resolved once, by the relay, within ten seconds, with at
+   most 32 lookups under way, those given up on included; every address
+   it returns is checked, and one refused address refuses the request,
+   so a name that also resolves somewhere private reaches nothing. The
+   address connected to is one of those checked, all of them tried
+   within thirty seconds. The predicate is its own, stricter than item
+   3's. It refuses loopback, 0.0.0.0/8, link-local, broadcast,
+   multicast and 240.0.0.0/4, RFC 1918, carrier-grade NAT
+   (100.64.0.0/10), 192.0.0.0/24, 198.18.0.0/15 (where local proxies
+   map names), the cloud platform endpoint 168.63.129.16; IPv6
+   unspecified, unique-local and site-local, NAT64's local-use prefix
+   whole; and the IPv4 address carried by an IPv4-mapped, SIIT,
+   IPv4-compatible, NAT64 well-known-prefix, 6to4 or Teredo (server and
+   client) address. It refuses this machine's own addresses and
+   networks too, read on each request without `unsafe`: from
+   `/proc/net/fib_trie`, every local route, an AnyIP prefix included,
+   and every network routed straight to a link that holds one of them;
+   from `/proc/net/if_inet6`, every address; from
+   `/proc/net/ipv6_route`, every route with no next hop that holds one
+   of those. A network that holds none of the machine's addresses is a
+   tunnel's route to the far side, a VPN's split routes included, or a
+   route to nowhere, and is not taken; nor is a prefix shorter than /8,
+   or /16 for IPv6, which is a tunnel's way to everything even when it
+   holds the tunnel's address. Failing to read the lists refuses the
+   request.
+
+   Of item 5's gaps, the relay closes the destination policy, which is
+   td-agent's, and bounds its name lookups. It does not close the rest:
+   a neighbour reached through a gateway, on a network this machine has
+   no route of its own to, is reached; so is the LAN through a NAT64
+   with a network-specific prefix, whose IPv4 address the relay cannot
+   know; and a name is defended against rebinding only as far as the
+   address connected to is one checked. The relay sees TLS as
+   ciphertext, so td-agent's policy is by host name, and a host that
+   fronts other domains carries them. On td the relay is served by
+   td-agent's unit, which its packaging adds.
+
 **Sequencing.** (1) The fetch service, proven in the boot with the
 current pinned `tn` and `tmc` switched to it: the last pin bump. (2) The
 rest of the conversion on the two repositories' `td` branches, checked

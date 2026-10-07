@@ -448,7 +448,7 @@ fn serve(socket: &Path, policy: Policy, parent: Option<u32>, limits: Limits) -> 
 /// this service bound, when it is still the one at `socket`, and the
 /// directory it was made in, when that is empty, and exit. Watched only
 /// once bound, so a refused start removes nothing it did not make.
-fn watch_parent(socket: &Path, parent: u32) -> Result<(), String> {
+pub(crate) fn watch_parent(socket: &Path, parent: u32) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     let bound = std::fs::symlink_metadata(socket)
         .map(|meta| (meta.dev(), meta.ino()))
@@ -511,7 +511,7 @@ impl Drop for Slot {
 /// starting at once would both find the name unserved and the later rename
 /// would take it silently: one instance is the unit's invariant, not this
 /// function's.
-fn bind(path: &Path) -> Result<UnixListener, String> {
+pub(crate) fn bind(path: &Path) -> Result<UnixListener, String> {
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if !meta.file_type().is_socket() {
             return Err(format!("{} exists and is not a socket", path.display()));

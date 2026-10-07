@@ -19,6 +19,9 @@ const EXIT: &str = "TD_LAUNCH_TEST_EXIT";
 const HOLD: &str = "TD_LAUNCH_TEST_HOLD";
 /// Where the launched program writes the companion variables it was given.
 const COMPANIONS: &str = "TD_LAUNCH_TEST_COMPANIONS";
+/// Where the launched program records whether an egress relay answers in
+/// its runtime directory.
+const EGRESS: &str = "TD_LAUNCH_TEST_EGRESS";
 
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("td-launch-it-{tag}-{}", std::process::id()));
@@ -57,6 +60,11 @@ fn launched_program() {
         session.parent().unwrap().join("wayland-9")
     );
     std::fs::write(&mark, socket.as_os_str().as_encoded_bytes()).unwrap();
+    if let Some(record) = std::env::var_os(EGRESS) {
+        let egress = runtime.join("td-egress/socket");
+        let served = UnixStream::connect(&egress).is_ok();
+        std::fs::write(record, if served { "served" } else { "none" }).unwrap();
+    }
     if let Some(record) = std::env::var_os(COMPANIONS) {
         let given = ["TD_AGENT_JAIL", "TD_AGENT_TXT"]
             .iter()
@@ -89,6 +97,7 @@ fn as_child<'a>(command: &'a mut Command, runtime: &Path, mark: &Path) -> &'a mu
         .env_remove(EXIT)
         .env_remove(HOLD)
         .env_remove(COMPANIONS)
+        .env_remove(EGRESS)
         .stdin(Stdio::null())
 }
 
@@ -249,10 +258,13 @@ fn a_link_named_for_an_application_launches_it_from_beside_the_binary() {
     let (runtime, mark) = (base.join("run"), base.join("mark"));
     std::fs::create_dir_all(&runtime).unwrap();
     let mut command = Command::new(bin.join("td-news"));
-    as_child(&mut command, &runtime, &mark);
+    let egress = base.join("egress");
+    as_child(&mut command, &runtime, &mark).env(EGRESS, &egress);
     let status = status_of_a_fresh_copy(&mut command);
     assert!(status.success(), "{status}");
     nothing_served(&runtime, &mark);
+    // No relay for an application that is not td-agent.
+    assert_eq!(std::fs::read_to_string(&egress).unwrap(), "none");
     std::fs::remove_dir_all(&base).unwrap();
 }
 
@@ -271,7 +283,9 @@ fn the_agent_is_given_its_companions_and_never_an_inherited_one() {
     let (runtime, mark, record) = (base.join("run"), base.join("mark"), base.join("record"));
     std::fs::create_dir_all(&runtime).unwrap();
     let mut command = Command::new(bin.join("td-agent"));
+    let egress = base.join("egress");
     as_child(&mut command, &runtime, &mark)
+        .env(EGRESS, &egress)
         .env(COMPANIONS, &record)
         .env("TD_AGENT_JAIL", "/stale/td-jail")
         .env("TD_AGENT_TXT", "/stale/td-txt");
@@ -286,6 +300,8 @@ fn the_agent_is_given_its_companions_and_never_an_inherited_one() {
             lib.join("td-jail").display()
         )
     );
+    // td-agent's launch serves the egress relay beside the fetch service.
+    assert_eq!(std::fs::read_to_string(&egress).unwrap(), "served");
     std::fs::remove_dir_all(&base).unwrap();
 }
 
