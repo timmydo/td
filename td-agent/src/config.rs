@@ -108,7 +108,7 @@ pub enum Network {
     #[default]
     Allowlist,
     /// The proxy admits any destination the relay reaches; only the
-    /// human sets it, in a template or on a card.
+    /// human sets it, in a template.
     Open,
 }
 
@@ -647,7 +647,7 @@ impl Client {
                     protected_branches(items.as_deref())?
                 }
             },
-            // As in the file: `open` is a template's or a card's alone.
+            // As in the file: `open` is a template's alone.
             network: match value.get("network") {
                 None => Network::default(),
                 Some(network) => network
@@ -1219,33 +1219,36 @@ pub fn templates_json(templates: &[Template]) -> Json {
         templates
             .iter()
             .map(|template| {
-                Json::Obj(vec![
-                    ("name".into(), Json::Str(template.name.clone())),
-                    (
-                        "repos".into(),
-                        Json::Arr(
-                            template
-                                .repos
-                                .iter()
-                                .map(|repo| {
-                                    Json::Obj(vec![
-                                        ("remote".into(), Json::Str(repo.remote.clone())),
-                                        ("base".into(), Json::Str(repo.base.clone())),
-                                        ("branch".into(), Json::Str(repo.branch.clone())),
-                                        (
-                                            "sparse".into(),
-                                            repo.sparse.as_ref().map_or(Json::Null, |paths| {
-                                                Json::Arr(
-                                                    paths.iter().cloned().map(Json::Str).collect(),
-                                                )
-                                            }),
-                                        ),
-                                    ])
-                                })
-                                .collect(),
-                        ),
+                let mut fields = vec![("name".into(), Json::Str(template.name.clone()))];
+                // Only a template given one names a network policy.
+                if let Some(network) = template.network {
+                    fields.push(("network".into(), Json::Str(network.name().into())));
+                }
+                fields.push((
+                    "repos".into(),
+                    Json::Arr(
+                        template
+                            .repos
+                            .iter()
+                            .map(|repo| {
+                                Json::Obj(vec![
+                                    ("remote".into(), Json::Str(repo.remote.clone())),
+                                    ("base".into(), Json::Str(repo.base.clone())),
+                                    ("branch".into(), Json::Str(repo.branch.clone())),
+                                    (
+                                        "sparse".into(),
+                                        repo.sparse.as_ref().map_or(Json::Null, |paths| {
+                                            Json::Arr(
+                                                paths.iter().cloned().map(Json::Str).collect(),
+                                            )
+                                        }),
+                                    ),
+                                ])
+                            })
+                            .collect(),
                     ),
-                ])
+                ));
+                Json::Obj(fields)
             })
             .collect(),
     )
@@ -1278,9 +1281,18 @@ pub fn templates_from_json(value: &Json) -> Result<Vec<Template>, String> {
     let id = crate::store::Id::parse(&"0".repeat(32)).ok_or("no placeholder id")?;
     let place = std::path::PathBuf::from(format!("/{}", "x".repeat(CHECK_PATH)));
     for item in items {
-        if !only_keys(item, &["name", "repos"]) {
+        if !only_keys(item, &["name", "network", "repos"]) {
             return Err(wrong.into());
         }
+        let network = match item.get("network") {
+            None => None,
+            Some(named) => Some(
+                named
+                    .as_str()
+                    .and_then(Network::parse)
+                    .ok_or("a template's network is off, allowlist or open")?,
+            ),
+        };
         let name = template_name(item.get("name").and_then(Json::as_str).ok_or(wrong)?)?;
         if templates.iter().any(|t| t.name.eq_ignore_ascii_case(&name)) {
             return Err(format!("two templates are named {name:?}"));
@@ -1324,7 +1336,7 @@ pub fn templates_from_json(value: &Json) -> Result<Vec<Template>, String> {
             .collect::<Result<Vec<_>, String>>()
             .map_err(|e| format!("template {name:?}: {e}"))?;
         let template = Template {
-            network: None,
+            network,
             name,
             repos,
             shared: None,
@@ -2063,6 +2075,49 @@ mod tests {
             let refused = parse(&format!("background_output_bytes = {text}")).unwrap_err();
             assert!(refused.contains("`background_output_bytes`"), "{refused}");
         }
+    }
+
+    /// A template made in the window keeps the network it names, none
+    /// writing no key, and a network that is none of the three is
+    /// refused.
+    #[test]
+    fn a_template_made_in_the_window_keeps_its_network() {
+        let repo = checked_repo("/srv/td", "main", "agent", None).unwrap();
+        let templates: Vec<Template> = [
+            None,
+            Some(Network::Off),
+            Some(Network::Allowlist),
+            Some(Network::Open),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(n, network)| Template {
+            network,
+            name: format!("t{n}"),
+            repos: vec![repo.clone()],
+            shared: None,
+        })
+        .collect();
+        let written = templates_json(&templates);
+        assert_eq!(templates_from_json(&written).unwrap(), templates);
+        // None names no policy: the key is left out.
+        assert!(
+            !written.to_string().contains(r#""name":"t0","network""#),
+            "{written}"
+        );
+        assert!(
+            written.to_string().contains(r#""network":"open""#),
+            "{written}"
+        );
+        let wrong = td_json::parse(
+            &written
+                .to_string()
+                .replace(r#""network":"open""#, r#""network":"anywhere""#),
+        )
+        .unwrap();
+        assert!(templates_from_json(&wrong)
+            .unwrap_err()
+            .contains("off, allowlist or open"));
     }
 
     /// A template made in the window is checked as preparing it would

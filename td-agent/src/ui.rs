@@ -3187,6 +3187,9 @@ impl App {
                 return self.reply(reply);
             }
             (Some(Asker::Template), _, Some(template)) => {
+                if !self.live {
+                    template.drive();
+                }
                 let reply = template.paste(text);
                 return self.template_reply(reply);
             }
@@ -4390,6 +4393,15 @@ impl App {
                 template,
                 replacing,
             } => {
+                // Only the person makes, changes or renames a template, so
+                // only the person gives a name its network (DESIGN.md §7,
+                // §11): saved by the window's own keyboard or pointer, from
+                // a dialog nothing else gave input to.
+                if !self.live || self.template.as_ref().is_some_and(TemplateDialog::driven) {
+                    return self.template_refused(
+                        "this dialog took input from the control seam, which saves no template; close it, and make or edit the template at the window's own keyboard or pointer".into(),
+                    );
+                }
                 self.requests.push(Request::SaveTemplate {
                     template,
                     replacing,
@@ -4427,6 +4439,9 @@ impl App {
         let Some(template) = self.template.as_mut() else {
             return;
         };
+        if !self.live {
+            template.drive();
+        }
         let reply = match input {
             Input::Key { chord, repeat } => {
                 self.press = None;
@@ -7626,6 +7641,67 @@ pub mod tests {
         ]
     }
 
+    /// A template is saved only by the window's own keyboard or pointer,
+    /// from a dialog nothing else gave input to: one the control seam's
+    /// keys typed into, or pressed Save in, saves nothing, even when the
+    /// live keyboard presses it after; edited through the seam, the same.
+    #[test]
+    fn only_the_live_keyboard_saves_a_template() {
+        let typed_live = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                key_live(app, &c.to_string());
+            }
+        };
+        let mut app = app();
+        app.menu_action(menu::Action::NewTemplate);
+        typed_live(&mut app, "td");
+        key_live(&mut app, "Tab");
+        typed_live(&mut app, "/srv/git/td");
+        for _ in 0..4 {
+            key_live(&mut app, "Tab");
+        }
+        assert_eq!(app.template_dialog().unwrap().part(), "network");
+        key(&mut app, "o");
+        typed_live(&mut app, "pen");
+        key_live(&mut app, "Return");
+        assert!(app.take_requests().is_empty());
+        assert!(app
+            .template_dialog()
+            .unwrap()
+            .message()
+            .unwrap()
+            .contains("control seam"));
+        key_live(&mut app, "Escape");
+        assert!(app.template_dialog().is_none());
+        app.menu_action(menu::Action::NewTemplate);
+        typed_live(&mut app, "td");
+        key_live(&mut app, "Tab");
+        typed_live(&mut app, "/srv/git/td");
+        key(&mut app, "Return");
+        assert!(app.take_requests().is_empty());
+        key_live(&mut app, "Escape");
+        app.menu_action(menu::Action::NewTemplate);
+        typed_live(&mut app, "td");
+        key_live(&mut app, "Tab");
+        typed_live(&mut app, "/srv/git/td");
+        for _ in 0..4 {
+            key_live(&mut app, "Tab");
+        }
+        typed_live(&mut app, "open");
+        key_live(&mut app, "Return");
+        let requests = app.take_requests();
+        let [Request::SaveTemplate { template, .. }] = requests.as_slice() else {
+            panic!("{requests:?}");
+        };
+        assert_eq!(template.network, Some(crate::config::Network::Open));
+        app.template_saved("saved".into());
+        // Edited through the seam, even unchanged, it saves nothing.
+        app.edit_template(template.clone());
+        assert_eq!(app.template_dialog().unwrap().text(5), "open");
+        key(&mut app, "Return");
+        assert!(app.take_requests().is_empty());
+    }
+
     /// File → New template… and the chooser's last row open the template
     /// dialog, modal; its Save is a request, which the session's refusal
     /// answers with the dialog kept, saying why, and its acceptance with
@@ -7638,7 +7714,7 @@ pub mod tests {
         use crate::keydialog::tests::Recorder;
         let typed = |app: &mut App, text: &str| {
             for c in text.chars() {
-                key(app, &c.to_string());
+                key_live(app, &c.to_string());
             }
         };
         let mut app = app();
@@ -7648,12 +7724,12 @@ pub mod tests {
         app.menu_action(menu::Action::NewTemplate);
         assert_eq!(app.template_dialog().unwrap().part(), "name");
         assert!(text(&app).contains("New template"));
-        key(&mut app, "C-n");
+        key_live(&mut app, "C-n");
         assert_eq!(app.picking(), "none");
         typed(&mut app, "td");
-        key(&mut app, "Tab");
+        key_live(&mut app, "Tab");
         let mut clipboard = Recorder::default();
-        app.input(
+        app.input_live(
             Input::Key {
                 chord: "C-v",
                 repeat: false,
@@ -7662,9 +7738,9 @@ pub mod tests {
         );
         assert_eq!(clipboard.pastes, 1);
         clipboard.inflight = false;
-        app.input(Input::Paste("/srv/git/td\n"), &mut clipboard);
+        app.input_live(Input::Paste("/srv/git/td\n"), &mut clipboard);
         assert_eq!(app.template_dialog().unwrap().text(1), "/srv/git/td");
-        key(&mut app, "Return");
+        key_live(&mut app, "Return");
         let requests = app.take_requests();
         let [Request::SaveTemplate {
             template,
@@ -7687,30 +7763,30 @@ pub mod tests {
         assert!(app.template_dialog().is_none());
         assert_eq!(app.notice(), Some("the template \"td\" is saved"));
         // The chooser's last row; Escape makes nothing.
-        key(&mut app, "C-n");
+        key_live(&mut app, "C-n");
         typed(&mut app, "New");
-        key(&mut app, "Return");
+        key_live(&mut app, "Return");
         assert!(app.picker().is_none());
         assert_eq!(app.template_dialog().unwrap().part(), "name");
-        key(&mut app, "Escape");
+        key_live(&mut app, "Escape");
         assert!(app.template_dialog().is_none());
         assert!(app.take_requests().is_empty());
         // Edit template….
         app.set_saved_templates(vec![template.clone()]);
         app.menu_action(menu::Action::EditTemplate);
         assert_eq!(app.picking(), "edit-template");
-        key(&mut app, "Return");
+        key_live(&mut app, "Return");
         assert!(app.take_requests().is_empty());
         assert_eq!(app.template_dialog().unwrap().editing(), Some("td"));
         assert!(text(&app).contains("Edit template"));
-        for _ in 0..6 {
-            key(&mut app, "Tab");
+        for _ in 0..7 {
+            key_live(&mut app, "Tab");
         }
         assert_eq!(app.template_dialog().unwrap().part(), "remove");
-        key(&mut app, "Return");
+        key_live(&mut app, "Return");
         assert_eq!(app.template_dialog().unwrap().part(), "confirm");
-        key(&mut app, "Tab");
-        key(&mut app, "Return");
+        key_live(&mut app, "Tab");
+        key_live(&mut app, "Return");
         assert_eq!(app.take_requests(), [Request::RemoveTemplate("td".into())]);
     }
 

@@ -159,13 +159,13 @@ pub const BINDINGS: &[Binding] = &[
         name: "new-template",
         chord: None,
         arguments: "",
-        help: "File > New template...: open the dialog that makes a repository template: Tab moves, Return saves, Escape cancels.",
+        help: "File > New template...: open the dialog that makes a repository template: Tab moves, Escape cancels; a dialog given input here saves nothing, only the person's own keyboard or pointer saving one.",
     },
     Binding {
         name: "edit-template",
         chord: None,
         arguments: "",
-        help: "File > Edit template...: choose a template made in the window and open it in the template dialog, to save or remove.",
+        help: "File > Edit template...: choose a template made in the window and open it in the template dialog, to remove it; a dialog given input here saves nothing.",
     },
     Binding {
         name: "model",

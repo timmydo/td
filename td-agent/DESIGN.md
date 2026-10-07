@@ -38,8 +38,8 @@ the circuit breaker and the trust mark (§11); and increment 16,
 compaction, by hand and past `compact_at`, and the card that asks how to
 resume a conversation whose cache has gone cold (§14). Increment 14,
 the push and fetch tools, is built; increment 15, the network, is built
-but for the classifier's part in its crossings and a way to set `open`
-from the window, so a workspace's commands reach its allowlist, or
+but for the classifier's part in its crossings, so a workspace's
+commands reach its allowlist, or
 anywhere under `open`, through its proxy and the egress relay, and a
 destination off the allowlist waits on the person's card, in `auto` as
 in `ask` until the classifier takes its row (§10, §11). Where building
@@ -1829,7 +1829,8 @@ and a push names the remote branch it writes (§9).
 without editing the configuration, which td-agent never writes: File →
 `New template…`, or the chooser's `New template…` row, opens a dialog of
 td-ui's entries asking a name, a remote, a base, a branch and,
-optionally, sparse paths parted by spaces, and Save checks them as
+optionally, sparse paths parted by spaces and a network policy (§10),
+and Save checks them as
 preparing the template would (the remote parsed as §7 admits one, the
 base a branch name, the branch one a push could name, each sparse path
 one the checkout's cone takes, and the template planned as its workspace
@@ -1845,8 +1846,9 @@ confirmed, removes it. A template saved takes the top-level shared
 directories from then on; one removed or renamed leaves its workspaces
 as they are but for those, which they bind no more, so a removal never
 widens what a workspace reaches. They are kept in the state directory's
-`templates` file, a JSON list of each template's name and repositories
-with no other key, rewritten whole from the file's own list, never from
+`templates` file, a JSON list of each template's name, its network
+policy when it names one, and its repositories, with no other key,
+rewritten whole from the file's own list, never from
 the chooser's, and read back as written; one past 64, a name a template
 in the file has, ASCII case aside, a built-in's name, a template with no
 repository or more than a workspace takes, or one its plan refuses is
@@ -1873,8 +1875,10 @@ the top-level shared directories (a `template_shared` entry of `None`).
 `templatedialog::TemplateDialog` is composed as the key dialog is, from
 td-ui's `entry_model` entries painted by `chrome::TextEntry`, each under
 its label, `chrome::Buttons` and td-ui's confirmation, centred and at
-most 72 cells wide: a title, what it does, the five fields (name;
-remote; base, `main` at first; branch, `agent` at first; sparse paths),
+most 72 cells wide: a title, what it does, the six fields (name;
+remote; base, `main` at first; branch, `agent` at first; sparse paths;
+network, `off`, `allowlist` or `open`, any case, or empty for the
+settings' `network`),
 two rows for a refusal, and Cancel and Save, with Remove between them
 for a template being edited. `Tab`/`Down` and `S-Tab`/`Up` move round
 the fields and buttons; `Return` saves from a field and presses a
@@ -1888,7 +1892,8 @@ space, or none at all, reads back the same; changed, they are the
 field's, parted by spaces. Each field takes at least what the file may
 hold, so every template in it opens. Save checks each field in turn
 (`config::template_name`, `git::Remote::parse`, `git::branch_name`,
-`git::push_branch`, then `config::checked_repo`), saying the first
+`git::push_branch`, then `config::checked_repo`, then the network's
+name), saying the first
 refusal and moving the keyboard to its field (the remote's for a
 recorded remote too long), and then asks the window, which refuses a
 name a configured template or another made in the window has, ASCII case
@@ -1914,7 +1919,9 @@ has opened meanwhile, the note names the repository and File → New
 template… instead. The driven actions gain `new-template` and
 `edit-template`, which have no chord, and the state gains `template`:
 `none`, or the part the dialog's keyboard is on (`name`, `remote`,
-`base`, `branch`, `sparse`, `cancel`, `remove`, `save`, or `confirm`).
+`base`, `branch`, `sparse`, `network`, `cancel`, `remove`, `save`, or
+`confirm`); a dialog given input through them saves nothing (§10, As
+built (the policy)), so through the seam they open, cancel and remove.
 
 The templates step builds the chooser, `[[template]]` and the two
 built-ins, which replace File's two workspace items (As built
@@ -3603,7 +3610,8 @@ A workspace has one of three network policies, shown in the status row:
   HOST[:PORT]` under the workspace's header in the human's rules, which
   opens it as the allowlist would.
 - `open`: any destination the relay will reach. Only the human sets it,
-  on a card or in a template (§7).
+  in a template: one in the configuration, or one made in the window,
+  whose network the window's own keyboard or pointer alone sets (§7).
 
 An allowlisted host is a standing decision by the human, and one that
 accepts uploads remains a possible channel out; the card that adds one
@@ -3644,7 +3652,7 @@ proxies, and a host that fronts other domains is a residual risk.
 
 As built (the policy): `config::Network` and `config::Destination`.
 `network` is `off` or `allowlist`; `open` there is refused, being a
-template's or a card's. `network_allowlist` is at most 256 hosts, each
+template's alone. `network_allowlist` is at most 256 hosts, each
 a DNS name (lower-cased, a trailing dot dropped, its last label not a
 number, decimal or `0x` hexadecimal, as the relay's hosts are, APPLICATIONS.md
 §W.8 item 6) or an IPv4 address or an IPv6 one in brackets, with an
@@ -3655,7 +3663,13 @@ conversation in the setup frame, beside the shared directories, and
 gives its directories: its template's, else `network`, and `off` when
 its template is no longer configured, so removing or renaming one
 never widens what its conversations reach. A template made in the
-window names no policy of its own. The status row's `network` item
+window names one when the person gave it one in the dialog (§7), and
+that file's `network` key is any of the three. Since a workspace's
+policy follows its template's name, a template is made, changed or
+renamed only by the person: the dialog saves only when the window's
+own keyboard or pointer presses Save, and never once any of its input
+came through the control seam (`TemplateDialog::driven`), saying so;
+the seam may open it and remove a template, which only narrows. The status row's `network` item
 says the open conversation's workspace's, `off` for a conversation with
 no workspace, and `network`'s with none open.
 

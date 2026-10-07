@@ -1,6 +1,6 @@
 //! The dialog File → New template… and Edit template… open (DESIGN.md §7,
 //! Templates made in the window): a modal panel over the window holding a
-//! title, what the dialog does, five td-ui entries (`entry_model`, painted
+//! title, what the dialog does, six td-ui entries (`entry_model`, painted
 //! by `chrome::TextEntry`), each under its label, a line for why the
 //! template is refused, and td-ui's buttons: Cancel and Save, and Remove
 //! between them for a template being edited, which td-ui's confirmation
@@ -54,13 +54,22 @@ const FIELDS: &[(&str, &str, usize)] = &[
         "td-agent td-ui",
         SPARSE_BYTES,
     ),
+    (
+        "Network: off, allowlist or open; empty takes your settings'",
+        "off, allowlist or open",
+        NETWORK_BYTES,
+    ),
 ];
-/// The name, remote, base, branch and sparse paths' fields, by place.
+/// The name, remote, base, branch, sparse paths' and network's fields,
+/// by place.
 const NAME: usize = 0;
 const REMOTE: usize = 1;
 const BASE: usize = 2;
 const BRANCH: usize = 3;
 const SPARSE: usize = 4;
+const NETWORK: usize = 5;
+/// The most bytes the network's field takes.
+const NETWORK_BYTES: usize = 16;
 /// The most bytes the sparse paths' field takes: past a workspace
 /// record's bound, so every template the file holds opens here.
 const SPARSE_BYTES: usize = 20 * 1024;
@@ -91,7 +100,8 @@ impl Part {
             Self::Field(REMOTE) => "remote",
             Self::Field(BASE) => "base",
             Self::Field(BRANCH) => "branch",
-            Self::Field(_) => "sparse",
+            Self::Field(SPARSE) => "sparse",
+            Self::Field(_) => "network",
             Self::Cancel => "cancel",
             Self::Remove => "remove",
             Self::Save => "save",
@@ -128,8 +138,8 @@ struct Layout {
     /// The explanation's first row; each line is a `ROW` under the last.
     lines: Rect,
     /// Each field's label row, then its entry.
-    labels: [Rect; 5],
-    entries: [TextEntry; 5],
+    labels: [Rect; 6],
+    entries: [TextEntry; 6],
     message: Rect,
     buttons: Buttons<'static>,
 }
@@ -158,6 +168,9 @@ pub struct TemplateDialog {
     confirm: Option<Confirm<RemoveIt, u64, ()>>,
     /// The dialog asked the clipboard for its text, not yet come.
     pasting: bool,
+    /// Something other than the window's own keyboard and pointer gave
+    /// it input, so it saves nothing (DESIGN.md §7).
+    driven: bool,
 }
 
 impl std::fmt::Debug for TemplateDialog {
@@ -186,7 +199,7 @@ impl TemplateDialog {
     pub fn new_template(surface: Surface, remote: Option<&str>) -> Result<Self, String> {
         Self::open(
             surface,
-            ["", remote.unwrap_or(""), "main", "agent", ""],
+            ["", remote.unwrap_or(""), "main", "agent", "", ""],
             None,
         )
     }
@@ -204,6 +217,7 @@ impl TemplateDialog {
             .as_deref()
             .map(|paths| paths.join(" "))
             .unwrap_or_default();
+        let network = template.network.map_or("", crate::config::Network::name);
         Self::open(
             surface,
             [
@@ -212,12 +226,13 @@ impl TemplateDialog {
                 &first.base,
                 &first.branch,
                 &sparse,
+                network,
             ],
             Some(template.clone()),
         )
     }
 
-    fn open(surface: Surface, texts: [&str; 5], editing: Option<Template>) -> Result<Self, String> {
+    fn open(surface: Surface, texts: [&str; 6], editing: Option<Template>) -> Result<Self, String> {
         let mut entries = Vec::with_capacity(FIELDS.len());
         for ((label, _, limit), text) in FIELDS.iter().zip(texts) {
             let mut entry = EntryModel::new(*limit).map_err(|e| format!("{label}: {e}"))?;
@@ -231,8 +246,8 @@ impl TemplateDialog {
             .map_or(0, |template| template.repos.len().saturating_sub(1));
         let explanation = match &editing {
             None => "A repository template: each conversation made from it works on a worktree of its own of the remote, on the branch, from the base. Return saves, Tab moves, Escape cancels.".to_string(),
-            Some(_) if more > 0 => format!("Save keeps the template in place of what it was; Remove removes it. Its other {more} repositories are kept as they are. Workspaces made from it are not touched."),
-            Some(_) => "Save keeps the template in place of what it was; Remove removes it. Workspaces made from it are not touched.".to_string(),
+            Some(_) if more > 0 => format!("Save keeps the template in place of what it was; Remove removes it. Its other {more} repositories are kept as they are. Workspaces made from it keep their worktrees, and their conversations take its network policy at once."),
+            Some(_) => "Save keeps the template in place of what it was; Remove removes it. Workspaces made from it keep their worktrees, and their conversations take its network policy at once.".to_string(),
         };
         let mut dialog = Self {
             sparse_opened: texts[SPARSE].to_string(),
@@ -248,6 +263,7 @@ impl TemplateDialog {
             editing,
             confirm: None,
             pasting: false,
+            driven: false,
         };
         dialog.relayout();
         if dialog.layout().is_none() {
@@ -266,7 +282,20 @@ impl TemplateDialog {
         }
     }
 
-    /// The text of field `at`: name, remote, base, branch, sparse paths.
+    /// Notes that input came from something other than the window's
+    /// own keyboard and pointer.
+    pub fn drive(&mut self) {
+        self.driven = true;
+    }
+
+    /// Whether any input came from something other than the window's
+    /// own keyboard and pointer.
+    pub fn driven(&self) -> bool {
+        self.driven
+    }
+
+    /// The text of field `at`: name, remote, base, branch, sparse paths,
+    /// network.
     pub fn text(&self, at: usize) -> &str {
         self.entries.get(at).map_or("", EntryModel::text)
     }
@@ -371,8 +400,15 @@ impl TemplateDialog {
             },
             title: band(0),
             lines: band(1),
-            labels: [label(0), label(1), label(2), label(3), label(4)],
-            entries: [entry(0)?, entry(1)?, entry(2)?, entry(3)?, entry(4)?],
+            labels: [label(0), label(1), label(2), label(3), label(4), label(5)],
+            entries: [
+                entry(0)?,
+                entry(1)?,
+                entry(2)?,
+                entry(3)?,
+                entry(4)?,
+                entry(5)?,
+            ],
             message: Rect {
                 height: (message_rows * row) as u32,
                 ..band(1 + lines + 2 * fields)
@@ -488,13 +524,25 @@ impl TemplateDialog {
             Err(why) if why.contains("sparse") => return self.refuse(SPARSE, why),
             Err(why) => return self.refuse(REMOTE, why),
         };
+        let network = match text(NETWORK).to_ascii_lowercase().as_str() {
+            "" => None,
+            named => match crate::config::Network::parse(named) {
+                Some(network) => Some(network),
+                None => {
+                    return self.refuse(
+                        NETWORK,
+                        "the network is off, allowlist or open, or none for your settings'",
+                    )
+                }
+            },
+        };
         let mut repos = vec![repo];
         if let Some(editing) = &self.editing {
             repos.extend(editing.repos.iter().skip(1).cloned());
         }
         Reply::Save {
             template: Template {
-                network: None,
+                network,
                 name,
                 repos,
                 shared: None,
@@ -915,9 +963,10 @@ mod tests {
                 dialog.text(1),
                 dialog.text(2),
                 dialog.text(3),
-                dialog.text(4)
+                dialog.text(4),
+                dialog.text(5)
             ],
-            ["", "/srv/git/td", "main", "agent", ""]
+            ["", "/srv/git/td", "main", "agent", "", ""]
         );
         assert_eq!(
             dialog.key("Return", false, &mut NoClipboard),
@@ -981,6 +1030,23 @@ mod tests {
                 replacing: None,
             }
         );
+        // The network: one of the three, or none.
+        dialog.key("Tab", false, &mut NoClipboard);
+        assert_eq!(dialog.part(), "network");
+        typed(&mut dialog, "everywhere");
+        dialog.key("Return", false, &mut NoClipboard);
+        assert_eq!(dialog.part(), "network");
+        assert!(
+            dialog.message().unwrap().contains("off, allowlist or open"),
+            "{:?}",
+            dialog.message()
+        );
+        clear(&mut dialog);
+        typed(&mut dialog, "Open");
+        let Reply::Save { template, .. } = dialog.key("Return", false, &mut NoClipboard) else {
+            panic!("not saved");
+        };
+        assert_eq!(template.network, Some(crate::config::Network::Open));
         // Escape cancels, from anywhere; Tab goes round the buttons.
         for _ in 0..2 {
             dialog.key("Tab", false, &mut NoClipboard);
@@ -1023,7 +1089,7 @@ mod tests {
         assert_eq!(saved.repos[0].base, "next");
         assert_eq!(saved.repos[1], second);
         // Remove: asked, cancelled, kept; asked, confirmed, removed.
-        for _ in 0..4 {
+        for _ in 0..5 {
             dialog.key("Tab", false, &mut NoClipboard);
         }
         assert_eq!(dialog.part(), "remove");
@@ -1042,7 +1108,7 @@ mod tests {
         );
         // A new template's dialog has no Remove.
         let mut new = TemplateDialog::new_template(surface(), None).unwrap();
-        for _ in 0..6 {
+        for _ in 0..7 {
             new.key("Tab", false, &mut NoClipboard);
         }
         assert_eq!(new.part(), "save");
