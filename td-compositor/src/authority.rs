@@ -15,16 +15,13 @@ pub(crate) mod consent;
 #[cfg_attr(not(feature = "target-recipe"), path = "../../td-authd/src/sys.rs")]
 #[cfg_attr(feature = "target-recipe", path = "auth/sys.rs")]
 mod sys;
-// `9a`'s names, admitted under the rules root sends them by.
+// `9a`'s names, admitted under the rules root sends them by and drawn on
+// the lock surface.
 #[cfg_attr(
     not(feature = "target-recipe"),
     path = "../../td-firstboot/src/hostname.rs"
 )]
 #[cfg_attr(feature = "target-recipe", path = "auth/hostname.rs")]
-#[allow(
-    dead_code,
-    reason = "the parsed name's accessor is provisioning's until the lock surface draws it"
-)]
 mod hostname;
 #[cfg_attr(
     not(feature = "target-recipe"),
@@ -63,10 +60,14 @@ enum Work {
 pub(crate) struct Launcher {
     send: SyncSender<Work>,
     login: Login,
+    /// Root's answer at connect, which the generation's start locks on:
+    /// never a later poll's.
+    connected: Option<Answer>,
 }
 
-/// Root's last `1a` answer (td-authd/DESIGN.md, login-state amendment 1):
-/// TOKEN-LOGIN.md's login state, with an enrolled record's key list.
+/// TOKEN-LOGIN.md's login state, as root's `1a` answer gives it
+/// (td-authd/DESIGN.md, login-state amendment 1), with an enrolled
+/// record's key list.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LoginState {
     Unenrolled,
@@ -76,20 +77,28 @@ pub(crate) enum LoginState {
     Unavailable(u8),
 }
 
-impl LoginState {
+/// Root's `1a` answer: the login state, and the primary username and
+/// hostname the lock surface draws above the state's rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Answer {
+    state: LoginState,
+    username: String,
+    /// Empty where root sent none.
+    hostname: String,
+}
+
+impl Answer {
     /// Exactly `9a`'s shape, or a protocol violation that ends the paired
     /// generation: a state, an enrolled list or a cause; a primary account
     /// name; an empty hostname or one under td-firstboot's rules; and the
     /// revocation byte, which is `00` until increment 5 defines another.
-    /// The names are checked and not kept: the lock surface draws them
-    /// from increment 4's C7.
     fn decode(answer: &[u8]) -> Result<Self, String> {
         let invalid = || "invalid login state answer".to_string();
         let [0x9a, state, rest @ ..] = answer else {
             return Err(invalid());
         };
-        let (decoded, rest) = match (*state, rest) {
-            (0, rest) => (Self::Unenrolled, rest),
+        let (state, rest) = match (*state, rest) {
+            (0, rest) => (LoginState::Unenrolled, rest),
             (1, [count, rest @ ..]) if (1..=consent::LOGIN_KEYS).contains(count) => {
                 let (keys, rest) = rest
                     .split_at_checked(usize::from(*count) * 4)
@@ -97,9 +106,9 @@ impl LoginState {
                 let (keys, []) = keys.as_chunks::<4>() else {
                     return Err(invalid());
                 };
-                (Self::Enrolled(keys.to_vec()), rest)
+                (LoginState::Enrolled(keys.to_vec()), rest)
             }
-            (2, [cause @ 0x0a..=0x0c, rest @ ..]) => (Self::Unavailable(*cause), rest),
+            (2, [cause @ 0x0a..=0x0c, rest @ ..]) => (LoginState::Unavailable(*cause), rest),
             _ => return Err(invalid()),
         };
         let [length, rest @ ..] = rest else {
@@ -116,39 +125,99 @@ impl LoginState {
             .ok_or_else(invalid)?;
         let username = std::str::from_utf8(username).map_err(|_| invalid())?;
         let host = std::str::from_utf8(host).map_err(|_| invalid())?;
-        if rest != [0]
-            || primary_account::validate_name(username).is_err()
-            || !(host.is_empty() || hostname::Hostname::parse(host).is_ok())
-        {
+        if rest != [0] || primary_account::validate_name(username).is_err() {
             return Err(invalid());
         }
-        Ok(decoded)
+        let hostname = if host.is_empty() {
+            String::new()
+        } else {
+            hostname::Hostname::parse(host)
+                .map_err(|_| invalid())?
+                .name()
+                .to_string()
+        };
+        Ok(Self {
+            state,
+            username: username.to_string(),
+            hostname,
+        })
+    }
+
+    pub(crate) fn state(&self) -> &LoginState {
+        &self.state
+    }
+
+    pub(crate) fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub(crate) fn hostname(&self) -> &str {
+        &self.hostname
+    }
+
+    /// Whether a generation starts locked on this answer: enrolled or
+    /// unavailable, any cause; never unenrolled, which is also how root
+    /// answers on the live medium (TOKEN-LOGIN.md, "Session lock").
+    pub(crate) fn locks(&self) -> bool {
+        !matches!(self.state, LoginState::Unenrolled)
     }
 }
 
-/// The last `1a` answer, shared: the authority worker writes it and the
-/// input bindings read it, each holding nothing else while they do.
+/// Called with every answer once it is stored.
+type Watcher = Arc<dyn Fn(&Answer) + Send + Sync>;
+
+#[derive(Default)]
+struct Shared {
+    answer: Option<Answer>,
+    watcher: Option<Watcher>,
+}
+
+/// The last `1a` answer, shared: the authority worker writes it, and the
+/// input bindings and the lock surface's watcher read it, each holding
+/// nothing else while they do.
 #[derive(Clone, Default)]
-pub(crate) struct Login(Arc<Mutex<Option<LoginState>>>);
+pub(crate) struct Login(Arc<Mutex<Shared>>);
 
 impl Login {
     /// The last answer's state; none before the first answer, and in the
     /// direct profile, which has no authority.
     pub(crate) fn state(&self) -> Option<LoginState> {
+        self.current().map(|answer| answer.state)
+    }
+
+    /// The last answer, when `state` has one.
+    pub(crate) fn current(&self) -> Option<Answer> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .answer
             .clone()
     }
 
-    fn set(&self, state: LoginState) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(state);
+    /// Calls `watcher` with each later answer, from the authority worker,
+    /// which holds no lock then, this handle's included.
+    pub(crate) fn watch(&self, watcher: impl Fn(&Answer) + Send + Sync + 'static) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .watcher = Some(Arc::new(watcher));
+    }
+
+    fn set(&self, answer: Answer) {
+        let watcher = {
+            let mut shared = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            shared.answer = Some(answer.clone());
+            shared.watcher.clone()
+        };
+        if let Some(watcher) = watcher {
+            watcher(&answer);
+        }
     }
 
     /// Takes `answer` as the worker takes root's.
     #[cfg(test)]
     pub(crate) fn answer(&self, answer: &[u8]) -> Result<(), String> {
-        self.set(LoginState::decode(answer)?);
+        self.set(Answer::decode(answer)?);
         Ok(())
     }
 }
@@ -167,9 +236,9 @@ impl LoginPoll {
         Self { login, next: None }
     }
 
-    fn read(&mut self, wire: &mut impl Exchange) -> Result<(), String> {
-        let state = LoginState::decode(&wire.exchange(&[0x1a])?)?;
-        self.next = if state == LoginState::Unavailable(UNREADABLE) {
+    fn read(&mut self, wire: &mut impl Exchange) -> Result<Answer, String> {
+        let answer = Answer::decode(&wire.exchange(&[0x1a])?)?;
+        self.next = if answer.state == LoginState::Unavailable(UNREADABLE) {
             Some(
                 Instant::now()
                     .checked_add(LOGIN_POLL)
@@ -178,8 +247,8 @@ impl LoginPoll {
         } else {
             None
         };
-        self.login.set(state);
-        Ok(())
+        self.login.set(answer.clone());
+        Ok(answer)
     }
 
     /// After the secret client's tick: `1a` again when a login operation
@@ -190,7 +259,7 @@ impl LoginPoll {
         secrets: &mut crate::secret_client::Client,
     ) -> Result<(), String> {
         if secrets.take_login_end() || self.next.is_some_and(|next| Instant::now() >= next) {
-            return self.read(wire);
+            return self.read(wire).map(drop);
         }
         Ok(())
     }
@@ -216,7 +285,7 @@ impl Launcher {
             return Err("program authority refused session admission".into());
         }
         let login = Login::default();
-        let poll = open_session(&mut wire, &login)?;
+        let (poll, connected) = open_session(&mut wire, &login)?;
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("terminal-authority".into())
@@ -231,12 +300,21 @@ impl Launcher {
                 std::process::exit(1);
             })
             .map_err(|e| format!("start program authority worker: {e}"))?;
-        Ok(Self { send, login })
+        Ok(Self {
+            send,
+            login,
+            connected: Some(connected),
+        })
     }
 
     /// The login state root last answered, which the worker keeps current.
     pub fn login(&self) -> Login {
         self.login.clone()
+    }
+
+    /// Root's answer at connect, which no later answer replaces.
+    pub(crate) fn connected(&self) -> Option<Answer> {
+        self.connected.clone()
     }
 
     pub fn unlock(
@@ -277,7 +355,14 @@ impl Queued {
     pub(crate) fn launcher() -> (Launcher, Self) {
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
         let login = Login::default();
-        (Launcher { send, login }, Self(receive))
+        (
+            Launcher {
+                send,
+                login,
+                connected: None,
+            },
+            Self(receive),
+        )
     }
 
     pub(crate) fn attempt(&self) -> Option<std::sync::Arc<crate::secret_client::Attempt>> {
@@ -421,12 +506,12 @@ fn prepare_session(wire: &mut impl Exchange) -> Result<(), String> {
 }
 
 /// Prepare, then the login state, both before the first repaint and any
-/// input admission.
-fn open_session(wire: &mut impl Exchange, login: &Login) -> Result<LoginPoll, String> {
+/// input admission: the poll, and the answer at connect.
+fn open_session(wire: &mut impl Exchange, login: &Login) -> Result<(LoginPoll, Answer), String> {
     prepare_session(wire)?;
     let mut poll = LoginPoll::new(login.clone());
-    poll.read(wire)?;
-    Ok(poll)
+    let connected = poll.read(wire)?;
+    Ok((poll, connected))
 }
 
 struct Processes {
@@ -599,7 +684,7 @@ mod tests {
 
     #[test]
     fn a_login_state_answer_has_exactly_one_shape() {
-        let decode = |bytes: &[u8]| LoginState::decode(bytes);
+        let decode = |bytes: &[u8]| Answer::decode(bytes).map(|answer| answer.state);
         assert_eq!(decode(&login_state(&[0])), Ok(LoginState::Unenrolled));
         for cause in [0x0a, 0x0b, 0x0c] {
             assert_eq!(
@@ -624,6 +709,16 @@ mod tests {
         let longest = [&[0x9a, 0, 32][..], &[b'a'; 32], &[63], &[b'h'; 63], &[0]].concat();
         assert_eq!(decode(&longest), Ok(LoginState::Unenrolled));
         assert_eq!(decode(b"\x9a\x00\x01a\x00\x00"), Ok(LoginState::Unenrolled));
+        // The names are kept for the lock surface, as root sent them.
+        let kept = Answer::decode(&login_state(&[0])).unwrap();
+        assert_eq!((kept.username(), kept.hostname()), ("tester", "td-laptop"));
+        let kept = Answer::decode(&longest).unwrap();
+        assert_eq!(kept.username(), "a".repeat(32));
+        assert_eq!(kept.hostname(), "h".repeat(63));
+        assert_eq!(
+            Answer::decode(b"\x9a\x00\x01a\x00\x00").unwrap().hostname(),
+            ""
+        );
         let refused = [
             vec![],
             vec![0x9a],
@@ -667,6 +762,67 @@ mod tests {
         }
     }
 
+    /// Each answer after the watch reaches the watcher once stored, with
+    /// the handle's own lock released, so the watcher may read it.
+    #[test]
+    fn every_later_answer_reaches_the_watcher_outside_the_handles_lock() {
+        let login = Login::default();
+        login.answer(&login_state(&[0])).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (watched, record) = (login.clone(), Arc::clone(&seen));
+        login.watch(move |answer| {
+            assert_eq!(watched.current().as_ref(), Some(answer));
+            record.lock().unwrap().push(answer.state().clone());
+        });
+        let mut poll = LoginPoll::new(login.clone());
+        let mut w = wire(vec![login_state(&[2, UNREADABLE]), login_state(&keys(1))]);
+        poll.read(&mut w).unwrap();
+        poll.read(&mut w).unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                LoginState::Unavailable(UNREADABLE),
+                LoginState::Enrolled(vec![[1; 4]])
+            ]
+        );
+    }
+
+    /// Enrolled and unavailable, any cause, start a generation locked;
+    /// unenrolled, which is also root's every answer on the live medium,
+    /// does not.
+    #[test]
+    fn enrolled_and_unavailable_answers_lock_and_unenrolled_does_not() {
+        let locks = |state: &[u8]| Answer::decode(&login_state(state)).unwrap().locks();
+        assert!(!locks(&[0]));
+        for count in 1..=8 {
+            assert!(locks(&keys(count)));
+        }
+        for cause in [0x0a, 0x0b, 0x0c] {
+            assert!(locks(&[2, cause]));
+        }
+    }
+
+    /// The answer at connect is kept apart from the handle: an unreadable
+    /// state that a poll reads unenrolled before the first paint still
+    /// starts the generation locked.
+    #[test]
+    fn the_connect_answer_is_not_replaced_by_a_later_poll() {
+        let login = Login::default();
+        let mut w = wire(vec![
+            vec![0x90],
+            vec![0x91, 2],
+            login_state(&[2, UNREADABLE]),
+            login_state(&[0]),
+        ]);
+        let (mut poll, connected) = open_session(&mut w, &login).unwrap();
+        poll.next = Some(Instant::now());
+        poll.follow(&mut w, &mut crate::secret_client::Client::default())
+            .unwrap();
+        assert_eq!(login.state(), Some(LoginState::Unenrolled));
+        assert_eq!(connected.state(), &LoginState::Unavailable(UNREADABLE));
+        assert!(connected.locks());
+    }
+
     #[test]
     fn connect_asks_the_login_state_once_prepared_and_refuses_a_malformed_one() {
         let login = Login::default();
@@ -676,7 +832,7 @@ mod tests {
             vec![0x91, 2],
             login_state(&keys(2)),
         ]);
-        let poll = open_session(&mut pending, &login).unwrap();
+        let (poll, connected) = open_session(&mut pending, &login).unwrap();
         assert_eq!(
             pending.requests,
             [vec![0x10], vec![0x11], vec![0x11], vec![0x1a]]
@@ -686,6 +842,7 @@ mod tests {
             Some(LoginState::Enrolled(vec![[1; 4], [2; 4]]))
         );
         assert!(poll.next.is_none());
+        assert_eq!(Some(connected), login.current());
         // Nothing is asked before preparation completes.
         let mut unprepared = wire(vec![vec![0x90], vec![0x91, 0]]);
         assert!(open_session(&mut unprepared, &Login::default()).is_err());
@@ -929,6 +1086,7 @@ mod tests {
         let launcher = Launcher {
             send,
             login: Login::default(),
+            connected: None,
         };
         assert!(launcher.launch().is_ok());
         assert!(launcher.launch().is_err());

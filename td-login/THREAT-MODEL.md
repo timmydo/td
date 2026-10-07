@@ -46,8 +46,10 @@ Adversaries considered:
   is on fd 0.
 - **A4 — a person at a locked machine** without an enrolled login key and
   its PIN. This adversary exists only under the planned login-key tier in
-  [`TOKEN-LOGIN.md`](TOKEN-LOGIN.md), which owns that tier's scope; td-login's
-  part is the console refusal in §3.
+  [`TOKEN-LOGIN.md`](TOKEN-LOGIN.md), which owns that tier's scope, and
+  only where a key is enrolled or the login directory is invalid, the
+  states the compositor starts locked on; td-login's part is the console
+  refusal in §3.
 
 Explicitly **not** in the model: an attacker who already has uid 0
 (nothing here can constrain them), physical DMA, and the kernel itself.
@@ -431,7 +433,10 @@ the primary one. A console session started before enrollment does not
 survive it; TOKEN-LOGIN.md's "Cutover" owns how. The stock image never
 contains a record and firstboot ensures the directory at every boot, so
 its console behaviour and the table above stand; the refusal acts only
-where a record or an invalid directory exists.
+where a record or an invalid directory exists. Since TOKEN-LOGIN.md's
+increment 4 (C7) the compositor starts every generation locked on
+exactly those states, so this refusal and the enforced SSH form are
+what keep the serial line and SSH from passing a lock screen there.
 
 The future hardware-backed disk and session unlock contract lives in
 [`td-install/ENCRYPTION.md`](../td-install/ENCRYPTION.md). It binds primary

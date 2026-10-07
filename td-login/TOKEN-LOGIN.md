@@ -13,14 +13,17 @@ paired requests `1b` and `1c`. The compositor's key-management screen
 sends `1b` for a first enrollment, an addition and a removal from the
 key list of td-authd's `1a` answer, each of which a production td-authd
 refuses before starting anything; without a list it refuses removal
-itself. Only its lock surface's chord sends an unlock's `1b`, and
-nothing in production locks. Its PIN field sends `1c` only when root
-asks for a PIN at a presented PIN step, which no production operation
+itself. Only its lock surface's chord sends an unlock's `1b`, and only
+while the state is enrolled; production locks only at a generation's
+start (increment 4's C7, below). Its PIN field sends `1c` only when
+root asks for a PIN at a presented PIN step, which only that unlock
 reaches. So nothing in production starts the worker or uses its
 `login_record` and `login_store` modules ("The login record"), its login
 identify, PIN-retry, assertion and creation steps ("Token profile"), or
 td-authd's login consent operations, step admission and supervision
-(`td-authd/DESIGN.md`, "Login-key operation supervision"). The worker
+(`td-authd/DESIGN.md`, "Login-key operation supervision"), except that
+unlock on a machine that holds a record, which nothing in production
+writes. The worker
 reads both retained deployments' tier markers before a write that would
 leave a record ("Versions"), which production td-authd still refuses
 before starting it. No deployment carries the marker before increment
@@ -39,12 +42,11 @@ client's login-key operations have landed too
 each operation's descriptions checked step by step, its commit and the
 failure texts ("Failure texts"). Production reaches only their refusals.
 The PIN field has landed as well ("PIN entry, presence and retries"),
-inert, since production never reaches a PIN step, and so has the lock
-surface with its login unlock ("Session lock"), inert: its one entry is
-test-only and nothing in production locks. Increment 3 is complete; its
+reached only by that unlock, and so has the lock surface with its login
+unlock ("Session lock"), which C7 made live. Increment 3 is complete; its
 desktop guest moved to increment 4 as `login-desktop`. Increment 4 is
 specified as twelve commits, C1 to C11 and C10b ("Increments"), of which
-C1 to C6 have landed: firstboot ensures the login directory at every
+C1 to C7 have landed: firstboot ensures the login directory at every
 boot, the live medium's included, through the shared login-state
 predicate, and rootcheck reports it on a marker of its own; td-authd
 answers request `1a` with the login state, through that predicate and
@@ -62,12 +64,19 @@ moot, since nothing enrolls before increment 5. td-login's interactive
 `login` and `login-primary` refuse the console there, returning the line
 to root and parking with one fixed line (`THREAT-MODEL.md` §3), while
 the image logs in only through `login-primary`; and firstboot's
-boot-time SSH render takes the enforced form there ("SSH"). Nothing in
-production locks on the state yet, and only those three refusals act on
-it, where a record or an invalid directory exists. Nothing else below is
+boot-time SSH render takes the enforced form there ("SSH"). The
+compositor starts every generation locked there too ("Session lock"):
+its first frame is the lock surface, with the answer's hostname and
+username above the state's rows, and on it the chord sends an unlock's
+`1b` only while the state is enrolled. Nothing else locks yet: `Super+l`,
+`L`, a lid close and a resume come with C9 and C10. Those three refusals
+and the locked start are all that act on the state, and only where a
+record or an invalid directory exists. Nothing else below is
 implemented. Until the increments at the end land, `THREAT-MODEL.md` §3
 is the complete current behaviour: the installed account logs in
-automatically and the session never locks. No document, UI or release
+automatically, and a machine with neither a record nor an invalid
+directory, as every stock machine is, never locks. No document, UI or
+release
 note may describe this tier as available before its acceptance evidence
 exists.
 
@@ -676,9 +685,7 @@ the unlock. A locked session
 whose state becomes unenrolled stays locked for the rest of its
 generation, since nothing on the lock surface unlocks it; the next
 generation, at a reboot or a compositor or authority restart, starts
-unlocked, as every unenrolled one does. Until increment 4's C7 draws
-the `1a` answer's rows, the lock surface shows `LOCKED` and `PRESS
-CTRL+ALT+ESC TO UNLOCK` alone.
+unlocked, as every unenrolled one does.
 
 On the lock surface Ctrl+Alt+Esc opens a login-unlock attention lifetime
 directly, without the menu. The prompt presents the unlock description; the
@@ -1373,11 +1380,31 @@ and the oracle that shows it.
      form on a full system is `qemu-login-system`'s (C11). It changes
      the boot path's td-firstboot, so its landing runs `check
      integration` by hand.
-   - C7, the activating commit: the compositor's locked start. The `1a`
-     state at connect locks an enrolled or unavailable session before
-     the first repaint, the lock surface gains the hostname and username
-     rows, the production lock entry replaces the test-only one with its
-     source pin amended, and every generation relocks.
+   - C7, landed, the activating commit: the compositor's locked start
+     (`td-compositor/DESIGN.md`, "The lock surface"). In the paired
+     profile, the `1a` answer at connect locks an enrolled or
+     unavailable session in the generation's first paint, which takes
+     the place of its first repaint, before any input reader or client;
+     that answer alone decides, never a later poll's, so a state that
+     could not be read at connect starts locked even if a poll reads it
+     unenrolled first. Every generation, a restarted compositor's
+     included, starts locked on that rule; the live medium's root
+     answers unenrolled and the direct development profile has no
+     authority, so neither locks.
+     The lock surface draws the answer's hostname and username above the
+     state's rows and follows each later answer. On it the chord sends
+     `1b` only while the state is enrolled; unavailable shows its cause's
+     rows and unenrolled `NO LOGIN KEYS ENROLLED`, sending nothing.
+     `Scene::lock` lost its test-only gate, its one production caller is
+     that first paint, and the amended source pin holds it; the live
+     entries for `Super+l` and `L` stay test-only until C9. Session units
+     start behind the lock, as "Locked boot" says. Host tests cover the
+     start decision per state, unenrolled and no authority, every frame
+     a recording output is handed, relock per generation, the rows' exact
+     positions and a 63-byte hostname's wrapping, the chord on each
+     state, a state turned unenrolled while locked, and the pin. No
+     oracle reaches the locked path, since the stock image is
+     unenrolled: `login-desktop` (C8) and `qemu-login-system` (C11) do.
    - C8: the `login-desktop` guest (below), which also updates the
      login-guest counts that say eleven (here, "Evidence", and
      `td-secret/DESIGN.md`, "Login-key worker guests").

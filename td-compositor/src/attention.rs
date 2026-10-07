@@ -365,14 +365,47 @@ pub(crate) fn paint(
     draw_rows(frame, width, height, stride, scale, columns, &rows);
 }
 
-/// The lock surface's rows (td-login/TOKEN-LOGIN.md, "Session lock"). The
-/// hostname and username join them with request `1a`'s answer, increment
-/// 4's.
-const LOCK_ROWS: &[&str] = &["LOCKED", "PRESS CTRL+ALT+ESC TO UNLOCK"];
+/// The lock surface's state row for an enrolled account.
+const UNLOCK_ROWS: &[&str] = &["PRESS CTRL+ALT+ESC TO UNLOCK"];
+
+/// The lock surface's rows for root's `1a` answer (td-login/TOKEN-LOGIN.md,
+/// "Session lock"): its hostname, unless empty, and username, uppercase,
+/// then `LOCKED` and the state's rows. With no answer, `LOCKED` alone.
+pub(crate) fn lock_rows(answer: Option<&crate::authority::Answer>) -> Vec<String> {
+    use crate::authority::LoginState;
+    use crate::secret_client::login_failure;
+    let Some(answer) = answer else {
+        return vec!["LOCKED".into()];
+    };
+    let state = match answer.state() {
+        LoginState::Enrolled(_) => Some(UNLOCK_ROWS),
+        LoginState::Unavailable(cause) => login_failure(*cause, 0),
+        LoginState::Unenrolled => login_failure(0x09, 0),
+    };
+    let hostname = Some(answer.hostname()).filter(|name| !name.is_empty());
+    hostname
+        .into_iter()
+        .chain([answer.username(), "LOCKED"])
+        .map(str::to_ascii_uppercase)
+        .chain(
+            state
+                .unwrap_or_default()
+                .iter()
+                .map(|row| String::from(*row)),
+        )
+        .collect()
+}
 
 /// The lock surface, over the whole output: display-only pixels, as the
-/// attention screen's are, in its chrome rows and place.
-pub(crate) fn paint_lock(frame: &mut [u8], width: usize, height: usize, stride: usize) {
+/// attention screen's are, in its chrome rows and place. A row wider than
+/// the output's columns, as a long hostname is, wraps.
+pub(crate) fn paint_lock(
+    frame: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    rows: &[String],
+) {
     ui::fill(
         frame,
         width,
@@ -382,8 +415,7 @@ pub(crate) fn paint_lock(frame: &mut [u8], width: usize, height: usize, stride: 
         [0x28, 0x20, 0x18, 0],
     );
     let (scale, columns) = layout(width, height);
-    let rows: Vec<String> = LOCK_ROWS.iter().map(|row| String::from(*row)).collect();
-    draw_rows(frame, width, height, stride, scale, columns, &rows);
+    draw_rows(frame, width, height, stride, scale, columns, rows);
 }
 
 /// `rows`, each wrapped to `columns`, from the menu's place down.
@@ -1009,14 +1041,27 @@ mod tests {
         assert!(painted == ordinary);
     }
 
-    /// The lock surface is the attention screen's chrome over the whole
-    /// output: its rows where the menu's title and notice go, on 1280x800
-    /// at 276 and 312, and nothing else, so no client pixel survives it.
-    #[test]
-    fn the_lock_surface_is_its_two_rows_over_the_whole_output() {
-        let (width, height, stride) = (1280, 800, 1280 * 4);
-        let mut painted = vec![0x55; stride * height];
-        paint_lock(&mut painted, width, height, stride);
+    /// Root's `9a` for `state`, for the primary `tester`, as the worker
+    /// keeps it.
+    fn answer(state: &[u8], hostname: &str) -> crate::authority::Answer {
+        let login = crate::authority::Login::default();
+        let host = u8::try_from(hostname.len()).unwrap();
+        let bytes = [
+            &[0x9a][..],
+            state,
+            b"\x06tester",
+            &[host],
+            hostname.as_bytes(),
+            &[0],
+        ]
+        .concat();
+        login.answer(&bytes).unwrap();
+        login.current().unwrap()
+    }
+
+    /// The lock surface's background with `rows` drawn at their tops.
+    fn lock_drawn(width: usize, height: usize, scale: usize, rows: &[(usize, &str)]) -> Vec<u8> {
+        let stride = width * 4;
         let mut expected = vec![0; stride * height];
         let bounds = (0, 0, width, height);
         ui::fill(
@@ -1027,32 +1072,154 @@ mod tests {
             bounds,
             [0x28, 0x20, 0x18, 0],
         );
-        for (top, text) in [(276, "LOCKED"), (312, "PRESS CTRL+ALT+ESC TO UNLOCK")] {
+        for (top, text) in rows {
             ui::draw_text_clipped(
                 &mut expected,
                 width,
                 height,
                 stride,
                 24,
-                top,
-                2,
+                *top,
+                scale,
                 text,
                 [0xff, 0xff, 0xff, 0],
                 bounds,
             );
         }
-        assert!(painted == expected);
-        // Whole, unwrapped and drawn on the smallest output a prompt takes.
-        for (width, height) in [(320, 200), (800, 600)] {
-            let stride = width * 4;
-            let mut frame = vec![0x55; stride * height];
-            paint_lock(&mut frame, width, height, stride);
-            assert!(frame.chunks(4).all(|pixel| pixel[0] != 0x55));
-            for row in LOCK_ROWS {
-                assert!(row.len() <= layout(width, height).1, "{row}");
+        expected
+    }
+
+    fn lock_painted(width: usize, height: usize, rows: &[String]) -> Vec<u8> {
+        let stride = width * 4;
+        let mut painted = vec![0x55; stride * height];
+        paint_lock(&mut painted, width, height, stride, rows);
+        assert!(painted.chunks(4).all(|pixel| pixel[0] != 0x55));
+        painted
+    }
+
+    /// The lock surface is the attention screen's chrome over the whole
+    /// output, so no client pixel survives it: the `1a` answer's hostname
+    /// and username, uppercase, then `LOCKED` and the state's rows, from
+    /// the menu's place down. On 1280x800 a one-row hostname is at 276,
+    /// the username at 312, `LOCKED` at 348 and the next row at 384; an
+    /// empty hostname draws no row.
+    #[test]
+    fn the_lock_surface_draws_the_names_then_the_states_rows() {
+        let enrolled = [1, 2, 1, 1, 1, 1, 2, 2, 2, 2];
+        let unlock = "PRESS CTRL+ALT+ESC TO UNLOCK";
+        let cases: &[(&[u8], &str, &[&str])] = &[
+            (
+                &enrolled,
+                "td-laptop",
+                &["TD-LAPTOP", "TESTER", "LOCKED", unlock],
+            ),
+            (
+                &[2, 0x0a],
+                "td-laptop",
+                &[
+                    "TD-LAPTOP",
+                    "TESTER",
+                    "LOCKED",
+                    "LOGIN KEY STATE UNAVAILABLE:",
+                    "DIRECTORY DAMAGED",
+                ],
+            ),
+            (
+                &[2, 0x0b],
+                "td",
+                &[
+                    "TD",
+                    "TESTER",
+                    "LOCKED",
+                    "LOGIN KEY STATE UNAVAILABLE:",
+                    "RECORD DAMAGED",
+                ],
+            ),
+            (
+                &[2, 0x0c],
+                "td",
+                &[
+                    "TD",
+                    "TESTER",
+                    "LOCKED",
+                    "LOGIN KEY STATE UNAVAILABLE:",
+                    "STATE COULD NOT BE READ",
+                ],
+            ),
+            (
+                &[0],
+                "td-laptop",
+                &["TD-LAPTOP", "TESTER", "LOCKED", "NO LOGIN KEYS ENROLLED"],
+            ),
+            (&enrolled, "", &["TESTER", "LOCKED", unlock]),
+        ];
+        for (state, hostname, expected) in cases {
+            let rows = lock_rows(Some(&answer(state, hostname)));
+            assert_eq!(rows, *expected);
+            let placed: Vec<(usize, &str)> = expected
+                .iter()
+                .enumerate()
+                .map(|(index, row)| (276 + 36 * index, *row))
+                .collect();
+            assert!(
+                lock_painted(1280, 800, &rows) == lock_drawn(1280, 800, 2, &placed),
+                "{expected:?}"
+            );
+            // Every row but the hostname fits the narrowest output whole,
+            // and every glyph is the font's.
+            for (index, row) in rows.iter().enumerate() {
                 assert!(row.bytes().all(ui::is_mapped), "{row}");
+                if index > 0 || hostname.is_empty() {
+                    assert!(row.len() <= layout(320, 200).1, "{row}");
+                }
             }
         }
+        // With no answer, which no paired generation has once connected.
+        assert_eq!(lock_rows(None), ["LOCKED"]);
+        assert!(
+            lock_painted(1280, 800, &lock_rows(None))
+                == lock_drawn(1280, 800, 2, &[(276, "LOCKED")])
+        );
+    }
+
+    /// A 63-byte hostname has no space to wrap at, so where it is wider
+    /// than the output's columns it breaks at the last column, and the
+    /// username and the state's rows follow below it.
+    #[test]
+    fn a_63_byte_hostname_wraps_at_the_last_column() {
+        let hostname = format!("{}.{}", "a".repeat(31), "b".repeat(31));
+        assert_eq!(hostname.len(), 63);
+        let upper = hostname.to_ascii_uppercase();
+        let rows = lock_rows(Some(&answer(&[2, 0x0c], &hostname)));
+        assert_eq!(rows[0], upper);
+        let cause = ["LOGIN KEY STATE UNAVAILABLE:", "STATE COULD NOT BE READ"];
+        // 1280x800 has 102 columns: one row.
+        let mut placed = vec![(276, upper.as_str()), (312, "TESTER"), (348, "LOCKED")];
+        placed.extend([(384, cause[0]), (420, cause[1])]);
+        assert!(lock_painted(1280, 800, &rows) == lock_drawn(1280, 800, 2, &placed));
+        // 800x600 has 62: the last byte wraps, from the menu's place, 176.
+        assert_eq!(layout(800, 600), (2, 62));
+        let placed = [
+            (176, &upper[..62]),
+            (212, &upper[62..]),
+            (248, "TESTER"),
+            (284, "LOCKED"),
+            (320, cause[0]),
+            (356, cause[1]),
+        ];
+        assert!(lock_painted(800, 600, &rows) == lock_drawn(800, 600, 2, &placed));
+        // The smallest output a prompt takes has 45, at single scale, and
+        // the block moves up to fit, as little as it must: to the top.
+        assert_eq!(layout(320, 200), (1, 45));
+        let placed = [
+            (0, &upper[..45]),
+            (18, &upper[45..]),
+            (36, "TESTER"),
+            (54, "LOCKED"),
+            (72, cause[0]),
+            (90, cause[1]),
+        ];
+        assert!(lock_painted(320, 200, &rows) == lock_drawn(320, 200, 1, &placed));
     }
 
     // The PIN field.

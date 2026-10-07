@@ -5978,10 +5978,11 @@ a security key's own keyboard, and none before the screen is on glass.
 
 #### The PIN field
 
-TOKEN-LOGIN.md's PIN entry, inert in production: no production
-operation reaches a PIN step, since root refuses every one that writes
-and only the lock surface's chord sends an unlock's `1b`, which nothing
-in production reaches ("The lock surface" below).
+TOKEN-LOGIN.md's PIN entry. Only a login unlock reaches it in
+production, since root refuses every operation that writes, and only
+the lock surface's chord sends an unlock's `1b`, only while the login
+state is enrolled ("The lock surface" below): on a machine holding a
+record, which nothing in production writes.
 
 It opens when root answers a poll with `0c` for the current step, which
 must ask for a PIN (consent's `asks_pin`) and have this client's
@@ -6117,32 +6118,48 @@ nothing but cancelling.
 
 ### The lock surface
 
-TOKEN-LOGIN.md's lock surface and login unlock, inert in production:
-nothing in production locks the session, and the compiler holds it.
-The scene's lock state is private to it; its one setter,
-`Scene::lock`, is compiled into tests alone, as are the entries above
-it, `Runtime::lock_session` and the evdev adapter's `lock_session`,
-and production's `Scene::unlock` only clears the state, so a
-production caller of any of them does not build. A source pin holds
-what the compiler cannot: `Scene::lock` is the one write of `true`,
-`Scene::new` starts unlocked, nothing borrows the state mutably, and
-every other write of a `locked` field in any source writes `false`.
-TOKEN-LOGIN.md's increment 4 adds the triggers (item 5 below). This
-build's test-only entry goes through the input bindings, needs the
-paired profile and refuses while attention is up; item 5 supersedes
-those two limits for the connect-time lock, which needs no binding, and
-for a lid close or resume during an open lifetime. Like opening
-attention it closes the launcher and sheet, and their key capture in
-the bindings with them, cancels a drag, withdraws keyboard focus and
-grabs, and paints the whole output, answering with that paint's
-`NoticePresentation`.
+TOKEN-LOGIN.md's lock surface and login unlock. Production locks in one
+place, the generation's first paint (TOKEN-LOGIN.md increment 4's C7):
+`Runtime::first_paint`, which `run_compositor` calls in place of its
+first repaint, after the authority's Prepare and first `1a` and before
+any input reader, overlay or client, locks in the paired profile when
+that connect-time answer is enrolled or unavailable, any cause
+(`Answer::locks`). The launcher keeps that answer apart from the handle
+the worker updates (`Launcher::connected`), so a later poll's answer
+gives the rows but never the decision: an unreadable state at connect
+starts locked even if a poll reads it unenrolled before the first paint,
+as D14 keeps such a session locked. Unenrolled, the live medium's every
+answer, starts unlocked, and the direct development profile has no
+authority and never locks. Every generation, a restarted compositor's
+included, therefore starts locked on that rule, and no client pixel of
+that generation precedes the lock surface on glass. Under fbdev the
+previous generation's last frame stays in `/dev/fb0` across a restart
+until the first paint replaces it; it discloses nothing that generation
+had not already shown. The scene's lock state is private to it, and
+production's `Scene::unlock` only clears it. A source pin holds what the
+compiler cannot: `Scene::lock` is the one write of `true`, `Scene::new`
+starts unlocked, nothing borrows the state mutably, and every other
+write of a `locked` field in any source writes `false`; `Scene::lock`
+has two callers, `first_paint` under that condition and the test-only
+`Runtime::lock_session`, whose caller, the evdev adapter's
+`lock_session`, is test-only too; and `first_paint` has the one caller
+above. Those live entries are C9's, for `Super+l` and `L` (item 5
+below). They go through the input bindings, need the paired profile and
+refuse while attention is up; item 5 supersedes the last limit for a lid
+close or resume during an open lifetime. Like opening attention they
+close the launcher and sheet, and their key capture in the bindings with
+them, cancel a drag, withdraw keyboard focus and grabs, and paint the
+whole output, answering with that paint's `NoticePresentation`.
 
 While locked the scene's private screen is the lock surface, beneath
 any attention screen: display rendering alone draws it, in the
 attention screen's chrome, background and row place, as
-TOKEN-LOGIN.md's lock rows ("Session lock"; on 1280x800 `LOCKED` at 276
-and `PRESS CTRL+ALT+ESC TO UNLOCK` at 312). The hostname and username
-rows join it with increment 4's `1a` (item 5 below). No client pixel,
+TOKEN-LOGIN.md's lock rows ("Session lock"): the last `1a` answer's
+hostname and username, then `LOCKED` and the state's rows (item 5's
+"Rows" below). The scene keeps the rows, and the authority worker,
+holding no lock, hands each later answer to the runtime
+(`runtime::watch_login`), which repaints a lock surface on glass when
+they change; an answer never locks or unlocks. No client pixel,
 cursor, title or workspace bar is drawn, and a client's commit changes
 nothing on glass.
 The runtime's key, modifier and pointer routing, keyboard and pointer
@@ -6151,18 +6168,32 @@ pixel-evidence oracle treat the lock surface as they treat the
 attention screen, so no client is focused or given input from any
 source, and the evidence reads zero. The evdev adapter runs no ordinary
 binding on it (terminal, launcher, sheet, workspaces and tiling).
-Control, automation, capture and clipboard control already refuse the
-paired profile, the only one that locks.
+Input automation, public capture and observation, and clipboard
+control already refuse the paired profile, the only one that locks. The
+control socket's tiling and report requests do not: while locked it
+still answers every tiling and report request: layout, workspace,
+focus, move, fullscreen, `send` to a workspace, `present` and `group`,
+and focus, send and move of a named window. None of them delivers input or a pixel,
+but a session process can choose which window has focus once the
+session unlocks, and read window titles and the arrangement behind the
+lock.
 
 On the lock surface Ctrl+Alt+Esc is the selection: it opens attention
 straight into a login unlock, the lifetime's one operation, and the
-private client sends `1b 07`. The attention screen opened there shows
-`PREPARING REQUEST`, never the menu, and the menu's and key-management
-screen's keys select nothing. The chord is read under the selection's
-rules: its Escape a fresh press, and Control and Alt held, each on a
-device secure attention reads, so a security key's own keyboard's
-chord leaves the lock surface as it was; its Escape still cancels an
-unlock another keyboard opened. One attention lifetime carries the
+private client sends `1b 07`, while the last `1a` answer is enrolled.
+Unavailable, the chord's attention screen shows the cause's two rows,
+and unenrolled `NO LOGIN KEYS ENROLLED`; nothing is sent and nothing
+more is selected in that lifetime, Escape returns to the lock surface,
+and a state that could not be read resolves through the worker's
+polling, after which the chord's unlock returns. A session whose state
+turns unenrolled while locked so stays locked for its generation. The
+attention screen opened there shows `PREPARING REQUEST`, never the
+menu, and the menu's and key-management screen's keys select nothing.
+The chord is read under the selection's rules: its Escape a fresh
+press, and Control and Alt held, each on a device secure attention
+reads, so a security key's own keyboard's chord leaves the lock
+surface as it was; its Escape still cancels an unlock another keyboard
+opened. One attention lifetime carries the
 whole chained unlock, each step admitted and presented as "Login-key
 operations" says, the PIN field included.
 
@@ -6184,10 +6215,9 @@ An Escape that came first, even after the commit, ends the lifetime
 still locked whatever root then reports. A `06` out of order, before
 the commit, for another step or nonce, or as a new lifetime's first
 status is a protocol violation that ends the paired generation without
-leaving the lock surface. The next generation starts locked only from
-increment 4, which reads the login state at Prepare; in this build it
-starts unlocked, as every generation does. A failure shows its text on
-the attention screen, still locked; Escape returns to the lock surface
+leaving the lock surface. The next generation starts locked again on
+the first paint's rule. A failure shows its text on the attention
+screen, still locked; Escape returns to the lock surface
 and a new chord opens a new lifetime. This build's root answers an unlock
 `NO LOGIN KEYS ENROLLED`, or `LOGIN KEY STATE UNAVAILABLE: DIRECTORY
 DAMAGED` while the directory is missing, before any description.
@@ -6203,14 +6233,24 @@ unlocked with the window on glass and focused; a `06` with a key held,
 drained under its success notice until the release; locking with the
 launcher or sheet open, their capture closed; a failure's text, still
 locked; Escape before and after the commit, still locked; and forged
-and out-of-order `06`s. The desktop guest is increment 4's
-`login-desktop`.
+and out-of-order `06`s. Host tests of the locked start cover the
+decision for each state, unenrolled, no answer and the direct profile;
+every frame a recording output is handed, the first being the lock
+surface; relock in each generation after an unlock; the rows' exact
+places and a 63-byte hostname's wrap at 1280x800, 800x600 and 320x200;
+the rows following later answers, never locking or unlocking; the
+chord on each unavailable cause, its rows and nothing sent, then its
+unlock once the state reads enrolled; a state turned unenrolled while
+locked; and the pin. The desktop guest is increment 4's
+`login-desktop`; no oracle on the stock, unenrolled image reaches the
+locked path.
 
 ### Session lock and login-key entry (target)
 
 Partly implemented: items 1 to 4 are "Login-key operations" above, and
 item 5's lock surface and unlock are "The lock surface" above, and its
-`1a` requests (not yet its lock) and request 19's refusal text are
+`1a` requests, its connect-time lock, the rows and the chord's rule
+(TOKEN-LOGIN.md increment 4's C7), and request 19's refusal text are
 implemented.
 [td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier, including when the session locks and what
@@ -6260,29 +6300,31 @@ excluded from every selection, confirmation and field below.
      not be read. The requests and their polling are implemented
      (increment 4's C3): the authority worker asks after the secret
      client reports a login operation's end, whatever the end, and
-     waits for work no longer than the next poll; the answer feeds only
-     `D` until C7 locks on it. It admits exactly `9a`'s shape
+     waits for work no longer than the next poll; the answer feeds `D`
+     and, since C7, the lock. It admits exactly `9a`'s shape
      (`td-authd/DESIGN.md`, "Login-key operation supervision"), with
      the username under td-authd's `primary_account` rule and the
      hostname empty or under td-firstboot's `Hostname::parse`, both
      compiled from those files behind the `auth/` `cfg_attr` pair and
-     checked but not kept until C7 draws them; any other answer, a
-     nonzero revocation byte included, ends the paired generation. A
-     production lock entry replaces the test-only one:
-     `Scene::lock` and the entries above it lose their test-only gate,
-     and the source pin of "The lock surface" names their production
-     callers, this connect-time lock and the triggers below, and no
-     other. Every generation therefore starts locked when the state is
-     enrolled or unavailable. A `1a` answer never locks an unlocked
+     kept for the rows; any other answer, a nonzero revocation byte
+     included, ends the paired generation. Implemented in C7: the
+     generation's first paint is the production lock entry ("The lock
+     surface" above), and the source pin there names its one caller.
+     `Scene::lock` lost its test-only gate; the live entries above it
+     lose theirs with the triggers below, which the pin then names, and
+     no other. Every generation therefore starts locked when the state
+     is enrolled or unavailable. A `1a` answer never locks an unlocked
      session (TOKEN-LOGIN.md, "Session lock").
-   - **Rows.** Above the state's rows the lock surface draws the `1a`
-     answer's hostname, then its username, both uppercase in the chrome
-     font; with a one-row hostname, on 1280x800 the hostname is at 276,
-     the username at 312, `LOCKED` at 348 and the next row at 384. An
-     empty hostname draws no row. A hostname holds no space, so where it
-     is wider than the output's columns the existing `wrap` breaks it at
-     the column, as it breaks any row with no space to break at; every
-     other row fits 45 columns whole.
+   - **Rows.** Implemented (C7). Above the state's rows the lock surface
+     draws the `1a` answer's hostname, then its username, both uppercase
+     in the chrome font; with a one-row hostname, on 1280x800 the
+     hostname is at 276, the username at 312, `LOCKED` at 348 and the
+     next row at 384. An empty hostname draws no row. A hostname holds no
+     space, so where it is wider than the output's columns the existing
+     `wrap` breaks it at the column, as it breaks any row with no space
+     to break at (a 63-byte name on 800x600, 62 columns, is two rows
+     from 176, and on 320x200, 45 columns, two rows from 0); every other
+     row fits 45 columns whole. The attention screen's rows do not move.
    - **`Super+l`** joins the binding list, and the help sheet's row, in
      the paired profile only. It is checked before the launcher's and
      help sheet's key capture, so it closes either and locks; always
@@ -6301,7 +6343,7 @@ excluded from every selection, confirmation and field below.
      an unenrolled account shows `NO LOGIN KEYS ENROLLED`.
    - **On the lock surface** the chord sends no `1b` unless the state
      is enrolled: unavailable shows its cause's rows, and unenrolled
-     `NO LOGIN KEYS ENROLLED`, until Escape.
+     `NO LOGIN KEYS ENROLLED`, until Escape. Implemented (C7).
    - **A lock during an open lifetime** is TOKEN-LOGIN.md's: a
      pre-commit cancellation (`15`), a drain without the result after a
      commit, or Escape within a login unlock. C9 implements it for
@@ -6352,8 +6394,9 @@ excluded from every selection, confirmation and field below.
    than about three seconds are certain to be detected; TOKEN-LOGIN.md
    discloses that limit.
 
-Nothing in the current profile locks, so no production operation reaches
-the PIN field.
+Only the generation's first paint locks in the current profile, and only
+on an enrolled or unavailable state, so only a login unlock on a machine
+holding a record reaches the PIN field.
 
 ### Immutable prompt presentation
 

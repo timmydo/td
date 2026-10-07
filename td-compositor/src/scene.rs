@@ -870,9 +870,12 @@ pub struct Scene {
     attention_field: Option<crate::attention::Field>,
     /// The lock surface (td-login/TOKEN-LOGIN.md, "Session lock"): drawn
     /// by display rendering alone, beneath any attention screen, while no
-    /// client is rendered, focused or given input. Only the test-only
-    /// `lock` sets it; nothing in production locks before increment 4.
+    /// client is rendered, focused or given input. Only `lock` sets it,
+    /// and production reaches that only through the generation's first
+    /// paint (`Runtime::first_paint`).
     locked: bool,
+    /// The lock surface's rows, which follow root's latest `1a` answer.
+    lock_rows: Vec<String>,
     /// This attention lifetime left the lock surface: its success notice
     /// stays above the drain row, which cancels nothing.
     attention_unlocked: bool,
@@ -918,6 +921,7 @@ impl Scene {
             attention_notice: crate::attention::Notice::Menu,
             attention_field: None,
             locked: false,
+            lock_rows: crate::attention::lock_rows(None),
             attention_unlocked: false,
             status: String::new(),
             text: crate::text::Text::default(),
@@ -3214,13 +3218,19 @@ impl Scene {
         self.locked
     }
 
-    /// The lock surface's one entry, compiled into tests alone: no
-    /// production function can set the lock.
-    #[cfg(test)]
+    /// The lock surface's one entry. Its production caller is the
+    /// generation's first paint alone, which a source pin holds.
     pub(crate) fn lock(&mut self) {
         self.locked = true;
         self.launcher.apply(LauncherAction::Close);
         self.help.set(false);
+    }
+
+    /// The lock surface's rows from now on; whether they changed.
+    pub(crate) fn set_lock_rows(&mut self, rows: Vec<String>) -> bool {
+        let changed = self.lock_rows != rows;
+        self.lock_rows = rows;
+        changed
     }
 
     /// Leaves the lock surface from the attention lifetime opened on it.
@@ -3382,7 +3392,7 @@ impl Scene {
                 self.attention_notice,
             );
         } else if self.locked {
-            crate::attention::paint_lock(frame, width, height, stride);
+            crate::attention::paint_lock(frame, width, height, stride, &self.lock_rows);
         } else {
             self.render(frame, width, height, stride);
         }

@@ -2197,11 +2197,14 @@ itself after 170 seconds, inside the guest's bound.
 `login_operation.rs`: session unlock, first enrollment, key addition
 and key removal. td-authd supervises it on the paired `TDLA003`
 requests `1b` and `1c` (`td-authd/DESIGN.md`, "Login-key operation
-supervision"), but nothing in production starts it: the compositor
-sends `1b` only for a first enrollment or an addition, which a
-production td-authd refuses before starting anything, as it refuses
-removal, and nothing sends an unlock's `1b`; the compositor's PIN field
-sends `1c` only at a PIN step, which no production operation reaches.
+supervision"), but nothing in production starts it except an unlock:
+the compositor sends `1b` for a first enrollment or an addition, which
+a production td-authd refuses before starting anything, as it refuses
+removal, and an unlock's `1b` only from its lock surface while the
+login state is enrolled, so only on a machine holding a record, which
+nothing in production writes (TOKEN-LOGIN.md increment 4's C7); the
+compositor's PIN field sends `1c` only at a PIN step, which only that
+unlock reaches.
 It reaches the command line only
 through `run`, keeps the unlock worker's root startup, unnamed
 socketpair, descriptor inventory and bounded framing, and uses its

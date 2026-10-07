@@ -635,17 +635,7 @@ impl KeyBindings {
                         // No key list: refused here with why, and nothing
                         // is sent.
                         None => {
-                            let rows = match state {
-                                Some(LoginState::Unenrolled) => {
-                                    crate::secret_client::login_failure(0x09, 0)
-                                }
-                                Some(LoginState::Unavailable(cause)) => {
-                                    crate::secret_client::login_failure(cause, 0)
-                                }
-                                _ => None,
-                            };
-                            decision.notice =
-                                Some(rows.map_or(Notice::NotAvailable, Notice::Login));
+                            decision.notice = Some(no_login_keys(state));
                             self.secret_selected = true;
                         }
                     }
@@ -1487,9 +1477,10 @@ impl Seat {
     }
 }
 
-/// The lock surface's entry, through the bindings as increment 4's
-/// triggers must go: the launcher and help capture close with the overlays
-/// the runtime closes. Compiled into tests alone, as the runtime's is.
+/// The lock surface's live entry, through the bindings as increment 4's
+/// `Super+l` and `L` must go: the launcher and help capture close with the
+/// overlays the runtime closes. Compiled into tests alone until C9, as the
+/// runtime's is; the connect-time lock needs no bindings.
 #[cfg(test)]
 fn lock_session(
     bindings: &Mutex<KeyBindings>,
@@ -2499,13 +2490,20 @@ fn deliver_key_decision<T: InputTarget>(
         } else if !runtime.session_locked() {
             runtime.attention(true)?;
         } else if decision.unlock {
-            // On the lock surface the chord is the selection: a login
-            // unlock, the lifetime's one operation, with no menu.
+            // On the lock surface the chord is the selection, with no
+            // menu: a login unlock, the lifetime's one operation, while the
+            // last `1a` answer is enrolled. Otherwise nothing is sent and
+            // the screen says why until Escape.
             runtime.attention(true)?;
             bindings.secret_selected = true;
-            decision.secret = Some(crate::secret_client::Selection::Login(
-                crate::secret_client::LoginSelection::Unlock,
-            ));
+            match bindings.login.state() {
+                Some(crate::authority::LoginState::Enrolled(_)) => {
+                    decision.secret = Some(crate::secret_client::Selection::Login(
+                        crate::secret_client::LoginSelection::Unlock,
+                    ));
+                }
+                state => decision.notice = Some(no_login_keys(state)),
+            }
         } else {
             // A security key's own keyboard selects nothing: its chord
             // leaves the lock surface as it was.
@@ -2550,6 +2548,23 @@ fn deliver_key_decision<T: InputTarget>(
         runtime.modifiers(modifiers)?;
     }
     Ok(())
+}
+
+/// Why a login operation that needs enrolled keys is not sent: unenrolled
+/// shows `NO LOGIN KEYS ENROLLED`, unavailable its cause's rows, and no
+/// answer at all, which the paired profile never has once connected, `NOT
+/// AVAILABLE IN THIS BUILD`.
+fn no_login_keys(state: Option<crate::authority::LoginState>) -> crate::attention::Notice {
+    use crate::authority::LoginState;
+    let rows = match state {
+        Some(LoginState::Unenrolled) => crate::secret_client::login_failure(0x09, 0),
+        Some(LoginState::Unavailable(cause)) => crate::secret_client::login_failure(cause, 0),
+        _ => None,
+    };
+    rows.map_or(
+        crate::attention::Notice::NotAvailable,
+        crate::attention::Notice::Login,
+    )
 }
 
 fn finish_attention<T: InputTarget>(
@@ -9641,6 +9656,7 @@ mod tests {
         let bindings = Mutex::new(KeyBindings {
             attention_enabled: true,
             attention_excluded: BTreeSet::from([KEY]),
+            login: login_answer(&ENROLLED),
             ..KeyBindings::default()
         });
         read_reports(&target, &bindings, KEY, &chord_reports(10));
@@ -9816,7 +9832,9 @@ mod tests {
     }
 
     /// A paired seat over a locked 800x600 output with one client window
-    /// behind the lock, its attempts queued for the worker the test plays.
+    /// behind the lock, its attempts queued for the worker the test plays,
+    /// and root's last `1a` answer enrolled, watched as the compositor
+    /// watches it.
     struct LockedSeat {
         cleanup: Cleanup,
         runtime: Arc<Mutex<Runtime>>,
@@ -9824,6 +9842,7 @@ mod tests {
         target: Arc<Mutex<LiveInputTarget>>,
         queued: crate::authority::Queued,
         surface: crate::scene::SurfaceKey,
+        login: crate::authority::Login,
     }
 
     impl LockedSeat {
@@ -9868,9 +9887,17 @@ mod tests {
                     .unwrap();
                 assert_eq!(runtime.keyboard_snapshot().focus, Some(surface));
             }
+            let login = login_answer(&ENROLLED);
+            crate::runtime::watch_login(&runtime, &login);
+            runtime
+                .lock()
+                .unwrap()
+                .follow_login(&login.current().unwrap())
+                .unwrap();
             let bindings = Arc::new(Mutex::new(KeyBindings {
                 attention_enabled: true,
                 attention_excluded: excluded.iter().copied().collect(),
+                login: login.clone(),
                 ..KeyBindings::default()
             }));
             let (launcher, queued) = crate::authority::Queued::launcher();
@@ -9892,6 +9919,7 @@ mod tests {
                 target,
                 queued,
                 surface,
+                login,
             };
             assert!(seat.client_shown());
             seat
@@ -9943,10 +9971,12 @@ mod tests {
             std::fs::read(&self.cleanup.0).unwrap()
         }
 
-        /// The lock surface, drawn independently of the runtime.
-        fn lock_surface() -> Vec<u8> {
+        /// The lock surface for root's last answer, drawn independently
+        /// of the runtime.
+        fn lock_surface(&self) -> Vec<u8> {
+            let rows = crate::attention::lock_rows(self.login.current().as_ref());
             let mut frame = vec![0; 800 * 600 * 4];
-            crate::attention::paint_lock(&mut frame, 800, 600, 3200);
+            crate::attention::paint_lock(&mut frame, 800, 600, 3200, &rows);
             frame
         }
 
@@ -10001,7 +10031,7 @@ mod tests {
     #[test]
     fn the_lock_surface_hides_every_client_and_withholds_input() {
         let seat = LockedSeat::new(&[]);
-        assert!(seat.glass() == LockedSeat::lock_surface());
+        assert!(seat.glass() == seat.lock_surface());
         assert!(!seat.client_shown());
         let mut runtime = seat.runtime.lock().unwrap();
         let before = runtime.keyboard_snapshot();
@@ -10030,7 +10060,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        assert!(seat.glass() == LockedSeat::lock_surface());
+        assert!(seat.glass() == seat.lock_surface());
         assert_eq!(runtime.keyboard_snapshot().focus, None);
         // Leaving it needs an open lifetime, whose screen shows no menu;
         // the entry refuses while one is open.
@@ -10046,7 +10076,7 @@ mod tests {
         runtime.attention(&origin, false).unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, None);
         drop(runtime);
-        assert!(seat.glass() == LockedSeat::lock_surface());
+        assert!(seat.glass() == seat.lock_surface());
         // Only the paired profile has a lock surface.
         let cleanup = Cleanup(std::env::temp_dir().join(format!(
             "td-lock-direct-{}-{}",
@@ -10151,7 +10181,7 @@ mod tests {
             assert_eq!(root.calls.len(), calls);
             seat.press(&[KEY_ESC], 30);
             assert!(!seat.attention_open() && seat.locked());
-            assert!(seat.glass() == LockedSeat::lock_surface());
+            assert!(seat.glass() == seat.lock_surface());
             let second = seat.unlock(40);
             assert!(!Arc::ptr_eq(&first, &second));
             assert!(seat.attention_open());
@@ -10256,7 +10286,7 @@ mod tests {
         assert_eq!(root.sent(0x15), 1);
         assert_eq!(root.sent(0x1c), 0);
         assert!(seat.locked());
-        assert!(seat.glass() == LockedSeat::lock_surface());
+        assert!(seat.glass() == seat.lock_surface());
         // Escape after the commit, before root's success.
         let seat = LockedSeat::new(&[]);
         let (mut client, mut root) = seat.committed();
@@ -10266,7 +10296,7 @@ mod tests {
         run(&mut client, &mut root).unwrap();
         assert!(root.replies.is_empty());
         assert!(seat.locked());
-        assert!(seat.glass() == LockedSeat::lock_surface());
+        assert!(seat.glass() == seat.lock_surface());
         assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
     }
 
@@ -10350,6 +10380,129 @@ mod tests {
         seat.read(KEY, 10, chord_reports(11));
         assert!(seat.queued.attempt().is_none());
         assert!(!seat.attention_open() && seat.locked());
-        assert!(seat.glass() == LockedSeat::lock_surface());
+        assert!(seat.glass() == seat.lock_surface());
+    }
+
+    /// Root's `9a` for `state`, with the names `login_answer` gives.
+    fn root_answer(state: &[u8]) -> Vec<u8> {
+        [&[0x9a][..], state, b"\x06tester\x09td-laptop\x00"].concat()
+    }
+
+    /// TOKEN-LOGIN.md's D13: on a lock surface whose state is unavailable
+    /// the chord opens attention on the cause's rows and sends no `1b`,
+    /// for every cause; the lifetime selects nothing more, and Escape
+    /// returns to the lock surface. A state that could not be read
+    /// resolves through the worker's polling, and once it reads enrolled
+    /// the rows and the chord's unlock come back.
+    #[test]
+    fn an_unavailable_lock_surface_shows_its_cause_and_sends_nothing() {
+        use crate::secret_client::{LoginSelection, Selection};
+        for cause in [0x0a, 0x0b, 0x0c] {
+            let seat = LockedSeat::new(&[]);
+            seat.login.answer(&root_answer(&[2, cause])).unwrap();
+            let rows = crate::secret_client::login_failure(cause, 0).unwrap();
+            // The rows follow the answer on glass.
+            assert_eq!(
+                crate::attention::lock_rows(seat.login.current().as_ref())[3..],
+                *rows
+            );
+            assert!(seat.glass() == seat.lock_surface());
+            seat.chord(10);
+            assert!(seat.queued.attempt().is_none());
+            assert!(seat.locked() && seat.attention_open());
+            assert_eq!(seat.shown(), Some(crate::attention::Notice::Login(rows)));
+            // Nothing else is a choice in this lifetime.
+            seat.press(&[KEY_K, KEY_1, KEY_U, KEY_I, KEY_ENTER], 20);
+            assert!(seat.queued.attempt().is_none());
+            assert_eq!(seat.shown(), Some(crate::attention::Notice::Login(rows)));
+            seat.press(&[KEY_ESC], 30);
+            assert!(!seat.attention_open() && seat.locked());
+            assert!(seat.glass() == seat.lock_surface());
+            // Resolved to enrolled: the unlock is offered again.
+            seat.login
+                .answer(&root_answer(&[1, 1, 7, 7, 7, 7]))
+                .unwrap();
+            assert!(seat.glass() == seat.lock_surface());
+            assert_eq!(
+                crate::attention::lock_rows(seat.login.current().as_ref()),
+                [
+                    "TD-LAPTOP",
+                    "TESTER",
+                    "LOCKED",
+                    "PRESS CTRL+ALT+ESC TO UNLOCK"
+                ]
+            );
+            let attempt = seat.unlock(40);
+            assert_eq!(
+                attempt.selection(),
+                &Selection::Login(LoginSelection::Unlock)
+            );
+        }
+    }
+
+    /// TOKEN-LOGIN.md's D14: a locked session whose state becomes
+    /// unenrolled stays locked for the rest of its generation. Its rows
+    /// say `NO LOGIN KEYS ENROLLED`, and so does the chord, which sends no
+    /// `1b`, so nothing on the lock surface can unlock it.
+    #[test]
+    fn a_lock_surface_whose_keys_are_gone_stays_locked() {
+        let seat = LockedSeat::new(&[]);
+        seat.login.answer(&root_answer(&[0])).unwrap();
+        assert!(seat.locked());
+        assert_eq!(
+            crate::attention::lock_rows(seat.login.current().as_ref()),
+            ["TD-LAPTOP", "TESTER", "LOCKED", "NO LOGIN KEYS ENROLLED"]
+        );
+        assert!(seat.glass() == seat.lock_surface());
+        assert!(!seat.client_shown());
+        for from in [10, 40] {
+            seat.chord(from);
+            assert!(seat.queued.attempt().is_none());
+            assert!(seat.locked() && seat.attention_open());
+            assert_eq!(
+                seat.shown(),
+                Some(crate::attention::Notice::Login(&["NO LOGIN KEYS ENROLLED"]))
+            );
+            seat.press(&[KEY_ESC], from + 10);
+            assert!(!seat.attention_open() && seat.locked());
+            assert!(seat.glass() == seat.lock_surface());
+            assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
+        }
+    }
+
+    /// The rows follow each answer, but an answer never repaints over an
+    /// open attention screen, never locks and never unlocks: the lock
+    /// surface shows the new rows once attention closes.
+    #[test]
+    fn the_lock_rows_follow_the_answer_beneath_attention() {
+        let seat = LockedSeat::new(&[]);
+        let _attempt = seat.unlock(10);
+        let open = seat.glass();
+        seat.login.answer(&root_answer(&[2, 0x0b])).unwrap();
+        assert!(seat.glass() == open);
+        assert!(seat.locked() && seat.attention_open());
+        seat.press(&[KEY_ESC], 30);
+        assert!(seat.glass() == seat.lock_surface());
+        // Unlocked, an answer that would lock changes nothing on glass.
+        let seat = LockedSeat::open(&[]);
+        let before = seat.glass();
+        for state in [&[2, 0x0a][..], &[1, 1, 7, 7, 7, 7], &[0]] {
+            seat.login.answer(&root_answer(state)).unwrap();
+            assert!(!seat.locked());
+            assert!(seat.glass() == before);
+        }
+    }
+
+    /// With no `1a` answer, which the paired profile never has once
+    /// connected, the lock surface's chord sends nothing either.
+    #[test]
+    fn a_lock_surface_with_no_answer_sends_nothing() {
+        let target = locked_target();
+        let bindings = attention_bindings(None);
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        let target = target.lock().unwrap();
+        assert_eq!(target.attention_events, [true]);
+        assert!(target.secret_roles.is_empty());
+        assert_eq!(target.notices, [crate::attention::Notice::NotAvailable]);
     }
 }

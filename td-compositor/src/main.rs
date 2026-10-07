@@ -441,6 +441,15 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
                 .map(|name| launcher::ApplicationLaunch { name }),
         })?)
     };
+    // Root's login state: the answer at connect, which the first frame
+    // locks on, and the handle the lock surface's rows follow. The direct
+    // profile has no authority and never locks.
+    let (login, connected) = match &launches {
+        launcher::LaunchBackend::Authority(authority) => {
+            (Some(authority.login()), authority.connected())
+        }
+        launcher::LaunchBackend::Direct(_) => (None, None),
+    };
     let task_launcher = launches.task_launcher();
     let backend = select_backend(&options.output, |card| std::fs::metadata(card).map(|_| ()))?;
     if let (OutputDevice::Card { card, .. }, Backend::Framebuffer(path)) =
@@ -500,10 +509,21 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     if let Some(flips) = flips {
         start_flip_threads(flips, &runtime)?;
     }
+    // Watched before the first paint, so no later answer is missed; an
+    // answer never locks.
+    if let Some(login) = &login {
+        runtime::watch_login(&runtime, login);
+    }
+    // Locked where root's `1a` answer at connect is enrolled or
+    // unavailable (td-login/TOKEN-LOGIN.md, "Session lock"): the first
+    // frame is then the lock surface, in every generation. The handle's
+    // latest answer gives the rows only, and the first paint reads it
+    // under the runtime's guard, so an answer stored after that read
+    // reaches the watcher after this paint, never before it.
     runtime
         .lock()
         .map_err(|_| "runtime lock poisoned".to_string())?
-        .repaint()?;
+        .first_paint(connected.as_ref(), login.as_ref())?;
     let inputs = input::start(&options.input, Arc::clone(&runtime), launches)?;
     // FATAL, like the Wayland listeners and unlike the status bar below. An
     // earlier draft reasoned from the bar — a session you can see beats one
@@ -1081,7 +1101,7 @@ mod confinement {
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0x972a783de97247ae;
+    const AUTHORITY_FINGERPRINT: u64 = 0xf34df6decf17f3db;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -2818,19 +2838,25 @@ pub struct MappedRegion {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// Nothing in production locks the session before TOKEN-LOGIN.md's
-    /// increment 4 adds its triggers. The compiler holds the capability:
-    /// the scene's `locked` is private, `Scene::lock` is compiled into
-    /// tests alone, and `Scene::unlock` only clears it, so a production
-    /// caller of either lock entry does not build. This pins what the
-    /// compiler cannot: that test-only `lock` is the one write of `true`,
-    /// a new scene starts unlocked, nothing borrows the field mutably, and
-    /// every other field write of a `locked`, in every source, is `false`.
+    /// Production locks the session in one place: the generation's first
+    /// paint, where root's `1a` answer is enrolled or unavailable, in the
+    /// paired profile (td-login/TOKEN-LOGIN.md increment 4's C7). The
+    /// compiler holds the field: the scene's `locked` is private and
+    /// `Scene::unlock` only clears it. This pins what the compiler cannot:
+    /// `Scene::lock` is the one write of `true`, a new scene starts
+    /// unlocked, nothing borrows the field mutably, and every other field
+    /// write of a `locked`, in every source, is `false`; `Scene::lock` has
+    /// two callers, `Runtime::first_paint` under that condition and the
+    /// test-only `Runtime::lock_session`, whose own caller, the evdev
+    /// adapter's `lock_session`, is test-only too; and `first_paint` has
+    /// one production caller, `run_compositor`, after the authority's
+    /// Prepare and first `1a` and in place of its first repaint, before
+    /// any input reader or client.
     #[test]
-    fn nothing_in_production_locks_the_session() {
+    fn production_locks_only_at_the_first_paint() {
         let scene = include_str!("scene.rs");
-        let entry =
-            "    #[cfg(test)]\n    pub(crate) fn lock(&mut self) {\n        self.locked = true;\n";
+        let entry = "    /// generation's first paint alone, which a source pin holds.\n    \
+                     pub(crate) fn lock(&mut self) {\n        self.locked = true;\n";
         assert_eq!(occurrences(scene, "self.locked = true"), 1);
         assert_eq!(occurrences(production(scene), entry), 1);
         assert_eq!(occurrences(scene, "fn lock("), 1);
@@ -2893,5 +2919,102 @@ pub struct MappedRegion {
             }
         }
         assert_eq!(sets, 1);
+        // `Scene::lock`'s callers: two, both the runtime's.
+        let runtime = production(include_str!("runtime.rs"));
+        let input = production(include_str!("input.rs"));
+        let sources = OTHER.iter().chain(&[("main.rs", MAIN), ("sys.rs", SYS)]);
+        for (name, source) in sources {
+            let source = source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .map_or(*source, |(body, _)| body);
+            let calls = if *name == "runtime.rs" { 2 } else { 0 };
+            assert_eq!(occurrences(source, "scene.lock()"), calls, "{name}");
+            assert_eq!(occurrences(source, "Scene::lock"), 0, "{name}");
+            assert_eq!(
+                occurrences(source, "first_paint("),
+                (*name == "runtime.rs" || *name == "main.rs") as usize,
+                "{name}"
+            );
+            let live = match *name {
+                "runtime.rs" => 1,
+                "input.rs" => 2,
+                _ => 0,
+            };
+            // `unlock_session` aside.
+            let lock_session = source
+                .match_indices("lock_session(")
+                .filter(|(at, _)| !source[..*at].ends_with("un"))
+                .count();
+            assert_eq!(lock_session, live, "{name}");
+        }
+        let first_paint = runtime
+            .split_once("    pub(crate) fn first_paint(")
+            .unwrap()
+            .1
+            .split_once("\n    }\n")
+            .unwrap()
+            .0;
+        assert_eq!(occurrences(first_paint, "scene.lock()"), 1);
+        // Decided by the answer at connect alone, never the handle's later.
+        assert!(first_paint.contains(
+            "        if self.attention_enabled && connected.is_some_and(crate::authority::Answer::locks) {\n            \
+             self.scene.lock();\n        }\n        self.repaint()"
+        ));
+        assert_eq!(occurrences(first_paint, "::locks"), 1);
+        // The handle is read inside, under the caller's runtime guard.
+        assert!(first_paint.contains(
+            "        let latest = login.and_then(crate::authority::Login::current);\n        \
+             if let Some(rows) = latest.as_ref().or(connected) {"
+        ));
+        assert_eq!(occurrences(first_paint, "latest"), 2);
+        assert_eq!(occurrences(first_paint, "::current"), 1);
+        assert_eq!(occurrences(first_paint, "if self.paints != 0 {"), 1);
+        // The live entries stay test-only until C9's `Super+l` and `L`.
+        let live = "    #[cfg(test)]\n    pub(crate) fn lock_session(&mut self)";
+        assert_eq!(occurrences(runtime, live), 1);
+        let (_, gated) = runtime.split_once(live).unwrap();
+        let gated = gated.split_once("\n    }\n").unwrap().0;
+        assert_eq!(occurrences(gated, "self.scene.lock();"), 1);
+        assert_eq!(occurrences(input, "#[cfg(test)]\nfn lock_session("), 1);
+        assert_eq!(occurrences(input, ".lock_session()?"), 1);
+        // The first paint's one caller, in place of the first repaint.
+        let run = MAIN
+            .split_once("fn run_compositor(")
+            .unwrap()
+            .1
+            .split_once("fn selftest(")
+            .unwrap()
+            .0;
+        assert_eq!(occurrences(run, ".first_paint("), 1);
+        assert_eq!(occurrences(run, ".repaint("), 0);
+        assert!(run.contains(".first_paint(connected.as_ref(), login.as_ref())?;"));
+        // Nothing reads the handle before the guard is taken.
+        assert_eq!(occurrences(run, "current"), 0);
+        let at = |needle: &str| run.find(needle).unwrap();
+        assert!(at("authority::Launcher::connect()") < at("runtime::watch_login("));
+        assert!(at("runtime::watch_login(") < at(".first_paint("));
+        assert!(at(".first_paint(") < at("input::start("));
+        assert!(at(".first_paint(") < at("server::serve("));
+        // The answer is the authority's at connect, which nothing else
+        // sets, and the direct profile has none.
+        assert!(run.contains(
+            "            (Some(authority.login()), authority.connected())\n        }\n        \
+             launcher::LaunchBackend::Direct(_) => (None, None),"
+        ));
+        assert_eq!(occurrences(run, "connected"), 3);
+        assert!(at("authority.connected()") < at("runtime::watch_login("));
+        let authority = production(AUTHORITY);
+        assert_eq!(occurrences(authority, "connected: Some(connected),"), 1);
+        assert_eq!(occurrences(authority, "connected:"), 3);
+        assert!(authority.contains(
+            "    pub(crate) fn connected(&self) -> Option<Answer> {\n        self.connected.clone()\n    }"
+        ));
+        assert_eq!(
+            occurrences(
+                authority,
+                "let (poll, connected) = open_session(&mut wire, &login)?;"
+            ),
+            1
+        );
     }
 }

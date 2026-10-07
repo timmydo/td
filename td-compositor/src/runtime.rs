@@ -2988,11 +2988,54 @@ impl Runtime {
         self.scene.locked()
     }
 
-    /// The lock surface's one entry, and only tests reach it: nothing in
-    /// production locks the session until TOKEN-LOGIN.md's increment 4
-    /// adds its triggers, which lock an open attention lifetime too. Like
-    /// opening attention it closes the overlays, withdraws focus and
-    /// grabs, and paints the whole output, answering with that paint.
+    /// The generation's first paint (td-login/TOKEN-LOGIN.md, "Session
+    /// lock"): in the paired profile, on the lock surface where root's
+    /// `1a` answer at connect, `connected`, is enrolled or unavailable, so
+    /// that every generation starts locked on that rule and no client
+    /// pixel of this generation precedes the lock. The handle's latest
+    /// answer gives the rows but never the decision, so an unreadable
+    /// state at connect starts locked whatever a poll reads since. The
+    /// handle is read here, under the runtime's guard, so an answer stored
+    /// after this read reaches `follow_login` after this paint, never
+    /// before it. It comes before any input reader, overlay or client, so
+    /// the lock withdraws nothing. The one production lock.
+    pub(crate) fn first_paint(
+        &mut self,
+        connected: Option<&crate::authority::Answer>,
+        login: Option<&crate::authority::Login>,
+    ) -> Result<(), String> {
+        if self.paints != 0 {
+            return Err("the generation's first paint was already made".into());
+        }
+        let latest = login.and_then(crate::authority::Login::current);
+        if let Some(rows) = latest.as_ref().or(connected) {
+            self.scene
+                .set_lock_rows(crate::attention::lock_rows(Some(rows)));
+        }
+        if self.attention_enabled && connected.is_some_and(crate::authority::Answer::locks) {
+            self.scene.lock();
+        }
+        self.repaint()
+    }
+
+    /// Root's latest `1a` answer: the lock surface's rows follow it, and
+    /// one on glass is repainted. An answer never locks or unlocks.
+    pub(crate) fn follow_login(&mut self, login: &crate::authority::Answer) -> Result<(), String> {
+        let changed = self
+            .scene
+            .set_lock_rows(crate::attention::lock_rows(Some(login)));
+        if changed && self.scene.locked() && !self.scene.attention_visible() {
+            self.owed_damage = Damage::Whole;
+            return self.repaint();
+        }
+        Ok(())
+    }
+
+    /// The lock surface's live entry, and only tests reach it until
+    /// TOKEN-LOGIN.md increment 4's C9 adds `Super+l` and `L`, which lock
+    /// an open attention lifetime too. Like opening attention it closes
+    /// the overlays, withdraws focus and grabs, and paints the whole
+    /// output, answering with that paint.
     #[cfg(test)]
     pub(crate) fn lock_session(&mut self) -> Result<NoticePresentation, String> {
         if !self.attention_enabled || self.scene.attention_visible() {
@@ -5468,6 +5511,25 @@ fn rgb_diagnostic(rgb: Option<[u8; 3]>) -> String {
         Some([red, green, blue]) => format!("{red:02x}{green:02x}{blue:02x}"),
         None => "none".to_string(),
     }
+}
+
+/// Keeps the lock surface's rows on root's latest `1a` answer. The
+/// authority worker calls in holding no lock and takes the runtime's
+/// alone. A failed repaint stays owed, as any other.
+pub(crate) fn watch_login(runtime: &Arc<Mutex<Runtime>>, login: &crate::authority::Login) {
+    let runtime = Arc::downgrade(runtime);
+    login.watch(move |answer| {
+        let Some(runtime) = runtime.upgrade() else {
+            return;
+        };
+        let followed = match runtime.lock() {
+            Ok(mut runtime) => runtime.follow_login(answer),
+            Err(_) => Err("runtime lock poisoned".into()),
+        };
+        if let Err(error) = followed {
+            eprintln!("td-compositor: lock surface: {error}");
+        }
+    });
 }
 
 #[cfg(test)]
@@ -15862,5 +15924,276 @@ mod tests {
             cutoff >= after_write,
             "cutoff preceded ordinary frame publication"
         );
+    }
+
+    /// An 800x600 output that keeps a copy of every frame it is handed.
+    struct Recorded {
+        frame: Vec<u8>,
+        frames: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl OutputBackend for Recorded {
+        fn output(&self) -> Output {
+            Output {
+                id: crate::output::OutputId::FIRST,
+                dimensions: crate::output::OutputDimensions {
+                    width: 800,
+                    height: 600,
+                },
+                scale: crate::output::OutputScale::ONE,
+                transform: crate::output::OutputTransform::Normal,
+            }
+        }
+        fn supported_formats(&self) -> &[crate::output::Fourcc] {
+            &[crate::output::DRM_FORMAT_XRGB8888]
+        }
+        fn begin_frame(&mut self, _: Damage) -> Result<crate::output::FrameTarget<'_>, String> {
+            Ok(crate::output::FrameTarget {
+                pixels: &mut self.frame,
+                width: 800,
+                height: 600,
+                stride: 3200,
+            })
+        }
+        fn target_stride(&self) -> usize {
+            3200
+        }
+        fn completed(&self) -> Option<crate::output::FrameView<'_>> {
+            None
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn present(&mut self) -> Result<Submission, String> {
+            self.frames.lock().unwrap().push(self.frame.clone());
+            Ok(Submission::Presented)
+        }
+        fn frame_presented(&mut self, _: FrameId) -> Result<(), String> {
+            Err("this backend queues nothing".into())
+        }
+        fn recover_stalled_frame(&mut self, _: FrameId) -> Result<(), String> {
+            Err("this backend queues nothing".into())
+        }
+    }
+
+    fn recorded(paired: bool) -> (Runtime, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = Runtime::new(Recorded {
+            frame: vec![0; 3200 * 600],
+            frames: Arc::clone(&frames),
+        });
+        runtime.enable_attention(paired);
+        (runtime, frames)
+    }
+
+    /// Root's `9a` for `state`, as the worker keeps it.
+    fn login(state: &[u8]) -> crate::authority::Login {
+        let login = crate::authority::Login::default();
+        login
+            .answer(&[&[0x9a][..], state, b"\x06tester\x09td-laptop\x00"].concat())
+            .unwrap();
+        login
+    }
+
+    fn lock_surface(answer: Option<&crate::authority::Answer>) -> Vec<u8> {
+        let mut frame = vec![0; 3200 * 600];
+        crate::attention::paint_lock(
+            &mut frame,
+            800,
+            600,
+            3200,
+            &crate::attention::lock_rows(answer),
+        );
+        frame
+    }
+
+    fn ordinary() -> Vec<u8> {
+        let mut frame = vec![0; 3200 * 600];
+        Scene::new().render(&mut frame, 800, 600, 3200);
+        frame
+    }
+
+    /// The generation's first paint decides the lock, so the first frame
+    /// the output is ever handed is the lock surface where root's `1a`
+    /// answer is enrolled or unavailable, for every cause: no frame of the
+    /// desktop precedes it. Unenrolled, which is also how root answers on
+    /// the live medium, starts unlocked; so does the paired profile with
+    /// no answer, and the direct development profile, which has no
+    /// authority, whatever it were given. There is one first paint.
+    #[test]
+    fn the_first_frame_is_the_lock_surface_where_root_answers_enrolled_or_unavailable() {
+        let states: &[(&[u8], bool)] = &[
+            (&[1, 1, 7, 7, 7, 7], true),
+            (&[1, 2, 7, 7, 7, 7, 8, 8, 8, 8], true),
+            (&[2, 0x0a], true),
+            (&[2, 0x0b], true),
+            (&[2, 0x0c], true),
+            (&[0], false),
+        ];
+        for (state, locks) in states {
+            let answer = login(state).current().unwrap();
+            assert_eq!(answer.locks(), *locks);
+            let (mut runtime, frames) = recorded(true);
+            runtime.first_paint(Some(&answer), None).unwrap();
+            assert_eq!(runtime.session_locked(), *locks, "{state:02x?}");
+            let expected = if *locks {
+                lock_surface(Some(&answer))
+            } else {
+                ordinary()
+            };
+            let frames = frames.lock().unwrap();
+            assert_eq!(frames.len(), 1, "{state:02x?}");
+            assert!(frames[0] == expected, "{state:02x?}");
+            assert_eq!(runtime.paints, 1);
+            drop(frames);
+            assert!(runtime.first_paint(Some(&answer), None).is_err());
+            assert_eq!(runtime.session_locked(), *locks);
+        }
+        let handle = login(&[1, 1, 7, 7, 7, 7]);
+        let enrolled = handle.current().unwrap();
+        for (paired, answer, handle) in [
+            (true, None, None),
+            (false, None, None),
+            (false, Some(&enrolled), Some(&handle)),
+        ] {
+            let (mut runtime, frames) = recorded(paired);
+            runtime.first_paint(answer, handle).unwrap();
+            assert!(!runtime.session_locked());
+            assert!(*frames.lock().unwrap() == [ordinary()]);
+        }
+    }
+
+    /// Every generation relocks on the same rule: a restarted compositor
+    /// keeps nothing of the last one's unlock, so on an answer that is
+    /// still enrolled or unavailable it starts on the lock surface again.
+    #[test]
+    fn every_generation_starts_locked_again() {
+        let origin = crate::input::test_origin();
+        for state in [&[1, 1, 7, 7, 7, 7][..], &[2, 0x0c]] {
+            for _generation in 0..3 {
+                let handle = login(state);
+                let answer = handle.current().unwrap();
+                let (mut runtime, frames) = recorded(true);
+                runtime.first_paint(Some(&answer), Some(&handle)).unwrap();
+                assert!(runtime.session_locked());
+                assert!(frames.lock().unwrap()[0] == lock_surface(Some(&answer)));
+                // Unlocked as root's success leaves it, then the
+                // generation ends.
+                runtime.attention(&origin, true).unwrap();
+                runtime.unlock_session(&origin).unwrap();
+                runtime.attention(&origin, false).unwrap();
+                assert!(!runtime.session_locked());
+            }
+        }
+    }
+
+    /// The rows follow each later answer and repaint the lock surface on
+    /// glass; an answer never locks an unlocked session or unlocks a
+    /// locked one.
+    #[test]
+    fn later_answers_change_the_rows_and_never_the_lock() {
+        let first = login(&[1, 1, 7, 7, 7, 7]);
+        let (mut runtime, frames) = recorded(true);
+        runtime
+            .first_paint(first.current().as_ref(), Some(&first))
+            .unwrap();
+        for state in [&[2, 0x0c][..], &[0], &[1, 1, 7, 7, 7, 7]] {
+            let answer = login(state).current().unwrap();
+            runtime.follow_login(&answer).unwrap();
+            assert!(runtime.session_locked());
+            assert!(*frames.lock().unwrap().last().unwrap() == lock_surface(Some(&answer)));
+        }
+        // An unchanged answer paints nothing.
+        let painted = frames.lock().unwrap().len();
+        runtime
+            .follow_login(&login(&[1, 1, 7, 7, 7, 7]).current().unwrap())
+            .unwrap();
+        assert_eq!(frames.lock().unwrap().len(), painted);
+        let (mut runtime, frames) = recorded(true);
+        let unenrolled = login(&[0]);
+        runtime
+            .first_paint(unenrolled.current().as_ref(), Some(&unenrolled))
+            .unwrap();
+        for state in [&[2, 0x0a][..], &[1, 1, 7, 7, 7, 7]] {
+            runtime
+                .follow_login(&login(state).current().unwrap())
+                .unwrap();
+            assert!(!runtime.session_locked());
+        }
+        assert!(*frames.lock().unwrap() == [ordinary()]);
+    }
+
+    /// The decision is the answer at connect's alone: an unreadable state
+    /// that the handle has since read unenrolled still starts locked,
+    /// showing the latest rows; an unenrolled connect answer starts
+    /// unlocked whatever the handle reads since.
+    #[test]
+    fn the_first_paint_locks_on_the_connect_answer_not_a_later_one() {
+        let handle = login(&[2, 0x0c]);
+        let connected = handle.current().unwrap();
+        handle
+            .answer(&[&[0x9a, 0][..], b"\x06tester\x09td-laptop\x00"].concat())
+            .unwrap();
+        let latest = handle.current().unwrap();
+        assert!(!latest.locks());
+        let (mut runtime, frames) = recorded(true);
+        runtime
+            .first_paint(Some(&connected), Some(&handle))
+            .unwrap();
+        assert!(runtime.session_locked());
+        assert!(*frames.lock().unwrap() == [lock_surface(Some(&latest))]);
+        let (mut runtime, frames) = recorded(true);
+        runtime
+            .first_paint(Some(&latest), Some(&login(&[2, 0x0c])))
+            .unwrap();
+        assert!(!runtime.session_locked());
+        assert!(*frames.lock().unwrap() == [ordinary()]);
+    }
+
+    /// The rows of an answer the worker stores after the generation's
+    /// watch and before its first paint: the watcher's `follow_login`
+    /// runs first, unlocked and painting nothing, and the first paint,
+    /// reading the handle under the runtime's guard, draws that answer,
+    /// not the one stored before it. An answer read before the guard was
+    /// taken would draw "could not be read" while the chord, reading the
+    /// handle, offered an unlock, and no poll would follow to repaint it.
+    #[test]
+    fn an_answer_stored_before_the_first_paint_is_the_one_it_draws() {
+        let handle = login(&[2, 0x0c]);
+        let connected = handle.current().unwrap();
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = Runtime::new(Recorded {
+            frame: vec![0; 3200 * 600],
+            frames: Arc::clone(&frames),
+        });
+        runtime.enable_attention(true);
+        let runtime = Arc::new(Mutex::new(runtime));
+        watch_login(&runtime, &handle);
+        handle
+            .answer(
+                &[
+                    &[0x9a, 1, 1, 7, 7, 7, 7][..],
+                    b"\x06tester\x09td-laptop\x00",
+                ]
+                .concat(),
+            )
+            .unwrap();
+        let enrolled = handle.current().unwrap();
+        assert!(frames.lock().unwrap().is_empty());
+        runtime
+            .lock()
+            .unwrap()
+            .first_paint(Some(&connected), Some(&handle))
+            .unwrap();
+        assert!(runtime.lock().unwrap().session_locked());
+        assert!(*frames.lock().unwrap() == [lock_surface(Some(&enrolled))]);
+        // An answer stored after the read reaches the watcher after the
+        // paint, and repaints the rows.
+        handle
+            .answer(&[&[0x9a, 2, 0x0b][..], b"\x06tester\x09td-laptop\x00"].concat())
+            .unwrap();
+        let damaged = handle.current().unwrap();
+        assert!(*frames.lock().unwrap().last().unwrap() == lock_surface(Some(&damaged)));
+        assert_eq!(frames.lock().unwrap().len(), 2);
     }
 }
