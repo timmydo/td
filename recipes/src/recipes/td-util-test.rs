@@ -79,11 +79,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-util --list failed' >&2; exit 1; }}; \
-                     for a in cat chmod chown clear cmp cpio diff dmesg free gunzip gzip less ln mkdir printf ps readlink rm sleep test which zcat; do \
+                     for a in cat chmod chown clear cmp cpio diff dmesg free gunzip gzip less ln mkdir od printf ps readlink rm sleep test which zcat; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-util does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 24 ] || {{ echo \"td-util serves $n applets, expected exactly 24 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 25 ] || {{ echo \"td-util serves $n applets, expected exactly 25 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -155,7 +155,7 @@ pub fn recipe() -> Recipe {
     // build-tool applets are left to the crate's
     // process tests, which the in-sandbox cargo gate runs: their names are
     // the retired findutils words, which the ladder guard refuses in any Run
-    // argv, so this text names them nowhere — the count of 24 above pins
+    // argv, so this text names them nowhere — the count of 25 above pins
     // that they are served.
     steps.push(
         Step::run(
@@ -218,7 +218,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly twenty-four applets, among them cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gunzip/gzip/less/ln/mkdir/printf/ps/readlink/rm/sleep/test/which/zcat, dispatches through both the argv[0] and `td-util <applet>` forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), interoperates with busybox gzip and newc cpio, and parses /proc for free/ps where /proc is mounted\n".into(),
+        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly twenty-five applets, among them cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gunzip/gzip/less/ln/mkdir/od/printf/ps/readlink/rm/sleep/test/which/zcat, dispatches through both the argv[0] and `td-util <applet>` forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), interoperates with busybox gzip and newc cpio, and parses /proc for free/ps where /proc is mounted\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -231,7 +231,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-util-test: build-plan --auto builds td-util (td's static diagnostics, pager and initramfs userland multicall plus build tools: cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gunzip/gzip/less/ln/mkdir/printf/ps/readlink/rm/sleep/test/which/zcat and two more, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the exit codes, and the /proc parsers"
+echo ">> recipe-check td-util-test: build-plan --auto builds td-util (td's static diagnostics, pager and initramfs userland multicall plus build tools: cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gunzip/gzip/less/ln/mkdir/od/printf/ps/readlink/rm/sleep/test/which/zcat and two more, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the exit codes, and the /proc parsers"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-util-test 1
 "#,

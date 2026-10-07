@@ -1,4 +1,4 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 use crate::td_boot_protocol;
@@ -140,15 +140,10 @@ fn publish_steps(
     // reads the filesystem's own directory entries rather than a restored copy
     // of them.
     //
-    // Compared through `od -v` rather than `cat`: `$(cat f)` strips trailing
-    // newlines from BOTH sides, so two files differing only there compare
-    // equal — and every file compared here is one whose exact bytes are the
-    // assertion, the trust root most of all. `-v` because od otherwise
-    // COLLAPSES repeated identical lines to `*`, under which files differing
-    // in how many identical blocks they hold compare equal too — a key of
-    // repeating bytes is exactly that shape. `cmp` would say the same thing
-    // more directly and is not in this recipe's declared applet set; `od`
-    // already is, three checks up.
+    // Compared with `cmp -s`, byte for byte, rather than through `cat`:
+    // `$(cat f)` strips trailing newlines from BOTH sides, so two files
+    // differing only there compare equal — and every file compared here is
+    // one whose exact bytes are the assertion, the trust root most of all.
     //
     // The update channel is asserted for all three of its properties: it
     // exists, it is a DIRECTORY, and it is EMPTY. The last is the contract — a
@@ -157,13 +152,11 @@ fn publish_steps(
     // `btrfs restore` at all, which everything `td-boot update` does on an
     // installed machine rests on.
     //
-    // `ls` and `[`, because `rmdir` would say all three in one call and is NOT
-    // in this recipe's declared applet set — the trap the `cmp` note above is
-    // about, one applet further on. Its exit status is CHECKED rather than
-    // discarded: `$(…)` captures stdout only, so a busybox whose `ls` did not
-    // take `-A` would print its usage to stderr and hand back the empty string,
-    // and an emptiness test that reads that as "empty" passes whatever is in
-    // the directory.
+    // `ls -A` and `[`, not `rmdir`, which would answer by changing the tree
+    // under test. The exit status is CHECKED rather than discarded: `$(…)`
+    // captures stdout only, so an `ls` that did not take `-A` would print its
+    // usage to stderr and hand back the empty string, and an emptiness test
+    // that reads that as "empty" passes whatever is in the directory.
     let deployment_is_in_the_volume = format!(
         "'{btrfs}' restore -s -S '{{root}}/scratch/td-volume.img' '{{root}}/restored' || \
          {{ echo 'the volume could not be restored' >&2; exit 1; }}; \
@@ -174,13 +167,12 @@ fn publish_steps(
          for f in {manifest} {sig} bzImage; do \
            [ -f \"{{root}}/restored/{deployments}/{id}/$f\" ] || \
            {{ echo \"the published $f is not in the volume at all\" >&2; exit 1; }}; \
-           [ \"$(od -An -v -tx1 \"{{root}}/restored/{deployments}/{id}/$f\")\" = \
-             \"$(od -An -v -tx1 \"{{root}}/deployment/$f\")\" ] || \
+           cmp -s \"{{root}}/restored/{deployments}/{id}/$f\" \"{{root}}/deployment/$f\" || \
            {{ echo \"the published $f is not the one that was signed\" >&2; exit 1; }}; \
          done; \
          [ -f '{{root}}/restored/{trusted}' ] && [ ! -L '{{root}}/restored/{trusted}' ] || \
          {{ echo 'the volume trust root is missing or not a regular file' >&2; exit 1; }}; \
-         [ \"$(od -An -v -tx1 '{{root}}/restored/{trusted}')\" = \"$(od -An -v -tx1 '{key}')\" ] || \
+         cmp -s '{{root}}/restored/{trusted}' '{key}' || \
          {{ echo 'the volume does not carry the key that authenticated it' >&2; exit 1; }}; \
          [ -d '{{root}}/restored/{channel}' ] || \
          {{ echo 'the volume has no update channel, or it is not a directory' >&2; exit 1; }}; \
@@ -206,7 +198,7 @@ fn publish_steps(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "'{bin}' volume '{disk}' '{mkfs}' '{{root}}/scratch' '{td_boot}' \
@@ -224,7 +216,7 @@ fn publish_steps(
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // ...and the key is LOAD-BEARING rather than passed along: the same publish
@@ -252,7 +244,7 @@ fn publish_steps(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "if '{bin}' volume '{disk}' '{mkfs}' '{{root}}/scratch2' '{td_boot}' \
@@ -274,7 +266,7 @@ fn publish_steps(
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     steps
@@ -356,9 +348,9 @@ pub fn recipe() -> Recipe {
     );
 
     let mut steps = vec![
-        // Engine-native, so the destination costs no `dd`: that would be an
-        // applet `busybox-x86-64`'s contract does not declare, which is the
-        // shape D7 exists to refuse.
+        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
+        // Engine-native, so the destination costs no `dd`, which the post-Rust
+        // farm does not serve.
         Step::Truncate {
             path: disk.into(),
             bytes: DISK_BYTES,
@@ -366,7 +358,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     // The size is CHECKED as well as asked for, because
@@ -380,14 +372,14 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
         // A REINSTALL over the disk just written. The disk GUID must be freshly
         // drawn, since a fixed one would have every td disk claim the same
         // identity, and the whole layout must still be there afterwards.
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "before=$(od -An -tx1 -j 568 -N 16 '{disk}') || exit 1; \
@@ -398,7 +390,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
         // D7's BINDING, and the reason it is a `Require` rather than a comment:
         // the one third-party program on the install path is named by
         // `protocol.rs` and composed into this path, so a btrfs-progs that
@@ -413,7 +405,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "'{bin}' volume '{disk}' '{mkfs}' '{{root}}/scratch' > '{{root}}/volume-out' || {{ echo 'td-install volume failed' >&2; exit 1; }}; \
@@ -427,7 +419,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     ];
 
     // The publish pass gets the DISK checks too, not only the deployment ones.
@@ -461,12 +453,7 @@ pub fn recipe() -> Recipe {
     ]);
 
     Recipe::mesboot("td-install-test", "1.0")
-        .native_inputs(&[
-            "td-install",
-            "td-boot",
-            "busybox-x86-64",
-            "btrfs-progs-x86-64",
-        ])
+        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["td-install", "td-boot", "btrfs-progs-x86-64"]))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"

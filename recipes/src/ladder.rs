@@ -641,9 +641,9 @@ pub const POST_RUST_SH: &str = "{in:td-sh}/bin/td-sh";
 /// The post-Rust build userland: the tool names gawk's build and every
 /// post-Rust farm call, each with exactly one td provider. td-txt, td-util
 /// and uutils dispatch on argv[0]. Not served: egrep and fgrep, which
-/// autoconf's probes replace with `grep -E` and `grep -F`, and od and tar,
-/// which no farm build needs (configure's tar probe falls back to none,
-/// which only `make dist` reads). `awk` is per recipe
+/// autoconf's probes replace with `grep -E` and `grep -F`, and tar, which no
+/// farm build needs (configure's tar probe falls back to none, which only
+/// `make dist` reads). `awk` is per recipe
 /// (`post_rust_tool_farm`): the awk that builds gawk cannot be gawk.
 const POST_RUST_TOOLS: &[(&str, &str, &[&str])] = &[
     ("td-sh", "{in:td-sh}/bin/td-sh", &["sh"]),
@@ -652,7 +652,7 @@ const POST_RUST_TOOLS: &[(&str, &str, &[&str])] = &[
         "td-util",
         "{in:td-util}/bin/td-util",
         &[
-            "cmp", "diff", "find", "gunzip", "gzip", "test", "which", "xargs", "zcat",
+            "cmp", "diff", "find", "gunzip", "gzip", "od", "test", "which", "xargs", "zcat",
         ],
     ),
     (

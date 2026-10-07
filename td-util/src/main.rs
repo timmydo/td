@@ -22,7 +22,7 @@
 //! `td-util <applet> [args]` form covers the un-symlinked case.
 //!
 //! A third kind replaces busybox in the build graph: `find`, `xargs`, `cmp`,
-//! `diff`, `gzip`/`gunzip`/`zcat` and `cpio`, the tools recipes and the
+//! `diff`, `od`, `gzip`/`gunzip`/`zcat` and `cpio`, the tools recipes and the
 //! initramfs build drive. Each takes the subset those callers use and refuses
 //! the rest rather than guessing at it. `gzip` decodes with the engine's
 //! inflater and CRC, included below, so one decoder serves source preparation
@@ -83,6 +83,7 @@ mod gz;
 )]
 mod gzip;
 mod less;
+mod od;
 mod printf;
 mod procfs;
 mod ps;
@@ -117,6 +118,7 @@ const APPLETS: &[(&str, Applet)] = &[
     ("less", less::run),
     ("ln", fileops::ln),
     ("mkdir", fileops::mkdir),
+    ("od", od::run),
     ("printf", printf::run),
     ("ps", ps::run),
     ("readlink", fileops::readlink),
@@ -392,8 +394,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            22,
-            "expected twenty-two modules in src/ beside the crate root"
+            23,
+            "expected twenty-three modules in src/ beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -436,6 +438,7 @@ mod confinement {
                 "gz.rs",
                 "less.rs",
                 "main.rs",
+                "od.rs",
                 "printf.rs",
                 "procfs.rs",
                 "ps.rs",

@@ -1,4 +1,4 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // Keep in lockstep with toolchain_x86_64::GLIBC_X86_64_STAGE and
@@ -36,7 +36,7 @@ fn dynamic_contract(label: &str, binary: &str, expected_needed: &str) -> Step {
     Step::run(
         "{root}",
         &[
-            POST_BOOTSTRAP_SH,
+            POST_RUST_SH,
             "-c",
             &format!(
                 "[ -x '{binary}' ] || {{ echo '{label} output is not executable' >&2; exit 1; }}; \
@@ -56,7 +56,7 @@ fn dynamic_contract(label: &str, binary: &str, expected_needed: &str) -> Step {
             ),
         ],
     )
-    .env("PATH", &post_bootstrap_path())
+    .env("PATH", "{tools}")
 }
 
 /// The contract of a td-owned static program the Cargo runner links
@@ -76,7 +76,7 @@ fn static_contract(label: &str, binary: &str) -> Step {
     Step::run(
         "{root}",
         &[
-            POST_BOOTSTRAP_SH,
+            POST_RUST_SH,
             "-c",
             &format!(
                 "[ -x '{binary}' ] || {{ echo '{label} output is not executable' >&2; exit 1; }}; \
@@ -94,7 +94,7 @@ fn static_contract(label: &str, binary: &str) -> Step {
             ),
         ],
     )
-    .env("PATH", &post_bootstrap_path())
+    .env("PATH", "{tools}")
 }
 
 pub fn recipe() -> Recipe {
@@ -104,6 +104,7 @@ pub fn recipe() -> Recipe {
     let mail = "{in:td-mail}/bin/td-mail";
     let fixture = "{root}/fixtures/known-needle.txt";
     let mut steps = vec![
+        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
         dynamic_contract("ripgrep", rg, "ld-linux-x86-64.so.2\nlibc.so.6"),
         dynamic_contract("fd", fd, "libc.so.6"),
         // The two applications are td's own root crates built static from
@@ -125,7 +126,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "actual=$('{rg}' --color never --no-filename '^needle$' '{fixture}') || {{ echo 'ripgrep search failed' >&2; exit 1; }}; \
@@ -139,7 +140,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(Step::MkDir {
         path: "{out}".into(),
@@ -155,19 +156,20 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("rust-userland-auto-test", "1.0")
-        .native_inputs(&[
-            "ripgrep",
-            "fd",
-            "td-news",
-            "td-mail",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-            "busybox-x86-64",
-            "td-txt",
-            // This boundary check needs the stage0 basename for its negative
-            // byte scan; it never executes the bootstrap compiler.
-            "rust-stage0",
-        ])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &[
+                "ripgrep",
+                "fd",
+                "td-news",
+                "td-mail",
+                "binutils-x86-64-self",
+                "glibc-x86-64",
+                // This boundary check needs the stage0 basename for its negative
+                // byte scan; it never executes the bootstrap compiler.
+                "rust-stage0",
+            ],
+        ))
         .steps(steps)
         .checks(vec![
             RecipeCheck::new(

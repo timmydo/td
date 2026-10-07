@@ -90,6 +90,7 @@ const MODULES: &[(&str, &str)] = &[
     ("glob", include_str!("../../../td-util/src/glob.rs")),
     ("gz", include_str!("../../../td-util/src/gz.rs")),
     ("less", include_str!("../../../td-util/src/less.rs")),
+    ("od", include_str!("../../../td-util/src/od.rs")),
     ("printf", include_str!("../../../td-util/src/printf.rs")),
     ("procfs", include_str!("../../../td-util/src/procfs.rs")),
     ("ps", include_str!("../../../td-util/src/ps.rs")),
