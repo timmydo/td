@@ -29,6 +29,9 @@ const HEAD_TIME: Duration = Duration::from_secs(30);
 /// How long a link waits for td-agent to open or refuse it, a person
 /// deciding included (§11).
 const OPEN_TIME: Duration = Duration::from_secs(30 * 60);
+/// How often a client waiting for its link to be opened is looked at,
+/// so one that left ends its link while td-agent still decides.
+const OPEN_LOOK: Duration = Duration::from_secs(1);
 /// How long a write to the client may wait.
 const WRITE_TIME: Duration = Duration::from_secs(5 * 60);
 
@@ -192,7 +195,7 @@ impl Proxy {
             port: request.port,
         });
         let said = if opened {
-            events.recv_timeout(OPEN_TIME).ok()
+            awaited(&events, &stream)
         } else {
             None
         };
@@ -204,8 +207,8 @@ impl Proxy {
                 return;
             }
             _ => {
-                self.forget(id);
                 self.send(Link::Shut { link: id });
+                self.forget(id);
                 let _ = answer(&mut stream, 504, "td-agent did not open the connection");
                 return;
             }
@@ -329,6 +332,45 @@ struct Request {
 
 /// The request's head, read up to its blank line within `HEAD_TIME`, and
 /// what it asks; a refusal is a status and why.
+/// What td-agent says of a link waiting to be opened, within
+/// `OPEN_TIME`; a client that left meanwhile (its end read, or its
+/// socket failed) is `Shut`, and none when td-agent said nothing.
+fn awaited(events: &Receiver<Event>, stream: &TcpStream) -> Option<Event> {
+    let deadline = std::time::Instant::now() + OPEN_TIME;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        match events.recv_timeout(left.min(OPEN_LOOK)) {
+            Ok(event) => return Some(event),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if left_us(stream) {
+            return Some(Event::Shut);
+        }
+    }
+}
+
+/// Whether the client has ended or its socket failed, nothing it sent
+/// taken: what it sent is read later, as the link's.
+fn left_us(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let peeked = stream.peek(&mut [0u8; 1]);
+    let _ = stream.set_nonblocking(false);
+    match peeked {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => !matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ),
+    }
+}
+
 fn read_request(stream: &mut TcpStream) -> Result<Request, (u16, String)> {
     let _ = stream.set_read_timeout(Some(HEAD_TIME));
     let mut head = Vec::new();
@@ -751,6 +793,49 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "link {link} kept");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// A client that leaves while its link waits to be opened ends the
+    /// link, and frees its place, with nothing said down.
+    #[test]
+    fn a_client_that_leaves_while_its_link_waits_ends_it() {
+        let (proxy, port, frames) = proxy();
+        let stream = client(port, "CONNECT elsewhere.example:443 HTTP/1.1\r\n\r\n");
+        let Link::Open { link, .. } = next(&frames) else {
+            panic!("no open");
+        };
+        drop(stream);
+        assert_eq!(next(&frames), Link::Shut { link });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while proxy.links.lock().unwrap().contains_key(&link) {
+            assert!(std::time::Instant::now() < deadline, "link {link} kept");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A client that sends past its head while its link waits has not
+    /// left: its bytes go up once it is opened.
+    #[test]
+    fn a_client_that_sends_while_its_link_waits_stays() {
+        let (proxy, port, frames) = proxy();
+        let mut stream = client(port, "CONNECT elsewhere.example:443 HTTP/1.1\r\n\r\n");
+        let Link::Open { link, .. } = next(&frames) else {
+            panic!("no open");
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        stream.write_all(b"early").unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(frames.try_recv().is_err());
+        proxy.down(Link::Opened { link });
+        line(&mut stream);
+        let mut got = Vec::new();
+        while got.len() < 5 {
+            let Link::Bytes { data, .. } = next(&frames) else {
+                panic!("no bytes");
+            };
+            got.extend(data);
+        }
+        assert_eq!(got, b"early");
     }
 
     #[test]

@@ -30,8 +30,10 @@ pub struct Bench {
     /// The file tools' instance, between calls.
     files: Option<Client>,
     /// What a command's instance reaches the network by (DESIGN.md §10),
-    /// none when its policy is `off`.
-    egress: Option<crate::egress::Egress>,
+    /// shared by every instance and changed in place.
+    judge: crate::egress::Judge,
+    /// Whom a connection that waits for a decision is handed to.
+    asker: Option<crate::egress::Asker>,
     digests: BTreeMap<String, String>,
 }
 
@@ -109,9 +111,9 @@ impl Bench {
         }
     }
 
-    /// The instance `call` runs in: a fresh one, or the file tools',
-    /// started when there is none.
-    pub fn take(&mut self, call: &Call) -> Result<Client, String> {
+    /// The instance `call`, logged as `started`, runs in: a fresh one, or
+    /// the file tools', started when there is none.
+    pub fn take(&mut self, call: &Call, started: u64) -> Result<Client, String> {
         if !fresh(call) {
             if let Some(files) = self.files.take() {
                 return Ok(files);
@@ -126,19 +128,61 @@ impl Bench {
             .policy
             .as_ref()
             .ok_or("the workspace is not prepared")?;
-        // Only a command's instance runs what would reach the network.
-        let egress = match call {
-            Call::Shell { .. } | Call::Background { .. } => self.egress.clone(),
+        // Only a command's instance runs what would reach the network,
+        // and none under `off`, which gives it no proxy.
+        let off = self
+            .judge
+            .lock()
+            .map_or(true, |egress| egress.network == crate::config::Network::Off);
+        let linked = match call {
+            Call::Shell { .. } | Call::Background { .. } if !off => Some(crate::egress::Linked {
+                judge: std::sync::Arc::clone(&self.judge),
+                asker: self.asker.clone(),
+                call: started,
+            }),
             _ => None,
         };
-        jail::launch_linked(programs, policy, specs, egress)
+        jail::launch_linked(programs, policy, specs, linked)
     }
 
     /// The network a command's instance is given: `network`, the
     /// allowlist it is judged by, and the relay it goes out through; `off`
-    /// gives none, and no proxy.
-    pub fn set_network(&mut self, egress: crate::egress::Egress) {
-        self.egress = (egress.network != crate::config::Network::Off).then_some(egress);
+    /// gives no proxy to the next, and refuses a running one's next
+    /// connection.
+    pub fn set_network(
+        &mut self,
+        network: crate::config::Network,
+        allowlist: Vec<crate::config::Destination>,
+        relay: Option<PathBuf>,
+    ) {
+        if let Ok(mut egress) = self.judge.lock() {
+            egress.network = network;
+            egress.allowlist = allowlist;
+            egress.relay = relay;
+        }
+    }
+
+    /// The network rules a connection is judged by, and the rules files
+    /// that could not be read (DESIGN.md §11).
+    pub fn set_rules(&mut self, rules: Vec<crate::rules::Sourced>, unread: Vec<(String, String)>) {
+        if let Ok(mut egress) = self.judge.lock() {
+            egress.rules = rules;
+            egress.unread = unread;
+        }
+    }
+
+    /// Whom a connection that waits is handed to.
+    pub fn set_asker(&mut self, asker: crate::egress::Asker) {
+        self.asker = Some(asker);
+    }
+
+    /// What a connection to `destination` would be, by the current
+    /// policy and rules.
+    pub fn judge(&self, destination: &crate::config::Destination) -> crate::egress::Judgment {
+        self.judge.lock().map_or_else(
+            |_| crate::egress::Judgment::Refuse("the policy is not readable".into()),
+            |egress| egress.judge(destination),
+        )
     }
 
     /// Keeps the file tools' instance for the next call; a fresh one is
@@ -260,7 +304,7 @@ mod tests {
         }));
         assert!(!fresh(&read));
         // Unprepared, nothing is launched.
-        assert!(bench.take(&read).is_err());
+        assert!(bench.take(&read, 1).is_err());
         assert_eq!(
             limit(&Call::Shell {
                 command: "x".into(),

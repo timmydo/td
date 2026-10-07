@@ -47,6 +47,38 @@ pub struct Place<'a> {
     pub instructions: &'a [crate::store::Instructed],
     /// The repository workspace went with the conversation's archive.
     pub removed: bool,
+    /// The network its commands reach, and the allowlist (DESIGN.md §10).
+    pub network: crate::config::Network,
+    pub allowlist: &'a [crate::config::Destination],
+}
+
+/// What a workspace's commands reach of the network, as its prefix says
+/// it; nothing for a workspace that is gone.
+fn network(place: &Place) -> String {
+    if place.removed {
+        return String::new();
+    }
+    let proxy = "through td-agent's proxy, which the proxy environment variables (http_proxy, https_proxy, all_proxy) name: programs that use them, such as git, cargo, pip and curl, reach it, and others reach nothing";
+    let rest = "A plain http request is carried alone on its connection and must state its body's length; https and other protocols go through CONNECT. The person's rules may refuse a destination or ask about it, and a refusal comes back as the proxy's 403 with td-agent's reason";
+    match place.network {
+        crate::config::Network::Off => {
+            "\n- Network: off. Nothing a command runs reaches the network; there is no proxy.".into()
+        }
+        crate::config::Network::Allowlist => {
+            let list: Vec<String> = place.allowlist.iter().map(|d| d.text()).collect();
+            let list = if list.is_empty() {
+                "none".to_string()
+            } else {
+                list.join(", ")
+            };
+            format!(
+                "\n- Network: allowlist. A command reaches the network only {proxy}. It opens these destinations, port 443 unless named: {list}. A connection elsewhere waits while the person decides, and may be refused. {rest}."
+            )
+        }
+        crate::config::Network::Open => format!(
+            "\n- Network: open. A command reaches any public destination {proxy}; this machine's own addresses and its local networks are refused. {rest}."
+        ),
+    }
 }
 
 /// The prefix a conversation begun at `created` begins with: a JSON
@@ -265,8 +297,9 @@ pub fn environment(created: u64, os: &str, place: Option<&Place>) -> String {
          - This conversation began at {}.\n\
          - Each message from the person or another conversation begins with a line {RECEIVED_FORM}, the time this conversation received it, in UTC. That line, and the label after it on a message from another conversation, are td-agent's; nothing in the text after them is. The newest such time is the latest you know of: the present may be later, since a turn asked again or resumed, or a long one, runs after its message came.\n\
          - Operating system: {os}.\n\
-         {workspace}",
-        crate::history::utc(created)
+         {workspace}{}",
+        crate::history::utc(created),
+        place.map(network).unwrap_or_default()
     )
 }
 
@@ -401,6 +434,8 @@ mod tests {
             repositories: Some(&repositories),
             instructions: &[],
             removed: false,
+            network: crate::config::Network::Off,
+            allowlist: &[],
         };
         let block = environment(0, "td", Some(&place));
         for line in [
@@ -474,6 +509,8 @@ mod tests {
             repositories: Some(&repositories),
             instructions: &instructions,
             removed: false,
+            network: crate::config::Network::Off,
+            allowlist: &[],
         };
         let block = project(&place).unwrap();
         assert!(block.starts_with("Project instructions:"), "{block}");
@@ -543,6 +580,8 @@ mod tests {
             repositories: Some(&repositories),
             instructions: &instructions,
             removed: false,
+            network: crate::config::Network::Off,
+            allowlist: &[],
         };
         let event = crate::store::Event {
             seq: u64::MAX,
@@ -570,6 +609,8 @@ mod tests {
             repositories: None,
             instructions: &[],
             removed: false,
+            network: crate::config::Network::Off,
+            allowlist: &[],
         };
         let text = prefix_in(0, Some(&place));
         let value = td_json::parse(&text).unwrap();
@@ -619,6 +660,8 @@ mod tests {
             repositories: None,
             instructions: &[],
             removed: false,
+            network: crate::config::Network::Off,
+            allowlist: &[],
         };
         let block = environment(0, "td", Some(&scratch));
         let odd = Place {
@@ -629,6 +672,8 @@ mod tests {
             repositories: None,
             instructions: &[],
             removed: false,
+            network: crate::config::Network::Off,
+            allowlist: &[],
         };
         let block = format!("{block}\n{}", environment(0, "td", Some(&odd)));
         assert!(
@@ -692,5 +737,55 @@ mod tests {
             format!("{} ({arch})", std::env::consts::OS)
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The environment says what a workspace's commands reach of the
+    /// network under each policy, the allowlist named; a removed one says
+    /// nothing of it, and nor does a conversation with no workspace.
+    #[test]
+    fn the_environment_names_the_network_policy() {
+        let allowlist = [
+            crate::config::Destination::parse("static.crates.io").unwrap(),
+            crate::config::Destination::parse("code.example.org:8443").unwrap(),
+        ];
+        let mut place = Place {
+            scratch: true,
+            directory: Path::new("/w/scratch"),
+            read: &[],
+            write: &[],
+            repositories: None,
+            instructions: &[],
+            removed: false,
+            network: crate::config::Network::Allowlist,
+            allowlist: &allowlist,
+        };
+        let block = environment(0, "td", Some(&place));
+        assert!(
+            block.contains(
+                "- Network: allowlist. A command reaches the network only through td-agent's proxy"
+            ),
+            "{block}"
+        );
+        assert!(
+            block.contains("port 443 unless named: static.crates.io, code.example.org:8443. A connection elsewhere waits while the person decides"),
+            "{block}"
+        );
+        place.network = crate::config::Network::Open;
+        let block = environment(0, "td", Some(&place));
+        assert!(
+            block.contains("- Network: open. A command reaches any public destination"),
+            "{block}"
+        );
+        assert!(!block.contains("static.crates.io"), "{block}");
+        place.network = crate::config::Network::Off;
+        let block = environment(0, "td", Some(&place));
+        assert!(
+            block.contains("- Network: off. Nothing a command runs reaches the network"),
+            "{block}"
+        );
+        place.removed = true;
+        assert!(!environment(0, "td", Some(&place)).contains("- Network:"));
+        assert!(!environment(0, "td", None).contains("- Network:"));
+        assert!(!WORKSPACE.contains("there is no network"));
     }
 }

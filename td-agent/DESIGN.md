@@ -38,10 +38,11 @@ the circuit breaker and the trust mark (§11); and increment 16,
 compaction, by hand and past `compact_at`, and the card that asks how to
 resume a conversation whose cache has gone cold (§14). Increment 14,
 the push and fetch tools, is built; increment 15, the network, is built
-but for its crossings and network rules, so a workspace's commands
-reach its allowlist, or anywhere under `open`, through its proxy and
-the egress relay, and a destination off the allowlist is refused rather
-than asked about (§10). Where building
+but for the classifier's part in its crossings and a way to set `open`
+from the window, so a workspace's commands reach its allowlist, or
+anywhere under `open`, through its proxy and the egress relay, and a
+destination off the allowlist waits on the person's card, in `auto` as
+in `ask` until the classifier takes its row (§10, §11). Where building
 an increment settled a point the design left open, the section says so
 under "As built". No recipe names td-agent yet. The decisions below that
 were the user's to make were made on 2026-10-01, 2026-10-02 and
@@ -3598,7 +3599,9 @@ A workspace has one of three network policies, shown in the status row:
   channel outside `git_push`; so `npm install`, for one, fails by default
   until the human admits its registry. Another
   destination is a crossing (§11): the connection waits while it is
-  decided, and an "always" answer adds it to this workspace's allowlist.
+  decided, and an "always allow" answer writes `allow network
+  HOST[:PORT]` under the workspace's header in the human's rules, which
+  opens it as the allowlist would.
 - `open`: any destination the relay will reach. Only the human sets it,
   on a card or in a template (§7).
 
@@ -3728,8 +3731,63 @@ thread writing to the relay. A refusal's reason is cut to the 1 KiB a
 link is opened through the relay, `connect HOST PORT`, an IPv6 host in
 brackets; the relay's refusal comes back as the link's reason, and with
 no relay socket every link is refused saying td-agent was not launched
-by td-net. Until the crossings land, a destination off the allowlist is
-refused, not asked.
+by td-net.
+
+As built (crossings). The conversation's `egress::Egress` is one
+judge for every instance it launches, held by its `Bench` and changed
+in place when the settings come, when the workspace's policy is worked
+out for a turn and when the human's rules change, so a running
+background process's next
+connection is judged by the current policy and rules; an instance
+launched under `off` has no proxy, and one whose policy becomes `off`
+has its next connection refused. A connection is judged on the client's
+reader thread, in §11's order: under `off` none; a network deny, the
+human's or a repository's, refuses it, even to a destination the
+allowlist or `open` admits; a network ask, or a rules file not read,
+asks, offering no "always allow"; one of the human's network allows
+opens it; then `open` opens any destination, `allowlist` one on the
+list, and the rest ask. A connection that asks waits in its `Links`,
+holding no thread, at most 40 to an instance and 64 destinations asked
+about over an instance's life, past which it is refused; the
+conversation is told, with the call whose command made it, through its
+inbox, which every wait of the conversation's reads, in a turn, a card,
+a stream or idle, so a connection is put before the person within a
+tenth of a second while a command runs, and at once otherwise. The
+conversation judges it again by the policy as it is then, a rule's
+answer opening or refusing it without a card, and asks only of one
+that still waits. Connections waiting on one destination share one
+card, whatever instance made them, its id past any call's, at most 8
+cards at once, past which a connection is refused: `Let a command
+connect to HOST:PORT?`, the calls whose commands ask (`shell #N`), why
+it is asked, and what each answer does, the card put again as more
+commands join it. Its "always" answers are `network HOST[:PORT]`
+rules, the window writing them as it writes a tool call's, a deny here
+or everywhere and an allow here; with the human's rules unread it
+offers none. The person's answer opens or refuses every connection
+waiting on that card, and holds for the rest of each instance that
+asked, a background process's included, where the allowlist alone
+would ask, so a command's retries ask once and a rule still decides;
+the next command asks again; an allow the policy now refuses is
+refused, a deny winning whenever it comes. A rule's answer is kept for
+no connection but the one it decides. A changed policy judges each
+waiting card again: one a rule now refuses or opens is taken back and
+its connections given that, and one still asked of is put again when
+why it asks or what it offers changed. The conversation takes the
+connections an answer settles out of waiting itself, so nothing it
+hears afterwards finds them waiting; what the answer sends down to a
+tool host is sent from a thread of its own, so the conversation never
+waits on one that has stopped reading. A connection that ends while it
+waits, its client leaving the proxy (looked for each second) or its
+instance ending, is said gone, and a card none waits on any longer is
+taken back. Each card's outcome is logged as an approval of each call
+whose command made one of its connections, `by` `human`, `rule` or,
+when taken back as gone or refused past the cards' bound, `td-agent`,
+its reason naming the destination; they are logged between calls or
+while the conversation is idle, never inside a request. In `auto` the card still goes to the person: the classifier's
+row in §11's table comes with a later commit, as the crossings between
+conversations did. A conversation's system prompt names the policy, the
+allowlist under `allowlist`, and that a connection elsewhere waits on
+the person and may be refused.
 
 What remains of this as built: a background process's link frames
 share its reply queue's reader with its output, so a conversation that
@@ -3737,9 +3795,9 @@ stops draining a background process's output stalls that process's
 network too; a link's frames share the tool host's outbox with a call's
 live output, which is dropped when the outbox is full, so heavy network
 traffic thins a running command's live output (its kept output is
-whole); a background process keeps the network it started with, so
-narrowing a workspace's policy reaches its next command and not one
-already running; the relay is one pool for every conversation, 64
+whole); a background process started under `off` has no proxy, so
+widening the policy reaches its next command and not one already
+running; the relay is one pool for every conversation, 64
 connections at once, which one workspace's links, 32 to an instance,
 can fill for as long as they are used; and the allowlist bounds the
 connection's destination, not the origin a shared front serves, which
@@ -3747,14 +3805,16 @@ a tunnel's TLS names in its SNI (a plain request's `Host` is its URL's);
 and a link has no half-close, so a client that shuts its sending side
 to say it is done ends the link, its answer with it: a tunnel's, and a
 plain request's too, whose client's end is read for so that one that
-leaves frees its place.
+leaves frees its place; and a client that sent bytes past its head and
+then left while its link waits for the person is not seen to have left
+until the link's 30 minutes pass, what it sent standing in the way.
 
 As built (the relay): `td-egressd` (net/src/egress.rs) and
 APPLICATIONS.md §W.8 item 6, which states its protocol, deadlines and
 predicate. `td-net launch` serves it for td-agent alone, at
 `td-egress/socket` under the runtime directory it gives td-agent; on td
-its unit comes with the packaging (§18, 17). Nothing calls it yet: the
-proxy and the policies are the increment's later commits.
+its unit comes with the packaging (§18, 17). td-agent's links reach it
+(As built (the proxy)).
 
 ## 11. Approval
 
@@ -3834,9 +3894,13 @@ stated only in chat can be lost to compaction, and a rule cannot.
 **As built (increment 13, a repository's rules).** `.td-agent/rules`
 holds one rule a line: `deny` or `ask`, then a tool the tool host runs
 (`read_file`, `write_file`, `edit_file`, `glob`, `grep`, `sed` or
-`shell`) or `git_push`, then, for `shell`, the words of an argv prefix,
-parted by spaces or tabs, and for `git_push` a remote and a branch, or
-the remote alone (As built (increment 14, rules for pushes)). Blank
+`shell`), `git_push` or `network`, then, for `shell`, the words of an
+argv prefix, parted by spaces or tabs, for `git_push` a remote and a
+branch, or the remote alone (As built (increment 14, rules for
+pushes)), and for `network` a destination as an allowlist writes it,
+`HOST[:PORT]`, 443 unless named, or none, which matches every
+connection; an allow must name one, reaching anywhere being the `open`
+policy (§10, As built (crossings)). Blank
 lines and lines starting with `#` are skipped. A word may not hold what
 the shell would read rather than pass, or what the matcher could never
 match: a quote, `\`, `$`, a backtick, `;`, `&`, `|`, `<`, `>`, a

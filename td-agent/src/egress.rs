@@ -19,12 +19,13 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use crate::config::{Destination, Network};
 use crate::frame;
 use crate::host::{Credit, Down, Link, LINK_CHUNK, LINK_WINDOW, MAX_LINKS, MAX_LINK_WHY};
+use crate::rules::{Sourced, Verdict};
 
 /// The relay's protocol line (net/src/egress.rs).
 const RELAY_PROTOCOL: &str = "td-egress 1";
@@ -45,13 +46,98 @@ pub const PIPE_STEP: Duration = Duration::from_secs(1);
 /// a link the proxy has a place for is not refused for them.
 const MAX_CARRIERS: usize = MAX_LINKS + 8;
 
-/// What a workspace's links are judged by and opened through.
+/// What a workspace's links are judged by and opened through: its
+/// policy, its allowlist, the network rules that apply to it and the
+/// rules files that could not be read (DESIGN.md §11), and the relay.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Egress {
     pub network: Network,
     pub allowlist: Vec<Destination>,
+    pub rules: Vec<Sourced>,
+    pub unread: Vec<(String, String)>,
     /// The relay's socket; none when td-agent was not launched with one.
     pub relay: Option<PathBuf>,
+}
+
+impl Default for Egress {
+    fn default() -> Self {
+        Self {
+            network: Network::Off,
+            allowlist: Vec::new(),
+            rules: Vec::new(),
+            unread: Vec::new(),
+            relay: None,
+        }
+    }
+}
+
+/// A conversation's `Egress`, shared by every instance it launches with
+/// a proxy and changed in place as its policy and rules change, so a
+/// running background process's next connection is judged by the
+/// current one.
+pub type Judge = Arc<Mutex<Egress>>;
+
+/// What the policy says of one destination.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Judgment {
+    /// Opened without asking.
+    Open,
+    /// Refused, and why.
+    Refuse(String),
+    /// A crossing (§11): the conversation decides, why it is asked, and
+    /// whether an "always allow" may be offered, which it may not when a
+    /// rule asks or a rules file could not be read.
+    Ask { why: String, allow: bool },
+}
+
+/// A link of an instance's that waits for the conversation, or that
+/// waited and is gone.
+/// Each names the call whose command made it, which outlives the
+/// instance.
+pub enum Asked {
+    Waits {
+        links: Weak<Links>,
+        link: u64,
+        call: u64,
+        destination: Destination,
+        why: String,
+        allow: bool,
+    },
+    Gone {
+        links: Weak<Links>,
+        link: u64,
+        call: u64,
+    },
+}
+
+/// The most destinations one instance may ask the conversation about
+/// over its life, so a command cannot keep the person's cards coming.
+pub const MAX_ASKED: usize = 64;
+
+/// Links taken out of waiting, each with its destination, to be given
+/// their answer.
+pub type Taken = Vec<(u64, Destination)>;
+
+/// How an instance's links reach the conversation that decides them.
+pub type Asker = Arc<dyn Fn(Asked) + Send + Sync>;
+
+/// What an instance with a proxy is launched with: the conversation's
+/// judge, whom to ask, and the call it runs, which approvals name.
+#[derive(Clone)]
+pub struct Linked {
+    pub judge: Judge,
+    pub asker: Option<Asker>,
+    pub call: u64,
+}
+
+/// `host` and `port` as a destination, as an allowlist names it.
+pub fn destination(host: &str, port: u16) -> Result<Destination, String> {
+    let named = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    Destination::parse(&named)
 }
 
 /// The relay's socket under `runtime`, td-net launch's runtime directory.
@@ -68,24 +154,29 @@ pub fn relay_here() -> Option<PathBuf> {
 }
 
 impl Egress {
-    /// Whether `host:port` may be opened, and why not: any under `open`;
-    /// one on the allowlist under `allowlist`; none under `off`, whose
-    /// instances have no proxy to ask.
-    pub fn judge(&self, host: &str, port: u16) -> Result<(), String> {
-        let named = if host.contains(':') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
-        };
-        let destination = Destination::parse(&named)?;
-        match self.network {
-            Network::Off => Err("this workspace's network policy is off".into()),
-            Network::Open => Ok(()),
-            Network::Allowlist if self.allowlist.contains(&destination) => Ok(()),
-            Network::Allowlist => Err(format!(
-                "{} is not on this workspace's allowlist",
-                destination.text()
-            )),
+    /// What may become of a connection to `destination` (§10, §11): none
+    /// under `off`; then a network deny refuses it, an ask or an unread
+    /// rules file asks, and an allow opens it; else `open` opens any, and
+    /// `allowlist` one on the allowlist and asks of the rest.
+    pub fn judge(&self, destination: &Destination) -> Judgment {
+        if self.network == Network::Off {
+            return Judgment::Refuse("this workspace's network policy is off".into());
+        }
+        match crate::rules::judge_network(&self.rules, &self.unread, destination) {
+            Verdict::Deny(why) => Judgment::Refuse(why),
+            Verdict::Ask(why) => Judgment::Ask { why, allow: false },
+            Verdict::Allow(_) => Judgment::Open,
+            Verdict::Table => match self.network {
+                Network::Open => Judgment::Open,
+                Network::Allowlist if self.allowlist.contains(destination) => Judgment::Open,
+                _ => Judgment::Ask {
+                    why: format!(
+                        "{} is not on this workspace's allowlist",
+                        destination.text()
+                    ),
+                    allow: true,
+                },
+            },
         }
     }
 }
@@ -202,7 +293,7 @@ impl Pipe {
 /// One tool host's links: what each is owed, and how its frames go down.
 pub struct Links {
     /// None for a tool host with no proxy, whose links are refused.
-    egress: Option<Egress>,
+    linked: Option<Linked>,
     pipe: Arc<Pipe>,
     open: Mutex<Open>,
 }
@@ -215,6 +306,19 @@ struct Open {
     /// ended before it.
     live: usize,
     last: u64,
+    /// Links waiting for the conversation, each its destination.
+    waiting: BTreeMap<u64, Destination>,
+    /// The person's answers for the rest of this instance, by
+    /// destination: opened, or refused and why. Only a destination the
+    /// allowlist alone asks about takes one, so a rule, or a rules file
+    /// not read, still decides.
+    answered: BTreeMap<Destination, Result<(), String>>,
+    /// The destinations this instance has asked about, at most
+    /// `MAX_ASKED`.
+    asked: std::collections::BTreeSet<Destination>,
+    /// Links taken out of waiting and not yet given their answer; one
+    /// the tool host shuts meanwhile is given none.
+    giving: std::collections::BTreeSet<u64>,
 }
 
 /// A link's place here: the one sender of the bytes for its relay
@@ -257,12 +361,119 @@ fn bounded(why: String) -> String {
 }
 
 impl Links {
-    pub fn new(egress: Option<Egress>, pipe: Arc<Pipe>) -> Arc<Self> {
+    pub fn new(linked: Option<Linked>, pipe: Arc<Pipe>) -> Arc<Self> {
         Arc::new(Self {
-            egress,
+            linked,
             pipe,
             open: Mutex::new(Open::default()),
         })
+    }
+
+    /// The call whose instance these links are, which approvals name.
+    pub fn call(&self) -> Option<u64> {
+        self.linked.as_ref().map(|linked| linked.call)
+    }
+
+    /// Whether link `link` still waits for the conversation.
+    pub fn waits(&self, link: u64) -> bool {
+        self.open
+            .lock()
+            .is_ok_and(|open| open.waiting.contains_key(&link))
+    }
+
+    /// The conversation's answer for `destination`, for every link of
+    /// this instance's waiting on it and for the rest of the instance:
+    /// opened, or refused and why.
+    /// Link `link`, if it still waits, opened or refused, the answer kept
+    /// for no other: a rule's, which the rules decide again next time.
+    pub fn settle(self: &Arc<Self>, link: u64, answer: Result<(), String>) {
+        let taken = self.take(link);
+        self.give(taken, &answer);
+    }
+
+    /// Link `link` taken out of waiting, with its destination, if it
+    /// still waited; nothing written, so the conversation may take it on
+    /// its own thread and `give` it on another.
+    pub fn take(&self, link: u64) -> Taken {
+        self.open
+            .lock()
+            .ok()
+            .and_then(|mut open| {
+                let destination = open.waiting.remove(&link)?;
+                open.giving.insert(link);
+                Some(vec![(link, destination)])
+            })
+            .unwrap_or_default()
+    }
+
+    /// The person's `answer` for `destination` kept for the rest of this
+    /// instance, and every link waiting on it taken out of waiting, with
+    /// nothing written.
+    pub fn take_answer(&self, destination: &Destination, answer: &Result<(), String>) -> Taken {
+        self.open
+            .lock()
+            .map(|mut open| {
+                open.answered.insert(destination.clone(), answer.clone());
+                let taken: Vec<u64> = open
+                    .waiting
+                    .iter()
+                    .filter(|(_, to)| *to == destination)
+                    .map(|(link, _)| *link)
+                    .collect();
+                for link in &taken {
+                    open.waiting.remove(link);
+                    open.giving.insert(*link);
+                }
+                taken
+                    .into_iter()
+                    .map(|link| (link, destination.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Links taken, opened or refused: what goes down to the tool host.
+    pub fn give(self: &Arc<Self>, taken: Taken, answer: &Result<(), String>) {
+        for (link, destination) in taken {
+            let still = self
+                .open
+                .lock()
+                .is_ok_and(|mut open| open.giving.remove(&link));
+            if !still {
+                continue;
+            }
+            match answer {
+                Ok(()) => self.start(link, &destination),
+                Err(why) => self.refuse(link, why.clone()),
+            }
+        }
+    }
+
+    /// The call these links' instance runs, for what it asks.
+    fn call_or_none(&self) -> u64 {
+        self.call().unwrap_or(0)
+    }
+
+    pub fn answer(self: &Arc<Self>, destination: &Destination, answer: Result<(), String>) {
+        let taken = self.take_answer(destination, &answer);
+        self.give(taken, &answer);
+    }
+
+    /// Tells the conversation link `link` no longer waits, if it did.
+    fn unwait(self: &Arc<Self>, link: u64) {
+        let waited = self
+            .open
+            .lock()
+            .is_ok_and(|mut open| open.waiting.remove(&link).is_some());
+        if waited {
+            if let Some(asker) = self.linked.as_ref().and_then(|l| l.asker.as_ref()) {
+                asker(Asked::Gone {
+                    links: Arc::downgrade(self),
+                    link,
+                    call: self.call_or_none(),
+                });
+            }
+        }
     }
 
     fn send(&self, link: Link) -> bool {
@@ -328,6 +539,10 @@ impl Links {
             }
             Link::Shut { link } => {
                 self.forget(link);
+                self.unwait(link);
+                if let Ok(mut open) = self.open.lock() {
+                    open.giving.remove(&link);
+                }
             }
             Link::Opened { .. } | Link::Refused { .. } => {}
         }
@@ -342,14 +557,79 @@ impl Links {
         if !fresh {
             return self.refuse(id, "a link's id is one already used".into());
         }
-        // Judged here, so a refusal costs no thread.
-        let judged = match &self.egress {
-            Some(egress) => egress.judge(&host, port),
-            None => Err("this instance has no network".into()),
+        let destination = match destination(&host, port) {
+            Ok(destination) => destination,
+            Err(why) => return self.refuse(id, why),
         };
-        if let Err(why) = judged {
+        // Judged here, so a refusal costs no thread, and asking waits on
+        // no thread either: the link is put aside for the conversation.
+        let Some(linked) = &self.linked else {
+            return self.refuse(id, "this instance has no network".into());
+        };
+        let judged = linked.judge.lock().map_or_else(
+            |_| Judgment::Refuse("the policy is not readable".into()),
+            |e| e.judge(&destination),
+        );
+        let (why, allow) = match judged {
+            Judgment::Open => return self.start(id, &destination),
+            Judgment::Refuse(why) => return self.refuse(id, why),
+            Judgment::Ask { why, allow } => (why, allow),
+        };
+        let Some(asker) = &linked.asker else {
             return self.refuse(id, why);
+        };
+        let waits = self
+            .open
+            .lock()
+            .map(|mut open| {
+                let answered = if allow {
+                    open.answered.get(&destination).cloned()
+                } else {
+                    None
+                };
+                if let Some(answered) = answered {
+                    return Err(answered);
+                }
+                if open.waiting.len() >= MAX_CARRIERS {
+                    return Err(Err(format!(
+                        "{MAX_CARRIERS} connections already wait for a decision"
+                    )));
+                }
+                if !open.asked.contains(&destination) && open.asked.len() >= MAX_ASKED {
+                    return Err(Err(format!(
+                        "this command has asked about {MAX_ASKED} destinations; ask the person to admit the ones it needs"
+                    )));
+                }
+                open.asked.insert(destination.clone());
+                open.waiting.insert(id, destination.clone());
+                Ok(())
+            });
+        match waits {
+            Ok(Ok(())) => asker(Asked::Waits {
+                links: Arc::downgrade(self),
+                link: id,
+                call: linked.call,
+                destination,
+                why,
+                allow,
+            }),
+            Ok(Err(Ok(()))) => self.start(id, &destination),
+            Ok(Err(Err(why))) => self.refuse(id, why),
+            Err(_) => self.refuse(id, why),
         }
+    }
+
+    /// Opens link `id` to `destination` on a thread of its own, if there
+    /// is room for one.
+    fn start(self: &Arc<Self>, id: u64, destination: &Destination) {
+        // An IPv6 host as the relay is named it by `connect`: bare.
+        let host = destination
+            .host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(&destination.host)
+            .to_string();
+        let port = destination.port;
         let (toward, from) = mpsc::channel();
         let peer = Arc::new(Peer::default());
         let taken = self.open.lock().is_ok_and(|mut open| {
@@ -463,9 +743,13 @@ impl Links {
     /// A connection through the relay to `host:port`, or why there is
     /// none: the relay's own refusal, as it gives it.
     fn connect(&self, host: &str, port: u16) -> Result<UnixStream, String> {
-        let socket = self.egress.as_ref().and_then(|e| e.relay.as_ref()).ok_or(
-            "there is no egress relay: td-agent was not launched by td-net, which serves one",
-        )?;
+        let socket = self
+            .linked
+            .as_ref()
+            .and_then(|linked| linked.judge.lock().ok()?.relay.clone())
+            .ok_or(
+                "there is no egress relay: td-agent was not launched by td-net, which serves one",
+            )?;
         let fault = |e: io::Error| format!("the egress relay: {e}");
         let mut relay = UnixStream::connect(socket).map_err(fault)?;
         relay.set_read_timeout(Some(ANSWER_TIME)).map_err(fault)?;
@@ -498,14 +782,28 @@ impl Links {
     }
 
     /// Every link ended: the tool host is gone.
-    pub fn close_all(&self) {
-        let entries = self
+    pub fn close_all(self: &Arc<Self>) {
+        let (entries, waiting) = self
             .open
             .lock()
-            .map(|mut open| std::mem::take(&mut open.entries))
+            .map(|mut open| {
+                (
+                    std::mem::take(&mut open.entries),
+                    std::mem::take(&mut open.waiting),
+                )
+            })
             .unwrap_or_default();
         for entry in entries.values() {
             entry.peer.credit.close();
+        }
+        if let Some(asker) = self.linked.as_ref().and_then(|l| l.asker.as_ref()) {
+            for link in waiting.into_keys() {
+                asker(Asked::Gone {
+                    links: Arc::downgrade(self),
+                    link,
+                    call: self.call_or_none(),
+                });
+            }
         }
     }
 }
@@ -545,8 +843,27 @@ mod tests {
                 .iter()
                 .map(|d| Destination::parse(d).unwrap())
                 .collect(),
+            rules: Vec::new(),
+            unread: Vec::new(),
             relay,
         }
+    }
+
+    fn judged(egress: &Egress, host: &str, port: u16) -> Judgment {
+        match destination(host, port) {
+            Ok(destination) => egress.judge(&destination),
+            Err(why) => Judgment::Refuse(why),
+        }
+    }
+
+    fn sourced(lines: &[&str]) -> Vec<Sourced> {
+        lines
+            .iter()
+            .map(|line| Sourced {
+                rule: crate::rules::Rule::parse(line).unwrap(),
+                from: "here".into(),
+            })
+            .collect()
     }
 
     /// `open` admits any host, `allowlist` its own by host and port, 443
@@ -563,23 +880,71 @@ mod tests {
             ],
             None,
         );
-        assert_eq!(allow.judge("static.crates.io", 443), Ok(()));
-        assert_eq!(allow.judge("Static.Crates.IO.", 443), Ok(()));
-        assert_eq!(allow.judge("git.example.org", 8443), Ok(()));
-        assert_eq!(allow.judge("2001:db8:0::1", 22), Ok(()));
-        let said = allow.judge("static.crates.io", 80).unwrap_err();
-        assert!(
-            said.contains("static.crates.io:80 is not on this workspace's allowlist"),
-            "{said}"
+        assert_eq!(judged(&allow, "static.crates.io", 443), Judgment::Open);
+        assert_eq!(judged(&allow, "Static.Crates.IO.", 443), Judgment::Open);
+        assert_eq!(judged(&allow, "git.example.org", 8443), Judgment::Open);
+        assert_eq!(judged(&allow, "2001:db8:0::1", 22), Judgment::Open);
+        assert_eq!(
+            judged(&allow, "static.crates.io", 80),
+            Judgment::Ask {
+                why: "static.crates.io:80 is not on this workspace's allowlist".into(),
+                allow: true
+            }
         );
-        assert!(allow.judge("git.example.org", 443).is_err());
-        assert!(allow.judge("crates.io", 443).is_err());
+        assert!(matches!(
+            judged(&allow, "crates.io", 443),
+            Judgment::Ask { .. }
+        ));
         let open = egress(Network::Open, &[], None);
-        assert_eq!(open.judge("anything.example", 22), Ok(()));
-        assert!(open.judge("a_b", 443).is_err());
-        assert!(open.judge("10.1", 443).is_err());
+        assert_eq!(judged(&open, "anything.example", 22), Judgment::Open);
+        assert!(matches!(judged(&open, "a_b", 443), Judgment::Refuse(_)));
+        assert!(matches!(judged(&open, "10.1", 443), Judgment::Refuse(_)));
         let off = egress(Network::Off, &["static.crates.io"], None);
-        assert!(off.judge("static.crates.io", 443).is_err());
+        assert!(matches!(
+            judged(&off, "static.crates.io", 443),
+            Judgment::Refuse(_)
+        ));
+    }
+
+    /// The rules come before the policy: a deny refuses even what the
+    /// allowlist or `open` admits, an ask or an unread file asks with no
+    /// allow to offer, an allow opens what the allowlist would ask of,
+    /// and nothing opens under `off`.
+    #[test]
+    fn links_are_judged_by_the_rules_first() {
+        let mut allow = egress(Network::Allowlist, &["static.crates.io"], None);
+        allow.rules = sourced(&[
+            "deny network static.crates.io",
+            "ask network ask.example",
+            "allow network extra.example:8443",
+        ]);
+        assert!(matches!(
+            judged(&allow, "static.crates.io", 443),
+            Judgment::Refuse(why) if why.contains("deny network static.crates.io")
+        ));
+        assert!(matches!(
+            judged(&allow, "ask.example", 443),
+            Judgment::Ask { allow: false, .. }
+        ));
+        assert_eq!(judged(&allow, "extra.example", 8443), Judgment::Open);
+        let mut open = egress(Network::Open, &[], None);
+        open.rules = sourced(&["deny network"]);
+        assert!(matches!(
+            judged(&open, "any.example", 443),
+            Judgment::Refuse(_)
+        ));
+        open.rules = Vec::new();
+        open.unread = vec![("theirs".into(), "broken".into())];
+        assert!(matches!(
+            judged(&open, "any.example", 443),
+            Judgment::Ask { allow: false, .. }
+        ));
+        let mut off = egress(Network::Off, &[], None);
+        off.rules = sourced(&["allow network extra.example"]);
+        assert!(matches!(
+            judged(&off, "extra.example", 443),
+            Judgment::Refuse(_)
+        ));
     }
 
     /// A stand-in relay: each request's head sent on `heads`, then
@@ -643,11 +1008,30 @@ mod tests {
 
     /// Links over `egress`, and the tool host's end of their frames.
     fn links(egress: Option<Egress>) -> (Arc<Links>, UnixStream) {
+        asking(egress, None)
+    }
+
+    fn asking(egress: Option<Egress>, asker: Option<Asker>) -> (Arc<Links>, UnixStream) {
         let (ours, theirs) = UnixStream::pair().unwrap();
         theirs
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        (Links::new(egress, Pipe::new(ours, PIPE_WRITE)), theirs)
+        let linked = egress.map(|egress| Linked {
+            judge: Arc::new(Mutex::new(egress)),
+            asker,
+            call: 7,
+        });
+        (Links::new(linked, Pipe::new(ours, PIPE_WRITE)), theirs)
+    }
+
+    /// An asker that hands what it is asked to the test.
+    fn asker() -> (Asker, mpsc::Receiver<Asked>) {
+        let (tell, asked) = mpsc::channel();
+        let tell = Mutex::new(tell);
+        let asker: Asker = Arc::new(move |one| {
+            let _ = tell.lock().unwrap().send(one);
+        });
+        (asker, asked)
     }
 
     fn down(theirs: &mut UnixStream) -> Link {
@@ -996,5 +1380,270 @@ mod tests {
         pipe.urgent.fetch_sub(1, Ordering::AcqRel);
         turn.send(()).unwrap();
         assert!(pipe.frame(b"call").is_err());
+    }
+
+    /// A link the policy asks of waits, nothing sent down, until the
+    /// conversation answers: opened, it goes through the relay; and the
+    /// answer holds for the rest of the instance, a later link to the
+    /// destination taking it without asking.
+    #[test]
+    fn a_link_asked_of_waits_for_the_answer_and_keeps_it() {
+        let (socket, heads) = relay("asked");
+        let (asker, asked) = asker();
+        let (links, mut theirs) = asking(
+            Some(egress(Network::Allowlist, &[], Some(socket))),
+            Some(asker),
+        );
+        assert_eq!(links.call(), Some(7));
+        links.up(Link::Open {
+            link: 1,
+            host: "Elsewhere.example".into(),
+            port: 443,
+        });
+        let Ok(Asked::Waits {
+            link,
+            destination,
+            why,
+            allow,
+            ..
+        }) = asked.recv_timeout(Duration::from_secs(5))
+        else {
+            panic!("not asked");
+        };
+        assert_eq!(
+            (link, destination.text()),
+            (1, "elsewhere.example".to_string())
+        );
+        assert!(why.contains("not on this workspace's allowlist"), "{why}");
+        assert!(allow);
+        assert!(links.waits(1));
+        theirs
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        assert!(frame::read(&mut theirs).is_err());
+        theirs
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        links.answer(&destination, Ok(()));
+        assert!(!links.waits(1));
+        assert_eq!(down(&mut theirs), Link::Opened { link: 1 });
+        assert_eq!(
+            heads.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "td-egress 1\nconnect elsewhere.example 443\n\n"
+        );
+        links.up(Link::Open {
+            link: 2,
+            host: "elsewhere.example".into(),
+            port: 443,
+        });
+        assert_eq!(down(&mut theirs), Link::Opened { link: 2 });
+        assert!(asked.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    /// A refusal is given to every link waiting on its destination and
+    /// kept; a link that waits and is shut, or whose tool host goes, is
+    /// said to be gone.
+    #[test]
+    fn a_refused_or_gone_link_is_said() {
+        let (asker, asked) = asker();
+        let (links, mut theirs) = asking(Some(egress(Network::Allowlist, &[], None)), Some(asker));
+        for link in [1, 2] {
+            links.up(Link::Open {
+                link,
+                host: "elsewhere.example".into(),
+                port: 443,
+            });
+        }
+        links.up(Link::Open {
+            link: 3,
+            host: "third.example".into(),
+            port: 443,
+        });
+        let mut waiting = Vec::new();
+        for _ in 0..3 {
+            let Ok(Asked::Waits { destination, .. }) = asked.recv_timeout(Duration::from_secs(5))
+            else {
+                panic!("not asked");
+            };
+            waiting.push(destination);
+        }
+        links.answer(&waiting[0], Err("no".into()));
+        for link in [1, 2] {
+            assert_eq!(
+                down(&mut theirs),
+                Link::Refused {
+                    link,
+                    why: "no".into()
+                }
+            );
+        }
+        links.up(Link::Open {
+            link: 4,
+            host: "elsewhere.example".into(),
+            port: 443,
+        });
+        assert_eq!(
+            down(&mut theirs),
+            Link::Refused {
+                link: 4,
+                why: "no".into()
+            }
+        );
+        links.up(Link::Shut { link: 3 });
+        assert!(matches!(
+            asked.recv_timeout(Duration::from_secs(5)),
+            Ok(Asked::Gone { link: 3, .. })
+        ));
+        links.up(Link::Open {
+            link: 5,
+            host: "fifth.example".into(),
+            port: 443,
+        });
+        assert!(matches!(
+            asked.recv_timeout(Duration::from_secs(5)),
+            Ok(Asked::Waits { link: 5, .. })
+        ));
+        links.close_all();
+        assert!(matches!(
+            asked.recv_timeout(Duration::from_secs(5)),
+            Ok(Asked::Gone { link: 5, .. })
+        ));
+    }
+
+    /// A judge changed in place reaches the next link of an instance
+    /// already running.
+    #[test]
+    fn a_changed_judge_reaches_a_running_instance() {
+        let (socket, _heads) = relay("changed");
+        let judge: Judge = Arc::new(Mutex::new(egress(Network::Open, &[], Some(socket))));
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        theirs
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let links = Links::new(
+            Some(Linked {
+                judge: Arc::clone(&judge),
+                asker: None,
+                call: 1,
+            }),
+            Pipe::new(ours, PIPE_WRITE),
+        );
+        links.up(Link::Open {
+            link: 1,
+            host: "a.example".into(),
+            port: 443,
+        });
+        assert_eq!(down(&mut theirs), Link::Opened { link: 1 });
+        judge.lock().unwrap().network = Network::Off;
+        links.up(Link::Open {
+            link: 2,
+            host: "a.example".into(),
+            port: 443,
+        });
+        assert!(matches!(down(&mut theirs), Link::Refused { link: 2, why } if why.contains("off")));
+    }
+
+    /// A rule's answer is kept for no other link; the person's is kept
+    /// only where the allowlist alone asks, so a rule that asks later
+    /// still asks; and an instance asks about at most `MAX_ASKED`
+    /// destinations, each said with its call, which a gone link names
+    /// too.
+    #[test]
+    fn what_is_kept_and_how_much_is_asked() {
+        let (asker, asked) = asker();
+        let judge = egress(Network::Allowlist, &[], None);
+        let (links, mut theirs) = asking(Some(judge), Some(asker));
+        let open = |link: u64, host: &str| {
+            links.up(Link::Open {
+                link,
+                host: host.into(),
+                port: 443,
+            })
+        };
+        let waits = || match asked.recv_timeout(Duration::from_secs(5)) {
+            Ok(Asked::Waits {
+                link,
+                call,
+                destination,
+                ..
+            }) => (link, call, destination),
+            _ => panic!("not asked"),
+        };
+        open(1, "a.example");
+        let (link, call, a) = waits();
+        assert_eq!((link, call), (1, 7));
+        links.settle(1, Err("a rule".into()));
+        assert_eq!(
+            down(&mut theirs),
+            Link::Refused {
+                link: 1,
+                why: "a rule".into()
+            }
+        );
+        open(2, "a.example");
+        assert_eq!(waits().0, 2);
+        links.answer(&a, Err("the person".into()));
+        assert!(matches!(down(&mut theirs), Link::Refused { link: 2, .. }));
+        open(3, "a.example");
+        assert!(matches!(down(&mut theirs), Link::Refused { link: 3, why } if why == "the person"));
+        // A rule that asks now outranks the person's kept answer.
+        links.linked.as_ref().unwrap().judge.lock().unwrap().rules =
+            sourced(&["ask network a.example"]);
+        open(4, "a.example");
+        assert_eq!(waits().0, 4);
+        links.up(Link::Shut { link: 4 });
+        assert!(matches!(
+            asked.recv_timeout(Duration::from_secs(5)),
+            Ok(Asked::Gone {
+                link: 4,
+                call: 7,
+                ..
+            })
+        ));
+        // One destination asked about so far, however many links; the
+        // rest of the budget, then refusals of a new one alone.
+        for n in 0..(MAX_ASKED as u64 - 1) {
+            open(10 + n, &format!("h{n}.example"));
+            assert_eq!(waits().0, 10 + n);
+            links.settle(10 + n, Err("no".into()));
+            assert!(matches!(down(&mut theirs), Link::Refused { .. }));
+        }
+        open(1000, "over.example");
+        assert!(matches!(
+            down(&mut theirs),
+            Link::Refused { link: 1000, why } if why.contains("asked about 64 destinations")
+        ));
+        open(1001, "h0.example");
+        assert_eq!(waits().0, 1001);
+    }
+
+    /// A link the tool host shuts between being taken and given its
+    /// answer is given none: nothing is opened for it.
+    #[test]
+    fn a_link_shut_while_its_answer_is_given_gets_none() {
+        let (socket, heads) = relay("shut-taken");
+        let (asker, asked) = asker();
+        let (links, mut theirs) = asking(
+            Some(egress(Network::Allowlist, &[], Some(socket))),
+            Some(asker),
+        );
+        links.up(Link::Open {
+            link: 1,
+            host: "a.example".into(),
+            port: 443,
+        });
+        let Ok(Asked::Waits { destination, .. }) = asked.recv_timeout(Duration::from_secs(5))
+        else {
+            panic!("not asked");
+        };
+        let taken = links.take_answer(&destination, &Ok(()));
+        assert_eq!(taken.len(), 1);
+        links.up(Link::Shut { link: 1 });
+        links.give(taken, &Ok(()));
+        assert!(heads.recv_timeout(Duration::from_millis(300)).is_err());
+        theirs
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        assert!(frame::read(&mut theirs).is_err());
     }
 }

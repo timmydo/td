@@ -23,7 +23,8 @@ pub const MAX_CARRIED: usize = 32 * 1024;
 /// and git's cut to it, so none carries the file's.
 pub const MAX_WHY: usize = 256;
 
-/// The tools a rule may name: those the tool host runs, and `git_push`.
+/// The tools a rule may name: those the tool host runs, `git_push`, and
+/// `network`, a command's connections (DESIGN.md §10).
 pub const TOOLS: &[&str] = &[
     "read_file",
     "write_file",
@@ -33,6 +34,7 @@ pub const TOOLS: &[&str] = &[
     "sed",
     "shell",
     "git_push",
+    "network",
 ];
 
 /// What a rule does with the calls it matches.
@@ -98,9 +100,30 @@ impl Rule {
                 prefix,
             });
         }
+        // A connection's destination, as an allowlist writes it. An allow
+        // names one: reaching anywhere is the `open` policy, a template's.
+        if tool == "network" {
+            if prefix.len() > 1 {
+                return Err("gives network more than one destination".into());
+            }
+            if let Some(destination) = prefix.first_mut() {
+                *destination = crate::config::Destination::parse(destination)?.text();
+            }
+            if prefix.is_empty() && effect == Effect::Allow {
+                return Err(
+                    "allows network to no one destination; name one, or set a template's network to open"
+                        .into(),
+                );
+            }
+            return Ok(Self {
+                effect,
+                tool: tool.to_string(),
+                prefix,
+            });
+        }
         if !prefix.is_empty() && tool != "shell" {
             return Err(format!(
-                "gives {tool} words, which only shell and git_push take"
+                "gives {tool} words, which only shell, git_push and network take"
             ));
         }
         if let Some(at) = prefix.iter().position(|w| !plain(w)) {
@@ -1633,6 +1656,56 @@ pub fn judge_push(
     }
 }
 
+/// Whether `rule` is for a connection to `destination`: a `network`
+/// rule naming none, or naming it.
+fn connects(rule: &Rule, destination: &crate::config::Destination) -> bool {
+    rule.tool == "network"
+        && rule.prefix.first().is_none_or(|named| {
+            crate::config::Destination::parse(named).is_ok_and(|named| &named == destination)
+        })
+}
+
+/// What the rules say of a command's connection to `destination`
+/// (DESIGN.md §10, §11): a deny refuses it, an ask or a rules file not
+/// read puts it on a card, and one of the person's allows opens it;
+/// else the policy and the table.
+pub fn judge_network(
+    rules: &[Sourced],
+    unread: &[(String, String)],
+    destination: &crate::config::Destination,
+) -> Verdict {
+    let said = |effect: Effect| {
+        rules
+            .iter()
+            .find(|one| one.rule.effect == effect && connects(&one.rule, destination))
+    };
+    if let Some(one) = said(Effect::Deny) {
+        return Verdict::Deny(format!(
+            "the rule `{}` of {} denies it",
+            one.rule.text(),
+            one.from
+        ));
+    }
+    if let Some(one) = said(Effect::Ask) {
+        return Verdict::Ask(format!(
+            "the rule `{}` of {} asks",
+            one.rule.text(),
+            one.from
+        ));
+    }
+    if let Some((from, why)) = unread.first() {
+        return Verdict::Ask(format!("{from} could not be read: {why}"));
+    }
+    match said(Effect::Allow) {
+        Some(one) => Verdict::Allow(format!(
+            "the rule `{}` of {} allows it",
+            one.rule.text(),
+            one.from
+        )),
+        None => Verdict::Table,
+    }
+}
+
 /// The allow rules that let a call to `tool` run, `command` its shell
 /// command as `split` read it: one for the whole tool, or for a command
 /// the matcher can see into, one for each segment, every segment
@@ -2069,7 +2142,7 @@ mod tests {
             ),
             (
                 "deny read_file x",
-                "line 1: gives read_file words, which only shell and git_push take",
+                "line 1: gives read_file words, which only shell, git_push and network take",
             ),
             (
                 "deny git_push https://h/r main x",
@@ -2656,5 +2729,93 @@ mod tests {
             assert_eq!(parse_human(text).unwrap_err(), why, "{text:?}");
         }
         assert!(parse_human(&"#".repeat(MAX_HUMAN_FILE + 1)).is_err());
+    }
+
+    /// A network rule names one destination, written as an allowlist
+    /// writes it; an allow names one; a deny or an ask may name none.
+    #[test]
+    fn network_rules_name_a_destination() {
+        for (line, text) in [
+            ("deny network", "deny network"),
+            ("ask network Example.ORG.", "ask network example.org"),
+            ("allow network example.org:443", "allow network example.org"),
+            (
+                "allow network example.org:8443",
+                "allow network example.org:8443",
+            ),
+            (
+                "deny network [2001:DB8::1]:22",
+                "deny network [2001:db8::1]:22",
+            ),
+            ("deny network 192.0.2.1", "deny network 192.0.2.1"),
+        ] {
+            assert_eq!(
+                Rule::parse(line).map(|r| r.text()),
+                Ok(text.to_string()),
+                "{line}"
+            );
+        }
+        for line in [
+            "allow network",
+            "deny network a.example b.example",
+            "deny network a_b",
+            "deny network 10.1",
+            "deny network example.org:0",
+            "deny network http://example.org/",
+        ] {
+            assert!(Rule::parse(line).is_err(), "{line}");
+        }
+        assert!(Always::checked(true, vec!["network example.org:8443".into()]).is_ok());
+        assert!(Always::checked(true, vec!["network Example.org".into()]).is_err());
+        // A repository may deny or ask, never allow.
+        assert!(parse("deny network example.org\n", true).is_ok());
+        assert!(parse("allow network example.org\n", true).is_err());
+    }
+
+    #[test]
+    fn a_connection_is_judged_deny_ask_unread_allow() {
+        let to = |text: &str| crate::config::Destination::parse(text).unwrap();
+        let from = |line: &str| Sourced {
+            rule: Rule::parse(line).unwrap(),
+            from: "here".into(),
+        };
+        let rules = vec![
+            from("allow network a.example"),
+            from("allow network b.example"),
+            from("deny network b.example"),
+            from("ask network c.example:8443"),
+            from("allow network c.example:8443"),
+        ];
+        assert!(matches!(
+            judge_network(&rules, &[], &to("a.example")),
+            Verdict::Allow(why) if why.contains("allow network a.example")
+        ));
+        assert!(matches!(
+            judge_network(&rules, &[], &to("B.example.:443")),
+            Verdict::Deny(why) if why.contains("deny network b.example")
+        ));
+        assert!(matches!(
+            judge_network(&rules, &[], &to("c.example:8443")),
+            Verdict::Ask(_)
+        ));
+        assert_eq!(judge_network(&rules, &[], &to("c.example")), Verdict::Table);
+        assert_eq!(
+            judge_network(&rules, &[], &to("a.example:80")),
+            Verdict::Table
+        );
+        let unread = vec![("theirs".to_string(), "broken".to_string())];
+        assert!(matches!(
+            judge_network(&rules, &unread, &to("a.example")),
+            Verdict::Ask(why) if why.contains("theirs could not be read")
+        ));
+        assert!(matches!(
+            judge_network(&[from("deny network")], &unread, &to("a.example")),
+            Verdict::Deny(_)
+        ));
+        // A shell rule is not a network one.
+        assert_eq!(
+            judge_network(&[from("deny shell curl")], &[], &to("a.example")),
+            Verdict::Table
+        );
     }
 }

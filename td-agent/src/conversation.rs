@@ -394,6 +394,9 @@ enum Inbound {
     },
     /// A background process, watched on its own thread (`watch`), ended.
     Ended(End),
+    /// A command's connection waits for a decision, or waited and is
+    /// gone (DESIGN.md §10).
+    Link(crate::egress::Asked),
 }
 
 /// How a background process ended: `how` as `process_list` says it, and
@@ -415,7 +418,35 @@ enum Work {
     Down(Down),
     Checked(String, Set),
     Ended(End),
+    /// Connections decided, their approvals to log.
+    Logged,
 }
+
+/// The first id of a card for connections, past any call's sequence
+/// number, so the window's cards never share one.
+const LINK_CARDS: u64 = 1 << 62;
+
+/// A card for the connections that wait on one destination, whichever
+/// of this conversation's instances made them.
+struct LinkCard {
+    destination: crate::config::Destination,
+    why: String,
+    /// Whether the card offers an "always allow".
+    allow: bool,
+    waiting: Vec<Waiting>,
+}
+
+/// A connection waiting on a card: its instance's links, its id there,
+/// and the call whose command made it.
+#[derive(Clone)]
+struct Waiting {
+    links: std::sync::Weak<crate::egress::Links>,
+    link: u64,
+    call: u64,
+}
+
+/// The most cards for connections a conversation shows at once.
+const MAX_LINK_CARDS: usize = 8;
 
 /// One step of a streamed request, as its thread read it.
 #[derive(Debug)]
@@ -545,6 +576,9 @@ pub fn serve_in(
         checked: VecDeque::new(),
         processes: BTreeMap::new(),
         exited: VecDeque::new(),
+        link_cards: BTreeMap::new(),
+        next_link_card: LINK_CARDS,
+        link_approvals: VecDeque::new(),
         human: (0, Ok(crate::rules::Policy::default())),
         mode: crate::config::Mode::Ask,
         braked: false,
@@ -552,6 +586,12 @@ pub fn serve_in(
     // What this conversation read or wrote before, so a replacement of an
     // unchanged file needs no read again.
     session.bench.restore(session.conversation.events());
+    // A command's connection that waits comes to the conversation as
+    // what the window sends does.
+    let asking = session.sender.clone();
+    session.bench.set_asker(Arc::new(move |asked| {
+        let _ = asking.send(Inbound::Link(asked));
+    }));
     session.send(&Up::Hello {
         title: session.conversation.meta().title.clone(),
         torn: load.torn,
@@ -838,6 +878,13 @@ struct Session {
     /// Background processes that ended, by number with how, kept until a
     /// turn's next step or the turn's end (`between`).
     exited: VecDeque<End>,
+    /// Cards for connections that wait for a decision (DESIGN.md §10,
+    /// §11), by card id, and the next id.
+    link_cards: BTreeMap<u64, LinkCard>,
+    next_link_card: u64,
+    /// Approvals of connections, logged at the next step between calls
+    /// or while idle, never inside a request.
+    link_approvals: VecDeque<Kind>,
     /// The human's rules as the window last sent them, with their
     /// version, or why they could not be read (DESIGN.md §11).
     human: (u64, Result<crate::rules::Policy, String>),
@@ -897,6 +944,7 @@ impl Session {
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Link(asked)) => self.link(asked),
                 Ok(Inbound::Closed) => self.ended = Some(Ok(())),
                 Ok(Inbound::Broken(e)) => self.ended = Some(Err(e)),
                 Err(_) => break,
@@ -913,6 +961,9 @@ impl Session {
         if let Some(end) = self.exited.pop_front() {
             return Ok(Some(Work::Ended(end)));
         }
+        if !self.link_approvals.is_empty() {
+            return Ok(Some(Work::Logged));
+        }
         match self.ended.take() {
             Some(Ok(())) => return Ok(None),
             Some(Err(e)) => return Err(format!("the window: {e}")),
@@ -920,6 +971,20 @@ impl Session {
         }
         loop {
             match self.inbox.recv() {
+                Ok(Inbound::Down(Down::Decision {
+                    call,
+                    allow,
+                    always,
+                })) if self.link_cards.contains_key(&call) => {
+                    self.link_decided(call, allow, always);
+                    return Ok(Some(Work::Logged));
+                }
+                Ok(Inbound::Link(asked)) => {
+                    self.link(asked);
+                    if !self.link_approvals.is_empty() {
+                        return Ok(Some(Work::Logged));
+                    }
+                }
                 Ok(Inbound::Down(down)) => return Ok(Some(Work::Down(down))),
                 Ok(Inbound::Checked { remote, result }) => {
                     return Ok(Some(Work::Checked(remote, result)))
@@ -944,6 +1009,11 @@ impl Session {
                     }
                     continue;
                 }
+                Some(Work::Logged) => {
+                    self.log_links()?;
+                    self.sync()?;
+                    continue;
+                }
                 Some(Work::Ended(end)) => {
                     self.ended(end, true)?;
                     // Durable, or the next open says it was lost.
@@ -956,7 +1026,10 @@ impl Session {
                 Some(Work::Down(down)) => down,
             };
             match down {
-                Down::Setup { key, client } => self.setup = Some((key, *client)),
+                Down::Setup { key, client } => {
+                    self.network_setup(&client);
+                    self.setup = Some((key, *client));
+                }
                 Down::Policy {
                     version,
                     rules,
@@ -1283,6 +1356,7 @@ impl Session {
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Link(asked)) => self.link(asked),
                 Ok(Inbound::Closed | Inbound::Broken(_)) | Err(RecvTimeoutError::Disconnected) => {
                     self.gone = true;
                     return Err("the window has closed".into());
@@ -1308,6 +1382,7 @@ impl Session {
                 Inbound::Fetch { .. } => {}
                 Inbound::Checked { remote, result } => self.checked.push_back((remote, result)),
                 Inbound::Ended(end) => self.exit(end),
+                Inbound::Link(asked) => self.link(asked),
                 Inbound::Closed | Inbound::Broken(_) => self.gone = true,
             }
         }
@@ -1318,6 +1393,11 @@ impl Session {
     fn later(&mut self, down: Down) {
         match down {
             Down::Kill { number } => self.killed_by_person(number),
+            Down::Decision {
+                call,
+                allow,
+                always,
+            } if self.link_cards.contains_key(&call) => self.link_decided(call, allow, always),
             Down::Policy {
                 version,
                 rules,
@@ -1333,6 +1413,7 @@ impl Session {
         let rules = rules.and_then(|text| crate::rules::parse_policy(&text));
         self.human = (version, rules);
         self.mode = mode;
+        self.network_rules();
         // The breaker holds until a policy the window read puts this
         // workspace in `ask`: one sent before it wrote that, or none
         // when it could not, leaves it held.
@@ -2058,6 +2139,7 @@ impl Session {
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Link(asked)) => self.link(asked),
                 Ok(Inbound::Broken(why)) => {
                     eprintln!("td-agent: the window: {why}");
                     self.gone = true;
@@ -2610,7 +2692,8 @@ impl Session {
     fn internal(&mut self, call: host::Call, time: Duration) -> Result<String, String> {
         let mut client = self
             .bench
-            .take(&call)
+            // td-agent's own calls reach no network, so name no call.
+            .take(&call, 0)
             .map_err(|why| format!("the jail: {why}"))?;
         client.call(call.clone())?;
         let deadline = Instant::now() + time;
@@ -3342,6 +3425,7 @@ impl Session {
     /// request reads it (DESIGN.md §7); whether there was one.
     fn between(&mut self) -> Result<bool, String> {
         self.hear();
+        self.log_links()?;
         while let Some(end) = self.exited.pop_front() {
             self.ended(end, false)?;
         }
@@ -3606,6 +3690,7 @@ impl Session {
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Link(asked)) => self.link(asked),
                 Ok(Inbound::Closed | Inbound::Broken(_)) | Err(_) => {
                     self.gone = true;
                     return Err("the window has closed".into());
@@ -3624,12 +3709,15 @@ impl Session {
             return Ok(crate::prompt::prefix(meta.created));
         };
         let state = StateDir::at(self.state.clone());
-        // The network its commands reach, as the settings give it now.
-        self.bench.set_network(crate::egress::Egress {
-            network: client.network_for(workspace),
-            allowlist: client.network_allowlist.clone(),
-            relay: crate::egress::relay_here(),
-        });
+        // The network its commands reach, as the settings give it now,
+        // and the rules, its repositories' among them, as they are now.
+        let network = client.network_for(workspace);
+        self.bench.set_network(
+            network,
+            client.network_allowlist.clone(),
+            crate::egress::relay_here(),
+        );
+        self.network_rules();
         let policy = self
             .bench
             .prepare(
@@ -3659,6 +3747,8 @@ impl Session {
             repositories,
             instructions: &instructions,
             removed: meta.removed,
+            network,
+            allowlist: &client.network_allowlist,
         };
         Ok(crate::prompt::prefix_in(meta.created, Some(&place)))
     }
@@ -3830,7 +3920,7 @@ impl Session {
             break;
         }
         let call = self.bench.with_digest(call);
-        let mut client = match self.bench.take(&call) {
+        let mut client = match self.bench.take(&call, started) {
             Ok(client) => client,
             Err(why) => return failed(format!("the jail: {why}")),
         };
@@ -4031,6 +4121,358 @@ impl Session {
         };
         self.sync()?;
         self.turn(started.seq)
+    }
+
+    /// The network the settings give this workspace's commands, given to
+    /// its connections' judge as soon as the settings come, and the cards
+    /// waiting judged again by it.
+    fn network_setup(&mut self, client: &Client) {
+        let Some(workspace) = self.conversation.meta().workspace.clone() else {
+            return;
+        };
+        self.bench.set_network(
+            client.network_for(&workspace),
+            client.network_allowlist.clone(),
+            crate::egress::relay_here(),
+        );
+        self.network_rules();
+    }
+
+    /// The network rules that apply to this workspace, and the rules
+    /// files that could not be read, given to its connections' judge, and
+    /// the cards waiting judged again by them.
+    fn network_rules(&mut self) {
+        let (rules, unread) = self.rules();
+        let rules = rules
+            .into_iter()
+            .filter(|one| one.rule.tool == "network")
+            .collect();
+        self.bench.set_rules(rules, unread);
+        self.rejudge_links();
+    }
+
+    /// A command's connection that waits for a decision, judged again
+    /// by the policy as it is now and put on the card for its
+    /// destination, one put up when there is none; or one that waited
+    /// and is gone, its card withdrawn when nothing else waits on it
+    /// (DESIGN.md §10, §11).
+    fn link(&mut self, asked: crate::egress::Asked) {
+        match asked {
+            crate::egress::Asked::Waits {
+                links,
+                link,
+                call,
+                destination,
+                why: _,
+                allow: _,
+            } => {
+                // Settled meanwhile, or its instance gone: nothing to ask.
+                if !links.upgrade().is_some_and(|strong| strong.waits(link)) {
+                    return;
+                }
+                let waiting = Waiting { links, link, call };
+                // What asked may have changed since the instance judged it.
+                let (why, allow) = match self.bench.judge(&destination) {
+                    crate::egress::Judgment::Ask { why, allow } => (why, allow),
+                    crate::egress::Judgment::Open => {
+                        return self.settle_by_rule(
+                            &destination,
+                            &[waiting],
+                            Ok(()),
+                            RULES_CHANGED.into(),
+                        )
+                    }
+                    crate::egress::Judgment::Refuse(why) => {
+                        return self.settle_by_rule(&destination, &[waiting], Err(why.clone()), why)
+                    }
+                };
+                if let Some((&id, card)) = self
+                    .link_cards
+                    .iter_mut()
+                    .find(|(_, card)| card.destination == destination)
+                {
+                    let joins = !card.waiting.iter().any(|one| one.call == waiting.call);
+                    card.waiting.push(waiting);
+                    if joins {
+                        self.show_link_card(id);
+                    }
+                    return;
+                }
+                if self.link_cards.len() >= MAX_LINK_CARDS {
+                    let refused = format!(
+                        "{MAX_LINK_CARDS} destinations already wait for the person's answer"
+                    );
+                    Self::give(
+                        std::slice::from_ref(&waiting),
+                        &destination,
+                        Err(refused),
+                        false,
+                    );
+                    self.link_approval(
+                        &destination,
+                        &[waiting],
+                        "deny",
+                        "td-agent",
+                        format!("{MAX_LINK_CARDS} cards for connections were up"),
+                    );
+                    return;
+                }
+                let id = self.next_link_card;
+                self.next_link_card += 1;
+                self.link_cards.insert(
+                    id,
+                    LinkCard {
+                        destination,
+                        why,
+                        allow,
+                        waiting: vec![waiting],
+                    },
+                );
+                self.show_link_card(id);
+            }
+            crate::egress::Asked::Gone { links, link, .. } => {
+                let mut empty = Vec::new();
+                for (id, card) in &mut self.link_cards {
+                    let gone: Vec<Waiting> = card
+                        .waiting
+                        .iter()
+                        .filter(|one| {
+                            one.link == link && std::sync::Weak::ptr_eq(&one.links, &links)
+                        })
+                        .cloned()
+                        .collect();
+                    if gone.is_empty() {
+                        continue;
+                    }
+                    card.waiting.retain(|one| {
+                        !(one.link == link && std::sync::Weak::ptr_eq(&one.links, &links))
+                    });
+                    if card.waiting.is_empty() {
+                        empty.push((*id, gone));
+                    }
+                }
+                for (id, gone) in empty {
+                    self.send(&Up::Withdraw { call: id });
+                    if let Some(card) = self.link_cards.remove(&id) {
+                        self.link_approval(
+                            &card.destination,
+                            &gone,
+                            "withdrawn",
+                            "td-agent",
+                            "the connection ended before it was decided".into(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Connection card `id` put before the person, or put again as it
+    /// changed: its destination, why it asks, the calls whose commands
+    /// wait on it, and what an answer does.
+    fn show_link_card(&mut self, id: u64) {
+        let Some(card) = self.link_cards.get(&id) else {
+            return;
+        };
+        let named = card.destination.text();
+        let mut calls: Vec<u64> = card.waiting.iter().map(|one| one.call).collect();
+        calls.sort_unstable();
+        calls.dedup();
+        let events = self.conversation.events();
+        let callers: Vec<String> = calls
+            .iter()
+            .map(|call| {
+                let name = events
+                    .iter()
+                    .find(|e| e.seq == *call)
+                    .and_then(|e| match &e.kind {
+                        Kind::ToolCall { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    });
+                format!("{} #{call}", name.unwrap_or("call"))
+            })
+            .collect();
+        let who = if callers.len() == 1 {
+            format!("The command of {} asks", callers.join(""))
+        } else {
+            format!("The commands of {} ask", callers.join(", "))
+        };
+        // No answer to keep while the human's rules are unread, which
+        // would leave nothing to write it to.
+        let always = if self.human.1.is_ok() {
+            crate::rules::Always::checked(card.allow, vec![format!("network {named}")])
+                .ok()
+                .map(crate::rules::Offer::Rules)
+        } else {
+            None
+        };
+        let up = Up::Ask {
+            call: id,
+            title: format!("Let a command connect to {named}?"),
+            details: vec![
+                format!("{who} to connect to {named} through the workspace's proxy."),
+                format!("Asked because {}.", card.why),
+                "Allow lets each command that asked reach it until that command ends, a background process's included, and Deny refuses it as long.".into(),
+            ],
+            always,
+        };
+        self.send(&up);
+    }
+
+    /// `waiting` settled with `answer`: taken out of waiting here, the
+    /// person's answer kept for the rest of each instance when `kept`, so
+    /// nothing heard after this finds them waiting; then what goes down
+    /// to each tool host, which may not be reading, written on a thread
+    /// of its own, or here when there is none to be had.
+    fn give(
+        waiting: &[Waiting],
+        destination: &crate::config::Destination,
+        answer: Result<(), String>,
+        kept: bool,
+    ) {
+        let mut taken: Vec<(Arc<crate::egress::Links>, crate::egress::Taken)> = Vec::new();
+        for one in waiting {
+            let Some(links) = one.links.upgrade() else {
+                continue;
+            };
+            if kept {
+                if taken.iter().any(|(seen, _)| Arc::ptr_eq(seen, &links)) {
+                    continue;
+                }
+                let links_taken = links.take_answer(destination, &answer);
+                taken.push((links, links_taken));
+            } else {
+                let links_taken = links.take(one.link);
+                taken.push((links, links_taken));
+            }
+        }
+        taken.retain(|(_, links_taken)| !links_taken.is_empty());
+        if taken.is_empty() {
+            return;
+        }
+        let here = taken.clone();
+        let there = answer.clone();
+        let spawned = std::thread::Builder::new()
+            .name("egress-answer".into())
+            .spawn(move || {
+                for (links, links_taken) in taken {
+                    links.give(links_taken, &there);
+                }
+            });
+        if spawned.is_err() {
+            for (links, links_taken) in here {
+                links.give(links_taken, &answer);
+            }
+        }
+    }
+
+    /// `waiting`, judged by a rule, opened or refused, the answer kept
+    /// for none of them, and logged.
+    fn settle_by_rule(
+        &mut self,
+        destination: &crate::config::Destination,
+        waiting: &[Waiting],
+        answer: Result<(), String>,
+        reason: String,
+    ) {
+        let outcome = if answer.is_ok() { "allow" } else { "deny" };
+        Self::give(waiting, destination, answer, false);
+        self.link_approval(destination, waiting, outcome, "rule", reason);
+    }
+
+    /// The human's answer to connection card `id`: every connection
+    /// waiting on it, and the rest of each command that asked, opened or
+    /// refused; an allow the policy now refuses is refused, a deny
+    /// winning whenever it comes.
+    fn link_decided(&mut self, id: u64, allow: bool, always: Option<String>) {
+        let Some(card) = self.link_cards.remove(&id) else {
+            return;
+        };
+        if allow {
+            if let crate::egress::Judgment::Refuse(why) = self.bench.judge(&card.destination) {
+                return self.settle_by_rule(
+                    &card.destination,
+                    &card.waiting,
+                    Err(why.clone()),
+                    why,
+                );
+            }
+        }
+        let named = card.destination.text();
+        let answer = if allow {
+            Ok(())
+        } else {
+            Err(format!("the person refused the connection to {named}"))
+        };
+        // Each instance's answer settles all its links waiting on it.
+        Self::give(&card.waiting, &card.destination, answer, true);
+        let reason = match always {
+            Some(always) => format!("{}; always: {always}", card.why),
+            None => card.why.clone(),
+        };
+        let outcome = if allow { "allow" } else { "deny" };
+        self.link_approval(&card.destination, &card.waiting, outcome, "human", reason);
+    }
+
+    /// The cards for connections judged again by a changed policy: one
+    /// a rule now refuses or lets open is taken back and its connections
+    /// given that; one still asked of is put again when why or what it
+    /// offers changed.
+    fn rejudge_links(&mut self) {
+        let ids: Vec<u64> = self.link_cards.keys().copied().collect();
+        for id in ids {
+            let Some(card) = self.link_cards.get_mut(&id) else {
+                continue;
+            };
+            let (answer, reason) = match self.bench.judge(&card.destination) {
+                crate::egress::Judgment::Ask { why, allow } => {
+                    if why != card.why || allow != card.allow {
+                        card.why = why;
+                        card.allow = allow;
+                        self.show_link_card(id);
+                    }
+                    continue;
+                }
+                crate::egress::Judgment::Open => (Ok(()), RULES_CHANGED.to_string()),
+                crate::egress::Judgment::Refuse(why) => (Err(why.clone()), why),
+            };
+            self.send(&Up::Withdraw { call: id });
+            if let Some(card) = self.link_cards.remove(&id) {
+                self.settle_by_rule(&card.destination, &card.waiting, answer, reason);
+            }
+        }
+    }
+
+    /// An approval for each call whose command made one of `waiting`,
+    /// kept to be logged between calls.
+    fn link_approval(
+        &mut self,
+        destination: &crate::config::Destination,
+        waiting: &[Waiting],
+        outcome: &str,
+        by: &str,
+        reason: String,
+    ) {
+        let mut calls: Vec<u64> = waiting.iter().map(|one| one.call).collect();
+        calls.sort_unstable();
+        calls.dedup();
+        for call in calls {
+            self.link_approvals.push_back(Kind::Approval {
+                call,
+                outcome: outcome.into(),
+                by: by.into(),
+                probabilities: None,
+                reason: Some(format!("connecting to {}: {reason}", destination.text())),
+            });
+        }
+    }
+
+    /// The approvals of connections decided meanwhile, logged.
+    fn log_links(&mut self) -> Result<(), String> {
+        while let Some(kind) = self.link_approvals.pop_front() {
+            self.log(kind)?;
+        }
+        Ok(())
     }
 
     /// Background process `number` ended `how`, heard: it runs no more,
@@ -4257,8 +4699,8 @@ impl Session {
                     allow,
                     always,
                 })) if call == started => break Some(Ok((allow, always))),
-                // A card already answered or withdrawn.
-                Ok(Inbound::Down(Down::Decision { .. })) => {}
+                // A card already answered or withdrawn, or a connection's.
+                Ok(Inbound::Down(down @ Down::Decision { .. })) => self.later(down),
                 // The human's rules changed while the card waited: one
                 // that now decides the call takes the card back.
                 Ok(Inbound::Down(Down::Policy {
@@ -4290,6 +4732,7 @@ impl Session {
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Link(asked)) => self.link(asked),
                 Ok(Inbound::Broken(why)) => {
                     eprintln!("td-agent: the window: {why}");
                     self.gone = true;
@@ -4993,6 +5436,7 @@ impl Session {
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Link(asked)) => self.link(asked),
                 Ok(Inbound::Closed | Inbound::Broken(_)) => {
                     self.gone = true;
                     return true;
@@ -5044,6 +5488,7 @@ impl Session {
                 Inbound::Fetch { .. } => {}
                 Inbound::Checked { remote, result } => self.checked.push_back((remote, result)),
                 Inbound::Ended(end) => self.exit(end),
+                Inbound::Link(asked) => self.link(asked),
                 Inbound::Down(Down::Interrupt) => {
                     break Streamed::Failed {
                         failure: Failure::Interrupted {

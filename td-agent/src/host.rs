@@ -740,14 +740,14 @@ impl Client {
     }
 
     /// Speaks to a tool host over `reader` and `writer`, its links judged
-    /// and opened by `egress` (DESIGN.md §10), or refused without one.
+    /// and opened as `linked` says (DESIGN.md §10), or refused without one.
     pub fn linked(
         mut reader: impl Read + Send + 'static,
         writer: impl Write + Send + 'static,
-        egress: Option<crate::egress::Egress>,
+        linked: Option<crate::egress::Linked>,
     ) -> Self {
         let writer = crate::egress::Pipe::new(writer, crate::egress::PIPE_WRITE);
-        let links = crate::egress::Links::new(egress, Arc::clone(&writer));
+        let links = crate::egress::Links::new(linked, Arc::clone(&writer));
         // Bounded, so a tool host that floods is held at the pipe, not in
         // this process's memory.
         let (send, replies) = mpsc::sync_channel(REPLY_QUEUE);

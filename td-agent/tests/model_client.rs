@@ -2768,6 +2768,150 @@ fn an_allowed_command_runs_in_the_workspace_jail() {
     )));
 }
 
+/// A command's connection to a destination off the allowlist waits on
+/// a card: one the person refuses is refused, with the reason, and one
+/// a deny rule taken meanwhile refuses is taken back; each logged once
+/// the call is done.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn a_commands_connection_off_the_allowlist_waits_on_a_card() {
+    let mut h = Harness::new_in(
+        "network",
+        Role::Conversation,
+        Some("scratch"),
+        true,
+        vec![
+            Reply::sse("stream-tool-network.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("List the remotes.");
+    let (call, _, _) = h.until_ask();
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
+    let (card, title, details) = h.until_ask();
+    assert_eq!(title, "Let a command connect to other.test:80?");
+    assert_eq!(
+        details[0],
+        format!("The command of shell #{call} asks to connect to other.test:80 through the workspace's proxy.")
+    );
+    assert!(
+        details[1].contains("other.test:80 is not on this workspace's allowlist"),
+        "{details:?}"
+    );
+    assert!(card >= 1 << 62, "{card}");
+    assert!(h.always.is_some());
+    h.down(&Down::Decision {
+        call: card,
+        allow: false,
+        always: None,
+    });
+    let (second, title, _) = h.until_ask();
+    assert_eq!(title, "Let a command connect to third.test:80?");
+    assert_ne!(second, card);
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(format!(
+            "[conversation {}]\ndeny network third.test:80\n",
+            h.id.as_str()
+        )),
+        mode: td_agent::config::Mode::Ask,
+    });
+    let withdrawn = h.until(|up| match up {
+        Up::Withdraw { call } => Some(*call),
+        _ => None,
+    });
+    assert_eq!(withdrawn, second);
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let results = results(&events);
+    assert_eq!(results[0].0, "toolu_shell_net");
+    assert!(
+        results[0]
+            .1
+            .contains("the person refused the connection to other.test:80"),
+        "{results:?}"
+    );
+    assert!(
+        results[0].1.contains("deny network third.test:80"),
+        "{results:?}"
+    );
+    let approvals: Vec<(String, String, String)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::Approval {
+                outcome,
+                by,
+                reason: Some(reason),
+                ..
+            } if reason.starts_with("connecting to") => {
+                Some((outcome.clone(), by.clone(), reason.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(approvals.len(), 2, "{approvals:?}");
+    assert_eq!(
+        (approvals[0].0.as_str(), approvals[0].1.as_str()),
+        ("deny", "human")
+    );
+    assert!(approvals[0].2.starts_with("connecting to other.test:80"));
+    assert_eq!(
+        (approvals[1].0.as_str(), approvals[1].1.as_str()),
+        ("deny", "rule")
+    );
+    assert!(approvals[1].2.contains("deny network third.test:80"));
+}
+
+/// A card for a connection no one answers is taken back when its
+/// command ends, and logged as withdrawn against the command's call.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn a_connection_card_left_unanswered_goes_with_its_command() {
+    let mut h = Harness::new_in(
+        "network-gone",
+        Role::Conversation,
+        Some("scratch"),
+        true,
+        vec![
+            Reply::sse("stream-tool-network-gone.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("List the remote.");
+    let (call, _, _) = h.until_ask();
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
+    let (card, title, _) = h.until_ask();
+    assert_eq!(title, "Let a command connect to other.test:80?");
+    let withdrawn = h.until(|up| match up {
+        Up::Withdraw { call } => Some(*call),
+        _ => None,
+    });
+    assert_eq!(withdrawn, card);
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            Kind::Approval { call: of, outcome, by, reason: Some(reason), .. }
+                if *of == call && outcome == "withdrawn" && by == "td-agent"
+                    && reason.starts_with("connecting to other.test:80")
+        )),
+        "{events:?}"
+    );
+}
+
 /// A command that stops its own tool host cannot hold the conversation:
 /// past the call's time and the grace for it, the jail is torn down and
 /// the call answered.

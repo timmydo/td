@@ -268,20 +268,20 @@ pub fn launch(programs: &Programs, policy: &Policy, spec_dir: &Path) -> Result<C
     launch_linked(programs, policy, spec_dir, None)
 }
 
-/// `launch`, the tool host serving the network proxy when `egress` is
+/// `launch`, the tool host serving the network proxy when `linked` is
 /// given, whose links it judges and opens (DESIGN.md §10).
 pub fn launch_linked(
     programs: &Programs,
     policy: &Policy,
     spec_dir: &Path,
-    egress: Option<crate::egress::Egress>,
+    linked: Option<crate::egress::Linked>,
 ) -> Result<Client, String> {
     let policy = Policy {
         home: private_dir(&policy.home)?,
         ..policy.clone()
     };
     let spec = write_spec(spec_dir, &spec_text(programs, &policy, &host_path())?)?;
-    let launched = start(programs, &policy, &spec, egress);
+    let launched = start(programs, &policy, &spec, linked);
     if launched.is_err() {
         let _ = fs::remove_file(&spec);
     }
@@ -292,7 +292,7 @@ fn start(
     programs: &Programs,
     policy: &Policy,
     spec: &Path,
-    egress: Option<crate::egress::Egress>,
+    linked: Option<crate::egress::Linked>,
 ) -> Result<Client, String> {
     let (ours, theirs) = UnixStream::pair().map_err(|e| format!("the jail's channel: {e}"))?;
     let channel = |e: io::Error| format!("the jail's channel: {e}");
@@ -313,7 +313,7 @@ fn start(
         .arg("tool-host")
         .arg("--txt")
         .arg(Programs::inside(&programs.txt)?);
-    if egress.is_some() {
+    if linked.is_some() {
         command.arg("--proxy");
     }
     if let Some(directory) = &policy.directory {
@@ -340,7 +340,7 @@ fn start(
     if reading.is_none() {
         tail.end();
     }
-    Ok(Client::linked(reader, ours, egress).owning(child, spec.to_path_buf(), tail))
+    Ok(Client::linked(reader, ours, linked).owning(child, spec.to_path_buf(), tail))
 }
 
 /// Runs `task` in a maintenance instance of `policy` (DESIGN.md §9), its

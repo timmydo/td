@@ -295,13 +295,37 @@ fn a_commands_network_goes_through_the_proxy_to_the_relay() {
     let egress = Egress {
         network: Network::Allowlist,
         allowlist: vec![Destination::parse("example.test:80").unwrap()],
+        rules: Vec::new(),
+        unread: Vec::new(),
         relay: Some(relay.clone()),
     };
+    // The conversation, standing in: what waits for it is refused, and
+    // said.
+    let (told, asked) = std::sync::mpsc::channel();
+    let told = std::sync::Mutex::new(told);
+    let asker: td_agent::egress::Asker = std::sync::Arc::new(move |one| {
+        if let td_agent::egress::Asked::Waits {
+            links,
+            destination,
+            why,
+            ..
+        } = one
+        {
+            let _ = told.lock().unwrap().send(why);
+            if let Some(links) = links.upgrade() {
+                links.answer(&destination, Err("the person refused it".into()));
+            }
+        }
+    });
     let mut client = jail::launch_linked(
         &programs(),
         &scratch.policy(),
         &scratch.0.join("jail"),
-        Some(egress),
+        Some(td_agent::egress::Linked {
+            judge: std::sync::Arc::new(std::sync::Mutex::new(egress)),
+            asker: Some(asker),
+            call: 1,
+        }),
     )
     .unwrap();
     let said = shell(
@@ -329,10 +353,11 @@ fn a_commands_network_goes_through_the_proxy_to_the_relay() {
         said.contains("repository 'http://example.test/repo.git/' not found"),
         "{said}"
     );
-    assert!(
-        said.contains("other.test:80 is not on this workspace's allowlist"),
-        "{said}"
-    );
+    assert!(asked
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .contains("other.test:80 is not on this workspace's allowlist"),);
+    assert!(said.contains("the person refused it"), "{said}");
     assert!(said.contains("403"), "{said}");
     // The second never reached the relay.
     assert!(heard.recv_timeout(Duration::from_millis(300)).is_err());
