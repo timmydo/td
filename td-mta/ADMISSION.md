@@ -20,6 +20,7 @@ not promise successful I/O or reserve filesystem blocks.
 | SQLite main database, bodies and metadata | 8 GiB |
 | SQLite WAL | 17280796224 bytes |
 | Upload category | 128 MiB |
+| Disposable ingress files | 512 MiB, 16 full-message slots |
 | Queue category | 256 MiB, 1000 retained submissions |
 | Sort scratch | 64 MiB |
 | Request retention | 128 MiB/request, 256 MiB aggregate |
@@ -387,3 +388,21 @@ M09 owns bounded network/DNS fault fixtures; M11 request retention and lost
 response; M13 query/sort fan-in and fairness; M17 phase/result reservations
 and queue saturation; M20 restore/offline consistency; M21 backup view and
 body lifecycle; M23 steady-state resource/concurrency qualification.
+
+## Disposable ingress reservation pool
+
+The concrete IngressSpool reserves an entire configured message_bytes slot
+before create_new, using smtp_sessions + https_connections cold slots. The
+default is 512 MiB across 16 slots; the theoretical hard ceiling is 2 GiB
+across 64. ResourcePlan still validates the complete 128 MiB memory budget.
+This pool has no hot used-byte counter: partial and prepared files keep the
+full reservation until their descriptor closes and owned inode unlinks.
+Failed cleanup retires the charged slot until bounded startup cleanup. The
+separate ingress-only root excludes every authoritative database path.
+
+This is temporary disk admission, not a durable body/upload/queue grant.
+Future protocol coordination must account for this pool alongside durable
+body/category and physical database/WAL limits, authenticate metadata and
+couple acknowledgements to proven SQLite COMMIT. The existing logical effect
+ledger and ports::Reservation/BlobWriter contracts remain separate; the
+standalone primitive does not manufacture coordinator reservation identities.

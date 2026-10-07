@@ -6535,8 +6535,9 @@ checks before and after do not promise a 60-second checkpoint or a 2 GiB I/O
 ceiling. Large-WAL recovery and checkpoint resource qualification is pending.
 Blob deletion is part of the metadata transaction; existing views retain the
 old body through WAL. Committed bodies need no external-file collector.
-Provisional ingress staging and its cleanup remain separate, unimplemented
-service responsibilities. The core does not implement online backup, history
+Provisional ingress preparation is implemented by the separate IngressSpool
+primitive; protocol admission and acknowledgement remain service
+responsibilities. The core does not implement online backup, history
 maintenance or runtime slot arbitration.
 
 ## 3. Reserve, stage, commit
@@ -6556,9 +6557,9 @@ physical I/O can still fail. The future authenticated port calls provisional
 body completion StagedBlob; finishing staging never establishes durability.
 Only the SQLite transaction publishes authoritative bodies and references.
 The port's begin_blob, BlobWriter::finish and StagedBlob are contracts for a
-future coordinator; they have no staging-store implementation yet. That work
-must specify bounded storage, quota accounting, failure cleanup and recovery
-before SMTP/JMAP ingress is activated. The future coordinator must keep
+future coordinator; they are not implemented by the standalone IngressSpool.
+That adapter must bind prepared ownership to authenticated reservations before
+SMTP/JMAP ingress is activated. The future coordinator must keep
 slow peers outside the global writer while they deliver their messages.
 
 IndexStore::commit accepts Crypto, CommitRequest, a bounded Operation slice
@@ -6576,8 +6577,9 @@ with checks before/after but no guarantee of interruption inside a native
 operation. The core holds the global writer while consuming the source. Its
 Read trait cannot enforce deadlines inside an arbitrary implementation:
 callers must supply prepared sources with bounded synchronous reads, not
-untrusted network streams. Provisional ingress preparation is future service
-work, not a durability claim of this low-level API.
+untrusted network streams. IngressSpool supplies one such prepared source.
+It is temporary preparation,
+not a durability or protocol-admission claim of this low-level API.
 
 The serialized transaction checks the expected sequence, applies operations
 in caller order, validates final owning references and parent chains, records
@@ -6779,3 +6781,31 @@ limits. This is an offline storage primitive; it grants no CLI, online backup,
 quota reservation, body-integrity or service-activation claim. Opening a
 snapshot permits offline inspection; restoring it for service requires a fresh
 epoch, which remains unimplemented.
+
+### Disposable prepared ingress inputs
+
+store_fs::IngressSpool::open borrows an ingress-only LockedRoot exclusively,
+a validated ResourcePlan and original startup clock/deadline. It validates
+and cleans the bounded canonical namespace before accepting any new files.
+SpoolCapacity derives full message reservations from configured SMTP/HTTPS
+slot counts; SpoolStatus reports occupied/retired counts and reserved bytes.
+These are temporary logical disk bounds and confer no durable store quota.
+
+begin reserves a complete slot, then creates its file and incremental digest.
+SpoolWriter::write accepts at most 64 KiB and refuses beyond message_bytes
+before writing; any failure is sticky. Consuming finish checks file metadata,
+EOF and original admission, finalizes SHA-256 and rewinds to return SpoolInput.
+Input owns the reservation and File until explicit discard or Drop. Its Read
+implementation returns at most 64 KiB, retains the original deadline, and
+makes read/seek failures terminal; failure retains their original typed error
+when Read reports an I/O kind. Rewind does not renew admission. It can be
+borrowed directly as BlobSource.source. Account, blob ID, kind and BlobRow
+metadata are passive caller data, not authenticated permissions or durability.
+
+Explicit discard closes the descriptor and removes only the owned inode
+before releasing credit. Failed cleanup retains the complete charge until
+quiescent restart cleanup. STORAGE.md owns exact file permissions, crash
+artifacts, error semantics and the separation from SQLite authority. Existing
+ports::BlobWriter::finish still returns passive StagedBlob and requires the
+future coordinator to retain the concrete prepared owner; IngressSpool does
+not falsely implement that contract by returning metadata without its file.

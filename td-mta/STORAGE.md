@@ -39,6 +39,10 @@ are explicit validate_integrity maintenance, not an opening scan. SQLite
 validates physical pages on access and body pins verify their full digest. Earlier formats
 are refused; no automatic migration or overwrite is provided.
 
+A separate ingress-only locked root holds LOCK and slot-00 through slot-63
+for disposable prepared bytes. It must never share the authoritative database
+root; the disposable ingress section below owns its cleanup contract.
+
 ## 2. SQLite and resource policy
 
 The private dependency is rusqlite 0.40.2 with bundled SQLite 3.53.2 and
@@ -116,8 +120,9 @@ One writer mutex serializes BEGIN IMMEDIATE, expected account-sequence
 comparison, body streaming, relational changes, final reference/parent checks,
 sequence update and COMMIT. A rejected source or batch rolls back both body
 and metadata. No separate publication proof, body rename or permanent-body orphan
-collection is required. Provisional ingress staging, its quotas and crash
-cleanup remain unimplemented service work. Existing body identity and bytes are immutable; an identical Blob PUT is a
+collection is required. The separate provisional ingress store below supplies
+prepared file inputs; service admission remains separate. Existing body
+identity and bytes are immutable; an identical Blob PUT is a
 no-op that retains its original changed sequence. Every chunk has at most
 65536 bytes and a consecutive ordinal; empty bodies have no chunks. No SQL
 statement assembles a complete message or rewrites an existing body. Blob IDs have a
@@ -218,6 +223,72 @@ cannot identify a different history; that restore operation is not implemented.
 Online backup, operational restore commands, verification/repair and history
 maintenance tools remain unimplemented.
 SQLite integrity checks do not replace digest and domain validation.
+
+### Disposable ingress staging
+
+IngressSpool borrows a separate LockedRoot exclusively. This root contains
+only LOCK and slot-00 through slot-63; it must never be the authoritative
+SQLite root. One owner validates the complete namespace before startup
+cleanup removes any file. Inspection visits at most 65 entries, requires
+LOCK and rejects unexpected names, directories, symlinks, extra hard links,
+wrong owners, public/executable/special permissions or files above 32 MiB.
+Cleanup accepts owner-only nonexecuting permission subsets of 0600 because
+creation may die before restoring umask-filtered owner bits. Live completed
+files require exact mode 0600. Startup inspects all 64 possible slots using
+the hard size cap, even when configuration reduces current capacity.
+
+Capacity is derived from the validated ResourcePlan: smtp_sessions plus
+https_connections slots, each reserving the full configured message_bytes.
+Defaults provide 16 slots and a 512 MiB aggregate logical byte ceiling;
+compiled concurrency and message bounds permit at most 64 slots and 2 GiB.
+The memory plan can refuse configurations below those theoretical maxima.
+Event subscriptions do not permanently subtract HTTPS ingress capacity.
+No file is created before its entire reservation is acquired. Fixed atomic
+bitmaps retain occupancy and retirement; admission attempts at most 64
+compare/exchange turns before Busy. Status is observational, not a coherent
+cross-thread admission snapshot. Partial and completed files retain their
+full charge until cleanup; no byte-growth counter or second body quota is
+introduced. This reserves logical bytes, not filesystem blocks or free space.
+
+SpoolWriter creates a slot name exclusively, restores mode 0600 and accepts
+at most 64 KiB per write, refusing arithmetic overflow or the configured
+message bound before I/O. It hashes successfully written bytes with the
+existing Crypto provider. Write or digest failure is terminal, including
+partial filesystem writes. Finish verifies descriptor identity, exact length
+and physical EOF, finalizes the digest, checks the original clock/deadline and
+rewinds before yielding an owned SpoolInput. It performs no fsync or durable
+publication. Input retains its File and reservation, exposes passive account,
+blob ID, kind, length and digest metadata, and implements bounded Read for
+BlobSource. SQLite independently checks expected length, EOF and digest in
+its atomic body/metadata transaction. No network read occurs through this
+prepared input. File reads and rewind preserve the original deadline and
+terminal errors; failure exposes the original typed error even when Read
+reports an I/O kind. Synchronous kernel I/O cannot promise deadline
+interruption.
+
+Explicit discard reports cleanup failure; Drop attempts the same cleanup.
+Close/take the File before unlinking, and return slot credit only after the
+known owned inode is successfully unlinked. Cleanup bypasses expired work
+budgets because it cannot undo acknowledged durable effects. A failure that
+prevents proven owned cleanup conservatively retains and retires the entire
+slot reservation. An unproven creation releases its slot only if a fresh
+path lookup establishes NotFound after closing any file; all existing or
+uninspectable paths retain the charge. Creation or identity failures never
+justify removing an existing or unidentified inode merely to regain capacity.
+In particular a
+created file whose identity could not be established is left for startup
+inspection. A retired slot stays charged until a fresh, quiescent startup under LOCK successfully cleans the namespace.
+No temporary operation calls fsync; a crash may leave any subset of these
+unacknowledged files, which startup discards. Process-death tests prove the
+kernel releases the lock and the next owner removes the abandoned input.
+
+Only successful SQLite COMMIT can authorize acknowledgement. Discarding an
+input after that commit cannot remove authoritative bytes. A coordinator
+chooses retry responsibility after rejection or indeterminate commit; the
+spool grants neither account authorization nor a durable acceptance receipt.
+The future ports::Store/BlobWriter/StagedBlob adapter, shared service quota
+coordination, listener activation and configured root provisioning remain
+separate. The low-level spool does not implement those ports or a CLI.
 
 ## 3. Metadata records
 

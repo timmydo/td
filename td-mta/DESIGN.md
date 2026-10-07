@@ -24,9 +24,11 @@ Protocol authorization, full mutation policy, operational tools, native
 resource and complete crash/fault qualification, and service activation
 remain unimplemented.
 Pure mailbox-parent, reference and recipient validators remain reusable.
-Committed bodies need no separate file publication. Provisional SMTP/JMAP
-ingress staging, its quotas and crash cleanup remain unimplemented service
-work; the synchronous core requires a prepared, bounded input source.
+Committed bodies need no separate file publication. The separate IngressSpool
+primitive supplies bounded disposable SMTP/JMAP
+ingress files, full per-slot quotas and cleanup under its own root lock.
+Prepared inputs feed the synchronous SQLite core; protocol admission,
+authorization and acknowledgement coordination remain service work.
 
 [WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.

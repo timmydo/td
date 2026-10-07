@@ -2641,9 +2641,9 @@ native-allocation, transient RSS peak or whole-service qualification.
 
 The synchronous core holds its writer while consuming prepared source bytes.
 An arbitrary Read implementation may block beyond the core's deadline checks;
-network ingress therefore needs separate bounded provisional staging before
-commit. That staging store, its temporary-byte quota and its crash cleanup
-are not implemented or included in the measured body-core evidence.
+network ingress therefore uses separate bounded provisional staging before
+commit. IngressSpool provides this primitive under a separate root lock; its
+resource qualification is separate from the measured SQLite body-core evidence.
 
 Logical body deletion releases ownership at commit. Freed SQLite pages remain
 in the database for reuse; only physical reconciliation can release physical
@@ -3275,3 +3275,28 @@ to preserve the actual durability outcome. Native checkpoint, filesystem read,
 write and sync calls remain synchronous; these checks are not hard scheduling
 interrupts. Backup requires separate caller quota and work admission and does
 not activate an online background slot or alter the startup memory ledger.
+
+IngressSpool derives its disk reservation from configured ingress concurrency:
+(smtp_sessions + https_connections) * message_bytes, or 16 * 32 MiB = 512 MiB
+by default. Partial, finished and retired files retain one complete message
+reservation. At most 64 fixed slot names exist, each at most 32 MiB. These
+are disk bytes, not resident buffers. The existing SMTP 64 KiB I/O buffer or
+HTTPS scratch supplies bounded writes; prepared reads borrow caller output.
+No message-sized allocation, per-file I/O buffer or growing file registry is
+created. Fixed occupancy/retirement bitmaps need 16 bytes and admission takes
+at most 64 compare/exchange turns. The separate root holds directory and LOCK
+descriptors, plus at most one temporary descriptor per occupied live slot.
+Startup temporarily opens one directory-iteration descriptor while no live
+spool slots exist; it closes before admission. The standalone resource plan
+does not yet enforce a whole-service file-descriptor ceiling. Listener
+activation must include these counts alongside sockets and SQLite handles.
+
+Compiled fixtures cap IngressSpool at 128 bytes, the production SHA-256 writer
+at 512 bytes, and SpoolInput at 384 bytes. These states fit existing SMTP
+16 KiB and HTTPS state/scratch reservations; no new startup memory entry or
+increase above the 128 MiB process budget is introduced. Paths use the existing
+bounded stack buffers for constructed names. Startup directory iteration
+uses bounded temporary std path/name allocations, retains no entry list and
+examines at most 65 entries. Whole-service stack, std allocation and combined
+RSS qualification remain required before listener activation; these layout
+and streaming fixtures are not a claim about kernel page-cache residency.

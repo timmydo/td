@@ -18,6 +18,10 @@ mod pinned;
 pub use pinned::with_pinned_fixture;
 pub use pinned::{PinnedBlob, PinnedBlobInput};
 
+#[path = "store_fs/spool.rs"]
+mod spool;
+pub use spool::{IngressSpool, SpoolCapacity, SpoolInput, SpoolStatus, SpoolWriter};
+
 /// Qualified by the host and portable allocation probes, including errors.
 /// This is a service limit, not a promise about every Rust implementation.
 pub const MAX_PATH_BYTES: usize = 383;

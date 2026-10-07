@@ -4,6 +4,8 @@ use std::{ffi::CStr, fmt, path::Path};
 
 /// Fixed path capacity includes headroom for known database sidecar names.
 pub const CAPACITY: usize = 128;
+/// Complete canonical ingress namespace, including abandoned old slots.
+pub const INGRESS_SLOTS: u8 = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -54,6 +56,12 @@ impl Name {
             RootEntry::Lock => "LOCK",
         };
         Self::encode(format_args!("{text}"))
+    }
+    pub fn ingress_slot(slot: u8) -> Result<Self, Error> {
+        if slot >= INGRESS_SLOTS {
+            return Err(Error::Encoding);
+        }
+        Self::encode(format_args!("slot-{slot:02}"))
     }
     pub fn as_bytes(&self) -> Result<&[u8], Error> {
         self.bytes.get(..self.length).ok_or(Error::Encoding)
