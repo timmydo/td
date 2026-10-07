@@ -328,6 +328,9 @@ struct KeyDecision {
     /// selection: a fresh Escape and held Control and Alt, each from a
     /// device secure attention reads.
     unlock: bool,
+    /// Lock the session: `Super+l`, or the attention menu's `L`, while
+    /// root's last `1a` answer is enrolled or unavailable.
+    lock: bool,
     draining: bool,
     command: Option<Command>,
     launcher: Option<LauncherAction>,
@@ -351,6 +354,7 @@ impl KeyBindings {
             confirm_install: None,
             field: None,
             unlock: false,
+            lock: false,
             draining: false,
             command: None,
             launcher: None,
@@ -489,6 +493,19 @@ impl KeyBindings {
         }
         if event.value == KEY_RELEASE {
             decision.forward = self.forward(physical, event);
+            return decision;
+        }
+        // `Super+l` in the paired profile alone (td-login/TOKEN-LOGIN.md,
+        // "Session lock"), checked before the sheet's and the launcher's
+        // capture so that neither swallows it, and always consumed, so no
+        // client sees it. It locks while root's last `1a` answer is enrolled
+        // or unavailable and does nothing while unenrolled.
+        if self.attention_enabled
+            && event.code == KEY_L
+            && (self.pressed(KEY_LEFTMETA) || self.pressed(KEY_RIGHTMETA))
+        {
+            self.consumed.insert(physical);
+            decision.lock = self.locks();
             return decision;
         }
         // Any NON-MODIFIER key dismisses the sheet: there is nothing to type
@@ -657,8 +674,27 @@ impl KeyBindings {
                 decision.notice = Some(Notice::LoginKeys);
                 None
             }
+            // The lifetime's one selection: it ends attention into the
+            // lock, or says why there is none and sends nothing.
+            KEY_L => {
+                self.secret_selected = true;
+                if self.locks() {
+                    decision.lock = true;
+                } else {
+                    decision.notice = Some(no_login_keys(self.login.state()));
+                }
+                None
+            }
             _ => None,
         };
+    }
+
+    /// Whether root's last `1a` answer locks: enrolled or unavailable.
+    fn locks(&self) -> bool {
+        self.login
+            .current()
+            .as_ref()
+            .is_some_and(crate::authority::Answer::locks)
     }
 
     /// A fresh press for the PIN field, from a device secure attention
@@ -1366,6 +1402,11 @@ trait InputTarget {
     fn session_locked(&mut self) -> bool {
         false
     }
+    /// Puts the lock surface up, answering with its paint; a target with
+    /// none refuses.
+    fn lock_screen(&mut self) -> Result<crate::runtime::NoticePresentation, String> {
+        Err("no lock surface on this input target".into())
+    }
 
     fn attention(&mut self, visible: bool) -> Result<u128, String>;
     fn drain_attention(&mut self) -> Result<(), String>;
@@ -1477,28 +1518,39 @@ impl Seat {
     }
 }
 
-/// The lock surface's live entry, through the bindings as increment 4's
-/// `Super+l` and `L` must go: the launcher and help capture close with the
-/// overlays the runtime closes. Compiled into tests alone until C9, as the
-/// runtime's is; the connect-time lock needs no bindings.
-#[cfg(test)]
-fn lock_session(
-    bindings: &Mutex<KeyBindings>,
-    target: &Mutex<LiveInputTarget>,
+/// The lock surface's live entry (td-login/TOKEN-LOGIN.md, "Session
+/// lock"), for `Super+l` and the attention menu's `L`, through the
+/// bindings and in the paired profile alone; the connect-time lock needs
+/// no bindings. An open attention lifetime ends first, as Escape ends it:
+/// before its operation's commit the attempt is cancelled, after it the
+/// screen drains and shows no result, and a login unlock's lifetime leaves
+/// the session locked. The launcher's and the sheet's capture close with
+/// the overlays the runtime closes, and attention closes onto the lock
+/// surface once held input has drained. Answers with the runtime's paint.
+fn lock_session<T: InputTarget>(
+    target: &mut T,
+    bindings: &mut KeyBindings,
 ) -> Result<crate::runtime::NoticePresentation, String> {
-    let mut bindings = bindings
-        .lock()
-        .map_err(|_| "input bindings lock poisoned".to_string())?;
-    let target = target
-        .lock()
-        .map_err(|_| "input target lock poisoned".to_string())?;
-    let presentation = target
-        .runtime
-        .lock()
-        .map_err(|_| "runtime lock poisoned".to_string())?
-        .lock_session()?;
-    bindings.settle_launcher(Some(false));
-    bindings.settle_help(Some(false));
+    if !bindings.attention_enabled {
+        return Err("the lock surface needs the paired profile".into());
+    }
+    let drained = if bindings.attention == AttentionState::Open {
+        bindings.attention = AttentionState::Draining;
+        target.drain_attention()
+    } else {
+        Ok(())
+    };
+    // The lock never waits on the drain's paint: a drain that failed to
+    // paint left the scene draining, and the session locks all the same,
+    // so no error below leads back to an unlocked desktop.
+    let locked = target.lock_screen();
+    if target.session_locked() {
+        bindings.settle_launcher(Some(false));
+        bindings.settle_help(Some(false));
+    }
+    drained?;
+    let presentation = locked?;
+    finish_attention(target, bindings)?;
     Ok(presentation)
 }
 
@@ -1842,6 +1894,13 @@ impl InputTarget for LiveInputTarget {
         self.runtime
             .lock()
             .map_or(true, |runtime| runtime.session_locked())
+    }
+
+    fn lock_screen(&mut self) -> Result<crate::runtime::NoticePresentation, String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .lock_session(&EvdevOrigin { _private: () })
     }
 
     fn drain_attention(&mut self) -> Result<(), String> {
@@ -2372,6 +2431,7 @@ fn apply_locked<T: InputTarget>(
         decision.attention = Some(false);
     }
     if !decision.draining
+        && !decision.lock
         && decision.attention.is_none()
         && decision.secret.is_none()
         && decision.notice.is_none()
@@ -2483,6 +2543,9 @@ fn deliver_key_decision<T: InputTarget>(
         decision.launch = None;
         bindings.settle_launcher(Some(false));
         bindings.settle_help(Some(false));
+    }
+    if decision.lock {
+        lock_session(runtime, bindings)?;
     }
     if let Some(visible) = decision.attention {
         if !visible {
@@ -4749,6 +4812,8 @@ mod tests {
         field_times: Vec<u128>,
         /// The lock surface is up.
         locked: bool,
+        /// How many times the lock surface was put up.
+        lock_screens: usize,
     }
 
     impl RecordingTarget {
@@ -4775,6 +4840,18 @@ mod tests {
 
         fn session_locked(&mut self) -> bool {
             self.locked
+        }
+
+        fn lock_screen(&mut self) -> Result<crate::runtime::NoticePresentation, String> {
+            self.lock_screens += 1;
+            self.locked = true;
+            self.launcher_visible = false;
+            self.help.set(false);
+            let epoch = u64::try_from(self.lock_screens).unwrap();
+            Ok(crate::runtime::NoticePresentation::for_test(
+                &self.clock,
+                epoch,
+            ))
         }
 
         fn pin_key(
@@ -5604,6 +5681,8 @@ mod tests {
         Launcher(LauncherAction),
         Launch(LaunchRequest),
         Help(HelpAction),
+        /// The paired profile's session lock.
+        Lock,
         /// Documented but not a key, so this row is exercised elsewhere. The
         /// SPELLING is carried because the mouse has three gestures here and
         /// the sheet names them all; the WORDS come from `action`, so a mouse
@@ -5675,6 +5754,7 @@ mod tests {
                 Bound::Launch(LaunchRequest::Dua) => "DISK USAGE",
                 Bound::Launcher(_) | Bound::Pointer(_, Pointing::Launcher) => "OPEN LAUNCHER",
                 Bound::Help(_) => "THIS HELP",
+                Bound::Lock => "LOCK SCREEN",
             }
         }
     }
@@ -5693,6 +5773,7 @@ mod tests {
             KEY_S => "S",
             KEY_T => "T",
             KEY_ENTER => "ENTER",
+            KEY_L => "L",
             // `?` IS the shifted `/`, so the glyph absorbs the modifier
             // rather than the sheet naming it twice.
             KEY_SLASH => return "SUPER+?".to_string(),
@@ -5766,6 +5847,7 @@ mod tests {
                 KEY_SLASH,
                 Bound::Help(HelpAction::Toggle),
             ),
+            (&[KEY_LEFTMETA], KEY_L, Bound::Lock),
             (&[], 0, Bound::Pointer("HOVER", Pointing::Focus)),
             (&[], 0, Bound::Pointer("CLICK", Pointing::Focus)),
             (&[], 0, Bound::Pointer("DRAG A TITLE", Pointing::Move)),
@@ -5778,19 +5860,25 @@ mod tests {
                 Bound::Pointer("CLICK THE BAR MENU", Pointing::Launcher),
             ),
         ];
+        // The paired profile's sheet, every row; the direct one lists all
+        // but `Super+l`, which it does not bind.
         assert_eq!(
             probes.len(),
-            crate::help::ROWS.len(),
+            crate::help::rows(true).count(),
             "every help row needs a probe"
         );
-        for (probe, row) in probes.iter().zip(crate::help::ROWS) {
+        for (probe, row) in probes.iter().zip(crate::help::rows(true)) {
             let (modifiers, code, expected) = probe;
             if let Bound::Pointer(keys, _) = expected {
                 assert_eq!(row.keys, *keys);
                 assert_eq!(row.action, expected.action());
                 continue;
             }
-            let mut bindings = KeyBindings::default();
+            let mut bindings = KeyBindings {
+                attention_enabled: true,
+                login: login_answer(&ENROLLED),
+                ..KeyBindings::default()
+            };
             for modifier in *modifiers {
                 bindings.feed(key(*modifier, KEY_PRESS));
             }
@@ -5800,11 +5888,13 @@ mod tests {
                 decision.launcher,
                 decision.launch,
                 decision.help,
+                decision.lock,
             ) {
-                (Some(command), None, None, None) => Bound::Command(command),
-                (None, Some(action), None, None) => Bound::Launcher(action),
-                (None, None, Some(request), None) => Bound::Launch(request),
-                (None, None, None, Some(action)) => Bound::Help(action),
+                (Some(command), None, None, None, false) => Bound::Command(command),
+                (None, Some(action), None, None, false) => Bound::Launcher(action),
+                (None, None, Some(request), None, false) => Bound::Launch(request),
+                (None, None, None, Some(action), false) => Bound::Help(action),
+                (None, None, None, None, true) => Bound::Lock,
                 other => panic!("{} produced {other:?}", row.keys),
             };
             assert_eq!(&actual, expected, "{} / {}", row.keys, row.action);
@@ -8922,6 +9012,20 @@ mod tests {
         .collect()
     }
 
+    /// `Super+l`, each change its own report.
+    fn super_l_reports(from: u32) -> Vec<Event> {
+        [
+            (KEY_LEFTMETA, KEY_PRESS),
+            (KEY_L, KEY_PRESS),
+            (KEY_L, KEY_RELEASE),
+            (KEY_LEFTMETA, KEY_RELEASE),
+        ]
+        .into_iter()
+        .zip(from..)
+        .flat_map(|((code, value), time)| [at_millis(key(code, value), time), syn(time)])
+        .collect()
+    }
+
     /// The whole device dispatcher: these reports, read from `device`.
     fn read_reports(
         target: &Mutex<RecordingTarget>,
@@ -9853,7 +9957,9 @@ mod tests {
         }
 
         fn lock(&self) -> Result<crate::runtime::NoticePresentation, String> {
-            lock_session(&self.bindings, &self.target)
+            let mut bindings = self.bindings.lock().unwrap();
+            let mut target = self.target.lock().unwrap();
+            lock_session(&mut *target, &mut bindings)
         }
 
         /// The same seat before it locks.
@@ -9928,6 +10034,11 @@ mod tests {
         /// `events` read from `device` by the whole device dispatcher,
         /// after a report boundary that any new cutoff discards.
         fn read(&self, device: usize, from: u32, events: Vec<Event>) {
+            self.try_read(device, from, events).unwrap();
+        }
+
+        /// The same read, answering the dispatcher's own result.
+        fn try_read(&self, device: usize, from: u32, events: Vec<Event>) -> Result<(), String> {
             let mut all = vec![syn(from)];
             all.extend(events);
             let data = later(all).into_iter().flat_map(encode).collect();
@@ -9940,7 +10051,6 @@ mod tests {
                 None,
                 &mut || None,
             )
-            .unwrap();
         }
 
         fn chord(&self, from: u32) {
@@ -9949,6 +10059,30 @@ mod tests {
 
         fn press(&self, codes: &[u16], from: u32) {
             self.read(0, from, presses(codes, from + 1));
+        }
+
+        /// `Super+l`, each change its own report.
+        fn super_l(&self, from: u32) {
+            self.read(0, from, super_l_reports(from + 1));
+        }
+
+        /// The keys root's client, the window's, was handed since `events`
+        /// subscribed.
+        fn client_keys(
+            events: &std::sync::mpsc::Receiver<crate::runtime::KeyboardDelivery>,
+        ) -> Vec<u32> {
+            use crate::keyboard::KeyboardEvent;
+            use crate::runtime::KeyboardDelivery;
+            events
+                .try_iter()
+                .filter_map(|delivery| match delivery {
+                    KeyboardDelivery::Event(event) => match event.event {
+                        KeyboardEvent::Key { input, .. } => Some(input.key),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect()
         }
 
         fn locked(&self) -> bool {
@@ -10071,7 +10205,10 @@ mod tests {
             runtime.attention_shown(),
             Some(crate::attention::Notice::Pending)
         );
-        assert!(runtime.lock_session().is_err());
+        assert!(runtime.lock_session(&origin).is_err());
+        // Ended as Escape ends it, the lifetime admits the lock beneath it.
+        runtime.drain_attention(&origin).unwrap();
+        runtime.lock_session(&origin).unwrap();
         // Closed again, the lock surface, not a client, is what returns.
         runtime.attention(&origin, false).unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, None);
@@ -10086,7 +10223,7 @@ mod tests {
         let mut direct = Runtime::new(
             crate::framebuffer::Framebuffer::test_file(&cleanup.0, 320, 200, 1280).unwrap(),
         );
-        assert!(direct.lock_session().is_err());
+        assert!(direct.lock_session(&test_origin()).is_err());
         assert!(!direct.session_locked());
     }
 
@@ -10504,5 +10641,489 @@ mod tests {
         assert_eq!(target.attention_events, [true]);
         assert!(target.secret_roles.is_empty());
         assert_eq!(target.notices, [crate::attention::Notice::NotAvailable]);
+    }
+
+    // `Super+l` and the attention menu's `L` (TOKEN-LOGIN.md increment 4's
+    // C9).
+
+    /// Root's `1a` states, each with whether it locks: enrolled and every
+    /// unavailable cause do, unenrolled does not.
+    const STATES: &[(&[u8], bool)] = &[
+        (&[1, 1, 7, 7, 7, 7], true),
+        (&[2, 0x0a], true),
+        (&[2, 0x0b], true),
+        (&[2, 0x0c], true),
+        (&[0], false),
+    ];
+
+    /// In the paired profile `Super+l`, from either Super, is always
+    /// consumed, press and release, and asks to lock exactly while root's
+    /// last answer is enrolled or unavailable; with no answer it does
+    /// nothing either. A bare `l` is still the client's.
+    #[test]
+    fn super_l_is_consumed_and_locks_only_on_a_locking_state() {
+        let answers = STATES
+            .iter()
+            .map(|(state, locks)| (Some(*state), *locks))
+            .chain([(None, false)]);
+        for (state, locks) in answers {
+            let login = crate::authority::Login::default();
+            if let Some(state) = state {
+                login.answer(&root_answer(state)).unwrap();
+            }
+            let mut bindings = KeyBindings {
+                attention_enabled: true,
+                login,
+                ..KeyBindings::default()
+            };
+            let bare = bindings.feed(key(KEY_L, KEY_PRESS));
+            assert!(!bare.lock && bare.forward.is_some());
+            assert!(bindings.feed(key(KEY_L, KEY_RELEASE)).forward.is_some());
+            for meta in [KEY_LEFTMETA, KEY_RIGHTMETA] {
+                bindings.feed(key(meta, KEY_PRESS));
+                let press = bindings.feed(key(KEY_L, KEY_PRESS));
+                assert_eq!(press.lock, locks, "{state:?}");
+                assert!(press.forward.is_none());
+                assert!(press.command.is_none() && press.launch.is_none());
+                assert!(press.launcher.is_none() && press.help.is_none());
+                assert!(press.notice.is_none() && press.attention.is_none());
+                let release = bindings.feed(key(KEY_L, KEY_RELEASE));
+                assert!(!release.lock && release.forward.is_none());
+                bindings.feed(key(meta, KEY_RELEASE));
+            }
+        }
+    }
+
+    /// TOKEN-LOGIN.md's D10: the direct development profile leaves
+    /// `Super+l` as it was, the client's, whatever an answer says.
+    #[test]
+    fn super_l_is_the_clients_in_the_direct_profile() {
+        let mut bindings = KeyBindings {
+            login: login_answer(&ENROLLED),
+            ..KeyBindings::default()
+        };
+        bindings.feed(key(KEY_LEFTMETA, KEY_PRESS));
+        let press = bindings.feed(key(KEY_L, KEY_PRESS));
+        assert!(!press.lock);
+        assert_eq!(press.forward, Some(key(KEY_L, KEY_PRESS).key_input()));
+        let release = bindings.feed(key(KEY_L, KEY_RELEASE));
+        assert_eq!(release.forward, Some(key(KEY_L, KEY_RELEASE).key_input()));
+        // Through the live seat: nothing locks, and the window has the key.
+        let seat = LockedSeat::open(&[]);
+        seat.runtime.lock().unwrap().enable_attention(false);
+        seat.bindings.lock().unwrap().attention_enabled = false;
+        let (events, _stop) = seat
+            .runtime
+            .lock()
+            .unwrap()
+            .subscribe_keyboard(1)
+            .unwrap()
+            .split();
+        seat.super_l(10);
+        assert!(!seat.locked());
+        assert!(seat.client_shown());
+        assert!(LockedSeat::client_keys(&events).contains(&u32::from(KEY_L)));
+    }
+
+    /// `Super+l` comes before the sheet's and the launcher's capture: with
+    /// either up it is not theirs. Locking, it closes both; unenrolled it
+    /// does nothing, so the overlay stays. In the direct profile the
+    /// overlay's capture keeps it, as before.
+    #[test]
+    fn super_l_is_read_before_the_overlays_capture() {
+        for (help, launcher) in [(true, false), (false, true)] {
+            for (state, locks) in STATES {
+                let login = crate::authority::Login::default();
+                login.answer(&root_answer(state)).unwrap();
+                let mut bindings = KeyBindings {
+                    attention_enabled: true,
+                    login,
+                    help_open: help,
+                    launcher_open: launcher,
+                    ..KeyBindings::default()
+                };
+                bindings.feed(key(KEY_LEFTMETA, KEY_PRESS));
+                let press = bindings.feed(key(KEY_L, KEY_PRESS));
+                assert_eq!(press.lock, *locks);
+                assert!(press.help.is_none() && press.launcher.is_none());
+                assert!(press.forward.is_none());
+            }
+            let mut direct = KeyBindings {
+                help_open: help,
+                launcher_open: launcher,
+                ..KeyBindings::default()
+            };
+            direct.feed(key(KEY_LEFTMETA, KEY_PRESS));
+            let press = direct.feed(key(KEY_L, KEY_PRESS));
+            assert!(!press.lock && press.forward.is_none());
+            assert_eq!(press.help, help.then_some(HelpAction::Close));
+        }
+        // Through the live seat, the overlays opened by their own chords.
+        for (state, locks) in STATES {
+            for opener in [KEY_SLASH, KEY_ENTER] {
+                let seat = LockedSeat::open(&[]);
+                seat.login.answer(&root_answer(state)).unwrap();
+                let open = [
+                    (KEY_LEFTMETA, KEY_PRESS),
+                    (opener, KEY_PRESS),
+                    (opener, KEY_RELEASE),
+                    (KEY_LEFTMETA, KEY_RELEASE),
+                ]
+                .into_iter()
+                .zip(11..)
+                .flat_map(|((code, value), time)| [at_millis(key(code, value), time), syn(time)])
+                .collect();
+                seat.read(0, 10, open);
+                let overlay = |seat: &LockedSeat| {
+                    let runtime = seat.runtime.lock().unwrap();
+                    runtime.help_visible() || runtime.launcher_visible()
+                };
+                assert!(overlay(&seat), "{opener}");
+                seat.super_l(20);
+                assert_eq!(seat.locked(), *locks);
+                assert_eq!(overlay(&seat), !locks);
+                let bindings = seat.bindings.lock().unwrap();
+                assert_eq!(bindings.help_open || bindings.launcher_open, !locks);
+                drop(bindings);
+                if *locks {
+                    assert!(seat.glass() == seat.lock_surface());
+                }
+            }
+        }
+    }
+
+    /// Through the whole device dispatcher, `Super+l` locks an enrolled or
+    /// unavailable session: the lock surface on glass, no window shown or
+    /// focused. Unenrolled it does nothing. Neither way does the window get
+    /// the `l`.
+    #[test]
+    fn super_l_locks_a_session_through_the_dispatcher() {
+        for (state, locks) in STATES {
+            let seat = LockedSeat::open(&[]);
+            seat.login.answer(&root_answer(state)).unwrap();
+            let (events, _stop) = seat
+                .runtime
+                .lock()
+                .unwrap()
+                .subscribe_keyboard(1)
+                .unwrap()
+                .split();
+            seat.super_l(10);
+            assert_eq!(seat.locked(), *locks, "{state:?}");
+            assert!(!seat.attention_open());
+            assert!(!LockedSeat::client_keys(&events).contains(&u32::from(KEY_L)));
+            let focus = seat.runtime.lock().unwrap().keyboard_snapshot().focus;
+            if *locks {
+                assert!(seat.glass() == seat.lock_surface());
+                assert!(!seat.client_shown());
+                assert_eq!(focus, None);
+                // Again on the lock surface: consumed, still locked.
+                seat.super_l(20);
+                assert!(seat.locked() && !seat.attention_open());
+                assert!(seat.glass() == seat.lock_surface());
+            } else {
+                assert!(seat.client_shown());
+                assert_eq!(focus, Some(seat.surface));
+            }
+        }
+    }
+
+    /// The attention menu's `L` is the lifetime's one selection. Enrolled
+    /// or unavailable, it ends attention into the lock and asks root for
+    /// nothing; unenrolled it shows NO LOGIN KEYS ENROLLED, asks nothing,
+    /// selects nothing more, and Escape returns to the session.
+    #[test]
+    fn the_menus_l_locks_or_says_why_not() {
+        use crate::attention::Notice;
+        for (state, locks) in STATES {
+            let seat = LockedSeat::open(&[]);
+            seat.login.answer(&root_answer(state)).unwrap();
+            seat.chord(10);
+            assert_eq!(seat.shown(), Some(Notice::Menu));
+            seat.press(&[KEY_L], 20);
+            assert!(seat.queued.attempt().is_none());
+            if *locks {
+                assert!(seat.locked() && !seat.attention_open(), "{state:?}");
+                assert!(seat.glass() == seat.lock_surface());
+                assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
+                continue;
+            }
+            let why = Some(Notice::Login(&["NO LOGIN KEYS ENROLLED"]));
+            assert!(!seat.locked() && seat.attention_open());
+            assert_eq!(seat.shown(), why);
+            seat.press(&[KEY_U, KEY_K, KEY_L, KEY_I], 30);
+            assert!(seat.queued.attempt().is_none());
+            assert_eq!(seat.shown(), why);
+            seat.press(&[KEY_ESC], 40);
+            assert!(!seat.attention_open() && !seat.locked());
+            assert!(seat.client_shown());
+        }
+    }
+
+    /// `L` is the menu's alone: not on the key-management screen, not once
+    /// the lifetime chose its operation, not in the lock surface's unlock,
+    /// and never from a security key's own keyboard.
+    #[test]
+    fn l_selects_only_on_the_menu() {
+        use crate::attention::Notice;
+        // The key-management screen.
+        let seat = LockedSeat::open(&[]);
+        seat.chord(10);
+        seat.press(&[KEY_K, KEY_L], 20);
+        assert!(!seat.locked() && seat.attention_open());
+        assert_eq!(seat.shown(), Some(Notice::LoginKeys));
+        // An operation already chosen.
+        let seat = LockedSeat::open(&[]);
+        seat.chord(10);
+        seat.press(&[KEY_U], 20);
+        let attempt = seat.queued.attempt().unwrap();
+        seat.press(&[KEY_L], 30);
+        assert!(!seat.locked() && seat.attention_open());
+        assert!(seat.queued.attempt().is_none());
+        drop(attempt);
+        // The lock surface's unlock: its lifetime stays open.
+        let seat = LockedSeat::new(&[]);
+        let _attempt = seat.unlock(10);
+        seat.press(&[KEY_L], 30);
+        assert!(seat.locked() && seat.attention_open());
+        assert_eq!(seat.shown(), Some(Notice::Pending));
+        // A security key's own keyboard.
+        const KEY: usize = 1;
+        let seat = LockedSeat::open(&[KEY]);
+        seat.chord(10);
+        seat.read(KEY, 20, presses(&[KEY_L], 21));
+        assert!(!seat.locked() && seat.attention_open());
+        assert_eq!(seat.shown(), Some(Notice::Menu));
+    }
+
+    /// While attention is up `Super+l` is the attention screen's: on the
+    /// menu it is read as the menu's `L`, under the menu's rules, and once
+    /// an operation is chosen it locks nothing.
+    #[test]
+    fn attention_reads_super_l_under_its_own_rules() {
+        let seat = LockedSeat::open(&[]);
+        seat.chord(10);
+        seat.press(&[KEY_U], 20);
+        let _attempt = seat.queued.attempt().unwrap();
+        seat.super_l(30);
+        assert!(!seat.locked() && seat.attention_open());
+        let seat = LockedSeat::open(&[]);
+        seat.chord(10);
+        seat.super_l(20);
+        assert!(seat.locked() && !seat.attention_open());
+        assert!(seat.glass() == seat.lock_surface());
+    }
+
+    /// TOKEN-LOGIN.md's D12: a lock while a lifetime is open ends it first,
+    /// as Escape does. Before the commit the operation is cancelled; after
+    /// it the screen drains and root's result is never shown; in a login
+    /// unlock's lifetime even a committed unlock leaves the session locked.
+    /// Held input drains under Escape's screen before the lock surface.
+    #[test]
+    fn a_lock_during_an_open_lifetime_ends_it_as_escape_does() {
+        // Before the commit.
+        let seat = LockedSeat::new(&[]);
+        let attempt = seat.unlock(10);
+        let mut root = root(to_pin());
+        let mut client = crate::secret_client::Client::trusting_memory();
+        client.start(&mut root, attempt).unwrap();
+        run(&mut client, &mut root).unwrap();
+        assert_eq!(seat.field(), Some(crate::attention::Field::Pin(0)));
+        seat.lock().unwrap();
+        assert!(!seat.attention_open() && seat.locked());
+        assert!(seat.glass() == seat.lock_surface());
+        root.replies.extend([
+            vec![0x95, 0],
+            [&[0x91, 0x0d, 0x80, 0][..], &pin_step().encode()].concat(),
+        ]);
+        run(&mut client, &mut root).unwrap();
+        assert!(root.replies.is_empty());
+        assert_eq!(root.sent(0x15), 1);
+        assert_eq!(root.sent(0x1c), 0);
+        assert!(seat.locked());
+        assert!(seat.glass() == seat.lock_surface());
+        // After the commit, before root's success, with a key held.
+        let seat = LockedSeat::new(&[]);
+        let (mut client, mut root) = seat.committed();
+        let mut pointer = PointerMotion::default();
+        let feed = |pointer: &mut PointerMotion, value, time| {
+            for event in later(vec![at_millis(key(KEY_A, value), time), syn(time)]) {
+                apply(
+                    seat.target.as_ref(),
+                    event,
+                    0,
+                    seat.bindings.as_ref(),
+                    pointer,
+                    None,
+                )
+                .unwrap();
+            }
+        };
+        feed(&mut pointer, KEY_PRESS, 61);
+        seat.lock().unwrap();
+        assert!(seat.bindings.lock().unwrap().attention == AttentionState::Draining);
+        root.replies.push_back(status(6, &pin_step()));
+        run(&mut client, &mut root).unwrap();
+        assert!(root.replies.is_empty());
+        assert!(seat.locked());
+        // Escape's drain, not the result.
+        let mut drained = vec![0; 800 * 600 * 4];
+        crate::attention::paint(
+            &mut drained,
+            800,
+            600,
+            3200,
+            true,
+            false,
+            crate::attention::Notice::Login(&["SESSION UNLOCKED"]),
+        );
+        assert!(seat.glass() == drained);
+        feed(&mut pointer, KEY_RELEASE, 71);
+        assert!(!seat.attention_open() && seat.locked());
+        assert!(seat.glass() == seat.lock_surface());
+        assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
+    }
+
+    /// The adapter's entry ends an open lifetime through the target's drain,
+    /// Escape's, which cancels whatever operation it chose, then locks and
+    /// closes attention once nothing is held. The direct profile has no
+    /// entry: it refuses and touches nothing.
+    #[test]
+    fn the_lock_entry_drains_an_open_lifetime_and_needs_the_paired_profile() {
+        let mut target = RecordingTarget::default();
+        let mut bindings = KeyBindings {
+            attention_enabled: true,
+            attention: AttentionState::Open,
+            secret_selected: true,
+            launcher_open: true,
+            ..KeyBindings::default()
+        };
+        lock_session(&mut target, &mut bindings).unwrap();
+        assert_eq!(target.draining_events, 1);
+        assert_eq!(target.lock_screens, 1);
+        assert_eq!(target.attention_events, [false]);
+        assert!(bindings.attention == AttentionState::Closed);
+        assert!(!bindings.launcher_open && !bindings.help_open);
+        let mut target = RecordingTarget::default();
+        let mut direct = KeyBindings {
+            attention: AttentionState::Open,
+            ..KeyBindings::default()
+        };
+        assert!(lock_session(&mut target, &mut direct).is_err());
+        assert_eq!((target.draining_events, target.lock_screens), (0, 0));
+        assert!(direct.attention == AttentionState::Open);
+        // A target with no lock surface refuses.
+        let (_cleanup, mut runtime) = automation_runtime();
+        let mut automation = AutomationTarget {
+            runtime: &mut runtime,
+        };
+        assert!(automation.lock_screen().is_err());
+    }
+
+    /// The paired profile's help sheet lists `Super+l`; the direct one's
+    /// does not.
+    #[test]
+    fn the_paired_sheet_lists_super_l() {
+        let seat = LockedSeat::open(&[]);
+        let sheet = |paired: bool| {
+            let mut runtime = seat.runtime.lock().unwrap();
+            runtime.enable_attention(paired);
+            assert!(runtime.help(HelpAction::Toggle).unwrap());
+            drop(runtime);
+            let glass = seat.glass();
+            assert!(!seat
+                .runtime
+                .lock()
+                .unwrap()
+                .help(HelpAction::Close)
+                .unwrap());
+            glass
+        };
+        let paired = sheet(true);
+        assert!(paired != sheet(false));
+        assert!(paired == sheet(true));
+    }
+
+    /// A lock never depends on the drain's paint: when the paint that
+    /// drains the open lifetime fails, the menu's `L` still locks, and the
+    /// reader's cleanup, which closes attention, returns to the lock
+    /// surface with no client focused, never to the desktop.
+    #[test]
+    fn a_failed_drain_paint_still_locks_for_the_menus_l() {
+        let seat = LockedSeat::open(&[]);
+        seat.chord(10);
+        seat.runtime.lock().unwrap().fail_next_repaint();
+        assert!(seat.try_read(0, 20, presses(&[KEY_L], 21)).is_err());
+        assert!(seat.locked());
+        assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
+        assert!(!seat.attention_open());
+        assert!(!seat.client_shown());
+        assert!(seat.queued.attempt().is_none());
+    }
+
+    /// The same through the entry with an operation open, as C10's lid and
+    /// resume will reach it: the drain's paint fails, the session locks all
+    /// the same, and closing attention shows the lock surface.
+    #[test]
+    fn a_failed_drain_paint_still_locks_an_open_lifetime() {
+        let seat = LockedSeat::open(&[]);
+        seat.chord(10);
+        seat.press(&[KEY_U], 20);
+        let _attempt = seat.queued.attempt().unwrap();
+        seat.runtime.lock().unwrap().fail_next_repaint();
+        assert!(seat.lock().is_err());
+        assert!(seat.locked());
+        assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
+        assert!(seat.bindings.lock().unwrap().attention == AttentionState::Draining);
+        // The next report closes the drained screen.
+        seat.press(&[KEY_A], 30);
+        assert!(!seat.attention_open() && seat.locked());
+        assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
+        assert!(seat.glass() == seat.lock_surface());
+    }
+
+    /// A lock that comes after root's success left the lock surface, while
+    /// held input still drains under `SESSION UNLOCKED`, takes that notice
+    /// down: the drain shows Escape's screen, and the release shows the
+    /// lock surface, not the desktop.
+    #[test]
+    fn a_relock_during_an_unlocks_drain_hides_its_success() {
+        let seat = LockedSeat::new(&[]);
+        let (mut client, mut root) = seat.committed();
+        let mut pointer = PointerMotion::default();
+        let feed = |pointer: &mut PointerMotion, value, time| {
+            for event in later(vec![at_millis(key(KEY_A, value), time), syn(time)]) {
+                apply(
+                    seat.target.as_ref(),
+                    event,
+                    0,
+                    seat.bindings.as_ref(),
+                    pointer,
+                    None,
+                )
+                .unwrap();
+            }
+        };
+        feed(&mut pointer, KEY_PRESS, 61);
+        root.replies.push_back(status(6, &pin_step()));
+        run(&mut client, &mut root).unwrap();
+        assert!(!seat.locked());
+        seat.lock().unwrap();
+        assert!(seat.locked());
+        let mut drained = vec![0; 800 * 600 * 4];
+        crate::attention::paint(
+            &mut drained,
+            800,
+            600,
+            3200,
+            true,
+            false,
+            crate::attention::Notice::Login(&["SESSION UNLOCKED"]),
+        );
+        assert!(seat.glass() == drained);
+        feed(&mut pointer, KEY_RELEASE, 71);
+        assert!(!seat.attention_open() && seat.locked());
+        assert!(seat.glass() == seat.lock_surface());
+        assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
     }
 }

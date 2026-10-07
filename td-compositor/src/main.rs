@@ -2838,27 +2838,34 @@ pub struct MappedRegion {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// Production locks the session in one place: the generation's first
-    /// paint, where root's `1a` answer is enrolled or unavailable, in the
-    /// paired profile (td-login/TOKEN-LOGIN.md increment 4's C7). The
-    /// compiler holds the field: the scene's `locked` is private and
+    /// Production locks the session in two places, both in the paired
+    /// profile: the generation's first paint, where root's `1a` answer is
+    /// enrolled or unavailable (td-login/TOKEN-LOGIN.md increment 4's C7),
+    /// and the live entry for `Super+l` and the attention menu's `L` (C9).
+    /// The compiler holds the field: the scene's `locked` is private and
     /// `Scene::unlock` only clears it. This pins what the compiler cannot:
     /// `Scene::lock` is the one write of `true`, a new scene starts
     /// unlocked, nothing borrows the field mutably, and every other field
     /// write of a `locked`, in every source, is `false`; `Scene::lock` has
-    /// two callers, `Runtime::first_paint` under that condition and the
-    /// test-only `Runtime::lock_session`, whose own caller, the evdev
-    /// adapter's `lock_session`, is test-only too; and `first_paint` has
-    /// one production caller, `run_compositor`, after the authority's
-    /// Prepare and first `1a` and in place of its first repaint, before
-    /// any input reader or client.
+    /// two callers, `Runtime::first_paint` under that condition and
+    /// `Runtime::lock_session` under the paired profile, whose one caller
+    /// is the evdev adapter's target, reached only from the adapter's
+    /// `lock_session`, which needs the paired profile and is reached only
+    /// from a key decision the bindings make for `Super+l` and `L`; and
+    /// `first_paint` has one production caller, `run_compositor`, after
+    /// the authority's Prepare and first `1a` and in place of its first
+    /// repaint, before any input reader or client.
     #[test]
-    fn production_locks_only_at_the_first_paint() {
+    fn production_locks_at_the_first_paint_and_the_live_entries() {
         let scene = include_str!("scene.rs");
-        let entry = "    /// generation's first paint alone, which a source pin holds.\n    \
+        let entry = "    /// which a source pin holds.\n    \
                      pub(crate) fn lock(&mut self) {\n        self.locked = true;\n";
         assert_eq!(occurrences(scene, "self.locked = true"), 1);
         assert_eq!(occurrences(production(scene), entry), 1);
+        // A relock never shows a drained unlock's success.
+        let (_, locking) = scene.split_once(entry).unwrap();
+        let locking = locking.split_once("\n    }\n").unwrap().0;
+        assert_eq!(occurrences(locking, "self.attention_unlocked = false;"), 1);
         assert_eq!(occurrences(scene, "fn lock("), 1);
         assert_eq!(occurrences(scene, "mut self.locked"), 0);
         let ident = |c: char| c.is_alphanumeric() || c == '_';
@@ -2935,6 +2942,8 @@ pub struct MappedRegion {
                 (*name == "runtime.rs" || *name == "main.rs") as usize,
                 "{name}"
             );
+            // The runtime's entry; in input.rs the target's call of it and
+            // the key decision's call of the adapter's entry.
             let live = match *name {
                 "runtime.rs" => 1,
                 "input.rs" => 2,
@@ -2946,6 +2955,32 @@ pub struct MappedRegion {
                 .filter(|(at, _)| !source[..*at].ends_with("un"))
                 .count();
             assert_eq!(lock_session, live, "{name}");
+            // The adapter's entry, and the target method between the two:
+            // the trait's refusing default, the evdev target's and the one
+            // call, from the adapter's entry.
+            let input = *name == "input.rs";
+            assert_eq!(
+                occurrences(source, "lock_session<"),
+                input as usize,
+                "{name}"
+            );
+            assert_eq!(occurrences(source, "fn lock_screen("), 2 * input as usize);
+            assert_eq!(occurrences(source, "lock_screen("), 3 * input as usize);
+            // Only the bindings decide to lock: two assignments, and the
+            // decision's one literal field, `false`; no `lock: true` or
+            // `|=` anywhere.
+            assert_eq!(occurrences(source, ".lock = "), 2 * input as usize);
+            let bare = |needle: &str| {
+                source
+                    .match_indices(needle)
+                    .filter(|(at, _)| !source[..*at].ends_with(ident))
+                    .count()
+            };
+            assert_eq!(bare("lock: true"), 0, "{name}");
+            assert_eq!(occurrences(source, ".lock |="), 0, "{name}");
+            assert_eq!(bare("lock:"), 2 * input as usize, "{name}");
+            assert_eq!(bare("lock: false,"), input as usize, "{name}");
+            assert_eq!(bare("lock: bool,"), input as usize, "{name}");
         }
         let first_paint = runtime
             .split_once("    pub(crate) fn first_paint(")
@@ -2969,14 +3004,102 @@ pub struct MappedRegion {
         assert_eq!(occurrences(first_paint, "latest"), 2);
         assert_eq!(occurrences(first_paint, "::current"), 1);
         assert_eq!(occurrences(first_paint, "if self.paints != 0 {"), 1);
-        // The live entries stay test-only until C9's `Super+l` and `L`.
-        let live = "    #[cfg(test)]\n    pub(crate) fn lock_session(&mut self)";
+        // The runtime's live entry, compiled in since C9: the paired
+        // profile, with any attention lifetime already draining.
+        let live = "\n    pub(crate) fn lock_session(\n        &mut self,\n        \
+                    _origin: &crate::input::EvdevOrigin,\n    ) -> Result<NoticePresentation, String> {\n        \
+                    if !self.attention_enabled\n            \
+                    || (self.scene.attention_visible() && !self.scene.attention_draining())\n        \
+                    {\n            return Err(";
         assert_eq!(occurrences(runtime, live), 1);
-        let (_, gated) = runtime.split_once(live).unwrap();
+        let (before, gated) = runtime.split_once(live).unwrap();
+        assert!(!before.trim_end().ends_with("#[cfg(test)]"));
         let gated = gated.split_once("\n    }\n").unwrap().0;
         assert_eq!(occurrences(gated, "self.scene.lock();"), 1);
-        assert_eq!(occurrences(input, "#[cfg(test)]\nfn lock_session("), 1);
-        assert_eq!(occurrences(input, ".lock_session()?"), 1);
+        // Locked before anything that can fail.
+        let (head, _) = gated.split_once("self.scene.lock();").unwrap();
+        assert!(!head.contains('?') && !head.contains("let ") && !head.contains("return"));
+        // Its one caller, the evdev target, with the adapter's witness.
+        let target = input
+            .split_once("impl InputTarget for LiveInputTarget {")
+            .unwrap()
+            .1;
+        assert!(target.contains(
+            "    fn lock_screen(&mut self) -> Result<crate::runtime::NoticePresentation, String> {\n        \
+             self.runtime\n            .lock()\n            .map_err(|_| \"runtime lock poisoned\".to_string())?\n            \
+             .lock_session(&EvdevOrigin { _private: () })\n    }"
+        ));
+        // Every other target refuses.
+        assert!(input.contains(
+            "    fn lock_screen(&mut self) -> Result<crate::runtime::NoticePresentation, String> {\n        \
+             Err(\"no lock surface on this input target\".into())\n    }"
+        ));
+        // The adapter's entry: the paired profile, an open lifetime ended
+        // as Escape ends it, then the lock.
+        let adapter = input
+            .split_once("\nfn lock_session<T: InputTarget>(\n")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let (guard, body) = adapter.split_once("    let drained = ").unwrap();
+        assert!(guard.contains(
+            "    if !bindings.attention_enabled {\n        \
+             return Err(\"the lock surface needs the paired profile\".into());\n    }\n"
+        ));
+        assert!(body.starts_with(
+            "if bindings.attention == AttentionState::Open {\n        \
+             bindings.attention = AttentionState::Draining;\n        \
+             target.drain_attention()\n    } else {\n        Ok(())\n    };\n"
+        ));
+        // Nothing between the drain and the lock returns, so a failed
+        // drain still locks; errors propagate only after it.
+        let (before, after) = body
+            .split_once("    let locked = target.lock_screen();\n")
+            .unwrap();
+        assert!(!before.contains('?') && !before.contains("return"));
+        assert!(after.contains("    drained?;\n    let presentation = locked?;\n"));
+        assert_eq!(occurrences(body, "return"), 0);
+        // Its one caller: a key decision.
+        assert_eq!(
+            occurrences(
+                input,
+                "    if decision.lock {\n        lock_session(runtime, bindings)?;\n    }"
+            ),
+            1
+        );
+        // Which the bindings make for `Super+l` in the paired profile
+        // before the sheet's and launcher's capture, and for the menu's
+        // `L`, each only while the last `1a` answer locks.
+        let feed = input
+            .split_once("    fn feed_device(")
+            .unwrap()
+            .1
+            .split_once("\n    }\n")
+            .unwrap()
+            .0;
+        let super_l = "        if self.attention_enabled\n            && event.code == KEY_L\n            \
+                       && (self.pressed(KEY_LEFTMETA) || self.pressed(KEY_RIGHTMETA))\n        {\n            \
+                       self.consumed.insert(physical);\n            decision.lock = self.locks();\n";
+        let at = |needle: &str| feed.find(needle).unwrap();
+        assert!(at(super_l) < at("        if self.help_open {"));
+        assert!(at(super_l) < at("        if self.launcher_open {"));
+        let select = input
+            .split_once("    fn select(")
+            .unwrap()
+            .1
+            .split_once("\n    }\n")
+            .unwrap()
+            .0;
+        assert!(select.contains(
+            "            KEY_L => {\n                self.secret_selected = true;\n                \
+             if self.locks() {\n                    decision.lock = true;\n"
+        ));
+        assert!(input.contains(
+            "    fn locks(&self) -> bool {\n        self.login\n            .current()\n            \
+             .as_ref()\n            .is_some_and(crate::authority::Answer::locks)\n    }"
+        ));
         // The first paint's one caller, in place of the first repaint.
         let run = MAIN
             .split_once("fn run_compositor(")

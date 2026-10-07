@@ -2261,6 +2261,11 @@ impl Scene {
         self.help.visible()
     }
 
+    /// Whether the sheet lists `Super+l`: the paired profile binds it.
+    pub(crate) fn list_lock_binding(&mut self, locks: bool) {
+        self.help.list_lock(locks);
+    }
+
     /// Either overlay is modal: it owns the keyboard, withdraws pointer
     /// hover, and must not be clicked through to the tiles it covers.
     pub fn modal(&self) -> bool {
@@ -3218,10 +3223,14 @@ impl Scene {
         self.locked
     }
 
-    /// The lock surface's one entry. Its production caller is the
-    /// generation's first paint alone, which a source pin holds.
+    /// The lock surface's one entry. Its production callers are the
+    /// generation's first paint and the live `Runtime::lock_session`,
+    /// which a source pin holds.
     pub(crate) fn lock(&mut self) {
         self.locked = true;
+        // A lock after an unlock's success, still draining, shows no
+        // `SESSION UNLOCKED` over the relocked session.
+        self.attention_unlocked = false;
         self.launcher.apply(LauncherAction::Close);
         self.help.set(false);
     }

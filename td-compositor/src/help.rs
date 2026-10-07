@@ -4,9 +4,9 @@ use crate::ui;
 const CARD_WIDTH: usize = 620;
 const CARD_PADDING: usize = 24;
 const TITLE_TOP: usize = 18;
-const FIRST_ROW_TOP: usize = 60;
+const FIRST_ROW_TOP: usize = 48;
 const ROW_STEP: usize = 26;
-const BOTTOM_PADDING: usize = 22;
+const BOTTOM_PADDING: usize = 10;
 const KEYS_LEFT: usize = 20;
 const ACTION_LEFT: usize = 280;
 const CARD: [u8; 4] = [0x18, 0x20, 0x28, 0];
@@ -20,7 +20,8 @@ pub struct Row {
     pub action: &'static str,
 }
 
-pub const ROWS: &[Row] = &[
+/// The chords every profile binds.
+pub const CHORDS: &[Row] = &[
     Row {
         keys: "SUPER+ARROWS",
         action: "FOCUS A TILE",
@@ -65,6 +66,18 @@ pub const ROWS: &[Row] = &[
         keys: "SUPER+?",
         action: "THIS HELP",
     },
+];
+
+/// `Super+l`'s row. Only the paired profile binds it
+/// (td-login/TOKEN-LOGIN.md, "Session lock"), so only its sheet lists it,
+/// below the other chords.
+pub const LOCK: Row = Row {
+    keys: "SUPER+L",
+    action: "LOCK SCREEN",
+};
+
+/// The pointer's rows, below the chords.
+pub const POINTING: &[Row] = &[
     // Not chords, and the only lines here the dispatch test cannot drive.
     // They earn their place because a cheat sheet that omits the mouse leaves
     // the operator believing the keyboard is the only way to focus — and HOVER
@@ -132,14 +145,27 @@ impl HelpAction {
     }
 }
 
+/// The sheet's rows in order: the chords, `Super+l`'s where `locks`, then
+/// the pointer's.
+pub fn rows(locks: bool) -> impl Iterator<Item = &'static Row> {
+    CHORDS.iter().chain(locks.then_some(&LOCK)).chain(POINTING)
+}
+
 #[derive(Clone, Default)]
 pub struct Help {
     visible: bool,
+    /// The paired profile's sheet, which lists `Super+l`.
+    locks: bool,
 }
 
 impl Help {
     pub fn set(&mut self, visible: bool) {
         self.visible = visible;
+    }
+
+    /// Whether the sheet lists `Super+l`, as the paired profile's does.
+    pub fn list_lock(&mut self, locks: bool) {
+        self.locks = locks;
     }
 
     pub fn visible(&self) -> bool {
@@ -151,7 +177,8 @@ impl Help {
             return;
         }
         let card_width = CARD_WIDTH.min(width.saturating_sub(CARD_PADDING.saturating_mul(2)));
-        let card_height = card_height().min(height.saturating_sub(CARD_PADDING.saturating_mul(2)));
+        let card_height =
+            card_height(self.locks).min(height.saturating_sub(CARD_PADDING.saturating_mul(2)));
         let left = width.saturating_sub(card_width) / 2;
         let top = height.saturating_sub(card_height) / 2;
         let card = (left, top, card_width, card_height);
@@ -170,7 +197,7 @@ impl Help {
             ([0xff, 0xff, 0xff, 0], CARD),
             card,
         );
-        for (index, row) in ROWS.iter().enumerate() {
+        for (index, row) in rows(self.locks).enumerate() {
             let row_top = top
                 .saturating_add(FIRST_ROW_TOP)
                 .saturating_add(index.saturating_mul(ROW_STEP));
@@ -200,9 +227,9 @@ impl Help {
 
 /// Sized from the table rather than pinned, so adding a row cannot silently
 /// push the last one past the card's bottom edge.
-fn card_height() -> usize {
+fn card_height(locks: bool) -> usize {
     FIRST_ROW_TOP
-        .saturating_add(ROWS.len().saturating_mul(ROW_STEP))
+        .saturating_add(rows(locks).count().saturating_mul(ROW_STEP))
         .saturating_add(BOTTOM_PADDING)
 }
 
@@ -233,7 +260,7 @@ mod tests {
         // `SUPER+1..9` once drew as `SUPER+1??9` for want of a period, so a
         // gap in the font was unreadable as one. Unifont is what draws a
         // character the outline face lacks, so it must have them all.
-        for row in ROWS {
+        for row in rows(true) {
             for character in row.keys.chars().chain(row.action.chars()) {
                 assert!(
                     crate::text::covered(character),
@@ -246,7 +273,7 @@ mod tests {
 
     #[test]
     fn every_row_fits_its_column_and_the_card() {
-        for row in ROWS {
+        for row in rows(true) {
             assert!(
                 KEYS_LEFT.saturating_add(text_width(row.keys)) <= ACTION_LEFT,
                 "{} overruns the action column",
@@ -260,9 +287,18 @@ mod tests {
             );
         }
         let last = FIRST_ROW_TOP
-            .saturating_add(ROWS.len().saturating_sub(1).saturating_mul(ROW_STEP))
+            .saturating_add(
+                rows(true)
+                    .count()
+                    .saturating_sub(1)
+                    .saturating_mul(ROW_STEP),
+            )
             .saturating_add(crate::text::CELL_HEIGHT);
-        assert!(last <= card_height(), "{last} rows past {}", card_height());
+        assert!(
+            last <= card_height(true),
+            "{last} rows past {}",
+            card_height(true)
+        );
         // And the card the rows are sized against fits a real screen, which
         // `card_height` alone does not say: `paint` CLIPS it to the output, so
         // a row past the bottom of one is a row that silently does not appear.
@@ -271,10 +307,39 @@ mod tests {
         // a cheat sheet missing its last rows is a cheat sheet nobody can use.
         const ORDINARY_ROWS: usize = 768;
         assert!(
-            card_height() <= ORDINARY_ROWS.saturating_sub(CARD_PADDING.saturating_mul(2)),
+            card_height(true) <= ORDINARY_ROWS.saturating_sub(CARD_PADDING.saturating_mul(2)),
             "the card wants {} rows of a {ORDINARY_ROWS}-row output",
-            card_height()
+            card_height(true)
         );
+        // The paired card, `Super+l`'s row included, fits 800x600 whole
+        // too, and the title clears the first row by more than a row gap.
+        assert_eq!(card_height(true), 552);
+        assert!(card_height(true) <= 600 - CARD_PADDING * 2);
+        const _: () = assert!(TITLE_TOP + ROW_STEP < FIRST_ROW_TOP);
+    }
+
+    /// Only the paired profile binds `Super+l`, so only its sheet lists it,
+    /// once, right below the other chords, on a card one row taller.
+    #[test]
+    fn only_the_paired_sheet_lists_super_l() {
+        let direct: Vec<&Row> = rows(false).collect();
+        let paired: Vec<&Row> = rows(true).collect();
+        assert!(!direct.contains(&&LOCK));
+        assert_eq!(paired.len(), direct.len() + 1);
+        assert_eq!(paired.get(CHORDS.len()), Some(&&LOCK));
+        assert_eq!(paired.iter().filter(|row| ***row == LOCK).count(), 1);
+        assert_eq!(card_height(true), card_height(false) + ROW_STEP);
+        let (width, height) = (900usize, 700usize);
+        let stride = width * 4;
+        let painted = |locks: bool| {
+            let mut frame = vec![0u8; stride * height];
+            let mut help = Help::default();
+            help.set(true);
+            help.list_lock(locks);
+            help.paint(&mut frame, width, height, stride, &Text::default());
+            frame
+        };
+        assert!(painted(true) != painted(false));
     }
 
     #[test]
@@ -289,7 +354,7 @@ mod tests {
         help.set(true);
         help.paint(&mut frame, width, height, stride, &Text::default());
         let card_width = CARD_WIDTH;
-        let card_height = card_height();
+        let card_height = card_height(false);
         let left = width.saturating_sub(card_width) / 2;
         let top = height.saturating_sub(card_height) / 2;
         let mut painted = 0usize;
@@ -325,7 +390,8 @@ mod tests {
         help.set(true);
         help.paint(&mut frame, width, height, stride, &Text::default());
         let card_width = CARD_WIDTH.min(width.saturating_sub(CARD_PADDING.saturating_mul(2)));
-        let card_height = card_height().min(height.saturating_sub(CARD_PADDING.saturating_mul(2)));
+        let card_height =
+            card_height(false).min(height.saturating_sub(CARD_PADDING.saturating_mul(2)));
         let left = width.saturating_sub(card_width) / 2;
         let top = height.saturating_sub(card_height) / 2;
         for y in 0..height {

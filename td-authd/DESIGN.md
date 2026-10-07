@@ -1718,36 +1718,37 @@ staged into the target authority recipe.
 ## Login keys and session lock (target)
 
 Implemented, inert: the consent operations and step admission
-(amendments 3 and 4), and the worker supervision, requests and
-deadlines of amendments 2, 5 and 6 ("Login-key operation supervision"
-below). The paired compositor sends `1b` for a first enrollment and an
-addition, which a production build refuses as it refuses every login
-operation that may write, and an unlock's `1b` only from its lock
-surface while the state is enrolled (`td-compositor/DESIGN.md`, "The
-lock surface"), so nothing in production starts the worker but that
-unlock on a machine holding a record, which nothing in production
-writes. Its PIN field sends `1c` only after this supervisor's `91 0c`
-for a presented PIN step, which only that unlock reaches
-(`td-compositor/DESIGN.md`, "The PIN field"). Login state (1) is
-implemented and live: request `1a`, its cache and the `9a` answer,
-which the compositor asks at connect, uses for `D`'s key list and,
-since TOKEN-LOGIN.md increment 4's C7, locks on at every generation's
-start where it is enrolled or unavailable, drawing its names on the
-lock surface. No td-authd change was needed for that: the connect-time
-`1a` already preceded the compositor's first paint. Update consent (8)
-is implemented (C4) and live: on an enrolled or unavailable machine
-request 19 refuses a queued deployment that cannot read the record. No
-deployment carries the tier marker before TOKEN-LOGIN.md increment 4's
-C10b, so until then that is every
+(amendments 3 and 4), and the worker supervision, requests and deadlines
+of amendments 2, 5 and 6 ("Login-key operation supervision" below). The
+paired compositor sends `1b` for a first enrollment and an addition,
+which a production build refuses as it refuses every login operation
+that may write, and an unlock's `1b` only from its lock surface while
+the state is enrolled (`td-compositor/DESIGN.md`, "The lock surface"),
+so nothing in production starts the worker but that unlock on a machine
+holding a record, which nothing in production writes. Its PIN field
+sends `1c` only after this supervisor's `91 0c` for a presented PIN
+step, which only that unlock reaches (`td-compositor/DESIGN.md`, "The
+PIN field"). Login state (1) is implemented and live: request `1a`, its
+cache and the `9a` answer, which the compositor asks at connect, uses
+for `D`'s key list and, since TOKEN-LOGIN.md increment 4's C7, locks on
+at every generation's start where it is enrolled or unavailable, drawing
+its names on the lock surface, and since C9 reads to decide whether
+`Super+l` and the attention menu's `L` lock (enrolled or unavailable) or
+do nothing (unenrolled, where `L` shows `NO LOGIN KEYS ENROLLED`). No
+td-authd change was needed for either: the connect-time `1a` already
+preceded the compositor's first paint, and the later answers already
+reached it. Update consent (8) is implemented (C4) and live: on an
+enrolled or unavailable machine request 19 refuses a queued deployment
+that cannot read the record. No deployment carries the tier marker
+before TOKEN-LOGIN.md increment 4's C10b, so until then that is every
 queued deployment, which is moot since nothing enrolls before increment
 5. Revocation (7) is not implemented.
-[`td-login/TOKEN-LOGIN.md`](../td-login/TOKEN-LOGIN.md)
-owns the planned login-key tier. "Session lock" there is the compositor's
-display and input lock; it is unrelated to this document's secret-session
-statuses (idle, a released key, relocking), and unlocking the session
-neither releases nor clears an application-store key. td-authd's part
-amends the contracts above as follows; increment numbers are
-TOKEN-LOGIN.md's.
+[`td-login/TOKEN-LOGIN.md`](../td-login/TOKEN-LOGIN.md) owns the planned
+login-key tier. "Session lock" there is the compositor's display and
+input lock; it is unrelated to this document's secret-session statuses
+(idle, a released key, relocking), and unlocking the session neither
+releases nor clears an application-store key. td-authd's part amends the
+contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
 
 1. **Login state (4).** Once Prepare has completed, and before the
    compositor admits any client or input, the compositor sends request

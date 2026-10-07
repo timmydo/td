@@ -2730,6 +2730,7 @@ impl Runtime {
 
     pub(crate) fn enable_attention(&mut self, enabled: bool) {
         self.attention_enabled = enabled;
+        self.scene.list_lock_binding(enabled);
     }
 
     pub(crate) fn attention_enabled(&self) -> bool {
@@ -2998,7 +2999,8 @@ impl Runtime {
     /// handle is read here, under the runtime's guard, so an answer stored
     /// after this read reaches `follow_login` after this paint, never
     /// before it. It comes before any input reader, overlay or client, so
-    /// the lock withdraws nothing. The one production lock.
+    /// the lock withdraws nothing. One of two production locks, beside the
+    /// live `lock_session` for `Super+l` and `L`.
     pub(crate) fn first_paint(
         &mut self,
         connected: Option<&crate::authority::Answer>,
@@ -3031,26 +3033,40 @@ impl Runtime {
         Ok(())
     }
 
-    /// The lock surface's live entry, and only tests reach it until
-    /// TOKEN-LOGIN.md increment 4's C9 adds `Super+l` and `L`, which lock
-    /// an open attention lifetime too. Like opening attention it closes
-    /// the overlays, withdraws focus and grabs, and paints the whole
-    /// output, answering with that paint.
-    #[cfg(test)]
-    pub(crate) fn lock_session(&mut self) -> Result<NoticePresentation, String> {
-        if !self.attention_enabled || self.scene.attention_visible() {
-            return Err("the lock surface needs the paired profile, attention closed".into());
+    /// The lock surface's live entry, reached only through the evdev
+    /// adapter's `lock_session` (`Super+l` and the attention menu's `L`).
+    /// An open attention lifetime must already be draining, as after
+    /// Escape: the lock lies beneath it, and closing it shows the lock
+    /// surface. Like opening attention it closes the overlays, withdraws
+    /// focus and grabs, and paints the whole output, answering with that
+    /// paint.
+    pub(crate) fn lock_session(
+        &mut self,
+        _origin: &crate::input::EvdevOrigin,
+    ) -> Result<NoticePresentation, String> {
+        if !self.attention_enabled
+            || (self.scene.attention_visible() && !self.scene.attention_draining())
+        {
+            return Err("the lock surface needs the paired profile, attention ended".into());
         }
-        let epoch = self.paints.checked_add(1).ok_or("paint epochs exhausted")?;
+        // Locked before anything that can fail, and every withdrawal is
+        // tried whatever failed before it: an error leaves the session
+        // locked with no client focused, never the desktop.
         self.scene.lock();
         self.owed_damage = Damage::Whole;
         self.cancel_drag_under_overlay();
-        let events = self.keyboard.suspend()?;
-        self.publish_keyboard(events)?;
-        self.refresh_focus()?;
-        self.repaint()?;
+        let epoch = self.paints.checked_add(1).ok_or("paint epochs exhausted");
+        let suspended = match self.keyboard.suspend() {
+            Ok(events) => self.publish_keyboard(events),
+            Err(error) => Err(error),
+        };
+        let focused = self.refresh_focus();
+        let painted = self.repaint();
+        suspended?;
+        focused?;
+        painted?;
         Ok(NoticePresentation {
-            epoch,
+            epoch: epoch?,
             clock: Arc::clone(&self.presented),
         })
     }

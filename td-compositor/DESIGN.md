@@ -505,7 +505,12 @@ binding is ONE chord on `Super`:
   `Control+p`, or Down and Up, move its selection; Enter activates it;
   Escape and `Control+g` close it. ASCII letters, digits, space, and hyphen
   filter its registry, and Backspace edits that filter. A left press on a
-  row activates that row, and one off the card closes it.
+  row activates that row, and one off the card closes it;
+- `Super+l` locks the session, in the paired profile alone and only
+  while the login state is enrolled or unavailable ("Session lock and
+  login-key entry", item 5). It is always consumed there, so no client
+  sees it, and the sheet lists it only there; the direct profile leaves
+  it the client's.
 
 Shift is read only where the list says so: `Super+Shift+f` is fullscreen and
 `Ctrl+Super+t` is a terminal, since the letter chords and the launcher one
@@ -514,7 +519,9 @@ modifier onto should do what it says rather than nothing — and it matches
 how the workspace and arrow bindings already treated Control and Alt. An
 overlay outranks all of it: while one is up it owns every non-modifier key,
 so `Super+t` behind it neither starts a second terminal nor types `t` into
-the query. The launcher outranks the sheet in turn, so the two can never
+the query. The paired profile's `Super+l` alone is read before either
+overlay's capture, so a lock is never swallowed by one; locking closes
+both. The launcher outranks the sheet in turn, so the two can never
 both be up: `Scene::set_help` REFUSES to raise the sheet while the launcher
 is visible. That refusal is the invariant, not the fact that `/` is no
 character the launcher accepts — the dispatch already cannot ask for it, so
@@ -5673,8 +5680,9 @@ these respects.
 A fresh physical U selects primary unlock, R recovery unlock, E enrollment
 with a second recovery token, X explicit unrecoverability, and W the ready
 credential write queued through `td-secret set`; I selects a queued system
-installation, and K opens the key-management screen ("Login-key
-operations" below). Only one operation is selected per successfully
+installation, K opens the key-management screen ("Login-key
+operations" below), and L locks the session ("Session lock and
+login-key entry" below, item 5). Only one operation is selected per successfully
 opened and closed attention lifetime. Held keys, repeats and a second
 device pressing an already-held logical key cannot select an operation; a key held only by
 a security key's own keyboard does not count as held (below). Ordinary
@@ -6140,16 +6148,30 @@ production's `Scene::unlock` only clears it. A source pin holds what the
 compiler cannot: `Scene::lock` is the one write of `true`, `Scene::new`
 starts unlocked, nothing borrows the state mutably, and every other
 write of a `locked` field in any source writes `false`; `Scene::lock`
-has two callers, `first_paint` under that condition and the test-only
-`Runtime::lock_session`, whose caller, the evdev adapter's
-`lock_session`, is test-only too; and `first_paint` has the one caller
-above. Those live entries are C9's, for `Super+l` and `L` (item 5
-below). They go through the input bindings, need the paired profile and
-refuse while attention is up; item 5 supersedes the last limit for a lid
-close or resume during an open lifetime. Like opening attention they
-close the launcher and sheet, and their key capture in the bindings with
-them, cancel a drag, withdraw keyboard focus and grabs, and paint the
-whole output, answering with that paint's `NoticePresentation`.
+has two callers, `first_paint` under that condition and the live
+`Runtime::lock_session` (C9), which needs the paired profile and any
+attention lifetime already draining; its one caller is the evdev
+target, with the adapter's origin witness, reached only from the evdev
+adapter's `lock_session`, which needs the paired profile and is reached
+only from the key decision the bindings make for `Super+l` and the
+menu's `L` (item 5 below); and `first_paint` has the one caller above.
+The adapter's entry ends an open attention lifetime first through the
+target's drain, Escape's, so before an operation's commit its attempt
+is cancelled, after it the screen drains and shows no result, and a
+login unlock's lifetime stays locked; attention then closes onto the
+lock surface once held input is released. Neither entry lets a failure
+undo the lock: the adapter's locks even when the drain's paint failed,
+and the runtime's sets the lock state before anything that can fail and
+then tries every withdrawal whatever failed before it, so an error
+reaches the input reader, whose cleanup closes attention, only with the
+session locked and no client focused. A lock also clears a
+draining unlock's success notice, so `SESSION UNLOCKED` never shows over
+a relocked session. Like opening attention the
+entries close the launcher and sheet, and their key capture in the
+bindings with them, cancel a drag, withdraw keyboard focus and grabs,
+and paint the whole output, answering with that paint's
+`NoticePresentation`: while a draining attention screen still covers
+the lock, that paint is the attention screen's.
 
 While locked the scene's private screen is the lock surface, beneath
 any attention screen: display rendering alone draws it, in the
@@ -6241,7 +6263,18 @@ places and a 63-byte hostname's wrap at 1280x800, 800x600 and 320x200;
 the rows following later answers, never locking or unlocking; the
 chord on each unavailable cause, its rows and nothing sent, then its
 unlock once the state reads enrolled; a state turned unenrolled while
-locked; and the pin. The desktop guest is increment 4's
+locked; and the pin. Host tests of the live entries (C9) cover `Super+l`
+on each state, with no answer, from either Super and in the direct
+profile; its precedence over the open sheet and launcher, through the
+device dispatcher, and that no client receives its `l`; the menu's `L`
+on each state, and its refusal on the key-management screen, after the
+lifetime's operation, in the lock surface's unlock and from a security
+key's own keyboard; `Super+l` read as the menu's `L` and locking nothing
+once an operation is chosen; a lock before an unlock's commit, which
+cancels it, and after it with a key held, which drains under Escape's
+screen and leaves root's success unshown and the session locked; the
+adapter's entry refusing the direct profile; and the sheet's row in the
+paired profile alone. The desktop guest is increment 4's
 `login-desktop`; no oracle on the stock, unenrolled image reaches the
 locked path.
 
@@ -6250,8 +6283,8 @@ locked path.
 Partly implemented: items 1 to 4 are "Login-key operations" above, and
 item 5's lock surface and unlock are "The lock surface" above, and its
 `1a` requests, its connect-time lock, the rows and the chord's rule
-(TOKEN-LOGIN.md increment 4's C7), and request 19's refusal text are
-implemented.
+(TOKEN-LOGIN.md increment 4's C7), `Super+l`, `L` and a lock during an
+open lifetime (C9), and request 19's refusal text are implemented.
 [td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier, including when the session locks and what
 clients receive while locked ("Session lock"). The rules in this section
@@ -6291,8 +6324,9 @@ excluded from every selection, confirmation and field below.
    attention lifetime, are TOKEN-LOGIN.md's ("Session lock"); the lock
    surface and its unlock are implemented ("The lock surface" above),
    and a lock is complete only when its own paint has a presentation
-   receipt under the rules below. Still to come are its entry points,
-   all in the paired profile only:
+   receipt under the rules below. Its entry points, all in the paired
+   profile only, are implemented but for a lid close and a resume
+   (items 6 and 7):
    - **The state at connect.** `Launcher::connect` sends `1a` right
      after Prepare's answer, before the first repaint, and an enrolled
      or unavailable answer locks then. It sends `1a` again after every
@@ -6311,8 +6345,9 @@ excluded from every selection, confirmation and field below.
      generation's first paint is the production lock entry ("The lock
      surface" above), and the source pin there names its one caller.
      `Scene::lock` lost its test-only gate; the live entries above it
-     lose theirs with the triggers below, which the pin then names, and
-     no other. Every generation therefore starts locked when the state
+     lost theirs with `Super+l` and `L` (C9), which the pin now names
+     beside the first paint, and no other. Every generation therefore
+     starts locked when the state
      is enrolled or unavailable. A `1a` answer never locks an unlocked
      session (TOKEN-LOGIN.md, "Session lock").
    - **Rows.** Implemented (C7). Above the state's rows the lock surface
@@ -6325,29 +6360,46 @@ excluded from every selection, confirmation and field below.
      to break at (a 63-byte name on 800x600, 62 columns, is two rows
      from 176, and on 320x200, 45 columns, two rows from 0); every other
      row fits 45 columns whole. The attention screen's rows do not move.
-   - **`Super+l`** joins the binding list, and the help sheet's row, in
-     the paired profile only. It is checked before the launcher's and
-     help sheet's key capture, so it closes either and locks; always
-     consumed, reaching no client, it locks an enrolled or unavailable
-     session and does nothing on an unenrolled one. The direct
-     development profile leaves `Super+l` unchanged.
-   - **`L`.** Only the attention menu grows: `L: LOCK SCREEN` sits
-     below `K`, and the menu's last row, `ESC TO RETURN`, moves down one
-     (on 1280x800 `L` at 528 and `ESC TO RETURN` at 564). Every other
-     attention screen keeps its rows, its last at 528, and the rows the
-     boot oracles read (276, 312, 456) do not move. The nine-row menu is
-     302 pixels tall at double scale and holds its top at 276 on an
-     output 800 pixels tall or taller; `rows_top`'s fit rule moves it up
-     on a shorter one. Read under the menu's rules, `L` is the
-     lifetime's one selection: it closes attention into the lock, or on
-     an unenrolled account shows `NO LOGIN KEYS ENROLLED`.
+   - **`Super+l`.** Implemented (C9). It joins the binding list, and
+     the help sheet's row (`SUPER+L`, `LOCK SCREEN`, below the other
+     chords), in the paired profile only. It is checked before the
+     launcher's and help sheet's key capture, so it closes either and
+     locks; always consumed, press and release, reaching no client, it
+     locks while the last `1a` answer is enrolled or unavailable and
+     does nothing while it is unenrolled, an open overlay included. On
+     the lock surface it is consumed and the session stays locked. While
+     attention is up the attention screen reads every key, so it is no
+     binding there: on the menu, under the menu's rules, it is `L`, and
+     once the lifetime's operation is chosen it selects nothing. The
+     direct development profile leaves `Super+l` unchanged, the
+     client's, and its sheet does not list it.
+   - **`L`.** Implemented (C9). Only the attention menu grows: `L: LOCK
+     SCREEN` sits below `K`, and the menu's last row, `ESC TO RETURN`,
+     moves down one (on 1280x800 `L` at 528 and `ESC TO RETURN` at
+     564). Every other attention screen keeps its rows, its last at 528,
+     and the rows the boot oracles read (276, 312, 456) do not move. The
+     nine-row menu is 302 pixels tall at double scale and keeps the
+     menu's long-standing top, 276 on 1280x800 and 176 on 800x600;
+     `rows_top`'s fit rule moves it up only on an output too short for
+     that, as 320x200, where it starts at 0. Read under the menu's
+     rules, `L` is the lifetime's one selection, never on the
+     key-management screen, after another selection, in the lock
+     surface's unlock or from a security key's own keyboard: while the
+     last `1a` answer is enrolled or unavailable it ends attention into
+     the lock, draining under Escape's screen until held keys are
+     released, with nothing sent to root; unenrolled it shows `NO LOGIN
+     KEYS ENROLLED`, sends nothing and selects nothing more.
    - **On the lock surface** the chord sends no `1b` unless the state
      is enrolled: unavailable shows its cause's rows, and unenrolled
      `NO LOGIN KEYS ENROLLED`, until Escape. Implemented (C7).
    - **A lock during an open lifetime** is TOKEN-LOGIN.md's: a
      pre-commit cancellation (`15`), a drain without the result after a
-     commit, or Escape within a login unlock. C9 implements it for
-     `Super+l` and `L`, and C10 for a lid close and a resume.
+     commit, or Escape within a login unlock. Implemented (C9) in the
+     evdev adapter's entry, which ends the lifetime through Escape's
+     drain and locks whether or not that drain's paint succeeded ("The
+     lock surface" above). `L` reaches it with no operation chosen, and
+     `Super+l` while attention is up only as the menu's `L`; C10's lid
+     close and resume are what reach it with one open.
    - **Request 19's refusal.** Implemented (increment 4's C4): `99 01`,
      answered to the installation review's `19` before any description,
      shows `UPDATE CANNOT READ LOGIN KEYS` on the attention screen, as
@@ -6394,9 +6446,9 @@ excluded from every selection, confirmation and field below.
    than about three seconds are certain to be detected; TOKEN-LOGIN.md
    discloses that limit.
 
-Only the generation's first paint locks in the current profile, and only
-on an enrolled or unavailable state, so only a login unlock on a machine
-holding a record reaches the PIN field.
+Only the generation's first paint, `Super+l` and the menu's `L` lock in
+the current profile, each only on an enrolled or unavailable state, so
+only a login unlock on a machine holding a record reaches the PIN field.
 
 ### Immutable prompt presentation
 

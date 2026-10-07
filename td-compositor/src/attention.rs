@@ -453,7 +453,10 @@ fn draw_rows(
     }
 }
 
-/// The title and the menu's rows: the last row is drawn below them.
+/// Every screen's rows are padded to the title and six more, and its last
+/// row is drawn below them: where the menu's was before `L`. The menu, a
+/// row longer, draws its last row one lower (td-compositor/DESIGN.md,
+/// "Session lock and login-key entry", item 5).
 const MENU_ROWS: usize = 7;
 
 /// The first row's top for rows `block` pixels tall, the last row's foot
@@ -499,8 +502,8 @@ fn wrap(text: &str, columns: usize) -> Vec<String> {
     rows
 }
 
-/// A notice's rows below the title. The menu's rows are fixed in place, and
-/// `K` comes below `I`, so the boot oracles' rows do not move.
+/// A notice's rows below the title. The menu's rows are fixed in place, `K`
+/// comes below `I` and `L` below `K`, so the boot oracles' rows do not move.
 fn notice_rows(notice: Notice) -> Vec<String> {
     let first = match notice {
         Notice::Menu => "U: UNLOCK  R: RECOVERY TOKEN",
@@ -545,6 +548,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
             "W: REVIEW PENDING CREDENTIAL WRITE",
             "I: REVIEW PENDING SYSTEM INSTALLATION",
             "K: LOGIN KEYS",
+            "L: LOCK SCREEN",
         ],
         Notice::LoginKeys => &[
             "1: ENROLL ONE KEY",
@@ -734,60 +738,76 @@ mod tests {
     }
 
     /// The menu's rows where the update and setup oracles read them on a
-    /// 1280x800 output, as at HEAD: the title at 276, the selections from
-    /// 312 and `I` at 456, 36 apart; `K` below `I`, and the last row below
-    /// that.
+    /// 1280x800 output, as before `L`: the title at 276, the selections
+    /// from 312 and `I` at 456, 36 apart; `K` below `I`, `L` below `K` at
+    /// 528, and the last row, which every other screen keeps at 528, one
+    /// lower at 564. On 800x600 the nine rows start at 176, and on 320x200,
+    /// at single scale, the fit rule moves them up to 0.
     #[test]
-    fn the_menu_keeps_its_rows_and_adds_k_below_i() {
-        let (width, height, stride) = (1280, 800, 1280 * 4);
-        let mut painted = vec![0; stride * height];
-        paint(
-            &mut painted,
-            width,
-            height,
-            stride,
-            false,
-            false,
-            Notice::Menu,
-        );
-        let mut expected = vec![0; stride * height];
-        let bounds = (0, 0, width, height);
-        ui::fill(
-            &mut expected,
-            width,
-            height,
-            stride,
-            bounds,
-            [0x28, 0x20, 0x18, 0],
-        );
-        for (top, text) in [
-            (276, "TD SECURE ATTENTION"),
-            (312, "U: UNLOCK  R: RECOVERY TOKEN"),
-            (348, "E: ENROLL TWO TOKENS (HAVE BOTH READY)"),
-            (384, "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL"),
-            (420, "W: REVIEW PENDING CREDENTIAL WRITE"),
-            (456, "I: REVIEW PENDING SYSTEM INSTALLATION"),
-            (492, "K: LOGIN KEYS"),
-            (528, "ESC TO RETURN"),
-        ] {
-            ui::draw_text_clipped(
+    fn the_menu_keeps_its_rows_and_adds_k_and_l_below_i() {
+        const MENU: &[&str] = &[
+            "TD SECURE ATTENTION",
+            "U: UNLOCK  R: RECOVERY TOKEN",
+            "E: ENROLL TWO TOKENS (HAVE BOTH READY)",
+            "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL",
+            "W: REVIEW PENDING CREDENTIAL WRITE",
+            "I: REVIEW PENDING SYSTEM INSTALLATION",
+            "K: LOGIN KEYS",
+            "L: LOCK SCREEN",
+            "ESC TO RETURN",
+        ];
+        for (width, height, top, scale) in
+            [(1280, 800, 276, 2), (800, 600, 176, 2), (320, 200, 0, 1)]
+        {
+            let stride = width * 4;
+            let mut painted = vec![0; stride * height];
+            paint(
+                &mut painted,
+                width,
+                height,
+                stride,
+                false,
+                false,
+                Notice::Menu,
+            );
+            let mut expected = vec![0; stride * height];
+            let bounds = (0, 0, width, height);
+            ui::fill(
                 &mut expected,
                 width,
                 height,
                 stride,
-                24,
-                top,
-                2,
-                text,
-                [0xff, 0xff, 0xff, 0],
                 bounds,
+                [0x28, 0x20, 0x18, 0],
             );
+            for (index, text) in MENU.iter().enumerate() {
+                ui::draw_text_clipped(
+                    &mut expected,
+                    width,
+                    height,
+                    stride,
+                    24,
+                    top + index * 18 * scale,
+                    scale,
+                    text,
+                    [0xff, 0xff, 0xff, 0],
+                    bounds,
+                );
+            }
+            assert!(painted == expected, "{width}x{height}");
         }
-        assert!(painted == expected);
+        // Nine doubled rows, the last row's foot included, are 302 tall
+        // and keep their top on 800 and 600 lines; on 200 single rows fit
+        // only from the top.
+        assert_eq!(rows_top(800, 8 * 36 + 14), 276);
+        assert_eq!(rows_top(600, 8 * 36 + 14), 176);
+        assert_eq!(rows_top(200, 8 * 18 + 7), 0);
     }
 
     /// HEAD's painter, before narrow outputs: every row doubled, 36 apart
     /// from `(height - 248) / 2`, padded to seven rows and then the last.
+    /// The menu, eight rows since `L`, has no padding, so only its last row
+    /// moves.
     fn unchanged(width: usize, height: usize, draining: bool, notice: Notice) -> Vec<u8> {
         let stride = width * 4;
         let mut frame = vec![0; stride * height];
@@ -806,7 +826,9 @@ mod tests {
         } else {
             rows.extend(notice_rows(notice));
         }
-        rows.resize(MENU_ROWS, String::new());
+        if rows.len() < 7 {
+            rows.resize(7, String::new());
+        }
         rows.push(
             if draining {
                 "RELEASE KEYS AND BUTTONS"
@@ -834,8 +856,10 @@ mod tests {
     }
 
     /// Every screen on every common output, where the old layout fits, is
-    /// drawn exactly as at HEAD, so the boot oracles' rows do not move: at
-    /// 1280x800 the title stays at 276, the notice at 312 and `I` at 456.
+    /// drawn exactly as at HEAD but for the menu's `L` and the last row
+    /// below it, so the boot oracles' rows do not move: at 1280x800 the
+    /// title stays at 276, the notice at 312 and `I` at 456, and every
+    /// other screen's last row at 528.
     #[test]
     fn rows_do_not_move_where_the_old_layout_fits() {
         for (width, height) in [

@@ -15,7 +15,8 @@ key list of td-authd's `1a` answer, each of which a production td-authd
 refuses before starting anything; without a list it refuses removal
 itself. Only its lock surface's chord sends an unlock's `1b`, and only
 while the state is enrolled; production locks only at a generation's
-start (increment 4's C7, below). Its PIN field sends `1c` only when
+start, on `Super+l` and on the attention menu's `L` (increment 4's C7
+and C9, below). Its PIN field sends `1c` only when
 root asks for a PIN at a presented PIN step, which only that unlock
 reaches. So nothing in production starts the worker or uses its
 `login_record` and `login_store` modules ("The login record"), its login
@@ -46,7 +47,7 @@ reached only by that unlock, and so has the lock surface with its login
 unlock ("Session lock"), which C7 made live. Increment 3 is complete; its
 desktop guest moved to increment 4 as `login-desktop`. Increment 4 is
 specified as twelve commits, C1 to C11 and C10b ("Increments"), of which
-C1 to C8 have landed: firstboot ensures the login directory at every
+C1 to C9 have landed: firstboot ensures the login directory at every
 boot, the live medium's included, through the shared login-state
 predicate, and rootcheck reports it on a marker of its own; td-authd
 answers request `1a` with the login state, through that predicate and
@@ -70,10 +71,15 @@ its first frame is the lock surface, with the answer's hostname and
 username above the state's rows, and on it the chord sends an unlock's
 `1b` only while the state is enrolled. The `login-desktop` guest shows
 that start and the unlock through the production authority and worker
-in QEMU ("Evidence"). Nothing else locks yet: `Super+l`,
-`L`, a lid close and a resume come with C9 and C10. Those three refusals
-and the locked start are all that act on the state, and only where a
-record or an invalid directory exists. Nothing else below is
+in QEMU ("Evidence"). `Super+l` and the attention menu's `L` lock an
+enrolled or unavailable session too, and a lock while an attention
+lifetime is open ends it as Escape does ("Session lock"); a lid close
+and a resume come with C10. Those three refusals, the locked start and
+those two locks are all that act on the state, and only where a record
+or an invalid directory exists, but for increment 4's live exceptions
+("Increments"): on every paired machine `Super+l` is consumed and the
+menu shows `L`, which answers `NO LOGIN KEYS ENROLLED` while
+unenrolled. Nothing else below is
 implemented. Until the increments at the end land, `THREAT-MODEL.md` §3
 is the complete current behaviour: the installed account logs in
 automatically, and a machine with neither a record nor an invalid
@@ -633,7 +639,8 @@ Locking closes overlays, withdraws focus and grabs, and paints the lock
 surface over the whole output. Until that paint has a presentation
 receipt, no client receives input. A lock that comes while an attention
 lifetime is open, from a lid close or a resume (the attention screen
-suppresses `Super+l`, and `L` is itself the lifetime's selection), ends
+reads `Super+l` as its own key, on the menu as `L`, and `L` is itself
+the lifetime's selection, which drains as Escape's does), ends
 that lifetime first. Before its operation's commit it cancels the
 operation under the existing pre-commit cancellation rules. After the
 commit the screen drains as Escape's does and the result is not shown:
@@ -1440,8 +1447,26 @@ and the oracle that shows it.
      --case login-desktop` runs alone, whose host answers the display
      checks the guest asks for over ttyS0 (`td-secret/DESIGN.md`,
      "Login desktop guest").
-   - C9: `Super+l`, the attention screen's `L`, locking an open lifetime
-     ("Session lock") and the help sheet's row.
+   - C9, landed: `Super+l`, the attention screen's `L`, locking an open
+     lifetime ("Session lock") and the help sheet's row
+     (`td-compositor/DESIGN.md`, item 5). The runtime's and the evdev
+     adapter's live entries lost their test-only gates, and the amended
+     source pin holds that they, beside the first paint, are the only
+     production locks: the adapter's entry needs the paired profile and is
+     reached only from the bindings' decision for `Super+l` and `L`.
+     `Super+l` is read before the sheet's and launcher's capture, always
+     consumed, and locks only an enrolled or unavailable session; the
+     direct profile leaves it the client's. `L: LOCK SCREEN` sits below
+     `K` on the menu alone, where the menu's last row moves to 564 on
+     1280x800 and every other screen's stays at 528. A lock while a
+     lifetime is open ends it through Escape's drain. Host tests cover
+     `Super+l` on each state and profile, under the sheet and launcher
+     and through the device dispatcher; `L` on each state, its refusal
+     elsewhere than the menu and from a security key's own keyboard; a
+     lock before and after an unlock's commit, with a key held; the
+     menu's rows at 1280x800, 800x600 and 320x200; the sheet's row in
+     the paired profile alone; and the pin. `qemu-login-system` (C11)
+     drives `Super+l` and `L` on a full system.
    - C10: lid-switch (`SW_LID`) and resume-gap detection.
    - C10b, "login: deployments carry the tier marker": the system
      recipe writes the marker, listing the build's `READS`, into the
