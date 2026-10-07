@@ -52,7 +52,7 @@ use std::os::unix::fs::{symlink, DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -434,6 +434,25 @@ const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 const CAP: usize = 256 * 1024;
 /// How long a marker kill waits for an empty side channel to fill.
 const SIDE_CHANNEL_GRACE: Duration = Duration::from_secs(10);
+/// How long a display lost after the guest's last screen, once the
+/// guest's persistent shutdown marker is seen, waits for QEMU's own exit
+/// to account for it.
+const SCREEN_EXIT_GRACE: Duration = Duration::from_secs(5);
+
+/// Whether QEMU exits on its own within `grace`; with none, whether it
+/// already has.
+fn exits_within(child: &mut Child, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => return false,
+        }
+    }
+}
 
 /// Per-poll read budget. Bounds the inner drain loop so the outer deadline check
 /// runs regularly even if qemu writes ttyS0 as fast as we read it.
@@ -3714,6 +3733,9 @@ enum SigningIdentity {
 pub(crate) struct RunTrust {
     signing: SigningIdentity,
     public: [u8; 32],
+    /// The builder that maps a throwaway volume seed's owner to guest root,
+    /// as an installation's is mapped; none records the host owner.
+    root_owner: Option<PathBuf>,
 }
 
 impl RunTrust {
@@ -3729,6 +3751,18 @@ impl RunTrust {
         Ok(Self {
             signing: SigningIdentity::Throwaway(seed),
             public,
+            root_owner: None,
+        })
+    }
+
+    /// `generate`, its volumes' files guest root's: mkfs runs beneath
+    /// `builder userns-private`, as an installation's does, so a guest
+    /// reader that requires root's files, as the login worker's retained
+    /// deployment read does, accepts them.
+    pub(crate) fn generate_root_owned(builder: PathBuf) -> Result<Self, String> {
+        Ok(Self {
+            root_owner: Some(builder),
+            ..Self::generate()?
         })
     }
 
@@ -3760,6 +3794,7 @@ impl RunTrust {
                 builder,
             },
             public,
+            root_owner: None,
         })
     }
 
@@ -3797,9 +3832,10 @@ impl RunTrust {
     }
 
     fn mkfs_command(&self, mkfs: &Path) -> Command {
-        match &self.signing {
-            SigningIdentity::Throwaway(_) => Command::new(mkfs),
-            SigningIdentity::Installation { builder, .. } => {
+        match (&self.signing, &self.root_owner) {
+            (SigningIdentity::Throwaway(_), None) => Command::new(mkfs),
+            (SigningIdentity::Throwaway(_), Some(builder))
+            | (SigningIdentity::Installation { builder, .. }, _) => {
                 // mkfs records numeric owners. Map the private seed's owner to
                 // guest root without host privilege or a first-boot chown.
                 let mut command = Command::new(builder);
@@ -4773,6 +4809,13 @@ enum BootSource<'a> {
         kernel: &'a Path,
         initramfs: &'a Path,
     },
+    /// A direct boot on a q35 machine whose ACPI offers suspend to RAM
+    /// (`ICH9-LPC.disable_s3=0`), for a guest that QMP `system_wakeup`
+    /// wakes.
+    Suspendable {
+        kernel: &'a Path,
+        initramfs: &'a Path,
+    },
     Firmware {
         code: &'a Path,
         vars: &'a Path,
@@ -5075,7 +5118,7 @@ fn boot_source(
     let mut cmd = Command::new(qemu);
     let q35 = matches!(
         source,
-        BootSource::Firmware { .. } | BootSource::LiveSetup { .. }
+        BootSource::Firmware { .. } | BootSource::LiveSetup { .. } | BootSource::Suspendable { .. }
     );
     cmd.args([
         "-M",
@@ -5146,6 +5189,14 @@ fn boot_source(
                 .arg("-initrd")
                 .arg(initramfs)
                 .args(["-append", &append]);
+        }
+        BootSource::Suspendable { kernel, initramfs } => {
+            cmd.arg("-kernel")
+                .arg(kernel)
+                .arg("-initrd")
+                .arg(initramfs)
+                .args(["-append", &append])
+                .args(["-global", "ICH9-LPC.disable_s3=0"]);
         }
         BootSource::Firmware { code, vars, .. } => {
             cmd.arg("-drive").arg(efi::pflash_arg(code, 0, true));
@@ -5446,7 +5497,22 @@ fn boot_source(
             ));
         }
         if let (Some(steps), Some(port)) = (screens.as_mut(), serial_port.as_mut()) {
-            if let Err(error) = steps.poll(port, &buf) {
+            // A capture lost after the guest's last request is QEMU's own
+            // exit when QEMU has already exited, or, once the guest's
+            // persistent shutdown marker is on the console, when it exits
+            // within the grace; the exit is judged below like any other.
+            let grace = if evidence.shutdown {
+                SCREEN_EXIT_GRACE
+            } else {
+                Duration::ZERO
+            };
+            if let Err(error) = steps.poll(port, &buf).or_else(|error| {
+                if steps.lost_after_last() && exits_within(&mut child, grace) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }) {
                 let _ = child.kill();
                 let _ = child.wait();
                 let console = String::from_utf8_lossy(&buf);
@@ -8876,6 +8942,7 @@ mod tests {
                 builder: dir.join("builder"),
             },
             public: [3; 32],
+            root_owner: None,
         };
         let seed = dir.join("installed");
         trust.stage_installation_identity(&seed).unwrap();
@@ -13304,6 +13371,7 @@ mod tests {
             screens: &[],
             order: &[],
             keep: None,
+            wake: None,
         };
         let check = |_: &[u8]| Ok(true);
         let shell: [serial_shell::ShellStep; 0] = [];

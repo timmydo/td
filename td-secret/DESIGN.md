@@ -2831,3 +2831,137 @@ passing summary, fixture success line, failure line or panic. The keys,
 root and presence are the fixtures above; this proves crash consistency
 of the store's own writes on Btrfs in a guest, not firstboot's
 temporary cleanup, which td-firstboot's host tests cover.
+
+### Login system guest
+
+`qemu-login-system` is TOKEN-LOGIN.md increment 4's C11: the login tier
+on the full system, with no TPM. `td-recipe-eval qemu-login-system`
+builds `system-secret-vm-test`, the production system image with the
+secret fixture's unit and test binaries, and boots it sixteen times in
+order on one disposable volume, each boot naming its phase as
+`td.login-system=PHASE` beside `td.hid-fixture=1`; the fixture init
+requires exactly one listed phase and runs the one ignored test,
+`qemu_login_system_locks_unlocks_and_refuses_on_a_full_system` in
+`login_system_vm.rs`, beneath the stock supervisor, then asks td-svc to
+reboot through the unchanged persistent shutdown, which ends QEMU under
+`-no-reboot`: QEMU's S3 wake resets the q35 chipset, after which the
+guest's ACPI soft-off no longer powers the machine down. It runs by hand,
+on KVM only, and is in neither `check` nor `check integration`. Every
+boot is the stock firstboot, serial greeter, sshd, boot health, seat,
+compositor, td-authd, terminal and the rest of the unit table; the test
+adds a UHID keyboard before the seat starts, which the fixture unit's
+readiness gates, and UHID keys.
+
+The volume is made as the boot oracles make theirs, with a throwaway
+signing identity, but mkfs runs beneath `td-builder userns-private`, as
+an installation's does, so its files are guest root's. That is what the
+worker's production read of the retained deployments needs: `Volume`
+with owner 0 over `/run/td-volume/td` gives this build's version only
+because the current deployment's files are root's, and the guest shows
+that the same read with another owner gives none. The machine is a
+direct-boot q35 with `ICH9-LPC.disable_s3=0`, so its ACPI offers S3.
+
+The host checks the display as for login-desktop (`guest_screens.rs`),
+with its `blank`, `blank-unlocked`, `pin`, `touch`, `unlocked` and
+`desktop` and these: the lock surfaces carry the image's
+hostname, `TD`, and each unavailable cause; the attention menu's rows;
+`UPDATE CANNOT READ LOGIN KEYS`; the trusted installation prompt for a
+named deployment, whose ID must be the booted manifest's as the host
+computes it; `release`, the touch request the guest names last before
+it completes the touch; `killed`, the lock palette or QEMU's inactive
+output once a compositor is killed; and `asleep`, the desktop the guest
+suspends from. Every hold of a lock screen admits the lock palette and
+QEMU's own frame for no scanout, black with its grey "Display output is
+not active." in the 16-pixel row from 384 within 128 pixels of the
+centre, which shows between a compositor's exit and its successor's
+first frame. Both touch requests hold that, and so does `killed`, until
+its successor's lock surface. After `asleep` is answered the host waits
+for QEMU to report the guest suspended, keeps it so for 10 seconds and
+sends `system_wakeup`. From the suspension to the end of the boot every
+capture must be what a lock screen's hold admits, but for the capture
+taken while it slept, which is admitted only until the first capture
+after the wake that differs from it, so the desktop cannot return; and
+QEMU's inactive output must show at least once after the wake, so the
+dead card is observed, not assumed. Every enrolled or unavailable
+boot waits for the serial greeter's td-login to hold ttyS0 before it
+asks for a screen, since its getty flushes the line's input first.
+
+| Phase | The boot |
+| --- | --- |
+| `seed` | unenrolled, with `inspect-login` failing: once the serial greeter has logged in it is stopped, so no shell reads ttyS0, then `blank-unlocked`, holding no lock pixel, and `desktop`; the ordinary SSH form, root's loopback key admitted; then two persistent keys enrolled through the worker with the production retained read, the first alone and the second added across a gated swap, and the record copied aside |
+| `locked` | locked from the first frame and still locked once the terminal is ready; boot health completes and the enforced SSH form refuses root and admits the primary; unlocks with each key, relocks by `Super+l` and by the menu's `L`; three queued updates; a killed compositor; the pair restarted with the helper failing; an unlock; last, suspend to RAM |
+| `damaged-CAUSE` | locked with the cause's rows; the chord shows them and no login worker lives for a second after it or after Escape, nor is one started at all; enforced SSH; then the documented recovery |
+| `repaired-CAUSE` | locked as enrolled, the record the copy; enforced SSH; then the next cause's damage, if any |
+
+The causes, each made at the end of the boot before: the login
+directory mode 0755, owned by the account, or replaced by a file; the
+record mode 0644, given a second link, truncated by a byte, or of an
+unknown version. Each is repaired as TOKEN-LOGIN.md's "Recovery" says:
+the directory restored as root:root mode 0700 with the record copy, the
+mode restored, the second link removed, or the record replaced by its
+copy.
+
+Each unlock is the chord, the PIN step empty and with four masks,
+Enter, the touch request with exactly one `login-operation` worker
+alive under td-authd and the key waiting for its touch, the touch
+request again with that worker still alive and the key still waiting,
+and `release`; only then does the guest complete the held touch, so the
+unlock cannot commit while the host holds lock pixels; then the
+client's window and the desktop, the key's retries back at eight. The
+killed compositor's step asks for `killed` as soon as the kill is sent.
+The updates are
+queued as the primary account with `td-authd request-update` over a
+source directory it owns: a deployment whose initramfs carries no
+marker and one whose marker lists another version are refused at the
+menu's `I` with `UPDATE CANNOT READ LOGIN KEYS`, and a copy of the
+booted deployment, whose C10b marker the guest reads first, reaches
+its prompt, which Escape cancels. `Super+l` follows a Caps Lock, since
+the unlock's close discards the keyboard's first fresh report.
+
+A recorder, a shell wrapper bind-mounted over the `td-secret` binary,
+appends each run's verb to a log and runs a copy of the binary; td-authd
+starts its login worker and its state helper through that path, so a
+worker however short-lived is in the log. A failing recorder also fails
+`inspect-login`. Each damaged boot's chord and Escape run under a
+recorder, which logs no worker. With a failing one the restarted pair
+locks with `STATE COULD NOT BE READ`, whose chord starts no worker,
+live or logged, while the log shows the polled helper; once it is
+unmounted the compositor's polling shows the enrolled lock surface. On
+`seed` a failing recorder logs no helper run but its own check: an
+unenrolled machine never runs the helper.
+
+The suspend spends the unlock's discarded report with a Caps Lock,
+mounts a recorder, selects `deep` sleep and writes `mem` to
+`/sys/power/state` from the unlocked desktop with the second key
+plugged, no worker live or logged; the kernel's count of successful
+suspensions and an uptime gap of at least 8 seconds confirm the sleep.
+The chord is sent as soon as the write returns, whole in one report
+(Ctrl, Alt and Escape, so one evdev frame, its modifiers before the
+key), and that report is the keyboard's first input after the wake. It
+starts exactly one
+logged and live `login-operation` worker under td-authd, an unlock's
+`1b`, which the chord sends only on a locked session (on the unlocked
+desktop it opens the menu), and the compositor and authority are the
+ones from before the suspend: the session was locked when the first
+post-wake input was routed, in the same generation. Escape then ends
+the worker. The lock surface itself cannot be seen: the wake resets the
+virtio-gpu card and Linux 7.1.4's driver has no freeze or restore, so
+the card stays dead and QEMU shows its inactive output, which the host
+requires. The suspend is the boot's last step, since the display does
+not return.
+
+The host requires, for each boot, the phase's pass line, QEMU's exit
+after the persistent shutdown marker (a capture lost after the last
+screen is forgiven only when QEMU has already exited, or exits within
+5 seconds once that marker is on the console), the selected current
+deployment, boot health's success marker, rootcheck's login directory
+marker except on a damaged directory's boots, and the serial greeter's
+exact refusal line once with no greeting on every boot but `seed`,
+whose greeter logs in. This proves the tier's locked boot, unlocks,
+relocks and refusals on the full system in QEMU. It does not show
+`Super+l` or `L` on an unavailable session, or request 19's admission
+while the state could not be read. The keys and keyboard are UHID
+fixtures, presence is scripted and enrollment's root is simulated; QEMU
+has no lid, its S3 is not a laptop's and leaves no display to see the
+resume's lock on, and there is no physical-presence, USB, firmware or
+YubiKey claim.

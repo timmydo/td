@@ -2223,3 +2223,9 @@ fn qemu_login_record_survives_power_cuts_inside_its_writes() -> Result<(), Strin
     applet(&["umount", "/var"]);
     Ok(())
 }
+
+/// qemu-login-system, the full-system guest (td-secret/DESIGN.md, "Login
+/// system guest"), which shares these helpers.
+mod system {
+    include!("login_system_vm.rs");
+}

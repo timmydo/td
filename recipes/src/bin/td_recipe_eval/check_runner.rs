@@ -785,6 +785,22 @@ pub fn qemu_secret_system_cli(args: &[String]) -> Result<(), String> {
     crate::checks::qemu_boot::secret::run_system(&runner, &tpm, powercuts)
 }
 
+/// The TPM-free login tier on the full test-only deployment, on KVM.
+pub fn qemu_login_system_cli(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: td-recipe-eval qemu-login-system".into());
+    }
+    let targets = crate::checks::qemu_boot::secret::SYSTEM_TARGETS;
+    crate::checks::accel::headless_from_env()?;
+    ensure_targets_provenance(targets)?;
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let name = scratch_name("qemu-login-system", targets);
+    let runner = RecipeCheckRunner::new(root, &name)?.with_streamed_progress();
+    warm_operator_inputs(&runner, targets);
+    let _lock = lock_ladder_for_run(&runner)?;
+    crate::checks::qemu_boot::secret::login_system::run(&runner)
+}
+
 /// Host-side qemu boot validation (re #529). This is deliberately NOT a gated
 /// recipe check: booting the kernel requires HOST qemu, and the gate wraps
 /// every recipe check in a host-free `pivot_root` sandbox that exposes only
@@ -10296,6 +10312,7 @@ chmod 755 '{}'
             "qemu-install-system-system-x86-64-127470",
             "qemu-install-encrypted-system-x86-64-31642",
             "qemu-secret-system-system-secret-vm-test-8",
+            "qemu-login-system-system-secret-vm-test-10",
             "warm-codex-4243",
             "bundle-system-x86-64-77",
             "gc-store-901",
@@ -12467,6 +12484,7 @@ chmod 755 '{}'
             "qemu_install_system_cli",
             "qemu_secret_cli",
             "qemu_secret_system_cli",
+            "qemu_login_system_cli",
             "run_cli",
             // The integration tier's memo, which keeps a pass a host without
             // KVM will not boot.

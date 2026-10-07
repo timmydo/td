@@ -134,6 +134,9 @@ pub(crate) enum Presence {
     #[default]
     Granted,
     Delayed(Duration),
+    /// Pending until `Virtual::release_touch`, or refused as a timeout
+    /// after a minute.
+    Held,
     Denied,
     Timeout,
 }
@@ -207,12 +210,13 @@ struct Authenticator {
     frozen: Option<fn(&str)>,
 }
 
-/// Whether a scripted presence delay runs now, and how long all of them
-/// have taken, in microseconds.
+/// Whether a scripted presence delay runs now, how long all of them have
+/// taken, in microseconds, and whether a held one was released.
 #[derive(Default)]
 struct Touch {
     now: AtomicBool,
     total: AtomicU64,
+    released: AtomicBool,
 }
 
 /// One virtual key; `link` is the channel a Transaction owns and drops.
@@ -383,6 +387,11 @@ impl Virtual {
     /// How long the key's scripted presence delays have actually taken.
     pub(crate) fn touched(&self) -> Duration {
         Duration::from_micros(self.touch.total.load(Ordering::Acquire))
+    }
+
+    /// Completes a `Presence::Held` request: the touch.
+    pub(crate) fn release_touch(&self) {
+        self.touch.released.store(true, Ordering::Release);
     }
 }
 
@@ -696,6 +705,21 @@ impl Authenticator {
                 let started = std::time::Instant::now();
                 self.touch.now.store(true, Ordering::Release);
                 std::thread::sleep(delay);
+                self.touch.now.store(false, Ordering::Release);
+                let took = u64::try_from(started.elapsed().as_micros()).unwrap();
+                self.touch.total.fetch_add(took, Ordering::AcqRel);
+                Ok(())
+            }
+            Presence::Held => {
+                let started = std::time::Instant::now();
+                self.touch.now.store(true, Ordering::Release);
+                while !self.touch.released.swap(false, Ordering::AcqRel) {
+                    if started.elapsed() >= Duration::from_secs(60) {
+                        self.touch.now.store(false, Ordering::Release);
+                        return Err(USER_ACTION_TIMEOUT);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 self.touch.now.store(false, Ordering::Release);
                 let took = u64::try_from(started.elapsed().as_micros()).unwrap();
                 self.touch.total.fetch_add(took, Ordering::AcqRel);
@@ -2604,6 +2628,25 @@ mod tests {
         let started = Instant::now();
         assert!(login(&key, &created, PIN, &mut Vec::new()).is_ok());
         assert!(started.elapsed() >= delay);
+        // A held touch waits for its release, and a release is used once.
+        key.script(Script {
+            presence: Presence::Held,
+            ..Script::default()
+        });
+        let releaser = key.clone();
+        let touched = key.touched();
+        let held = std::thread::spawn(move || {
+            while !releaser.touching() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(delay);
+            assert!(releaser.touching());
+            releaser.release_touch();
+        });
+        assert!(login(&key, &created, PIN, &mut Vec::new()).is_ok());
+        held.join().unwrap();
+        assert!(!key.touching());
+        assert!(key.touched() >= touched + delay);
 
         // A wrong secret still verifies its signature; the record refuses it.
         let output: [u8; 32] = created.output().bytes().try_into().unwrap();

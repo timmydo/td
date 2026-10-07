@@ -46,8 +46,8 @@ The PIN field has landed as well ("PIN entry, presence and retries"),
 reached only by that unlock, and so has the lock surface with its login
 unlock ("Session lock"), which C7 made live. Increment 3 is complete;
 its desktop guest moved to increment 4 as `login-desktop`. Increment 4
-is specified as twelve commits, C1 to C11 and C10b ("Increments"), of
-which C1 to C10 and C10b have landed: firstboot ensures the login
+is specified as twelve commits, C1 to C11 and C10b ("Increments"), all
+of which have landed, so increment 4 is complete: firstboot ensures the login
 directory at every boot, the live medium's included, through the shared
 login-state predicate, and rootcheck reports it on a marker of its own;
 td-authd answers request `1a` with the login state, through that
@@ -76,6 +76,14 @@ that start and the unlock through the production authority and worker in
 QEMU ("Evidence"). `Super+l`, the attention menu's `L`, a lid close and
 a resume lock an enrolled or unavailable session too, and a lock while
 an attention lifetime is open ends it as Escape does ("Session lock").
+The `qemu-login-system` guest shows on the full system image the three
+refusals, the locked start, and an enrolled session's `Super+l`, `L` and
+killed-compositor locks. It does not show a lid, `Super+l` or `L` on an
+unavailable session, or request 19's admission while the state could
+not be read; and after QEMU's S3, whose wake leaves the virtio-gpu card
+dead, it shows only that the session was locked when the first
+post-wake input was routed, in the same generation, not the lock
+surface ("Evidence").
 Those three refusals, the locked start and those four locks are all that
 act on the state, and only where a record or an invalid directory
 exists, but for increment 4's live exceptions ("Increments"): on every
@@ -1583,9 +1591,18 @@ and the oracle that shows it.
      deployment that carries the marker. Every deployment ID changes,
      since the initramfs does, so its landing runs `check integration`
      by hand.
-   - C11: the `qemu-login-system` guest (below), which depends on
-     C10b's marked deployments: they are what its install and refusal
-     cases tell apart.
+   - C11, landed, completing increment 4: the `qemu-login-system`
+     guest (below; `td-secret/DESIGN.md`, "Login system guest"), which
+     depends on C10b's marked deployments: they are what its install
+     and refusal cases tell apart. `td-recipe-eval qemu-login-system`
+     boots the test-only system image once per phase on one disposable
+     volume whose files are guest root's, as an installation's are, so
+     the worker's production read of the retained deployments' markers
+     sees this build's version. It changes no production behaviour:
+     the guest, its host oracle, a direct q35 boot with S3 for it, and
+     in the test-only image the fixture unit's longer readiness bound
+     and a reboot, not a power off, to end these boots, since the q35
+     chipset QEMU resets at the wake no longer powers down.
 
    C7 lands only after the update-consent refusal (C4), the console
    refusal (C5) and the enforced SSH render (C6), so no build locks the
@@ -1620,8 +1637,15 @@ and the oracle that shows it.
      unlocks; `Super+l` and `L`, unlock, relock after killing the
      compositor; suspend to RAM in a q35 machine with S3 enabled
      (`ICH9-LPC.disable_s3=0`), held suspended at least 10 seconds and
-     woken over QMP `system_wakeup`, whose first routed input after resume
-     reaches the lock surface and no client; the unavailable state, with
+     woken over QMP `system_wakeup`, whose first post-wake input, the
+     chord, in one HID report, starts the boot's one login worker since
+     before the suspend under the same compositor and authority, which
+     the chord does only on a locked session: the session was locked
+     when the first post-wake input was routed, in the same generation.
+     After the display's first change following the wake it shows only
+     lock pixels or QEMU's inactive output, which it must show: Linux 7.1.4's virtio-gpu has no freeze or restore, so
+     the card the wake resets stays dead and the lock surface itself is
+     not seen; the unavailable state, with
      its screen text and the enforced SSH form, for a wrong-mode,
      wrong-owner and non-directory `/var/lib/td/login` and for a record
      with the wrong mode, two links, truncated bytes or an unknown version,
@@ -1630,7 +1654,11 @@ and the oracle that shows it.
      image that boots unlocked with the ordinary SSH policy, and a seeded
      record that shows `STATE COULD NOT BE READ` and resolves to enrolled
      once the helper answers; refusal to install a marker-less deployment
-     and a marked deployment that does not read the record's version.
+     and a marked deployment that does not read the record's version,
+     and admission of a copy of the booted, C10b-marked deployment to
+     its prompt, which is cancelled. The could-not-be-read case restarts
+     the enrolled boot's pair with the helper failing, rather than
+     booting with it.
    - Both guests run by hand, on KVM only, in neither `check` nor
      `check integration`.
    - Compositor input tests replay recorded `SW_LID` events and clock gaps

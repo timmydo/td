@@ -1212,10 +1212,15 @@ pub(super) fn menu_pixels_match(pixels: &[u8]) -> Result<bool> {
 }
 
 fn prompt_matches(bytes: &[u8], id: &str) -> Result<bool> {
+    prompt_pixels_match(ppm(bytes)?, id)
+}
+
+/// Whether a capture's pixels are the trusted installation prompt for
+/// deployment `id`.
+pub(super) fn prompt_pixels_match(pixels: &[u8], id: &str) -> Result<bool> {
     if !canonical_id(id) {
         return Err("invalid expected deployment ID".into());
     }
-    let pixels = ppm(bytes)?;
     // Eight rows including the variable countdown, 32px glyphs + 8px gaps.
     // Check every static row independently of the compositor's text builder.
     for (row, text) in [

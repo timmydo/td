@@ -1,6 +1,6 @@
 use crate::types::{Recipe, Step};
 
-const SERVICE: &str = "\n[secret-fixture]\ntype=daemon\nexec=/bin/secret-vm-init --system\nafter=td-firstboot\nrequires=td-firstboot\nready=/bin/td-util test -f /run/td-secret-system-input-ready\nready-timeout=30\nrestart=never\nlog=/run/td-secret-system.log\nconsole=yes\n";
+const SERVICE: &str = "\n[secret-fixture]\ntype=daemon\nexec=/bin/secret-vm-init --system\nafter=td-firstboot\nrequires=td-firstboot\nready=/bin/td-util test -f /run/td-secret-system-input-ready\nready-timeout=120\nrestart=never\nlog=/run/td-secret-system.log\nconsole=yes\n";
 
 pub fn recipe() -> Recipe {
     let mut recipe = super::system_x86_64::recipe();

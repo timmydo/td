@@ -236,6 +236,102 @@ pub fn system_phase(cmdline: &str) -> Result<&str, String> {
     Ok(phase)
 }
 
+/// qemu-login-system (td-secret/DESIGN.md, "Login system guest"): the
+/// full-system TPM-free login guest, its one test booted once per phase,
+/// in this order, on one disposable volume beneath the stock supervisor.
+pub const LOGIN_SYSTEM_TEST: &str =
+    "login_operation::tests::vm::system::qemu_login_system_locks_unlocks_and_refuses_on_a_full_system";
+pub const LOGIN_SYSTEM_PASS: &str = "TD-LOGIN-SYSTEM-PASS";
+/// `seed` enrolls; `locked` is the enrolled machine's boot and its
+/// relocks; each damage named after `damaged-` boots unavailable and is
+/// repaired, and the `repaired-` boot after it is an enrolled one again.
+pub const LOGIN_SYSTEM_PHASES: &[&str] = &[
+    "seed",
+    "locked",
+    "damaged-directory-mode",
+    "repaired-directory-mode",
+    "damaged-directory-owner",
+    "repaired-directory-owner",
+    "damaged-directory-file",
+    "repaired-directory-file",
+    "damaged-record-mode",
+    "repaired-record-mode",
+    "damaged-record-links",
+    "repaired-record-links",
+    "damaged-record-truncated",
+    "repaired-record-truncated",
+    "damaged-record-version",
+    "repaired-record-version",
+];
+/// The stock image's hostname, which its lock surface shows.
+pub const LOGIN_SYSTEM_HOST: &str = "td";
+/// The serial greeter's one refusal line (td-login/THREAT-MODEL.md §3).
+pub const CONSOLE_REFUSED: &str =
+    "td-login: login keys enrolled or unavailable; console login refused";
+/// One unlock as the guest asks the host to see it: the PIN step empty and
+/// with four masks, the touch request around the worker's check and again
+/// once it is known alive, the touch request once more just before the
+/// guest completes the touch, the client's window, and the desktop.
+const UNLOCK: &[&str] = &[
+    "pin", "pin", "touch", "touch", "release", "unlocked", "desktop",
+];
+
+/// The screens each phase asks for, in order. `seed` boots unlocked from
+/// the blank to the desktop, once its serial greeter has logged in and
+/// been stopped so that no shell reads the answers. `locked` starts
+/// locked under a client, then unlocks, relocks with `Super+l`, unlocks,
+/// relocks with `L`, unlocks, queues three updates, relocks by a killed
+/// compositor, restarts the pair with the state helper failing until it
+/// answers again, unlocks, and last suspends to RAM, after which its
+/// virtio-gpu card shows nothing more.
+pub fn login_system_screens(phase: &str) -> Vec<&'static str> {
+    let mut screens = Vec::new();
+    if phase == "seed" {
+        screens.extend(["blank-unlocked", "desktop"]);
+    } else if phase == "locked" {
+        screens.extend(["blank", "locked", "locked"]);
+        screens.extend(UNLOCK);
+        screens.push("locked");
+        screens.extend(UNLOCK);
+        screens.extend(["menu", "locked"]);
+        screens.extend(UNLOCK);
+        for _ in 0..2 {
+            screens.extend(["menu", "update-refused", "desktop"]);
+        }
+        screens.extend(["menu", "install", "desktop", "killed", "locked"]);
+        screens.extend([
+            "locked-unreadable",
+            "unreadable",
+            "locked-unreadable",
+            "locked",
+        ]);
+        screens.extend(UNLOCK);
+        screens.push("asleep");
+    } else if phase.starts_with("damaged-directory-") {
+        screens.extend(["blank", "locked-damaged", "damaged", "locked-damaged"]);
+    } else if phase.starts_with("damaged-record-") {
+        screens.extend(["blank", "locked-record", "record", "locked-record"]);
+    } else if phase.starts_with("repaired-") {
+        screens.extend(["blank", "locked"]);
+    }
+    screens
+}
+
+/// The one login system phase the command line names.
+pub fn login_system_phase(cmdline: &str) -> Result<&str, String> {
+    let mut phases = cmdline
+        .split_ascii_whitespace()
+        .filter_map(|token| token.strip_prefix("td.login-system="));
+    let phase = phases
+        .next()
+        .filter(|phase| LOGIN_SYSTEM_PHASES.contains(phase))
+        .ok_or("unknown or missing login system phase")?;
+    if phases.next().is_some() {
+        return Err("duplicate login system phase".into());
+    }
+    Ok(phase)
+}
+
 pub const PASS: &str = "TD-SECRET-VM-PASS";
 pub const FAIL: &str = "TD-SECRET-VM-FAIL";
 
@@ -337,8 +433,14 @@ fn system() -> Result<(), String> {
     let cmdline =
         fs::read_to_string("/proc/cmdline").map_err(|e| format!("read command line: {e}"))?;
     let tokens: Vec<_> = cmdline.split_ascii_whitespace().collect();
+    // Exactly one of the image's two guests: the secret store's or the
+    // login keys'.
+    let (test, pass) = match (system_phase(&cmdline), login_system_phase(&cmdline)) {
+        (Ok(_), Err(_)) => (SYSTEM_TEST, SYSTEM_PASS.to_string()),
+        (Err(_), Ok(phase)) => (LOGIN_SYSTEM_TEST, format!("{LOGIN_SYSTEM_PASS} {phase}")),
+        _ => return Err("system secret fixture was not explicitly selected".into()),
+    };
     if !tokens.contains(&"td.hid-fixture=1")
-        || system_phase(&cmdline).is_err()
         || fs::read("/case").map_err(|e| format!("read image fixture marker: {e}"))?
             != b"fido-system"
     {
@@ -352,7 +454,7 @@ fn system() -> Result<(), String> {
     let status = Command::new("/bin/td-secret-tests")
         .args([
             "--exact",
-            SYSTEM_TEST,
+            test,
             "--ignored",
             "--test-threads=1",
             "--nocapture",
@@ -374,7 +476,7 @@ fn system() -> Result<(), String> {
             "system secret test failed or exceeded its log ceiling: {status}"
         ));
     }
-    println!("{SYSTEM_PASS}");
+    println!("{pass}");
     Ok(())
 }
 
@@ -383,7 +485,14 @@ fn main() -> std::process::ExitCode {
         if let Err(error) = system() {
             eprintln!("{FAIL}: {error}");
         }
-        match Command::new("/bin/td-svc").arg("poweroff").status() {
+        // QEMU's S3 wake resets the q35 chipset, after which the guest's
+        // ACPI soft-off no longer powers it down; a reset still ends the
+        // login system's boots under -no-reboot.
+        let end = match fs::read_to_string("/proc/cmdline") {
+            Ok(cmdline) if login_system_phase(&cmdline).is_ok() => "reboot",
+            _ => "poweroff",
+        };
+        match Command::new("/bin/td-svc").arg(end).status() {
             Ok(status) if status.success() => return std::process::ExitCode::SUCCESS,
             result => {
                 eprintln!("{FAIL}: system shutdown: {result:?}");

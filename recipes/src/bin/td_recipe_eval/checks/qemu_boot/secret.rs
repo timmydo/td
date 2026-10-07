@@ -5,6 +5,7 @@ use td_engine::cpio::{self, Entry, Kind};
 #[path = "../../../../fixtures/secret_vm.rs"]
 #[allow(dead_code)]
 mod fixture;
+pub(crate) mod login_system;
 
 pub(crate) const TARGETS: &[&str] = &[
     "linux-x86-64",
@@ -345,6 +346,7 @@ pub(crate) fn run(
         screens: &screens,
         order: fixture::LOGIN_DESKTOP_SCREENS,
         keep: Some(&keep),
+        wake: None,
     };
     for ((name, test), is_tpm) in cases {
         let emulator = match (is_tpm, tpm, tpm_scratch.as_ref()) {
@@ -710,7 +712,12 @@ fn chrome(pixels: &[u8], rows: &[(usize, String)]) -> Result<bool, String> {
 /// The lock surface: the hostname, the username, `LOCKED` and the state's
 /// rows (td-login/TOKEN-LOGIN.md, "Session lock").
 fn lock_surface(state: &[&str]) -> Vec<(usize, String)> {
-    [fixture::LOGIN_DESKTOP_HOST, "tester", "locked"]
+    lock_surface_on(fixture::LOGIN_DESKTOP_HOST, state)
+}
+
+/// `lock_surface` on a machine named `host`.
+fn lock_surface_on(host: &str, state: &[&str]) -> Vec<(usize, String)> {
+    [host, "tester", "locked"]
         .into_iter()
         .chain(state.iter().copied())
         .enumerate()
@@ -1495,7 +1502,7 @@ mod tests {
 
     /// Chrome rows drawn from the compositor's own 5x7 glyphs, doubled
     /// from 24 pixels in, on the attention ground.
-    fn chrome_frame(rows: &[(usize, &str)]) -> Vec<u8> {
+    pub(super) fn chrome_frame(rows: &[(usize, &str)]) -> Vec<u8> {
         let chrome = include_str!("../../../../../../td-compositor/src/ui.rs");
         let mut pixels = GROUND.repeat(1280 * 800);
         for (top, text) in rows {
