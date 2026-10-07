@@ -150,6 +150,15 @@ const STAGED_FILES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/src/channel.rs"),
     ),
     ("auth/sys.rs", include_str!("../../../td-authd/src/sys.rs")),
+    // `9a`'s admission: the primary name rule and the hostname rules.
+    (
+        "auth/primary_account.rs",
+        include_str!("../../../td-authd/src/primary_account.rs"),
+    ),
+    (
+        "auth/hostname.rs",
+        include_str!("../../../td-firstboot/src/hostname.rs"),
+    ),
     (
         "tests/channel.rs",
         include_str!("../../../td-authd/tests/channel.rs"),
@@ -373,7 +382,13 @@ mod tests {
             .iter()
             .find_map(|(name, source)| (*name == "authority").then_some(*source))
             .unwrap();
-        for path in ["auth/channel.rs", "auth/sys.rs", "auth/consent.rs"] {
+        for path in [
+            "auth/channel.rs",
+            "auth/sys.rs",
+            "auth/consent.rs",
+            "auth/primary_account.rs",
+            "auth/hostname.rs",
+        ] {
             assert!(authority.contains(&format!("path = {path:?}")));
         }
         let recipe = recipe();
@@ -389,6 +404,14 @@ mod tests {
             (
                 "{src}/auth/sys.rs",
                 include_str!("../../../td-authd/src/sys.rs"),
+            ),
+            (
+                "{src}/auth/primary_account.rs",
+                include_str!("../../../td-authd/src/primary_account.rs"),
+            ),
+            (
+                "{src}/auth/hostname.rs",
+                include_str!("../../../td-firstboot/src/hostname.rs"),
             ),
             (
                 "{src}/tests/channel.rs",

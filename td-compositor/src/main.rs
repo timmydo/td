@@ -1081,7 +1081,7 @@ mod confinement {
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0xc8f29575166fdb63;
+    const AUTHORITY_FINGERPRINT: u64 = 0x972a783de97247ae;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -1217,8 +1217,33 @@ mod confinement {
         assert!(AUTHORITY.starts_with("#![deny(unsafe_code)]"));
         assert_eq!(AUTHORITY.matches("mod channel;").count(), 1);
         assert_eq!(AUTHORITY.matches("mod sys;").count(), 1);
-        assert_eq!(AUTHORITY.matches("path =").count(), 6);
+        assert_eq!(AUTHORITY.matches("path =").count(), 10);
         assert_eq!(AUTHORITY.matches("mod consent;").count(), 1);
+        // `9a`'s admission rules: std-only, and neither one reaches the
+        // channel, a descriptor or a raw call.
+        for (name, source, pin) in [
+            (
+                "primary_account.rs",
+                include_str!("../../td-authd/src/primary_account.rs"),
+                0xe44c4437071a8ed4,
+            ),
+            (
+                "hostname.rs",
+                include_str!("../../td-firstboot/src/hostname.rs"),
+                0x49026f28c1db76ec,
+            ),
+        ] {
+            assert_eq!(
+                fingerprint(source),
+                pin,
+                "shared {name} changed: reconcile td-authd and this pin"
+            );
+            for forbidden in ["unsafe", "sys::", "channel", "from_raw_fd", "asm!"] {
+                assert!(!source.contains(forbidden), "{name}: {forbidden}");
+            }
+        }
+        assert_eq!(AUTHORITY.matches("mod primary_account;").count(), 1);
+        assert_eq!(AUTHORITY.matches("mod hostname;").count(), 1);
         assert_eq!(AUTH_SYS.matches("unsafe").count(), 4);
         assert_eq!(AUTH_SYS.matches("#[allow(unsafe_code)]").count(), 2);
         assert_eq!(AUTH_SYS.matches("const SYS_").count(), 4);

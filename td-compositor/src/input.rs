@@ -289,10 +289,10 @@ struct KeyBindings {
     /// That screen's latest paint: a choice on it waits until it is on
     /// glass, as a prompt's consent waits for its receipt.
     login_shown: Option<crate::runtime::NoticePresentation>,
-    /// The enrolled keys in canonical slot order, which removal digits name.
-    /// Request `1a` supplies them from TOKEN-LOGIN.md's increment 4; until
-    /// then nothing does, and `D` refuses locally.
-    enrolled: Option<Vec<crate::authority::consent::Fingerprint>>,
+    /// Root's last `1a` answer, which the authority worker keeps current:
+    /// an enrolled record's keys in canonical slot order, which removal
+    /// digits name, or why there are none.
+    login: crate::authority::Login,
     cutoff: Option<u128>,
     pressed: BTreeSet<(usize, u16)>,
     forwarded: BTreeSet<(usize, u16)>,
@@ -621,14 +621,31 @@ impl KeyBindings {
                 KEY_2 => Some(Selection::Login(LoginSelection::Enroll(2))),
                 KEY_A => Some(Selection::Login(LoginSelection::Add)),
                 KEY_D => {
-                    match self.enrolled.clone().and_then(Removal::new) {
+                    use crate::authority::LoginState;
+                    let state = self.login.state();
+                    let removal = match &state {
+                        Some(LoginState::Enrolled(keys)) => Removal::new(keys.clone()),
+                        _ => None,
+                    };
+                    match removal {
                         Some(removal) => {
                             decision.notice = Some(removal.shown());
                             self.login_screen = LoginScreen::Removing(removal);
                         }
-                        // No key list yet: refused here, and nothing is sent.
+                        // No key list: refused here with why, and nothing
+                        // is sent.
                         None => {
-                            decision.notice = Some(Notice::NotAvailable);
+                            let rows = match state {
+                                Some(LoginState::Unenrolled) => {
+                                    crate::secret_client::login_failure(0x09, 0)
+                                }
+                                Some(LoginState::Unavailable(cause)) => {
+                                    crate::secret_client::login_failure(cause, 0)
+                                }
+                                _ => None,
+                            };
+                            decision.notice =
+                                Some(rows.map_or(Notice::NotAvailable, Notice::Login));
                             self.secret_selected = true;
                         }
                     }
@@ -2995,9 +3012,14 @@ pub fn start(
     } else {
         BTreeSet::new()
     };
+    let login = match &launches {
+        LaunchBackend::Authority(authority) => authority.login(),
+        LaunchBackend::Direct(_) => crate::authority::Login::default(),
+    };
     let bindings = Arc::new(Mutex::new(KeyBindings {
         attention_enabled,
         attention_excluded,
+        login,
         ..KeyBindings::default()
     }));
     let target = Arc::new_cyclic(|own| {
@@ -8908,9 +8930,20 @@ mod tests {
     fn attention_bindings(enrolled: Option<Vec<[u8; 4]>>) -> Mutex<KeyBindings> {
         Mutex::new(KeyBindings {
             attention_enabled: true,
-            enrolled,
+            login: enrolled
+                .map_or_else(crate::authority::Login::default, |keys| login_answer(&keys)),
             ..KeyBindings::default()
         })
+    }
+
+    /// The login state of root's `9a` for `keys`, as the worker stores it.
+    fn login_answer(keys: &[[u8; 4]]) -> crate::authority::Login {
+        let mut answer = vec![0x9a, 1, keys.len() as u8];
+        answer.extend(keys.iter().flatten());
+        answer.extend_from_slice(b"\x06tester\x09td-laptop\x00");
+        let login = crate::authority::Login::default();
+        login.answer(&answer).unwrap();
+        login
     }
 
     const ENROLLED: [[u8; 4]; 3] = [[0xa1; 4], [0xa2; 4], [0xa3; 4]];
@@ -8985,18 +9018,92 @@ mod tests {
     #[test]
     fn removal_without_a_key_list_is_refused_locally_and_ends_the_choice() {
         use crate::attention::Notice;
+        let unavailable = |cause: &'static str| -> &'static [&'static str] {
+            match cause {
+                "directory" => &["LOGIN KEY STATE UNAVAILABLE:", "DIRECTORY DAMAGED"],
+                "record" => &["LOGIN KEY STATE UNAVAILABLE:", "RECORD DAMAGED"],
+                _ => &["LOGIN KEY STATE UNAVAILABLE:", "STATE COULD NOT BE READ"],
+            }
+        };
+        for (answer, shown) in [
+            // Unenrolled, and each cause of the unavailable state, as root
+            // answers them.
+            (
+                Some(&b"\x9a\x00\x06tester\x09td-laptop\x00"[..]),
+                Notice::Login(&["NO LOGIN KEYS ENROLLED"]),
+            ),
+            (
+                Some(&b"\x9a\x02\x0a\x06tester\x00\x00"[..]),
+                Notice::Login(unavailable("directory")),
+            ),
+            (
+                Some(&b"\x9a\x02\x0b\x06tester\x00\x00"[..]),
+                Notice::Login(unavailable("record")),
+            ),
+            (
+                Some(&b"\x9a\x02\x0c\x06tester\x00\x00"[..]),
+                Notice::Login(unavailable("unreadable")),
+            ),
+            // No answer: the direct profile, which has no authority.
+            (None, Notice::NotAvailable),
+        ] {
+            let target = Mutex::new(RecordingTarget::default());
+            let bindings = attention_bindings(None);
+            if let Some(answer) = answer {
+                bindings.lock().unwrap().login.answer(answer).unwrap();
+            }
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            read_reports(
+                &target,
+                &bindings,
+                0,
+                &presses(&[KEY_K, KEY_D, KEY_1, KEY_ENTER, KEY_A, KEY_2, KEY_U], 20),
+            );
+            let target = target.lock().unwrap();
+            assert_eq!(target.notices, [Notice::LoginKeys, shown]);
+            assert!(target.secret_roles.is_empty());
+        }
+    }
+
+    /// The list `D` numbers is whatever root last answered: an answer that
+    /// arrives once the bindings exist, as the worker's do, is the one used.
+    #[test]
+    fn removal_numbers_the_list_of_roots_latest_answer() {
+        use crate::attention::Notice;
+        use crate::authority::consent::Slot;
+        use crate::secret_client::{LoginSelection, Selection};
         let target = Mutex::new(RecordingTarget::default());
         let bindings = attention_bindings(None);
+        let login = bindings.lock().unwrap().login.clone();
+        login.answer(b"\x9a\x00\x06tester\x00\x00").unwrap();
+        // A later answer, taken by the worker's handle, is the one `D` reads.
+        let mut answer = vec![0x9a, 1, 2];
+        answer.extend_from_slice(&[0xb1; 4]);
+        answer.extend_from_slice(&[0xb2; 4]);
+        answer.extend_from_slice(b"\x06tester\x00\x00");
+        login.answer(&answer).unwrap();
         read_reports(&target, &bindings, 0, &chord_reports(10));
-        read_reports(
-            &target,
-            &bindings,
-            0,
-            &presses(&[KEY_K, KEY_D, KEY_1, KEY_ENTER, KEY_A, KEY_2, KEY_U], 20),
-        );
+        read_reports(&target, &bindings, 0, &presses(&[KEY_K, KEY_D, KEY_2], 20));
+        read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER], 40));
         let target = target.lock().unwrap();
-        assert_eq!(target.notices, [Notice::LoginKeys, Notice::NotAvailable]);
-        assert!(target.secret_roles.is_empty());
+        assert_eq!(
+            target.notices,
+            [
+                Notice::LoginKeys,
+                Notice::Removing { keys: 2, chosen: 0 },
+                Notice::Removing {
+                    keys: 2,
+                    chosen: 0b10
+                },
+            ]
+        );
+        assert_eq!(
+            target.secret_roles,
+            [Selection::Login(LoginSelection::Remove(vec![Slot {
+                position: 2,
+                key: [0xb2; 4],
+            }]))]
+        );
     }
 
     #[test]
@@ -9066,7 +9173,7 @@ mod tests {
         let bindings = Mutex::new(KeyBindings {
             attention_enabled: true,
             attention_excluded: BTreeSet::from([KEY]),
-            enrolled: Some(ENROLLED.to_vec()),
+            login: login_answer(&ENROLLED),
             ..KeyBindings::default()
         });
         read_reports(&target, &bindings, 0, &chord_reports(10));

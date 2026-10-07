@@ -15,18 +15,44 @@ pub(crate) mod consent;
 #[cfg_attr(not(feature = "target-recipe"), path = "../../td-authd/src/sys.rs")]
 #[cfg_attr(feature = "target-recipe", path = "auth/sys.rs")]
 mod sys;
+// `9a`'s names, admitted under the rules root sends them by.
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../td-firstboot/src/hostname.rs"
+)]
+#[cfg_attr(feature = "target-recipe", path = "auth/hostname.rs")]
+#[allow(
+    dead_code,
+    reason = "the parsed name's accessor is provisioning's until the lock surface draws it"
+)]
+mod hostname;
+#[cfg_attr(
+    not(feature = "target-recipe"),
+    path = "../../td-authd/src/primary_account.rs"
+)]
+#[cfg_attr(feature = "target-recipe", path = "auth/primary_account.rs")]
+#[allow(
+    dead_code,
+    reason = "only the name rule is the compositor's; the account database is td-authd's"
+)]
+mod primary_account;
 
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 const VERSION: &[u8] = b"TDLA003\n";
 const CAPACITY: usize = 16;
 const QUEUE_CAPACITY: usize = 1;
 const TICK: Duration = Duration::from_millis(250);
+/// How often `1a` is asked again while the state could not be read.
+const LOGIN_POLL: Duration = Duration::from_millis(250);
+/// TOKEN-LOGIN.md's failure kind for a state that could not be read.
+const UNREADABLE: u8 = 0x0c;
 
 enum Work {
     Program(Program),
@@ -36,6 +62,145 @@ enum Work {
 #[derive(Clone)]
 pub(crate) struct Launcher {
     send: SyncSender<Work>,
+    login: Login,
+}
+
+/// Root's last `1a` answer (td-authd/DESIGN.md, login-state amendment 1):
+/// TOKEN-LOGIN.md's login state, with an enrolled record's key list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LoginState {
+    Unenrolled,
+    /// One to eight fingerprints in canonical slot order.
+    Enrolled(Vec<consent::Fingerprint>),
+    /// The cause as its failure kind: `0a`, `0b` or `0c`.
+    Unavailable(u8),
+}
+
+impl LoginState {
+    /// Exactly `9a`'s shape, or a protocol violation that ends the paired
+    /// generation: a state, an enrolled list or a cause; a primary account
+    /// name; an empty hostname or one under td-firstboot's rules; and the
+    /// revocation byte, which is `00` until increment 5 defines another.
+    /// The names are checked and not kept: the lock surface draws them
+    /// from increment 4's C7.
+    fn decode(answer: &[u8]) -> Result<Self, String> {
+        let invalid = || "invalid login state answer".to_string();
+        let [0x9a, state, rest @ ..] = answer else {
+            return Err(invalid());
+        };
+        let (decoded, rest) = match (*state, rest) {
+            (0, rest) => (Self::Unenrolled, rest),
+            (1, [count, rest @ ..]) if (1..=consent::LOGIN_KEYS).contains(count) => {
+                let (keys, rest) = rest
+                    .split_at_checked(usize::from(*count) * 4)
+                    .ok_or_else(invalid)?;
+                let (keys, []) = keys.as_chunks::<4>() else {
+                    return Err(invalid());
+                };
+                (Self::Enrolled(keys.to_vec()), rest)
+            }
+            (2, [cause @ 0x0a..=0x0c, rest @ ..]) => (Self::Unavailable(*cause), rest),
+            _ => return Err(invalid()),
+        };
+        let [length, rest @ ..] = rest else {
+            return Err(invalid());
+        };
+        let (username, rest) = rest
+            .split_at_checked(usize::from(*length))
+            .ok_or_else(invalid)?;
+        let [length, rest @ ..] = rest else {
+            return Err(invalid());
+        };
+        let (host, rest) = rest
+            .split_at_checked(usize::from(*length))
+            .ok_or_else(invalid)?;
+        let username = std::str::from_utf8(username).map_err(|_| invalid())?;
+        let host = std::str::from_utf8(host).map_err(|_| invalid())?;
+        if rest != [0]
+            || primary_account::validate_name(username).is_err()
+            || !(host.is_empty() || hostname::Hostname::parse(host).is_ok())
+        {
+            return Err(invalid());
+        }
+        Ok(decoded)
+    }
+}
+
+/// The last `1a` answer, shared: the authority worker writes it and the
+/// input bindings read it, each holding nothing else while they do.
+#[derive(Clone, Default)]
+pub(crate) struct Login(Arc<Mutex<Option<LoginState>>>);
+
+impl Login {
+    /// The last answer's state; none before the first answer, and in the
+    /// direct profile, which has no authority.
+    pub(crate) fn state(&self) -> Option<LoginState> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set(&self, state: LoginState) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(state);
+    }
+
+    /// Takes `answer` as the worker takes root's.
+    #[cfg(test)]
+    pub(crate) fn answer(&self, answer: &[u8]) -> Result<(), String> {
+        self.set(LoginState::decode(answer)?);
+        Ok(())
+    }
+}
+
+/// When the worker asks `1a`: at connect, after every login operation's
+/// end, and every 250 ms while the state could not be read, so a transient
+/// helper failure resolves without a reboot.
+struct LoginPoll {
+    login: Login,
+    /// When to ask again; none unless the state could not be read.
+    next: Option<Instant>,
+}
+
+impl LoginPoll {
+    fn new(login: Login) -> Self {
+        Self { login, next: None }
+    }
+
+    fn read(&mut self, wire: &mut impl Exchange) -> Result<(), String> {
+        let state = LoginState::decode(&wire.exchange(&[0x1a])?)?;
+        self.next = if state == LoginState::Unavailable(UNREADABLE) {
+            Some(
+                Instant::now()
+                    .checked_add(LOGIN_POLL)
+                    .ok_or("login state poll overflow")?,
+            )
+        } else {
+            None
+        };
+        self.login.set(state);
+        Ok(())
+    }
+
+    /// After the secret client's tick: `1a` again when a login operation
+    /// ended in it, or when the poll is due.
+    fn follow(
+        &mut self,
+        wire: &mut impl Exchange,
+        secrets: &mut crate::secret_client::Client,
+    ) -> Result<(), String> {
+        if secrets.take_login_end() || self.next.is_some_and(|next| Instant::now() >= next) {
+            return self.read(wire);
+        }
+        Ok(())
+    }
+
+    /// How long the worker may wait for work before it is due.
+    fn wait(&self) -> Duration {
+        self.next.map_or(TICK, |next| {
+            next.saturating_duration_since(Instant::now()).min(TICK)
+        })
+    }
 }
 
 impl Launcher {
@@ -50,12 +215,13 @@ impl Launcher {
         if wire.receive().map_err(|e| e.to_string())? != [0x80] {
             return Err("program authority refused session admission".into());
         }
-        prepare_session(&mut wire)?;
+        let login = Login::default();
+        let poll = open_session(&mut wire, &login)?;
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("terminal-authority".into())
             .spawn(move || {
-                if let Err(error) = worker(wire, receive) {
+                if let Err(error) = worker(wire, receive, poll) {
                     let _ = writeln!(
                         std::io::stderr().lock(),
                         "td-compositor: program authority: {error}"
@@ -65,7 +231,12 @@ impl Launcher {
                 std::process::exit(1);
             })
             .map_err(|e| format!("start program authority worker: {e}"))?;
-        Ok(Self { send })
+        Ok(Self { send, login })
+    }
+
+    /// The login state root last answered, which the worker keeps current.
+    pub fn login(&self) -> Login {
+        self.login.clone()
     }
 
     pub fn unlock(
@@ -105,7 +276,8 @@ pub(crate) struct Queued(Receiver<Work>);
 impl Queued {
     pub(crate) fn launcher() -> (Launcher, Self) {
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
-        (Launcher { send }, Self(receive))
+        let login = Login::default();
+        (Launcher { send, login }, Self(receive))
     }
 
     pub(crate) fn attempt(&self) -> Option<std::sync::Arc<crate::secret_client::Attempt>> {
@@ -248,6 +420,15 @@ fn prepare_session(wire: &mut impl Exchange) -> Result<(), String> {
     }
 }
 
+/// Prepare, then the login state, both before the first repaint and any
+/// input admission.
+fn open_session(wire: &mut impl Exchange, login: &Login) -> Result<LoginPoll, String> {
+    prepare_session(wire)?;
+    let mut poll = LoginPoll::new(login.clone());
+    poll.read(wire)?;
+    Ok(poll)
+}
+
 struct Processes {
     handles: VecDeque<u64>,
     latest: u64,
@@ -322,11 +503,15 @@ impl Processes {
     }
 }
 
-fn worker(mut wire: impl Exchange, receive: Receiver<Work>) -> Result<(), String> {
+fn worker(
+    mut wire: impl Exchange,
+    receive: Receiver<Work>,
+    mut login: LoginPoll,
+) -> Result<(), String> {
     let mut processes = Processes::new();
     let mut secrets = crate::secret_client::Client::default();
     loop {
-        match receive.recv_timeout(TICK) {
+        match receive.recv_timeout(login.wait()) {
             Ok(Work::Secret(attempt)) => secrets.start(&mut wire, attempt)?,
             Ok(Work::Program(terminal)) => {
                 if let Some(error) = processes.start(&mut wire, terminal)? {
@@ -340,6 +525,7 @@ fn worker(mut wire: impl Exchange, receive: Receiver<Work>) -> Result<(), String
             let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
         }
         secrets.tick(&mut wire)?;
+        login.follow(&mut wire, &mut secrets)?;
     }
 }
 
@@ -396,6 +582,176 @@ mod tests {
                 1
             );
         }
+    }
+
+    /// `9a` for `state`, with a primary name and a hostname.
+    fn login_state(state: &[u8]) -> Vec<u8> {
+        [&[0x9a][..], state, b"\x06tester\x09td-laptop\x00"].concat()
+    }
+
+    fn keys(count: u8) -> Vec<u8> {
+        let mut bytes = vec![1, count];
+        for key in 1..=count {
+            bytes.extend_from_slice(&[key; 4]);
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_login_state_answer_has_exactly_one_shape() {
+        let decode = |bytes: &[u8]| LoginState::decode(bytes);
+        assert_eq!(decode(&login_state(&[0])), Ok(LoginState::Unenrolled));
+        for cause in [0x0a, 0x0b, 0x0c] {
+            assert_eq!(
+                decode(&login_state(&[2, cause])),
+                Ok(LoginState::Unavailable(cause))
+            );
+        }
+        for count in 1..=8 {
+            assert_eq!(
+                decode(&login_state(&keys(count))),
+                Ok(LoginState::Enrolled(
+                    (1..=count).map(|key| [key; 4]).collect()
+                ))
+            );
+        }
+        // Two keys may share a fingerprint; positions keep them apart.
+        assert_eq!(
+            decode(&login_state(&[&[1, 2][..], &[7; 8]].concat())),
+            Ok(LoginState::Enrolled(vec![[7; 4], [7; 4]]))
+        );
+        // The longest names, and no hostname at all.
+        let longest = [&[0x9a, 0, 32][..], &[b'a'; 32], &[63], &[b'h'; 63], &[0]].concat();
+        assert_eq!(decode(&longest), Ok(LoginState::Unenrolled));
+        assert_eq!(decode(b"\x9a\x00\x01a\x00\x00"), Ok(LoginState::Unenrolled));
+        let refused = [
+            vec![],
+            vec![0x9a],
+            vec![0x9b, 0],
+            login_state(&[3]),
+            // Enrolled with no keys, nine, or a list cut short or long.
+            login_state(&[1, 0]),
+            login_state(&keys(9)),
+            login_state(&[&[1, 2][..], &[7; 7]].concat()),
+            login_state(&[&[1, 1][..], &[7; 5]].concat()),
+            // A cause that is not the unavailable state's, or none.
+            login_state(&[2, 0x09]),
+            login_state(&[2, 0x0d]),
+            login_state(&[2]),
+            // A state byte with a stray byte after it.
+            login_state(&[0, 0]),
+            // Usernames: empty, too long, not a primary name, not UTF-8.
+            b"\x9a\x00\x00\x00\x00".to_vec(),
+            [&[0x9a, 0, 33][..], &[b'a'; 33], &[0, 0]].concat(),
+            b"\x9a\x00\x04Root\x00\x00".to_vec(),
+            b"\x9a\x00\x041abc\x00\x00".to_vec(),
+            b"\x9a\x00\x04a.bc\x00\x00".to_vec(),
+            b"\x9a\x00\x02a\xff\x00\x00".to_vec(),
+            // Hostnames: too long, against firstboot's rules, not UTF-8.
+            [&[0x9a, 0, 1, b'a', 64][..], &[b'h'; 64], &[0]].concat(),
+            b"\x9a\x00\x01a\x02TD\x00".to_vec(),
+            b"\x9a\x00\x01a\x05host-\x00".to_vec(),
+            b"\x9a\x00\x01a\x03a b\x00".to_vec(),
+            b"\x9a\x00\x01a\x03td\n\x00".to_vec(),
+            b"\x9a\x00\x01a\x02\xc3\xb6\x00".to_vec(),
+            // Lengths that overrun the answer.
+            b"\x9a\x00\x07tester".to_vec(),
+            b"\x9a\x00\x06tester\x09td".to_vec(),
+            // The revocation byte: missing, nonzero, or followed by more.
+            b"\x9a\x00\x06tester\x00".to_vec(),
+            b"\x9a\x00\x06tester\x00\x01".to_vec(),
+            b"\x9a\x00\x06tester\x00\x00\x00".to_vec(),
+        ];
+        for answer in refused {
+            assert!(decode(&answer).is_err(), "{answer:02x?}");
+        }
+    }
+
+    #[test]
+    fn connect_asks_the_login_state_once_prepared_and_refuses_a_malformed_one() {
+        let login = Login::default();
+        let mut pending = wire(vec![
+            vec![0x90],
+            vec![0x91, 1],
+            vec![0x91, 2],
+            login_state(&keys(2)),
+        ]);
+        let poll = open_session(&mut pending, &login).unwrap();
+        assert_eq!(
+            pending.requests,
+            [vec![0x10], vec![0x11], vec![0x11], vec![0x1a]]
+        );
+        assert_eq!(
+            login.state(),
+            Some(LoginState::Enrolled(vec![[1; 4], [2; 4]]))
+        );
+        assert!(poll.next.is_none());
+        // Nothing is asked before preparation completes.
+        let mut unprepared = wire(vec![vec![0x90], vec![0x91, 0]]);
+        assert!(open_session(&mut unprepared, &Login::default()).is_err());
+        assert!(!unprepared.requests.contains(&vec![0x1a]));
+        for answer in [
+            vec![0x9a],
+            [&login_state(&[0])[..login_state(&[0]).len() - 1], &[1]].concat(),
+            vec![0x91, 2],
+        ] {
+            let login = Login::default();
+            let mut refused = wire(vec![vec![0x90], vec![0x91, 2], answer]);
+            assert!(open_session(&mut refused, &login).is_err());
+            assert_eq!(login.state(), None);
+        }
+    }
+
+    #[test]
+    fn an_unreadable_state_is_asked_again_every_250_ms_until_it_resolves() {
+        let login = Login::default();
+        let mut poll = LoginPoll::new(login.clone());
+        let mut client = crate::secret_client::Client::default();
+        let mut w = wire(vec![login_state(&[2, UNREADABLE])]);
+        poll.read(&mut w).unwrap();
+        assert_eq!(login.state(), Some(LoginState::Unavailable(UNREADABLE)));
+        let due = poll.next.unwrap();
+        assert!(due > Instant::now() && due <= Instant::now() + LOGIN_POLL);
+        assert!(poll.wait() <= LOGIN_POLL);
+        // Not yet due: nothing is asked.
+        poll.follow(&mut w, &mut client).unwrap();
+        assert_eq!(w.requests.len(), 1);
+        // Due: asked again, still unreadable, and due again later.
+        poll.next = Some(Instant::now());
+        assert_eq!(poll.wait(), Duration::ZERO);
+        w.answers.push_back(login_state(&[2, UNREADABLE]));
+        poll.follow(&mut w, &mut client).unwrap();
+        assert_eq!(w.requests, [vec![0x1a], vec![0x1a]]);
+        assert!(poll.next.unwrap() > Instant::now());
+        // Resolved: no more polling.
+        poll.next = Some(Instant::now());
+        w.answers.push_back(login_state(&keys(1)));
+        poll.follow(&mut w, &mut client).unwrap();
+        assert_eq!(login.state(), Some(LoginState::Enrolled(vec![[1; 4]])));
+        assert_eq!(poll.next, None);
+        assert_eq!(poll.wait(), TICK);
+        poll.follow(&mut w, &mut client).unwrap();
+        assert_eq!(w.requests.len(), 3);
+        // Other unavailable causes are not transient: no polling.
+        for cause in [0x0a, 0x0b] {
+            w.answers.push_back(login_state(&[2, cause]));
+            poll.read(&mut w).unwrap();
+            assert_eq!(poll.next, None);
+        }
+    }
+
+    #[test]
+    fn the_login_state_is_asked_after_every_login_operation_ends() {
+        let login = Login::default();
+        let mut poll = LoginPoll::new(login.clone());
+        let mut w = wire(vec![login_state(&[0])]);
+        let mut ended = crate::secret_client::Client::with_login_ended();
+        poll.follow(&mut w, &mut ended).unwrap();
+        assert_eq!(w.requests, [vec![0x1a]]);
+        assert_eq!(login.state(), Some(LoginState::Unenrolled));
+        // Once only.
+        poll.follow(&mut w, &mut ended).unwrap();
+        assert_eq!(w.requests.len(), 1);
     }
 
     #[test]
@@ -558,14 +914,22 @@ mod tests {
         assert!(send.try_send(Work::Program(Program::Home)).is_ok());
         drop(send);
         let calls = std::rc::Rc::new(std::cell::Cell::new(0));
-        assert!(worker(Broken(calls.clone()), receive).is_err());
+        assert!(worker(
+            Broken(calls.clone()),
+            receive,
+            LoginPoll::new(Login::default())
+        )
+        .is_err());
         assert_eq!(calls.get(), 1);
     }
 
     #[test]
     fn launcher_queue_never_blocks_input_or_retries_a_delivered_request() {
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
-        let launcher = Launcher { send };
+        let launcher = Launcher {
+            send,
+            login: Login::default(),
+        };
         assert!(launcher.launch().is_ok());
         assert!(launcher.launch().is_err());
         assert!(matches!(

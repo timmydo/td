@@ -5888,16 +5888,18 @@ against its timestamp: where a paint presents synchronously (fbdev), a
 device secure attention reads, not an unseen screen.
 
 `D` needs the enrolled key list, which td-authd's `1a` answer supplies
-from TOKEN-LOGIN.md's increment 4 (`td-authd/DESIGN.md`, amendment 1).
-Until then the compositor has none, so `D` shows `NOT AVAILABLE IN THIS
-BUILD`, sends nothing and ends the choice. From increment 4 the list is
-the last `1a` answer's; without one `D` still sends nothing and ends the
-choice, showing `NO LOGIN KEYS ENROLLED` when that answer was
-unenrolled, or its cause's rows when unavailable. With a list, the
-screen shows `REMOVE: PRESS 1 TO N THEN ENTER` and the chosen positions;
-digit 1 to N toggles that position, and Enter selects the nonempty set
-in position order, each slot with its listed fingerprint. Tests supply a
-list.
+(`td-authd/DESIGN.md`, amendment 1; TOKEN-LOGIN.md increment 4's C3).
+The list is the last `1a` answer's, which the authority worker keeps in
+a handle the input bindings read when `D` is pressed; without one `D`
+sends nothing and ends the choice, showing `NO LOGIN KEYS ENROLLED` when
+that answer was unenrolled, or its cause's rows when unavailable, and
+`NOT AVAILABLE IN THIS BUILD` only with no answer at all, which the
+paired profile never has once connected. With a list, the screen shows
+`REMOVE: PRESS 1 TO N THEN ENTER` and the chosen positions; digit 1 to N
+toggles that position, and Enter selects the nonempty set in position
+order, each slot with its listed fingerprint. Root refuses the removal
+(`9b 00`) until TOKEN-LOGIN.md's increment 5. Device-dispatcher tests
+read lists and states through root's `9a` bytes.
 
 The private client sends the choice as `1b`: `07` unlock, `08 01` or
 `08 02` first enrollment, `09` addition, or `0a`, a count and that many
@@ -6207,7 +6209,8 @@ and out-of-order `06`s. The desktop guest is increment 4's
 ### Session lock and login-key entry (target)
 
 Partly implemented: items 1 to 4 are "Login-key operations" above, and
-item 5's lock surface and unlock are "The lock surface" above.
+item 5's lock surface and unlock are "The lock surface" above, and its
+`1a` requests (not yet its lock) are implemented.
 [td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier, including when the session locks and what
 clients receive while locked ("Session lock"). The rules in this section
@@ -6253,7 +6256,18 @@ excluded from every selection, confirmation and field below.
      after Prepare's answer, before the first repaint, and an enrolled
      or unavailable answer locks then. It sends `1a` again after every
      login operation's end and every 250 ms while the answer reads could
-     not be read. A production lock entry replaces the test-only one:
+     not be read. The requests and their polling are implemented
+     (increment 4's C3): the authority worker asks after the secret
+     client reports a login operation's end, whatever the end, and
+     waits for work no longer than the next poll; the answer feeds only
+     `D` until C7 locks on it. It admits exactly `9a`'s shape
+     (`td-authd/DESIGN.md`, "Login-key operation supervision"), with
+     the username under td-authd's `primary_account` rule and the
+     hostname empty or under td-firstboot's `Hostname::parse`, both
+     compiled from those files behind the `auth/` `cfg_attr` pair and
+     checked but not kept until C7 draws them; any other answer, a
+     nonzero revocation byte included, ends the paired generation. A
+     production lock entry replaces the test-only one:
      `Scene::lock` and the entries above it lose their test-only gate,
      and the source pin of "The lock surface" names their production
      callers, this connect-time lock and the triggers below, and no

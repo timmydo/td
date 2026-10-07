@@ -602,7 +602,9 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
             }
             Ok(value)
         };
-        // Same name grammar as td-authd terminal-serve; td-login refuses leading hyphens.
+        // Any launch-session account's name, which td-login refuses with a
+        // leading hyphen. td-authd terminal-serve, the only caller, names
+        // only the primary account, whose rule (a leading letter) is narrower.
         if user.is_empty()
             || user.starts_with('-')
             || user.len() > 32

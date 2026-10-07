@@ -43,19 +43,16 @@ impl Config {
                 compositor,
             });
         }
-        // Keep the named interface aligned with check-launch-session.
+        // The named account is the primary one, UID 1000, whose name request
+        // `1a` carries: the primary rule, which check-launch-session's wider
+        // account grammar contains.
         let [user_flag, user, owner_flag, owner, peer_flag, compositor] = arguments else {
             return Err(USAGE.into());
         };
         if user_flag != "--user"
             || owner_flag != "--uid"
             || peer_flag != "--peer-uid"
-            || user.is_empty()
-            || user.starts_with('-')
-            || user.len() > 32
-            || !user
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
+            || crate::primary_account::validate_name(user).is_err()
         {
             return Err("invalid terminal launch configuration".into());
         }
@@ -481,9 +478,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             Ok(Request::Poll(handle))
         }
         [3] => Ok(Request::Heartbeat),
-        [0x10..=0x19 | 0x1b | 0x1c, ..] => {
-            Ok(Request::Secret(crate::session::Request::decode(bytes)?))
-        }
+        [0x10..=0x1c, ..] => Ok(Request::Secret(crate::session::Request::decode(bytes)?)),
         _ => Err("invalid terminal authority request".into()),
     }
 }
@@ -558,8 +553,8 @@ pub(crate) fn serve(mut channel: Channel, config: Config) -> Result<(), String> 
     }
     check_session(&config)?;
     let mut launches = Launches::new(generation()?);
+    let mut secrets = crate::session::Session::new(config.owner, &config.user)?;
     channel.send(&[0x80]).map_err(|e| e.to_string())?;
-    let mut secrets = crate::session::Session::new(config.owner)?;
     let result = (|| -> Result<(), String> {
         loop {
             let mut bytes = channel.receive().map_err(|e| e.to_string())?;
@@ -621,8 +616,11 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         request(&[&[0x1c, 0][..], b"1234"].concat()),
         Err(reason) if !reason.contains("1234")
     ));
-    // Login state is increment 4's.
-    assert!(request(&[0x1a]).is_err());
+    assert_eq!(
+        request(&[0x1a])?,
+        Request::Secret(crate::session::Request::LoginState)
+    );
+    assert!(request(&[0x1a, 0]).is_err());
     assert!(request(&[0x1d]).is_err());
     assert!(request(&[0x16, 2]).is_err());
     Ok(())

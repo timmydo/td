@@ -10,10 +10,11 @@ implemented**, inert: td-secret's private `login-operation` worker
 unlocks, enrolls, adds and removes keys against the record
 ("Placement"), and td-authd starts and drives it on the paired requests
 `1b` and `1c`. The compositor's key-management screen sends `1b` for a
-first enrollment and an addition, which a production td-authd refuses
-before starting anything; it refuses removal itself, having no key list
-yet. Only its lock surface's chord sends an unlock's `1b`, and nothing
-in production locks. Its PIN field sends `1c` only
+first enrollment, an addition and a removal from the key list of
+td-authd's `1a` answer, each of which a production td-authd refuses
+before starting anything; without a list it refuses removal itself.
+Only its lock surface's chord sends an unlock's `1b`, and nothing in
+production locks. Its PIN field sends `1c` only
 when root asks for a PIN at a presented PIN step, which no production
 operation reaches. So nothing
 in production starts the worker or uses its `login_record` and
@@ -40,11 +41,14 @@ inert, since production never reaches a PIN step, and so has the lock
 surface with its login unlock ("Session lock"), inert: its one entry is
 test-only and nothing in production locks. Increment 3 is complete; its
 desktop guest moved to increment 4 as `login-desktop`. Increment 4 is
-specified as eleven commits ("Increments"), of which only C1 has
+specified as eleven commits ("Increments"), of which C1 to C3 have
 landed: firstboot ensures the login directory at every boot, the live
 medium's included, through the shared login-state predicate, and
-rootcheck reports it on a marker of its own. Nothing in production
-acts on the state yet. Nothing else below is implemented.
+rootcheck reports it on a marker of its own; td-authd answers request
+`1a` with the login state, through that predicate and the read-only
+`inspect-login` helper; and the compositor asks it and uses its key
+list for `D`. Nothing in production locks on the state or refuses
+because of it yet. Nothing else below is implemented.
 Until the increments at the end land, `THREAT-MODEL.md` §3 is the
 complete current behaviour: the installed account logs in automatically
 and the session never locks. No document, UI or release
@@ -559,8 +563,8 @@ it refused a PIN field ("PIN entry, presence and retries"). An end
 td-authd
 reports uncertain (`91 0e`, only after a write's acknowledged commit
 round) shows `RESULT UNCERTAIN` above its kind's rows, or alone for kind
-`0e`; nothing is retried, and from increment 4 the screen re-reads the
-state through `1a`. Any other kind
+`0e`; nothing is retried, and the compositor re-reads the state through
+`1a`, as after every login operation (increment 4's C3). Any other kind
 or detail, or an end td-authd could not have reported, is a protocol
 violation that ends the paired generation: an uncertain end before such
 a commit or a certain one after it; kind `0e` in a certain end; `80`
@@ -656,8 +660,9 @@ the unlock. A locked session
 whose state becomes unenrolled stays locked for the rest of its
 generation, since nothing on the lock surface unlocks it; the next
 generation, at a reboot or a compositor or authority restart, starts
-unlocked, as every unenrolled one does. Until increment 4's `1a`, the
-lock surface shows `LOCKED` and `PRESS CTRL+ALT+ESC TO UNLOCK` alone.
+unlocked, as every unenrolled one does. Until increment 4's C7 draws
+the `1a` answer's rows, the lock surface shows `LOCKED` and `PRESS
+CTRL+ALT+ESC TO UNLOCK` alone.
 
 On the lock surface Ctrl+Alt+Esc opens a login-unlock attention lifetime
 directly, without the menu. The prompt presents the unlock description; the
@@ -840,10 +845,10 @@ That list is td-authd's: its enrolled `1a` answer carries the slot
 count and each slot's fingerprint in canonical order, as `inspect-login`
 reports them, and every `1a` answer carries the validated primary
 username and the hostname (`td-authd/DESIGN.md`, amendment 1).
-Increment 4 implements it. What `D` shows without a list, before
-increment 4 and on a machine with no enrolled record after it, is
-`td-compositor/DESIGN.md`'s ("Login-key operations"); its digits and
-request are tested against a list the tests supply.
+Increment 4's C3 implements it. What `D` shows without a list, on a
+machine with no enrolled record, is `td-compositor/DESIGN.md`'s
+("Login-key operations"); its digits and request are tested against
+lists the tests supply, through root's answer.
 
 **First enrollment** applies only to an unenrolled account and is
 authorized by the physical selection alone: no key exists yet, and a person
@@ -1157,7 +1162,8 @@ and the oracle that shows it.
      end kind against a scripted authority, and device-dispatcher tests
      the selections, their refusal outside attention and from an
      excluded keyboard. Production root refuses `1`, `2` and `A`, and
-     `D` is refused locally until increment 4's key list.
+     `D` was refused locally until increment 4's C3 supplied the key
+     list; root refuses its removal until increment 5.
    - The PIN field has landed (`td-compositor/DESIGN.md`, "The PIN
      field"): root's `0c` for the presented PIN step opens it once the
      compositor's own memory check passes; it takes fresh presses from
@@ -1226,12 +1232,19 @@ and the oracle that shows it.
      inspection"), sharing inspect-store's admission and reply code and
      reading through the record store, which nothing runs yet; host
      tests only, since no guest reaches it before C3.
-   - C3: `1a` end to end (`td-authd/DESIGN.md`, amendment 1): root's
-     predicate, the helper under its two-second deadline, the cache and
-     the `9a` answer; the compositor's `1a` at connect, after Prepare,
-     after every login operation and every 250 ms while the state could
-     not be read, feeding the key list `D` uses. Root still answers a
-     removal `9b 00`, and nothing locks yet.
+   - C3, landed: `1a` end to end (`td-authd/DESIGN.md`, amendment 1):
+     root's predicate, the helper under its two-second deadline, the
+     cache and the `9a` answer; the compositor's `1a` at connect, after
+     Prepare, after every login operation and every 250 ms while the
+     state could not be read, feeding the key list `D` uses. Root still
+     answers a removal `9b 00`, and nothing locks yet. Host tests cover
+     each state, the helper missing, slow, malformed and answering, the
+     cache, the helper's pause while unreadable, the live boot, the
+     hostname rules and the exact bytes on root's side, and every
+     malformed `9a`, the connect-time and polled `1a` and `D` over a
+     list or none on the compositor's; `qemu-secret`'s
+     `supervise-login` case also reads `1a` through the production
+     helper.
    - C4: the tier marker in every deployment's initramfs, listing the
      build's `READS` ("Deployments"); the worker's read sets taken from
      the retained deployments' markers in place of its empty `UNMARKED`

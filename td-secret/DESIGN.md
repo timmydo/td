@@ -1565,8 +1565,8 @@ ordinary child fixtures use the same factory and descriptor assignment.
 **Login state.** TOKEN-LOGIN.md's increment 4 adds a second hidden
 root helper, `td-secret inspect-login --uid UID`, which td-authd runs
 with UID 1000 only, and only when the login record's name exists
-(`td-authd/DESIGN.md`, login-state amendment 1); until increment 4's C3
-nothing runs it. Both helpers are one function in `lib.rs`: the private
+(`td-authd/DESIGN.md`, login-state amendment 1), for request `1a` from
+increment 4's C3. Both helpers are one function in `lib.rs`: the private
 operation startup admission above, then the UID, then the read, then
 the whole result written to the stdin socket under the two-second write
 timeout, so a refused admission reads nothing and a failure writes
@@ -1601,7 +1601,9 @@ the record, change its mode, append to it or rewrite it, a lookup that
 sees an unlinked inode, a renaming writer running alongside, the exact
 argv, and admission before the UID or any read. The root startup
 admission itself is `operation::startup`'s, shared and not re-proved
-here; no root guest runs this helper until C3.
+here. td-authd's tests play the helper with child fixtures, and
+`qemu-secret`'s `supervise-login` root case runs the production helper
+over a damaged record through `1a`.
 
 ## Token-authorized named write backend
 
@@ -1852,9 +1854,9 @@ and takes no lock: td-authd's single operation slot serializes writers
 The walk, the directory check, the name lookup and the temporary
 cleanup are the shared login-state predicate's, `login_state.rs`
 (TOKEN-LOGIN.md, "The login record"): one std-only file, with
-`#![forbid(unsafe_code)]`, that td-firstboot compiles through a reviewed
-`#[path]`, and that td-authd and td-login will compile the same way
-(TOKEN-LOGIN.md increment 4's C3 and C5). It takes the root it reads
+`#![forbid(unsafe_code)]`, that td-firstboot and td-authd compile
+through a reviewed `#[path]` (td-authd from TOKEN-LOGIN.md increment 4's
+C3), and that td-login will compile the same way (C5). It takes the root it reads
 under, answers unenrolled, enrolled (the record name exists, whatever
 it holds) or unavailable with a cause, and reads no record bytes; each
 refusal also carries one line saying what was refused, for firstboot's

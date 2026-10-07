@@ -30,6 +30,7 @@ impl Hostname {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
     #[test]
     fn installed_names_are_bounded_and_unambiguous() {

@@ -399,8 +399,7 @@ impl LoginSelection {
 }
 
 /// The key-management screen's removal digits over the enrolled keys in
-/// canonical slot order. Nothing supplies that list before request `1a`
-/// (td-login/TOKEN-LOGIN.md increment 4), so until then nothing builds one.
+/// canonical slot order: the list of root's last `1a` answer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Removal {
     keys: Vec<Fingerprint>,
@@ -466,7 +465,7 @@ impl Removal {
 /// sends.
 /// Cancellation adds nothing: the person chose it, or this client did and
 /// already said why.
-fn login_failure(kind: u8, detail: u8) -> Option<&'static [&'static str]> {
+pub(crate) fn login_failure(kind: u8, detail: u8) -> Option<&'static [&'static str]> {
     Some(match (kind, detail) {
         (0x01, _) => &["WRONG PIN"],
         (0x02, 0) => &["REMOVE AND REINSERT THIS KEY"],
@@ -895,6 +894,9 @@ impl Drop for LoginPending {
 pub(crate) struct Client {
     pending: Option<Pending>,
     login: Option<LoginPending>,
+    /// A login operation ended since the authority worker last asked: its
+    /// cue to read the login state again (`1a`).
+    login_ended: bool,
     inspection: Option<Inspection>,
     /// The check before a PIN field opens.
     memory: fn() -> Result<(), String>,
@@ -905,6 +907,7 @@ impl Default for Client {
         Self {
             pending: None,
             login: None,
+            login_ended: false,
             inspection: None,
             memory: protected_memory,
         }
@@ -920,9 +923,22 @@ impl Client {
             ..Self::default()
         }
     }
+
+    /// A client a login operation just ended in.
+    pub(crate) fn with_login_ended() -> Self {
+        Self {
+            login_ended: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl Client {
+    /// Whether a login operation ended since the last call.
+    pub fn take_login_end(&mut self) -> bool {
+        std::mem::take(&mut self.login_ended)
+    }
+
     pub fn start(&mut self, wire: &mut impl Exchange, attempt: Arc<Attempt>) -> Result<(), String> {
         if !attempt.active() {
             return Ok(());
@@ -1015,6 +1031,7 @@ impl Client {
                 let rows = login_failure(*kind, *detail).ok_or("invalid login failure kind")?;
                 let attempt = Arc::clone(&login.attempt);
                 self.login = None;
+                self.login_ended = true;
                 return if uncertain {
                     attempt.notice(Notice::Uncertain(if *kind == 0x0e { &[] } else { rows }))
                 } else if rows.is_empty() {
@@ -1076,6 +1093,7 @@ impl Client {
                 let rows = login.selection.success();
                 let unlock = login.selection == LoginSelection::Unlock;
                 self.login = None;
+                self.login_ended = true;
                 attempt.notice(Notice::Login(rows))?;
                 // Only root's success for the unlock this client committed,
                 // whose every step it admitted, leaves the lock surface.
@@ -2608,9 +2626,12 @@ mod tests {
                 vec![0x11],
                 vec![0x11],
             ]);
-            let (client, wire, result) = drive(&screen, replies);
+            let (mut client, wire, result) = drive(&screen, replies);
             assert_eq!(result, Ok(()), "{selection:?}");
             assert!(client.login.is_none());
+            // Its success is followed by `1a`, once.
+            assert!(client.take_login_end());
+            assert!(!client.take_login_end());
             assert_eq!(wire.calls, calls, "{selection:?}");
             assert_eq!(sent(&wire, 0x13), steps.len());
             // One `1c` for each PIN step, and only for those.
@@ -2631,9 +2652,11 @@ mod tests {
             LoginSelection::Remove(removal()),
         ] {
             let screen = Screen::login(selection.clone());
-            let (client, wire, result) = drive(&screen, vec![vec![0x9b, 0]]);
+            let (mut client, wire, result) = drive(&screen, vec![vec![0x9b, 0]]);
             assert_eq!(result, Ok(()));
             assert!(client.login.is_none());
+            // Nothing began, so nothing ended.
+            assert!(!client.take_login_end());
             assert_eq!(wire.calls.len(), 1);
             assert_eq!(screen.shown(), Some(Notice::NotAvailable));
         }
@@ -3193,6 +3216,10 @@ mod tests {
                     );
                     if accepted {
                         assert!(client.login.is_none());
+                        // Every end, uncertain ones too, is followed by `1a`.
+                        let mut client = client;
+                        assert!(client.take_login_end());
+                        assert!(!client.take_login_end());
                     }
                 }
                 // The other status is a violation, at every point.

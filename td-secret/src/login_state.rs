@@ -1,8 +1,8 @@
 //! The login-state predicate (td-login/TOKEN-LOGIN.md, "The login record"):
 //! whether `<root>/var/lib/td/login` is a valid directory and whether the
 //! record's name is in it. It reads no record bytes. td-secret's record
-//! store and td-firstboot compile this one file, and td-authd and td-login
-//! will (TOKEN-LOGIN.md increment 4's C3 and C5); it uses std alone.
+//! store, td-firstboot and td-authd compile this one file, and td-login
+//! will (TOKEN-LOGIN.md increment 4's C5); it uses std alone.
 #![forbid(unsafe_code)]
 
 use std::fs::{self, File, Metadata, OpenOptions};

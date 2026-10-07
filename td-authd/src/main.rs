@@ -17,6 +17,7 @@ mod inspection;
 mod installation_consent;
 mod launch;
 mod login;
+mod login_status;
 mod mount_sys;
 mod portal_files;
 mod primary_account;

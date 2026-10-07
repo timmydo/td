@@ -23,14 +23,77 @@ fn child() {
             wire.write_all(&[0x17, 2]).unwrap();
             std::thread::sleep(Duration::from_secs(30));
         }
+        // The login helper's results (td-secret/DESIGN.md, "Login state").
+        LOGIN_DAMAGED => wire.write_all(&[0x1a, 0]).unwrap(),
+        LOGIN_TWO => wire
+            .write_all(&[&[0x1a, 1, 1, 2][..], &[0xa1; 4], &[0xa2; 4]].concat())
+            .unwrap(),
+        LOGIN_EIGHT => {
+            let mut bytes = vec![0x1a, 1, 1, 8];
+            for key in 1..=8 {
+                bytes.extend_from_slice(&[key; 4]);
+            }
+            wire.write_all(&bytes).unwrap();
+        }
+        LOGIN_OVERSIZED => {
+            let mut bytes = vec![0x1a, 1, 1, 8];
+            bytes.extend_from_slice(&[7; 33]);
+            wire.write_all(&bytes).unwrap();
+        }
+        LOGIN_FAILED => std::process::exit(1),
+        HELD => std::thread::sleep(Duration::from_secs(3)),
         _ => panic!("unknown fixture"),
     }
 }
 
+pub(crate) const LOGIN_DAMAGED: u8 = 10;
+pub(crate) const LOGIN_TWO: u8 = 11;
+pub(crate) const LOGIN_EIGHT: u8 = 12;
+pub(crate) const LOGIN_OVERSIZED: u8 = 13;
+pub(crate) const LOGIN_FAILED: u8 = 14;
+/// Writes nothing and outlives every deadline.
+pub(crate) const STALLED: u8 = 8;
+/// Writes nothing and outlives a short deadline, then exits; `stuck`'s.
+const HELD: u8 = 15;
+
 pub(crate) fn fixture(selector: u8) -> Inspection {
+    with_limit(selector, STORE_RESULT)
+}
+
+/// The child as the login helper, with its result bound.
+pub(crate) fn login_fixture(selector: u8) -> Inspection {
+    with_limit(selector, LOGIN_RESULT)
+}
+
+/// The login child `selector`, whose deadline is `after` from now.
+pub(crate) fn expiring(selector: u8, after: Duration) -> Inspection {
+    let mut inspection = login_fixture(selector);
+    inspection.deadline = Instant::now() + after;
+    inspection
+}
+
+/// A login helper past its deadline in `after` whose SIGKILL never takes
+/// effect, as for a child in uninterruptible sleep: `try_wait` keeps
+/// answering that it runs, until `release` or its own exit three seconds on.
+pub(crate) fn stuck(after: Duration) -> Inspection {
+    let mut inspection = expiring(HELD, after);
+    inspection.stop = |_| Ok(());
+    inspection
+}
+
+/// The kernel's kill reaches a `stuck` helper at last.
+pub(crate) fn release(inspection: &mut Inspection) {
+    inspection.stop = Child::kill;
+}
+
+fn alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn with_limit(selector: u8, limit: usize) -> Inspection {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.args(["--exact", "inspection::tests::child", "--ignored"]);
-    let mut inspection = Inspection::spawn(command).unwrap();
+    let mut inspection = Inspection::spawn(command, limit).unwrap();
     inspection
         .wire
         .as_mut()
@@ -93,10 +156,13 @@ fn complete_bytes_alone_and_an_open_endpoint_never_report_state() {
         child: None,
         wire: Some(parent),
         bytes: vec![0x17, 3],
+        limit: STORE_RESULT,
         eof: false,
         deadline: Instant::now() + LIFETIME,
         failed: false,
+        missed: false,
         terminal: None,
+        stop: Child::kill,
     };
     assert_eq!(operation.poll().unwrap(), Event::Waiting);
     operation.deadline = Instant::now();
@@ -106,10 +172,98 @@ fn complete_bytes_alone_and_an_open_endpoint_never_report_state() {
 #[test]
 fn production_factory_refuses_wrong_owner_missing_binary_and_missing_reply() {
     assert!(Inspection::start(1001).is_err());
-    assert!(Inspection::spawn(Command::new("/missing-inspection-fixture")).is_err());
+    assert!(Inspection::login(1001).is_err());
+    assert!(Inspection::spawn(Command::new("/missing-inspection-fixture"), STORE_RESULT).is_err());
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.args(["--list"]);
-    let mut operation = Inspection::spawn(command).unwrap();
+    let mut operation = Inspection::spawn(command, STORE_RESULT).unwrap();
     assert_eq!(finish(&mut operation), Event::Unavailable);
     assert!(operation.child.is_none());
+}
+
+#[test]
+fn the_login_helper_answers_whole_bounded_bytes_or_nothing() {
+    let mut damaged = login_fixture(LOGIN_DAMAGED);
+    assert_eq!(damaged.wait(), Some(vec![0x1a, 0]));
+    assert!(!damaged.missed());
+    assert!(damaged.reaped());
+    let two = login_fixture(LOGIN_TWO).wait().unwrap();
+    assert_eq!(two.len(), 12);
+    // The longest result, eight keys, is exactly the bound.
+    let eight = login_fixture(LOGIN_EIGHT).wait().unwrap();
+    assert_eq!(eight.len(), LOGIN_RESULT);
+    // One byte past it, a failed exit after nothing, a store-sized bound
+    // over a login result, and a child that is not the helper: nothing.
+    for mut inspection in [
+        login_fixture(LOGIN_OVERSIZED),
+        login_fixture(LOGIN_FAILED),
+        fixture(LOGIN_TWO),
+        login_fixture(7),
+    ] {
+        inspection.deadline = Instant::now() + Duration::from_secs(4);
+        assert_eq!(inspection.wait(), None);
+        // The helper, not the deadline, ended these.
+        assert!(!inspection.missed());
+    }
+}
+
+#[test]
+fn a_login_helper_past_its_two_second_deadline_is_killed_and_reaped() {
+    assert_eq!(LIFETIME, Duration::from_secs(2));
+    let started = Instant::now();
+    let mut inspection = login_fixture(STALLED);
+    let pid = inspection.child.as_ref().unwrap().id();
+    assert_eq!(inspection.wait(), None);
+    let waited = started.elapsed();
+    assert!(waited >= LIFETIME, "{waited:?}");
+    assert!(waited < LIFETIME + Duration::from_secs(1), "{waited:?}");
+    assert!(inspection.missed());
+    let until = Instant::now() + Duration::from_secs(1);
+    while !inspection.reaped() {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!alive(pid));
+}
+
+#[test]
+fn a_stuck_helper_is_answered_at_its_deadline_and_kept_for_reaping() {
+    let deadline = Duration::from_millis(200);
+    let started = Instant::now();
+    let mut inspection = stuck(deadline);
+    let pid = inspection.child.as_ref().unwrap().id();
+    assert_eq!(inspection.wait(), None);
+    let waited = started.elapsed();
+    assert!(waited >= deadline, "{waited:?}");
+    assert!(waited < deadline + Duration::from_secs(1), "{waited:?}");
+    assert!(inspection.missed());
+    // Still running, and still owned: reaping never waits for it.
+    for _ in 0..3 {
+        let started = Instant::now();
+        assert!(!inspection.reaped());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(alive(pid));
+    }
+    release(&mut inspection);
+    let until = Instant::now() + Duration::from_secs(1);
+    while !inspection.reaped() {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!alive(pid));
+}
+
+#[test]
+fn dropping_a_stuck_helper_never_waits_for_it() {
+    // Running, and past its deadline and answered.
+    for answered in [false, true] {
+        let mut inspection = stuck(Duration::from_millis(50));
+        if answered {
+            assert_eq!(inspection.wait(), None);
+        }
+        let started = Instant::now();
+        drop(inspection);
+        let dropped = started.elapsed();
+        assert!(dropped < Duration::from_secs(1), "{dropped:?}");
+    }
 }

@@ -149,8 +149,8 @@ fn wire_parser_refuses_ambiguity_and_arbitrary_arguments() {
 
 #[test]
 fn cleanup_must_finish_before_any_operation_and_prepare_is_single_use() {
-    assert!(Session::new(1001).is_err());
-    let mut session = Session::new(1000).unwrap();
+    assert!(Session::new(1001, "tester").is_err());
+    let mut session = Session::new(1000, "tester").unwrap();
     assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 0]);
     assert!(session
         .answer_with(
@@ -169,7 +169,7 @@ fn cleanup_must_finish_before_any_operation_and_prepare_is_single_use() {
 #[test]
 fn failed_or_stalled_cleanup_never_admits_an_operation() {
     for name in ["failing_cleanup_child", "stalled_cleanup_child"] {
-        let mut session = Session::new(1000).unwrap();
+        let mut session = Session::new(1000, "tester").unwrap();
         session
             .answer_with(Request::Prepare, |_| fixture(name), unexpected_begin)
             .unwrap();
@@ -217,7 +217,7 @@ fn poll_until(session: &mut Session, status: u8) -> Vec<u8> {
 
 #[test]
 fn one_operation_retains_its_bound_description_until_terminal_delivery() {
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     prepare(&mut session);
     let response = session
         .answer_with(
@@ -271,7 +271,7 @@ fn one_operation_retains_its_bound_description_until_terminal_delivery() {
 
 #[test]
 fn missing_cleanup_cannot_be_retried_as_a_fresh_prepare() {
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     assert!(session
         .answer_with(
             Request::Prepare,
@@ -317,7 +317,7 @@ fn root_session_preparation_failure_and_generation_exit_relock() {
         std::os::unix::fs::fchown(fs::File::open(key).unwrap(), Some(991), Some(991)).unwrap();
     };
     seed();
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     session.answer(Request::Prepare).unwrap();
     let until = Instant::now() + Duration::from_secs(5);
     loop {
@@ -366,7 +366,7 @@ fn silent_unlock_child() {
 
 #[test]
 fn generation_cleanup_runs_after_an_internal_cleanup_error() {
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     prepare(&mut session);
     session.operation = Some(Active::Secret(Box::new(
         Unlock::fixture(description(), fixture("silent_unlock_child")).unwrap(),
@@ -401,7 +401,7 @@ fn generation_cleanup_runs_after_an_internal_cleanup_error() {
 
 #[test]
 fn generation_exit_reaps_a_live_worker_before_cleanup() {
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     prepare(&mut session);
     session.operation = Some(Active::Secret(Box::new(
         Unlock::fixture(description(), fixture("silent_unlock_child")).unwrap(),
@@ -441,7 +441,7 @@ fn cleanup_requires_timely_observation_and_preserves_its_failure() {
 
 #[test]
 fn generation_exit_cleans_an_unpolled_completion() {
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     prepare(&mut session);
     session
         .answer_with(Request::Begin(Role::Recovery), cleanup_command, |_, _| {
@@ -540,7 +540,7 @@ fn paired_enrollment_fixes_recovery_and_returns_each_required_presentation() {
     for (flag, recovery) in [(0, Recovery::Unrecoverable), (1, Recovery::SecondToken)] {
         let start = Request::decode(&[0x16, flag]).unwrap();
         assert_eq!(start, Request::Enroll(recovery));
-        let mut session = Session::new(1000).unwrap();
+        let mut session = Session::new(1000, "tester").unwrap();
         assert!(session
             .answer_with(start, cleanup_command, unexpected_begin)
             .is_err());
@@ -605,7 +605,7 @@ fn invalid_enrollment_receipts_require_generation_teardown() {
     for stale in [false, true] {
         let recovery = Recovery::Unrecoverable;
         let initial = enrollment_description(recovery, Enrollment::CreatePrimary);
-        let mut session = Session::new(1000).unwrap();
+        let mut session = Session::new(1000, "tester").unwrap();
         prepare(&mut session);
         session
             .answer_with(Request::Enroll(recovery), cleanup_command, |_, _| {
@@ -639,7 +639,7 @@ fn invalid_enrollment_receipts_require_generation_teardown() {
 fn inspection_requires_idle_preparation_and_retains_its_result_until_poll() {
     assert_eq!(Request::decode(&[0x17]).unwrap(), Request::Inspect);
     assert!(Request::decode(&[0x17, 0]).is_err());
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     let start = |_| Ok(crate::inspection::tests::fixture(3));
     assert!(session.inspect_with(start).is_err());
     prepare(&mut session);
@@ -728,7 +728,7 @@ fn root_inspection_observes_file_state_without_publishing_or_repairing() {
         fs::set_permissions(path.join(name), fs::Permissions::from_mode(0o600)).unwrap();
         std::os::unix::fs::chown(path.join(name), Some(991), Some(991)).unwrap();
     }
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     session.answer(Request::Prepare).unwrap();
     let until = Instant::now() + Duration::from_secs(5);
     while session.answer(Request::Poll).unwrap() != [0x91, 2] {
@@ -759,7 +759,7 @@ fn root_inspection_observes_file_state_without_publishing_or_repairing() {
 
 /// A prepared session on a live boot, serving through a fake service.
 fn live_session() -> (Session, UnixStream) {
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     prepare(&mut session);
     let (setup, mut service) = crate::disk_install::tests::served();
     session.setup = Some(setup);
@@ -987,7 +987,7 @@ fn login_requests_have_one_encoding_and_a_pin_never_prints() {
 #[test]
 fn a_login_unlock_runs_through_the_paired_session() {
     use crate::consent::LoginStep;
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     prepare(&mut session);
     begin_login(&mut session, Selection::Unlock, "unlock");
     let identify = login_step(2, LoginStep::Identify);
@@ -1034,7 +1034,7 @@ fn a_login_unlock_runs_through_the_paired_session() {
 #[test]
 fn login_ends_are_typed_and_a_cancel_relocks_nothing() {
     use crate::consent::LoginStep;
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     prepare(&mut session);
     // Refused from the baseline: no description, then idle.
     begin_login(&mut session, Selection::Add, "baseline-eight");
@@ -1076,7 +1076,7 @@ fn login_ends_are_typed_and_a_cancel_relocks_nothing() {
     assert!(session
         .answer(Request::Pin(Box::new(unlock), Pin::new(b"1234").unwrap()))
         .is_err());
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     prepare(&mut session);
     begin_login(&mut session, Selection::Unlock, "stall-pin");
     login_pin_step(&mut session);
@@ -1085,7 +1085,7 @@ fn login_ends_are_typed_and_a_cancel_relocks_nothing() {
 
 #[test]
 fn a_pin_past_the_deadline_is_dropped_and_the_generation_lives_on() {
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     prepare(&mut session);
     begin_login(&mut session, Selection::Unlock, "stall-pin");
     let unlock = login_pin_step(&mut session);
@@ -1111,7 +1111,7 @@ fn a_pin_past_the_deadline_is_dropped_and_the_generation_lives_on() {
 
 #[test]
 fn production_refuses_login_writes_before_any_worker_starts() {
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     prepare(&mut session);
     for selection in [
         Selection::Enroll(1),
@@ -1142,7 +1142,7 @@ fn production_refuses_login_writes_before_any_worker_starts() {
 
 #[test]
 fn a_login_operation_occupies_the_one_operation_slot() {
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     assert!(session
         .begin_login(Selection::Unlock, true, |_, _| panic!("unprepared"))
         .is_err());
@@ -1174,7 +1174,7 @@ fn a_login_operation_occupies_the_one_operation_slot() {
         .unwrap();
     assert!(session.operation.is_none());
     // And a secret operation keeps a login out.
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     prepare(&mut session);
     session.operation = Some(Active::Secret(Box::new(
         Unlock::fixture(description(), fixture("silent_unlock_child")).unwrap(),
@@ -1185,6 +1185,84 @@ fn a_login_operation_occupies_the_one_operation_slot() {
             "login beside unlock"
         ))
         .is_err());
+}
+
+#[test]
+fn login_state_needs_preparation_but_never_the_operation_slot() {
+    use crate::login_status::tests::{answer, never, Root};
+    assert_eq!(Request::decode(&[0x1a]).unwrap(), Request::LoginState);
+    assert!(Request::decode(&[0x1a, 0]).is_err());
+    let root = Root::new();
+    let mut session = Session::new(1000, "tester").unwrap();
+    session.login_state = root.status(never());
+    assert!(session.answer(Request::LoginState).is_err());
+    let unenrolled = answer(&[0], "td-laptop");
+    prepare(&mut session);
+    assert_eq!(session.answer(Request::LoginState).unwrap(), unenrolled);
+    // Beside a login operation, which keeps its slot.
+    begin_login(&mut session, Selection::Unlock, "silent");
+    assert_eq!(session.answer(Request::LoginState).unwrap(), unenrolled);
+    assert!(matches!(session.operation, Some(Active::Login(_))));
+    assert!(session
+        .begin_login(Selection::Unlock, true, |_, _| panic!("second login"))
+        .is_err());
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+#[test]
+fn a_login_operations_end_refreshes_the_cached_state() {
+    use crate::inspection::tests::LOGIN_TWO;
+    use crate::login_status::tests::{answer, counting, Root};
+    let root = Root::new();
+    root.enroll();
+    let (helper, runs) = counting(LOGIN_TWO);
+    let mut session = Session::new(1000, "tester").unwrap();
+    session.login_state = root.status(helper);
+    prepare(&mut session);
+    let enrolled = answer(&[&[1, 2][..], &[0xa1; 4], &[0xa2; 4]].concat(), "td-laptop");
+    assert_eq!(session.answer(Request::LoginState).unwrap(), enrolled);
+    root.unenroll();
+    // An operation still running leaves the cache as it was.
+    begin_login(&mut session, Selection::Unlock, "baseline-none");
+    assert_eq!(session.answer(Request::LoginState).unwrap(), enrolled);
+    assert_eq!(login_end(&mut session), [0x91, 0x0d, 0x09, 0]);
+    // Its end, once delivered, reads the state afresh.
+    assert_eq!(
+        session.answer(Request::LoginState).unwrap(),
+        answer(&[0], "td-laptop")
+    );
+    // A secret operation's end does not.
+    root.enroll();
+    session
+        .answer_with(Request::Begin(Role::Recovery), cleanup_command, |_, _| {
+            Unlock::fixture(description(), fixture("unlock_child"))
+        })
+        .unwrap();
+    poll_until(&mut session, 4);
+    session.answer(Request::Presented(description())).unwrap();
+    poll_until(&mut session, 5);
+    session.answer(Request::Commit(description())).unwrap();
+    poll_until(&mut session, 6);
+    assert_eq!(
+        session.answer(Request::LoginState).unwrap(),
+        answer(&[0], "td-laptop")
+    );
+    assert_eq!(runs.get(), 1);
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+#[test]
+fn a_live_session_answers_unenrolled_without_reading() {
+    use crate::login_status::tests::{answer, never, Root};
+    let root = Root::new();
+    root.enroll();
+    let (mut session, _service) = live_session();
+    session.login_state = root.status(never());
+    assert_eq!(
+        session.answer(Request::LoginState).unwrap(),
+        answer(&[0], "td-laptop")
+    );
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
 }
 
 #[test]
@@ -1203,7 +1281,7 @@ fn root_login_supervision_meets_the_production_worker() {
         .is_some_and(|ids| ids.split_whitespace().collect::<Vec<_>>() == ["0"; 4]));
     let directory = Path::new("/var/lib/td/login");
     assert!(!directory.exists());
-    let mut session = Session::new(1000).unwrap();
+    let mut session = Session::new(1000, "tester").unwrap();
     session.answer(Request::Prepare).unwrap();
     let until = Instant::now() + Duration::from_secs(5);
     while session.answer(Request::Poll).unwrap() != [0x91, 2] {
@@ -1215,13 +1293,35 @@ fn root_login_supervision_meets_the_production_worker() {
         assert_eq!((answer.len(), &answer[..2]), (34, &[0x9b, 1][..]));
         login_end(session)
     };
-    // No directory: the worker's own typed refusal, before any baseline.
+    // Request 1a's state bytes; the guest's hostname is whatever it is.
+    let state = |session: &mut Session| {
+        let answer = session.answer(Request::LoginState).unwrap();
+        let names = answer
+            .windows(7)
+            .position(|window| window == b"\x06tester")
+            .unwrap();
+        assert_eq!((answer[0], answer.last()), (0x9a, Some(&0)));
+        answer[1..names].to_vec()
+    };
+    // No directory: the predicate's damage, and the worker's own typed
+    // refusal, before any baseline.
+    assert_eq!(state(&mut session), [2, 0x0a]);
     assert_eq!(end(&mut session, Selection::Unlock), [0x91, 0x0d, 0x0a, 0]);
     fs::create_dir_all(directory).unwrap();
     fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    // The operation's end refreshed the cache: unenrolled, with no helper.
+    assert_eq!(state(&mut session), [0]);
     // Unenrolled: root refuses these from the worker's baseline.
     assert_eq!(end(&mut session, Selection::Unlock), [0x91, 0x0d, 0x09, 0]);
     assert_eq!(end(&mut session, Selection::Add), [0x91, 0x0d, 0x09, 0]);
+    // A record name: the production inspect-login helper reads it as a
+    // damaged record, and the cache keeps that until an operation ends.
+    let record = directory.join("1000");
+    fs::write(&record, b"not a login record").unwrap();
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(state(&mut session), [2, 0x0b]);
+    fs::remove_file(&record).unwrap();
+    assert_eq!(state(&mut session), [2, 0x0b]);
     // Root's first step reaches the worker, which refuses to write while no
     // deployment carries the tier marker.
     let reply = end(&mut session, Selection::Enroll(1));
@@ -1236,6 +1336,7 @@ fn root_login_supervision_meets_the_production_worker() {
             step: crate::consent::LoginStep::Connect,
         }
     );
+    assert_eq!(state(&mut session), [0]);
     assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
     session.close().unwrap();
 }

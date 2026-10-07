@@ -37,6 +37,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "inspection.rs",
             "launch.rs",
             "login.rs",
+            "login_status.rs",
             "main.rs",
             "mount_sys.rs",
             "portal_files.rs",
@@ -68,6 +69,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("launch.rs", 0),
         ("unlock.rs", 0),
         ("login.rs", 0),
+        ("login_status.rs", 0),
         ("session.rs", 0),
         ("secret_intake.rs", 0),
         ("secret_request.rs", 0),
@@ -165,7 +167,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0x25f3c4bc5793e778,
+        0xdc852bb120b21cd2,
         "paired secret controller changed"
     );
     assert_eq!(
@@ -181,8 +183,49 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0x13e77bb9effa0802,
+        0xccbc4c8905ecac0b,
         "read-only store controller changed"
+    );
+    let inspection = include_str!("../src/inspection.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    // Two fixed read-only helpers, one launch each.
+    assert_eq!(inspection.matches("Command::new(").count(), 2);
+    assert_eq!(
+        inspection
+            .matches("Command::new(\"/bin/td-secret\")")
+            .count(),
+        2
+    );
+    assert_eq!(inspection.matches("\"inspect-store\"").count(), 1);
+    assert_eq!(inspection.matches("\"inspect-login\"").count(), 1);
+    // Request 1a: the shared predicate first, the helper only through the
+    // inspection launch, and nothing it reads names a path from the peer.
+    let login_state = include_str!("../src/login_status.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(fingerprint(login_state), LOGIN_STATE_FINGERPRINT);
+    assert!(login_state.contains("#[path = \"../../td-secret/src/login_state.rs\"]"));
+    assert!(login_state.contains("#[path = \"../../td-firstboot/src/hostname.rs\"]"));
+    assert_eq!(login_state.matches("#[path").count(), 2);
+    assert_eq!(login_state.matches("Inspection::login").count(), 1);
+    for forbidden in ["Command", "spawn", "/bin/", "write", "remove", "create"] {
+        assert!(
+            !login_state.contains(forbidden),
+            "login_status.rs: {forbidden}"
+        );
+    }
+    assert_eq!(
+        fingerprint(include_str!("../../td-secret/src/login_state.rs")),
+        SHARED_LOGIN_STATE_FINGERPRINT,
+        "shared login-state predicate changed: reconcile td-firstboot and this pin"
+    );
+    assert_eq!(
+        fingerprint(include_str!("../../td-firstboot/src/hostname.rs")),
+        SHARED_HOSTNAME_FINGERPRINT,
+        "shared hostname rules changed: reconcile td-compositor's confinement and this pin"
     );
     let installation = include_str!("../src/deployment.rs")
         .split("#[cfg(test)]")
@@ -530,7 +573,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0x3602ee6c2f3d26fc,
+        0x3f5951a8ac2c8889,
         "main.rs: production startup changed"
     );
     assert_eq!(
@@ -548,7 +591,11 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LAUNCH_FINGERPRINT: u64 = 0x29d12118312e8df1;
+const LOGIN_STATE_FINGERPRINT: u64 = 0x3972919165b8d11f;
+const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x17e654b025c229b8;
+const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
+
+const LAUNCH_FINGERPRINT: u64 = 0x4d56251894415780;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;

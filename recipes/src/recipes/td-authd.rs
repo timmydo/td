@@ -71,6 +71,14 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/src/login.rs"),
     ),
     (
+        "src/login_status.rs",
+        include_str!("../../../td-authd/src/login_status.rs"),
+    ),
+    (
+        "tests/login_status.rs",
+        include_str!("../../../td-authd/tests/login_status.rs"),
+    ),
+    (
         "tests/login.rs",
         include_str!("../../../td-authd/tests/login.rs"),
     ),
@@ -184,6 +192,7 @@ pub fn recipe() -> Recipe {
         "{src}/td-firstboot/src",
         "{src}/engine/src",
         "{src}/td-install/src",
+        "{src}/td-secret/src",
     ] {
         steps.push(Step::MkDir {
             path: directory.into(),
@@ -197,6 +206,15 @@ pub fn recipe() -> Recipe {
         (
             "{src}/td-firstboot/src/principals_tests.rs",
             include_str!("../../../td-firstboot/src/principals_tests.rs"),
+        ),
+        // Request 1a's hostname rules and login-state predicate.
+        (
+            "{src}/td-firstboot/src/hostname.rs",
+            include_str!("../../../td-firstboot/src/hostname.rs"),
+        ),
+        (
+            "{src}/td-secret/src/login_state.rs",
+            include_str!("../../../td-secret/src/login_state.rs"),
         ),
         (
             "{src}/engine/src/sha256.rs",
@@ -363,6 +381,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// td-authd reads at most `LOGIN_RESULT` bytes of `td-secret
+    /// inspect-login`'s answer: `1a 01`, the version, the count and the
+    /// record's most fingerprints. Neither crate compiles against the other,
+    /// and the sandboxed td-authd build stages neither td-secret source, so
+    /// the bound is tied here, on the host.
+    #[test]
+    fn the_login_bound_is_td_secrets_longest_inspection() {
+        const INSPECTION: &str = include_str!("../../../td-authd/src/inspection.rs");
+        const STORE: &str = include_str!("../../../td-secret/src/login_store.rs");
+        const RECORD: &str = include_str!("../../../td-secret/src/login_record.rs");
+        for (source, line) in [
+            (INSPECTION, "const LOGIN_RESULT: usize = 36;"),
+            (
+                STORE,
+                "pub(super) const MAX_INSPECTION: usize = 4 + 4 * MAX_SLOTS;",
+            ),
+            (RECORD, "pub(super) const MAX_SLOTS: usize = 8;"),
+        ] {
+            assert_eq!(source.matches(line).count(), 1, "{line}");
+        }
+        assert_eq!(36, 4 + 4 * 8);
     }
 
     /// td-authd's terminal launch names an absolute path into a DIFFERENT

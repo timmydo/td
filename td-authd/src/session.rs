@@ -21,6 +21,8 @@ pub(crate) enum Request {
     Presented(Description),
     Commit(Description),
     Cancel([u8; 32]),
+    /// `1a`: the human's login state.
+    LoginState,
     /// `1b`: a login-key operation.
     Login(Selection),
     /// `1c`: the presented PIN step's description and its PIN.
@@ -35,6 +37,7 @@ impl Request {
             [0x17] => Ok(Self::Inspect),
             [0x18] => Ok(Self::Write),
             [0x19] => Ok(Self::Install),
+            [0x1a] => Ok(Self::LoginState),
             [0x12, 1] => Ok(Self::Begin(Role::Primary)),
             [0x12, 2] => Ok(Self::Begin(Role::Recovery)),
             [0x16, 0] => Ok(Self::Enroll(Recovery::Unrecoverable)),
@@ -234,11 +237,13 @@ pub(crate) struct Session {
     event: Option<Event>,
     inspection: Option<Inspection>,
     inspection_event: Option<InspectionEvent>,
+    login_state: crate::login_status::Status,
 }
 
 impl Session {
-    /// Construct only after the root launch admission has succeeded.
-    pub fn new(owner: u32) -> Result<Self, String> {
+    /// Construct only after the root launch admission has succeeded, with
+    /// the primary account's name.
+    pub fn new(owner: u32, username: &str) -> Result<Self, String> {
         if owner != 1000 {
             return Err("unsupported secret session owner".into());
         }
@@ -256,6 +261,7 @@ impl Session {
             event: None,
             inspection: None,
             inspection_event: None,
+            login_state: crate::login_status::Status::new(owner, username)?,
         })
     }
 
@@ -313,6 +319,10 @@ impl Session {
             Request::Inspect => self.inspect_with(Inspection::start),
             Request::Write => self.begin_write(),
             Request::Install => self.begin_install(),
+            // Beside any operation, which it neither needs nor takes. Only
+            // a live boot binds the setup intake.
+            Request::LoginState if self.prepared => self.login_state.answer(self.setup.is_some()),
+            Request::LoginState => Err("login state before session preparation".into()),
             Request::Begin(role) => self.begin(Start::Unlock(role), begin),
             Request::Enroll(recovery) => self.begin(Start::Enroll(recovery), begin),
             Request::Login(selection) => {
@@ -609,6 +619,7 @@ impl Session {
         if let Some(inspection) = &mut self.inspection {
             self.inspection_event = Some(inspection.poll()?);
         }
+        self.login_state.tick();
         Ok(())
     }
 
@@ -675,6 +686,10 @@ impl Session {
                 }
                 self.installing = false;
             }
+            // However it ended, the next `1a` reads the login state afresh.
+            if matches!(operation, Active::Login(_)) {
+                self.login_state.operation_ended();
+            }
             self.operation = None;
             self.event = None;
         }
@@ -699,7 +714,9 @@ impl Session {
         self.installations = None;
         // Stops the installation service, as an update helper is stopped.
         self.setup = None;
-        self.inspection = None;
+        if let Some(inspection) = self.inspection.take() {
+            inspection.reap_for_teardown();
+        }
         self.inspection_event = None;
         // Dropping pending generation cleanup also reaps before replacement.
         self.cleanup = None;

@@ -1720,8 +1720,11 @@ increment 4 (`td-compositor/DESIGN.md`, "The lock surface"), so
 nothing in production starts the worker. Its PIN field sends `1c` only
 after this supervisor's `91 0c` for a presented PIN step, which no
 production operation reaches (`td-compositor/DESIGN.md`, "The PIN
-field"). Login state (1),
-revocation (7) and update consent (8) are not implemented.
+field"). Login state (1) is implemented and live: request `1a`, its
+cache and the `9a` answer, which the compositor asks at connect and
+uses only for `D`'s key list until TOKEN-LOGIN.md increment 4's C7
+locks on it. Its request 19 read is C4's. Revocation (7) and update
+consent (8) are not implemented.
 [`td-login/TOKEN-LOGIN.md`](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier. "Session lock" there is the compositor's
 display and input lock; it is unrelated to this document's secret-session
@@ -1750,8 +1753,9 @@ TOKEN-LOGIN.md's.
    answer, cached or not, through a 65-byte bound, drops one trailing
    newline and sends the name only when it passes td-firstboot's
    `Hostname::parse` rules; an unreadable, longer or invalid one is sent
-   empty. Increment 4 implements all of this; until then the compositor
-   has no key list ("Login-key operations" in `td-compositor/DESIGN.md`).
+   empty. Increment 4's C3 implements all of this (`login_status.rs`);
+   before it the compositor had no key list ("Login-key operations" in
+   `td-compositor/DESIGN.md`).
 
    On a live boot (Prepare's `td.live=1`, "Whole-disk installation
    intake") root answers every `1a` unenrolled without the predicate or
@@ -1766,25 +1770,48 @@ TOKEN-LOGIN.md's.
    inspect-login --uid 1000` child to tell enrolled from a damaged record.
    It shares store inspection's fixed helper launch (empty environment,
    `/` cwd, null stdout and stderr, private stdin socketpair), its exact
-   bounded result and its two-second observed deadline, but not its
+   bounded result (here at most 36 bytes, the parent reading at most
+   one past them) and its two-second observed deadline, but not its
    protocol (`td-secret/DESIGN.md`, "Read-only enrollment-state
    inspection", gives its result): it is not request `17`, it runs
    synchronously inside the `1a` that needs it, it never occupies the
-   operation slot, and a missing helper, failed spawn, malformed result
-   or expired deadline answers unavailable (state could not be read)
-   rather than ending the generation. A name that exists is therefore
-   always the enforced state, whatever the helper does, and a helper
-   failure on an unenrolled machine cannot arise.
+   operation slot, and a missing helper, failed spawn, malformed result,
+   failed exit, failure to reap or expired deadline answers unavailable
+   (state could not be read) rather than ending the generation. Root
+   drops the result's version byte, which `9a` does not carry. A name
+   that exists is therefore always the enforced state, whatever the
+   helper does, and a helper failure on an unenrolled machine cannot
+   arise. The username is the one `terminal-serve` resolved, and a
+   session whose name fails `primary_account`'s rule refuses to start,
+   before it admits the compositor, so every answer's name is one the
+   compositor admits.
 
    Root caches the last state, with an enrolled state's key list, and
    serializes `1a`, so requests never overlap; the cache holds nothing
    else. A generation's first `1a` fills it, and a later one returns it,
-   refreshing it first only after a login operation or while it reads
-   could-not-be-read. While it reads could-not-be-read, root runs the
-   helper at most once every two seconds: a `1a` in between answers the
-   cached could-not-be-read at once, so the helper's deadline does not
-   hold root for most of the compositor's polls. Request 19's fresh read
-   (amendment 8) also updates the cache. The compositor sends `1a` again
+   refreshing it first only after a login operation (once its terminal
+   status has been polled) or while it reads could-not-be-read. While it
+   reads could-not-be-read, root pauses the helper after its last run
+   ended: two seconds, doubled for each consecutive run its deadline
+   ended beyond the first (2, 4, 8, then 16 s at most), and back to two
+   once a run ends by the helper's own exit or the state reads anything
+   else. A `1a` inside the pause answers the cached could-not-be-read at
+   once. The run itself never waits past its deadline: root kills a
+   helper at the deadline and answers at once, keeps the killed child,
+   reaps it with nonblocking polls at every later tick and every `1a`
+   that reads the record, and runs no other helper until it is reaped,
+   so a child the kill has not yet stopped costs nothing more. One `1a` therefore delays the requests
+   behind it on the serialized channel by at most one helper deadline,
+   two seconds, and a persistently stuck helper by that at most once in
+   sixteen seconds. Ending the generation never waits for this child:
+   td-authd exits after teardown, and the read-only child, if still
+   unreaped, is reparented and reaped outside it. Store inspection
+   shares this launch and its nonblocking polls but not this end: its
+   result stays pending until its child is reaped, and teardown still
+   kills and waits for it before cleanup, as "Paired read-only store
+   inspection" states. The predicate is not
+   paused, so a name that disappears resolves at the next `1a`. Request
+   19's fresh read (amendment 8, C4) also updates the cache. The compositor sends `1a` again
    after every completed, failed or uncertain login operation, and every
    250 ms while a revocation is pending or the state could not be read,
    so a first enrollment, the removal of the last key or a transient
@@ -1807,10 +1834,9 @@ TOKEN-LOGIN.md's.
    exit, whether a typed failure, a lost channel, a failed exit or root's
    own deadline, is UNCERTAIN, not failed, and root re-reads the login
    state before showing a result. An unlock writes nothing, so its
-   non-success after `13` is a failure. The re-read is amendment 1's: the
-   compositor's `1a` after every login operation refreshes root's cached
-   state. Until `1a` lands in increment 4, root reports the uncertain end
-   (`91 0e`) and reads no login state of its own.
+   non-success after `13` is a failure. The re-read is amendment 1's: root
+   reports the uncertain end (`91 0e`), and the compositor's `1a` after
+   every login operation refreshes root's cached state.
 3. **Consent operations (2).** Implemented, inert: `consent.rs` has tags
    7 to 10, login unlock, first enrollment, key addition and key removal.
    Each carries its step, the key count before and after and the
@@ -1845,8 +1871,8 @@ TOKEN-LOGIN.md's.
    production build, and an unlock refuses while no record exists. Host
    child fixtures and the ignored root session fixture drive both requests
    through the real paired Session, as they do for secret operations.
-   Request `1a` lands with login state in increment 4, and tests that treat
-   `1a` as unknown change with it. The worker's baseline, not root, tells
+   Request `1a` landed with login state in increment 4's C3, still
+   `TDLA003` and without negotiation. The worker's baseline, not root, tells
    it that no record exists: an unlock against an unenrolled baseline ends
    as NO RECORD before any description.
 6. **Deadlines (2).** The fixed 120-second ceiling becomes 120 seconds per
@@ -1947,7 +1973,7 @@ argument. The paired requests are:
 
 | Request | Response |
 | --- | --- |
-| `1a` (increment 4) | `9a`, then the state: `00` unenrolled; `01`, a slot count of 1 to 8 and that many four-byte fingerprints in canonical slot order; or `02` and the cause `0a`, `0b` or `0c`, TOKEN-LOGIN.md's failure kinds; then a length byte of 1 to 32 and the primary username, a length byte of 0 to 63 and the hostname, and the revocation byte, `00` (amendment 1) |
+| `1a` | `9a`, then the state: `00` unenrolled; `01`, a slot count of 1 to 8 and that many four-byte fingerprints in canonical slot order; or `02` and the cause `0a`, `0b` or `0c`, TOKEN-LOGIN.md's failure kinds; then a length byte of 1 to 32 and the primary username, a length byte of 0 to 63 and the hostname, and the revocation byte, `00` (amendment 1) |
 | `1b 07` unlock; `1b 08 01` or `1b 08 02` one- or two-key first enrollment; `1b 09` addition; `1b 0a N` and N slots, each a position and a four-byte fingerprint, positions strictly increasing within 1 to 8 | `9b 01` and the 32-byte nonce: started; `9b 00`: refused in this build |
 | `1c`, one length byte, the current step's canonical description, then the PIN (4 to 63 printable ASCII bytes) | `9c 00` PIN queued; `9c 01` the operation had already ended, or root's deadline has passed, which ends it as TIMEOUT: the PIN is dropped |
 
@@ -2062,4 +2088,20 @@ typed refusal before any baseline, NO RECORD from an unenrolled baseline
 for an unlock and an addition, and a one-key enrollment whose first step
 reaches the worker, which refuses it as VERSION while no deployment
 carries the tier marker. No token takes part; the worker's own guests
-cover token I/O with simulated root acknowledgements.
+cover token I/O with simulated root acknowledgements. The same case reads
+`1a` between those operations: the missing directory's damage, unenrolled
+once it exists, and a record name the production `inspect-login` helper
+reads as a damaged record, held by the cache until the next operation
+ends.
+
+Request `1a`'s host tests (`tests/login_status.rs`, and the paired
+Session's in `tests/session.rs`) run the predicate over a temporary root
+owned by the test and play the helper with child fixtures: an unenrolled
+or damaged directory that never runs it, a missing, failing, malformed,
+oversized and two-second-stalled helper, each unreadable, one and eight
+keys and a damaged record with their exact `9a` bytes, the cache and its
+refresh after a login operation's end, the helper's pause while
+unreadable, the live boot, every hostname rule and the username rule;
+and through the Session, `1a` refused before preparation, answered beside
+a login operation without its slot, and refreshed only by a login
+operation's end.

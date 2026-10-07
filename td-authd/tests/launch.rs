@@ -16,7 +16,7 @@ fn config() -> Config {
 fn only_canonical_disjoint_session_identities_are_configurable() {
     let valid = ["--user", "tester", "--uid", "1000", "--peer-uid", "993"].map(String::from);
     assert_eq!(config().peer_uid(), 993);
-    for name in ["123".to_string(), "a".repeat(32)] {
+    for name in ["a1_b-c".to_string(), "a".repeat(32)] {
         let mut args = valid.clone();
         args[1] = name;
         assert!(Config::parse(&args).is_ok());
@@ -25,7 +25,15 @@ fn only_canonical_disjoint_session_identities_are_configurable() {
     too_long[1] = "a".repeat(33);
     assert!(Config::parse(&too_long).is_err());
     for (index, values) in [
-        (1, vec!["", "../root", "root:0", "A", "a b", "-tester"]),
+        // The primary account's rule, which request 1a's answers carry:
+        // check-launch-session alone would admit the leading digit or
+        // underscore.
+        (
+            1,
+            vec![
+                "", "../root", "root:0", "A", "a b", "-tester", "123", "_tester", "a.b",
+            ],
+        ),
         (
             3,
             vec!["0", "999", "01000", "+1000", "65534", "4294967296", "1001"],
