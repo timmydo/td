@@ -98,6 +98,7 @@ const MODULES: &[(&str, &str)] = &[
     ("sys", include_str!("../../../td-util/src/sys.rs")),
     ("term", include_str!("../../../td-util/src/term.rs")),
     ("test", include_str!("../../../td-util/src/test.rs")),
+    ("uname", include_str!("../../../td-util/src/uname.rs")),
     ("which", include_str!("../../../td-util/src/which.rs")),
     ("xargs", include_str!("../../../td-util/src/xargs.rs")),
 ];
@@ -121,9 +122,19 @@ const ENGINE: &[(&str, &str, &str)] = &[
 ];
 
 pub fn recipe() -> Recipe {
+    build("td-util", "rust-toolchain")
+}
+
+/// td-util compiled by `rust`'s rustc into the output `name`. td-util-boot is
+/// the same sources built by the Rust snapshot, for the builds that run
+/// before rust-toolchain exists; it is staged under `{src}/<name>` so the
+/// ladder's tool-provider roster names each recipe's bodies apart.
+pub fn build(name: &str, rust: &str) -> Recipe {
     // The self-hosted toolchains install under a nested stage/td/store/<pkg>
     // DESTDIR (re the /td/store prefix); rust-toolchain installs flat.
-    let rustc = "{in:rust-toolchain}/bin/rustc";
+    let rustc = format!("{{in:{rust}}}/bin/rustc");
+    let rustc = rustc.as_str();
+    let main_rs = format!("{{src}}/{name}/src/main.rs");
     let gcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
     let gccbin = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin";
     let bbin = "{in:binutils-x86-64-self}/bin";
@@ -153,15 +164,15 @@ pub fn recipe() -> Recipe {
     // `../../engine/src`, and the ladder's tool-provider roster names these
     // bodies by where they are written.
     steps.push(Step::WriteFile {
-        path: "{src}/td-util/src/main.rs".into(),
+        path: main_rs.clone(),
         content: MAIN_RS.into(),
         exec: false,
     });
     // Every module `main.rs` declares must sit beside it so `rustc src/main.rs`
     // can resolve `mod NAME;` from the filesystem.
-    for (name, source) in MODULES {
+    for (module, source) in MODULES {
         steps.push(Step::WriteFile {
-            path: format!("{{src}}/td-util/src/{name}.rs"),
+            path: format!("{{src}}/{name}/src/{module}.rs"),
             content: (*source).into(),
             exec: false,
         });
@@ -212,7 +223,7 @@ pub fn recipe() -> Recipe {
                 "-Clink-arg=-static-libgcc",
                 "-o",
                 "{out}/bin/td-util",
-                "{src}/td-util/src/main.rs",
+                &main_rs,
             ],
         )
         .env("PATH", &path)
@@ -227,9 +238,9 @@ pub fn recipe() -> Recipe {
     steps.push(split_target_debug("{out}"));
     steps.push(Step::assert_static(&["{out}/bin/td-util"]));
 
-    Recipe::mesboot("td-util", "0.1")
+    Recipe::mesboot(name, "0.1")
         .native_inputs(&[
-            "rust-toolchain",
+            rust,
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",

@@ -1,11 +1,16 @@
-use crate::ladder::{mesboot0_inputs, relocate_ld_scripts, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{
+    mesboot0_inputs, mesboot0_path, relocate_ld_scripts, unpack_into, unpack_keep_top, SH,
+};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // CMake 3.31.12 is the one explicitly approved new build-only dependency for the
 // source Rust bridge. Rust's in-tree LLVM 22 requires CMake >= 3.20. This rung
 // bootstraps CMake from its release source with td's native GCC/G++, native GNU
-// Make, and BusyBox userland. All bundled third-party libraries are used; OpenSSL,
-// Qt, curses, Sphinx, Ninja, and host libraries are absent.
+// Make, and the bootstrap root's GNU userland (`mesboot0_path`). That userland
+// has no `uname`, which `bootstrap` and CMake's system probe both run; td-util,
+// compiled by the Rust snapshot as td-util-boot, serves it from the tool farm.
+// All bundled third-party libraries are used; OpenSSL, Qt, curses, Sphinx,
+// Ninja, and host libraries are absent.
 //
 // The produced cmake is fully static. It can therefore configure LLVM inside a
 // later recipe sandbox without inheriting a runtime loader/library closure of its
@@ -16,7 +21,7 @@ pub fn recipe() -> Recipe {
     let ngpp = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/g++";
     let nbin = "{in:binutils-x86-64-self}/bin";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
-    let path = format!("{{root}}/wb:{{tools}}:{nbin}");
+    let path = format!("{{root}}/wb:{}:{nbin}", mesboot0_path());
     let mut steps = unpack_into("cmake-x86-64-source", "{src}");
 
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
@@ -32,15 +37,7 @@ pub fn recipe() -> Recipe {
         "/td/store/glibc-2.41-x86_64",
     ));
     steps.push(Step::ToolFarm {
-        links: [
-            "awk", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "dirname", "echo",
-            "env", "expr", "false", "find", "grep", "head", "install", "ln", "ls", "mkdir",
-            "mktemp", "mv", "printf", "pwd", "rm", "sed", "sort", "tail", "tee", "test", "touch",
-            "tr", "true", "uname", "wc", "which", "xargs",
-        ]
-        .iter()
-        .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))
-        .collect(),
+        links: vec![("uname".into(), "{in:td-util-boot}/bin/td-util".into())],
     });
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
@@ -141,7 +138,7 @@ pub fn recipe() -> Recipe {
             "binutils-x86-64-self",
             "glibc-x86-64",
             "make-x86-64",
-            "busybox-x86-64",
+            "td-util-boot",
         ])
         .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)

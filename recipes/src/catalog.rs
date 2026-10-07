@@ -250,6 +250,7 @@ mod tests {
             "td-txt",
             "td-update",
             "td-util",
+            "td-util-boot",
             "td-vm-guest",
         ];
         let mut covered = Vec::new();
@@ -393,7 +394,10 @@ mod tests {
         for &(stem, _) in td_engine::target_profile::ASSEMBLY_EXCEPTIONS {
             let recipe = lookup(stem)
                 .unwrap_or_else(|| panic!("assembly exception names missing recipe {stem}"));
-            if matches!(stem, "gcc-x86-64-stage1" | "gcc-x86-64-native") {
+            if matches!(
+                stem,
+                "gcc-x86-64-stage1" | "gcc-x86-64-native" | "rust-stage0"
+            ) {
                 continue;
             }
             let generic_cargo_split =
@@ -411,6 +415,7 @@ mod tests {
         }
 
         // These compiler rungs are build-only provenance for libgcc objects
+        // (or, for rust-stage0, the snapshot std td-util-boot links)
         // linked into later outputs. They do not need companions of their own,
         // but the marker on each split consumer must name the actual rung.
         assert!(
@@ -423,6 +428,9 @@ mod tests {
                 .iter()
                 .any(|(source, _)| *source == "gcc-x86-64-native"));
         }
+        let boot = td_engine::target_profile::output_assembly_exceptions("td-util-boot");
+        assert!(boot.iter().any(|(source, _)| *source == "rust-stage0"));
+        assert!(!boot.iter().any(|(source, _)| *source == "rust-toolchain"));
 
         let mut rust_outputs: Vec<&str> = all()
             .into_iter()

@@ -1,4 +1,6 @@
-use crate::ladder::{mesboot0_inputs, target_rustc, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{
+    mesboot0_inputs, mesboot0_path, target_rustc, unpack_into, unpack_keep_top, SH,
+};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step, TextEdit};
 
 // rust-toolchain is the shipped, source-built Rust 1.96.0 toolchain. The exact
@@ -27,7 +29,10 @@ pub fn recipe() -> Recipe {
     let nbin = "{in:binutils-x86-64-self}/bin";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let py = "{in:python-mesboot}/bin/python3";
-    let path = format!("{{tools}}:{nbin}");
+    // The bootstrap root's GNU userland, behind the farm below. The root has
+    // no `uname`, which LLVM's config.guess and CMake run; td-util-boot serves
+    // it (see cmake-x86-64.rs).
+    let path = format!("{}:{nbin}", mesboot0_path());
     // The rung's own source lands in TD_INPUT_MAP under the LOCAL `{name}-source`,
     // not its sourceInput pin key (see linux-x86-64.rs) — reference the local name.
     let mut steps = unpack_into("rust-toolchain-source", "{src}");
@@ -48,8 +53,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::run(
         "{root}",
         &[
-            "{in:busybox-x86-64}/bin/busybox",
-            "mv",
+            "{in:coreutils-mesboot0}/bin/mv",
             "{src}/vendor",
             "{root}/vendor",
         ],
@@ -61,8 +65,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::run(
         "{root}",
         &[
-            "{in:busybox-x86-64}/bin/busybox",
-            "mv",
+            "{in:coreutils-mesboot0}/bin/mv",
             "{root}/vendor",
             "{src}/vendor",
         ],
@@ -115,14 +118,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::ToolFarm {
         links: [
-            "awk", "basename", "cat", "chmod", "cmp", "comm", "cp", "cut", "date", "dirname",
-            "echo", "env", "expr", "false", "find", "grep", "head", "install", "ln", "ls", "mkdir",
-            "mktemp", "mv", "printf", "pwd", "readlink", "realpath", "rm", "rmdir", "sed", "sleep",
-            "sort", "tail", "tee", "test", "touch", "tr", "true", "uname", "wc", "which", "xargs",
-        ]
-        .iter()
-        .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))
-        .chain([
+            ("uname".into(), "{in:td-util-boot}/bin/td-util".into()),
             ("sh".into(), SH.into()),
             ("bash".into(), SH.into()),
             ("python".into(), py.into()),
@@ -142,8 +138,8 @@ pub fn recipe() -> Recipe {
             ("objdump".into(), format!("{nbin}/objdump")),
             ("readelf".into(), format!("{nbin}/readelf")),
             ("strip".into(), format!("{nbin}/strip")),
-        ])
-        .collect(),
+        ]
+        .into(),
     });
 
     // Remove native TLS/SSH transports from in-tree Cargo. td's recipe graph
@@ -416,9 +412,11 @@ jemalloc = false
                 "ls '{out}'/lib/rustlib/x86_64-unknown-linux-gnu/lib/libproc_macro-*.rlib >/dev/null 2>&1 || { echo 'shipped sysroot is missing libproc_macro: x.py must build the `library` alias, not `library/std`' >&2; exit 1; }; \
                  ls '{out}'/lib/rustlib/x86_64-unknown-linux-gnu/lib/libtest-*.rlib >/dev/null 2>&1 || { echo 'shipped sysroot is missing libtest: x.py must build the `library` alias, not `library/std`' >&2; exit 1; }; \
                  readelf -l '{out}/bin/rustc' | grep -F '{in:glibc-x86-64}' >/dev/null || { echo 'stage2 rustc does not use td glibc' >&2; exit 1; }; \
-                 readelf -d '{out}/bin/cargo' | grep -E 'libssl|libcrypto|libssh2' && { echo 'source Cargo retained a forbidden TLS/SSH native dependency' >&2; exit 1; } || :; \
+                 readelf -d '{out}/bin/cargo' | grep -E 'libssl|libcrypto|libssh2' >/dev/null; rc=$?; \
+                 [ $rc -eq 1 ] || { echo \"source Cargo retained a forbidden TLS/SSH native dependency (grep exit $rc)\" >&2; exit 1; }; \
                  for llvm in '{out}'/lib/libLLVM*.so*; do test ! -e \"$llvm\" || { echo 'stage2 copied a prebuilt/shared LLVM' >&2; exit 1; }; done; \
-                 grep -R -a -F -l '{in:rust-stage0}' '{out}' >'{root}/stage0-refs' && { echo 'stage2 output references rust-stage0' >&2; exit 1; } || :",
+                 grep -r -a -F -l '{in:rust-stage0}' '{out}' >'{root}/stage0-refs'; rc=$?; \
+                 [ $rc -eq 1 ] || { if [ $rc -eq 0 ]; then echo 'stage2 output references rust-stage0:'; cat '{root}/stage0-refs'; else echo \"stage0 reference scan failed: grep exit $rc\"; fi >&2; exit 1; }",
             ],
         )
         .env("PATH", &path),
@@ -478,7 +476,7 @@ jemalloc = false
             "python-mesboot",
             "glibc-mesboot-shared",
             "make-x86-64",
-            "busybox-x86-64",
+            "td-util-boot",
         ])
         .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
@@ -516,9 +514,8 @@ mod tests {
             Step::Run { argv, .. }
                 if matches!(
                     argv.as_slice(),
-                    [busybox, mv, from, to]
-                        if busybox == "{in:busybox-x86-64}/bin/busybox"
-                            && mv == "mv"
+                    [mv, from, to]
+                        if mv == "{in:coreutils-mesboot0}/bin/mv"
                             && from == "{src}/vendor"
                             && to == "{root}/vendor"
                 )
@@ -528,9 +525,8 @@ mod tests {
             Step::Run { argv, .. }
                 if matches!(
                     argv.as_slice(),
-                    [busybox, mv, from, to]
-                        if busybox == "{in:busybox-x86-64}/bin/busybox"
-                            && mv == "mv"
+                    [mv, from, to]
+                        if mv == "{in:coreutils-mesboot0}/bin/mv"
                             && from == "{root}/vendor"
                             && to == "{src}/vendor"
                 )

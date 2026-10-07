@@ -78,12 +78,21 @@ pub const ASSEMBLY_EXCEPTIONS: &[(&str, &str)] = &[
         "rust-toolchain",
         "upstream LLVM and Rust compiler-runtime assembly",
     ),
+    // td-util-boot links the snapshot's prebuilt std, not rust-toolchain's.
+    (
+        "rust-stage0",
+        "upstream Rust 1.95.0 snapshot std and compiler-runtime assembly",
+    ),
     // The target-built td-net multicall, the fetch service's tier, links
     // rustls through `ring`, whose pregenerated x86_64 assembly is compiled
     // by its build script (APPLICATIONS.md §W.8). The terminal applications
     // it serves are std alone and carry none.
     ("td-net", "ring 0.17.14 x86_64 assembly"),
 ];
+
+/// The Rust-profiled recipes compiled by the stage0 snapshot, whose std is
+/// the snapshot's prebuilt one rather than rust-toolchain's.
+pub const SNAPSHOT_STD_RECIPES: &[&str] = &["td-util-boot"];
 
 /// Recipes whose linked outputs include the Rust runtime boundary. The glibc
 /// and libgcc boundaries apply to every output passed to the target splitter;
@@ -131,6 +140,7 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "td-txt",
     "td-update",
     "td-util",
+    "td-util-boot",
     "td-vm-guest",
     "uutils",
 ];
@@ -149,7 +159,10 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
                     && matches!(recipe, "binutils-x86-64-self" | "gcc-x86-64-self"))
                 || (*source == "gcc-x86-64-self"
                     && !matches!(recipe, "glibc-x86-64" | "binutils-x86-64-self"))
-                || (*source == "rust-toolchain" && RUST_PROFILED_RECIPES.contains(&recipe))
+                || (*source == "rust-toolchain"
+                    && RUST_PROFILED_RECIPES.contains(&recipe)
+                    && !SNAPSHOT_STD_RECIPES.contains(&recipe))
+                || (*source == "rust-stage0" && SNAPSHOT_STD_RECIPES.contains(&recipe))
                 // A package's own crate assembly reaches that package alone.
                 || (*source == recipe && recipe == "td-net")
         })
@@ -330,7 +343,22 @@ mod tests {
                     "rust-toolchain",
                     "upstream LLVM and Rust compiler-runtime assembly"
                 ),
+                (
+                    "rust-stage0",
+                    "upstream Rust 1.95.0 snapshot std and compiler-runtime assembly"
+                ),
                 ("td-net", "ring 0.17.14 x86_64 assembly"),
+            ]
+        );
+        assert_eq!(
+            output_assembly_exceptions("td-util-boot"),
+            vec![
+                ("glibc-x86-64", "upstream glibc sysdeps/x86_64 assembly"),
+                ("gcc-x86-64-self", "upstream GCC libgcc x86_64 assembly"),
+                (
+                    "rust-stage0",
+                    "upstream Rust 1.95.0 snapshot std and compiler-runtime assembly"
+                ),
             ]
         );
         assert_eq!(TOOLCHAIN_DEBUG_CEILING_BYTES, 4_294_967_296);

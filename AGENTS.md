@@ -157,9 +157,12 @@ no class here and needs an amendment to this file.
 Rust enters only after the native GCC/glibc platform and GNU build userland
 exist. td pins the Rust source and exact upstream bootstrap snapshot. The
 snapshot is transformed to run on td's declared runtime and is used only as
-stage0. Full-bootstrap builds stage1, rebuilds rustc and the in-tree standard
-library as stage2, and builds in-tree Cargo. No downloaded Cargo, library,
-stage0 byte, or prebuilt LLVM enters a final distribution closure.
+stage0 and to compile `td-util-boot`, the build-only td-util that serves the
+pre-Rust CMake and Rust builds the `uname` the bootstrap userland lacks;
+nothing it compiles ships. Full-bootstrap builds stage1, rebuilds rustc and
+the in-tree standard library as stage2, and builds in-tree Cargo. No
+downloaded Cargo, library, stage0 byte, or prebuilt LLVM enters a final
+distribution closure.
 
 The snapshot remains a bootstrap trust root; source rebuilding alone does not
 defeat trusting trust. A stronger claim needs a separately specified diverse

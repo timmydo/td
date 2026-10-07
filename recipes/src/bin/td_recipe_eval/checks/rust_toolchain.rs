@@ -29,7 +29,17 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let gcc_tree = runner.ladder_out_from(&build_out, "gcc-x86-64-self")?;
     let binutils_tree = runner.ladder_out_from(&build_out, "binutils-x86-64-self")?;
     let glibc_tree = runner.ladder_out_from(&build_out, "glibc-x86-64")?;
-    let busybox_tree = runner.ladder_out_from(&build_out, "busybox-x86-64")?;
+    // The proof's shell and text tools are the bootstrap root's userland, which
+    // the toolchain's own build ran on: nothing later exists before this check.
+    let sh = format!(
+        "{}/sh",
+        root_userland_bin(runner, &build_out, "bash-mesboot")?
+    );
+    let userland = ROOT_USERLAND
+        .iter()
+        .map(|stem| root_userland_bin(runner, &build_out, stem))
+        .collect::<Result<Vec<_>, _>>()?
+        .join(":");
     println!(
         "   [ladder] x86_64 Rust bridge via build-plan --auto: exact stage0 snapshot -> source-built rustc/std/Cargo/Clippy ({})",
         rust_tree.display()
@@ -51,12 +61,10 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let gcc_base = path_basename(&gcc_tree)?;
     let binutils_base = path_basename(&binutils_tree)?;
     let glibc_base = path_basename(&glibc_tree)?;
-    let busybox_base = path_basename(&busybox_tree)?;
     let rust_path = format!("{TD_STORE_DIR}/{rust_base}");
     let gcc_path = format!("{TD_STORE_DIR}/{gcc_base}/{GCC_STAGE}");
     let binutils_path = format!("{TD_STORE_DIR}/{binutils_base}/bin");
     let glibc_path = format!("{TD_STORE_DIR}/{glibc_base}/{GLIBC_STAGE}");
-    let busybox_path = format!("{TD_STORE_DIR}/{busybox_base}/bin/busybox");
 
     let rustc_version =
         runner.store_ns_output(&[&format!("{rust_path}/bin/rustc"), "--version"], None)?;
@@ -78,43 +86,43 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let smoke = format!(
         "set -eu\n\
          test ! -e /gnu/store\n\
-         bb='{busybox_path}'\n\
+         export PATH='{userland}'\n\
          readelf='{binutils_path}/readelf'\n\
          test -f '{rust_path}/share/td/debug-size'\n\
-         \"$bb\" grep -F -x 'scope=rust-toolchain' '{rust_path}/share/td/debug-size' >/dev/null\n\
+         grep -F -x 'scope=rust-toolchain' '{rust_path}/share/td/debug-size' >/dev/null\n\
          marker='{rust_path}/lib/debug/.td-assembly-exception'\n\
          test -f \"$marker\"\n\
-         \"$bb\" grep -F -x 'exception.2.source=rust-toolchain' \"$marker\" >/dev/null\n\
+         grep -F -x 'exception.2.source=rust-toolchain' \"$marker\" >/dev/null\n\
          line_marker='{rust_path}/lib/debug/.td-line-attribution-exception'\n\
          driver_runtime='{rust_path}/lib/librustc_driver-277b25caa34f5853.so'\n\
          driver_debug='{rust_path}/lib/debug/lib/librustc_driver-277b25caa34f5853.so.debug'\n\
          test -f \"$line_marker\"\n\
          test -f \"$driver_runtime\"\n\
          test -f \"$driver_debug\"\n\
-         driver_runtime_id=\"$(\"$readelf\" -n \"$driver_runtime\" | \"$bb\" grep 'Build ID:')\"\n\
-         driver_debug_id=\"$(\"$readelf\" -n \"$driver_debug\" | \"$bb\" grep 'Build ID:')\"\n\
+         driver_runtime_id=\"$(\"$readelf\" -n \"$driver_runtime\" | grep 'Build ID:')\"\n\
+         driver_debug_id=\"$(\"$readelf\" -n \"$driver_debug\" | grep 'Build ID:')\"\n\
          test -n \"$driver_runtime_id\" || exit 83\n\
          test \"$driver_runtime_id\" = \"$driver_debug_id\" || exit 84\n\
-         if \"$readelf\" -S \"$driver_runtime\" | \"$bb\" grep -F '.symtab' >/dev/null; then exit 87; fi\n\
-         \"$readelf\" -S \"$driver_debug\" | \"$bb\" grep -F '.symtab' >/dev/null\n\
-         line_size=\"$(\"$readelf\" -SW \"$driver_debug\" | \"$bb\" awk '{{ for (i = 1; i <= NF; i++) if ($i == \".debug_line\") {{ print $(i + 4); exit }} }}')\"\n\
-         printf '%s\\n' \"$line_size\" | \"$bb\" grep -E '^0*6179aa9$' >/dev/null || exit 85\n\
-         if \"$readelf\" -SW \"$driver_debug\" | \"$bb\" grep -E '[[:space:]](\\.debug_(info|abbrev|aranges|types|ranges|rnglists|frame|loc|loclists|str|str_offsets|addr|macro|macinfo|pubnames|pubtypes|gnu_pubnames|gnu_pubtypes|names|sup|cu_index|tu_index)|\\.gdb_index)([[:space:]]|$)' >/dev/null; then exit 88; fi\n\
-         test \"$(\"$bb\" wc -c < \"$driver_debug\")\" = 165003688 || exit 86\n\
-         \"$bb\" grep -F -x 'output=rust-toolchain' \"$line_marker\" >/dev/null\n\
-         \"$bb\" grep -F -x 'runtime=lib/librustc_driver-277b25caa34f5853.so' \"$line_marker\" >/dev/null\n\
-         \"$bb\" grep -F -x 'reader_ceiling_bytes=33554432' \"$line_marker\" >/dev/null\n\
-         \"$bb\" grep -F -x 'admitted_ceiling_bytes=134217728' \"$line_marker\" >/dev/null\n\
-         \"$bb\" grep -F -x 'companion_ceiling_bytes=201326592' \"$line_marker\" >/dev/null\n\
-         \"$bb\" grep -F \"Rust 1.96.0 librustc_driver's line program\" \"$line_marker\" >/dev/null\n\
+         rc=0; \"$readelf\" -S \"$driver_runtime\" | grep -F '.symtab' >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 87\n\
+         \"$readelf\" -S \"$driver_debug\" | grep -F '.symtab' >/dev/null\n\
+         line_size=\"$(\"$readelf\" -SW \"$driver_debug\" | awk '{{ for (i = 1; i <= NF; i++) if ($i == \".debug_line\") {{ print $(i + 4); exit }} }}')\"\n\
+         printf '%s\\n' \"$line_size\" | grep -E '^0*6179aa9$' >/dev/null || exit 85\n\
+         rc=0; \"$readelf\" -SW \"$driver_debug\" | grep -E '[[:space:]](\\.debug_(info|abbrev|aranges|types|ranges|rnglists|frame|loc|loclists|str|str_offsets|addr|macro|macinfo|pubnames|pubtypes|gnu_pubnames|gnu_pubtypes|names|sup|cu_index|tu_index)|\\.gdb_index)([[:space:]]|$)' >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 88\n\
+         test \"$(wc -c < \"$driver_debug\")\" = 165003688 || exit 86\n\
+         grep -F -x 'output=rust-toolchain' \"$line_marker\" >/dev/null\n\
+         grep -F -x 'runtime=lib/librustc_driver-277b25caa34f5853.so' \"$line_marker\" >/dev/null\n\
+         grep -F -x 'reader_ceiling_bytes=33554432' \"$line_marker\" >/dev/null\n\
+         grep -F -x 'admitted_ceiling_bytes=134217728' \"$line_marker\" >/dev/null\n\
+         grep -F -x 'companion_ceiling_bytes=201326592' \"$line_marker\" >/dev/null\n\
+         grep -F \"Rust 1.96.0 librustc_driver's line program\" \"$line_marker\" >/dev/null\n\
          for name in rustc rustdoc cargo cargo-clippy clippy-driver; do\n\
            runtime='{rust_path}/bin/'\"$name\"\n\
            debug='{rust_path}/lib/debug/bin/'\"$name\"'.debug'\n\
            test -f \"$debug\"\n\
-           test \"$(\"$readelf\" -n \"$runtime\" | \"$bb\" grep 'Build ID:')\" = \"$(\"$readelf\" -n \"$debug\" | \"$bb\" grep 'Build ID:')\"\n\
-           if \"$readelf\" -S \"$runtime\" | \"$bb\" grep -F '.symtab' >/dev/null; then exit 89; fi\n\
-           \"$readelf\" -S \"$debug\" | \"$bb\" grep -F '.symtab' >/dev/null\n\
-           \"$readelf\" -S \"$debug\" | \"$bb\" grep -F '.debug_line' >/dev/null\n\
+           test \"$(\"$readelf\" -n \"$runtime\" | grep 'Build ID:')\" = \"$(\"$readelf\" -n \"$debug\" | grep 'Build ID:')\"\n\
+           rc=0; \"$readelf\" -S \"$runtime\" | grep -F '.symtab' >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 89\n\
+           \"$readelf\" -S \"$debug\" | grep -F '.symtab' >/dev/null\n\
+           \"$readelf\" -S \"$debug\" | grep -F '.debug_line' >/dev/null\n\
          done\n\
          printf '%s\\n' 'fn main() {{ println!(\"42\"); }}' >/tmp/td-rust-smoke.rs\n\
          '{rust_path}/bin/rustc' --edition=2021 /tmp/td-rust-smoke.rs \
@@ -128,7 +136,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
            -C link-arg=-Wl,-rpath,{glibc_path}/lib \
            -o /tmp/td-rust-smoke\n\
          test \"$(/tmp/td-rust-smoke)\" = 42\n\
-         '{busybox_path}' mkdir -p /tmp/td-cargo-smoke/src /tmp/td-cargo-home /tmp/td-cargo-target\n\
+         mkdir -p /tmp/td-cargo-smoke/src /tmp/td-cargo-home /tmp/td-cargo-target\n\
          printf '%s\\n' '[package]' 'name = \"td-cargo-smoke\"' 'version = \"0.0.0\"' 'edition = \"2021\"' >/tmp/td-cargo-smoke/Cargo.toml\n\
          printf '%s\\n' 'fn main() {{ println!(\"43\"); }}' >/tmp/td-cargo-smoke/src/main.rs\n\
          export PATH='{rust_path}/bin'\n\
@@ -142,7 +150,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          printf '%s\\n' CARGO-BRIDGE-OK\n\
          printf '%s\\n' RUST-BRIDGE-OK\n"
     );
-    let smoke_out = runner.store_ns_output(&[&busybox_path, "sh", "-c", &smoke], None)?;
+    let smoke_out = runner.store_ns_output(&[&sh, "-c", &smoke], None)?;
     if !smoke_out.lines().any(|line| line == "RUST-BRIDGE-OK")
         || !smoke_out.lines().any(|line| line == "CARGO-BRIDGE-OK")
     {
@@ -158,12 +166,12 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         &gcc_path,
         &binutils_path,
         &glibc_path,
-        &busybox_path,
+        &sh,
+        &userland,
         rust_base,
         gcc_base,
         binutils_base,
         glibc_base,
-        busybox_base,
     )?;
     println!(
         "PASS: rust-toolchain: source-built Rust 1.96.0 rustc/std/Cargo/Clippy contain no stage0 artifacts; td shell builds (or reuses from its cache) and runs ripgrep/fd/uutils against td GCC/glibc with /gnu/store absent"
@@ -179,12 +187,12 @@ fn prove_td_shell_userland(
     gcc_path: &str,
     binutils_path: &str,
     glibc_path: &str,
-    busybox_path: &str,
+    sh: &str,
+    userland: &str,
     rust_base: &str,
     gcc_base: &str,
     binutils_base: &str,
     glibc_base: &str,
-    busybox_base: &str,
 ) -> Result<(), String> {
     let root = std::env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let vendor_root = root.join(".td-build-cache/crate-vendor");
@@ -274,7 +282,7 @@ fn prove_td_shell_userland(
     let script = format!(
         "set -eu\n\
          test ! -e /gnu/store\n\
-         export PATH='{TD_STORE_DIR}/{busybox_base}/bin'\n\
+         export PATH='{userland}'\n\
          rg=''\n\
          for p in {TD_STORE_DIR}/*-ripgrep-{rg_version}/bin/rg; do\n\
            if test -x \"$p\"; then rg=$p; fi\n\
@@ -303,7 +311,7 @@ fn prove_td_shell_userland(
          uu_id=$(\"$uutils\" id -u)\n\
          case \"$uu_id\" in ''|*[!0-9]*) exit 98 ;; esac\n\
          \"$uutils\" --list >/tmp/td-shell-userland/uutils-list || exit 99\n\
-         if grep -F -x stdbuf /tmp/td-shell-userland/uutils-list >/dev/null; then exit 100; fi\n\
+         rc=0; grep -F -x stdbuf /tmp/td-shell-userland/uutils-list >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 100\n\
          readelf='{binutils_path}/readelf'\n\
          \"$readelf\" -l \"$rg\" | grep -F '{interp}' >/dev/null\n\
          \"$readelf\" -l \"$fd\" | grep -F '{interp}' >/dev/null\n\
@@ -314,15 +322,15 @@ fn prove_td_shell_userland(
            debug=\"$package/lib/debug/bin/$name.debug\"\n\
            test -f \"$debug\"\n\
            test \"$(\"$readelf\" -n \"$binary\" | grep 'Build ID:')\" = \"$(\"$readelf\" -n \"$debug\" | grep 'Build ID:')\"\n\
-           if \"$readelf\" -S \"$binary\" | grep -F '.symtab' >/dev/null; then exit 88; fi\n\
+           rc=0; \"$readelf\" -S \"$binary\" | grep -F '.symtab' >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 88\n\
            \"$readelf\" -S \"$debug\" | grep -F '.symtab' >/dev/null\n\
            \"$readelf\" -S \"$debug\" | grep -F '.debug_line' >/dev/null\n\
            marker=\"$package/lib/debug/.td-assembly-exception\"\n\
            grep -F -x 'exception.0.source=glibc-x86-64' \"$marker\" >/dev/null\n\
            grep -F -x 'exception.1.source=gcc-x86-64-self' \"$marker\" >/dev/null\n\
            grep -F -x 'exception.2.source=rust-toolchain' \"$marker\" >/dev/null\n\
-           if grep -a -F /gnu/store \"$binary\" >/dev/null; then exit 93; fi\n\
-           if grep -a -F '{stage0_base}' \"$binary\" >/dev/null; then exit 94; fi\n\
+           rc=0; grep -a -F /gnu/store \"$binary\" >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 93\n\
+           rc=0; grep -a -F '{stage0_base}' \"$binary\" >/dev/null || rc=$?; [ \"$rc\" = 1 ] || exit 94\n\
          done\n\
          printf '%s\\n' TD-SHELL-USERLAND-OK\n"
     );
@@ -372,7 +380,7 @@ fn prove_td_shell_userland(
         .args(["--", store_ns_builder_s])
         .arg("store-ns")
         .arg(tdstore_s)
-        .args(["--", busybox_path, "sh", "-c", &script]);
+        .args(["--", sh, "-c", &script]);
     let output = cmd
         .output()
         .map_err(|e| format!("spawn td shell ripgrep fd uutils product proof: {e}"))?;
@@ -426,6 +434,39 @@ fn reset_shell_cache_on_toolchain_change(cache: &Path, toolchain: &str) -> Resul
 fn path_str(path: &Path) -> Result<&str, String> {
     path.to_str()
         .ok_or_else(|| format!("path is not UTF-8: {}", path.display()))
+}
+
+/// The bootstrap root's userland on the proofs' PATH, in lookup order: `sh` is
+/// bash, and coreutils 5.0, grep 2.4 and gawk serve the rest.
+const ROOT_USERLAND: &[&str] = &[
+    "coreutils-mesboot0",
+    "grep-mesboot0",
+    "gawk-mesboot0",
+    "bash-mesboot",
+];
+
+/// A root userland rung's `bin` directory under `/td/store`: the pinned
+/// root's item when the plan started at the cut, which stages it into the
+/// check's store, else the plan's own build of the rung from stage0.
+fn root_userland_bin(
+    runner: &RecipeCheckRunner,
+    build_out: &Path,
+    stem: &str,
+) -> Result<String, String> {
+    let base = if runner.bootstrap_root_db_for("rust-toolchain")?.is_some() {
+        crate::bootstrap_root::root()?
+            .exports
+            .iter()
+            .find(|(export, _)| export == stem)
+            .map(|(_, base)| base.clone())
+            .ok_or_else(|| format!("{stem}: not exported by the bootstrap root"))?
+    } else {
+        path_basename(&runner.ladder_out_from(build_out, stem)?)?.to_string()
+    };
+    if !runner.tdstore_path().join(&base).join("bin").is_dir() {
+        return Err(format!("{stem}: {base} is not staged in the check's store"));
+    }
+    Ok(format!("{TD_STORE_DIR}/{base}/bin"))
 }
 
 pub(super) fn path_basename(path: &Path) -> Result<&str, String> {

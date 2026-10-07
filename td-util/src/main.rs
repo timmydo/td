@@ -22,9 +22,9 @@
 //! `td-util <applet> [args]` form covers the un-symlinked case.
 //!
 //! A third kind replaces busybox in the build graph: `find`, `xargs`, `cmp`,
-//! `diff`, `od`, `gzip`/`gunzip`/`zcat` and `cpio`, the tools recipes and the
-//! initramfs build drive. Each takes the subset those callers use and refuses
-//! the rest rather than guessing at it. `gzip` decodes with the engine's
+//! `diff`, `od`, `uname`, `gzip`/`gunzip`/`zcat` and `cpio`, the tools recipes
+//! and the initramfs build drive. Each takes the subset those callers use and
+//! refuses the rest rather than guessing at it. `gzip` decodes with the engine's
 //! inflater and CRC, included below, so one decoder serves source preparation
 //! and this.
 //!
@@ -91,6 +91,7 @@ mod sleep;
 mod sys;
 mod term;
 mod test;
+mod uname;
 mod which;
 mod xargs;
 
@@ -125,6 +126,7 @@ const APPLETS: &[(&str, Applet)] = &[
     ("rm", fileops::rm),
     ("sleep", sleep::run),
     ("test", test::run),
+    ("uname", uname::run),
     ("which", which::run),
     ("xargs", xargs::run),
     ("zcat", gz::zcat),
@@ -394,8 +396,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            23,
-            "expected twenty-three modules in src/ beside the crate root"
+            24,
+            "expected twenty-four modules in src/ beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -446,6 +448,7 @@ mod confinement {
                 "sys.rs",
                 "term.rs",
                 "test.rs",
+                "uname.rs",
                 "which.rs",
                 "xargs.rs",
             ],

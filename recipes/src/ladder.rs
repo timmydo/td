@@ -88,8 +88,9 @@ pub const BASH: &str = "bash-mesboot";
 /// `AuditedSeed`/`RecipeOutput` edges, never bare host names.
 ///
 /// GNU findutils is deliberately absent as an evidenced DEAD axis for this
-/// bootstrap toolset. A later source build may expose BusyBox `find`/`xargs`
-/// through a ToolFarm only when it declares `busybox-x86-64`; the
+/// bootstrap toolset. A later build may expose `find`/`xargs` only through a
+/// ToolFarm link to a declared multicall that serves them (td-util, or
+/// BusyBox for its last consumers); the
 /// `no_bootstrap_step_invokes_host_find_or_xargs` guard below enforces that
 /// provenance instead of permitting an ambient PATH lookup.
 pub const MESBOOT0_TOOLS: &[&str] = &[
@@ -625,9 +626,9 @@ pub fn debug_line_validator_regression_steps() -> Vec<Step> {
     ]
 }
 
-/// The shell and userland beyond the native self-hosting tool boundary. BusyBox
-/// is a reviewed boundary output and must be a declared `native_input` of every
-/// recipe using these paths.
+/// BusyBox's shell and userland, for its last post-Rust consumers. BusyBox is
+/// a bootstrap-side consumer, so each recipe using these paths declares it and
+/// is a named exception in the ladder's boundary guard.
 pub const POST_BOOTSTRAP_SH: &str = "{in:busybox-x86-64}/bin/sh";
 
 pub fn post_bootstrap_path() -> String {
@@ -1835,7 +1836,6 @@ mod tests {
         "gcc-x86-64-self",
         "binutils-x86-64-self",
         "glibc-x86-64",
-        "busybox-x86-64",
         // Static CMake is already built with the final native GCC and is the
         // reviewed configure-language boundary for later C/C++ build tools.
         "cmake-x86-64",
@@ -1845,6 +1845,7 @@ mod tests {
     // to the far side of the boundary and must not grow this list silently.
     const BOOTSTRAP_SIDE_CONSUMERS: &[&str] = &[
         "busybox-test",
+        "busybox-x86-64",
         "elfutils-x86-64",
         "elfutils-x86-64-test",
         "flex-x86-64",
@@ -1889,6 +1890,14 @@ mod tests {
         // its grep td-txt, so the tests of those two take the root's.
         ("td-sh-test", "bash-mesboot"),
         ("td-txt-test", "grep-mesboot0"),
+        // BusyBox left the Rust bootstrap; these are its last consumers, each
+        // retired from this list as it moves to td's userland.
+        ("kexec-spike-x86-64", "busybox-x86-64"),
+        ("kexec-spike-x86-64-test", "busybox-x86-64"),
+        ("system-secret-vm-test", "busybox-x86-64"),
+        ("system-x86-64", "busybox-x86-64"),
+        ("td-jail-test", "busybox-x86-64"),
+        ("td-util-test", "busybox-x86-64"),
     ];
     const RECIPE_SHEBANG_INTERPRETERS: &[&str] =
         &[super::SH, super::POST_BOOTSTRAP_SH, super::POST_RUST_SH];
@@ -2287,6 +2296,10 @@ mod tests {
         ("td-util", "find.rs", &["find"]),
         ("td-util", "main.rs", &["find", "xargs"]),
         ("td-util", "xargs.rs", &["xargs"]),
+        // The same bodies, compiled by the Rust snapshot for the pre-Rust builds.
+        ("td-util-boot", "find.rs", &["find"]),
+        ("td-util-boot", "main.rs", &["find", "xargs"]),
+        ("td-util-boot", "xargs.rs", &["xargs"]),
     ];
 
     /// Whether this step writes a body `stem` provides `cmd` from.
@@ -2578,7 +2591,7 @@ mod tests {
         recipes.push((
             "synthetic-post-bootstrap",
             Recipe::mesboot("synthetic-post-bootstrap", "0")
-                .native_inputs(&["busybox-x86-64"])
+                .native_inputs(&["glibc-x86-64"])
                 .inputs_owned(vec!["bash-mesboot".into(), "binutils-x86-64-native".into()]),
         ));
         let mut synthetic_closure = HashSet::new();
@@ -2918,7 +2931,7 @@ mod tests {
     /// This walks the WHOLE catalog and fails if any rung reintroduces a host
     /// `find`/`xargs` invocation, which would silently need the removed PATH node
     /// back. A rung may expose one only through a ToolFarm link to an explicitly
-    /// declared td-built BusyBox input; the Rust source build needs those tools.
+    /// declared td-built multicall that serves it.
     ///
     /// Coverage note: it scans every catalog-authored surface that becomes a
     /// command or an interpreted script/Makefile — Run argv, ANY WriteFile body
@@ -2934,7 +2947,7 @@ mod tests {
                     "recipe `{stem}' invokes `{cmd}' in `{text}' — \
                      GNU findutils was retired from the tool tier; a rung \
                      must expose this command through a ToolFarm link to \
-                     its declared td-built busybox-x86-64 input"
+                     a declared td-built multicall (td-util or busybox-x86-64)"
                 );
             }
         }
