@@ -468,6 +468,16 @@ enum Fetched {
     Failed(td_fetch_client::Error),
 }
 
+/// What a fetched item tells request's record.
+fn observe(record: &mut crate::wire::Record, item: &Fetched) {
+    match item {
+        Fetched::Head { status, headers } => record.head(*status, headers),
+        Fetched::Chunk(bytes) => record.chunk(bytes),
+        Fetched::End => record.end("the body came whole".into()),
+        Fetched::Failed(e) => record.end(format!("the exchange failed: {e}")),
+    }
+}
+
 /// What a streamed request came to.
 enum Streamed {
     Replied(Completion),
@@ -5712,15 +5722,21 @@ impl Session {
         self.live.store(request, Ordering::SeqCst);
         let url = format!("{}/chat/completions", client.base_url);
         let headers = client::headers(key.expose());
+        // What the exchange carries, for the window's Debug view, its
+        // credentials never among it (DESIGN.md §6).
+        let mut record = crate::wire::Record::new("POST", &url, &headers);
         let (send, live) = (self.sender.clone(), self.live.clone());
         let spawned = std::thread::Builder::new()
             .name("td-agent-stream".into())
             .spawn(move || fetch(&url, &headers, body.as_bytes(), request, &live, &send));
         if let Err(e) = spawned {
+            let message = format!("the stream's thread: {e}");
+            record.end(format!("not sent: {message}"));
+            self.keep_record(request, &record, key);
             return Streamed::Failed {
                 failure: Failure::Stop {
                     status: None,
-                    message: format!("the stream's thread: {e}"),
+                    message,
                 },
                 partial: None,
             };
@@ -5739,6 +5755,7 @@ impl Session {
             };
             match inbound {
                 Inbound::Fetch { request: of, item } if of == request => {
+                    observe(&mut record, &item);
                     if let Some(end) = self.fetched(request, item, &mut reading) {
                         break end;
                     }
@@ -5762,7 +5779,26 @@ impl Session {
         };
         // Its thread reads no further than the frame it is waiting for.
         self.live.store(0, Ordering::SeqCst);
+        record.end(match &end {
+            Streamed::Replied(_) => "td-agent read a whole reply".into(),
+            Streamed::Failed {
+                failure: Failure::Interrupted { .. },
+                ..
+            } => "interrupted: td-agent closed the connection".into(),
+            Streamed::Failed { failure, .. } => format!("td-agent read a failure: {failure:?}"),
+        });
+        self.keep_record(request, &record, key);
         end
+    }
+
+    /// Request `request`'s record, kept beside the log; one that cannot
+    /// be is said on standard error, the request unaffected.
+    fn keep_record(&self, request: u64, record: &crate::wire::Record, key: &Secret) {
+        let dir = StateDir::at(self.state.clone()).conversation(&self.conversation.meta().id);
+        let text = record.text(&crate::wire::key_forms(key.expose()));
+        if let Err(e) = crate::wire::write(&dir, request, &text) {
+            eprintln!("td-agent: request {request}'s record: {e}");
+        }
     }
 
     /// One step of request `request`'s stream: what it ended in, when it

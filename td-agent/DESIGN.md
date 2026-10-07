@@ -1168,7 +1168,9 @@ keeps that bears on what it did, and never the key file.
   present, under the same rules and key checks, beside the
   configuration and the manifest, whose `scope:` line names the
   conversation and says no other's files and none of the state
-  directory's shared ones are taken (the whole export's says the whole
+  directory's shared ones are taken; its wire records (§6) are taken
+  here alone, the whole export leaving every conversation's `http/`
+  out, saying so (the whole export's says the whole
   state directory). Each step to them is checked as the whole walk
   checks a directory it enters: a link, or the key's directory under
   another name, is left out, said why, and a conversation that is not
@@ -1610,6 +1612,41 @@ human's verdicts are in it. A conversation can be forked at any
 message, which copies its prefix and log up to there into a new
 conversation, and exported to a local file; nothing is shared through
 any service.
+
+**Wire records.** Beside the log, `http/<request>` in the conversation's
+directory keeps what each streamed request (a turn's step or a
+compaction's summary) carried on the wire, for the window's Debug view
+(§4): the request's method, URL and headers, then a `--- reply ---`
+line, the reply's status and headers and its body as it came (raw
+server-sent events, or an error's JSON) as text, the first 1 MiB of it
+with how many bytes it had, and how the exchange ended (the body whole,
+a failure, an interruption, what td-agent read of it, or that it was
+never sent). The request's body is not kept twice: the log rebuilds it
+(`client::body`). The line and each side's headers are held to 64 KiB.
+
+The key is never in one. A credential's header, `authorization`,
+`proxy-authorization`, `cookie` or `set-cookie`, keeps its name and has
+its value replaced by `[redacted]`, as has a user and password in the
+URL's authority. Every form of the key (`wire::key_forms`: as written,
+as a JSON string escapes it, and that with its solidi escaped, the forms
+the diagnostics export looks for) is replaced the same way wherever it
+is before the record is written, so a reply that echoed it, or a
+failure's text, keeps nothing of it; the body is held 4 KiB past its
+bound until then, more than any form of a key, and cut at the bound only
+once scrubbed, so a key the cut would split leaves nothing either.
+
+A record is written once the exchange ends, mode 0600 in a directory of
+mode 0700 that is not a link, through a temporary opened without
+following links and renamed into place. A conversation's records are
+held to 16 MiB, the oldest requests' removed first, and a temporary a
+write that did not finish is removed with them; one that cannot be
+written is said on standard error and changes nothing else. One is read
+back within what a record can hold, its text decoded as it was written.
+A side request (a title, a classifier's) has none. They are a debugging
+aid, not part of the log: replay never reads them. A conversation's own
+diagnostics export takes them under its key checks; the whole export
+leaves every conversation's out, saying so, so that they cannot crowd
+the logs out of its bound on bytes (§4).
 
 **Recovery.** Every effect is logged as started, with an id, and synced
 before it runs, and logged as finished after: a model request, a tool

@@ -658,6 +658,27 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
         "The person asks what a sparse checkout is. Answer plainly."
     );
     assert!(h.deltas.len() > 2, "{:?}", h.deltas);
+    // The exchange is kept beside the log for the Debug view: the
+    // request's line and headers, the key's replaced, and the reply as it
+    // came; the key nowhere in it.
+    let record = td_agent::wire::read(&h.state.conversation(&h.id), reply[0].0).unwrap();
+    assert!(
+        record.starts_with(
+            "POST https://openrouter.ai/api/v1/chat/completions\nauthorization: [redacted]\ncontent-type: application/json\n"
+        ),
+        "{record}"
+    );
+    assert!(!record.contains(KEY), "{record}");
+    assert!(
+        record.contains(&format!("{}\nstatus 200\n", td_agent::wire::REPLY)),
+        "{record}"
+    );
+    assert!(record.contains("data: "), "{record}");
+    // Read whole at `[DONE]`, before the service says the body ended.
+    assert!(
+        record.ends_with("data: [DONE]\n\n[td-agent read a whole reply]\n"),
+        "{record}"
+    );
     assert_eq!(body["reasoning.effort"], "medium");
     assert_eq!(body["provider.require_parameters"], "true");
     assert_eq!(body["provider.data_collection"], "deny");

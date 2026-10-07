@@ -85,4 +85,5 @@ pub mod ui;
 pub mod upstream;
 pub mod wake;
 pub mod window;
+pub mod wire;
 pub mod workspace;

@@ -295,6 +295,10 @@ struct Walk {
     left_out: Vec<(String, String)>,
     budget: usize,
     beyond: usize,
+    /// Whether the conversations' wire records are taken: in one
+    /// conversation's export, not in the whole one, where they would
+    /// crowd its logs out of the bound on bytes.
+    records: bool,
 }
 
 impl Walk {
@@ -329,6 +333,7 @@ fn write(
         left_out: Vec::new(),
         budget: limits.entries,
         beyond: 0,
+        records: sources.conversation.is_some(),
     };
     match std::fs::metadata(&sources.state) {
         Ok(m) if Some(identity(&m)) == never.directory => walk.left_out.push((
@@ -465,6 +470,15 @@ fn descend(dir: &Path, name: &str, depth: usize, never: &Never, walk: &mut Walk)
                         named,
                         "the workspaces' jail directories hold the human's work".into(),
                     ));
+                } else if depth == 2
+                    && file == crate::wire::DIR
+                    && name.starts_with("state/conversations/")
+                    && !walk.records
+                {
+                    walk.left_out.push((
+                        named,
+                        "the wire records: each conversation's own export takes them".into(),
+                    ));
                 } else if key_directory {
                     walk.left_out.push((
                         named,
@@ -526,15 +540,9 @@ fn read_regular(
 fn keys(secrets: &[Secret]) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     for secret in secrets {
-        let key = secret.expose();
-        let quoted = td_json::Json::Str(key.to_string()).to_string();
-        let escaped = quoted
-            .strip_prefix('"')
-            .and_then(|q| q.strip_suffix('"'))
-            .unwrap_or(key);
-        for form in [key, escaped] {
-            if !form.is_empty() && !keys.iter().any(|k| k == form) {
-                keys.push(form.to_string());
+        for form in crate::wire::key_forms(secret.expose()) {
+            if !keys.contains(&form) {
+                keys.push(form);
             }
         }
     }
@@ -797,6 +805,8 @@ mod tests {
         let id = "a".repeat(32);
         let conversation = state.join("conversations").join(&id);
         std::fs::create_dir_all(&conversation).unwrap();
+        std::fs::create_dir_all(conversation.join(crate::wire::DIR)).unwrap();
+        std::fs::write(conversation.join(crate::wire::DIR).join("2"), "POST u\n").unwrap();
         std::fs::write(conversation.join("log"), "{\"seq\":1}\n").unwrap();
         std::fs::write(conversation.join("meta"), "{}").unwrap();
         let outbox = state.join("outbox").join(&id);
@@ -882,6 +892,11 @@ mod tests {
             "{manifest}"
         );
         assert!(manifest.contains("  config 14\n"), "{manifest}");
+        // The wire records are each conversation's own export's.
+        assert!(
+            manifest.contains(&format!("state/conversations/{id}/http: the wire records")),
+            "{manifest}"
+        );
         // The jail directories hold the human's work: left out whole.
         assert!(
             manifest.contains("state/jail: the workspaces' jail directories"),
@@ -891,7 +906,7 @@ mod tests {
             members.iter().all(|(name, _)| !name.contains("/jail/")),
             "{members:?}"
         );
-        assert_eq!((exported.files, exported.left_out), (5, 3));
+        assert_eq!((exported.files, exported.left_out), (5, 4));
         // No part is left, and a second export in the same second takes
         // a name of its own.
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
@@ -916,6 +931,7 @@ mod tests {
         let other = sources.state.join("conversations").join("b".repeat(32));
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join("log"), "other").unwrap();
+        // Its wire records go with it.
         sources.conversation = Some(crate::store::Id::parse(&id).unwrap());
         let out = out(&scratch, "out");
         let exported = export(&sources, &out, NOW, &[]).unwrap();
@@ -931,6 +947,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                format!("{top}/state/conversations/{id}/http/2"),
                 format!("{top}/state/conversations/{id}/log"),
                 format!("{top}/state/conversations/{id}/meta"),
                 format!("{top}/state/outbox/{id}/{:020}-{}", 7, "d".repeat(32)),
@@ -938,7 +955,7 @@ mod tests {
                 format!("{top}/MANIFEST"),
             ]
         );
-        let manifest = String::from_utf8(members[4].1.clone()).unwrap();
+        let manifest = String::from_utf8(members[5].1.clone()).unwrap();
         assert!(
             manifest.contains(&format!("scope: conversation {id}: ")),
             "{manifest}"
