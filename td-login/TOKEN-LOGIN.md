@@ -16,53 +16,54 @@ refuses before starting anything; without a list it refuses removal
 itself. Only its lock surface's chord sends an unlock's `1b`, and only
 while the state is enrolled; production locks only at a generation's
 start, on `Super+l`, on the attention menu's `L`, on a lid close and on
-a resume (increment 4's C7, C9 and C10, below). Its PIN field sends
-`1c` only when
-root asks for a PIN at a presented PIN step, which only that unlock
-reaches. So nothing in production starts the worker or uses its
+a resume (increment 4's C7, C9 and C10, below). Its PIN field sends `1c`
+only when root asks for a PIN at a presented PIN step, which only that
+unlock reaches. So nothing in production starts the worker or uses its
 `login_record` and `login_store` modules ("The login record"), its login
 identify, PIN-retry, assertion and creation steps ("Token profile"), or
 td-authd's login consent operations, step admission and supervision
 (`td-authd/DESIGN.md`, "Login-key operation supervision"), except that
 unlock on a machine that holds a record, which nothing in production
-writes. The worker
-reads both retained deployments' tier markers before a write that would
-leave a record ("Versions"), which production td-authd still refuses
-before starting it. No deployment carries the marker before increment
-4's C10b ("Deployments"), so until then it reads no record version for
-either and would refuse every such write. Its `qemu-secret` guests,
-which have no volume and so take both retained deployments to read this
-build's version in the marker's place, run it over UHID virtual keys
-through every case increment 2 lists, including power cuts inside its
-writes on a disposable disk ("Evidence"): increment 2 is complete. Of
-increment 3, the compositor's exclusion of a security key's own keyboard
-from secure attention has landed, and it is live: it narrows the
-existing attention selections and confirmation and needs no record
-(`td-compositor/DESIGN.md`, "Physical secure attention"). The private
-client's login-key operations have landed too
+writes. The worker reads both retained deployments' tier markers before
+a write that would leave a record ("Versions"), which production
+td-authd still refuses before starting it. Every deployment built from
+increment 4's C10b onward carries the marker ("Deployments"), so it
+reads the record versions of each retained deployment that carries it;
+one built before C10b carries none and reads no version. Its
+`qemu-secret` guests, which have no volume and so take both retained
+deployments to read this build's version in the marker's place, run it
+over UHID virtual keys through every case increment 2 lists, including
+power cuts inside its writes on a disposable disk ("Evidence"):
+increment 2 is complete. Of increment 3, the compositor's exclusion of a
+security key's own keyboard from secure attention has landed, and it is
+live: it narrows the existing attention selections and confirmation and
+needs no record (`td-compositor/DESIGN.md`, "Physical secure
+attention"). The private client's login-key operations have landed too
 (`td-compositor/DESIGN.md`, "Login-key operations"): the `K` screen,
 each operation's descriptions checked step by step, its commit and the
 failure texts ("Failure texts"). Production reaches only their refusals.
 The PIN field has landed as well ("PIN entry, presence and retries"),
 reached only by that unlock, and so has the lock surface with its login
-unlock ("Session lock"), which C7 made live. Increment 3 is complete; its
-desktop guest moved to increment 4 as `login-desktop`. Increment 4 is
-specified as twelve commits, C1 to C11 and C10b ("Increments"), of which
-C1 to C10 have landed: firstboot ensures the login directory at every
-boot, the live medium's included, through the shared login-state
-predicate, and rootcheck reports it on a marker of its own; td-authd
-answers request `1a` with the login state, through that predicate and
-the read-only `inspect-login` helper; the compositor asks it and uses
-its key list for `D`; the tier marker's grammar, placement and readers
-are specified ("Deployments") and implemented: the worker reads its
-write version from the retained deployments' markers, and on an enrolled
-or unavailable machine td-authd's request 19 refuses a queued deployment
-that cannot read the record, which the compositor shows. Deployments
-carry the marker only from C10b, the commit after C10 that completes
-increment 4's enforcement, since the marker claims that a deployment
-honours the record at every entry point. Until C10b, request 19 on an
-enrolled or unavailable machine therefore refuses every update; that is
-moot, since nothing enrolls before increment 5. td-login's interactive
+unlock ("Session lock"), which C7 made live. Increment 3 is complete;
+its desktop guest moved to increment 4 as `login-desktop`. Increment 4
+is specified as twelve commits, C1 to C11 and C10b ("Increments"), of
+which C1 to C10 and C10b have landed: firstboot ensures the login
+directory at every boot, the live medium's included, through the shared
+login-state predicate, and rootcheck reports it on a marker of its own;
+td-authd answers request `1a` with the login state, through that
+predicate and the read-only `inspect-login` helper; the compositor asks
+it and uses its key list for `D`; the tier marker's grammar, placement
+and readers are specified ("Deployments") and implemented: the worker
+reads its write version from the retained deployments' markers, and on
+an enrolled or unavailable machine td-authd's request 19 refuses a
+queued deployment that cannot read the record, which the compositor
+shows. Every deployment built from C10b, the commit after C10 that
+completes increment 4's enforcement, carries the marker, since the
+marker claims that a deployment honours the record at every entry point.
+On an enrolled or unavailable machine, request 19 therefore admits a
+marked deployment that reads the record's version (any marked one while
+the record cannot be read) and refuses one built before C10b, which
+carries none; nothing enrolls before increment 5. td-login's interactive
 `login` and `login-primary` refuse the console there, returning the line
 to root and parking with one fixed line (`THREAT-MODEL.md` §3), while
 the image logs in only through `login-primary`; and firstboot's
@@ -71,23 +72,21 @@ compositor starts every generation locked there too ("Session lock"):
 its first frame is the lock surface, with the answer's hostname and
 username above the state's rows, and on it the chord sends an unlock's
 `1b` only while the state is enrolled. The `login-desktop` guest shows
-that start and the unlock through the production authority and worker
-in QEMU ("Evidence"). `Super+l`, the attention menu's `L`, a lid close
-and a resume lock an enrolled or unavailable session too, and a lock
-while an attention lifetime is open ends it as Escape does ("Session
-lock"). Those three refusals, the locked start and those four locks are
-all that act on the state, and only where a record
-or an invalid directory exists, but for increment 4's live exceptions
-("Increments"): on every paired machine `Super+l` is consumed and the
-menu shows `L`, which answers `NO LOGIN KEYS ENROLLED` while
-unenrolled. Nothing else below is
+that start and the unlock through the production authority and worker in
+QEMU ("Evidence"). `Super+l`, the attention menu's `L`, a lid close and
+a resume lock an enrolled or unavailable session too, and a lock while
+an attention lifetime is open ends it as Escape does ("Session lock").
+Those three refusals, the locked start and those four locks are all that
+act on the state, and only where a record or an invalid directory
+exists, but for increment 4's live exceptions ("Increments"): on every
+paired machine `Super+l` is consumed and the menu shows `L`, which
+answers `NO LOGIN KEYS ENROLLED` while unenrolled. Nothing else below is
 implemented. Until the increments at the end land, `THREAT-MODEL.md` §3
 is the complete current behaviour: the installed account logs in
 automatically, and a machine with neither a record nor an invalid
 directory, as every stock machine is, never locks. No document, UI or
-release
-note may describe this tier as available before its acceptance evidence
-exists.
+release note may describe this tier as available before its acceptance
+evidence exists.
 
 **Enrollment requires §L.1 elevation.** Enrolling a key refuses every
 interactive login, and on a fresh install `su` cannot elevate from a
@@ -835,10 +834,11 @@ close and resume (C9, C10). Enrollment trusts `current` and `previous`
 on that claim, so a deployment that carried the marker but not that
 enforcement would be a rollback target that boots open on an enrolled
 machine. Deployments therefore carry it only from C10b, the commit after
-C10; the readers below land earlier, in C4, and until C10b read no
-version from any td-built deployment.
+C10, and every deployment built from C10b onward carries it; the readers
+below landed earlier, in C4, and read no version from a td-built
+deployment built before C10b.
 
-From C10b the system recipe writes it into the deployment phase's
+Since C10b the system recipe writes it into the deployment phase's
 `gen_init_cpio` spec only, beside `dir /etc 0755 0 0`, as `file
 /etc/td-login-tier` with mode 0444 and owner 0:0, its content a constant
 of the recipe; the selector initramfs carries none. A recipe test reads
@@ -913,7 +913,8 @@ record version, as a deployment without the tier.
 C4; `td-secret/DESIGN.md`, "Tier marker reader"), with the budget a
 parameter of each reader: td-authd's `MARKER_GIVE_UP` of two seconds
 and the worker's `RETAINED_GIVE_UP` of ten. Its tests build their own
-archives; the recipe's writing is C10b's.
+archives; the recipe's writing is C10b's, which a recipe test and the
+build's archive check hold to the placement above.
 
 A deployment without the marker ignores the record, so booting it
 restores automatic login. Therefore:
@@ -1374,11 +1375,11 @@ and the oracle that shows it.
      deployments' markers in place of its empty `UNMARKED`
      (`td-secret/DESIGN.md`, "Login-key worker"); and request 19's
      refusal (`td-authd/DESIGN.md`, amendment 8), shown as `UPDATE
-     CANNOT READ LOGIN KEYS`. No deployment carries the marker until
-     C10b, so until then the worker reads no version and request 19 on
-     an enrolled or unavailable machine refuses every update; nothing
-     enrolls before increment 5, so neither refusal costs anything
-     meanwhile. Host tests cover the grammar, every reader bound, the
+     CANNOT READ LOGIN KEYS`. No deployment carried the marker until
+     C10b, so between C4 and C10b the worker read no version and request
+     19 on an enrolled or unavailable machine refused every td-built
+     update; nothing enrolls before increment 5, so neither refusal cost
+     anything. Host tests cover the grammar, every reader bound, the
      digest chain, the read sets over fixture volumes, request 19 on
      each state and marker and past its two-second budget, all over
      archives the tests build, and the compositor's text; the refusal
@@ -1502,25 +1503,31 @@ and the oracle that shows it.
      the commit, and the pin. A real lid and
      a real suspend are the hardware evidence's ("Evidence"); QEMU's
      S3 is `qemu-login-system`'s (C11).
-   - C10b, "login: deployments carry the tier marker": the system
-     recipe writes the marker, listing the build's `READS`, into the
-     deployment initramfs as "Deployments" places it; a recipe test
-     holds the constant to `login_record.rs` and the spec, and the
-     build's archive check finds it in the deployment initramfs and not
-     the selector's. It follows C10 because the marker claims the
-     deployment honours the record at every entry point, which holds
-     only once C5, C6, C7, C9 and C10 have landed: a deployment built
-     between C4 and C10 that carried it would pass increment 5's
-     enrollment check as `current` or `previous` and, rolled back to,
-     boot open. Every deployment ID changes, since the initramfs does,
-     so its landing runs `check integration` by hand.
-   - C11: the `qemu-login-system` guest (below), which depends on C10b:
-     its marked deployments are what its install and refusal cases
-     tell apart.
+   - C10b, landed, "login: deployments carry the tier marker": the
+     system recipe writes the marker, listing the build's `READS`, into
+     the deployment initramfs as "Deployments" places it, so every
+     deployment from C10b onward carries it; a recipe test holds the
+     constant to `login_record.rs`, the spec and the write before the
+     pack, and the build's archive check finds it in the deployment
+     initramfs and not the selector's. It follows C10 because the
+     marker claims the deployment honours the record at every entry
+     point, which holds only once C5, C6, C7, C9 and C10 have landed: a
+     deployment built between C4 and C10 that carried it would pass
+     increment 5's enrollment check as `current` or `previous` and,
+     rolled back to, boot open. From it, on an enrolled or unavailable
+     machine, request 19 admits a marked deployment that reads the
+     record's version (any marked one while the record cannot be read),
+     and the worker reads the record versions of each retained
+     deployment that carries the marker. Every deployment ID changes,
+     since the initramfs does, so its landing runs `check integration`
+     by hand.
+   - C11: the `qemu-login-system` guest (below), which depends on
+     C10b's marked deployments: they are what its install and refusal
+     cases tell apart.
 
    C7 lands only after the update-consent refusal (C4), the console
    refusal (C5) and the enforced SSH render (C6), so no build locks the
-   screen while an update, the console or SSH could pass it. C10b lands
+   screen while an update, the console or SSH could pass it. C10b landed
    only after C10, so no deployment carries the marker before it
    honours the record at every entry point. Each commit
    before C7 changes behaviour only where a record or an invalid

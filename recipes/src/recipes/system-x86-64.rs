@@ -4149,6 +4149,14 @@ fn etc_files(sys: &SystemDef) -> Result<Vec<(&'static str, String, bool)>, Strin
     ])
 }
 
+/// The login-key tier marker (td-login/TOKEN-LOGIN.md, "Deployments"): the
+/// record versions td-secret's codec reads, `login_record.rs`'s `READS`, in
+/// the marker's grammar. Only the deployment initramfs carries it, as
+/// `/etc/td-login-tier`, mode 0444, 0:0; a test holds it to `READS`.
+const LOGIN_TIER_MARKER: &str = "td-login-tier-v1 1\n";
+/// The marker's bytes in build scratch, which the deployment spec packs.
+const LOGIN_TIER_SOURCE: &str = "{root}/td-login-tier";
+
 /// Which of the two structurally distinct boot phases a cpio is packed for. They carry
 /// DISJOINT capabilities, and each one's absence from the other phase is asserted: the
 /// selector kexecs (`/bin/td-kexec`) and never pivots, the deployment phase pivots
@@ -4282,6 +4290,12 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
             s.push_str(
                 "slink /bin/mkfs.btrfs {in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static 0777 0 0\n",
             );
+            // The tier marker, read by td-authd's update consent and the
+            // login worker through the deployment ID; nothing at boot reads it.
+            s.push_str("dir /etc 0755 0 0\n");
+            s.push_str(&format!(
+                "file /etc/td-login-tier {LOGIN_TIER_SOURCE} 0444 0 0\n"
+            ));
         }
     }
     s.push_str("nod /dev/console 0600 0 0 c 5 1\n");
@@ -5003,6 +5017,8 @@ fn shape_check() -> String {
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/td-firstboot || { echo 'deployment initramfs: primary home provisioner missing' >&2; exit 1; }; \
      printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-firstboot$' || { echo 'deployment initramfs: provisioner store member missing' >&2; exit 1; }; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/td-firstboot; then echo 'selector initramfs: home provisioner must be deployment-only' >&2; exit 1; fi; \
+     printf '%s\\n' \"$init_list\" | grep -q -x -F etc/td-login-tier || { echo 'deployment initramfs: the login tier marker etc/td-login-tier is missing - an enrolled machine would refuse to install it' >&2; exit 1; }; \
+     if printf '%s\\n' \"$selector_list\" | grep -q -x -F etc/td-login-tier; then echo 'selector initramfs: the login tier marker must be deployment-only' >&2; exit 1; fi; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/switch_root || { echo 'deployment initramfs: bin/switch_root missing - its /init would exec nothing and the boot would end in a 300s timeout with no cause' >&2; exit 1; }; \
      printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-init$' || { echo 'deployment initramfs: td-init store member missing - the switch_root and mount/umount symlinks would dangle' >&2; exit 1; }; \
      for l in \"$selector_list\" \"$init_list\"; do printf '%s\\n' \"$l\" | grep -qE '^td/store/[^/]+/bin/td-util$' || { echo 'initramfs: td-util store member missing - /bin/td-util would dangle and the /init would stop at its first cat/sleep under set -e, with no cause on the console' >&2; exit 1; }; done; \
@@ -5446,6 +5462,11 @@ pub fn recipe() -> Recipe {
         path: "{root}/deployment-init".into(),
         content: build_deployment_init(&SYSTEM),
         exec: true,
+    });
+    steps.push(Step::WriteFile {
+        path: LOGIN_TIER_SOURCE.into(),
+        content: LOGIN_TIER_MARKER.into(),
+        exec: false,
     });
     steps.push(Step::WriteFile {
         path: "{root}/deployment.spec".into(),
@@ -12904,6 +12925,84 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             "shape_check no longer parses the archives with the declared build-tool \
              busybox; if that went away the input should have gone with it"
         );
+    }
+
+    /// TOKEN-LOGIN.md, "Deployments": the marker lists exactly the record
+    /// versions td-secret's codec reads, in the marker's grammar, and only
+    /// the deployment phase packs it, read-only and root's.
+    #[test]
+    fn the_login_tier_marker_lists_exactly_the_codecs_record_versions() {
+        const CODEC: &str = include_str!("../../../td-secret/src/login_record.rs");
+        let constant = |name: &str, kind: &str| {
+            let prefix = format!("pub(super) const {name}: {kind} = ");
+            let lines: Vec<&str> = CODEC
+                .lines()
+                .filter_map(|line| line.strip_prefix(prefix.as_str())?.strip_suffix(';'))
+                .collect();
+            assert_eq!(lines.len(), 1, "{name}");
+            lines[0]
+        };
+        // `READS` names each version by literal or as `VERSION`.
+        let version = constant("VERSION", "u8");
+        let reads = constant("READS", "&[u8]");
+        let listed = reads
+            .strip_prefix("&[")
+            .and_then(|list| list.strip_suffix(']'))
+            .unwrap();
+        let versions: Vec<u8> = listed
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| if entry == "VERSION" { version } else { entry })
+            .map(|entry| {
+                assert!(!entry.starts_with('0'), "{entry}");
+                entry.parse().unwrap()
+            })
+            .collect();
+        assert!(!versions.is_empty());
+        assert!(versions.windows(2).all(|pair| pair[0] < pair[1]));
+        let fields: String = versions.iter().map(|v| format!(" {v}")).collect();
+        assert_eq!(LOGIN_TIER_MARKER, format!("td-login-tier-v1{fields}\n"));
+        assert_eq!(LOGIN_TIER_MARKER, "td-login-tier-v1 1\n");
+        assert!(LOGIN_TIER_MARKER.len() <= 256);
+        // Only the deployment phase packs it, beside its /etc.
+        let deployment = build_initramfs_spec("deployment-init", Phase::Deployment);
+        let selector = build_initramfs_spec("selector-init", Phase::Selector);
+        let entry = "file /etc/td-login-tier {root}/td-login-tier 0444 0 0";
+        let lines: Vec<&str> = deployment.lines().collect();
+        let at = |wanted: &str| {
+            let found: Vec<usize> = (0..lines.len()).filter(|i| lines[*i] == wanted).collect();
+            assert_eq!(found.len(), 1, "{wanted}");
+            found[0]
+        };
+        assert!(at("dir /etc 0755 0 0") < at(entry));
+        assert_eq!(deployment.matches("td-login-tier").count(), 2);
+        assert!(!selector.contains("td-login-tier") && !selector.contains("dir /etc "));
+        // The recipe writes those bytes, and no others, before it packs.
+        let steps = recipe().steps.unwrap();
+        let written: Vec<usize> = (0..steps.len())
+            .filter(|i| {
+                matches!(&steps[*i], Step::WriteFile { path, content, exec: false }
+                    if path == LOGIN_TIER_SOURCE && content == LOGIN_TIER_MARKER)
+            })
+            .collect();
+        assert_eq!(written.len(), 1);
+        let packed = steps
+            .iter()
+            .position(|step| {
+                matches!(step, Step::Run { argv, .. }
+                    if argv.iter().any(|arg| arg.contains("'{root}/deployment.spec'")))
+            })
+            .unwrap();
+        assert!(written[0] < packed);
+        // The build's own listing of both archives agrees.
+        let check = shape_check();
+        assert!(
+            check.contains("printf '%s\\n' \"$init_list\" | grep -q -x -F etc/td-login-tier || {")
+        );
+        assert!(check.contains(
+            "if printf '%s\\n' \"$selector_list\" | grep -q -x -F etc/td-login-tier; then"
+        ));
     }
 
     #[test]

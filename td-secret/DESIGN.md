@@ -1852,9 +1852,10 @@ copy each crate already compiles (td-secret names `crypto`'s as
 read against and the owner its files must have; `retained` takes the
 volume and a selector name, `current` or `previous`, and reads the
 deployment it names by that name. Any failure reads no version. The
-system recipe writes no marker before TOKEN-LOGIN.md increment 4's C10b,
-which follows the enforcement the marker claims, so until then these
-readers find none in a td-built deployment; the tests below build their
+system recipe writes the marker into every deployment from
+TOKEN-LOGIN.md increment 4's C10b, which follows the enforcement the
+marker claims, so these readers find it in a td-built deployment from
+C10b onward and none in one built before; the tests below build their
 own archives.
 
 Each of `manifest` and `initramfs.cpio` is opened through the
@@ -2251,13 +2252,15 @@ PIN step's acknowledgement. `17` stays store inspection's.
    the marker taken by the shared bounded newc reader,
    `login_tier.rs`, which td-authd compiles for request 19. A
    deployment whose marker does not verify, or a machine with no volume,
-   reads no version. No deployment carries the marker before
-   TOKEN-LOGIN.md increment 4's C10b, which follows the enforcement it
-   claims ("Deployments"), so until then `run` reads no version from
-   any td-built deployment and every such write fails as VERSION.
-   Production still refuses every write before it reaches the worker
-   (`td-authd/DESIGN.md`, `login::WRITES`), so this changes no
-   production answer until activation.
+   reads no version. Every deployment built from TOKEN-LOGIN.md
+   increment 4's C10b onward carries the marker, C10b following the
+   enforcement it claims ("Deployments"), so `run` reads the record
+   versions of each retained deployment that carries it and none from
+   one built before C10b; a write still fails as VERSION while either
+   retained deployment predates C10b. Production still refuses every
+   write before it reaches the worker (`td-authd/DESIGN.md`,
+   `login::WRITES`), so this changes no production answer until
+   activation.
 3. It presents root's own first step (identify, or an enrollment's
    first connect), then reads the record again: if it no longer reads as
    the baseline, an unavailable state included, it fails as RECORD

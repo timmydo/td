@@ -1739,10 +1739,12 @@ td-authd change was needed for either: the connect-time `1a` already
 preceded the compositor's first paint, and the later answers already
 reached it. Update consent (8) is implemented (C4) and live: on an
 enrolled or unavailable machine request 19 refuses a queued deployment
-that cannot read the record. No deployment carries the tier marker
-before TOKEN-LOGIN.md increment 4's C10b, so until then that is every
-queued deployment, which is moot since nothing enrolls before increment
-5. Revocation (7) is not implemented.
+that cannot read the record. Every deployment built from TOKEN-LOGIN.md
+increment 4's C10b onward carries the tier marker, so on such a machine
+it admits a marked deployment that reads the record's version (any
+marked one while the record cannot be read) and refuses one built
+before C10b, which carries none; nothing enrolls before increment 5.
+Revocation (7) is not implemented.
 [`td-login/TOKEN-LOGIN.md`](../td-login/TOKEN-LOGIN.md) owns the planned
 login-key tier. "Session lock" there is the compositor's display and
 input lock; it is unrelated to this document's secret-session statuses
@@ -1993,13 +1995,17 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    receive rather than ending the paired generation (TOKEN-LOGIN.md,
    "Deployments"). The worker's own reads keep ten seconds each.
 
-   The system recipe writes the marker only from TOKEN-LOGIN.md
-   increment 4's C10b, after C10, since the marker claims that a
-   deployment honours the record at every entry point (console, SSH,
-   locked start and session lock), which no build before C10 does.
-   Until C10b, request 19 on an enrolled or unavailable machine
-   therefore refuses every queued deployment with `99 01`; that is moot,
-   since no machine enrolls before increment 5, and an unenrolled
+   The system recipe writes the marker into every deployment from
+   TOKEN-LOGIN.md increment 4's C10b, which landed after C10, since the
+   marker claims that a deployment honours the record at every entry
+   point (console, SSH, locked start and session lock), which no build
+   before C10 does. Between C4 and C10b, request 19 on an enrolled or
+   unavailable machine refused every td-built queued deployment with
+   `99 01`.
+   From C10b it admits a queued deployment whose marker lists the
+   enrolled record's version, or any marked one while the record cannot
+   be read, and still refuses one built before C10b, which carries no
+   marker; no machine enrolls before increment 5, and an unenrolled
    machine reads no marker. The full-system refusal, in
    `qemu-login-system` (C11), depends on C10b's marked deployments.
 
@@ -2156,7 +2162,7 @@ operation's end or request 19.
 Request 19's host tests (`tests/session.rs`, `tests/deployment.rs`) drive
 a real admitted intake over a deployment directory whose archive the
 test builds with `login_tier.rs`'s fixtures, not the system recipe's
-(which carries no marker before C10b): a marker-less
+(whose marker, written since C10b, a recipe test pins): a marker-less
 deployment, one whose marker lists another version, and one listing the
 record's, each under an unenrolled machine (always selectable), an
 enrolled record of version 1 or 2, and a damaged record, a damaged
