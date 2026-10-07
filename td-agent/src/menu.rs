@@ -39,6 +39,10 @@ pub enum Action {
     Workspace,
     /// Open the dialog that stores the OpenRouter key.
     SetKey,
+    /// Open the dialog that makes a workspace template (DESIGN.md §7).
+    NewTemplate,
+    /// Choose a template made in the window, to edit or remove.
+    EditTemplate,
     /// Write the diagnostics archive (DESIGN.md §4).
     Export,
     /// Close the window, as the compositor's close does.
@@ -79,6 +83,8 @@ pub enum Action {
 /// works, or none), and the action.
 pub const FILE: &[(&str, &str, Action)] = &[
     ("New conversation\u{2026}", "C-n", Action::New),
+    ("New template\u{2026}", "", Action::NewTemplate),
+    ("Edit template\u{2026}", "", Action::EditTemplate),
     ("Set OpenRouter key\u{2026}", "", Action::SetKey),
     ("Export diagnostics", "", Action::Export),
     ("Messages\u{2026}", "C-S-m", Action::Messages),
@@ -559,7 +565,7 @@ mod tests {
         let outcome = menu
             .event(Some(1), Event::Press { x: row.0, y: row.1 })
             .unwrap();
-        assert_eq!(outcome, Outcome::Activated(Action::SetKey));
+        assert_eq!(outcome, Outcome::Activated(Action::NewTemplate));
         // The second header opens the Conversation menu.
         let header = bar(surface()).header(1).unwrap();
         let press = Event::Press {

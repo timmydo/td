@@ -1187,6 +1187,26 @@ fn untextual(path: &Path) -> Option<String> {
         .then(|| format!("{} cannot be named as text", path.display()))
 }
 
+/// The git directory `path` is in, or the repository whose top it is.
+fn repository_holding(path: &Path) -> Option<&Path> {
+    let git_directory = path
+        .ancestors()
+        .find(|dir| dir.file_name() == Some(".git".as_ref()) || is_git_directory(dir));
+    git_directory.or(is_repository(path).then_some(path))
+}
+
+/// The repository a template's remote would name for `chosen`, which
+/// `admit_directory` refuses as being in it: its work tree's top, or a
+/// bare repository itself.
+pub fn repository_remote(chosen: &Path) -> Option<PathBuf> {
+    let path = fs::canonicalize(chosen).ok()?;
+    let repository = repository_holding(&path)?;
+    match repository.file_name() {
+        Some(name) if name == ".git" => repository.parent().map(Path::to_path_buf),
+        _ => Some(repository.to_path_buf()),
+    }
+}
+
 /// The directory `chosen` names, admitted as a directory workspace, or why
 /// not: a directory, in no git repository, and none of `places`, nor
 /// overlapping a shared directory, which every workspace is given anyway.
@@ -1205,13 +1225,9 @@ pub fn admit_directory(
     // A repository's top, or anything inside a git directory: the model
     // could write hooks or configuration the human's git then runs. A
     // work tree's subdirectory is admitted: its `.git` is out of reach.
-    let git_directory = path
-        .ancestors()
-        .find(|dir| dir.file_name() == Some(".git".as_ref()) || is_git_directory(dir));
-    if let Some(repository) = git_directory.or(is_repository(&path).then_some(path.as_path())) {
+    if let Some(repository) = repository_holding(&path) {
         return Err(format!(
-            "{} is in the git repository {}; repository workspaces come with the git \
-             worker (increment 11)",
+            "{} is in the git repository {}; a repository template makes workspaces of it",
             path.display(),
             repository.display()
         ));
@@ -2199,6 +2215,24 @@ mod tests {
         assert!(admit_directory(&home, &places, &shared)
             .unwrap_err()
             .contains("home directory"));
+        // A repository refused is a template's remote: the work tree's
+        // top, or the bare repository; a work tree's subdirectory, which
+        // is admitted, and a plain directory are none.
+        for (chosen, remote) in [
+            ("src/repo", Some("src/repo")),
+            ("src/repo/.git/hooks", Some("src/repo")),
+            ("src/bare.git", Some("src/bare.git")),
+            ("src/bare.git/objects", Some("src/bare.git")),
+            ("src/repo/sub", None),
+            ("src/a", None),
+            ("missing", None),
+        ] {
+            assert_eq!(
+                repository_remote(&home.join(chosen)),
+                remote.map(|remote| home.join(remote)),
+                "{chosen}"
+            );
+        }
 
         let (admitted, notes) = admit_shared(
             &[

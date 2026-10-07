@@ -795,6 +795,9 @@ painted after the window's frame. File's items are:
 
 - `New conversation…`, shown with `C-n`, which does what `C-n` does:
   the template chooser of §7;
+- `New template…` and `Edit template…`, which open the template dialog
+  and the list of templates made in the window (§7, Templates made in
+  the window); they have no chord;
 - `Set OpenRouter key…`, which opens the key dialog below; it has no
   chord;
 - `Export diagnostics`, the diagnostics export (below, "As built (the
@@ -1859,7 +1862,53 @@ paths of 257 bytes and no shared directories;
 not read back as written, and `set_templates_aside`; and the window
 lists them after the configuration's (`merged_templates`), each taking
 the top-level shared directories (a `template_shared` entry of `None`).
-The dialog, its menu items and the chooser's row follow.
+
+**As built (templates made in the window, the dialog).**
+`templatedialog::TemplateDialog` is composed as the key dialog is, from
+td-ui's `entry_model` entries painted by `chrome::TextEntry`, each under
+its label, `chrome::Buttons` and td-ui's confirmation, centred and at
+most 72 cells wide: a title, what it does, the five fields (name;
+remote; base, `main` at first; branch, `agent` at first; sparse paths),
+two rows for a refusal, and Cancel and Save, with Remove between them
+for a template being edited. `Tab`/`Down` and `S-Tab`/`Up` move round
+the fields and buttons; `Return` saves from a field and presses a
+button; `Space` presses a focused button; `Escape` cancels; the
+clipboard chords copy, cut and paste a field's text, a paste taking its
+first non-blank line trimmed, and only a paste the dialog itself asked
+for: one the key dialog asked for that comes after it closed is dropped,
+never typed into a plain field. An edited template's sparse paths, while
+their field is as it opened, are kept as they were, so a path holding a
+space, or none at all, reads back the same; changed, they are the
+field's, parted by spaces. Each field takes at least what the file may
+hold, so every template in it opens. Save checks each field in turn
+(`config::template_name`, `git::Remote::parse`, `git::branch_name`,
+`git::push_branch`, then `config::checked_repo`), saying the first
+refusal and moving the keyboard to its field (the remote's for a
+recorded remote too long), and then asks the window, which refuses a
+name a configured template or another made in the window has, ASCII case
+aside, a 65th template, and one `workspace::plan` refuses where its
+workspaces would be made with the top-level shared directories (without
+the jail or a data directory, where none can be made, the file's own
+check alone), saying why in the dialog; else it writes the file and
+closes the dialog with a note. Remove is asked on a confirmation first.
+The window keeps the configured templates and the file's list apart,
+rewrites the file from the latter, and gives each conversation the
+shared directories anew: a configured template's as admitted at start,
+one made in the window `None`, even when start withheld every template's
+list as too long to hand over, since `None` adds nothing to the setup
+frame but the name. File's two items, the chooser's last row `New
+template…` (meta `make one`), whose name no template may take, and
+Directory… over a repository (`workspace::repository_remote`: the work
+tree's top, or a bare repository) open the dialog; Edit template… opens
+td-ui's finder over the file's templates (`picking=edit-template`), or
+says there are none; the window hands the app the templates whole, so
+choosing one opens the dialog at once, before a card waiting behind the
+finder. Directory… over a repository asks the window first: when a card
+has opened meanwhile, the note names the repository and File → New
+template… instead. The driven actions gain `new-template` and
+`edit-template`, which have no chord, and the state gains `template`:
+`none`, or the part the dialog's keyboard is on (`name`, `remote`,
+`base`, `branch`, `sparse`, `cancel`, `remove`, `save`, or `confirm`).
 
 The templates step builds the chooser, `[[template]]` and the two
 built-ins, which replace File's two workspace items (As built
@@ -2313,7 +2362,8 @@ workspace under the jail directory, for a general-assistant conversation
 or scratch work; Directory… admits an existing directory of the human's
 that is not a git repository. Neither has git management. A directory
 whose top holds a `.git` is refused with a pointer to a repository
-template.
+template, and the template dialog opens with the repository as its
+remote (§7, Templates made in the window).
 
 **As built (increment 10, workspaces).** File had two workspace items,
 which the templates step folded into the chooser as its built-ins: New

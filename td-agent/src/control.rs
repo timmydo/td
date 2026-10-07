@@ -156,6 +156,18 @@ pub const BINDINGS: &[Binding] = &[
         help: "File > Set OpenRouter key...: open the dialog that stores the OpenRouter API key.",
     },
     Binding {
+        name: "new-template",
+        chord: None,
+        arguments: "",
+        help: "File > New template...: open the dialog that makes a repository template: Tab moves, Return saves, Escape cancels.",
+    },
+    Binding {
+        name: "edit-template",
+        chord: None,
+        arguments: "",
+        help: "File > Edit template...: choose a template made in the window and open it in the template dialog, to save or remove.",
+    },
+    Binding {
         name: "model",
         chord: None,
         arguments: "",
@@ -226,6 +238,8 @@ impl Controller for Remote<'_> {
         if matches!(
             name,
             "set-key"
+                | "new-template"
+                | "edit-template"
                 | "model"
                 | "export-diagnostics"
                 | "delete-conversation"
@@ -236,6 +250,8 @@ impl Controller for Remote<'_> {
             let before = self.app.generation();
             match name {
                 "set-key" => self.app.open_key_dialog(),
+                "new-template" => self.app.open_new_template(None),
+                "edit-template" => self.app.open_edit_picker(),
                 "model" => self.app.open_picker(),
                 "delete-conversation" => self.app.open_delete(),
                 "compact-conversation" => self.app.compact(None),
@@ -320,7 +336,7 @@ impl Controller for Remote<'_> {
             |chooser| chooser.folder().display().to_string(),
         );
         Ok(format!(
-            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tpicking={}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tdefault={}\tchooser={}\tnotes={}\tunread={}\tnote={}\tarchived={}\tshown={}\trow-menu={}\tstatus={}\tcard={}",
+            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tpicking={}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tdefault={}\tchooser={}\tnotes={}\tunread={}\tnote={}\tarchived={}\tshown={}\trow-menu={}\tstatus={}\tcard={}\ttemplate={}",
             app.rows().len(),
             active.map_or("none", |id| id.as_str()),
             app.focus().word(),
@@ -349,6 +365,9 @@ impl Controller for Remote<'_> {
             } else {
                 "closed"
             },
+            // The template dialog's part, as the key dialog's: what its
+            // fields hold is read through `text`.
+            app.template_dialog().map_or("none", |template| template.part()),
         ))
     }
 
@@ -443,6 +462,38 @@ mod tests {
         assert!(remote.state().unwrap().contains("\tshown=all\t"));
     }
 
+    /// The template dialog and Edit template… through the seam: the
+    /// snapshot says the dialog's part, and its keys are the dialog's.
+    #[test]
+    fn the_template_dialog_is_driven() {
+        let mut app = crate::ui::tests::app();
+        let mut remote = Remote { app: &mut app };
+        assert!(remote.state().unwrap().ends_with("\ttemplate=none"));
+        assert!(driven::request(&mut remote, b"1\t1\taction\tedit-template").ends_with("changed"));
+        assert!(remote.app.notice().unwrap().contains("New template"));
+        assert!(driven::request(&mut remote, b"1\t2\taction\tnew-template").ends_with("changed"));
+        assert!(remote.state().unwrap().ends_with("\ttemplate=name"));
+        driven::request(&mut remote, format!("1\t3\tkey\t{}", hex("Tab")).as_bytes());
+        assert!(remote.state().unwrap().ends_with("\ttemplate=remote"));
+        driven::request(
+            &mut remote,
+            format!("1\t4\tkey\t{}", hex("Escape")).as_bytes(),
+        );
+        assert!(remote.state().unwrap().ends_with("\ttemplate=none"));
+        remote
+            .app
+            .set_saved_templates(vec![crate::config::Template {
+                name: "td".into(),
+                repos: vec![crate::config::checked_repo("/srv/td", "main", "a", None).unwrap()],
+                shared: None,
+            }]);
+        driven::request(&mut remote, b"1\t5\taction\tedit-template");
+        assert!(remote
+            .state()
+            .unwrap()
+            .contains("\tpicking=edit-template\t"));
+    }
+
     /// The File menu and the key dialog through the seam: opened, typed
     /// into and saved, the snapshot and the text read-back never holding
     /// the key.
@@ -473,7 +524,7 @@ mod tests {
         // `workspace` is `C-S-w`: with no repository workspace open, it
         // says so and opens nothing.
         driven::request(&mut remote, b"1\t92\taction\tworkspace");
-        assert!(remote.state().unwrap().ends_with("\tcard=closed"));
+        assert!(remote.state().unwrap().contains("\tcard=closed\t"));
         assert!(remote
             .app
             .notice()
@@ -481,12 +532,14 @@ mod tests {
             .contains("no repository workspace"));
         assert!(driven::request(&mut remote, b"1\t1\taction\tmenu").ends_with("changed"));
         assert!(remote.state().unwrap().contains("menu=open"));
-        // Down to Set OpenRouter key…, below New conversation…, and
-        // chosen.
-        driven::request(
-            &mut remote,
-            format!("1\t4\tkey\t{}", hex("Down")).as_bytes(),
-        );
+        // Down to Set OpenRouter key…, below New conversation… and the
+        // two template items, and chosen.
+        for _ in 0..3 {
+            driven::request(
+                &mut remote,
+                format!("1\t4\tkey\t{}", hex("Down")).as_bytes(),
+            );
+        }
         driven::request(
             &mut remote,
             format!("1\t5\tkey\t{}", hex("Return")).as_bytes(),

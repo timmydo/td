@@ -76,6 +76,7 @@ pub mod sse;
 pub mod store;
 pub mod supervisor;
 pub mod system;
+pub mod templatedialog;
 pub mod toolhost;
 pub mod tools;
 pub mod ui;

@@ -320,6 +320,12 @@ pub struct Session {
     /// The templates the chooser lists (DESIGN.md §7): the configured
     /// ones, then those made in the window.
     templates: Vec<Template>,
+    /// The configured templates.
+    configured: Vec<Template>,
+    /// The templates file as read, which a save rewrites from: every
+    /// template in it, listed or not; or why none can be saved until the
+    /// file is mended.
+    saved: Result<Vec<Template>, String>,
     /// The remotes admitted (DESIGN.md §7): the configuration's, then
     /// those the human admitted on a card.
     remotes: Vec<crate::git::Admission>,
@@ -374,6 +380,17 @@ impl Session {
                 Request::NewScratch => self.start_in(None),
                 Request::NewIn(folder) => self.start_in(Some(folder)),
                 Request::NewFrom(name) => self.start_from(&name),
+                Request::SaveTemplate {
+                    template,
+                    replacing,
+                } => match self.save_template(template, replacing.as_deref()) {
+                    Ok(said) => self.app.template_saved(said),
+                    Err(why) => self.app.template_refused(why),
+                },
+                Request::RemoveTemplate(name) => match self.remove_template(&name) {
+                    Ok(said) => self.app.template_saved(said),
+                    Err(why) => self.app.template_refused(why),
+                },
                 Request::Send(text) => {
                     if let Err(e) = self.supervisor.send(text.clone()) {
                         self.app.restore(&text, e);
@@ -695,7 +712,21 @@ impl Session {
             Some(folder) => {
                 match workspace::admit_directory(&folder, places, &self.client.shared) {
                     Ok(admitted) => Workspace::Directory(admitted),
-                    Err(why) => return self.app.note(format!("no conversation there: {why}")),
+                    Err(why) => {
+                        self.app.note(format!("no conversation there: {why}"));
+                        // A repository is a template's remote: the dialog
+                        // offers one (DESIGN.md §7).
+                        if let Some(repository) = workspace::repository_remote(&folder) {
+                            match repository.to_str() {
+                                Some(remote) => self.app.open_new_template(Some(remote)),
+                                None => self.app.note(format!(
+                                    "{} cannot be a remote: it is not UTF-8",
+                                    repository.display()
+                                )),
+                            }
+                        }
+                        return;
+                    }
                 }
             }
         };
@@ -748,6 +779,75 @@ impl Session {
                 .app
                 .note(format!("no conversation from template {name:?}: {why}")),
         }
+    }
+
+    /// Keeps `template`, made in the window, in place of the one so made
+    /// named `replacing` (DESIGN.md §7): checked against every template's
+    /// name, planned where its workspaces would be made, written, then
+    /// listed, each conversation told its shared directories.
+    fn save_template(
+        &mut self,
+        template: Template,
+        replacing: Option<&str>,
+    ) -> Result<String, String> {
+        let saved = self.saved.as_ref().map_err(Clone::clone)?;
+        let next = with_template(&self.configured, saved, template.clone(), replacing)?;
+        if let (Ok(places), Ok(data)) = (&self.places, &self.data) {
+            let id = Id::random()?;
+            workspace::plan(&template, &id, data, &places.root, self.client.shared.len())?;
+        }
+        self.keep_templates(next)?;
+        Ok(match replacing {
+            Some(old) if old != template.name => format!(
+                "the template {old:?} is now {:?}; workspaces made from it are kept, and bind the shared directories no more",
+                template.name
+            ),
+            Some(_) => format!("the template {:?} is saved", template.name),
+            None => format!("the template {:?} is saved; File \u{2192} New conversation\u{2026} lists it", template.name),
+        })
+    }
+
+    /// Removes the template made in the window named `name`.
+    fn remove_template(&mut self, name: &str) -> Result<String, String> {
+        let saved = self.saved.as_ref().map_err(Clone::clone)?;
+        if !saved.iter().any(|t| t.name == name) {
+            return Err(format!("no template made in the window is named {name:?}"));
+        }
+        let next = saved.iter().filter(|t| t.name != name).cloned().collect();
+        self.keep_templates(next)?;
+        Ok(format!(
+            "the template {name:?} is removed; workspaces made from it are kept, and bind the shared directories no more"
+        ))
+    }
+
+    /// `saved` written as the templates file, then the chooser's list, the
+    /// edit list and every conversation's shared directories made anew
+    /// from it; refused, nothing changes.
+    fn keep_templates(&mut self, saved: Vec<Template>) -> Result<(), String> {
+        let (templates, _) = merged_templates(&self.configured, &saved);
+        let mut client = self.client.clone();
+        client.template_shared =
+            template_shared(&client.template_shared, &self.configured, &templates);
+        if client.to_json().to_string().len() > SETUP_CLIENT_BYTES {
+            return Err(
+                "the templates' shared directories would be too many to hand to conversations"
+                    .into(),
+            );
+        }
+        self.state.save_templates(&saved)?;
+        self.app.set_templates(
+            templates
+                .iter()
+                .map(|template| (template.name.clone(), !template.repos.is_empty()))
+                .collect(),
+        );
+        self.templates = templates;
+        self.saved = Ok(saved);
+        self.app
+            .set_saved_templates(self.saved.as_deref().unwrap_or_default().to_vec());
+        self.client = client;
+        self.supervisor.reconfigure(self.client.clone());
+        Ok(())
     }
 
     /// The human admitted `remotes` on template `name`'s card: kept in the
@@ -2157,6 +2257,7 @@ pub fn run(
         eprintln!("td-agent: {clash}");
         app.note(clash);
     }
+    app.set_saved_templates(saved.as_deref().unwrap_or_default().to_vec());
     let mut client = config.client.clone();
     // Workspaces, and the shared directories each gets, admitted once
     // here; without the jail there are none, and asking says why. No
@@ -2286,6 +2387,8 @@ pub fn run(
         show_keys: false,
         places,
         templates,
+        configured: config.templates.clone(),
+        saved,
         remotes,
         stores: data.as_ref().ok().map(|data| {
             crate::git::Service::start(git_dir, data.join("store"), crate::git::kept_env())
@@ -2357,6 +2460,75 @@ fn merged_templates(configured: &[Template], saved: &[Template]) -> (Vec<Templat
         }
     }
     (templates, clashes)
+}
+
+/// `saved` with `template` in place of the one named `replacing`, or
+/// added: refused when a configured template, or another made in the
+/// window, has its name, ASCII case aside, or when there would be more
+/// than `config::MAX_TEMPLATES`.
+fn with_template(
+    configured: &[Template],
+    saved: &[Template],
+    template: Template,
+    replacing: Option<&str>,
+) -> Result<Vec<Template>, String> {
+    let name = template.name.clone();
+    if configured
+        .iter()
+        .any(|t| t.name.eq_ignore_ascii_case(&name))
+    {
+        return Err(format!(
+            "the configuration names a template {name:?}; choose another name"
+        ));
+    }
+    if saved
+        .iter()
+        .any(|t| t.name.eq_ignore_ascii_case(&name) && Some(t.name.as_str()) != replacing)
+    {
+        return Err(format!(
+            "a template is named {name:?} already; choose another name"
+        ));
+    }
+    let mut next = saved.to_vec();
+    match replacing {
+        Some(old) => match next.iter_mut().find(|t| t.name == old) {
+            Some(slot) => *slot = template,
+            None => return Err(format!("no template made in the window is named {old:?}")),
+        },
+        None if next.len() >= crate::config::MAX_TEMPLATES => {
+            return Err(format!(
+                "{} templates are made in the window already; remove one first",
+                crate::config::MAX_TEMPLATES
+            ))
+        }
+        None => next.push(template),
+    }
+    Ok(next)
+}
+
+/// Each listed template's shared directories for the conversations: a
+/// configured one's as `held` has them, one made in the window's the
+/// top level's (`None`).
+fn template_shared(
+    held: &[TemplateShared],
+    configured: &[Template],
+    listed: &[Template],
+) -> Vec<TemplateShared> {
+    let mut shared: Vec<TemplateShared> = held
+        .iter()
+        .filter(|entry| configured.iter().any(|t| t.name == entry.name))
+        .cloned()
+        .collect();
+    shared.extend(
+        listed
+            .iter()
+            .filter(|template| !configured.iter().any(|t| t.name == template.name))
+            .map(|template| TemplateShared {
+                name: template.name.clone(),
+                shared: None,
+            }),
+    );
+    shared
 }
 
 /// The local repositories `remotes` admit, each by its path.
@@ -2517,7 +2689,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
         as_staged, default_model, ended_pushes, forget_rules, held, local_remote, merged_templates,
-        names, pushing_entry, reached, refetched, remember, remember_crossing, set_mode, Client,
+        names, pushing_entry, reached, refetched, remember, remember_crossing, set_mode,
+        template_shared, with_template, Client, TemplateShared,
     };
     use crate::protocol::Down;
     use crate::workspace::Workspace;
@@ -2626,6 +2799,75 @@ mod tests {
         assert!(remember(&state, &id, false, true, &bodies).is_err());
         assert!(forget_rules(&state, Some("workspace td-1-ab"), &id).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[x]\n");
+    }
+
+    /// A template saved in the window is refused a configured one's name,
+    /// or another's made in the window, case aside, but for its own when
+    /// edited; it takes the place of the one edited, renamed or not; and
+    /// there are at most `MAX_TEMPLATES`. Each listed template's shared
+    /// directories follow: a configured one's kept, one made in the
+    /// window the top level's, one removed none.
+    #[test]
+    fn a_template_saved_in_the_window_is_named_once_and_shares_the_top_level() {
+        let repo = crate::config::checked_repo("/srv/td", "main", "a", None).unwrap();
+        let template = |name: &str| crate::config::Template {
+            name: name.into(),
+            repos: vec![repo.clone()],
+            shared: None,
+        };
+        let configured = [template("td")];
+        let saved = [template("notes"), template("mail")];
+        let names = |list: &[crate::config::Template]| -> Vec<String> {
+            list.iter().map(|t| t.name.clone()).collect()
+        };
+        assert_eq!(
+            names(&with_template(&configured, &saved, template("own"), None).unwrap()),
+            ["notes", "mail", "own"]
+        );
+        for (name, replacing, why) in [
+            ("TD", None, "the configuration"),
+            ("Notes", None, "already"),
+            ("mail", Some("notes"), "already"),
+            ("own", Some("gone"), "no template"),
+        ] {
+            let e = with_template(&configured, &saved, template(name), replacing).unwrap_err();
+            assert!(e.contains(why), "{name}: {e}");
+        }
+        // Edited in place, its own name kept or changed, case and all.
+        assert_eq!(
+            names(&with_template(&configured, &saved, template("Notes"), Some("notes")).unwrap()),
+            ["Notes", "mail"]
+        );
+        assert_eq!(
+            names(&with_template(&configured, &saved, template("work"), Some("notes")).unwrap()),
+            ["work", "mail"]
+        );
+        let full: Vec<_> = (0..crate::config::MAX_TEMPLATES)
+            .map(|n| template(&format!("t{n}")))
+            .collect();
+        assert!(with_template(&configured, &full, template("one"), None)
+            .unwrap_err()
+            .contains("remove one"));
+        with_template(&configured, &full, template("one"), Some("t0")).unwrap();
+
+        let own = Some(Vec::new());
+        let held = vec![
+            TemplateShared {
+                name: "td".into(),
+                shared: own.clone(),
+            },
+            TemplateShared {
+                name: "notes".into(),
+                shared: None,
+            },
+        ];
+        let listed = [template("td"), template("mail")];
+        let shared = template_shared(&held, &configured, &listed);
+        let entries: Vec<(&str, bool)> = shared
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.shared.is_some()))
+            .collect();
+        assert_eq!(entries, [("td", true), ("mail", false)]);
     }
 
     /// The chooser lists the configuration's templates, then those made

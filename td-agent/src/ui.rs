@@ -59,6 +59,7 @@ use crate::post::Entry;
 use crate::protocol::{Up, MAX_TEXT};
 use crate::store::{Event, Held, Id, Kind, Purpose, Role, Status, TodoItem};
 use crate::supervisor::Update;
+use crate::templatedialog::{Reply as TemplateReply, TemplateDialog};
 use crate::tools;
 use crate::workspace::Workspace;
 
@@ -217,6 +218,15 @@ enum Picking {
     Default,
     /// A new conversation's workspace template.
     Template,
+    /// A template made in the window, to edit or remove.
+    Edit,
+}
+
+/// Which dialog asked the clipboard for its text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Asker {
+    Key,
+    Template,
 }
 
 /// How much of a background process's command its row shows.
@@ -268,6 +278,16 @@ pub enum Request {
     NewIn(PathBuf),
     /// Start a new conversation from the configured template named.
     NewFrom(String),
+    /// Keep the template from the template dialog, in place of the one
+    /// made in the window named `replacing`; the session answers through
+    /// `template_saved` or `template_refused`.
+    SaveTemplate {
+        template: crate::config::Template,
+        replacing: Option<String>,
+    },
+    /// Remove the template made in the window so named, as the human
+    /// confirmed in its dialog.
+    RemoveTemplate(String),
     /// Send the human's message to the open conversation.
     Send(String),
     /// Ask the open conversation's failed turn again.
@@ -644,6 +664,8 @@ pub struct App {
     /// The configured templates the template chooser lists after the
     /// built-ins, each a name and whether it names repositories.
     templates: Vec<(String, bool)>,
+    /// The templates made in the window, which Edit template… lists.
+    saved_templates: Vec<crate::config::Template>,
     /// The directory chooser while it is open, modal over the window, and
     /// the folder it opens on.
     chooser: Option<Chooser>,
@@ -716,6 +738,9 @@ pub struct App {
     live: bool,
     /// The key dialog while it is open, modal over the window.
     dialog: Option<KeyDialog>,
+    /// The template dialog, while it is open: modal over the window, as
+    /// the key dialog is.
+    template: Option<TemplateDialog>,
     /// Where the key file is, as the dialog says it; none when there is
     /// no configuration directory to put it in.
     key_path: Option<String>,
@@ -727,7 +752,7 @@ pub struct App {
     /// The key dialog asked the clipboard for its text, and the paste has
     /// not come: it is the dialog's, and dropped if the dialog has gone,
     /// never the composer's.
-    dialog_paste: bool,
+    dialog_paste: Option<Asker>,
     clock: u64,
     dirty: bool,
     /// Counts the changes that need a paint, so a driven input can say
@@ -795,6 +820,7 @@ impl App {
             notes: None,
             picking: Picking::Model,
             templates: Vec::new(),
+            saved_templates: Vec::new(),
             chooser: None,
             chooser_start: std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -832,10 +858,11 @@ impl App {
             live: false,
             card_trust: None,
             dialog: None,
+            template: None,
             key_path: None,
             keyed: true,
             press: None,
-            dialog_paste: false,
+            dialog_paste: None,
             clock: 0,
             dirty: true,
             generation: 0,
@@ -1119,6 +1146,12 @@ impl App {
         self.templates = templates;
     }
 
+    /// The templates made in the window, by name, which Edit template…
+    /// lists.
+    pub fn set_saved_templates(&mut self, templates: Vec<crate::config::Template>) {
+        self.saved_templates = templates;
+    }
+
     /// The most recently active conversation's id, archived ones aside,
     /// when the list holds any.
     pub fn most_recent(&self) -> Option<Id> {
@@ -1228,13 +1261,14 @@ impl App {
     }
 
     /// What the open picker chooses: `default`, `conversation`,
-    /// `template`, or `none` when it is closed.
+    /// `template`, `edit-template`, or `none` when it is closed.
     pub fn picking(&self) -> &'static str {
         match (&self.picker, self.picking) {
             (None, _) => "none",
             (Some(_), Picking::Default) => "default",
             (Some(_), Picking::Model) => "conversation",
             (Some(_), Picking::Template) => "template",
+            (Some(_), Picking::Edit) => "edit-template",
         }
     }
 
@@ -1292,6 +1326,11 @@ impl App {
     /// The key dialog, while it is open.
     pub fn dialog(&self) -> Option<&KeyDialog> {
         self.dialog.as_ref()
+    }
+
+    /// The template dialog, while it is open.
+    pub fn template_dialog(&self) -> Option<&TemplateDialog> {
+        self.template.as_ref()
     }
 
     /// Whether the menu is open.
@@ -2713,6 +2752,12 @@ impl App {
                 self.note("the window is now too small for the key dialog, which is closed");
             }
         }
+        if let Some(template) = self.template.as_mut() {
+            if !template.resize(self.surface) {
+                self.close_template();
+                self.note("the window is now too small for the template dialog, which is closed; nothing is saved");
+            }
+        }
         self.place();
     }
 
@@ -2779,6 +2824,7 @@ impl App {
         let on = |f: Focus| {
             self.focused
                 && self.dialog.is_none()
+                && self.template.is_none()
                 && self.picker.is_none()
                 && self.notes.is_none()
                 && self.chooser.is_none()
@@ -2792,7 +2838,7 @@ impl App {
         };
         let (list, transcript, composer) = (list_focus, on(Focus::Transcript), on(Focus::Composer));
         let _ = self.list.set_focus(list);
-        let notes_focus = self.focused && self.dialog.is_none();
+        let notes_focus = self.focused && self.dialog.is_none() && self.template.is_none();
         if let Some(notes) = self.notes.as_mut() {
             notes.focus(notes_focus);
         }
@@ -3012,11 +3058,14 @@ impl App {
         // after it stops saying one is in flight. Only the window's own
         // clipboard can say so: the control seam's has none, and its
         // inputs never release the dialog's paste.
-        if self.dialog_paste && clipboard.available() && !clipboard.pasting() {
-            self.dialog_paste = false;
+        if self.dialog_paste.is_some() && clipboard.available() && !clipboard.pasting() {
+            self.dialog_paste = None;
         }
         if self.dialog.is_some() {
             return self.dialog_input(input, clipboard);
+        }
+        if self.template.is_some() {
+            return self.template_input(input, clipboard);
         }
         if self.picker.is_some() {
             return self.picker_input(input);
@@ -3083,18 +3132,31 @@ impl App {
     /// no other paste goes anywhere; otherwise the focused composer
     /// takes it.
     fn pasted(&mut self, text: &str) {
-        if std::mem::take(&mut self.dialog_paste) {
-            match self.dialog.as_mut() {
-                Some(dialog) => {
-                    let reply = dialog.paste(text);
-                    self.reply(reply);
-                }
-                None => self.note("the key dialog closed before its paste came; it is dropped"),
+        // Only to the dialog that asked: a paste the masked key dialog
+        // asked for never reaches the template dialog's plain fields.
+        match (
+            self.dialog_paste.take(),
+            self.dialog.as_mut(),
+            self.template.as_mut(),
+        ) {
+            (Some(Asker::Key), Some(dialog), _) => {
+                let reply = dialog.paste(text);
+                return self.reply(reply);
             }
-            return;
+            (Some(Asker::Template), _, Some(template)) => {
+                let reply = template.paste(text);
+                return self.template_reply(reply);
+            }
+            (Some(_), _, _) => {
+                return self.note("the dialog closed before its paste came; it is dropped")
+            }
+            (None, _, _) => {}
         }
         if self.dialog.is_some() {
             return self.note("a paste that came while the key dialog was open is dropped");
+        }
+        if self.template.is_some() {
+            return self.note("a paste that came while the template dialog was open is dropped");
         }
         if self.picker.is_some() {
             return self.note("a paste that came while the picker was open is dropped");
@@ -3237,6 +3299,8 @@ impl App {
             menu::Action::Messages => self.open_messages(),
             menu::Action::Workspace => self.open_workspace(),
             menu::Action::SetKey => self.open_key_dialog(),
+            menu::Action::NewTemplate => self.open_new_template(None),
+            menu::Action::EditTemplate => self.open_edit_picker(),
             menu::Action::Export => self.export_diagnostics(),
             menu::Action::Quit => self.requests.push(Request::Quit),
             menu::Action::Model => self.open_picker(),
@@ -3583,6 +3647,10 @@ impl App {
             let meta = if *repos { "repositories" } else { "scratch" };
             (name.clone(), meta.to_string())
         }));
+        rows.push((
+            crate::config::NEW_TEMPLATE.to_string(),
+            "make one".to_string(),
+        ));
         let note = if self.templates.iter().any(|(_, repos)| *repos) {
             "a repository template's worktrees are checked out in the background; a remote not yet admitted is asked about first"
         } else {
@@ -3593,12 +3661,13 @@ impl App {
     }
 
     /// Whether a modal is open: the picker, the Messages window, the
-    /// chooser, the key dialog or the question.
+    /// chooser, the key or template dialog, or the question.
     fn modal(&self) -> bool {
         self.picker.is_some()
             || self.notes.is_some()
             || self.chooser.is_some()
             || self.dialog.is_some()
+            || self.template.is_some()
             || self.confirm.is_some()
     }
 
@@ -3888,7 +3957,10 @@ impl App {
             crate::picker::Reply::Closed => self.close_picker(),
             crate::picker::Reply::Chosen(name) => {
                 let picking = self.picking;
-                if picking == Picking::Template && name == crate::config::DIRECTORY {
+                let onward = [crate::config::DIRECTORY, crate::config::NEW_TEMPLATE];
+                if picking == Picking::Edit
+                    || (picking == Picking::Template && onward.contains(&name.as_str()))
+                {
                     self.picker = None;
                     self.picking = Picking::Model;
                     // Focus back where it was, should the chooser not open.
@@ -3916,9 +3988,33 @@ impl App {
                             self.offer();
                         }
                     }
+                    // Straight on to the template dialog, as Directory… goes
+                    // to the chooser.
+                    Picking::Template if name == crate::config::NEW_TEMPLATE => {
+                        self.open_new_template(None);
+                        if self.template.is_none() {
+                            self.offer();
+                        }
+                    }
                     Picking::Template => {
                         self.requests.push(Request::NewFrom(name));
                         self.touch();
+                    }
+                    // Straight on to the dialog, as New template… goes.
+                    Picking::Edit => {
+                        let found = self
+                            .saved_templates
+                            .iter()
+                            .find(|t| t.name == name)
+                            .cloned();
+                        match found {
+                            Some(template) => self.edit_template(template),
+                            None => self
+                                .note(format!("no template made in the window is named {name:?}")),
+                        }
+                        if self.template.is_none() {
+                            self.offer();
+                        }
                     }
                 }
             }
@@ -4141,7 +4237,7 @@ impl App {
 
     /// Opens the key dialog, modal over the window.
     pub fn open_key_dialog(&mut self) {
-        if self.dialog.is_some() {
+        if self.dialog.is_some() || self.template.is_some() {
             return;
         }
         let Some(path) = self.key_path.clone() else {
@@ -4166,6 +4262,167 @@ impl App {
             }
             Err(e) => self.note(e),
         }
+    }
+
+    /// Opens the template dialog for a new template, as File → New
+    /// template… and the chooser's row do, its remote `remote` when the
+    /// folder chooser found a repository (DESIGN.md §7).
+    pub fn open_new_template(&mut self, remote: Option<&str>) {
+        if self.modal() {
+            return self.note(match remote {
+                Some(remote) => format!(
+                    "File \u{2192} New template\u{2026} makes a template of {remote} once what is open closes"
+                ),
+                None => "the template dialog opens once what is open closes".into(),
+            });
+        }
+        let opened = TemplateDialog::new_template(self.surface, remote);
+        self.show_template(opened);
+    }
+
+    /// Lists the templates made in the window, as File → Edit template…
+    /// does: the one chosen opens in the template dialog.
+    pub fn open_edit_picker(&mut self) {
+        if self.modal() {
+            return;
+        }
+        if self.saved_templates.is_empty() {
+            return self.note(
+                "no template has been made in the window; File \u{2192} New template\u{2026} makes one",
+            );
+        }
+        let rows: Vec<(String, String)> = self
+            .saved_templates
+            .iter()
+            .map(|template| (template.name.clone(), "repositories".to_string()))
+            .collect();
+        let opened = Picker::templates(
+            self.surface,
+            body(self.surface),
+            &rows,
+            "a template made in the window, to edit or remove; the configuration's are edited there",
+        );
+        self.show_picker(opened, Picking::Edit);
+    }
+
+    /// Opens `template`, made in the window, in the template dialog.
+    pub fn edit_template(&mut self, template: crate::config::Template) {
+        if self.modal() {
+            return self.note("the template dialog opens once what is open closes");
+        }
+        let opened = TemplateDialog::edit(self.surface, template);
+        self.show_template(opened);
+    }
+
+    fn show_template(&mut self, opened: Result<TemplateDialog, String>) {
+        if self.modal() {
+            return;
+        }
+        self.cancel_pointer();
+        self.menu.dismiss();
+        self.press = None;
+        match opened {
+            Ok(template) => {
+                self.template = Some(template);
+                self.apply_focus();
+                self.touch();
+            }
+            Err(e) => self.note(e),
+        }
+    }
+
+    fn close_template(&mut self) {
+        self.template = None;
+        self.apply_focus();
+        self.offer();
+        self.touch();
+    }
+
+    fn template_reply(&mut self, reply: TemplateReply) {
+        match reply {
+            TemplateReply::Stay(true) => self.touch(),
+            TemplateReply::Stay(false) => {}
+            TemplateReply::Closed => self.close_template(),
+            TemplateReply::Save {
+                template,
+                replacing,
+            } => {
+                self.requests.push(Request::SaveTemplate {
+                    template,
+                    replacing,
+                });
+                self.touch();
+            }
+            TemplateReply::Remove(name) => {
+                self.requests.push(Request::RemoveTemplate(name));
+                self.touch();
+            }
+        }
+    }
+
+    /// The template is kept, or removed, as `said` says: the dialog
+    /// closes.
+    pub fn template_saved(&mut self, said: String) {
+        self.close_template();
+        self.note(said);
+    }
+
+    /// The template is refused: the dialog stays, saying why.
+    pub fn template_refused(&mut self, why: String) {
+        match self.template.as_mut() {
+            Some(template) => {
+                template.refused(why);
+                self.touch();
+            }
+            None => self.note(why),
+        }
+    }
+
+    /// An input while the template dialog is open, which is the
+    /// dialog's, as the key dialog's are.
+    fn template_input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) {
+        let Some(template) = self.template.as_mut() else {
+            return;
+        };
+        let reply = match input {
+            Input::Key { chord, repeat } => {
+                self.press = None;
+                let idle = !clipboard.pasting();
+                let reply = template.key(chord, repeat, clipboard);
+                if idle && clipboard.pasting() {
+                    self.dialog_paste = Some(Asker::Template);
+                }
+                reply
+            }
+            Input::Pointer {
+                phase,
+                x,
+                y,
+                extend,
+                ..
+            } => template.pointer(phase, x, y, extend),
+            Input::Paste(_) => return,
+            Input::CancelPointer => {
+                template.cancel_pointer();
+                TemplateReply::Stay(true)
+            }
+            Input::Focus(focused) => {
+                if !focused {
+                    template.focus_lost();
+                }
+                self.focused = focused;
+                self.apply_focus();
+                TemplateReply::Stay(true)
+            }
+            Input::Resize(surface) => {
+                self.resize(surface);
+                return;
+            }
+            Input::Wheel { .. } | Input::Hover(_) | Input::Context { .. } | Input::Close => {
+                TemplateReply::Stay(false)
+            }
+        };
+        self.template_reply(reply);
     }
 
     /// Closes the key dialog, its entry cleared first.
@@ -4203,7 +4460,7 @@ impl App {
                 let reply = dialog.key(chord, repeat, clipboard);
                 // This key asked the clipboard for its text.
                 if idle && clipboard.pasting() {
-                    self.dialog_paste = true;
+                    self.dialog_paste = Some(Asker::Key);
                 }
                 reply
             }
@@ -4312,6 +4569,9 @@ impl App {
         // An open dialog, picker or menu has every key.
         if self.dialog.is_some() {
             return self.dialog_input(Input::Key { chord, repeat }, clipboard);
+        }
+        if self.template.is_some() {
+            return self.template_input(Input::Key { chord, repeat }, clipboard);
         }
         if self.picker.is_some() {
             return self.picker_input(Input::Key { chord, repeat });
@@ -4771,6 +5031,9 @@ impl App {
         }
         if let Some(dialog) = &self.dialog {
             dialog.emit(self.focused, damage, sink);
+        }
+        if let Some(template) = &self.template {
+            template.emit(self.focused, damage, sink);
         }
     }
 }
@@ -6375,8 +6638,11 @@ pub mod tests {
         app.set_key_path(Some(PATH.into()));
         app.set_keyed(false);
         key(&mut app, "F10");
-        // Set OpenRouter key…, below New conversation….
-        key(&mut app, "Down");
+        // Set OpenRouter key…, below New conversation… and the two
+        // template items.
+        for _ in 0..3 {
+            key(&mut app, "Down");
+        }
         key(&mut app, "Return");
         assert!(app.dialog().is_some());
         app
@@ -6725,9 +6991,9 @@ pub mod tests {
         key(&mut app, "C-n");
         assert_eq!(app.picking(), "template");
         key(&mut app, "Escape");
-        // A press on the header opens it; one on the third row exports,
-        // and one on the fifth quits.
-        for (row, request) in [(2, Request::Export), (4, Request::Quit)] {
+        // A press on the header opens it; one on the fifth row exports,
+        // and one on the seventh quits.
+        for (row, request) in [(4, Request::Export), (6, Request::Quit)] {
             press(&mut app, CELL_WIDTH as i64 + 4, 4);
             assert!(app.menu_open());
             let panel = app.menu.panel(0).unwrap();
@@ -7293,8 +7559,11 @@ pub mod tests {
     fn with_nowhere_to_store_a_key_the_dialog_does_not_open() {
         let mut app = app();
         key(&mut app, "F10");
-        // Set OpenRouter key…, below New conversation….
-        key(&mut app, "Down");
+        // Set OpenRouter key…, below New conversation… and the two
+        // template items.
+        for _ in 0..3 {
+            key(&mut app, "Down");
+        }
         key(&mut app, "Return");
         assert!(app.dialog().is_none());
         assert!(app.notice().unwrap().contains("nowhere to store a key"));
@@ -7312,6 +7581,134 @@ pub mod tests {
             offer("m/conv", true),
             offer("m/plain", false),
         ]
+    }
+
+    /// File → New template… and the chooser's last row open the template
+    /// dialog, modal; its Save is a request, which the session's refusal
+    /// answers with the dialog kept, saying why, and its acceptance with
+    /// the dialog closed; a paste goes to its field. Edit template…
+    /// lists the templates made in the window, or says there are none;
+    /// its choice is a request, and the template opens with Remove,
+    /// which, confirmed, is a request too.
+    #[test]
+    fn templates_are_made_and_edited_through_the_template_dialog() {
+        use crate::keydialog::tests::Recorder;
+        let typed = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                key(app, &c.to_string());
+            }
+        };
+        let mut app = app();
+        app.menu_action(menu::Action::EditTemplate);
+        assert!(app.picker().is_none());
+        assert!(app.notice().unwrap().contains("New template"));
+        app.menu_action(menu::Action::NewTemplate);
+        assert_eq!(app.template_dialog().unwrap().part(), "name");
+        assert!(text(&app).contains("New template"));
+        key(&mut app, "C-n");
+        assert_eq!(app.picking(), "none");
+        typed(&mut app, "td");
+        key(&mut app, "Tab");
+        let mut clipboard = Recorder::default();
+        app.input(
+            Input::Key {
+                chord: "C-v",
+                repeat: false,
+            },
+            &mut clipboard,
+        );
+        assert_eq!(clipboard.pastes, 1);
+        clipboard.inflight = false;
+        app.input(Input::Paste("/srv/git/td\n"), &mut clipboard);
+        assert_eq!(app.template_dialog().unwrap().text(1), "/srv/git/td");
+        key(&mut app, "Return");
+        let requests = app.take_requests();
+        let [Request::SaveTemplate {
+            template,
+            replacing: None,
+        }] = requests.as_slice()
+        else {
+            panic!("{requests:?}");
+        };
+        assert_eq!(template.name, "td");
+        assert_eq!(template.repos[0].remote, "file:///srv/git/td");
+        app.template_refused("a template is named \"td\" already; choose another name".into());
+        assert!(app
+            .template_dialog()
+            .unwrap()
+            .message()
+            .unwrap()
+            .contains("already"));
+        assert!(text(&app).contains("choose another name"));
+        app.template_saved("the template \"td\" is saved".into());
+        assert!(app.template_dialog().is_none());
+        assert_eq!(app.notice(), Some("the template \"td\" is saved"));
+        // The chooser's last row; Escape makes nothing.
+        key(&mut app, "C-n");
+        typed(&mut app, "New");
+        key(&mut app, "Return");
+        assert!(app.picker().is_none());
+        assert_eq!(app.template_dialog().unwrap().part(), "name");
+        key(&mut app, "Escape");
+        assert!(app.template_dialog().is_none());
+        assert!(app.take_requests().is_empty());
+        // Edit template….
+        app.set_saved_templates(vec![template.clone()]);
+        app.menu_action(menu::Action::EditTemplate);
+        assert_eq!(app.picking(), "edit-template");
+        key(&mut app, "Return");
+        assert!(app.take_requests().is_empty());
+        assert_eq!(app.template_dialog().unwrap().editing(), Some("td"));
+        assert!(text(&app).contains("Edit template"));
+        for _ in 0..6 {
+            key(&mut app, "Tab");
+        }
+        assert_eq!(app.template_dialog().unwrap().part(), "remove");
+        key(&mut app, "Return");
+        assert_eq!(app.template_dialog().unwrap().part(), "confirm");
+        key(&mut app, "Tab");
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [Request::RemoveTemplate("td".into())]);
+    }
+
+    /// A paste the key dialog asked for, coming after it closed and the
+    /// template dialog opened, is dropped, never typed into a plain
+    /// field; the template dialog does not open over another modal, and
+    /// says so.
+    #[test]
+    fn a_key_paste_never_reaches_the_template_dialog() {
+        use crate::keydialog::tests::Recorder;
+        let mut app = keyless();
+        let mut clipboard = Recorder::default();
+        app.input(
+            Input::Key {
+                chord: "C-v",
+                repeat: false,
+            },
+            &mut clipboard,
+        );
+        assert_eq!(clipboard.pastes, 1);
+        app.input(
+            Input::Key {
+                chord: "Escape",
+                repeat: false,
+            },
+            &mut clipboard,
+        );
+        assert!(app.dialog().is_none());
+        app.menu_action(menu::Action::NewTemplate);
+        key(&mut app, "Tab");
+        clipboard.inflight = false;
+        app.input(Input::Paste(&format!("{KEY}\n")), &mut clipboard);
+        assert_eq!(app.template_dialog().unwrap().text(1), "");
+        assert!(app.notice().unwrap().contains("dropped"));
+        assert!(!text(&app).contains(KEY));
+        key(&mut app, "Escape");
+        // Over the chooser, it says how instead.
+        key(&mut app, "C-n");
+        app.open_new_template(Some("/srv/git/td"));
+        assert!(app.template_dialog().is_none());
+        assert!(app.notice().unwrap().contains("/srv/git/td"));
     }
 
     #[test]
@@ -7337,7 +7734,16 @@ pub mod tests {
             .iter()
             .map(|entry| entry.name())
             .collect();
-        assert_eq!(listed, ["Empty", "Directory\u{2026}", "notes", "td"]);
+        assert_eq!(
+            listed,
+            [
+                "Empty",
+                "Directory\u{2026}",
+                "notes",
+                "td",
+                "New template\u{2026}"
+            ]
+        );
         assert_eq!(picker.selected(), Some("Empty"));
         assert!(
             text(&app).contains("checked out in the background"),

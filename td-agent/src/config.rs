@@ -765,9 +765,11 @@ pub struct Repo {
 pub const MAX_TEMPLATE_NAME: usize = 64;
 /// The most templates a configuration lists.
 pub const MAX_TEMPLATES: usize = 64;
-/// The chooser's built-ins, which no template may be named.
+/// The chooser's built-ins and its row that makes a template, which no
+/// template may be named.
 pub const EMPTY: &str = "Empty";
 pub const DIRECTORY: &str = "Directory\u{2026}";
+pub const NEW_TEMPLATE: &str = "New template\u{2026}";
 
 /// A template's name: visible, at most `MAX_TEMPLATE_NAME` bytes, and
 /// neither built-in's, ASCII case aside.
@@ -781,9 +783,16 @@ pub fn template_name(name: &str) -> Result<String, String> {
         ));
     }
     let lower = name.to_ascii_lowercase();
-    if lower == "empty" || lower == "directory\u{2026}" || lower == "directory..." {
+    let reserved = [
+        "empty",
+        "directory\u{2026}",
+        "directory...",
+        "new template\u{2026}",
+        "new template...",
+    ];
+    if reserved.contains(&lower.as_str()) {
         return Err(format!(
-            "no template may be named {name:?}: the chooser lists {EMPTY} and {DIRECTORY} itself"
+            "no template may be named {name:?}: the chooser lists {EMPTY}, {DIRECTORY} and {NEW_TEMPLATE} itself"
         ));
     }
     Ok(name.to_string())
@@ -2213,6 +2222,11 @@ mod tests {
         assert!(parse(&many).unwrap_err().contains("at most"));
         assert!(template_name(&"x".repeat(MAX_TEMPLATE_NAME)).is_ok());
         assert!(template_name(&"x".repeat(MAX_TEMPLATE_NAME + 1)).is_err());
+        for reserved in ["New template\u{2026}", "new template..."] {
+            assert!(template_name(reserved)
+                .unwrap_err()
+                .contains("New template"));
+        }
     }
 
     #[test]

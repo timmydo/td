@@ -120,7 +120,7 @@ impl std::fmt::Debug for KeyDialog {
 /// `text` wrapped at `columns` on spaces, a word longer than a row broken
 /// where the row ends, at most `rows` rows, the last ending in an
 /// ellipsis when there was more.
-fn wrap(text: &str, columns: usize, rows: usize) -> Vec<String> {
+pub(crate) fn wrap(text: &str, columns: usize, rows: usize) -> Vec<String> {
     let columns = columns.max(1);
     let mut lines: Vec<String> = Vec::new();
     let mut line = String::new();
@@ -684,7 +684,7 @@ impl KeyDialog {
 
 /// Where the replace confirmation may go, in the order tried: centred,
 /// then at the top and the foot of the surface.
-fn confirm_rects(surface: Surface) -> [Rect; 3] {
+pub(crate) fn confirm_rects(surface: Surface) -> [Rect; 3] {
     let s = surface.scale.value() as i64;
     let cell = CELL_WIDTH as i64 * s;
     let row = ROW as i64 * s;
