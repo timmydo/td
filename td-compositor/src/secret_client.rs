@@ -2,8 +2,8 @@
 
 use crate::attention::{Field, Notice};
 use crate::authority::consent::{
-    Admitted, Enrollment, Fingerprint, LoginStep, Operation, Platform, Recovery, Request, Role,
-    Slot, LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_TWO_CEREMONIES,
+    Admitted, ApprovalKey, Enrollment, Fingerprint, LoginStep, Operation, Platform, Recovery,
+    Request, Role, Slot, LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_TWO_CEREMONIES,
 };
 use crate::authority::Exchange;
 use crate::input::EvdevOrigin;
@@ -276,6 +276,7 @@ pub(crate) enum Selection {
     Write,
     Install,
     Login(LoginSelection),
+    Elevation(Elevation),
 }
 impl From<Role> for Selection {
     fn from(role: Role) -> Self {
@@ -285,7 +286,7 @@ impl From<Role> for Selection {
 impl Selection {
     fn operation(&self) -> Option<Operation> {
         Some(match self {
-            Self::Write | Self::Install | Self::Login(_) => return None,
+            Self::Write | Self::Install | Self::Login(_) | Self::Elevation(_) => return None,
             Self::Unlock(role) => Operation::Unlock { role: *role },
             Self::Enroll(recovery) => Operation::Enroll {
                 platform: Platform::TpmPcr7,
@@ -303,6 +304,7 @@ impl Selection {
             Self::Enroll(Recovery::Unrecoverable) => vec![0x16, 0],
             Self::Enroll(Recovery::SecondToken) => vec![0x16, 1],
             Self::Login(login) => return login.request(),
+            Self::Elevation(elevation) => elevation.request(),
         })
     }
     /// The attention lifetime, fixed at the selection and never renewed.
@@ -312,6 +314,53 @@ impl Selection {
             _ => SECRET_LIFETIME,
         }
     }
+    /// Whether a physical confirmation on the presented prompt must come
+    /// before commit: a fresh Enter for an installation, the approval key
+    /// for an elevation.
+    fn confirms(&self) -> bool {
+        matches!(self, Self::Install | Self::Elevation(_))
+    }
+}
+
+/// An elevation (td-compositor/DESIGN.md, "Elevation consent"): what the
+/// attention menu's `B` asks root for, and from L4 what its `H` selects.
+/// Each description carries the approval key that alone confirms it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Elevation {
+    Rollback,
+    Hostname,
+}
+
+impl Elevation {
+    /// The elevation `request` describes, and its approval key.
+    fn of(request: &Request) -> Option<(Self, ApprovalKey)> {
+        match request.operation() {
+            Operation::DeployRollback { key, .. } => Some((Self::Rollback, *key)),
+            Operation::SetHostname { key, .. } => Some((Self::Hostname, *key)),
+            _ => None,
+        }
+    }
+
+    /// Root's request (td-authd/DESIGN.md, "Elevation operations"), which
+    /// takes no operand.
+    fn request(self) -> Vec<u8> {
+        match self {
+            Self::Rollback => vec![0x1d],
+            Self::Hostname => vec![0x1e],
+        }
+    }
+}
+
+/// A presented prompt that waits for its physical confirmation.
+struct Presented {
+    request: Request,
+    /// A press must be stamped strictly later than this: the
+    /// CLOCK_MONOTONIC sample taken after the prompt's full-frame
+    /// submission, and once an approval key's first digit is typed, that
+    /// digit's time.
+    after: u128,
+    /// How many of the approval key's digits were typed in order.
+    typed: usize,
 }
 
 /// A login-key operation (td-login/TOKEN-LOGIN.md): root's request `1b`.
@@ -506,7 +555,7 @@ pub(crate) struct Attempt {
     selection: Selection,
     state: AtomicU8,
     deadline: Option<Instant>,
-    presentation: Mutex<Option<(Request, u128)>>,
+    presentation: Mutex<Option<Presented>>,
     confirmed: AtomicBool,
     /// The PIN field, shared by the evdev adapter that types into it and
     /// the authority worker that sends what it holds.
@@ -766,9 +815,7 @@ impl Attempt {
     }
 
     fn commit(&self) -> bool {
-        if !self.active()
-            || (self.selection == Selection::Install && !self.confirmed.load(Ordering::SeqCst))
-        {
+        if !self.active() || (self.selection.confirms() && !self.confirmed.load(Ordering::SeqCst)) {
             return false;
         }
         self.state
@@ -819,14 +866,26 @@ impl Attempt {
         }
         let completed = receipt.completed();
         let request = receipt.into_request();
-        if self.selection == Selection::Install {
+        if self.selection.confirms() {
             *self
                 .presentation
                 .lock()
-                .map_err(|_| "installation receipt lock poisoned")? =
-                Some((request.clone(), completed));
+                .map_err(|_| "presentation receipt lock poisoned")? = Some(Presented {
+                request: request.clone(),
+                after: completed,
+                typed: 0,
+            });
         }
         Ok(request)
+    }
+
+    /// Whether a press stamped `timestamp` can answer `presented`: strictly
+    /// later than its `after`, within this attempt's lifetime, while that
+    /// exact prompt is still visible outside drain.
+    fn answers(&self, runtime: &Runtime, presented: &Presented, timestamp: u128) -> bool {
+        timestamp > presented.after
+            && self.active()
+            && runtime.attention_request_visible(&presented.request)
     }
 
     /// Only the physical evdev adapter can offer a confirmation key.
@@ -838,14 +897,70 @@ impl Attempt {
         let presentation = self
             .presentation
             .lock()
-            .map_err(|_| "installation receipt lock poisoned")?;
-        if let Some((request, completed)) = &*presentation {
-            if timestamp > *completed && self.active() && runtime.attention_request_visible(request)
-            {
+            .map_err(|_| "presentation receipt lock poisoned")?;
+        if let Some(presented) = &*presentation {
+            if self.answers(&runtime, presented, timestamp) {
                 self.confirmed.store(true, Ordering::SeqCst);
             }
         }
         Ok(())
+    }
+
+    /// One approval-key digit, `2` to `9` in ASCII, pressed at `timestamp`,
+    /// which only the physical evdev adapter can offer: answers whether it
+    /// ended the request. A press the prompt cannot answer (stamped before
+    /// the prompt was on glass or before the first digit, a withdrawn or
+    /// replaced prompt, a key already typed) neither advances nor ends it.
+    /// A digit that matches its position advances, and the second confirms;
+    /// one that does not cancels the attempt, as Escape does, and the
+    /// adapter then drains the screen.
+    pub fn approve(
+        &self,
+        _origin: &EvdevOrigin,
+        digit: u8,
+        timestamp: u128,
+    ) -> Result<bool, String> {
+        if !matches!(self.selection, Selection::Elevation(_))
+            || !(b'2'..=b'9').contains(&digit)
+            || !self.active()
+        {
+            return Ok(false);
+        }
+        let wrong = {
+            let runtime = self.runtime.lock().map_err(|_| "runtime lock poisoned")?;
+            let mut presentation = self
+                .presentation
+                .lock()
+                .map_err(|_| "presentation receipt lock poisoned")?;
+            let Some(presented) = presentation
+                .as_mut()
+                .filter(|presented| self.answers(&runtime, presented, timestamp))
+            else {
+                return Ok(false);
+            };
+            let Some((_, key)) = Elevation::of(&presented.request) else {
+                return Ok(false);
+            };
+            let digits = key.digits();
+            let Some(expected) = digits.get(presented.typed) else {
+                return Ok(false);
+            };
+            let wrong = digit != *expected;
+            if !wrong {
+                presented.typed += 1;
+                presented.after = timestamp;
+                if presented.typed == digits.len() {
+                    self.confirmed.store(true, Ordering::SeqCst);
+                }
+            }
+            wrong
+        };
+        // Outside the runtime's guard, since cancellation takes the PIN
+        // field's, which every holder takes before the runtime's.
+        if wrong {
+            self.cancel();
+        }
+        Ok(wrong)
     }
 
     pub fn notice(&self, notice: crate::attention::Notice) -> Result<(), String> {
@@ -1180,6 +1295,9 @@ impl Client {
                         ..
                     }
                 ),
+                Selection::Elevation(elevation) => {
+                    Elevation::of(&request).is_some_and(|(described, _)| described == elevation)
+                }
                 // An update on an installed system; a whole disk on a live
                 // boot.
                 Selection::Install => matches!(
@@ -1288,7 +1406,7 @@ impl Client {
                 && !pending.committed
                 && !pending.cancelled =>
             {
-                if pending.attempt.selection == Selection::Install
+                if pending.attempt.selection.confirms()
                     && pending.attempt.active()
                     && !pending.attempt.confirmed.load(Ordering::SeqCst)
                 {
@@ -1307,7 +1425,11 @@ impl Client {
                     pending.cancel(wire)?;
                 }
             }
-            6 if pending.committed => {
+            // An elevation's success screen comes with its operation, from
+            // L3; until then root's success for one is out of order.
+            6 if pending.committed
+                && !matches!(pending.attempt.selection, Selection::Elevation(_)) =>
+            {
                 pending.attempt.notice(
                     if matches!(pending.attempt.selection, Selection::Enroll(_)) {
                         crate::attention::Notice::Enrolled
@@ -1850,7 +1972,7 @@ mod tests {
             .unwrap()
             .as_ref()
             .unwrap()
-            .1;
+            .after;
         screen
             .attempt
             .confirm_install(&crate::input::test_origin(), completed)
@@ -1931,7 +2053,7 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .1;
+                .after;
             screen
                 .attempt
                 .confirm_install(&crate::input::test_origin(), completed + 1)
@@ -2022,6 +2144,338 @@ mod tests {
                 .confirm_install(&crate::input::test_origin(), u128::MAX)
                 .unwrap();
             assert!(!screen.attempt.commit());
+        }
+    }
+
+    // Elevation consent: the approval key.
+
+    const ELEVATIONS: &[Elevation] = &[Elevation::Rollback, Elevation::Hostname];
+
+    /// Root's description of `elevation` for the owner, carrying `key`.
+    fn elevation(elevation: Elevation, key: &[u8; 2]) -> Request {
+        let key = crate::authority::consent::ApprovalKey::new(*key).unwrap();
+        let operation = match elevation {
+            Elevation::Rollback => Operation::DeployRollback {
+                key,
+                current: "a".repeat(64),
+                previous: "b".repeat(64),
+            },
+            Elevation::Hostname => Operation::SetHostname {
+                key,
+                requester: 1000,
+                old: "td".into(),
+                new: "td-laptop".into(),
+            },
+        };
+        Request::new([42; 32], 1000, operation).unwrap()
+    }
+
+    fn elevation_screen(elevation: Elevation) -> Screen {
+        let mut screen = Screen::new();
+        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Elevation(elevation);
+        screen
+    }
+
+    /// `request` selected and presented, its presentation acknowledged,
+    /// then `then`: the client, the wire, and when the prompt was on glass.
+    fn presented_elevation(
+        screen: &Screen,
+        request: &Request,
+        then: Vec<Vec<u8>>,
+    ) -> (Client, Wire, u128) {
+        let mut replies = vec![
+            description(&[0x92], request),
+            status(4, request),
+            vec![0x93],
+        ];
+        replies.extend(then);
+        let mut wire = wire(replies);
+        let mut client = Client::default();
+        client
+            .start(&mut wire, Arc::clone(&screen.attempt))
+            .unwrap();
+        client.tick(&mut wire).unwrap();
+        assert_eq!(sent(&wire, 0x13), 1);
+        let shown = screen
+            .attempt
+            .presentation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .after;
+        (client, wire, shown)
+    }
+
+    /// The evdev adapter's offer of `digit` pressed at `at`: whether it
+    /// ended the request.
+    fn press(screen: &Screen, digit: u8, at: u128) -> bool {
+        screen
+            .attempt
+            .approve(&crate::input::test_origin(), digit, at)
+            .unwrap()
+    }
+
+    fn confirmed(screen: &Screen) -> bool {
+        screen.attempt.confirmed.load(Ordering::SeqCst)
+    }
+
+    /// Each elevation's prompt commits once, only after its two digits are
+    /// typed in order on the presented prompt, and the commit is root's
+    /// exact description, so it carries the key typed. The same digit
+    /// twice is two presses. Root's success has no screen until L3.
+    #[test]
+    fn each_elevation_commits_only_after_its_key_is_typed_in_order() {
+        for (elevation, key, request) in [
+            (Elevation::Rollback, b"47", vec![0x1d]),
+            (Elevation::Hostname, b"44", vec![0x1e]),
+        ] {
+            let screen = elevation_screen(elevation);
+            let described = super::tests::elevation(elevation, key);
+            let invitation = status(5, &described);
+            let (mut client, mut wire, shown) = presented_elevation(
+                &screen,
+                &described,
+                vec![
+                    invitation.clone(),
+                    invitation.clone(),
+                    invitation,
+                    vec![0x94],
+                    status(6, &described),
+                ],
+            );
+            assert_eq!(wire.calls[0], request);
+            // Invited to commit, the client waits for the key.
+            client.tick(&mut wire).unwrap();
+            assert!(!press(&screen, key[0], shown + 1));
+            assert!(!confirmed(&screen) && screen.attempt.active());
+            client.tick(&mut wire).unwrap();
+            assert_eq!(sent(&wire, 0x14), 0);
+            assert!(!press(&screen, key[1], shown + 2));
+            assert!(confirmed(&screen));
+            client.tick(&mut wire).unwrap();
+            let commits: Vec<_> = wire
+                .calls
+                .iter()
+                .filter(|call| call.first() == Some(&0x14))
+                .collect();
+            assert_eq!(commits, [&description(&[0x14], &described)]);
+            assert_eq!(commits[0][46..48], key[..]);
+            assert!(client.pending.as_ref().unwrap().committed);
+            assert_eq!(
+                client.tick(&mut wire).unwrap_err(),
+                "out-of-order secret operation status"
+            );
+            assert_eq!(sent(&wire, 0x14), 1);
+        }
+    }
+
+    /// Enter never confirms an elevation, nor can an installation's Enter
+    /// path, nor a digit anything but an elevation.
+    #[test]
+    fn enter_never_confirms_an_elevation_nor_a_digit_an_installation() {
+        for &elevation in ELEVATIONS {
+            let screen = elevation_screen(elevation);
+            let described = super::tests::elevation(elevation, b"47");
+            let (mut client, mut wire, shown) =
+                presented_elevation(&screen, &described, vec![status(5, &described)]);
+            for at in [shown + 1, shown + 2, u128::MAX] {
+                screen
+                    .attempt
+                    .confirm_install(&crate::input::test_origin(), at)
+                    .unwrap();
+            }
+            assert!(!confirmed(&screen));
+            client.tick(&mut wire).unwrap();
+            assert_eq!(sent(&wire, 0x14), 0);
+            assert!(!screen.attempt.commit());
+        }
+        let mut screen = Screen::new();
+        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+        let request = Request::new(
+            [42; 32],
+            1000,
+            Operation::Install {
+                deployment: "ab".repeat(32),
+                requester: 1000,
+            },
+        )
+        .unwrap();
+        screen.attempt.present(request).unwrap();
+        for digit in *b"23456789" {
+            assert!(!press(&screen, digit, u128::MAX));
+        }
+        assert!(!confirmed(&screen) && screen.attempt.active());
+    }
+
+    /// A digit stamped before the prompt was on glass, or the second before
+    /// the first, neither advances nor ends the request, right or wrong.
+    #[test]
+    fn a_digit_stamped_before_its_turn_neither_advances_nor_ends() {
+        for &elevation in ELEVATIONS {
+            let screen = elevation_screen(elevation);
+            // Selected, not yet presented: nothing to answer.
+            assert!(!press(&screen, b'4', u128::MAX));
+            assert!(!press(&screen, b'9', u128::MAX));
+            let described = super::tests::elevation(elevation, b"47");
+            let (_client, _wire, shown) = presented_elevation(&screen, &described, vec![]);
+            for (digit, at) in [(b'4', shown), (b'4', shown - 1), (b'9', shown), (b'9', 0)] {
+                assert!(!press(&screen, digit, at));
+            }
+            assert!(screen.attempt.active());
+            assert_eq!(
+                screen
+                    .attempt
+                    .presentation
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .typed,
+                0
+            );
+            assert!(!press(&screen, b'4', shown + 5));
+            // The second digit must be later than the first.
+            for (digit, at) in [(b'7', shown + 5), (b'9', shown + 5), (b'7', shown + 4)] {
+                assert!(!press(&screen, digit, at));
+            }
+            assert!(!confirmed(&screen) && screen.attempt.active());
+            assert!(!press(&screen, b'7', shown + 6));
+            assert!(confirmed(&screen));
+            // A third digit has no position, right or wrong.
+            assert!(!press(&screen, b'9', shown + 7));
+            assert!(screen.attempt.active());
+        }
+    }
+
+    /// A counted digit from 2 to 9 that does not match, at either position,
+    /// ends the request unapproved: the attempt is cancelled, the client
+    /// cancels with root and never commits. 0, 1 and anything else are no
+    /// digit of the key's alphabet and end nothing.
+    #[test]
+    fn a_wrong_digit_at_either_position_ends_the_request() {
+        for &elevation in ELEVATIONS {
+            for typed_first in [false, true] {
+                let screen = elevation_screen(elevation);
+                let described = super::tests::elevation(elevation, b"47");
+                let (mut client, mut wire, shown) = presented_elevation(
+                    &screen,
+                    &described,
+                    vec![vec![0x95, 0], status(7, &described)],
+                );
+                for digit in [b'0', b'1', b'a', 0x34 + 0x80, b'\n'] {
+                    assert!(!press(&screen, digit, shown + 1));
+                }
+                if typed_first {
+                    assert!(!press(&screen, b'4', shown + 1));
+                }
+                assert!(screen.attempt.active());
+                assert!(press(&screen, b'8', shown + 2));
+                assert!(!screen.attempt.active() && !confirmed(&screen));
+                // The right digits after it change nothing.
+                assert!(!press(&screen, b'4', shown + 3));
+                assert!(!press(&screen, b'7', shown + 4));
+                assert!(!confirmed(&screen));
+                client.tick(&mut wire).unwrap();
+                assert!(client.pending.is_none());
+                assert_eq!(sent(&wire, 0x15), 1);
+                assert_eq!(sent(&wire, 0x14), 0);
+            }
+        }
+    }
+
+    /// A prompt replaced by a notice, withdrawn or draining, or a cancelled
+    /// attempt, takes no digit: none advances, ends or confirms.
+    #[test]
+    fn a_hidden_prompt_or_cancelled_attempt_takes_no_digit() {
+        for &elevation in ELEVATIONS {
+            for case in 0..3 {
+                let screen = elevation_screen(elevation);
+                let described = super::tests::elevation(elevation, b"47");
+                let (_client, _wire, shown) = presented_elevation(&screen, &described, vec![]);
+                let mut runtime = screen.attempt.runtime.lock().unwrap();
+                match case {
+                    0 => {
+                        runtime
+                            .attention_notice(
+                                &crate::input::test_origin(),
+                                crate::attention::Notice::Failed,
+                            )
+                            .unwrap();
+                    }
+                    1 => runtime.abandon_attention_presentation(&described),
+                    _ => {
+                        runtime
+                            .drain_attention(&crate::input::test_origin())
+                            .unwrap();
+                    }
+                }
+                drop(runtime);
+                for (digit, at) in [(b'4', shown + 1), (b'7', shown + 2), (b'9', shown + 3)] {
+                    assert!(!press(&screen, digit, at));
+                }
+                assert!(!confirmed(&screen) && screen.attempt.active());
+                assert!(!screen.attempt.commit());
+            }
+            let screen = elevation_screen(elevation);
+            let described = super::tests::elevation(elevation, b"47");
+            let (_client, _wire, shown) = presented_elevation(&screen, &described, vec![]);
+            screen.attempt.cancel();
+            assert!(!press(&screen, b'4', shown + 1));
+            assert!(!press(&screen, b'7', shown + 2));
+            assert!(!confirmed(&screen));
+        }
+    }
+
+    /// Root's description must be the selected elevation for the owner:
+    /// another elevation, an installation, or another owner ends the
+    /// channel before anything is presented.
+    #[test]
+    fn root_must_describe_the_selected_elevation_for_the_owner() {
+        let other_owner = Request::new(
+            [42; 32],
+            1001,
+            Operation::DeployRollback {
+                key: crate::authority::consent::ApprovalKey::new(*b"47").unwrap(),
+                current: "a".repeat(64),
+                previous: "b".repeat(64),
+            },
+        )
+        .unwrap();
+        let update = Request::new(
+            [42; 32],
+            1000,
+            Operation::Install {
+                deployment: "ab".repeat(32),
+                requester: 1000,
+            },
+        )
+        .unwrap();
+        for (selection, described) in [
+            (
+                Selection::Elevation(Elevation::Rollback),
+                elevation(Elevation::Hostname, b"47"),
+            ),
+            (
+                Selection::Elevation(Elevation::Hostname),
+                elevation(Elevation::Rollback, b"47"),
+            ),
+            (Selection::Elevation(Elevation::Rollback), other_owner),
+            (Selection::Elevation(Elevation::Rollback), update),
+            (Selection::Install, elevation(Elevation::Rollback, b"47")),
+            (Selection::Write, elevation(Elevation::Hostname, b"47")),
+        ] {
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = selection;
+            let mut wire = wire(vec![description(&[0x92], &described)]);
+            let mut client = Client::default();
+            assert_eq!(
+                client
+                    .start(&mut wire, Arc::clone(&screen.attempt))
+                    .unwrap_err(),
+                "root secret request changed the selected operation"
+            );
+            assert!(client.pending.is_none());
         }
     }
 

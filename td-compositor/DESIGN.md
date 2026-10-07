@@ -5719,10 +5719,11 @@ also refuses, or an oversized read declares nothing. Symlinks (`driver`,
 256 entries is not read. Report descriptors are world-readable in sysfs,
 so this is plain file reads and no new syscall.
 
-An excluded device's keys never select (U, R, E, X, W, I, K, and the
+An excluded device's keys never select (U, R, E, X, W, I, K, B, and the
 key-management screen's 1, 2, A, D, digits and Enter) and never confirm
-(Enter). Its held keys neither stop another keyboard's fresh press
-of the same key nor count as modifiers while attention is up. Its presses
+(Enter, or an approval key's digit, "Elevation consent" below). Its
+held keys neither stop another keyboard's fresh press of the same key
+nor count as modifiers while attention is up. Its presses
 and releases are still tracked, so the release drain waits for them, and
 its Escape still cancels, so no capture outlives the person's way out.
 The chord itself is read as before. Outside attention it is an ordinary
@@ -5936,20 +5937,25 @@ protocol is in td-authd/DESIGN.md.
 
 ### Elevation consent (target)
 
-Nothing in this section is implemented. APPLICATIONS.md §L.1, "The v1
-operations (target)", says what the operations are and why, and
-"Elevation increments" when each part lands; td-authd/DESIGN.md,
-"Elevation operations (target)", gives the protocol. This section alone
-says which input confirms.
+Implemented, inert (L2): the confirmation below and `B`'s refusal;
+nothing in production yet produces a prompt that takes the key.
+APPLICATIONS.md §L.1, "The v1 operations (target)", says what the
+operations are and why, and "Elevation increments" when each part
+lands; td-authd/DESIGN.md, "Elevation operations (target)", gives the
+protocol. This section alone says which input confirms.
 
 A fresh physical `B` on the attention menu asks root for a rollback
 (`1d`), and from L4 a fresh physical `H` selects the queued hostname
 request (`1e`), each under the menu's rules for a selection: one per
 attention lifetime, never from a held key or a repeat. Both letters are
 modhex, so the exclusion of a security key's own keyboard above extends
-to them. L2 adds `B` and a production build refuses it, showing `NOT
-AVAILABLE IN THIS BUILD`, until L3. Root's description must be the
-selected operation for owner 1000.
+to them. On the lock surface neither selects, as no menu letter does.
+L2 adds `B` and a production build refuses it, showing `NOT AVAILABLE
+IN THIS BUILD`, until L3: the refusal asks root nothing and is the
+lifetime's one selection, as `L`'s is without keys. `H` is unbound
+until L4. Root's description must be the selected operation for owner
+1000; another elevation, another operation or another owner ends the
+paired generation, as a changed secret request does.
 
 The prompt shows the description's rows and then the approval key it
 carries, two digits from 2 to 9, as the keys to press in order, with
@@ -5962,21 +5968,39 @@ attention reads, of a key no other such device holds, with no Control,
 Alt or Super held (Shift is allowed, for layouts that shift digits),
 stamped strictly later than that sample, while the exact request is
 still visible outside drain and the attention lifetime remains. The
-second digit must be a fresh press after the first, so a repeat never
-supplies it; the same digit twice is two presses. A counted digit that
-matches its position advances; the second completes the key, and the
-existing atomic cancellation/commit transition then consumes the
-confirmation before sending the exact commit, as for an installation. A
-counted digit from 2 to 9 that does not match, at either position, ends
-the request unapproved, as Escape does.
+second digit must be a fresh press after the first, stamped strictly
+later than it, so a repeat never supplies it; the same digit twice is
+two presses. A counted digit that matches its position advances; the
+second completes the key, and the existing atomic cancellation/commit
+transition then consumes the confirmation before sending the exact
+commit, root's description and so the key it carries, as for an
+installation. A counted digit from 2 to 9 that does not match, at
+either position, ends the request unapproved, as Escape does: the
+attempt cancels with root (`15`) and the screen drains, showing
+`RELEASE KEYS AND BUTTONS` until the digit is released. Presses from
+two keyboards are taken in the order their reports are read, not by
+timestamp, so the right digits typed across two keyboards within
+milliseconds can end the request as a wrong digit; that fails safe.
 
 Everything else neither advances nor ends the request: Enter, which
 never confirms; a digit stamped before presentation, or held from before
 it; 0, 1 and the keypad; a digit under Control, Alt or Super; repeats
-and held logical keys; and injected, automation, control, Wayland and
-bridge input. A security key's own keyboard neither advances nor ends
-the key, though its Escape still cancels. A replaced or hidden prompt
-confirms nothing.
+and held logical keys; a digit after the key is complete; and injected,
+automation, control, Wayland and bridge input. A security key's own
+keyboard neither advances nor ends the key, though its Escape still
+cancels. A replaced or hidden prompt confirms nothing.
+
+L2 leaves to L3 and L4 what only a live operation needs: the menu's
+rows, root's refusals (`9d`, `9e`), which the client does not yet
+accept, and the success screens, so root's success (`06`) for an
+elevation is out of order and ends the paired generation. Host tests
+drive a rollback's and a hostname change's prompt against a scripted
+authority to its one commit, and through each refusal above;
+device-dispatcher tests cover `B`'s production refusal, its selection
+where wired, the digits offered, the drain after a wrong one, a
+security key's own keyboard and the lock surface. Source pins hold what
+they cannot: production's refusal of `B`, and that only the evdev
+target offers the attempt a digit.
 
 The approval key appears only on the private prompt, so ordinary
 rendering never carries it. In L5 an update's confirmation moves from

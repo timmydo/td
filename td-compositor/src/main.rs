@@ -3309,4 +3309,149 @@ pub struct MappedRegion {
             1
         );
     }
+
+    /// Elevation consent, L2 (DESIGN.md, "Elevation consent"): no
+    /// production build asks root for a rollback, so `B` shows NOT
+    /// AVAILABLE IN THIS BUILD and `H` is not bound; and an elevation's one
+    /// commit, root's exact description and so its key, follows only the
+    /// two digits the evdev adapter offers. What a runtime test cannot see
+    /// is held here: the production half of `rollback_wired`, and that no
+    /// other path confirms.
+    #[test]
+    fn production_refuses_b_and_only_the_typed_key_commits_an_elevation() {
+        let input = production(include_str!("input.rs"));
+        let client = production(include_str!("secret_client.rs"));
+        let body = |source: &'static str, head: &str| -> &'static str {
+            source
+                .split_once(head)
+                .unwrap()
+                .1
+                .split_once("\n    }\n")
+                .unwrap()
+                .0
+        };
+        // `B`: the lifetime's one selection, a rollback only where wired.
+        let select = body(input, "    fn select(");
+        assert!(select.contains(
+            "            KEY_B => {\n                self.secret_selected = true;\n                \
+             if self.rollback_wired() {\n                    \
+             Some(Selection::Elevation(Elevation::Rollback))\n                } else {\n                    \
+             decision.notice = Some(Notice::NotAvailable);\n                    None\n                }\n            }\n"
+        ));
+        // Neither `H` nor any other elevation is bound before L4.
+        assert!(!select.contains("KEY_H"));
+        assert_eq!(occurrences(input, "Selection::Elevation("), 1);
+        assert_eq!(occurrences(input, "Elevation::Hostname"), 0);
+        // Wired only in the tests: production's answer is a literal false,
+        // and the tests' switch does not exist outside them.
+        assert_eq!(occurrences(input, "fn rollback_wired("), 2);
+        assert_eq!(
+            occurrences(
+                input,
+                "    #[cfg(not(test))]\n    fn rollback_wired(&self) -> bool {\n        false\n    }\n"
+            ),
+            1
+        );
+        assert_eq!(
+            occurrences(
+                input,
+                "    #[cfg(test)]\n    fn rollback_wired(&self) -> bool {\n        self.rollback\n    }\n"
+            ),
+            1
+        );
+        assert_eq!(
+            occurrences(input, "    #[cfg(test)]\n    rollback: bool,\n"),
+            1
+        );
+        assert_eq!(occurrences(input, "rollback: bool"), 1);
+        assert_eq!(occurrences(input, "rollback: true"), 0);
+        assert_eq!(occurrences(input, ".rollback "), 0);
+        assert_eq!(occurrences(input, ".rollback\n"), 1);
+        // A digit is a fresh number-row 2 to 9 under no Control, Alt or
+        // Super, offered only on the open screen after the selection.
+        let digit = body(
+            input,
+            "    fn approval_digit(&self, code: u16) -> Option<u8> {\n",
+        );
+        assert!(digit.contains(
+            "        if held(KEY_LEFTCTRL, KEY_RIGHTCTRL)\n            \
+             || held(KEY_LEFTALT, KEY_RIGHTALT)\n            \
+             || held(KEY_LEFTMETA, KEY_RIGHTMETA)\n            \
+             || !(KEY_2..=KEY_9).contains(&code)\n"
+        ));
+        assert!(!digit.contains("KEY_KP"));
+        let feed = body(input, "    fn feed_device(");
+        assert_eq!(occurrences(feed, ".approval_digit(event.code)"), 1);
+        assert!(feed.contains(
+            "            if self.attention == AttentionState::Open\n                \
+             && readable\n                && chosen\n                \
+             && !attention_held\n                && event.value == KEY_PRESS\n            {\n                \
+             decision.field = self.field_key(event.code).map(|key| (key, event.timestamp));\n                \
+             decision.approval = self\n"
+        ));
+        assert_eq!(occurrences(input, "decision.approval ="), 1);
+        // The attempt's one caller, the evdev target, with the adapter's
+        // witness; the trait's default takes none.
+        assert_eq!(occurrences(input, ".approve("), 1);
+        let target = input
+            .split_once("impl InputTarget for LiveInputTarget {")
+            .unwrap()
+            .1;
+        assert!(target.contains(
+            "            Some(attempt) => attempt.approve(&EvdevOrigin { _private: () }, digit, timestamp),\n"
+        ));
+        assert!(input.contains(
+            "    fn approval_digit(&mut self, _digit: u8, _timestamp: u128) -> Result<bool, String> {\n        \
+             Ok(false)\n    }\n"
+        ));
+        for (name, source) in std::iter::once(("main.rs", MAIN)).chain(OTHER.iter().copied()) {
+            let source = source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .map_or(source, |(body, _)| body);
+            if !matches!(name, "input.rs" | "secret_client.rs") {
+                for reach in ["approve(", "approval_digit(", "Elevation::"] {
+                    assert!(!source.contains(reach), "{name}: {reach}");
+                }
+            }
+        }
+        // The client: an elevation commits only once confirmed, and only
+        // the second matching digit, or an installation's Enter, confirms.
+        assert!(client.contains(
+            "    fn confirms(&self) -> bool {\n        \
+             matches!(self, Self::Install | Self::Elevation(_))\n    }\n"
+        ));
+        assert!(client.contains(
+            "        if !self.active() || (self.selection.confirms() && !self.confirmed.load(Ordering::SeqCst)) {\n            \
+             return false;\n        }\n"
+        ));
+        assert_eq!(occurrences(client, "confirmed.store(true"), 2);
+        let approve = body(client, "    pub fn approve(");
+        assert!(approve.contains(
+            "            let wrong = digit != *expected;\n            if !wrong {\n                \
+             presented.typed += 1;\n                presented.after = timestamp;\n                \
+             if presented.typed == digits.len() {\n                    \
+             self.confirmed.store(true, Ordering::SeqCst);\n"
+        ));
+        assert!(
+            approve.contains(".filter(|presented| self.answers(&runtime, presented, timestamp))")
+        );
+        let answers = body(client, "    fn answers(");
+        assert!(answers.contains(
+            "        timestamp > presented.after\n            && self.active()\n            \
+             && runtime.attention_request_visible(&presented.request)"
+        ));
+        // Its commit is the pending description itself, after the CAS.
+        let tick = body(client, "    pub fn tick(");
+        assert!(tick.contains(
+            "                if pending.attempt.commit() {\n                    \
+             pending.committed = true;\n                    let mut bytes = vec![0x14];\n                    \
+             bytes.extend_from_slice(&pending.request.encode());\n"
+        ));
+        assert!(tick.contains(
+            "                if pending.attempt.selection.confirms()\n                    \
+             && pending.attempt.active()\n                    \
+             && !pending.attempt.confirmed.load(Ordering::SeqCst)\n                {\n                    \
+             return Ok(());\n                }\n"
+        ));
+    }
 }

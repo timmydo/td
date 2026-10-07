@@ -8730,7 +8730,9 @@ required before enabling consent or a WebAuthn grant.
 **Current credential consent is specified in §W.4.** Physical selection,
 immutable presentation and a token assertion now mediate credential writes,
 enrollment and release. The broader operation vocabulary here remains a
-target; the proposed randomized-key mechanism is not implemented. The kernel now carries USB PCI xHCI, generic HID,
+target; the compositor's randomized-key confirmation is implemented but
+inert, since nothing in production yet produces a prompt that takes it
+(L2 below). The kernel now carries USB PCI xHCI, generic HID,
 USB HID and hidraw. The root-only worker implements the narrow CTAP HID
 transport described in `td-secret/DESIGN.md`; it does not grant consent.
 USB keyboard interfaces follow the compositor's seat-assigned startup
@@ -8741,10 +8743,12 @@ keyboard events never prove a FIDO assertion.
 
 #### The v1 operations (target)
 
-Nothing in this subsection is implemented. It says what the first
-operations are and why; the elevation increments below (L1 to L7) build
-them, and each part stays a target until the increment named for it
-lands with its evidence. The protocol, encodings and write rules are in
+It says what the first operations are and why; the elevation
+increments below (L1 to L7) build them, and each part stays a target
+until the increment named for it lands with its evidence. So far only
+the consent descriptions (L1) and the compositor's approval-key
+confirmation (L2) exist, and both are inert: nothing produces an
+elevation request. The protocol, encodings and write rules are in
 `td-authd/DESIGN.md`, "Elevation operations (target)"; which key presses
 confirm is in `td-compositor/DESIGN.md`, "Elevation consent (target)".
 
@@ -8935,13 +8939,16 @@ statements it changes, including those named here.
   (`td-compositor/DESIGN.md`, "Elevation consent (target)"). After L1.
 - **L3**, `deploy-rollback` live: the principal table and its UID-1000
   row, request `1d`, nonce and key, presentation `13` then commit `14`,
+  the menu's `B` row, the compositor's reading of `9d` and the success
+  screen,
   the spawn with td-boot's new CURRENT and PREVIOUS operands, a QEMU
   phase that reads the key off the screen, and integration evidence. It
   amends `UNSAFE.md` §16, whose confinement-pinned fixed child argv the
   td-boot spawn joins, and `td-secret/DESIGN.md` (`login_tier.rs`'s
   selector reader in td-authd). After L2.
 - **L4**, `set-hostname` through its typed intake, request `1e`, the
-  menu letter `H` and the intake's backoff, with the next boot's
+  menu letter `H` with its row, `9e` and its success screen, and the
+  intake's backoff, with the next boot's
   `TD-HOSTNAME-READY` as its oracle. It amends `UNSAFE.md` §16 (the
   intake is a further `secret_sys.rs` transport consumer),
   `td-secret/DESIGN.md`'s consumers of that transport, and

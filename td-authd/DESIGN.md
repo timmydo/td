@@ -1756,7 +1756,9 @@ staged into the target authority recipe.
 ## Elevation operations (target)
 
 Nothing in this section is implemented but its consent tags, which
-`consent.rs` encodes, decodes and renders and nothing yet produces.
+`consent.rs` encodes, decodes and renders and nothing yet produces, and
+the compositor's side of the approval key (td-compositor/DESIGN.md
+"Elevation consent (target)"), which no request yet reaches.
 APPLICATIONS.md §L.1, "The v1 operations (target)", says what
 `deploy-rollback`, `set-hostname` and `deploy-publish` are and why, and
 its "Elevation increments" which commit lands each part;

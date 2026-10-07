@@ -301,6 +301,10 @@ struct KeyBindings {
     /// an enrolled record's keys in canonical slot order, which removal
     /// digits name, or why there are none.
     login: crate::authority::Login,
+    /// The tests' stand-in for root's `1d`, which L3 wires: with it `B`
+    /// asks root for a rollback (`rollback_wired`).
+    #[cfg(test)]
+    rollback: bool,
     /// Resume detection, checked before each batch is routed; the paired
     /// profile's alone.
     resume: Option<Arc<Resume>>,
@@ -341,6 +345,9 @@ struct KeyDecision {
     /// A screen of the attention lifetime that selects nothing yet.
     notice: Option<crate::attention::Notice>,
     confirm_install: Option<u128>,
+    /// An approval-key digit (`approval_digit`) and its evdev time. The
+    /// attempt takes it only for its presented elevation prompt.
+    approval: Option<(u8, u128)>,
     /// A key for the PIN field and its evdev time. The attempt takes it only
     /// while its field is open and was on glass before the press.
     field: Option<(crate::secret_client::FieldKey, u128)>,
@@ -392,6 +399,7 @@ impl KeyBindings {
             secret: None,
             notice: None,
             confirm_install: None,
+            approval: None,
             field: None,
             unlock: false,
             lock: false,
@@ -445,6 +453,9 @@ impl KeyBindings {
                 && event.value == KEY_PRESS
             {
                 decision.field = self.field_key(event.code).map(|key| (key, event.timestamp));
+                decision.approval = self
+                    .approval_digit(event.code)
+                    .map(|digit| (digit, event.timestamp));
             }
             if self.attention == AttentionState::Open
                 && readable
@@ -655,7 +666,7 @@ impl KeyBindings {
     fn select(&mut self, code: u16, decision: &mut KeyDecision) {
         use crate::attention::Notice;
         use crate::authority::consent::{Recovery, Role};
-        use crate::secret_client::{LoginSelection, Removal, Selection};
+        use crate::secret_client::{Elevation, LoginSelection, Removal, Selection};
         // Nothing on a screen the person may not see yet is a choice.
         if self.login_screen != LoginScreen::Closed
             && !self
@@ -715,6 +726,18 @@ impl KeyBindings {
                 decision.notice = Some(Notice::LoginKeys);
                 None
             }
+            // A rollback, which no build asks root for until L3 wires root's
+            // `1d`: until then this build refuses it, and the refusal is
+            // the lifetime's one selection.
+            KEY_B => {
+                self.secret_selected = true;
+                if self.rollback_wired() {
+                    Some(Selection::Elevation(Elevation::Rollback))
+                } else {
+                    decision.notice = Some(Notice::NotAvailable);
+                    None
+                }
+            }
             // The lifetime's one selection: it ends attention into the
             // lock, or says why there is none and sends nothing.
             KEY_L => {
@@ -728,6 +751,35 @@ impl KeyBindings {
             }
             _ => None,
         };
+    }
+
+    /// Whether `B` asks root for a rollback: in no production build until
+    /// L3 wires root's `1d`.
+    #[cfg(not(test))]
+    fn rollback_wired(&self) -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    fn rollback_wired(&self) -> bool {
+        self.rollback
+    }
+
+    /// An approval-key digit for a fresh press from a device secure
+    /// attention reads: a number-row 2 to 9, as its ASCII digit, with no
+    /// Control, Alt or Super held on such a device. Shift is allowed, for
+    /// layouts that shift digits; 0, 1 and the keypad are none.
+    fn approval_digit(&self, code: u16) -> Option<u8> {
+        let held = |left, right| self.attention_pressed(left) || self.attention_pressed(right);
+        if held(KEY_LEFTCTRL, KEY_RIGHTCTRL)
+            || held(KEY_LEFTALT, KEY_RIGHTALT)
+            || held(KEY_LEFTMETA, KEY_RIGHTMETA)
+            || !(KEY_2..=KEY_9).contains(&code)
+        {
+            return None;
+        }
+        let offset = u8::try_from(code.checked_sub(KEY_2)?).ok()?;
+        b'2'.checked_add(offset)
     }
 
     /// Whether root's last `1a` answer locks: enrolled or unavailable.
@@ -1461,6 +1513,12 @@ struct PointerFrame {
 trait InputTarget {
     fn confirm_install(&mut self, _timestamp: u128) -> Result<(), String> {
         Ok(())
+    }
+    /// An approval-key digit for the attempt's presented elevation prompt:
+    /// answers whether it ended the request. A target with no attempt
+    /// takes none.
+    fn approval_digit(&mut self, _digit: u8, _timestamp: u128) -> Result<bool, String> {
+        Ok(false)
     }
     fn secret_request(&mut self, _role: crate::secret_client::Selection) -> Result<(), String> {
         Err("secret requests unavailable on this input target".into())
@@ -2346,6 +2404,12 @@ impl InputTarget for LiveInputTarget {
         }
         Ok(())
     }
+    fn approval_digit(&mut self, digit: u8, timestamp: u128) -> Result<bool, String> {
+        match &self.secret_attempt {
+            Some(attempt) => attempt.approve(&EvdevOrigin { _private: () }, digit, timestamp),
+            None => Ok(false),
+        }
+    }
     fn pin_key(
         &mut self,
         key: crate::secret_client::FieldKey,
@@ -2948,6 +3012,9 @@ fn apply_locked<T: InputTarget>(
         && decision.secret.is_none()
         && decision.notice.is_none()
         && decision.confirm_install.is_none()
+        // Redundant today, since each approval digit also yields a field
+        // byte, but kept so a digit never falls through as nothing.
+        && decision.approval.is_none()
         && decision.field.is_none()
         && decision.command.is_none()
         && decision.launcher.is_none()
@@ -3087,6 +3154,14 @@ fn deliver_key_decision<T: InputTarget>(
     }
     if let Some(timestamp) = decision.confirm_install {
         runtime.confirm_install(timestamp)?;
+    }
+    // A wrong digit ended the request unapproved: the screen drains, as
+    // Escape's does.
+    if let Some((digit, timestamp)) = decision.approval {
+        if runtime.approval_digit(digit, timestamp)? && bindings.attention == AttentionState::Open {
+            bindings.attention = AttentionState::Draining;
+            runtime.drain_attention()?;
+        }
     }
     if let Some((key, timestamp)) = decision.field {
         runtime.pin_key(key, timestamp)?;
@@ -4129,6 +4204,8 @@ mod tests {
             "Command::new",
             "enable_attention(",
             ".attention(",
+            // No injected digit reaches an approval key.
+            "approv",
         ] {
             assert!(!source.contains(forbidden), "{forbidden}");
         }
@@ -5383,6 +5460,10 @@ mod tests {
         notices_owed: bool,
         clock: Arc<crate::runtime::PresentationClock>,
         confirmations: Vec<u128>,
+        /// Each approval-key digit offered, with its evdev time.
+        approvals: Vec<(u8, u128)>,
+        /// The attempt answers that each offered digit ended its request.
+        approval_ends: bool,
         attention_cutoff: u128,
         attention_error: Option<String>,
         draining_events: usize,
@@ -5436,6 +5517,11 @@ mod tests {
         fn confirm_install(&mut self, timestamp: u128) -> Result<(), String> {
             self.confirmations.push(timestamp);
             Ok(())
+        }
+
+        fn approval_digit(&mut self, digit: u8, timestamp: u128) -> Result<bool, String> {
+            self.approvals.push((digit, timestamp));
+            Ok(self.approval_ends)
         }
 
         fn secret_request(&mut self, role: crate::secret_client::Selection) -> Result<(), String> {
@@ -10143,6 +10229,364 @@ mod tests {
         );
         assert_eq!(target.notices.len(), 6);
         assert_eq!(target.confirmations, [102_000_000]);
+    }
+
+    // Elevation consent: `B` and the approval key.
+
+    /// Bindings whose `B` asks root for a rollback, as L3's will.
+    fn rollback_bindings() -> Mutex<KeyBindings> {
+        Mutex::new(KeyBindings {
+            attention_enabled: true,
+            rollback: true,
+            ..KeyBindings::default()
+        })
+    }
+
+    /// One event from `device`, decided and delivered.
+    fn deliver(
+        bindings: &mut KeyBindings,
+        target: &mut RecordingTarget,
+        device: usize,
+        event: Event,
+    ) {
+        let decision = bindings.feed_device(device, event);
+        deliver_key_decision(target, bindings, decision).unwrap();
+    }
+
+    /// This build refuses `B`: the menu shows NOT AVAILABLE IN THIS BUILD,
+    /// asks root nothing, and the refusal is the lifetime's one selection.
+    /// `H` is L4's and selects nothing yet. Outside attention both are
+    /// ordinary keys.
+    #[test]
+    fn b_is_refused_in_this_build_and_ends_the_lifetimes_choice() {
+        use crate::attention::Notice;
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = attention_bindings(None);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_B, KEY_H], 1));
+        {
+            let target = target.lock().unwrap();
+            assert!(target.secret_roles.is_empty() && target.notices.is_empty());
+            assert_eq!(target.keys.len(), 4);
+        }
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        let typed = target.lock().unwrap().keys.len();
+        read_reports(&target, &bindings, 0, &presses(&[KEY_H], 20));
+        assert!(target.lock().unwrap().notices.is_empty());
+        read_reports(
+            &target,
+            &bindings,
+            0,
+            &presses(&[KEY_B, KEY_B, KEY_U, KEY_I, KEY_K, KEY_L, KEY_H], 30),
+        );
+        let target = target.lock().unwrap();
+        assert_eq!(target.attention_events, [true]);
+        assert_eq!(target.notices, [Notice::NotAvailable]);
+        assert!(target.secret_roles.is_empty());
+        assert_eq!(target.lock_screens, 0);
+        assert_eq!(target.keys.len(), typed);
+    }
+
+    /// Where root's `1d` is wired, `B` is the lifetime's one selection, a
+    /// rollback: never from a repeat, a key held from before the screen
+    /// opened, or another device's press of a held key. `H` still selects
+    /// nothing.
+    #[test]
+    fn b_selects_one_rollback_where_root_is_wired() {
+        use crate::secret_client::{Elevation, Selection};
+        let mut bindings = rollback_bindings().into_inner().unwrap();
+        let mut target = RecordingTarget::default();
+        // Held from before the chord, on another keyboard.
+        deliver(&mut bindings, &mut target, 1, key(KEY_B, KEY_PRESS));
+        for event in [
+            key(KEY_LEFTCTRL, KEY_PRESS),
+            key(KEY_LEFTALT, KEY_PRESS),
+            key(KEY_ESC, KEY_PRESS),
+            key(KEY_ESC, KEY_RELEASE),
+            key(KEY_LEFTCTRL, KEY_RELEASE),
+            key(KEY_LEFTALT, KEY_RELEASE),
+        ] {
+            deliver(&mut bindings, &mut target, 0, event);
+        }
+        for (device, event) in [
+            (1, key(KEY_B, KEY_REPEAT)),
+            (0, key(KEY_B, KEY_PRESS)),
+            (0, key(KEY_B, KEY_RELEASE)),
+            (1, key(KEY_B, KEY_RELEASE)),
+            (0, key(KEY_H, KEY_PRESS)),
+            (0, key(KEY_H, KEY_RELEASE)),
+        ] {
+            deliver(&mut bindings, &mut target, device, event);
+        }
+        assert!(target.secret_roles.is_empty() && target.notices.is_empty());
+        for event in [
+            key(KEY_B, KEY_PRESS),
+            key(KEY_B, KEY_REPEAT),
+            key(KEY_B, KEY_RELEASE),
+            key(KEY_B, KEY_PRESS),
+            key(KEY_B, KEY_RELEASE),
+            key(KEY_U, KEY_PRESS),
+            key(KEY_U, KEY_RELEASE),
+        ] {
+            deliver(&mut bindings, &mut target, 0, event);
+        }
+        assert_eq!(target.attention_events, [true]);
+        assert_eq!(
+            target.secret_roles,
+            [Selection::Elevation(Elevation::Rollback)]
+        );
+        assert!(target.notices.is_empty());
+    }
+
+    /// After the lifetime's selection, only a fresh number-row 2 to 9 from
+    /// a device secure attention reads, with no Control, Alt or Super held
+    /// on such a device, is offered as an approval-key digit, with its
+    /// evdev time; Shift is allowed. 0, 1, the keypad, Enter, repeats, a
+    /// digit another read device holds and a security key's own keyboard
+    /// offer none, nor does a digit before the selection.
+    #[test]
+    fn only_fresh_number_row_digits_from_a_read_keyboard_are_offered() {
+        use crate::secret_client::{Elevation, Selection};
+        const KEY: usize = 2;
+        let mut bindings = KeyBindings {
+            attention_excluded: BTreeSet::from([KEY]),
+            ..rollback_bindings().into_inner().unwrap()
+        };
+        let mut target = RecordingTarget::default();
+        fn stroke(
+            bindings: &mut KeyBindings,
+            target: &mut RecordingTarget,
+            device: usize,
+            code: u16,
+            millis: u32,
+        ) {
+            for (value, millis) in [(KEY_PRESS, millis), (KEY_RELEASE, millis + 1)] {
+                deliver(
+                    bindings,
+                    target,
+                    device,
+                    at_millis(key(code, value), millis),
+                );
+            }
+        }
+        // Outside attention, and on the menu before the selection.
+        stroke(&mut bindings, &mut target, 0, KEY_4, 1);
+        for (code, value) in [
+            (KEY_LEFTCTRL, KEY_PRESS),
+            (KEY_LEFTALT, KEY_PRESS),
+            (KEY_ESC, KEY_PRESS),
+            (KEY_ESC, KEY_RELEASE),
+            (KEY_LEFTCTRL, KEY_RELEASE),
+            (KEY_LEFTALT, KEY_RELEASE),
+        ] {
+            deliver(&mut bindings, &mut target, 0, key(code, value));
+        }
+        stroke(&mut bindings, &mut target, 0, KEY_4, 10);
+        stroke(&mut bindings, &mut target, 0, KEY_B, 12);
+        // None of these is a digit of the key's alphabet.
+        for (code, millis) in [
+            (KEY_KP4, 20),
+            (KEY_KP7, 22),
+            (KEY_KP2, 24),
+            (KEY_0, 26),
+            (KEY_1, 28),
+            (KEY_ENTER, 30),
+            (KEY_KPENTER, 32),
+        ] {
+            stroke(&mut bindings, &mut target, 0, code, millis);
+        }
+        // Under Control, Alt or Super, from either side.
+        for (modifier, millis) in [
+            (KEY_LEFTCTRL, 40),
+            (KEY_RIGHTCTRL, 44),
+            (KEY_LEFTALT, 48),
+            (KEY_RIGHTALT, 52),
+            (KEY_LEFTMETA, 56),
+            (KEY_RIGHTMETA, 60),
+        ] {
+            deliver(&mut bindings, &mut target, 0, key(modifier, KEY_PRESS));
+            stroke(&mut bindings, &mut target, 0, KEY_4, millis);
+            deliver(&mut bindings, &mut target, 0, key(modifier, KEY_RELEASE));
+        }
+        // Under Shift it counts.
+        deliver(&mut bindings, &mut target, 0, key(KEY_LEFTSHIFT, KEY_PRESS));
+        stroke(&mut bindings, &mut target, 0, KEY_4, 70);
+        deliver(
+            &mut bindings,
+            &mut target,
+            0,
+            key(KEY_LEFTSHIFT, KEY_RELEASE),
+        );
+        // A repeat supplies nothing.
+        for (value, millis) in [(KEY_PRESS, 80), (KEY_REPEAT, 81), (KEY_RELEASE, 82)] {
+            deliver(
+                &mut bindings,
+                &mut target,
+                0,
+                at_millis(key(KEY_7, value), millis),
+            );
+        }
+        // Held on one read keyboard, the other's press is no fresh press.
+        for (device, value, millis) in [
+            (1, KEY_PRESS, 90),
+            (0, KEY_PRESS, 91),
+            (0, KEY_RELEASE, 92),
+            (1, KEY_RELEASE, 93),
+        ] {
+            deliver(
+                &mut bindings,
+                &mut target,
+                device,
+                at_millis(key(KEY_5, value), millis),
+            );
+        }
+        // A security key's own keyboard types none, and its Control held
+        // is no modifier here.
+        for (code, millis) in (KEY_2..=KEY_9).zip((100..).step_by(2)) {
+            stroke(&mut bindings, &mut target, KEY, code, millis);
+        }
+        deliver(
+            &mut bindings,
+            &mut target,
+            KEY,
+            key(KEY_LEFTCTRL, KEY_PRESS),
+        );
+        stroke(&mut bindings, &mut target, 0, KEY_6, 120);
+        deliver(
+            &mut bindings,
+            &mut target,
+            KEY,
+            key(KEY_LEFTCTRL, KEY_RELEASE),
+        );
+        // Each number-row digit from 2 to 9.
+        for (code, millis) in (KEY_2..=KEY_9).zip((130..).step_by(2)) {
+            stroke(&mut bindings, &mut target, 0, code, millis);
+        }
+        let ms = |millis: u128| millis * 1_000_000;
+        let mut offered = vec![
+            (b'4', ms(70)),
+            (b'7', ms(80)),
+            (b'5', ms(90)),
+            (b'6', ms(120)),
+        ];
+        offered.extend((b'2'..=b'9').zip((130..).step_by(2).map(ms)));
+        assert_eq!(target.approvals, offered);
+        assert_eq!(
+            target.secret_roles,
+            [Selection::Elevation(Elevation::Rollback)]
+        );
+        // Enter went where it always goes, and confirms no elevation.
+        assert_eq!(target.confirmations, [ms(30)]);
+        assert_eq!(target.draining_events, 0);
+    }
+
+    /// A digit the attempt says ended its request drains the screen as
+    /// Escape does: capture holds until the digit is released, then
+    /// attention closes. A digit that did not end it changes nothing.
+    #[test]
+    fn a_digit_that_ends_the_request_drains_the_screen_as_escape_does() {
+        let mut bindings = rollback_bindings().into_inner().unwrap();
+        let mut target = RecordingTarget::default();
+        for (code, value) in [
+            (KEY_LEFTCTRL, KEY_PRESS),
+            (KEY_LEFTALT, KEY_PRESS),
+            (KEY_ESC, KEY_PRESS),
+            (KEY_ESC, KEY_RELEASE),
+            (KEY_LEFTCTRL, KEY_RELEASE),
+            (KEY_LEFTALT, KEY_RELEASE),
+            (KEY_B, KEY_PRESS),
+            (KEY_B, KEY_RELEASE),
+            (KEY_4, KEY_PRESS),
+            (KEY_4, KEY_RELEASE),
+        ] {
+            deliver(&mut bindings, &mut target, 0, key(code, value));
+        }
+        assert!(bindings.attention == AttentionState::Open);
+        assert_eq!(target.draining_events, 0);
+        target.approval_ends = true;
+        deliver(&mut bindings, &mut target, 0, key(KEY_8, KEY_PRESS));
+        assert!(bindings.attention == AttentionState::Draining);
+        assert_eq!(target.draining_events, 1);
+        assert_eq!(target.attention_events, [true]);
+        // Draining, nothing more is offered.
+        deliver(&mut bindings, &mut target, 0, key(KEY_7, KEY_PRESS));
+        deliver(&mut bindings, &mut target, 0, key(KEY_7, KEY_RELEASE));
+        assert_eq!(target.attention_events, [true]);
+        deliver(&mut bindings, &mut target, 0, key(KEY_8, KEY_RELEASE));
+        assert!(bindings.attention == AttentionState::Closed);
+        assert_eq!(target.attention_events, [true, false]);
+        assert_eq!(target.draining_events, 1);
+        assert_eq!(target.approvals.len(), 2);
+    }
+
+    /// A security key's own keyboard neither selects `B`, wired or not, nor
+    /// types an approval-key digit; the keyboard's do, and the key's
+    /// Escape still cancels.
+    #[test]
+    fn a_security_keys_keyboard_cannot_select_b_or_type_the_key() {
+        use crate::attention::Notice;
+        use crate::secret_client::{Elevation, Selection};
+        const KEY: usize = 1;
+        for wired in [false, true] {
+            let target = Mutex::new(RecordingTarget::default());
+            let bindings = Mutex::new(KeyBindings {
+                attention_enabled: true,
+                attention_excluded: BTreeSet::from([KEY]),
+                rollback: wired,
+                ..KeyBindings::default()
+            });
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            read_reports(
+                &target,
+                &bindings,
+                KEY,
+                &presses(&[KEY_B, KEY_H, KEY_4, KEY_7], 20),
+            );
+            {
+                let target = target.lock().unwrap();
+                assert!(target.notices.is_empty() && target.secret_roles.is_empty());
+                assert!(target.approvals.is_empty());
+            }
+            read_reports(&target, &bindings, 0, &presses(&[KEY_B], 30));
+            read_reports(&target, &bindings, KEY, &presses(&[KEY_4, KEY_7], 40));
+            assert!(target.lock().unwrap().approvals.is_empty());
+            read_reports(&target, &bindings, 0, &presses(&[KEY_4], 50));
+            read_reports(&target, &bindings, KEY, &presses(&[KEY_ESC], 60));
+            let target = target.lock().unwrap();
+            if wired {
+                assert_eq!(
+                    target.secret_roles,
+                    [Selection::Elevation(Elevation::Rollback)]
+                );
+                assert!(target.notices.is_empty());
+            } else {
+                assert!(target.secret_roles.is_empty());
+                assert_eq!(target.notices, [Notice::NotAvailable]);
+            }
+            assert_eq!(target.approvals, [(b'4', 50_000_000)]);
+            assert_eq!(target.draining_events, 1);
+            assert_eq!(target.attention_events, [true, false]);
+        }
+    }
+
+    /// On the lock surface the menu's letters select nothing, `B` among
+    /// them, wired or not: the chord's unlock is the lifetime's one
+    /// selection.
+    #[test]
+    fn b_selects_nothing_on_the_lock_surface() {
+        use crate::secret_client::{LoginSelection, Selection};
+        for wired in [false, true] {
+            let target = locked_target();
+            let bindings = attention_bindings(Some(ENROLLED.to_vec()));
+            bindings.lock().unwrap().rollback = wired;
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            read_reports(&target, &bindings, 0, &presses(&[KEY_B, KEY_H], 20));
+            let target = target.lock().unwrap();
+            assert_eq!(
+                target.secret_roles,
+                [Selection::Login(LoginSelection::Unlock)]
+            );
+            assert!(target.notices.is_empty());
+        }
     }
 
     #[test]
