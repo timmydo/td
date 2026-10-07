@@ -308,7 +308,8 @@ fn ago(seconds: u64) -> Instant {
 
 /// Ticks until a retained helper is reaped.
 fn settle(status: &mut Status) {
-    let until = Instant::now() + Duration::from_secs(1);
+    // Returns once the killed helper is reaped; the bound only stops a hang.
+    let until = Instant::now() + Duration::from_secs(10);
     while status.running.is_some() {
         assert!(Instant::now() < until);
         status.tick();
@@ -369,7 +370,14 @@ fn each_deadline_miss_doubles_the_pause_to_sixteen_seconds_and_an_answer_resets_
     let (chosen, counted) = (Rc::clone(&selector), Rc::clone(&runs));
     let mut status = root.status(Box::new(move |_| {
         counted.set(counted.get() + 1);
-        Ok(expiring(chosen.get(), Duration::from_millis(20)))
+        // Only the stalled helper may miss: one that answers gets a deadline
+        // a loaded machine's exec cannot outrun.
+        let after = if chosen.get() == STALLED {
+            Duration::from_millis(20)
+        } else {
+            Duration::from_secs(10)
+        };
+        Ok(expiring(chosen.get(), after))
     }));
     let unreadable = answer(&UNREADABLE, "td-laptop");
     assert_eq!(status.answer(false).unwrap(), unreadable);
@@ -378,7 +386,7 @@ fn each_deadline_miss_doubles_the_pause_to_sixteen_seconds_and_an_answer_resets_
     for (run, pause) in [2, 4, 8, 16, 16].into_iter().enumerate() {
         assert_eq!(status.pause(), Duration::from_secs(pause));
         settle(&mut status);
-        status.helped = Some(ago(pause) + Duration::from_millis(200));
+        status.helped = Some(ago(pause) + Duration::from_secs(1));
         assert_eq!(status.answer(false).unwrap(), unreadable);
         assert_eq!(runs.get(), run + 1, "paused {pause}");
         status.helped = Some(ago(pause));
