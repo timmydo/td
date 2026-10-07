@@ -264,6 +264,10 @@ fn init() {
         ("/etc/group","root:x:0:\nalice:x:1000:\ntdc1000:x:993:\n",0o644),
         ("/etc/shadow","root::1:0:99999:7:::\nalice::1:0:99999:7:::\ntdc1000:!td-service:1:0:99999:7:::\n",0o600),
     ] { fs::write(path,text).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(mode)).unwrap(); }
+    // Unenrolled: td-login's console logins, login-primary among them, refuse
+    // and park unless this root-owned 0700 directory lacks the record.
+    fs::create_dir("/var/lib/td/login").unwrap();
+    fs::set_permissions("/var/lib/td/login", fs::Permissions::from_mode(0o700)).unwrap();
     primary_login_checks();
     primary_authority_refusals();
     assert!(Command::new("/bin/td-firstboot")
@@ -294,6 +298,7 @@ fn init() {
     attempt(true, false, false);
     assert!(!Path::new("/run/user/1000/terminal-evidence").exists());
     assert!(!Path::new("/var/lib/td/principals.tsv").exists());
+    fs::remove_dir("/var/lib/td/login").unwrap();
     fs::remove_dir("/var/lib/td").unwrap();
     attempt(true, false, false);
     assert!(!Path::new("/var/lib/td").exists());

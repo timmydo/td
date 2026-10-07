@@ -1,16 +1,28 @@
 //! `login` — start a session for a named user.
 //!
 //! On a td image this is what getty execs: `/etc/autologin` runs
+//! `td-login login-primary`, which resolves the primary account and enters
 //! `login -f <user>`, which is how the machine reaches its greeter at all. The
 //! `-f` (already-authenticated) path is therefore the one the boot proves on
 //! every start; the interactive path is the one the policy table of
-//! THREAT-MODEL.md §3 governs.
+//! THREAT-MODEL.md §3 governs. Both console logins, the interactive one and
+//! `login-primary`, first pass `guard_console`.
 
 use crate::creds::Credentials;
 use crate::db::{self, Account, Denied};
+use crate::login_state::{self, Owner, State};
 use crate::session::{self, Env, Session};
 use crate::status::Status;
-use crate::{emit, emit_err};
+use crate::{emit, emit_err, primary_account};
+use std::path::Path;
+
+/// THREAT-MODEL.md §3's one line, written whole to standard error when the
+/// console refuses.
+pub(crate) const CONSOLE_REFUSED: &str =
+    "td-login: login keys enrolled or unavailable; console login refused\n";
+
+/// The root the console gate reads the login state under: the real one.
+const REAL_ROOT: &str = "/";
 
 /// How many user names an interactive login will accept before giving up, the
 /// same bound `login(1)` uses. Unbounded retries against a getty that respawns
@@ -100,6 +112,9 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     if forced && !status.is_root() {
         return Err("only root may use -f (it starts a session without authenticating)".into());
     }
+    if !forced {
+        guard_console(&status);
+    }
     let mode = if opts.preserve {
         Env::Preserve
     } else {
@@ -108,6 +123,58 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     match target {
         Some(name) => start(name, forced, mode, &status),
         None => ask(mode, &status),
+    }
+}
+
+/// The console gate (THREAT-MODEL.md §3): returns only on a verifiably
+/// unenrolled machine, and otherwise refuses for good.
+///
+/// It concerns a caller root in some uid column. One root in none can switch
+/// to nobody but itself (`creds::may_switch`, §4), so it reaches no session it
+/// lacked, and it cannot read the root-only directory either: gating it would
+/// refuse every unprivileged `login` on an unenrolled machine for nothing.
+pub(crate) fn guard_console(status: &Status) {
+    guard_console_at(status, Path::new(REAL_ROOT), Owner::ROOT);
+}
+
+fn guard_console_at(status: &Status, root: &Path, owner: Owner) {
+    if status.uid.contains(&0) && !admits(console_state(root, owner)) {
+        refuse_console(status)
+    }
+}
+
+/// The shared predicate for the primary account's record under `root`.
+fn console_state(root: &Path, owner: Owner) -> State {
+    login_state::state_as(root, owner, primary_account::UID)
+}
+
+/// Only unenrolled opens the console; enrolled and every unavailable cause
+/// keep it shut.
+fn admits(state: State) -> bool {
+    state == State::Unenrolled
+}
+
+/// Hands the terminal back to root, says the one line and parks. It never
+/// exits: the greeter's wrapper reboots when its session chain succeeds and
+/// td-svc restarts the unit whenever it ends, so an exit would be a reboot or
+/// a respawn loop.
+fn refuse_console(status: &Status) -> ! {
+    if status.is_root() {
+        if let Err(why) = crate::tty::reclaim() {
+            emit_err(&format!(
+                "login: not returning the terminal to root: {why}\n"
+            ));
+        }
+    }
+    emit_err(CONSOLE_REFUSED);
+    park()
+}
+
+/// Blocks until a signal ends the process. A wakeup without an unpark, which
+/// nothing here issues, parks again rather than spinning.
+fn park() -> ! {
+    loop {
+        std::thread::park();
     }
 }
 
@@ -352,5 +419,349 @@ mod tests {
         };
         assert_eq!(workdir(&account, |_| true), "/home/tester");
         assert_eq!(workdir(&account, |_| false), "/");
+    }
+
+    use crate::login_state::Cause;
+
+    use std::os::unix::fs::{symlink, DirBuilderExt, MetadataExt};
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    /// The child harness's caller uid columns, root, and the owner it
+    /// requires as `UID:GID`.
+    const CHILD_CALLER: &str = "TD_LOGIN_TEST_CONSOLE_CALLER";
+    const CHILD_ROOT: &str = "TD_LOGIN_TEST_CONSOLE_ROOT";
+    const CHILD_OWNER: &str = "TD_LOGIN_TEST_CONSOLE_OWNER";
+    const CHILD_TEST: &str = "login::tests::console_gate_child";
+    /// Printed by the child when the gate returned.
+    const PROCEEDED: &str = "td-login-test: the console gate returned";
+
+    /// A temporary root whose `var/lib/td/login` is a valid 0700 directory,
+    /// owned by the test's own IDs, which `owner` stands in for root's.
+    struct Root {
+        root: PathBuf,
+        owner: Owner,
+    }
+
+    impl Root {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "td-login-console-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("var/lib/td")).unwrap();
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(login_state::directory(&root))
+                .unwrap();
+            let meta = std::fs::metadata(login_state::directory(&root)).unwrap();
+            Self {
+                root,
+                owner: Owner {
+                    uid: meta.uid(),
+                    gid: meta.gid(),
+                },
+            }
+        }
+
+        fn login(&self) -> PathBuf {
+            login_state::directory(&self.root)
+        }
+
+        fn state(&self) -> State {
+            console_state(&self.root, self.owner)
+        }
+
+        fn enrol(&self) {
+            std::fs::write(self.login().join("1000"), b"not parsed").unwrap();
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn status(uid: [u32; 4]) -> Status {
+        Status {
+            uid,
+            gid: [0; 4],
+            groups: vec![0],
+            threads: 1,
+            cap_prm: 0,
+            cap_eff: 0,
+            cap_amb: 0,
+            cap_inh: 0,
+        }
+    }
+
+    #[test]
+    fn the_refusal_line_is_the_threat_models_exactly() {
+        assert_eq!(
+            CONSOLE_REFUSED,
+            "td-login: login keys enrolled or unavailable; console login refused\n"
+        );
+        let model =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/THREAT-MODEL.md"))
+                .unwrap();
+        let line = CONSOLE_REFUSED.trim_end();
+        assert_eq!(model.matches(&format!("`{line}`")).count(), 1);
+        assert_eq!(REAL_ROOT, "/");
+        assert_eq!(primary_account::UID, 1000);
+    }
+
+    /// Only unenrolled opens the console; every other state, each cause of
+    /// unavailable included, keeps it shut.
+    #[test]
+    fn only_an_unenrolled_state_admits_the_console() {
+        assert!(admits(State::Unenrolled));
+        for shut in [
+            State::Enrolled,
+            State::Unavailable(Cause::DirectoryDamaged),
+            State::Unavailable(Cause::RecordDamaged),
+            State::Unavailable(Cause::Unreadable),
+        ] {
+            assert!(!admits(shut), "{shut:?}");
+        }
+    }
+
+    /// The gate reads the shared predicate for the primary account's record,
+    /// under the root it is given.
+    #[test]
+    fn the_console_reads_the_primary_record_name_under_its_root() {
+        let damaged = State::Unavailable(Cause::DirectoryDamaged);
+        let root = Root::new();
+        assert_eq!(root.state(), State::Unenrolled);
+        // Another account's name, or a temporary, is not the record.
+        for name in ["1001", "tmp-1000", "10000"] {
+            std::fs::write(root.login().join(name), b"").unwrap();
+        }
+        assert_eq!(root.state(), State::Unenrolled);
+        root.enrol();
+        assert_eq!(root.state(), State::Enrolled);
+        std::fs::remove_file(root.login().join("1000")).unwrap();
+        assert_eq!(root.state(), State::Unenrolled);
+        // Another owner, a missing directory, a file and a link in its place.
+        let other = Owner {
+            uid: root.owner.uid ^ 1,
+            ..root.owner
+        };
+        assert_eq!(console_state(&root.root, other), damaged);
+        let held = root.root.join("held");
+        std::fs::rename(root.login(), &held).unwrap();
+        assert_eq!(root.state(), damaged);
+        std::fs::write(root.login(), b"").unwrap();
+        assert_eq!(root.state(), damaged);
+        std::fs::remove_file(root.login()).unwrap();
+        symlink(&held, root.login()).unwrap();
+        assert_eq!(root.state(), damaged);
+        std::fs::remove_file(root.login()).unwrap();
+        std::fs::rename(&held, root.login()).unwrap();
+        assert_eq!(root.state(), State::Unenrolled);
+    }
+
+    /// The child half of `the_gate_parks_a_refusal_and_returns_otherwise`:
+    /// runs the gate for the caller, root and owner it is handed, and says so
+    /// only if the gate returned. Without them it does nothing.
+    #[test]
+    #[ignore = "spawned by the_gate_parks_a_refusal_and_returns_otherwise"]
+    fn console_gate_child() {
+        let (Some(caller), Some(root), Some(owner)) = (
+            std::env::var(CHILD_CALLER).ok(),
+            std::env::var_os(CHILD_ROOT),
+            std::env::var(CHILD_OWNER).ok(),
+        ) else {
+            return;
+        };
+        let columns: Vec<u32> = caller.split(',').map(|id| id.parse().unwrap()).collect();
+        let (uid, gid) = owner.split_once(':').unwrap();
+        let owner = Owner {
+            uid: uid.parse().unwrap(),
+            gid: gid.parse().unwrap(),
+        };
+        guard_console_at(
+            &status(columns.try_into().unwrap()),
+            Path::new(&root),
+            owner,
+        );
+        emit_err(&format!("{PROCEEDED}\n"));
+    }
+
+    /// A child the test still holds, and the file its stderr goes to. A
+    /// file rather than a pipe, so the test can read what the child has said
+    /// so far without blocking on a child that never ends. Dropping it kills
+    /// the child, so a failed assertion leaves no parked process behind.
+    struct Held {
+        child: Child,
+        log: PathBuf,
+    }
+
+    impl Held {
+        fn said(&self) -> String {
+            std::fs::read_to_string(&self.log).unwrap_or_default()
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_file(&self.log);
+        }
+    }
+
+    /// The gate in a child of its own: refused, it never returns, and only
+    /// another process can watch that without parking itself.
+    fn spawn_gate(caller: [u32; 4], root: &Path, owner: Owner) -> Held {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let log = std::env::temp_dir().join(format!(
+            "td-login-gate-{}-{}.log",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let stderr = std::fs::File::create(&log).unwrap();
+        let caller: Vec<String> = caller.iter().map(u32::to_string).collect();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([CHILD_TEST, "--exact", "--ignored", "--nocapture"])
+            .env(CHILD_CALLER, caller.join(","))
+            .env(CHILD_ROOT, root)
+            .env(CHILD_OWNER, format!("{}:{}", owner.uid, owner.gid))
+            // Never a terminal: the root caller's hand-back then finds
+            // /dev/null, which is no controlling terminal, and changes
+            // nothing.
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .unwrap();
+        Held { child, log }
+    }
+
+    const ROOT_CALLER: [u32; 4] = [0; 4];
+    const USER_CALLER: [u32; 4] = [1000; 4];
+    /// The shape a setuid-root exec would leave: root in some columns.
+    const MIXED_CALLER: [u32; 4] = [1000, 0, 0, 0];
+    /// How long a loaded machine may take to start a child and reach the
+    /// gate. Generous: only a broken gate waits it out.
+    const DEADLINE: Duration = Duration::from_secs(30);
+    /// After the line, how long a refused gate must stay alive.
+    const GRACE: Duration = Duration::from_millis(500);
+    const POLL: Duration = Duration::from_millis(20);
+
+    /// Refused, the gate never returns: for a caller root in some column,
+    /// each state that is not unenrolled writes the one line last and is
+    /// still alive after a grace period past it. It returns for a root
+    /// caller on an unenrolled machine, and for a caller root in no column
+    /// whatever the state: that caller can switch to nobody but itself, and
+    /// the directory is root's to read. Every wait is bounded, so a broken
+    /// gate reds rather than hangs.
+    #[test]
+    fn the_gate_parks_a_refusal_and_returns_otherwise() {
+        let unenrolled = Root::new();
+        let enrolled = Root::new();
+        enrolled.enrol();
+        let missing = Root::new();
+        std::fs::remove_dir(missing.login()).unwrap();
+        let not_a_directory = Root::new();
+        std::fs::remove_dir(not_a_directory.login()).unwrap();
+        std::fs::write(not_a_directory.login(), b"").unwrap();
+        let foreign = Root::new();
+        let foreign_owner = Owner {
+            uid: foreign.owner.uid ^ 1,
+            ..foreign.owner
+        };
+
+        let mut refused = [
+            (
+                "enrolled",
+                spawn_gate(ROOT_CALLER, &enrolled.root, enrolled.owner),
+            ),
+            (
+                "missing",
+                spawn_gate(ROOT_CALLER, &missing.root, missing.owner),
+            ),
+            (
+                "not a directory",
+                spawn_gate(ROOT_CALLER, &not_a_directory.root, not_a_directory.owner),
+            ),
+            (
+                "foreign owner",
+                spawn_gate(ROOT_CALLER, &foreign.root, foreign_owner),
+            ),
+            (
+                "enrolled, mixed caller",
+                spawn_gate(MIXED_CALLER, &enrolled.root, enrolled.owner),
+            ),
+        ];
+        let mut returned = [
+            (
+                "unenrolled",
+                spawn_gate(ROOT_CALLER, &unenrolled.root, unenrolled.owner),
+            ),
+            (
+                "unenrolled, mixed caller",
+                spawn_gate(MIXED_CALLER, &unenrolled.root, unenrolled.owner),
+            ),
+            (
+                "enrolled, user caller",
+                spawn_gate(USER_CALLER, &enrolled.root, enrolled.owner),
+            ),
+            (
+                "missing, user caller",
+                spawn_gate(USER_CALLER, &missing.root, missing.owner),
+            ),
+        ];
+
+        let deadline = std::time::Instant::now() + DEADLINE;
+        for (case, held) in &mut refused {
+            while !held.said().contains(CONSOLE_REFUSED) {
+                assert!(
+                    held.child.try_wait().unwrap().is_none(),
+                    "{case}: the gate exited without the line: {:?}",
+                    held.said()
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{case}: no line by the deadline: {:?}",
+                    held.said()
+                );
+                std::thread::sleep(POLL);
+            }
+        }
+        std::thread::sleep(GRACE);
+        for (case, held) in &mut refused {
+            assert!(
+                held.child.try_wait().unwrap().is_none(),
+                "{case}: the refused gate exited"
+            );
+            held.child.kill().unwrap();
+            held.child.wait().unwrap();
+            let said = held.said();
+            assert!(said.ends_with(CONSOLE_REFUSED), "{case}: {said:?}");
+            assert_eq!(said.matches(CONSOLE_REFUSED).count(), 1, "{case}");
+            assert!(!said.contains(PROCEEDED), "{case}: {said:?}");
+        }
+        for (case, held) in &mut returned {
+            let exit = loop {
+                if let Some(exit) = held.child.try_wait().unwrap() {
+                    break exit;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{case}: the gate did not return"
+                );
+                std::thread::sleep(POLL);
+            };
+            let said = held.said();
+            assert!(exit.success(), "{case}: {exit:?}: {said}");
+            assert!(said.contains(PROCEEDED), "{case}: {said:?}");
+            assert!(!said.contains(CONSOLE_REFUSED), "{case}: {said:?}");
+        }
     }
 }

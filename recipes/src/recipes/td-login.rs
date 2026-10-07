@@ -33,8 +33,8 @@ use crate::types::{Recipe, Step};
 // defence; see THREAT-MODEL.md section 2.
 //
 // system-x86-64 SHIPS this as the /bin/{login,su} farm, off busybox. Unlike
-// the td-util cutover the success paths need no synthetic probe: `login -f`
-// is how the image reaches its greeter, and /etc/bootsuccess runs health legs
+// the td-util cutover the success paths need no synthetic probe:
+// `td-login login-primary` is how the image reaches its greeter, and /etc/bootsuccess runs health legs
 // through `su`; rootcheck's ownership and host-key probes use literal
 // execution subcommands. A failed credential transition fails the boot
 // outright. What the boot could NOT see is a switch that "worked" while
@@ -53,11 +53,15 @@ use crate::types::{Recipe, Step};
 // The actual static link needs the full target toolchain (no target rustc in
 // the loop sandbox); the sibling td-login-test carries that build+assert check.
 //
-// The crate root declares sibling modules and one path-qualified shared primary
-// account reader. Preserve that directory layout when staging the sources.
-// MODULES is held to the root's `mod` lines by
-// `the_recipe_writes_out_exactly_the_modules_the_crate_declares` below; the
-// crate's confinement scan pins both local sources and the shared reader.
+// The crate root declares sibling modules and two path-qualified shared
+// sources: td-authd's primary account reader and td-secret's login-state
+// predicate, which the console refusal asks (THREAT-MODEL.md §3). Preserve
+// that directory layout when staging the sources. MODULES is held to the
+// root's `mod` lines by
+// `the_recipe_writes_out_exactly_the_modules_the_crate_declares` below, and
+// each shared source to its declared path by
+// `the_shared_sources_are_staged_at_their_declared_paths`; the crate's
+// confinement scan pins the local and the shared sources.
 //
 // Every source below is written out with a WriteFile, which the ladder
 // `no_bootstrap_step_invokes_host_find_or_xargs` guard scans as a command
@@ -68,13 +72,17 @@ use crate::types::{Recipe, Step};
 // of td-login's is on it.
 const MAIN_RS: &str = include_str!("../../../td-login/src/main.rs");
 
-// (module basename, source text); the shared reader keeps its declared path.
+// (module basename, source text); the shared sources keep their declared paths.
 const MODULES: &[(&str, &str)] = &[
     ("cgroup", include_str!("../../../td-login/src/cgroup.rs")),
     ("creds", include_str!("../../../td-login/src/creds.rs")),
     ("db", include_str!("../../../td-login/src/db.rs")),
     ("exec_as", include_str!("../../../td-login/src/exec_as.rs")),
     ("login", include_str!("../../../td-login/src/login.rs")),
+    (
+        "login_state",
+        include_str!("../../../td-secret/src/login_state.rs"),
+    ),
     (
         "primary_account",
         include_str!("../../../td-authd/src/primary_account.rs"),
@@ -85,6 +93,23 @@ const MODULES: &[(&str, &str)] = &[
     ("sys", include_str!("../../../td-login/src/sys.rs")),
     ("tty", include_str!("../../../td-login/src/tty.rs")),
 ];
+
+/// The modules `main.rs` reaches by `#[path]`, each staged where that path
+/// resolves from `{src}/td-login/src`.
+const SHARED: &[(&str, &str)] = &[
+    ("primary_account", "{src}/td-authd/src/primary_account.rs"),
+    ("login_state", "{src}/td-secret/src/login_state.rs"),
+];
+
+/// Where a module's source is written: its shared path, or beside `main.rs`.
+fn staged_path(name: &str) -> String {
+    for (shared, path) in SHARED {
+        if *shared == name {
+            return (*path).into();
+        }
+    }
+    format!("{{src}}/td-login/src/{name}.rs")
+}
 
 /// The embedded source of one module, `"main"` included. Lets a consumer that
 /// hard-codes a string td-login parses — system-x86-64's health probe spells out
@@ -144,7 +169,11 @@ pub fn recipe() -> Recipe {
     let path = format!("{bbin}:{gccbin}");
 
     let mut steps = Vec::new();
-    for directory in ["{src}/td-login/src", "{src}/td-authd/src"] {
+    for directory in [
+        "{src}/td-login/src",
+        "{src}/td-authd/src",
+        "{src}/td-secret/src",
+    ] {
         steps.push(Step::MkDir {
             path: directory.into(),
         });
@@ -157,14 +186,10 @@ pub fn recipe() -> Recipe {
         content: MAIN_RS.into(),
         exec: false,
     });
-    // Preserve sibling locations and the shared reader's explicit path.
+    // Preserve sibling locations and the shared sources' explicit paths.
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
-            path: if *name == "primary_account" {
-                "{src}/td-authd/src/primary_account.rs".into()
-            } else {
-                format!("{{src}}/td-login/src/{name}.rs")
-            },
+            path: staged_path(name),
             content: (*source).into(),
             exec: false,
         });
@@ -263,6 +288,41 @@ mod tests {
              stale and this test is now vacuous",
             declared.len()
         );
+    }
+
+    /// Each shared source is staged where `main.rs`'s `#[path]` resolves from
+    /// `{src}/td-login/src`, under the `mod` line that attribute governs, and
+    /// those two are the crate root's only path attributes. The login-state
+    /// predicate is the one the console refusal reads (THREAT-MODEL.md §3).
+    #[test]
+    fn the_shared_sources_are_staged_at_their_declared_paths() {
+        let mut names: Vec<&str> = SHARED.iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["login_state", "primary_account"]);
+        for (name, path) in SHARED {
+            let relative = path.strip_prefix("{src}/").unwrap();
+            let attribute = format!("#[path = \"../../{relative}\"]\n");
+            let (_, after) = MAIN_RS.split_once(&attribute).unwrap();
+            let declaration = after
+                .lines()
+                .find(|line| !line.starts_with('#') && !line.starts_with(' ') && *line != ")]")
+                .unwrap();
+            assert_eq!(declaration, format!("mod {name};"));
+            assert_eq!(staged_path(name), *path);
+        }
+        assert_eq!(
+            MAIN_RS
+                .lines()
+                .filter(|line| line.trim_start().starts_with("#[path"))
+                .count(),
+            SHARED.len()
+        );
+        assert_eq!(staged_path("login"), "{src}/td-login/src/login.rs");
+        assert!(source("login_state").is_some_and(|text| text.contains("pub fn state_as(")));
+        assert!(source("login").is_some_and(|text| text.contains(
+            "pub(crate) const CONSOLE_REFUSED: &str =\n    \
+             \"td-login: login keys enrolled or unavailable; console login refused\\n\";"
+        )));
     }
 
     /// The embedded sources are the SAME bytes the lintable crate carries, which

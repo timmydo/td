@@ -1905,7 +1905,7 @@ cleanup are the shared login-state predicate's, `login_state.rs`
 (TOKEN-LOGIN.md, "The login record"): one std-only file, with
 `#![forbid(unsafe_code)]`, that td-firstboot and td-authd compile
 through a reviewed `#[path]` (td-authd from TOKEN-LOGIN.md increment 4's
-C3), and that td-login will compile the same way (C5). It takes the root it reads
+C3) and td-login (C5). It takes the root it reads
 under, answers unenrolled, enrolled (the record name exists, whatever
 it holds) or unavailable with a cause, and reads no record bytes; each
 refusal also carries one line saying what was refused, for firstboot's

@@ -45,7 +45,7 @@ mod login_operation;
 mod login_record;
 #[allow(
     dead_code,
-    reason = "the shared login-state predicate also serves td-firstboot; td-authd and td-login will compile it"
+    reason = "the shared login-state predicate also serves td-firstboot, td-authd and td-login"
 )]
 mod login_state;
 mod login_store;

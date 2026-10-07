@@ -35,6 +35,14 @@ mod creds;
 mod db;
 mod exec_as;
 mod login;
+// The predicate forbids the unsafe lint itself; a second forbid here would
+// only duplicate that attribute.
+#[path = "../../td-secret/src/login_state.rs"]
+#[allow(
+    dead_code,
+    reason = "td-login reads only the predicate; the record store and firstboot use the rest"
+)]
+mod login_state;
 #[forbid(unsafe_code)]
 #[path = "../../td-authd/src/primary_account.rs"]
 mod primary_account;
@@ -109,6 +117,11 @@ fn primary_arguments(
 }
 
 fn primary_run(args: &[String], login: bool) -> Result<u8, String> {
+    // The greeter's console login: refused, before anything else, while login
+    // keys are enrolled or their state is unavailable (THREAT-MODEL.md §3).
+    if login {
+        login::guard_console(&status::Status::read()?);
+    }
     let forwarded = primary_arguments(args, login, || {
         primary_account::load().map_err(|error| error.to_string())
     })?;
@@ -645,18 +658,38 @@ mod confinement {
     use std::path::Path;
     use td_source_scan::{self as scan, squeeze, unsafe_allows, unsafe_blocks, unsafe_items};
 
+    /// The two reviewed shared sources, as `main.rs` names them by `#[path]`
+    /// (THREAT-MODEL.md §3), and the file name each is scanned under.
+    const SHARED: &[(&str, &str)] = &[
+        (
+            "../../td-authd/src/primary_account.rs",
+            "primary_account.rs",
+        ),
+        ("../../td-secret/src/login_state.rs", "login_state.rs"),
+    ];
+
     /// Every source file of the crate, read from disk (see `scan::read_tree`),
-    /// plus the one explicitly admitted shared account reader.
+    /// plus the explicitly admitted shared sources.
     fn walk() -> scan::Tree {
         let base = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
         let mut tree = scan::read_tree(base).unwrap();
-        let shared = base.join("../../td-authd/src/primary_account.rs");
-        tree.rs.push((
-            "primary_account.rs".into(),
-            scan::strip_comments(&std::fs::read_to_string(shared).unwrap()),
-        ));
+        for (path, name) in SHARED {
+            tree.rs.push((
+                (*name).into(),
+                scan::strip_comments(&std::fs::read_to_string(base.join(path)).unwrap()),
+            ));
+        }
         tree.rs.sort();
         tree
+    }
+
+    /// A source squeezed up to its test module, the part a shipped binary
+    /// compiles.
+    fn production(name: &str) -> String {
+        let text = squeeze(&source(name));
+        let marker = concat!("#[cfg(test)]", "modtests{");
+        assert_eq!(text.matches(marker).count(), 1, "{name}");
+        text.split_once(marker).unwrap().0.to_string()
     }
 
     fn sources() -> Vec<(String, String)> {
@@ -706,8 +739,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            11,
-            "expected ten local modules and the audited primary-account module"
+            12,
+            "expected ten local modules and the two audited shared modules"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -719,7 +752,8 @@ mod confinement {
         }
     }
 
-    /// The eleven local files plus the shared reader are the complete input.
+    /// The eleven local files plus the two shared sources are the complete
+    /// input.
     ///
     /// The scan above proves every `mod` line has a file and every file has a
     /// `mod` line, which is a closed loop that says nothing about WHICH files:
@@ -730,7 +764,7 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn the_scan_holds_exactly_the_twelve_audited_modules() {
+    fn the_scan_holds_exactly_the_thirteen_audited_modules() {
         let scan::Tree { rs, other } = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
@@ -741,6 +775,7 @@ mod confinement {
                 "db.rs",
                 "exec_as.rs",
                 "login.rs",
+                "login_state.rs",
                 "main.rs",
                 "primary_account.rs",
                 "session.rs",
@@ -894,15 +929,20 @@ mod confinement {
         // These constructs would make the scanned text stop describing the
         // compiled crate, and every assertion here reads text. A `path`
         // attribute and `include!` can pull in unscanned code. Admit only the
-        // shared reader that walk() explicitly scans. `macro_rules!` builds tokens that no longer appear in the
-        // source, so `hidden!(unsafe)` is an unsafe block the block count cannot
-        // see and a macro can expand one audited call into two.
-        let permitted_path = concat!("#[", "path=\"../../td-authd/src/primary_account.rs\"]");
-        assert_eq!(
-            squeeze(&source("main.rs")).matches(permitted_path).count(),
-            1
-        );
-        let squeezed = squeezed().replacen(permitted_path, "", 1);
+        // two shared sources that walk() explicitly scans, each named once by
+        // `main.rs`. `macro_rules!` builds tokens that no longer appear in the
+        // source, so `hidden!(unsafe)` is an unsafe block the block count
+        // cannot see and a macro can expand one audited call into two.
+        let mut squeezed = squeezed();
+        for (path, _) in SHARED {
+            let permitted_path = format!("{}{path}\"]", concat!("#[", "path=\""));
+            assert_eq!(
+                squeeze(&source("main.rs")).matches(&permitted_path).count(),
+                1,
+                "{path}"
+            );
+            squeezed = squeezed.replacen(&permitted_path, "", 1);
+        }
         for construct in scan::DECOUPLING {
             assert_eq!(
                 squeezed.matches(construct).count(),
@@ -925,18 +965,19 @@ mod confinement {
     /// build then accepts a second asm entry point with every other assertion
     /// in this module intact.
     ///
-    /// The lint is denied at root, forbidden on the shared reader and allowed
-    /// only on the one asm body.
+    /// The lint is denied at root, forbidden on the shared account reader
+    /// (the login-state predicate forbids it on itself) and allowed only on
+    /// the one asm body.
     #[test]
-    fn the_unsafe_lint_has_only_the_three_reviewed_mentions() {
+    fn the_unsafe_lint_has_only_the_four_reviewed_mentions() {
         const LINT: &str = concat!("un", "safe_code");
         let mut total = 0;
         for (path, text) in sources() {
             let count = text.matches(LINT).count();
-            let expected = if path == "main.rs" {
-                2
-            } else {
-                usize::from(path == "sys.rs")
+            let expected = match path.as_str() {
+                "main.rs" => 2,
+                "sys.rs" | "login_state.rs" => 1,
+                _ => 0,
             };
             assert_eq!(
                 count, expected,
@@ -945,14 +986,23 @@ mod confinement {
             total += count;
         }
         assert_eq!(
-            total, 3,
-            "denied at root, forbidden on the shared module, allowed on the syscall body"
+            total, 4,
+            "denied at root, forbidden on each shared module, allowed on the syscall body"
         );
         assert!(source("main.rs").contains(concat!(
             "#[forbid(un",
             "safe_code)]\n#[",
             "path = \"../../td-authd/src/primary_account.rs\"]\nmod primary_account;"
         )));
+        assert!(source("main.rs").contains(concat!(
+            "#[",
+            "path = \"../../td-secret/src/login_state.rs\"]\n",
+            "#[allow(\n    dead_code,\n"
+        )));
+        // The predicate's own inner attribute, the first thing it compiles.
+        assert!(source("login_state.rs")
+            .trim_start()
+            .starts_with(concat!("#![forbid(un", "safe_code)]")));
     }
 
     /// Inline assembly has more than one entry point, and the block pin only
@@ -1258,24 +1308,37 @@ mod confinement {
     #[test]
     fn the_child_process_api_is_never_used_to_set_credentials() {
         // MetadataExt reads take no argument; CommandExt setters require one.
-        let metadata_read = concat!(".u", "id()");
-        assert_eq!(
-            squeeze(&source("primary_account.rs"))
-                .matches(metadata_read)
-                .count(),
-            4
-        );
+        // Each file's zero-argument reads are pinned: the account reader's
+        // owner checks, the predicate's `Facts::of` and its test fixture, the
+        // hand-back's read-back and the console and terminal tests' fixtures.
+        const READS: &[(&str, usize, usize)] = &[
+            ("login.rs", 1, 1),
+            ("login_state.rs", 2, 2),
+            ("primary_account.rs", 4, 0),
+            ("tty.rs", 2, 2),
+        ];
+        let uid_read = concat!(".u", "id()");
+        let gid_read = concat!(".g", "id()");
         let squeezed: String = sources()
             .into_iter()
             .map(|(path, text)| {
                 let text = squeeze(&text);
-                if path == "primary_account.rs" {
-                    text.replace(metadata_read, "")
-                } else {
-                    text
-                }
+                let (uids, gids) = READS
+                    .iter()
+                    .find(|(name, _, _)| *name == path)
+                    .map_or((0, 0), |(_, uids, gids)| (*uids, *gids));
+                assert_eq!(text.matches(uid_read).count(), uids, "{path}");
+                assert_eq!(text.matches(gid_read).count(), gids, "{path}");
+                text.replace(uid_read, "").replace(gid_read, "")
             })
             .collect();
+        // Shipped reads: `Facts::of`'s two in the predicate and the
+        // hand-back's read-back in tty.rs; login.rs's are its tests'.
+        for (shipped, count) in [("login_state.rs", 1), ("tty.rs", 1), ("login.rs", 0)] {
+            let text = production(shipped);
+            assert_eq!(text.matches(uid_read).count(), count, "{shipped}");
+            assert_eq!(text.matches(gid_read).count(), count, "{shipped}");
+        }
         for shut in [
             concat!(".u", "id("),
             concat!(".g", "id("),
@@ -1298,32 +1361,50 @@ mod confinement {
 
     /// td-login must never be reachable as a setuid-root program (THREAT-MODEL.md
     /// section 4). Nothing in the crate may set a mode with the setuid or setgid
-    /// bit, and the one place it sets a mode at all is the terminal hand-over.
+    /// bit, and the one place it sets a mode at all is the terminal's mode write,
+    /// shared by the grant and the refusal's hand-back.
     #[test]
     fn no_mode_this_crate_sets_carries_a_setuid_bit() {
         const MODE: &str = concat!("from_", "mode(");
-        let shared = source("primary_account.rs");
-        let (reader, tests) = shared.split_once("#[cfg(test)]").unwrap();
-        assert!(!reader.contains(MODE), "the account reader writes no modes");
-        assert_eq!(tests.matches(&format!("{MODE}0o644)")).count(), 2);
-        assert_eq!(tests.matches(&format!("{MODE}0o666)")).count(), 1);
+        // Test fixtures only, each pinned by file: the account reader's
+        // 0644/0666 files, the predicate's directory modes, and the terminal
+        // tests' 0640 files. No shipped part of a shared source writes a mode.
+        const FIXTURES: &[(&str, &str, usize)] = &[
+            ("login_state.rs", "0o644)", 1),
+            ("login_state.rs", "0o700)", 2),
+            ("login_state.rs", "mode)", 1),
+            ("primary_account.rs", "0o644)", 2),
+            ("primary_account.rs", "0o666)", 1),
+            ("tty.rs", "0o640)", 5),
+        ];
+        for shared in ["primary_account.rs", "login_state.rs"] {
+            assert!(
+                !production(shared).contains(MODE),
+                "{shared} writes no modes"
+            );
+        }
         let squeezed: String = sources()
             .into_iter()
             .map(|(path, text)| {
-                let text = squeeze(&text);
-                if path == "primary_account.rs" {
-                    text.replace(&format!("{MODE}0o644)"), "")
-                        .replace(&format!("{MODE}0o666)"), "")
-                } else {
-                    text
+                let mut text = squeeze(&text);
+                for (_, argument, count) in FIXTURES.iter().filter(|(name, _, _)| *name == path) {
+                    let fixture = format!("{MODE}{argument}");
+                    let tests = text
+                        .split_once(concat!("#[cfg(test)]", "modtests{"))
+                        .unwrap()
+                        .1;
+                    assert_eq!(tests.matches(&fixture).count(), *count, "{path}: {fixture}");
+                    assert_eq!(text.matches(&fixture).count(), *count, "{path}: {fixture}");
+                    text = text.replace(&fixture, "");
                 }
+                text
             })
             .collect();
         assert_eq!(
             squeezed.matches(MODE).count(),
             2,
-            "modes are written in one place (the terminal hand-over: set, and put \
-             back when the chown that follows it fails) and nowhere else"
+            "modes are written in one place (the terminal's TTY_MODE write, shared by \
+             the grant and the hand-back, and the grant's rollback) and nowhere else"
         );
         // ...and neither site names a literal it could grow a setuid bit in: one
         // is the pinned constant, the other is the mode the node already had.
@@ -1349,6 +1430,126 @@ mod confinement {
             1,
             "MODE_BITS is the chmod(2) mask, so the rollback restores the whole \
              previous mode rather than a subset of it"
+        );
+    }
+
+    /// THREAT-MODEL.md §3's console refusal comes before anything that could
+    /// start a session: `login-primary` asks before it resolves or forwards
+    /// the account, and interactive `login` before it prompts or looks one up.
+    #[test]
+    fn the_console_gate_precedes_every_console_session() {
+        let gate = concat!("guard_", "console(");
+        let main = squeeze(&source("main.rs"));
+        let primary = main
+            .split_once("fnprimary_run(")
+            .and_then(|(_, rest)| rest.split_once("fnlookup("))
+            .map(|(body, _)| body)
+            .unwrap();
+        let at = |body: &str, needle: &str| body.find(needle).unwrap();
+        assert!(
+            at(primary, &format!("iflogin{{login::{gate}"))
+                < at(primary, "primary_arguments(args,login,")
+        );
+        let login = squeeze(&source("login.rs"));
+        let run = login
+            .split_once("pubfnrun(")
+            .and_then(|(_, rest)| rest.split_once("fnask("))
+            .map(|(body, _)| body)
+            .unwrap();
+        let guarded = at(run, &format!("if!forced{{{gate}&status);}}"));
+        assert!(guarded < at(run, "Some(name)=>start("));
+        assert!(guarded < at(run, "None=>ask("));
+        // Named only where it is defined and at those two calls.
+        let named: Vec<(String, usize)> = sources()
+            .into_iter()
+            .map(|(path, text)| {
+                let count = text.matches(gate).count();
+                (path, count)
+            })
+            .filter(|(_, count)| *count != 0)
+            .collect();
+        assert_eq!(
+            named,
+            [("login.rs".to_string(), 2), ("main.rs".to_string(), 1)]
+        );
+    }
+
+    /// The refusal hands the line back to root, says the one line, and parks
+    /// on the calling thread: no thread starts, so `creds::apply`'s
+    /// `Threads: 1` tripwire stays a tripwire.
+    #[test]
+    fn the_refusal_returns_the_line_says_one_line_and_parks() {
+        let login = squeeze(&source("login.rs"));
+        let refuse = login
+            .split_once("fnrefuse_console(status:&Status)->!{")
+            .and_then(|(_, rest)| rest.split_once("fnpark()->!{"))
+            .unwrap();
+        let (body, park) = refuse;
+        let hand_back = body.find(concat!("crate::tty::", "reclaim()")).unwrap();
+        let line = body.find("emit_err(CONSOLE_REFUSED);park()}").unwrap();
+        assert!(hand_back < line);
+        assert!(body.starts_with("ifstatus.is_root(){"));
+        assert!(park.starts_with("loop{std::thread::park();}}"));
+        // The hand-back is root:root, owner first, then the mode, then the
+        // open file read back: an owner who could chmod between a chmod and
+        // a chown cannot once root owns the line.
+        let tty = production("tty.rs");
+        let reclaim = tty
+            .split_once("pubfnreclaim()")
+            .and_then(|(_, rest)| rest.split_once("fntake("))
+            .map(|(body, _)| body)
+            .unwrap();
+        assert!(reclaim.contains("take(&path,Path::new(STDIN_LINK),0,0)?;"));
+        let take = tty
+            .split_once("fntake(")
+            .and_then(|(_, rest)| rest.split_once("fnto_tty_mode("))
+            .map(|(body, _)| body)
+            .unwrap();
+        let chown = take.find("chown(path,Some(uid),Some(gid))").unwrap();
+        let chmod = take.find("to_tty_mode(path)?;").unwrap();
+        let read_back = take.find("fs::metadata(opened)").unwrap();
+        assert!(chown < chmod && chmod < read_back);
+        assert!(take.contains("if now != (uid, gid, TTY_MODE)".replace(' ', "").as_str()));
+        // The refusal is reclaim's one caller; the login hand-over keeps its own.
+        let callers: Vec<(String, usize)> = sources()
+            .into_iter()
+            .map(|(path, text)| {
+                (
+                    path,
+                    squeeze(&text).matches(concat!("tty::", "reclaim(")).count(),
+                )
+            })
+            .filter(|(_, count)| *count != 0)
+            .collect();
+        assert_eq!(callers, [("login.rs".to_string(), 1)]);
+        for (path, text) in sources() {
+            assert!(
+                !squeeze(&text).contains(concat!("thread::", "spawn")),
+                "{path} starts a thread"
+            );
+        }
+    }
+
+    /// The shared predicate's writer is compiled in, under the `dead_code`
+    /// allowance, and called by nothing here.
+    #[test]
+    fn the_shared_predicates_writer_is_never_called() {
+        for name in [
+            concat!("remove_", "temporaries"),
+            concat!("set_fd_", "root"),
+        ] {
+            for (path, text) in sources() {
+                if path != "login_state.rs" {
+                    assert_eq!(text.matches(name).count(), 0, "{path} names {name}");
+                }
+            }
+        }
+        assert_eq!(
+            production("login_state.rs")
+                .matches(concat!("fs::remove_", "file("))
+                .count(),
+            1,
+            "the predicate unlinks only in its temporaries sweep"
         );
     }
 }

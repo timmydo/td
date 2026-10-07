@@ -1908,6 +1908,10 @@ TOKEN-LOGIN.md's.
      firstboot's account validation and serializes publication against all
      account readers, as boot-time rendering does (`td-login/THREAT-MODEL.md`
      §1);
+   - returns the greeter's line to root:root with the pinned terminal
+     mode, owner first, so no descriptor opened after the state change and
+     before the restart outlives it (`td-login/TOKEN-LOGIN.md`,
+     "Cutover"); increment 5 specifies how the line is named;
    - asks td-svc, over its existing control socket, to restart `sshd` and
      `greeter`, issuing both requests before polling either, so their
      TERM waits overlap; it names no other unit;

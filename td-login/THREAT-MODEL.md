@@ -261,14 +261,20 @@ their existing front ends exactly. The applet/symlink roster stays `login,su`.
 
 The shared reader is compiled beneath `forbid(unsafe_code)` and is included
 in the source-level confinement scan alongside the local modules. Exactly
-one reviewed external path is admitted; other path attributes and code
-inclusion remain forbidden. TOKEN-LOGIN.md's increment 4 admits a second
-on the same terms, the shared std-only login-state predicate
-`td-secret/src/login_state.rs` (below), and no other. Metadata's
-zero-argument UID reads are distinct
-from credential setters, and the reader's test-only mode-0644/0666 fixtures
-are pinned separately from the two production terminal mode writes. No
-credential syscall, policy decision or terminal handover is added.
+two reviewed external paths are admitted: that reader and, since
+TOKEN-LOGIN.md's increment 4 (C5), the shared std-only login-state
+predicate `td-secret/src/login_state.rs` (below), which forbids
+`unsafe_code` on itself and is compiled under a reasoned `dead_code`
+allowance, since td-login calls only its predicate; the confinement scan
+holds that its temporaries sweep, the one place it unlinks, is named
+nowhere else. Other path attributes and code inclusion remain forbidden.
+Metadata's zero-argument UID and GID reads are distinct from credential
+setters and are pinned per file; the shared sources' and the terminal
+tests' test-only mode fixtures are pinned separately from the two
+production terminal mode writes, and neither shared source writes a mode
+outside its tests. The predicate adds no credential syscall or policy
+decision; the console refusal below adds a hand-back to root that reuses
+§6's identification and mode write in its own order.
 
 | `/etc/shadow` field | class        | interactive `login` | `login -f` | `su`, `exec-as` (forced) | `exec-service-as` |
 | ------------------- | ------------ | ------------------- | ---------- | ------------------------ | ----------------- |
@@ -290,8 +296,9 @@ Consequences worth stating plainly:
   busybox (whose `-f` skips the account database entirely) and stricter
   than `su(1)`. A locked account is an explicit administrative statement
   that no session may run as it; the cheap way to honour that is to make
-  `/etc/autologin` naming a locked account fail loudly instead of
-  quietly working. Nothing on a td image needs the other behaviour.
+  the primary selector resolving a locked primary account fail loudly
+  instead of quietly working. Nothing on a td image needs the other
+  behaviour.
 - **A service account is a distinct credential class, not an ordinary lock
   with a special caller.** `system-x86-64` writes the exact
   `!td-service` marker only for identities a unit starts through
@@ -354,7 +361,10 @@ Consequences worth stating plainly:
   `SYSTEM.users`.
 - `system-x86-64`'s `system_def_is_self_consistent` test refuses to ship
   a `SYSTEM` definition whose auto-login user is not passwordless, so the
-  image cannot be tailored into a machine that will not let anyone in.
+  image cannot be tailored into a machine that will not let anyone in. It
+  also requires that user to be the primary account `login-primary`
+  selects, and `build_autologin` refuses the build otherwise: the console
+  logs in only through that selector.
 - Both interactive accounts on the stock image, `root` and `tester`, are
   `passwordless: true`, so the console is trusted **by image
   configuration**, not by td-login. The service identities above are
@@ -362,35 +372,56 @@ Consequences worth stating plainly:
   interactive behavior is unchanged from the busybox chain this replaces,
   which also accepted the empty shadow field without prompting.
 
-**Target, not implemented: login keys.** Under
+**Login keys: the console refusal.** Under
 [`TOKEN-LOGIN.md`](TOKEN-LOGIN.md), enrolling a FIDO2 login key publishes
-`/var/lib/td/login/1000`. td-login reads no CTAP and does not parse that
-record; it asks only whether one may exist, through the directory-and-name
-predicate it shares with firstboot and td-authd. Unless the root-owned
-mode-0700 `/var/lib/td/login` opens with valid metadata and the record
-name is absent, interactive `login` and `login-primary` refuse **every**
-account, root included, so no console path bypasses the key. Before
-refusing, they return a terminal that passes §6's checks to root:root
-with the pinned `TTY_MODE`, so no unprivileged process can open the line
-afresh. Each then writes the one fixed line
+`/var/lib/td/login/1000`; nothing in production enrolls one yet. td-login
+reads no CTAP and does not parse that record; it asks only whether one may
+exist, through the directory-and-name predicate it shares with firstboot
+and td-authd, on the real root and before anything else that could start
+a session: `login-primary` before it resolves the primary account,
+interactive `login` before it prompts or looks a name up. Unless the
+root-owned mode-0700 `/var/lib/td/login` opens with valid metadata and the
+record name is absent, interactive `login` and `login-primary` refuse
+**every** account, root included, so no console path bypasses the key.
+The gate concerns a caller root in some uid column. A caller root in none
+can switch to nobody but itself (§4), so it reaches no session it lacked,
+and it cannot read the root-only directory: it keeps its existing
+behaviour, which is what keeps an unenrolled machine's unprivileged
+`login` unchanged. Before refusing, a root caller takes a terminal that
+passes §6's checks back for root:root with the pinned `TTY_MODE`, so no
+unprivileged process can open the line afresh. It writes the owner first,
+then the mode, then reads both back off the open file. The order is the
+reverse of §6's handover, which grants: here the node still belongs to
+the account the console last served, and an owner may chmod its own
+node, so a chmod first would let that account set 0666 again before the
+chown and leave the line root's and open to everyone. Once root owns it,
+only root changes its mode. A hand-back that fails or reads back wrong is
+warned about as §6's is, and the refusal goes on. It does not revoke a
+descriptor already open (TOKEN-LOGIN.md, "Cutover"). Each then writes
+the one fixed line
 `td-login: login keys enrolled or unavailable; console login refused`
-to standard error and parks until killed, in safe `std` and with no new
+to standard error and parks until killed, on its own thread in safe `std`
+(`std::thread::park` in a loop, starting no thread) and with no new
 syscall surface, rather than exit: the greeter's wrapper reboots the
 machine when its session chain succeeds (`&& exec /bin/td-svc reboot`),
 and its td-svc unit restarts it whenever it ends (`restart=always`), so
-any exit would be a reboot or a respawn loop. Neither `su` nor root's
+any exit would be a reboot or a respawn loop. A signal still ends it:
+Ctrl-C or Ctrl-\ typed on the serial line, `SIGHUP` or `SIGTERM` ends
+td-login with a non-zero status, so the `&&` skips the reboot and td-svc
+respawns the greeter into the same gate. Neither `su` nor root's
 empty shadow field exists as an administrative path on an enrolled
 machine (TOKEN-LOGIN.md, "Enrollment requires §L.1 elevation"). The
 forced paths (`login -f`, `su`, `exec-as`, `exec-primary`,
 `exec-service-as`) keep this section's rules: they change credentials only
 for an all-root caller (§4) and are otherwise no-ops. A greeter must
-therefore use `login-primary`; the increment that adds this refusal
-deletes `build_autologin`'s `login -f` fallback for a non-primary
-autologin account, and `system_def_is_self_consistent` then requires the
-autologin account to be the primary one. A console session started
-before enrollment does not survive it; TOKEN-LOGIN.md's "Cutover" owns
-how. The stock image never contains a record, so its console behaviour
-and the table above stand.
+therefore use `login-primary`: `build_autologin` has no `login -f`
+fallback for a non-primary autologin account, refuses the build for one,
+and `system_def_is_self_consistent` requires the autologin account to be
+the primary one. A console session started before enrollment does not
+survive it; TOKEN-LOGIN.md's "Cutover" owns how. The stock image never
+contains a record and firstboot ensures the directory at every boot, so
+its console behaviour and the table above stand; the refusal acts only
+where a record or an invalid directory exists.
 
 The future hardware-backed disk and session unlock contract lives in
 [`td-install/ENCRYPTION.md`](../td-install/ENCRYPTION.md). It binds primary
@@ -608,7 +639,8 @@ over. If the restore itself fails, that is said too, because at that
 point the console really is unusable and the warning is the operator's
 only notice. The order is `chmod` first on purpose: `chown` first would
 leave a window in which the terminal is the user's with the *old*,
-group-readable mode.
+group-readable mode. That reasoning is for a grant; the console
+refusal's hand-back to root writes `chown` first, for §3's reason.
 
 Residual risk, accepted and stated: steps 2–5 read the filesystem more
 than once, so a sufficiently fast attacker who can create entries in
@@ -671,6 +703,8 @@ assert equality against `/proc/self/status`.
   capabilities, environment replacement and working directories.
   A nonroot forced login, foreign-UID primary exec, locked/service-only
   shadow records, missing UID 1000 and duplicate UID aliases must refuse.
+  Its guest holds an unenrolled root-owned mode-0700 `/var/lib/td/login`,
+  so the console gate admits its root `login-primary`.
   The foreign-UID case temporarily makes the disposable guest's shadow
   readable to prove the credential gate itself refuses the switch. This
   fixture is a host diagnostic supplied with the target td-login binary,
@@ -684,7 +718,17 @@ assert equality against `/proc/self/status`.
   supplementary set. A switch that "worked" but left a residual group
   attached prints no marker and reds the boot oracle — which is the one
   failure mode every other check on the image would pass.
-- The login-key refusal's planned evidence is in `TOKEN-LOGIN.md`.
+- The console refusal's host tests run the gate in spawned processes
+  against temporary roots: for a caller root in some column, enrolled, a
+  missing directory, a non-directory and a foreign owner each write the
+  exact line last, waited for up to a 30-second deadline, and leave the
+  gate alive past a grace period after it; unenrolled returns; a caller
+  root in no column returns whatever the state. Every unavailable cause
+  is refused by the decision, and the line is this section's. The
+  handover's writes and the hand-back's (owner first, nothing written
+  before a refused `chown`, and a wrong read-back refused) are watched
+  on files the test owns. Its full-system evidence is
+  `TOKEN-LOGIN.md`'s `qemu-login-system`.
 - The jailed fixture is the cgroup-placement evidence. Its QEMU marker is
   withheld unless td-jail observes the active per-instance sibling leaf with
   the exact configured caps; that migration can succeed only when the

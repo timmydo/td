@@ -37,9 +37,60 @@ pub fn hand_over(uid: u32, gid: u32) -> Result<Option<PathBuf>, String> {
     let Some((path, was)) = controlling_terminal()? else {
         return Ok(None);
     };
-    fs::set_permissions(&path, fs::Permissions::from_mode(TTY_MODE))
-        .map_err(|e| format!("cannot chmod {} to {TTY_MODE:o}: {e}", path.display()))?;
-    if let Err(e) = std::os::unix::fs::chown(&path, Some(uid), Some(gid)) {
+    give(&path, was, uid, gid)?;
+    Ok(Some(path))
+}
+
+/// Take the terminal on fd 0 back for root:root with `TTY_MODE`, for the
+/// console refusal (THREAT-MODEL.md §3). `Ok(None)` is a caller with no
+/// controlling terminal; `Err` a hand-back that did not take, which the
+/// caller warns about and refuses anyway.
+pub fn reclaim() -> Result<Option<PathBuf>, String> {
+    let Some((path, _)) = controlling_terminal()? else {
+        return Ok(None);
+    };
+    take(&path, Path::new(STDIN_LINK), 0, 0)?;
+    Ok(Some(path))
+}
+
+/// The hand-back's writes, owner FIRST. The node still belongs to the
+/// account the console last served, and an owner may chmod its own node: a
+/// chmod first would leave a window in which that account sets 0666 again
+/// before the chown, and the line would end up root's and open to everyone.
+/// Once root owns it, only root changes its mode. The result is then read
+/// back off the open file (`opened`), so whatever happened in between is
+/// seen rather than assumed. There is no rollback: a line half taken from
+/// its last owner is no worse than one never taken.
+fn take(path: &Path, opened: &Path, uid: u32, gid: u32) -> Result<(), String> {
+    std::os::unix::fs::chown(path, Some(uid), Some(gid))
+        .map_err(|e| format!("cannot chown {} to {uid}:{gid}: {e}", path.display()))?;
+    to_tty_mode(path)?;
+    let meta =
+        fs::metadata(opened).map_err(|e| format!("cannot read {} back: {e}", path.display()))?;
+    let now = (meta.uid(), meta.gid(), meta.mode() & MODE_BITS);
+    if now != (uid, gid, TTY_MODE) {
+        return Err(format!(
+            "{} reads back as {}:{} mode {:o}, not {uid}:{gid} mode {TTY_MODE:o}",
+            path.display(),
+            now.0,
+            now.1,
+            now.2
+        ));
+    }
+    Ok(())
+}
+
+fn to_tty_mode(path: &Path) -> Result<(), String> {
+    fs::set_permissions(path, fs::Permissions::from_mode(TTY_MODE))
+        .map_err(|e| format!("cannot chmod {} to {TTY_MODE:o}: {e}", path.display()))
+}
+
+/// The two writes on the node `controlling_terminal` identified, whose mode
+/// was `was`: `TTY_MODE`, then `uid`:`gid`, with the mode put back when the
+/// owner cannot follow. Separate so a test can watch both on a file it owns.
+fn give(path: &Path, was: u32, uid: u32, gid: u32) -> Result<(), String> {
+    to_tty_mode(path)?;
+    if let Err(e) = std::os::unix::fs::chown(path, Some(uid), Some(gid)) {
         // The chmod took and the chown did not, so the terminal is now 0600 and
         // still owned by root: the session about to start cannot read or write
         // its own console. Put the mode back, so the warning login prints is
@@ -47,7 +98,7 @@ pub fn hand_over(uid: u32, gid: u32) -> Result<Option<PathBuf>, String> {
         // to restore is appended rather than swallowed -- that IS the dead
         // console, and it is the operator's only notice of it.
         let mut why = format!("cannot chown {} to {uid}:{gid}: {e}", path.display());
-        if let Err(back) = fs::set_permissions(&path, fs::Permissions::from_mode(was & MODE_BITS)) {
+        if let Err(back) = fs::set_permissions(path, fs::Permissions::from_mode(was & MODE_BITS)) {
             why.push_str(&format!(
                 "; and mode {:o} could not be restored ({back}), so this terminal is \
                  unusable by anyone but root",
@@ -56,7 +107,7 @@ pub fn hand_over(uid: u32, gid: u32) -> Result<Option<PathBuf>, String> {
         }
         return Err(why);
     }
-    Ok(Some(path))
+    Ok(())
 }
 
 /// Identify fd 0 as this process's controlling terminal, or refuse.
@@ -161,6 +212,24 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
 
+    /// A test's directory, removed however the test ends.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("td-login-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn only_plain_paths_under_dev_are_accepted() {
         for good in ["/dev/ttyS0", "/dev/tty1", "/dev/pts/0", "/dev/vc/1"] {
@@ -203,6 +272,77 @@ mod tests {
         assert!(tty_nr("no parens here").is_none());
         assert!(tty_nr("412 (sh) S 411").is_none());
         assert!(tty_nr("412 (sh) S 411 412 412 nope 412").is_none());
+    }
+
+    fn owner(path: &Path) -> (u32, u32, u32) {
+        let meta = fs::metadata(path).unwrap();
+        (meta.uid(), meta.gid(), meta.mode() & MODE_BITS)
+    }
+
+    /// The writes login's hand-over makes on the line, watched on a file
+    /// this test owns: the pinned mode and the owner asked for, or, where
+    /// the owner cannot follow, the old mode back.
+    #[test]
+    fn the_terminal_is_given_whole_or_left_as_it_was() {
+        let dir = Scratch::new("give");
+        let dir = dir.0.as_path();
+        let path = dir.join("line");
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let (uid, gid, was) = owner(&path);
+        assert_eq!(was, 0o640);
+        give(&path, was, uid, gid).unwrap();
+        assert_eq!(owner(&path), (uid, gid, TTY_MODE));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        match give(&path, 0o100640, 0, 0) {
+            // Root (or a namespace mapping it) can take the file.
+            Ok(()) => assert_eq!(owner(&path), (0, 0, TTY_MODE)),
+            // Anyone else keeps it, with its own mode back rather than 0600.
+            Err(why) => {
+                assert!(why.starts_with("cannot chown "), "{why}");
+                assert!(why.contains(" to 0:0: "), "{why}");
+                assert_eq!(owner(&path), (uid, gid, 0o640));
+            }
+        }
+    }
+
+    /// The console refusal's hand-back, watched on files this test owns.
+    /// Taken with the test's own IDs it ends at `TTY_MODE`, read back off
+    /// the open file. Taken for root by anyone else, the chown refuses FIRST
+    /// and nothing changes: no chmod ran before it that the line's owner
+    /// could race. A read-back that does not show what was asked refuses.
+    #[test]
+    fn the_hand_back_takes_the_owner_first_and_reads_it_back() {
+        let dir = Scratch::new("take");
+        let dir = dir.0.as_path();
+        let path = dir.join("line");
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let (uid, gid, _) = owner(&path);
+        take(&path, &path, uid, gid).unwrap();
+        assert_eq!(owner(&path), (uid, gid, TTY_MODE));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        match take(&path, &path, 0, 0) {
+            Ok(()) => assert_eq!(owner(&path), (0, 0, TTY_MODE)),
+            Err(why) => {
+                assert!(why.starts_with("cannot chown "), "{why}");
+                assert!(why.contains(" to 0:0: "), "{why}");
+                assert_eq!(owner(&path), (uid, gid, 0o640), "no write before the chown");
+            }
+        }
+
+        // `opened` stands for the open file: here it reads back as something
+        // other than what the writes asked for, as a node changed under them.
+        let other = dir.join("other");
+        fs::write(&other, b"").unwrap();
+        fs::set_permissions(&other, fs::Permissions::from_mode(0o640)).unwrap();
+        let line = dir.join("line2");
+        fs::write(&line, b"").unwrap();
+        let why = take(&line, &other, uid, gid).unwrap_err();
+        assert!(why.contains(" reads back as "), "{why}");
+        assert!(why.ends_with(&format!("not {uid}:{gid} mode 600")), "{why}");
     }
 
     /// The mode constants, since one wrong bit is the difference between a

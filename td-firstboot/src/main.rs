@@ -55,7 +55,7 @@ mod login_directory;
 #[path = "../../td-secret/src/login_state.rs"]
 #[allow(
     dead_code,
-    reason = "the shared login-state predicate also serves the record store; td-authd and td-login will compile it"
+    reason = "the shared login-state predicate also serves the record store, td-authd and td-login"
 )]
 mod login_state;
 mod machineid;

@@ -190,9 +190,10 @@ struct SystemDef {
     /// Welcome banner printed by the login shell (via `/etc/profile`).
     motd: &'static str,
     /// The user getty auto-logs-in on ttyS0, through `/etc/autologin` running
-    /// the primary selector (named login for non-primary fixtures). td-login
-    /// refuses forced login for a LOCKED account, so this user must be
-    /// `passwordless` — `system_def_is_self_consistent` holds that.
+    /// the primary selector; it must be the primary account, or the build
+    /// refuses (`build_autologin`). td-login refuses forced login for a LOCKED
+    /// account, so this user must be `passwordless` —
+    /// `system_def_is_self_consistent` holds that.
     autologin: &'static str,
     users: &'static [User],
     applications: &'static [ShippedApplication],
@@ -440,13 +441,13 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
     },
 ];
 
-/// Account names are embedded UNQUOTED in generated root shell — `/bin/su -s /bin/sh
-/// <name> -c …` in diagnostic health legs and named logins for non-primary
-/// autologin fixtures — and in the colon-separated /etc/{passwd,group,shadow}
-/// this recipe writes. A name carrying `$(…)` would run as ROOT at sysinit; one
-/// carrying `:` would silently restructure the account database. This is the same
-/// hazard `valid_home` below already guards, applied to the other string that
-/// reaches those scripts.
+/// Account names are written into the colon-separated /etc/{passwd,group,shadow}
+/// this recipe generates, where one carrying `:` would silently restructure the
+/// account database. Generated root shell reaches the human account through
+/// `exec-primary` and the quoted `$health_user` it reports, never by a name
+/// spliced into the script, and the plain-name rule would keep one safe there.
+/// This is the hazard `valid_home` below guards, applied to the other account
+/// string.
 ///
 /// The grammar is td-login's own `plausible_name`, so a name this accepts is one the
 /// image's `login` will look up (`the_account_grammar_matches_the_one_td_login_uses`
@@ -2487,17 +2488,24 @@ fn build_shutdown() -> String {
     )
 }
 
-fn build_autologin(sys: &SystemDef) -> String {
-    // getty (-n -l) execs this with the tty already set up; force-login the
-    // configured user with no authentication.
+/// getty (-n -l) execs this with the tty already set up. The console's one
+/// login is the primary selector, which td-login refuses while login keys are
+/// enrolled or their state is unavailable (td-login/THREAT-MODEL.md §3); a
+/// forced `login -f NAME` is not refused there, so no image logs in by it, and
+/// an autologin account that is not the primary one refuses the build.
+fn build_autologin(sys: &SystemDef) -> Result<String, String> {
     if sys
         .users
         .iter()
         .any(|user| user.name == sys.autologin && user.uid == UI_UID)
     {
-        "#!/bin/sh\nexec /bin/td-login login-primary\n".into()
+        Ok("#!/bin/sh\nexec /bin/td-login login-primary\n".into())
     } else {
-        format!("#!/bin/sh\nexec /bin/login -f {}\n", sys.autologin)
+        Err(format!(
+            "autologin account {:?} is not the primary account (UID {UI_UID}); the console \
+             logs in only through td-login login-primary",
+            sys.autologin
+        ))
     }
 }
 
@@ -2518,33 +2526,28 @@ fn build_rootcheck(sys: &SystemDef) -> String {
          /bin/chown 0:0 {SSHD_PRIVSEP_PATH} || ok=0\n\
          /bin/chmod 0755 {SSHD_PRIVSEP_PATH} || ok=0\n"
     ));
-    if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
-        if user.uid != 0 {
-            let launcher = account_probe_launcher(user);
-            // These probes WRITE rather than ask `test -w`: POSIX `-w` is access(2),
-            // and a mode-bits answer would read root's own bit on 0755 `/var` and
-            // report success for a system that had failed. Negative attempts run
-            // in nested shells: a failed special-builtin redirection exits td-sh,
-            // but the parent still needs to run the remaining checks.
-            //
-            // Root clears only the protected probe paths on both sides: a stale
-            // root-owned file could otherwise mask a world-writable directory.
-            // The child clears and writes its own HOME with dropped credentials;
-            // its positive redirection can abort that child directly on failure.
-            s.push_str(&format!(
-                "/bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su || ok=0\n\
-                 if {launcher} /bin/sh -c \
-                 '/bin/td-util test -d /var/root || exit 1; \
-                 /bin/sh -c \": > /var/.tdwr-su\" 2>/dev/null && exit 1; \
-                 /bin/sh -c \": > /var/root/.tdwr-su\" 2>/dev/null && exit 1; \
-                 /bin/td-util rm -f \"$HOME/.tdwr-su\" || exit 1; \
-                 : > \"$HOME/.tdwr-su\" || exit 1; \
-                 /bin/td-util rm -f \"$HOME/.tdwr-su\"'; then \
-                 echo {SYSTEM_STATE_OWNER_MARKER}; else ok=0; fi\n\
-                 /bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su || ok=0\n"
-            ));
-        }
-    }
+    // These probes WRITE rather than ask `test -w`: POSIX `-w` is access(2),
+    // and a mode-bits answer would read root's own bit on 0755 `/var` and
+    // report success for a system that had failed. Negative attempts run
+    // in nested shells: a failed special-builtin redirection exits td-sh,
+    // but the parent still needs to run the remaining checks.
+    //
+    // Root clears only the protected probe paths on both sides: a stale
+    // root-owned file could otherwise mask a world-writable directory.
+    // The child clears and writes its own HOME with dropped credentials;
+    // its positive redirection can abort that child directly on failure.
+    s.push_str(&format!(
+        "/bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su || ok=0\n\
+         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
+         '/bin/td-util test -d /var/root || exit 1; \
+         /bin/sh -c \": > /var/.tdwr-su\" 2>/dev/null && exit 1; \
+         /bin/sh -c \": > /var/root/.tdwr-su\" 2>/dev/null && exit 1; \
+         /bin/td-util rm -f \"$HOME/.tdwr-su\" || exit 1; \
+         : > \"$HOME/.tdwr-su\" || exit 1; \
+         /bin/td-util rm -f \"$HOME/.tdwr-su\"'; then \
+         echo {SYSTEM_STATE_OWNER_MARKER}; else ok=0; fi\n\
+         /bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su || ok=0\n"
+    ));
     // `/` is a read-only erofs mount (fields: <src> <mnt> <fstype> <opts> …; erofs is
     //     always mounted `ro`, so the options field begins `ro`).
     s.push_str(&format!(
@@ -2605,14 +2608,12 @@ fn build_rootcheck(sys: &SystemDef) -> String {
          [ \"$(/bin/td-util readlink /dev/ptmx)\" = pts/ptmx ] || ok=0\n\
          [ -c /dev/pts/ptmx ] || ok=0\n",
     );
-    s.push_str(&build_mutable_etc_check(sys));
-    // Exclude exactly the non-root autologin account probed above, including
-    // named diagnostic accounts. Their HOME write already used their credentials.
+    s.push_str(&build_mutable_etc_check());
+    // Exclude exactly the primary account probed above: its HOME write already
+    // used its credentials.
     let mut probe_paths = "/var /run /tmp /home /root".to_string();
     for user in sys.users {
-        if gets_generic_persistent_home_setup(user)
-            && !(user.name == sys.autologin && user.uid != 0)
-        {
+        if gets_generic_persistent_home_setup(user) && user.name != sys.autologin {
             probe_paths.push(' ');
             probe_paths.push_str(user.home);
         }
@@ -2675,7 +2676,7 @@ fn build_rootcheck(sys: &SystemDef) -> String {
 /// The private-key leg is a BEHAVIOURAL mode check rather than a `stat` comparison: the
 /// unprivileged login user must be unable to read the host key and able to read its
 /// `.pub`. That is the property that actually matters, and busybox ships no `stat`.
-fn build_mutable_etc_check(sys: &SystemDef) -> String {
+fn build_mutable_etc_check() -> String {
     let mut s = String::from("me=1\n");
     for entry in MUTABLE_ETC {
         // Every entry: the symlink must say exactly what the table records. A
@@ -2696,32 +2697,24 @@ fn build_mutable_etc_check(sys: &SystemDef) -> String {
     }
     // The id must be the shape every reader expects, read back THROUGH /etc.
     s.push_str("/bin/grep -Eq '^[0-9a-f]{32}$' /etc/machine-id || me=0\n");
-    if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
-        if user.uid != 0 {
-            // Require one successful child to prove both halves. A failed
-            // credential switch cannot stand in for an unreadable private key.
-            s.push_str(&format!(
-                "if {launcher} /bin/sh -c \
-                 'if /bin/td-util cat {key} >/dev/null 2>&1; then exit 1; fi; \
-                 /bin/td-util cat {key}.pub >/dev/null 2>&1'; then :; else me=0; fi\n",
-                launcher = account_probe_launcher(user),
-                key = SSHD_HOST_KEY,
-            ));
-        }
-    }
+    // Require one successful child to prove both halves. A failed
+    // credential switch cannot stand in for an unreadable private key.
+    s.push_str(&format!(
+        "if {launcher} /bin/sh -c \
+         'if /bin/td-util cat {key} >/dev/null 2>&1; then exit 1; fi; \
+         /bin/td-util cat {key}.pub >/dev/null 2>&1'; then :; else me=0; fi\n",
+        launcher = PRIMARY_PROBE_LAUNCHER,
+        key = SSHD_HOST_KEY,
+    ));
     s.push_str(&format!(
         "if [ \"$me\" = 1 ]; then echo {SYSTEM_ETC_MUTABLE_MARKER}; fi\n"
     ));
     s
 }
 
-fn account_probe_launcher(user: &User) -> String {
-    if user.uid == UI_UID {
-        "/bin/td-login exec-primary --".into()
-    } else {
-        format!("/bin/td-login exec-as {} --", user.name)
-    }
-}
+/// How root-run health probes become the human account: through the primary
+/// selector, since the autologin account is the primary one (`build_autologin`).
+const PRIMARY_PROBE_LAUNCHER: &str = "/bin/td-login exec-primary --";
 
 /// The supplementary gids the SHIPPED `/etc/group` grants `user`, derived by reading the
 /// generated file the way td-login will read it at boot rather than by restating the gids
@@ -3158,10 +3151,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
         td_init_probes.push_str(&td_init_probe(applet, probe));
     }
     let health_user_setup = match sys.users.iter().find(|user| user.name == sys.autologin) {
-        Some(user) => format!(
-            "health_user=$({} /bin/printenv USER) || fail",
-            account_probe_launcher(user)
-        ),
+        Some(_) => format!("health_user=$({PRIMARY_PROBE_LAUNCHER} /bin/printenv USER) || fail"),
         None => "echo \"td-boot: no autologin account for health probes\"; fail".into(),
     };
     let td_login_probe = td_login_probe(sys);
@@ -4146,7 +4136,7 @@ fn etc_files(sys: &SystemDef) -> Result<Vec<(&'static str, String, bool)>, Strin
         // Executable glue (mode 0755): getty execs autologin; init respawns tty-session
         // and runs rootcheck at sysinit. They live in /etc so /bin stays a pure
         // store-symlink farm.
-        ("autologin", build_autologin(sys), true),
+        ("autologin", build_autologin(sys)?, true),
         ("tty-session", build_tty_session(), true),
         ("shutdown", build_shutdown(), true),
         (ROOTCHECK_ETC_NAME, build_rootcheck(sys), true),
@@ -5586,7 +5576,7 @@ pub fn recipe() -> Recipe {
         //   fills the /var targets the MUTABLE_ETC symlinks point at.
         // td-login: the static credential multicall (empty runtime closure, CopyTree'd),
         //   serving the /bin/{login,su} farm. Load-bearing like td-init rather than
-        //   probe-only like td-util: `login -f` is how the greeter is reached and `su` is
+        //   probe-only like td-util: `login-primary` is how the greeter is reached and `su` is
         //   how every unprivileged health leg runs. See td-login/THREAT-MODEL.md.
         // td-svc: the static service supervisor that starts every real-root job.
         // td-jail: the static application boundary; its target-kernel transition probe
@@ -5734,18 +5724,34 @@ mod tests {
         assert!(!config.contains(&format!("/bin/td-login exec-as {UI_USER} --")));
         assert!(!config.contains("/bin/su"));
         assert_eq!(
-            build_autologin(&SYSTEM),
-            "#!/bin/sh\nexec /bin/td-login login-primary\n"
+            build_autologin(&SYSTEM).as_deref(),
+            Ok("#!/bin/sh\nexec /bin/td-login login-primary\n")
         );
-        // A tailored non-primary console still uses the named login interface.
-        let diagnostic = SystemDef {
-            autologin: "root",
-            ..SYSTEM
-        };
-        assert_eq!(
-            build_autologin(&diagnostic),
-            "#!/bin/sh\nexec /bin/login -f root\n"
-        );
+        // The console's only login is the primary selector, which td-login
+        // refuses while login keys are enrolled or unavailable
+        // (td-login/THREAT-MODEL.md §3). A forced `login -f NAME` would not
+        // be refused, so a non-primary autologin account, root's included,
+        // refuses the build rather than falling back to one.
+        for name in SYSTEM
+            .users
+            .iter()
+            .filter(|user| user.uid != UI_UID)
+            .map(|user| user.name)
+            .chain(["nobody-here"])
+        {
+            let tailored = SystemDef {
+                autologin: name,
+                ..SYSTEM
+            };
+            let why = build_autologin(&tailored).unwrap_err();
+            assert!(why.contains("is not the primary account"), "{name}: {why}");
+            assert_eq!(etc_files(&tailored).err(), Some(why.clone()), "{name}");
+            assert_eq!(real_root_steps(&tailored).err(), Some(why), "{name}");
+        }
+        // No generated file logs anyone in by the forced front end.
+        for (name, content, _) in etc_files(&SYSTEM).unwrap() {
+            assert!(!content.contains("login -f"), "{name}");
+        }
         let source = super::super::td_login::source("main").unwrap();
         assert!(source.contains("const EXEC_PRIMARY: &str = \"exec-primary\";"));
         assert!(source.contains("const LOGIN_PRIMARY: &str = \"login-primary\";"));
@@ -9104,8 +9110,9 @@ mod tests {
 
     /// The tailorable `SYSTEM` const is hand-edited to shape the distro; guard the
     /// invariants a bad edit would otherwise surface only as a silent boot failure —
-    /// a getty respawn-looping on `login -f <missing-user>`, or a login shell that was
-    /// never packed into /bin.
+    /// a getty respawn-looping on `login-primary` with no primary account, a
+    /// console that logs in someone the selector does not, or a login shell that
+    /// was never packed into /bin.
     #[test]
     fn system_def_is_self_consistent() {
         let group_text = build_group(&SYSTEM);
@@ -9207,6 +9214,21 @@ mod tests {
              the human runtime binds tester 1000:1000; compositor sockets belong to UID 993; \
              make those generated before changing the graphical account"
         );
+        // The autologin account is the primary one, as `login-primary`
+        // resolves it from the generated passwd: the console logs in only
+        // through that selector, which td-login refuses while login keys are
+        // enrolled or unavailable (td-login/THREAT-MODEL.md §3).
+        let primary = crate::primary_account::parse(&build_passwd(&SYSTEM))
+            .unwrap_or_else(|error| unreachable!("the generated passwd has no primary: {error}"));
+        assert_eq!(
+            primary.name(),
+            SYSTEM.autologin,
+            "the autologin account must be the primary account login-primary selects"
+        );
+        assert_eq!(
+            build_autologin(&SYSTEM).as_deref(),
+            Ok("#!/bin/sh\nexec /bin/td-login login-primary\n")
+        );
         assert_eq!(
             unit_key("seat", "exec"),
             Some(format!(
@@ -9261,9 +9283,8 @@ mod tests {
             assert!(
                 valid_account_name(u.name),
                 "user name '{}' must be a plain [A-Za-z0-9._-] name of at most 32 bytes: it \
-                 is embedded UNQUOTED in generated root shell (`/bin/su … <name> -c …`, \
-                 `/bin/login -f <name>`) and in the colon-separated /etc/{{passwd,group,shadow}} \
-                 this recipe writes",
+                 is written into the colon-separated /etc/{{passwd,group,shadow}} this \
+                 recipe generates",
                 u.name
             );
             assert!(
@@ -10594,7 +10615,7 @@ mod tests {
         assert_eq!(optional[0].target, "/var/lib/td/timezone");
         assert!(include_str!("../../../td-install/src/main.rs")
             .contains("const TIMEZONE_STATE_RELATIVE: &str = \"lib/td/timezone\";"));
-        let check = build_mutable_etc_check(&SYSTEM);
+        let check = build_mutable_etc_check();
         assert!(check.contains("readlink /etc/timezone"));
         assert!(!check.contains("test -f /etc/timezone"));
         assert!(
@@ -11804,45 +11825,6 @@ mod tests {
         let refusal = "echo \"td-boot: no autologin account for health probes\"; fail";
         assert!(script.find(refusal).unwrap() < script.find("/bin/su ").unwrap());
         assert!(!script.contains("health_user=$("));
-    }
-
-    #[test]
-    fn rootcheck_uses_the_named_diagnostic_account_outside_the_primary_uid() {
-        const DIAGNOSTIC: User = User {
-            name: "diagnostic",
-            uid: 1001,
-            gid: 1001,
-            gecos: "Diagnostic",
-            home: "/home/diagnostic",
-            shell: "/bin/sh",
-            groups: &[],
-            passwordless: true,
-            service_only: false,
-        };
-        const USERS: &[User] = &[
-            DIAGNOSTIC,
-            User {
-                name: "other",
-                uid: 1002,
-                gid: 1002,
-                home: "/home/other",
-                ..DIAGNOSTIC
-            },
-        ];
-        let diagnostic = SystemDef {
-            users: USERS,
-            autologin: "diagnostic",
-            ..SYSTEM
-        };
-        let script = build_rootcheck(&diagnostic);
-        assert_eq!(
-            script
-                .matches("/bin/td-login exec-as diagnostic -- /bin/sh -c")
-                .count(),
-            2
-        );
-        assert!(!script.contains("exec-primary") && !script.contains("/home/diagnostic"));
-        assert!(script.contains("for d in /var /run /tmp /home /root /home/other; do "));
     }
 
     /// The read-only-root self-check must emit both diagnostic markers the headless

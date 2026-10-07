@@ -1,26 +1,25 @@
 # Login keys and session lock
 
-This is the normative target for td's login-key tier. td-authd, td-secret,
-td-compositor and td-login implement it together; this document owns the
-tier's rules, and each component document states the amendments its own
-contract needs. **Only the record codec, the record store, the consent
-descriptions, the CTAP login primitives, the root worker and td-authd's
-supervision of it and the compositor's client of that supervision are
-implemented**, inert: td-secret's private `login-operation` worker
-unlocks, enrolls, adds and removes keys against the record
-("Placement"), and td-authd starts and drives it on the paired requests
-`1b` and `1c`. The compositor's key-management screen sends `1b` for a
-first enrollment, an addition and a removal from the key list of
-td-authd's `1a` answer, each of which a production td-authd refuses
-before starting anything; without a list it refuses removal itself.
-Only its lock surface's chord sends an unlock's `1b`, and nothing in
-production locks. Its PIN field sends `1c` only
-when root asks for a PIN at a presented PIN step, which no production
-operation reaches. So nothing
-in production starts the worker or uses its `login_record` and
-`login_store` modules ("The login record"), its login identify,
-PIN-retry, assertion and creation steps ("Token profile"), or td-authd's
-login consent operations, step admission and supervision
+This is the normative target for td's login-key tier. td-authd,
+td-secret, td-compositor and td-login implement it together; this
+document owns the tier's rules, and each component document states the
+amendments its own contract needs. **Only the record codec, the record
+store, the consent descriptions, the CTAP login primitives, the root
+worker and td-authd's supervision of it and the compositor's client of
+that supervision are implemented**, inert: td-secret's private
+`login-operation` worker unlocks, enrolls, adds and removes keys against
+the record ("Placement"), and td-authd starts and drives it on the
+paired requests `1b` and `1c`. The compositor's key-management screen
+sends `1b` for a first enrollment, an addition and a removal from the
+key list of td-authd's `1a` answer, each of which a production td-authd
+refuses before starting anything; without a list it refuses removal
+itself. Only its lock surface's chord sends an unlock's `1b`, and
+nothing in production locks. Its PIN field sends `1c` only when root
+asks for a PIN at a presented PIN step, which no production operation
+reaches. So nothing in production starts the worker or uses its
+`login_record` and `login_store` modules ("The login record"), its login
+identify, PIN-retry, assertion and creation steps ("Token profile"), or
+td-authd's login consent operations, step admission and supervision
 (`td-authd/DESIGN.md`, "Login-key operation supervision"). The worker
 reads both retained deployments' tier markers before a write that would
 leave a record ("Versions"), which production td-authd still refuses
@@ -28,14 +27,14 @@ before starting it. No deployment carries the marker before increment
 4's C10b ("Deployments"), so until then it reads no record version for
 either and would refuse every such write. Its `qemu-secret` guests,
 which have no volume and so take both retained deployments to read this
-build's version in the marker's place, run it over UHID
-virtual keys through every case increment 2 lists, including power cuts
-inside its writes on a disposable disk ("Evidence"): increment 2 is
-complete. Of increment 3, the compositor's exclusion of a security
-key's own keyboard from secure attention has landed, and it is live: it
-narrows the existing attention selections and confirmation and needs no
-record (`td-compositor/DESIGN.md`, "Physical secure attention"). The
-private client's login-key operations have landed too
+build's version in the marker's place, run it over UHID virtual keys
+through every case increment 2 lists, including power cuts inside its
+writes on a disposable disk ("Evidence"): increment 2 is complete. Of
+increment 3, the compositor's exclusion of a security key's own keyboard
+from secure attention has landed, and it is live: it narrows the
+existing attention selections and confirmation and needs no record
+(`td-compositor/DESIGN.md`, "Physical secure attention"). The private
+client's login-key operations have landed too
 (`td-compositor/DESIGN.md`, "Login-key operations"): the `K` screen,
 each operation's descriptions checked step by step, its commit and the
 failure texts ("Failure texts"). Production reaches only their refusals.
@@ -44,28 +43,30 @@ inert, since production never reaches a PIN step, and so has the lock
 surface with its login unlock ("Session lock"), inert: its one entry is
 test-only and nothing in production locks. Increment 3 is complete; its
 desktop guest moved to increment 4 as `login-desktop`. Increment 4 is
-specified as twelve commits, C1 to C11 and C10b ("Increments"), of
-which C1 to C4 have landed: firstboot ensures the login directory at every boot, the live
-medium's included, through the shared login-state predicate, and
-rootcheck reports it on a marker of its own; td-authd answers request
-`1a` with the login state, through that predicate and the read-only
-`inspect-login` helper; the compositor asks it and uses its key
-list for `D`; the tier marker's grammar, placement and readers are
-specified ("Deployments") and implemented: the worker reads its write
-version from the retained deployments' markers, and on an enrolled or
-unavailable machine td-authd's request 19 refuses a queued deployment
+specified as twelve commits, C1 to C11 and C10b ("Increments"), of which
+C1 to C5 have landed: firstboot ensures the login directory at every
+boot, the live medium's included, through the shared login-state
+predicate, and rootcheck reports it on a marker of its own; td-authd
+answers request `1a` with the login state, through that predicate and
+the read-only `inspect-login` helper; the compositor asks it and uses
+its key list for `D`; the tier marker's grammar, placement and readers
+are specified ("Deployments") and implemented: the worker reads its
+write version from the retained deployments' markers, and on an enrolled
+or unavailable machine td-authd's request 19 refuses a queued deployment
 that cannot read the record, which the compositor shows. Deployments
 carry the marker only from C10b, the commit after C10 that completes
 increment 4's enforcement, since the marker claims that a deployment
 honours the record at every entry point. Until C10b, request 19 on an
 enrolled or unavailable machine therefore refuses every update; that is
-moot, since nothing enrolls before increment 5. Nothing in production
-locks on the state yet, and only that refusal acts on it, where a
+moot, since nothing enrolls before increment 5. td-login's interactive
+`login` and `login-primary` refuse the console there, returning the line
+to root and parking with one fixed line (`THREAT-MODEL.md` §3), while
+the image logs in only through `login-primary`. Nothing in production
+locks on the state yet, and only those two refusals act on it, where a
 record or an invalid directory exists. Nothing else below is
-implemented.
-Until the increments at the end land, `THREAT-MODEL.md` §3 is the
-complete current behaviour: the installed account logs in automatically
-and the session never locks. No document, UI or release
+implemented. Until the increments at the end land, `THREAT-MODEL.md` §3
+is the complete current behaviour: the installed account logs in
+automatically and the session never locks. No document, UI or release
 note may describe this tier as available before its acceptance evidence
 exists.
 
@@ -758,16 +759,24 @@ cannot be observed complete is a failure that ends in one orderly reboot,
 whose boot ordering enforces the boundary; td-authd's guard keeps a
 persistent failure from looping.
 
-The restarted greeter re-enters `login-primary`, which refuses and returns
-the terminal to root (`THREAT-MODEL.md` §3). The greeter's `tty=`
-containment covers its leader and every process whose controlling terminal
-is that device (`td-svc/DESIGN.md`, "Stopping"). A process that holds a
-descriptor to the line without it being its controlling terminal, because
-it opened the line that way or called `setsid()` and kept an inherited
-descriptor, survives; it exists only through the account's own earlier
-act, or a compromise, before enrollment. `sshd`'s unit stops its whole
-service leaf (`stop=leaf`, `td-svc/DESIGN.md`), so OpenSSH sessions in
-their own process groups end too.
+The restarted greeter re-enters `login-primary`, which refuses and
+returns the terminal to root (`THREAT-MODEL.md` §3). The greeter's
+`tty=` containment covers its leader and every process whose controlling
+terminal is that device (`td-svc/DESIGN.md`, "Stopping"). A process that
+holds a descriptor to the line without it being its controlling
+terminal, because it opened the line that way or called `setsid()` and
+kept an inherited descriptor, survives, and the hand-back does not take
+its descriptor away: a chown revokes no open file. Such a descriptor
+exists through an act of the account, or a compromise, while the line is
+still the account's. That is before enrollment, and also after it until
+the refusal's hand-back runs, because the node stays the account's own
+until the restarted greeter's refusal takes it for root. Revocation
+should therefore return the line to root:root with the pinned mode
+before it restarts the greeter, which narrows that window to the time
+between the state change and the revocation. Increment 5 owns that step;
+the refusal's hand-back alone does not close the window. `sshd`'s unit
+stops its whole service leaf (`stop=leaf`, `td-svc/DESIGN.md`), so
+OpenSSH sessions in their own process groups end too.
 
 Removing the last key reverses the cutover, so console login and the
 ordinary SSH policy return at once. The graphical session that performed
@@ -1314,10 +1323,24 @@ and the oracle that shows it.
      archives the tests build, and the compositor's text; the refusal
      on a full system is `qemu-login-system`'s (C11). No boot archive
      changes.
-   - C5: td-login's console refusal through the shared predicate
-     (`THREAT-MODEL.md` §3), and the deletion of `build_autologin`'s
-     `login -f` branch, `system_def_is_self_consistent` then requiring
-     the autologin account to be the primary account.
+   - C5, landed: td-login's console refusal through the shared predicate
+     (`THREAT-MODEL.md` §3), compiled into td-login as its second
+     reviewed `#[path]` and staged by its recipe: interactive `login` and
+     `login-primary`, for a caller root in some uid column, read the state
+     on the real root before anything else that could start a session and,
+     unless it is unenrolled, hand the line back to root:root with
+     `TTY_MODE`, write the one fixed line and park; and the deletion of
+     `build_autologin`'s `login -f` branch, a non-primary autologin
+     account now refusing the build and `system_def_is_self_consistent`
+     requiring the autologin account to be the primary account. Host tests
+     cover the decision on each state and cause, a spawned gate on each
+     refusing state that writes the line last within a 30-second deadline
+     and is still alive after a further grace period, an unenrolled one
+     returning, the hand-back's order (owner first, nothing written
+     before a refused chown, a wrong read-back refused), the grant's
+     writes and the recipe's staging; the refusal on a full system is
+     `qemu-login-system`'s (C11). It changes every boot's greeter path,
+     so its landing runs `check integration` by hand.
    - C6: `render-primary-sshd`'s enforced form ("SSH"), its unenrolled
      output byte-identical to the one before it.
    - C7, the activating commit: the compositor's locked start. The `1a`
@@ -1421,7 +1444,9 @@ requires §L.1 elevation" above requires.
    in-boot SSH render (`td-firstboot render-ssh-policy`), the `stop=leaf`
    key and `sshd`'s use of it (`td-svc/DESIGN.md`), the `K` screens, the
    disclosures, addition and removal, the deployment-marker check on
-   enrollment, and revocation with its reboot guard. It lands only after
+   enrollment, and revocation with its reboot guard, which returns the
+   greeter's line to root:root with the pinned mode before it restarts
+   the greeter ("Cutover"). It lands only after
    the prerequisite, and its oracle uses the §L.1 operations; this
    activates the tier.
    - Full-system QEMU: both enrollment choices through the attention
