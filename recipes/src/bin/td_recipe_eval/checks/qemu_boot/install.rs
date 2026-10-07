@@ -8,7 +8,9 @@ pub(super) use td_recipe::td_install_qemu_protocol as protocol;
 pub(super) const TARGET_DRIVE_ID: &str = "install-target";
 const MINIMUM_TARGET_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 // Verifying the full deployment fills page cache before kexec allocates its
-// control page without reclaim retries. Reserve room above the 3 GiB payload.
+// pages with __GFP_NORETRY. td-kexec drops the clean page cache and retries
+// once on ENOMEM; the room above the 3 GiB payload is a deliberate margin so
+// the oracle does not depend on that fallback.
 pub(super) const INSTALLED_SYSTEM_MEMORY_MIB: &str = "4096";
 
 /// Only this module can create a writable installation target, in owned scratch.

@@ -933,10 +933,16 @@ left. The initramfs, and the copy with the archive, are bounded by
 Once the key is in the memfd, any later failure (writing the archive's
 trailer, the length check, the seals, `kexec_file_load`, or `reboot`
 returning) leaves it there until td-kexec exits, and the memfd's pages
-are then freed without being zeroed. A loaded kexec image whose `reboot`
-fails keeps its copy of the key in the staged segments. Both are copies
-in memory of the kind described below, within the memory-extraction
-residue that Scope excludes.
+are then freed without being zeroed. A `kexec_file_load` that fails with
+ENOMEM is retried once after td-kexec drops the clean page cache, which
+leaves the memfd alone; the failed attempt's buffers are freed without
+being zeroed. A loaded kexec image whose `reboot` fails keeps its copy
+of the key in the staged segments. Each is a copy in memory of the kind
+described below, within the memory-extraction residue that Scope
+excludes. The retry reads the kernel again from the device after
+td-boot's hash, and the initramfs too except under `--fds-key`, whose
+memfd is not dropped: the payload-reread residual `MEDIA.md` "Live
+boot" already states.
 
 The deployment initramfs reads the key from its RAM-backed root, opens
 the volume by descriptor and removes the key file before starting the

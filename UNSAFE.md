@@ -259,10 +259,18 @@ seals, since `kexec_file_load` refuses an initramfs open for writing.
 Adopting the descriptor into a `File`, or closing it, would be a second
 scoped `#[allow]` or a further syscall and amends this section. Key
 material reaches td-kexec only by descriptor: a pipe named
-`/proc/<pid>/fd/<n>`, never argv or the environment. The crate's
-`confinement` tests pin the one unsafe block and allowance, the four call
-sites with their exact arguments, the pinned values, and the absence of
-descriptor adoption and environment reads; its unit tests run the real
+`/proc/<pid>/fd/<n>`, never argv or the environment. A `kexec_file_load`
+that fails with ENOMEM is retried once after td-kexec writes `1` to
+`/proc/sys/vm/drop_caches` through std, which is no request of its own:
+the installed selector's page cache holds the root image it hashed
+(the live selector hashes none, though the retry serves it too), and
+kexec's `__GFP_NORETRY` allocations, the control page and x86's
+transition page tables, may fail rather than reclaim enough of it. The
+kernel logs its own rate-limited `drop_caches: 1` info line for the
+write. The crate's `confinement` tests pin the one unsafe block and allowance,
+the four call sites with their exact arguments, the pinned values, that
+write's path, value and one caller, and the absence of descriptor
+adoption and environment reads; its unit tests run the real
 `memfd_create` and `F_ADD_SEALS` and check each seal's refusal, and no
 test calls `kexec_file_load` or `reboot`. One `#[cfg(test)]` helper
 passes `fcntl(2)` `F_SETLEASE` (1024) with `F_RDLCK` (0) through the same

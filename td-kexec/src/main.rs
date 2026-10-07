@@ -16,6 +16,9 @@
 //! `#[allow]`, so any other `unsafe` reds; the `confinement` tests pin which
 //! requests reach it.
 //!
+//! A `kexec_file_load` that fails with ENOMEM is retried once after writing
+//! 1 to `/proc/sys/vm/drop_caches` through std; that write is no new request.
+//!
 //! Usage: `td-kexec <kernel> <initramfs|-> <cmdline>`
 //!        `td-kexec --fds <cmdline>` (kernel on fd 0, initramfs on fd 1)
 //!        `td-kexec --fds-key <initramfs sha256> <key pipe> <cmdline>`
@@ -75,6 +78,16 @@ const INITRD_RETAINING_PARAMS: &[&str] = &["retain_initrd", "keepinitrd"];
 const F_ADD_SEALS: usize = 1024 + 9;
 // F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE (linux/fcntl.h).
 const SEALS: usize = 0x0001 | 0x0002 | 0x0004 | 0x0008;
+// The installed selector hashes root.erofs, filling the page cache with
+// clean pages; kexec_file_load's __GFP_NORETRY allocations (the control
+// page, x86's transition page tables) may fail rather than reclaim enough
+// of them. On its ENOMEM td-kexec drops them (1: page cache only), which
+// the kernel logs as a rate-limited `drop_caches: 1` info line, and stages
+// once more. The live selector hashes no root image; the retry serves it too.
+const DROP_CACHES: &str = "/proc/sys/vm/drop_caches";
+const DROP_CLEAN_PAGE_CACHE: &[u8] = b"1\n";
+// ENOMEM (asm-generic/errno-base.h).
+const ENOMEM: i32 = 12;
 // Visible only as the `/proc/<pid>/fd` link text; the memfd has no path.
 const MEMFD_NAME: &CStr = c"td-kexec-handoff";
 
@@ -235,6 +248,41 @@ fn open_key_pipe(path: &Path) -> std::io::Result<File> {
     Ok(pipe)
 }
 
+/// Writes 1 to `vm.drop_caches`: the kernel drops clean, unmapped page cache
+/// and skips dirty pages and shmem, the handoff memfd included, so nothing
+/// unwritten is lost. Through std's open and write; no request of its own.
+fn drop_clean_page_cache() -> std::io::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .open(DROP_CACHES)?
+        .write_all(DROP_CLEAN_PAGE_CACHE)?;
+    let _ = writeln!(
+        std::io::stderr(),
+        "td-kexec: kexec_file_load: out of memory; dropped the clean page cache, retrying once"
+    );
+    Ok(())
+}
+
+/// Stages the image, and on ENOMEM alone drops the clean page cache and
+/// stages once more, returning that attempt's result. A failed drop reports
+/// the ENOMEM with the drop's error beside it.
+fn stage_with_reclaim(
+    mut stage: impl FnMut() -> std::io::Result<()>,
+    drop_cache: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let enomem = match stage() {
+        Err(e) if e.raw_os_error() == Some(ENOMEM) => e,
+        staged => return staged,
+    };
+    drop_cache().map_err(|drop_error| {
+        std::io::Error::new(
+            enomem.kind(),
+            format!("{enomem}; dropping the page cache to retry failed: {drop_error}"),
+        )
+    })?;
+    stage()
+}
+
 fn load(kernel_fd: i32, initrd_fd: i32, flags: usize, cmdline: &OsStr) -> std::io::Result<()> {
     // The kernel copies `cmdline_len` bytes and requires the last be NUL, so pass
     // the length WITH the terminator.
@@ -247,14 +295,18 @@ fn load(kernel_fd: i32, initrd_fd: i32, flags: usize, cmdline: &OsStr) -> std::i
     let cmdline_bytes = cmdline_c.as_bytes_with_nul();
 
     // kexec_file_load(kernel_fd, initrd_fd, cmdline_len, cmdline_ptr, flags)
-    check(syscall5(
-        SYS_KEXEC_FILE_LOAD,
-        kernel_fd as usize,
-        initrd_fd as usize,
-        cmdline_bytes.len(),
-        cmdline_bytes.as_ptr() as usize,
-        flags,
-    ))?;
+    let stage = || {
+        check(syscall5(
+            SYS_KEXEC_FILE_LOAD,
+            kernel_fd as usize,
+            initrd_fd as usize,
+            cmdline_bytes.len(),
+            cmdline_bytes.as_ptr() as usize,
+            flags,
+        ))
+        .map(|_| ())
+    };
+    stage_with_reclaim(stage, drop_clean_page_cache)?;
 
     // reboot(magic1, magic2, LINUX_REBOOT_CMD_KEXEC, NULL) — jumps into the
     // staged image and does not return on success.
@@ -611,6 +663,89 @@ mod tests {
         assert_eq!(check(-2).unwrap_err().raw_os_error(), Some(2));
         assert_eq!(check(0).unwrap(), 0);
         assert_eq!(check(5).unwrap(), 5);
+    }
+
+    /// Drives `stage_with_reclaim` with scripted stage results, recording
+    /// each call: `S` a stage, `D` a drop.
+    fn reclaim(
+        stages: &[std::io::Result<()>],
+        drop_result: std::io::Result<()>,
+    ) -> (std::io::Result<()>, String) {
+        let log = std::cell::RefCell::new(String::new());
+        let mut results = stages.iter();
+        let result = stage_with_reclaim(
+            || {
+                log.borrow_mut().push('S');
+                match results.next() {
+                    Some(Ok(())) => Ok(()),
+                    Some(Err(e)) => {
+                        Err(std::io::Error::from_raw_os_error(e.raw_os_error().unwrap()))
+                    }
+                    None => panic!("staged more often than scripted"),
+                }
+            },
+            || {
+                log.borrow_mut().push('D');
+                drop_result
+            },
+        );
+        (result, log.into_inner())
+    }
+
+    fn errno(code: i32) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(code))
+    }
+
+    #[test]
+    fn enomem_drops_the_page_cache_then_stages_again() {
+        let (result, log) = reclaim(&[errno(ENOMEM), Ok(())], Ok(()));
+        result.unwrap();
+        assert_eq!(log, "SDS");
+    }
+
+    #[test]
+    fn a_staged_image_drops_nothing() {
+        let (result, log) = reclaim(&[Ok(())], Ok(()));
+        result.unwrap();
+        assert_eq!(log, "S");
+    }
+
+    /// EBUSY, EINVAL, ETXTBSY, EPERM, ENOEXEC, EFBIG: returned as they are.
+    #[test]
+    fn any_other_errno_is_returned_without_a_retry() {
+        for code in [16, 22, 26, 1, 8, 27] {
+            let (result, log) = reclaim(&[errno(code), Ok(())], Ok(()));
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(code));
+            assert_eq!(log, "S", "errno {code}");
+        }
+    }
+
+    /// One retry, not a loop: a second ENOMEM, or any other failure of the
+    /// retry, is the result.
+    #[test]
+    fn the_retry_happens_once() {
+        for code in [ENOMEM, 16] {
+            let (result, log) = reclaim(&[errno(ENOMEM), errno(code), Ok(())], Ok(()));
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(code));
+            assert_eq!(log, "SDS", "errno {code}");
+        }
+    }
+
+    #[test]
+    fn a_failed_drop_reports_the_enomem_and_the_drop_error() {
+        let (result, log) = reclaim(
+            &[errno(ENOMEM), Ok(())],
+            Err(std::io::Error::from_raw_os_error(13)),
+        );
+        let err = result.unwrap_err();
+        assert_eq!(log, "SD");
+        assert_eq!(err.kind(), std::io::ErrorKind::OutOfMemory);
+        let enomem = std::io::Error::from_raw_os_error(ENOMEM).to_string();
+        let eacces = std::io::Error::from_raw_os_error(13).to_string();
+        let text = err.to_string();
+        assert!(text.starts_with(&enomem), "{text}");
+        assert!(text.contains("dropping the page cache"), "{text}");
+        assert!(text.ends_with(&eacces), "{text}");
     }
 
     #[test]
@@ -1158,6 +1293,36 @@ mod tests {
             assert_eq!(SEALS, 0xf, "SEAL | SHRINK | GROW | WRITE");
             assert_eq!(MEMFD_NAME.to_bytes(), b"td-kexec-handoff");
             assert_eq!(MAX_HANDOFF_BYTES, 4 * 1024 * 1024 * 1024);
+            assert_eq!(ENOMEM, 12);
+            assert_eq!(DROP_CACHES, "/proc/sys/vm/drop_caches");
+            assert_eq!(DROP_CLEAN_PAGE_CACHE, b"1\n", "page cache only");
+        }
+
+        /// The page-cache drop is the reclaim seam's only drop, reached only
+        /// through the one kexec_file_load call site, and writes nothing but
+        /// the pinned value to the pinned file.
+        #[test]
+        fn the_one_cache_drop_serves_the_one_kexec_file_load() {
+            let code = production();
+            assert_eq!(code.matches("drop_clean_page_cache").count(), 2);
+            assert_eq!(code.matches("stage_with_reclaim(").count(), 2);
+            // `stage` is the closure around the one kexec_file_load request
+            // (`exactly_four_requests_reach_the_instruction`), and nothing else.
+            assert_eq!(code.matches("let stage").count(), 1);
+            assert!(code.contains(
+                "    let stage = || {\n        check(syscall5(\n            \
+                 SYS_KEXEC_FILE_LOAD,\n            kernel_fd as usize,\n            \
+                 initrd_fd as usize,\n            cmdline_bytes.len(),\n            \
+                 cmdline_bytes.as_ptr() as usize,\n            flags,\n        ))\n        \
+                 .map(|_| ())\n    };\n    \
+                 stage_with_reclaim(stage, drop_clean_page_cache)?;\n"
+            ));
+            assert_eq!(code.matches("DROP_CACHES").count(), 2);
+            assert_eq!(code.matches("DROP_CLEAN_PAGE_CACHE").count(), 2);
+            assert!(code.contains(
+                "        .open(DROP_CACHES)?\n        .write_all(DROP_CLEAN_PAGE_CACHE)?;\n"
+            ));
+            assert_eq!(code.matches("/proc/sys/").count(), 1);
         }
 
         /// The seals go on the memfd and nothing else, once, after its

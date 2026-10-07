@@ -1475,8 +1475,10 @@ authorization and mode-0600 test key in its disposable volume, which the
 autotest health probe requires. Ordinary installer artifacts do not
 contain that diagnostic fixture. The full installed-system boots use a
 4 GiB test VM: the current roughly 3 GiB deployment verification can
-fill a 2 GiB guest's page cache before kexec allocates its control page
-without reclaim retries. This is an oracle budget, not a minimum-memory
+fill a 2 GiB guest's page cache before kexec allocates its pages with
+`__GFP_NORETRY`. td-kexec drops the clean page cache and retries once on
+ENOMEM; the 4 GiB stays as a deliberate margin so the oracle does not
+depend on that fallback. This is an oracle budget, not a minimum-memory
 hardware qualification. The small diagnostic matrix retains 2 GiB.
 The application-evidence boot uses the shared system-test timeout,
 which covers the longer autotest profiler prerequisite; installation
