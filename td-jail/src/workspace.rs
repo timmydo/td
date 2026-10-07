@@ -1,6 +1,6 @@
 //! The `workspace` launch kind (APPLICATIONS.md §C, td-agent/DESIGN.md §8):
-//! a development-host launch whose policy is a spec file its launcher
-//! writes, for an agent's tools. It runs a program the launcher names, not
+//! a launch on a development host, or on td by td's account, whose policy
+//! is a spec file its launcher writes, for an agent's tools. It runs a program the launcher names, not
 //! a package; binds the launcher's worktrees read-write and executable at
 //! their real paths, its git repositories through the git mount chain,
 //! shared directories at theirs, a private home, and the host's own system
@@ -37,10 +37,22 @@ pub(crate) const LANG: &str = "C.UTF-8";
 pub(crate) const TERM: &str = "dumb";
 /// The host's trees bound read-only and executable, as the host has them:
 /// a link stays the same link, and a tree the host lacks is absent. `gnu`
-/// and `nix` are the stores where Guix and NixOS keep every program.
+/// and `nix` are the stores where Guix and NixOS keep every program, and
+/// `td` td's, which its `/bin` links into.
 pub(crate) const SYSTEM_TREES: &[&str] = &[
-    "bin", "gnu", "lib", "lib32", "lib64", "libx32", "nix", "sbin", "usr",
+    "bin", "gnu", "lib", "lib32", "lib64", "libx32", "nix", "sbin", "td", "usr",
 ];
+/// The system trees one of which the host must have as a directory:
+/// where its programs are. td has no `/usr`; another host has no `/td`.
+pub(crate) const PROGRAM_TREES: &[&str] = &["td", "usr"];
+/// td's one account, the human's: where the product configuration is
+/// installed, the kind serves it alone, whose td-agent launches it
+/// (APPLICATIONS.md §X.8).
+const TD_ACCOUNT_UID: u32 = 1000;
+/// The caller's user namespace's map of ids.
+const UID_MAP: &str = "/proc/self/uid_map";
+/// More than any map the kernel writes: at most 340 lines of three ids.
+const MAX_UID_MAP_BYTES: u64 = 16 * 1024;
 /// The host's links under `/run` repeated in the jail's otherwise empty
 /// one: a store-based host's current system, which its `/etc` entries and
 /// `PATH` name.
@@ -76,7 +88,7 @@ pub(crate) const SYNTHESIZED_ETC: &[&str] =
 /// own mount points and the host trees bound for it.
 const RESERVED: &[&str] = &[
     "/bin", "/boot", "/dev", "/etc", "/gnu", "/lib", "/lib32", "/lib64", "/libx32", "/nix", "/opt",
-    "/proc", "/run", "/sbin", "/sys", "/tmp", "/usr", "/var/tmp",
+    "/proc", "/run", "/sbin", "/sys", "/td", "/tmp", "/usr", "/var/tmp",
 ];
 const FORMAT_LINE: &str = "format=1";
 const O_NOFOLLOW: i32 = 0o400_000;
@@ -329,7 +341,6 @@ pub(crate) fn resolve<I>(spec_path: &OsStr, arguments: I) -> io::Result<Workspac
 where
     I: Iterator<Item = OsString>,
 {
-    authority::require_no_product_configuration("the workspace kind")?;
     let (uid, gid) = authority::caller_identity()?;
     if uid == 0 || gid == 0 {
         return Err(io::Error::new(
@@ -337,6 +348,7 @@ where
             "the workspace kind requires a nonzero identity",
         ));
     }
+    require_account(uid, Path::new(UID_MAP), Path::new(authority::CONFIG_PATH))?;
     let spec_path = Path::new(spec_path);
     let text = read_spec(spec_path, uid)?;
     let spec = parse_spec(&text)?;
@@ -349,6 +361,34 @@ where
     };
     let arguments = authority::collect_arguments(arguments)?;
     admit(spec, spec_path, uid, gid, &real_home, arguments, RESERVED)
+}
+
+/// Where the product configuration at `config` is installed, td's, the
+/// kind serves td's account alone, as the initial user namespace knows it
+/// (`uid_map`, the caller's map): a uid is the caller's namespace's, and
+/// an application's own is the account's. On a development host, any
+/// nonzero identity. It grants nothing the caller could not do itself:
+/// td-jail is no more privileged than its caller, and the kind only
+/// narrows what the caller's tools reach.
+fn require_account(uid: u32, uid_map: &Path, config: &Path) -> io::Result<()> {
+    if uid == TD_ACCOUNT_UID && initial_user_namespace(uid_map)? {
+        return Ok(());
+    }
+    authority::require_no_configuration_at(
+        config,
+        "the workspace kind for any identity but td's account in the initial user namespace",
+    )
+}
+
+/// Whether the map at `uid_map` is the initial user namespace's: the
+/// whole range of ids, each itself.
+fn initial_user_namespace(uid_map: &Path) -> io::Result<bool> {
+    let mut text = String::new();
+    fs::File::open(uid_map)?
+        .take(MAX_UID_MAP_BYTES + 1)
+        .read_to_string(&mut text)?;
+    let fields: Vec<&str> = text.split_ascii_whitespace().collect();
+    Ok(fields == ["0", "0", "4294967295"])
 }
 
 /// The spec: a direct regular file of the caller's that no one else can
@@ -951,6 +991,35 @@ mod tests {
         }
     }
 
+    /// Where td's product configuration is installed, td's account alone
+    /// may launch the kind, in the initial user namespace, not an
+    /// application whose own uid is the account's; without it, any
+    /// identity may.
+    #[test]
+    fn on_td_the_kind_is_its_accounts_alone() {
+        let base = std::env::temp_dir().join(format!("td-jail-account-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let config = base.join("td-app.conf");
+        let initial = base.join("initial");
+        fs::write(&initial, "         0          0 4294967295\n").unwrap();
+        // An application's: its own uid 1000 is the host's 65536.
+        let jailed = base.join("jailed");
+        fs::write(&jailed, "      1000      65536          1\n").unwrap();
+        assert!(require_account(1001, &initial, &config).is_ok());
+        assert!(require_account(TD_ACCOUNT_UID, &jailed, &config).is_ok());
+        fs::write(&config, "format=1\n").unwrap();
+        assert!(require_account(TD_ACCOUNT_UID, &initial, &config).is_ok());
+        let refused = require_account(1001, &initial, &config).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert!(require_account(65536, &initial, &config).is_err());
+        let refused = require_account(TD_ACCOUNT_UID, &jailed, &config).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        // This process's own map reads as one or the other.
+        assert!(initial_user_namespace(Path::new(UID_MAP)).is_ok());
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn reserved_trees_and_the_home_are_refused() {
         let home = &[PathBuf::from("/home/u"), PathBuf::from("/var/home/u")];
@@ -969,6 +1038,8 @@ mod tests {
             "/sys",
             "/gnu/store",
             "/nix",
+            "/td",
+            "/td/store",
             "/opt/project",
         ] {
             assert!(
@@ -1380,6 +1451,7 @@ mod tests {
         for good in [
             "/gnu/store/x-profile/bin",
             "/nix/store/y/bin",
+            "/td/store/z-git/bin",
             "/usr/bin",
             "/usr",
         ] {
@@ -1394,6 +1466,7 @@ mod tests {
             "usr/bin",
             "/usr/a:b",
             "/usrx/bin",
+            "/tdx/bin",
         ] {
             assert!(!path_directory_named(Path::new(bad)), "{bad}");
         }

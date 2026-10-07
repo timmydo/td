@@ -247,11 +247,12 @@ mod confinement {
 
     /// The workspace kind (APPLICATIONS.md §C) is selected only by the exact
     /// `td-jail --workspace`, is refused where the product configuration is
-    /// installed, and ties the outer process to its launcher before anything
+    /// installed to every identity but td's account, before its spec is
+    /// read, and ties the outer process to its launcher before anything
     /// else; its stage 2 reads its plan back, then confines, then starts the
     /// entry on the channel.
     #[test]
-    fn the_workspace_kind_is_host_only_tied_and_ordered() {
+    fn the_workspace_kind_is_a_hosts_or_tds_accounts_tied_and_ordered() {
         let shipped_main = MAIN.split_once("#[cfg(test)]").unwrap().0;
         assert!(shipped_main.contains(
             "first_argument.is_some_and(|argument| workspace::is_workspace_argument(argument))"
@@ -259,9 +260,26 @@ mod confinement {
         assert!(shipped_main.contains(
             "if kind == ApplicationLaunchKind::Workspace {\n            // `--workspace LAUNCHER-PID SPEC [ARG...]`\n            let arguments: Vec<std::ffi::OsString> = arguments.collect();\n            transition::tie_workspace_to_launcher(arguments.get(1))?;\n            return transition::spawn_application_session(argv0, arguments);"
         ));
-        assert!(WORKSPACE
-            .contains("authority::require_no_product_configuration(\"the workspace kind\")?;"));
-        assert!(AUTHORITY.contains("pub(crate) fn require_no_product_configuration(what: &str)"));
+        // On td, its account's alone: the product configuration refuses
+        // every other identity, before the spec is read.
+        assert!(WORKSPACE.contains("const TD_ACCOUNT_UID: u32 = 1000;"));
+        assert!(WORKSPACE.contains("const UID_MAP: &str = \"/proc/self/uid_map\";"));
+        assert!(WORKSPACE.contains("Ok(fields == [\"0\", \"0\", \"4294967295\"])"));
+        let resolve = WORKSPACE
+            .split_once("pub(crate) fn resolve<I>(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        let account = resolve
+            .find("require_account(uid, Path::new(UID_MAP), Path::new(authority::CONFIG_PATH))?;")
+            .unwrap();
+        assert!(account < resolve.find("read_spec(").unwrap());
+        assert!(WORKSPACE.contains(
+            "    if uid == TD_ACCOUNT_UID && initial_user_namespace(uid_map)? {\n        return Ok(());\n    }\n    authority::require_no_configuration_at(\n        config,\n"
+        ));
+        assert!(AUTHORITY.contains(
+            "pub(crate) fn require_no_configuration_at(path: &Path, what: &str) -> io::Result<()> {\n    match fs::symlink_metadata(path) {"
+        ));
         let tie = TRANSITION
             .split_once("pub fn tie_workspace_to_launcher(")
             .unwrap()

@@ -6818,9 +6818,11 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
     for name in workspace::SYSTEM_TREES {
         bind_system_tree(name)?;
     }
-    if !fs::symlink_metadata(format!("{NEW_ROOT}/usr")).is_ok_and(|usr| usr.is_dir()) {
+    if !workspace::PROGRAM_TREES.iter().any(|name| {
+        fs::symlink_metadata(format!("{NEW_ROOT}/{name}")).is_ok_and(|tree| tree.is_dir())
+    }) {
         return Err(io::Error::other(
-            "the host has no /usr directory for the workspace kind to bind",
+            "the host has neither a /usr nor a /td directory for the workspace kind to bind",
         ));
     }
     prepare_workspace_etc(plan, identity)?;
@@ -7036,13 +7038,15 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
     }
     require_workspace_scaffolds(plan)?;
     require_planned_rows(plan, &mountinfo)?;
+    let mut programs = false;
     for name in workspace::SYSTEM_TREES {
         let path = format!("/{name}");
         match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound && *name != "usr" => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
-            Ok(metadata) if metadata.file_type().is_symlink() && *name != "usr" => {}
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
             Ok(metadata) if metadata.is_dir() => {
+                programs |= workspace::PROGRAM_TREES.contains(name);
                 for row in grant_mount_rows(&mountinfo, Path::new(&path))? {
                     for required in ["ro", "nosuid", "nodev"] {
                         if !row.options.contains(required) {
@@ -7060,6 +7064,11 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
                 )))
             }
         }
+    }
+    if !programs {
+        return Err(io::Error::other(
+            "workspace root binds neither the host's /usr nor its /td directory",
+        ));
     }
     for name in read_dir_names("/run")? {
         if !workspace::RUN_LINKS.contains(&name.as_str())

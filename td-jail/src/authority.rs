@@ -11,7 +11,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-const CONFIG_PATH: &str = "/etc/td-app.conf";
+pub(crate) const CONFIG_PATH: &str = "/etc/td-app.conf";
 const REGISTRY_PATH: &str = "/etc/td-applications.tsv";
 const PACKAGE_ROOT: &str = "/td/store";
 const STATE_ROOT: &str = ".td/app";
@@ -372,10 +372,11 @@ where
     )
 }
 
-/// The development-host kinds are absent where the product configuration
-/// is installed, as `--host` is.
-pub(crate) fn require_no_product_configuration(what: &str) -> io::Result<()> {
-    match fs::symlink_metadata(CONFIG_PATH) {
+/// That no product configuration is installed at `path`, `CONFIG_PATH`
+/// but in a test: the workspace kind serves any identity but td's
+/// account only on a development host.
+pub(crate) fn require_no_configuration_at(path: &Path, what: &str) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(

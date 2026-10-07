@@ -3517,14 +3517,24 @@ pretending `about:support` exposes a per-class level that it does not.
 
 The third launch kind, beside an application launch and §X.1's host
 launch, runs an agent's tools rather than a package (td-agent/DESIGN.md
-§8). It is a development-host kind: selected only by the exact
+§8). It is selected only by the exact
 
 ```text
 td-jail --workspace LAUNCHER-PID SPEC [ARG...]
 ```
 
-under the exact `td-jail` argv[0], never inferred, and refused, as
-`--host` is, wherever the product configuration is installed. Its policy
+under the exact `td-jail` argv[0], never inferred. On a development host
+any nonzero identity may launch it; wherever the product configuration
+is installed, td's, only td's account, uid 1000 as the initial user
+namespace knows it, may, whose td-agent launches it as a program of that
+account's (td-agent/DESIGN.md §8), and every other identity is refused
+before its spec is read. A uid is the caller's namespace's, so the
+caller's map must be the initial namespace's, each id itself: an
+application is uid 1000 in its own namespace and is refused by that,
+and, were it not, by its filter, which refuses every namespace and
+mount call. That grants nothing: td-jail is no more privileged than its
+caller, and the kind only narrows what the caller's own tools reach.
+Its policy
 is a spec its launcher writes: a direct regular file of the caller's that
 no one else can write, at most 64 KiB, and an exact, ordered keyfile:
 
@@ -3557,6 +3567,10 @@ with the kind's own departures:
   directory, holding no `:`, named once, and inside one of the system
   trees every instance binds (below), so naming one binds nothing and
   reaches nothing an instance could not already run by its full path.
+  On td a path directory may lie in any output of `/td/store`, a marked
+  foreign payload's among them, which the caller can already run by its
+  full path outside; naming it binds nothing and makes it no tool of a
+  source-built output.
   A store-based host keeps its tools in profiles under the home, which
   no instance binds, but those resolve into its store, which every
   instance does; without these an agent there finds no `git` or
@@ -3565,8 +3579,8 @@ with the kind's own departures:
   real paths rather than below `/home/td`. Any two of them overlapping by
   path or by mount identity is refused, as is any overlap with the
   reserved trees (`/bin`, `/boot`, `/dev`, `/etc`, `/gnu`, `/lib*`,
-  `/nix`, `/opt`, `/proc`, `/run`, `/sbin`, `/sys`, `/tmp`, `/usr`,
-  `/var/tmp`, a linked one by what it resolves to), by path or by mount
+  `/nix`, `/opt`, `/proc`, `/run`, `/sbin`, `/sys`, `/td`, `/tmp`,
+  `/usr`, `/var/tmp`, a linked one by what it resolves to), by path or by mount
   identity, and one that is or contains the caller's own home, as passwd
   spells it, as it resolves, or through a bind mount of it or of a
   directory above it anywhere in the tree: the home is absent except for
@@ -3611,10 +3625,12 @@ with the kind's own departures:
 The rest of the plan is fixed. The base trees are an application's:
 `/dev`, procfs, devpts, `/dev/shm`, and fresh `/tmp` and `/var/tmp`,
 which here are executable, since a worktree is anyway. The host's
-`/bin`, `/gnu`, `/lib`, `/lib32`, `/lib64`, `/libx32`, `/nix`, `/sbin`
-and `/usr` are bound recursively read-only, `nosuid,nodev`, executable,
-or recreated as the same link, and are absent where the host lacks them;
-`/usr` is required. `/run` holds only a store-based host's
+`/bin`, `/gnu`, `/lib`, `/lib32`, `/lib64`, `/libx32`, `/nix`, `/sbin`,
+`/td` and `/usr` are bound recursively read-only, `nosuid,nodev`,
+executable, or recreated as the same link, and are absent where the host
+lacks them; a `/usr` or a `/td` directory is required, where the host's
+programs are (td has no `/usr`, and its `/bin` and `/etc` links resolve
+into `/td/store`). `/run` holds only a store-based host's
 `current-system` link, to its resolved target when that lies in a bound
 tree. `/etc` is a tmpfs holding synthesized account, group, host,
 hostname and NSS files, the account the caller's identity with the
@@ -10910,9 +10926,13 @@ service of its own any other way.
 
 ### X.8 The `workspace` kind on a host
 
-§C's `workspace` kind is a development-host kind by construction, and
-its divergences from §X.1 are availability ones, named here as the
-two-configuration rule requires:
+§C's `workspace` kind was built for a development host, and its
+divergences from §X.1 are availability ones, named here as the
+two-configuration rule requires. On td it is td's account's alone (§C):
+td-agent, a program of that account's, launches it there with td's own
+trees. A host's own `/td`, where a development host builds for td's
+store, is bound read-only and reserved like the other trees, so a jailed
+tool reads td's store there and cannot write it.
 
 - **(a) A program, not a package.** It runs the installed td-agent
   tool host and td-txt, bound read-only, with no package root, registry,
