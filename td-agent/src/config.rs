@@ -82,14 +82,185 @@ pub struct Client {
     /// The branches a push to which is always the person's (DESIGN.md
     /// §9, Pushing), beside each workspace's bases.
     pub protected_branches: Vec<String>,
+    /// The network policy of a workspace whose template sets none
+    /// (DESIGN.md §10).
+    pub network: Network,
+    /// The destinations every workspace's allowlist starts from.
+    pub network_allowlist: Vec<Destination>,
 }
 
 /// A configured template and its own shared directories, admitted; none
-/// when it names none and its workspaces bind `shared`.
+/// when it names none and its workspaces bind `shared`; and its own
+/// network policy, none when its workspaces take `network`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TemplateShared {
     pub name: String,
     pub shared: Option<Vec<Shared>>,
+    pub network: Option<Network>,
+}
+
+/// A workspace's network policy (DESIGN.md §10).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Network {
+    /// No proxy: nothing leaves the jail.
+    Off,
+    /// The proxy admits the workspace's allowlist.
+    #[default]
+    Allowlist,
+    /// The proxy admits any destination the relay reaches; only the
+    /// human sets it, in a template or on a card.
+    Open,
+}
+
+impl Network {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Allowlist => "allowlist",
+            Self::Open => "open",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "off" => Some(Self::Off),
+            "allowlist" => Some(Self::Allowlist),
+            "open" => Some(Self::Open),
+            _ => None,
+        }
+    }
+}
+
+/// The most destinations an allowlist holds.
+pub const MAX_ALLOWLIST: usize = 256;
+
+/// The shipped `network_allowlist` (DESIGN.md §10): download hosts
+/// alone, none that also takes uploads with a token.
+pub const DEFAULT_ALLOWLIST: &[&str] = &[
+    "static.crates.io",
+    "index.crates.io",
+    "static.rust-lang.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "codeload.github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "proxy.golang.org",
+    "sum.golang.org",
+];
+
+/// A destination on an allowlist: a host, a DNS name in lower case or
+/// an IP address, and a port.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Destination {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Destination {
+    /// `host`, `host:port`, `[v6]` or `[v6]:port`; 443 when no port is
+    /// named.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let wrong = || format!("{text:?} is not a host with an optional port");
+        let (host, port) = if let Some(rest) = text.strip_prefix('[') {
+            let (inner, after) = rest.split_once(']').ok_or_else(wrong)?;
+            let v6 = inner.parse::<std::net::Ipv6Addr>().map_err(|_| wrong())?;
+            let port = match after {
+                "" => None,
+                after => Some(after.strip_prefix(':').ok_or_else(wrong)?),
+            };
+            (format!("[{v6}]"), port)
+        } else {
+            let (host, port) = match text.rsplit_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (text, None),
+            };
+            (dns_or_v4(host).ok_or_else(wrong)?, port)
+        };
+        let port = match port {
+            None => 443,
+            Some(port) => Some(port)
+                .filter(|port| (1..=5).contains(&port.len()))
+                .filter(|port| port.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|port| port.parse::<u16>().ok())
+                .filter(|port| *port != 0)
+                .ok_or_else(wrong)?,
+        };
+        Ok(Self { host, port })
+    }
+
+    /// As configuration writes it: the port left off when it is 443.
+    pub fn text(&self) -> String {
+        if self.port == 443 {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// `host` as a destination names it: an IPv4 address, or a DNS name of
+/// letters, digits and hyphens, in lower case, a trailing dot dropped,
+/// whose last label is not a number, decimal or `0x` hexadecimal, since
+/// the resolver reads such a name (`10.1`, `0x7f.1`, `2130706433`) as an
+/// address. The egress relay's `parse_host` (net/src/egress.rs) holds
+/// the same rule.
+pub fn dns_or_v4(host: &str) -> Option<String> {
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Some(host.to_string());
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    let label_ok = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    let numeric = name.rsplit('.').next().is_some_and(|last| {
+        let hex = last
+            .get(..2)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("0x"))
+            .and_then(|_| last.get(2..));
+        last.bytes().all(|b| b.is_ascii_digit())
+            || hex.is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
+    });
+    (!name.is_empty() && name.len() <= 253 && name.split('.').all(label_ok) && !numeric)
+        .then(|| name.to_ascii_lowercase())
+}
+
+/// `network_allowlist`'s list, each a destination, at most
+/// `MAX_ALLOWLIST`, each once.
+fn allowlist(items: Option<&[String]>) -> Result<Vec<Destination>, String> {
+    let wrong = format!(
+        "`network_allowlist` is a list of at most {MAX_ALLOWLIST} hosts, each with an optional port"
+    );
+    let items = items.ok_or(wrong.as_str())?;
+    if items.len() > MAX_ALLOWLIST {
+        return Err(wrong);
+    }
+    let mut found: Vec<Destination> = Vec::new();
+    for item in items {
+        let destination =
+            Destination::parse(item).map_err(|e| format!("`network_allowlist`: {e}"))?;
+        if !found.contains(&destination) {
+            found.push(destination);
+        }
+    }
+    Ok(found)
+}
+
+/// The shipped allowlist.
+pub fn default_allowlist() -> Vec<Destination> {
+    DEFAULT_ALLOWLIST
+        .iter()
+        .map(|host| Destination {
+            host: (*host).to_string(),
+            port: 443,
+        })
+        .collect()
 }
 
 impl Default for Client {
@@ -115,6 +286,8 @@ impl Default for Client {
             cache_ttl: DEFAULT_CACHE_TTL,
             cold_resume_tokens: Some(DEFAULT_COLD_RESUME_TOKENS),
             background_output_bytes: DEFAULT_BACKGROUND_OUTPUT_BYTES,
+            network: Network::default(),
+            network_allowlist: default_allowlist(),
             protected_branches: crate::git::PROTECTED
                 .iter()
                 .map(|branch| (*branch).to_string())
@@ -225,6 +398,29 @@ impl Client {
         }
     }
 
+    /// A workspace's network policy: its template's own when it names
+    /// one, `network` when it names none or the workspace has no
+    /// template, and `off` when its template is no longer configured, so
+    /// removing or renaming one never widens what its conversations
+    /// reach.
+    pub fn network_for(&self, workspace: &Workspace) -> Network {
+        let template = match workspace {
+            Workspace::Template(name) => Some(name),
+            Workspace::Repositories(repositories) => Some(&repositories.template),
+            Workspace::Scratch | Workspace::Directory(_) => None,
+        };
+        match template {
+            Some(name) => match self.template_shared.iter().find(|t| &t.name == name) {
+                Some(TemplateShared {
+                    network: Some(own), ..
+                }) => *own,
+                Some(TemplateShared { network: None, .. }) => self.network,
+                None => Network::Off,
+            },
+            None => self.network,
+        }
+    }
+
     /// The settings as the socketpair carries them.
     pub fn to_json(&self) -> Json {
         let limit = |l: Option<u64>| l.map_or(Json::Null, Json::from);
@@ -300,6 +496,16 @@ impl Client {
                         .collect(),
                 ),
             ),
+            ("network".into(), Json::Str(self.network.name().into())),
+            (
+                "network_allowlist".into(),
+                Json::Arr(
+                    self.network_allowlist
+                        .iter()
+                        .map(|destination| Json::Str(destination.text()))
+                        .collect(),
+                ),
+            ),
             (
                 "template_shared".into(),
                 Json::Arr(
@@ -311,6 +517,12 @@ impl Client {
                                 (
                                     "shared".into(),
                                     template.shared.as_deref().map_or(Json::Null, shared_json),
+                                ),
+                                (
+                                    "network".into(),
+                                    template
+                                        .network
+                                        .map_or(Json::Null, |n| Json::Str(n.name().into())),
                                 ),
                             ])
                         })
@@ -435,6 +647,27 @@ impl Client {
                     protected_branches(items.as_deref())?
                 }
             },
+            // As in the file: `open` is a template's or a card's alone.
+            network: match value.get("network") {
+                None => Network::default(),
+                Some(network) => network
+                    .as_str()
+                    .and_then(Network::parse)
+                    .filter(|network| *network != Network::Open)
+                    .ok_or("`network` is off or allowlist")?,
+            },
+            network_allowlist: match value.get("network_allowlist") {
+                None => default_allowlist(),
+                Some(list) => {
+                    let items: Option<Vec<String>> = list.as_arr().and_then(|items| {
+                        items
+                            .iter()
+                            .map(|item| item.as_str().map(str::to_string))
+                            .collect()
+                    });
+                    allowlist(items.as_deref())?
+                }
+            },
             template_shared: match value.get("template_shared") {
                 None => Vec::new(),
                 Some(Json::Arr(items)) => items
@@ -452,9 +685,20 @@ impl Client {
                             ),
                             None => return Err(format!("template {name:?} with no shared")),
                         };
+                        let network = match item.get("network") {
+                            None | Some(Json::Null) => None,
+                            Some(network) => Some(
+                                network.as_str().and_then(Network::parse).ok_or_else(|| {
+                                    format!(
+                                        "template {name:?}: `network` is off, allowlist or open"
+                                    )
+                                })?,
+                            ),
+                        };
                         Ok(TemplateShared {
                             name: template_name(name)?,
                             shared,
+                            network,
                         })
                     })
                     .collect::<Result<_, String>>()?,
@@ -663,8 +907,8 @@ const KEYS: &[(&str, Use)] = &[
     ("shared", Use::Read),
     ("template", Use::Read),
     ("remotes", Use::Read),
-    ("network", Use::Later(15)),
-    ("network_allowlist", Use::Later(15)),
+    ("network", Use::Read),
+    ("network_allowlist", Use::Read),
     ("protected_branches", Use::Read),
     ("fetch_interval", Use::Read),
     ("fetch_concurrency", Use::Later(11)),
@@ -749,6 +993,8 @@ pub struct Template {
     /// Its own `[[shared]]`, `~` unexpanded, in place of the top-level
     /// list; none is the top-level list.
     pub shared: Option<Vec<Shared>>,
+    /// Its own network policy, in place of the top-level `network`.
+    pub network: Option<Network>,
 }
 
 /// One of a template's repositories.
@@ -852,8 +1098,8 @@ fn sparse_path(path: &str) -> Option<String> {
         .then(|| path.to_string())
 }
 
-/// `[[template]]`, and a note for each key it has that is not read yet.
-fn templates(value: &Toml, notes: &mut Vec<String>) -> Result<Vec<Template>, String> {
+/// `[[template]]`.
+fn templates(value: &Toml) -> Result<Vec<Template>, String> {
     let wrong = "`template` is a list of `[[template]]` tables";
     let items = value.as_arr().ok_or(wrong)?;
     if items.len() > MAX_TEMPLATES {
@@ -874,11 +1120,13 @@ fn templates(value: &Toml, notes: &mut Vec<String>) -> Result<Vec<Template>, Str
         if templates.iter().any(|t| t.name.eq_ignore_ascii_case(&name)) {
             return Err(format!("two templates are named {name:?}"));
         }
-        if item.get("network").is_some() {
-            notes.push(format!(
-                "template {name:?}'s `network` is accepted and not read yet: increment 15 reads it"
-            ));
-        }
+        let network = match item.optional_str("network") {
+            Ok(None) => None,
+            Ok(Some(text)) => Some(Network::parse(text).ok_or_else(|| {
+                format!("template {name:?}: `network` is off, allowlist or open, not {text:?}")
+            })?),
+            Err(e) => return Err(format!("template {name:?}: {e}")),
+        };
         let mut repos = Vec::new();
         if let Some(value) = item.get("repos") {
             let wrong = "`template.repos` is a list of `[[template.repos]]` tables";
@@ -915,6 +1163,7 @@ fn templates(value: &Toml, notes: &mut Vec<String>) -> Result<Vec<Template>, Str
             name,
             repos,
             shared,
+            network,
         });
     }
     Ok(templates)
@@ -1075,6 +1324,7 @@ pub fn templates_from_json(value: &Json) -> Result<Vec<Template>, String> {
             .collect::<Result<Vec<_>, String>>()
             .map_err(|e| format!("template {name:?}: {e}"))?;
         let template = Template {
+            network: None,
             name,
             repos,
             shared: None,
@@ -1249,7 +1499,30 @@ pub fn parse(text: &str) -> Result<Config, String> {
         config.shared = Some(shared_list("shared", value)?);
     }
     if let Some(value) = table.get("template") {
-        config.templates = templates(value, &mut config.notes)?;
+        config.templates = templates(value)?;
+    }
+    // `open` is the human's alone, on a card or in a template (§10):
+    // never every workspace's default.
+    match table.optional_str("network").map_err(|e| e.to_string())? {
+        None => {}
+        Some("off") => config.client.network = Network::Off,
+        Some("allowlist") => config.client.network = Network::Allowlist,
+        Some("open") => {
+            return Err(
+                "`network` is `off` or `allowlist`: `open` is set in a template or on a card"
+                    .into(),
+            )
+        }
+        Some(other) => return Err(format!("`network` is `off` or `allowlist`, not {other:?}")),
+    }
+    if let Some(value) = table.get("network_allowlist") {
+        let items: Option<Vec<String>> = value.as_arr().and_then(|items| {
+            items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string))
+                .collect()
+        });
+        config.client.network_allowlist = allowlist(items.as_deref())?;
     }
     if let Some(value) = table.get("protected_branches") {
         let items: Option<Vec<String>> = value.as_arr().and_then(|items| {
@@ -1552,6 +1825,7 @@ mod tests {
         assert_eq!(
             config.templates,
             [Template {
+                network: None,
                 name: "td".into(),
                 repos: vec![Repo {
                     remote: "https://github.com/timmydo/td".into(),
@@ -1860,11 +2134,13 @@ mod tests {
         }
         let templates = vec![
             Template {
+                network: None,
                 name: "td".into(),
                 repos: vec![repo.clone(), local.clone()],
                 shared: None,
             },
             Template {
+                network: None,
                 name: "notes".into(),
                 repos: vec![local],
                 shared: None,
@@ -1906,6 +2182,7 @@ mod tests {
         if let (Json::Arr(items), Json::Arr(more)) = (
             &mut twice,
             templates_json(&[Template {
+                network: None,
                 name: "TD".into(),
                 ..templates.get(1).unwrap().clone()
             }]),
@@ -1952,6 +2229,7 @@ mod tests {
         // Planned as a workspace: one branch of a remote named twice, and
         // a record past its bound, refused; no sparse path reads back.
         let twice = Template {
+            network: None,
             name: "td".into(),
             repos: vec![repo.clone(), repo.clone()],
             shared: None,
@@ -1971,6 +2249,7 @@ mod tests {
         )
         .unwrap();
         let long = Template {
+            network: None,
             name: "td".into(),
             repos: vec![long],
             shared: None,
@@ -1979,6 +2258,7 @@ mod tests {
             .unwrap_err()
             .contains("fewer sparse paths"));
         let none = vec![Template {
+            network: None,
             name: "td".into(),
             repos: vec![checked_repo("/srv/td", "main", "a", Some(Vec::new())).unwrap()],
             shared: None,
@@ -2127,6 +2407,201 @@ mod tests {
         assert_eq!(path(None, None), None);
     }
 
+    /// `network` is `off` or `allowlist`, `open` being a template's or
+    /// a card's; `network_allowlist` is hosts with optional ports, the
+    /// shipped download hosts by default; both cross to a conversation
+    /// whole, a template's own policy beside them; and a workspace's
+    /// policy is its template's, else the top level's, and `off` for a
+    /// template no longer configured.
+    #[test]
+    fn the_network_policy_and_allowlist_are_read_and_cross_whole() {
+        let config = Config::default();
+        assert_eq!(config.client.network, Network::Allowlist);
+        assert_eq!(
+            config
+                .client
+                .network_allowlist
+                .iter()
+                .map(Destination::text)
+                .collect::<Vec<_>>(),
+            DEFAULT_ALLOWLIST
+        );
+        assert!(!DEFAULT_ALLOWLIST.iter().any(|host| [
+            "github.com",
+            "crates.io",
+            "registry.npmjs.org"
+        ]
+        .contains(host)));
+        let config = parse(
+            "network = \"off\"\nnetwork_allowlist = [\"Example.COM.\", \"example.com:443\", \
+             \"git.example.org:8443\", \"192.0.2.7:80\", \"[2001:db8::1]\", \"[2001:db8::2]:22\"]\n\
+             [[template]]\nname = \"open\"\nnetwork = \"open\"\n\
+             [[template]]\nname = \"plain\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.client.network, Network::Off);
+        assert_eq!(
+            config
+                .client
+                .network_allowlist
+                .iter()
+                .map(Destination::text)
+                .collect::<Vec<_>>(),
+            [
+                "example.com",
+                "git.example.org:8443",
+                "192.0.2.7:80",
+                "[2001:db8::1]",
+                "[2001:db8::2]:22"
+            ]
+        );
+        assert_eq!(
+            config.templates.first().unwrap().network,
+            Some(Network::Open)
+        );
+        for (text, said) in [
+            ("network = \"open\"", "set in a template or on a card"),
+            ("network = \"on\"", "`off` or `allowlist`"),
+            ("network_allowlist = \"a\"", "a list of at most"),
+            ("network_allowlist = [\"a:0\"]", "not a host"),
+            ("network_allowlist = [\"a:+1\"]", "not a host"),
+            ("network_allowlist = [\"a_b\"]", "not a host"),
+            ("network_allowlist = [\"[1.2.3.4]\"]", "not a host"),
+            ("network_allowlist = [\"*.example.com\"]", "not a host"),
+            (
+                "[[template]]\nname = \"t\"\nnetwork = \"on\"",
+                "off, allowlist or open",
+            ),
+        ] {
+            let e = parse(text).unwrap_err();
+            assert!(e.contains(said), "{text}: {e}");
+        }
+        let many = (0..=MAX_ALLOWLIST)
+            .map(|n| format!("\"h{n}.example\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(parse(&format!("network_allowlist = [{many}]")).is_err());
+        let most = (0..MAX_ALLOWLIST)
+            .map(|n| format!("\"h{n}.example\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let config_most = parse(&format!("network_allowlist = [{most}]")).unwrap();
+        assert_eq!(config_most.client.network_allowlist.len(), MAX_ALLOWLIST);
+        assert!(parse("[[template]]\nname = \"t\"\nnetwork = 1").is_err());
+        // A destination's edges.
+        let text = |given: &str| Destination::parse(given).map(|d| d.text());
+        assert_eq!(text("Example.com.:8443"), Ok("example.com:8443".into()));
+        assert_eq!(text("example.com:0443"), Ok("example.com".into()));
+        assert_eq!(text("[::FFFF:1.2.3.4]"), Ok("[::ffff:1.2.3.4]".into()));
+        assert_eq!(
+            text(&format!("{}.com", "a".repeat(63))).map(|t| t.len()),
+            Ok(67)
+        );
+        for bad in [
+            format!("{}.com", "a".repeat(64)),
+            format!("{}.com", "a.".repeat(125)),
+            "[::1]x".into(),
+            "[::1]:".into(),
+            "[fe80::1%eth0]".into(),
+            "::1".into(),
+            "bücher.example".into(),
+            "a..b".into(),
+            "a.b..".into(),
+            "10.1".into(),
+            "2130706433".into(),
+            "0x7f.1".into(),
+            "a.0X7F".into(),
+            "192.0.2.010".into(),
+        ] {
+            assert!(Destination::parse(&bad).is_err(), "{bad}");
+        }
+        assert_eq!(text("a.0x7g"), Ok("a.0x7g".into()));
+        assert_eq!(text("1a.example"), Ok("1a.example".into()));
+        // Across the setup frame, whole.
+        let mut client = config.client.clone();
+        client.template_shared = vec![
+            TemplateShared {
+                name: "open".into(),
+                shared: None,
+                network: Some(Network::Open),
+            },
+            TemplateShared {
+                name: "plain".into(),
+                shared: None,
+                network: None,
+            },
+        ];
+        let crossed = Client::from_json(&client.to_json()).unwrap();
+        assert_eq!(crossed, client);
+        // A frame refuses what the file does, and a frame without the
+        // keys, from a window before them, takes the defaults.
+        let with = |key: &str, value: Json| {
+            let mut pairs = match client.to_json() {
+                Json::Obj(pairs) => pairs,
+                _ => Vec::new(),
+            };
+            pairs.retain(|(k, _)| k != key);
+            pairs.push((key.into(), value));
+            Client::from_json(&Json::Obj(pairs))
+        };
+        assert!(with("network", Json::Str("open".into())).is_err());
+        assert!(with("network", Json::Str("on".into())).is_err());
+        assert!(with(
+            "network_allowlist",
+            Json::Arr(vec![Json::Str("a_b".into())])
+        )
+        .is_err());
+        let mut pairs = match client.to_json() {
+            Json::Obj(pairs) => pairs,
+            _ => Vec::new(),
+        };
+        pairs.retain(|(k, _)| k != "network" && k != "network_allowlist");
+        let old = Client::from_json(&Json::Obj(pairs)).unwrap();
+        assert_eq!(old.network, Network::Allowlist);
+        assert_eq!(old.network_allowlist, default_allowlist());
+        // Each workspace's.
+        let open = Workspace::Template("open".into());
+        assert_eq!(crossed.network_for(&open), Network::Open);
+        assert_eq!(
+            crossed.network_for(&Workspace::Template("plain".into())),
+            Network::Off
+        );
+        assert_eq!(
+            crossed.network_for(&Workspace::Template("gone".into())),
+            Network::Off
+        );
+        let allowing = Client {
+            network: Network::Allowlist,
+            ..crossed.clone()
+        };
+        assert_eq!(
+            allowing.network_for(&Workspace::Template("plain".into())),
+            Network::Allowlist
+        );
+        assert_eq!(
+            allowing.network_for(&Workspace::Scratch),
+            Network::Allowlist
+        );
+        assert_eq!(
+            allowing.network_for(&Workspace::Directory("/home/u/src".into())),
+            Network::Allowlist
+        );
+        let repositories = |template: &str| {
+            Workspace::Repositories(crate::workspace::Repositories {
+                template: template.into(),
+                name: "w".into(),
+                entries: Vec::new(),
+            })
+        };
+        assert_eq!(allowing.network_for(&repositories("open")), Network::Open);
+        assert_eq!(allowing.network_for(&repositories("gone")), Network::Off);
+        assert_eq!(allowing.network_for(&open), Network::Open);
+        assert_eq!(
+            allowing.network_for(&Workspace::Template("gone".into())),
+            Network::Off
+        );
+    }
+
     #[test]
     fn templates_are_read_in_order_and_checked() {
         let config = parse(
@@ -2152,9 +2627,11 @@ mod tests {
         assert_eq!(config.templates.get(2).unwrap().repos.len(), 1);
         let repo = config.templates.get(2).unwrap().repos.first().unwrap();
         assert_eq!(repo.sparse, None);
+        assert!(config.notes.is_empty(), "{:?}", config.notes);
+        let network = |n: usize| config.templates.get(n).unwrap().network;
         assert_eq!(
-            config.notes,
-            ["template \"bare\"'s `network` is accepted and not read yet: increment 15 reads it"]
+            [network(0), network(1), network(2)],
+            [None, Some(Network::Off), None]
         );
         for (text, said) in [
             ("template = 3", "a list of `[[template]]` tables"),
@@ -2244,10 +2721,12 @@ mod tests {
                 TemplateShared {
                     name: "notes".into(),
                     shared: Some(own.clone()),
+                    network: None,
                 },
                 TemplateShared {
                     name: "plain".into(),
                     shared: None,
+                    network: None,
                 },
             ],
             ..Client::default()

@@ -483,6 +483,7 @@ mod tests {
         remote
             .app
             .set_saved_templates(vec![crate::config::Template {
+                network: None,
                 name: "td".into(),
                 repos: vec![crate::config::checked_repo("/srv/td", "main", "a", None).unwrap()],
                 shared: None,

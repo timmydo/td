@@ -494,6 +494,7 @@ impl TemplateDialog {
         }
         Reply::Save {
             template: Template {
+                network: None,
                 name,
                 repos,
                 shared: None,
@@ -966,6 +967,7 @@ mod tests {
             dialog.key("Return", false, &mut NoClipboard),
             Reply::Save {
                 template: Template {
+                    network: None,
                     name: "td".into(),
                     repos: vec![crate::config::checked_repo(
                         "/srv/git/td",
@@ -998,6 +1000,7 @@ mod tests {
         let second =
             crate::config::checked_repo("https://example.org/a/b", "main", "agent", None).unwrap();
         let template = Template {
+            network: None,
             name: "td".into(),
             repos: vec![first, second.clone()],
             shared: None,
@@ -1053,6 +1056,7 @@ mod tests {
         for sparse in [Some(vec!["docs/API guide".to_string()]), Some(Vec::new())] {
             let repo = crate::config::checked_repo("/srv/td", "main", "a", sparse.clone()).unwrap();
             let template = Template {
+                network: None,
                 name: "td".into(),
                 repos: vec![repo],
                 shared: None,
@@ -1081,6 +1085,7 @@ mod tests {
     #[test]
     fn the_pointer_presses_buttons_and_focuses_fields() {
         let template = Template {
+            network: None,
             name: "td".into(),
             repos: vec![crate::config::checked_repo("/srv/td", "main", "a", None).unwrap()],
             shared: None,

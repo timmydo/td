@@ -48,7 +48,7 @@ use td_ui::window::{Clipboard, Input, PointerPhase};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
 use crate::chooser::Chooser;
-use crate::config::Mode;
+use crate::config::{Mode, Network};
 use crate::confirm::{self, Confirm};
 use crate::cost;
 use crate::key::Secret;
@@ -611,6 +611,10 @@ pub struct App {
     /// `jev_required = false`: the classifier may allow on its reasoning
     /// stage alone, which the status row says (DESIGN.md §11).
     without_jev: bool,
+    /// The settings that give each workspace its network policy
+    /// (DESIGN.md §10), `network` and the templates' own, which the
+    /// status row says.
+    networks: crate::config::Client,
     /// td-agent's notes, which the Messages window shows.
     log: crate::notes::Log,
     /// Each row's workspace as the list's third column names it.
@@ -796,6 +800,7 @@ impl App {
             mode,
             modes: Some(Vec::new()),
             without_jev: false,
+            networks: crate::config::Client::default(),
             log: crate::notes::Log::default(),
             labels: Vec::new(),
             show_archived: false,
@@ -1032,14 +1037,17 @@ impl App {
             .map(|c| format!(" | {c}"))
             .unwrap_or_default();
         format!(
-            "{state}{retry}{keyless}{unread}{card} | {model} {effort} | {context} | cost {}{today}{credit} | mode {}{} | no limits | {} background",
-            of(self.meter.spent, self.limits.conversation),
+            // The mode and the network policy first, so a narrow row
+            // never cuts them off.
+            "{state}{retry}{keyless}{unread}{card} | mode {}{} | network {} | {model} {effort} | {context} | cost {}{today}{credit} | no limits | {} background",
             self.shown_mode().word(),
             if self.without_jev {
                 ", classifier without Jev"
             } else {
                 ""
             },
+            self.shown_network().name(),
+            of(self.meter.spent, self.limits.conversation),
             self.processes.values().map(Vec::len).sum::<usize>()
         )
     }
@@ -1048,6 +1056,41 @@ impl App {
     pub fn set_without_jev(&mut self, without: bool) {
         self.without_jev = without;
         self.touch();
+    }
+
+    /// The network policies `client` gives workspaces.
+    pub fn set_networks(&mut self, client: &crate::config::Client) {
+        self.networks = crate::config::Client {
+            network: client.network,
+            template_shared: client
+                .template_shared
+                .iter()
+                .map(|template| crate::config::TemplateShared {
+                    name: template.name.clone(),
+                    shared: None,
+                    network: template.network,
+                })
+                .collect(),
+            ..crate::config::Client::default()
+        };
+        self.touch();
+    }
+
+    /// The network policy the status row says: the open conversation's
+    /// workspace's, as `Client::network_for` gives it, `off` for one with
+    /// no workspace, which has no jail, and the configuration's with none
+    /// open.
+    fn shown_network(&self) -> Network {
+        let open = self
+            .active
+            .as_ref()
+            .and_then(|id| self.rows.iter().find(|r| &r.id == id));
+        match open {
+            None => self.networks.network,
+            Some(row) => row.workspace.as_ref().map_or(Network::Off, |workspace| {
+                self.networks.network_for(workspace)
+            }),
+        }
     }
 
     /// Each workspace's mode as the human's rules set it, or none while
@@ -5183,7 +5226,7 @@ pub mod tests {
         let mut app = app();
         assert_eq!(
             app.status_line(),
-            "starting | m/default medium | ctx 0/200k | cost $0.0000 | mode ask | no limits | 0 background"
+            "starting | mode ask | network off | m/default medium | ctx 0/200k | cost $0.0000 | no limits | 0 background"
         );
         app.update(
             Update::Up(Up::Hello {
@@ -5205,8 +5248,8 @@ pub mod tests {
         );
         assert_eq!(
             app.status_line(),
-            "idle | 1 new message: C-S-m | m/default medium | ctx 0/200k | cost $0.0000 \
-             | today $0.2500 | credit $7.5000 | mode ask | no limits | 0 background"
+            "idle | 1 new message: C-S-m | mode ask | network off | m/default medium | ctx 0/200k \
+             | cost $0.0000 | today $0.2500 | credit $7.5000 | no limits | 0 background"
         );
         // Each total against its limit, where one is set.
         app.set_limits(cost::Limits::default());
@@ -7918,6 +7961,69 @@ pub mod tests {
         );
         app.menu_action(menu::Action::AutoMode);
         assert!(app.take_requests().is_empty());
+    }
+
+    /// The status row says the open workspace's network policy: its
+    /// template's own, else the configuration's; `off` for a template no
+    /// longer configured and for a conversation with no workspace; the
+    /// configuration's with none open.
+    #[test]
+    fn the_status_row_says_the_workspaces_network_policy() {
+        let mut app = app();
+        let network = |app: &App| {
+            let line = app.status_line();
+            let at = line.find("| network ").unwrap();
+            line.get(at + 10..)
+                .and_then(|rest| rest.split(' ').next())
+                .unwrap()
+                .to_string()
+        };
+        app.set_networks(&crate::config::Client {
+            network: Network::Allowlist,
+            template_shared: vec![
+                crate::config::TemplateShared {
+                    name: "open".into(),
+                    shared: None,
+                    network: Some(Network::Open),
+                },
+                crate::config::TemplateShared {
+                    name: "plain".into(),
+                    shared: None,
+                    network: None,
+                },
+            ],
+            ..crate::config::Client::default()
+        });
+        app.active = None;
+        assert_eq!(network(&app), "allowlist");
+        for (n, workspace, said) in [
+            (9, Some(Workspace::Scratch), "allowlist"),
+            (10, Some(Workspace::Template("open".into())), "open"),
+            (11, Some(Workspace::Template("plain".into())), "allowlist"),
+            (12, Some(Workspace::Template("gone".into())), "off"),
+            (13, None, "off"),
+            (
+                14,
+                Some(Workspace::Repositories(crate::workspace::Repositories {
+                    template: "open".into(),
+                    name: "w".into(),
+                    entries: Vec::new(),
+                })),
+                "open",
+            ),
+            (
+                15,
+                Some(Workspace::Directory("/home/u/src".into())),
+                "allowlist",
+            ),
+        ] {
+            app.add_row(Row {
+                workspace,
+                ..row(n, 1)
+            });
+            app.set_active(id(n));
+            assert_eq!(network(&app), said, "row {n}");
+        }
     }
 
     #[test]

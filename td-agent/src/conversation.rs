@@ -6247,6 +6247,7 @@ mod tests {
             sparse: None,
         };
         let template = crate::config::Template {
+            network: None,
             name: "td".into(),
             repos: vec![
                 repo("https://example.org/a/td", "develop"),
@@ -6312,6 +6313,7 @@ mod tests {
     #[test]
     fn a_call_into_a_worktree_not_ready_is_told_its_state() {
         let template = crate::config::Template {
+            network: None,
             name: "td".into(),
             repos: vec![
                 crate::config::Repo {

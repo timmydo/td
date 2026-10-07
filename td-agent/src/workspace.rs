@@ -1557,6 +1557,7 @@ mod tests {
 
     fn template(repos: &[(&str, &str, &str)]) -> crate::config::Template {
         crate::config::Template {
+            network: None,
             name: "td agent!".into(),
             repos: repos
                 .iter()

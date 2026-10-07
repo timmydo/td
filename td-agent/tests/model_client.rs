@@ -1918,6 +1918,7 @@ fn a_template_workspace_binds_its_own_shared_directories() {
                 write: false,
             }],
             template_shared: vec![TemplateShared {
+                network: None,
                 name: "notes".into(),
                 shared: Some(vec![Shared {
                     path: "/own".into(),
@@ -2050,6 +2051,7 @@ fn a_workspace_gone_with_its_archive_refuses_its_tools() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
             remote: "https://example.org/a/td".into(),
@@ -2118,6 +2120,7 @@ fn a_repositorys_rules_ask_for_a_read_and_refuse_a_command() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
             remote: "https://example.org/a/td".into(),
@@ -2243,6 +2246,7 @@ fn a_checkout_done_while_idle_wakes_its_conversation() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
             remote: "https://example.org/a/td".into(),
@@ -2423,6 +2427,7 @@ fn a_call_into_a_worktree_not_prepared_is_told_so_without_a_card() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
             remote: "https://example.org/a/td".into(),
@@ -2496,6 +2501,7 @@ fn a_step_that_may_change_files_is_snapshotted_or_says_why_not_once() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
             remote: "https://example.org/a/td".into(),
@@ -4552,6 +4558,7 @@ fn the_classifier_is_given_the_project_instructions_only_when_trusted() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
             remote: "https://example.org/a/td".into(),
@@ -6382,6 +6389,7 @@ fn git_push_is_refused_until_it_can_export() {
     ));
     let remote = "https://example.org/a/td";
     let template = td_agent::config::Template {
+        network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
             remote: remote.into(),
@@ -6538,6 +6546,7 @@ fn prepared(
     git_in(&up, &["commit", "--quiet", "-m", "one"]);
     let remote = "https://example.org/a/td".to_string();
     let template = td_agent::config::Template {
+        network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
             remote: remote.clone(),
@@ -7315,6 +7324,7 @@ fn git_fetch_asks_the_window_and_says_what_came() {
     ));
     let remote = "https://example.org/a/td";
     let template = td_agent::config::Template {
+        network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
             remote: remote.into(),

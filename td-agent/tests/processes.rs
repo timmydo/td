@@ -290,6 +290,7 @@ fn a_conversation_restoring_a_step_is_kept_until_it_is_done() {
 /// A repository workspace's record, as the window makes it.
 fn repositories(id: &Id, base: &Path) -> Workspace {
     let template = td_agent::config::Template {
+        network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
             remote: "https://example.org/a/td".into(),
@@ -556,6 +557,7 @@ fn a_prepared_repository_follows_its_bases_and_says_a_failure_once() {
         "https://example.org/a/docs".to_string(),
     );
     let template = td_agent::config::Template {
+        network: None,
         name: "td".into(),
         repos: [&one, &two]
             .iter()

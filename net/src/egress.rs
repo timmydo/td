@@ -310,7 +310,18 @@ fn parse_host(text: &str) -> Result<Host, String> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
     };
-    if name.is_empty() || name.len() > 253 || !name.split('.').all(label_ok) {
+    // A last label that is a number, decimal or `0x` hexadecimal, makes
+    // the resolver read the name as an address (`10.1`, `0x7f.1`); td-agent's
+    // `config::dns_or_v4` holds the same rule.
+    let numeric = name.rsplit('.').next().is_some_and(|last| {
+        let hex = last
+            .get(..2)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("0x"))
+            .and_then(|_| last.get(2..));
+        last.bytes().all(|b| b.is_ascii_digit())
+            || hex.is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
+    });
+    if name.is_empty() || name.len() > 253 || !name.split('.').all(label_ok) || numeric {
         return Err(format!("{text:?} is not a host"));
     }
     Ok(Host::Name(name.to_ascii_lowercase()))
@@ -1106,6 +1117,11 @@ mod tests {
             &[PROTOCOL, "connect a/b 443"],
             &[PROTOCOL, "connect [1.1.1.1] 443"],
             &[PROTOCOL, "connect [::1 443"],
+            &[PROTOCOL, "connect 10.1 443"],
+            &[PROTOCOL, "connect 2130706433 443"],
+            &[PROTOCOL, "connect 0x7f.1 443"],
+            &[PROTOCOL, "connect a.0X7F 443"],
+            &[PROTOCOL, "connect 192.0.2.010 443"],
             &[PROTOCOL, "get h 443"],
         ] {
             assert!(head(bad).is_err(), "{bad:?}");

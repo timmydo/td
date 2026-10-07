@@ -10192,7 +10192,9 @@ webpki-roots, and no decoder. So:
    for td-agent. Its protocol is one request per connection, a
    `td-egress 1` line and either `probe` or `connect HOST PORT`, a host
    being an IPv4 address, an IPv6 address bare or in brackets, or a DNS
-   name of letters, digits and hyphens, and a port one to five digits;
+   name of letters, digits and hyphens whose last label is not a number,
+   decimal or `0x` hexadecimal (the resolver would read `10.1` or
+   `0x7f.1` as an address), and a port one to five digits;
    the answer is `ok` or `error malformed|refused|transport: why`. After
    `ok` the connection carries the destination's bytes both ways until
    either side ends or fails, five minutes pass with no byte moved

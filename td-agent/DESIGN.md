@@ -872,8 +872,10 @@ conversation uses it from now on.
 fixed width: the state, `C-r asks again` while a turn may be asked
 again, `no key: F10`, a count of the notes not yet read (`2 new
 messages: C-S-m`), `workspace: C-S-w` for a repository workspace (§7,
-As built (increment 11, the workspace card)), the model and effort,
-the context, the cost, today and the credit, the mode, `no limits` and `0 background`. A note, which
+As built (increment 11, the workspace card)), the mode and the network
+policy (§10), first so a narrow row never cuts them off, the model and
+effort, the context, the cost, today and the credit, `no limits` and
+`0 background`. A note, which
 the row used to show cut to fit (a refusal said by name, a step done, a
 background conversation's notice under its title), goes to a log of the
 last 500, each with the time it came and kept whole up to 16 KiB, a
@@ -3634,6 +3636,23 @@ with a destination-carrying sibling. It sees only ciphertext for TLS
 destinations, so policy is by host name, as in Claude Code's and Codex's
 proxies, and a host that fronts other domains is a residual risk.
 
+As built (the policy): `config::Network` and `config::Destination`.
+`network` is `off` or `allowlist`; `open` there is refused, being a
+template's or a card's. `network_allowlist` is at most 256 hosts, each
+a DNS name (lower-cased, a trailing dot dropped, its last label not a
+number, decimal or `0x` hexadecimal, as the relay's hosts are, APPLICATIONS.md
+§W.8 item 6) or an IPv4 address or an IPv6 one in brackets, with an
+optional port of one to five digits, each once; no wildcard. A template's `network` is any of the three.
+The window hands both keys and each template's own policy to every
+conversation in the setup frame, beside the shared directories, and
+`Client::network_for` gives a workspace its policy as `shared_for`
+gives its directories: its template's, else `network`, and `off` when
+its template is no longer configured, so removing or renaming one
+never widens what its conversations reach. A template made in the
+window names no policy of its own. The status row's `network` item
+says the open conversation's workspace's, `off` for a conversation with
+no workspace, and `network`'s with none open.
+
 As built (the relay): `td-egressd` (net/src/egress.rs) and
 APPLICATIONS.md §W.8 item 6, which states its protocol, deadlines and
 predicate. `td-net launch` serves it for td-agent alone, at
@@ -5193,8 +5212,8 @@ default; `jev_threshold`'s is calibrated (§11):
     cone-mode paths to check out, absent for the whole tree (§7);
   - `shared`: as the top-level `shared`, in place of it for this
     template's workspaces; absent, the top-level list;
-  - `network` (later, with increment 15): `off`, `allowlist` or `open`
-    for this template's workspaces; absent, the top-level `network`
+  - `network`: `off`, `allowlist` or `open` for this template's
+    workspaces; absent, the top-level `network`
 - `remotes`: the admitted git remotes (§7), each a remote's URL, a local
   repository's absolute path, or a host with a path prefix; default
   empty, so the first workspace on a remote asks; what a card admits is
@@ -5281,9 +5300,8 @@ there are at most 64 templates. Each of `repos` has a `remote`, a
 character, and an optional `sparse` list of paths, each relative, with
 no `..` and no control character; increment 11 prepares them.
 `shared` is checked as the top-level key is, its errors naming
-`template.shared`. `network` is accepted
-with a note that increment 15 reads it, and any other key is refused
-by name.
+`template.shared`. `network` is `off`, `allowlist` or `open`, and any
+other key is refused by name.
 
 ## 16. Prior art: opencode
 
@@ -5972,7 +5990,7 @@ build costs every td-agent native run a second build of the crate, in a
 target directory of its own, its library tests and its strict Clippy.
 
 **As built (templates).** `src/config.rs` covers templates read in
-order, their own shared lists, an empty one included, `network`'s note,
+order, their own shared lists, an empty one included, `network`,
 and each refusal (no name, an empty, padded, control-bearing or
 invisible one, a built-in's, a duplicate in any case, an unknown key,
 `repos` that is no list or lacks a field, a `sparse` that is no list,

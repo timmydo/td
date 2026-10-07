@@ -799,7 +799,7 @@ impl Session {
         self.keep_templates(next)?;
         Ok(match replacing {
             Some(old) if old != template.name => format!(
-                "the template {old:?} is now {:?}; workspaces made from it are kept, and bind the shared directories no more",
+                "the template {old:?} is now {:?}; workspaces made from it are kept, and bind the shared directories and reach the network no more",
                 template.name
             ),
             Some(_) => format!("the template {:?} is saved", template.name),
@@ -816,7 +816,7 @@ impl Session {
         let next = saved.iter().filter(|t| t.name != name).cloned().collect();
         self.keep_templates(next)?;
         Ok(format!(
-            "the template {name:?} is removed; workspaces made from it are kept, and bind the shared directories no more"
+            "the template {name:?} is removed; workspaces made from it are kept, and bind the shared directories and reach the network no more"
         ))
     }
 
@@ -830,7 +830,7 @@ impl Session {
             template_shared(&client.template_shared, &self.configured, &templates);
         if client.to_json().to_string().len() > SETUP_CLIENT_BYTES {
             return Err(
-                "the templates' shared directories would be too many to hand to conversations"
+                "the templates' shared directories and network policies would be too many to hand to conversations"
                     .into(),
             );
         }
@@ -845,6 +845,7 @@ impl Session {
         self.saved = Ok(saved);
         self.app
             .set_saved_templates(self.saved.as_deref().unwrap_or_default().to_vec());
+        self.app.set_networks(&client);
         self.client = client;
         self.supervisor.reconfigure(self.client.clone());
         Ok(())
@@ -2286,6 +2287,7 @@ pub fn run(
                 client.template_shared.push(TemplateShared {
                     name: template.name.clone(),
                     shared,
+                    network: template.network,
                 });
             }
             for note in &notes {
@@ -2305,7 +2307,7 @@ pub fn run(
             // workspaces bind none, rather than no process starting.
             if client.to_json().to_string().len() > SETUP_CLIENT_BYTES {
                 client.template_shared.clear();
-                let note = "the templates' shared directories are too many to hand to conversations; their workspaces bind none";
+                let note = "the templates' shared directories and network policies are too many to hand to conversations; their workspaces bind none and reach no network";
                 eprintln!("td-agent: {note}");
                 app.note(note);
             }
@@ -2315,6 +2317,7 @@ pub fn run(
             app.set_no_workspaces(Some(why.clone()));
         }
     }
+    app.set_networks(&client);
     app.set_templates(
         templates
             .iter()
@@ -2533,6 +2536,7 @@ fn template_shared(
             .map(|template| TemplateShared {
                 name: template.name.clone(),
                 shared: None,
+                network: template.network,
             }),
     );
     shared
@@ -2818,6 +2822,7 @@ mod tests {
     fn a_template_saved_in_the_window_is_named_once_and_shares_the_top_level() {
         let repo = crate::config::checked_repo("/srv/td", "main", "a", None).unwrap();
         let template = |name: &str| crate::config::Template {
+            network: None,
             name: name.into(),
             repos: vec![repo.clone()],
             shared: None,
@@ -2862,10 +2867,12 @@ mod tests {
             TemplateShared {
                 name: "td".into(),
                 shared: own.clone(),
+                network: None,
             },
             TemplateShared {
                 name: "notes".into(),
                 shared: None,
+                network: None,
             },
         ];
         let listed = [template("td"), template("mail")];
@@ -2882,6 +2889,7 @@ mod tests {
     #[test]
     fn templates_made_in_the_window_follow_the_configurations() {
         let template = |name: &str| crate::config::Template {
+            network: None,
             name: name.into(),
             repos: Vec::new(),
             shared: None,
@@ -2944,6 +2952,7 @@ mod tests {
             template_shared: vec![crate::config::TemplateShared {
                 name: "t".into(),
                 shared: Some(vec![shared(repo.join("refs"))]),
+                network: None,
             }],
             ..Client::default()
         };
@@ -2957,6 +2966,7 @@ mod tests {
     #[test]
     fn a_conversation_asks_only_what_its_record_names() {
         let template = crate::config::Template {
+            network: None,
             name: "td".into(),
             repos: ["main", "next"]
                 .iter()
