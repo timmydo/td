@@ -991,22 +991,51 @@ crash/fault and combined-owner measurements are required before packaging an
 activated persistence service. Host SQLite tests are not target evidence.
 
 The mail Rust/native/RSS executables also accept --sqlite-body. This scenario
-is registered in the isolated runtime, but its native compilation and
-thresholds remain pending and unqualified until that build and runtime pass.
+is registered in the isolated runtime and passed the isolated qualification
+recorded below.
 It generates an exact 32 MiB body in 64 KiB chunks, commits it, verifies
 bytes/digest, reopens, rejects a short source and an oversized source, and
 successfully reuses the rolled-back ID. Eight ordered observations bracket
 opening, midpoint streaming, commit, verification, reopen, rejection and
 teardown. No whole-message allocation enters the source or oracle.
 
-The unqualified acceptance thresholds require a Rust requested-byte
+The acceptance thresholds require a Rust requested-byte
 high-water increase of at most 2 MiB and teardown return to its warmed
 baseline. They require wrapped native requested-byte growth of at most
 17 MiB (SQLite's 16 MiB shared heap plus 1 MiB C runtime allowance), positive
 allocation evidence and exact warmed byte/block return. Unwrapped RSS
 samples at those eight points must grow by at most 24 MiB. These are test
-requirements, not measurements established by adding the probes. RSS samples
+requirements; adding the probes alone establishes no measurement. RSS samples
 do not establish a transient peak; native counters observe
 wrapped allocation lifetime high-water separately. Host native builds remain
 UNQUALIFIED; only the isolated static-musl wrappers can qualify their native
 observations. Guarded stack and combined-service workload remain separate.
+
+
+The isolated x86-64 musl release qualification on 2026-10-07, using the
+pinned Rust 1.96.0 kit and declared GNU tools on Linux 7.0.14, passed the
+complete portable command including all eight artifact checks, API confinement
+and clean-runtime cases. The 32 MiB body observations were:
+
+| Observer | Warm baseline | Lifetime requested peak / maximum RSS sample | After teardown |
+| --- | ---: | ---: | ---: |
+| Rust requested bytes | 512 | 197926 | 512 |
+| Wrapped C boundary requested bytes | 1296 (4 blocks) | 1060262 | 1296 (4 blocks) |
+| Unwrapped RSS, KiB | 3364 | 4696 | 3504 |
+
+Both allocation domains returned exactly to their warmed live baseline.
+The C boundary includes allocator calls reached through the wrapped runtime;
+it is not a SQLite-only attribution. The eight RSS samples do not establish
+a transient peak. This run used the 2 MiB individual SQLite allocation cap
+and does not qualify maximum-WAL checkpointing, guarded native stack,
+filesystem fault recovery, backup or combined-service overlap.
+
+The published artifact NAR was
+`5fcb5ac60b44923eaa33a850aa6a86c82fab9544c82c13f93d15cec65bccd3f1`;
+its BUILD-INPUTS records staged source NAR
+`78b88ceb0dfb8dd4db99e22ed0bc13cea6bd5a367b4c63d90b8baeecd5e0ec58`
+and vendor NAR
+`d122b8e7843f7da35cfb1f393dd0d8aea43ef534e9f5cffddc77a095fe971916`.
+The original runtime driver stopped after Rust evidence because the paired
+probes reused a create-new log name. The successful run used separate Rust
+and native command logs; it did not reuse a partially successful runtime.

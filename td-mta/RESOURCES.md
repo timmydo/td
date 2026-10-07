@@ -2617,9 +2617,11 @@ SQLite setup and query calls may allocate Rust/native memory and are excluded
 from pure MIME zero-allocation claims. MIME fixtures prepare a real verified
 snapshot body pin cold; their existing intervals measure parser/adapter work
 and retained ownership, not SQL read allocations. The separate --sqlite-body
-probes define the explicit maximum-body acceptance scenario. Their isolated
-native thresholds remain pending and unqualified until that build and runtime
-actually pass. Combined service overlap, guarded native stack and complete
+probes define the explicit maximum-body acceptance scenario. The isolated
+x86-64 musl release run passed its Rust/native allocation and sampled RSS
+thresholds; td-crypto/PORTABLE.md records the exact artifact and measurements.
+This qualifies that bounded body scenario only. Combined service overlap,
+guarded native stack and complete
 fault qualification remain activation requirements. The resource ledger is
 planning, not measured combined-process usage or proof of durability.
 
