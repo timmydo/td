@@ -52,12 +52,16 @@ const STALL: &[&str] = &[
     "core.sshCommand=ssh -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=4",
 ];
 
-/// A transport td-agent admits: never `file`, a local path, `ext`,
-/// `git` or plain `http`.
+/// A transport td-agent admits: https, ssh, or a local repository named
+/// by its absolute path, fetched and pushed over git's file transport;
+/// never `ext`, `git`, plain `http` or a relative path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Transport {
     Https,
     Ssh,
+    /// A repository on this machine (DESIGN.md §7, Admitted remotes),
+    /// its path in `segments` and no host.
+    Local,
 }
 
 /// A git remote as td-agent records it, parsed and checked.
@@ -75,10 +79,6 @@ pub struct Remote {
     /// Written scp-like with a path relative to the login's home, which
     /// an `ssh://` URL cannot spell; git is given that form back.
     pub relative: bool,
-    /// A test's local repository, fetched over the file transport that
-    /// only tests admit.
-    #[cfg(test)]
-    pub local: Option<PathBuf>,
 }
 
 impl Remote {
@@ -94,23 +94,40 @@ impl Remote {
         if text.chars().any(|c| c.is_control() || c.is_whitespace()) {
             return Err(refuse("holds a space or a control character"));
         }
+        // A local repository: its absolute path, plain or as a `file://`
+        // URL with no host.
+        let local = match strip_scheme(text, "file://") {
+            Some(rest) if rest.starts_with('/') => Some(rest),
+            Some(_) => return Err(refuse("names a host or no absolute path after file://")),
+            None => text.starts_with('/').then_some(text),
+        };
+        if let Some(path) = local {
+            return Ok(Self {
+                transport: Transport::Local,
+                user: None,
+                host: String::new(),
+                port: None,
+                segments: segments(path).map_err(|why| refuse(&why))?,
+                relative: false,
+            });
+        }
         let (transport, rest, scp) = if let Some(rest) = strip_scheme(text, "https://") {
             (Transport::Https, rest, false)
         } else if let Some(rest) = strip_scheme(text, "ssh://") {
             (Transport::Ssh, rest, false)
         } else if text.contains("://") || text.starts_with("ext::") {
             return Err(refuse(
-                "is not https or ssh: td-agent admits no other transport",
+                "is not https, ssh or a local repository: td-agent admits no other transport",
             ));
         } else {
-            // scp-like: a colon before any slash; a local path has none.
+            // scp-like: a colon before any slash; a relative path has none.
             match text.split_once(':') {
                 Some((before, _)) if !before.is_empty() && !before.contains('/') => {
                     (Transport::Ssh, text, true)
                 }
                 _ => {
                     return Err(refuse(
-                        "is a local path: td-agent admits only https and ssh remotes",
+                        "is a relative path: a local repository is named by its absolute path",
                     ))
                 }
             }
@@ -177,19 +194,19 @@ impl Remote {
             port,
             segments,
             relative,
-            #[cfg(test)]
-            local: None,
         })
+    }
+
+    /// A local repository's path; none for a remote on another host.
+    pub fn local_path(&self) -> Option<PathBuf> {
+        (self.transport == Transport::Local).then(|| Path::new("/").join(self.segments.join("/")))
     }
 
     /// The URL git is given: always this record, never a file a jail can
     /// write.
     pub fn url(&self) -> String {
-        #[cfg(test)]
-        if let Some(local) = &self.local {
-            return format!("file://{}", local.display());
-        }
         let (scheme, user) = match self.transport {
+            Transport::Local => return format!("file:///{}", self.segments.join("/")),
             Transport::Https => ("https", String::new()),
             Transport::Ssh => (
                 "ssh",
@@ -211,9 +228,14 @@ impl Remote {
         )
     }
 
-    /// The path compared for admission: its segments, a final `.git` off.
+    /// The path compared for admission: its segments, a final `.git` off
+    /// but for a local repository's, where `td` and `td.git` are two
+    /// directories.
     fn key(&self) -> Vec<&str> {
         let mut key: Vec<&str> = self.segments.iter().map(String::as_str).collect();
+        if self.transport == Transport::Local {
+            return key;
+        }
         if let Some(last) = key.last_mut() {
             *last = last.strip_suffix(".git").unwrap_or(last);
         }
@@ -224,7 +246,11 @@ impl Remote {
     /// file name, then a digest of the whole record, so that two remotes
     /// never share a store.
     pub fn store_name(&self) -> String {
-        let mut name: String = std::iter::once(self.host.as_str())
+        let host = match self.transport {
+            Transport::Local => "local",
+            Transport::Https | Transport::Ssh => self.host.as_str(),
+        };
+        let mut name: String = std::iter::once(host)
             .chain(self.key())
             .collect::<Vec<_>>()
             .join("-")
@@ -324,7 +350,9 @@ impl Admission {
             && text
                 .split_once(':')
                 .is_some_and(|(before, _)| !before.contains('/'));
-        if scheme || scp {
+        // A local repository is admitted by its path alone, never a
+        // prefix.
+        if scheme || scp || text.starts_with('/') {
             return Remote::parse(text).map(Self::Exact);
         }
         let (host, path) = text.split_once('/').unwrap_or((text, ""));
@@ -361,7 +389,8 @@ impl Admission {
             }
             Self::Prefix { host, segments } => {
                 let key = remote.key();
-                *host == remote.host
+                remote.transport != Transport::Local
+                    && *host == remote.host
                     && segments.len() <= key.len()
                     && segments.iter().zip(&key).all(|(a, b)| a == b)
             }
@@ -406,9 +435,6 @@ pub struct Worker {
     hooks: PathBuf,
     /// What an outside git keeps of td-agent's environment.
     env: Vec<(String, OsString)>,
-    /// Tests fetch from local repositories, which no product build does.
-    #[cfg(test)]
-    file: bool,
 }
 
 impl Worker {
@@ -441,13 +467,7 @@ impl Worker {
             .cloned()
             .collect();
         let config = dir.join("gitconfig");
-        let worker = Self {
-            config,
-            hooks,
-            env,
-            #[cfg(test)]
-            file: false,
-        };
+        let worker = Self { config, hooks, env };
         worker.copy_identity()?;
         Ok(worker)
     }
@@ -547,8 +567,14 @@ impl Worker {
         {
             command.arg("-c").arg(setting);
         }
-        #[cfg(test)]
-        if self.file {
+        command
+    }
+
+    /// `command` for git that reaches `remote`: the file transport allowed
+    /// for a local repository's alone, so no other URL can use it.
+    fn over(&self, git_dir: &Path, remote: &Remote) -> Command {
+        let mut command = self.command(git_dir);
+        if remote.transport == Transport::Local {
             command.args(["-c", "protocol.file.allow=always"]);
         }
         command
@@ -639,7 +665,7 @@ impl Worker {
     /// Fetches every branch of `remote` into its store, pruning the ones
     /// gone: the only place objects are downloaded.
     pub fn fetch(&self, store: &Path, remote: &Remote) -> Result<(), String> {
-        let mut fetch = self.command(store);
+        let mut fetch = self.over(store, remote);
         fetch
             .args([
                 "fetch",
@@ -2206,7 +2232,7 @@ impl Worker {
         if peeled.ok().as_deref() != Some(push.id.as_str()) {
             return Err(format!("{} is not a commit to push", push.id));
         }
-        let mut command = self.command(publish);
+        let mut command = self.over(publish, remote);
         command.args([
             "push",
             "--porcelain",
@@ -2531,14 +2557,29 @@ pub(crate) mod tests {
         );
         let ssh = Remote::parse("ssh://git@example.org:2222/srv/repo").unwrap();
         assert_eq!(ssh.url(), "ssh://git@example.org:2222/srv/repo");
+        // A local repository, by its path or a `file://` URL, recorded as
+        // the URL, which reads back as itself.
+        let local = Remote::parse("/srv/git/td").unwrap();
+        assert_eq!(local.transport, Transport::Local);
+        assert_eq!(local.url(), "file:///srv/git/td");
+        assert_eq!(Remote::parse("FILE:///srv/git/td/").unwrap(), local);
+        assert_eq!(Remote::parse(&local.url()).unwrap(), local);
+        assert!(local.store_name().starts_with("local-srv-git-td-"));
+        assert_eq!(local.local_path(), Some(PathBuf::from("/srv/git/td")));
+        assert_eq!(ssh.local_path(), None);
         for (text, why) in [
-            ("http://github.com/a/b", "not https or ssh"),
-            ("git://github.com/a/b", "not https or ssh"),
-            ("file:///srv/a", "not https or ssh"),
+            ("http://github.com/a/b", "no other transport"),
+            ("git://github.com/a/b", "no other transport"),
+            ("file://host/srv/a", "names a host"),
+            ("file:///srv/../a", "segment"),
+            ("/srv/./a", "segment"),
+            ("/srv//a", "segment"),
+            ("/srv/a b", "space"),
+            ("/", "no path"),
             ("ext::sh -c x", "space"),
-            ("ext::x", "not https or ssh"),
-            ("/srv/repo.git", "local path"),
-            ("../repo", "local path"),
+            ("ext::x", "not https, ssh or a local repository"),
+            ("../repo", "relative path"),
+            ("repo", "relative path"),
             ("https://user:pw@github.com/a/b", "credentials"),
             ("ssh://-oProxyCommand=x@h/a", "user"),
             ("ssh://h/-x", "option-like"),
@@ -2577,6 +2618,16 @@ pub(crate) mod tests {
         let host = Admission::parse("example.org").unwrap();
         assert!(host.admits(&remote("https://example.org/any/thing")));
         assert!(Admission::parse("github.com/../x").is_err());
+        // A local repository is admitted by its own path: never by a
+        // prefix, nor another directory's, `td.git` beside `td`.
+        let local = Remote::parse("/srv/git/td").unwrap();
+        assert!(Admission::parse("/srv/git/td").unwrap().admits(&local));
+        assert!(Admission::parse("file:///srv/git/td")
+            .unwrap()
+            .admits(&local));
+        assert!(!Admission::parse("/srv/git/td.git").unwrap().admits(&local));
+        assert!(!Admission::parse("/srv/git").unwrap().admits(&local));
+        assert!(!Admission::parse("local/srv").unwrap().admits(&local));
         assert!(Admission::parse("http://github.com/a").is_err());
         // Two remotes never share a store.
         let a = remote("https://github.com/timmydo/td").store_name();
@@ -2621,12 +2672,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// A local remote: file transport, admitted only in tests.
+    /// The local repository at `dir` as a remote.
     fn local(dir: &Path) -> Remote {
-        Remote {
-            local: Some(dir.to_path_buf()),
-            ..Remote::parse("https://local/up").unwrap()
-        }
+        Remote::parse(dir.to_str().unwrap()).unwrap()
     }
 
     /// The output of git run in `dir`.
@@ -2666,8 +2714,7 @@ pub(crate) mod tests {
         std::fs::write(&told, "#!/bin/sh\necho the remote took it >&2\n").unwrap();
         std::fs::set_permissions(&told, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
-        let mut worker = Worker::new(&root.join("worker"), &kept_env()).unwrap();
-        worker.file = true;
+        let worker = Worker::new(&root.join("worker"), &kept_env()).unwrap();
         let remote = local(&up);
         let stores = root.join("store");
         let store = worker.store(&stores, &remote).unwrap();
@@ -2891,7 +2938,7 @@ pub(crate) mod tests {
             "GIT_CONFIG_PARAMETERS".into(),
             "'core.hooksPath'='/evil'".into(),
         ));
-        let mut worker = Worker::new(&root.join("worker"), &env).unwrap();
+        let worker = Worker::new(&root.join("worker"), &env).unwrap();
         let copied = std::fs::read_to_string(root.join("worker/gitconfig")).unwrap();
         assert!(
             copied.contains("name = Human") && copied.contains("helper = store"),
@@ -2913,10 +2960,25 @@ pub(crate) mod tests {
         let remote = local(&up);
         let stores = root.join("store");
         let store = worker.store(&stores, &remote).unwrap();
-        // Without the test's file transport, a local remote is refused.
-        let refused = worker.fetch(&store, &remote).unwrap_err();
+        // The file transport is a local repository's alone: git as it runs
+        // for any other remote refuses it.
+        let mut plain = worker.command(&store);
+        plain
+            .args(["fetch", "--quiet", "--end-of-options"])
+            .arg(remote.url())
+            .arg("+refs/heads/*:refs/heads/*");
+        let refused = run(&mut plain, 64 * 1024, LOCAL_TIME)
+            .unwrap_err()
+            .to_string();
         assert!(refused.contains("not allowed"), "{refused}");
-        worker.file = true;
+        let allows = |command: &Command| {
+            command
+                .get_args()
+                .any(|arg| arg.to_str().is_some_and(|a| a.starts_with("protocol.file")))
+        };
+        let https = Remote::parse("https://example.org/a/td").unwrap();
+        assert!(!allows(&worker.over(&store, &https)));
+        assert!(allows(&worker.over(&store, &remote)));
         // The store's own hooks never run: a fetch updates references.
         let hook = store.join("hooks/reference-transaction");
         let ran = root.join("hook-ran");
@@ -2996,10 +3058,7 @@ pub(crate) mod tests {
         // when it records another remote, as a collided name would.
         assert_eq!(worker.store(&stores, &remote).unwrap(), store);
         // A store whose `init` never ran, as after a crash, is finished.
-        let other = Remote {
-            local: Some(up.clone()),
-            ..Remote::parse("https://local/up.git").unwrap()
-        };
+        let other = local(&up.with_extension("git"));
         let other_store = worker.store(&stores, &other).unwrap();
         assert_ne!(other_store, store, "`.git` names another repository");
         std::fs::remove_file(other_store.join("HEAD")).unwrap();

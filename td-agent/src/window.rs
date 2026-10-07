@@ -764,6 +764,10 @@ impl Session {
                         self.remotes.push(admission);
                     }
                 }
+                // No workspace made from now on reaches a local one.
+                if let Ok(places) = &mut self.places {
+                    places.locals = local_paths(&self.remotes);
+                }
                 self.start_from(name);
             }
             Err(why) => self
@@ -1207,7 +1211,19 @@ impl Session {
                 "the remote {remote} is not admitted: admit it on a template's card, or list it in `remotes` in the configuration"
             ));
         }
+        self.local(&parsed)?;
         Ok(parsed)
+    }
+
+    /// Where a workspace reaches (`reached`).
+    fn reached(&self) -> Vec<PathBuf> {
+        reached(&self.state.list().0, &self.client)
+    }
+
+    /// Whether `remote` may be fetched or pushed where it lies
+    /// (`local_remote`), checked at every fetch and push.
+    fn local(&self, remote: &crate::git::Remote) -> Result<(), String> {
+        local_remote(remote, &self.places, &self.reached())
     }
 
     /// The store thread's answers: a preparation's to the conversation
@@ -1407,12 +1423,22 @@ impl Session {
             return;
         }
         self.next_refresh = now.checked_add(self.fetch_interval).unwrap_or(now);
-        let Some(stores) = &self.stores else {
+        if self.stores.is_none() {
             return;
-        };
+        }
         let (metas, _) = self.state.list();
         for (remote, bases) in crate::upstream::in_use(&metas, &self.remotes, &self.refreshing) {
             let url = remote.url();
+            // Said once while it stands, not at every interval.
+            let refused = self.local(&remote).err();
+            let skip = refused.is_some();
+            self.trouble(
+                format!("local {url}"),
+                refused.map(|why| format!("not fetching in the background: {why}")),
+            );
+            let Some(stores) = self.stores.as_ref().filter(|_| !skip) else {
+                continue;
+            };
             match stores.refresh(remote, bases) {
                 Ok(()) => self.refreshing.push(url),
                 Err(e) => eprintln!("td-agent: fetching {url} in the background: {e}"),
@@ -1768,26 +1794,8 @@ impl Session {
                 .note("no diagnostics: HOME is not an absolute path to write them under");
         };
         let downloads = home.join("Downloads");
-        // Not where a workspace reaches: a shared directory, or a
-        // conversation's own directory.
-        let directories: Vec<PathBuf> = self
-            .state
-            .list()
-            .0
-            .into_iter()
-            .filter_map(|meta| match meta.workspace {
-                Some(Workspace::Directory(path)) => Some(path),
-                _ => None,
-            })
-            .chain(self.client.shared.iter().map(|shared| shared.path.clone()))
-            .chain(
-                self.client
-                    .template_shared
-                    .iter()
-                    .flat_map(|template| template.shared.iter().flatten())
-                    .map(|shared| shared.path.clone()),
-            )
-            .collect();
+        // Not where a workspace reaches.
+        let directories = self.reached();
         let shared = std::fs::canonicalize(&downloads).is_ok_and(|real| {
             directories
                 .iter()
@@ -2100,10 +2108,35 @@ pub fn run(
         app.note(format!("the store: {problem}"));
     }
     app.set_rows(rows);
+    let mut remotes = config.remotes.clone();
+    match state.load_admitted().and_then(|urls| {
+        urls.iter()
+            .map(|url| crate::git::Admission::parse(url))
+            .collect::<Result<Vec<_>, _>>()
+    }) {
+        Ok(admitted) => remotes.extend(admitted),
+        Err(e) => {
+            let said = match state.set_admitted_aside() {
+                Ok(to) => format!(
+                    "the remotes admitted on cards are set aside, as {}, and none of them is admitted: {e}",
+                    to.display()
+                ),
+                Err(moved) => format!(
+                    "the remotes admitted on cards are not admitted, and no card can admit until the file is mended: {e}; {moved}"
+                ),
+            };
+            eprintln!("td-agent: {said}");
+            app.note(said);
+        }
+    }
     let mut client = config.client.clone();
     // Workspaces, and the shared directories each gets, admitted once
-    // here; without the jail there are none, and asking says why.
-    let places = places(&config, &state);
+    // here; without the jail there are none, and asking says why. No
+    // workspace may reach an admitted local repository.
+    let places = places(&config, &state).map(|places| crate::workspace::Places {
+        locals: local_paths(&remotes),
+        ..places
+    });
     match &places {
         Ok(places) => {
             let (shared, mut notes) = workspace::admit_shared(&config.shared(&places.home), places);
@@ -2197,27 +2230,6 @@ pub fn run(
         }
     };
     let ledger = Ledger::load(Some(state.root()), client.limits.day, store::now());
-    let mut remotes = config.remotes.clone();
-    match state.load_admitted().and_then(|urls| {
-        urls.iter()
-            .map(|url| crate::git::Admission::parse(url))
-            .collect::<Result<Vec<_>, _>>()
-    }) {
-        Ok(admitted) => remotes.extend(admitted),
-        Err(e) => {
-            let said = match state.set_admitted_aside() {
-                Ok(to) => format!(
-                    "the remotes admitted on cards are set aside, as {}, and none of them is admitted: {e}",
-                    to.display()
-                ),
-                Err(moved) => format!(
-                    "the remotes admitted on cards are not admitted, and no card can admit until the file is mended: {e}; {moved}"
-                ),
-            };
-            eprintln!("td-agent: {said}");
-            app.note(said);
-        }
-    }
     let (outbox, problems) = Outbox::load(&state);
     for problem in &problems {
         eprintln!("td-agent: the outbox: {problem}");
@@ -2294,6 +2306,53 @@ pub fn run(
         std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
     );
     td_ui::window::run(&mut session, stream, std::env::temp_dir(), typeface)
+}
+
+/// The local repositories `remotes` admit, each by its path.
+fn local_paths(remotes: &[crate::git::Admission]) -> Vec<PathBuf> {
+    remotes
+        .iter()
+        .filter_map(|admission| match admission {
+            crate::git::Admission::Exact(remote) => remote.local_path(),
+            crate::git::Admission::Prefix { .. } => None,
+        })
+        .collect()
+}
+
+/// Where a workspace reaches: a conversation's own directory, or a
+/// shared directory, the top level's or a template's.
+fn reached(metas: &[crate::store::Meta], client: &Client) -> Vec<PathBuf> {
+    metas
+        .iter()
+        .filter_map(|meta| match &meta.workspace {
+            Some(Workspace::Directory(path)) => Some(path.clone()),
+            _ => None,
+        })
+        .chain(client.shared.iter().map(|shared| shared.path.clone()))
+        .chain(
+            client
+                .template_shared
+                .iter()
+                .flat_map(|template| template.shared.iter().flatten())
+                .map(|shared| shared.path.clone()),
+        )
+        .collect()
+}
+
+/// Whether `remote`, when a local repository, lies where no jail reaches
+/// (DESIGN.md §7, Admitted remotes): none of `places`, nor overlapping
+/// any of `reached`; a remote on another host always may be.
+fn local_remote(
+    remote: &crate::git::Remote,
+    places: &Result<Places, String>,
+    reached: &[PathBuf],
+) -> Result<(), String> {
+    let Some(path) = remote.local_path() else {
+        return Ok(());
+    };
+    let places = places.as_ref().map_err(Clone::clone)?;
+    crate::workspace::local_repository(&path, places, reached)
+        .map_err(|why| format!("the local repository {}: {why}", path.display()))
 }
 
 /// Adds `bodies`, as allows or denies, to the human's rules for
@@ -2406,11 +2465,12 @@ fn remember_crossing(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
-        as_staged, default_model, ended_pushes, forget_rules, held, names, pushing_entry,
-        refetched, remember, remember_crossing, set_mode,
+        as_staged, default_model, ended_pushes, forget_rules, held, local_remote, names,
+        pushing_entry, reached, refetched, remember, remember_crossing, set_mode, Client,
     };
     use crate::protocol::Down;
     use crate::workspace::Workspace;
+    use std::path::PathBuf;
 
     /// A card's "always" answer adds its rules under the conversation's
     /// workspace's header, or every workspace's, and says what it added;
@@ -2515,6 +2575,64 @@ mod tests {
         assert!(remember(&state, &id, false, true, &bodies).is_err());
         assert!(forget_rules(&state, Some("workspace td-1-ab"), &id).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[x]\n");
+    }
+
+    /// A local remote is fetched and pushed only where no workspace
+    /// reaches: a directory workspace or a shared directory, the top
+    /// level's or a template's, over it refuses it, as no places do; a
+    /// remote on another host is never asked.
+    #[test]
+    fn a_local_remote_lies_where_no_workspace_reaches() {
+        let scratch = crate::store::tests::Scratch::new("local-remote");
+        let root = std::fs::canonicalize(scratch.state().root()).unwrap();
+        let repo = root.join("srv/td.git");
+        for dir in ["objects", "refs"] {
+            std::fs::create_dir_all(repo.join(dir)).unwrap();
+        }
+        std::fs::write(repo.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let remote = crate::git::Remote::parse(repo.to_str().unwrap()).unwrap();
+        let places: Result<crate::workspace::Places, String> = Ok(crate::workspace::Places {
+            home: root.join("home"),
+            state: root.join("state"),
+            root: root.join("home/td-agent"),
+            ..crate::workspace::Places::default()
+        });
+        let client = Client::default();
+        local_remote(&remote, &places, &reached(&[], &client)).unwrap();
+        let meta = crate::store::Meta {
+            id: crate::store::Id::random().unwrap(),
+            role: crate::store::Role::Conversation,
+            title: String::new(),
+            created: 0,
+            paused: false,
+            model: None,
+            effort: None,
+            workspace: Some(Workspace::Directory(root.join("srv"))),
+            archived: false,
+            prepared: Vec::new(),
+            removed: false,
+            tracked: Vec::new(),
+        };
+        let e = local_remote(&remote, &places, &reached(&[meta], &client)).unwrap_err();
+        assert!(e.contains("overlaps"), "{e}");
+        let shared = |path: PathBuf| crate::workspace::Shared { path, write: false };
+        let top = Client {
+            shared: vec![shared(root.join("srv"))],
+            ..Client::default()
+        };
+        assert!(local_remote(&remote, &places, &reached(&[], &top)).is_err());
+        let templated = Client {
+            template_shared: vec![crate::config::TemplateShared {
+                name: "t".into(),
+                shared: Some(vec![shared(repo.join("refs"))]),
+            }],
+            ..Client::default()
+        };
+        assert!(local_remote(&remote, &places, &reached(&[], &templated)).is_err());
+        let none: Result<crate::workspace::Places, String> = Err("no places".into());
+        assert!(local_remote(&remote, &none, &[]).is_err());
+        let https = crate::git::Remote::parse("https://example.org/a/td").unwrap();
+        local_remote(&https, &none, std::slice::from_ref(&root)).unwrap();
     }
 
     #[test]

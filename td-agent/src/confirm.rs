@@ -375,18 +375,8 @@ impl Confirm {
         remotes: Vec<String>,
         revision: u64,
     ) -> Result<Self, String> {
-        let asked = match remotes.len() {
-            1 => format!("Template \u{201c}{template}\u{201d} works on a remote no admission covers:"),
-            n => format!(
-                "Template \u{201c}{template}\u{201d} works on {n} remotes no admission covers, all admitted together:"
-            ),
-        };
-        let mut details: Vec<&str> = vec![&asked];
-        details.extend(remotes.iter().map(String::as_str));
-        details.push(
-            "Admitted, td-agent's git clones and fetches each for you, outside any jail and with your git credentials, bypassing the egress relay that holds the workspace's own network. Each stays admitted, with or without a final .git, for every later workspace: td-agent keeps them in the `remotes` file of its state directory, beside `remotes` in the configuration.",
-        );
-        details.push("Cancel makes nothing.");
+        let owned = admit_details(&template, &remotes);
+        let details: Vec<&str> = owned.iter().map(String::as_str).collect();
         let model = Model::new(ADMIT_TITLE, ADMIT, &details, Act::Confirm, revision)
             .map_err(|e| format!("the admission card: {e}"))?;
         let purpose = Purpose::Admit { template, remotes };
@@ -491,6 +481,29 @@ impl Confirm {
     }
 }
 
+/// What the admission card says of `remotes`, which `template` names:
+/// what admitting them lets td-agent do, and, for a local repository,
+/// that its hooks run as the human (DESIGN.md §7, Local repositories).
+fn admit_details(template: &str, remotes: &[String]) -> Vec<String> {
+    let mut details = vec![match remotes.len() {
+        1 => format!("Template \u{201c}{template}\u{201d} works on a remote no admission covers:"),
+        n => format!(
+            "Template \u{201c}{template}\u{201d} works on {n} remotes no admission covers, all admitted together:"
+        ),
+    }];
+    details.extend(remotes.iter().cloned());
+    details.push(
+        "Admitted, td-agent's git clones and fetches each for you, outside any jail and with your git credentials, bypassing the egress relay that holds the workspace's own network. Each stays admitted, with or without a final .git, for every later workspace: td-agent keeps them in the `remotes` file of its state directory, beside `remotes` in the configuration.".into(),
+    );
+    if remotes.iter().any(|remote| remote.starts_with("file://")) {
+        details.push(
+            "A local repository runs its own hooks as you when a push reaches it, outside any jail and on commits the model wrote, with td-agent's git configuration in place of your global one. td-agent fetches and pushes it only while no workspace or shared directory reaches it or what git reads of it, and from now on admits no workspace that would.".into(),
+        );
+    }
+    details.push("Cancel makes nothing.".into());
+    details
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -527,6 +540,14 @@ mod tests {
 
     #[test]
     fn the_admission_card_admits_only_on_its_action() {
+        // A local repository's hooks are said; another remote's are not.
+        let said = admit_details("td", &["file:///srv/git/td".into()]);
+        assert!(
+            said.iter().any(|line| line.contains("its own hooks")),
+            "{said:?}"
+        );
+        let said = admit_details("td", &["https://example.org/a/td".into()]);
+        assert!(!said.iter().any(|line| line.contains("hooks")), "{said:?}");
         let surface = Surface::new(1024, 640, Scale::default()).unwrap();
         let admit = || {
             Confirm::admit(

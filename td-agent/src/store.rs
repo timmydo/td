@@ -3737,7 +3737,11 @@ pub mod tests {
         assert!(state.admit(&["http://example.org/a".into()]).is_err());
         assert_eq!(state.load_admitted().unwrap(), both);
         // A line td-agent would not have written refuses the file.
-        for line in ["HTTPS://Example.org/a/td/", "file:///srv/x", "not a remote"] {
+        for line in [
+            "HTTPS://Example.org/a/td/",
+            "git://example.org/x",
+            "not a remote",
+        ] {
             std::fs::write(state.root().join(ADMITTED), format!("{line}\n")).unwrap();
             assert!(state.load_admitted().is_err(), "{line}");
             assert!(state.admit(&both).is_err(), "{line}");

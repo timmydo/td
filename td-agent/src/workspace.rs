@@ -648,6 +648,10 @@ pub struct Places {
     /// or the model could replace its own jail, or what builds it.
     pub programs: Vec<PathBuf>,
     pub path: Vec<PathBuf>,
+    /// The local repositories admitted as remotes (DESIGN.md §7, Local
+    /// repositories), whose hooks run as the human: no workspace or
+    /// shared directory may reach one.
+    pub locals: Vec<PathBuf>,
 }
 
 /// Below the home: credentials, keyrings, browser and mail profiles,
@@ -754,6 +758,8 @@ impl Places {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // The window adds them once it has read the admitted remotes.
+            locals: Vec::new(),
         })
     }
 
@@ -772,6 +778,13 @@ impl Places {
                 .map(|dir| ("the session's runtime directory".to_string(), dir, false)),
         );
         places.push(("the workspace root".into(), self.root.clone(), false));
+        places.extend(self.locals.iter().map(|local| {
+            (
+                "a local repository admitted as a remote, whose hooks run as you".to_string(),
+                local.clone(),
+                false,
+            )
+        }));
         let credentials = "where credentials, a profile or what the session runs live";
         let below = |base: &Path, names: &[&str]| -> Vec<Protected> {
             names
@@ -979,6 +992,191 @@ pub fn is_repository(dir: &Path) -> bool {
 /// holds `HEAD`, `objects` and `refs`.
 fn is_git_directory(dir: &Path) -> bool {
     dir.join("HEAD").is_file() && dir.join("objects").is_dir() && dir.join("refs").is_dir()
+}
+
+/// The most bytes of a local repository's configuration read.
+const LOCAL_CONFIG: u64 = 1024 * 1024;
+/// Configuration a local repository may not set, as git names it: what
+/// would have git read another file, run a program, or write a tree,
+/// from elsewhere. `include.` and `includeif.` names are refused too.
+const LOCAL_REFUSED: &[&str] = &[
+    "core.alternaterefscommand",
+    "core.attributesfile",
+    "core.fsmonitor",
+    "core.hookspath",
+    "core.worktree",
+    "extensions.worktreeconfig",
+];
+
+/// Whether the local repository at `path` may be fetched or pushed
+/// (DESIGN.md §7, Local repositories), or why not: git runs its hooks
+/// and reads its configuration as the human's, outside any jail, so no
+/// jail may reach anything of it git reads. It is named by its own path,
+/// through no link. Its git directory is `.git`, a directory and no
+/// link, or the path itself when bare; it is no linked worktree's
+/// (`commondir`), borrows no objects (`objects/info/alternates`), and
+/// its configuration, a file and no link, includes no other and moves
+/// no hooks (`LOCAL_REFUSED`). The path, its git directory, its
+/// configuration, its hooks directory and every hook are none of
+/// td-agent's or the human's protected places, the workspace root among
+/// them, and none holds or lies inside any of `reached`, the shared
+/// directories and directory workspaces, by path or through a mount.
+pub fn local_repository(path: &Path, places: &Places, reached: &[PathBuf]) -> Result<(), String> {
+    let real = fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if real != path {
+        return Err(format!(
+            "{} is reached through a link, to {}: name the repository by its own path",
+            path.display(),
+            real.display()
+        ));
+    }
+    let dot = path.join(".git");
+    let git_dir = match fs::symlink_metadata(&dot) {
+        Ok(meta) if meta.is_dir() => dot,
+        Ok(_) => {
+            return Err(format!(
+                "{} is a link or a file, as a linked worktree's is: name the repository whose .git it points to",
+                dot.display()
+            ))
+        }
+        Err(_) if is_git_directory(path) => path.to_path_buf(),
+        Err(_) => return Err(format!("{} is not a git repository", path.display())),
+    };
+    for (name, why) in [
+        ("commondir", "is a linked worktree's"),
+        (
+            "objects/info/alternates",
+            "borrows another repository's objects",
+        ),
+    ] {
+        if fs::symlink_metadata(git_dir.join(name)).is_ok() {
+            return Err(format!("{} {why}", git_dir.display()));
+        }
+    }
+    // Nothing of it git reads is a link out of it.
+    for dir in [git_dir.clone(), git_dir.join("objects")] {
+        for entry in fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+            if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                return Err(format!("{} is a link", entry.path().display()));
+            }
+        }
+    }
+    if fs::symlink_metadata(git_dir.join("config.worktree")).is_ok() {
+        return Err(format!(
+            "{} has a config.worktree, which td-agent does not follow",
+            git_dir.display()
+        ));
+    }
+    let config = git_dir.join("config");
+    match fs::symlink_metadata(&config) {
+        Ok(meta) if meta.is_file() && meta.len() <= LOCAL_CONFIG => {
+            if let Some(why) = local_config_refusal(&local_config_names(&config)?) {
+                return Err(format!("{} {why}", config.display()));
+            }
+        }
+        Ok(meta) if meta.is_file() => {
+            return Err(format!("{} is past {LOCAL_CONFIG} bytes", config.display()))
+        }
+        Ok(_) => return Err(format!("{} is not a file", config.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", config.display())),
+    }
+    // What git reads or runs, each where it really lies.
+    let mut read = vec![path.to_path_buf(), git_dir.clone()];
+    let hooks = git_dir.join("hooks");
+    match fs::symlink_metadata(&hooks) {
+        Ok(meta) if meta.is_dir() => {
+            for entry in fs::read_dir(&hooks).map_err(|e| format!("{}: {e}", hooks.display()))? {
+                let entry = entry.map_err(|e| format!("{}: {e}", hooks.display()))?;
+                let hook = entry.path();
+                read.push(fs::canonicalize(&hook).map_err(|e| format!("{}: {e}", hook.display()))?);
+            }
+        }
+        Ok(_) => return Err(format!("{} is not a directory", hooks.display())),
+        Err(_) => {}
+    }
+    // The repository itself is among `places`' admitted ones.
+    let places = Places {
+        locals: Vec::new(),
+        ..places.clone()
+    };
+    for one in &read {
+        if let Some(why) = places
+            .refusal(one, false)
+            .or_else(|| reach_refusal(one, reached))
+        {
+            return Err(why);
+        }
+    }
+    Ok(())
+}
+
+/// The names `config` sets, as git's own parser reads them, its
+/// includes not followed: git with nothing of the human's
+/// configuration, which reads the file and runs nothing.
+fn local_config_names(config: &Path) -> Result<Vec<String>, String> {
+    let failed = |e: String| format!("{}, as git reads it: {e}", config.display());
+    let out = std::process::Command::new("git")
+        .env_clear()
+        .envs(std::env::var_os("PATH").map(|path| ("PATH", path)))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .current_dir("/")
+        .stdin(std::process::Stdio::null())
+        .args(["config", "--file"])
+        .arg(config)
+        .args(["--no-includes", "--null", "--name-only", "--list"])
+        .output()
+        .map_err(|e| failed(e.to_string()))?;
+    if !out.status.success() {
+        return Err(failed(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    Ok(out
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8_lossy(name).to_ascii_lowercase())
+        .collect())
+}
+
+/// Why a local repository's configuration, setting `names`, is refused,
+/// if it is: an include, or a name of `LOCAL_REFUSED`.
+fn local_config_refusal(names: &[String]) -> Option<String> {
+    names.iter().find_map(|name| {
+        if name.starts_with("include.") || name.starts_with("includeif.") {
+            Some("includes another file".to_string())
+        } else {
+            LOCAL_REFUSED
+                .contains(&name.as_str())
+                .then(|| format!("sets {name}, which td-agent does not follow"))
+        }
+    })
+}
+
+/// Why `path` is refused for overlapping any of `reached`, where a
+/// workspace writes, by path or through a mount, if it is.
+fn reach_refusal(path: &Path, reached: &[PathBuf]) -> Option<String> {
+    if let Some(reach) = reached.iter().find(|reach| overlaps(path, reach)) {
+        return Some(format!(
+            "{} overlaps {}, which a workspace can write, so what git runs there could be the model's",
+            path.display(),
+            reach.display()
+        ));
+    }
+    let protected: Vec<Protected> = reached
+        .iter()
+        .map(|reach| ("where a workspace writes".to_string(), reach.clone(), false))
+        .collect();
+    match fs::read_to_string("/proc/self/mountinfo") {
+        Ok(table) => mount_refusal(&table, path, &protected),
+        Err(e) => Some(format!(
+            "the mount table, to check {} against: {e}",
+            path.display()
+        )),
+    }
 }
 
 /// Why `path` cannot be named to the jail and the conversation's process,
@@ -1337,6 +1535,7 @@ mod tests {
             data_homes: vec![home.join(".local/share"), "/data".into()],
             programs: vec![home.join("src/td/target/release/td-jail")],
             path: vec![home.join("tools/bin")],
+            locals: Vec::new(),
         }
     }
 
@@ -1510,7 +1709,7 @@ mod tests {
             ),
             (
                 vec![("http://github.com/timmydo/td", "main", "x")],
-                "https or ssh",
+                "no other transport",
             ),
         ] {
             let e = repositories(&template(&repos), &id, data, root, &admitted, 0).unwrap_err();
@@ -1768,6 +1967,179 @@ mod tests {
         // Inside where programs live puts nothing there.
         assert_eq!(places.refusal(Path::new("/home/u/tools/bin/x"), true), None);
         assert_eq!(places.refusal(Path::new("/home/u/bin/x"), true), None);
+    }
+
+    /// A local repository is fetched and pushed only from its own path,
+    /// a repository, where no jail reaches: none of the protected places
+    /// nor anywhere a workspace writes.
+    #[test]
+    fn a_local_repository_lies_where_no_jail_reaches() {
+        let base = std::env::temp_dir().join(format!(
+            "td-agent-local-{}-{}",
+            std::process::id(),
+            crate::store::random_hex(4).unwrap()
+        ));
+        for dir in [
+            "srv/git/td.git/objects",
+            "srv/git/td.git/refs",
+            "srv/plain",
+            "home/src/work/.git/objects",
+            "home/src/work/.git/refs",
+            "home/td-agent/ws/x.git/objects",
+            "home/td-agent/ws/x.git/refs",
+            "shared/inner.git/objects",
+            "shared/inner.git/refs",
+        ] {
+            fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        for head in [
+            "srv/git/td.git",
+            "home/td-agent/ws/x.git",
+            "shared/inner.git",
+        ] {
+            fs::write(base.join(head).join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        }
+        let base = fs::canonicalize(&base).unwrap();
+        std::os::unix::fs::symlink(base.join("srv/git"), base.join("srv/link")).unwrap();
+        let home = base.join("home");
+        let places = places(&home);
+        let bare = base.join("srv/git/td.git");
+        local_repository(&bare, &places, &[]).unwrap();
+        local_repository(&home.join("src/work"), &places, &[]).unwrap();
+        for (path, reached, why) in [
+            (base.join("srv/link/td.git"), vec![], "through a link"),
+            (base.join("srv/plain"), vec![], "not a git repository"),
+            (base.join("srv/missing"), vec![], "No such file"),
+            (home.join("td-agent/ws/x.git"), vec![], "workspace root"),
+            (
+                base.join("shared/inner.git"),
+                vec![base.join("shared")],
+                "overlaps",
+            ),
+            (bare.clone(), vec![base.join("srv")], "overlaps"),
+            (bare.clone(), vec![bare.join("objects")], "overlaps"),
+        ] {
+            let e = local_repository(&path, &places, &reached).unwrap_err();
+            assert!(e.contains(why), "{}: {e}", path.display());
+        }
+        // What git reads or runs elsewhere: a linked worktree's `.git`
+        // file, a `commondir`, borrowed objects, a configuration that
+        // includes another or moves the hooks, a linked configuration or
+        // hooks directory, and a hook linked to where a workspace writes.
+        let shared = base.join("shared");
+        let refused = |setup: &dyn Fn(&Path), why: &str| {
+            let repo = base.join("srv/case.git");
+            let _ = fs::remove_dir_all(&repo);
+            for dir in ["objects/info", "refs", "hooks"] {
+                fs::create_dir_all(repo.join(dir)).unwrap();
+            }
+            fs::write(repo.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            local_repository(&repo, &places, std::slice::from_ref(&shared)).unwrap();
+            setup(&repo);
+            let e = local_repository(&repo, &places, std::slice::from_ref(&shared)).unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+        };
+        let worktree = base.join("srv/linked");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(worktree.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let e = local_repository(&worktree, &places, &[]).unwrap_err();
+        assert!(e.contains("linked worktree"), "{e}");
+        refused(
+            &|repo| fs::write(repo.join("commondir"), "..").unwrap(),
+            "linked worktree",
+        );
+        refused(
+            &|repo| fs::write(repo.join("objects/info/alternates"), "/x\n").unwrap(),
+            "borrows",
+        );
+        for (config, why) in [
+            ("[include]\n\tpath = /x\n", "includes"),
+            ("[includeIf \"gitdir:/\"]\npath = /x\n", "includes"),
+            ("[a][include]path = /f\n", "includes"),
+            ("[core]\n\thooksPath = /x\n", "core.hookspath"),
+            ("[core] HooksPath=/x\n", "core.hookspath"),
+            ("[b]\r[core]\rfsmonitor = x\n", "core.fsmonitor"),
+            (
+                "[core]\nalternateRefsCommand = x\n",
+                "core.alternaterefscommand",
+            ),
+            ("[core]\nworktree = /x\n", "core.worktree"),
+            ("[core]\nattributesFile = /x\n", "core.attributesfile"),
+            (
+                "[extensions]\nworktreeConfig = true\n",
+                "extensions.worktreeconfig",
+            ),
+            ("[core\n", "as git reads it"),
+        ] {
+            refused(&|repo| fs::write(repo.join("config"), config).unwrap(), why);
+        }
+        refused(
+            &|repo| {
+                std::os::unix::fs::symlink(base.join("srv/plain"), repo.join("config")).unwrap()
+            },
+            "is a link",
+        );
+        refused(
+            &|repo| {
+                fs::remove_dir_all(repo.join("hooks")).unwrap();
+                std::os::unix::fs::symlink(&shared, repo.join("hooks")).unwrap();
+            },
+            "is a link",
+        );
+        refused(
+            &|repo| std::os::unix::fs::symlink(&shared, repo.join("packed-refs")).unwrap(),
+            "is a link",
+        );
+        refused(
+            &|repo| std::os::unix::fs::symlink(&shared, repo.join("objects/pack")).unwrap(),
+            "is a link",
+        );
+        refused(
+            &|repo| fs::write(repo.join("config.worktree"), "").unwrap(),
+            "config.worktree",
+        );
+        refused(
+            &|repo| fs::write(repo.join("config"), "#".repeat(1024 * 1024 + 1)).unwrap(),
+            "past",
+        );
+        refused(
+            &|repo| {
+                fs::write(shared.join("post-receive"), "#!/bin/sh\n").unwrap();
+                std::os::unix::fs::symlink(
+                    shared.join("post-receive"),
+                    repo.join("hooks/post-receive"),
+                )
+                .unwrap();
+            },
+            "overlaps",
+        );
+        // A plain configuration, the repository's own, is no matter.
+        let plain = base.join("srv/case.git");
+        fs::remove_file(plain.join("hooks/post-receive")).unwrap();
+        fs::write(
+            plain.join("config"),
+            "[core]\n\tbare = true\n[remote \"o\"]\n\turl = /x/include\n",
+        )
+        .unwrap();
+        local_repository(&plain, &places, &[]).unwrap();
+        // An admitted local repository is among the places no workspace
+        // or shared directory may reach, and not refused for being one.
+        let guarded = Places {
+            locals: vec![bare.clone()],
+            ..places.clone()
+        };
+        local_repository(&bare, &guarded, &[]).unwrap();
+        let e = admit_directory(&base.join("srv/git"), &guarded, &[]).unwrap_err();
+        assert!(e.contains("local repository"), "{e}");
+        let (admitted, notes) = admit_shared(
+            &[Shared {
+                path: base.join("srv"),
+                write: false,
+            }],
+            &guarded,
+        );
+        assert!(admitted.is_empty(), "{notes:?}");
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

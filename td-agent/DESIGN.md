@@ -1934,16 +1934,52 @@ $XDG_DATA_HOME/td-agent/
   and its conversation's id, so that no two workspaces share one.
 
 **Admitted remotes.** A remote is the human's decision: a URL, or a host
-with a path prefix matched on whole path segments after normalization, in
-`remotes` in configuration or added through a card.
-Only `https` and `ssh` transports are admitted, never `file`, a local path,
-`ext` or plain `http`. Naming a remote in a template does not admit it:
-choosing a template whose remote is not admitted asks the human, on a
-card in both modes, to admit it, saying that cloning it runs outside any
-jail with the human's credentials and bypasses the egress relay;
-refused, nothing is made. A remote of another transport is refused
-outright. Branch and base names are checked as git ref names before use
-and passed after `--end-of-options`.
+with a path prefix matched on whole path segments after normalization,
+in `remotes` in configuration or added through a card. Only `https` and
+`ssh` transports and a local repository named by its absolute path are
+admitted, never `ext`, `git`, plain `http` or a relative path. Naming a
+remote in a template does not admit it: choosing a template whose remote
+is not admitted asks the human, on a card in both modes, to admit it,
+saying that cloning it runs outside any jail with the human's
+credentials and bypasses the egress relay; refused, nothing is made. A
+remote of another transport is refused outright. Branch and base names
+are checked as git ref names before use and passed after
+`--end-of-options`.
+
+**Local repositories.** A remote may be a repository on this machine,
+written as its absolute path or a `file://` URL with no host, recorded
+as `file:///<path>`, and fetched and pushed over git's file transport,
+which the fixed shape allows for that remote's commands alone. Its path
+is checked as an https path is, and it is admitted only by that exact
+path, never by a prefix, `td` and `td.git` being two directories. git
+runs a local repository's own configuration and hooks as the human,
+outside any jail, its `receive-pack` running the repository's
+`pre-receive`, `update` and `post-receive` hooks on a push, on commits
+the model wrote; git's `local_repo_env` clears the fixed shape's `-c`
+settings for it, though not `GIT_CONFIG_GLOBAL`, so td-agent's copied
+global file stands in for the human's own there too. No jail may
+therefore reach anything of it git reads. Before every fetch and push,
+the background fetch's included, the window refuses it when its path
+runs through a link; when its git directory is not `.git`, a directory
+and no link, or the path itself when bare, so no linked worktree's
+`.git` file; when that directory is a linked worktree's (`commondir`),
+borrows another's objects (`objects/info/alternates`), holds a link at
+its top or in `objects`, or holds a `config.worktree`; when its
+configuration is no plain file, is past 1 MiB, or, as git's own parser
+reads it, includes another (`include.`, `includeIf.`) or sets
+`core.hooksPath`, `core.fsmonitor`, `core.alternateRefsCommand`,
+`core.worktree`, `core.attributesFile` or `extensions.worktreeConfig`;
+and when the path, its git directory, configuration, hooks directory or
+any hook, each where it really lies, is, contains or lies inside one of
+the places no workspace may be (§8), the workspace root among them, or
+overlaps a directory workspace or a shared directory, the top level's or
+a template's, by path or through a mount. An admitted local repository
+is in turn one of the places no workspace or shared directory may be, so
+none made after its admission reaches it, and a fetch or push queued
+behind another cannot find one that has come to. A refused remote is
+said, once while it stands, and nothing is fetched or pushed. A
+repository the human works in, `~/src/td` with its `.git`, may be one,
+its hooks then being theirs.
 
 **As built (increment 11, admission).** Choosing a template asks, on
 one modal card titled `Admit remotes`, about every remote it names that
@@ -2966,7 +3002,9 @@ Every outside invocation is fixed in shape:
   configuration applies;
 - `-c core.hooksPath=` an empty directory td-agent owns,
   `-c core.fsmonitor=false`, `-c protocol.allow=never` with
-  `protocol.https.allow` and `protocol.ssh.allow` set to `always`,
+  `protocol.https.allow` and `protocol.ssh.allow` set to `always`, and
+  `protocol.file.allow` too for a local repository's fetch and push
+  alone (§7, Local repositories),
   `-c submodule.recurse=false`, `-c fetch.recurseSubmodules=false`,
   `-c push.recurseSubmodules=no`, `-c http.followRedirects=false`,
   `-c core.attributesFile=/dev/null`, and `GIT_NO_REPLACE_OBJECTS=1`;
@@ -3038,11 +3076,11 @@ human's, or the classifier's, to publish, as in td's own workflow, where a
 pushed branch is the submission.
 
 **As built (increment 11, the store).** The first step of increment 11
-is the git worker's outside half, `src/git.rs`, which nothing calls
-yet: the window's store fetch, base reads and admission arrive with
+is the git worker's outside half, `src/git.rs`, which nothing calls yet:
+the window's store fetch, base reads and admission arrive with
 repository templates. A remote parses as `https://host[:port]/path`,
 `ssh://[user@]host[:port]/path` or the scp-like `[user@]host:path`;
-every other transport, a local path, credentials in an https URL, a
+every other transport, a relative path, credentials in an https URL, a
 query, an empty, `.`, `..` or option-like path segment, and a user or
 host that could be read as an option are refused by name, the host
 lower-cased and a default port dropped; an IPv6 literal is refused. An
@@ -3051,19 +3089,18 @@ scp-like path relative to the login's home keeps that form, since an
 absolute one. A `remotes` entry is a remote, admitting that one (its
 transport, user, host, port and path, a final `.git` aside), or
 `host[/prefix]`, admitting every https or ssh remote on that host, on
-any port and as any ssh user, whose path starts with the prefix's
-whole segments, a final `.git` aside, the path written relative to the
-ssh login's home or absolute alike. A branch or base is checked as
-`git check-ref-format --branch` would and may not start with `-`, `+`,
-`:` or `/`. The store for a remote is
-`store/<host>-<path>-<digest>.git`, its host and path made one file
-name and a 64-bit FNV digest of everything naming the repository
-fetched, a final `.git` included, appended. The store records that text
-in `td-agent-remote` before anything else, written whole, and is refused
-to any other remote, so a collided digest fails rather than shares; it
-is then made with `init --bare`, again whenever it lacks its `HEAD`, and
-holds no remote configuration. A fetch names
-td-agent's record of the URL after `--end-of-options` with
+any port and as any ssh user, whose path starts with the prefix's whole
+segments, a final `.git` aside, the path written relative to the ssh
+login's home or absolute alike. A branch or base is checked as `git
+check-ref-format --branch` would and may not start with `-`, `+`, `:` or
+`/`. The store for a remote is `store/<host>-<path>-<digest>.git`, its
+host and path made one file name and a 64-bit FNV digest of everything
+naming the repository fetched, a final `.git` included, appended. The
+store records that text in `td-agent-remote` before anything else,
+written whole, and is refused to any other remote, so a collided digest
+fails rather than shares; it is then made with `init --bare`, again
+whenever it lacks its `HEAD`, and holds no remote configuration. A fetch
+names td-agent's record of the URL after `--end-of-options` with
 `+refs/heads/*:refs/heads/*`, `--prune`, `--no-tags`,
 `--no-write-fetch-head` and `--no-auto-maintenance`. The fixed shape
 adds `gc.auto=0` and `maintenance.auto=false`, since workspaces borrow
@@ -3072,14 +3109,14 @@ bounds, https below a kilobyte a second for a minute and ssh in
 BatchMode that cannot connect in 30 seconds or whose server stops
 answering for a minute. A fetch is killed after an hour and any other
 git after two minutes; git's standard error is read to its end, so a
-chatty helper never ends a good fetch on a closed pipe, and once git
-has exited its answer is what its pipes gave within a second, though a
-helper it left behind still holds them. Every outside
-git, the configuration copy and `init` included, runs in td-agent's
-worker directory with discovery stopped there. `HOME` is kept, so the
-human's `~/.ssh/config` and `~/.netrc` apply to the fetch as they do to
-the human's own. The global file is rewritten at the worker's start, and
-put in place whole, through git's own `config --file` writer from the
+chatty helper never ends a good fetch on a closed pipe, and once git has
+exited its answer is what its pipes gave within a second, though a
+helper it left behind still holds them. Every outside git, the
+configuration copy and `init` included, runs in td-agent's worker
+directory with discovery stopped there. `HOME` is kept, so the human's
+`~/.ssh/config` and `~/.netrc` apply to the fetch as they do to the
+human's own. The global file is rewritten at the worker's start, and put
+in place whole, through git's own `config --file` writer from the
 human's `user.name`, `user.email` and `credential.helper`,
 `credential.username` and `credential.useHttpPath`, each also per URL,
 read with `GIT_CONFIG_NOSYSTEM` and includes followed (`XDG_CONFIG_HOME`
@@ -3351,6 +3388,36 @@ workspace's bases on the remote are protected whatever it says. A
 removed repository workspace's publish repositories go with it, renamed
 out of the way as its repositories are (`removal::doom`), and a start
 sweeps what a crash left in `publish/` as in `ws/`.
+
+**As built (local repositories).** `git::Transport::Local` is a remote
+with no host, user or port, its path in `segments`: `Remote::parse`
+takes `/<path>` or `file:///<path>`, a `file://` URL with a host
+refused, and `url()` gives `file:///<path>`; its store is
+`store/local-<path>-<digest>.git`; an exact admission compares its path
+whole, `.git` and all, and a prefix never admits it. The worker's
+`fetch` and `push` add `protocol.file.allow=always` for it alone
+(`Worker::over`); git as it runs for any other remote still refuses the
+file transport. The window checks it in `admitted`, which every
+preparation, `git_fetch`, stage and push passes, and before each
+background fetch (`window::local_remote`), with
+`workspace::local_repository`, which holds §7's rules: the git directory
+found without following a link, its configuration's names listed by `git
+config --file <config> --no-includes --null --name-only --list`, run
+with nothing of the human's configuration and no environment but `PATH`,
+which reads the file and runs nothing, and every hook canonicalized;
+each place refused by `Places` as a read-only grant would be and, by
+path and through `mount_refusal`, by any directory workspace of any
+conversation, archived ones included, or shared directory.
+`Places::locals` holds the admitted local repositories, read with the
+remotes before any shared directory is admitted and added to as a card
+admits one, so `admit_directory` and `admit_shared` refuse what would
+reach them; `local_repository` sets them aside for the repository it
+checks. A background fetch refused is said once while it stands
+(`trouble`). The admission card says, when it asks about a local
+repository, that its hooks and configuration run as the human on a push
+and that it is fetched and pushed only while nothing reaches it. The
+tests' own file-transport remote, which only tests could make, is gone:
+they use a local repository as any build does.
 
 ## 10. Network policy
 
@@ -4965,10 +5032,10 @@ default; `jev_threshold`'s is calibrated (§11):
     template's workspaces; absent, the top-level list;
   - `network` (later, with increment 15): `off`, `allowlist` or `open`
     for this template's workspaces; absent, the top-level `network`
-- `remotes`: the admitted git remotes (§7), each a remote's URL or a
-  host with a path prefix; default empty, so the first workspace on a
-  remote asks; what a card admits is kept beside it, in the state
-  directory's `remotes` (§7)
+- `remotes`: the admitted git remotes (§7), each a remote's URL, a local
+  repository's absolute path, or a host with a path prefix; default
+  empty, so the first workspace on a remote asks; what a card admits is
+  kept beside it, in the state directory's `remotes` (§7)
 - `network`: the default policy, `off` or `allowlist`; default `allowlist`
 - `network_allowlist`: the default allowlist of §10, hosts with ports
 - `protected_branches`: at most 64 branch names, a push to which is
@@ -5451,19 +5518,18 @@ tests hold that no note kept, not only the newest, carries the key. And
 For the store, `src/git.rs` covers remote parsing and every refused
 form, admission by remote and by whole-segment prefix, distinct store
 names for one repository's https and ssh remotes, branch names, and,
-against a local repository fetched over the file transport that only
-tests admit: the copied global file keeping the identity and both
-helpers and dropping a hooks path, a URL rewrite and an alias; a
-`GIT_CONFIG_PARAMETERS` in td-agent's environment not reaching git; the
-local remote refused without the test's admission; a store hook not
-running on fetch; the store made with no remote configured; a base
-resolved and its `AGENTS.md` and `.td-agent/rules` read, a tree, a link
-and a missing path none; a branch fetched and then pruned; a file past
-the bound refused; a store recording another remote refused; and a run
-whose standard error is long draining it, and one past its time
-killed. These run where a
-`git` is on PATH, as in the host preflight; the in-sandbox gate's
-toolchain has none, and there the test says it is skipped.
+against a local repository fetched over the file transport: the copied
+global file keeping the identity and both helpers and dropping a hooks
+path, a URL rewrite and an alias; a `GIT_CONFIG_PARAMETERS` in
+td-agent's environment not reaching git; the local remote refused
+without the test's admission; a store hook not running on fetch; the
+store made with no remote configured; a base resolved and its
+`AGENTS.md` and `.td-agent/rules` read, a tree, a link and a missing
+path none; a branch fetched and then pruned; a file past the bound
+refused; a store recording another remote refused; and a run whose
+standard error is long draining it, and one past its time killed. These
+run where a `git` is on PATH, as in the host preflight; the in-sandbox
+gate's toolchain has none, and there the test says it is skipped.
 
 For the git mount chain, td-jail's `workspace.rs` covers the spec's
 `checkout` and `repository` keys in order and a repository admitted

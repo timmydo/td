@@ -2076,8 +2076,8 @@ mod tests {
                 "line 1: gives git_push more than a remote and a branch",
             ),
             (
-                "deny git_push file:///r",
-                "line 1: the remote \"file:///r\" is not https or ssh: td-agent admits no other transport",
+                "deny git_push git://h/r",
+                "line 1: the remote \"git://h/r\" is not https, ssh or a local repository: td-agent admits no other transport",
             ),
             (
                 "deny git_push https://h/r refs/heads/main",
