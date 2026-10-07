@@ -168,10 +168,6 @@ pub trait Resolver {
 pub struct ViewIdentity {
     pub account: AccountId,
     pub epoch: StoreEpoch,
-    pub generation: u64,
-    pub checkpoint: Sequence,
-    pub segment: u64,
-    pub committed_offset: u64,
     pub committed_sequence: Sequence,
     pub history_floor: Sequence,
 }
@@ -184,7 +180,7 @@ pub struct Record<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChangeCursor {
     pub sequence: Sequence,
-    /// Zero-based operation in a frame; u32::MAX skips its whole sequence.
+    /// Zero-based operation in a transaction; u32::MAX skips its whole sequence.
     pub operation: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,7 +191,7 @@ pub struct ChangeRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChangeStep {
     Record(ChangeRecord),
-    /// Completed this whole frame, including when no matching CHANGE existed.
+    /// Completed this whole transaction, including when no matching CHANGE existed.
     Advanced {
         through: Sequence,
     },
@@ -204,7 +200,7 @@ pub enum ChangeStep {
 pub trait ReadView: Send + Sync {
     fn identity(&self) -> ViewIdentity;
     /// Scan strictly after the cursor, within the pinned history and endpoint.
-    /// Body PUTs are skipped with bounded I/O; no whole-frame allocation.
+    /// The backend uses its native change index; blob payloads remain files.
     fn next_change(&mut self, after: ChangeCursor, kind: ObjectType) -> Result<ChangeStep, Error>;
     /// Decode and validate into caller storage; None means absent in this view.
     fn get<'a>(
@@ -226,7 +222,7 @@ pub enum Mutation<'a> {
     Put { key: Key<'a>, row: Row<'a> },
     Delete(Key<'a>),
 }
-/// Canonical FORMAT PUT/DELETE/CHANGE operations, without a frame header.
+/// Canonical FORMAT PUT/DELETE/CHANGE operations, without a transaction header.
 /// The store validates count, framing, rows and references before any append.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionInput<'a> {
@@ -291,7 +287,7 @@ pub struct DiskBudget {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReservationSize {
-    pub frame_bytes: usize,
+    pub transaction_bytes: usize,
     pub operations: usize,
     pub disk: DiskBudget,
 }
@@ -314,8 +310,8 @@ pub struct Commit {
     pub epoch: StoreEpoch,
     pub sequence: Sequence,
 }
-/// Rejected guarantees this attempt appended no frame. Indeterminate means a
-/// recoverable frame may exist: stop the writer and recover before more writes.
+/// Rejected guarantees this attempt committed no transaction. Indeterminate means a
+/// transaction may have committed: stop the writer and recover before more writes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommitFailure {
     Rejected(Error),
@@ -433,8 +429,7 @@ mod tests {
         SubmissionRow, MAX_ADDRESS, MAX_DIAGNOSTIC, MAX_SMTP_REPLY,
     };
     use crate::format::{
-        FRAME_FOOTER_BYTES, FRAME_HEADER_BYTES, MAX_FRAME_BYTES, MAX_FRAME_OPERATIONS,
-        OPERATION_HEADER_BYTES,
+        MAX_TRANSACTION_BYTES, MAX_TRANSACTION_OPERATIONS, OPERATION_HEADER_BYTES,
     };
     use crate::ids::{AttemptId, EmailId, IdentityId, SubmissionId, ThreadId};
 
@@ -491,14 +486,12 @@ mod tests {
             notification_email: Some(EmailId::from_bytes([5; 16])),
         })
         .encoded_len()?;
-        let envelope = FRAME_HEADER_BYTES
-            + FRAME_FOOTER_BYTES
-            + OPERATION_HEADER_BYTES
+        let envelope = OPERATION_HEADER_BYTES
             + Key::Submission(id).encoded_len()?
             + submission_bytes
             + OPERATION_HEADER_BYTES
             + 16; // CHANGE key, no value.
-        assert!(recipient_puts + envelope < MAX_FRAME_BYTES);
+        assert!(recipient_puts + envelope < MAX_TRANSACTION_BYTES);
         let canceled = RecipientRow {
             state: RecipientState::Canceled,
             next_attempt_at: None,
@@ -506,8 +499,8 @@ mod tests {
             ..recipient
         };
         let long_cancel = Row::Recipient(canceled).encoded_len()? + recipient_overhead;
-        assert!(long_cancel * 100 + envelope < MAX_FRAME_BYTES);
-        assert!(long_cancel * 1000 + envelope > MAX_FRAME_BYTES);
+        assert!(long_cancel * 100 + envelope < MAX_TRANSACTION_BYTES);
+        assert!(long_cancel * 1000 + envelope > MAX_TRANSACTION_BYTES);
         let queued = RecipientRow {
             state: RecipientState::Queued,
             attempt: None,
@@ -539,9 +532,9 @@ mod tests {
         for row in [queued, fresh_cancel] {
             let bytes = (Row::Recipient(row).encoded_len()? + recipient_overhead) * 1000;
             // Creation also adds the transmitted blob row.
-            assert!(bytes + envelope + blob_put < MAX_FRAME_BYTES);
+            assert!(bytes + envelope + blob_put < MAX_TRANSACTION_BYTES);
         }
-        const { assert!(1000 + 3 < MAX_FRAME_OPERATIONS) };
+        const { assert!(1000 + 3 < MAX_TRANSACTION_OPERATIONS) };
         Ok(())
     }
 }
@@ -597,6 +590,7 @@ mod crypto_boundary_tests {
         assert_eq!(
             dependencies,
             [
+                r#"rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "hooks", "limits"] }"#,
                 r#"td-crypto = { path = "../td-crypto" }"#,
                 r#"td-header = { path = "../td-header" }"#,
                 r#"td-json = { path = "../td-json" }"#,

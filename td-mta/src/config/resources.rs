@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(actual.admission().work().request_seconds, 600);
         assert_eq!(actual.timeouts().execution_seconds(), 600);
         assert_eq!(actual.timeouts().limits().minimum_rate, 32768);
-        assert_eq!(actual.resources().total_bytes(), 96_650_496);
+        assert_eq!(actual.resources().total_bytes(), 100_058_368);
     }
     #[test]
     fn duplicates_keep_first_location_and_poison_candidate() {
@@ -636,8 +636,8 @@ mod tests {
             &[
                 "body_bytes",
                 "body_files",
-                "live_metadata_bytes",
-                "checkpoint_bytes",
+                "metadata_bytes",
+                "wal_bytes",
                 "response_bytes",
                 "response_total_bytes",
                 "cache_bytes",
@@ -727,10 +727,9 @@ mod tests {
     fn fixed_fields_cross_section_keys_and_noninteger_values_are_refused() {
         for key in [
             "outbound_deliveries",
-            "journal_bytes",
-            "journal_operations",
-            "frame_bytes",
-            "frame_operations",
+            "sqlite_heap_bytes",
+            "transaction_bytes",
+            "transaction_operations",
             "body_bytes",
         ] {
             let mut b = Builder::default();

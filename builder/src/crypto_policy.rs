@@ -26,7 +26,7 @@ pub(crate) fn admitted(name: &str) -> bool {
 pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-crypto" => "7ca2d70176ddb80083ff07de51465e8194fd01e4e4d435201444f11ed997c308",
-        "td-mta" => "7a8c3a5233931da73589b804d3a051574f35bd5cc9357a1fe8afc7da7b834481",
+        "td-mta" => "4bb2d56662494db1992d719ca8ac882d4d71fc91b37eacfd116a69a980c73793",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
         "td-json" => "2793cd9cd8ffc7bac436069324b42b503f7f3114418fc95f558fb0831060e8b3",
         "td-nfc" => "39d752d381e239345e4ba213ea2ce2fb4efb723a4ea9f16f1d8aa1f1173359cf",
@@ -43,7 +43,7 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
 pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-crypto" => "499bfd9b6780ca6cc7df5c928a16d7397c43b61bbde1d164d532c494c530514b",
-        "td-mta" => "929c0ffbf66b9a6d43883f73b29ea53d46db061a54a2d794ec9c3c6afa046402",
+        "td-mta" => "575d661fb04a0af98ba5269132716679cf33e4c98504861e7ebf72169d037df3",
         "td-header" => "2862fd9186d5cdef3d645af0b43dee9f77ba51beee5d98219e5aae30db11eabc",
         "td-json" => "679f89cdafa0f8457884ba0d0f0c197814d2b13e4f6ece4557575c9bdfe3848c",
         "td-nfc" => "6b447fb42d5b4e2aa2a02da0817647db6f178d445f8dc3861c7c9a011cce4695",
@@ -154,6 +154,15 @@ webpki-roots v1.0.8|
 zeroize v1.9.0|alloc,default
 ";
 
+const SQLITE_ACTIVE: &str = "bitflags v2.13.2|
+fallible-iterator v0.3.0|alloc,default
+fallible-streaming-iterator v0.1.9|
+libsqlite3-sys v0.38.2|bundled,bundled_bindings,cc,default,min_sqlite_version_3_34_1,pkg-config,vcpkg
+rusqlite v0.40.2|bundled,hooks,limits,modern_sqlite
+smallvec v1.16.2|
+vcpkg v0.2.15|
+";
+
 pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), String> {
     if !admitted(name) {
         return Err(format!(
@@ -163,6 +172,7 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
     let mut expected: BTreeSet<String> = ACTIVE.lines().map(str::to_owned).collect();
     let mut local = vec!["td-crypto"];
     if name == "td-mta" {
+        expected.extend(SQLITE_ACTIVE.lines().map(str::to_owned));
         local.extend(["td-header", "td-json", "td-mime", "td-mta", "td-nfc"]);
     }
     for package in local {
@@ -183,6 +193,8 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
     }
     Ok(())
 }
+
+pub(crate) const SQLITE_DEPENDENCY: &str = "rusqlite = { version = \"=0.40.2\", default-features = false, features = [\"bundled\", \"hooks\", \"limits\"] }";
 
 #[cfg(test)]
 mod tests {
@@ -384,7 +396,7 @@ mod tests {
         let nfc = root.join("td-nfc").canonicalize().unwrap();
         let mime = root.join("td-mime").canonicalize().unwrap();
         let mailgraph = format!(
-            "{graph}td-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\n",
+            "{graph}{SQLITE_ACTIVE}td-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\n",
             mail.display(),
             json.display(),
             header.display(),
@@ -398,6 +410,15 @@ mod tests {
         )
         .is_err());
         assert!(active_graph(&root, "td-mta", &mailgraph).is_ok());
+        for bad in [
+            mailgraph.replace("rusqlite v0.40.2|bundled,hooks,limits,modern_sqlite", "rusqlite v0.40.2|bundled,hooks,limits,load_extension,modern_sqlite"),
+            mailgraph.replace("libsqlite3-sys v0.38.2|bundled,bundled_bindings,cc,default,min_sqlite_version_3_34_1,pkg-config,vcpkg", "libsqlite3-sys v0.38.2|default,pkg-config,vcpkg"),
+            mailgraph.replace("rusqlite v0.40.2", "rusqlite v0.40.1"),
+            mailgraph.replace("smallvec v1.16.2|\n", ""),
+        ] {
+            assert!(active_graph(&root, "td-mta", &bad).is_err());
+        }
+
         assert!(active_graph(
             &root,
             "td-mta",

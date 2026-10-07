@@ -6,7 +6,7 @@ health/status snapshots in `observability/queue.rs` and `observability/health.rs
 They borrow caller storage and allocate nothing. Runtime aggregation,
 synchronization, log files/rotation and stderr fallback remain M19. These
 records are diagnostics, never the authoritative
-journal, an acceptance condition or an authorization token.
+metadata store, an acceptance condition or an authorization token.
 
 ## Envelope
 
@@ -40,7 +40,7 @@ already supplied values and does not mint IDs, sample clocks or access secrets.
 A failed clock sample is null, never a fabricated epoch-zero time. These records
 do not persist monotonic deadlines or compare ticks across boots.
 
-Runtime producers supply relevant correlations: mail/journal events use the
+Runtime producers supply relevant correlations: mail/metadata events use the
 committed transaction, relay events use the submission, protocol events use the
 connection and request where applicable. An encoder cannot prove the underlying
 operation happened. Config generation identifies the snapshot actually used by
@@ -65,8 +65,8 @@ input shape; it is not a substring filter. Normal events always have empty
 | `tls_failed` | `protocol` | warning | none |
 | `mail_accepted` | unsigned `bytes` | info | none |
 | `admission_refused` | `reason` | warning | mapped below |
-| `journal_committed` | none | info | none |
-| `checkpoint_selected` | unsigned `generation` | info | none |
+| `metadata_committed` | none | info | none |
+| `wal_checkpointed` | none | info | none |
 | `relay_outcome` | `outcome` | info for accepted, otherwise warning | inspect_submission for permanent_failure/unknown |
 | `authentication_failed` | none | warning | none |
 | `certificate_renewed` | signed `expires_utc_ms` | info | none |

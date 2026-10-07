@@ -1,329 +1,65 @@
-//! Safe fixture for the dedicated allocation-measurement process.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+//! Actual raw-file operations under the dedicated Rust allocation counter.
+#![allow(clippy::unwrap_used)]
 use super::*;
-use std::{os::unix::fs::DirBuilderExt, path::PathBuf};
+use crate::{format::row::BlobKind, ids::BlobId};
 
-struct Fixture {
-    path: PathBuf,
-    root: LockedRoot,
-    account: AccountId,
-}
-impl Fixture {
-    fn new(path: PathBuf) -> Self {
-        create_directory(&path);
-        let path = fs::canonicalize(path).unwrap();
-        let directory = Directory::from_path(path.to_str().unwrap()).unwrap();
-        let owner = directory.metadata().unwrap().uid();
-        let lock = super::super::acquire_lock(&directory, owner).unwrap();
-        // Only this cfg(test) fixture bypasses deployment root admission.
-        // The actual lock and every temporary-file I/O check still run.
-        let root = LockedRoot {
-            root: super::super::PrivateRoot { directory },
-            _lock: lock,
-        };
+pub fn run(mut snapshot: impl FnMut()) {
+    for fixture in [
+        super::super::tests::Fixture::new(),
+        super::super::tests::Fixture::maximum_root(),
+    ] {
+        let root = fixture.locked();
         let account = AccountId::from_bytes([0x42; 16]);
-        let name = Name::account(account, AccountEntry::Temporary).unwrap();
-        let mut parent = path.clone();
-        for part in name.as_path().unwrap().components() {
-            parent.push(part);
-            create_directory(&parent);
-        }
+        let id = BlobId::from_bytes([0x44; 16]);
+        root.create_accounts_directory().unwrap();
         for entry in [
-            AccountEntry::Metadata,
-            AccountEntry::Checkpoints,
-            AccountEntry::Checkpoint(Number::new(u64::MAX).unwrap()),
-            AccountEntry::Journals,
+            AccountEntry::Root,
+            AccountEntry::Temporary,
             AccountEntry::Messages,
-            AccountEntry::Shard(crate::format::row::BlobKind::Message, 0xff),
+            AccountEntry::Shard(BlobKind::Message, 0x44),
         ] {
             root.create_account_directory(account, entry).unwrap();
         }
-        Self {
-            path,
-            root,
-            account,
-        }
-    }
-}
-fn create_directory(path: &Path) {
-    fs::DirBuilder::new().mode(0o700).create(path).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-/// Invokes the snapshot callback immediately before and after just the measured
-/// operations. Fixture preparation and removal are deliberately outside it.
-pub fn run(mut snapshot: impl FnMut()) {
-    let base = std::env::temp_dir().join(format!("td-mta-file-alloc-{}", std::process::id()));
-    create_directory(&base);
-    let base = fs::canonicalize(base).unwrap();
-    let tail = super::super::MAX_ROOT_BYTES
-        .checked_sub(base.as_os_str().len())
-        .and_then(|remaining| remaining.checked_sub(1))
-        .filter(|length| (1..=255).contains(length))
-        .expect("allocation fixture TMPDIR must leave a valid maximum root component");
-    let short = Fixture::new(base.join("short"));
-    let long = Fixture::new(base.join("x".repeat(tail)));
-    assert_eq!(long.path.as_os_str().len(), super::super::MAX_ROOT_BYTES);
-    for fixture in [&short, &long] {
-        for point in 0..8 {
-            let account = AccountId::from_bytes([0x60 + point; 16]);
-            fixture
-                .root
-                .create_account_directory(account, AccountEntry::Root)
-                .unwrap();
-            fixture
-                .root
-                .create_account_directory(account, AccountEntry::Metadata)
-                .unwrap();
-        }
-    }
-    for fixture in [&short, &long] {
-        super::super::selection::prepare_probe(&fixture.root);
-    }
-    let table_probe = super::super::table::prepare_probe(&short.root);
-    drop(super::super::table::prepare_probe(&long.root));
-    let mut lookup_value = vec![0; crate::format::MAX_VALUE_BYTES];
-    let mut table_scratch = [0; crate::format::table::MAX_RECORD_BYTES];
-    let history_probe = super::super::history::prepare_probe(&short.root);
-    drop(super::super::history::prepare_probe(&long.root));
-    let active_probe = super::super::active::prepare_probe(&short.root);
-    drop(super::super::active::prepare_probe(&long.root));
-    for fixture in [&short, &long] {
-        super::super::blob::prepare_probe(&fixture.root);
-        super::super::blob_sweep::prepare_probe(&fixture.root);
-    }
-    let repair_update = super::super::input::prepare_repair_probe();
-    let recovery_probe = super::super::input::prepare_recovery_probe();
-    let mut history_scratch = vec![0; crate::format::MAX_FRAME_BYTES];
-    let mut overlay_cells = [crate::overlay::Cell::EMPTY; 2];
-    let mut selection_scratch = super::super::SelectionScratch::new();
-    snapshot();
-    for fixture in [&short, &long] {
-        super::super::blob::probe(&fixture.root);
-        super::super::blob_sweep::probe(&fixture.root);
-        super::super::selection::probe(&fixture.root, &mut selection_scratch);
-        super::super::table::probe(&fixture.root, &table_probe, &mut table_scratch);
-        super::super::history::probe(
-            &fixture.root,
-            &history_probe,
-            history_scratch.as_mut_slice().try_into().unwrap(),
-        );
-        super::super::active::probe(
-            &fixture.root,
-            &active_probe,
-            history_scratch.as_mut_slice().try_into().unwrap(),
-        );
-        super::super::change_locator::probe(
-            &fixture.root,
-            &active_probe,
-            history_scratch
-                .get_mut(..crate::format::table::MAX_RECORD_BYTES)
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        );
-        super::super::change_scan::probe(
-            &fixture.root,
-            &active_probe,
-            history_scratch
-                .get_mut(..crate::format::table::MAX_RECORD_BYTES)
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        );
-        super::super::active_overlay::probe(
-            &fixture.root,
-            &active_probe,
-            &mut history_scratch,
-            &mut overlay_cells,
-        );
-        super::super::history::probe_sweep(&fixture.root, &history_probe, &mut table_scratch);
-        super::super::table::probe_sweep(
-            &fixture.root,
-            &table_probe,
-            &active_probe,
-            &mut history_scratch,
-            &mut overlay_cells,
-            &mut table_scratch,
-        );
-        super::super::table::probe_replay(
-            &fixture.root,
-            &table_probe,
-            &active_probe,
-            &mut history_scratch,
-            &mut overlay_cells,
-            &mut table_scratch,
-        );
-        super::super::table::probe_lookup(
-            &fixture.root,
-            &table_probe,
-            &active_probe,
-            &mut history_scratch,
-            &mut overlay_cells,
-            &mut table_scratch,
-            &mut lookup_value,
-        );
-        super::super::table::probe_next(
-            &fixture.root,
-            &table_probe,
-            &active_probe,
-            &mut history_scratch,
-            &mut overlay_cells,
-            &mut table_scratch,
-            &mut lookup_value,
-        );
-        super::super::input::probe_recovery(
-            &fixture.root,
-            &recovery_probe,
-            history_scratch.as_mut_slice().try_into().unwrap(),
-        );
-        super::super::input::probe_repair(
-            &fixture.root,
-            &recovery_probe,
-            &repair_update,
-            history_scratch.as_mut_slice().try_into().unwrap(),
-        );
-        super::super::input::probe_prefix(&fixture.root);
-        super::current::probe(&fixture.root, fixture.account);
-        super::super::input::probe(&fixture.root, fixture.account);
-        super::publication::probe(&fixture.root, fixture.account);
-        assert!(
-            matches!(fixture.root.create_accounts_directory(), Err(CreateError::Uncreated(e)) if e.kind() == io::ErrorKind::AlreadyExists)
-        );
-        let directory_account = AccountId::from_bytes([0x17; 16]);
-        for entry in [
-            AccountEntry::Root,
-            AccountEntry::Metadata,
-            AccountEntry::Checkpoints,
-            AccountEntry::Checkpoint(Number::new(u64::MAX).unwrap()),
-            AccountEntry::Temporary,
-            AccountEntry::Messages,
-            AccountEntry::Shard(crate::format::row::BlobKind::Message, 0xff),
-        ] {
-            let directory = fixture
-                .root
-                .create_account_directory(directory_account, entry)
-                .unwrap();
-            assert!(directory.metadata().unwrap().is_dir());
-            drop(directory);
-            assert!(
-                matches!(fixture.root.create_account_directory(directory_account, entry), Err(CreateError::Uncreated(e)) if e.kind() == io::ErrorKind::AlreadyExists)
-            );
-        }
-        assert!(
-            matches!(fixture.root.create_account_directory(directory_account, AccountEntry::Current), Err(CreateError::Uncreated(e)) if e.kind() == io::ErrorKind::InvalidInput)
-        );
-        for number in 1..=16 {
-            let number = Number::new(number).unwrap();
-            let mut file = fixture
-                .root
-                .create_temporary(fixture.account, number, 4096)
-                .unwrap();
-            file.write(&[0x5a; 4096]).unwrap();
-            assert_eq!(
-                file.write(b"!").unwrap_err().kind(),
-                io::ErrorKind::InvalidInput
-            );
-            assert!(
-                matches!(fixture.root.create_temporary(fixture.account, number, 4096), Err(CreateError::Uncreated(e)) if e.kind() == io::ErrorKind::AlreadyExists)
-            );
-            let synced = file.sync().unwrap();
-            let mut bytes = [0; 4096];
-            assert_eq!(synced.read_at(0, &mut bytes).unwrap(), 4096);
-            assert!(bytes.iter().all(|byte| *byte == 0x5a));
-            assert_eq!(synced.read_at(4096, &mut bytes).unwrap(), 0);
-            assert_eq!(
-                synced.read_at(4097, &mut bytes).unwrap_err().kind(),
-                io::ErrorKind::InvalidInput
-            );
-            drop(synced);
-        }
-        assert!(
-            matches!(fixture.root.create_temporary(AccountId::from_bytes([1;16]), Number::new(1).unwrap(), 1), Err(CreateError::Uncreated(e)) if e.kind() == io::ErrorKind::NotFound)
-        );
-        let file = fixture
-            .root
-            .create_temporary(fixture.account, Number::new(17).unwrap(), 1)
+        snapshot();
+        let mut temporary = root
+            .create_temporary(account, Number::new(1).unwrap(), 3)
             .unwrap();
-        assert_eq!(
-            file.sync_using(|_| Err(io::ErrorKind::StorageFull.into()))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::StorageFull
-        );
-        for number in 18..=19 {
-            let name = Name::account(
-                fixture.account,
-                AccountEntry::TemporaryFile(Number::new(number).unwrap()),
-            )
+        temporary.write(b"abc").unwrap();
+        let published = temporary
+            .sync()
+            .unwrap()
+            .publish_blob(BlobKind::Message, id)
             .unwrap();
-            let result = create_using(
-                &fixture.root.root.directory,
-                &name,
-                |path| {
-                    let file = open_new(path)?;
-                    if number == 18 {
-                        return Err(io::ErrorKind::PermissionDenied.into());
-                    }
-                    Ok(file)
-                },
-                |_, _| Err(io::ErrorKind::StorageFull.into()),
-            );
-            if number == 18 {
-                assert!(
-                    matches!(result, Err(CreateError::Attempted(e)) if e.kind() == io::ErrorKind::PermissionDenied)
-                );
-            } else {
-                assert!(
-                    matches!(result, Err(CreateError::Created(e)) if e.kind() == io::ErrorKind::StorageFull)
-                );
-            }
-        }
-        let mut file = fixture
-            .root
-            .create_temporary(fixture.account, Number::new(20).unwrap(), 1)
+        assert_eq!(published.len(), 3);
+        drop(published);
+        snapshot();
+        snapshot();
+        let mut temporary = root
+            .create_temporary(account, Number::new(2).unwrap(), 3)
             .unwrap();
-        assert_eq!(
-            file.progress
-                .write(&mut Interrupted, b"x")
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::WouldBlock
-        );
-        assert_eq!(
-            file.write(b"x").unwrap_err().kind(),
-            io::ErrorKind::BrokenPipe
-        );
-        assert_eq!(file.sync().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
-        let mut file = fixture
-            .root
-            .create_temporary(fixture.account, Number::new(21).unwrap(), 1)
+        temporary.write(b"xyz").unwrap();
+        assert!(temporary
+            .sync()
+            .unwrap()
+            .publish_blob(BlobKind::Message, id)
+            .is_err());
+        snapshot();
+        snapshot();
+        let mut input = root
+            .open_account_file(account, AccountEntry::Blob(BlobKind::Message, id), 3)
             .unwrap();
-        file.write(b"x").unwrap();
-        let file = file.sync().unwrap();
-        file.file.file.set_len(0).unwrap();
-        assert_eq!(
-            file.read_at(0, &mut [0]).unwrap_err().kind(),
-            io::ErrorKind::UnexpectedEof
-        );
-    }
-    snapshot();
-    drop(short);
-    drop(long);
-    fs::remove_dir(base).unwrap();
-}
-
-struct Interrupted;
-impl Write for Interrupted {
-    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-        Err(io::ErrorKind::Interrupted.into())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        let mut bytes = [0; 4];
+        assert_eq!(input.read(&mut bytes).unwrap(), 3);
+        assert_eq!(bytes.get(..3), Some(b"abc".as_slice()));
+        assert_eq!(input.finish().unwrap().len(), 3);
+        snapshot();
+        snapshot();
+        assert!(root
+            .open_account_file(account, AccountEntry::Blob(BlobKind::Message, id), 2)
+            .is_err());
+        assert!(root
+            .create_temporary(account, Number::new(2).unwrap(), 3)
+            .is_err());
+        snapshot();
     }
 }

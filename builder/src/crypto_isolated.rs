@@ -1351,7 +1351,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "tls_smoke::mutual_authentication_refuses_server_only_usage", false),
         ("td-crypto-smoke", "tls_smoke::mutual_authentication_refuses_bad_signature", false),
         ("td-crypto-smoke", "tls_smoke::mutual_authentication_refuses_mismatched_key_before_connect", false),
-        ("td-mta-format-smoke", "provider_hashes_container_and_binding_fixtures", false),
+        ("td-mta-format-smoke", "provider_hashes_blob_fixture", false),
         ("td-mta-format-smoke", "provider_hashes_import_snapshot_fixtures", false),
         ("td-mta-config-smoke", "portable_loader_stack", true),
         ("td-mta-config-smoke", "portable_materialized_stack", true),
@@ -1666,7 +1666,7 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
     }
     crate::crypto_build::validate(root)?;
     let inputs = crate::crypto_portable::inputs(root, archives)?;
-    let vendor = crate::host_bin::prepare_crypto_vendor(root)?;
+    let vendor = crate::host_bin::prepare_mail_vendor(root)?;
     let scratch = Scratch::new(root)?;
     let source = scratch.0.join("source");
     stage_sources(root, &source)?;

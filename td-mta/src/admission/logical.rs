@@ -74,7 +74,6 @@ pub struct PartId(SlotId);
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Issued {
     pub lease: LeaseId,
-    pub frame: Option<PartId>,
 }
 #[derive(Clone, Copy, Debug)]
 struct Record {
@@ -168,9 +167,6 @@ impl<'a> Leases<'a> {
         self.slots.available()
     }
 
-    pub(super) fn quotas(&self) -> &Quotas {
-        &self.quotas
-    }
     pub(super) fn project(&self, requests: &[Charges]) -> Result<Quotas, Error> {
         self.healthy()?;
         if requests.is_empty() || requests.len() > MAX_GROUP_CELLS {
@@ -187,15 +183,6 @@ impl<'a> Leases<'a> {
         }
         self.quotas.with_reservation(extra).map_err(Error::Quota)
     }
-    pub(super) fn project_rollover(&self) -> Result<Quotas, Error> {
-        self.healthy()?;
-        self.quotas.with_rollover().map_err(Error::Quota)
-    }
-    pub(super) fn rollover(&mut self) -> Result<(), Error> {
-        self.quotas = self.project_rollover()?;
-        Ok(())
-    }
-
     /// Atomic across up to eight records. Duplicate kinds add across the group.
     /// This reserves logical budgets only; runtime handles write/sync failure.
     pub fn reserve(
@@ -213,22 +200,12 @@ impl<'a> Leases<'a> {
         now: Tick,
         acquire: impl FnMut(&mut SlotPool<'a>, usize) -> Result<SlotId, SlotError>,
     ) -> Result<LeaseId, Error> {
-        self.reserve_inner(requests, false, deadline, now, acquire)
+        self.reserve_inner(requests, deadline, now, acquire)
             .map(|issued| issued.lease)
-    }
-    pub(super) fn reserve_group(
-        &mut self,
-        requests: &[Charges],
-        has_frame: bool,
-        deadline: Deadline,
-        now: Tick,
-    ) -> Result<Issued, Error> {
-        self.reserve_inner(requests, has_frame, deadline, now, |pool, _| pool.acquire())
     }
     fn reserve_inner(
         &mut self,
         requests: &[Charges],
-        has_frame: bool,
         deadline: Deadline,
         now: Tick,
         mut acquire: impl FnMut(&mut SlotPool<'a>, usize) -> Result<SlotId, SlotError>,
@@ -275,15 +252,6 @@ impl<'a> Leases<'a> {
             return Err(Error::Poisoned);
         };
         let mut records = [None; MAX_GROUP_CELLS];
-        let frame = if has_frame {
-            let Some((id, _)) = issued.iter().flatten().last() else {
-                self.poisoned = true;
-                return Err(Error::Poisoned);
-            };
-            Some(PartId(*id))
-        } else {
-            None
-        };
         for (ordinal, (issued, charges)) in issued.iter().flatten().zip(requests).enumerate() {
             let (id, index) = *issued;
             if !self.cells.get(index).is_some_and(|c| c.record.is_none())
@@ -322,7 +290,6 @@ impl<'a> Leases<'a> {
         self.quotas = next;
         Ok(Issued {
             lease: LeaseId(root_id),
-            frame,
         })
     }
     fn rollback(&mut self, issued: &[Option<(SlotId, usize)>]) -> Result<(), Error> {
@@ -436,27 +403,12 @@ impl<'a> Leases<'a> {
         ticket: &mut EffectTicket,
         result: EffectResult,
     ) -> Result<(), Error> {
-        self.complete_effect_inner(ticket, result, false)
-    }
-    pub(super) fn check_effect(&self, ticket: &EffectTicket) -> Result<(), Error> {
-        let part = ticket.part.ok_or(Error::InactiveTicket)?;
-        if !self.record(part)?.1.busy {
-            return Err(Error::Invalid);
-        }
-        Ok(())
-    }
-    pub(super) fn complete_frame(
-        &mut self,
-        ticket: &mut EffectTicket,
-        result: EffectResult,
-    ) -> Result<(), Error> {
-        self.complete_effect_inner(ticket, result, true)
+        self.complete_effect_inner(ticket, result)
     }
     fn complete_effect_inner(
         &mut self,
         ticket: &mut EffectTicket,
         result: EffectResult,
-        release_remainder: bool,
     ) -> Result<(), Error> {
         let part = ticket.part.ok_or(Error::InactiveTicket)?;
         let (index, mut record) = self.record(part)?;
@@ -486,14 +438,6 @@ impl<'a> Leases<'a> {
         }
         let mut next = self.quotas.clone();
         next.complete(used)?;
-        if release_remainder {
-            let mut unused = Usage::default();
-            for charge in record.charges() {
-                unused.add(charge.kind, charge.amount)?;
-            }
-            next.release_unused(unused)?;
-            record.amounts.fill(0);
-        }
         record.busy = false;
         let cell = self.cells.get_mut(index).ok_or(Error::Stale)?;
         cell.record = Some(record);

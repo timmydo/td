@@ -1,13 +1,7 @@
 //! Private output and consuming immutable publication under the writer lock.
-#[path = "temporary/current.rs"]
-mod current;
-pub use current::{CurrentError, CurrentUpdate};
 #[path = "temporary/publication.rs"]
 mod publication;
-pub use publication::{MetadataDestination, PublishError, PublishedFile};
-#[cfg(test)]
-#[path = "temporary/probe.rs"]
-pub mod probe;
+pub use publication::{PublishError, PublishedFile};
 
 use super::{Directory, LockedRoot, MAX_PATH_BYTES};
 use crate::{
@@ -684,3 +678,7 @@ mod tests {
         assert!(!progress.failed);
     }
 }
+
+#[cfg(test)]
+#[path = "temporary/probe.rs"]
+pub(super) mod probe;

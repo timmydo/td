@@ -173,10 +173,7 @@ mod tests {
         ViewIdentity {
             account: AccountId::from_bytes([1; 16]),
             epoch: StoreEpoch::from_bytes([2; 16]),
-            generation: 1,
-            checkpoint: Sequence::from_u64(3),
-            segment: 1,
-            committed_offset: 256,
+
             committed_sequence: Sequence::from_u64(5),
             history_floor: Sequence::from_u64(0),
         }
@@ -230,7 +227,7 @@ mod tests {
         ) -> Result<Option<(Row<'a>, Sequence)>, ports::Error> {
             self.calls += 1;
             if self.change_during_get {
-                self.identity.generation += 1;
+                self.identity.epoch = crate::ids::StoreEpoch::from_bytes([99; 16]);
             }
             if let Some(e) = self.error {
                 return Err(e);
@@ -359,7 +356,7 @@ mod tests {
             let captured = view.identity();
             let expected = match case {
                 0 => {
-                    view.identity.generation += 1;
+                    view.identity.epoch = crate::ids::StoreEpoch::from_bytes([99; 16]);
                     Error::ChangedView
                 }
                 1 => {
@@ -421,7 +418,7 @@ mod tests {
         let mut walk = ParentWalk::new(view.identity(), id(0), 1).unwrap();
         walk.advance(&mut view, &mut value).unwrap();
         assert!(walk.is_complete());
-        view.identity.generation += 1;
+        view.identity.epoch = crate::ids::StoreEpoch::from_bytes([99; 16]);
         assert_eq!(walk.advance(&mut view, &mut value), Err(Error::ChangedView));
         assert_eq!(view.calls, 1);
         assert!(walk.is_failed());

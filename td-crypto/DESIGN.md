@@ -28,7 +28,9 @@ The target dependency graph is:
 td-mta (library and packaging executable)
   -> td-header (std-only bounded header lexical cursors)
   -> td-json (std-only bounded JSON string framing)
+  -> td-mime (std-only MIME/header/charset/Unicode implementation)
   -> td-nfc (std-only bounded canonical composition)
+  -> rusqlite (private bundled SQLite metadata backend)
   -> td-crypto (td-owned API and private backend)
        -> rustls + aws-lc-rs + reviewed root data
 ```
@@ -37,6 +39,20 @@ td-mta/DESIGN.md section 3 owns the direct mail dependency rule. After backend
 admission, td-mta is this crate's only permitted roster consumer. The common
 gate must reject other direct or transitive consumers; the engine workspace
 and other std-only roster crates cannot inherit its external closure.
+
+The mail crate also has the explicitly approved private rusqlite 0.40.2
+closure with bundled SQLite 3.53.2. td-crypto does not consume SQLite.
+The common offline vendor uses the td-mta lock's union of crypto and SQLite
+sources, checking every archive checksum; td-crypto's selected 19-package
+normal/build graph is unchanged. Mail adds exactly seven selected packages,
+listed in DEPENDENCIES.md, with no other roster consumer. The exact direct
+manifest and active graph are pinned alongside the existing crypto policy.
+Mail's STORAGE.md owns native SQL, limits, filesystem and recovery semantics.
+The shared host and portable drivers force bundled linking and reviewed
+LIBSQLITE3_FLAGS; ambient LIBSQLITE3_/SQLITE_/SQLITE3_ controls are refused.
+No pkg-config fallback, extension loading, bindgen or external database tool
+is selected. Native SQLite heap/stack/RSS and target qualification are new
+mail obligations, not established by earlier crypto-only measurements.
 
 `td-crypto` does not depend on td-mta, its identifiers, configuration grammar,
 mail protocols, storage, logging, workers or service administration. Its own

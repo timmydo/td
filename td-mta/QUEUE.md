@@ -21,7 +21,7 @@ Do not silently discard recipient parameters or accept FUTURERELEASE.
 The queue stores the immutable, Bcc-stripped transmitted message separately
 from the user's email. Its blob, submission, every recipient row and the
 submission-created CHANGE become visible in one durable transaction. Reserve
-the entire frame before creating this responsibility. A configured recipient
+the entire transaction before creating this responsibility. A configured recipient
 limit must fit that transaction; the format ceiling is 1000. Generated IDs
 come from Entropy, with collision checks against live objects and retained
 history. Do not deliberately reuse IDs; random 128-bit identifiers are not
@@ -76,7 +76,7 @@ returns OutcomeUnknown, never RetryWait/Failed. InFlight
 starts with reason None. The uncertainty bit is latched once any attempt may
 have accepted; later definitive failures cannot clear it. Accepted may retain
 that bit to expose an earlier duplicate risk. All state changes produce an
-EmailSubmission-updated CHANGE in the same frame, even when only local
+EmailSubmission-updated CHANGE in the same transaction, even when only local
 diagnostics change. Mailbox/Email/Thread changes are added only when their
 objects actually change (for example a local failure notice).
 
@@ -123,13 +123,13 @@ attempt. Close the connection after a partial/invalid reply that cannot be
 classified safely. SMTP parser limits must refuse overlong replies, not turn
 a truncated prefix into a successful status.
 
-Journal reservations cover the whole selected batch and its CHANGE. The
+Transaction and WAL reservations cover the whole selected batch and its CHANGE. The
 maximum encoded recipient row is 9019 bytes; a PUT adds 12 operation-header
-bytes and a 20-byte key. A 100-row update is 905100 bytes before frame and
-submission/CHANGE overhead, below the 1 MiB frame ceiling. RESOURCES.md
+bytes and a 20-byte key. A 100-row update is 905100 bytes before transaction and
+submission/CHANGE overhead, below the 1 MiB transaction ceiling. RESOURCES.md
 accounts separately for retaining distinct replies while the remote peer
-is slow; the shared writer frame cannot be held across a network round trip.
-Before committing AcceptancePossible, hold both its frame reservation and
+is slow; the shared writer staging cannot be held across a network round trip.
+Before committing AcceptancePossible, hold both its transaction reservation and
 a separate worst-case final-outcome reservation for the selected DATA subset,
 including submission/CHANGE overhead. Only the phase reservation is consumed
 by that commit. Keep the final reservation and refresh expected sequence under
@@ -139,8 +139,8 @@ If these reservations cannot be obtained, abort before handing off terminator
 bytes; do not create an uncertain outcome merely because admission is full.
 Sync/I/O failure after handoff remains inherently uncertain despite capacity.
 
-If a journal write/sync fails, stop the writer. A complete replayable frame
-may exist even when the caller saw an error. Recovery decides the state;
+If a SQLite COMMIT has an indeterminate I/O result, stop the writer and
+reopen for SQLite recovery. Read the durable transaction state before retry;
 the worker must not append an alternative result or continue transmitting
 after losing its durable phase fence. A crash between remote acceptance and
 local durability is inherently ambiguous. Retries use identical transmitted
@@ -194,7 +194,7 @@ fence and close any Prepared/Body attempt before committing cancellation.
 Refuse if any recipient is Accepted, has uncertainty, or is currently in
 AcceptancePossible. An already wholly Canceled submission is an idempotent
 success. Before fencing or changing rows, compute and reserve the complete
-cancellation frame, retaining actual replies. Refuse with cannotUnsend (CLI
+cancellation transaction, retaining actual replies. Refuse with cannotUnsend (CLI
 limit reason) if it cannot fit the byte/operation ceiling or obtain capacity;
 never split cancellation or discard replies to fit it. Thus up to 1000 fresh
 queued recipients can cancel together, but a large attempted submission with
@@ -220,10 +220,10 @@ destruction does not mean cancellation (RFC 8621 §7.5).
 When a submission becomes terminal with any Failed/OutcomeUnknown recipient,
 set notification Pending in the same transaction. A local account-only
 failure email and notification Stored + notificationEmail are committed in
-one later frame; retry Pending on local storage failure. Its Email ID is
+one later transaction; retry Pending on local storage failure. Its Email ID is
 historical after user deletion, so a deleted notice is not generated again.
 Never notify an external inbound reverse path. Administrative acknowledgement
-and deletion are explicit, journaled actions subject to the same worker fence.
+and deletion are explicit, durably committed actions subject to the same worker fence.
 
 ## 5. Standard JMAP projection
 

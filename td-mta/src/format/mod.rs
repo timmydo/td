@@ -1,47 +1,20 @@
-//! Format-v1 scalar/key/row, fixed-container and table-record codecs.
-//! FORMAT.md owns the layout; selected-store validation and persistence remain M05.
+//! Canonical bounded metadata keys, values and operation input codecs.
+//! SQLite owns metadata persistence; raw message files own body bytes.
 use std::fmt;
 
-pub mod bindings;
-pub mod container;
-pub mod frame;
-pub mod frame_header;
-pub mod frame_stream;
-pub mod journal_stream;
 pub mod key;
-pub mod manifest;
 pub mod operation;
 pub mod row;
 pub mod scalar;
-pub mod table;
-pub mod table_stream;
 
-pub const CONTAINER_VERSION: u16 = 1;
 pub const SCHEMA_VERSION: u16 = 1;
 pub const MAX_KEY_BYTES: usize = 1024;
 pub const MIN_KEY_BYTES: usize = 16;
 pub const MAX_VALUE_BYTES: usize = 65536;
-pub const FORMAT_BYTES: usize = 80;
-pub const CURRENT_BYTES: usize = 120;
-pub const TABLE_HEADER_BYTES: usize = 112;
-pub const JOURNAL_HEADER_BYTES: usize = 96;
-pub const FRAME_HEADER_BYTES: usize = 64;
-pub const FRAME_FOOTER_BYTES: usize = 40;
-pub const RECORD_OVERHEAD_BYTES: usize = 48;
-pub const MANIFEST_PREFIX_BYTES: usize = 88;
-pub const TABLE_DESCRIPTOR_BYTES: usize = 56;
-pub const HISTORY_DESCRIPTOR_BYTES: usize = 64;
-pub const MANIFEST_DIGEST_BYTES: usize = 32;
 pub const TABLE_COUNT: usize = 11;
-pub const MAX_HISTORY_DESCRIPTORS: usize = 64;
-pub const MAX_MANIFEST_BYTES: usize = 4832;
 pub const OPERATION_HEADER_BYTES: usize = 12;
-pub const MIN_FRAME_BYTES: usize =
-    FRAME_HEADER_BYTES + FRAME_FOOTER_BYTES + OPERATION_HEADER_BYTES + MIN_KEY_BYTES;
-pub const MAX_FRAME_BYTES: usize = 1_048_576;
-pub const MAX_FRAME_OPERATIONS: usize = 4096;
-pub const MAX_JOURNAL_FRAME_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_JOURNAL_OPERATIONS: usize = 8192;
+pub const MAX_TRANSACTION_BYTES: usize = 1_048_576;
+pub const MAX_TRANSACTION_OPERATIONS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -74,7 +47,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Zero describes an empty initial checkpoint; transaction sequences start at 1.
+/// Zero describes an empty initial account; transaction sequences start at 1.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Sequence(u64);
 
@@ -106,7 +79,7 @@ pub enum Table {
     Imports,
 }
 
-/// Shared by import key kinds and journal CHANGE records; not Rust discriminants.
+/// Shared by import key kinds and CHANGE records; not Rust discriminants.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObjectType {
     Mailbox,
@@ -217,18 +190,10 @@ mod tests {
     #[test]
     fn registry_matches_the_admission_profile() {
         let limits = crate::limits::Limits::default();
-        assert_eq!(limits.frame_bytes, MAX_FRAME_BYTES);
-        assert_eq!(limits.frame_operations, MAX_FRAME_OPERATIONS);
-        assert_eq!(limits.journal_bytes, MAX_JOURNAL_FRAME_BYTES);
-        assert_eq!(limits.journal_operations, MAX_JOURNAL_OPERATIONS);
-        assert_eq!(MIN_FRAME_BYTES, 132);
-        assert_eq!(
-            MAX_MANIFEST_BYTES,
-            MANIFEST_PREFIX_BYTES
-                + TABLE_COUNT * TABLE_DESCRIPTOR_BYTES
-                + MAX_HISTORY_DESCRIPTORS * HISTORY_DESCRIPTOR_BYTES
-                + MANIFEST_DIGEST_BYTES
-        );
+        assert_eq!(limits.transaction_bytes, MAX_TRANSACTION_BYTES);
+        assert_eq!(limits.transaction_operations, MAX_TRANSACTION_OPERATIONS);
+        assert_eq!(MAX_KEY_BYTES, 1024);
+        assert_eq!(MAX_VALUE_BYTES, 65536);
     }
 
     #[test]

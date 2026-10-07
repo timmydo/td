@@ -19,7 +19,7 @@ pub enum Target {
     Submission { id: SubmissionId, ordinal: u32 },
 }
 impl Target {
-    fn key(self) -> Key<'static> {
+    pub(crate) fn key(self) -> Key<'static> {
         match self {
             Self::Blob { id, .. } => Key::Blob(id),
             Self::Mailbox(id) => Key::Mailbox(id),
@@ -76,6 +76,9 @@ pub struct ReferenceCheck<'k> {
     failed: bool,
 }
 impl<'k> ReferenceCheck<'k> {
+    pub(crate) fn targets(&self) -> &[Option<Target>; 2] {
+        &self.targets
+    }
     /// The caller supplies the final source row and an admitted wall-time sample.
     pub fn new(
         identity: ViewIdentity,
@@ -252,10 +255,7 @@ pub(crate) mod tests {
         ViewIdentity {
             account: AccountId::from_bytes([7; 16]),
             epoch: StoreEpoch::from_bytes([8; 16]),
-            generation: 1,
-            checkpoint: Sequence::from_u64(1),
-            segment: 2,
-            committed_offset: 256,
+
             committed_sequence: Sequence::from_u64(2),
             history_floor: Sequence::default(),
         }
@@ -380,7 +380,7 @@ pub(crate) mod tests {
         ) -> Result<Option<(Row<'a>, Sequence)>, ports::Error> {
             self.calls += 1;
             if self.moved {
-                self.identity.generation += 1;
+                self.identity.epoch = crate::ids::StoreEpoch::from_bytes([99; 16]);
             }
             if let Some(error) = self.error {
                 return Err(error);
@@ -532,7 +532,7 @@ pub(crate) mod tests {
                 0 => view.error = Some(ports::Error::Capacity),
                 1 => view.rows[0].1 = Row::Thread,
                 2 => view.sequence = Sequence::from_u64(3),
-                3 => view.identity.generation += 1,
+                3 => view.identity.epoch = crate::ids::StoreEpoch::from_bytes([99; 16]),
                 4 => {
                     view.moved = true;
                     view.missing = true;
@@ -574,7 +574,7 @@ pub(crate) mod tests {
             assert_eq!(view.calls, 1);
             match mode {
                 0 => view.missing = true,
-                1 => view.identity.generation += 1,
+                1 => view.identity.epoch = crate::ids::StoreEpoch::from_bytes([99; 16]),
                 2 => view.rows[3].1 = Row::Keyword,
                 _ => view.error = Some(ports::Error::Capacity),
             }
@@ -634,7 +634,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(check.advance(&mut view, &mut []).unwrap());
-        view.identity.generation += 1;
+        view.identity.epoch = crate::ids::StoreEpoch::from_bytes([99; 16]);
         assert_eq!(check.advance(&mut view, &mut []), Err(Error::ChangedView));
         assert!(matches!(check.finish(), Err(Error::Failed)));
     }

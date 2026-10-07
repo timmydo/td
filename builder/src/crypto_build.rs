@@ -32,13 +32,21 @@ pub(crate) const CONTROLS: &[(&str, &str)] = &[
     ("AWS_LC_SYS_PREBUILT_NASM", "0"),
     ("AWS_LC_SYS_STATIC", "1"),
     ("AWS_LC_SYS_EXTERNAL_BINDGEN", "0"),
+    ("LIBSQLITE3_SYS_USE_PKG_CONFIG", "0"),
+    ("LIBSQLITE3_FLAGS", "-DSQLITE_OMIT_LOAD_EXTENSION=1 -DSQLITE_TEMP_STORE=3 -DSQLITE_MAX_MEMORY=16777216 -DSQLITE_MAX_ALLOCATION_SIZE=2097152 -DSQLITE_MAX_LENGTH=69632 -DSQLITE_MAX_SQL_LENGTH=8192 -DSQLITE_MAX_PAGE_COUNT=8192 -DSQLITE_DEFAULT_CACHE_SIZE=-128"),
 ];
+
+fn reserved_control(key: &str) -> bool {
+    key.starts_with("AWS_LC_SYS_")
+        || key.starts_with("LIBSQLITE3_")
+        || key.starts_with("SQLITE_")
+        || key.starts_with("SQLITE3_")
+}
 
 fn check_controls(vars: impl Iterator<Item = (String, String)>) -> Result<()> {
     for (key, value) in vars {
-        if key.starts_with("AWS_LC_SYS_") && !CONTROLS.iter().any(|(k, v)| *k == key && *v == value)
-        {
-            return Err(format!("unsupported crypto build override: {key}"));
+        if reserved_control(&key) && !CONTROLS.iter().any(|(k, v)| *k == key && *v == value) {
+            return Err(format!("unsupported native mail build override: {key}"));
         }
     }
     Ok(())
@@ -91,7 +99,7 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
             let key = key
                 .into_string()
                 .map_err(|_| "build environment key is not UTF-8")?;
-            if key.starts_with("AWS_LC_SYS_") {
+            if reserved_control(&key) {
                 Ok((
                     key,
                     value
@@ -105,7 +113,7 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     check_controls(variables.into_iter())?;
     let home = Scratch::create(root)?;
-    let vendor = crate::host_bin::prepare_crypto_vendor(root)?;
+    let vendor = crate::host_bin::prepare_mail_vendor(root)?;
     let vendor = vendor
         .canonicalize()
         .map_err(|e| format!("crypto vendor path: {e}"))?;
@@ -134,6 +142,10 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
     }
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .unwrap_or_else(|| root.join(".td-build-cache/crypto-target").into_os_string());
+    let native_flags = format!(
+        "-march=x86-64 -mtune=generic -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -g1 -ffile-prefix-map={}=/td-build -ffile-prefix-map={vendor}=/td-cargo/vendor -ffile-prefix-map={}=/td-build-root",
+        root.display(), Path::new(&target_dir).display()
+    );
     let command = |verb: &str, manifest: &str| {
         let mut cmd = Command::new(&cargo);
         cmd.current_dir(root)
@@ -173,11 +185,13 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
         // cc-rs recognizes target-specific spellings before plain CC/AR.
         for prefix in ["", "HOST_", "TARGET_"] {
             cmd.env(format!("{prefix}CC"), &cc)
-                .env(format!("{prefix}AR"), &ar);
+                .env(format!("{prefix}AR"), &ar)
+                .env(format!("{prefix}CFLAGS"), &native_flags);
         }
         for target in [host.clone(), host.replace('-', "_")] {
             cmd.env(format!("CC_{target}"), &cc)
-                .env(format!("AR_{target}"), &ar);
+                .env(format!("AR_{target}"), &ar)
+                .env(format!("CFLAGS_{target}"), &native_flags);
         }
         for (key, value) in CONTROLS {
             cmd.env(key, value);
@@ -289,6 +303,10 @@ mod tests {
             ("AWS_LC_SYS_STATIC", "0"),
             ("AWS_LC_SYS_CMAKE_BUILDER_x86_64_unknown_linux_gnu", "1"),
             ("AWS_LC_SYS_EXTERNAL_BINDGEN", "1"),
+            ("LIBSQLITE3_SYS_USE_PKG_CONFIG", "1"),
+            ("LIBSQLITE3_FLAGS", "-DSQLITE_OMIT_LOAD_EXTENSION=0"),
+            ("SQLITE_MAX_COLUMN", "1"),
+            ("SQLITE3_LIB_DIR", "/ambient"),
         ] {
             assert!(check_controls(std::iter::once((key.into(), value.into()))).is_err());
         }

@@ -1,18 +1,9 @@
-# Store format v1 registry
+# Store application format registry
 
-This is the normative byte-layout companion to [STORAGE.md](STORAGE.md).
-M02a and M02b implement allocation-free scalar, primary-key and row codecs in
-`src/format/`, with literal row/container fixtures. M05a1 adds fixed FORMAT,
-CURRENT and journal-header integrity codecs. M05a2a adds table headers and
-individual record envelopes. M05a2b1 validates supplied table streams. M05a2b2
-adds manifest structure codecs; M05a2b3 binds selected metadata, table summaries
-and journal headers. M05a3a adds transaction headers and individual operation
-codecs. M05a3b validates complete local frames and supplied journal streams.
-Selected-graph and complete final-view validation, publication and recovery
-are unimplemented.
-M02c freezes semantic
-APIs. Production persistence waits for those contracts
-and the M05 store implementation. Nothing here advertises a usable store.
+This is the normative application-byte companion to [STORAGE.md](STORAGE.md).
+SQLite owns physical pages, WAL, transactions and recovery. The allocation-free
+scalar, key, row and operation codecs define only bounded application values.
+No custom FORMAT/CURRENT/table/manifest/journal container is emitted.
 
 ## 1. Conventions
 
@@ -20,8 +11,7 @@ Offsets are zero-based decimal byte offsets, never native Rust layouts.
 `u16`, `u32`, `u64`, `i64` mean fixed-width little-endian integers. `be32`
 means big-endian u32. `ID` is 16 opaque bytes. `H` is a 32-byte SHA-256
 digest. Hash input is exactly the stated bytes, without implicit domain text,
-alignment, terminators or padding. The eight-byte magic already identifies
-each container. No digest is a credential or protection against a store writer.
+alignment, terminators or padding. SQLite identifies its own physical containers. No digest is a credential or protection against a store writer.
 
 `bytes(N)` is `u32 length` followed by that many bytes, at most N. `text(N)`
 also requires UTF-8; N counts bytes, not Unicode characters. A presence or
@@ -38,14 +28,12 @@ they are not an extensible TLV protocol. A changed layout needs a new schema
 and explicit migration. Reuse of a retired numeric tag is forbidden.
 
 All times are signed i64 UTC milliseconds since the Unix epoch. Protocol date
-validation and presentation are separate. Checkpoint sequence 0 denotes an
+validation and presentation are separate. Account sequence 0 denotes an
 empty store; the first transaction is 1. Every later transaction is the exact
 checked successor. On u64 exhaustion stop mutation, keep reads available and
 require explicit migration to a fresh epoch. Never wrap or reset in place.
-Generation and segment numbers are nonzero u64, independently allocated using
-exclusive creation. Their exhaustion likewise refuses publication. Numeric
-path components are 20 zero-padded decimal digits; shortened examples in
-STORAGE.md are illustrative, not alternative encodings.
+Temporary-file numbers are nonzero u64, exclusively created and rendered
+as 20 zero-padded decimal digits. They convey no database generation.
 
 The checked scalar readers borrow their input; writers use caller-owned
 buffers. After any scalar codec error discard that cursor and its partial
@@ -55,25 +43,24 @@ and does not prove that a referenced row exists.
 
 ## 2. Table and primary-key registry
 
-Table tags are u16. A table file and a journal operation identify the table;
+Table tags are u16. A SQLite record and an application operation identify the table;
 the primary-key bytes do not contain another table tag. Keys are unique and
 sorted by unsigned bytewise comparison of their complete encoded form.
-Descriptor ordering uses `Table::tag()`, never Rust enum declaration order.
-M05 supplies the path mapping from these tags to the fixed filenames below.
+Logical ordering uses `Table::tag()`, never Rust enum declaration order.
 
-| Tag | Table filename | Key bytes, in order | Exact / maximum bytes |
+| Tag | Logical table | Key bytes, in order | Exact / maximum bytes |
 | ---: | --- | --- | ---: |
-| 1 | `blobs.tbl` | blob ID | 16 |
-| 2 | `mailboxes.tbl` | mailbox ID | 16 |
-| 3 | `emails.tbl` | email ID | 16 |
-| 4 | `memberships.tbl` | email ID, mailbox ID | 32 |
-| 5 | `keywords.tbl` | email ID, nonempty UTF-8 keyword bytes, no inner length | 17..271 |
-| 6 | `threads.tbl` | thread ID | 16 |
-| 7 | `thread-anchors.tbl` | `text(1004)` header Message-ID, email ID | 21..1024 |
-| 8 | `submissions.tbl` | submission ID | 16 |
-| 9 | `recipients.tbl` | submission ID, `be32` recipient ordinal | 20 |
-| 10 | `leases.tbl` | upload blob ID | 16 |
-| 11 | `imports.tbl` | source instance ID, u8 source kind, source account bytes, source object bytes | 27..1024 |
+| 1 | `blobs` | blob ID | 16 |
+| 2 | `mailboxes` | mailbox ID | 16 |
+| 3 | `emails` | email ID | 16 |
+| 4 | `memberships` | email ID, mailbox ID | 32 |
+| 5 | `keywords` | email ID, nonempty UTF-8 keyword bytes, no inner length | 17..271 |
+| 6 | `threads` | thread ID | 16 |
+| 7 | `thread-anchors` | `text(1004)` header Message-ID, email ID | 21..1024 |
+| 8 | `submissions` | submission ID | 16 |
+| 9 | `recipients` | submission ID, `be32` recipient ordinal | 20 |
+| 10 | `leases` | upload blob ID | 16 |
+| 11 | `imports` | source instance ID, u8 source kind, source account bytes, source object bytes | 27..1024 |
 
 For imports, source kind 1 is Mailbox and 3 is Email, from the shared
 `ObjectType` registry used by CHANGE below. Other object types are not legal
@@ -88,8 +75,7 @@ Mailbox and Email namespaces must remain different mappings. Invalid source
 IDs are reported, never silently truncated or replaced with a digest.
 
 Keyword raw bytes are capped at 255. A shorter nonempty keyword key is another
-well-formed key, not evidence of a truncated record; outer record framing and
-checksum supply that evidence. Header-ID keys use the parsed bytes specified
+well-formed key, not evidence of a truncated record; the SQLite record extent supplies that evidence. Header-ID keys use the parsed bytes specified
 in STORAGE section 3; framing does not implement the header parser. Length
 prefixes remain little-endian even in keys. Their byte order is canonical,
 not a promise of semantic lexical string order; ordered queries use their own
@@ -114,419 +100,22 @@ It encodes u16 0x1234, u32 0x12345678, u64 1, i64 -2, true and `text(2)`
 containing U+00E9. The core tests compare the literal bytes in both directions.
 They do not claim to test a cryptographic provider or durable filesystem I/O.
 
-## 3. Fixed containers
+## 3. Application operation batches
 
-`format::container` implements `StoreIdentity`, `Current` and `JournalHeader`.
-Their decoders require exactly the stated extent, verify SHA-256 through the
-injected Crypto adapter, and reject wrong magic/version/schema/flags. CURRENT
-generations and journal segment numbers must be nonzero. Opaque IDs permit all
-bit patterns; an exhausted sequence remains readable. Callers pass only the
-96-byte header to `JournalHeader::decode`, not a file containing later frames.
-Successful decoding does not validate any referenced file or select a store.
+A locally checked operation has a 12-byte prefix: u8 opcode, u8 action,
+u16 table/object tag, u32 key length, u32 value length; then exact key and
+value bytes. PUT is (1,0), DELETE (2,0), CHANGE (3,1..3) for created,
+updated and destroyed. DELETE/CHANGE have no value; CHANGE has a 16-byte
+object ID. Table and object tags use their separate fixed registries.
+The store refuses Identity changes. Local decoding grants no authorization
+or live-reference proof. SQL transaction validation checks final rows,
+owning references, parent cycles and change-action existence.
 
-Encoding uses caller storage and a fixed local array no larger than 120 bytes;
-all returned errors leave caller output unchanged, and bytes after the encoded
-extent remain untouched. Digest construction/update/finish failures propagate
-separately from format errors and checksum mismatch. These codecs allocate no
-owned heap; a supplied Crypto implementation retains its own resource contract.
-The tests use the real facade plus failure injection. The existing Rust hot-path
-probe checks the concrete provider with successful codecs and capacity,
-truncation and checksum failures; whole-store resources remain unqualified.
-
-Every container starts with its listed eight-byte ASCII magic. Common fields
-at offsets 8, 10 and 12 are container version u16=1, schema u16=1, and flags
-u32=0, except the table header's explicit table/flags pair. Flags cannot turn
-off integrity checks. Numeric sizes below include all digest bytes.
-
-### FORMAT: 80 bytes
-
-| Offset | Width | Field |
-| ---: | ---: | --- |
-| 0 | 8 | `TDMTAFMT` |
-| 8 | 2 | Container version |
-| 10 | 2 | Store schema |
-| 12 | 4 | Reserved flags |
-| 16 | 16 | Instance ID |
-| 32 | 16 | Store epoch |
-| 48 | 32 | SHA-256 of bytes 0..48 |
-
-FORMAT is a whole-service identity, not a checkpoint selector. Restore changes
-the epoch before any listeners open; selected account metadata must match it.
-
-### CURRENT: 120 bytes
-
-| Offset | Width | Field |
-| ---: | ---: | --- |
-| 0 | 8 | `TDMTCUR1` |
-| 8 | 2 | Container version |
-| 10 | 2 | Store schema |
-| 12 | 4 | Reserved flags |
-| 16 | 16 | Account ID |
-| 32 | 16 | Store epoch |
-| 48 | 8 | Selected generation |
-| 56 | 32 | SHA-256 of the **entire** selected manifest, including its footer |
-| 88 | 32 | SHA-256 of bytes 0..88 |
-
-Only CURRENT chooses a generation. A valid newer unselected directory cannot
-override it. Every selected account, epoch and generation must match its
-manifest and tables. Invalid CURRENT is a diagnosis/repair condition.
-
-### Table header: 112 bytes
-
-| Offset | Width | Field |
-| ---: | ---: | --- |
-| 0 | 8 | `TDMTTBL1` |
-| 8 | 2 | Container version |
-| 10 | 2 | Row schema |
-| 12 | 2 | Table tag |
-| 14 | 2 | Reserved flags, zero |
-| 16 | 16 | Account ID |
-| 32 | 16 | Store epoch |
-| 48 | 8 | Generation |
-| 56 | 8 | Checkpoint through-sequence C |
-| 64 | 8 | Record count |
-| 72 | 8 | Payload byte length |
-| 80 | 32 | SHA-256 of bytes 0..80 |
-
-The payload begins at 112. Exact file size is 112 + payload length; no trailer
-follows the last record. Manifest descriptors hash the entire file. A record
-is `u32 key_len, u32 value_len, u64 last_change, key, value, H`, with H covering
-the preceding 16-byte record prefix plus key and value. Key length is 16..1024
-and then must satisfy its table's stricter key grammar; value length is
-0..65536 subject to the row schema. Last-change is 1..C. An empty initial
-table has C=0, count=0 and payload length=0. Duplicate/out-of-order keys fail
-verification. The 48-byte record overhead is independent of its row kind.
-
-`format::table` implements `TableHeader` and a borrowed `Record`. The header
-checks its exact extent/digest, tag/schema/flags, nonzero generation, empty
-table consistency and checked file-size arithmetic. Generic record bounds
-(64..66608 bytes each) reject impossible count/payload combinations without
-allocating or iterating the count. They do not prove that actual records exist,
-match the count, are sorted, or fit their table-specific grammar.
-
-Record prefix lengths are untrusted until the whole checksum passes. They may
-only establish the bounded input extent: key 16..1024, value 0..65536 and checked
-48-byte overhead. Decoding requires that exact extent, checks the digest, then
-uses `row::decode_record` and requires `1 <= last_change <= through`. A record
-borrows the original key/value bytes and exposes the corresponding typed
-`ports::Record`; no row-sized copy or allocation is made. Its constructor checks
-local row/key rules and a nonzero sequence; encode additionally checks the
-checkpoint sequence supplied by the caller. Live references remain separate.
-
-Encoding a header uses 112 local bytes. Record encoding hashes a 16-byte prefix,
-borrowed key and borrowed value before writing anything to caller storage.
-Returned errors leave output unchanged and a successful encode preserves its
-suffix. SHA-256 factory/update/finish failures remain distinct from encoding and
-checksum errors. These individual codecs do not establish whole-table
-validity; the stream verifier below checks the supplied record sequence, while
-manifest and selected-store binding validation use the separate selection
-and storage adapters.
-No decoder treats immutable-table truncation as a recoverable journal tail.
-
-`table::record_extent` accepts exactly the 16-byte record prefix and returns
-its bounded total length. It validates only lengths, not sequence, checksum or
-row grammar. The record decoder shares these bounds. One preallocated MAX_RECORD_BYTES
-(66608-byte) record buffer suffices; a caller must never allocate from an
-unchecked prefix.
-
-`table_stream::Verifier` accepts an exact validated header followed by exact
-record slices. Its `header` getter exposes the decoded header before records,
-physical extent or selected bindings are validated. It checks each full record,
-strictly increasing unsigned raw key
-order, and running count/payload against the declared ceilings. Its fixed state
-holds one 1024-byte prior key, counters and a digest; record memory belongs to
-the caller and may be reused after each returned borrow ends. A supplied record
-error permanently fails the stream, including provider failures; later pushes
-and finish return that same error without trying to resume after it.
-
-Finish consumes the verifier and requires exact count/payload agreement before
-returning the header and SHA-256 of all supplied bytes, including header and
-record digests. Per-record results remain provisional until completion and
-selected-file bindings pass. The verifier neither reads physical EOF nor proves
-that omitted suffix bytes do not exist; the storage adapter must check EOF and
-the manifest's identity, extent and whole-file digest before publishing a table.
-The implemented private table input performs these checks as specified in
-[STORAGE.md](STORAGE.md#streaming-selected-tables). It provides no cross-row
-reference, account authorization or durability proof.
-Its state does not grow with the header's count; work is one bounded record per
-push, with future I/O consumers responsible for work/deadline admission.
-
-### Journal header: 96 bytes
-
-| Offset | Width | Field |
-| ---: | ---: | --- |
-| 0 | 8 | `TDMTJNL1` |
-| 8 | 2 | Container version |
-| 10 | 2 | Store schema |
-| 12 | 4 | Reserved flags |
-| 16 | 16 | Account ID |
-| 32 | 16 | Store epoch |
-| 48 | 8 | Segment number |
-| 56 | 8 | Base sequence |
-| 64 | 32 | SHA-256 of bytes 0..64 |
-
-The active journal's base equals its selecting checkpoint's C. Frames start
-at offset 96, with first sequence C+1. Header bytes are outside the 4 MiB
-committed-frame budget. History segments are sealed immutable files and obey
-their manifest descriptors. An active journal has no preallocated disk tail.
-
-## 4. Transaction framing
-
-| Header offset | Width | Field |
-| ---: | ---: | --- |
-| 0 | 8 | `TDMTFRM1` |
-| 8 | 2 | Container version |
-| 10 | 2 | Store schema |
-| 12 | 4 | Reserved flags |
-| 16 | 4 | Total frame length, including 64-byte header and 40-byte footer |
-| 20 | 4 | Stored operation count, including change descriptors |
-| 24 | 8 | Transaction sequence |
-| 32 | 32 | SHA-256 of bytes 0..32 |
-
-Read exactly the 64-byte header and verify its digest before trusting lengths.
-Total length is 132..1048576: 104 bytes of header/footer plus at least a
-12-byte operation header and 16-byte key. Count is 1..4096. Read the bounded payload
-and 40-byte footer: eight-byte `TDMTEND1`, then SHA-256 of the entire header,
-payload and end magic. The footer digest excludes itself. Verify both hashes,
-sequence continuity, count, all operations and final-row invariants before
-publishing a recovered frame. Checksummed arbitrary bytes are not valid rows.
-
-Every operation begins with the following 12 bytes, then key and value:
-
-| Offset | Width | Field |
-| ---: | ---: | --- |
-| 0 | 1 | Opcode: PUT=1, DELETE=2, CHANGE=3 |
-| 1 | 1 | Action: zero for PUT/DELETE; created=1, updated=2, destroyed=3 for CHANGE |
-| 2 | 2 | Table tag for PUT/DELETE; object-type tag for CHANGE |
-| 4 | 4 | Key length |
-| 8 | 4 | Value length |
-
-PUT carries a complete bounded row value. DELETE carries no value. Their row
-last-change sequence comes from the frame, not another embedded field. CHANGE
-uses a 16-byte object ID as key and no value; its type tags are Mailbox=1,
-Thread=2, Email=3, Identity=4, EmailSubmission=5. Unknown tags fail closed.
-Both row operations and CHANGE count toward frame/journal operation caps.
-CHANGE is evidence for state APIs, not a row mutation; API.md defines required
-coalescing from the final transaction view. Identity=4 remains a known byte
-tag but is rejected by v1 transaction validation: identities are an atomic
-configuration snapshot, with their separate API.md state token.
-A transaction may affect several JMAP types. Repeated writes to a key retain
-stored ordinal order; the final
-operation wins. Byte/operation reservations include the entire frame and all
-descriptors, preventing apparently small metadata changes from exceeding caps.
-
-M05a3a implements `format::frame_header::Header` for exactly 64 bytes. The
-fixed header digest is checked before interpreting length/count/sequence.
-Length and count satisfy the bounds above; sequence is nonzero. Payload length
-must fit the declared count under the generic operation bounds of 28 through
-66572 bytes each. These arithmetic checks do not prove that an actual payload
-has that extent, valid operations or matching footer. Encoding stages only the
-64-byte header and preserves caller output on every returned error.
-
-`format::operation` implements bounded exact operation prefixes and borrowed
-local values. PUT validates a complete typed key/row; DELETE validates the whole
-key and refuses a value. CHANGE validates a known object tag, action, 16-byte
-ID and absent value. Its known Identity tag remains decodable wire syntax;
-v1 transaction validation must reject it. Operations have no own checksum or
-embedded sequence. `extent` grants only prefix framing, not row validity or
-integrity. Encoding prechecks the full output capacity; errors preserve output,
-and success preserves its suffix. Neither individual codec checks final-view references,
-CHANGE coalescing, complete frame integrity, continuity or recovery.
-
-M05a3b implements `format::frame::Frame`. Its `DecodeError::Incomplete` is
-reserved for fewer than 64 supplied header bytes, or fewer supplied bytes than
-the validated header's length after expected-sequence checks pass. A complete
-malformed operation or row is `Invalid`, even when its nested format error is `Truncated`. Missing supplied
-bytes grant no physical-tail repair authority; the I/O adapter establishes EOF.
-`Invalid` retains provider errors too; those do not prove on-disk corruption.
-Decoding verifies the fixed header and expected next sequence before using the
-declared extent. It then checks complete footer hash, end magic, exact operation
-count and every locally valid operation.
-Identity CHANGE is refused. Only after all checks pass can the caller iterate
-borrowed entries, with zero-based stored ordinals preserved. Repeated keys stay
-in wire order. This validates local bytes, not final-view references or CHANGE
-coalescing; M08 must validate those before recovered rows become visible.
-
-`frame::seal` takes an exact caller-owned frame buffer whose middle already
-contains encoded operations. It validates the complete payload, stages a
-64-byte header and computes the footer digest before changing the buffer.
-Returned errors preserve every byte. It uses no second frame-sized buffer.
-Successful sealing establishes local frame grammar and integrity, not sequence
-continuity relative to a journal, authorization or durable publication.
-
-`format::frame_stream::Verifier` validates the same local frame grammar with
-one exact operation per push. Construction checks the exact 64-byte header
-and next sequence; each push checks local rows, rejects Identity CHANGE,
-meters count/payload bytes and updates the frame digest. Returned entries
-retain stored ordinals and borrow only that call's input. They are provisional:
-no caller may publish them before consuming finish verifies exact count,
-payload extent, the exact 40-byte footer, end magic and digest. All push errors
-are sticky, including crypto failures; finish consumes the verifier. Its
-Summary contains the checked header and footer digest (excluding the digest
-itself), not a whole-journal hash. It retains no operation bytes or frame arena.
-
-This incremental codec does not classify physical incomplete tails, read files,
-bind selected journals, coalesce changes or validate final references. Even
-its Truncated error supplies no repair authority. The existing complete-frame
-reader and stopped recovery scanner retain their separate contracts.
-
-`format::journal_stream::Verifier` hashes the exact journal header and supplied
-frames, enforces consecutive sequences and both the 4 MiB frame-byte and 8192
-operation caps, and retains only a digest, counters and identity. Its `header`
-getter exposes only the validated journal identity; frames, selected binding
-and EOF remain unchecked. Before a short body is classified as incomplete, the verified header must fit both remaining
-journal budgets. Exhausted sequences and budgets that cannot admit even one
-minimum frame refuse any further push, including a short header. Journal-wide
-errors carry journal context separately from frame errors. Every push
-error permanently fails that verifier, including provider failures. Completion
-reports the supplied stream's header, through-sequence, extents, operation count
-and whole-file digest. Empty streams are allowed, including an exhausted base;
-no further frame is accepted after sequence exhaustion. Individual frames and
-the summary remain provisional until final-view and selected-file checks pass.
-The caller binds the expected extent/through-sequence using Selection's
-completed-stream checks in section 5. Completion does not prove that an omitted
-suffix is absent. M05d owns physical EOF, exact committed-prefix consumption,
-invoking the selected-file checks, incomplete physical-tail recovery and
-selected graph publication; the byte codecs do not truncate, scan ahead or
-perform I/O.
-`journal_stream::changes::Verifier` reexports the same journal Verifier, adding
-begin/Pending to feed one operation at a time into a frame-change Collector.
-Whole-frame push and incremental begin share sequence, byte/operation admission,
-digest and completion state; callers may mix complete frames and completed
-incremental frames in one stream. Beginning a
-frame checks its header, next sequence and aggregate byte/operation ceilings.
-Begin hashes the exact frame header before returning Pending. The Pending
-frame holds an exclusive parent borrow and hashes operations and the complete
-footer, including its checksum. Frame completion returns only its compact checked changes.
-Journal counters/through-sequence advance only after both frame verification
-and the journal hash update succeed. The supplied journal can finish empty.
-
-Beginning immediately marks the parent incomplete. Any begin/push/finish error
-is terminal for that parent; discarding Pending without successful finish
-leaves a Truncated journal error, even if all operations had been supplied.
-Later push/begin/finish calls refuse and no summary can omit an abandoned frame.
-Insufficient caller change slots report Journal(Format(OutputFull)), a resource
-refusal rather than invalid frame bytes; provider failures retain their cause.
-No operation/body buffer is retained; the caller owns the separate change slots.
-Frames and their changes remain provisional until external selected-file and
-final-view checks pass. This interface does not implement file input, tail
-repair, cursor positioning, view pins or physical EOF.
-
-Retained-history I/O completion is implemented by the private adapter in
-[STORAGE.md](STORAGE.md#streaming-retained-history). Captured active-frame
-validation uses the same frame decoder with separate prefix completion and
-selected sequence/offset binding, specified in
-[STORAGE.md](STORAGE.md#validating-captured-active-frames).
-
-The complete-header/short-body distinction and every sync boundary are owned
-by STORAGE sections 5-6. The read-only stopped scanner implements physical
-classification as specified in
-[STORAGE.md](STORAGE.md#scanning-a-stopped-active-journal); explicit repair is
-still separate. A checksum-invalid complete final frame is corruption,
-not a recoverable incomplete tail. No forward magic search is permitted.
-
-## 5. Manifest
-
-The fixed prefix is 88 bytes:
-
-| Offset | Width | Field |
-| ---: | ---: | --- |
-| 0 | 8 | `TDMTMAN1` |
-| 8 | 2 | Container version |
-| 10 | 2 | Store schema |
-| 12 | 4 | Reserved flags |
-| 16 | 16 | Account ID |
-| 32 | 16 | Store epoch |
-| 48 | 8 | Generation |
-| 56 | 8 | Checkpoint through-sequence C |
-| 64 | 8 | Active segment number |
-| 72 | 8 | Active segment base, equal to C |
-| 80 | 4 | Table descriptor count, exactly 11 |
-| 84 | 4 | Retained history descriptor count, 0..64 |
-
-Then exactly 11 table descriptors in ascending table-tag order, 56 bytes each:
-`u16 table, u16 row_schema=1, u32 flags=0, u64 record_count, u64 file_bytes,
-H whole_file`. Table names are derived from the registry; the manifest cannot
-supply paths. Header and descriptor counts/schema must agree. Then the history
-descriptors, 64 bytes each: `u64 segment, u64 base, u64 through, u64 file_bytes,
-H whole_file`. Each is nonempty with through > base. They are in increasing
-sequence order, contiguous (each base equals previous through), ending at C
-when any history is retained. They may start after zero because history expires.
-No selected segment number repeats or equals the active segment. Every header
-and validated frame range must agree with its descriptor. History files remain
-pinned for readers even after a later manifest drops them.
-
-The final 32 bytes are SHA-256 of all preceding manifest bytes. Exact total
-length is `88 + 11*56 + history_count*64 + 32`, at most 4832 bytes. CURRENT
-hashes that complete file, including this digest. The active journal's changing
-extent is never given a fictitious immutable whole-file digest; read views
-capture its committed offset/sequence under the publication lock instead.
-
-`format::manifest` implements a borrowed `Manifest` view and an encoder taking
-a `Header`, exactly eleven typed table descriptors and a bounded history slice.
-Decode uses the untrusted history count only to bound the exact input extent
-before checking the trailing checksum. It then checks magic/schema/flags,
-nonzero generation/active segment, the repeated base sequence, exact ascending
-table tags, and each descriptor's count/file-size consistency using the table
-header rules. IDs and exhausted sequence/name values remain readable.
-
-History segments must be nonzero, unique and distinct from the active segment.
-Ranges are nonempty, contiguous and end at the checkpoint; an expired prefix
-may start after zero and no history is also permitted. For N = through - base, the declared
-file size minus the 96-byte journal header must fit N frames of 132..1048576
-bytes each. Minimum multiplication overflow refuses; an overflowing maximum
-cannot exclude a u64 payload. These checks do not prove actual frame contents
-or admission ceilings. Actual frame ranges and whole-file digests remain
-selected-file validation;
-parsing a descriptor does not establish that any referenced file exists.
-Segment numbers need not be numerically sorted; sequence ranges determine order.
-
-Encoding stages at most 4832 bytes before invoking the digest provider and
-copying to caller output. All returned errors preserve output and success
-preserves its suffix. Decoding retains only the borrowed bytes, small header
-and history count. Descriptor access returns checked values without allocation;
-out-of-range history indices refuse. Duplicate-segment checks perform at most
-2016 bounded pair comparisons. No filesystem path is supplied by a manifest,
-and neither encoder nor decoder grants CURRENT selection or storage authority.
-
-`format::bindings::Selection` checks exact FORMAT and CURRENT containers and
-requires the caller's expected account plus the FORMAT epoch. It decodes the
-manifest and matches account, epoch and generation, then compares CURRENT's
-digest against the entire manifest, including its footer. FORMAT's instance ID
-is retained for inspection; CURRENT and the manifest have no instance field.
-This establishes selected metadata consistency, not filesystem identity or trust.
-
-`check_table` takes an expected table tag from the requested file and a completed
-`table_stream::Summary`. It matches table/account/epoch/generation/checkpoint,
-record count, full length and digest to the selected descriptor. A file's decoded
-tag cannot choose which descriptor it is checked against. Summary generation
-must consume all physical file bytes; the storage adapter still owns EOF and
-immutable-file/pin enforcement.
-
-`check_active_header` and `check_history_header` accept exactly a 96-byte journal
-header and match its account, epoch, segment and base to the selected active
-segment or indexed history descriptor. They do not validate frames, history end
-sequence, whole-file length/digest or the active committed prefix. Those checks
-need the completed-stream checks below and M05d. Invalid history indices refuse
-before requesting a digest.
-
-M05a3c adds `check_history_journal` for a completed `journal_stream::Summary`.
-It checks the selected account/epoch and indexed descriptor's segment/base,
-final sequence,
-whole-file extent and digest, including the journal header and frame checksums.
-Invalid indices or metadata refuse before calling the injected digest comparison.
-`check_active_prefix` instead checks selected active identity/base and the
-caller's expected committed sequence and full prefix length. The caller obtains
-those values from its pinned read view under the publication lock; they are not
-new on-disk fields or a substitute for owning that pin. No fictitious immutable
-hash is assigned to the growing active journal. These methods bind already
-validated supplied bytes; physical EOF for history and exact committed-prefix
-consumption for active views remain M05d responsibilities.
-All checks use bounded caller input and fixed state through the injected Crypto
-facade. No path or filesystem operation is introduced. Checks are independent;
-Selection does not track a complete set or expose a whole-store readiness proof.
-Recovery must require every selected file and frame check to succeed before it
-permits reads or mutations under its storage contract.
+At most 4096 operations and 1048576 encoded bytes form one caller batch.
+Repeated row keys are applied in caller order; their last effect determines
+final reference validation. Each changed object has at most one CHANGE.
+A batch is not a disk journal format and contains no custom frame header,
+footer, checksum, generation or replay descriptor.
 
 ## 6. Positional row values
 
@@ -663,34 +252,9 @@ budget is reported unrepresentable, never split into partial visible state.
 Absent role and parent remain distinct from invalid empty values. No local
 thread assignment, cache, SMTP receipt, or export time enters this digest.
 
-## 7. Oracles and implementation boundary
+## 7. Oracles
 
-`tests/format_rows.rs` compares all table value types against checked-in
-literal hex fixtures, in both directions, including options, origins, IPv4
-and IPv6. It refuses every truncated prefix and appended byte and verifies
-that insufficient output leaves caller storage unchanged. Both encoding and
-decoding borrow/use caller storage; only the tests allocate their corpora.
-The writer's internal measuring mode shares the validated field emitter with
-encoding, so whole-row capacity checks cannot drift from an independent size
-formula. Decode enforces the same local rules as encode.
-
-`tests/fixtures/format-v1/README.md` defines the complete container oracles and
-preimages. They were calculated independently of the Rust codecs with Python
-struct/hashlib during development; Python is not a build/runtime dependency.
-M02b tests row bytes and fixture structure. M07a2 additionally hashes the
-existing container, cross-file binding, blob and import snapshot fixtures
-through the real td-crypto facade, with fragmented updates and changed-byte
-comparisons. These host and portable tests qualify literal hash coverage;
-they do not implement production container validation or crash durability.
-`tests/format_containers.rs` covers M05a1's five fixed-container artifacts and
-M05a2a's initial table headers, later empty/populated headers and blob record.
-It checks both directions, every truncated prefix, one bit flip per byte
-position, extra bytes and rehashed invalid fields. Provider construction, each
-update and finish failures preserve output. Earlier record sequences and exact
-generic header bounds remain accepted.
-M02c supplies state, queue and API meanings. Remaining M05 work implements
-the other exact container encoders/decoders, validates
-cross-file bindings and exercises fault I/O. The M07a2 tests compare against
-the independently calculated golden digests. A successful row test must never
-be reported as a successful integrity, replay, synchronization or crash-recovery
-test.
+format_operations and format_rows exercise literal application values and
+rejections; inline scalar/key tests pin numeric and primary-key encodings.
+Actual SQLite and immutable-file tests exercise persistence separately.
+A row codec does not establish SQLite integrity, authorization or durability.

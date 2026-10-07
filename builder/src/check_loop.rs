@@ -920,29 +920,29 @@ fn host_net_applet(root: &Path, applet: &str, deadline: Option<Instant>) -> Opti
     Some(link)
 }
 
-/// Prepare the admitted crypto closure before offline host or sandbox Cargo.
-pub(crate) fn warm_crypto_sources(root: &Path) -> Result<(), String> {
+/// Prepare the admitted crypto/SQLite union before offline host or sandbox Cargo.
+pub(crate) fn warm_mail_sources(root: &Path) -> Result<(), String> {
     crate::crypto_build::validate(root)?;
-    if vendor_is_complete(root, "td-crypto", Some("td-crypto/Cargo.lock")) {
+    if vendor_is_complete(root, "td-mta", Some("td-mta/Cargo.lock")) {
         return Ok(());
     }
     let deadline = warm_timeout_secs().map(|n| Instant::now() + Duration::from_secs(n));
     let feed = newstore_bin(root, ".td-build-cache/td-feed/sd/newstore", "td-feed")
         .or_else(|| host_net_applet(root, "td-feed", deadline))
-        .ok_or("cannot prepare crypto sources: td-feed unavailable")?;
+        .ok_or("cannot prepare native mail sources: td-feed unavailable")?;
     let mut command = Command::new(feed);
     command
-        .args(["warm", "crate-local", "td-crypto", "td-crypto"])
+        .args(["warm", "crate-local", "td-mta", "td-mta"])
         .stdin(Stdio::null())
         .current_dir(root);
     arm_check_child(&mut command);
     let mut child = command
         .spawn()
-        .map_err(|e| format!("prepare crypto sources: {e}"))?;
+        .map_err(|e| format!("prepare native mail sources: {e}"))?;
     if !wait_with_deadline(&mut child, deadline)
-        || !vendor_is_complete(root, "td-crypto", Some("td-crypto/Cargo.lock"))
+        || !vendor_is_complete(root, "td-mta", Some("td-mta/Cargo.lock"))
     {
-        return Err("crypto source preparation incomplete".into());
+        return Err("native mail source preparation incomplete".into());
     }
     Ok(())
 }
@@ -1545,8 +1545,8 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     let ul = provision_userland(&root)?;
     let disabled = std::env::var("TD_CHECK_DISABLE").unwrap_or_default();
     if !listing_only && crate::gates::goals_include(&goals, "cargo-test", &disabled)? {
-        if let Err(e) = warm_crypto_sources(&root) {
-            eprintln!("td-builder check: crypto source preparation: {e}; the cargo gate enforces presence when provisioned");
+        if let Err(e) = warm_mail_sources(&root) {
+            eprintln!("td-builder check: native mail source preparation: {e}; the cargo gate enforces presence when provisioned");
         }
     }
     let toolchain = loop_path_with_native_applets(&root, &tb, &ul.path).map_err(|e| {

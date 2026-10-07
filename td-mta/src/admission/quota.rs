@@ -9,31 +9,23 @@ pub enum Kind {
     UploadBytes,
     QueueBytes,
     QueueSubmissions,
-    LiveMetadataBytes,
-    CheckpointBytes,
-    ClosedJournalBytes,
-    ClosedJournalSegments,
-    ActiveJournalBytes,
-    ActiveJournalOperations,
+    MetadataBytes,
+    WalBytes,
     SortBytes,
     ResponseBytes,
     CacheBytes,
     LogBytes,
     ColdBytes,
 }
-pub const COUNT: usize = 16;
+pub const COUNT: usize = 12;
 pub const ALL: [Kind; COUNT] = [
     Kind::BodyBytes,
     Kind::BodyFiles,
     Kind::UploadBytes,
     Kind::QueueBytes,
     Kind::QueueSubmissions,
-    Kind::LiveMetadataBytes,
-    Kind::CheckpointBytes,
-    Kind::ClosedJournalBytes,
-    Kind::ClosedJournalSegments,
-    Kind::ActiveJournalBytes,
-    Kind::ActiveJournalOperations,
+    Kind::MetadataBytes,
+    Kind::WalBytes,
     Kind::SortBytes,
     Kind::ResponseBytes,
     Kind::CacheBytes,
@@ -99,12 +91,8 @@ impl Quotas {
                 plan.upload_bytes(),
                 plan.queue_bytes(),
                 plan.queue_submissions(),
-                d.live_metadata_bytes,
-                d.checkpoint_bytes,
-                plan.closed_journal_bytes(),
-                plan.closed_journal_segments(),
-                plan.active_journal_bytes(),
-                plan.active_journal_operations(),
+                d.metadata_bytes,
+                d.wal_bytes,
                 plan.sort_bytes(),
                 d.response_total_bytes,
                 d.cache_bytes,
@@ -152,35 +140,6 @@ impl Quotas {
         }
         Ok(next)
     }
-    /// Called only at the writer barrier. Header bytes were already written;
-    /// this is a logical category transfer, never new physical growth.
-    pub(super) fn with_rollover(&self) -> Result<Self, Kind> {
-        let mut next = self.clone();
-        let bytes = self
-            .used
-            .get(Kind::ActiveJournalBytes)
-            .map_err(|_| Kind::ActiveJournalBytes)?;
-        let operations = self
-            .used
-            .get(Kind::ActiveJournalOperations)
-            .map_err(|_| Kind::ActiveJournalOperations)?;
-        let header = super::widen(crate::format::JOURNAL_HEADER_BYTES, "journal header")
-            .map_err(|_| Kind::ClosedJournalBytes)?;
-        let closed = bytes.checked_add(header).ok_or(Kind::ClosedJournalBytes)?;
-        next.used
-            .add(Kind::ClosedJournalBytes, closed)
-            .map_err(|_| Kind::ClosedJournalBytes)?;
-        next.used
-            .add(Kind::ClosedJournalSegments, 1)
-            .map_err(|_| Kind::ClosedJournalSegments)?;
-        next.used
-            .subtract(Kind::ActiveJournalBytes, bytes)
-            .map_err(|_| Kind::ActiveJournalBytes)?;
-        next.used
-            .subtract(Kind::ActiveJournalOperations, operations)
-            .map_err(|_| Kind::ActiveJournalOperations)?;
-        next.with_reservation(Usage::default())
-    }
     // Private transitions to be wired to checked live lease entries. No public
     // release-by-kind or public constructed reservation can authorize effects.
     pub(super) fn complete(&mut self, used: Usage) -> Result<(), Error> {
@@ -207,7 +166,7 @@ impl Quotas {
 mod tests {
     use super::*;
     use crate::{
-        admission::{DiskLimits, ViewMode, WorkLimits, GIB, MIB},
+        admission::{DiskLimits, ViewMode, WorkLimits, MIB},
         limits::Limits,
     };
     #[test]
@@ -225,8 +184,8 @@ mod tests {
         .plan()?;
         let plan = DiskLimits {
             body_files: 250003,
-            live_metadata_bytes: 258 * MIB,
-            checkpoint_bytes: 3 * GIB,
+            metadata_bytes: 32 * MIB,
+            wal_bytes: 80 * MIB,
             response_total_bytes: 270 * MIB,
             cache_bytes: 140 * MIB,
             cold_bytes: 18 * MIB,
@@ -239,8 +198,8 @@ mod tests {
         )?;
         let quotas = Quotas::new(&plan, Usage::default()).map_err(|_| "invalid fixture caps")?;
         let expected = [
-            4294967296, 250003, 138412032, 272629760, 1003, 270532608, 3221225472, 415236096, 195,
-            4194304, 8192, 71303168, 283115520, 146800640, 66060288, 18874368,
+            4294967296, 250003, 138412032, 272629760, 1003, 33554432, 83886080, 71303168,
+            283115520, 146800640, 66060288, 18874368,
         ];
         for (kind, cap) in ALL.into_iter().zip(expected) {
             assert_eq!(quotas.caps().get(kind)?, cap, "{kind:?}");

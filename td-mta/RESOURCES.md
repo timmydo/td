@@ -21,8 +21,8 @@ the checked ledger and pass the budget gate before admission is enabled.
 | SMTP slots | 8 | 376064 | 3008512 |
 | HTTPS slots | 8 | 1703936 | 13631488 |
 | Body/search jobs | 2 | 425984 | 851968 |
-| Storage read views | 2 | 4755456 | 9510912 |
-| Writer and checkpoint | 1 | 6946816 | 6946816 |
+| Storage read views | 2 | 299008 | 598016 |
+| SQLite writer | 1 | 19267584 | 19267584 |
 | Resident index cache | 1 | 8388608 | 8388608 |
 | Outbound slots | 1 | 572672 | 572672 |
 | Sort runs and merge buffers | 1 | 1048576 | 1048576 |
@@ -37,11 +37,11 @@ the checked ledger and pass the budget gate before admission is enabled.
 | Certificate generations | 2 | 8388608 | 16777216 |
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
-| **Total** | | | **96650496** |
+| **Total** | | | **100058368** |
 
-The total is approximately 92.17 MiB against a 96 MiB configured budget;
-the remaining 4012800 bytes are unassigned headroom, not another cache.
-With all other defaults, three TLS handshake slots require 100844800 bytes;
+The total is approximately 95.42 MiB against a 96 MiB configured budget;
+the remaining 604928 bytes are unassigned headroom, not another cache.
+With all other defaults, three TLS handshake slots require 104252672 bytes;
 the default 96 MiB budget refuses that profile. Increase the configured memory
 budget explicitly when adding that third handshake slot.
 The 64 MiB idle and 128 MiB workload RSS release ceilings remain independent
@@ -99,44 +99,12 @@ encoded-header adapters or combined service RSS.
   without pinning storage views between emissions.
 - Body job: headers, 64 bytes per MIME descriptor, 96 KiB decode/work scratch.
   Nested parsing and transfer decoding share that reservation.
-- Read view: 4 MiB journal prefix, 32 bytes per journal operation, 292 KiB
-  cursor/value scratch. Backup consumes an existing view.
-  The replay Overlay borrows the immutable frame arena and at most 8192
-  caller-owned Cell values. Limits::plan checks each compiled Cell fits the
-  32-byte journal slot. Cells retain offsets, lengths, sequence, ordinal,
-  tag and operation kind; in-place unstable sorting adds no heap inventory.
-  Construction bounds work by the entire arena/count; point/next lookup uses
-  binary search and a fixed 1024-byte key scratch for typed get. The dedicated
-  allocation probe builds and sorts 8192 operations with repeated/permuted keys,
-  performs successful/absent point and next lookups, and refuses a short slot
-  buffer and corrupt frame without Rust allocations after cold preparation.
-  The provisional table Merge borrows the same overlay, retaining a pending
-  borrowed entry, scalar progress and a fixed 1024-byte previous checkpoint key.
-  Each push/finish initializes one 1024-byte overlay-key stack buffer and reuses
-  it while emitting borrowed rows. Merge's previous key is inline state, not a
-  borrow from the per-view cursor/value arena. Tests cap the compiled Merge at
-  4 KiB; this state and its temporary key buffer are charged to the owning worker
-  stack. Runtime integration still must qualify the complete worker stack.
-  TableLookup borrows a target key and a distinct result buffer while retaining
-  the replay's record scratch. The 66608-byte maximum table record has its own
-  68 KiB partition; the 64 KiB result, 1 KiB key and existing 63 KiB cursor
-  allowances are separate at simultaneous peak. The default two views add
-  136 KiB to the plan, within the unchanged 96 MiB budget. Tests pin this
-  partition sum and the maximum record extent. The allocation probe exercises
-  present/absent/deleted lookups, completion and insufficient-result refusal
-  at both root bounds, with all buffers prepared before measurement.
-  TableNext uses those same record/value partitions and the 1 KiB output-key
-  partition. Its borrowed input cursor is at most 1 KiB within the existing
-  cursor allowance; comparison uses another fixed 1 KiB worker-stack buffer
-  until a candidate is captured. Tests cap compiled TableNext at 8 KiB; this
-  inline state plus its temporary buffer stays charged to the worker stack,
-  whose full runtime qualification remains pending. The allocation probe covers
-  initial/equal/later cursors, deletions, exhaustion and short-key refusal at
-  both root bounds. No additional pool or whole-table map is allocated. Admit one input
-  record plus up to 8192 overlay keys per push, and up to 8192 keys for finish.
-  The allocation executable checks unchanged/replaced/deleted rows, remaining
-  output, input/sink failures, and draining the full-operation overlay after
-  cold preparation. Callback allocations remain the caller's responsibility.
+- Read view: 292 KiB caller-owned key/value/cursor scratch and one cold
+  pooled SQLite connection. No journal prefix, replay map, overlay descriptor
+  array, table-record envelope or frame-change collection is retained.
+  SQLite native allocations belong to the process-wide 16 MiB writer/native
+  reservation. Connection Rust wrappers and adapter overhead remain within
+  the process/allocator allowance and need combined runtime qualification.
   ParentWalk copies three mailbox IDs, the view identity and scalar progress;
   tests cap compiled state at 256 bytes, charged to its owning worker stack.
   Each advance borrows the existing result buffer for one ReadView get and
@@ -183,244 +151,15 @@ encoded-header adapters or combined service RSS.
   gets; the admission budget must account for that cost
   and each lookup's full physical work. Allocation probes cover rooted shared
   chains and an empty forest using fixed slices and result scratch.
-  BlobSweep retains one private BlobInput/digest, a copied pending BlobRow,
-  prior ID and scalar progress. With the shipped Provider its compiled state
-  fits 1 KiB on the worker stack; there is no new arena. Enumeration value
-  scratch becomes the at-most-64-KiB chunk buffer after row detachment. Finite
-  row and cumulative-byte allowances precede opens; only one file is retained.
-  Each step admits one next/open/read/completion operation and its deadline.
-  Allocation probes cover empty/populated views and row/byte refusal over
-  prepared files at both supported root lengths.
-  TableSweep retains one TableReplay, selected metadata/overlay borrows and
-  scalar/per-table counts. With the shipped Provider its compiled state fits
-  4 KiB on the worker stack. Completion also moves one TableReplay out of
-  the retained option and uses Merge's temporary 1 KiB key; those temporaries
-  are charged to the same worker stack, whose full qualification remains pending.
-  The same charged record partition transfers between
-  tables only after completion; no per-table arena is allocated. Descriptor
-  byte totals are admitted before table I/O and a finite row allowance covers
-  final merge output. Per-step overlay work retains Merge's bounded cost.
-  Allocation probes cover all-table replay and scratch reuse at both roots.
-  StoppedStore moves the existing LockedRoot (including its directory and lock
-  descriptors) without another allocation, descriptor or synchronization object.
-  Its operations reuse the existing metadata, overlay, record and change arenas.
-  FileValidation holds both sweep states (only one performs I/O at a time),
-  completion summaries and buffer references; its Provider state fits 8 KiB.
-  Constructing both sweeps and the returned coordinator, or moving a completed
-  sweep, can create additional stack temporaries; whole-worker stack
-  qualification remains pending. It transfers the existing record buffer from
-  table to history work and returns the existing change slots, adding no arena.
-  ReservedAppend adds an exclusive borrow of the existing WriterLedger and one
-  existing append ticket; the combined state fits 2 KiB. ReconciledAppend retains
-  only the durable evidence and fits 1 KiB. The guard allocates no
-  ledger, arena or reservation cells. Caller-owned fixed quota/slot backing is
-  reused, with full charges retained on abandonment until recovery. Production
-  stack and maximum-data allocation qualification remain pending for this path.
-  The dedicated allocation process measures reservation creation and physical
-  append through terminal reconciliation/disposal in sixteen intervals: short
-  and maximum roots, each with ordinary completion, successful short writes,
-  partial write failure, sync failure, final-length refusal, and abandonment
-  before writing, after writing and after confirmation. Every allocator counter
-  must remain identical, including frees, failures and live/peak bytes. Ordinary
-  completion and abandonment use the public advance and production Real I/O;
-  short-write and failure scenarios use the injected operations. Root,
-  selection, scan, encoded frame and ledger backing are prepared before each
-  interval; fixture cleanup and ledger destruction follow it. This uses small
-  frames and injected failure boundaries, not maximum-size datasets, native
-  allocation, worker-stack or whole-service RSS qualification.
-  JournalAppend and SyncedAppend each fit 1 KiB of Provider state. An append
-  borrows the existing immutable transaction-frame buffer until finish/drop
-  and keeps one writable descriptor after comparing it to the consumed prior
-  boundary's descriptor. Every advance writes at most 64 KiB, syncs once, or
-  checks final metadata/EOF; 64 total write calls cap pathological short-write
-  progress. It adds no arena, queue or thread. Construction rechecks CURRENT
-  using two fixed 120-byte buffers, up to 64 reads plus EOF and one transient
-  descriptor. After that closes, the prior boundary descriptor overlaps the
-  new writable descriptor: a read-only scan for the first append, or the
-  retained previous append thereafter. Opening also uses existing fixed path
-  scratch and transient parent handles. Each successor consumes the prior
-  evidence and returns its next owner. The caller may refill the same frame
-  buffer after finish and reuse its ledger; no additional frame arena or full
-  journal reread is needed between successes. Constructor frame parsing/hash
-  and std open work still need caller admission, and whole-worker
-  stack/allocation/resource qualification remains pending for this new append
-  path.
-
-  JournalCapture and CapturedJournal each fit 2 KiB of provider state. Capture
-  borrows the existing 1 MiB whole-frame recovery scratch; its consuming finish
-  releases that borrow for reuse, with no new arena. Overlay loading still uses
-  the existing 4 MiB replay arena: the 1 MiB scratch suffices only for prefixes
-  whose frame bytes fit. Comparing the two prefix digests adds no I/O. Each
-  advance/finish still requires caller admission and deadline checks. The
-  retained scan descriptor
-  overlaps the reopened prefix descriptor during overlay loading; release the
-  capture after handoff. No descriptor registry or serving lease is implied.
-  Tests allocate their frame storage before scanning; full-worker stack and
-  whole-process resource qualification remain separate.
-  DataValidation retains one ValidationView, the four fixed sweep states and
-  their scalar completion evidence. Provider state fits 8 KiB on the existing
-  worker stack; only one sweep does I/O at a time. Construction/moves and inner
-  lookup/replay/reference temporaries remain additional stack work awaiting
-  whole-worker qualification. No arena is added. Caller key/value storage is
-  reused for every phase, with value storage becoming blob chunk scratch;
-  record/change scratch borrows end on finish/drop independently of the retained
-  CheckedData file/owner proof. Finite row, parent-get and blob-byte limits plus
-  the reader work/deadline bounds apply. Existing component allocation probes
-  remain; this composition adds no whole-service allocation or RSS claim.
-  ValidationView retains the checked snapshot borrow, one ChangeScan, a clock
-  guard and scalar limits. Its Provider state fits 4 KiB, excluding the temporary
-  TableLookup/TableNext constructed during a row call and their existing merge
-  temporaries. Whole-worker stack qualification remains pending. Existing record
-  scratch is shared across row reads and change steps; retained change slots
-  remain separate. No arena, per-operation collection or thread is added.
-  The blocking verify_account composition borrows these existing partitions
-  together: selection, 1 MiB recovery frame, 4 MiB replay bytes, overlay cells,
-  record/change slots and key/value buffers. It allocates no additional arena.
-  The frame scratch is idle after capture; physical validation transfers its
-  record/change buffers into data validation. The capture descriptor is dropped
-  after overlay loading, and all input descriptors close before return. Its
-  VerifiedAccount summary fits 2 KiB and borrows only the stopped owner. Local
-  coordinator construction/moves and nested reader temporaries still require
-  whole-worker stack qualification. The dedicated Rust allocator probe now
-  measures this composition on small empty/blob fixtures at short and maximum
-  roots, including refusals and persisted corruption. Fixture construction and
-  buffers are cold; no whole-service RSS or native allocation claim follows.
-  One fixed atomic watermark lets outer and nested clock samples share
-  regression/deadline checks without an allocated registry.
-
-  VerifiedStore fits 2 KiB including the consumed stopped root and its selected
-  CURRENT/identity/journal summary. Its verification borrows the same cold
-  VerifyScratch partitions; no read descriptor or scratch borrow survives.
-  This replaces the stopped owner at completion and adds no pool or arena.
-  Its whole-worker stack and allocation qualification remain pending.
-
-  JournalSession fits 8 KiB, including the existing writer ledger, one
-  retained journal boundary and two mutex states. It borrows the consumed
-  VerifiedStore for its whole scope. Caller ledger cells/slots remain
-  preallocated; startup reuses selection and recovery-frame scratch,
-  returning the frame to the scoped callback. Reader pins use a bounded
-  counter (configured one through eight) and a borrowed owner plus copied
-  identity, without a new pool or arena. No filesystem I/O occurs under the
-  publication mutex. The Rust allocation probe measures public commit and
-  reader capture/drop in sixteen intervals: short and maximum roots crossed
-  with repeated public commits, an initial deadline followed by success,
-  deadlines after write/sync/reconciliation/publication, malformed frame
-  refusal and capacity/lock contention. Reservations, physical append,
-  reconciliation and visibility run inside measurement; fixture creation,
-  owned verification, ledger/session startup, frame construction and owner
-  teardown remain cold. It uses small 160-byte frames and requires all
-  allocator counters unchanged, including frees. This does not qualify
-  maximum datasets, concurrent worker stacks, native allocation, session
-  startup or whole-service RSS. Runtime read scratch-pool leasing is
-  described below; query scopes are qualified separately below.
-
-  Pinned query preparation borrows one captured pin exclusively and reuses
-  caller selection, replay frame/cell, record and change partitions. Its
-  5032-byte SelectionScratch uses 5 KiB of the existing 292 KiB cursor/value
-  reservation. Pool bookkeeping takes 1 KiB and pinned-body state takes 4
-  KiB, leaving 53 KiB for cursor/history/index/checksum state. It keeps one
-  LoadedOverlay descriptor while the existing table/history sweeps reuse
-  record/change scratch, then lends ValidationView (the existing 4 KiB state
-  bound) only within a callback. No second recovery-frame arena or
-  heap-owned reader is created. File validation and full-table row scans
-  repeat per scope and query respectively; this is a bounded fallback. The
-  complete preparation/query stack still needs qualification. No per-pin
-  heap, new worker or additional arena is admitted.
-
-  The Rust allocation probe measures complete pinned read scopes in sixteen
-  intervals at short and maximum roots. Cases cover successful get/next/change
-  reads, an append during an old reader callback, deadlines before preparation,
-  after overlay loading or at callback completion, work/scratch refusal and
-  ignored query errors. Each interval also retries the old pin and queries a
-  fresh pin, then drops both. Selection loading, captured-prefix replay,
-  table/history validation, query I/O and temporary disposal run inside
-  measurement. Fixtures, buffer allocation, owned verification, session startup
-  and owner teardown remain cold. Every counter, including frees and peak,
-  must remain unchanged. These small empty-final-state and short-history
-  fixtures do not qualify maximum data, native allocation, worker stacks or
-  whole-service RSS.
-
-  ReadScratchSlot checks exact admitted replay-byte/cell and change-cell
-  extents before clearing all backing at startup. ReadScratchPool
-  exclusively borrows exactly storage_views slots and moves a partition into
-  one private lease per capture. Per-view bookkeeping reserves 1 KiB from
-  the existing cursor/value allowance: slot at most 256 bytes, pooled reader
-  at most 512 bytes, and pool at most 64 bytes (conservatively charged per
-  view). Runtime constructors enforce those compiled layout ceilings. No
-  arena size or total changes. Capture is a bounded try-lock scan; drop
-  briefly locks to return backing, without resetting poison. No lock spans
-  query I/O or callbacks. Complete worker stacks, service startup and
-  whole-service RSS remain unqualified. Pool allocation measurements follow
-  below.
-
-  The Rust allocation probe measures sixteen pool intervals at short and
-  maximum roots: normal queries, append during an old reader callback,
-  initial deadline, zero-step work refusal after preparation, pool capacity,
-  slot contention, publication contention and publication capacity. It calls
-  public capture and pooled queries, retries the old reader, reads a fresh
-  pin, and drops both leases before the closing snapshot. Every Rust
-  allocator counter must stay unchanged. Both full-size scratch sets are
-  allocated and touched before measurement; fixture creation, owned
-  verification, frame creation, pool/session startup and owner teardown
-  remain cold. Query data remains small and empty in its final state, with
-  short retained history. Poison, unwinding, native allocation, maximum
-  datasets and complete worker stacks are outside this probe's measured
-  scope.
-
-  A pooled view lends at most one PinnedBlobInput or PinnedBlob at a time.
-  Their combined compiled state is capped at 4 KiB during construction,
-  reserved from existing cursor/value space. This covers the descriptor,
-  digest, clock and terminal-error state across the consuming handoff. A
-  fixed 64-byte BlobRow lookup buffer uses the worker stack. Sequential and
-  random reads use caller output and at most 64 KiB per call, without a
-  whole-body arena. The descriptor retains the pooled view's pin and backing
-  until drop. No arena size or planning total changes; complete worker-stack
-  and whole-service RSS qualification remain separate.
-
-  The Rust allocation probe measures twenty body intervals at short and
-  maximum roots. It covers normal and empty bodies, deletion after capture,
-  missing-row/byte-cap refusal, checksum mismatch, truncation and deadlines
-  after input read, digest finish or random read. Public pool capture, row
-  lookup, body opening/hash/finish/range reads, terminal retries, post-error
-  metadata queries and pin disposal are inside measurement. Require exactly
-  forty snapshots and every Rust allocator counter unchanged. Fixtures, full
-  scratch creation/touching, owned verification, session startup and teardown
-  stay cold. A preopened fault handle truncates inside its measured interval;
-  checksum corruption is installed before measurement. These zero/three-byte
-  fixtures do not qualify maximum body sizes, native allocation, clock-source
-  or regression failures, constructor I/O faults, worker stacks or service RSS.
-
-  HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
-  its shipped-Provider state fits 2 KiB on the worker stack. Completion moves
-  that input to a temporary; complete worker-stack qualification remains pending.
-  Existing record scratch and full change slots are reused across segments.
-  Descriptor byte/frame totals are admitted before I/O; each frame retains the
-  operation reader's existing work bound. No arena or journal buffer is added.
-  Allocation probes cover selected completion and slot reclaim at both roots.
-  Frame-change collection has its own 4096 slots of at most 24 bytes each,
-  a separate 96 KiB reservation per view. Retained changes may coexist with
-  get/next result storage; their memory never aliases those partitions. This
-  adds 192 KiB for the default two views within the unchanged 96 MiB budget.
-  Limits::plan checks the compiled Cell layout. Collector retains only the
-  frame verifier, slot borrow and scalar progress; its compiled Provider layout
-  is capped at 1 KiB on the worker stack. Operations use the existing record
-  region, and copied CHANGE data survives reuse of that input. The allocation
-  interval covers maximum-capacity collection, repeated draining, corrupted
-  footer and short-slot failure after cold slot/input preparation. Runtime
-  cursor I/O, whole-worker stack/RSS and actual pin ownership remain pending.
-- Writer: one journal arena and descriptor array, one 1 MiB frame, and
-  256 KiB table/manifest/value scratch, a separate 1 MiB input key/value
-  arena and 4096 operation slots of 32 bytes. The latter bounds the actual
-  Option<StagedOperation> layout: owned offsets, lengths, type tag, ordinal
-  and PUT/DELETE/CHANGE kind/action. All operations share that one index;
-  there is no second CHANGE descriptor array. Journal descriptors are a
-  different structure. Limits::plan
-  checks the compiled operation-index layout fits. Decode one borrowed row at
-  a time from the input bytes while encoding the separate output frame; never
-  retain a self-referencing row array or alias input with mutable output.
-  Pending commits reference fixed protocol slots and have no private frame.
-  Exclusive GC reuses 4 KiB of writer scratch for 128 candidate cells; it
-  cannot allocate an inventory-sized live-ID set.
+- SQLite writer: a process-wide 16 MiB requested-native-heap ceiling,
+  two separate 1 MiB transaction/input arenas, 4096 operation slots of
+  32 bytes and 256 KiB row/validation scratch. Native connections share
+  this heap cap; it is not 16 MiB per view and does not measure RSS,
+  allocator metadata or every Rust wrapper allocation. Application operation
+  slots contain offsets/type/action, never borrowed self-referencing rows.
+  The synchronous core applies closed parameterized SQL without mailbox-sized
+  RAM collections. The full coordinator still must qualify simultaneous
+  stack/scratch/native owners and enforce logical disk/category reservations.
 - Outbound: exactly 100 envelope cells of 320 bytes, 100 distinct 4096-byte
   RCPT reply cells, and 128 KiB transfer/reply scratch. This per-attempt batch
   is independent of the configured inbound recipient ceiling. The final DATA
@@ -569,7 +308,7 @@ that value as `maxSizeUpload` and enforces it even for attachment uploads.
 `upload_disk_bytes` is the separate aggregate quota for retained upload blobs.
 
 The compiled maxima and checked default values live in `limits.rs`; this table
-records the default byte ledger only. Journal/frame limits are fixed to the
+records the default byte ledger only. Transaction/WAL limits are fixed to the
 storage contract. SMTP retains room for at least 100 recipients. Disabled event
 streams may use zero slots; mandatory pools and byte budgets cannot be zero.
 The bounds are startup validation, not protocol error mappings or proof that
@@ -591,7 +330,7 @@ there; unavailable work stays queued within its deadline.
 
 | Fixed worker | Count | Work and ownership |
 | --- | ---: | --- |
-| Writer/checkpoint | 1 | Serialized metadata planning/validation, frame sync/publication and checkpoint barrier; owns transaction staging |
+| SQLite writer | 1 | Serialized metadata validation/commit/checkpoint; owns transaction staging and native heap allowance |
 | Body/read | 2 | SMTP/HTTP parsing, JSON tokenization, auth verifier work, JMAP dispatch/serialization, streaming blob I/O, MIME, reads/search and per-object planning; yields by bounded chunks |
 | TLS handshake/dial | 2 | Bounded connect_timeout and handshake steps; moves a transport slot back to main after success |
 | Logger | 1 | Fixed event queue drain, bounded encoding and file rotation |
@@ -693,8 +432,8 @@ concrete structures require a ledger amendment before admission is enabled.
 | Reservation | Partition |
 | --- | --- |
 | Body work, 96 KiB/job | Six 8 KiB nested-decode rings (NestedPartId::MAX_STEPS); 16 KiB parser/boundary/locator state; 32 KiB conversion/output |
-| Read cursor/value, 292 KiB/view | 68 KiB table-record input; 64 KiB retained result value; 1 KiB key; 5 KiB selected metadata; 1 KiB pool bookkeeping; 4 KiB pinned-body input/reader state; 53 KiB cursors, history streaming, sparse-index lookups and checksums; 96 KiB retained frame changes |
-| Outbound scratch, 128 KiB | 64 KiB body transfer; 16 KiB reply assembly; 16 KiB SMTP/TLS handoff state; 32 KiB frame-planning/ID/diagnostic scratch |
+| Read cursor/value, 292 KiB/view | 68 KiB row input/reserve; 64 KiB retained result value; 1 KiB key; 5 KiB selected metadata; 1 KiB pool bookkeeping; 4 KiB pinned-body input/reader state; 149 KiB typed row/change cursors, native wrapper bookkeeping and reference validation scratch |
+| Outbound scratch, 128 KiB | 64 KiB body transfer; 16 KiB reply assembly; 16 KiB SMTP/TLS handoff state; 32 KiB transaction-planning/ID/diagnostic scratch |
 | DNS/control, 512 KiB | 128 KiB resolver + 384 KiB control as detailed below |
 | Log, 128 KiB | 384 queued fixed event cells of at most 256 bytes (96 KiB); 16 KiB encoder/output; 16 KiB rotation/drop counters and emergency status |
 | Cold reload, 2 MiB | Two immutable configuration snapshots of at most 1 MiB each, including referenced credential data; reject a third live generation |
@@ -2832,12 +2571,9 @@ whole-process memory usage or execution-time enforcement.
 
 Logical reservation records and grouped quota checks use fixed caller-owned
 cells and linear effect tickets. Each cell plus slot fits within 128 bytes;
-there is no physical-filesystem binding or probe table. The scalar writer
-ledger uses the same cells for journal bytes/operations, with fixed stack
-projections and no heap growth. Its barrier preserves pending frame ownership
-and stays closed after selection until runtime reconciliation exists. M08 owns
-building/retention accounting in a dedicated attempt outside client slots,
-actual cleanup, writer/view locking and publication authority.
+there is no physical-filesystem binding or free-space probe. SQLite owns
+metadata writer/checkpoint state. The coordinator must couple logical charges
+to durable SQL outcomes and raw-file publication/cleanup before activation.
 
 The std directory adapter owns a File and a 383-byte path buffer per retained
 directory. Complete operational paths are bounded at 383 bytes and data roots
@@ -2853,280 +2589,18 @@ buffer and retains one additional File inside LockedRoot. No per-request
 lock-file open or descriptor cloning is permitted. Cooperative
 process locking does not alter the request pool or worker ledger.
 
-Each live TemporaryFile/SyncedTemporary retains two Files (output and its
-parent directory), one generated Name, account ID, counters and
-a borrow of the existing LockedRoot. Writes and reads use caller slices without
-buffer growth; path assembly uses the directory adapter's fixed byte ceiling.
-These operations do not acquire quota or runtime pool slots. The dedicated
-Rust allocation probe compiles the same filesystem source with its cfg(test)
-fixture. That fixture supplies a root for the namespace-mapped test identity;
-it does not alter production root admission. It still takes the real writer
-lock and executes the actual creation, policy, I/O and sync paths. The imported
-module permits unused items in this second compilation, including omitted
-libtest helpers; normal library and unit-test builds remain the lint authority.
+Immutable-file primitives retain bounded descriptors/names and use caller
+I/O slices. SQLite setup and query calls may allocate Rust and native memory;
+they are excluded from the pure MIME zero-allocation claim. The removed
+custom-engine probe intervals no longer qualify storage transactions. Existing
+MIME fixtures create and verify a real SQLite-bound body pin during cold
+preparation, then measure only the parser/adapters and retained file reads.
+Native SQLite heap/stack/RSS, capacity and fault qualification remain required
+before activating the service. Default resource planning is a checked ledger,
+not measured combined-process usage or a durability proof.
 
-At both short and maximum 254-byte root paths, the measured interval covers
-exclusive typed account/checkpoint/shard directory creation and sync, existing
-directory collisions and refusal of file entries passed as directory requests;
-exclusive create/prepare, 4 KiB write/read/sync/drop, existing-name collision,
-byte-limit and read-offset refusal, missing ancestors, injected open/preparation
-and sync failures, Interrupted attempt exhaustion, retired output refusal and
-unexpected early EOF. Blob publication adds link/sync/unlink/sync success,
-collision and errors before/after every effect boundary, plus bounded reads. Fresh metadata publication additionally
-covers table, manifest and journal destinations with maximum numeric components,
-including success and collision refusal at both root bounds.
-Expected CURRENT preparation retains two fixed 120-byte encodings, an optional
-previous marker and AccountId. Replacement writes directly from that retained
-encoding and reads through 120-byte scratch plus a one-byte EOF buffer. It uses
-fixed source/target paths and the shared temporary constructor's path scratch.
-The expected-state read briefly opens CURRENT. At rename, the call retains
-source and target parent Directories and the temporary's two Files (four Files
-in addition to LockedRoot's retained root directory and LOCK). Each Directory
-also retains its bounded path. The expected-state read bounds explicit extent
-calls to 64 plus one EOF call. The measured interval includes initialization,
-replacement, stale/absence refusal and injected errors before/after each file
-sync, temporary-parent sync, rename and final parent sync at both root bounds.
-Fixture account/directory preparation stays outside that interval.
-PublishedFile retains one File, one Name, completed length and the LOCK borrow;
-publication uses fixed source/destination paths and transient directory handles.
-It requires unchanged Rust allocation/deallocation
-counters after setup and before cleanup. No new allocator hook or production
-fixture constructor is introduced. Repeat on host and static musl when compiler
-or filesystem adapter code changes. This does not measure kernel page cache,
-native-library allocations, directory enumeration or the whole service RSS.
-Admission integration remains required before activation.
-
-Each StoreReader/CompleteFile owns one File and generated Name, scalar extent
-(and reader progress/failure fields), plus the existing LOCK borrow. Opening
-uses fixed path buffers and transient parent handles. Reads use caller slices
-and return after one explicit operation of at most 64 KiB. Completion adds a
-length query and a one-byte EOF probe. The same allocation interval exercises
-complete reads, random reads, ceiling/role refusal, injected read errors, early
-EOF and completion-probe failure at both root bounds. No per-file heap buffer,
-new allocator hook or runtime pool is introduced.
-
-BlobInput retains one StoreReader, fixed provider digest state and supplied
-account/ID/row fields. It hashes directly from caller read storage with a
-64 KiB step ceiling. No whole-blob buffer or additional arena is reserved.
-CompleteBlob retains one CompleteFile, account/ID/kind and observed digest.
-The existing allocation interval measures complete reads/digest/EOF, random
-reads, admission and premature-finish refusal, checksum mismatch and sticky
-I/O failure at both root bounds. Fixture publication precedes measurement.
-It grants no runtime pin or whole-service memory qualification.
-
-Active-overlay loading reuses the admitted journal arena and Cell array;
-frames exclude the 96-byte header kept on stack. It retains one CompletePrefix,
-borrowed Overlay and ViewIdentity with no additional frame buffer or pool.
-A single 128-read budget covers header and captured payload; each read is at
-most 64 KiB, so a full 4 MiB payload needs 64 full reads plus the header. Short
-reads consume the same budget, and exhaustion returns WouldBlock. Validation
-and in-place sorting are one bounded synchronous work unit, admitted in full
-with deadline checks around it. The existing allocation interval covers empty
-and populated loads, tombstone lookup and byte/slot refusal before and after I/O
-at both root bounds;
-fixture creation and arena/cell preparation precede measurement. This establishes
-primitive allocation behavior, not full-service RSS or runtime pin ownership.
-
-Selection loading uses caller-owned scratch totaling 5032 bytes: FORMAT (80),
-CURRENT (120) and maximum manifest (4832). It retains at most one input File
-at a time in addition to the root and LOCK; opening uses the same transient
-parent handles and fixed path scratch as StoreReader. Container decoders use
-bounded stack state and the existing allocation-free SHA-256 provider. Each
-file permits at most 64 explicit extent reads plus one EOF probe. Selection
-borrows the scratch manifest, preventing its reuse until that borrow ends.
-The allocation interval loads literal metadata and exercises missing-account
-refusal at short/maximum roots; fixture bytes/directories and scratch are
-prepared before measurement. This does not instantiate recovery workers or
-prove full-service RSS.
-
-TableInput borrows one 66608-byte record buffer and the selected manifest,
-retains one StoreReader and the fixed table verifier (1024-byte previous key,
-scalar counters/header and provider digest state). Opening uses a 112-byte
-header buffer, shared fixed path scratch and transient parent handles; it
-checks the manifest descriptor against an explicit admitted file-byte ceiling.
-Header input permits 64 explicit reads; each record shares a fresh 64-call
-allowance across prefix/remainder. No whole-table buffer or count-sized array
-is allocated. CompleteTable retains one CompleteFile and Summary. Existing
-writer/read-view scratch must supply these buffers before worker activation.
-The measured interval streams all eleven table tags, including a populated
-blob record, completes them, and exercises byte-ceiling and premature-finish
-refusal at short/maximum roots. Literal fixture loading and buffers precede
-measurement; this does not add allocator instrumentation or service pools.
-
-TableReplay owns that existing TableInput and fixed inline Merge state while
-borrowing LoadedOverlay. It introduces no arena or pool: the table continues to
-use caller record scratch, and the loaded prefix keeps its admitted frame/cell
-storage. Inline state and temporary merge keys are charged to the worker stack.
-One table descriptor is open in addition to the retained active-prefix descriptor;
-CompleteReplay retains the verified table and borrows the prefix, releasing the
-record scratch for reuse. Advance admits one table record plus bounded intervening
-overlay work, and finish admits complete-table checks plus residual overlay work.
-The allocation interval measures unchanged/deleted rows, input exhaustion and
-completion, premature completion and sticky sink failure at both root bounds.
-Full worker-stack/RSS and actual pin ownership remain integration obligations.
-
-The supplied-byte frame_stream verifier retains a provider borrow, checked
-header, digest, count/extent scalars and sticky error. Its compiled Provider layout is
-capped at 512 bytes, charged to the worker stack. Each push borrows one exact
-operation (at most 66572 bytes), which fits the existing 68 KiB record region;
-no input bytes remain borrowed by the verifier after the call. The existing
-allocation interval covers successful completion and sticky malformed input.
-There is no new pool or frame arena. Future history/change cursor integration
-must prove its collection and input scratch overlap within the admitted view;
-this codec alone grants no completed cursor or new reservation.
-
-The incremental journal-change entry point uses the existing journal verifier's
-provider borrow, checked header, digest and scalar progress/error state; its compiled Provider
-layout is capped at 512 bytes. Pending owns the existing Collector and borrows
-that parent exclusively, with a compiled ceiling of 2 KiB. Both are charged
-to the worker stack. Change slots remain in their separate 96 KiB reservation,
-operation input uses the existing record region, and no journal/frame arena
-is added. The allocation interval covers combined journal/change completion
-and an abandoned frame. Runtime I/O scheduling and complete-worker stack/RSS
-qualification remain unimplemented.
-
-HistoryChangesInput retains separate CHANGE cells, one StoreReader, the
-journal verifier, selection and compact progress/completion state. Each
-advance borrows existing MAX_RECORD_BYTES operation scratch only for that
-call; get/next can reuse it while a completed frame remains available.
-Completed frames keep the original mutable slot capacity behind read-only
-record access; consuming that result recovers all slots for the next frame.
-Its compiled Provider layout is capped at 8 KiB, charged to the worker
-stack, alongside the transient Pending and fixed 64-byte header/40-byte
-footer. No input frame arena is retained. Opening uses shared private-path
-scratch/transient parent handles. One frame admits at most 8258 explicit
-read attempts, while its total bytes and operations retain the format
-limits; callers still meter full-frame work and deadlines. The allocation
-interval reuses a cold fixture buffer's record-sized prefix for selected
-opening, local frame progress, completion and refusal at both root bounds;
-that fixture allocation grants no new deployment reservation. Whole-worker
-stack/RSS and live serving-view integration remain pending.
-
-ActiveChangesInput uses the same private operation reader as HistoryChangesInput,
-with PrefixReader fixing its captured extent and prefix-only completion. Its
-compiled Provider layout also fits 8 KiB on the worker stack. Record scratch,
-CHANGE slots, transient Pending and read allowances are unchanged; append growth
-creates no new inventory. Existing root-bound allocation intervals cover empty
-and populated prefixes, checksum completion and admission/premature-finish
-refusals using the cold fixture record-buffer prefix. This is component evidence,
-not complete-worker memory qualification or live-view activation.
-
-The supplied-frame change Cursor fits 512 bytes on the worker stack. It owns
-only ViewIdentity, kind/cursor, current Summary/index and terminal error state;
-it borrows no operation buffer or CHANGE arena between calls. Each poll scans
-at most the remaining 4096 compact slots in one frame and retains its next
-index, so draining never rescans examined entries. NeedFrame performs no I/O;
-the driver separately bounds initial location and each frame read. Existing
-allocation instrumentation drains maximum changes, filters an empty result and
-checks changed-view refusal without new hooks. No resource allowance changes.
-
-ChangeRoute borrows its already admitted selected manifest and stores one
-ViewIdentity, fitting a compiled 512-byte stack ceiling. A lookup examines at
-most the format's 64 history descriptors, retaining no separate index or file
-handles. Existing allocation instrumentation covers history/active routing and
-below-floor/changed-view refusal. Physical frame location and complete-view
-memory remain
-separate work; this helper changes no arena or concurrency allowance.
-
-ChangeInput holds one history/active reader plus captured identity, target and
-fixed progress fields. The compiled Provider wrapper fits the existing 8 KiB
-reader stack ceiling. Each advance retains the common 8258-read, one-frame bound
-and borrows the same per-call record scratch. Finish reclaims original full
-CHANGE capacity after selected completion, even after End or an empty prefix;
-it does not clear or allocate a replacement arena. The returned completion
-retains its descriptor until dropped, so the driver must budget retained handles
-or drop it before moving segments. Existing root-bound allocation intervals
-cover history-to-active scratch reuse, empty-prefix reclaim and target refusal.
-Actual streaming view ownership and complete-worker measurements remain pending.
-
-ChangeScan adds fixed cursor/source-transition state to one locator, borrowing
-one slot arena throughout. Its compiled Provider layout remains within 8 KiB.
-It drops a checked source completion before opening the next descriptor. Each
-advance performs one open, bounded frame read, bounded slot drain or completion;
-Progress changes no caller cursor. max_bytes is per source, and total scan work
-still needs driver admission. The existing allocation interval covers a history
-to active transition and successful full-capacity reclaim at both root bounds.
-
-The account-verification allocation fixture loads actual CURRENT and checks all
-selected metadata, replay, references, queue/mailbox scans and final blob files.
-Four cold-created stores combine short/maximum root length with empty final data
-and a published three-byte blob. Empty stores retain an incomplete active tail.
-Each store has two measured intervals: success plus initial/mid-pipeline
-deadlines, capture extent, overlay, history and read-work refusals, then a
-separately prepared malformed CURRENT or exact blob-checksum failure.
-All 16 snapshots must be valid; each before/after pair must match every counter,
-including allocation, reallocation, deallocation, failed requests and live/peak
-requested bytes. Scratch reuse and result disposal occur within measurement;
-fixture creation, corruption writes, buffer allocation and cleanup are outside.
-The existing positive controls and counter model run first. The --store-files
-path also runs these cases. This qualifies representative composed Rust call
-behaviour, not maximum datasets, native allocation, stack high water or RSS.
-
-HistoryInput borrows one preallocated 1 MiB frame buffer and the selected
-manifest, retains one StoreReader and the fixed journal verifier (header,
-sequence/count/extent counters and provider digest state). Opening uses a
-96-byte header buffer plus the existing transient handles and path scratch.
-The selected extent must fit the admitted ceiling and the fixed 4 MiB frame
-bytes plus header. Each frame shares 64 explicit read attempts across its
-64-byte header and remainder; the header is checksummed before its length is
-used. No whole-history inventory or additional per-frame buffer is allocated.
-CompleteHistory retains one CompleteFile and Summary. Recovery/verification
-must reuse an admitted existing frame arena (such as the writer's 1 MiB frame
-buffer); this grants no additional per-view MiB. ReadView::next_change still
-requires its separate cursor that skips PUT bodies with bounded I/O.
-The allocation fixture creates
-its 1 MiB buffer on the cold path before measurement and drops it afterward;
-stream, completion, missing-descriptor/byte-cap and premature-finish refusal
-run inside the interval at both root bounds. No new hook or service pool is
-introduced.
-
-PrefixReader retains one StoreReader with its extent fixed to the captured
-prefix; CompletePrefix retains one File, Name, prefix length and LOCK borrow.
-Opening uses the existing fixed path scratch and transient parent handles.
-Sequential and completed random reads borrow caller slices and keep the
-64 KiB step ceiling. No suffix buffer or per-prefix allocation is introduced.
-The existing measured interval opens/consumes/completes a journal prefix,
-checks bounded random reads and exercises invalid limits, short physical
-extent, premature completion and sticky read failure at short/maximum roots.
-Fixture files precede measurement; output uses a fixed stack array. This
-qualifies primitive Rust allocations, not live read-view pinning or complete
-service memory.
-
-ActiveInput uses the same fixed journal frame reader as HistoryInput, with a
-PrefixReader in place of StoreReader and captured sequence/offset counters.
-It borrows an existing 1 MiB frame arena and Selection; complete active input
-retains one CompletePrefix and Summary. Shared framing preserves the existing
-64-call per-frame allowance and adds no dynamic dispatch or collection.
-The measured interval reuses the history frame arena sequentially for empty
-and populated active prefixes with an incomplete suffix, final binding and
-invalid-view/admission refusal. Literal active files and metadata are prepared
-before the snapshots. No extra per-view buffer or runtime pin pool is added.
-
-RecoveryInput retains one whole-file StoreReader, fixed journal verifier and
-valid sequence/operation counters and a fixed Current value, borrowing the
-same admitted 1 MiB frame arena. It performs at most 64 explicit reads per
-frame/tail, and no suffix allocation or directory inventory. ScannedJournal
-retains the CompleteFile, verified Summary, selected Current and valid byte
-boundary. The allocation interval reuses the active fixture with its
-incomplete suffix and the existing frame arena, checks physical EOF
-completion, whole-file byte refusal, premature completion and sticky read
-failure at both root bounds. Fixture metadata preparation is cold; no worker
-slot or extra frame reservation is introduced.
-
-Explicit repair encodes and reads CURRENT using two fixed 120-byte buffers,
-64 explicit extent reads and one EOF probe. After that input closes, it
-retains the scanner's read-only File plus one private writable journal File;
-opening uses shared fixed path scratch and transient parent handles. It calls
-set_len and sync_all once, closes the writable File, then confirms the original
-File's length and EOF. RepairedJournal retains one CompleteFile and Summary.
-The allocation interval advances the fixture CURRENT to its supplied generation
-using an already prepared CurrentUpdate, scans/repairs the active suffix,
-checks bounded reads, rescans the repaired journal and refuses a second repair.
-All metadata/intent preparation is cold; the 1 MiB frame arena is reused.
-This fixture composes I/O primitives, not a validated complete store graph.
-
-Pending/failed files retain their logical charges until explicit
-cleanup, including when syncing consumed and closed their handles.
+Pending/failed body files retain charges until durable explicit cleanup,
+including when syncing consumed and closed their handles.
 
 M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire
 buffers and atomic text formatting. They neither allocate backing storage nor

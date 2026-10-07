@@ -1,12 +1,12 @@
 //! Canonical relative storage names. Names grant no filesystem or account authority.
 use crate::{
     bounded::TextBuffer,
-    format::{row::BlobKind, Table},
+    format::row::BlobKind,
     ids::{AccountId, BlobId},
 };
 use std::{ffi::CStr, fmt, path::Path};
 
-/// Longest current path is 102 bytes; reserve 128 plus one NUL byte.
+/// Longest blob path is 90 bytes; reserve 128 plus one NUL byte.
 pub const CAPACITY: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,7 +18,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::InvalidNumber => "noncanonical storage generation or segment number",
+            Self::InvalidNumber => "noncanonical temporary object number",
             Self::InvalidBlobName => "noncanonical blob filename or wrong shard",
             Self::Encoding => "generated storage path exceeds its encoding bounds",
         })
@@ -26,7 +26,7 @@ impl fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
-/// Positive generation/segment number, rendered with exactly twenty decimal digits.
+/// Positive temporary object number, rendered with exactly twenty decimal digits.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Number(u64);
 impl Number {
@@ -66,7 +66,9 @@ impl fmt::Display for Number {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RootEntry {
-    Format,
+    Database,
+    Wal,
+    SharedMemory,
     Lock,
     Accounts,
 }
@@ -76,16 +78,6 @@ pub enum AccountEntry {
     Root,
     Messages,
     Uploads,
-    Metadata,
-    Current,
-    CurrentTemporary(Number),
-    Checkpoints,
-    Checkpoint(Number),
-    Manifest(Number),
-    Table(Number, Table),
-    Journals,
-    Journal(Number),
-    Cache,
     Temporary,
     TemporaryFile(Number),
     Shard(BlobKind, u8),
@@ -112,7 +104,9 @@ impl Name {
     }
     pub fn root(entry: RootEntry) -> Result<Self, Error> {
         let text = match entry {
-            RootEntry::Format => "FORMAT",
+            RootEntry::Database => "metadata.sqlite3",
+            RootEntry::Wal => "metadata.sqlite3-wal",
+            RootEntry::SharedMemory => "metadata.sqlite3-shm",
             RootEntry::Lock => "LOCK",
             RootEntry::Accounts => "accounts",
         };
@@ -121,32 +115,6 @@ impl Name {
     pub fn account(account: AccountId, entry: AccountEntry) -> Result<Self, Error> {
         let suffix = match entry {
             AccountEntry::Root => return Self::encode(format_args!("accounts/{account}")),
-            AccountEntry::Checkpoint(number) => {
-                return Self::encode(format_args!(
-                    "accounts/{account}/metadata/checkpoints/{number}"
-                ))
-            }
-            AccountEntry::Manifest(number) => {
-                return Self::encode(format_args!(
-                    "accounts/{account}/metadata/checkpoints/{number}/manifest"
-                ))
-            }
-            AccountEntry::Table(number, table) => {
-                return Self::encode(format_args!(
-                    "accounts/{account}/metadata/checkpoints/{number}/{}",
-                    table_name(table)
-                ))
-            }
-            AccountEntry::Journal(number) => {
-                return Self::encode(format_args!(
-                    "accounts/{account}/metadata/journal/{number}.log"
-                ))
-            }
-            AccountEntry::CurrentTemporary(number) => {
-                return Self::encode(format_args!(
-                    "accounts/{account}/metadata/CURRENT.{number}.tmp"
-                ));
-            }
             AccountEntry::TemporaryFile(number) => {
                 return Self::encode(format_args!("accounts/{account}/tmp/{number}.tmp"))
             }
@@ -166,11 +134,6 @@ impl Name {
             }
             AccountEntry::Messages => "messages",
             AccountEntry::Uploads => "uploads",
-            AccountEntry::Metadata => "metadata",
-            AccountEntry::Current => "metadata/CURRENT",
-            AccountEntry::Checkpoints => "metadata/checkpoints",
-            AccountEntry::Journals => "metadata/journal",
-            AccountEntry::Cache => "cache",
             AccountEntry::Temporary => "tmp",
         };
         Self::encode(format_args!("accounts/{account}/{suffix}"))
@@ -191,21 +154,6 @@ impl Name {
     }
 }
 
-fn table_name(table: Table) -> &'static str {
-    match table {
-        Table::Blobs => "blobs.tbl",
-        Table::Mailboxes => "mailboxes.tbl",
-        Table::Emails => "emails.tbl",
-        Table::Memberships => "memberships.tbl",
-        Table::Keywords => "keywords.tbl",
-        Table::Threads => "threads.tbl",
-        Table::ThreadAnchors => "thread-anchors.tbl",
-        Table::Submissions => "submissions.tbl",
-        Table::Recipients => "recipients.tbl",
-        Table::Leases => "leases.tbl",
-        Table::Imports => "imports.tbl",
-    }
-}
 fn blob_directory(kind: BlobKind) -> &'static str {
     match kind {
         BlobKind::Message => "messages",
@@ -230,4 +178,23 @@ pub fn parse_blob_name(kind: BlobKind, shard: u8, text: &str) -> Result<BlobId, 
         return Err(Error::InvalidBlobName);
     }
     Ok(blob)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn longest_retained_blob_name_fits_its_exact_capacity() -> Result<(), Error> {
+        let name = Name::account(
+            AccountId::from_bytes([255; 16]),
+            AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([255; 16])),
+        )?;
+        assert_eq!(name.as_path()?.as_os_str().len(), 90);
+        assert!(name.as_path()?.as_os_str().len() < CAPACITY);
+        assert_eq!(
+            name.as_c_str()?.to_bytes(),
+            name.as_path()?.as_os_str().as_encoded_bytes()
+        );
+        Ok(())
+    }
 }

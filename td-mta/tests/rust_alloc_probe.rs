@@ -19,17 +19,15 @@ use td_crypto::Digest;
 
 // Compile filesystem and checker sources with their cfg(test) fixtures.
 // Filesystem fixtures need no production exception for the mapped test identity.
-use td_mta::{
-    bounded, change_cursor, config, format, frame_changes, ids, limits, merge, overlay, ownership,
-    ports, store_paths, wire,
-};
+use td_mta::{bounded, config, format, ids, limits, ownership, ports, store_paths, wire};
 #[path = "../src/admission.rs"]
-#[allow(unused)] // Keep the private append guard in this measured source compilation.
+#[allow(unused)] // Keep quota/work helpers in this measured source compilation.
 mod admission;
 #[path = "../src/row_references.rs"]
 #[allow(unused)]
-mod measured_row_references;
-use td_mta::{mailbox_parents, mailbox_sweep, recipient_sweep, reference_sweep, row_references};
+mod row_references;
+use row_references as measured_row_references;
+use td_mta::mailbox_parents;
 #[path = "../src/mailbox_sweep.rs"]
 #[allow(unused)]
 mod measured_mailbox_sweep;
@@ -41,8 +39,7 @@ mod measured_recipient_sweep;
 mod measured_reference_sweep;
 #[path = "../src/store_fs.rs"]
 #[allow(unused)] // Second compilation; the library build remains the lint authority.
-pub mod measured_store_fs;
-use measured_store_fs as store_fs;
+pub mod store_fs;
 
 // Expand at this root to retain production child paths and restricted visibility.
 include!("../src/mime_probe_modules.rs");
@@ -109,11 +106,7 @@ fn hot_paths() {
         let mut digest = td_crypto::Sha256::try_new().unwrap();
         digest.update(black_box(&data)).unwrap();
         black_box(digest.finish().unwrap());
-        store_containers();
-        store_table_records();
-        store_manifests();
-        store_frame_parts();
-        store_complete_frames();
+
         store_paths();
         measured_row_references::tests::probe();
         measured_reference_sweep::tests::probe();
@@ -136,198 +129,26 @@ fn hot_paths() {
     );
 }
 
-fn store_containers() {
-    use td_mta::{
-        format::{
-            container::{Current, Error as ContainerError, JournalHeader, StoreIdentity},
-            Error as FormatError, Sequence,
-        },
-        ids::{AccountId, InstanceId, StoreEpoch},
-    };
-    let crypto = td_crypto::Provider;
-    let mut bytes = [0; 120];
-    let identity = StoreIdentity {
-        instance: InstanceId::from_bytes([0x11; 16]),
-        epoch: StoreEpoch::from_bytes([0x22; 16]),
-    };
-    let n = identity.encode(&crypto, black_box(&mut bytes)).unwrap();
-    assert_eq!(
-        StoreIdentity::decode(&crypto, bytes.get(..n).unwrap()).unwrap(),
-        identity
-    );
-    let current = Current {
-        account: AccountId::from_bytes([0x33; 16]),
-        epoch: identity.epoch,
-        generation: 1,
-        manifest_digest: [0x44; 32],
-    };
-    let n = current.encode(&crypto, black_box(&mut bytes)).unwrap();
-    assert_eq!(
-        Current::decode(&crypto, bytes.get(..n).unwrap()).unwrap(),
-        current
-    );
-    assert_eq!(
-        current.encode(&crypto, bytes.get_mut(..n - 1).unwrap()),
-        Err(ContainerError::Format(FormatError::OutputFull))
-    );
-    let journal = JournalHeader {
-        account: current.account,
-        epoch: current.epoch,
-        segment: 1,
-        base: Sequence::default(),
-    };
-    let n = journal.encode(&crypto, black_box(&mut bytes)).unwrap();
-    assert_eq!(
-        JournalHeader::decode(&crypto, bytes.get(..n).unwrap()).unwrap(),
-        journal
-    );
-    assert_eq!(
-        JournalHeader::decode(&crypto, bytes.get(..n - 1).unwrap()),
-        Err(ContainerError::Format(FormatError::Truncated))
-    );
-    *bytes.get_mut(n - 1).unwrap() ^= 1;
-    assert_eq!(
-        JournalHeader::decode(&crypto, bytes.get(..n).unwrap()),
-        Err(ContainerError::Checksum)
-    );
-}
-
-fn store_table_records() {
-    use td_mta::{
-        format::{
-            container::Error,
-            row::{BlobKind, BlobRow, Row},
-            table::{record_extent, Record, TableHeader},
-            table_stream::Verifier,
-            Error as FormatError, Sequence, Table,
-        },
-        ids::{AccountId, StoreEpoch},
-    };
-    let crypto = td_crypto::Provider;
-    let through = Sequence::from_u64(1);
-    let header = TableHeader {
-        table: Table::Blobs,
-        account: AccountId::from_bytes([0x33; 16]),
-        epoch: StoreEpoch::from_bytes([0x22; 16]),
-        generation: 2,
-        through,
-        record_count: 1,
-        payload_bytes: 113,
-    };
-    let mut header_bytes = [0; 112];
-    header.encode(&crypto, &mut header_bytes).unwrap();
-    let mut stream = Verifier::new(&crypto, &header_bytes).unwrap();
-    let mut bytes = [0; 120];
-    let n = header.encode(&crypto, black_box(&mut bytes)).unwrap();
-    assert_eq!(
-        TableHeader::decode(&crypto, bytes.get(..n).unwrap()),
-        Ok(header)
-    );
-    let mut value = [0; 49];
-    let row = Row::Blob(BlobRow {
-        kind: BlobKind::Message,
-        length: 3,
-        digest: [0; 32],
-        created_at: 0,
-    });
-    assert_eq!(row.encode(&mut value), Ok(value.len()));
-    let key = [0x44; 16];
-    let record = Record::new(Table::Blobs, through, &key, &value).unwrap();
-    let n = record
-        .encode(&crypto, through, black_box(&mut bytes))
-        .unwrap();
-    assert_eq!(
-        Record::decode(&crypto, Table::Blobs, through, bytes.get(..n).unwrap()).unwrap(),
-        record
-    );
-    assert_eq!(record_extent(bytes.get(..16).unwrap()), Ok(n));
-    assert_eq!(stream.push(bytes.get(..n).unwrap()), Ok(record));
-    assert_eq!(stream.finish().unwrap().header(), header);
-    let mut failed = Verifier::new(&crypto, &header_bytes).unwrap();
-    assert_eq!(
-        failed.push(bytes.get(..n - 1).unwrap()),
-        Err(Error::Format(FormatError::Truncated))
-    );
-    assert_eq!(
-        failed.push(bytes.get(..n).unwrap()),
-        Err(Error::Format(FormatError::Truncated))
-    );
-    assert_eq!(failed.finish(), Err(Error::Format(FormatError::Truncated)));
-    assert_eq!(
-        record.encode(&crypto, through, bytes.get_mut(..n - 1).unwrap()),
-        Err(Error::Format(FormatError::OutputFull))
-    );
-    assert_eq!(
-        Record::decode(&crypto, Table::Blobs, through, bytes.get(..n - 1).unwrap()),
-        Err(Error::Format(FormatError::Truncated))
-    );
-    *bytes.get_mut(n - 1).unwrap() ^= 1;
-    assert_eq!(
-        Record::decode(&crypto, Table::Blobs, through, bytes.get(..n).unwrap()),
-        Err(Error::Checksum)
-    );
-}
-
-fn store_frame_parts() {
-    use td_mta::{
-        format::{
-            frame_header::Header,
-            operation::{extent, Operation},
-            Error, ObjectType, Sequence, Table,
-        },
-        ports::ChangeAction,
-    };
-    let crypto = td_crypto::Provider;
-    let header = Header {
-        frame_bytes: 132,
-        operations: 1,
-        sequence: Sequence::from_u64(1),
-    };
-    let mut header_bytes = [0; 64];
-    header
-        .encode(&crypto, black_box(&mut header_bytes))
-        .unwrap();
-    assert_eq!(Header::decode(&crypto, &header_bytes), Ok(header));
-    let key = [0x44; 16];
-    let members = [0x55; 32];
-    for operation in [
-        Operation::delete(Table::Blobs, &key).unwrap(),
-        Operation::put(Table::Memberships, &members, &[]).unwrap(),
-        Operation::change(ObjectType::Email, ChangeAction::Updated, &key),
-    ] {
-        let mut bytes = [0; 64];
-        let n = operation.encode(black_box(&mut bytes)).unwrap();
-        assert_eq!(extent(bytes.get(..12).unwrap()), Ok(n));
-        assert_eq!(Operation::decode(bytes.get(..n).unwrap()), Ok(operation));
-        assert_eq!(
-            operation.encode(bytes.get_mut(..n - 1).unwrap()),
-            Err(Error::OutputFull)
-        );
-        assert_eq!(
-            Operation::decode(bytes.get(..n - 1).unwrap()),
-            Err(Error::Truncated)
-        );
-    }
-}
-
 fn store_paths() {
     use td_mta::{
-        format::{row::BlobKind, Table},
+        format::row::BlobKind,
         ids::{AccountId, BlobId},
         store_paths::{parse_blob_name, AccountEntry, Name, Number, RootEntry},
     };
     let account = AccountId::from_bytes(black_box([0xff; 16]));
     let blob = BlobId::from_bytes(black_box([0xab; 16]));
     let generation = Number::new(black_box(u64::MAX)).unwrap();
-    for entry in [RootEntry::Format, RootEntry::Lock, RootEntry::Accounts] {
+    for entry in [
+        RootEntry::Database,
+        RootEntry::Wal,
+        RootEntry::SharedMemory,
+        RootEntry::Lock,
+        RootEntry::Accounts,
+    ] {
         black_box(Name::root(black_box(entry)).unwrap());
     }
     for entry in [
         AccountEntry::Root,
-        AccountEntry::Current,
-        AccountEntry::Table(generation, Table::ThreadAnchors),
-        AccountEntry::Manifest(generation),
-        AccountEntry::Journal(generation),
         AccountEntry::Shard(BlobKind::Message, 0xab),
         AccountEntry::Blob(BlobKind::Message, blob),
         AccountEntry::Blob(BlobKind::Upload, blob),
@@ -358,227 +179,6 @@ fn store_paths() {
     assert!(parse_blob_name(BlobKind::Message, 0xac, text).is_err());
     assert!(parse_blob_name(BlobKind::Upload, 0xab, text).is_err());
     assert!(parse_blob_name(BlobKind::Message, 0xab, black_box("../bad.eml")).is_err());
-}
-
-fn store_manifests() {
-    use td_crypto::Crypto;
-    use td_mta::{
-        format::{
-            bindings::Selection,
-            container::{Current, Error, JournalHeader, StoreIdentity},
-            manifest::{self, Header, HistoryDescriptor, Manifest, TableDescriptor},
-            table::TableHeader,
-            table_stream::Verifier,
-            Error as FormatError, Sequence, Table, MAX_MANIFEST_BYTES,
-        },
-        ids::{AccountId, InstanceId, StoreEpoch},
-    };
-    let crypto = td_crypto::Provider;
-    let header = Header {
-        account: AccountId::from_bytes([0x33; 16]),
-        epoch: StoreEpoch::from_bytes([0x22; 16]),
-        generation: 1,
-        through: Sequence::from_u64(1),
-        active_segment: 2,
-    };
-    let mut table_bytes = [0; 112];
-    TableHeader {
-        table: Table::Blobs,
-        account: header.account,
-        epoch: header.epoch,
-        generation: header.generation,
-        through: header.through,
-        record_count: 0,
-        payload_bytes: 0,
-    }
-    .encode(&crypto, &mut table_bytes)
-    .unwrap();
-    let summary = Verifier::new(&crypto, &table_bytes)
-        .unwrap()
-        .finish()
-        .unwrap();
-    let mut tables = std::array::from_fn(|i| TableDescriptor {
-        table: Table::from_tag(u16::try_from(i + 1).unwrap()).unwrap(),
-        record_count: 0,
-        file_bytes: 112,
-        digest: [0; 32],
-    });
-    tables.first_mut().unwrap().digest = summary.digest();
-    let mut retained_bytes = [0; 228];
-    JournalHeader {
-        account: header.account,
-        epoch: header.epoch,
-        segment: 1,
-        base: Sequence::default(),
-    }
-    .encode(&crypto, retained_bytes.get_mut(..96).unwrap())
-    .unwrap();
-    td_mta::format::operation::Operation::delete(Table::Blobs, &[0x44; 16])
-        .unwrap()
-        .encode(retained_bytes.get_mut(160..188).unwrap())
-        .unwrap();
-    td_mta::format::frame::seal(
-        &crypto,
-        header.through,
-        1,
-        black_box(retained_bytes.get_mut(96..).unwrap()),
-    )
-    .unwrap();
-    let mut journal_stream =
-        td_mta::format::journal_stream::Verifier::new(&crypto, retained_bytes.get(..96).unwrap())
-            .unwrap();
-    journal_stream
-        .push(retained_bytes.get(96..).unwrap())
-        .unwrap();
-    let retained_summary = journal_stream.finish().unwrap();
-    let history = [HistoryDescriptor {
-        segment: 1,
-        base: Sequence::default(),
-        through: header.through,
-        file_bytes: 228,
-        digest: retained_summary.digest(),
-    }];
-    let mut bytes = [0; MAX_MANIFEST_BYTES];
-    let n = manifest::encode(&crypto, header, &tables, &history, black_box(&mut bytes)).unwrap();
-    let view = Manifest::decode(&crypto, bytes.get(..n).unwrap()).unwrap();
-    assert_eq!(view.header(), header);
-    assert_eq!(
-        view.history(0),
-        history.first().copied().ok_or(FormatError::InvalidValue)
-    );
-    assert_eq!(
-        view.table(Table::Blobs),
-        tables.first().copied().ok_or(FormatError::InvalidValue)
-    );
-    assert_eq!(view.history(1), Err(FormatError::InvalidValue));
-    let mut format_bytes = [0; 80];
-    StoreIdentity {
-        instance: InstanceId::from_bytes([0x11; 16]),
-        epoch: header.epoch,
-    }
-    .encode(&crypto, &mut format_bytes)
-    .unwrap();
-    let mut digest = crypto.sha256().unwrap();
-    digest.update(bytes.get(..n).unwrap()).unwrap();
-    let mut current_bytes = [0; 120];
-    Current {
-        account: header.account,
-        epoch: header.epoch,
-        generation: header.generation,
-        manifest_digest: digest.finish().unwrap(),
-    }
-    .encode(&crypto, &mut current_bytes)
-    .unwrap();
-    let selection = Selection::decode(
-        &crypto,
-        header.account,
-        &format_bytes,
-        &current_bytes,
-        bytes.get(..n).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        selection.check_table(&crypto, Table::Blobs, summary),
-        Ok(())
-    );
-    assert_eq!(
-        selection.check_table(&crypto, Table::Mailboxes, summary),
-        Err(Error::Format(FormatError::InvalidValue))
-    );
-    let bound_view = td_mta::ports::ViewIdentity {
-        account: header.account,
-        epoch: header.epoch,
-        generation: header.generation,
-        checkpoint: header.through,
-        segment: header.active_segment,
-        committed_offset: 228,
-        committed_sequence: header.through.successor().unwrap(),
-        history_floor: Sequence::default(),
-    };
-    let route = td_mta::store_fs::ChangeRoute::new(selection, bound_view).unwrap();
-    assert_eq!(
-        route.source(bound_view, header.through),
-        Ok(td_mta::store_fs::ChangeSource::History { index: 0 })
-    );
-    assert_eq!(
-        route.source(bound_view, bound_view.committed_sequence),
-        Ok(td_mta::store_fs::ChangeSource::Active)
-    );
-    assert_eq!(
-        route.source(bound_view, Sequence::default()),
-        Err(td_mta::ports::Error::HistoryLost)
-    );
-    let mut changed = bound_view;
-    changed.generation += 1;
-    assert_eq!(
-        route.source(changed, header.through),
-        Err(td_mta::ports::Error::Conflict)
-    );
-    let mut journal_bytes = [0; 96];
-    let journal = JournalHeader {
-        account: header.account,
-        epoch: header.epoch,
-        segment: header.active_segment,
-        base: header.through,
-    };
-    journal.encode(&crypto, &mut journal_bytes).unwrap();
-    assert_eq!(
-        selection.check_active_header(&crypto, &journal_bytes),
-        Ok(journal)
-    );
-    let active = td_mta::format::journal_stream::Verifier::new(&crypto, &journal_bytes)
-        .unwrap()
-        .finish()
-        .unwrap();
-    assert_eq!(
-        selection.check_active_prefix(header.through, 96, active),
-        Ok(())
-    );
-    assert_eq!(
-        selection.check_active_prefix(header.through, 95, active),
-        Err(Error::Format(FormatError::InvalidValue))
-    );
-    assert_eq!(
-        selection.check_history_journal(&crypto, 0, retained_summary),
-        Ok(())
-    );
-    assert_eq!(
-        selection.check_history_journal(&crypto, 1, retained_summary),
-        Err(Error::Format(FormatError::InvalidValue))
-    );
-    let retained = JournalHeader {
-        segment: 1,
-        base: Sequence::default(),
-        ..journal
-    };
-    retained.encode(&crypto, &mut journal_bytes).unwrap();
-    assert_eq!(
-        selection.check_history_header(&crypto, 0, &journal_bytes),
-        Ok(retained)
-    );
-    assert_eq!(
-        selection.check_history_header(&crypto, 1, &journal_bytes),
-        Err(Error::Format(FormatError::InvalidValue))
-    );
-    assert_eq!(
-        manifest::encode(
-            &crypto,
-            header,
-            &tables,
-            &history,
-            bytes.get_mut(..n - 1).unwrap()
-        ),
-        Err(Error::Format(FormatError::OutputFull))
-    );
-    assert_eq!(
-        Manifest::decode(&crypto, bytes.get(..n - 1).unwrap()),
-        Err(Error::Format(FormatError::Truncated))
-    );
-    *bytes.get_mut(n - 1).unwrap() ^= 1;
-    assert_eq!(
-        Manifest::decode(&crypto, bytes.get(..n).unwrap()),
-        Err(Error::Checksum)
-    );
 }
 
 fn tls_clients() {
@@ -808,74 +408,6 @@ fn store_directories() {
     );
     drop(root);
     std::fs::remove_dir_all(path).unwrap();
-}
-
-fn store_temporary_files() {
-    let mut samples = [COUNTERS.snapshot(); 2];
-    let mut slots = samples.iter_mut();
-    measured_store_fs::probe_temporary_io(|| *slots.next().unwrap() = COUNTERS.snapshot());
-    assert!(slots.next().is_none());
-    assert!(samples.iter().all(|sample| !sample.invalid));
-    assert_eq!(
-        samples.first(),
-        samples.get(1),
-        "std temporary I/O allocated"
-    );
-}
-
-fn store_verify_account() {
-    let mut samples = [COUNTERS.snapshot(); 16];
-    let mut slots = samples.iter_mut();
-    measured_store_fs::probe_verify_account(|| *slots.next().unwrap() = COUNTERS.snapshot());
-    assert!(slots.next().is_none());
-    assert!(samples.iter().all(|sample| !sample.invalid));
-    for [before, after] in samples.as_chunks::<2>().0 {
-        assert_eq!(before, after, "stopped account verification allocated");
-    }
-}
-
-fn store_reserved_append() {
-    let mut samples = [COUNTERS.snapshot(); 32];
-    let mut slots = samples.iter_mut();
-    measured_store_fs::probe_reserved_append(|| *slots.next().unwrap() = COUNTERS.snapshot());
-    assert!(slots.next().is_none());
-    assert!(samples.iter().all(|sample| !sample.invalid));
-    for [before, after] in samples.as_chunks::<2>().0 {
-        assert_eq!(before, after, "reservation-bound journal append allocated");
-    }
-}
-
-fn store_journal_publication() {
-    let mut samples = [COUNTERS.snapshot(); 32];
-    let mut slots = samples.iter_mut();
-    measured_store_fs::probe_journal_publication(|| *slots.next().unwrap() = COUNTERS.snapshot());
-    assert!(slots.next().is_none());
-    assert!(samples.iter().all(|sample| !sample.invalid));
-    for [before, after] in samples.as_chunks::<2>().0 {
-        assert_eq!(before, after, "scoped journal publication allocated");
-    }
-}
-
-fn store_pinned_reads() {
-    let mut samples = [COUNTERS.snapshot(); 32];
-    let mut slots = samples.iter_mut();
-    measured_store_fs::probe_pinned_reads(|| *slots.next().unwrap() = COUNTERS.snapshot());
-    assert!(slots.next().is_none());
-    assert!(samples.iter().all(|sample| !sample.invalid));
-    for [before, after] in samples.as_chunks::<2>().0 {
-        assert_eq!(before, after, "pinned read scope allocated");
-    }
-}
-
-fn store_read_pool() {
-    let mut samples = [COUNTERS.snapshot(); 32];
-    let mut slots = samples.iter_mut();
-    measured_store_fs::probe_read_pool(|| *slots.next().unwrap() = COUNTERS.snapshot());
-    assert!(slots.next().is_none());
-    assert!(samples.iter().all(|sample| !sample.invalid));
-    for [before, after] in samples.as_chunks::<2>().0 {
-        assert_eq!(before, after, "pooled read scope allocated");
-    }
 }
 
 fn mime_filename_retention() {
@@ -12642,216 +12174,18 @@ fn retained_requested_source_bound_properties() {
     }
 }
 
-fn store_pinned_blobs() {
-    let mut samples = [COUNTERS.snapshot(); 40];
-    let mut slots = samples.iter_mut();
-    measured_store_fs::probe_pinned_blobs(|| *slots.next().unwrap() = COUNTERS.snapshot());
-    assert!(slots.next().is_none());
-    assert!(samples.iter().all(|sample| !sample.invalid));
-    for [before, after] in samples.as_chunks::<2>().0 {
-        assert_eq!(before, after, "pinned body read allocated");
-    }
-}
-
-fn journal_overlay() {
-    use td_mta::{
-        format::{
-            container::JournalHeader, frame, key::Key, operation::Operation, Sequence, Table,
-            FRAME_FOOTER_BYTES, FRAME_HEADER_BYTES, JOURNAL_HEADER_BYTES, MAX_FRAME_OPERATIONS,
-            MAX_JOURNAL_OPERATIONS, OPERATION_HEADER_BYTES,
-        },
-        ids::{AccountId, StoreEpoch, ThreadId},
-        overlay::{Cell, Overlay},
-    };
-    let mut header = [0; JOURNAL_HEADER_BYTES];
-    JournalHeader {
-        account: AccountId::from_bytes([3; 16]),
-        epoch: StoreEpoch::from_bytes([4; 16]),
-        segment: 1,
-        base: Sequence::from_u64(0),
-    }
-    .encode(&td_crypto::Provider, &mut header)
-    .unwrap();
-    let frame_length = FRAME_HEADER_BYTES
-        + FRAME_FOOTER_BYTES
-        + MAX_FRAME_OPERATIONS * (OPERATION_HEADER_BYTES + 16);
-    let mut bytes = Vec::with_capacity(frame_length * 2);
-    for sequence in 1..=2 {
-        let mut encoded = vec![0; frame_length];
-        let mut offset = FRAME_HEADER_BYTES;
-        for ordinal in 0..MAX_FRAME_OPERATIONS {
-            let key = [(ordinal % 251) as u8; 16];
-            offset += Operation::delete(Table::Threads, &key)
-                .unwrap()
-                .encode(encoded.get_mut(offset..).unwrap())
-                .unwrap();
-        }
-        frame::seal(
-            &td_crypto::Provider,
-            Sequence::from_u64(sequence),
-            MAX_FRAME_OPERATIONS,
-            &mut encoded,
-        )
-        .unwrap();
-        bytes.extend_from_slice(&encoded);
-    }
-    let mut cells = vec![Cell::EMPTY; MAX_JOURNAL_OPERATIONS];
-    let before = COUNTERS.snapshot();
-    {
-        let overlay = Overlay::decode(
-            &td_crypto::Provider,
-            black_box(&header),
-            black_box(&bytes),
-            &mut cells,
-        )
-        .unwrap();
-        assert_eq!(overlay.operation_count(), MAX_JOURNAL_OPERATIONS);
-        for id in 0..=250 {
-            assert!(overlay
-                .get(Key::Thread(ThreadId::from_bytes([id; 16])))
-                .unwrap()
-                .is_some());
-            assert!(
-                overlay
-                    .next(Table::Threads, Some(&[id; 16]))
-                    .unwrap()
-                    .is_some()
-                    == (id != 250)
-            );
-        }
-        assert!(overlay
-            .get(Key::Thread(ThreadId::from_bytes([255; 16])))
-            .unwrap()
-            .is_none());
-        let table = td_mta::format::table::TableHeader {
-            table: Table::Threads,
-            account: AccountId::from_bytes([3; 16]),
-            epoch: StoreEpoch::from_bytes([4; 16]),
-            generation: 1,
-            through: Sequence::from_u64(0),
-            record_count: 0,
-            payload_bytes: 0,
-        };
+fn raw_file_io() {
+    let mut file_samples = [COUNTERS.snapshot(); 16];
+    let mut file_slots = file_samples.iter_mut();
+    store_fs::probe_temporary_io(|| *file_slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(file_slots.next().is_none());
+    for pair in file_samples.as_chunks::<2>().0 {
         assert_eq!(
-            td_mta::merge::Merge::new(table, &overlay)
-                .unwrap()
-                .finish(|_| Ok::<_, ()>(()))
-                .unwrap(),
-            0
+            pair.first(),
+            pair.get(1),
+            "raw-file publication/input allocated Rust memory"
         );
     }
-    assert!(Overlay::decode(
-        &td_crypto::Provider,
-        &header,
-        &bytes,
-        cells.get_mut(..MAX_JOURNAL_OPERATIONS - 1).unwrap()
-    )
-    .is_err());
-    *bytes.last_mut().unwrap() ^= 1;
-    assert!(Overlay::decode(&td_crypto::Provider, &header, &bytes, &mut cells).is_err());
-    assert!(!before.invalid);
-    assert_eq!(COUNTERS.snapshot(), before, "journal overlay allocated");
-}
-
-fn journal_merge() {
-    use td_mta::{
-        format::{
-            container::JournalHeader,
-            frame,
-            key::Key,
-            operation::Operation,
-            table::{Record, TableHeader},
-            Sequence, Table, FRAME_FOOTER_BYTES, FRAME_HEADER_BYTES, JOURNAL_HEADER_BYTES,
-        },
-        ids::{AccountId, StoreEpoch},
-        merge::{Error, Merge},
-        overlay::{Cell, Overlay},
-    };
-    let account = AccountId::from_bytes([3; 16]);
-    let epoch = StoreEpoch::from_bytes([4; 16]);
-    let mut header = [0; JOURNAL_HEADER_BYTES];
-    JournalHeader {
-        account,
-        epoch,
-        segment: 2,
-        base: Sequence::from_u64(5),
-    }
-    .encode(&td_crypto::Provider, &mut header)
-    .unwrap();
-    let operations = [
-        Operation::put(Table::Threads, &[1; 16], &[]).unwrap(),
-        Operation::delete(Table::Threads, &[2; 16]).unwrap(),
-        Operation::put(Table::Threads, &[4; 16], &[]).unwrap(),
-    ];
-    let mut bytes = vec![
-        0;
-        FRAME_HEADER_BYTES
-            + FRAME_FOOTER_BYTES
-            + operations
-                .iter()
-                .map(|v| v.encoded_len().unwrap())
-                .sum::<usize>()
-    ];
-    let mut offset = FRAME_HEADER_BYTES;
-    for operation in operations {
-        offset += operation.encode(bytes.get_mut(offset..).unwrap()).unwrap();
-    }
-    frame::seal(&td_crypto::Provider, Sequence::from_u64(6), 3, &mut bytes).unwrap();
-    let mut cells = [Cell::EMPTY; 3];
-    let overlay = Overlay::decode(&td_crypto::Provider, &header, &bytes, &mut cells).unwrap();
-    let table = TableHeader {
-        table: Table::Threads,
-        account,
-        epoch,
-        generation: 1,
-        through: Sequence::from_u64(5),
-        record_count: 2,
-        payload_bytes: 128,
-    };
-    let first = Record::new(Table::Threads, Sequence::from_u64(3), &[2; 16], &[]).unwrap();
-    let second = Record::new(Table::Threads, Sequence::from_u64(3), &[3; 16], &[]).unwrap();
-    let expected = [(1, 6), (3, 3), (4, 6)];
-    let before = COUNTERS.snapshot();
-    let mut outputs = 0;
-    let mut sink = |row: td_mta::ports::Record<'_>| {
-        let id = match row.key {
-            Key::Thread(id) => *id.as_bytes().first().unwrap(),
-            _ => panic!("wrong table"),
-        };
-        assert_eq!(Some(&(id, row.last_change.number())), expected.get(outputs));
-        outputs += 1;
-        Ok::<_, ()>(())
-    };
-    let mut merge = Merge::new(table, &overlay).unwrap();
-    merge.push(first, &mut sink).unwrap();
-    merge.push(second, &mut sink).unwrap();
-    assert_eq!(merge.finish(&mut sink).unwrap(), 3);
-    assert_eq!(outputs, 3);
-    assert!(Merge::new(
-        TableHeader {
-            account: AccountId::from_bytes([9; 16]),
-            ..table
-        },
-        &overlay
-    )
-    .is_err());
-    let mut merge = Merge::new(table, &overlay).unwrap();
-    assert_eq!(merge.push(first, |_| Err(7)), Err(Error::Sink(7)));
-    assert_eq!(merge.finish(|_| Ok::<_, i32>(())), Err(Error::Failed));
-    let mut merge = Merge::new(table, &overlay).unwrap();
-    merge.push(first, |_| Ok::<_, ()>(())).unwrap();
-    assert!(matches!(
-        merge.push(first, |_| Ok::<_, ()>(())),
-        Err(Error::Format(_))
-    ));
-    assert!(merge.is_failed());
-    assert!(matches!(
-        Merge::new(table, &overlay)
-            .unwrap()
-            .finish(|_| Ok::<_, ()>(())),
-        Err(Error::Format(_))
-    ));
-    assert_eq!(COUNTERS.snapshot(), before, "journal merge allocated");
 }
 
 fn main() {
@@ -12861,13 +12195,7 @@ fn main() {
         .nth(1)
         .is_some_and(|arg| arg == "--store-files")
     {
-        store_temporary_files();
-        store_verify_account();
-        store_reserved_append();
-        store_journal_publication();
-        store_pinned_reads();
-        store_read_pool();
-        store_pinned_blobs();
+        raw_file_io();
         mime_base64();
         mime_qp();
         mime_qp_input();
@@ -13040,13 +12368,8 @@ fn main() {
         return;
     }
     store_directories();
-    store_temporary_files();
-    store_verify_account();
-    store_reserved_append();
-    store_journal_publication();
-    store_pinned_reads();
-    store_read_pool();
-    store_pinned_blobs();
+    raw_file_io();
+
     pinned_source_binding();
     source_bound_members();
     selected_source_bound_part_fields();
@@ -13169,10 +12492,9 @@ fn main() {
     mime_checkpoints();
     mime_unfold();
     header_raw();
-    journal_overlay();
-    journal_merge();
+
     mailbox_parent_walks();
-    collected_frame_changes();
+
     hot_paths();
     println!("rust-allocation-probe-v1: counter-model forwarding hot-paths passed");
 }
@@ -13323,96 +12645,6 @@ fn tls_remote_chain() {
     println!("tls-{scenario}-allocation-v1: rust passed");
 }
 
-fn store_complete_frames() {
-    use td_mta::{
-        format::{
-            container::JournalHeader,
-            frame::{seal, Frame},
-            journal_stream::Verifier,
-            operation::Operation,
-            Sequence, Table,
-        },
-        ids::{AccountId, StoreEpoch},
-    };
-    let crypto = td_crypto::Provider;
-    let mut bytes = [0; 132];
-    Operation::delete(Table::Blobs, &[0x44; 16])
-        .unwrap()
-        .encode(bytes.get_mut(64..92).unwrap())
-        .unwrap();
-    seal(&crypto, Sequence::from_u64(1), 1, black_box(&mut bytes)).unwrap();
-    let frame = Frame::decode(&crypto, Sequence::default(), black_box(&bytes)).unwrap();
-    let mut count = 0;
-    for entry in frame.operations() {
-        assert_eq!(entry.unwrap().ordinal, count);
-        count += 1;
-    }
-    assert_eq!(count, 1);
-    for fail in [false, true] {
-        let mut incremental = td_mta::format::frame_stream::Verifier::new(
-            &crypto,
-            Sequence::default(),
-            bytes.get(..64).unwrap(),
-        )
-        .unwrap();
-        let operation = bytes.get(64..92).unwrap();
-        if fail {
-            assert!(incremental.push(operation.get(..27).unwrap()).is_err());
-            assert!(incremental.push(operation).is_err());
-            assert!(incremental.finish(bytes.get(92..).unwrap()).is_err());
-        } else {
-            assert_eq!(incremental.push(operation).unwrap().ordinal, 0);
-            assert_eq!(
-                incremental
-                    .finish(bytes.get(92..).unwrap())
-                    .unwrap()
-                    .header(),
-                frame.header()
-            );
-        }
-    }
-    let header = JournalHeader {
-        account: AccountId::from_bytes([0x33; 16]),
-        epoch: StoreEpoch::from_bytes([0x22; 16]),
-        segment: 1,
-        base: Sequence::default(),
-    };
-    let mut header_bytes = [0; 96];
-    header
-        .encode(&crypto, black_box(&mut header_bytes))
-        .unwrap();
-    let mut stream = Verifier::new(&crypto, &header_bytes).unwrap();
-    stream.push(&bytes).unwrap();
-    assert_eq!(stream.finish().unwrap().operations(), 1);
-    let mut stream = Verifier::new(&crypto, &header_bytes).unwrap();
-    assert!(stream.push(bytes.get(..131).unwrap()).is_err());
-    assert!(stream.push(&bytes).is_err());
-    assert!(stream.finish().is_err());
-    Operation::change(
-        td_mta::format::ObjectType::Email,
-        td_mta::ports::ChangeAction::Updated,
-        &[4; 16],
-    )
-    .encode(bytes.get_mut(64..92).unwrap())
-    .unwrap();
-    seal(&crypto, Sequence::from_u64(1), 1, &mut bytes).unwrap();
-    let mut cells = [td_mta::frame_changes::Cell::EMPTY; 1];
-    let mut changes =
-        td_mta::format::journal_stream::changes::Verifier::new(&crypto, &header_bytes).unwrap();
-    let mut pending = changes.begin(bytes.get(..64).unwrap(), &mut cells).unwrap();
-    pending.push(bytes.get(64..92).unwrap()).unwrap();
-    let complete = pending.finish(bytes.get(92..).unwrap()).unwrap();
-    assert_eq!(complete.records().next().unwrap().change.id, [4; 16]);
-    assert_eq!(changes.finish().unwrap().operations(), 1);
-    let mut changes =
-        td_mta::format::journal_stream::changes::Verifier::new(&crypto, &header_bytes).unwrap();
-    {
-        let mut pending = changes.begin(bytes.get(..64).unwrap(), &mut cells).unwrap();
-        pending.push(bytes.get(64..92).unwrap()).unwrap();
-    }
-    assert!(changes.finish().is_err());
-}
-
 fn mailbox_parent_walks() {
     use td_mta::{
         format::{
@@ -13481,10 +12713,7 @@ fn mailbox_parent_walks() {
     let identity = ViewIdentity {
         account: AccountId::from_bytes([1; 16]),
         epoch: StoreEpoch::from_bytes([2; 16]),
-        generation: 1,
-        checkpoint: Sequence::from_u64(3),
-        segment: 1,
-        committed_offset: 256,
+
         committed_sequence: Sequence::from_u64(5),
         history_floor: Sequence::from_u64(0),
     };
@@ -13518,129 +12747,4 @@ fn mailbox_parent_walks() {
         assert_eq!(result.err(), expected);
     }
     assert_eq!(COUNTERS.snapshot(), before, "mailbox parent walk allocated");
-}
-
-fn collected_frame_changes() {
-    use td_mta::{
-        format::{frame, operation::Operation, ObjectType, Sequence, MAX_FRAME_OPERATIONS},
-        frame_changes::{Cell, Collector},
-        ports::ChangeAction,
-    };
-    let mut cells = vec![Cell::EMPTY; MAX_FRAME_OPERATIONS];
-    let mut bytes = vec![0; 104 + 28 * MAX_FRAME_OPERATIONS];
-    let operation = Operation::change(ObjectType::Email, ChangeAction::Updated, &[7; 16]);
-    let end = bytes.len() - 40;
-    for output in bytes.get_mut(64..end).unwrap().as_chunks_mut::<28>().0 {
-        operation.encode(output).unwrap();
-    }
-    frame::seal(
-        &td_crypto::Provider,
-        Sequence::from_u64(1),
-        MAX_FRAME_OPERATIONS,
-        &mut bytes,
-    )
-    .unwrap();
-    let mut bad_footer = [0; 40];
-    bad_footer.copy_from_slice(bytes.get(end..).unwrap());
-    *bad_footer.last_mut().unwrap() ^= 1;
-    let before = COUNTERS.snapshot();
-    for mode in [0, 1, 2, 0] {
-        let slots = if mode == 2 {
-            MAX_FRAME_OPERATIONS - 1
-        } else {
-            MAX_FRAME_OPERATIONS
-        };
-        let mut collector = Collector::new(
-            &td_crypto::Provider,
-            Sequence::default(),
-            bytes.get(..64).unwrap(),
-            cells.get_mut(..slots).unwrap(),
-        )
-        .unwrap();
-        for (index, input) in bytes
-            .get(64..end)
-            .unwrap()
-            .as_chunks::<28>()
-            .0
-            .iter()
-            .enumerate()
-        {
-            let result = collector.push(black_box(input));
-            if mode == 2 && index == MAX_FRAME_OPERATIONS - 1 {
-                assert!(result.is_err());
-                assert!(collector.push(input).is_err());
-            } else {
-                assert!(result.is_ok());
-            }
-        }
-        let footer = if mode == 1 {
-            &bad_footer
-        } else {
-            bytes.get(end..).unwrap()
-        };
-        let result = collector.finish(footer);
-        if mode == 0 {
-            let complete = result.unwrap();
-            assert_eq!(complete.len(), MAX_FRAME_OPERATIONS);
-            let view = td_mta::ports::ViewIdentity {
-                account: td_mta::ids::AccountId::from_bytes([1; 16]),
-                epoch: td_mta::ids::StoreEpoch::from_bytes([2; 16]),
-                generation: 1,
-                checkpoint: Sequence::default(),
-                segment: 1,
-                committed_offset: bytes.len() as u64 + 96,
-                committed_sequence: Sequence::from_u64(1),
-                history_floor: Sequence::default(),
-            };
-            let start = td_mta::ports::ChangeCursor {
-                sequence: Sequence::default(),
-                operation: u32::MAX,
-            };
-            let mut cursor =
-                td_mta::change_cursor::Cursor::new(view, start, ObjectType::Email).unwrap();
-            for ordinal in 0..MAX_FRAME_OPERATIONS {
-                assert!(
-                    matches!(cursor.poll(view, cursor.after(), Some(&complete)).unwrap(),
-                    td_mta::change_cursor::Step::Change(td_mta::ports::ChangeStep::Record(record)) if record.cursor.operation as usize == ordinal)
-                );
-            }
-            assert!(
-                matches!(cursor.poll(view, cursor.after(), Some(&complete)).unwrap(),
-                td_mta::change_cursor::Step::Change(td_mta::ports::ChangeStep::Advanced { through }) if through.number() == 1)
-            );
-            assert_eq!(
-                cursor.poll(view, cursor.after(), None).unwrap(),
-                td_mta::change_cursor::Step::Change(td_mta::ports::ChangeStep::Complete)
-            );
-            let mut empty =
-                td_mta::change_cursor::Cursor::new(view, start, ObjectType::Thread).unwrap();
-            assert!(matches!(
-                empty.poll(view, start, Some(&complete)).unwrap(),
-                td_mta::change_cursor::Step::Change(td_mta::ports::ChangeStep::Advanced { .. })
-            ));
-            let mut changed = view;
-            changed.generation += 1;
-            assert_eq!(
-                empty.poll(changed, empty.after(), None),
-                Err(td_mta::ports::Error::Conflict)
-            );
-            assert_eq!(
-                empty.poll(view, empty.after(), None),
-                Err(td_mta::ports::Error::Conflict)
-            );
-            for _ in 0..2 {
-                for (index, record) in complete.records().enumerate() {
-                    assert_eq!(black_box(record).cursor.operation as usize, index);
-                    assert_eq!(record.change.id, [7; 16]);
-                }
-            }
-        } else {
-            assert!(result.is_err());
-        }
-    }
-    assert_eq!(
-        COUNTERS.snapshot(),
-        before,
-        "frame change collection allocated"
-    );
 }

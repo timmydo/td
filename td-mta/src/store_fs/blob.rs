@@ -165,57 +165,6 @@ impl CompleteBlob<'_> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-pub(super) fn prepare_probe(root: &LockedRoot) {
-    root.create_account_directory(tests::ACCOUNT, AccountEntry::Shard(BlobKind::Message, 0xee))
-        .unwrap();
-    tests::install(root, BlobKind::Message, 401, b"abc");
-}
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-pub(super) fn probe(root: &LockedRoot) {
-    use td_crypto::Provider;
-    let row = tests::row(BlobKind::Message, b"abc");
-    let mut input = root
-        .open_blob_input(&Provider, tests::ACCOUNT, tests::BLOB, row, 3)
-        .unwrap();
-    let mut output = [0; 8];
-    assert_eq!(input.read(&mut output).unwrap(), 3);
-    assert_eq!(output.get(..3), Some(b"abc".as_slice()));
-    let complete = input.finish().unwrap();
-    assert_eq!(complete.file().read_at(1, &mut output).unwrap(), 2);
-    assert_eq!(output.get(..2), Some(b"bc".as_slice()));
-    assert_eq!(complete.file().read_at(3, &mut output).unwrap(), 0);
-    assert_eq!(complete.digest(), &row.digest);
-    assert!(
-        matches!(root.open_blob_input(&Provider,tests::ACCOUNT,tests::BLOB,row,2),Err(BlobInputError::Io(e)) if e.kind()==io::ErrorKind::InvalidInput)
-    );
-    let input = root
-        .open_blob_input(&Provider, tests::ACCOUNT, tests::BLOB, row, 3)
-        .unwrap();
-    assert!(
-        matches!(input.finish(),Err(BlobInputError::Io(e)) if e.kind()==io::ErrorKind::InvalidInput)
-    );
-    let mut bad = row;
-    bad.digest[0] ^= 1;
-    let mut input = root
-        .open_blob_input(&Provider, tests::ACCOUNT, tests::BLOB, bad, 3)
-        .unwrap();
-    input.read(&mut output).unwrap();
-    assert!(matches!(input.finish(), Err(BlobInputError::Checksum)));
-    let mut input = root
-        .open_blob_input(&Provider, tests::ACCOUNT, tests::BLOB, row, 3)
-        .unwrap();
-    assert!(
-        matches!(input.read_using(&mut output,|_,_|Err(io::ErrorKind::Interrupted.into())),Err(BlobInputError::Io(e)) if e.kind()==io::ErrorKind::Interrupted)
-    );
-    assert!(input.is_failed());
-    assert!(
-        matches!(input.finish(),Err(BlobInputError::Io(e)) if e.kind()==io::ErrorKind::BrokenPipe)
-    );
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::super::{tests::Fixture, MAX_FILE_STEP_BYTES};
     use super::*;

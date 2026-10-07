@@ -52,7 +52,7 @@ fn retained_metadata_and_path_lookup_have_distinct_lifetimes() {
     let fixture = Fixture::new();
     let original = fixture.0.join("root");
     let moved = fixture.0.join("moved");
-    let name = Name::account(AccountId::from_bytes([7; 16]), AccountEntry::Metadata).unwrap();
+    let name = Name::account(AccountId::from_bytes([7; 16]), AccountEntry::Temporary).unwrap();
     fs::create_dir_all(original.join(name.as_path().unwrap())).unwrap();
     let root = Directory::from_path(original.to_str().unwrap()).unwrap();
     let before = root.open(&name).unwrap();
@@ -73,9 +73,9 @@ fn reject_existing_final_and_intermediate_links() {
     let fixture = Fixture::new();
     let root = fixture.anchor();
     let account = AccountId::from_bytes([8; 16]);
-    let nested = Name::account(account, AccountEntry::Metadata).unwrap();
+    let nested = Name::account(account, AccountEntry::Temporary).unwrap();
     let accounts = Name::root(RootEntry::Accounts).unwrap();
-    fs::create_dir_all(fixture.0.join(format!("real/{account}/metadata"))).unwrap();
+    fs::create_dir_all(fixture.0.join(format!("real/{account}/tmp"))).unwrap();
     symlink("real", fixture.0.join("accounts")).unwrap();
     for name in [&accounts, &nested] {
         assert_eq!(

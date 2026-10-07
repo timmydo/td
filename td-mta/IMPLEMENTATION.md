@@ -107,7 +107,7 @@ need adapters. The dependency edges are the shared-interface handoff gate.
 | `TlsTransport`, `Resolver` | Fixed endpoint + deadline -> verified bounded stream | M07/M09 |
 | `SmtpSession` | Peer, input chunk, limits -> reply / store request | M10 |
 | `JmapRequest`, `MethodResult` | Account, tokens, read view -> streaming responses | M13/M14 |
-| `Submission`, `RecipientAttempt` | Immutable envelope/blob -> journaled state machine | M16 |
+| `Submission`, `RecipientAttempt` | Immutable envelope/blob -> transactional state machine | M16 |
 | `EventSink`, `HealthSnapshot` | Typed event -> bounded log/status output | M04/M19 |
 
 ## M01 — Service skeleton, limits, and conformance inventory
@@ -137,11 +137,11 @@ M02 is split at the format/API boundaries into independently reviewed
 commits. Consumers of M02 wait for all parts; early contracts do not authorize
 writing production mail or advertising capabilities.
 
-- **M02a — Scalars, keys and framing registry:** checked borrowed codecs,
-  table/key tags, exact container offsets and sequence exhaustion. Tests pin
+- **M02a — Scalars, keys and application registry:** checked borrowed codecs,
+  table/key tags, exact application encodings and sequence exhaustion. Tests pin
   canonical scalar/key bytes, malformed input and cross-type import identity.
 - **M02b — Rows and golden fixtures:** complete value field registry, bounded
-  row codecs, full row/container byte examples and digest-provider test inputs.
+  row codecs, full row byte examples and digest-provider test inputs.
   Implemented in `format/row.rs` and `tests/format_rows.rs`.
 - **M02c — Runtime and protocol contracts:** continues in three bounded
   increments. **M02c1** freezes generic/local wire IDs and checked MIME-part
@@ -158,12 +158,9 @@ writing production mail or advertising capabilities.
 **Depends on:** M01. **Own:** module interfaces, format specification and golden
 fixture descriptions. **Read:** DESIGN sections 8-11 and standards inventory.
 
-Complete STORAGE.md's numeric field/table registry and exact byte offsets,
-with golden encodings for every row, journal frame, manifest and CURRENT.
-Preserve its chosen sorted-checkpoint/bounded-journal model, byte/operation
-ceilings, endian rules and authority distinctions. Pin sequence exhaustion,
-crash points and the source-key encoding; do not reopen the storage-engine
-choice in a consumer task. Pin immutable thread assignment/anchor lookup, duplicated Message-ID handling,
+Complete FORMAT.md's numeric key/row registry and literal application
+encodings. Preserve SQLite metadata authority and immutable body publication,
+with fixed batch/key/value ceilings and sequence exhaustion. Pin immutable thread assignment/anchor lookup, duplicated Message-ID handling,
 and multi-mailbox membership. Freeze typed MIME part blob locators, checked
 streaming decode and parent pin/reuse rules. Define the submission state transition table and
 its exact standard JMAP field mapping, including uncertain outcomes and partial
@@ -173,7 +170,7 @@ Specify receivedAt sorting/text semantics, MIME/property/charset coverage,
 initial retry/cancel behavior, error mapping, and bounded per-operation work.
 Choose the minimum worker layout and TLS/cold-path budget within M01's ledger.
 Pin event-stream scheduling, read-slot wait/error mappings, maintenance work
-budgets and journal reservation transfer across the checkpoint commit barrier.
+budgets and reservation reconciliation around SQLite commit outcomes.
 This is the main design review checkpoint; protocol consumers wait for it.
 
 **Acceptance:** byte-level format examples round-trip through tiny encoders/
@@ -491,14 +488,10 @@ Split at these concrete boundaries before dependent milestones start:
   actual state transitions, idle resets and scheduling enforcement.
 - **M04c3b1:** fixed logical quota groups and linear effect tickets in
   `admission/quota.rs` and `admission/logical.rs`; no physical I/O permission.
-- **M04c3b2:** coordinator-owned selected/journal scalar ledger and derived
-  checkpoint capacity in `admission/writer.rs`, including reserved candidate
-  frames, dedicated append tickets and simulated writer-barrier transitions.
-  Rollover preserves outstanding leases and stays closed for reconciliation.
-  M08 supplies trusted selected/committed state and exact metadata accounting.
-- **M04c3 runtime integration:** pending logical building/retention quota,
-  cleanup accounting and post-checkpoint reconciliation under M08. Use the
-  existing bounded logical ledger. No physical-space registry or probe gate.
+- SQLite owns native writer/checkpoint state. The former simulated scalar
+  journal writer ledger is removed; fixed logical leases remain coordinator
+  building blocks and grant no physical I/O permission.
+
 - **M04d1:** implemented typed bounded event and explicit inspection encoders
   in `observability.rs`, including stable JSON Lines fields, redaction by
   default event shape, bounded UTF-8 truncation and ASCII JSON escaping.
@@ -531,644 +524,34 @@ log truncation are deterministic. Inject hostile strings to verify JSON escaping
 Bounded structures never increase capacity after construction. No networking,
 store mutations, live reload or filesystem log rotation in this task.
 
-## M05 — Immutable blobs and journal commit/replay
+## M05 — SQLite metadata and immutable bodies
 
-ADMISSION.md's logical quotas and failure/recovery contract apply before
-write admission. Use std filesystem APIs and STORAGE.md's stable-path
-deployment assumptions. Physical free-space admission is not part of v1.
+The implemented private-root validation, bounded typed paths, persistent LOCK,
+exclusive temporary output and directory creation, immutable blob publication,
+and streamed file/digest readers from M05b/M05c remain. Their raw-file contract
+and coverage continue under SQLite. Metadata-container publication and CURRENT
+selection were removed; SQLite owns their transaction/recovery responsibilities.
 
-**Depends on:** M02/M04/M07. **Own:** storage I/O adapter, blob files, journal codec,
-store locking and initial replay; no search index or protocol endpoints.
+The custom container, manifest, journal/replay, selected-table and checkpoint
+engine has been replaced by store_fs/index.rs. SQLite owns transactions,
+native indexes, WAL snapshots and recovery. Raw mail remains immutable files;
+store_fs/pinned.rs binds verified file access to the captured database view.
+The application scalar/key/row/operation codecs remain useful bounded values.
+The private rusqlite/SQLite closure is exactly pinned and built offline.
 
-Split this milestone before persistence consumers begin. Pure container codecs
-need committed M07a1/M07a2 digest primitives/oracles and M07a4
-Crypto::sha256/equal_digest factory operations; they do not depend on TLS
-service activation. Each part lands independently:
+Implemented core boundaries: fresh create/reopen and closed schema validation;
+serialized expected-sequence commits; final direct references and parent cycles;
+fixed reader pool and original deadlines; immutable-file publication proof,
+whole-file digest verification and snapshot borrows; explicit WAL checkpoint;
+coarse view exclusion for one-file orphan collection; permanent blob IDs and
+native indexed change rows. Schema, heap, page, WAL, batch and VM ceilings are
+fixed. The old engine and its tests/allocation claims are deleted together.
 
-- **M05a1 — fixed identity and journal headers:** exact FORMAT, CURRENT and
-  journal-header codecs through the injected Crypto adapter. Check fixed extent,
-  checksums, magic/schema/flags and nonzero generation/segment numbers before
-  returning typed fields. Encoders leave caller output unchanged on returned
-  errors. Use the existing literal fixtures, every truncated prefix, changed
-  bytes, rehashed invalid fields and injected digest failures. This implements
-  only these fixed containers, not referent validation, replay or disk I/O.
-- **M05a2 — checkpoint containers:** bounded table header/record and manifest
-  codecs, full row validation, digest coverage and cross-file identity/length
-  bindings. Stream tables; keep only bounded manifest descriptors. Exercise
-  duplicate/out-of-order keys, mismatched descriptors and selected history.
-  - **M05a2a — table header and record codecs:** exact fixed table headers and
-    individually checksummed borrowed records. Bound prefix lengths before
-    hashing, validate full local key/row grammar and checkpoint sequence, and
-    stage digest work before changing output. Test literal empty/populated
-    tables, malformed/rehashed fields, arithmetic exhaustion, every truncated
-    record prefix and failures in all three streaming digest updates. These
-    codecs do not verify a whole table or select any persistent state.
-  - **M05a2b — table validation and manifests:** bounded sorted-record traversal,
-    exact count/extent and whole-file digest, manifest descriptor codecs and
-    cross-file account/epoch/generation/sequence/hash checks. Carry failure
-    state through streaming completion; never accept a valid header as proof
-    that the table payload is complete. Persistence consumers wait for this.
-    - **M05a2b1 — streamed table validation:** share bounded prefix framing,
-      consume exact individual records with sticky failures, verify unsigned
-      key order and declared count/extent, and compute the supplied-stream digest. Retain only the
-      prior key, digest and counters; caller owns the record buffer. Completion
-      describes the supplied stream, not filesystem EOF or manifest selection.
-    - **M05a2b2 — manifest codec:** bounded borrowed manifest decoding and
-      atomic encoding, all eleven table descriptors and at most 64 contiguous
-      history descriptors. Validate local structural constraints; no path from
-      disk input or selected-file authority follows from a parsed descriptor.
-    - **M05a2b3 — checkpoint bindings:** match CURRENT, store identity, manifest,
-      validated table summaries and journal headers. Require the caller's
-      expected account/table, hash the entire manifest including its footer,
-      and keep partial header checks distinct from full-file verification.
-      History frame validation follows M05a3, and M05d validates the complete
-      selected graph with I/O.
-      Persistence consumers require all parts.
-- **M05a3 — transaction frames:** exact bounded operation/header/footer codecs
-  and validated sequential frame iteration. Validate header digest before using
-  lengths; distinguish a short physical tail from full-length corrupt data.
-  Preserve operation ordinals and return no partial successful frame.
-  - **M05a3a — header and operation codecs:** fixed checked frame headers,
-    exact bounded operation prefixes and borrowed locally valid PUT/DELETE/
-    CHANGE values. Preserve output on encode failure; keep known Identity wire
-    syntax separate from its v1 transaction prohibition. These pieces grant
-    no full-frame validation or recovery authority.
-  - **M05a3b — complete frames and sequential validation:** validate complete
-    footer coverage, count, operation grammar and continuity before exposing
-    a frame. Preserve ordinals, reject v1 Identity changes and carry failure
-    through bounded sequential completion. Distinguish missing supplied header
-    or body bytes from invalid complete contents: classify by supplied extent
-    versus the checked header length, never by a row/operation error kind.
-    Seal caller-built payloads in place with fixed header/footer scratch and
-    preserve bytes on any returned error.
-    Hash complete supplied journals and enforce byte and operation caps.
-    Physical EOF remains with M05d;
-    complete final-view transaction/reference rules remain with M08.
-  - **M05a3c — selected journal summaries:** bind complete history streams to
-    the indexed manifest range, extent and digest. Match active stream identity
-    and the caller's pinned committed offset/sequence. Preserve independent
-    checks without claiming graph completeness, physical EOF or pin ownership.
-- **M05b — private storage adapter:** trusted roots, generated paths, exclusive
-  lock, short/failing I/O, sync and non-replacing publication. Specify any new
-  syscall surface under UNSAFE.md before introducing it. Own the deterministic
-  fault-I/O model and process-death lock tests.
-  - **M05b1 — canonical names:** fixed-buffer relative paths from typed account/
-    blob IDs, positive canonical generation/segment numbers and known table
-    names. Validate directory-entry blob names against namespace and shard.
-    No filesystem access or authority follows from these names.
-  - **M05b2 — std filesystem boundary:** generated paths, startup permission
-    checks, cooperative writer lock and durable publication under STORAGE.md.
-    - **M05b2a — lookup/root checks:** implemented bounded std path lookup,
-      pre-existing symlink/type refusal, retained File metadata and mode/owner
-      checks. Supervisor identity and stable roots/mounts are deployment
-      preconditions. Tests distinguish retained-file identity from later
-      pathname lookup and cover maximum-path allocation on host/musl.
-    - **M05b2b — persistent LOCK:** implemented std `File::try_lock` with
-      explicit contention, private empty single-link regular-file policy,
-      opened identity validation and file/root-directory sync. `LockedRoot`
-      consumes PrivateRoot and retains the lock without exposing clone/unlock.
-      Tests cover independent opens, independent-process contention, process
-      death, policy refusals and permission errors (where the harness identity
-      cannot bypass modes). Process tests bound their ready wait and support a
-      single CPU. The inode survives release/restart; no store
-      recovery or service activation follows from owning this lock alone.
-    - **M05b2c — durable file operations:** implement exclusive temporary
-      creation, bounded reads/writes, immutable publication via `hard_link`,
-      same-directory CURRENT replacement via `rename`, and explicit file and
-      directory sync. Keep fixed path buffers and extend allocation/error tests.
-      Checkpoint directories use exclusive creation and gain authority only
-      through CURRENT. Same-filesystem publication is required; propagate
-      cross-device errors. Inject failure before/after every operation and
-      distinguish proven no effect, partial private output and uncertain commit.
-      - **M05b2c1 — private temporary output:** implemented typed exclusive
-        creation below pre-existing private account directories, lifetime-bound
-        LOCK ownership, bounded sequential writes and consuming file/parent
-        sync. Errors retain partial-output accounting; Drop never unlinks.
-        Completed private output has bounded caller-buffer reads. Real-file
-        tests and injected short/write/sync errors cover these primitives.
-        The dedicated allocation probe covers successful/failed operations at
-        short and maximum root paths on the pinned host/musl builds. Logical
-        admission, publication and cleanup remain separate
-        work.
-      - **M05b2c2 — exclusive directories:** implemented one-level creation of
-        the accounts entry and typed account/checkpoint directories, shared
-        private-parent checks,
-        umask normalization and new-directory/parent sync. Existing entries
-        refuse untouched. Uncertain/created failures retain accounting; tests
-        inject before/after creation and each sync. Allocation probes include
-        successful and refused directory operations. Directory creation does
-        not select a checkpoint or activate serving.
-      - **M05b2c3 — immutable blob publication:** implemented consuming,
-        account-bound, non-replacing hard links, destination-parent sync,
-        temporary unlink and temporary-parent sync. Explicit failure stages
-        preserve possible effects; no implicit rollback/adoption or writable
-        result handle. Source identity/length/private policy are checked.
-        Host/musl allocation probes cover success, collisions and errors at
-        every mutation/sync boundary. Transaction/admission coupling remains
-        M05c; CURRENT replacement and recovery remain separate work.
-      - **M05b2c4 — fresh metadata publication:** implemented a closed typed
-        destination for tables, manifests and initial journal segments through
-        the same non-replacing publication sequence. Names remain bound to the
-        temporary file's account; CURRENT is not expressible. Missing parents
-        refuse. Tests cover all table tags and unchanged collisions; allocation
-        probes cover each metadata role at maximum generation/root lengths.
-        Format validation, selected reachability and append authority remain
-        caller/recovery responsibilities. CURRENT replacement follows.
-      - **M05b2c5 — CURRENT replacement:** implemented fixed encoded intent
-        with expected absence/previous selector, same-account/epoch advancing
-        generations, private exact-length/EOF checks, typed same-directory
-        temporary output, file/parent sync, rename and final directory sync.
-        Errors retain private/uncertain-selection effects. Fault tests pin
-        sync handles, ordering and old/new bytes at every sync/rename boundary;
-        allocation probes cover initialization/replacement, absence/stale
-        refusal and sync/rename faults at maximum roots. Durable graph
-        validation, actual barriers, reservation reconciliation and startup
-        orphan cleanup remain required before activation.
-    - **M05b2d — input files:** std type/link/owner/mode checks under SCHEMA.md,
-      bounded reading through EOF and opened-file identity checks. Deployment
-      uses the data-root owner as its trusted expected service identity.
-      Configuration replacement during reload may refuse/retry; no hostile
-      namespace writer or effective-UID verification claim.
-      - **M05b2d1 — selected-store inputs:** implemented a typed private-file
-        reader for FORMAT, CURRENT, tables, manifests, journals and blobs.
-        Enforce private ancestor/file policy, identity and byte ceilings;
-        bound each caller-buffer read, retire errors, require full extent and
-        observed physical EOF for completion. Tests cover truncated/growing
-        files, stale size, partial/failed reads, roles, modes, links and limits;
-        the allocation interval covers success and refusal/error paths.
-        Parser/digest/selection binding remains M05d. Operator-config/secrets
-        loading remains separate; M05d4a below implements concurrent journal
-        prefix I/O without claiming frame validation or a real read-view pin.
-    - **M05b2e — recovery evidence:** local temporary-folder process tests
-      exercise the common std API on the host. XFS deployment crash/power-loss
-      qualification is release evidence; no xfsprogs prerequisite for ordinary
-      tests and no runtime filesystem whitelist/profile probe.
-- **M05c — immutable blobs:** admitted streamed temporary bodies, inline SHA-256,
-  exact size accounting and durable non-replacing publication. Couple effect
-  tickets and logical completion budgets; inject failures at each filesystem step.
-- **M05d — selected-store recovery:** validate CURRENT's complete selected graph,
-  replay contiguous frames, fence corruption and repair only incomplete EOF
-  tails under the lock. Do not scan for a newer unselected generation or magic.
-  - **M05d1 — selection loading:** implemented private FORMAT/CURRENT and named
-    manifest reads through complete-extent/EOF evidence, then container and
-    account/epoch/generation/digest binding. Fixed caller scratch and per-file
-    read-attempt limits; errors identify the failed stage. Literal-file tests
-    cover identity/checksum/size failures and missing selection without scans;
-    the allocation probe covers success and missing-account refusal at both
-    root bounds. Whole table/journal validation, replay, orphan accounting and
-    final-view invariants remain required before activating the store.
-  - **M05d2 — selected table input:** implemented header/extent binding before
-    row reads, incremental prefix-bounded records with sticky failure, and
-    completion through physical EOF plus whole-table manifest digest. Caller
-    scratch and per-record read-call bounds prevent whole-table buffering.
-    Tests exercise every table tag, literal input, multi-record scratch reuse,
-    valid mismatched headers, shared prefix/body attempt limits, corrupt input,
-    changed final extents and digest mismatch;
-    allocation probes cover table reads/completion and refusal at both roots.
-    Rows remain provisional. History/active journal reads, replay and complete
-    graph/final-view validation follow before store activation.
-  - **M05d3 — retained-history input:** implemented exact selected segment
-    extents and header identity, incremental checksummed frame reads with a
-    shared prefix/body attempt allowance, sticky failure, and completion
-    against physical EOF and selected history sequence/size/digest. Literal
-    tests cover multiple frames, valid identity mismatches, corrupt lengths,
-    headers/footers, truncation, changed extents and selected digest refusal.
-    The existing allocation interval covers frame reading and completion at
-    both root bounds. Shared exact reads replace the metadata/table copies.
-    ReadView change iteration still needs a separate cursor that skips PUT
-    bodies. Active prefixes, active-tail repair, replay and whole-graph/final-view
-    invariants remain required before activation.
-  - **M05d4a — captured prefix I/O:** implemented journal-only PrefixReader
-    and distinct CompletePrefix. Private-file checks permit same-inode
-    monotonic growth within the opening ceiling; reads expose only the
-    supplied captured bytes. Completion accepts later appends but refuses a
-    missing prefix, without claiming physical EOF. Tests cover open-time
-    growth/shrink/replacement, suffix exclusion, limits, truncation and sticky
-    errors; the existing allocation interval covers both root bounds. Real
-    pin ownership, active header/frame/selection validation and repair remain
-    separate. Whole-file readers retain their exact extent/EOF contract.
-  - **M05d4b — active-prefix validation:** implemented supplied active identity
-    and captured sequence/offset checks before I/O, checked frame streaming
-    through caller scratch, and completion against the selected active summary.
-    Shared framing preserves retained history's physical EOF and active input's
-    distinct prefix evidence. Tests cover empty/populated prefixes with later
-    appends, invalid views/headers, cut frames, corrupt footers, physical
-    truncation and final sequence mismatch. Both adapters reuse one admitted
-    frame arena in the allocation fixture. Real pins/history retention,
-    ReadView's separate change cursor, tail repair and final-view checks remain.
-  - **M05d5a — stopped active scan:** implemented read-only whole-file scanning
-    with selected header identity, bounded provisional frames and physical EOF
-    completion. ScannedJournal retains the last valid boundary and incomplete
-    tail extent without repair. Short journal headers, complete corrupt frames,
-    gaps and impossible declared budgets refuse. Tests cover every short final
-    header/body/footer length, complete corruption, short-tail gaps, exhausted
-    sequence/byte/operation budgets, the physical format cap, read-budget
-    failure and changed extents. Allocation probes reuse the existing arena at
-    both roots. Live journal readers retain strict short-frame refusal.
-  - **M05d5b — explicit tail repair:** implemented consuming repair of a scanned
-    incomplete suffix. Recheck exact CURRENT and retained journal identity/
-    extent, truncate with std set_len, sync_all, then confirm retained-file EOF.
-    Errors retain attempted/truncated/synced effect stages; no automatic retry
-    or rollback. Tests cover stale selectors, changed/replaced/nonprivate-file
-    refusal and errors before/after effects. Allocation probes share the
-    existing arena at both root bounds. Finish graph/replay and reference
-    validation before opening pins or mutation admission.
-  - **M05d6 — referenced blob integrity:** implemented supplied account/ID/row
-    input with admitted length, exact private file size, incremental SHA-256
-    and physical EOF/digest completion. One caller-buffer read is at most
-    64 KiB; I/O/hash errors retire input. Tests cover known digest, both blob
-    kinds, empty/large files, limits, corruption, changed extents and provider
-    errors. Allocation probes cover success/refusal at both root bounds.
-    Final owning-reference resolution and actual pins remain coordinator work.
-  - **M05d7 — bounded replay overlay:** implemented immutable supplied frame
-    bytes and caller-owned operation cells, complete contiguous frame validation,
-    in-place descriptor sorting and latest-key lookup/iteration with tombstones.
-    All operations count toward the cap; CHANGE records never become rows.
-    Limits::plan checks the 32-byte compiled cell budget. Tests cover independent
-    last-write comparison, sequence/ordinal ties, corruption/truncation, full
-    operation capacity and scratch reuse; allocation instrumentation covers
-    8192 operations and lookups/refusals.
-  - **M05d8 — active-overlay loading:** implemented selected prefix loading into
-    caller frame/cell arenas, early header binding, one shared 128-read budget
-    and final sequence/offset binding. Refuse impossible cell capacity before I/O;
-    exact per-operation capacity is checked during decode. Classify buffer-size
-    refusal as InvalidInput. Retain the consumed prefix descriptor
-    alongside the borrowed overlay. Tests cover suffix growth, identity and
-    admission refusal, corruption/cut frames, endpoint mismatch and exact read
-    budget/error boundaries; allocation probes cover short/maximum roots.
-  - **M05d9 — provisional table replay:** implemented a streaming sorted merge
-    of supplied checkpoint records and latest overlay entries. Bind table header
-    account/epoch/base, validate input order/count/extent, retain unchanged row
-    sequences and replace/drop rows according to PUT/DELETE. Callback output
-    remains provisional; input or sink failure retires the merge. Tests compare
-    an independent last-write map, check independent pre-output count/payload
-    ceilings, wrong inputs/identities and sink errors;
-    allocation probes include full-capacity overlay draining. File/digest
-    bindings are connected by M05d10 below.
-  - **M05d10 — selected table replay:** implemented conversion of fresh TableInput
-    into a failure-sticky replay bound to LoadedOverlay's supplied view. Advance
-    performs one record/merge step; finish verifies table checksum/EOF/selection
-    before residual overlay callbacks. Tests also prove successful PUT output
-    both before a checkpoint row and during the final drain. Completion retains
-    the selected table and
-    borrows the loaded prefix. Tests cover unchanged/deleted/empty tables, input
-    freshness, generation mismatch, input/sink errors and late digest/extent
-    failure; allocation probes reuse existing caller arenas at both root bounds.
-    Checkpoint publication, final reference validation and live pins remain
-    integration work.
-  - **M05d11 — selected point lookup:** implemented a complete selected-table
-    replay that retains only the matching row in a separate caller buffer.
-    Completion exposes the final row/sequence or absence only after digest/EOF
-    and residual-overlay validation. Tests cover unchanged/replaced/inserted/
-    deleted/absent rows, variable and zero-byte values, wrong keys, short result
-    buffers, early finish and late corruption. The allocation probe exercises
-    lookup success/refusal at both root bounds. The ledger separately charges
-    maximum record and result buffers. Whole-graph reference validation and
-    runtime pin ownership remain coordinator work.
-  - **M05d12 — selected ordered scan:** implemented a complete selected replay
-    retaining only the first final row strictly after an encoded cursor, or
-    the first row when no cursor is supplied. Completion returns key/value/
-    sequence or proven exhaustion. Tests cover canonical encoded ordering,
-    replacements/deletions/residual rows, exclusive cursors, malformed cursors,
-    short output, incomplete consumption and late corruption; allocation probes
-    cover both root bounds. Existing scratch partitions fund both outputs.
-    Indexed iteration, whole-graph recovery and live pins remain separate work.
-  - **M05d13 — mailbox parent chains:** implemented fixed-state cycle/missing-
-    target validation over one supplied ReadView, one get per advance. Bind
-    exact view identity before/after reads, validate rows/sequence ceilings,
-    retire on errors or explicit lookup-budget exhaustion, and expose
-    completion only at a root. Tests compare exhaustive small functional
-    graphs against an independent visited-set oracle, plus long chains,
-    changed views, malformed rows and sticky errors. The allocation probe
-    covers success/cycle/missing/limit cases. Actual view integration and the
-    all-mailbox/whole-graph coordinator remain separate work.
-  - **M05d14a — incremental frame validation:** implemented supplied-byte
-    verification with exact header, one operation per push and exact footer.
-    Validate sequence/local grammar, preserve stored ordinals and enforce
-    count/extent/digest before completion, with sticky push errors. Differential
-    tests cover literal and maximum frames, malformed counts/bytes, Identity
-    CHANGE and provider faults. Existing allocation instrumentation covers
-    success and failure. This retains only digest/counters, enabling future
-    retained-change input without another frame arena. File I/O, journal
-    binding, change collection and ReadView integration remain separate work.
-  - **M05d14b — checked frame changes:** implemented caller-slot collection of
-    CHANGE type/ID/action and stored ordinal. Validate every supplied operation
-    and expose the compact sequence only after consuming frame completion.
-    Short capacity and malformed input retire the collector; row-only frames
-    need no change slots. Preserve duplicates and all v1 actions/types. Tests
-    compare mixed and maximum frames against the complete decoder, prove
-    copied ownership and exercise missing operations/corrupt footer/sticky
-    failure. Separate per-view change scratch permits interleaved row lookups;
-    the existing allocation probe covers bounded collection after preparation.
-    Physical history input, cursor policy and real ReadView pins remain future.
-  - **M05d14c — incremental journal changes:** implemented checked journal
-    headers and exclusive pending frames over the change collector. Validate
-    sequence and aggregate budgets before operations, hash all supplied bytes
-    including footer checksums, and return the existing journal Summary only
-    after every begun frame finishes. Abandonment and all errors retire the
-    parent. Tests compare whole-frame summaries, retained changes, empty and
-    exhausted bases, journal caps, frame errors and crypto faults. The existing
-    allocation interval exercises completion and abandonment. File input,
-    selected history/prefix binding and ReadView cursor activation follow.
-  - **M05d14d — selected history changes:** implemented immutable selected-file
-    opening and complete-frame iteration borrowing per-call operation scratch
-    and retaining compact change slots. Check exact extent/header/aggregate limits, bound operation
-    framing and share a finite read-call budget. Consume each frame checksum
-    before retaining changes; recover full scratch capacity for the next frame.
-    Selected digest/EOF completion is separate from provisional frame access.
-    Tests cover repeated/max frames, changed bytes, short cells, read budgets,
-    I/O errors, buffer reuse and final selection. Existing allocation
-    instrumentation covers both path bounds. Live cursor/floor policy and
-    read-view pins remain future.
-  - **M05d14e — captured active changes:** implemented selected-prefix changes
-    over the same operation input as immutable history. Validate active identity
-    and byte admission, retain one checked frame of compact changes and finish
-    only at the captured sequence/offset. Prefix completion permits append growth
-    and refuses shrinkage or partial frames. Tests cover complete/incomplete
-    later appends, empty prefixes, short slots, I/O faults, mismatched views and
-    endpoint mismatch. Existing allocation instrumentation covers both root
-    bounds. Live cursor, history-floor and pin integration remain future.
-  - **M05d14f — supplied change cursor:** implemented fixed-kind, captured-view
-    policy over checked compact frames. Validate floor/endpoint/caller cursor,
-    request the exact next sequence, retain frame identity and slot position,
-    and return ordered matching records or explicit frame boundaries. All
-    errors are terminal; completion requires the endpoint boundary. Tests cover
-    maximum frames, partial cursors, filtering/actions/duplicates, empty ranges,
-    view changes and frame substitution. Allocation instrumentation covers
-    draining and refusal. File location, real pins and serving remain future.
-  - **M05d14g — selected change routing:** implemented retained coverage checks
-    and bounded source choice over selected metadata/captured view fields. Map
-    an exact required sequence to a history descriptor or the active prefix,
-    refusing missing history, future frames and changed identity. Tests cover
-    all 64 descriptors, segment/floor/checkpoint/endpoint boundaries, missing
-    coverage and invalid views. Existing allocation instrumentation covers both
-    source types and below-floor/changed-view refusal. Physical frame location
-    and real pins remain future.
-  - **M05d14h — bounded selected frame location:** implemented opening a routed
-    source and locating the target with at most one frame per advance. Hide
-    earlier frames, bind supplied view identity and refuse excess sequences.
-    Continue within that segment, then require its selected completion before
-    returning full reusable slots. Tests cover exact read positions, locating
-    before the floor, both source types, append growth, premature finish, view/
-    checksum/I/O failures and endpoint refusal. Existing allocation probes cover
-    slot transfer and empty-prefix reclaim. Segment transitions/live pins remain.
-  - **M05d14i — sequential selected change scan:** implemented cursor/locator
-    coordination with separate bounded opening, locating, draining and completion
-    phases. Verify/close each source before transferring slots; retain caller
-    continuation during internal work and retire the entire scan on errors.
-    Tests cover source transitions, partial cursors, filtering, late corruption,
-    exact continuation, I/O refusal and exhausted ranges without I/O. Existing
-    allocation probes cover source transfer/reclaim. Runtime ReadView integration
-    and early-page validity/pins remain future.
-  - **M05d15 — direct final-row references:** implemented supplied-source
-    validation with at most two typed targets and one ReadView get per advance.
-    Check identity around lookups, source/target sequence ceilings, blob kinds,
-    recipient ordinal bounds and lease account/expiry; omit historical IDs.
-    Tests cover every table, missing/malformed targets, view movement, time
-    boundary, incomplete/terminal state and fixed lookup counts. Existing
-    allocation instrumentation covers the helper. Whole-graph enumeration,
-    physical blob verification, parent cycles and real pins remain separate.
-  - **M05d16 — direct-reference sweep:** implemented bounded enumeration over a
-    supplied ReadView, one next plus at most two direct-reference gets per step.
-    Check table/key progression, identity around next and finite row admission;
-    detach source keys before value reuse and retain fixed per-table counts.
-    Tests cover populated/empty scans, logical work bounds, exact/short/zero row
-    budgets, order/type/sequence faults, lookup failures and changed-view
-    precedence. Allocation probes reuse fixed fixtures. Full physical graph,
-    blob bytes, parent cycles, aggregate invariants and runtime pins remain.
-  - **M05d17 — exact recipient coverage:** implemented ordered submission and
-    recipient validation with one next per advance, exact 0..count ordinals,
-    independent stream order, identity/sequence/local checks and a finite total
-    row budget. Tests cover an empty view, multiple/maximum groups, missing/extra/orphan
-    rows, duplicate keys, lookup/identity faults, malformed sources and terminal
-    states. Allocation probes cover fixed populated/empty fixtures. Queue state
-    policy, physical view completeness and actual pins remain separate.
-  - **M05d18 — all-mailbox parent validation:** implemented ordered enumeration
-    plus one incremental ParentWalk at a time. Each step performs one next or
-    get, with separate finite row/total-get allowances and view checks. Tests
-    cover rooted/shared chains, empty views, late cycles/missing parents,
-    exhausted work, corrupt/moved lookups and duplicate/descending enumeration.
-    Allocation probes cover populated/empty fixtures. Physical completeness,
-    configured depth policy and runtime pins remain separate.
-  - **M05d19 — final blob file sweep:** implemented ordered final blob rows
-    connected to private-file opening, bounded chunk hashing and digest/EOF completion.
-    Separate row/total-byte admission and full identity checks precede success;
-    reuse value scratch after detaching scalar source data. Tests cover empty
-    files/views, cumulative limits, late corruption, missing files, source/order
-    faults and view movement through every phase. Existing allocation probes
-    cover fixed prepared files. Physical view completeness and actual pins remain.
-  - **M05d20 — complete selected-table replay:** implemented all-table
-    sequencing with byte/final-row budgets and one reusable record buffer.
-    Reclaim scratch only after selected digest/EOF and residual merge completion;
-    count every final row and retire failures. Tests cover all selected files,
-    deletion overlays, exact/short admission, missing late files and changed
-    final extents. Allocation probes check both root bounds. Retained history,
-    cross-row/blob checks, actual view pins and activation remain separate.
-  - **M05d21 — complete retained-history validation:** implemented sequencing
-    over every selected descriptor with aggregate byte/frame admission and one
-    reusable change-slot slice. Each step opens, reads one frame or verifies a
-    selected segment; completion returns exact selection/counts and slots.
-    Tests cover empty/multiple/maximal history, admission/capacity errors,
-    missing late segments and selected digest failure. Existing allocation
-    probes cover slot reclamation at both roots; the multi-segment unit test
-    covers reuse. Full graph/pins/activation remain.
-  - **M05d22 — stopped validation ownership:** implemented a consuming owner for
-    LockedRoot with read-only selection, overlay, table and history operations.
-    Borrowed metadata/inputs prevent thaw while live; consuming return restores
-    mutation access without lock reacquisition. Compile-fail tests enforce the
-    transfer/return lifetimes; file tests cover retained lock and validation.
-    Trusted filesystem authority remains required; serving view pins, full
-    selected-graph validation and activation remain separate.
-  - **M05d23 — owned selected physical-file validation:** implemented a coordinator
-    tying the captured active prefix to the stopped owner, admitting table and
-    history budgets before I/O and reclaiming one record buffer between sweeps.
-    Finish retains owner/overlay/selection with complete physical summaries and
-    returns scratch only after both sweeps succeed. Tests cover phase ordering,
-    buffer identity, foreign owners, early admission, late faults and retirement.
-    Current selection loading, final row/blob rules and activation remain separate.
-  - **M05d24 — offline validation ReadView:** implemented get/next through complete
-    table replay and a retained fixed-kind change scan over CheckedFiles. Admit
-    all selected source sizes and per-call work, check monotonic deadlines and
-    retire all errors. Shared scratch supports interleaved row/change calls.
-    Tests cover present/deleted rows, ordered EOF, history/active continuations,
-    short capacity, budgets, clock/cursor errors and late refusal. Full logical
-    validation, runtime leases and service activation remain separate.
-  - **M05d25 — final queue consistency:** implemented current recipient
-    phase/retry/uncertainty/reason and required reply-code checks in the existing
-    recipient sweep. Exact groups now require correct completedAt/notification
-    state and submission-wide cancellation, retaining only scalar flags. Tests
-    exercise all states, definitive/uncertain results, historical replies,
-    retryable unknowns, group combinations and sticky sweep failures. Transition
-    history, worker fences and complete logical graph integration remain separate.
-  - **M05d26 — owned final-data validation:** implemented ordered composition
-    of direct references, recipient queue consistency, mailbox parent walks and
-    final blob files over one offline ValidationView. Bracket every step and
-    consuming completion with the deadline, compare counts against physical
-    replay and retain stopped ownership independently of reusable scratch.
-    Real selected-file tests cover populated/empty success and errors in every
-    phase, budgets, sticky failure and deadlines after blob reads/completion.
-    Recovery repair/accounting, mutation policy and activation remain separate.
-  - **M05d27 — stopped journal capture:** implemented a read-only wrapper that
-    derives committed prefix identity/history floor from a completed bounded
-    scan and loads that same prefix into caller overlay storage. Keep repair
-    capability private, report incomplete tails, require End plus physical EOF
-    and release frame scratch at finish. Tests cover empty/complete/partial
-    input, corruption, capacity, premature finish, late size changes, history
-    floor derivation, unchanged tail bytes and downstream physical validation.
-    Compare reloaded prefix digests and test same-size valid replacement refusal
-    and dropping the capture before using the handed-off overlay.
-    Compile-fail cases pin owner retention and absence of a repair method.
-  - **M05d28 — stopped account verification:** implemented one bounded library
-    entry point from actual CURRENT selection through capture, overlay, physical
-    files and final-data checks. Apply one monotonic deadline across all stages
-    and nested readers; return owner-bound summaries after releasing all scratch
-    and input descriptors. Tests cover actual selection, empty/tail/blob cases,
-    phase failures, admission, clock failures/regressions and final deadline.
-    Preserve tails without repair. CLI/JSON, complete mutation policy, recovery
-    accounting and activation remain separate.
-  - **M05d29 — composed verification allocation probe:** exercise the complete
-    stopped-account path inside the existing Rust allocation counter, at short
-    and maximum roots with empty/tail and populated-blob fixtures. Keep fixture
-    setup, buffer allocation and corruption writes outside eight intervals;
-    require 16 valid, unchanged paired snapshots for success and errors.
-    No instrumentation surface, allocator policy or dependency is added. Native
-    allocation, maximum datasets, worker-stack and RSS qualification remain.
-- **M05e — serialized commit publication:** connect reservations, complete frame
-  append/sync and atomic sequence/offset visibility. Failed sync stops writes;
-  all crash boundaries preserve acknowledged state. M08 supplies the complete
-  object transaction/reference rules before protocol mutations are enabled.
-  - **M05e1 — bounded frame append:** implemented a consuming complete-scan to
-    immutable-frame append path using std APIs. Recheck CURRENT and inode/length,
-    validate sequence/checksum/local operations and cumulative journal caps,
-    bound each write and the call count, then require file sync plus exact EOF
-    before returning durable endpoint evidence. Failures retire output and leave
-    uncertain effects for recovery. Tests cover partial writes, sync/confirmation
-    faults, pre-write refusal, premature finish, replay, large frames and caps.
-    Runtime reservations, final transaction policy and visibility remain external.
-  - **M05e2 — append admission integration:** implemented the reservation-bound
-    adapter using the existing writer ledger and exact frame ticket. Check prior
-    journal counters and actual frame bounds before any write. Hold the ledger
-    exclusively, stop admission and retain busy charges on uncertainty or drop,
-    and reconcile actual durable frame bytes/operations before returning evidence.
-    Tests cover conservative-to-actual accounting, independent reservations,
-    constructor refusal, every append fault, every abandonment phase and failed
-    bookkeeping. Account/generation ownership, work/deadline orchestration and
-    final mutation policy remain caller responsibilities.
-  - **M05e2b — append allocation probe:** implemented sixteen observation
-    intervals over short/maximum roots and success, short-write, failure and
-    abandonment cases. Measure reservation creation, std append and exact
-    reconciliation/disposal with every allocator counter unchanged. Keep scan,
-    frame construction and fixture lifecycle cold; worker stack, maximum data
-    and whole-service RSS qualification remain separate.
-  - **M05e2c — reusable reconciled boundary:** implemented consuming successor
-    append from ReconciledAppend, sharing the original construction and binding
-    checks. Keep prior sequence/count/extent evidence and compare CURRENT and
-    reopened inode/extent before each append without replaying the whole journal.
-    Constructor refusal consumes the owner and needs a later rescan; uncertainty
-    retains stopped admission and busy charges. Tests cover repeated successors,
-    replay/accounting, changed selection/extent/inode and partial second writes.
-    Live views and publication remain separate.
-  - **M05e3a — owned verified store:** implemented a consuming verification
-    transition that retains the locked store and copied CURRENT, view
-    identity and journal summary without caller scratch or a writable root
-    accessor. Refuse an incomplete tail without repair; errors release
-    ownership, requiring a fresh lock and verification on retry. Consuming
-    return discards this proof before restoring offline operations. This
-    prepares the owner for publication; reader leases, serialized live
-    append and atomic visibility remain separate.
-  - **M05e3b — scoped journal publication:** implemented an owning scope with
-    startup digest/extent/ledger rechecks, one serialized writer and a
-    separate publication mutex. Bounded borrowed identity pins retain the
-    fixed selected namespace. Publish only after sync and reconciliation;
-    failures after reservation permanently retire writes, including a late
-    deadline after publication. Serving query I/O, scratch leases and live
-    checkpoint/retention transitions remain separate.
-  - **M05e3c — publication allocation probe:** implemented sixteen observation
-    intervals across short/maximum roots, repeated public commit calls, reader
-    capture/drop, capacity and lock contention, constructor refusal and
-    deadlines before admission or after write/sync/reconciliation/publication.
-    Require unchanged Rust allocator counters; setup, session startup and
-    teardown remain cold. Small frames qualify these paths; maximum data,
-    native allocation, worker stacks and whole-service RSS remain separate.
-  - **M05e3d — pinned query scopes:** implemented exclusive pin borrowing
-    with caller selection/replay/record/change scratch. Reload the unchanged
-    selection, validate its captured prefix and physical tables/history,
-    then lend the bounded ReadView implementation under one deadline. Later
-    appended bytes stay invisible to old pins, ignored reader errors still
-    fail the scope, and failed preparation releases scratch for reuse. Only
-    the owned session permits prefix queries alongside its serialized
-    writer; standalone append retains stopped-store exclusion. Runtime pool
-    leases and performance, allocation and whole-worker stack qualification
-    remain pending.
-  - **M05e3e — pinned-read allocation probe:** implemented sixteen intervals
-    across short/maximum roots and successful queries, append during an old
-    read scope, early/late deadlines, work/scratch refusal and ignored query
-    error. Include selection/replay/file validation, get/next/changes,
-    temporary cleanup and pin disposal; require every Rust allocator counter
-    unchanged. Fixtures, arena creation and session startup/teardown stay cold.
-    Small fixtures do not qualify maximum data, native allocation or worker RSS.
-  - **M05e3f — admitted read scratch pool:** implemented exact backing checks
-    and startup touching for fixed slots. Capture pairs a moved partition with
-    a committed pin; refusal/drop returns resources without holding slot locks
-    across I/O, publication locking or callbacks. Scoped thread handoff and
-    retries reuse the same backing. Capacity, contention, poison and mismatched
-    admission refuse explicitly. Existing memory reservations cover the
-    bookkeeping; pool allocation and whole-worker qualification remain open.
-  - **M05e3g — pooled-read allocation probe:** implemented sixteen measured
-    intervals at short/maximum roots using full preallocated read backing.
-    Cover queries, callback append, deadline/work refusal, full pools and
-    slot/publication contention or capacity. Retry the old reader, read a
-    fresh pin and drop both leases inside measurement; require every Rust
-    allocator counter unchanged. Setup, startup, poison/unwind paths, native
-    allocation and whole-worker/RSS qualification remain separate.
-  - **M05e4a — pinned immutable body reads:** implemented captured BlobRow
-    lookup and a bounded sequential digest input borrowing one pooled view.
-    Consuming EOF/extent/digest completion returns a bounded random reader of
-    the same file. Preserve one deadline/watermark and terminal body errors
-    across all stages; retain the view pin until body drop. Existing cursor
-    memory covers state. Authorization, worker integration, MIME locators and
-    combined allocation/stack qualification remain separate.
-  - **M05e4b — pinned-body allocation probe:** implemented twenty intervals
-    across short/maximum roots, normal/empty bodies, delete-after-capture,
-    missing rows, byte caps, checksum/truncation failures and late body-step
-    deadlines. Include complete public pool/body paths, metadata reuse and
-    owner disposal; require forty valid snapshots with unchanged Rust counters.
-    Startup/teardown, maximum bodies, native allocation and full-worker/RSS
-    qualification remain separate.
-  - **M05e5 — explicit journal write stop:** implemented an irreversible
-    atomic request with nonblocking writer-idle confirmation. Check it
-    before admission, around append work and at publication completion.
-    Preserve in-flight uncertainty and old read pins; cover idle, contended,
-    poisoned and every commit clock boundary. Health/queue policy and
-    runtime integration remain separate.
-  - **M05e3 — committed visibility:** runtime integration remains pending.
-    Connect pooled queries to worker ownership and queue admission; retain
-    generation/history ownership across live checkpoint and retention changes.
-    Keep the durable append/publication ordering and fault oracles before
-    exposing any SMTP/JMAP acknowledgment path.
-
-Implement exclusive store access, generated private paths, streamed temporary
-blobs, digesting through the adapter, file/directory sync and journal commit.
-Use STORAGE.md publication order, admission reservations and complete-frame
-versus incomplete-tail rules. Do not deduplicate bodies or pack MIME into a
-metadata value.
-Implement bounded sequential replay with incomplete-tail recovery and explicit
-interior-corruption refusal. Expose committed visibility only after durability.
-The mail core accepts the shared Crypto interface; its deterministic fake tests
-check ordering/failure behavior, not digest correctness. M05 owns td-mta
-integration tests using M07's real provider through the td-crypto facade for
-every SHA-256-bearing golden frame/table/blob. These introduce no direct
-external dev-dependency.
-Provide deterministic failure injection before/after each filesystem operation.
-
-**Acceptance:** two writers cannot open the store; partial/short writes and
-failed sync never return committed success. Every crash boundary preserves
-previous commits, and uncommitted orphan data is distinguishable from missing
-committed data. Malicious IDs cannot escape the root. Tiny configured limits
-exercise oversize behavior without large allocations. Test full-length bad-checksum final frames without silently truncating them.
-Test ENOSPC/EIO and
-lock release on process death. Never claim process-kill tests alone prove
-power-loss ordering; include the fault I/O model and later VM evidence.
+Before protocol activation, implement the authenticated ports::Store adapter,
+full mutation/queue policy, quota/result reconciliation, native allocation/RSS
+and guarded-stack qualification, complete crash/fault matrix, bounded orphan
+walk, history maintenance, inspection/backup and explicit legacy migration.
+SQLite's durability is not a body-publication, authorization or memory proof.
 
 ## M06 — Streaming message and MIME representation
 
@@ -2893,36 +2276,25 @@ requires an UNSAFE.md amendment. No live CA/provider contact, ignored
 certificate errors, hidden second backend or unreviewed direct mail
 dependency.
 
-## M08 — Store objects, indexes, checkpoints and reclamation
+## M08 — Store policy and maintenance
 
-**Depends on:** M05/M06. **Own:** object transactions, read views, index cache,
-checkpoint publication, change history and garbage collection.
+**Depends on:** M05/M06. **Own:** authenticated object transactions, query
+planning, bounded history pruning, backup and orphan reclamation scheduling.
 
-Implement mailbox hierarchy/membership/keywords, immutable email objects,
-thread assignments and authoritative anchors, account state and retained changes. Implement STORAGE.md's sorted flat tables,
-fixed journal arenas/descriptors, exact-prefix read views and streaming merge.
-Pause new mutations during checkpointing; publish table/manifest/journal pairs
-through CURRENT in the specified order. Sparse/secondary disk indexes remain
-rebuildable. Bound retired-generation pins and enforce history floors, disk
-reservations and checkpoint overlap budgets. Implement body reclamation only
-inside the specified exclusive maintenance window, including queue/lease roots.
-Enforce ADMISSION.md's corrected checkpoint record-overhead reserve, separate
-closed-journal/history charges, background-view arbitration, startup orphan
-cleanup and quota-derived maintenance work bounds. Prove a complete GC pass
-at configured caps across bounded candidate windows and a validated scheduling
-cursor; a scan that always restarts without progress is not reclamation support.
+Use the existing SQLite core for mailbox/email/thread/submission metadata;
+do not add a second replay or checkpoint implementation. Complete aggregate
+recipient and queue-transition validation, changed-object coverage, category
+quota reconciliation and request idempotence. Native indexes serve metadata
+queries; parsed-body/search caches remain disposable. Authoritative database
+values must survive cache rebuilds. Maintenance respects captured SQLite
+snapshots, fixed disk/heap ceilings and immutable-file publication ordering.
 
-**Acceptance:** remove indexes, rebuild and compare object IDs, bytes, folder
-membership and states. Readers never observe half a transaction or an index
-ahead of commit. Kill at every checkpoint/reclaim boundary. Old state tokens
-produce explicit resync errors; restored epochs cannot alias previous states.
-Scale many small objects without mailbox-sized RAM. Exercise both journal
-byte/operation ceilings, read views spanning commit/checkpoint, pin exhaustion,
-queue references after visible email deletion, and orphan cleanup after a failed
-publication. Inspect identical logical views before and after checkpointing.
-Exercise repeated operations on one key in a frame, reserved streaming work
-finishing across checkpoint, physical orphan scans and abandoned sort cleanup.
-Do not implement JMAP here.
+**Acceptance:** snapshots across commits/checkpoints, pool exhaustion, native
+page/WAL/heap capacity, failed publication, indeterminate COMMIT recovery,
+queue references after visible email deletion, history resync, bounded orphan
+progress and stopped backups of database plus bodies. Inject actual failures
+at each commit/publication/checkpoint/unlink/sync boundary. Do not advertise
+JMAP or deployment before the corresponding protocol/resource evidence.
 
 ## M09 — Bounded DNS and outbound HTTPS transport
 
@@ -3064,7 +2436,7 @@ cover Bcc, Unicode and attachments. Do not initiate remote delivery here.
 
 ## M16 — Durable JMAP submission state machine
 
-**Depends on:** M08/M15. **Own:** immutable submission intent, journal transitions,
+**Depends on:** M08/M15. **Own:** immutable submission intent, database transitions,
 recipient states, JMAP submission methods, success filing and reconciliation.
 
 Implement DESIGN section 11 with a fake deterministic transport boundary first.
@@ -3129,8 +2501,8 @@ sink, runtime health/status aggregation and config generation lifecycle.
 Wire the runtime administration subset of DESIGN section 6 through a private
 control socket or exclusive offline lock: config check/show, serve, status,
 doctor, dns-plan, reload, queue/device operations, and store layout/inspect/
-journal/export. Implement versioned JSON output, pagination, queue
-inspection/operations, storage layout/record/journal inspection and raw export,
+changes/export. Implement versioned JSON output, pagination, queue
+inspection/operations, storage layout/record/change inspection and raw export,
 device creation/revocation, doctor, redacted config and
 atomic reload. Add size-based log rotation, suppression counters and fallback
 diagnostics. Ensure a restart-required change does not partly apply.

@@ -12,6 +12,7 @@ description = "Bounded personal mail service using the local td-crypto boundary"
 clippy-all-targets = true
 
 [dependencies]
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "hooks", "limits"] }
 td-crypto = { path = "../td-crypto" }
 td-header = { path = "../td-header" }
 td-json = { path = "../td-json" }

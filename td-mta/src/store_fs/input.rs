@@ -1,8 +1,8 @@
-//! Bounded reads of typed private store files; parsing and generation pins are external.
+//! Bounded reads of typed private store files; parsing and view pins are external.
 use super::{Directory, LockedRoot, MAX_PATH_BYTES};
 use crate::{
     ids::AccountId,
-    store_paths::{AccountEntry, Name, RootEntry},
+    store_paths::{AccountEntry, Name},
 };
 use std::{
     fs::{self, File},
@@ -10,33 +10,8 @@ use std::{
     os::unix::fs::{FileExt, MetadataExt},
 };
 
-#[path = "input/recovery.rs"]
-mod recovery;
-#[cfg(test)]
-pub use recovery::probe_reserved_append;
-#[cfg(test)]
-pub(super) use recovery::{prepare_probe as prepare_recovery_probe, probe as probe_recovery};
-#[cfg(test)]
-pub(super) use recovery::{prepare_repair_probe, probe_repair};
-pub use recovery::{
-    AppendError, AppendStep, JournalAppend, ReconciledAppend, RecoveryInput, RecoveryInputError,
-    RepairError, RepairedJournal, ReservedAppend, ReservedAppendError, ScannedJournal,
-    SyncedAppend,
-};
-
-#[path = "input/prefix.rs"]
-mod prefix;
-#[cfg(test)]
-pub(super) use prefix::probe as probe_prefix;
-pub use prefix::{CompletePrefix, PrefixReader};
-
 impl LockedRoot {
-    /// Startup FORMAT input. Whole-container validation still belongs to the codec.
-    pub fn open_format(&self) -> io::Result<StoreReader<'_>> {
-        let name = Name::root(RootEntry::Format).map_err(|_| io::ErrorKind::InvalidInput)?;
-        self.open_input(name, crate::format::FORMAT_BYTES as u64)
-    }
-    /// Caller authorizes the account, pins the selected generation/extent and
+    /// Caller authorizes the account, retains the selected live view/extent and
     /// admits the read work. No directory, LOCK or temporary role is accepted.
     pub fn open_account_file(
         &self,
@@ -44,14 +19,7 @@ impl LockedRoot {
         entry: AccountEntry,
         max_bytes: u64,
     ) -> io::Result<StoreReader<'_>> {
-        if !matches!(
-            entry,
-            AccountEntry::Current
-                | AccountEntry::Table(_, _)
-                | AccountEntry::Manifest(_)
-                | AccountEntry::Journal(_)
-                | AccountEntry::Blob(_, _)
-        ) {
+        if !matches!(entry, AccountEntry::Blob(_, _)) {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         let name = Name::account(account, entry).map_err(|_| io::ErrorKind::InvalidInput)?;
@@ -63,7 +31,7 @@ impl LockedRoot {
         }
         let (file, length) = open(&self.root.directory, &name, max_bytes)?;
         Ok(StoreReader {
-            owner: self,
+            _owner: self,
             file,
             name,
             length,
@@ -75,7 +43,7 @@ impl LockedRoot {
 
 #[derive(Debug)]
 pub struct StoreReader<'a> {
-    owner: &'a LockedRoot,
+    _owner: &'a LockedRoot,
     file: File,
     name: Name,
     length: u64,
@@ -159,7 +127,7 @@ impl<'a> StoreReader<'a> {
             return Err(io::ErrorKind::InvalidData.into());
         }
         Ok(CompleteFile {
-            owner: self.owner,
+            _owner: self._owner,
             file: self.file,
             name: self.name,
             length: self.length,
@@ -171,7 +139,7 @@ impl<'a> StoreReader<'a> {
 /// digest, current pathname binding, read-view pin or authorization.
 #[derive(Debug)]
 pub struct CompleteFile<'a> {
-    owner: &'a LockedRoot,
+    _owner: &'a LockedRoot,
     file: File,
     name: Name,
     length: u64,
@@ -190,38 +158,26 @@ impl CompleteFile<'_> {
         super::temporary::read_extent(&self.file, self.length, offset, output)
     }
 }
-#[derive(Clone, Copy)]
-enum Extent {
-    Whole,
-    Prefix(u64),
-}
 fn open(root: &Directory, name: &Name, max_bytes: u64) -> io::Result<(File, u64)> {
-    open_extent_using(root, name, max_bytes, Extent::Whole, |path| {
-        File::open(path)
-    })
+    open_extent_using(root, name, max_bytes, |path| File::open(path))
 }
 fn open_extent_using(
     root: &Directory,
     name: &Name,
     max_bytes: u64,
-    extent: Extent,
     open_file: impl FnOnce(&std::path::Path) -> io::Result<File>,
 ) -> io::Result<(File, u64)> {
     let mut buffer = [0; MAX_PATH_BYTES];
     let source = root.destination(name, &mut buffer)?;
     let before = fs::symlink_metadata(source.path)?;
     check(&before, source.owner, max_bytes)?;
-    if matches!(extent, Extent::Prefix(end) if before.len() < end) {
-        return Err(io::ErrorKind::InvalidData.into());
-    }
     let file = open_file(source.path)?;
     let after = file.metadata()?;
     check(&after, source.owner, max_bytes)?;
-    let length = match extent {
-        Extent::Whole if before.len() == after.len() => after.len(),
-        Extent::Prefix(end) if after.len() >= before.len() => end,
-        _ => return Err(io::ErrorKind::InvalidData.into()),
-    };
+    if before.len() != after.len() {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let length = after.len();
     if !super::same_file(&before, &after) {
         return Err(io::ErrorKind::InvalidData.into());
     }
@@ -239,106 +195,12 @@ fn check(metadata: &fs::Metadata, owner: u32, max_bytes: u64) -> io::Result<()> 
     Ok(())
 }
 
-// Exact bounded reads share the caller's attempt allowance across framing phases.
-pub(super) fn fill_exact(
-    file: &mut StoreReader<'_>,
-    output: &mut [u8],
-    attempts: &mut usize,
-) -> io::Result<()> {
-    fill_exact_using(file, output, attempts, StoreReader::read)
-}
-pub(super) fn fill_exact_using<R>(
-    file: &mut R,
-    mut output: &mut [u8],
-    attempts: &mut usize,
-    mut read: impl FnMut(&mut R, &mut [u8]) -> io::Result<usize>,
-) -> io::Result<()> {
-    while !output.is_empty() {
-        *attempts = attempts.checked_sub(1).ok_or(io::ErrorKind::WouldBlock)?;
-        let actual = read(file, output)?;
-        if actual == 0 {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-        output = output.get_mut(actual..).ok_or(io::ErrorKind::InvalidData)?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-pub(super) fn probe(root: &LockedRoot, account: AccountId) {
-    let mut file = root
-        .open_account_file(account, AccountEntry::Current, 120)
-        .unwrap();
-    let mut buffer = [0; 17];
-    while file.position() < file.len() {
-        assert!(file.read(&mut buffer).unwrap() > 0);
-    }
-    let file = file.finish().unwrap();
-    assert_eq!(file.len(), 120);
-    assert_eq!(file.read_at(0, &mut buffer).unwrap(), buffer.len());
-    assert_eq!(file.read_at(120, &mut buffer).unwrap(), 0);
-    assert_eq!(
-        file.read_at(121, &mut buffer).unwrap_err().kind(),
-        io::ErrorKind::InvalidInput
-    );
-    assert!(root
-        .open_account_file(account, AccountEntry::Current, 119)
-        .is_err());
-    assert!(root
-        .open_account_file(account, AccountEntry::Temporary, 120)
-        .is_err());
-    let mut file = root
-        .open_account_file(account, AccountEntry::Current, 120)
-        .unwrap();
-    assert_eq!(
-        file.read_using(
-            &mut buffer,
-            |_, _, _| Err(io::ErrorKind::Interrupted.into())
-        )
-        .unwrap_err()
-        .kind(),
-        io::ErrorKind::Interrupted
-    );
-    assert!(file.is_failed());
-    assert_eq!(
-        file.read(&mut buffer).unwrap_err().kind(),
-        io::ErrorKind::BrokenPipe
-    );
-    assert_eq!(file.finish().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
-    let mut file = root
-        .open_account_file(account, AccountEntry::Current, 120)
-        .unwrap();
-    assert_eq!(
-        file.read_using(&mut buffer, |_, _, _| Ok(0))
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::UnexpectedEof
-    );
-    let mut file = root
-        .open_account_file(account, AccountEntry::Current, 120)
-        .unwrap();
-    while file.position() < file.len() {
-        assert!(file.read(&mut buffer).unwrap() > 0);
-    }
-    assert_eq!(
-        file.finish_using(|_, _, _| Err(io::ErrorKind::PermissionDenied.into()))
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::PermissionDenied
-    );
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::super::tests::Fixture;
     use super::*;
-    use crate::{
-        format::{row::BlobKind, Table},
-        ids::BlobId,
-        store_paths::Number,
-    };
+    use crate::{format::row::BlobKind, ids::BlobId, store_paths::Number};
     use std::{
         io::Write,
         os::unix::fs::{symlink, PermissionsExt},
@@ -349,10 +211,6 @@ mod tests {
         root.create_accounts_directory().unwrap();
         for entry in [
             AccountEntry::Root,
-            AccountEntry::Metadata,
-            AccountEntry::Checkpoints,
-            AccountEntry::Checkpoint(Number::new(1).unwrap()),
-            AccountEntry::Journals,
             AccountEntry::Messages,
             AccountEntry::Shard(BlobKind::Message, 0x09),
         ] {
@@ -373,14 +231,8 @@ mod tests {
         let fixture = Fixture::new();
         let root = fixture.locked();
         setup(&root);
-        let number = Number::new(1).unwrap();
-        for entry in [
-            AccountEntry::Current,
-            AccountEntry::Table(number, Table::Emails),
-            AccountEntry::Manifest(number),
-            AccountEntry::Journal(number),
-            AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
-        ] {
+        {
+            let entry = AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16]));
             write(&path(&fixture, entry), b"hello");
             let mut file = root.open_account_file(ACCOUNT, entry, 5).unwrap();
             assert_eq!(file.name(), &Name::account(ACCOUNT, entry).unwrap());
@@ -414,15 +266,19 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
-        write(&fixture.path.join("FORMAT"), &[0; 80]);
-        let mut format = root.open_format().unwrap();
-        assert_eq!(format.read(&mut [0; 80]).unwrap(), 80);
-        assert_eq!(format.finish().unwrap().len(), 80);
-        write(&fixture.path.join("FORMAT"), &[0; 81]);
-        assert!(root.open_format().is_err());
-        write(&path(&fixture, AccountEntry::Current), b"");
+        write(
+            &path(
+                &fixture,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+            ),
+            b"",
+        );
         let file = root
-            .open_account_file(ACCOUNT, AccountEntry::Current, 0)
+            .open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                0,
+            )
             .unwrap();
         assert!(file.is_empty());
         assert!(file.finish().unwrap().is_empty());
@@ -436,9 +292,7 @@ mod tests {
         for entry in [
             AccountEntry::Root,
             AccountEntry::Temporary,
-            AccountEntry::Metadata,
             AccountEntry::TemporaryFile(number),
-            AccountEntry::CurrentTemporary(number),
         ] {
             assert_eq!(
                 root.open_account_file(ACCOUNT, entry, 5)
@@ -447,38 +301,65 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
-        let current = path(&fixture, AccountEntry::Current);
+        let current = path(
+            &fixture,
+            AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+        );
         write(&current, b"hello");
         assert_eq!(
-            root.open_account_file(ACCOUNT, AccountEntry::Current, 4)
-                .unwrap_err()
-                .kind(),
+            root.open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                4
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::InvalidData
         );
         assert_eq!(
-            root.open_account_file(ACCOUNT, AccountEntry::Current, u64::MAX)
-                .unwrap_err()
-                .kind(),
+            root.open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                u64::MAX
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::InvalidInput
         );
         fs::set_permissions(&current, fs::Permissions::from_mode(0o640)).unwrap();
         assert!(root
-            .open_account_file(ACCOUNT, AccountEntry::Current, 5)
+            .open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                5
+            )
             .is_err());
         fs::set_permissions(&current, fs::Permissions::from_mode(0o600)).unwrap();
         fs::hard_link(&current, fixture.path.join("extra")).unwrap();
         assert!(root
-            .open_account_file(ACCOUNT, AccountEntry::Current, 5)
+            .open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                5
+            )
             .is_err());
         fs::remove_file(&current).unwrap();
         symlink(fixture.path.join("extra"), &current).unwrap();
         assert!(root
-            .open_account_file(ACCOUNT, AccountEntry::Current, 5)
+            .open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                5
+            )
             .is_err());
         fs::remove_file(&current).unwrap();
         fs::create_dir(&current).unwrap();
         assert!(root
-            .open_account_file(ACCOUNT, AccountEntry::Current, 5)
+            .open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                5
+            )
             .is_err());
         fs::remove_dir(&current).unwrap();
         let socket = fixture.path.join("socket");
@@ -486,26 +367,38 @@ mod tests {
         fs::rename(&socket, &current).unwrap();
         fs::set_permissions(&current, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
-            root.open_account_file(ACCOUNT, AccountEntry::Current, 5)
-                .unwrap_err()
-                .kind(),
+            root.open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                5
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::InvalidData
         );
         drop(listener);
         fs::remove_file(&current).unwrap();
         assert_eq!(
-            root.open_account_file(ACCOUNT, AccountEntry::Current, 5)
-                .unwrap_err()
-                .kind(),
+            root.open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                5
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::NotFound
         );
         write(&current, b"hello");
         let parent = current.parent().unwrap();
         fs::set_permissions(parent, fs::Permissions::from_mode(0o750)).unwrap();
         assert_eq!(
-            root.open_account_file(ACCOUNT, AccountEntry::Current, 5)
-                .unwrap_err()
-                .kind(),
+            root.open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                5
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::PermissionDenied
         );
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
@@ -515,11 +408,18 @@ mod tests {
         let fixture = Fixture::new();
         let root = fixture.locked();
         setup(&root);
-        let current = path(&fixture, AccountEntry::Current);
+        let current = path(
+            &fixture,
+            AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+        );
         for error in [io::ErrorKind::Interrupted, io::ErrorKind::PermissionDenied] {
             write(&current, b"hello");
             let mut file = root
-                .open_account_file(ACCOUNT, AccountEntry::Current, 5)
+                .open_account_file(
+                    ACCOUNT,
+                    AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                    5,
+                )
                 .unwrap();
             assert_eq!(
                 file.read_using(&mut [0; 5], |_, _, _| Err(error.into()))
@@ -537,7 +437,11 @@ mod tests {
         }
         write(&current, b"hello");
         let mut file = root
-            .open_account_file(ACCOUNT, AccountEntry::Current, 5)
+            .open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                5,
+            )
             .unwrap();
         assert_eq!(
             file.read_using(&mut [0; 5], |_, bytes, _| Ok(bytes.len() + 1))
@@ -553,7 +457,11 @@ mod tests {
         );
         assert_eq!(file.finish().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
         let mut file = root
-            .open_account_file(ACCOUNT, AccountEntry::Current, 5)
+            .open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                5,
+            )
             .unwrap();
         assert_eq!(file.read(&mut [0; 5]).unwrap(), 5);
         write(&current, b"");
@@ -563,7 +471,11 @@ mod tests {
         );
         write(&current, b"hello");
         let mut file = root
-            .open_account_file(ACCOUNT, AccountEntry::Current, 5)
+            .open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                5,
+            )
             .unwrap();
         write(&current, b"");
         assert_eq!(
@@ -573,7 +485,11 @@ mod tests {
         assert_eq!(file.finish().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
         write(&current, b"hello");
         let mut file = root
-            .open_account_file(ACCOUNT, AccountEntry::Current, 5)
+            .open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                5,
+            )
             .unwrap();
         file.read(&mut [0; 5]).unwrap();
         write(&current, b"longer");
@@ -583,7 +499,11 @@ mod tests {
         );
         write(&current, b"hello");
         let mut file = root
-            .open_account_file(ACCOUNT, AccountEntry::Current, 5)
+            .open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                5,
+            )
             .unwrap();
         file.read(&mut [0; 5]).unwrap();
         assert_eq!(
@@ -606,11 +526,18 @@ mod tests {
         setup(&root);
         let count = super::super::MAX_FILE_STEP_BYTES;
         write(
-            &path(&fixture, AccountEntry::Current),
+            &path(
+                &fixture,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+            ),
             &vec![0x5a; count + 1],
         );
         let mut file = root
-            .open_account_file(ACCOUNT, AccountEntry::Current, (count + 1) as u64)
+            .open_account_file(
+                ACCOUNT,
+                AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([9; 16])),
+                (count + 1) as u64,
+            )
             .unwrap();
         let mut bytes = vec![0; count + 1];
         assert_eq!(file.read(&mut bytes).unwrap(), count);

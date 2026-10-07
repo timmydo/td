@@ -11,151 +11,20 @@ The M01 library skeleton provides typed local IDs, configuration versioning and
 checked resource planning only. [RESOURCES.md](RESOURCES.md) records its checked startup
 byte ledger; [CONFORMANCE.md](CONFORMANCE.md) inventories the unimplemented JMAP
 contract and current client calls. There are no protocol handlers or listeners.
-The M02a/M02b format module adds checked scalar/key/row codecs and literal
-format fixtures. [FORMAT.md](FORMAT.md) fixes their byte layout and the
-container registry. M05a1 adds exact FORMAT, CURRENT and journal-header
-encoders/decoders with checked digests. These codecs do not validate selected
-store bindings, replay transactions or perform filesystem I/O.
-M05a2a adds checked table headers and individually checksummed borrowed records;
-M05a2b1 checks supplied table streams for order/count/extent and computes
-their digest. M05a2b2 adds bounded manifest structure codecs. M05a2b3 binds
-selected metadata, completed table summaries and journal headers. M05a3a adds
-checked fixed transaction headers and local PUT/DELETE/CHANGE codecs. M05a3b
-validates complete frames and supplied journal streams with bounded counters,
-sequence continuity and sticky failure; it seals caller-built payloads in place.
-M05a3c binds history summaries to selected descriptors and active summaries to
-the caller's pinned committed prefix.
-M05b1 generates canonical storage paths. The std filesystem adapter checks
-existing directory types, links and private-root permissions under an explicit
-operator-controlled stable-path contract. It performs no direct syscalls or
-free-space probes. A retained std file lock provides cooperative writer
-exclusion. Typed private-file readers now require complete extent consumption
-and physical EOF before returning a retained completion handle. Selection
-loading reads FORMAT, CURRENT and only its named manifest, then binds their
-account, epoch, generation and digests in caller-owned scratch. Selected-table
-input checks headers against that manifest, yields one provisional record at
-a time, and requires physical EOF and the complete table digest to finish.
-Retained-history input likewise yields one checked, provisional frame at a time
-and finishes only against the selected segment's extent, sequence and digest.
-Captured-prefix I/O now opens private journal files, allows append growth and
-returns distinct prefix completion without claiming physical EOF. Active
-input validates supplied view identity/ranges, streams checked frames and binds
-completion to the captured sequence/offset. It still requires actual caller
-pin ownership. Read-only stopped-journal recovery scanning now distinguishes
-physically incomplete final bytes from complete corruption and retains a
-verified prefix boundary through physical EOF. Explicit tail repair rechecks
-CURRENT and the scanned file identity/extent, truncates only that suffix and
-syncs before confirming the repaired extent. Referenced-blob input now checks
-exact length, streams SHA-256 and requires whole-file EOF and digest equality
-against a supplied row. The supplied-byte replay overlay now validates complete
-frames, sorts bounded descriptors and resolves latest operations/tombstones.
-The active-overlay loader reads a captured private prefix into caller arenas,
-binds its selected header/endpoint and retains the consumed prefix descriptor.
-A provisional streaming merge now combines sorted checkpoint records with
-overlay replacements and deletions using fixed key state and borrowed rows.
-The table-replay adapter binds a fresh table input to the loaded prefix and
-requires selected table digest/EOF completion before draining residual updates.
-Point lookup now scans that complete replay and retains one matching row in
-caller scratch; it returns a row or absence only after selected-table completion.
-An ordered next step applies the same completion rule to the first final row,
-or the first row strictly beyond an optional encoded cursor.
-A bounded mailbox-parent walker now checks one supplied ReadView chain for
-missing targets and cycles without retaining a visited-node collection.
-Incremental frame validation now checks supplied operations and their final
-footer without retaining a complete frame; entries remain provisional until
-completion. A frame-change collector copies compact descriptors into separate
-caller slots and exposes them only after checksum completion. Incremental
-journal validation now connects those frames to a whole-journal checksum and
-bounded sequence progress; an abandoned frame retires its parent. Retained-
-history input can now read selected files with one operation buffer and compact
-change slots, requiring EOF/digest binding at completion. Active change input
-shares that operation reader while stopping at a captured prefix, allowing
-append growth and binding completion to its sequence/offset. A supplied-frame
-cursor now checks captured identity, retained floors and endpoint
-boundaries while draining supplied checked frames. A selected-route helper
-checks retained coverage and chooses a history descriptor or the captured active
-segment. A bounded locator now reads at most one frame per step within that
-source, hides earlier changes and returns reusable slots only after selected
-completion. A sequential scan now coordinates cursor draining and checked
-source transitions with the same arena. Actual view-pin integration remains
-separate.
-Direct owning references now have a bounded supplied-row checker with at most
-two lookups. A supplied-view sweep now enumerates direct checks in bounded
-steps with fixed counts; physical graph completeness and remaining aggregate
-invariants still need coordination. An ordered recipient sweep now verifies exact
-submission recipient-count/ordinal coverage and current queue state/group
-consistency. Attempt transitions and worker fences remain separate.
-A mailbox sweep now enumerates and roots every supplied parent chain with
-separate row/get budgets and no growing visited set. A blob sweep connects
-final rows to private-file, chunked digest and EOF verification under finite
-row/byte budgets. A selected-table sweep now verifies and replays all 11
-checkpoint tables using one reusable record buffer and finite byte/row limits.
-A retained-history sweep checks all selected immutable segments with shared
-record/change scratch and finite byte/frame admission.
-A stopped-store owner now retains the cooperative lock behind read-only
-validation operations; consuming it restores mutation access after borrows end.
-Its journal capture now derives the complete prefix and retained-history floor
-from a stopped scan, reports incomplete tails without repair, and loads the
-same prefix for replay using caller storage.
-A file-validation coordinator now couples that owner to the captured overlay,
-all selected table replays and retained history before returning borrowed
-physical-file evidence. An offline ReadView now connects this evidence to row
-lookup, ordered iteration and retained change history with work/deadline limits.
-An owned data-validation pass composes the reference, recipient, mailbox
-and blob sweeps through that reader, compares their counts with physical
-replay, and retains stopped ownership on completion. Recovery repair/accounting,
-mutation policy and service activation remain separate.
-A bounded account-verification entry point now loads actual CURRENT, captures
-and replays the prefix, and drives selected-file and data checks under one
-monotonic deadline. It returns owner-bound summaries with reusable scratch;
-incomplete tails are reported without repair. The inspection CLI is still
-unimplemented.
-A consuming verification transition now retains the locked store with copied
-CURRENT, view identity and journal summary, without scratch or mutation
-access. It refuses incomplete tails, and failed verification releases the
-lock for a later reacquisition. This prepares ownership for committed
-visibility; it does not activate a service or grant live reader leases.
-A scoped journal session now consumes that owner and its recovered ledger,
-rechecks the selected journal, and serializes append before paired
-sequence/offset publication. Bounded borrowed identity pins retain the
-selected namespace and old prefixes. Any failure after reservation retires
-its writer; a deadline failure following publication can leave visible
-durable state without acknowledgment. Each pin can lend a bounded ReadView
-scope over its captured prefix, with caller scratch, full physical-file checks
-and one monotonic deadline. Later appended bytes stay invisible to old readers,
-which do not hold the writer lock. A fixed read scratch pool now pairs each
-lease with a captured pin and returns both on drop. Startup verifies and
-clears caller backing; captures and reads allocate no new backing. A pooled
-view can now lend an immutable body input bound to its captured BlobRow.
-Sequential integrity checks produce a bounded random reader of the same
-descriptor; one deadline and the view borrow survive that transition. Worker
-scheduling, live checkpoint/retention transitions and protocol mutations
-remain unimplemented.
+Checked scalar/key/row and operation codecs define bounded application
+values in [FORMAT.md](FORMAT.md). SQLite now owns metadata transactions,
+native indexes, WAL snapshots and crash recovery. The store_fs adapter keeps
+raw bodies in immutable files, verifies them before metadata commit and
+retains their view borrow through MIME processing. A fixed connection pool,
+closed SQL, native heap/page ceilings and monotonic operation bounds constrain
+the core. [STORAGE.md](STORAGE.md) owns these implemented boundaries.
+The custom journal/checkpoint/replay engine has been removed atomically.
+Protocol authorization, full mutation policy, operational tools, native
+resource/crash qualification and service activation remain unimplemented.
+Pure mailbox-parent, reference and recipient validators remain reusable.
+Private body output still uses exclusive creation, bounded writes, file sync,
+nonreplacement publication and directory sync under the stable-path contract.
 
-The scoped session also accepts an irreversible coordinator write-stop
-request. It fences new commits and reports Busy until an in-flight writer
-can be confirmed idle. Bounded commit steps observe the request; existing
-durable bytes or published state are retained for recovery. Readers keep
-their pins. Service-health reporting and queue cancellation remain runtime
-work.
-
-Complete mutation-policy validation and mail publication remain unimplemented.
-A one-frame append primitive now validates a successor against a complete
-scan, rechecks CURRENT/inode/extent, and writes bounded chunks before sync
-and EOF confirmation. Failed or abandoned appends retain uncertain effects
-for recovery; the reservation-bound adapter stops admission on uncertainty
-or abandonment and reconciles exact frame charges only after durable
-completion. The scoped session now couples it to atomic identity visibility.
-A reconciled boundary can start its successor without a full journal rescan,
-while retaining the CURRENT/inode/extent checks and append exclusion contract.
-Private temporary output now has exclusive creation, bounded I/O and explicit
-file/parent sync. Typed private-directory creation also syncs the new directory
-and parent. Completed private blobs and fresh table/manifest/journal files can
-be published without replacement using std hard-link and directory-sync
-operations. These low-level primitives grant
-no transaction, hash or admission authority. Expected CURRENT replacement uses
-a synced same-directory temporary and rename; graph validation, writer/view
-barriers and recovery still gate any accepting service.
 [WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.
 [API.md](API.md) defines the compiling M02c2 adapter contracts and implemented
@@ -167,11 +36,11 @@ state codecs; [QUEUE.md](QUEUE.md) freezes future queue/restart/JMAP semantics.
 M04's `bounded` and `ownership` modules provide caller-owned buffer/queue/slot
 primitives. Its `admission` module validates disk/work settings and derived
 capacity requirements and supplies charged work meters, timer budgets and
-fixed logical leases with grouped quota checks and effect tickets. The scalar
-writer ledger derives checkpoint output bounds from those quotas and models a
-closed writer barrier. Physical free-space accounting is absent; bounded logical
-reservations cannot guarantee successful future I/O. M05/M08 still own actual
-publication, orphan accounting and checkpoint reconciliation.
+fixed logical leases with grouped quota checks and effect tickets.
+Physical free-space accounting is absent; logical reservations cannot
+promise successful I/O. SQLite owns native commit/checkpoint state; service
+coordination must reconcile body publication, indeterminate commits, orphan
+charges and maintenance before activating client mutation admission.
 They do not instantiate service pools, perform live disk I/O or
 implement protocol handlers.
 
@@ -230,9 +99,9 @@ V1 must report sender authentication as not evaluated, never as passed.
    Checked arithmetic, bounded nesting, and explicit error handling extend
    the rule to lengths, counters, conversions, locks, and thread creation.
 7. Cryptographic primitives and TLS come from the narrowly reviewed provider;
-   application protocols and storage use std and td-owned interfaces. No
-   shell subprocesses implement mail, certificates, configuration, or
-   administration.
+   application protocols use std and td-owned interfaces. Metadata storage
+   uses the explicitly admitted private SQLite boundary. No shell subprocesses
+   implement mail, certificates, configuration, or administration.
 8. Protocol tests run offline against local fixtures. Neither Migadu nor a
    public CA nor the deployment host is a test endpoint.
 
@@ -269,11 +138,12 @@ tree is removed in the same change.
 Use `td-mta/` for the service library and installed binary named `td-mta`.
 The M03b2c packaging entry point supports only `--version` and `--help`;
 service commands arrive with their implementations. Its direct
-dependencies are the local `td-crypto`, `td-header`, `td-json`,
-`td-mime`, and `td-nfc` crates. Application protocols, storage, configuration and
-scheduling use std plus these local libraries. There is no separate
-runtime package or td-net helper executable. `td-crypto/DESIGN.md` owns
-the shared crypto/TLS API and private backend; `td-crypto/TLS.md`
+dependencies are the local `td-crypto`, `td-header`, `td-json`, `td-mime`
+and `td-nfc` crates, plus the approved private rusqlite dependency with
+bundled SQLite. Application protocols, configuration and scheduling use std
+plus the local libraries; store_fs/index.rs alone owns native SQL. There is
+no separate runtime package or td-net helper executable.
+`td-crypto/DESIGN.md` owns the shared crypto/TLS API and private backend; `td-crypto/TLS.md`
 specifies the TLS policy and session contract. ClientConfig, ServerConfig,
 shared clock and public client/server sessions are implemented. The mail
 record pump composes them; admitted transport integration and
@@ -1141,8 +1011,10 @@ mail parsing library.
 The backend admission and gate contract lives in td-crypto/DESIGN.md. All
 three packages stay in the test roster. The user approved Rustls with AWS-LC;
 M03b1 records exact transitive pins, features, licenses, roots and rationale;
-M03b2 pins the portable native inputs. No external async runtime, web
-framework, database, mail parser, serialization or ACME framework rides along.
+M03b2 pins the portable native inputs. The separate, user-approved private
+SQLite storage closure is pinned in td-crypto/DEPENDENCIES.md and
+STORAGE.md. No external async runtime, web framework, mail parser,
+serialization or ACME framework rides along.
 The backend increment demonstrates static musl linking and bounded TLS
 behavior before consumers depend on it; exact versions belong in the
 lock/review.
@@ -1326,7 +1198,7 @@ Initial default ceilings (validated together at startup):
 | JMAP object IDs per get/set / query page | 256 / 256 |
 | JSON nesting / parser tokens per request | 32 / 32768 |
 | Combined resident index cache | 8 MiB |
-| Storage read views | 2, each with a 4 MiB journal arena plus bounded descriptors |
+| Storage read views | 2, each with bounded row/key/cursor scratch and a SQLite snapshot |
 | Unattached upload storage | 128 MiB per account, expiry after 24 hours |
 | Retained submission storage | 256 MiB and 1000 submissions |
 | Maintenance sort scratch on disk | 64 MiB per account |
@@ -1339,7 +1211,7 @@ arena ledger with byte counts, worker stack sizes, scratch reservations, and
 TLS headroom before committing a default profile. A larger configured pool
 cannot silently retain the default memory claim.
 
-The ledger reserves 96650496 bytes under the default 96 MiB planning budget,
+The ledger reserves 100058368 bytes under the default 96 MiB planning budget,
 including planned stack, TLS, reload and process allowances. Default connection
 counts remain eight SMTP, eight HTTPS and one outbound delivery. Established
 TLS processing has a separate allowance for the single main thread, alongside
@@ -1349,7 +1221,9 @@ structures and provider use within the ledger before enabling service admission.
 
 The no-allocation contract covers td-owned hot processing: SMTP parsing and
 streaming, MIME scanning, HTTP/JSON parsing, JMAP evaluation/serialization,
-store commits, queue dispatch, and structured logging after slot admission.
+queue dispatch, and structured logging after slot admission. SQLite query and
+commit wrappers may allocate Rust/native memory within separately bounded
+reservations; those paths need resource qualification before activation.
 Use reusable arenas, borrowed views, bounded formatting, and fallible capacity
 checks. Allocating on every admitted request and calling it admission work is
 not an exemption. Any std/platform allocation unavoidable in an I/O adapter is
@@ -1417,9 +1291,9 @@ Planned commands, with stable JSON output and exit codes:
 | `dns-plan` | Expected records and MTA-STS policy; no DNS changes |
 | `reload` | Validate candidate, report bounded pending issuance if needed, then atomically install or retain old config; SCHEMA.md owns cancellation/deadline rules |
 | `queue list`, `queue inspect ID` | Paginated status and redacted reasons |
-| `queue retry ID`, `queue cancel ID` | Named, journaled operation; never repeat accepted recipients |
+| `queue retry ID`, `queue cancel ID` | Named, transactional operation; never repeat accepted recipients |
 | `device create`, `device revoke ID` | Local credential administration |
-| `store layout`, `store inspect`, `store journal`, `store export` | Bounded read-only decoding/export under local administrator authority |
+| `store layout`, `store inspect`, `store changes`, `store export` | Bounded read-only decoding/export under local administrator authority |
 | `store verify`, `store repair` | Read-only verification; explicit offline repair with a manifest |
 | `backup`, `restore`, `migrate` | Bounded, resumable tools using the storage contract |
 
@@ -1486,33 +1360,23 @@ reviewed artifact update. A test trust override must not disable verification.
 
 ## 8. On-disk store and crash consistency
 
-[STORAGE.md](STORAGE.md) is the normative physical storage specification.
-Read it before implementing persistence, queries, queues, migration or backup.
-It owns the directory/file layout, authoritative row model, binary container
-rules, transaction publication, checkpoint/replay, bounded read views,
-reclamation and inspection commands.
+[STORAGE.md](STORAGE.md) owns the SQLite metadata schema, immutable body
+layout, commit ordering, snapshots, checkpointing, reclamation and operational
+boundaries. SQLite metadata is authoritative for names, membership, flags,
+IDs, threading, submissions and history. Parsed-body/search caches are
+rebuildable; authoritative metadata is not. Raw message bytes remain `.eml`
+files and never enter SQL operation values.
 
-The chosen representation is ordinary immutable `.eml` files plus compact
-binary metadata inspected through td-mta commands. Folder names, membership,
-keywords, JMAP IDs/history and submission outcomes are authoritative metadata;
-message bytes alone cannot reconstruct them. Parsed headers, offsets and search
-indexes are disposable caches. Live metadata changes use the transaction API;
-direct file editing is unsupported. No database dependency is added.
-
-One sorted metadata checkpoint plus a bounded recent-change journal forms the
-current account state. The single writer pauses new mutation admission during
-checkpointing; readers pin a checkpoint and an exact committed journal prefix.
-This is a small purpose-built storage engine with explicit recovery obligations,
-not a claim that filesystem rename alone supplies multi-object transactions.
-Large message bytes are streamed and never included in metadata checkpoints.
-
-The core publication rule remains: sync new immutable bytes and their published
-directory entries, then append/sync the complete metadata transaction, then
-expose it and acknowledge success. Preserve queued transmitted bytes independently
-of the visible email's lifetime. A failed sync stops the writer for recovery.
-Storage corruption is distinct from a rebuildable index failure. Account backups
-pin one exact view; capturing all service secrets/configuration initially requires
-a stopped whole-service backup.
+Sync and publish immutable body bytes before their metadata transaction.
+SQLite WAL with synchronous FULL supplies metadata commit/recovery. Existing
+read transactions retain old snapshots; a verified body borrows that view.
+File collection requires durable row removal and no live views. An uncertain
+COMMIT retires the writer until reopen/recovery; never acknowledge before
+COMMIT succeeds. Preserve queue bytes independently of visible email lifetime.
+A stopped whole-service backup initially captures metadata and referenced files
+together. No custom journal, replay map, manifest or selector remains.
+Native allocation/RSS, fault injection, complete domain mutation policy and
+service deployment remain required before activating the store in protocols.
 
 ## 9. SMTP receiving and message representation
 
@@ -1777,7 +1641,7 @@ subjects, and recipient addresses; authorized inspection can retrieve details.
 One writer rotates by size using rename, retaining the configured generations.
 Bound log buffering; a flooded peer cannot block durable mail storage behind
 logging. Report suppressed-event counts and log-write failures in health plus
-a rate-limited stderr fallback. Logs are diagnostic evidence, not the journal
+a rate-limited stderr fallback. Logs are diagnostic evidence, not the metadata authority
 or an acceptance condition. The supervisor must not rotate the same files.
 
 Expose counters for accepted/refused mail, TLS/plain sessions, active slots,
@@ -1859,7 +1723,7 @@ V1 is ready only with reproducible evidence for all of the following:
   Provider assembly must have a supported implementation for each target; its
   presence alone does not prohibit reviewed per-architecture acceleration.
 - Syntax/confinement lint coverage and malformed-input property/fuzz fixtures
-  for SMTP, HTTP, JSON, MIME, config, journal, DNS and certificates. Fuzzing
+  for SMTP, HTTP, JSON, MIME, config, database rows, DNS and certificates. Fuzzing
   tooling is development-only and separately pinned/approved if external.
 - Allocation instrumentation of admitted hot operations, including error and
   logging paths; separate TLS/cold-path measurements. Pool exhaustion refuses

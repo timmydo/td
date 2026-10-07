@@ -373,109 +373,6 @@ fn key_value_checks_do_not_confuse_framing_with_semantics() -> Result<(), Box<dy
 }
 
 #[test]
-fn container_oracles_pin_extent_and_nested_row_bytes() -> Result<(), Box<dyn std::error::Error>> {
-    use td_mta::format::{scalar::Reader, *};
-    let format = fixture!("format");
-    assert_eq!(format.len(), FORMAT_BYTES);
-    assert_eq!(format.get(..8), Some(b"TDMTAFMT".as_slice()));
-    for (current, manifest, history) in [
-        (fixture!("current"), fixture!("manifest"), 0),
-        (fixture!("current-history"), fixture!("manifest-history"), 1),
-    ] {
-        assert_eq!(current.len(), CURRENT_BYTES);
-        assert_eq!(
-            manifest.len(),
-            MANIFEST_PREFIX_BYTES
-                + TABLE_COUNT * TABLE_DESCRIPTOR_BYTES
-                + history * HISTORY_DESCRIPTOR_BYTES
-                + MANIFEST_DIGEST_BYTES
-        );
-        let mut r = Reader::new(manifest.get(80..).ok_or("manifest prefix")?);
-        assert_eq!(r.u32()?, 11);
-        assert_eq!(r.u32()?, history as u32);
-        for tag in 1..=11 {
-            assert_eq!(r.u16()?, tag);
-            assert_eq!(r.u16()?, 1);
-            assert_eq!(r.u32()?, 0);
-            let count = r.u64()?;
-            let bytes = r.u64()?;
-            r.take(32)?;
-            if history == 1 && tag == 1 {
-                assert_eq!((count, bytes), (1, 225));
-            } else {
-                assert_eq!((count, bytes), (0, 112));
-            }
-        }
-        if history == 1 {
-            assert_eq!(r.u64()?, 1);
-            assert_eq!(r.u64()?, 0);
-            assert_eq!(r.u64()?, 1);
-            assert_eq!(r.u64()?, 277);
-            r.take(32)?;
-        }
-        r.take(32)?;
-        r.finish()?;
-    }
-    let table = fixture!("populated-blob-table");
-    let record = fixture!("record-blob");
-    assert_eq!(table.get(TABLE_HEADER_BYTES..), Some(record.as_slice()));
-    let mut r = Reader::new(&record);
-    assert_eq!(r.u32()?, 16);
-    assert_eq!(r.u32()?, 49);
-    assert_eq!(r.u64()?, 1);
-    assert_eq!(r.take(16)?, [0x44; 16]);
-    assert_eq!(r.take(49)?, fixture!("row-blob"));
-    r.take(32)?;
-    r.finish()?;
-    let frame = fixture!("frame-put-blob");
-    let journal = fixture!("journal-with-frame");
-    assert_eq!(
-        journal.get(..JOURNAL_HEADER_BYTES),
-        Some(fixture!("empty-journal").as_slice())
-    );
-    assert_eq!(journal.get(JOURNAL_HEADER_BYTES..), Some(frame.as_slice()));
-    for (frame, operations, sequence) in [(frame, 1, 1), (fixture!("frame-delete-change"), 2, 2)] {
-        let mut r = Reader::new(&frame);
-        assert_eq!(r.take(8)?, b"TDMTFRM1");
-        assert_eq!(r.u16()?, 1);
-        assert_eq!(r.u16()?, 1);
-        assert_eq!(r.u32()?, 0);
-        assert_eq!(r.u32()? as usize, frame.len());
-        assert_eq!(r.u32()?, operations);
-        assert_eq!(r.u64()?, sequence);
-        r.take(32)?;
-        for _ in 0..operations {
-            let op = r.u8()?;
-            let action = r.u8()?;
-            let tag = r.u16()?;
-            let key = r.u32()? as usize;
-            let value = r.u32()? as usize;
-            let keybytes = r.take(key)?;
-            let valuebytes = r.take(value)?;
-            if op == 1 {
-                assert_eq!(action, 0);
-                let table = Table::from_tag(tag)?;
-                let key = Key::decode(table, keybytes)?;
-                Row::decode(table, valuebytes)?.validate_key(key)?;
-            } else {
-                assert!(op == 2 || op == 3);
-                assert_eq!(key, 16);
-                assert_eq!(value, 0);
-                if op == 2 {
-                    assert_eq!((action, tag), (0, 1));
-                } else {
-                    assert_eq!((action, tag), (3, 3));
-                }
-            }
-        }
-        assert_eq!(r.take(8)?, b"TDMTEND1");
-        r.take(32)?;
-        r.finish()?;
-    }
-    Ok(())
-}
-
-#[test]
 fn submission_count_uses_the_collection_limit_error() -> Result<(), Box<dyn std::error::Error>> {
     let bytes = fixture!("row-submission");
     let Row::Submission(base) = Row::decode(Table::Submissions, &bytes)? else {
@@ -649,100 +546,6 @@ fn structurally_valid_fields_still_require_semantic_validation(
 }
 
 #[test]
-fn every_container_fixture_has_the_selected_identity_and_extent(
-) -> Result<(), Box<dyn std::error::Error>> {
-    use td_mta::format::scalar::Reader;
-    for (bytes, tag, generation, checkpoint) in [
-        (fixture!("empty-table-1"), 1, 1, 0),
-        (fixture!("empty-table-2"), 2, 1, 0),
-        (fixture!("empty-table-3"), 3, 1, 0),
-        (fixture!("empty-table-4"), 4, 1, 0),
-        (fixture!("empty-table-5"), 5, 1, 0),
-        (fixture!("empty-table-6"), 6, 1, 0),
-        (fixture!("empty-table-7"), 7, 1, 0),
-        (fixture!("empty-table-8"), 8, 1, 0),
-        (fixture!("empty-table-9"), 9, 1, 0),
-        (fixture!("empty-table-10"), 10, 1, 0),
-        (fixture!("empty-table-11"), 11, 1, 0),
-        (fixture!("checkpoint-table-2"), 2, 2, 1),
-        (fixture!("checkpoint-table-3"), 3, 2, 1),
-        (fixture!("checkpoint-table-4"), 4, 2, 1),
-        (fixture!("checkpoint-table-5"), 5, 2, 1),
-        (fixture!("checkpoint-table-6"), 6, 2, 1),
-        (fixture!("checkpoint-table-7"), 7, 2, 1),
-        (fixture!("checkpoint-table-8"), 8, 2, 1),
-        (fixture!("checkpoint-table-9"), 9, 2, 1),
-        (fixture!("checkpoint-table-10"), 10, 2, 1),
-        (fixture!("checkpoint-table-11"), 11, 2, 1),
-    ] {
-        let mut r = Reader::new(&bytes);
-        assert_eq!(r.take(8)?, b"TDMTTBL1");
-        assert_eq!(r.u16()?, 1);
-        assert_eq!(r.u16()?, 1);
-        assert_eq!(r.u16()?, tag);
-        assert_eq!(r.u16()?, 0);
-        assert_eq!(r.take(16)?, [0x33; 16]);
-        assert_eq!(r.take(16)?, [0x22; 16]);
-        assert_eq!(r.u64()?, generation);
-        assert_eq!(r.u64()?, checkpoint);
-        assert_eq!(r.u64()?, 0);
-        assert_eq!(r.u64()?, 0);
-        r.take(32)?;
-        r.finish()?;
-    }
-    for (bytes, segment, base, frames) in [
-        (fixture!("empty-journal"), 1, 0, 0),
-        (fixture!("journal-with-frame"), 1, 0, 181),
-        (fixture!("active-journal-two"), 2, 1, 0),
-    ] {
-        let mut r = Reader::new(&bytes);
-        assert_eq!(r.take(8)?, b"TDMTJNL1");
-        assert_eq!(r.u16()?, 1);
-        assert_eq!(r.u16()?, 1);
-        assert_eq!(r.u32()?, 0);
-        assert_eq!(r.take(16)?, [0x33; 16]);
-        assert_eq!(r.take(16)?, [0x22; 16]);
-        assert_eq!(r.u64()?, segment);
-        assert_eq!(r.u64()?, base);
-        r.take(32)?;
-        assert_eq!(r.remaining().len(), frames);
-    }
-    for (current, manifest, generation, checkpoint, segment) in [
-        (fixture!("current"), fixture!("manifest"), 1, 0, 1),
-        (
-            fixture!("current-history"),
-            fixture!("manifest-history"),
-            2,
-            1,
-            2,
-        ),
-    ] {
-        let mut r = Reader::new(&current);
-        assert_eq!(r.take(8)?, b"TDMTCUR1");
-        assert_eq!(r.u16()?, 1);
-        assert_eq!(r.u16()?, 1);
-        assert_eq!(r.u32()?, 0);
-        assert_eq!(r.take(16)?, [0x33; 16]);
-        assert_eq!(r.take(16)?, [0x22; 16]);
-        assert_eq!(r.u64()?, generation);
-        r.take(64)?;
-        r.finish()?;
-        let mut r = Reader::new(&manifest);
-        assert_eq!(r.take(8)?, b"TDMTMAN1");
-        assert_eq!(r.u16()?, 1);
-        assert_eq!(r.u16()?, 1);
-        assert_eq!(r.u32()?, 0);
-        assert_eq!(r.take(16)?, [0x33; 16]);
-        assert_eq!(r.take(16)?, [0x22; 16]);
-        assert_eq!(r.u64()?, generation);
-        assert_eq!(r.u64()?, checkpoint);
-        assert_eq!(r.u64()?, segment);
-        assert_eq!(r.u64()?, checkpoint);
-    }
-    Ok(())
-}
-
-#[test]
 fn source_preimage_literals_pin_raw_id_sort_and_optional_lengths(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use td_mta::format::scalar::Reader;
@@ -803,105 +606,6 @@ fn hash_matches(input: &[u8], expected: &[u8]) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-fn hash_at(bytes: &[u8], end: usize) -> Result<(), Box<dyn std::error::Error>> {
-    hash_matches(
-        bytes.get(..end).ok_or("preimage extent")?,
-        bytes
-            .get(end..end.checked_add(32).ok_or("digest overflow")?)
-            .ok_or("digest extent")?,
-    )
-}
-
-#[test]
-fn provider_hashes_container_and_binding_fixtures() -> Result<(), Box<dyn std::error::Error>> {
-    hash_at(&fixture!("format"), 48)?;
-    let initial_tables = [
-        fixture!("empty-table-1"),
-        fixture!("empty-table-2"),
-        fixture!("empty-table-3"),
-        fixture!("empty-table-4"),
-        fixture!("empty-table-5"),
-        fixture!("empty-table-6"),
-        fixture!("empty-table-7"),
-        fixture!("empty-table-8"),
-        fixture!("empty-table-9"),
-        fixture!("empty-table-10"),
-        fixture!("empty-table-11"),
-    ];
-    let checkpoint_tables = [
-        fixture!("populated-blob-table"),
-        fixture!("checkpoint-table-2"),
-        fixture!("checkpoint-table-3"),
-        fixture!("checkpoint-table-4"),
-        fixture!("checkpoint-table-5"),
-        fixture!("checkpoint-table-6"),
-        fixture!("checkpoint-table-7"),
-        fixture!("checkpoint-table-8"),
-        fixture!("checkpoint-table-9"),
-        fixture!("checkpoint-table-10"),
-        fixture!("checkpoint-table-11"),
-    ];
-    for table in initial_tables.iter().chain(&checkpoint_tables) {
-        hash_at(table, 80)?;
-    }
-    let record = fixture!("record-blob");
-    hash_at(
-        &record,
-        record.len().checked_sub(32).ok_or("record footer")?,
-    )?;
-    assert_eq!(
-        checkpoint_tables.first().ok_or("blob table")?.get(112..),
-        Some(record.as_slice())
-    );
-    for journal in [
-        fixture!("empty-journal"),
-        fixture!("journal-with-frame"),
-        fixture!("active-journal-two"),
-    ] {
-        hash_at(&journal, 64)?;
-    }
-    for frame in [fixture!("frame-put-blob"), fixture!("frame-delete-change")] {
-        hash_at(&frame, 32)?;
-        hash_at(&frame, frame.len().checked_sub(32).ok_or("frame footer")?)?;
-    }
-    assert_eq!(
-        fixture!("journal-with-frame").get(96..),
-        Some(fixture!("frame-put-blob").as_slice())
-    );
-    for (current, manifest, tables) in [
-        (fixture!("current"), fixture!("manifest"), &initial_tables),
-        (
-            fixture!("current-history"),
-            fixture!("manifest-history"),
-            &checkpoint_tables,
-        ),
-    ] {
-        hash_at(&current, 88)?;
-        hash_at(
-            &manifest,
-            manifest.len().checked_sub(32).ok_or("manifest footer")?,
-        )?;
-        hash_matches(
-            &manifest,
-            current.get(56..88).ok_or("CURRENT manifest hash")?,
-        )?;
-        for (index, table) in tables.iter().enumerate() {
-            // Descriptor hash follows its 24-byte fields, after 88-byte prefix.
-            let start = 88 + index * 56 + 24;
-            hash_matches(table, manifest.get(start..start + 32).ok_or("table hash")?)?;
-        }
-    }
-    let history = fixture!("manifest-history");
-    // The sole history descriptor follows all eleven table descriptors.
-    let start = 88 + 11 * 56 + 32;
-    hash_matches(
-        &fixture!("journal-with-frame"),
-        history.get(start..start + 32).ok_or("history hash")?,
-    )?;
-    hash_matches(b"abc", fixture!("row-blob").get(9..41).ok_or("blob hash")?)?;
-    Ok(())
-}
-
 #[test]
 fn provider_hashes_import_snapshot_fixtures() -> Result<(), Box<dyn std::error::Error>> {
     for (preimage, digest) in [
@@ -916,5 +620,14 @@ fn provider_hashes_import_snapshot_fixtures() -> Result<(), Box<dyn std::error::
     ] {
         hash_matches(&hex(preimage)?, &hex(digest)?)?;
     }
+    Ok(())
+}
+
+#[test]
+fn provider_hashes_blob_fixture() -> Result<(), Box<dyn std::error::Error>> {
+    hash_matches(
+        b"abc",
+        &hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")?,
+    )?;
     Ok(())
 }

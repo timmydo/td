@@ -368,12 +368,17 @@ message.
   exception is `td-crypto`'s private Rustls/AWS-LC closure: exact manifests,
   locks, root Cargo configuration and active features are pinned in `builder/src/crypto_policy.rs`.
   `td-mta` depends directly on local `td-crypto` and std-only `td-header`
-  plus `td-json`, `td-mime` and `td-nfc`; its lock includes their closures. All six
+  plus `td-json`, `td-mime` and `td-nfc`, and the approved private
+  `rusqlite` 0.40.2 closure with source-built bundled SQLite 3.53.2. Its
+  exact manifest, lock and active features are pinned in the same policy.
+  Its lock includes these closures. All six
   local manifests and locks are pinned. No other roster crate may depend
   on `td-crypto` or `td-mta`, directly or transitively; `td-header`,
   `td-json`, `td-mime` and `td-nfc` remain
   ordinary std-only shared crates.
-  `td-crypto/DESIGN.md` owns offline preparation and backend confinement.
+  `td-crypto/DESIGN.md` owns offline preparation and crypto confinement;
+  `td-mta/STORAGE.md` owns the private SQLite boundary. No other roster
+  crate may consume the SQLite closure, directly or transitively.
   Any new external dependency needs principle-2 sign-off.
 - A new standalone crate joins the gate by EXISTING: `builder/src/affected.rs`
   discovers every `td-*/Cargo.toml` at the repo root and derives both the

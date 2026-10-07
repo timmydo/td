@@ -220,7 +220,7 @@ inputs consumed by RESOURCES.md and ADMISSION.md's planners. The supported v1
 key vocabulary is listed below and pinned by an independent test oracle.
 Adding a declaration must reconcile that vocabulary and this schema. The
 Limits declaration separates configurable values from fixed storage and
-execution constants. Fixed journal/frame sizes/counts and the single outbound
+execution constants. Fixed SQLite heap and transaction sizes/counts and the single outbound
 worker are not operator keys; spelling them in a file is an unknown-field
 error even when the supplied value equals the constant.
 
@@ -230,7 +230,7 @@ error even when the supplied value equals the constant.
 `event_streams`, `body_jobs`, `storage_views`, `message_bytes`,
 `header_bytes`, `mime_depth`, `mime_parts`, `smtp_recipients`, `json_bytes`,
 `json_methods`, `json_depth`, `json_tokens`, `objects_per_method`,
-`query_page`, `index_cache_bytes`, `journal_bytes`, `upload_disk_bytes`,
+`query_page`, `index_cache_bytes`, `upload_disk_bytes`,
 `upload_expiry_seconds`, `queue_disk_bytes`, `queue_submissions`,
 `sort_disk_bytes`, `log_file_bytes`, `retained_logs`, `memory_budget_bytes`.
 
@@ -241,9 +241,13 @@ the budget alone does not change connection counts or the RSS release targets.
 
 ### `[disk]`
 
-`body_bytes`, `body_files`, `live_metadata_bytes`, `checkpoint_bytes`,
+`body_bytes`, `body_files`, `metadata_bytes`, `wal_bytes`,
 `response_bytes`, `response_total_bytes`, `cache_bytes`, `cold_bytes`.
 These are logical quotas; physical free-space settings are not supported.
+`metadata_bytes` is retained as an admission key and must equal the core
+32 MiB ceiling (33554432). `wal_bytes` must cover the fixed 67502144-byte
+core ceiling; raising this logical reservation does not enlarge SQLite WAL
+capacity. Native heap, page and transaction limits remain fixed.
 
 ### `[work]`
 

@@ -1,4 +1,4 @@
-//! Borrowed PUT/DELETE/CHANGE bytes. Frame integrity and transaction semantics are separate.
+//! Borrowed PUT/DELETE/CHANGE bytes. SQLite owns transaction integrity; domain policy is separate.
 use super::{
     key::Key,
     row,

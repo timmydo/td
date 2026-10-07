@@ -31,11 +31,6 @@ impl LockedRoot {
             AccountEntry::Root
                 | AccountEntry::Messages
                 | AccountEntry::Uploads
-                | AccountEntry::Metadata
-                | AccountEntry::Checkpoints
-                | AccountEntry::Checkpoint(_)
-                | AccountEntry::Journals
-                | AccountEntry::Cache
                 | AccountEntry::Temporary
                 | AccountEntry::Shard(_, _)
         ) {
@@ -110,11 +105,6 @@ mod tests {
             AccountEntry::Root,
             AccountEntry::Messages,
             AccountEntry::Uploads,
-            AccountEntry::Metadata,
-            AccountEntry::Checkpoints,
-            AccountEntry::Checkpoint(number),
-            AccountEntry::Journals,
-            AccountEntry::Cache,
             AccountEntry::Temporary,
             AccountEntry::Shard(BlobKind::Message, 1),
             AccountEntry::Shard(BlobKind::Upload, 2),
@@ -133,13 +123,8 @@ mod tests {
             assert_eq!(fs::read(path.join("marker")).unwrap(), b"preserve");
         }
         for entry in [
-            AccountEntry::Current,
-            AccountEntry::CurrentTemporary(number),
-            AccountEntry::Manifest(number),
-            AccountEntry::Journal(number),
             AccountEntry::TemporaryFile(number),
             AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([1; 16])),
-            AccountEntry::Table(number, crate::format::Table::Emails),
         ] {
             assert!(
                 matches!(root.create_account_directory(account, entry), Err(CreateError::Uncreated(e)) if e.kind() == io::ErrorKind::InvalidInput)

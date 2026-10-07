@@ -237,10 +237,7 @@ pub(crate) mod tests {
         ViewIdentity {
             account: AccountId::from_bytes([6; 16]),
             epoch: StoreEpoch::from_bytes([7; 16]),
-            generation: 1,
-            checkpoint: Sequence::from_u64(1),
-            segment: 2,
-            committed_offset: 256,
+
             committed_sequence: Sequence::from_u64(2),
             history_floor: Sequence::default(),
         }
@@ -340,7 +337,7 @@ pub(crate) mod tests {
         ) -> Result<Option<(Row<'a>, Sequence)>, ports::Error> {
             self.gets += 1;
             if self.move_get {
-                self.identity.generation += 1;
+                self.identity.epoch = crate::ids::StoreEpoch::from_bytes([99; 16]);
             }
             if self.get_error {
                 return Err(ports::Error::Capacity);
@@ -369,7 +366,7 @@ pub(crate) mod tests {
         ) -> Result<Option<Record<'a>>, ports::Error> {
             self.nexts += 1;
             if self.moved {
-                self.identity.generation += 1;
+                self.identity.epoch = crate::ids::StoreEpoch::from_bytes([99; 16]);
             }
             if self.error {
                 return Err(ports::Error::Capacity);
@@ -584,7 +581,7 @@ pub(crate) mod tests {
                 0 => view.error = true,
                 1 => view.rows[0].row = Row::Thread,
                 2 => view.rows[0].last_change = Sequence::from_u64(3),
-                3 => view.identity.generation += 1,
+                3 => view.identity.epoch = crate::ids::StoreEpoch::from_bytes([99; 16]),
                 4 => view.moved = true,
                 5 => {
                     view.moved = true;
@@ -627,7 +624,7 @@ pub(crate) mod tests {
         }
         assert!(sweep.is_complete());
         let calls = (view.nexts, view.gets);
-        view.identity.generation += 1;
+        view.identity.epoch = crate::ids::StoreEpoch::from_bytes([99; 16]);
         assert_eq!(
             sweep.advance(&mut view, &mut [], &mut []),
             Err(Error::ChangedView)

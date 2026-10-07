@@ -40,12 +40,12 @@ fn check(bytes: &[u8], expected: Operation<'_>) {
     assert_eq!(extent(&bytes[..13]), Err(Error::TrailingBytes));
 }
 #[test]
-fn independent_frame_payloads_pin_all_three_operation_encodings() {
-    let put = hex(include_str!("fixtures/format-v1/frame-put-blob.hex"));
+fn independent_payloads_pin_all_three_operation_encodings() {
+    let put = hex(include_str!("fixtures/format-v1/operation-put-blob.hex"));
     let row = hex(include_str!("fixtures/format-v1/row-blob.hex"));
     let key = [0x44; 16];
     let operation = Operation::put(Table::Blobs, &key, &row).unwrap();
-    check(&put[64..put.len() - 40], operation);
+    check(&put, operation);
     assert_eq!(operation.kind(), OperationKind::Put);
     assert_eq!(operation.type_tag(), 1);
     assert_eq!(operation.key_bytes(), key);
@@ -57,9 +57,11 @@ fn independent_frame_payloads_pin_all_three_operation_encodings() {
             row: Row::decode(Table::Blobs, &row).unwrap(),
         })
     );
-    let pair = hex(include_str!("fixtures/format-v1/frame-delete-change.hex"));
+    let pair = hex(include_str!(
+        "fixtures/format-v1/operation-delete-change.hex"
+    ));
     let deletion = Operation::delete(Table::Blobs, &key).unwrap();
-    check(&pair[64..92], deletion);
+    check(&pair[..28], deletion);
     assert_eq!(
         deletion.value(),
         Value::Row(Mutation::Delete(Key::Blob(BlobId::from_bytes(key))))
@@ -67,7 +69,7 @@ fn independent_frame_payloads_pin_all_three_operation_encodings() {
     assert_eq!(deletion.kind(), OperationKind::Delete);
     let id = [0x77; 16];
     let change = Operation::change(ObjectType::Email, ChangeAction::Destroyed, &id);
-    check(&pair[92..120], change);
+    check(&pair[28..56], change);
     assert_eq!(
         change.value(),
         Value::Change(Change {
@@ -179,8 +181,8 @@ fn deletion_validates_the_selected_tables_entire_key_grammar() {
 }
 #[test]
 fn malformed_operation_prefixes_and_rows_are_refused_without_integrity_claims() {
-    let literal = hex(include_str!("fixtures/format-v1/frame-put-blob.hex"));
-    let payload = &literal[64..literal.len() - 40];
+    let literal = hex(include_str!("fixtures/format-v1/operation-put-blob.hex"));
+    let payload = &literal;
     for (offset, byte) in [(0, 0), (0, 4), (1, 1), (2, 0), (2, 12)] {
         let mut bytes = payload.to_vec();
         bytes[offset] = byte;

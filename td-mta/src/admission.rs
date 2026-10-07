@@ -3,7 +3,6 @@ use crate::limits::ResourcePlan;
 
 pub const MIB: u64 = 1 << 20;
 pub const GIB: u64 = 1 << 30;
-pub const HISTORY_BYTES: u64 = 128 * MIB;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -61,14 +60,12 @@ pub mod quota;
 pub mod timers;
 #[path = "admission/work.rs"]
 pub mod work;
-#[path = "admission/writer.rs"]
-pub mod writer;
 
 settings! { DiskLimits {
     body_bytes: 4 * GIB, 1, 1024 * GIB;
     body_files: 250000, 1, 1000000;
-    live_metadata_bytes: 256 * MIB, 1, GIB;
-    checkpoint_bytes: 2 * GIB, 1, 8 * GIB;
+    metadata_bytes: 32 * MIB, 1, 32 * MIB;
+    wal_bytes: 2 * (8192 * (4096 + 24) + 32), 1, 128 * MIB;
     response_bytes: 128 * MIB, 1, GIB;
     response_total_bytes: 256 * MIB, 1, 4 * GIB;
     cache_bytes: 128 * MIB, 1024, GIB;
@@ -111,10 +108,6 @@ pub struct Plan {
     disk: DiskLimits,
     work: WorkLimits,
     view_mode: ViewMode,
-    active_journal_bytes: u64,
-    active_journal_operations: u64,
-    closed_journal_bytes: u64,
-    closed_journal_segments: u64,
     minimum_response_bytes: u64,
     log_bytes: u64,
     upload_bytes: u64,
@@ -132,18 +125,6 @@ impl Plan {
     }
     pub fn view_mode(&self) -> ViewMode {
         self.view_mode
-    }
-    pub fn active_journal_bytes(&self) -> u64 {
-        self.active_journal_bytes
-    }
-    pub fn active_journal_operations(&self) -> u64 {
-        self.active_journal_operations
-    }
-    pub fn closed_journal_bytes(&self) -> u64 {
-        self.closed_journal_bytes
-    }
-    pub fn closed_journal_segments(&self) -> u64 {
-        self.closed_journal_segments
     }
     pub fn minimum_response_bytes(&self) -> u64 {
         self.minimum_response_bytes
@@ -191,42 +172,22 @@ impl DiskLimits {
     ) -> Result<Plan, Error> {
         self.validate()?;
         work.validate()?;
-        require(
-            self.live_metadata_bytes
-                >= mul(
-                    widen(crate::format::TABLE_COUNT, "table count")?,
-                    widen(crate::format::TABLE_HEADER_BYTES, "table header bytes")?,
-                    "empty metadata headers",
-                )?,
-            "live metadata quota must fit empty table headers",
-        )?;
         let limits = resources.limits();
-        let journal = widen(limits.journal_bytes, "journal bytes")?;
-        let operations = widen(limits.journal_operations, "journal operations")?;
-        let sort = widen(limits.sort_disk_bytes, "sort bytes")?;
-        let generations = add(
-            widen(limits.storage_views, "storage views")?,
-            1,
-            "closed journal generations",
+        require(
+            self.metadata_bytes >= 32 * MIB,
+            "metadata quota must fit SQLite page ceiling",
         )?;
-        let closed_journal_bytes = mul(
-            generations,
-            add(HISTORY_BYTES, journal, "closed journal length")?,
-            "closed journal cap",
+        require(
+            self.wal_bytes >= 2 * (8192 * (4096 + 24) + 32),
+            "WAL quota must fit bounded transaction overlap",
         )?;
-        let closed_journal_segments = mul(
-            generations,
-            add(
-                widen(crate::format::MAX_HISTORY_DESCRIPTORS, "history segments")?,
-                1,
-                "history segments",
-            )?,
-            "closed journal segments",
+        require(
+            self.body_bytes >= widen(limits.message_bytes, "message bytes")?,
+            "raw quota must fit one maximum message",
         )?;
-        let checkpoint = add(
-            add(self.live_metadata_bytes, journal, "checkpoint projection")?,
-            MIB,
-            "checkpoint projection",
+        require(
+            self.response_bytes <= self.response_total_bytes,
+            "per-request retention exceeds aggregate retention",
         )?;
         let minimum_response_bytes = add(
             add(
@@ -242,119 +203,65 @@ impl DiskLimits {
                 )?,
                 "response framing",
             )?,
-            64 * 1024,
+            65536,
             "response framing",
         )?;
-        let gc_io = add(
-            add(
-                mul(4, self.live_metadata_bytes, "GC I/O")?,
-                mul(16, sort, "GC I/O")?,
-                "GC I/O",
-            )?,
-            add(mul(8, journal, "GC I/O")?, 16 * MIB, "GC I/O")?,
-            "GC I/O",
+        require(
+            self.response_bytes >= minimum_response_bytes,
+            "request retention cannot hold mandatory framing",
         )?;
-        let gc_records = add(
-            mul(
-                16,
-                add(self.live_metadata_bytes / 64, self.body_files, "GC records")?,
-                "GC records",
-            )?,
-            mul(16, operations, "GC records")?,
-            "GC records",
-        )?;
-        for (condition, rule) in [
-            (
-                self.body_bytes >= widen(limits.message_bytes, "message bytes")?,
-                "raw body quota must fit one maximum message",
-            ),
-            (
-                self.response_bytes <= self.response_total_bytes,
-                "per-request retention exceeds aggregate retention",
-            ),
-            (
-                self.response_bytes >= minimum_response_bytes,
-                "request retention cannot hold mandatory framing",
-            ),
-            (
-                self.checkpoint_bytes >= mul(4, checkpoint, "checkpoint quota")?,
-                "checkpoint quota cannot hold generation overlap",
-            ),
-            (
-                work.checkpoint_io_bytes >= mul(2, checkpoint, "checkpoint I/O")?,
-                "checkpoint I/O cannot cover configured metadata",
-            ),
-            (
-                work.gc_io_bytes >= gc_io,
-                "GC I/O cannot cover configured capacities",
-            ),
-            (
-                work.gc_records >= gc_records,
-                "GC records cannot cover configured capacities",
-            ),
-            (
-                work.gc_seconds >= add(work.checkpoint_seconds, work.commit_seconds, "GC time")?,
-                "GC time must include checkpoint and commit",
-            ),
-            (
-                views != ViewMode::OnlineBackground || limits.storage_views >= 2,
-                "background work requires a foreground read view",
-            ),
-        ] {
-            require(condition, rule)?;
+        if views == ViewMode::OnlineBackground {
+            require(
+                limits.storage_views >= 2,
+                "online background work requires another view",
+            )?;
         }
         Ok(Plan {
             disk: self,
             work,
             view_mode: views,
-            active_journal_bytes: journal,
-            active_journal_operations: operations,
-            closed_journal_bytes,
-            closed_journal_segments,
             minimum_response_bytes,
-            log_bytes: widen(resources.log_disk_bytes(), "logs")?,
-            upload_bytes: widen(limits.upload_disk_bytes, "upload quota")?,
-            queue_bytes: widen(limits.queue_disk_bytes, "queue quota")?,
-            queue_submissions: widen(limits.queue_submissions, "queue count")?,
-            sort_bytes: sort,
+            log_bytes: widen(resources.log_disk_bytes(), "log bytes")?,
+            upload_bytes: widen(limits.upload_disk_bytes, "upload bytes")?,
+            queue_bytes: widen(limits.queue_disk_bytes, "queue bytes")?,
+            queue_submissions: widen(limits.queue_submissions, "queue submissions")?,
+            sort_bytes: widen(limits.sort_disk_bytes, "sort bytes")?,
         })
     }
 }
-
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::limits::Limits;
-
     #[test]
-    fn default_disk_and_work_plan_pins_independent_numeric_oracles(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let resources = Limits::default().plan()?;
-        let plan = DiskLimits::default().plan(
-            &resources,
-            WorkLimits::default(),
-            ViewMode::OnlineBackground,
-        )?;
-        assert_eq!(plan.disk().body_bytes, 4294967296);
-        assert_eq!(plan.closed_journal_bytes(), 415236096);
-        assert_eq!(plan.closed_journal_segments(), 195);
-        assert_eq!(plan.minimum_response_bytes(), 33685504);
-        assert_eq!(plan.log_bytes(), 41943040);
-        assert_eq!(plan.upload_bytes(), 134217728);
-        assert_eq!(plan.queue_bytes(), 268435456);
-        assert_eq!(plan.queue_submissions(), 1000);
-        assert_eq!(plan.sort_bytes(), 67108864);
-        assert_eq!(plan.work().foreground_io_bytes, 8589934592);
-        Ok(())
+    fn sqlite_page_and_wal_caps_are_independently_admitted() {
+        let resources = crate::limits::Limits::default().plan().unwrap();
+        assert!(DiskLimits::default()
+            .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
+            .is_ok());
+        let disk = DiskLimits {
+            metadata_bytes: 32 * MIB - 1,
+            ..DiskLimits::default()
+        };
+        assert!(disk
+            .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
+            .is_err());
+        let disk = DiskLimits {
+            wal_bytes: 2 * (8192 * (4096 + 24) + 32) - 1,
+            ..DiskLimits::default()
+        };
+        assert!(disk
+            .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
+            .is_err());
     }
 
     #[test]
-    fn mandatory_response_and_generation_limits_are_exact() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let resources = Limits::default().plan()?;
+    fn retained_response_view_and_sort_admission_boundaries(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let resources = crate::limits::Limits::default().plan()?;
         let disk = DiskLimits {
             response_bytes: 33685504,
-            checkpoint_bytes: 1094713344,
             ..DiskLimits::default()
         };
         assert!(disk
@@ -367,114 +274,24 @@ mod tests {
         .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
         .is_err());
         assert!(DiskLimits {
-            checkpoint_bytes: 1094713343,
-            ..disk
-        }
-        .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
-        .is_err());
-        assert!(DiskLimits {
             response_total_bytes: 33685503,
             ..disk
         }
         .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
         .is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn raised_metadata_requires_raised_maintenance_work() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let resources = Limits::default().plan()?;
-        let disk = DiskLimits {
-            live_metadata_bytes: GIB,
-            checkpoint_bytes: 8 * GIB,
-            ..DiskLimits::default()
-        };
-        assert!(disk
-            .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
-            .is_err());
-        let work = WorkLimits {
-            checkpoint_io_bytes: 3 * GIB,
-            gc_records: 300000000,
-            ..WorkLimits::default()
-        };
-        assert!(disk
-            .plan(&resources, work, ViewMode::ForegroundOnly)
-            .is_ok());
-        assert!(disk
-            .plan(
-                &resources,
-                WorkLimits {
-                    gc_records: 128000000,
-                    ..work
-                },
-                ViewMode::ForegroundOnly
-            )
-            .is_err());
-        assert!(disk
-            .plan(
-                &resources,
-                WorkLimits {
-                    gc_seconds: 120,
-                    checkpoint_seconds: 120,
-                    ..work
-                },
-                ViewMode::ForegroundOnly
-            )
-            .is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn maintenance_capacity_relations_refuse_one_below_exact_boundaries(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let resources = Limits {
-            sort_disk_bytes: 256 * crate::limits::MIB,
-            ..Limits::default()
+        let one = crate::limits::Limits {
+            storage_views: 1,
+            ..crate::limits::Limits::default()
         }
         .plan()?;
-        let disk = DiskLimits {
-            live_metadata_bytes: GIB,
-            checkpoint_bytes: 8 * GIB,
-            ..DiskLimits::default()
-        };
-        let work = WorkLimits {
-            checkpoint_io_bytes: 2157969408,
-            gc_io_bytes: 8640266240,
-            gc_records: 272566528,
-            checkpoint_seconds: 90,
-            commit_seconds: 60,
-            gc_seconds: 150,
-            ..WorkLimits::default()
-        };
         assert!(disk
-            .plan(&resources, work, ViewMode::OnlineBackground)
+            .plan(&one, WorkLimits::default(), ViewMode::OnlineBackground)
+            .is_err());
+        assert!(disk
+            .plan(&one, WorkLimits::default(), ViewMode::ForegroundOnly)
             .is_ok());
-        for insufficient in [
-            WorkLimits {
-                checkpoint_io_bytes: 2157969407,
-                ..work
-            },
-            WorkLimits {
-                gc_io_bytes: 8640266239,
-                ..work
-            },
-            WorkLimits {
-                gc_records: 272566527,
-                ..work
-            },
-            WorkLimits {
-                gc_seconds: 149,
-                ..work
-            },
-        ] {
-            assert!(disk
-                .plan(&resources, insufficient, ViewMode::OnlineBackground)
-                .is_err());
-        }
         Ok(())
     }
-
     #[test]
     fn logical_subquotas_do_not_reserve_whole_message_capacity(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -490,7 +307,6 @@ mod tests {
         let plan = disk.plan(&resources, work, ViewMode::ForegroundOnly)?;
         assert_eq!(plan.upload_bytes(), 1);
         assert_eq!(plan.queue_bytes(), 1);
-        assert_eq!(plan.closed_journal_segments(), 130);
         assert_eq!(plan.view_mode(), ViewMode::ForegroundOnly);
         let small_quotas = Limits {
             upload_disk_bytes: 1,
@@ -562,7 +378,7 @@ mod tests {
             })
         ));
         let minimum = DiskLimits {
-            live_metadata_bytes: 1232,
+            metadata_bytes: 32 * MIB,
             cache_bytes: 1024,
             ..DiskLimits::default()
         };
@@ -571,7 +387,7 @@ mod tests {
             .is_ok());
         for disk in [
             DiskLimits {
-                live_metadata_bytes: 1231,
+                metadata_bytes: 32 * MIB - 1,
                 ..minimum
             },
             DiskLimits {

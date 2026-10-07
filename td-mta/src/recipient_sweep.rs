@@ -311,10 +311,7 @@ pub(crate) mod tests {
         ViewIdentity {
             account: AccountId::from_bytes([1; 16]),
             epoch: StoreEpoch::from_bytes([2; 16]),
-            generation: 1,
-            checkpoint: Sequence::from_u64(1),
-            segment: 2,
-            committed_offset: 256,
+
             committed_sequence: Sequence::from_u64(2),
             history_floor: Sequence::default(),
         }
@@ -411,7 +408,7 @@ pub(crate) mod tests {
         ) -> Result<Option<Record<'a>>, ports::Error> {
             self.calls += 1;
             if self.moved {
-                self.identity.generation += 1;
+                self.identity.epoch = crate::ids::StoreEpoch::from_bytes([99; 16]);
             }
             if self.error {
                 return Err(ports::Error::Capacity);
@@ -675,7 +672,7 @@ pub(crate) mod tests {
                 }
                 let calls = view.calls;
                 match mode {
-                    0 => view.identity.generation += 1,
+                    0 => view.identity.epoch = crate::ids::StoreEpoch::from_bytes([99; 16]),
                     1 => view.moved = true,
                     2 => {
                         view.moved = true;
@@ -743,7 +740,7 @@ pub(crate) mod tests {
                 .advance(&mut view, &mut [0; 20], &mut [0; 512])
                 .unwrap();
         }
-        view.identity.generation += 1;
+        view.identity.epoch = crate::ids::StoreEpoch::from_bytes([99; 16]);
         assert_eq!(
             sweep.advance(&mut view, &mut [], &mut []),
             Err(Error::ChangedView)

@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)]
 use td_mta::{
-    format::{row::BlobKind, Table},
+    format::row::BlobKind,
     ids::{AccountId, BlobId},
     store_paths::{parse_blob_name, AccountEntry, Error, Name, Number, RootEntry, CAPACITY},
 };
@@ -79,73 +79,31 @@ fn canonical_storage_numbers_cover_width_transitions_and_exhaustion() {
 #[test]
 fn generated_layout_matches_literal_paths() {
     for (entry, text) in [
-        (RootEntry::Format, "FORMAT"),
+        (RootEntry::Database, "metadata.sqlite3"),
+        (RootEntry::Wal, "metadata.sqlite3-wal"),
+        (RootEntry::SharedMemory, "metadata.sqlite3-shm"),
         (RootEntry::Lock, "LOCK"),
         (RootEntry::Accounts, "accounts"),
     ] {
         check(&Name::root(entry).unwrap(), text);
     }
     let account = AccountId::parse("000102030405060708090a0b0c0d0e0f").unwrap();
-    let number = Number::new(42).unwrap();
     for (entry, suffix) in [
         (AccountEntry::Root, ""),
         (AccountEntry::Messages, "/messages"),
         (AccountEntry::Uploads, "/uploads"),
-        (AccountEntry::Metadata, "/metadata"),
-        (AccountEntry::Current, "/metadata/CURRENT"),
-        (AccountEntry::Checkpoints, "/metadata/checkpoints"),
-        (
-            AccountEntry::Checkpoint(number),
-            "/metadata/checkpoints/00000000000000000042",
-        ),
-        (
-            AccountEntry::Manifest(number),
-            "/metadata/checkpoints/00000000000000000042/manifest",
-        ),
-        (AccountEntry::Journals, "/metadata/journal"),
-        (
-            AccountEntry::Journal(number),
-            "/metadata/journal/00000000000000000042.log",
-        ),
-        (AccountEntry::Cache, "/cache"),
         (AccountEntry::Temporary, "/tmp"),
         (
-            AccountEntry::TemporaryFile(number),
+            AccountEntry::TemporaryFile(Number::new(42).unwrap()),
             "/tmp/00000000000000000042.tmp",
         ),
+        (AccountEntry::Shard(BlobKind::Message, 255), "/messages/ff"),
     ] {
         check(
             &Name::account(account, entry).unwrap(),
-            &format!("accounts/000102030405060708090a0b0c0d0e0f{suffix}"),
+            &format!("accounts/{account}{suffix}"),
         );
     }
-    for (table, basename) in [
-        (Table::Blobs, "blobs.tbl"),
-        (Table::Mailboxes, "mailboxes.tbl"),
-        (Table::Emails, "emails.tbl"),
-        (Table::Memberships, "memberships.tbl"),
-        (Table::Keywords, "keywords.tbl"),
-        (Table::Threads, "threads.tbl"),
-        (Table::ThreadAnchors, "thread-anchors.tbl"),
-        (Table::Submissions, "submissions.tbl"),
-        (Table::Recipients, "recipients.tbl"),
-        (Table::Leases, "leases.tbl"),
-        (Table::Imports, "imports.tbl"),
-    ] {
-        check(
-            &Name::account(account, AccountEntry::Table(number, table)).unwrap(),
-            &format!(
-                "accounts/000102030405060708090a0b0c0d0e0f/metadata/checkpoints/00000000000000000042/{basename}"
-            ),
-        );
-    }
-    let max = Name::account(
-        account,
-        AccountEntry::Table(Number::new(u64::MAX).unwrap(), Table::ThreadAnchors),
-    )
-    .unwrap();
-    check(&max, "accounts/000102030405060708090a0b0c0d0e0f/metadata/checkpoints/18446744073709551615/thread-anchors.tbl");
-    assert_eq!(max.as_bytes().unwrap().len(), 102);
 }
 
 #[test]

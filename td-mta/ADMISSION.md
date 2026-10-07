@@ -1,117 +1,54 @@
 # Disk admission, bounded work and request retention
 
-This is the normative companion to [RESOURCES.md](RESOURCES.md),
-[API.md](API.md) and [STORAGE.md](STORAGE.md). M02c3b freezes the policies.
-M04c1 implements checked disk/work configuration in
-[src/admission.rs](src/admission.rs); it produces an immutable plan from an
-already validated ResourcePlan, DiskLimits, WorkLimits and explicit
-ViewMode. It validates capacity relationships without allocating pools or
-inspecting the filesystem. M04c2 supplies pure charged meters and timer
-budgets in `../td-mime/src/work.rs` (re-exported by `src/admission/work.rs`)
-and `src/admission/timers.rs`. Fixed logical
-leases and linear effect tickets live in `src/admission/logical.rs`, using `src/admission/quota.rs`.
-The scalar writer/checkpoint ledger is in `src/admission/writer.rs`.
-Runtime locking, actual I/O, cleanup proofs and recovery remain M05/M08.
+This is the normative companion to RESOURCES.md, API.md and STORAGE.md.
+admission.rs validates an immutable disk/work plan without allocating pools
+or inspecting free space. Fixed logical leases and effect tickets provide
+coordinator accounting; SQLite owns actual metadata transaction/recovery state.
+The low-level IndexStore does not implement the service reservation coordinator.
 
 ## 1. Disk accounting
 
-Disk lengths, offsets, counts and arithmetic use checked u64 values. Convert
-only an individual bounded I/O chunk to usize. A four-GiB quota is not a
-four-GiB allocation or an assumption that every target has 64-bit usize.
-One coordinator serializes logical accounting and reservations for the store,
-including logs and private scratch even when they reside on separate mounts.
+Lengths, offsets, quotas and arithmetic use checked u64. Only bounded I/O
+chunks convert to usize. One future coordinator serializes used and pending
+logical charges, including raw orphans, scratch and logs. Logical quotas do
+not promise successful I/O or reserve filesystem blocks.
 
-The default personal profile has these ceilings. MiB and GiB are binary units.
-These are caps on use, not files preallocated to every cap at startup.
+| Resource | Default ceiling |
+| --- | ---: |
+| Raw message/upload/private/orphan bytes | 4 GiB |
+| Raw body files | 250000 |
+| SQLite main database | 32 MiB |
+| SQLite WAL | 67502144 bytes |
+| Upload category | 128 MiB |
+| Queue category | 256 MiB, 1000 retained submissions |
+| Sort scratch | 64 MiB |
+| Request retention | 128 MiB/request, 256 MiB aggregate |
+| Disposable caches | 128 MiB |
+| Logs | Five 8 MiB files |
+| Mutable cold state | 16 MiB |
 
-| Account/service resource | Default ceiling and charge |
-| --- | --- |
-| Raw body files | 4 GiB of message/upload/published-orphan/private-body file lengths, plus unspent reservations |
-| Body files | 250000 message/upload/orphan/private-body files, plus reserved new files |
-| Live metadata | 256 MiB of projected checkpoint records including table headers |
-| Checkpoint generations | 2 GiB total selected, retired and building files; at most one current, two pinned retired and one building generation |
-| Advertised retained history | 128 MiB and 64 segments; seven-day retention is a target within both limits |
-| All closed journals | (storage_views + 1) * (128 MiB + journal_bytes), initially 396 MiB; at most (storage_views + 1) * 65 segments, initially 195 |
-| Active journal | 4 MiB and 8192 operations, including outstanding commit reservations |
-| Upload lease quota | 128 MiB, charged once per distinct upload blob with an active lease |
-| Queue quota | 256 MiB and 1000 retained submissions; charge each transmitted blob once while any retained submission pins it |
-| External-sort scratch | 64 MiB across all runs; one sort job |
-| Request retention | 128 MiB per request, 256 MiB across all active requests, including response indexes and creation-ID maps |
-| Disposable disk caches | 128 MiB across current and rebuilding files |
-| Logs | Five 8 MiB files, as derived by Limits::plan |
-| Mutable cold state | 16 MiB for device/ACME state and old/new generations, excluding externally maintained configuration/secret source files |
+DiskLimits caps body bytes at 1 TiB and files at 1000000, metadata at 32 MiB,
+WAL policy at 128 MiB, responses at 1 GiB/request and 4 GiB aggregate, caches
+at 1 GiB and cold state at 64 MiB. Native SQLite's fixed 32 MiB page limit
+and 67502144-byte WAL bound are fixed. Metadata configuration must equal
+32 MiB, and WAL configuration must cover that fixed bound; raising WAL's
+logical budget does not enlarge the core. Other quota reductions below actual
+usage refuse; coordinator admission still owns logical body/queue/response
+policy before invoking the core.
+Raw quota must cover message_bytes, aggregate response quota must cover its
+per-request quota, and per-request response quota must fit
+32 * json_bytes + 4096 * json_methods + 64 KiB. OnlineBackground requires at
+least two storage views; ForegroundOnly requires one. The cache must fit the
+1 KiB maintenance cursor reserve. These relationships do not enlarge RAM.
 
-Existing upload, queue, sort and log configuration limits retain the checked
-ranges in limits.rs. M04 implements the other disk settings with defaults above
-and finite compiled maxima: body bytes 1 TiB, body files 1000000, live metadata
-1 GiB, checkpoint files 8 GiB, response retention 1 GiB/request and 4 GiB total,
-caches 1 GiB, cold state 64 MiB. History, journal and generation-count maxima
-remain fixed by FORMAT.md/STORAGE.md. Validate all relationships, including
-per-request retention <= aggregate retention, raw body quota >= message_bytes,
-and checkpoint quota >= four times (live metadata cap + journal_bytes + 1 MiB).
-Per-request retention must be at least
-`32 * json_bytes + 4096 * json_methods + 64 KiB`, a conservative bound for
-mandatory framing/errors and escaped initial creation-map copies. Count actual
-request reservations, not this entire startup ceiling, against aggregate use.
-The live metadata cap must fit all empty table headers (1232 bytes), and
-the cache cap must fit the 1 KiB GC cursor reserve. Other new byte/count
-caps must be positive. Changing quotas does not enlarge
-any RAM pool. Quota reductions below current
-use fail configuration validation rather than delete existing data.
-Logical upload/queue quotas are independent policy ceilings: they may be
-smaller than message_bytes or larger than the raw-body quota. Effective
-admission is the intersection of all applicable quotas and current use.
-maxSizeUpload advertises a per-object ceiling, not a guarantee that remaining
-account disk quota can hold such an upload. Redacted effective configuration
-reports the overlap; do not silently raise operator quotas to match it.
-
-Upload and queue quotas are logical subquotas of the raw-body namespace. Do
-not add those body lengths a second time to physical use. A blob may consume
-both logical categories while occupying one file. Expiry/removing its last
-category pin releases that logical charge, but its raw-file charge lasts until
-unlink. Failed writes and interrupted publication retain their written-byte
-and file charges until safe cleanup; releasing an unused reservation cannot
-make an orphan disappear from accounting. Reusing an existing blob still
-reserves any new logical category charge before creating the reference.
-Completed submissions retained by QUEUE.md still consume queue count/body
-quota. Reaching that quota refuses new submissions even if none is currently
-pending. Automatic eligible retention cleanup and explicit administrative
-deletion reclaim the logical quota; neither may bypass QUEUE.md's minimum
-retention or uncertainty acknowledgements. Status reports pending and retained
-counts separately so this refusal is diagnosable.
-
-Bound new shard directories and temporary metadata/control files by their
-format/job limits, even though they are not body files. All 256
-shards may be prepared during startup; if created later their publication and
-directory sync remain part of the admitted operation. A checkpoint's projected
-live size is computed from the final row changes before commit, with checked
-old/new record lengths. Tombstones do not let a live table exceed its quota.
-Size-nonincreasing deletion remains possible at a full logical quota, subject
-to journal/response quotas and successful filesystem operations.
-
-The service reconstructs charges under LOCK before opening listeners, including
-private/orphan files, every selected/unselected/retired/building generation,
-history and caches. Nothing is made invisible merely by being unselected.
-Disposable request/sort files from an earlier process are removed only from
-validated private namespaces. Live body/checkpoint files are not scratch.
-No mailbox-sized in-memory inventory is required; bounded scans and sort runs
-perform reconciliation. Counters are admission aids, not on-disk authority.
-After validating CURRENT, its manifest/journal and recovery boundary, startup
-has no surviving process pins. It can then remove proven-unselected checkpoint
-builds/generations and private unpublished body files in their recognized
-temporary namespace, syncing removals before releasing charges. No authoritative
-reference ever targets a private body pathname. Published message/upload orphans
-require the separate exclusive inventory/liveness proof. Unknown entries are
-reported, never swept by a broad tmp-directory deletion.
-
-Journals are excluded from checkpoint-byte charges. Count each closed segment
-once against the all-closed-journals cap, whether selected for history, pinned
-by a retired view or both. Each view can pin its bounded history plus one
-journal prefix; the separate cap permits all admitted views and current history
-to coexist. Before a rollover, reserve the newly closed segment and next active
-file. Prune only unselected/unpinned files after publishing a safe history floor;
-defer checkpoint/admission if the cap cannot be met. A full advertised history
-does not itself require evicting a pinned segment or stalling every rollover.
+Upload/queue are subquotas of raw bodies: one file is charged physically once,
+even when both categories reference it. Completed retained submissions still
+consume queue count and body categories. Releasing a lease/category does not
+release raw disk charge until proven unlink. Interrupted writes/publications
+remain charged. Cancel releases only unused reservations; uncertainty cannot
+be reconciled as a zero effect. Quota reductions below actual use refuse
+configuration rather than deleting data. Effective admission intersects all
+applicable quotas; maxSizeUpload does not guarantee available capacity.
 
 ### Logical lease implementation
 
@@ -121,7 +58,7 @@ the whole group; every applicable category must fit used plus pending plus
 new charges before any group is installed. Constructor use comes from trusted
 store reconciliation and cannot exceed configured caps. These counters are
 not disk authority. The helper does not grant filesystem or writer permission;
-M08 must couple its reservation to the writer and checkpoint state.
+M08 must couple its reservation to the writer and SQLite commit state.
 
 Group and part tokens validate the complete process-local slot generation.
 A bounded extension increases a part's reservation without allocating another
@@ -142,7 +79,7 @@ charges remain. The logical helper has no public operation to release used
 charges. M05/M08's object ledger and proven cleanup/commit transitions own
 that later integration; a freed lease token cannot authenticate object cleanup.
 The writer and future runtime coordinator wrap this same logical ledger,
-without duplicate quota-used counters. Typed journal commit/rollover and object cleanup transitions must
+without duplicate quota-used counters. Typed SQLite commit/checkpoint and object cleanup transitions must
 account for all recycled buckets, including scratch and logs. Proven effect
 amounts are trusted adapter inputs, not capabilities against arbitrary code.
 Runtime integration must restrict who can supply that proof.
@@ -161,228 +98,50 @@ Unexpected internal failures after slot acquisition poison the table and stop
 new work; ordinary refusal rolls back without changing live charges.
 No syscall, publication or authoritative cleanup is implemented here.
 
-### Writer ledger implementation
+## 2. Reservations and I/O failure
 
-M04c3b2's WriterLedger owns the logical lease table, selected table-length
-baseline and scalar writer phase. It reads committed journal frames from the
-same ledger's used buckets and outstanding frames from its pending buckets;
-there is no duplicate journal counter. Recovery supplies the selected lengths
-and used quotas from one trusted snapshot. Active bytes exclude the 96-byte
-segment header. Zero committed frame bytes and zero operations must agree.
+Reserve body/file, metadata/WAL, response and category growth before taking
+responsibility. An account/size/deadline lease grants only its named operation.
+Before starting a SQL write the core reserves worst-case WAL room; Busy asks
+for bounded maintenance rather than allowing growth past the ceiling.
+PublishedFile is physical publication evidence, not a logical quota ticket.
+Service callers must couple both proofs before mutation admission is activated.
 
-Preparation checks all logical caps and derives the checkpoint bound from
-selected tables plus committed, pending and candidate frame bytes/operations.
-A prepared request holds an exclusive ledger borrow through installation;
-dropping it changes nothing. Installation rechecks its deadline
-and atomically acquires the logical cells. A framed job appends one dedicated
-frame cell to at most seven ordinary cells. Generic requests/effects reject
-active/closed journal, checkpoint and live-metadata quota kinds even at zero
-amount; these require writer or maintenance transitions. Ordinary parts may
-be extended only within their logical caps. A frame
-reserves its full ceiling at initial admission and cannot be extended.
+Known rejection before COMMIT requires rollback. Deferred constraint or busy
+refusal with an intact transaction also rejects only after rollback. A proven
+successful COMMIT reports its durable result even if its deadline expired
+during completion. Other COMMIT errors remain indeterminate and stop writes
+until reopen/recovery; new snapshots remain available. Preserve actual
+raw-file charges on both outcomes. File I/O, native memory/page exhaustion,
+metadata corruption and missing/damaged bodies are distinct failure domains;
+SQLite metadata integrity does not prove the immutable files are intact.
 
-Only one dedicated append ticket may be in flight. Its actual byte/operation
-amounts must fit the reserved ceilings; both ceilings and actual counts must
-fit the minimum encoded size for that many operations. M08 still validates
-the serialized frame. Proven durable completion moves exactly those amounts
-from pending to used and atomically releases the unused frame remainder.
-A frame reservation permits only one successful transaction; separated appends
-cannot reuse its logical frame budget. Proven no-write completion leaves
-the reservation unchanged and permits retry. An uncertain
-append keeps its ticket busy and pending and stops writer admission: the active
-EOF may have a torn tail, so checkpoint rollover is unsafe before recovery.
-Losing an append ticket also pins the writer. No generic effect can consume a
-frame cell. An already consumed append ticket cannot stop a later retry on
-the same frame; every result validates ticket liveness before changing phase.
-
-A simulated checkpoint barrier refuses while an append is in flight and checks
-closed-journal byte/segment caps before closing all new admission. It protects
-the future logical transfer by excluding concurrent writer changes, without
-posting a duplicate pending charge. Existing non-journal effects can finish
-and outstanding jobs can resolve parts, enumerate expired leases and cancel
-through the barrier. Read accessors remain available. Proven abort before any
-selection reopens unchanged; a dropped barrier stops the writer. Uncertain
-selection also stops the writer. Actual writer/view locking and pin eligibility remain M08.
-
-After trusted durable selection, one quota transition adds the old active
-journal's 96-byte header plus committed frame bytes to closed-journal usage,
-adds one closed segment, and clears only committed active bytes/operations.
-Outstanding frame reservations and their identifiers stay unchanged. The new
-selected table length must fit the committed-only output bound and
-live-metadata cap; uncommitted reservations cannot explain selected output.
-Invalid selection leaves counters unchanged and stops the writer, because
-the adapter reported an already durable on-disk change. Success enters
-AwaitingRecovery. The scalar model has no public reopen operation; M08 must
-reconcile selected identities, output/orphan charges, journal rollover and
-view pins before opening runtime admission. Building/retention quota accounting
-belongs to that same future runtime integration.
-
-## 2. Logical reservations and I/O failure
-
-Admission enforces configured logical byte/file quotas, fixed request slots,
-writer state and work deadlines. It does not query physical free bytes, inodes,
-filesystem type, allocation granularity or quota profiles. There are no
-`free_bytes` or `free_inodes` settings, probe tickets or backing-capacity keys.
-Unknown disk statistics remain unavailable in health; startup never fabricates
-capacity from quota ceilings. Quotas bound service growth, not other writers,
-filesystem metadata, compression, snapshots or the host's available blocks.
-
-Operators provision headroom for coexisting selected/retired/building metadata,
-message bodies, response/sort scratch, logs and cold state. Disk-backed scratch
-is the low-memory deployment default; tmpfs use adds host/cgroup memory outside
-the service's RSS. No spare-block guarantee is made, even for admitted work.
-External filesystem quotas and ordinary monitoring may be used by deployment;
-none is a runtime dependency or an admission oracle.
-
-Before mutation reserve the maximum logical body, frame, response and category
-charges. Count a blob once in raw bytes even when upload/queue logical categories
-overlap. Keep written/orphan charges until proven cleanup. Checkpoint output
-bounds use selected table lengths plus committed/pending/candidate journal bytes,
-plus 36 bytes per journal operation and a 1 MiB format overhead allowance.
-This checked length bound is not rounded disk allocation. The new journal's
-96-byte header is separate. M08 must reserve building output within checkpoint
-quota, preserve outstanding frame leases across rollover and account old/new
-files until cleanup. Client-slot exhaustion must not prevent bounded maintenance.
-
-A reservation promises only logical room. Every create, write, flush, file sync,
-publication and directory sync can fail. Return temporary protocol failure
-before acceptance, retain partial-output charges, and stop new mutations when
-journal/selection durability is uncertain. Do not treat an error as proof that
-no bytes were written. Recovery must establish the committed prefix and selected
-generation before the writer reopens. Pure private-body failures may be cleaned
-up without declaring journal corruption; record the actual failure domain.
-Already committed operations remain committed even if later response output fails.
-Never emit SMTP success or JMAP creation success before required durable steps.
-
-Disk full can prevent maintenance or deletion transactions as well as receipt.
-Expose refusing-mutations health and require operator capacity repair when
-needed. Do not delete acknowledged mail or pinned history, silently release
-orphan charges, or loop on failing writes to manufacture progress. Bounded
-retry/backoff applies to recoverable private-output failures; uncertain commits
-require recovery. A checkpoint must honor generation pins and logical quotas
-before starting, and cannot publish partial output after a failure.
-
-An online backup uses a chosen external destination, bounded output work and
-ordinary I/O failure handling. It is outside store quotas; source pins remain
-accounted. Do not create a backup hardlink farm or target the active store.
+Checkpoint and file collection refuse while views are held. Bound the wait
+within the enclosing deadline; a timeout returns Busy/error, never a claim of
+successful cleanup. Hold the writer fence only for the actual exclusive step;
+a scheduler must establish quiescence without canceling durable effects.
+Whole-service recovery, startup orphan scans and quota reconciliation remain
+unimplemented; do not infer them from pure accounting helper tests.
 
 ## 3. Work budgets and deadlines
 
-Use Clock's monotonic Tick for deadlines; persisted UTC is not a timeout clock.
-Every job carries an absolute deadline and checked remaining counters for bytes
-read/written, records examined and output bytes. Charge repeated reads and
-merge passes again. Stop on the first exhausted dimension. A counter never
-wraps, and partial scans are never returned as complete query/search results.
+WorkLimits retains finite job budgets: foreground 120s/8 GiB/2000000 records;
+changes 30s/128 MiB/1000000 records; request 300s; commit 30s/256 MiB/250000
+records; checkpoint 60s/2 GiB; GC drain 30s, exclusive 120s/8 GiB/128000000
+records/1000 unlinks; backup 900s/16 GiB; admission wait 1s. Raised values
+are at most 16 times defaults. These are future coordinator job ceilings,
+not evidence that full jobs or native resource limits have been qualified.
 
-The implemented Meter charges I/O bytes, records, output bytes and GC
-unlinks atomically before a bounded step. A rejected charge consumes no
-counters and permanently stops that meter at its first refusal, including
-deadline expiry. Charge failed/repeated operations too. Construct a meter
-with validated job limits and the minimum of all enclosing deadlines. It
-neither refunds durable effects nor cancels I/O; callers keep completion
-reservations for work whose effects already started. This helper does not
-implement scheduler step limits.
-
-A CPU/I/O scheduling step handles at most 64 KiB or 256 records before yielding
-and checking cancellation/deadlines. One issued filesystem operation can block
-past the deadline; do not promise kernel-I/O cancellation or spawn a replacement
-worker. RESOURCES.md's fixed workers, queues, stricter per-role step limits and
-shared sort lease still apply.
-
-| Job | Default total budget |
-| --- | --- |
-| Foreground mail get/query/search | 120 seconds, 8 GiB scanned bytes, 2000000 examined records |
-| /changes | 30 seconds, 128 MiB history bytes, 1000000 operations |
-| One JMAP request's method execution | 300 seconds, including waits and all method work |
-| Writer commit after complete input admission | 30 seconds, one frame, 256 MiB validation reads and 250000 examined records |
-| Checkpoint | 60 seconds, 2 GiB combined read/write bytes |
-| GC drain | 30 seconds; do not hold writer lock while draining |
-| GC exclusive window | 120 seconds, 8 GiB combined I/O, 128000000 records, at most 1000 unlinks |
-| Online backup | 900 seconds, 16 GiB combined I/O, one existing read view |
-| Admission/pool wait | 1 second, within the enclosing job deadline |
-
-M04 accepts finite raised values up to 16 times each default, using checked
-multiplication; lowering a work limit below the default is not a v1 option.
-The fixed frame/journal/count-format ceilings cannot be raised through these
-settings. A larger corpus or slow disk may require a raised work budget even
-when its disk quota fits. Operators see the exhausted dimension and job kind
-in bounded logs/health. This is an explicit failure, not an incomplete success.
-
-Validate maintenance work against configured capacities before startup:
-
-- Checkpoint I/O >= `2 * (live_metadata_cap + journal_bytes + 1 MiB)`.
-- GC I/O >= `4 * live_metadata_cap + 16 * sort_disk_bytes +
-  8 * journal_bytes + 16 MiB`.
-- GC examined records >= `16 * (live_metadata_cap / 64 + body_file_cap) +
-  16 * journal_operations`. A checkpoint row is at least 64 bytes.
-- GC exclusive time >= checkpoint time + one commit time. The GC's initial
-  checkpoint consumes the same exclusive time/I/O/record budget.
-
-These conservative bounds cover checkpointing and at least one complete
-candidate-window proof at configured metadata/file caps, including a shard
-scan and current owning-reference scans. GC does not require a full-mailbox
-external sort before it can make progress. If real I/O cannot finish even one
-proof within the wall-clock window, defer safely and report
-maintenance_budget_insufficient; do not report successful reclamation or keep
-retrying a known-insufficient window without actionable health failure. M08/M23
-must demonstrate repeated-window progress on the configured maximum corpus.
-
-The admission wait covers acquisition of a new pool/reservation, not each step
-of already admitted work. Maintenance deliberately refuses new work promptly
-with temporary errors; callers need not wait through its entire pause. GC
-drains admitted work before taking exclusivity, so it cannot strand an active
-commit behind an exclusive sweep. A checkpoint may defer queued mutations
-within their enclosing deadlines. This is the explicit v1 availability
-tradeoff, not a promise that every request waits for maintenance to finish.
-
-The GC exclusive phase uses 128 fixed 32-byte candidate cells (4 KiB) from
-the writer's existing 256 KiB scratch. Each records ID, namespace and live bit.
-Visit message/upload shards in namespace, shard, then raw-ID order. A bounded
-selection pass keeps the next 128 distinct IDs after the cursor from inventory
-and validated directory entries; it does not depend on directory iteration
-order. Stream all current owning references to mark this window before unlink.
-Physical entry enumeration consumes record/work budget too.
-
-Commit/unlink batches contain at most 100 proven-dead candidates and no more
-than one frame. Do not begin a batch without completion capacity. On expiry
-finish an admitted durable batch, then resume service; discard incomplete
-liveness proofs. Advance the cursor only through candidates whose keep/delete
-decision finished, including completed unlink/sync for dead files; live entries
-advance it too. A partly processed window resumes after the last such entry.
-Each new exclusive window must obtain a fresh view
-and repeat its reference proof; cross-generation cursor progress never grants
-permission to unlink. Deleted entries do not invalidate the ordering cursor.
-
-Persist the scheduling hint as at most 256 bytes at cache/gc-cursor, using an
-exclusive temporary file and atomic replacement. Reserve 1 KiB and two file
-entries within the cache quota for this purpose. Its ASCII record is exactly
-`gc1 EPOCH NAMESPACE SHARD LAST\n`: EPOCH is 32 lowercase hex, NAMESPACE is
-messages or uploads, SHARD is two lowercase hex, LAST is a 32-lowercase-hex ID
-or '-' for the beginning of a shard. Require LAST's prefix to match SHARD;
-reject extra fields/bytes. A missing, malformed or foreign-epoch cursor starts
-at messages/00/-; after uploads/ff, wrap there. It is disposable, needs no
-fsync and carries no liveness evidence. Failed cursor persistence is visible
-health/work failure, not permission to reuse a stale proof.
-
-Sort merge fan-in is eight, with at most 32 open files per sort job including
-inputs/output/bookkeeping. Its existing RAM arena and disk quota include runs
-coexisting with their replacements. These sorts serve queries/indexes; GC's
-candidate proof does not depend on enough scratch to hold every live reference.
-
-A checkpoint timeout before selection discards only proven-unselected scratch;
-it cannot publish a partial table or advance CURRENT. After a publication
-attempt whose durability is uncertain, stop the writer for recovery. A read
-view's deadline is the enclosing operation's deadline. A completed JMAP response
-spool releases its store view before waiting for a slow HTTP reader. Queue body
-views and backup views use their own finite budgets below/above, not an
-unbounded exception to retirement limits.
-All long background views (outbound transfer, backup, cache build) share one
-background permit; never start a backup and queue body view concurrently in
-the default two-view profile. Reserve at least one view for foreground work.
-An online configuration enabling these background operations requires at least
-two views; the one-view profile is for foreground/offline operation. Waiting
-for the background permit occurs before starting an outbound attempt. Rotate
-pending background job classes when the permit becomes available.
+The core retains one deadline and 8000000 SQLite VM steps per view or commit.
+Cold schema/integrity validation has 128000000 steps under the same startup
+deadline. Per-instruction callbacks sample the original monotonic clock.
+Queries check before and after work. Clock and VM-fuel failures are sticky;
+retries
+or chunk boundaries cannot renew work. Rollback cleanup bypasses expired
+request fuel without clearing its failure. Writer acquisition and SQLite busy
+wait both refuse immediately with Busy; callers schedule bounded retries. Body digest I/O
+checks the same clock between bounded chunks. Complete service work meters
+must additionally charge bytes/records, scheduling turns and response output.
 
 ### Network timers
 
@@ -490,7 +249,7 @@ This is required even when the client does not ask to return createdIds.
 Use an exclusively created mode-0600 file in `tmp/requests/REQUEST/` for response
 JSON, response offsets and the creation-ID map. Names are server-owned and
 validated; no client string becomes a path. These are disposable private files,
-not journal records or backups, and do not need fsync. Charge every byte before
+not metadata records or backups, and do not need fsync. Charge every byte before
 writing. Cleanup after completion/disconnect; abandoned files are discarded
 under LOCK at startup. No response-sized heap tree or mailbox-sized map exists.
 
@@ -554,8 +313,8 @@ method responses. Never use serverUnavailable/serverFail at method level after
 its known effects. Physical spool I/O failure after effects can still prevent
 any response: close the incomplete
 HTTP exchange and preserve committed effects for client reconciliation. Do not
-undo journal state or fabricate failure of an already committed object. A
-spool fault alone is not journal corruption; report the actual failure domain.
+undo metadata state or fabricate failure of an already committed object. A
+spool fault alone is not database corruption; report the actual failure domain.
 Headers for the final JSON response are emitted only after complete request
 retention succeeds, then stream its exact results and release all files/pins.
 
@@ -602,62 +361,26 @@ separate mechanisms and both need exact retention.
 
 ## 5. Required evidence
 
-M04c1 tests pin numeric default/derived caps, exact response and checkpoint
-quota boundaries, larger-metadata maintenance requirements, one-view refusal
-for online background work, logical subquotas below the per-object ceiling,
-invalid ranges/fixed overhead floors and helper-level arithmetic overflow.
-Current configuration ranges prevent plan-level overflow. Disk quota changes leave the
-RAM plan unchanged. These tests do not establish observed-use reconciliation,
-safe quota reduction, live reservations, filesystem availability or runtime
-work charging; those remain the implementation gates below.
+Before activation, qualify native heap/stack/RSS with combined owners; full
+logical quota reconciliation; exact result retention; metadata page/WAL
+capacity refusal; injected COMMIT/rollback/IO faults and reopen recovery;
+body publication and orphan cleanup; snapshot/pool exhaustion and bounded
+maintenance progress. Record independent failure domains and verified red
+controls. Pure Rust/MIME zero-allocation evidence excludes SQLite native
+allocation and does not establish whole-service admission or durability.
 
-M04c2 tests pin exact counter exhaustion, atomic/sticky refusal, absolute
-expiry, HTTP ceiling division and slow-rate budgets, outer exchange sums,
-SMTP recipient/block/fence budgets, independently raised phases/work limits
-and Tick overflow. They
-do not exercise sockets, scheduler priority, cancellation or allocation/RSS.
-Those remain tests at the consumers below.
+## Retained scheduling and quota requirements
 
-M04c3b1 tests pin independently configured quota mappings, duplicate grouped
-charges, all-or-nothing cap/late-ticket refusal, fixed capacity and record
-layout, stale/foreign tokens, extensions, effect pinning, uncertain/orphan
-charges surviving cancellation, deadline/completion separation and rejection
-of startup use above a cap. Expiry enumeration covers short output buffers and
-busy non-root members; overflow and disabled extensions preserve the book.
-These tests exercise logical state transitions;
-runtime writer barriers, actual cleanup and durable effects remain
-M05/M08 gates.
+A coordinator turn processes at most 64 KiB or 256 records before yielding.
+External sort merges at most eight runs and owns at most 32 open files.
+A deletion with no physical growth remains admissible when a logical quota
+is full; physical WAL capacity still applies. Full queue quotas refuse new
+submissions before publication. One long background-view permit preserves
+a foreground view when storage_views is two; backups and outbound transfer
+share it. These scheduler/coordinator rules remain requirements, not active
+workers in the storage core.
 
-M04c3b2 tests derive checkpoint bounds from used/pending/candidate counters,
-exercise serialized proven/uncertain appends, reject generic writer-quota
-bypasses, check barrier abort/refusal and closed-journal caps, and preserve
-outstanding IDs/charges across scalar rollover. These are conditional
-accounting tests, not filesystem publication or view-pin evidence. Additional
-cases pin append-ticket replay, one successful transaction per frame lease,
-barrier expiry handling, stopped completion handling, dropped/uncertain
-barriers, committed-only selection bounds and exact closed-quota fits.
-
-M04/M05/M08/M13 add tests at their real execution boundaries, not document-only
-assertions: concurrent quota reservations cannot overbook; failed publications
-keep orphan charges; logical reservations survive competing cache/GC work; pinned generations block checkpoint
-admission; every maintenance limit resumes service without unsafe reclamation.
-Inject failures before/after selection, sync and response-file writes.
-Include minimum-row metadata at configured caps, at least one full successful
-GC traversal across bounded proof/unlink windows, startup private-body/unselected-checkpoint cleanup,
-disk-full refusal/recovery and history pins across journal rollover.
-
-M09/M11/M17 own DNS, receiving and smart-host timer/slow-peer tests; M13 owns
-HTTP execution-versus-transmission timers and per-byte transfer bounds. M20
-tests online backup/view arbitration and destination capacity; M21 tests finite
-offline page/blob transfer at the admitted minimum rate. M23 measures background
-fairness and maximum-corpus progress without increasing the RAM ledger.
-
-JMAP tests chain query, mutation and reference and prove the reference sees the
-original query result. Cover duplicate call IDs/implicit responses, nested
-wildcards/escaping, creation maps, input-depth versus MIME output-depth, exact
-spool exhaustion before and after earlier method/object commits, unlimited body
-values, slow HTTP readers releasing store views, and cleanup after disconnect
-or process death. Allocation counters cover spool walkers and repeated lookups.
-
-Sources: [JMAP Core, RFC 8620](https://www.rfc-editor.org/rfc/rfc8620.html)
-and [SMTP timers, RFC 5321 section 4.5.3.2](https://www.rfc-editor.org/rfc/rfc5321.html#section-4.5.3.2).
+M09 owns bounded network/DNS fault fixtures; M11 request retention and lost
+response; M13 query/sort fan-in and fairness; M17 phase/result reservations
+and queue saturation; M20 restore/offline consistency; M21 backup view and
+body lifecycle; M23 steady-state resource/concurrency qualification.

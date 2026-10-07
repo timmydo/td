@@ -1,4 +1,4 @@
-//! Bounded diagnostic records; these are neither authorization nor a journal.
+//! Bounded diagnostic records; these grant no authorization or metadata authority.
 use crate::ports::TlsVersion;
 use crate::{
     bounded::{self, TextBuffer},
@@ -158,10 +158,8 @@ pub enum Kind {
     AdmissionRefused {
         reason: Refusal,
     },
-    JournalCommitted,
-    CheckpointSelected {
-        generation: u64,
-    },
+    MetadataCommitted,
+    WalCheckpointed,
     RelayOutcome {
         outcome: Delivery,
     },
@@ -190,8 +188,8 @@ impl Kind {
             Self::TlsFailed { .. } => "tls_failed",
             Self::MailAccepted { .. } => "mail_accepted",
             Self::AdmissionRefused { .. } => "admission_refused",
-            Self::JournalCommitted => "journal_committed",
-            Self::CheckpointSelected { .. } => "checkpoint_selected",
+            Self::MetadataCommitted => "metadata_committed",
+            Self::WalCheckpointed => "wal_checkpointed",
             Self::RelayOutcome { .. } => "relay_outcome",
             Self::AuthenticationFailed => "authentication_failed",
             Self::CertificateRenewed { .. } => "certificate_renewed",
@@ -218,8 +216,8 @@ impl Kind {
             | Self::ConnectionClosed
             | Self::TlsEstablished { .. }
             | Self::MailAccepted { .. }
-            | Self::JournalCommitted
-            | Self::CheckpointSelected { .. }
+            | Self::MetadataCommitted
+            | Self::WalCheckpointed
             | Self::RelayOutcome {
                 outcome: Delivery::Accepted,
             }
@@ -242,8 +240,8 @@ impl Kind {
             | Self::TlsEstablished { .. }
             | Self::TlsFailed { .. }
             | Self::MailAccepted { .. }
-            | Self::JournalCommitted
-            | Self::CheckpointSelected { .. }
+            | Self::MetadataCommitted
+            | Self::WalCheckpointed
             | Self::AuthenticationFailed
             | Self::RelayOutcome {
                 outcome: Delivery::Accepted | Delivery::Retry,
@@ -301,7 +299,6 @@ impl fmt::Display for EventJson<'_> {
             )?,
             Kind::MailAccepted { bytes } => write!(f, ",\"bytes\":{bytes}")?,
             Kind::AdmissionRefused { reason } => write!(f, ",\"reason\":\"{}\"", reason.code())?,
-            Kind::CheckpointSelected { generation } => write!(f, ",\"generation\":{generation}")?,
             Kind::RelayOutcome { outcome } => write!(f, ",\"outcome\":\"{}\"", outcome.code())?,
             Kind::CertificateRenewed { expires_utc_ms } => {
                 write!(f, ",\"expires_utc_ms\":{expires_utc_ms}")?
@@ -319,7 +316,8 @@ impl fmt::Display for EventJson<'_> {
             Kind::BootStarted
             | Kind::ConfigActivated
             | Kind::ConnectionClosed
-            | Kind::JournalCommitted
+            | Kind::MetadataCommitted
+            | Kind::WalCheckpointed
             | Kind::AuthenticationFailed
             | Kind::CertificateRenewalFailed => {}
         }
@@ -489,10 +487,8 @@ mod tests {
             Kind::ConfigActivated,
             Kind::ConnectionClosed,
             Kind::MailAccepted { bytes: u64::MAX },
-            Kind::JournalCommitted,
-            Kind::CheckpointSelected {
-                generation: u64::MAX,
-            },
+            Kind::MetadataCommitted,
+            Kind::WalCheckpointed,
             Kind::AuthenticationFailed,
             Kind::CertificateRenewed {
                 expires_utc_ms: i64::MIN,
@@ -574,7 +570,7 @@ mod tests {
         out.clear();
         Event {
             context: fullest(),
-            kind: Kind::JournalCommitted,
+            kind: Kind::MetadataCommitted,
         }
         .encode(&mut out)?;
         assert_eq!(out.as_str()?, concat!(
@@ -582,7 +578,7 @@ mod tests {
             "\"utc_ms\":-9223372036854775808,\"config_generation\":18446744073709551615,",
             "\"connection_id\":18446744073709551615,\"request_id\":18446744073709551615,",
             "\"transaction_sequence\":18446744073709551615,\"submission_id\":\"ffffffffffffffffffffffffffffffff\",",
-            "\"facts\":{\"code\":\"journal_committed\",\"severity\":\"info\"},",
+            "\"facts\":{\"code\":\"metadata_committed\",\"severity\":\"info\"},",
             "\"recommended_actions\":[],\"untrusted\":[]}\n"));
         Ok(())
     }
@@ -699,8 +695,8 @@ mod tests {
                     Refusal::Recovery => "[\"inspect_recovery\"]",
                 },
             ),
-            Kind::JournalCommitted => ("journal_committed", "info", "[]"),
-            Kind::CheckpointSelected { .. } => ("checkpoint_selected", "info", "[]"),
+            Kind::MetadataCommitted => ("metadata_committed", "info", "[]"),
+            Kind::WalCheckpointed => ("wal_checkpointed", "info", "[]"),
             Kind::RelayOutcome {
                 outcome: Delivery::Accepted,
             } => ("relay_outcome", "info", "[]"),

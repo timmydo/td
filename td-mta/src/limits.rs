@@ -7,9 +7,8 @@ pub const MIB: usize = 1024 * KIB;
 pub const OUTBOUND_RECIPIENT_BATCH: usize = 100;
 /// Owned operation offsets/ordinal/type/kind, including Option layout.
 pub const OPERATION_SLOT_BYTES: usize = 32;
-pub const JOURNAL_SLOT_BYTES: usize = 32;
 pub const CHANGE_SLOT_BYTES: usize = 24;
-/// Separate table record, retained result, key, cursor and retained frame changes.
+/// Separate bounded row/result, key, cursor and retained change scratch.
 pub const READ_VIEW_SCRATCH_BYTES: usize = 292 * KIB;
 /// Planned provider session ceiling, not a measured worst-case bound.
 pub const TLS_SESSION_BYTES: usize = 512 * KIB;
@@ -119,10 +118,9 @@ limits! {
     }
     fixed {
         outbound_deliveries: 1;
-        journal_bytes: 4 * MIB;
-        journal_operations: 8192;
-        frame_bytes: MIB;
-        frame_operations: 4096;
+        sqlite_heap_bytes: 16 * MIB;
+        transaction_bytes: MIB;
+        transaction_operations: 4096;
     }
 }
 
@@ -186,14 +184,6 @@ impl Limits {
         self.validate_ranges()?;
         for (valid, rule) in [
             (
-                std::mem::size_of::<crate::frame_changes::Cell>() <= CHANGE_SLOT_BYTES,
-                "retained change exceeds its scratch slot",
-            ),
-            (
-                std::mem::size_of::<crate::overlay::Cell>() <= JOURNAL_SLOT_BYTES,
-                "journal index exceeds its operation slot",
-            ),
-            (
                 std::mem::size_of::<Option<crate::ports::StagedOperation>>()
                     <= OPERATION_SLOT_BYTES,
                 "operation index exceeds its staging slot",
@@ -244,14 +234,9 @@ impl Limits {
         let json_descriptors = product("JSON tokens", self.json_tokens, 16)?;
         let mime_descriptors = product("MIME parts", self.mime_parts, 64)?;
         let recipient_bytes = product("SMTP recipients", self.smtp_recipients, 320)?;
-        let journal_descriptors = product(
-            "journal descriptors",
-            self.journal_operations,
-            JOURNAL_SLOT_BYTES,
-        )?;
         let mutation_slots = product(
             "transaction operation index",
-            self.frame_operations,
+            self.transaction_operations,
             OPERATION_SLOT_BYTES,
         )?;
         let outbound_recipients = product("outbound recipients", OUTBOUND_RECIPIENT_BATCH, 320)?;
@@ -291,25 +276,17 @@ impl Limits {
             Reservation {
                 name: "read views",
                 count: self.storage_views,
-                bytes_each: sum(
-                    "read view",
-                    &[
-                        self.journal_bytes,
-                        journal_descriptors,
-                        READ_VIEW_SCRATCH_BYTES,
-                    ],
-                )?,
+                bytes_each: sum("read view", &[READ_VIEW_SCRATCH_BYTES])?,
             },
             Reservation {
-                name: "writer/checkpoint",
+                name: "SQLite writer",
                 count: 1,
                 bytes_each: sum(
-                    "writer/checkpoint",
+                    "SQLite writer",
                     &[
-                        self.journal_bytes,
-                        journal_descriptors,
-                        self.frame_bytes,
-                        self.frame_bytes, // Borrowed key/value staging, separate from frame output.
+                        self.sqlite_heap_bytes,
+                        self.transaction_bytes,
+                        self.transaction_bytes, // Borrowed key/value staging, separate from transaction output.
                         mutation_slots,
                         256 * KIB,
                     ],
@@ -418,15 +395,15 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 96_650_496);
-        const { assert!(crate::format::table::MAX_RECORD_BYTES <= 68 * KIB) };
+        assert_eq!(plan.total_bytes(), 100_058_368);
+        const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
             68 * KIB
                 + crate::format::MAX_VALUE_BYTES
                 + crate::format::MAX_KEY_BYTES
                 + 63 * KIB
-                + CHANGE_SLOT_BYTES * crate::format::MAX_FRAME_OPERATIONS
+                + CHANGE_SLOT_BYTES * crate::format::MAX_TRANSACTION_OPERATIONS
         );
         assert_eq!(plan.limits().memory_budget_bytes, 96 * MIB);
         assert!(plan.total_bytes() < plan.limits().memory_budget_bytes);
@@ -467,13 +444,13 @@ mod tests {
             }
             .plan(),
             Err(ResourceError::MemoryBudget {
-                required: 100_844_800,
+                required: 104_252_672,
                 available: 96 * MIB
             })
         );
         assert!(Limits {
             tls_handshakes: 3,
-            memory_budget_bytes: 100_844_800,
+            memory_budget_bytes: 104_252_672,
             ..defaults
         }
         .plan()
@@ -532,6 +509,7 @@ mod tests {
         let plan = Limits::default().plan()?;
         let larger_inbound = Limits {
             smtp_recipients: 1000,
+            memory_budget_bytes: 128 * MIB,
             ..Limits::default()
         }
         .plan()?;
@@ -546,9 +524,9 @@ mod tests {
             let writer = profile
                 .reservations()
                 .iter()
-                .find(|r| r.name == "writer/checkpoint")
+                .find(|r| r.name == "SQLite writer")
                 .ok_or(ResourceError::Inconsistent("missing writer reservation"))?;
-            assert_eq!(writer.bytes_each, 6_946_816);
+            assert_eq!(writer.bytes_each, 19_267_584);
         }
         assert_eq!(
             larger_inbound.total_bytes() - plan.total_bytes(),
@@ -698,7 +676,7 @@ mod tests {
     #[test]
     fn larger_pool_cannot_keep_default_memory_claim() -> Result<(), ResourceError> {
         let limits = Limits {
-            https_connections: 24,
+            https_connections: 23,
             ..Limits::default()
         };
         assert!(matches!(

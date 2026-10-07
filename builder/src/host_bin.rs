@@ -171,11 +171,8 @@ fn prepare_native_vendor(root: &Path) -> Result<PathBuf, String> {
     prepare_vendor(root, extract_native_vendor(root)?)
 }
 
-pub(crate) fn prepare_crypto_vendor(root: &Path) -> Result<PathBuf, String> {
-    prepare_vendor(
-        root,
-        extract_vendor(root, "td-crypto", "td-crypto/Cargo.lock")?,
-    )
+pub(crate) fn prepare_mail_vendor(root: &Path) -> Result<PathBuf, String> {
+    prepare_vendor(root, extract_vendor(root, "td-mta", "td-mta/Cargo.lock")?)
 }
 
 fn prepare_vendor(root: &Path, prepared: NativeVendor) -> Result<PathBuf, String> {
@@ -511,28 +508,28 @@ mod native_vendor_tests {
     }
 
     #[test]
-    fn crypto_vendor_uses_its_own_lock_and_rejects_tampering() {
+    fn native_mail_vendor_uses_its_own_lock_and_rejects_tampering() {
         let fixture = fixture("crypto");
-        assert!(prepare_crypto_vendor(&fixture.0).is_err());
-        fs::rename(fixture.0.join("net"), fixture.0.join("td-crypto")).unwrap();
+        assert!(prepare_mail_vendor(&fixture.0).is_err());
+        fs::rename(fixture.0.join("net"), fixture.0.join("td-mta")).unwrap();
         fs::rename(
             fixture.0.join(".td-build-cache/crate-vendor/td-net"),
-            fixture.0.join(".td-build-cache/crate-vendor/td-crypto"),
+            fixture.0.join(".td-build-cache/crate-vendor/td-mta"),
         )
         .unwrap();
-        let prepared = prepare_crypto_vendor(&fixture.0).unwrap();
+        let prepared = prepare_mail_vendor(&fixture.0).unwrap();
         assert!(prepared.join("tinydep-0.1.0/src/lib.rs").is_file());
         assert!(prepare_native_vendor(&fixture.0).is_err());
         fs::write(prepared.join("tinydep-0.1.0/src/lib.rs"), "changed").unwrap();
-        assert!(prepare_crypto_vendor(&fixture.0).is_err());
+        assert!(prepare_mail_vendor(&fixture.0).is_err());
         fs::remove_dir_all(prepared).unwrap();
         let archive = fixture
             .0
-            .join(".td-build-cache/crate-vendor/td-crypto/vendor/tinydep-0.1.0.crate");
+            .join(".td-build-cache/crate-vendor/td-mta/vendor/tinydep-0.1.0.crate");
         fs::write(&archive, "corrupt").unwrap();
-        assert!(prepare_crypto_vendor(&fixture.0).is_err());
+        assert!(prepare_mail_vendor(&fixture.0).is_err());
         fs::remove_file(archive).unwrap();
-        assert!(prepare_crypto_vendor(&fixture.0).is_err());
+        assert!(prepare_mail_vendor(&fixture.0).is_err());
     }
 
     #[test]

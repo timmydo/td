@@ -3435,7 +3435,7 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
         }
         [op, flag, archives] if op == "crypto-portable-build" && flag == "--archives" => {
             if let Err(e) = crate::crypto_build::validate(&root)
-                .and_then(|()| crate::check_loop::warm_crypto_sources(&root))
+                .and_then(|()| crate::check_loop::warm_mail_sources(&root))
             {
                 return fail(&e);
             }
@@ -4372,7 +4372,10 @@ fn manifest_path_dependencies(
             }
             continue;
         };
-        if name == "td-crypto" && !is_dev && crate::crypto_policy::DEPENDENCIES.contains(&line) {
+        if !is_dev
+            && ((name == "td-crypto" && crate::crypto_policy::DEPENDENCIES.contains(&line))
+                || (name == "td-mta" && line == crate::crypto_policy::SQLITE_DEPENDENCY))
+        {
             continue;
         }
         let admitted = line
@@ -4479,9 +4482,12 @@ fn refuse_cargo_config_overrides(root: &Path, roster: &[GateCrate]) -> Result<()
             // read; it is refused with the redirects.
             let table = segment.trim_matches(['"', '\'']).trim();
             // Cargo applies [env] after the wrapper checks its inherited
-            // environment. Reserve every AWS-LC control for the wrapper.
-            if line.contains("AWS_LC_SYS_") {
-                return Err(format!("{name} sets a reserved crypto build control"));
+            // environment. Reserve every native mail control for the wrapper.
+            if ["AWS_LC_SYS_", "LIBSQLITE3_", "SQLITE_", "SQLITE3_"]
+                .iter()
+                .any(|prefix| line.contains(prefix))
+            {
+                return Err(format!("{name} sets a reserved native mail build control"));
             }
             if matches!(table, "paths" | "patch" | "source" | "include") {
                 return Err(format!(
@@ -5775,7 +5781,7 @@ fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
                 .iter()
                 .any(|cmd| cmd.contains(" gate-crates crypto-cargo "))
             {
-                if let Err(e) = crate::check_loop::warm_crypto_sources(root) {
+                if let Err(e) = crate::check_loop::warm_mail_sources(root) {
                     eprintln!("affected-checks: {e}");
                     return 1;
                 }

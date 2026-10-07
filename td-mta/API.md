@@ -6493,575 +6493,81 @@ publication, native allocation and stack/RSS remain unqualified.
 
 ## 2. Read views and change history
 
-ReadView pins account/epoch, checkpoint generation and sequence, active segment,
-exact committed byte prefix and committed sequence, and retained history floor.
-It never observes later commits. Pins include history needed by next_change;
-if unavailable, acquisition/iteration returns HistoryLost, never a partial
-successful change page. Deadline/pool expiry invalidates further operations.
-history_floor is the last sequence whose frame need not remain: all frames
-strictly after it through the committed endpoint are retained. Thus a since
-state equal to the floor is valid. GC/checkpoint retention obeys those pins.
-Detached Record values borrow only
-caller key/value storage; holding them does not keep a view or blob alive.
+store_fs::IndexStore owns a locked root, one serialized SQLite writer and
+one to eight cold reader connections. create requires a fresh database;
+open validates the physical files and exact schema before accepting metadata.
+Both borrow LockedRoot exclusively for the owner's lifetime, preventing
+independent owners from bypassing its checkpoint/collection fence.
 
-get and next use shared row/key semantic validation and verify checksums before
-exposing bytes. Buffer shortage returns Capacity, not a truncated record.
-next visits strictly increasing encoded keys in the specified table, with
-None meaning exhaustion; after=None starts at the first key. Validate a supplied
-after key for that table. next_change scans complete retained frames after its
-cursor through the pinned committed sequence. It returns matching CHANGEs in
-(sequence, operation ordinal) order, skipping PUT bytes with bounded I/O.
-Read action from operation-header byte 1 (FORMAT.md); the empty CHANGE value
-does not remove its created/updated/destroyed header action.
-Operation ordinal is zero-based across all frame operations; u32::MAX denotes
-the end of its sequence. A cursor below history_floor gives HistoryLost, above
-the pinned end gives Invalid. Identity is not a journal-backed change kind.
-No frame-sized allocation or arbitrary caller cursor may cross the pinned end.
-Each call returns Record for one matching CHANGE, Advanced at the next
-complete frame boundary (even with no matching changes), or Complete only
-at the pinned endpoint. Stop scanning at that first record/boundary; a call
-reads no more than one bounded frame after locating its cursor. The view
-retains its streaming cursor so repeated calls do not rescan earlier frames.
-After Advanced, the caller resumes at (through, u32::MAX). The coordinator
-can publish a bounded advancing empty page or a prior fitting boundary when
-the next frame exceeds its remaining budget; it never skips unseen changes.
-A below-floor or invalid cursor fails before scanning, and deadline expiry
-is an error, not Complete. Locating an initial cursor also has a work budget.
+view captures a real SQLite WAL read transaction under the writer mutex.
+ViewIdentity contains account, epoch, committed_sequence and history_floor.
+Later commits remain invisible. get and next decode bounded typed rows into
+caller buffers; next follows strictly increasing encoded keys. Missing rows
+return None; insufficient buffers return Capacity. Bad rows return Corrupt.
+Detached rows borrow the caller buffers and confer no body or view ownership.
 
-`frame_changes::Collector` is a supplied-byte building block for that future
-cursor. It wraps the incremental frame verifier, accepts one exact operation
-per push and copies each CHANGE's type/ID/action/ordinal into caller Cell slots.
-It validates PUT/DELETE bodies but retains none of their bytes. A slot shortage
-returns OutputFull and permanently fails collection, as do malformed operations
-or provider errors. No partial list or success boundary is exposed. Consuming
-finish checks the complete frame and returns CompleteChanges with its Summary
-and read-only access to populated slots. Consuming into_cells returns the
-original full mutable scratch capacity for the next frame, ending that result's
-slot borrow; retained unused slots never appear in records. Records have the
-frame sequence and original ordinals; duplicates/actions are not coalesced or
-filtered. Row-only frames can complete with zero slots. Results do not borrow
-the operation input and retain no file or view pin. RESOURCES.md reserves
-distinct change slots because get/next may use their result buffers while a
-completed frame is being drained.
-This helper performs no I/O, cursor/floor/endpoint check, selected-journal
-binding, JMAP coalescing or next_change activation.
+next_change reads the native kind/sequence/operation index through the captured
+endpoint. Below-floor cursors return HistoryLost; above-end cursors return
+Invalid. Matching entries retain action and operation order. The SQL adapter
+returns Record or Complete; it needs no replay-only Advanced step. Identity
+changes are refused. A view retains its original monotonic deadline and VM
+fuel; clock/VM-budget failure or reversed time is sticky. Drop ends the read transaction
+before returning its connection; failed rollback retires the slot.
 
-`change_cursor::Cursor` implements the supplied-frame policy for one fixed
-object kind and captured ViewIdentity. Construct it with an initial after
-cursor; Identity, a future sequence or an inverted floor/end range is Invalid.
-A cursor below the floor, or partway through the floor's unretained frame, is
-HistoryLost. The floor boundary `(floor, u32::MAX)` remains valid. The caller
-owns actual pins and verifies deadlines, selected files and final-view validity
-before using any returned step as serving data.
+IndexReadView::open_blob_input takes the crypto provider, blob ID and byte
+ceiling. The snapshot supplies the BlobRow, account, original clock and
+deadline. Complete length/digest/EOF verification yields PinnedBlob random
+reads from the same file. The input and completed pin borrow the view, which
+blocks slot release and orphan collection until that borrow ends. A caller
+cannot renew the deadline by supplying another clock or duration.
 
-`poll` requires the identical captured identity and the exact last returned
-cursor. View changes are Conflict; caller cursor jumps or reuse of an older
-cursor after progress are Invalid. With no supplied frame, NeedFrame names
-the next exact sequence;
-locating/reading it has an external work budget. Supply a CompleteChanges from
-a checked frame. The initial finite ordinal must name an operation in that
-frame; it need not be a CHANGE. Frames out of order or replacement of the
-currently drained frame's Summary are Corrupt. All poll errors are terminal.
-
-Drain matching records in original ordinal order, including duplicates/actions.
-A saved slot index never revisits examined changes. One call returns the next
-record or Advanced at that same frame's end; no matching records still produces
-Advanced. Resume at `(through, u32::MAX)` after Advanced; the next call can
-request the next frame. Complete occurs only after the pinned endpoint boundary,
-including an empty range. This helper reads no files, coalesces no JMAP events
-and supplies no live pin, selected-history validation or protocol activation.
-
-`row_references::ReferenceCheck` checks one supplied final row's direct owning
-references through ReadView, at most one get per advance and two gets total.
-It validates source/target rows and sequence ceilings, expected blob kinds,
-recipient ordinals, account-bound lease expiry and exact view identity around
-lookups. Historical IDs cause no lookup. Completion records supplied source,
-identity and wall-time sample; full graph/blob/parent-cycle validation and actual
-pins remain coordinator requirements. Its source key borrow stays separate from
-the caller's target-result scratch. A key from next's Record must first be
-detached/re-decoded into independent key scratch to end the shared key/value
-borrow before reusing that value buffer for target lookups.
-
-`reference_sweep::Sweep` enumerates all final tables through a supplied ReadView
-and applies those direct checks, one next and at most two gets per advance. It
-checks exact identity, table/key order and a finite row budget, detaches source
-key bytes before reusing value scratch, and reports row/table progress separately
-from completion. Completion carries row counts and the same UTC sample; full
-physical graph/aggregate validity, parent chains, blobs and pins stay external.
-
-`store_fs::StoppedStore` consumes LockedRoot and retains its cooperative lock
-behind a read-only validation interface. Metadata, overlay and sweep borrows
-keep that owner alive; consuming into_locked restores mutation access only
-after those borrows end. No raw/root accessor is exposed. This excludes writes
-through this API owner under the existing trusted-path policy, without claiming
-external filesystem exclusion, complete graph validity or runtime view pins.
-
-`StoppedStore::validate_files` admits both selected-table and history sweeps,
-checks the loaded prefix belongs to this owner and enforces captured history
-routing. Complete the tables first, then history using the same reclaimed
-record buffer. Finish yields CheckedFiles plus full record/change buffers only
-after both succeed. CheckedFiles retains the stopped owner and overlay; it
-proves supplied selected physical inputs, not final reference/blob invariants
-or current selection loading. Every error retires the coordinator.
-
-`CheckedFiles::read_view` constructs an offline ValidationView implementing
-ReadView over these physically checked files. It retains the stopped snapshot,
-borrows record/change scratch and binds one forward change scan to the requested
-kind and starting cursor. Get/next may interleave with that scan. Construction
-admits every selected table/source byte ceiling and a nonzero per-call work
-allowance; calls check a fixed monotonic deadline before work units and before
-returning results. Each get/next replays its entire selected table before exposing
-a copied row; next_change retains its cursor instead of restarting scans.
-
-Changing kind, using an unexpected continuation, short output/scratch,
-work exhaustion, clock regression, deadline or I/O failure retires the view.
-Subsequent calls return that first final error without more clock/I/O work.
-A late deadline/clock error takes precedence over the operation result; buffers
-may already be changed and must be discarded on failure. Dropping the view
-releases its scratch borrows; retained CheckedFiles can construct another scan.
-This supplies offline validation reads, without service authorization, runtime
-pool leases, complete logical invariants or activation. The existing blocking
-std I/O duration limitation remains; a deadline check cannot interrupt a syscall.
-
-`StoppedStore::verify_owned_account` consumes the store and applies the same
-VerifyLimits/VerifyScratch validation as verify_account. Verification failures
-return OwnedVerifyError::Verification with the original source; an incomplete
-tail returns IncompleteTail without repair. Errors drop the store and release
-its lock. VerifiedStore retains the checked CURRENT/identity/journal summary
-and the store itself, without scratch or read descriptors. Summary getters are
-copies, not read leases. Its only ownership exit, into_stopped, consumes the
-proof before restoring offline access. No writable handle or activation
-authority is exposed.
-
-`VerifiedStore::with_journal` consumes the store and its recovered account
-ledger for a scoped JournalSession. Startup rechecks actual CURRENT, the
-complete active journal digest/extent and ledger counters under its
-deadline. It lends the session only after all checks; any error drops both
-owners. The callback receives the recovery frame scratch for reuse.
-Returning drops the session and store lock; neither the session nor a
-borrowed CommittedView may escape the callback.
-
-JournalSession::capture reserves one configured view slot (one through
-eight) and copies the entire ViewIdentity under a short publication mutex.
-Its borrowed CommittedView retains the session and selected namespace; only
-append beyond an already published prefix can change journal bytes. Drop
-returns the slot. Capacity or mutex contention refuses without waiting;
-poisoning retires new captures. Capture itself performs no filesystem I/O.
-
-CommittedView::with_read_view exclusively borrows one pin and caller-owned
-selection, overlay, record and change scratch for a callback over ReadView.
-PinnedReadRequest bounds overlay loading, selected table/history validation
-and each query. Reload CURRENT and require the session's unchanged selection;
-load only this pin's prefix, complete the existing physical table/history
-checks, then lend the existing bounded query implementation. One shared
-monotonic clock brackets preparation, callback and completion using the query
-deadline. A callback that ignores a retired reader's error still fails. The
-post-work clock check wins over earlier errors; all failure paths release
-scratch and temporary readers. PinnedReadError retains policy, selection,
-overlay or physical-validation errors. The pin remains usable for another
-scope, and query failure alone does not retire the writer.
-
-The callback cannot retain the reader or its borrowed scratch. Its exclusive
-pin borrow allows only one read scope per captured slot at a time. Existing
-pins can query their old prefix while the session appends beyond it; no
-writer/publication lock is held during reads or callbacks. Tables and retained
-history stay immutable throughout the session. This deliberately rechecks
-physical files per scope and scans tables per row query; it is a bounded
-fallback, not a performance qualification. Live checkpoint/retention
-transitions remain separate.
-
-ReadScratchSlot::new takes caller-owned PinnedReadScratch at startup,
-requires exact admitted replay-byte, replay-cell and change-cell extents,
-checks the fixed selection/record/layout ceilings, then clears the backing.
-Refusal precedes clearing. ReadScratchPool::new exclusively borrows an array
-of these slots; its length must equal ResourcePlan's storage_views. The pool
-allocates nothing and is borrowed by each lease, preventing reconstruction
-or backing reuse while a lease exists. Startup reads slot state through
-exclusive access without locking. A deliberately forgotten lease leaves its
-slot unavailable and prevents reconstruction of that slot array.
-
-ReadScratchPool::capture requires the session's view count to match. It tries
-at most that many slot locks, moves available scratch into a private lease,
-releases the slot lock, then captures a committed pin. Capture refusal returns
-the scratch. Full capacity, temporary lock contention, observed poison and
-invalid backing are distinct ReadPoolError cases; a journal refusal preserves
-its source. Observed poison fails that acquisition and is never cleared.
-
-PooledRead owns the pin and scratch lease and is Send + Sync, but querying
-requires an exclusive borrow. Its with_read_view reuses the existing scope
-checks; read failures retain the lease for retry. No slot lock spans I/O,
-publication locking or callbacks. Drop returns the pin and backing even after
-callback unwind; it briefly locks each owner separately. Backing remains
-provisional data between uses and has no secure-erasure guarantee. Startup
-allocation and the protocol worker/queue ownership remain caller duties.
-
-PooledRead::open_blob_input looks up the supplied root BlobId in its captured
-view, copies the authoritative BlobRow and opens that typed immutable path.
-The caller must authorize the account/root blob and admit query work before
-entry; this primitive does not establish email visibility or upload-lease
-access. Refuse a missing row, oversized body or incompatible descriptor
-layout. A byte cap cannot exceed i64::MAX. The returned PinnedBlobInput
-exclusively borrows the pooled view, so its pin and scratch cannot be returned
-or reused while body access exists. At most one body descriptor is retained
-per pooled view; no writable or raw file accessor is exposed.
-
-Input reads process at most 64 KiB and incrementally hash the bytes. They
-remain provisional until consuming finish checks exact consumption, unchanged
-extent, physical EOF and the authoritative digest. Success returns PinnedBlob,
-which implements BlobReader with bounded random reads from that same verified
-descriptor. It retains the original view borrow. The query's absolute deadline
-and a shared monotonic watermark span lookup, open, every input read, finish
-and subsequent random reads. Post-work time/source failure overrides an earlier
-result; any body-step failure is terminal, with subsequent calls returning the
-same fixed error without further clock or I/O work. Errors may have changed
-caller output. Its check_deadline performs a fresh no-I/O fence through
-that same clock, preserving remembered failures. Dropping the body owner
-releases its descriptor and view borrow;
-it does not mechanically retire the writer or the pooled view. A present
-row with missing, truncated or invalid-length bytes returns Corrupt, as does
-a digest mismatch. Other I/O and caller-argument failures retain their fixed
-error classes. The caller must route Corrupt through the service-health and
-mutation-stop policy below; this primitive does not implement that wiring.
-
-These checks rely on immutable blob files in the stable private namespace.
-The completed reader does not rehash each range. Service authorization,
-worker admission, MIME/derived locators and protocol acknowledgment remain
-separate. The existing blocking-I/O deadline limitation still applies.
-
-JournalSession::commit serializes one immutable frame under a separate
-writer mutex. It installs a frame-only reservation, advances bounded
-append/sync/confirm, reconciles actual charges and releases the empty
-reservation, then publishes the sequence and byte offset together. Clock
-checks bracket construction, each step and finish; a final check follows
-publication. Initial time/admission or writer-lock contention returns
-Rejected without starting append. A poisoned writer mutex or an already
-stopped writer returns Stopped even before reservation. Once reservation
-succeeds, any failure returns Stopped and prevents all future writes in this
-session. Full or partial bytes may exist; a final deadline failure can
-follow publication. Existing views retain their old identity. No failure
-rolls back bytes or visibility. Recovery requires a new lock, verification
-and ledger. Poisoning either mutex prevents success. Mutex critical sections
-for capture/publication contain no I/O or clock callbacks. Blocking
-filesystem calls and lock acquisition remain uninterruptible.
-
-JournalSession::stop_writes records an irreversible atomic stop request,
-then tries the writer mutex. Ok confirms the writer is idle and later commit
-attempts are fenced. Busy leaves the request active: callers must retry for
-confirmation, and cannot treat it as proof that an in-flight writer has
-finished. WriterStopped means the mutex is poisoned; the request still
-fences new attempts. Repeated successful stops are idempotent. Commit checks
-the request before admission, around bounded append operations, before
-publication and after its final clock sample. A stop observed after
-reservation returns Stopped and retains recovery uncertainty. An operation
-already in progress may change bytes or publish before it observes the
-request; stop never rolls back. Existing pins and read capture remain
-available. This primitive does not mark service health, cancel other queues
-or perform recovery; the coordinator must wire those policies. Idle
-confirmation retains existing descriptors until session teardown and
-performs no filesystem I/O. Once a step starts, its existing clock/I/O error
-takes precedence over a concurrent stop request; the request still fences
-future writes.
-
-The caller admits full frame work and supplies its actual recovered ledger
-and planned view count. Complete transaction/blob policy, live
-checkpoint/retention changes and protocol acknowledgment remain
-external. No selected namespace change is available during this
-fixed-generation session.
-
-`ScannedJournal::append_frame` is a mutation-capable low-level operation
-outside the stopped read-only facade. Keep actual stopped-store exclusion
-from scan through completion. The sole exception is JournalSession: its
-serialized writer may coexist with borrowed queries confined to retained
-committed prefixes. It consumes a scan without a partial tail, validates a
-borrowed successor frame and cumulative journal ceilings, rechecks CURRENT
-and opens the same private inode at the exact scanned length. Constructor
-errors are Rejected before writes. JournalAppend advances through bounded
-writes, sync and final length/EOF confirmation. Any step error permanently
-retires it and reports Indeterminate; Failed/Incomplete finish errors and
-unfinished drop also leave uncertain bytes and charges for recovery. Only
-consuming complete finish yields SyncedAppend endpoint/count evidence.
-Caller reservations, writer serialization, graph policy, deadline/work
-checks, atomic visibility and acknowledgment remain external. No writable
-handle escapes.
-
-`ScannedJournal::append_reserved` binds that physical append to the existing
-WriterLedger's exact frame ticket after checking prior journal counts. The
-caller supplies the correct account ledger and the same append exclusion
-contract through completion. ReservedAppend holds an exclusive ledger
-borrow; step errors and unfinished drop stop admission and preserve busy
-charges. Successful finish first obtains durable evidence, then reconciles
-actual frame bytes/operations before returning ReconciledAppend, whose
-durable evidence is accessible by shared reference only. Constructor refusal
-starts no new effect; bookkeeping refusal after durable I/O is uncertain and
-stops admission. Runtime publication and client acknowledgment remain
-external.
-
-`ReconciledAppend::append_reserved` consumes a reconciled boundary for the
-next successor without a full rescan. Shared construction retains cumulative
-sequence, byte and operation checks and rechecks CURRENT/inode/extent before
-writes. Keep the same append exclusion contract and account ledger. Refusal
-consumes the old owner but writes nothing; rescan before a later attempt.
-Successful finish gives the next reconciled owner. This grants no live view
-or publication authority.
-
-`StoppedStore::capture_journal` wraps a bounded stopped scan using caller frame
-scratch and a physical byte ceiling. Advances yield scalar frame progress or
-provisional End; finish verifies EOF and returns CapturedJournal with a derived
-ViewIdentity, selected metadata, byte totals and incomplete-tail status. Failed
-or unfinished scans cannot finish. The retained-history floor comes from the
-first descriptor or checkpoint. CapturedJournal can load that same prefix into
-caller overlay storage, checking its digest against the scan summary, but
-exposes no repair handle or mutation method. Caller
-admission/deadline checks and subsequent file/data validation remain required.
-
-`CheckedFiles::validate_data` drives direct references, recipient queue checks,
-mailbox parent chains and blob verification under the same stopped owner and
-ValidationView. DataLimits bounds total final rows, parent gets and blob bytes;
-each advance performs one underlying sweep step and brackets its full work with
-deadline checks. Retired view errors preserve their nested source without more
-clock work. Completion compares every table's physical/reference counts and the
-three specialized totals. Consuming finish rechecks the deadline and returns
-CheckedData retaining the file proof/owner, while releasing reader scratch.
-Any error retires the coordinator; repair/accounting, mutation policy, runtime
-leases and service activation remain separate.
-
-`StoppedStore::verify_account` loads actual CURRENT and composes capture,
-digest-bound overlay loading, selected-file validation and data validation.
-VerifyLimits supplies all existing phase bounds plus one absolute deadline;
-VerifyScratch supplies caller-owned partitions. Limits are admitted by each
-phase before its work; malformed later-phase limits may follow earlier I/O.
-Outer pre/post checks bracket
-every stage/step/completion, and the same clock wrapper tracks monotonic samples
-from nested readers. Late outer clock errors take precedence and report Policy
-without phase context, replacing any operation error. Other failures retain
-their phase/source. Failures yield no report and may overwrite scratch. VerifiedAccount
-retains only stopped ownership and scalar completion summaries, allowing all
-scratch reuse. Incomplete tails are reported without repair. This is a blocking
-offline library API; CLI/JSON, full mutation policy, recovery accounting and
-service activation remain separate.
-
-`store_fs::HistorySweep` verifies every retained selected history segment,
-admitting total descriptor bytes and frames before I/O. Advances open, read one
-bounded frame, or complete one selected file; only digest/EOF completion releases
-its full change-slot buffer to the next segment. Finish returns selected CURRENT,
-checkpoint and counts plus the original slots. Progress is provisional; active
-prefixes, tables, final-row invariants and actual pins remain separate. Reaching
-a selected endpoint stops frame decoding; remaining bytes fail completion.
-Insufficient change slots report ChangeCapacity, with no corruption claim.
-
-`store_fs::TableSweep` verifies and replays every selected checkpoint table
-against a supplied LoadedOverlay. Constructor admits total selected file bytes;
-merge callbacks enforce a total final-row allowance. Each advance opens, steps
-or finishes one table. Only selected digest/EOF and successful replay completion
-release its record buffer for the next table. Finish returns CompleteTables plus
-the original scratch. Selected history, references, blobs, real pins and full
-activation remain separate. TableInput/TableReplay finish_reuse expose that
-same checked scratch transfer without weakening existing finish semantics.
-
-`store_fs::BlobSweep` walks supplied final blob rows and verifies each named
-private file. Enumeration, opening, one bounded chunk and digest/EOF completion
-are separate advances. Row/total-byte limits precede file opening and full view
-identity is checked around each phase. Source value scratch is reused for
-chunks after scalar row detachment. Completion requires all enumerated files
-verified and table EOF; it records identity/counts and grants no pin, reference
-ownership or physical-enumeration completeness authority.
-
-`mailbox_sweep::Sweep` enumerates mailboxes and checks each complete parent
-chain, at most one next or get per advance. Separate row and total-get budgets
-bound admitted work without a growing visited set. Completion requires mailbox
-EOF and every chain rooted under the same view identity. Cycles, missing or
-malformed rows, ordering/view changes and exhausted admission retire the sweep.
-CompleteForest carries identity/counts; physical completeness, pins and the
-configured depth policy remain external.
-
-`recipient_sweep::Sweep` checks exact recipient ordinals for every submission
-through one next per advance, preserving ordered progress in both tables. It
-requires both streams exhausted before completion and refuses missing/extra/
-orphan rows, malformed sources, changed identity and total-row exhaustion.
-Recipient state and whole-group completion/notification/cancellation rules from
-QUEUE.md are checked before completing each group. Queue errors identify the
-submission and optionally its recipient ordinal. Completion records coverage
-counts; transition history, worker fencing, selected physical completeness and
-actual pins remain separate.
-
-`store_fs::ChangeRoute` selects the source for a NeedFrame sequence using
-selected manifest metadata and captured ViewIdentity. It validates retained
-coverage through the checkpoint, then returns a history descriptor index or
-Active only within `(history_floor, committed_sequence]`. Changed identity is
-Conflict; missing history is HistoryLost and future sequences are Invalid.
-This immutable lookup performs no I/O and does not retire on a caller error.
-The driver still validates/opens files, locates the frame under a work budget
-and holds real pins; a source choice is not serving authorization.
-
-`LockedRoot::open_changes_at` returns ChangeInput for one requested sequence.
-Each advance reads at most one complete bounded frame and returns Locating,
-Frame or End. Locating hides earlier changes and does not change the caller's change cursor.
-Frame permits draining the checked result before the next advance. Exact view
-identity is required on each advance. End alone proves no selected completion;
-finish verifies the source and returns typed completion plus reusable full
-CHANGE slots. ChangeScan below coordinates segment transitions; the driver
-admits work/deadlines and holds real pins. These remain provisional filesystem
-building blocks, not ReadView service.
-
-`store_fs::ChangeScan` connects that locator to the cursor for a fixed kind and
-starting position. Each advance returns internal Progress or a cursor Change
-step. It verifies and closes each consumed source before reusing slots for the
-next source, and retires on any failure. Complete/finish cover consumed sources
-only; an already exhausted range requires no file I/O. Returned changes retain
-the same provisional status and external validity/pin requirements.
-
-BlobReader is an already authorized, opened, immutable file with a live owner
-pin held until it closes. Store::open_blob requires Access and borrows the
-view, retaining that ownership until the reader drops. It checks live message/
-submission references or an authorized unexpired upload lease before opening
-the root blob; a known BlobId alone grants nothing. Opening private paths
-belongs to M05; protocol handlers do not open files directly. read_at uses
-checked offsets,
-returns at most output.len() bytes, zero only at EOF or for empty output,
-and refuses offsets beyond len. A positive short read is legal. The caller
-loops within its work budget. Missing/truncated committed bodies are Corrupt.
-Part locators additionally require WIRE.md's authorization/descriptor checks.
+checkpoint takes the writer fence and refuses while any view is held. A
+successful SQLite WAL TRUNCATE plus root sync permits further bounded writes.
+collect_orphan requires a durably absent current BlobRow, no live views,
+validated immutable path, unlink and parent sync. The core does not implement
+an online backup, complete orphan walk, history-pruning scheduler or runtime
+slot arbitration; operational callers must provide those admission policies.
 
 ## 3. Reserve, publish, commit
 
-Store::reserve runs before accepting a body or mutation responsibility.
-Access carries the account, trusted principal and configuration generation.
-It is constructed by the coordinator after authentication/admission, never by
-deserializing a client field. Recheck principal permissions/device revocation
-and the selected configuration at each access and at commit. SMTP, queue and
-maintenance principals have only their named operation rights. A stale
-configuration generation causes reauthorization against the selected snapshot;
-the coordinator can refresh Access without releasing the reservation, its
-body quota or pins. Generation mismatch alone is not device revocation. An
-actually revoked device cannot commit a device-initiated mutation.
+The existing ports::Store trait is the future authenticated service boundary;
+IndexStore is its low-level persistence core, not an implementation of device
+authorization or the complete reservation coordinator. Access still requires
+account, trusted principal and current configuration. Recheck revocation and
+permissions at commit. Named SMTP, queue and maintenance principals retain
+only their authorized operation rights. Queue outcome recording uses its
+durable attempt fence even if credentials change after transmission.
 
-Queue outcome recording belongs to the durable attempt/fence that authorized
-the transmission. A later route credential/identity configuration change may
-stop new dispatch, but cannot revoke the queue principal's right to record
-that already-authorized attempt's final result using its held reservation.
-Refresh Access for that narrow recording operation; do not rerun sender
-authorization as though it were a new submission. New dispatch uses the new
-configuration. This also applies to recovery of the prior attempt.
+Reserve body, operation, response and category capacity before accepting
+responsibility. ReservationId retains coordinator instance, slot and checked
+generation. Linear logical effect tickets prevent double reconciliation;
+physical I/O can still fail. Published but unreferenced files stay charged
+until durable cleanup, independently of unused logical reservations.
 
-The account/size/deadline lease has a ReservationId containing coordinator
-instance ID, slot and checked generation; a different instance or expired/
-reused slot is rejected even if it has the same Rust type.
-Include every PUT, DELETE and retained CHANGE in frame bytes/operation count.
-Capacity is global across reservations and survives checkpoint transfer under
-STORAGE.md's barrier. No unaccounted frame/operation overrun may reach disk.
-DiskBudget separately reserves logical raw-blob bytes/files, metadata
-bytes/files and logical upload/queue quota increases (including a new pin on
-an existing body). Upload/queue categories may overlap raw-blob charges and are not
-added to raw use a second time. When size is unknown reserve the admitted maximum.
-ADMISSION.md fixes logical quota ceilings and checkpoint output bounds; no blob creation
-may bypass this reservation. Exceeding a logical quota returns Quota; temporary
-pool/storage pressure returns Capacity/Busy. Dropping or expiring releases
-unused capacity once; already-written orphan bytes remain charged until cleanup.
-DiskBudget covers store operations. Request retention, sort/cache runs, logs
-and cold-state files have separate typed logical leases. No lease reserves
-physical blocks or guarantees I/O success. All write/sync failures propagate.
+IndexStore::commit accepts Crypto, CommitRequest, a bounded Operation slice
+and owner-bound PublishedFile proofs. CommitRequest carries account, expected
+sequence, UTC validation time and one monotonic deadline. Every fresh BlobRow
+requires a matching durably published, exact-length and digest-verified file.
+A permanent SQLite ID registry prevents recreating deleted blob IDs. No
+message bytes are copied into database values or transaction staging.
 
-Store::begin_blob borrows an active reservation exclusively and charges its
-raw-body quota before creating the private file. BlobWriter writes whole
-chunks or fails; after error the entire writer is poisoned and must be
-dropped, never retried with the same chunk. publish
-consumes it and returns only after file and publication-directory sync.
-PublishedBlob has read-only accessors for reservation/account/id/length/digest;
-only core persistence constructs it, and it is neither Clone nor Copy. It is
-bound to the same still-active reservation that pins its pending blob against
-GC. It is not an authorization credential. M05 owns root paths, publication
-checks and orphan cleanup. A publication error may leave an orphan but cannot
-create metadata. Dropping a writer ends its borrow, not the reservation.
+The serialized transaction checks the expected sequence, applies operations
+in caller order, validates final owning references and parent chains, records
+changes and updates the unsigned account sequence. Change actions agree with
+pre/post existence; a native unique index refuses duplicate object changes.
+Repeated row keys take their last effect. Caller authorization, queue
+transitions, aggregate recipient policy and complete changed-object coverage
+remain the coordinator's responsibility.
 
-M02c3a refines transaction handoff to TransactionInput: one immutable encoded
-byte slice plus operation count, using all FORMAT.md PUT/DELETE/CHANGE
-operation headers and key/value encodings without a journal frame header.
-There is no separately allocated CHANGE slice. Validate every input byte,
-tag, count, length and semantic key/row before append; TransactionInput
-is not a proof of validity. Owned StagedOperation offsets (bounded to 32 bytes
-per slot, including parsed operation kind/type/action) index the input arena.
-Each Row/Key is decoded only while used.
-Do not store an array of borrowed Mutations beside their mutable backing arena:
-that prevents safe buffer reuse across requests. The single-record Mutation
-enum remains an encoder input, not a pooled self-referencing object graph.
-M05 supplies the operation encoder/parser; this increment only fixes handoff
-and checked startup layout. Frame header/footer bytes must fit in addition
-to the supplied operation bytes (which already include CHANGE). Input and
-output buffers are distinct. Both arenas reserve `frame_bytes`, but valid
-input is at most `frame_bytes - FRAME_HEADER_BYTES - FRAME_FOOTER_BYTES`;
-reject a larger operation stream before encoding or append. Unused input
-arena capacity does not increase the permitted journal frame size.
-The extra input arena is deliberate: protocol-owned canonical input stays
-immutable while the store builds and validates its own complete frame. This
-keeps the commit interface independent of store-private mutable buffer leases
-and gives inspection/fault adapters the same handoff. V1 pays one bounded copy
-instead of requiring vectored append or exposing a writer arena to callers.
-M05 uses the checked StagedOperation slot representation, or amends its size
-contract before substituting a different internal descriptor.
-
-Ports express the thread handoff: transports, digest state, reservations and
-blob handles are Send; shared stores, clocks, crypto and read views are Sync.
-This does not permit concurrent mutation or erase borrowed lifetimes. Startup
-owners outlive scoped workers and their leased handles; queues still carry
-slot IDs, never lifetime casts. TLS factories are worker-owned Send values.
-
-Store::commit runs only on the serialized writer worker. Recheck reservation
-ownership/deadline, expected account sequence, authorization supplied by the
-coordinator through Access, record semantics/references, published-blob
-reservation/account/digest/length and matching blob PUTs, and exact encoded size/count before any append.
-Every newly referenced blob must be either live in the current view or in
-this call's checked published handoff. A handoff alone does not grant access
-to an existing blob in another account. Derive/validate CHANGEs from actual
-object effects; do not trust protocol callers to omit or forge them. Identity
-CHANGE is reserved by the byte registry but rejected in v1 mail transactions.
-Repeated keys follow FORMAT.md ordering; changes describe the frame's final
-object effect. Never allow a partially valid transaction into the journal.
-
-Effects include derived properties even when their own table row is unchanged:
-Email create/destroy changes Thread.emailIds and all affected Mailbox counts;
-membership changes update that Email and affected Mailboxes; $seen/$draft
-changes update that Email and affected unread counts. V1 chooses RFC 8621
-§2's simple mailbox-local unreadThreads definition: count distinct threads
-with an email in this mailbox having neither $seen nor $draft. totalThreads
-is distinct threads with any member in this mailbox. Compare before/final
-counts and emit a Mailbox CHANGE wherever any count or stored property changed.
-Emit Thread-created/destroyed when its first/last email is added/removed,
-otherwise Thread-updated on emailIds changes. Account for the complete derived
-fan-out in the reservation before accepting the transaction. Never omit a
-CHANGE to fit a frame. Mailbox/changes.updatedProperties is always null in v1,
-because the journal does not track which individual properties changed.
-
-expected is the sequence used to prepare the mutation. A different current
-sequence yields Rejected(Conflict) without appending. The coordinator may
-replan within its bounded work budget while retaining the same reservation,
-including streamed/published body quota and GC pins; ifInState still compares
-the client's token against the newly selected view before mutation. A commit returns Ok
-only after complete frame sync and durable visibility publication. commit
-borrows the reservation mutably. Rejected(Conflict) leaves it active; other
-pre-append refusals leave it active unless its deadline/authorization/identity
-is invalid. Ok consumes its reserved capacity into committed usage, and
-Indeterminate poisons it until recovery. is_active becomes false in either
-case; it can never be reused or double-released. An invalid/expired lease
-returns unused capacity once and transfers written orphan charges to cleanup.
-
-CommitFailure deliberately separates:
-
-- Rejected: this attempt appended no frame; ordinary object/method error is
-  safe if this method has no earlier commits. The active reservation and its
-  pending-blob pins survive Conflict; dropping it makes unreferenced blobs
-  eligible for orphan cleanup.
-- Indeterminate: a partial or complete recoverable frame may have been written.
-  Stop all writes and transmitting workers; recover before accepting another
-  mutation. Do not fabricate an ordinary failed Set result claiming no effect,
-  retry the append or roll back prior successful methods. If the HTTP response
-  cannot accurately report the outcome, close the request; reconciliation
-  uses committed IDs/history after recovery. Inbound SMTP closes without final
-  acceptance, so a sender can retry and a duplicate is possible.
-
-An error after frame durability but before local notification is still an
-indeterminate caller outcome. Cancellation/deadline cannot revoke a committed
-frame. The contract requires injected failure tests around every boundary;
-the enum itself does not implement them.
+COMMIT with synchronous FULL precedes success. CommitError::Rejected means
+the pre-COMMIT check or a deferred-constraint/busy refusal rejected the
+transaction and rollback completed; failed rollback additionally retires
+writes. A successful FULL COMMIT plus autocommit reports its durable sequence
+even when the deadline expires during completion. Other COMMIT errors are
+Indeterminate and stop writes until reopen/recovery. New read snapshots
+remain available. Never report an ordinary retryable method error for an
+uncertain external effect. Response notification can fail after durable
+commit; the service still needs idempotence/result-retention reconciliation.
 
 ## 4. Opaque state strings
 
@@ -7095,11 +6601,11 @@ each ID by final effect: create then destroy disappears; create then update
 is created; update then destroy is destroyed; repeated updates occur once.
 No deliberate delete/recreate reuse is allowed. Return IDs disjoint across
 created/updated/destroyed and ascending raw ID within each array. Restrict
-maxChanges across their combined size. Page only at complete frame boundaries;
+maxChanges across their combined size. Page only at complete transaction boundaries;
 choose the latest scanned boundary that fits all effects, pinning that page's
 old/new state. If no advancing boundary fits before the work budget expires,
 return cannotCalculateChanges. Do not split a transaction or omit excess IDs.
-hasMoreChanges means more frames remain through the pinned target; the next
+hasMoreChanges means more transactions remain through the pinned target; the next
 request may see a newer target. An unchanged request at current returns empty
 arrays, equal states and false. Retention loss forces explicit resynchronization.
 
@@ -7110,7 +6616,7 @@ queryState encoding and bounded sort/search semantics; CASES.md names the
 wire fixtures. The queryState codec is still owned by M14/M16.
 
 Identity data comes from one atomically selected validated configuration
-snapshot, outside the mail journal. Digest preimage is ASCII td-mta-identities-v1
+snapshot, outside the mail database. Digest preimage is ASCII td-mta-identities-v1
 followed by a NUL byte, u32-LE count, then identities sorted by raw ID. Each
 identity is raw 16-byte ID, name, email, replyTo, bcc, textSignature,
 htmlSignature, mayDelete in that order. Strings are u32-LE UTF-8 byte length
@@ -7207,7 +6713,7 @@ without a suitable standard SetError uses serverPartialFail and requires
 resync; never replace known effects with method-level serverUnavailable or
 serverFail. RFC 8620 §5.3 does not enumerate those generic method failures
 as SetErrors. ADMISSION.md specifies the exact retained-response behavior.
-Reserve response capacity before mutation. An indeterminate journal outcome
+Reserve response capacity before mutation. An indeterminate SQLite commit outcome
 follows section 3, never a guessed result.
 
 SMTP rejects unavailable admission with temporary status before DATA and

@@ -11,87 +11,23 @@ use std::{
 mod create_directory;
 #[path = "store_fs/input.rs"]
 mod input;
-pub use input::{
-    AppendError, AppendStep, CompleteFile, CompletePrefix, JournalAppend, PrefixReader,
-    ReconciledAppend, RecoveryInput, RecoveryInputError, RepairError, RepairedJournal,
-    ReservedAppend, ReservedAppendError, ScannedJournal, StoreReader, SyncedAppend,
-};
-#[path = "store_fs/stopped.rs"]
-mod stopped;
-pub use stopped::{
-    CaptureError, CaptureStep, CapturedJournal, CheckedData, CheckedFiles, CommitError,
-    CommittedView, DataError, DataLimits, DataStep, DataValidation, FileValidation, JournalCapture,
-    JournalError, JournalSession, JournalStart, JournalStartScratch, OwnedVerifyError, PinnedBlob,
-    PinnedBlobInput, PinnedReadError, PinnedReadRequest, PinnedReadScratch, PooledRead, ReadLimits,
-    ReadPoolError, ReadScratchPool, ReadScratchSlot, StoppedStore, ValidationError,
-    ValidationLimits, ValidationReadRequest, ValidationStep, ValidationView, VerifiedAccount,
-    VerifiedStore, VerifyError, VerifyLimits, VerifyScratch,
-};
-#[path = "store_fs/selection.rs"]
-mod selection;
-pub use selection::{SelectionError, SelectionScratch, SelectionStage};
+pub use input::{CompleteFile, StoreReader};
 #[path = "store_fs/blob.rs"]
 mod blob;
 pub use blob::{BlobInput, BlobInputError, CompleteBlob};
-#[path = "store_fs/blob_sweep.rs"]
-mod blob_sweep;
-pub use blob_sweep::{BlobSweep, BlobSweepError, BlobSweepStep, CompleteBlobSweep};
-#[path = "store_fs/table.rs"]
-mod table;
-pub use table::{
-    CompleteLookup, CompleteNext, CompleteReplay, CompleteTable, CompleteTables, LookupError,
-    NextError, TableInput, TableInputError, TableLookup, TableNext, TableReplay, TableReplayError,
-    TableSweep, TableSweepError, TableSweepLimits, TableSweepStep,
-};
-#[path = "store_fs/active_overlay.rs"]
-mod active_overlay;
-pub use active_overlay::{LoadedOverlay, OverlayInputError};
-#[path = "store_fs/active.rs"]
-mod active;
-#[path = "store_fs/journal_input.rs"]
-mod journal_input;
-pub use active::{ActiveInput, ActiveInputError, CompleteActive};
-#[path = "store_fs/history.rs"]
-mod history;
-pub use history::{
-    CompleteHistory, CompleteHistorySweep, HistoryInput, HistoryInputError, HistorySweep,
-    HistorySweepError, HistorySweepLimits, HistorySweepStep,
-};
-#[path = "store_fs/active_changes.rs"]
-mod active_changes;
-#[path = "store_fs/change_locator.rs"]
-mod change_locator;
-pub use change_locator::{ChangeCompletion, ChangeFrameStep, ChangeInput, ChangeInputError};
-#[path = "store_fs/change_route.rs"]
-mod change_route;
-pub use change_route::{ChangeRoute, ChangeSource};
-#[path = "store_fs/change_scan.rs"]
-mod change_scan;
-pub use change_scan::{ChangeScan, ChangeScanRequest, ChangeScanStep};
-#[path = "store_fs/change_input.rs"]
-mod change_input;
-pub use active_changes::{ActiveChangesInput, CompleteActiveChanges};
-#[path = "store_fs/history_changes.rs"]
-mod history_changes;
-pub use history_changes::{CompleteHistoryChanges, HistoryChangesInput};
 #[path = "store_fs/temporary.rs"]
 mod temporary;
 pub use temporary::{
-    CreateError, CurrentError, CurrentUpdate, MetadataDestination, PublishError, PublishedFile,
-    SyncedTemporary, TemporaryFile, MAX_FILE_STEP_BYTES,
+    CreateError, PublishError, PublishedFile, SyncedTemporary, TemporaryFile, MAX_FILE_STEP_BYTES,
 };
-
+#[path = "store_fs/index.rs"]
+mod index;
+pub use index::{CommitError, CommitRequest, IndexReadView, IndexStore};
+#[path = "store_fs/pinned.rs"]
+mod pinned;
 #[cfg(test)]
-pub use input::probe_reserved_append;
-#[cfg(test)]
-pub use stopped::with_pinned_fixture;
-#[cfg(test)]
-pub use stopped::{
-    probe_journal_publication, probe_pinned_blobs, probe_pinned_reads, probe_read_pool,
-    probe_verify_account,
-};
-#[cfg(test)]
-pub use temporary::probe::run as probe_temporary_io;
+pub use pinned::with_pinned_fixture;
+pub use pinned::{PinnedBlob, PinnedBlobInput};
 
 /// Qualified by the host and portable allocation probes, including errors.
 /// This is a service limit, not a promise about every Rust implementation.
@@ -391,6 +327,9 @@ fn validate(path: &str) -> io::Result<()> {
 fn trusted_owner(owner: u32, service: u32) -> bool {
     owner == 0 || owner == service
 }
+
+#[cfg(test)]
+pub use temporary::probe::run as probe_temporary_io;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
