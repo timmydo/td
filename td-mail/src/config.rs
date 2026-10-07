@@ -770,20 +770,6 @@ pub fn setup_username(username: &str) -> Result<String, String> {
     Ok(username.to_string())
 }
 
-/// A TOML basic string holding `value`, which holds no control character.
-fn toml_string(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('"');
-    for c in value.chars() {
-        if c == '"' || c == '\\' {
-            quoted.push('\\');
-        }
-        quoted.push(c);
-    }
-    quoted.push('"');
-    quoted
-}
-
 /// Whether `line` is the table header `[account.NAME]` as TOML lets it be
 /// written: spaces inside the brackets, the name quoted, a comment after.
 fn is_account_header(line: &str, name: &str) -> bool {
@@ -848,7 +834,10 @@ fn replace_account_server(
         } else {
             ""
         };
-        out.push_str(&format!("{key} = {}{ending}", toml_string(value)));
+        // td-toml's own literal: it escapes what a basic string must and
+        // parses back to the same value.
+        let literal = Toml::Str(value.to_owned());
+        out.push_str(&format!("{key} = {literal}{ending}"));
     }
     if sections != 1 || replaced != [1, 1] {
         return Err(format!(
@@ -1596,6 +1585,24 @@ secret = \"portal\"
             );
         }
         assert!(!is_account_header("[account.main] trailing", "main"));
+
+        // A value is written as td-toml's literal, so what parses back is the
+        // value given: quotes and backslashes, and a control character the
+        // form's own checks would have refused before it got here.
+        let text = "[account.main]\nwell_known_url = \"https://a/\"\nusername = \"u\"\n";
+        let tricky = "a\"b\\c\u{1}d\ne\u{7f}";
+        let replaced = replace_account_server(text, "main", "https://x/", tricky).unwrap();
+        assert_eq!(replaced.lines().count(), text.lines().count());
+        let document = td_toml::parse(&replaced).unwrap();
+        let field = |name: &str| {
+            document
+                .get("account")
+                .and_then(|accounts| accounts.get("main"))
+                .and_then(|main| main.get(name))
+                .and_then(Toml::as_str)
+        };
+        assert_eq!(field("username"), Some(tricky));
+        assert_eq!(field("well_known_url"), Some("https://x/"));
 
         // What the form can change is what the window offers it for: a
         // legacy [jmap] account is not.
