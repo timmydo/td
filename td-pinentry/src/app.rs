@@ -703,38 +703,10 @@ impl Composition for Frame<'_> {
 /// at spaces, a word longer than a row split across rows, and an empty
 /// line kept as an empty row. No columns is one row per line.
 fn wrap(text: &str, columns: usize) -> Vec<String> {
-    let mut rows = Vec::new();
-    for line in text.split('\n') {
-        if columns == 0 {
-            rows.push(line.to_owned());
-            continue;
-        }
-        let mut row = String::new();
-        let mut width = 0;
-        for word in line.split_whitespace() {
-            let length = word.chars().count();
-            if width > 0 && width + 1 + length <= columns {
-                row.push(' ');
-                row.push_str(word);
-                width += 1 + length;
-                continue;
-            }
-            if width > 0 {
-                rows.push(std::mem::take(&mut row));
-            }
-            let mut rest = word;
-            while let Some((at, _)) = rest.char_indices().nth(columns) {
-                let Some((head, tail)) = rest.split_at_checked(at) else {
-                    break;
-                };
-                rows.push(head.to_owned());
-                rest = tail;
-            }
-            row.push_str(rest);
-            width = rest.chars().count();
-        }
-        rows.push(row);
-    }
+    let mut rows: Vec<String> = text
+        .split('\n')
+        .flat_map(|line| td_ui::text::wrap(line, columns))
+        .collect();
     while rows.last().is_some_and(|row| row.is_empty()) {
         rows.pop();
     }

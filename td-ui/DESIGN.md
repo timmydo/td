@@ -409,8 +409,8 @@ of its own files may name each module.
 - `text`: `wrap`, the greedy word wrap of a string into rows of at most
   a number of characters (whitespace runs as one space, an overlong word
   split, empty text one empty row, no columns the whole text as one
-  row); pure. The key help, td-pass's prompt and td-setup's welcome
-  page wrap through it.
+  row); pure. The key help, td-pass's prompt, td-setup's welcome page
+  and each line of td-pinentry's dialog text wrap through it.
 - `theme`: `Theme` (`name`, `colors` in `KEYS` order; `map`, a colour
   as the theme draws it; `primitive`, a draw's colours mapped; `next`),
   `ROLES` and `KEYS`, the shared palette's colour for each role; the six

@@ -305,6 +305,8 @@ fn wrapping_keeps_lines_and_splits_long_words() {
     assert_eq!(wrap("abcdefgh", 3), vec!["abc", "def", "gh"]);
     assert_eq!(wrap("one two three", 7), vec!["one two", "three"]);
     assert_eq!(wrap("trailing\n", 20), vec!["trailing"]);
+    assert_eq!(wrap("a\n  \nb", 10), vec!["a", "", "b"]);
+    assert_eq!(wrap("a b\ncd", 0), vec!["a b", "cd"]);
     let mut rows = vec!["aaaa".to_owned(), "bbbb".to_owned(), "cc".to_owned()];
     shorten(&mut rows, 2, 4);
     assert_eq!(rows, vec!["aaaa", "bbb…"]);
