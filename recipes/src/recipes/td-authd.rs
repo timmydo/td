@@ -207,7 +207,9 @@ pub fn recipe() -> Recipe {
             "{src}/td-firstboot/src/principals_tests.rs",
             include_str!("../../../td-firstboot/src/principals_tests.rs"),
         ),
-        // Request 1a's hostname rules and login-state predicate.
+        // The hostname rules, which serve request 1a and consent's hostname
+        // descriptions (td-secret and td-compositor include them too), and
+        // request 1a's login-state predicate.
         (
             "{src}/td-firstboot/src/hostname.rs",
             include_str!("../../../td-firstboot/src/hostname.rs"),

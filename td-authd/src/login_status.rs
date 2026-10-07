@@ -1,14 +1,13 @@
 //! Request `1a`: the human's login state, with root's cache of it
 //! (td-authd/DESIGN.md, login-state amendment 1).
 
+use crate::hostname;
 use crate::inspection::Inspection;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-#[path = "../../td-firstboot/src/hostname.rs"]
-mod hostname;
 #[path = "../../td-secret/src/login_state.rs"]
 #[allow(
     dead_code,

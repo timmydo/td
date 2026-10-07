@@ -11,6 +11,9 @@ mod channel;
 mod consent;
 mod deployment;
 mod disk_install;
+// Request 1a's kernel name and consent's hostname descriptions.
+#[path = "../../td-firstboot/src/hostname.rs"]
+mod hostname;
 mod inspection;
 #[allow(dead_code, reason = "shared codec; the service sends the other half")]
 #[path = "../../td-install/src/installation_consent.rs"]

@@ -8926,7 +8926,9 @@ statements it changes, including those named here.
 - **L0**, documents only: this specification. Nothing ships.
 - **L1**, the consent codec, inert: consent tags 11 (`deploy-rollback`)
   and 12 (`set-hostname`) and the two-byte approval-key field
-  (`td-authd/DESIGN.md`, "Elevation operations (target)"). After L0.
+  (`td-authd/DESIGN.md`, "Elevation operations (target)"). It amends
+  `td-secret/DESIGN.md` (tags its workers reject), whose shared codec
+  then decodes both tags. After L0.
 - **L2**, the compositor's approval-key confirmation, inert: freshness
   rules generalised from physical installation confirmation, and the
   menu letter `B`, which production refuses until L3
@@ -8936,8 +8938,8 @@ statements it changes, including those named here.
   the spawn with td-boot's new CURRENT and PREVIOUS operands, a QEMU
   phase that reads the key off the screen, and integration evidence. It
   amends `UNSAFE.md` §16, whose confinement-pinned fixed child argv the
-  td-boot spawn joins, and `td-secret/DESIGN.md` (tags its workers
-  reject, and `login_tier.rs`'s selector reader in td-authd). After L2.
+  td-boot spawn joins, and `td-secret/DESIGN.md` (`login_tier.rs`'s
+  selector reader in td-authd). After L2.
 - **L4**, `set-hostname` through its typed intake, request `1e`, the
   menu letter `H` and the intake's backoff, with the next boot's
   `TD-HOSTNAME-READY` as its oracle. It amends `UNSAFE.md` §16 (the

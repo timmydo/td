@@ -43,6 +43,9 @@ mod fido_p256;
 mod fido_pin;
 #[allow(dead_code, reason = "private portable transaction runner")]
 mod fido_transaction;
+#[path = "../../td-firstboot/src/hostname.rs"]
+#[allow(dead_code, reason = "the shared consent's hostname rules")]
+mod hostname;
 mod login_operation;
 mod login_record;
 #[allow(
@@ -221,6 +224,36 @@ mod fido_virtual;
 #[cfg(test)]
 mod fido_uhid;
 
+/// Valid elevation descriptions, consent tags 11 and 12, for `owner`.
+/// td-secret decodes them through the shared consent codec but performs
+/// neither, so every worker's operation match must refuse them.
+#[cfg(test)]
+fn elevation_descriptions(owner: u32) -> Vec<Vec<u8>> {
+    let key = consent::ApprovalKey::new(*b"47").unwrap();
+    [
+        consent::Operation::DeployRollback {
+            key,
+            current: "a".repeat(64),
+            previous: "b".repeat(64),
+        },
+        consent::Operation::SetHostname {
+            key,
+            requester: owner,
+            old: "td".into(),
+            new: "my-laptop".into(),
+        },
+    ]
+    .into_iter()
+    .map(|operation| {
+        let bytes = consent::Request::new([42; 32], owner, operation)
+            .unwrap()
+            .encode();
+        assert!(consent::Request::decode(&bytes).is_ok());
+        bytes
+    })
+    .collect()
+}
+
 #[cfg(test)]
 mod confinement {
     #[test]
@@ -253,21 +286,32 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("operation.rs")),
-            0x5f22633580b007c5
+            0xf27203ecc1c3251f
         );
         assert_eq!(
             fingerprint(include_str!("login_operation.rs")),
-            0xb8c03675ebcf7f75
+            0xf6911aec2fe1fe13
         );
         assert_eq!(
             fingerprint(include_str!("write_operation.rs")),
-            0x2f5050ddd2493660
+            0x5991b168732f47ac
         );
         assert_eq!(
             fingerprint(include_str!("enrollment_operation.rs")),
-            0x30dcb428ed75a535
+            0x44a7a283c11747d6
         );
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x002d4bc49483c0dc, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x68e38f4ad9c4584d, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+        // The shared consent's hostname rules: firstboot's one copy.
+        let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(production.contains(
+            "#[path = \"../../td-firstboot/src/hostname.rs\"]\n#[allow(dead_code, reason = \"the shared consent's hostname rules\")]\nmod hostname;\n"
+        ));
+        assert_eq!(production.matches("mod hostname;").count(), 1);
+        assert_eq!(
+            fingerprint(include_str!("../../td-firstboot/src/hostname.rs")),
+            0x49026f28c1db76ec,
+            "shared hostname rules changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins"
+        );
     }
 
     /// TOKEN-LOGIN.md, "Deployments": the shared tier reader only opens and
@@ -468,6 +512,10 @@ mod confinement {
             ("login_state.rs", include_str!("login_state.rs")),
             ("login_store.rs", include_str!("login_store.rs")),
             ("login_tier.rs", include_str!("login_tier.rs")),
+            (
+                "hostname.rs",
+                include_str!("../../td-firstboot/src/hostname.rs"),
+            ),
             ("pin_sys.rs", include_str!("pin_sys.rs")),
             ("pin_terminal.rs", include_str!("pin_terminal.rs")),
             ("token_check.rs", include_str!("token_check.rs")),

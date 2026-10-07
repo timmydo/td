@@ -1755,12 +1755,14 @@ staged into the target authority recipe.
 
 ## Elevation operations (target)
 
-Nothing in this section is implemented. APPLICATIONS.md §L.1, "The v1
-operations (target)", says what `deploy-rollback`, `set-hostname` and
-`deploy-publish` are and why, and its "Elevation increments" which
-commit lands each part; `td-compositor/DESIGN.md`, "Elevation consent
-(target)", says which presses confirm. Today the private channel routes
-requests `10` to `1c` to the secret session and refuses `1d` and above.
+Nothing in this section is implemented but its consent tags, which
+`consent.rs` encodes, decodes and renders and nothing yet produces.
+APPLICATIONS.md §L.1, "The v1 operations (target)", says what
+`deploy-rollback`, `set-hostname` and `deploy-publish` are and why, and
+its "Elevation increments" which commit lands each part;
+`td-compositor/DESIGN.md`, "Elevation consent (target)", says which
+presses confirm. Today the private channel routes requests `10` to `1c`
+to the secret session and refuses `1d` and above.
 
 **Consent tags.** Tags 11 (`deploy-rollback`) and 12 (`set-hostname`)
 follow the login tags. Each carries, right after its tag byte, the
@@ -1778,15 +1780,20 @@ The key is never derived from the nonce.
   63 bytes that `Hostname::parse` (`td-firstboot/src/hostname.rs`)
   admits, and the two differ: at most 179 bytes.
 
-Both stay under the 256-byte bound. In L5 tag 5 gains the same two bytes
-after its tag byte, 115 bytes in all, so an update's description carries
-its key. Tag 6, the live disk installation, gains none. TOKEN-LOGIN.md's
-increment 5 adds the same two bytes, right after the tag byte, to the
-login tags whose descriptions carry a disclosure: enrollment (8) and
-removal (10), whose one-key and remove-every-key disclosures it
-confirms. Root draws a fresh key for each presented description, so each
-step of a multi-step enrollment has its own. The widest login value, a
-removal of eight keys at its authorize step, becomes 100 bytes.
+Both stay under the 256-byte bound. Each renders its operation, both IDs
+or the requester and both names, and that a restart completes it, then
+ends its description with the key's rows, `APPROVE: TYPE 4 THEN 7` and
+`ESC: CANCEL`, in place of the generic Escape row; every fixed row fits
+the narrowest prompt, so wrapping never splits the key. In L5 tag 5
+gains the same two bytes after its tag byte, 115 bytes in all, so an
+update's description carries its key. Tag 6, the live disk
+installation, gains none. TOKEN-LOGIN.md's increment 5 adds the same two
+bytes, right after the tag byte, to the login tags whose descriptions
+carry a disclosure: enrollment (8) and removal (10), whose one-key and
+remove-every-key disclosures it confirms. Root draws a fresh key for
+each presented description, so each step of a multi-step enrollment has
+its own. The widest login value, a removal of eight keys at its
+authorize step, becomes 100 bytes.
 
 **Requests.** `1d` asks for a rollback and `1e` selects the queued
 hostname request; neither takes an operand. Each answers `92` and the

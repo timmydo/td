@@ -2681,7 +2681,7 @@ mod tests {
         .unwrap()
         .encode();
         let start = key.device.transcript().len();
-        for description in [
+        let refused = [
             unlocks(1001, 1, LoginStep::Identify),
             unlocks(UID, 2, LoginStep::Identify),
             unlocks(
@@ -2698,7 +2698,11 @@ mod tests {
             store,
             vec![1, 2, 3],
             [&[operation::PIN][..], PIN].concat(),
-        ] {
+        ];
+        for description in refused
+            .into_iter()
+            .chain(crate::elevation_descriptions(UID))
+        {
             let (result, seen) = unlock(
                 &fixture,
                 &[&key.device],

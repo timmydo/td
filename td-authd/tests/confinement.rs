@@ -121,7 +121,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0x002d4bc49483c0dc,
+        0x68e38f4ad9c4584d,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -208,8 +208,13 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert_eq!(fingerprint(login_state), LOGIN_STATE_FINGERPRINT);
     assert!(login_state.contains("#[path = \"../../td-secret/src/login_state.rs\"]"));
-    assert!(login_state.contains("#[path = \"../../td-firstboot/src/hostname.rs\"]"));
-    assert_eq!(login_state.matches("#[path").count(), 2);
+    assert_eq!(login_state.matches("#[path").count(), 1);
+    // One copy of the hostname rules, which consent's hostname descriptions
+    // share.
+    assert!(login_state.contains("\nuse crate::hostname;\n"));
+    assert!(include_str!("../src/main.rs")
+        .contains("#[path = \"../../td-firstboot/src/hostname.rs\"]\nmod hostname;\n"));
+    assert!(include_str!("../src/consent.rs").contains("\nuse super::hostname::Hostname;\n"));
     assert_eq!(login_state.matches("Inspection::login").count(), 1);
     for forbidden in ["Command", "spawn", "/bin/", "write", "remove", "create"] {
         assert!(
@@ -225,7 +230,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(
         fingerprint(include_str!("../../td-firstboot/src/hostname.rs")),
         SHARED_HOSTNAME_FINGERPRINT,
-        "shared hostname rules changed: reconcile td-compositor's confinement and this pin"
+        "shared hostname rules, which also serve consent's hostname descriptions, changed: reconcile td-compositor's and td-secret's confinement and this pin"
     );
     let installation = include_str!("../src/deployment.rs")
         .split("#[cfg(test)]")
@@ -611,7 +616,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0x3f5951a8ac2c8889,
+        0x5fcac884f2789cf7,
         "main.rs: production startup changed"
     );
     assert_eq!(
@@ -629,7 +634,7 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LOGIN_STATE_FINGERPRINT: u64 = 0x4f9fa256dee303f7;
+const LOGIN_STATE_FINGERPRINT: u64 = 0xf7d4c1e582d5ed83;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x82d5e067ac0d3cb6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 

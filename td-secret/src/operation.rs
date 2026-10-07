@@ -561,6 +561,9 @@ mod tests {
         )
         .unwrap();
         assert!(description(&write.encode(), 1000).is_err());
+        for elevation in crate::elevation_descriptions(1000) {
+            assert!(description(&elevation, 1000).is_err());
+        }
     }
 
     #[test]

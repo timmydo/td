@@ -695,6 +695,45 @@ mod tests {
         );
     }
 
+    /// The elevation prompts, rollback with both IDs and a hostname change
+    /// with both names at 63 bytes, are shown whole with a time line from
+    /// 800x600, and 320x200, which cannot hold their wrapped arguments,
+    /// refuses rather than clips. The key is on the prompt.
+    #[test]
+    fn the_widest_elevation_prompts_fit_an_800_by_600_output() {
+        use crate::authority::consent::ApprovalKey;
+        let prompts = |digits: &[u8; 2]| {
+            let key = ApprovalKey::new(*digits).unwrap();
+            [
+                Operation::DeployRollback {
+                    key,
+                    current: "a".repeat(64),
+                    previous: "b".repeat(64),
+                },
+                Operation::SetHostname {
+                    key,
+                    requester: 65533,
+                    old: "a".repeat(63),
+                    new: "b".repeat(63),
+                },
+            ]
+            .map(|operation| Request::new([1; 32], 65533, operation).unwrap())
+        };
+        for (request, swapped) in prompts(b"47").into_iter().zip(prompts(b"74")) {
+            assert!(Prepared::with_time(request.clone(), 800, 600, 3200, Some(120)).is_ok());
+            assert_eq!(
+                Prepared::with_time(request.clone(), 320, 200, 1280, Some(120))
+                    .err()
+                    .unwrap(),
+                "output cannot hold every trusted prompt argument"
+            );
+            assert_ne!(
+                Prepared::new(request, 800, 600, 3200).unwrap().pixels,
+                Prepared::new(swapped, 800, 600, 3200).unwrap().pixels
+            );
+        }
+    }
+
     /// Consent keeps every login row within `PROMPT_COLUMNS`, this renderer's
     /// columns at its narrowest accepted width, so wrapping never splits a
     /// fingerprint. The widest login prompt asks for a PIN, and at 800x600

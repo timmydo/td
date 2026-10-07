@@ -495,6 +495,9 @@ mod tests {
         )
         .unwrap();
         assert!(Plan::decode(&unlock.encode(), 1000).is_err());
+        for elevation in crate::elevation_descriptions(1000) {
+            assert!(Plan::decode(&elevation, 1000).is_err());
+        }
     }
 
     #[test]

@@ -274,6 +274,11 @@ pub fn recipe() -> Recipe {
             "{src}/td-firstboot/src/principals_tests.rs",
             include_str!("../../../td-firstboot/src/principals_tests.rs"),
         ),
+        // The shared consent's hostname rules.
+        (
+            "{src}/td-firstboot/src/hostname.rs",
+            include_str!("../../../td-firstboot/src/hostname.rs"),
+        ),
         (
             "{src}/engine/src/principals.rs",
             include_str!("../../../engine/src/principals.rs"),
@@ -575,12 +580,26 @@ mod tests {
             }
         }
         let mut embedded: Vec<_> = MODULES.iter().map(|(name, _)| *name).collect();
-        embedded.push("principals");
+        embedded.extend(["principals", "hostname"]);
         declared.sort_unstable();
         embedded.sort_unstable();
         assert_eq!(declared, embedded);
-        assert!(recipe().steps.iter().flatten().any(|step| matches!(step,
-            Step::WriteFile { path, content, .. } if path == "{src}/td-firstboot/src/principals.rs"
-                && content == include_str!("../../../td-firstboot/src/principals.rs"))));
+        for (path, source) in [
+            (
+                "{src}/td-firstboot/src/principals.rs",
+                include_str!("../../../td-firstboot/src/principals.rs"),
+            ),
+            (
+                "{src}/td-firstboot/src/hostname.rs",
+                include_str!("../../../td-firstboot/src/hostname.rs"),
+            ),
+        ] {
+            assert!(
+                recipe().steps.iter().flatten().any(|step| matches!(step,
+                    Step::WriteFile { path: written, content, .. }
+                        if written == path && content == source)),
+                "{path}"
+            );
+        }
     }
 }

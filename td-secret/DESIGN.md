@@ -1810,6 +1810,12 @@ credential access. Consent tag 5 describes a system installation; secret
 workers reject it, and physical Enter for installation cannot substitute for
 a token-bound secret operation.
 
+Consent tags 11 and 12 describe the elevation operations `deploy-rollback`
+and `set-hostname` (td-authd/DESIGN.md, "Elevation operations (target)").
+td-secret's copy of the shared codec decodes them, so their refusal rests on
+each worker's operation match: the unlock, enrollment, credential write and
+login-key workers each reject both, which a test feeds every worker.
+
 ## Login record codec
 
 `login_record.rs` is the first piece of

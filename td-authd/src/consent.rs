@@ -2,6 +2,10 @@
 
 use std::time::Duration;
 
+// Every includer declares the shared `td-firstboot/src/hostname.rs` beside
+// this module, so a hostname description admits exactly firstboot's names.
+use super::hostname::Hostname;
+
 const MAGIC: &[u8; 8] = b"TDCONS01";
 const MAX_BYTES: usize = 256;
 // Whole-disk installation summary bounds, in displayed (escaped) bytes.
@@ -62,6 +66,27 @@ pub type Fingerprint = [u8; 4];
 /// 48 of margin in 8-pixel Unifont cells (td-compositor/src/attention.rs).
 /// Every login row fits, so wrapping never splits a fingerprint.
 pub const PROMPT_COLUMNS: usize = 34;
+
+/// The approval key an elevation prompt asks for: two ASCII digits, each
+/// `2` to `9`, typed in order (td-authd/DESIGN.md, "Elevation operations
+/// (target)"). No other value can be constructed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApprovalKey([u8; 2]);
+
+impl ApprovalKey {
+    pub fn new(digits: [u8; 2]) -> Result<Self, String> {
+        if digits.iter().all(|digit| (b'2'..=b'9').contains(digit)) {
+            Ok(Self(digits))
+        } else {
+            Err("invalid consent approval key".into())
+        }
+    }
+
+    /// The two ASCII digits, in the order they are typed.
+    pub fn digits(self) -> [u8; 2] {
+        self.0
+    }
+}
 
 /// One key a removal names: its 1-based position in the record's canonical
 /// slot order, which the key-management screen's digits also name, and its
@@ -435,6 +460,20 @@ pub enum Operation {
         removed: Vec<Slot>,
         step: LoginStep,
     },
+    /// `deploy-rollback`: move `current` back to `previous`, the pair the
+    /// two boot selectors name.
+    DeployRollback {
+        key: ApprovalKey,
+        current: String,
+        previous: String,
+    },
+    /// `set-hostname`: replace the configured name `old` with `new`.
+    SetHostname {
+        key: ApprovalKey,
+        requester: u32,
+        old: String,
+        new: String,
+    },
 }
 
 impl Operation {
@@ -560,6 +599,25 @@ impl Request {
                 || *requester != owner =>
             {
                 return Err("invalid consent credential target".into());
+            }
+            Operation::DeployRollback {
+                key: _,
+                current,
+                previous,
+            } if !deployment_id(current) || !deployment_id(previous) || current == previous => {
+                return Err("invalid consent rollback pair".into());
+            }
+            Operation::SetHostname {
+                key: _,
+                requester,
+                old,
+                new,
+            } if *requester != owner
+                || Hostname::parse(old).is_err()
+                || Hostname::parse(new).is_err()
+                || old == new =>
+            {
+                return Err("invalid consent hostname change".into());
             }
             _ => {}
         }
@@ -865,6 +923,29 @@ impl Request {
                     }
                 }
             }
+            Operation::DeployRollback {
+                key,
+                current,
+                previous,
+            } => {
+                bytes.push(11);
+                bytes.extend_from_slice(&key.digits());
+                bytes.extend_from_slice(current.as_bytes());
+                bytes.extend_from_slice(previous.as_bytes());
+            }
+            Operation::SetHostname {
+                key,
+                requester,
+                old,
+                new,
+            } => {
+                bytes.push(12);
+                bytes.extend_from_slice(&key.digits());
+                bytes.extend_from_slice(&requester.to_be_bytes());
+                // Construction bounds both names to 63 bytes.
+                put_text(&mut bytes, old);
+                put_text(&mut bytes, new);
+            }
         }
         bytes
     }
@@ -885,8 +966,7 @@ impl Request {
         let operation = match input.byte()? {
             5 => Operation::Install {
                 requester: input.number()?,
-                deployment: String::from_utf8(input.take(64)?.to_vec())
-                    .map_err(|_| "invalid deployment ID encoding")?,
+                deployment: input.deployment()?,
             },
             6 => {
                 let requester = input.number()?;
@@ -1004,6 +1084,26 @@ impl Request {
                             step: input.login_step()?,
                         }
                     }
+                }
+            }
+            11 => {
+                let key = input.approval_key()?;
+                let current = input.deployment()?;
+                Operation::DeployRollback {
+                    key,
+                    current,
+                    previous: input.deployment()?,
+                }
+            }
+            12 => {
+                let key = input.approval_key()?;
+                let requester = input.number()?;
+                let old = input.text()?;
+                Operation::SetHostname {
+                    key,
+                    requester,
+                    old,
+                    new: input.text()?,
                 }
             }
             _ => return Err("unknown consent operation".into()),
@@ -1140,10 +1240,37 @@ impl Request {
                     login_lines(&mut lines, &login);
                 }
             }
+            Operation::DeployRollback {
+                key,
+                current,
+                previous,
+            } => {
+                lines.push("ROLL BACK TO THE PREVIOUS SYSTEM".into());
+                lines.push(format!("CURRENT: {current}"));
+                lines.push(format!("PREVIOUS: {previous}"));
+                lines.push("TAKES EFFECT AT THE NEXT RESTART".into());
+                approval_lines(&mut lines, *key);
+            }
+            Operation::SetHostname {
+                key,
+                requester,
+                old,
+                new,
+            } => {
+                lines.push("CHANGE HOSTNAME".into());
+                lines.push(format!("REQUESTER UID {requester}"));
+                lines.push(format!("OLD NAME: {old}"));
+                lines.push(format!("NEW NAME: {new}"));
+                lines.push("A RESTART COMPLETES THE CHANGE".into());
+                approval_lines(&mut lines, *key);
+            }
         }
         if !matches!(
             self.operation,
-            Operation::Install { .. } | Operation::InstallDisk { .. }
+            Operation::Install { .. }
+                | Operation::InstallDisk { .. }
+                | Operation::DeployRollback { .. }
+                | Operation::SetHostname { .. }
         ) {
             lines.push("ESC TO CANCEL".into());
         }
@@ -1250,6 +1377,18 @@ fn login_lines(lines: &mut Vec<String>, login: &Login<'_>) {
     }
 }
 
+/// The approval key's rows, last on an elevation prompt, which carry its
+/// Escape. Each fits `PROMPT_COLUMNS`, so wrapping never splits the key.
+fn approval_lines(lines: &mut Vec<String>, key: ApprovalKey) {
+    let [first, second] = key.digits();
+    lines.push(format!(
+        "APPROVE: TYPE {} THEN {}",
+        char::from(first),
+        char::from(second)
+    ));
+    lines.push("ESC: CANCEL".into());
+}
+
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut text = String::with_capacity(bytes.len().saturating_mul(2));
@@ -1318,6 +1457,17 @@ impl<'a> Input<'a> {
                 .try_into()
                 .map_err(|_| "truncated consent number")?,
         ))
+    }
+    fn approval_key(&mut self) -> Result<ApprovalKey, String> {
+        ApprovalKey::new(
+            self.take(2)?
+                .try_into()
+                .map_err(|_| "truncated consent approval key")?,
+        )
+    }
+    fn deployment(&mut self) -> Result<String, String> {
+        String::from_utf8(self.take(64)?.to_vec())
+            .map_err(|_| "invalid deployment ID encoding".into())
     }
     fn fingerprint(&mut self) -> Result<Fingerprint, String> {
         self.take(4)?
@@ -1487,6 +1637,327 @@ mod tests {
             .lines()
             .iter()
             .any(|line| line == "ENTER: INSTALL   ESC: CANCEL"));
+    }
+
+    const CURRENT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const PREVIOUS: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    fn approval(digits: &[u8; 2]) -> ApprovalKey {
+        ApprovalKey::new(*digits).unwrap()
+    }
+
+    fn rollback(current: &str, previous: &str) -> Operation {
+        Operation::DeployRollback {
+            key: approval(b"47"),
+            current: current.into(),
+            previous: previous.into(),
+        }
+    }
+
+    fn approval_key(request: &Request) -> Option<ApprovalKey> {
+        match request.operation() {
+            Operation::DeployRollback { key, .. } | Operation::SetHostname { key, .. } => {
+                Some(*key)
+            }
+            _ => None,
+        }
+    }
+
+    fn rename(requester: u32, old: &str, new: &str) -> Operation {
+        Operation::SetHostname {
+            key: approval(b"29"),
+            requester,
+            old: old.into(),
+            new: new.into(),
+        }
+    }
+
+    /// The literal tag-11 and tag-12 values: the key right after the tag
+    /// byte, then the fields in their order, and each one's rows.
+    #[test]
+    fn elevation_descriptions_have_independent_literal_encodings_and_rows() {
+        let request = Request::new([1; 32], 1000, rollback(CURRENT, PREVIOUS)).unwrap();
+        let mut literal = b"TDCONS01".to_vec();
+        literal.extend([1; 32]);
+        literal.extend([0, 0, 3, 232, 11, b'4', b'7']);
+        literal.extend(CURRENT.bytes());
+        literal.extend(PREVIOUS.bytes());
+        assert_eq!(literal.len(), 175);
+        assert_eq!(request.encode(), literal);
+        assert_eq!(Request::decode(&literal).unwrap(), request);
+        assert_eq!(
+            request.lines(),
+            [
+                "TD SECURE ATTENTION".to_string(),
+                "SESSION USER 1000".into(),
+                "ROLL BACK TO THE PREVIOUS SYSTEM".into(),
+                format!("CURRENT: {CURRENT}"),
+                format!("PREVIOUS: {PREVIOUS}"),
+                "TAKES EFFECT AT THE NEXT RESTART".into(),
+                "APPROVE: TYPE 4 THEN 7".into(),
+                "ESC: CANCEL".into(),
+            ]
+        );
+
+        let request = Request::new([1; 32], 1000, rename(1000, "td", "my-laptop")).unwrap();
+        let mut literal = b"TDCONS01".to_vec();
+        literal.extend([1; 32]);
+        literal.extend([0, 0, 3, 232, 12, b'2', b'9', 0, 0, 3, 232, 2]);
+        literal.extend(b"td");
+        literal.push(9);
+        literal.extend(b"my-laptop");
+        assert_eq!(request.encode(), literal);
+        assert_eq!(Request::decode(&literal).unwrap(), request);
+        assert_eq!(
+            request.lines(),
+            [
+                "TD SECURE ATTENTION",
+                "SESSION USER 1000",
+                "CHANGE HOSTNAME",
+                "REQUESTER UID 1000",
+                "OLD NAME: td",
+                "NEW NAME: my-laptop",
+                "A RESTART COMPLETES THE CHANGE",
+                "APPROVE: TYPE 2 THEN 9",
+                "ESC: CANCEL",
+            ]
+        );
+    }
+
+    /// Bytes 45 and 46 are the key, in typing order, for both tags: a
+    /// swapped pair is the other key, never the same one or a refusal.
+    #[test]
+    fn the_approval_key_follows_the_tag_byte_in_typing_order() {
+        for operation in [rollback(CURRENT, PREVIOUS), rename(1000, "td", "my-laptop")] {
+            let request = Request::new([1; 32], 1000, operation).unwrap();
+            let bytes = request.encode();
+            let key = approval_key(&request).unwrap();
+            assert_eq!(bytes[45..47], key.digits());
+            let mut swapped = bytes.clone();
+            swapped.swap(45, 46);
+            let decoded = Request::decode(&swapped).unwrap();
+            let [first, second] = key.digits();
+            assert_eq!(approval_key(&decoded).unwrap().digits(), [second, first]);
+            assert_eq!(
+                decoded.lines().iter().rev().nth(1).unwrap(),
+                &format!(
+                    "APPROVE: TYPE {} THEN {}",
+                    char::from(second),
+                    char::from(first)
+                )
+            );
+        }
+    }
+
+    /// Exactly the 64 keys of two digits from 2 to 9 exist, and a decoder
+    /// refuses every other byte at either position of either tag.
+    #[test]
+    fn every_approval_digit_outside_two_to_nine_refuses() {
+        let mut admitted = 0;
+        for first in 0..=255u8 {
+            for second in 0..=255u8 {
+                let key = ApprovalKey::new([first, second]);
+                let digits = (b'2'..=b'9').contains(&first) && (b'2'..=b'9').contains(&second);
+                assert_eq!(key.is_ok(), digits, "{first} {second}");
+                if digits {
+                    admitted += 1;
+                    assert_eq!(key.unwrap().digits(), [first, second]);
+                }
+            }
+        }
+        assert_eq!(admitted, 64);
+        for operation in [rollback(CURRENT, PREVIOUS), rename(1000, "td", "my-laptop")] {
+            let bytes = Request::new([1; 32], 1000, operation).unwrap().encode();
+            for index in [45, 46] {
+                for byte in 0..=255u8 {
+                    let mut changed = bytes.clone();
+                    changed[index] = byte;
+                    let decoded = Request::decode(&changed);
+                    if (b'2'..=b'9').contains(&byte) {
+                        assert!(decoded.is_ok(), "{index} {byte}");
+                    } else {
+                        assert_eq!(
+                            decoded.err().unwrap(),
+                            "invalid consent approval key",
+                            "{index} {byte}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Both IDs are canonical and differ; each is exactly 64 bytes, so the
+    /// value is exactly 175.
+    #[test]
+    fn a_rollback_names_two_distinct_canonical_deployments() {
+        for id in [
+            "a".repeat(63),
+            "a".repeat(65),
+            "A".repeat(64),
+            "g".repeat(64),
+            format!("{}\n", "a".repeat(63)),
+            String::new(),
+        ] {
+            for operation in [rollback(&id, PREVIOUS), rollback(CURRENT, &id)] {
+                assert_eq!(
+                    Request::new([1; 32], 1000, operation).err().unwrap(),
+                    "invalid consent rollback pair"
+                );
+            }
+        }
+        assert_eq!(
+            Request::new([1; 32], 1000, rollback(CURRENT, CURRENT))
+                .err()
+                .unwrap(),
+            "invalid consent rollback pair"
+        );
+        let bytes = Request::new([1; 32], 1000, rollback(CURRENT, PREVIOUS))
+            .unwrap()
+            .encode();
+        // Each ID's first byte, uppercase, outside hex, or not UTF-8.
+        for index in [47, 111] {
+            for byte in [b'A', b'g', b'\n', 0xff] {
+                let mut bad = bytes.clone();
+                bad[index] = byte;
+                assert!(Request::decode(&bad).is_err(), "{index} {byte}");
+            }
+        }
+        let mut same = bytes.clone();
+        same[111..175].copy_from_slice(CURRENT.as_bytes());
+        assert_eq!(
+            Request::decode(&same).err().unwrap(),
+            "invalid consent rollback pair"
+        );
+        assert_eq!(
+            Request::decode(&bytes[..174]).err().unwrap(),
+            "truncated consent request"
+        );
+        let mut long = bytes.clone();
+        long.push(b'a');
+        assert_eq!(
+            Request::decode(&long).err().unwrap(),
+            "trailing consent request bytes"
+        );
+    }
+
+    /// Both names are what `Hostname::parse` admits, they differ, and the
+    /// requester is the owner. The widest value is 179 bytes.
+    #[test]
+    fn a_hostname_change_names_two_canonical_names_for_its_owner() {
+        let widest = Request::new(
+            [1; 32],
+            1000,
+            rename(1000, &"a".repeat(63), &"b".repeat(63)),
+        )
+        .unwrap();
+        assert_eq!(widest.encode().len(), 179);
+        assert!(widest.encode().len() <= MAX_BYTES);
+        assert_eq!(Request::decode(&widest.encode()).unwrap(), widest);
+        let narrowest = Request::new([1; 32], 1000, rename(1000, "a", "b")).unwrap();
+        assert_eq!(narrowest.encode().len(), 55);
+        for name in [
+            String::new(),
+            "a".repeat(64),
+            "TD".into(),
+            "1host".into(),
+            "-host".into(),
+            "host-".into(),
+            ".host".into(),
+            "a..b".into(),
+            "a b".into(),
+            "a\nb".into(),
+            "a/b".into(),
+            "höst".into(),
+            "127.0.0.1".into(),
+        ] {
+            for operation in [rename(1000, &name, "td"), rename(1000, "td", &name)] {
+                assert_eq!(
+                    Request::new([1; 32], 1000, operation).err().unwrap(),
+                    "invalid consent hostname change",
+                    "{name:?}"
+                );
+            }
+        }
+        for operation in [rename(1000, "td", "td"), rename(1001, "td", "host")] {
+            assert_eq!(
+                Request::new([1; 32], 1000, operation).err().unwrap(),
+                "invalid consent hostname change"
+            );
+        }
+        // Decoded: td -> my-laptop, with the requester at bytes 47 to 50,
+        // the old name's length at 51 and the new name's length at 54.
+        let bytes = Request::new([1; 32], 1000, rename(1000, "td", "my-laptop"))
+            .unwrap()
+            .encode();
+        for (index, byte, refusal) in [
+            (49, 4, "invalid consent hostname change"),
+            (52, b'T', "invalid consent hostname change"),
+            (52, b'1', "invalid consent hostname change"),
+            (53, b'-', "invalid consent hostname change"),
+            (55, b'.', "invalid consent hostname change"),
+            (60, 0xff, "invalid consent text"),
+            (54, 10, "truncated consent request"),
+            (54, 8, "trailing consent request bytes"),
+        ] {
+            let mut bad = bytes.clone();
+            bad[index] = byte;
+            assert_eq!(
+                Request::decode(&bad).err().unwrap(),
+                refusal,
+                "{index} {byte}"
+            );
+        }
+        let mut same = bytes[..51].to_vec();
+        same.extend([2, b't', b'd', 2, b't', b'd']);
+        let mut empty_old = bytes[..51].to_vec();
+        empty_old.extend([0, 9]);
+        empty_old.extend(b"my-laptop");
+        let mut empty_new = bytes[..54].to_vec();
+        empty_new.push(0);
+        for bad in [same, empty_old, empty_new] {
+            assert_eq!(
+                Request::decode(&bad).err().unwrap(),
+                "invalid consent hostname change"
+            );
+        }
+        let mut long = widest.encode();
+        long[115] = 64;
+        long.insert(116, b'b');
+        assert_eq!(
+            Request::decode(&long).err().unwrap(),
+            "invalid consent hostname change"
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(b'a');
+        assert_eq!(
+            Request::decode(&trailing).err().unwrap(),
+            "trailing consent request bytes"
+        );
+    }
+
+    /// Each fixed row fits the narrowest prompt, so wrapping never splits
+    /// the key, and the key's two rows close the prompt in place of the
+    /// generic Escape row.
+    #[test]
+    fn elevation_rows_end_with_the_key_and_its_escape() {
+        for operation in [
+            rollback(CURRENT, PREVIOUS),
+            rename(65533, &"a".repeat(63), &"b".repeat(63)),
+        ] {
+            let request = Request::new([1; 32], 65533, operation).unwrap();
+            let lines = request.lines();
+            assert_eq!(lines[lines.len() - 1], "ESC: CANCEL");
+            assert!(lines[lines.len() - 2].starts_with("APPROVE: TYPE "));
+            assert!(!lines.iter().any(|line| line == "ESC TO CANCEL"));
+            for line in &lines {
+                let argument = ["CURRENT: ", "PREVIOUS: ", "OLD NAME: ", "NEW NAME: "]
+                    .iter()
+                    .any(|field| line.starts_with(field));
+                assert!(argument || line.len() <= PROMPT_COLUMNS, "{line:?}");
+                assert!(line.is_ascii() && !line.contains('\n'));
+            }
+        }
     }
 
     fn disk(model: Option<Label>, serial: Option<Label>) -> Operation {
@@ -1779,6 +2250,10 @@ mod tests {
                 Some(Label::escape(&[b'9'; 40], SERIAL_WIDTH)),
             ),
             widest_disk(),
+            rollback(CURRENT, PREVIOUS),
+            rollback(PREVIOUS, CURRENT),
+            rename(1000, "a", "b"),
+            rename(1000, &"a".repeat(63), &"b".repeat(63)),
             Operation::Unlock {
                 role: Role::Primary,
             },
@@ -2219,7 +2694,7 @@ mod tests {
         let mut identify = header(7);
         identify.extend([2, 2, 1]);
         assert!(Request::decode(&identify).is_ok());
-        for tag in [0, 3, 11, 255] {
+        for tag in [0, 3, 13, 255] {
             let mut bad = identify.clone();
             bad[44] = tag;
             assert_eq!(

@@ -328,6 +328,14 @@ mod tests {
             &registry().applications().cloned().collect::<Vec<_>>()
         )
         .is_err());
+        for elevation in crate::elevation_descriptions(1000) {
+            assert!(description(
+                &elevation,
+                1000,
+                &registry().applications().cloned().collect::<Vec<_>>()
+            )
+            .is_err());
+        }
         assert!(request(Role::Recovery)
             .lines()
             .iter()

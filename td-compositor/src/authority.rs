@@ -16,7 +16,7 @@ pub(crate) mod consent;
 #[cfg_attr(feature = "target-recipe", path = "auth/sys.rs")]
 mod sys;
 // `9a`'s names, admitted under the rules root sends them by and drawn on
-// the lock surface.
+// the lock surface, and the names a consent hostname description admits.
 #[cfg_attr(
     not(feature = "target-recipe"),
     path = "../../td-firstboot/src/hostname.rs"
