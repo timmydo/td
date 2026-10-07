@@ -2841,7 +2841,8 @@ pub struct MappedRegion {
     /// Production locks the session in two places, both in the paired
     /// profile: the generation's first paint, where root's `1a` answer is
     /// enrolled or unavailable (td-login/TOKEN-LOGIN.md increment 4's C7),
-    /// and the live entry for `Super+l` and the attention menu's `L` (C9).
+    /// and the live entry for `Super+l` and the attention menu's `L` (C9),
+    /// and for a lid close and a resume (C10).
     /// The compiler holds the field: the scene's `locked` is private and
     /// `Scene::unlock` only clears it. This pins what the compiler cannot:
     /// `Scene::lock` is the one write of `true`, a new scene starts
@@ -2851,7 +2852,10 @@ pub struct MappedRegion {
     /// `Runtime::lock_session` under the paired profile, whose one caller
     /// is the evdev adapter's target, reached only from the adapter's
     /// `lock_session`, which needs the paired profile and is reached only
-    /// from a key decision the bindings make for `Super+l` and `L`; and
+    /// from a key decision the bindings make for `Super+l` and `L`, and
+    /// from the suspend entry, which needs the paired profile and a locking
+    /// last answer and is reached only from a lid switch's close and an
+    /// owed resume lock; and
     /// `first_paint` has one production caller, `run_compositor`, after
     /// the authority's Prepare and first `1a` and in place of its first
     /// repaint, before any input reader or client.
@@ -2942,11 +2946,12 @@ pub struct MappedRegion {
                 (*name == "runtime.rs" || *name == "main.rs") as usize,
                 "{name}"
             );
-            // The runtime's entry; in input.rs the target's call of it and
-            // the key decision's call of the adapter's entry.
+            // The runtime's entry; in input.rs the target's call of it, and
+            // the key decision's and the suspend entry's calls of the
+            // adapter's entry.
             let live = match *name {
                 "runtime.rs" => 1,
-                "input.rs" => 2,
+                "input.rs" => 3,
                 _ => 0,
             };
             // `unlock_session` aside.
@@ -3069,6 +3074,130 @@ pub struct MappedRegion {
             ),
             1
         );
+        // The suspend entry, its other caller (C10): the paired profile
+        // and a locking last answer, else nothing, then the adapter's
+        // entry, reached from exactly two triggers.
+        let suspend = input
+            .split_once("\nfn lock_for_suspend<T: InputTarget>(\n")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(suspend.contains(
+            "    if !bindings.attention_enabled || !bindings.locks() {\n        \
+             return Ok(());\n    }\n"
+        ));
+        assert_eq!(occurrences(suspend, "lock_session("), 1);
+        assert!(suspend.ends_with("    lock_session(&mut *target, bindings).map(|_| ())"));
+        assert_eq!(occurrences(input, "lock_for_suspend("), 2);
+        // A lid switch's close, from its own reader.
+        let lid = input
+            .split_once("\nfn read_lid<T: InputTarget>(\n")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(lid.contains(
+            "            if event.kind == EV_SW && event.code == SW_LID && event.value == LID_CLOSED {\n                \
+             let mut bindings = bindings\n                    .lock()\n                    \
+             .map_err(|_| \"input bindings lock poisoned\".to_string())?;\n                \
+             if let Err(error) = lock_for_suspend(target, &mut bindings) {\n"
+        ));
+        assert_eq!(occurrences(input, "LID_CLOSED"), 2);
+        // Read only where start admits it, on the answer at connect in the
+        // paired profile.
+        assert_eq!(occurrences(input, "read_lid("), 1);
+        let lids = input
+            .split_once("    for (path, mut file) in lids {\n")
+            .unwrap()
+            .1;
+        assert!(lids.contains(
+            "                let read = read_lid(&path, &mut file, target.as_ref(), bindings.as_ref());\n"
+        ));
+        assert!(input.contains("    let lids = open_lids(lids);\n"));
+        assert!(input.contains(
+            "    let lid = lid_admitted(attention_enabled, connected.as_ref());\n    \
+             let (paths, lids) = admit_lids(event_paths(input_dir)?, Path::new(SYSFS_INPUT), lid);\n"
+        ));
+        assert!(input.contains(
+            "    attention_enabled && connected.is_some_and(crate::authority::Answer::locks)\n}"
+        ));
+        assert_eq!(occurrences(input, "lid_admitted("), 2);
+        // An owed resume lock, from the gate, which samples only while the
+        // last answer locks.
+        let gate = input
+            .split_once("    fn gate<T: InputTarget>(\n")
+            .unwrap()
+            .1
+            .split_once("\n    }\n")
+            .unwrap()
+            .0;
+        assert!(
+            gate.contains("        if !self.check() {\n            return Ok(());\n        }\n")
+        );
+        assert!(gate.contains(
+            "        if !self.watch().owed {\n            return Ok(());\n        }\n        \
+             let locked = lock_for_suspend(target, &mut bindings);\n"
+        ));
+        let check = input
+            .split_once("    fn check(&self) -> bool {\n")
+            .unwrap()
+            .1
+            .split_once("\n    }\n")
+            .unwrap()
+            .0;
+        assert!(check.starts_with(
+            "        let locks = self\n            .login\n            .current()\n            \
+             .as_ref()\n            .is_some_and(crate::authority::Answer::locks);\n        \
+             let mut watch = self.watch();\n        if !locks {\n"
+        ));
+        // Owed until the session is locked, or the answer no longer locks.
+        assert!(gate.contains(
+            "        if made || !bindings.locks() {\n            self.watch().owed = false;\n        }\n"
+        ));
+        // Only a check of the clocks makes a lock owed.
+        let watch_check = input
+            .split_once("    fn check(&mut self) {\n")
+            .unwrap()
+            .1
+            .split_once("\n    }\n")
+            .unwrap()
+            .0;
+        assert_eq!(occurrences(watch_check, "self.owed = true;"), 2);
+        assert_eq!(occurrences(input, ".owed = true"), 2);
+        assert_eq!(occurrences(input, ".owed |="), 0);
+        // A reader gates each batch before routing it, and its teardown
+        // before releasing what its device held.
+        let reader = input
+            .split_once("\nfn read_device<T: InputTarget>(\n")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert_eq!(occurrences(reader, "resume.guard(target, bindings);"), 2);
+        let (_, teardown) = reader.split_once("    let cleanup = match (").unwrap();
+        assert!(!teardown.contains("resume."));
+        assert!(reader
+            .split_once("    let cleanup = match (")
+            .unwrap()
+            .0
+            .ends_with("    if let Some(resume) = &resume {\n        resume.guard(target, bindings);\n    }\n    // Both run: a release that failed is the case where the screen is most\n    // likely stale, so it must not be the case that skips the final paint.\n"));
+        // The monitor holds the seat for the generation.
+        assert!(input.contains(
+            "            .spawn(move || resume.monitor(target.as_ref(), bindings.as_ref()))\n"
+        ));
+        // The runtime withholds a client's paint, focus and input while a
+        // lock is owed, and nothing on a private screen.
+        assert_eq!(occurrences(runtime, "self.resume_withholds()"), 7);
+        assert!(runtime.contains(
+            "        !self.scene.private_screen() && self.resume.as_ref().is_some_and(|resume| resume.holds())\n"
+        ));
+        // Resume detection exists in the paired profile alone.
+        assert_eq!(occurrences(input, "Resume::new("), 1);
+        assert!(input.contains("    let resume = attention_enabled.then(|| {\n"));
         // Which the bindings make for `Super+l` in the paired profile
         // before the sheet's and launcher's capture, and for the menu's
         // `L`, each only while the last `1a` answer locks.

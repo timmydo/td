@@ -15,9 +15,11 @@ use crate::sys;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
+use std::time::{Duration, Instant};
 
 const EVENT_SIZE: usize = 24;
 /// Records drained per read. A batch is what makes a full-speed pointer cost
@@ -29,6 +31,12 @@ const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
 const EV_REL: u16 = 2;
 const EV_ABS: u16 = 3;
+const EV_SW: u16 = 5;
+/// The kernel's `EV_CNT`: `capabilities/ev` declares no type at or above it.
+const EV_CNT: u16 = 0x20;
+const SW_LID: u16 = 0;
+/// `SW_LID`'s value for a closed lid.
+const LID_CLOSED: i32 = 1;
 const SYN_REPORT: u16 = 0;
 const SYN_DROPPED: u16 = 3;
 const REL_X: u16 = 0;
@@ -293,6 +301,9 @@ struct KeyBindings {
     /// an enrolled record's keys in canonical slot order, which removal
     /// digits name, or why there are none.
     login: crate::authority::Login,
+    /// Resume detection, checked before each batch is routed; the paired
+    /// profile's alone.
+    resume: Option<Arc<Resume>>,
     cutoff: Option<u128>,
     pressed: BTreeSet<(usize, u16)>,
     forwarded: BTreeSet<(usize, u16)>,
@@ -1046,6 +1057,46 @@ fn absolute_kind(sysfs: &Path, node: &Path) -> AbsoluteKind {
     )
 }
 
+/// Whether a node is a lid switch (td-compositor/DESIGN.md item 6): a
+/// switch-only device, whose `capabilities/ev` declares `EV_SW` and no type
+/// but `EV_SYN` beside it, and whose `capabilities/sw` declares `SW_LID`.
+/// Read from sysfs, as `absolute_kind` is, rather than through new ioctls.
+/// Anything unreadable answers `false`, and the node is read as before.
+fn lid_switch(sysfs: &Path, node: &Path) -> bool {
+    let Some(name) = node.file_name() else {
+        return false;
+    };
+    let capabilities = sysfs.join(name).join("device").join("capabilities");
+    let (Some(types), Some(switches)) = (
+        read_bitmap(&capabilities.join("ev")),
+        read_bitmap(&capabilities.join("sw")),
+    ) else {
+        return false;
+    };
+    let switch_only = (0..EV_CNT).all(|kind| {
+        bitmap_bit(&types, usize::from(kind))
+            .is_some_and(|set| set == (kind == EV_SW) || kind == EV_SYN)
+    });
+    switch_only && bitmap_bit(&switches, usize::from(SW_LID)) == Some(true)
+}
+
+/// Whether a lid switch is admitted (td-compositor/DESIGN.md item 6): in
+/// the paired profile, where root's answer at connect is enrolled or
+/// unavailable, the answer the generation's first paint locks on.
+fn lid_admitted(attention_enabled: bool, connected: Option<&crate::authority::Answer>) -> bool {
+    attention_enabled && connected.is_some_and(crate::authority::Answer::locks)
+}
+
+/// Splits the roster into the ordinary readers' nodes and the lid
+/// switches `read_lid` reads, which only `lid` admits: an unadmitted lid
+/// switch is not opened at all. Either way no lid switch reaches an
+/// ordinary reader, which would take it for a keyboard or pointer.
+fn admit_lids(paths: Vec<PathBuf>, sysfs: &Path, lid: bool) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let (lids, ordinary): (Vec<PathBuf>, Vec<PathBuf>) =
+        paths.into_iter().partition(|path| lid_switch(sysfs, path));
+    (ordinary, if lid { lids } else { Vec::new() })
+}
+
 /// Whether a node shares its USB device with a FIDO interface: a security
 /// key's own OTP keyboard, whose touch types modhex and Enter. Read from
 /// sysfs with plain file reads. Anything unreadable, and a node with no USB
@@ -1519,7 +1570,8 @@ impl Seat {
 }
 
 /// The lock surface's live entry (td-login/TOKEN-LOGIN.md, "Session
-/// lock"), for `Super+l` and the attention menu's `L`, through the
+/// lock"), for `Super+l` and the attention menu's `L`, and through
+/// `lock_for_suspend` for a lid close and a resume, through the
 /// bindings and in the paired profile alone; the connect-time lock needs
 /// no bindings. An open attention lifetime ends first, as Escape ends it:
 /// before its operation's commit the attempt is cancelled, after it the
@@ -1552,6 +1604,332 @@ fn lock_session<T: InputTarget>(
     let presentation = locked?;
     finish_attention(target, bindings)?;
     Ok(presentation)
+}
+
+/// The live entry for a lid close and a resume (td-compositor/DESIGN.md
+/// items 6 and 7), which call it holding the bindings: in the paired
+/// profile alone, and only while root's last `1a` answer is enrolled or
+/// unavailable. Otherwise it does nothing. An open attention lifetime ends
+/// as `lock_session` ends it, as Escape does.
+fn lock_for_suspend<T: InputTarget>(
+    target: &Mutex<T>,
+    bindings: &mut KeyBindings,
+) -> Result<(), String> {
+    if !bindings.attention_enabled || !bindings.locks() {
+        return Ok(());
+    }
+    let mut target = target
+        .lock()
+        .map_err(|_| "input target lock poisoned".to_string())?;
+    lock_session(&mut *target, bindings).map(|_| ())
+}
+
+/// A lid switch's reader (td-compositor/DESIGN.md item 6): a close locks
+/// through `lock_for_suspend`, and nothing else is read from it, so none
+/// of its reports reaches the bindings, the pointer or a client. A lock
+/// that fails is reported and the lid read on, since the entry locks
+/// before anything can fail; a read that fails ends the reader.
+fn read_lid<T: InputTarget>(
+    path: &Path,
+    file: &mut impl Read,
+    target: &Mutex<T>,
+    bindings: &Mutex<KeyBindings>,
+) -> Result<(), String> {
+    let mut buffer = [0u8; READ_BATCH_BYTES];
+    let mut filled = 0usize;
+    loop {
+        let tail = match buffer.get_mut(filled..) {
+            Some(tail) if !tail.is_empty() => tail,
+            _ => return Err(format!("input {} overran its batch buffer", path.display())),
+        };
+        let read = match file.read(tail) {
+            Ok(0) => return Ok(()),
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("read input {}: {error}", path.display())),
+        };
+        filled = filled.saturating_add(read);
+        let records = filled / EVENT_SIZE;
+        for index in 0..records {
+            let at = index.saturating_mul(EVENT_SIZE);
+            let record = buffer
+                .get(at..at.saturating_add(EVENT_SIZE))
+                .ok_or_else(|| format!("input {} lost a record", path.display()))?;
+            let event = parse(record)?;
+            if event.kind == EV_SW && event.code == SW_LID && event.value == LID_CLOSED {
+                let mut bindings = bindings
+                    .lock()
+                    .map_err(|_| "input bindings lock poisoned".to_string())?;
+                if let Err(error) = lock_for_suspend(target, &mut bindings) {
+                    let _ = writeln!(std::io::stderr().lock(), "td-compositor: lid: {error}");
+                }
+            }
+        }
+        filled = carry_remainder(&mut buffer, records.saturating_mul(EVENT_SIZE), filled);
+    }
+}
+
+/// More than this between how far the boot-time clock and the monotonic
+/// clock advanced since the last accepted sample is a suspend.
+const RESUME_GAP: Duration = Duration::from_secs(2);
+/// A sample whose two monotonic reads, around its boot-time read, are
+/// further apart than this is discarded and retaken.
+const SAMPLE_SPREAD: Duration = Duration::from_millis(100);
+/// Discards in a row before a check counts as unverifiable.
+const SAMPLE_RETAKES: usize = 16;
+/// The monitor's period: at least once a second, with room to spare for
+/// scheduling.
+const RESUME_PERIOD: Duration = Duration::from_millis(500);
+/// The boot-time clock, which counts suspended time.
+const UPTIME: &str = "/proc/uptime";
+/// Its one line is two decimals; anything longer is refused.
+const UPTIME_BYTES: usize = 64;
+
+/// The two clocks resume detection compares, a seam for its tests.
+trait ResumeClocks: Send {
+    /// The monotonic clock, which stops while the machine is suspended.
+    fn monotonic(&mut self) -> Duration;
+    /// The boot-time clock, which does not.
+    fn boot(&mut self) -> Result<Duration, String>;
+}
+
+/// Production's clocks, both safe `std`: `Instant`, which is
+/// `CLOCK_MONOTONIC` on Linux, and `/proc/uptime`, which the kernel reads
+/// from `CLOCK_BOOTTIME`. The file stays open and is read from offset zero
+/// each time, so a check opens no descriptor; one that fails to read is
+/// closed and opened again by the next.
+struct SystemClocks {
+    origin: Instant,
+    uptime: Option<File>,
+}
+
+impl ResumeClocks for SystemClocks {
+    fn monotonic(&mut self) -> Duration {
+        self.origin.elapsed()
+    }
+
+    fn boot(&mut self) -> Result<Duration, String> {
+        let file = match self.uptime.take() {
+            Some(file) => file,
+            None => File::open(UPTIME).map_err(|error| format!("open {UPTIME}: {error}"))?,
+        };
+        let mut buffer = [0u8; UPTIME_BYTES + 1];
+        let read = file
+            .read_at(&mut buffer, 0)
+            .map_err(|error| format!("read {UPTIME}: {error}"))?;
+        self.uptime = Some(file);
+        buffer
+            .get(..read)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(uptime)
+            .ok_or_else(|| format!("{UPTIME} is malformed"))
+    }
+}
+
+/// `/proc/uptime`'s first field: whole seconds, a point and a fraction of
+/// at most nine digits.
+fn uptime(text: &str) -> Option<Duration> {
+    if text.len() > UPTIME_BYTES {
+        return None;
+    }
+    let (seconds, fraction) = text.split_ascii_whitespace().next()?.split_once('.')?;
+    let digits = |field: &str| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit());
+    if !digits(seconds) || !digits(fraction) || fraction.len() > 9 {
+        return None;
+    }
+    let scale = 10u32.checked_pow(9u32.checked_sub(u32::try_from(fraction.len()).ok()?)?)?;
+    let nanos = fraction.parse::<u32>().ok()?.checked_mul(scale)?;
+    Duration::from_secs(seconds.parse().ok()?).checked_add(Duration::from_nanos(u64::from(nanos)))
+}
+
+/// One accepted sample: the monotonic clock just before the boot-time
+/// clock was read, and that read.
+#[derive(Clone, Copy)]
+struct Reading {
+    monotonic: Duration,
+    boot: Duration,
+}
+
+struct Watch {
+    clocks: Box<dyn ResumeClocks>,
+    /// The last accepted sample; none before the first, while root's last
+    /// answer does not lock, and after an unverifiable check.
+    baseline: Option<Reading>,
+    /// A suspend was seen, and its lock is not yet made.
+    owed: bool,
+    /// The monitor is asked to check now.
+    woken: bool,
+}
+
+impl Watch {
+    /// One sample, retaken while its monotonic reads are too far apart.
+    fn sample(&mut self) -> Result<Reading, String> {
+        for _ in 0..SAMPLE_RETAKES {
+            let monotonic = self.clocks.monotonic();
+            let boot = self.clocks.boot()?;
+            if self.clocks.monotonic().saturating_sub(monotonic) <= SAMPLE_SPREAD {
+                return Ok(Reading { monotonic, boot });
+            }
+        }
+        Err(format!("{SAMPLE_RETAKES} samples in a row were discarded"))
+    }
+
+    /// Compares a new sample with the baseline. A check that cannot be
+    /// verified, the boot-time clock unreadable or every sample discarded,
+    /// counts as a suspend once: the baseline is dropped, and the next
+    /// accepted sample starts a new one.
+    fn check(&mut self) {
+        match self.sample() {
+            Ok(reading) => {
+                if let Some(baseline) = self.baseline {
+                    let boot = reading.boot.saturating_sub(baseline.boot);
+                    let awake = reading.monotonic.saturating_sub(baseline.monotonic);
+                    if boot.saturating_sub(awake) > RESUME_GAP {
+                        self.owed = true;
+                    }
+                }
+                self.baseline = Some(reading);
+            }
+            Err(error) => {
+                if self.baseline.take().is_some() {
+                    self.owed = true;
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "td-compositor: resume check unverifiable, locking: {error}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Resume detection (td-compositor/DESIGN.md item 7), in the paired
+/// profile: while root's last `1a` answer is enrolled or unavailable, it
+/// compares how far the boot-time clock, which counts suspended time, and
+/// the monotonic clock have advanced since the last check, and a gap of
+/// more than `RESUME_GAP` locks through `lock_for_suspend`. It checks
+/// before each input batch is routed and before a reader's teardown
+/// releases, and at least once a second in its monitor; while a lock is
+/// owed the runtime withholds every client's paint, focus, input and VM
+/// clipboard access. Its own lock is a leaf: nothing is taken while it is
+/// held.
+pub(crate) struct Resume {
+    login: crate::authority::Login,
+    watch: Mutex<Watch>,
+    wake: Condvar,
+}
+
+impl Resume {
+    fn new(login: crate::authority::Login, clocks: Box<dyn ResumeClocks>) -> Self {
+        Self {
+            login,
+            watch: Mutex::new(Watch {
+                clocks,
+                baseline: None,
+                owed: false,
+                woken: false,
+            }),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn watch(&self) -> MutexGuard<'_, Watch> {
+        self.watch.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Samples while root's last answer locks, and answers whether a
+    /// suspend's lock is owed. Otherwise nothing is sampled or owed, and
+    /// the baseline is dropped.
+    fn check(&self) -> bool {
+        let locks = self
+            .login
+            .current()
+            .as_ref()
+            .is_some_and(crate::authority::Answer::locks);
+        let mut watch = self.watch();
+        if !locks {
+            watch.baseline = None;
+            watch.owed = false;
+            return false;
+        }
+        watch.check();
+        watch.owed
+    }
+
+    /// Before an input batch is routed, before a reader's teardown
+    /// releases what its device held, and the monitor's tick: a lock owed
+    /// is made through `lock_for_suspend` first. It stays owed until the
+    /// session is locked, or the last answer no longer locks, so a lock
+    /// refused before the lock state was set is retaken by the next gate,
+    /// and the runtime withholds every client's paint, focus and input
+    /// meanwhile.
+    fn gate<T: InputTarget>(
+        &self,
+        target: &Mutex<T>,
+        bindings: &Mutex<KeyBindings>,
+    ) -> Result<(), String> {
+        if !self.check() {
+            return Ok(());
+        }
+        let mut bindings = bindings
+            .lock()
+            .map_err(|_| "input bindings lock poisoned".to_string())?;
+        // Another gate may have made it while this one waited.
+        if !self.watch().owed {
+            return Ok(());
+        }
+        let locked = lock_for_suspend(target, &mut bindings);
+        let made = target
+            .lock()
+            .is_ok_and(|mut target| target.session_locked());
+        if made || !bindings.locks() {
+            self.watch().owed = false;
+        }
+        locked
+    }
+
+    /// A reader's or the monitor's gate. A lock that fails is reported and
+    /// stays owed, and the caller reads on, as the lid's reader does.
+    fn guard<T: InputTarget>(&self, target: &Mutex<T>, bindings: &Mutex<KeyBindings>) {
+        if let Err(error) = self.gate(target, bindings) {
+            let _ = writeln!(std::io::stderr().lock(), "td-compositor: resume: {error}");
+        }
+    }
+
+    /// Before a repaint, focus change, client input or VM clipboard access,
+    /// with the runtime held, whether a suspend's lock is owed. If it is,
+    /// that work waits and
+    /// the monitor is woken to make the lock, which the lock order keeps
+    /// from here.
+    pub(crate) fn holds(&self) -> bool {
+        let owed = self.check();
+        if owed {
+            self.watch().woken = true;
+            self.wake.notify_one();
+        }
+        owed
+    }
+
+    /// Waits out the monitor's period, or until a repaint wakes it.
+    fn wait(&self) {
+        let watch = self.watch();
+        let (mut watch, _) = self
+            .wake
+            .wait_timeout_while(watch, RESUME_PERIOD, |watch| !watch.woken)
+            .unwrap_or_else(PoisonError::into_inner);
+        watch.woken = false;
+    }
+
+    /// The monitor: a check at once, then one each period and whenever a
+    /// repaint wakes it, for the whole generation. It holds the seat
+    /// itself, so a repaint's wake is answered and the lock made even once
+    /// every reader has ended, as a USB-only seat's may at a resume.
+    fn monitor<T: InputTarget>(&self, target: &Mutex<T>, bindings: &Mutex<KeyBindings>) {
+        loop {
+            self.guard(target, bindings);
+            self.wait();
+        }
+    }
 }
 
 /// One synthetic seat for an explicitly enabled headless process generation.
@@ -2957,10 +3335,12 @@ fn read_device<T: InputTarget>(
             axes.y.resolution
         );
     }
-    let attention_enabled = bindings
-        .lock()
-        .map_err(|_| "input bindings lock poisoned".to_string())?
-        .attention_enabled;
+    let (attention_enabled, resume) = {
+        let bindings = bindings
+            .lock()
+            .map_err(|_| "input bindings lock poisoned".to_string())?;
+        (bindings.attention_enabled, bindings.resume.clone())
+    };
     let mut state = DeviceState::new(axes, kind, resync, attention_enabled);
     let mut last_time = 0;
     let result = loop {
@@ -2980,6 +3360,11 @@ fn read_device<T: InputTarget>(
         };
         filled = filled.saturating_add(read);
         let records = filled / EVENT_SIZE;
+        // Before the batch is routed, so no client receives input after a
+        // resume before the lock (td-compositor/DESIGN.md item 7).
+        if let (Some(resume), true) = (&resume, records > 0) {
+            resume.guard(target, bindings);
+        }
         let mut failure = None;
         for index in 0..records {
             let at = index.saturating_mul(EVENT_SIZE);
@@ -3014,6 +3399,12 @@ fn read_device<T: InputTarget>(
             }
         }
     };
+    // A device lost at a resume, as a USB one re-enumerating is, releases
+    // what it held only once the lock is made, so a held button's release
+    // cannot complete a click on a client after a suspend.
+    if let Some(resume) = &resume {
+        resume.guard(target, bindings);
+    }
     // Both run: a release that failed is the case where the screen is most
     // likely stale, so it must not be the case that skips the final paint.
     let cleanup = match (
@@ -3078,26 +3469,45 @@ pub fn start(
     runtime: Arc<Mutex<Runtime>>,
     launches: LaunchBackend,
 ) -> Result<usize, String> {
-    let devices = open_event_devices(event_paths(input_dir)?, |path| File::open(path))?;
-    let count = devices.len();
     let attention_enabled = runtime
         .lock()
         .map_err(|_| "runtime lock poisoned".to_string())?
         .attention_enabled();
+    let (login, connected) = match &launches {
+        LaunchBackend::Authority(authority) => (authority.login(), authority.connected()),
+        LaunchBackend::Direct(_) => (crate::authority::Login::default(), None),
+    };
+    let lid = lid_admitted(attention_enabled, connected.as_ref());
+    let (paths, lids) = admit_lids(event_paths(input_dir)?, Path::new(SYSFS_INPUT), lid);
+    let devices = open_event_devices(paths, |path| File::open(path))?;
+    let lids = open_lids(lids);
+    let count = devices.len().saturating_add(lids.len());
     // Decided once against the fixed roster, as admission is.
     let attention_excluded = if attention_enabled {
         attention_exclusions(Path::new(SYSFS_INPUT), &devices)
     } else {
         BTreeSet::new()
     };
-    let login = match &launches {
-        LaunchBackend::Authority(authority) => authority.login(),
-        LaunchBackend::Direct(_) => crate::authority::Login::default(),
-    };
+    let resume = attention_enabled.then(|| {
+        Arc::new(Resume::new(
+            login.clone(),
+            Box::new(SystemClocks {
+                origin: Instant::now(),
+                uptime: None,
+            }),
+        ))
+    });
+    if let Some(resume) = &resume {
+        runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .hold_for_resume(Arc::clone(resume));
+    }
     let bindings = Arc::new(Mutex::new(KeyBindings {
         attention_enabled,
         attention_excluded,
         login,
+        resume: resume.clone(),
         ..KeyBindings::default()
     }));
     let target = Arc::new_cyclic(|own| {
@@ -3171,7 +3581,54 @@ pub fn start(
             })
             .map_err(|e| format!("spawn input reader for {label}: {e}"))?;
     }
+    for (path, mut file) in lids {
+        let label = path.display().to_string();
+        let target = Arc::clone(&target);
+        let bindings = Arc::clone(&bindings);
+        thread::Builder::new()
+            .name("input-lid".into())
+            .spawn(move || {
+                let read = read_lid(&path, &mut file, target.as_ref(), bindings.as_ref());
+                if let Err(error) = read {
+                    let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
+                }
+            })
+            .map_err(|e| format!("spawn lid reader for {label}: {e}"))?;
+    }
+    if let Some(resume) = resume {
+        thread::Builder::new()
+            .name("resume".into())
+            .spawn(move || resume.monitor(target.as_ref(), bindings.as_ref()))
+            .map_err(|e| format!("spawn resume monitor: {e}"))?;
+    }
     Ok(count)
+}
+
+/// Opens the admitted lid switches. One that cannot be opened is reported
+/// and left out, as an unavailable input is: resume detection still sees
+/// the suspend a close would have preceded.
+fn open_lids(paths: Vec<PathBuf>) -> Vec<(PathBuf, File)> {
+    let mut lids = Vec::with_capacity(paths.len());
+    for path in paths {
+        match File::open(&path) {
+            Ok(file) => {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "td-compositor: {} is a lid switch; closing it locks",
+                    path.display()
+                );
+                lids.push((path, file));
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "td-compositor: skipping lid switch {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+    lids
 }
 
 #[cfg(test)]
@@ -11125,5 +11582,1093 @@ mod tests {
         assert!(!seat.attention_open() && seat.locked());
         assert!(seat.glass() == seat.lock_surface());
         assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
+    }
+
+    // A lid close and a resume (TOKEN-LOGIN.md increment 4's C10).
+
+    fn switch(code: u16, value: i32) -> Event {
+        Event {
+            timestamp: 0,
+            time: 0,
+            kind: EV_SW,
+            code,
+            value,
+        }
+    }
+
+    /// `SW_TABLET_MODE`, a switch that is not the lid.
+    const SW_TABLET_MODE: u16 = 1;
+
+    /// What `TestClocks` reads: the two clocks, how many boot-time reads
+    /// remain to straddle a stall, whether those reads fail, and how many
+    /// were made.
+    #[derive(Default)]
+    struct Time {
+        monotonic: Duration,
+        boot: Duration,
+        stalls: usize,
+        failing: bool,
+        reads: usize,
+    }
+
+    #[derive(Clone, Default)]
+    struct TestClocks(Arc<Mutex<Time>>);
+
+    impl TestClocks {
+        /// Time awake: both clocks advance.
+        fn advance(&self, by: Duration) {
+            let mut time = self.0.lock().unwrap();
+            time.monotonic += by;
+            time.boot += by;
+        }
+
+        /// A suspend: only the boot-time clock advances.
+        fn suspend(&self, by: Duration) {
+            self.0.lock().unwrap().boot += by;
+        }
+
+        /// The next `count` samples are preempted for 150 ms between their
+        /// two monotonic reads.
+        fn stall(&self, count: usize) {
+            self.0.lock().unwrap().stalls = count;
+        }
+
+        fn fail(&self, failing: bool) {
+            self.0.lock().unwrap().failing = failing;
+        }
+
+        fn reads(&self) -> usize {
+            self.0.lock().unwrap().reads
+        }
+    }
+
+    impl ResumeClocks for TestClocks {
+        fn monotonic(&mut self) -> Duration {
+            self.0.lock().unwrap().monotonic
+        }
+
+        fn boot(&mut self) -> Result<Duration, String> {
+            let mut time = self.0.lock().unwrap();
+            time.reads += 1;
+            if time.failing {
+                return Err("unreadable".into());
+            }
+            if time.stalls > 0 {
+                time.stalls -= 1;
+                time.monotonic += Duration::from_millis(150);
+                time.boot += Duration::from_millis(150);
+            }
+            Ok(time.boot)
+        }
+    }
+
+    fn test_resume(login: &crate::authority::Login) -> (Arc<Resume>, TestClocks) {
+        let clocks = TestClocks::default();
+        let resume = Arc::new(Resume::new(login.clone(), Box::new(clocks.clone())));
+        (resume, clocks)
+    }
+
+    /// The lock a gate made, as the gate itself records it.
+    fn made(resume: &Resume) {
+        resume.watch().owed = false;
+    }
+
+    /// The two triggers, each through its own production entry: a lid
+    /// switch's close read by `read_lid`, and a resume after a three-second
+    /// suspend found by `Resume::gate`.
+    #[derive(Clone, Copy, Debug)]
+    enum Trigger {
+        Lid,
+        Resume,
+    }
+
+    const TRIGGERS: &[Trigger] = &[Trigger::Lid, Trigger::Resume];
+
+    impl LockedSeat {
+        /// `events` read from a lid switch by its reader.
+        fn lid(&self, events: Vec<Event>) -> Result<(), String> {
+            let data = events.into_iter().flat_map(encode).collect();
+            read_lid(
+                Path::new("event-lid"),
+                &mut ChunkedReader::new(data, Vec::new()),
+                self.target.as_ref(),
+                self.bindings.as_ref(),
+            )
+        }
+
+        /// Resume detection as the paired profile's start installs it: the
+        /// bindings check it before each batch, and the runtime before each
+        /// repaint that could show a client.
+        fn resume(&self) -> (Arc<Resume>, TestClocks) {
+            let (resume, clocks) = test_resume(&self.login);
+            self.bindings.lock().unwrap().resume = Some(Arc::clone(&resume));
+            self.runtime
+                .lock()
+                .unwrap()
+                .hold_for_resume(Arc::clone(&resume));
+            (resume, clocks)
+        }
+
+        fn trigger(&self, trigger: Trigger) -> Result<(), String> {
+            match trigger {
+                Trigger::Lid => self.lid(vec![switch(SW_LID, LID_CLOSED), syn(0)]),
+                Trigger::Resume => {
+                    let (resume, clocks) = test_resume(&self.login);
+                    assert!(!resume.check());
+                    clocks.advance(Duration::from_secs(1));
+                    clocks.suspend(Duration::from_secs(3));
+                    resume.gate(self.target.as_ref(), self.bindings.as_ref())
+                }
+            }
+        }
+    }
+
+    /// A lid switch is a switch-only node, `EV_SYN` and `EV_SW` in
+    /// `capabilities/ev`, declaring `SW_LID`. A node with keys beside its
+    /// switches, a switch-only node without the lid, and anything
+    /// unreadable is not; nor is a keyboard.
+    #[test]
+    fn a_lid_switch_is_a_switch_only_node_declaring_sw_lid() {
+        struct Tree(PathBuf);
+        impl Drop for Tree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let tree = Tree(std::env::temp_dir().join(format!(
+            "td-input-lid-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let entry = |name: &str, types: Option<&str>, switches: Option<&str>| {
+            let capabilities = tree.0.join(name).join("device").join("capabilities");
+            std::fs::create_dir_all(&capabilities).unwrap();
+            for (file, text) in [("ev", types), ("sw", switches)] {
+                match text {
+                    Some(text) => std::fs::write(capabilities.join(file), text).unwrap(),
+                    None => std::fs::create_dir(capabilities.join(file)).unwrap(),
+                }
+            }
+        };
+        // The ACPI lid: EV_SYN and EV_SW, SW_LID.
+        entry("event0", Some("21\n"), Some("1\n"));
+        // EV_SW alone, without EV_SYN's bit.
+        entry("event1", Some("20\n"), Some("1\n"));
+        // A lid beside keys (EV_KEY), as some embedded controllers report.
+        entry("event2", Some("23\n"), Some("1\n"));
+        // Switch-only, without the lid: tablet mode, a headphone jack.
+        entry("event3", Some("21\n"), Some("2\n"));
+        entry("event4", Some("21\n"), Some("4\n"));
+        // A keyboard, whose `sw` is empty.
+        entry("event5", Some("120013\n"), Some("0\n"));
+        // Unreadable halves.
+        entry("event6", None, Some("1\n"));
+        entry("event7", Some("21\n"), None);
+        entry("event8", Some("2x\n"), Some("1\n"));
+        // A lid with EV_REL or EV_ABS is no switch-only node.
+        entry("event9", Some("25\n"), Some("1\n"));
+        entry("event10", Some("29\n"), Some("1\n"));
+        let lid = |node: &str| lid_switch(&tree.0, Path::new(node));
+        assert!(lid("/dev/input/event0"));
+        assert!(lid("/dev/input/event1"));
+        for node in 2..=10 {
+            assert!(!lid(&format!("/dev/input/event{node}")), "event{node}");
+        }
+        assert!(!lid("/dev/input/event11"));
+        assert!(!lid("/"));
+        // The roster: the lid is read apart where admitted, and opened by
+        // no ordinary reader either way.
+        let paths: Vec<PathBuf> = (0..=11)
+            .map(|node| PathBuf::from(format!("/dev/input/event{node}")))
+            .collect();
+        let lids = [paths[0].clone(), paths[1].clone()];
+        let ordinary: Vec<PathBuf> = paths[2..].to_vec();
+        assert_eq!(
+            admit_lids(paths.clone(), &tree.0, true),
+            (ordinary.clone(), lids.to_vec())
+        );
+        assert_eq!(admit_lids(paths, &tree.0, false), (ordinary, Vec::new()));
+    }
+
+    /// A lid switch is admitted in the paired profile alone, on root's
+    /// answer at connect: enrolled or unavailable admits it, unenrolled and
+    /// no answer do not, and the direct profile never does.
+    #[test]
+    fn a_lid_switch_is_admitted_on_a_locking_answer_at_connect() {
+        for (state, locks) in STATES {
+            let login = crate::authority::Login::default();
+            login.answer(&root_answer(state)).unwrap();
+            let connected = login.current();
+            assert_eq!(lid_admitted(true, connected.as_ref()), *locks, "{state:?}");
+            assert!(!lid_admitted(false, connected.as_ref()));
+        }
+        assert!(!lid_admitted(true, None));
+    }
+
+    /// A lid close locks exactly while root's last answer is enrolled or
+    /// unavailable, through the whole live entry: the lock surface on
+    /// glass and no window focused. Unenrolled, it does nothing; nor does
+    /// opening the lid or another switch closing. The direct profile has
+    /// no lock, and a close there does nothing either.
+    #[test]
+    fn a_lid_close_locks_only_on_a_locking_state() {
+        for (state, locks) in STATES {
+            let seat = LockedSeat::open(&[]);
+            seat.login.answer(&root_answer(state)).unwrap();
+            seat.lid(vec![
+                switch(SW_LID, 0),
+                syn(1),
+                switch(SW_TABLET_MODE, LID_CLOSED),
+                syn(2),
+            ])
+            .unwrap();
+            assert!(!seat.locked() && seat.client_shown());
+            seat.lid(vec![switch(SW_LID, LID_CLOSED), syn(3)]).unwrap();
+            assert_eq!(seat.locked(), *locks, "{state:?}");
+            assert!(!seat.attention_open());
+            let focus = seat.runtime.lock().unwrap().keyboard_snapshot().focus;
+            if *locks {
+                assert!(seat.glass() == seat.lock_surface());
+                assert_eq!(focus, None);
+                // Closed again on the lock surface: still locked.
+                seat.lid(vec![switch(SW_LID, LID_CLOSED), syn(4)]).unwrap();
+                assert!(seat.locked() && seat.glass() == seat.lock_surface());
+            } else {
+                assert!(seat.client_shown());
+                assert_eq!(focus, Some(seat.surface));
+            }
+        }
+        let seat = LockedSeat::open(&[]);
+        seat.runtime.lock().unwrap().enable_attention(false);
+        seat.bindings.lock().unwrap().attention_enabled = false;
+        seat.lid(vec![switch(SW_LID, LID_CLOSED), syn(1)]).unwrap();
+        assert!(!seat.locked() && seat.client_shown());
+    }
+
+    /// Nothing a lid switch reports reaches the bindings, the pointer or a
+    /// client: a key, a button, motion and the switch itself are read by
+    /// the lid's reader alone, which acts only on a close.
+    #[test]
+    fn a_lid_switch_reaches_no_client() {
+        let seat = LockedSeat::open(&[]);
+        seat.login.answer(&root_answer(&[0])).unwrap();
+        let (events, _stop) = seat
+            .runtime
+            .lock()
+            .unwrap()
+            .subscribe_keyboard(1)
+            .unwrap()
+            .split();
+        let pointer = seat.runtime.lock().unwrap().pointer_snapshot();
+        seat.lid(vec![
+            key(KEY_LEFTMETA, KEY_PRESS),
+            key(KEY_A, KEY_PRESS),
+            syn(1),
+            key(KEY_A, KEY_RELEASE),
+            key(KEY_LEFTMETA, KEY_RELEASE),
+            syn(2),
+            key(BTN_LEFT, KEY_PRESS),
+            Event {
+                kind: EV_REL,
+                code: REL_X,
+                value: 40,
+                ..key(0, 0)
+            },
+            syn(3),
+            switch(SW_LID, LID_CLOSED),
+            syn(4),
+            switch(SW_LID, 0),
+            syn(5),
+        ])
+        .unwrap();
+        assert!(LockedSeat::client_keys(&events).is_empty());
+        assert_eq!(seat.runtime.lock().unwrap().pointer_snapshot(), pointer);
+        let bindings = seat.bindings.lock().unwrap();
+        assert!(bindings.pressed.is_empty() && bindings.consumed.is_empty());
+        assert!(bindings.forwarded.is_empty() && bindings.pointer_pressed.is_empty());
+        assert!(bindings.attention == AttentionState::Closed);
+        drop(bindings);
+        assert!(!seat.locked() && seat.client_shown());
+    }
+
+    /// `/proc/uptime`'s first field, in seconds; anything else is refused.
+    #[test]
+    fn uptime_reads_the_boot_time_field() {
+        assert_eq!(
+            uptime("350735.47 234388.90\n"),
+            Some(Duration::from_millis(350_735_470))
+        );
+        assert_eq!(uptime("0.01 0.00\n"), Some(Duration::from_millis(10)));
+        assert_eq!(
+            uptime("1.123456789 0\n"),
+            Some(Duration::new(1, 123_456_789))
+        );
+        for bad in [
+            "",
+            "\n",
+            "12 3.00\n",
+            ".5 1.00\n",
+            "5. 1.00\n",
+            "+5.00 1.00\n",
+            "5.0000000001 1\n",
+            "-1.00 1.00\n",
+            "1.0x 1.00\n",
+            "99999999999999999999.00 1.00\n",
+        ] {
+            assert_eq!(uptime(bad), None, "{bad:?}");
+        }
+        let long = format!("1.00 {}\n", "0".repeat(64));
+        assert_eq!(uptime(&long), None);
+        // The running kernel's own answers.
+        let mut clocks = SystemClocks {
+            origin: Instant::now(),
+            uptime: None,
+        };
+        let first = clocks.boot().unwrap();
+        // Kept open and read again from the start: the kernel regenerates
+        // the line, so a later read is later.
+        assert!(clocks.uptime.is_some());
+        thread::sleep(Duration::from_millis(30));
+        assert!(clocks.boot().unwrap() > first);
+        assert!(clocks.uptime.is_some());
+    }
+
+    /// A gap of more than two seconds between how far the boot-time clock
+    /// and the monotonic clock advanced since the last check is a suspend;
+    /// two seconds or less, or time awake however long, is not.
+    #[test]
+    fn a_resume_gap_over_two_seconds_is_a_suspend() {
+        let login = login_answer(&ENROLLED);
+        for (millis, owed) in [
+            (0, false),
+            (1_500, false),
+            (2_000, false),
+            (2_001, true),
+            (2_500, true),
+            (3_600_000, true),
+        ] {
+            let (resume, clocks) = test_resume(&login);
+            // The first check takes the baseline alone.
+            clocks.suspend(Duration::from_secs(60));
+            assert!(!resume.check());
+            clocks.advance(Duration::from_secs(5));
+            clocks.suspend(Duration::from_millis(millis));
+            assert_eq!(resume.check(), owed, "{millis}");
+            // Owed until the lock is made, whatever later checks find.
+            clocks.advance(Duration::from_secs(1));
+            assert_eq!(resume.check(), owed, "{millis}");
+            made(&resume);
+            assert!(!resume.check());
+        }
+        let (resume, clocks) = test_resume(&login);
+        assert!(!resume.check());
+        clocks.advance(Duration::from_secs(3_600));
+        assert!(!resume.check());
+        // Each check measures since the last: two short suspends apart.
+        clocks.suspend(Duration::from_millis(1_500));
+        assert!(!resume.check());
+        clocks.suspend(Duration::from_millis(1_500));
+        assert!(!resume.check());
+    }
+
+    /// A sample whose monotonic reads are more than 100 ms apart is
+    /// discarded and retaken, and the retake is what is compared. Sixteen
+    /// discards in a row, or an unreadable boot-time clock, are
+    /// unverifiable: a suspend once, after which the baseline starts again
+    /// from the next accepted sample.
+    #[test]
+    fn a_discarded_or_unreadable_sample_holds_until_verified() {
+        let login = login_answer(&ENROLLED);
+        let (resume, clocks) = test_resume(&login);
+        assert!(!resume.check());
+        clocks.stall(1);
+        clocks.suspend(Duration::from_secs(3));
+        assert!(resume.check());
+        assert_eq!(clocks.reads(), 3);
+        made(&resume);
+        clocks.stall(SAMPLE_RETAKES - 1);
+        assert!(!resume.check());
+        clocks.stall(SAMPLE_RETAKES);
+        assert!(resume.check());
+        made(&resume);
+        // No baseline now: unverifiable again is no new lock.
+        clocks.stall(SAMPLE_RETAKES);
+        assert!(!resume.check());
+        // The next accepted sample is a baseline, then gaps count again.
+        clocks.suspend(Duration::from_secs(3));
+        assert!(!resume.check());
+        clocks.suspend(Duration::from_secs(3));
+        assert!(resume.check());
+        made(&resume);
+        // An unreadable boot-time clock: once, then not until it reads.
+        clocks.fail(true);
+        assert!(resume.check());
+        made(&resume);
+        assert!(!resume.check());
+        clocks.fail(false);
+        assert!(!resume.check());
+        clocks.suspend(Duration::from_secs(3));
+        assert!(resume.check());
+    }
+
+    /// Resume detection samples only while root's last answer is enrolled
+    /// or unavailable: unenrolled, or with no answer, it reads no clock and
+    /// owes nothing, and a suspend then is never counted later.
+    #[test]
+    fn resume_samples_only_on_a_locking_state() {
+        for (state, locks) in STATES {
+            let login = crate::authority::Login::default();
+            login.answer(&root_answer(state)).unwrap();
+            let (resume, clocks) = test_resume(&login);
+            assert!(!resume.check());
+            clocks.suspend(Duration::from_secs(3));
+            assert_eq!(resume.check(), *locks, "{state:?}");
+            assert_eq!(clocks.reads() > 0, *locks, "{state:?}");
+        }
+        let login = crate::authority::Login::default();
+        let (resume, clocks) = test_resume(&login);
+        clocks.suspend(Duration::from_secs(3));
+        assert!(!resume.check() && !resume.check());
+        assert_eq!(clocks.reads(), 0);
+        // Turned enrolled, a fresh baseline: the earlier suspend is not
+        // counted, a later one is.
+        login.answer(&root_answer(STATES[0].0)).unwrap();
+        assert!(!resume.check());
+        clocks.suspend(Duration::from_secs(3));
+        assert!(resume.check());
+        // Turned unenrolled before the lock was made, nothing is owed.
+        login.answer(&root_answer(&[0])).unwrap();
+        assert!(!resume.check());
+    }
+
+    /// Before a batch is routed: after a suspend of more than two seconds
+    /// an enrolled or unavailable session locks first, so the batch's key
+    /// reaches the lock surface and not the window. A shorter suspend, or
+    /// an unenrolled session, routes it as before.
+    #[test]
+    fn a_resume_locks_before_the_batch_is_routed() {
+        for (millis, (state, locks)) in [(3_000, STATES[0]), (1_500, STATES[0])]
+            .into_iter()
+            .chain(STATES.iter().map(|state| (3_000, *state)))
+        {
+            let seat = LockedSeat::open(&[]);
+            seat.login.answer(&root_answer(state)).unwrap();
+            let (_resume, clocks) = seat.resume();
+            let (events, _stop) = seat
+                .runtime
+                .lock()
+                .unwrap()
+                .subscribe_keyboard(1)
+                .unwrap()
+                .split();
+            seat.press(&[KEY_A], 10);
+            assert!(LockedSeat::client_keys(&events).contains(&u32::from(KEY_A)));
+            clocks.advance(Duration::from_secs(1));
+            clocks.suspend(Duration::from_millis(millis));
+            seat.press(&[KEY_B], 20);
+            let locked = locks && millis > 2_000;
+            assert_eq!(seat.locked(), locked, "{state:?} {millis}");
+            assert_eq!(
+                LockedSeat::client_keys(&events).contains(&u32::from(KEY_B)),
+                !locked,
+                "{state:?} {millis}"
+            );
+            if locked {
+                assert!(seat.glass() == seat.lock_surface());
+                assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
+            }
+        }
+    }
+
+    /// Before a repaint that could show a client: after a suspend the
+    /// window's new frame is held, the frame from before the suspend stays
+    /// on glass, and the monitor is woken; its lock then paints the lock
+    /// surface. Unenrolled, the frame is painted as before.
+    #[test]
+    fn a_resume_holds_a_clients_repaint_until_the_lock() {
+        const NEW: [u8; 4] = [9, 8, 7, 0];
+        for (state, locks) in STATES {
+            let seat = LockedSeat::open(&[]);
+            seat.login.answer(&root_answer(state)).unwrap();
+            let (resume, clocks) = seat.resume();
+            assert!(!resume.check());
+            clocks.suspend(Duration::from_secs(3));
+            seat.runtime
+                .lock()
+                .unwrap()
+                .commit(
+                    seat.surface,
+                    crate::buffer::Surface::from_shm_pixels(
+                        100,
+                        100,
+                        NEW.repeat(10_000),
+                        crate::scene::SHM_XRGB8888,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let glass = seat.glass();
+            assert_eq!(glass.as_chunks::<4>().0.contains(&NEW), !locks, "{state:?}");
+            assert_eq!(seat.client_shown(), *locks, "{state:?}");
+            assert_eq!(resume.watch().woken, *locks);
+            resume
+                .gate(seat.target.as_ref(), seat.bindings.as_ref())
+                .unwrap();
+            assert_eq!(seat.locked(), *locks);
+            if *locks {
+                assert!(seat.glass() == seat.lock_surface());
+            }
+        }
+    }
+
+    /// Polls `done` for up to five seconds, answering how long it took.
+    fn waited(done: &dyn Fn() -> bool) -> Duration {
+        let start = Instant::now();
+        while !done() && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        start.elapsed()
+    }
+
+    /// The monitor as start runs it, holding the seat for the generation.
+    /// It never ends, so a test's monitor outlives its test, checking a
+    /// test clock nothing advances.
+    fn spawn_monitor(
+        resume: &Arc<Resume>,
+        target: Arc<Mutex<LiveInputTarget>>,
+        bindings: Arc<Mutex<KeyBindings>>,
+    ) {
+        let resume = Arc::clone(resume);
+        thread::spawn(move || resume.monitor(target.as_ref(), bindings.as_ref()));
+    }
+
+    /// The monitor checks at once and then at least once a second, so a
+    /// resume with no input and no repaint still locks within a second; a
+    /// repaint's wake ends its wait at once.
+    #[test]
+    fn the_monitor_checks_at_least_once_a_second() {
+        assert!(RESUME_PERIOD <= Duration::from_secs(1));
+        let seat = LockedSeat::open(&[]);
+        let (resume, clocks) = seat.resume();
+        spawn_monitor(
+            &resume,
+            Arc::clone(&seat.target),
+            Arc::clone(&seat.bindings),
+        );
+        let first = waited(&|| clocks.reads() > 0);
+        assert!(first < Duration::from_millis(750), "{first:?}");
+        clocks.suspend(Duration::from_secs(3));
+        let took = waited(&|| seat.locked());
+        assert!(seat.locked());
+        assert!(took <= Duration::from_secs(1), "{took:?}");
+        assert!(seat.glass() == seat.lock_surface());
+        // Woken, the wait ends at once.
+        resume.watch().woken = true;
+        let start = Instant::now();
+        resume.wait();
+        assert!(start.elapsed() < RESUME_PERIOD / 2);
+        assert!(!resume.watch().woken);
+    }
+
+    /// With every reader gone, as a USB-only seat's may be at a resume, the
+    /// monitor holds the seat itself: a client's repaint held for the owed
+    /// lock wakes it, and the lock is made, never a repaint withheld for
+    /// good.
+    #[test]
+    fn the_monitor_locks_with_every_reader_gone() {
+        let seat = LockedSeat::open(&[]);
+        let (resume, clocks) = seat.resume();
+        let LockedSeat {
+            cleanup,
+            runtime,
+            target,
+            bindings,
+            surface,
+            login,
+            ..
+        } = seat;
+        spawn_monitor(&resume, target, bindings);
+        waited(&|| clocks.reads() > 0);
+        clocks.suspend(Duration::from_secs(3));
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                surface,
+                crate::buffer::Surface::from_shm_pixels(
+                    100,
+                    100,
+                    [9, 8, 7, 0].repeat(10_000),
+                    crate::scene::SHM_XRGB8888,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        waited(&|| runtime.lock().unwrap().session_locked());
+        assert!(runtime.lock().unwrap().session_locked());
+        let rows = crate::attention::lock_rows(login.current().as_ref());
+        let mut frame = vec![0; 800 * 600 * 4];
+        crate::attention::paint_lock(&mut frame, 800, 600, 3200, &rows);
+        assert!(std::fs::read(&cleanup.0).unwrap() == frame);
+    }
+
+    /// What `events` delivered since it subscribed, by kind: key and
+    /// button transitions with their direction, and every other delivery
+    /// by name.
+    fn delivered(
+        events: &std::sync::mpsc::Receiver<crate::runtime::KeyboardDelivery>,
+    ) -> Vec<String> {
+        use crate::keyboard::KeyboardEvent;
+        use crate::pointer::PointerEvent;
+        use crate::runtime::KeyboardDelivery;
+        let mut seen = Vec::new();
+        for delivery in events.try_iter() {
+            match delivery {
+                KeyboardDelivery::Event(event) => seen.push(match event.event {
+                    KeyboardEvent::Key { input, .. } => {
+                        format!("key {} {:?}", input.key, input.state)
+                    }
+                    KeyboardEvent::Enter { .. } => "keyboard enter".into(),
+                    KeyboardEvent::Leave { .. } => "keyboard leave".into(),
+                    KeyboardEvent::Modifiers { .. } => "modifiers".into(),
+                }),
+                KeyboardDelivery::Pointer(frame) => {
+                    for event in frame.events {
+                        seen.push(match event {
+                            PointerEvent::Button { input, .. } => {
+                                format!("button {} {:?}", input.button, input.state)
+                            }
+                            PointerEvent::Enter { .. } => "pointer enter".into(),
+                            PointerEvent::Leave { .. } => "pointer leave".into(),
+                            PointerEvent::Motion { .. } => "motion".into(),
+                            PointerEvent::Axis { .. } => "axis".into(),
+                        });
+                    }
+                }
+                _ => seen.push("other".into()),
+            }
+        }
+        seen
+    }
+
+    /// `client`'s keyboard and pointer deliveries, both active.
+    fn subscribe_input(
+        seat: &LockedSeat,
+    ) -> impl FnMut(
+        u64,
+    ) -> (
+        std::sync::mpsc::Receiver<crate::runtime::KeyboardDelivery>,
+        crate::runtime::KeyboardSubscriptionStop,
+    ) + '_ {
+        move |client| {
+            let active = || Arc::new(std::sync::atomic::AtomicBool::new(true));
+            seat.runtime
+                .lock()
+                .unwrap()
+                .subscribe_input_with_activity(client, active(), active())
+                .unwrap()
+                .split()
+        }
+    }
+
+    /// Puts the pointer at (60, 90), over the seat's window, so a press is
+    /// the window's.
+    fn over_window(seat: &LockedSeat) {
+        let at = |numerator, denominator| Fraction {
+            numerator,
+            denominator,
+        };
+        seat.runtime
+            .lock()
+            .unwrap()
+            .pointer_frame_at(1, at(3, 40), at(3, 20), &[], PointerScroll::default())
+            .unwrap();
+    }
+
+    /// A reader that hands out `data`, then suspends `clocks` for three
+    /// seconds and fails as a device lost at the resume does.
+    struct LostAtResume {
+        data: Option<Vec<u8>>,
+        clocks: TestClocks,
+    }
+
+    impl Read for LostAtResume {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            match self.data.take() {
+                Some(data) => {
+                    buffer[..data.len()].copy_from_slice(&data);
+                    Ok(data.len())
+                }
+                None => {
+                    self.clocks.suspend(Duration::from_secs(3));
+                    Err(std::io::Error::from_raw_os_error(19))
+                }
+            }
+        }
+    }
+
+    /// A device lost at a resume releases what it held only once the lock
+    /// is made, so neither the held key's nor the held button's release
+    /// reaches the window, and the session is locked.
+    #[test]
+    fn a_device_lost_at_a_resume_releases_nothing_before_the_lock() {
+        let seat = LockedSeat::open(&[]);
+        let (_resume, clocks) = seat.resume();
+        let (events, _stop) = subscribe_input(&seat)(1);
+        over_window(&seat);
+        let held = later(vec![
+            syn(10),
+            at_millis(key(KEY_A, KEY_PRESS), 11),
+            at_millis(key(BTN_LEFT, KEY_PRESS), 11),
+            syn(11),
+        ]);
+        let mut device = LostAtResume {
+            data: Some(held.into_iter().flat_map(encode).collect()),
+            clocks: clocks.clone(),
+        };
+        let lost = read_device(
+            Path::new("event-lost"),
+            &mut device,
+            0,
+            seat.target.as_ref(),
+            seat.bindings.as_ref(),
+            None,
+            &mut || None,
+        );
+        assert!(lost.is_err());
+        let seen = delivered(&events);
+        let press = |kind: &str, code: u16| {
+            seen.iter()
+                .filter(|seen| seen.starts_with(&format!("{kind} {code} ")))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(press("key", KEY_A).len(), 1, "{seen:?}");
+        assert!(press("key", KEY_A)[0].ends_with("Pressed"), "{seen:?}");
+        assert_eq!(press("button", BTN_LEFT).len(), 1, "{seen:?}");
+        assert!(
+            press("button", BTN_LEFT)[0].ends_with("Pressed"),
+            "{seen:?}"
+        );
+        assert!(seat.locked());
+        assert!(seat.glass() == seat.lock_surface());
+    }
+
+    /// While a suspend's lock is owed and not yet made, nothing reaches a
+    /// client: no new window's keyboard enter, no key, modifier, button or
+    /// motion, and no new frame. The lock then withdraws the window.
+    #[test]
+    fn an_owed_lock_withholds_focus_and_input() {
+        let seat = LockedSeat::open(&[]);
+        let (resume, clocks) = seat.resume();
+        let mut subscribe = subscribe_input(&seat);
+        let (first, _first_stop) = subscribe(1);
+        let (second, _second_stop) = subscribe(2);
+        over_window(&seat);
+        assert!(delivered(&first).contains(&"pointer enter".to_string()));
+        assert!(!resume.check());
+        clocks.suspend(Duration::from_secs(3));
+        {
+            let mut runtime = seat.runtime.lock().unwrap();
+            runtime
+                .commit(
+                    crate::scene::SurfaceKey {
+                        client: 2,
+                        object: 1,
+                    },
+                    crate::buffer::Surface::from_shm_pixels(
+                        100,
+                        100,
+                        [9, 8, 7, 0].repeat(10_000),
+                        crate::scene::SHM_XRGB8888,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            runtime.key(key(KEY_A, KEY_PRESS).key_input()).unwrap();
+            runtime
+                .modifiers(ModifierState {
+                    depressed: MOD_SHIFT,
+                    ..ModifierState::default()
+                })
+                .unwrap();
+            let press = [PointerButtonInput {
+                button: u32::from(BTN_LEFT),
+                state: PointerButtonState::Pressed,
+                time: 1,
+            }];
+            runtime
+                .pointer_frame(1, 5, 5, &press, PointerScroll::default())
+                .unwrap();
+            runtime
+                .pointer_frame_at(
+                    2,
+                    Fraction {
+                        numerator: 1,
+                        denominator: 2,
+                    },
+                    Fraction {
+                        numerator: 1,
+                        denominator: 2,
+                    },
+                    &[],
+                    PointerScroll::default(),
+                )
+                .unwrap();
+        }
+        assert_eq!(delivered(&first), Vec::<String>::new());
+        assert_eq!(delivered(&second), Vec::<String>::new());
+        assert!(!seat.glass().as_chunks::<4>().0.contains(&[9, 8, 7, 0]));
+        assert!(resume.watch().owed);
+        resume
+            .gate(seat.target.as_ref(), seat.bindings.as_ref())
+            .unwrap();
+        assert!(seat.locked() && !resume.watch().owed);
+        assert!(seat.glass() == seat.lock_surface());
+        assert!(delivered(&second)
+            .iter()
+            .all(|seen| !seen.ends_with("Pressed") && seen != "keyboard enter"));
+    }
+
+    /// A resume lock refused before the lock state was set stays owed: the
+    /// reader reads on rather than ending, the batch's key reaches no
+    /// client meanwhile, and the next gate retakes the lock.
+    #[test]
+    fn a_refused_resume_lock_stays_owed_and_is_retaken() {
+        let seat = LockedSeat::open(&[]);
+        let (resume, clocks) = seat.resume();
+        let (events, _stop) = seat
+            .runtime
+            .lock()
+            .unwrap()
+            .subscribe_keyboard(1)
+            .unwrap()
+            .split();
+        assert!(!resume.check());
+        clocks.suspend(Duration::from_secs(3));
+        // The runtime's entry refuses before `Scene::lock`.
+        seat.runtime.lock().unwrap().enable_attention(false);
+        seat.try_read(0, 10, presses(&[KEY_A], 11)).unwrap();
+        assert!(!seat.locked());
+        assert!(resume.watch().owed);
+        assert!(!delivered(&events)
+            .iter()
+            .any(|seen| seen.starts_with("key ")));
+        seat.runtime.lock().unwrap().enable_attention(true);
+        seat.try_read(0, 20, presses(&[KEY_B], 21)).unwrap();
+        assert!(seat.locked() && !resume.watch().owed);
+        assert!(!delivered(&events)
+            .iter()
+            .any(|seen| seen.starts_with("key ")));
+        assert!(seat.glass() == seat.lock_surface());
+    }
+
+    /// TOKEN-LOGIN.md's D12 through a lid close and a resume: a lock while
+    /// a lifetime is open ends it as Escape does. Before an unlock's commit
+    /// it is cancelled with `15`; after it, with a key held, the screen
+    /// drains, root's `06` unlocks nothing and its result is never shown.
+    #[test]
+    fn a_lid_close_or_resume_during_an_unlock_ends_it_as_escape_does() {
+        for trigger in TRIGGERS {
+            // Before the commit.
+            let seat = LockedSeat::new(&[]);
+            let attempt = seat.unlock(10);
+            let mut root = root(to_pin());
+            let mut client = crate::secret_client::Client::trusting_memory();
+            client.start(&mut root, attempt).unwrap();
+            run(&mut client, &mut root).unwrap();
+            assert_eq!(seat.field(), Some(crate::attention::Field::Pin(0)));
+            seat.trigger(*trigger).unwrap();
+            assert!(!seat.attention_open() && seat.locked(), "{trigger:?}");
+            assert!(seat.glass() == seat.lock_surface());
+            root.replies.extend([
+                vec![0x95, 0],
+                [&[0x91, 0x0d, 0x80, 0][..], &pin_step().encode()].concat(),
+            ]);
+            run(&mut client, &mut root).unwrap();
+            assert!(root.replies.is_empty());
+            assert_eq!(root.sent(0x15), 1, "{trigger:?}");
+            assert_eq!(root.sent(0x1c), 0);
+            assert!(seat.locked());
+            assert!(seat.glass() == seat.lock_surface());
+            // After the commit, before root's success, with a key held.
+            let seat = LockedSeat::new(&[]);
+            let (mut client, mut root) = seat.committed();
+            let mut pointer = PointerMotion::default();
+            let feed = |pointer: &mut PointerMotion, value, time| {
+                for event in later(vec![at_millis(key(KEY_A, value), time), syn(time)]) {
+                    apply(
+                        seat.target.as_ref(),
+                        event,
+                        0,
+                        seat.bindings.as_ref(),
+                        pointer,
+                        None,
+                    )
+                    .unwrap();
+                }
+            };
+            feed(&mut pointer, KEY_PRESS, 61);
+            seat.trigger(*trigger).unwrap();
+            assert!(seat.bindings.lock().unwrap().attention == AttentionState::Draining);
+            root.replies.push_back(status(6, &pin_step()));
+            run(&mut client, &mut root).unwrap();
+            assert!(root.replies.is_empty());
+            assert!(seat.locked(), "{trigger:?}");
+            assert_eq!(root.sent(0x15), 0);
+            assert!(seat.glass() == drained());
+            feed(&mut pointer, KEY_RELEASE, 71);
+            assert!(!seat.attention_open() && seat.locked());
+            assert!(seat.glass() == seat.lock_surface());
+            assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
+        }
+    }
+
+    /// Escape's drained screen at 800x600, which shows no result.
+    fn drained() -> Vec<u8> {
+        let mut drained = vec![0; 800 * 600 * 4];
+        crate::attention::paint(
+            &mut drained,
+            800,
+            600,
+            3200,
+            true,
+            false,
+            crate::attention::Notice::Menu,
+        );
+        drained
+    }
+
+    fn remove_step(
+        step: crate::authority::consent::LoginStep,
+    ) -> crate::authority::consent::Request {
+        crate::authority::consent::Request::new(
+            LOCK_NONCE,
+            1000,
+            crate::authority::consent::Operation::LoginRemove {
+                account: 1000,
+                before: 3,
+                after: 2,
+                removed: vec![crate::authority::consent::Slot {
+                    position: 1,
+                    key: ENROLLED[0],
+                }],
+                step,
+            },
+        )
+        .unwrap()
+    }
+
+    fn authorize_step() -> crate::authority::consent::Request {
+        remove_step(crate::authority::consent::LoginStep::Authorize {
+            key: ENROLLED[0],
+            retries: 8,
+        })
+    }
+
+    /// A removal of the first key chosen on an unlocked seat's
+    /// key-management screen, driven to its PIN step: root's answers from
+    /// `1b` until the authorize step asks for its PIN.
+    fn removal_to_pin(seat: &LockedSeat) -> (crate::secret_client::Client, Root) {
+        use crate::secret_client::{LoginSelection, Selection};
+        seat.chord(10);
+        seat.press(&[KEY_K, KEY_D, KEY_1, KEY_ENTER], 20);
+        let attempt = seat.queued.attempt().unwrap();
+        assert!(matches!(
+            attempt.selection(),
+            Selection::Login(LoginSelection::Remove(_))
+        ));
+        let (identify, step) = (
+            remove_step(crate::authority::consent::LoginStep::Identify),
+            authorize_step(),
+        );
+        let mut root = root(vec![
+            started(),
+            vec![0x91, 0x0b],
+            status(3, &identify),
+            status(4, &identify),
+            vec![0x93],
+            status(3, &identify),
+            status(4, &step),
+            vec![0x93],
+            status(0x0c, &step),
+        ]);
+        let mut client = crate::secret_client::Client::trusting_memory();
+        client.start(&mut root, attempt).unwrap();
+        run(&mut client, &mut root).unwrap();
+        assert_eq!(seat.field(), Some(crate::attention::Field::Pin(0)));
+        (client, root)
+    }
+
+    /// D12 for a key-management lifetime, which C9 left to the lid and
+    /// resume: a removal open when either comes is cancelled with `15`
+    /// before its commit; after its commit the screen drains under
+    /// Escape's screen, root's success is never shown, and the session
+    /// ends on the lock surface.
+    #[test]
+    fn a_lid_close_or_resume_during_a_removal_ends_it_as_escape_does() {
+        for trigger in TRIGGERS {
+            // Before the commit.
+            let seat = LockedSeat::open(&[]);
+            let (mut client, mut root) = removal_to_pin(&seat);
+            seat.trigger(*trigger).unwrap();
+            assert!(!seat.attention_open() && seat.locked(), "{trigger:?}");
+            assert!(seat.glass() == seat.lock_surface());
+            root.replies.extend([
+                vec![0x95, 0],
+                [&[0x91, 0x0d, 0x80, 0][..], &authorize_step().encode()].concat(),
+            ]);
+            run(&mut client, &mut root).unwrap();
+            assert!(root.replies.is_empty());
+            assert_eq!(root.sent(0x15), 1, "{trigger:?}");
+            assert_eq!(root.sent(0x1c), 0);
+            assert!(seat.locked() && seat.glass() == seat.lock_surface());
+            // After the commit, with a key held.
+            let seat = LockedSeat::open(&[]);
+            let (mut client, mut root) = removal_to_pin(&seat);
+            let step = authorize_step();
+            seat.press(&[KEY_1, KEY_2, KEY_3, KEY_4, KEY_ENTER], 40);
+            root.replies.extend([
+                status(0x0c, &step),
+                vec![0x9c, 0],
+                status(3, &step),
+                status(5, &step),
+                vec![0x94],
+                status(3, &step),
+            ]);
+            run(&mut client, &mut root).unwrap();
+            assert_eq!(root.sent(0x14), 1);
+            let mut pointer = PointerMotion::default();
+            let feed = |pointer: &mut PointerMotion, value, time| {
+                for event in later(vec![at_millis(key(KEY_A, value), time), syn(time)]) {
+                    apply(
+                        seat.target.as_ref(),
+                        event,
+                        0,
+                        seat.bindings.as_ref(),
+                        pointer,
+                        None,
+                    )
+                    .unwrap();
+                }
+            };
+            feed(&mut pointer, KEY_PRESS, 61);
+            seat.trigger(*trigger).unwrap();
+            assert!(seat.bindings.lock().unwrap().attention == AttentionState::Draining);
+            root.replies.push_back(status(6, &step));
+            run(&mut client, &mut root).unwrap();
+            assert!(root.replies.is_empty());
+            assert_eq!(root.sent(0x15), 0, "{trigger:?}");
+            assert!(seat.locked());
+            assert!(seat.glass() == drained());
+            assert_ne!(
+                seat.shown(),
+                Some(crate::attention::Notice::Login(&["LOGIN KEYS REMOVED"]))
+            );
+            feed(&mut pointer, KEY_RELEASE, 71);
+            assert!(!seat.attention_open() && seat.locked());
+            assert!(seat.glass() == seat.lock_surface());
+            assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
+        }
     }
 }

@@ -6126,8 +6126,8 @@ nothing but cancelling.
 
 ### The lock surface
 
-TOKEN-LOGIN.md's lock surface and login unlock. Production locks in one
-place, the generation's first paint (TOKEN-LOGIN.md increment 4's C7):
+TOKEN-LOGIN.md's lock surface and login unlock. Production's first lock
+is the generation's first paint (TOKEN-LOGIN.md increment 4's C7):
 `Runtime::first_paint`, which `run_compositor` calls in place of its
 first repaint, after the authority's Prepare and first `1a` and before
 any input reader, overlay or client, locks in the paired profile when
@@ -6154,7 +6154,10 @@ attention lifetime already draining; its one caller is the evdev
 target, with the adapter's origin witness, reached only from the evdev
 adapter's `lock_session`, which needs the paired profile and is reached
 only from the key decision the bindings make for `Super+l` and the
-menu's `L` (item 5 below); and `first_paint` has the one caller above.
+menu's `L` (item 5 below), and from the suspend entry, which needs the
+paired profile and an enrolled or unavailable last answer and is
+reached only from a lid switch's close and an owed resume lock (items
+6 and 7 below); and `first_paint` has the one caller above.
 The adapter's entry ends an open attention lifetime first through the
 target's drain, Escape's, so before an operation's commit its attempt
 is cancelled, after it the screen drains and shows no result, and a
@@ -6274,7 +6277,22 @@ once an operation is chosen; a lock before an unlock's commit, which
 cancels it, and after it with a key held, which drains under Escape's
 screen and leaves root's success unshown and the session locked; the
 adapter's entry refusing the direct profile; and the sheet's row in the
-paired profile alone. The desktop guest is increment 4's
+paired profile alone. Host tests of a lid close and a resume (C10)
+replay `SW_LID` reports and clock gaps through the adapter: a close on
+each state and in the direct profile, an opened lid and another switch
+locking nothing; the lid's admission on the answer at connect and its
+sysfs classification; its keys, buttons and motion reaching no binding,
+pointer or client; gaps of 1.5, 2 and just over 2 seconds, time awake,
+discarded, exhausted and unreadable samples and the state rule; a batch
+whose key reaches the lock surface after a suspend and the window after
+a short one; a client's repaint held until the lock; a new window's
+focus, a key, a modifier, a button and motion withheld while the lock
+is owed; a device lost at a resume releasing its held key and button
+only once the lock is made; a refused lock staying owed and retaken
+while the reader reads on; the monitor locking within a second, its
+wake, and its lock with every reader gone; and both triggers during an
+unlock and a removal, before and after the commit. The
+desktop guest is increment 4's
 `login-desktop`; no oracle on the stock, unenrolled image reaches the
 locked path.
 
@@ -6284,7 +6302,8 @@ Partly implemented: items 1 to 4 are "Login-key operations" above, and
 item 5's lock surface and unlock are "The lock surface" above, and its
 `1a` requests, its connect-time lock, the rows and the chord's rule
 (TOKEN-LOGIN.md increment 4's C7), `Super+l`, `L` and a lock during an
-open lifetime (C9), and request 19's refusal text are implemented.
+open lifetime (C9), a lid close and a resume (C10, items 6 and 7), and
+request 19's refusal text are implemented.
 [td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier, including when the session locks and what
 clients receive while locked ("Session lock"). The rules in this section
@@ -6325,8 +6344,8 @@ excluded from every selection, confirmation and field below.
    surface and its unlock are implemented ("The lock surface" above),
    and a lock is complete only when its own paint has a presentation
    receipt under the rules below. Its entry points, all in the paired
-   profile only, are implemented but for a lid close and a resume
-   (items 6 and 7):
+   profile only, are implemented, a lid close and a resume (items 6
+   and 7) since C10:
    - **The state at connect.** `Launcher::connect` sends `1a` right
      after Prepare's answer, before the first repaint, and an enrolled
      or unavailable answer locks then. It sends `1a` again after every
@@ -6346,7 +6365,8 @@ excluded from every selection, confirmation and field below.
      surface" above), and the source pin there names its one caller.
      `Scene::lock` lost its test-only gate; the live entries above it
      lost theirs with `Super+l` and `L` (C9), which the pin now names
-     beside the first paint, and no other. Every generation therefore
+     beside the first paint, with a lid close and a resume (C10), and
+     no other. Every generation therefore
      starts locked when the state
      is enrolled or unavailable. A `1a` answer never locks an unlocked
      session (TOKEN-LOGIN.md, "Session lock").
@@ -6398,8 +6418,11 @@ excluded from every selection, confirmation and field below.
      evdev adapter's entry, which ends the lifetime through Escape's
      drain and locks whether or not that drain's paint succeeded ("The
      lock surface" above). `L` reaches it with no operation chosen, and
-     `Super+l` while attention is up only as the menu's `L`; C10's lid
-     close and resume are what reach it with one open.
+     `Super+l` while attention is up only as the menu's `L`; a lid close
+     and a resume (C10) are what reach it with one open, through the
+     suspend entry, so an unlock, enrollment, addition or removal is
+     cancelled before its commit and drains without its result after
+     it.
    - **Request 19's refusal.** Implemented (increment 4's C4): `99 01`,
      answered to the installation review's `19` before any description,
      shows `UPDATE CANNOT READ LOGIN KEYS` on the attention screen, as
@@ -6412,13 +6435,25 @@ excluded from every selection, confirmation and field below.
    On an unenrolled account a lid close or resume does nothing, since
    neither is read (items 6 and 7). The live medium's root answers
    unenrolled, so it never locks.
-6. **Lid switch (4).** When the connect-time `1a` state is enrolled or
-   unavailable, the startup roster admits the ACPI lid switch's evdev
-   node, a switch-only device reporting `SW_LID`; on an unenrolled
-   account it is not admitted. Its close event locks while the last
-   `1a` state is enrolled or unavailable; nothing else is read from it.
+6. **Lid switch (4).** Implemented (C10). When the connect-time `1a`
+   state is enrolled or unavailable, the startup roster admits the ACPI
+   lid switch's evdev node, a switch-only device reporting `SW_LID`; on
+   an unenrolled account, with no answer and in the direct profile it
+   is not admitted. Its close event locks while the last `1a` state is
+   enrolled or unavailable; nothing else is read from it.
    Since the roster is fixed, a generation that starts unenrolled reads
-   no lid until the next generation.
+   no lid until the next generation. The node is classified from sysfs,
+   as a touchpad is, with no new ioctl: its `capabilities/ev` declares
+   `EV_SW` and no type but `EV_SYN` beside it, and its `capabilities/sw`
+   declares `SW_LID`; anything unreadable is no lid. A node reporting
+   `SW_LID` beside keys or axes is therefore no lid switch and is read
+   as before, its `SW_LID` ignored. A lid switch never reaches the
+   ordinary readers: admitted, its own reader acts on a close
+   (`SW_LID` 1) and on nothing else; not admitted, it is not opened.
+   A lid switch that cannot be opened is reported and left out. A
+   close lost to a dropped batch is not recovered (the switch state is
+   not re-queried, which would be a new ioctl); resume detection still
+   sees the suspend it would have preceded.
 7. **Resume (4).** The kernel does not repeat an unchanged switch state, so
    a lid close cannot be relied on to precede every suspend. The compositor
    detects resume itself, sampling only while the last `1a` state is
@@ -6428,12 +6463,44 @@ excluded from every selection, confirmation and field below.
    between two `Instant` reads and is discarded when those differ by more
    than 100 ms. A gap of more than two seconds locks. The check runs before
    each input batch is routed, before each repaint and at least once a
-   second, so no client receives input after resume before the lock; the
-   pre-suspend frame can stay on glass until the first check. A discarded
-   sample does not let the gated batch or repaint proceed: the sample is
-   retaken, and input stays held and the repaint deferred until a sample
-   is accepted. Both reads
-   are safe `std`, with no new syscall.
+   second, so no client receives input after resume before the lock. A
+   discarded sample does not let the gated batch or repaint proceed: the
+   sample is retaken until one is accepted or sixteen in a row have been
+   discarded. Sixteen discards in a row, like an unreadable
+   `/proc/uptime`, make the check unverifiable. With a baseline, an
+   unverifiable check locks as a gap does, once, and drops the baseline;
+   with none, it owes nothing and the batch or repaint proceeds, and the
+   next accepted sample starts a new baseline without a comparison. Both
+   reads are safe `std`, with no new syscall; `/proc/uptime` stays open
+   and is read again from offset zero, so a check opens no descriptor.
+
+   Implemented (C10). The monitor checks at once and then every 500 ms,
+   for the whole generation: it holds the input seat itself, so the lock
+   is made even once every reader has ended, as a USB-only seat's may at
+   a resume. The evdev adapter checks before routing each batch and
+   before a reader's teardown releases what its device held, so a lost
+   device's held key or button is released only once the lock is made,
+   and locks there. A lock is made through the same suspend entry as the
+   lid's. It stays owed until the session is locked or the last state no
+   longer locks: a lock refused before the lock state was set is logged
+   and retaken by the next check, and the reader reads on. While a lock is
+   owed and the screen is not already private, the runtime withholds
+   every client's paint, focus and input: a repaint, a focus change (the
+   keyboard's and the pointer's enter, leave and motion, a commit that
+   maps a window or changes an input region included) and a key,
+   modifier or pointer report are each deferred or dropped, and a
+   deferred repaint wakes the monitor to make the lock, since the
+   runtime's lock order keeps it from taking the input bindings itself.
+   The baseline is dropped while the last state does not lock, so a
+   suspend while unenrolled is never counted later.
+
+   No new client frame is painted between the resume and the lock, but
+   the pre-suspend frame may be shown again until the lock's paint is
+   presented: a page flip queued before the suspend can complete after
+   the first check, and the output watchdog's recovery of a stalled flip
+   sets the last submitted buffer again. Neither carries a frame
+   composed after the suspend, though either may be one that had not
+   yet reached glass before it.
 
    This depends on `Instant` being `CLOCK_MONOTONIC` on Linux, which
    excludes suspended time; Rust documents whether `Instant` counts
@@ -6446,8 +6513,9 @@ excluded from every selection, confirmation and field below.
    than about three seconds are certain to be detected; TOKEN-LOGIN.md
    discloses that limit.
 
-Only the generation's first paint, `Super+l` and the menu's `L` lock in
-the current profile, each only on an enrolled or unavailable state, so
+Only the generation's first paint, `Super+l`, the menu's `L`, a lid
+close and a resume lock in the current profile, each only on an enrolled
+or unavailable state, so
 only a login unlock on a machine holding a record reaches the PIN field.
 
 ### Immutable prompt presentation

@@ -15,8 +15,9 @@ key list of td-authd's `1a` answer, each of which a production td-authd
 refuses before starting anything; without a list it refuses removal
 itself. Only its lock surface's chord sends an unlock's `1b`, and only
 while the state is enrolled; production locks only at a generation's
-start, on `Super+l` and on the attention menu's `L` (increment 4's C7
-and C9, below). Its PIN field sends `1c` only when
+start, on `Super+l`, on the attention menu's `L`, on a lid close and on
+a resume (increment 4's C7, C9 and C10, below). Its PIN field sends
+`1c` only when
 root asks for a PIN at a presented PIN step, which only that unlock
 reaches. So nothing in production starts the worker or uses its
 `login_record` and `login_store` modules ("The login record"), its login
@@ -47,7 +48,7 @@ reached only by that unlock, and so has the lock surface with its login
 unlock ("Session lock"), which C7 made live. Increment 3 is complete; its
 desktop guest moved to increment 4 as `login-desktop`. Increment 4 is
 specified as twelve commits, C1 to C11 and C10b ("Increments"), of which
-C1 to C9 have landed: firstboot ensures the login directory at every
+C1 to C10 have landed: firstboot ensures the login directory at every
 boot, the live medium's included, through the shared login-state
 predicate, and rootcheck reports it on a marker of its own; td-authd
 answers request `1a` with the login state, through that predicate and
@@ -71,11 +72,11 @@ its first frame is the lock surface, with the answer's hostname and
 username above the state's rows, and on it the chord sends an unlock's
 `1b` only while the state is enrolled. The `login-desktop` guest shows
 that start and the unlock through the production authority and worker
-in QEMU ("Evidence"). `Super+l` and the attention menu's `L` lock an
-enrolled or unavailable session too, and a lock while an attention
-lifetime is open ends it as Escape does ("Session lock"); a lid close
-and a resume come with C10. Those three refusals, the locked start and
-those two locks are all that act on the state, and only where a record
+in QEMU ("Evidence"). `Super+l`, the attention menu's `L`, a lid close
+and a resume lock an enrolled or unavailable session too, and a lock
+while an attention lifetime is open ends it as Escape does ("Session
+lock"). Those three refusals, the locked start and those four locks are
+all that act on the state, and only where a record
 or an invalid directory exists, but for increment 4's live exceptions
 ("Increments"): on every paired machine `Super+l` is consumed and the
 menu shows `L`, which answers `NO LOGIN KEYS ENROLLED` while
@@ -1467,7 +1468,40 @@ and the oracle that shows it.
      menu's rows at 1280x800, 800x600 and 320x200; the sheet's row in
      the paired profile alone; and the pin. `qemu-login-system` (C11)
      drives `Super+l` and `L` on a full system.
-   - C10: lid-switch (`SW_LID`) and resume-gap detection.
+   - C10, landed: a lid close and a resume (`td-compositor/DESIGN.md`,
+     items 6 and 7), each locking through the evdev adapter's suspend
+     entry, which needs the paired profile and an enrolled or
+     unavailable last `1a` answer and otherwise does nothing; the
+     amended source pin holds that these two, beside the first paint,
+     `Super+l` and `L`, are the only production locks. A switch-only
+     lid node declaring `SW_LID` in sysfs is read by its own reader,
+     which acts on a close and reads nothing else, and only where the
+     answer at connect is enrolled or unavailable; otherwise, on an
+     unenrolled machine, with no answer and in the direct profile, it is
+     not opened at all, where it was opened and ignored before, and it
+     never reaches the ordinary readers. Resume is a gap of more than two
+     seconds between how far `/proc/uptime` and `Instant` advanced,
+     checked before each input batch is routed and before a reader's
+     teardown releases what it held, before each repaint, focus change
+     and input delivery that could reach a client, which wait while a
+     lock is owed, and at least once a second by a monitor thread, only
+     while the last answer locks. The monitor runs for the generation on
+     every paired machine, enrolled or not, and samples nothing while
+     the last answer is unenrolled. Both need no new
+     syscall, request or `unsafe`. A lid close or a resume during an
+     open lifetime ends it as Escape does, so an unlock, enrollment,
+     addition or removal is cancelled before its commit and drains
+     without its result after it. Host tests replay `SW_LID` events and
+     clock gaps through the adapter: the lid on each state and profile,
+     its admission and classification, its reports kept from every
+     client, gaps over and under two seconds, discarded and unreadable
+     samples, the state rule, a batch, a repaint, focus and input held
+     until the lock, a lost device's releases held until it, a refused
+     lock retaken, the monitor's period and its lock with every reader
+     gone, both triggers during an unlock and a removal before and after
+     the commit, and the pin. A real lid and
+     a real suspend are the hardware evidence's ("Evidence"); QEMU's
+     S3 is `qemu-login-system`'s (C11).
    - C10b, "login: deployments carry the tier marker": the system
      recipe writes the marker, listing the build's `READS`, into the
      deployment initramfs as "Deployments" places it; a recipe test

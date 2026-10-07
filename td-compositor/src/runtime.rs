@@ -649,6 +649,9 @@ pub struct Runtime {
     /// the manager generation which authorizes its lifetime.
     portal_dialogs: BTreeMap<SurfaceKey, PortalDialog>,
     pending_paint: bool,
+    /// Resume detection, which a repaint that could show a client asks
+    /// first (td-compositor/DESIGN.md item 7); the paired profile's alone.
+    resume: Option<Arc<crate::input::Resume>>,
     /// A compound-surface commit holds the runtime lock across every scene
     /// mutation and settles once. Calls made inside it record what they owe
     /// here instead of exposing a parent frame before its synchronized
@@ -855,6 +858,7 @@ impl Runtime {
             toplevel_parents: BTreeMap::new(),
             portal_dialogs: BTreeMap::new(),
             pending_paint: false,
+            resume: None,
             compound_settle: None,
             application_ready: None,
             client_resources: BTreeMap::new(),
@@ -1344,6 +1348,12 @@ impl Runtime {
         if self.in_flight.is_some() {
             return Ok(());
         }
+        // A paint that could show a client waits while a suspend's lock is
+        // owed: no new client frame reaches glass before the lock surface
+        // (td-compositor/DESIGN.md item 7).
+        if self.resume_withholds() {
+            return Ok(());
+        }
         let next_output = self
             .headless_output
             .map(|stamp| {
@@ -1632,6 +1642,22 @@ impl Runtime {
     #[cfg(test)]
     pub(crate) fn frame_in_flight(&self) -> Option<FrameId> {
         self.in_flight.map(|in_flight| in_flight.frame)
+    }
+
+    /// Hands each repaint, focus change and input delivery that could
+    /// reach a client to resume detection first. The evdev adapter's start
+    /// calls it once, in the paired profile.
+    pub(crate) fn hold_for_resume(&mut self, resume: Arc<crate::input::Resume>) {
+        self.resume = Some(resume);
+    }
+
+    /// Whether a suspend's lock is owed and not yet made
+    /// (td-compositor/DESIGN.md item 7): a paint that could show a client,
+    /// and focus and input for one, wait for it. Nothing waits on a private
+    /// screen, the lock surface's or the attention screen's, so the lock's
+    /// own paint and focus never do.
+    fn resume_withholds(&self) -> bool {
+        !self.scene.private_screen() && self.resume.as_ref().is_some_and(|resume| resume.holds())
     }
 
     /// Owe a paint instead of taking one. The scene is already current, so any
@@ -3000,7 +3026,7 @@ impl Runtime {
     /// after this read reaches `follow_login` after this paint, never
     /// before it. It comes before any input reader, overlay or client, so
     /// the lock withdraws nothing. One of two production locks, beside the
-    /// live `lock_session` for `Super+l` and `L`.
+    /// live `lock_session` for `Super+l`, `L`, a lid close and a resume.
     pub(crate) fn first_paint(
         &mut self,
         connected: Option<&crate::authority::Answer>,
@@ -3034,7 +3060,8 @@ impl Runtime {
     }
 
     /// The lock surface's live entry, reached only through the evdev
-    /// adapter's `lock_session` (`Super+l` and the attention menu's `L`).
+    /// adapter's `lock_session` (`Super+l`, the attention menu's `L`, and
+    /// through `lock_for_suspend` a lid close and a resume).
     /// An open attention lifetime must already be draining, as after
     /// Escape: the lock lies beneath it, and closing it shows the lock
     /// surface. Like opening attention it closes the overlays, withdraws
@@ -3334,7 +3361,7 @@ impl Runtime {
         buttons: &[PointerButtonInput],
         scroll: PointerScroll,
     ) -> Result<(), String> {
-        if self.scene.private_screen() {
+        if self.scene.private_screen() || self.resume_withholds() {
             return Ok(());
         }
         // Whether the pointer MOVED, which a nonzero delta does not prove: an
@@ -3364,7 +3391,7 @@ impl Runtime {
         scroll: PointerScroll,
     ) -> Result<(), String> {
         let size = self.backend.dimensions();
-        if self.scene.private_screen() {
+        if self.scene.private_screen() || self.resume_withholds() {
             return Ok(());
         }
         let moved = self.scene.place_pointer(x, y, size.width, size.height);
@@ -3990,7 +4017,7 @@ impl Runtime {
     }
 
     pub fn key(&mut self, input: KeyInput) -> Result<(), String> {
-        if self.scene.private_screen() {
+        if self.scene.private_screen() || self.resume_withholds() {
             return Ok(());
         }
         if let Some(event) = self.keyboard.key(input)? {
@@ -4000,7 +4027,7 @@ impl Runtime {
     }
 
     pub fn modifiers(&mut self, modifiers: ModifierState) -> Result<(), String> {
-        if self.scene.private_screen() {
+        if self.scene.private_screen() || self.resume_withholds() {
             return Ok(());
         }
         if let Some(event) = self.keyboard.modifiers(modifiers)? {
@@ -4865,7 +4892,10 @@ impl Runtime {
     }
 
     pub(crate) fn vm_snapshot(&self) -> Result<u64, String> {
-        if self.scene.private_screen() || self.keyboard.snapshot().focus.is_none() {
+        if self.scene.private_screen()
+            || self.resume_withholds()
+            || self.keyboard.snapshot().focus.is_none()
+        {
             return Err("guest has no ordinary keyboard focus".into());
         }
         Ok(self.vm_revision)
@@ -5373,6 +5403,11 @@ impl Runtime {
     fn refresh_focus(&mut self) -> Result<(), String> {
         if let Some(compound) = self.compound_settle.as_mut() {
             compound.focus = true;
+            return Ok(());
+        }
+        // No keyboard or pointer enter, leave or motion reaches a client
+        // while a suspend's lock is owed; the lock refreshes focus itself.
+        if self.resume_withholds() {
             return Ok(());
         }
         // Every step runs whatever the one before it did, as `settle`'s own
