@@ -492,21 +492,9 @@ fn debug_line_validation_command(producer: &str, source: &str, source_root: &str
 
 /// Validate one retained DWARF-5 source file against the line-table-only
 /// companion policy. Every directory and file entry resolves below a declared
-/// stable root; the named source must resolve below `source_root`.
+/// stable root; the named source must resolve below `source_root`. It runs
+/// under td-sh with the post-Rust farm's awk, so the recipe builds that farm.
 pub fn debug_line_source_root_check(
-    readelf: &str,
-    debug: &str,
-    source: &str,
-    source_root: &str,
-) -> Step {
-    let producer = format!("'{readelf}' --debug-dump=rawline '{debug}' 2>/dev/null");
-    let command = debug_line_validation_command(&producer, source, source_root);
-    Step::run("{root}", &[POST_BOOTSTRAP_SH, "-c", &command]).env("PATH", &post_bootstrap_path())
-}
-
-/// `debug_line_source_root_check` for a recipe on the post-Rust tool farm:
-/// the same validator under td-sh, its awk the farm's.
-pub fn post_rust_debug_line_source_root_check(
     readelf: &str,
     debug: &str,
     source: &str,
@@ -518,19 +506,9 @@ pub fn post_rust_debug_line_source_root_check(
 }
 
 /// Execute the shared parser against hostile captured-table shapes. This is a
-/// recipe step so the oracle uses the same declared awk as production: this
-/// one BusyBox's, `post_rust_debug_line_validator_regression_steps` the
-/// post-Rust farm's.
+/// recipe step so the oracle uses the same declared awk as production: the
+/// post-Rust farm's, under td-sh.
 pub fn debug_line_validator_regression_steps() -> Vec<Step> {
-    debug_line_validator_regression_steps_under(POST_BOOTSTRAP_SH, &post_bootstrap_path())
-}
-
-/// The same hostile-table oracle under td-sh and the post-Rust farm's awk.
-pub fn post_rust_debug_line_validator_regression_steps() -> Vec<Step> {
-    debug_line_validator_regression_steps_under(POST_RUST_SH, "{tools}")
-}
-
-fn debug_line_validator_regression_steps_under(shell: &str, path: &str) -> Vec<Step> {
     const GOOD: &str = r#"  Offset: 0
   DWARF Version: 5
  The Directory Table
@@ -643,7 +621,7 @@ fn debug_line_validator_regression_steps_under(shell: &str, path: &str) -> Vec<S
             content: DEBUG_LINE_AWK.into(),
             exec: false,
         },
-        Step::run("{root}", &[shell, "-c", &command]).env("PATH", path),
+        Step::run("{root}", &[POST_RUST_SH, "-c", &command]).env("PATH", "{tools}"),
     ]
 }
 
@@ -663,7 +641,7 @@ pub const POST_RUST_SH: &str = "{in:td-sh}/bin/td-sh";
 /// The post-Rust build userland: the tool names gawk's build and the
 /// zlib/make/libressl-class farms call, each with exactly one td provider.
 /// td-txt, td-util and uutils dispatch on argv[0]. Not yet here, for the
-/// farms that still link them from BusyBox: egrep, fgrep, od and tar. `awk`
+/// farms that still link them from BusyBox: egrep, fgrep and od. `awk`
 /// is per recipe (`post_rust_tool_farm`): the awk that builds gawk cannot be
 /// gawk.
 const POST_RUST_TOOLS: &[(&str, &str, &[&str])] = &[
@@ -1777,9 +1755,11 @@ mod tests {
             "main.c",
             "/td-build",
         );
-        let Step::Run { argv, .. } = step else {
+        let Step::Run { argv, env, .. } = step else {
             panic!("line-table check is not executable");
         };
+        assert_eq!(argv.first().map(String::as_str), Some(super::POST_RUST_SH));
+        assert!(env.iter().any(|(k, v)| k == "PATH" && v == "{tools}"));
         let command = argv.get(2).expect("line-table check command");
         for required in [
             "--debug-dump=rawline",
@@ -1796,9 +1776,11 @@ mod tests {
     fn line_only_parser_regressions_wire_one_real_recipe_probe() {
         let steps = super::debug_line_validator_regression_steps();
         assert!(matches!(steps.first(), Some(Step::WriteFile { .. })));
-        let Some(Step::Run { argv, .. }) = steps.get(1) else {
+        let Some(Step::Run { argv, env, .. }) = steps.get(1) else {
             panic!("line-table regression check is not executable");
         };
+        assert_eq!(argv.first().map(String::as_str), Some(super::POST_RUST_SH));
+        assert!(env.iter().any(|(k, v)| k == "PATH" && v == "{tools}"));
         let command = argv.get(2).expect("line-table regression command");
         for required in [
             "canonical rawline fixture was rejected",

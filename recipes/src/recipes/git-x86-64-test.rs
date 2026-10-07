@@ -1,6 +1,6 @@
 use crate::ladder::{
-    debug_line_source_root_check, debug_line_validator_regression_steps, post_bootstrap_path,
-    POST_BOOTSTRAP_SH,
+    debug_line_source_root_check, debug_line_validator_regression_steps, post_rust_inputs,
+    post_rust_tool_farm, POST_RUST_SH,
 };
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
@@ -10,11 +10,9 @@ pub fn recipe() -> Recipe {
     let openssh = "{in:openssh-x86-64}";
     let openssh_test = "{in:openssh-x86-64-test}";
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let path = format!(
-        "{git}/bin:{git}/libexec/git-core:{openssh}/bin:{{tools}}:{}",
-        post_bootstrap_path()
-    );
+    let path = format!("{git}/bin:{git}/libexec/git-core:{openssh}/bin:{{tools}}");
     let mut steps = vec![
+        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
         Step::Require {
             paths: vec![
                 format!("{git}/bin/git"),
@@ -46,7 +44,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "grep -Fq 'PASS: curl 8.21.0 performs verified local-socket HTTPS' '{curl_test}/result' || \
@@ -68,6 +66,13 @@ pub fn recipe() -> Recipe {
                          for forbidden in '/gnu/store' '/td-input/'; do \
                              if grep -a -Fq \"$forbidden\" \"$binary\"; then echo \"Git binary retains forbidden path $forbidden\" >&2; exit 1; fi; \
                          done; \
+                     done; \
+                     r=0; grep -r -a -l -F -e '{{in:td-sh}}' '{git}' > build-shell.refs || r=$?; \
+                     [ \"$r\" = 1 ] || {{ echo \"Git output names the build shell (grep status $r):\" >&2; cat build-shell.refs >&2; exit 1; }}; \
+                     for script in '{git}'/libexec/git-core/git-submodule '{git}'/libexec/git-core/git-merge-octopus \
+                         '{git}'/share/git-core/templates/hooks/pre-commit.sample; do \
+                         IFS= read -r first < \"$script\" || exit 1; \
+                         [ \"$first\" = '#!/bin/sh' ] || {{ echo \"$script starts $first, not #!/bin/sh\" >&2; exit 1; }}; \
                      done"
                 ),
             ],
@@ -78,6 +83,22 @@ pub fn recipe() -> Recipe {
         },
         Step::MkDir {
             path: "{root}/work".into(),
+        },
+        // GIT_SSH is executed directly; GIT_SSH_COMMAND would go through the
+        // compiled /bin/sh, which the sandbox lacks. The probe runs the
+        // verified ssh and records each call's status: git's -G variant
+        // check exits 0, and the connection attempt 255, ssh's own failure,
+        // where a failure to run ssh at all is 126 or 127.
+        Step::WriteFile {
+            path: "{root}/ssh-probe".into(),
+            content: format!(
+                "#!{POST_RUST_SH}\n\
+                 '{openssh}/bin/ssh' -F /dev/null -o BatchMode=yes \"$@\"\n\
+                 s=$?\n\
+                 printf '%s ' \"$s\" >> '{{root}}/ssh-status'\n\
+                 exit \"$s\"\n"
+            ),
+            exec: true,
         },
     ];
     steps.extend(debug_line_validator_regression_steps());
@@ -103,7 +124,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}/work",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 "git init -b main repo || exit 1; \
                  cd repo || exit 1; \
@@ -141,8 +162,9 @@ pub fn recipe() -> Recipe {
                  test -s remote.archive || exit 1; \
                  if GIT_TRACE=1 GIT_TERMINAL_PROMPT=0 git ls-remote https://127.0.0.1:9/td-no-service >https-helper.log 2>&1; then exit 1; fi; \
                  grep -Fq 'git-remote-https' https-helper.log || exit 1; \
-                 if GIT_TRACE=1 GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='{in:openssh-x86-64}/bin/ssh -F /dev/null -o BatchMode=yes' git ls-remote ssh://127.0.0.1:9/td-no-service >ssh-helper.log 2>&1; then exit 1; fi; \
-                 grep -Fq '{in:openssh-x86-64}/bin/ssh' ssh-helper.log || exit 1; \
+                 if GIT_TRACE=1 GIT_TERMINAL_PROMPT=0 GIT_SSH='{root}/ssh-probe' git ls-remote ssh://127.0.0.1:9/td-no-service >ssh-helper.log 2>&1; then echo 'ssh ls-remote reached a service' >&2; exit 1; fi; \
+                 grep -Fq '{root}/ssh-probe' ssh-helper.log || { echo 'Git did not dispatch to the ssh probe:' >&2; cat ssh-helper.log >&2; exit 1; }; \
+                 test \"$(cat '{root}/ssh-status')\" = '0 255 ' || { echo \"OpenSSH did not check its variant and then fail its connection: statuses $(cat '{root}/ssh-status')\" >&2; cat ssh-helper.log >&2; exit 1; }; \
                  cd repo || exit 1; \
                  build=$(git version --build-options) || exit 1; \
                  printf '%s\\n' \"$build\" | grep -Fq 'git version 2.55.0' || exit 1; \
@@ -169,15 +191,17 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("git-x86-64-test", "1.0")
-        .native_inputs(&[
-            "git-x86-64",
-            "curl-x86-64-test",
-            "openssh-x86-64",
-            "openssh-x86-64-test",
-            "glibc-x86-64",
-            "binutils-x86-64-self",
-            "busybox-x86-64",
-        ])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &[
+                "git-x86-64",
+                "curl-x86-64-test",
+                "openssh-x86-64",
+                "openssh-x86-64-test",
+                "glibc-x86-64",
+                "binutils-x86-64-self",
+            ],
+        ))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -200,13 +224,17 @@ mod tests {
             recipe.native_inputs.as_deref(),
             Some(
                 [
+                    "td-sh",
+                    "td-txt",
+                    "td-util",
+                    "uutils",
+                    "gawk-x86-64-self",
                     "git-x86-64",
                     "curl-x86-64-test",
                     "openssh-x86-64",
                     "openssh-x86-64-test",
                     "glibc-x86-64",
                     "binutils-x86-64-self",
-                    "busybox-x86-64",
                 ]
                 .map(str::to_string)
                 .as_slice()

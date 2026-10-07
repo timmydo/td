@@ -1,6 +1,6 @@
 use crate::ladder::{
-    post_rust_debug_line_source_root_check, post_rust_debug_line_validator_regression_steps,
-    post_rust_inputs, post_rust_tool_farm, POST_RUST_SH,
+    debug_line_source_root_check, debug_line_validator_regression_steps, post_rust_inputs,
+    post_rust_tool_farm, POST_RUST_SH,
 };
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
@@ -28,8 +28,8 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
     ];
-    steps.extend(post_rust_debug_line_validator_regression_steps());
-    steps.push(post_rust_debug_line_source_root_check(
+    steps.extend(debug_line_validator_regression_steps());
+    steps.push(debug_line_source_root_check(
         readelf,
         debug,
         "main.c",

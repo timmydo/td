@@ -1,4 +1,6 @@
-use crate::ladder::{post_bootstrap_path, split_target_debug, unpack_into, POST_BOOTSTRAP_SH};
+use crate::ladder::{
+    post_rust_inputs, post_rust_tool_farm, split_target_debug, unpack_into, POST_RUST_SH,
+};
 use crate::types::{Recipe, Step, TextEdit};
 
 // Source-built Git with local repository support and smart HTTP(S) transport.
@@ -12,28 +14,40 @@ pub fn recipe() -> Recipe {
     let curl = "{in:curl-x86-64}";
     let tls = "{in:libressl-x86-64}";
     let zlib = "{in:zlib-x86-64-self}";
-    let path = format!("{{root}}/wb:{{tools}}:{sbin}:{}", post_bootstrap_path());
+    let path = format!("{{root}}/wb:{{tools}}:{sbin}");
 
     let mut steps = unpack_into("git-x86-64-source", "{src}");
-    steps.push(Step::ToolFarm {
-        links: [
-            "awk", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "diff", "dirname",
-            "echo", "env", "expr", "false", "find", "grep", "head", "install", "ln", "ls", "mkdir",
-            "mktemp", "mv", "printf", "pwd", "rm", "rmdir", "sed", "sort", "tail", "tar", "tee",
-            "test", "touch", "tr", "true", "uname", "wc", "which", "xargs",
-        ]
-        .iter()
-        .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))
-        .collect(),
-    });
+    steps.push(post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
-        shell: POST_BOOTSTRAP_SH.into(),
+        shell: POST_RUST_SH.into(),
     });
 
     // SHELL_PATH is compiled into shipped scripts as /bin/sh. Generated build
-    // inputs must nevertheless run with the declared BusyBox shell while the
-    // recipe sandbox has no ambient /bin. Keep those two roles separate.
+    // inputs must nevertheless run with the declared td-sh while the recipe
+    // sandbox has no ambient /bin. Keep those two roles separate.
+    //
+    // PatchShebangs gives every script td-sh's store path, and git restores
+    // SHELL_PATH over it with `1s|#!.*/sh|`, which BusyBox's .../bin/sh met
+    // and .../bin/td-sh does not. Each such rewrite gains a second
+    // expression for exactly that path, so shipped scripts and hook samples
+    // keep #!/bin/sh and name no build shell.
+    steps.push(Step::substitute_text(
+        "{src}/tools/generate-script.sh",
+        vec![TextEdit::new(
+            "sed -e \"1s|#!.*/sh|#!$SHELL_PATH|\" \\",
+            "sed -e \"1s|#!.*/sh|#!$SHELL_PATH|\" -e \"1s|#!.*/td-sh$|#!$SHELL_PATH|\" \\",
+            1,
+        )],
+    ));
+    steps.push(Step::substitute_text(
+        "{src}/templates/Makefile",
+        vec![TextEdit::new(
+            "sed -e '1s|#!.*/sh|#!$(SHELL_PATH_SQ)|' \\",
+            "sed -e '1s|#!.*/sh|#!$(SHELL_PATH_SQ)|' -e '1s|#!.*/td-sh$$|#!$(SHELL_PATH_SQ)|' \\",
+            1,
+        )],
+    ));
     steps.push(Step::substitute_text(
         "{src}/shared.mak",
         vec![TextEdit::new(
@@ -61,6 +75,11 @@ pub fn recipe() -> Recipe {
                 1,
             ),
             TextEdit::new(
+                "sed -e '1s|#!.*/sh|#!$(SHELL_PATH_SQ)|' \\",
+                "sed -e '1s|#!.*/sh|#!$(SHELL_PATH_SQ)|' -e '1s|#!.*/td-sh$$|#!$(SHELL_PATH_SQ)|' \\",
+                3,
+            ),
+            TextEdit::new(
                 "REMOTE_CURL_ALIASES = git-remote-https$X git-remote-ftp$X git-remote-ftps$X",
                 "REMOTE_CURL_ALIASES = git-remote-https$X",
                 1,
@@ -70,7 +89,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/wb/cc".into(),
         content: format!(
-            "#!{POST_BOOTSTRAP_SH}\n\
+            "#!{POST_RUST_SH}\n\
              exec \"{sgcc}\" -isystem \"{xglibc}/include\" \
              -B\"{sbin}/\" -B\"{xglibc}/lib\" \
              -L\"{xglibc}/lib\" -static-libgcc \"$@\" \
@@ -89,7 +108,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/wb/curl-config".into(),
         content: format!(
-            "#!{POST_BOOTSTRAP_SH}\n\
+            "#!{POST_RUST_SH}\n\
              case \"$1\" in\n\
              --vernum) printf '%s\\n' '081500';;\n\
              *) exit 1;;\n\
@@ -139,7 +158,7 @@ pub fn recipe() -> Recipe {
             &[
                 "{in:make-x86-64-self}/bin/make",
                 "-j{jobs}",
-                &format!("SHELL={POST_BOOTSTRAP_SH}"),
+                &format!("SHELL={POST_RUST_SH}"),
                 "git",
                 "git-remote-http",
                 "git-remote-https",
@@ -160,7 +179,7 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("PATH", &path)
-        .env("SHELL", POST_BOOTSTRAP_SH)
+        .env("SHELL", POST_RUST_SH)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(
@@ -170,12 +189,12 @@ pub fn recipe() -> Recipe {
                 "{in:make-x86-64-self}/bin/make",
                 "-C",
                 "templates",
-                &format!("SHELL={POST_BOOTSTRAP_SH}"),
+                &format!("SHELL={POST_RUST_SH}"),
                 "SHELL_PATH=/bin/sh",
             ],
         )
         .env("PATH", &path)
-        .env("SHELL", POST_BOOTSTRAP_SH)
+        .env("SHELL", POST_RUST_SH)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
 
@@ -261,16 +280,18 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("git-x86-64", "2.55.0")
         .source_input("git-x86-64-source")
-        .native_inputs(&[
-            "curl-x86-64",
-            "libressl-x86-64",
-            "zlib-x86-64-self",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-            "make-x86-64-self",
-            "busybox-x86-64",
-        ])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &[
+                "curl-x86-64",
+                "libressl-x86-64",
+                "zlib-x86-64-self",
+                "gcc-x86-64-self",
+                "binutils-x86-64-self",
+                "glibc-x86-64",
+                "make-x86-64-self",
+            ],
+        ))
         .steps(steps)
 }
 
@@ -286,6 +307,11 @@ mod tests {
             recipe.native_inputs.as_deref(),
             Some(
                 [
+                    "td-sh",
+                    "td-txt",
+                    "td-util",
+                    "uutils",
+                    "gawk-x86-64-self",
                     "curl-x86-64",
                     "libressl-x86-64",
                     "zlib-x86-64-self",
@@ -293,7 +319,6 @@ mod tests {
                     "binutils-x86-64-self",
                     "glibc-x86-64",
                     "make-x86-64-self",
-                    "busybox-x86-64",
                 ]
                 .map(str::to_string)
                 .as_slice()
