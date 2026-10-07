@@ -1,7 +1,6 @@
 //! Visible-cell-only semantic painting for the tree table.
 use crate::raster::{
-    self, Draw, GlyphStyle, Primitive, Rect, BORDER, CHROME, INACTIVE_SELECTION, INK, PAPER,
-    SELECTED,
+    self, fill, Draw, GlyphStyle, Rect, BORDER, CHROME, INACTIVE_SELECTION, INK, PAPER, SELECTED,
 };
 use crate::tree_table::{Controller, Focus};
 use crate::tree_table_geometry::{CellRect, INDENT};
@@ -15,14 +14,6 @@ pub enum Direction {
 pub struct Sort {
     pub column: usize,
     pub direction: Direction,
-}
-fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
-    if let Some(clip) = rect.intersection(damage) {
-        sink(Draw {
-            clip,
-            primitive: Primitive::Fill { rect, color },
-        });
-    }
 }
 /// The disclosure mark in a slot whose top left is `(x, y)`: a box nine
 /// logical pixels square with a minus, and a plus while collapsed, drawn

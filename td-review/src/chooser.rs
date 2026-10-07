@@ -21,7 +21,7 @@ use td_ui::chrome::{Status, ROW};
 use td_ui::finder::{self, Choose, Entry, Kind, Listing};
 use td_ui::pointer::DoubleClick;
 use td_ui::raster::{
-    text_run, Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Surface, BORDER, CHROME, INK,
+    fill, text_run, Composition, Draw, GlyphStyle, Raster, Rect, Surface, BORDER, CHROME, INK,
     LINE_NUMBER,
 };
 use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase};
@@ -554,15 +554,6 @@ impl Chooser {
             rect: finder_rect(laid),
         });
         self.outcome(outcome)
-    }
-}
-
-fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
-    if let Some(clip) = rect.intersection(damage) {
-        sink(Draw {
-            clip,
-            primitive: Primitive::Fill { rect, color },
-        });
     }
 }
 

@@ -12,7 +12,7 @@
 
 use td_ui::font::{self, Font};
 use td_ui::raster::{
-    hint_run, text_run, Composition, Draw, Error, GlyphStyle, Primitive, Raster, Rect, Scale,
+    fill, hint_run, text_run, Composition, Draw, Error, GlyphStyle, Primitive, Raster, Rect, Scale,
     Scrollbar, Surface, Weight, CHROME, INK, PAPER,
 };
 use td_ui::theme::{DUSK, SAND, THEMES};
@@ -102,6 +102,43 @@ fn a_theme_paints_the_palette_in_its_colours_and_passes_others() {
         .chunks(4)
         .any(|p| u32::from_le_bytes(p.try_into().unwrap()) & 0xff_ffff == DUSK.map(INK)));
     assert_eq!(THEMES.len(), 6);
+}
+
+#[test]
+fn fill_streams_the_whole_rect_clipped_to_the_damage_or_nothing() {
+    let rect = Rect {
+        x: -4,
+        y: 2,
+        width: 10,
+        height: 6,
+    };
+    let damage = Rect {
+        x: 0,
+        y: 0,
+        width: 3,
+        height: 5,
+    };
+    let mut draws = Vec::new();
+    fill(rect, INK, damage, &mut |draw| draws.push(draw));
+    let clip = Rect {
+        x: 0,
+        y: 2,
+        width: 3,
+        height: 3,
+    };
+    let whole = Primitive::Fill { rect, color: INK };
+    assert_eq!(
+        draws,
+        [Draw {
+            clip,
+            primitive: whole
+        }]
+    );
+
+    let apart = Rect { x: 6, ..rect };
+    draws.clear();
+    fill(apart, INK, damage, &mut |draw| draws.push(draw));
+    assert!(draws.is_empty(), "{draws:?}");
 }
 
 #[test]

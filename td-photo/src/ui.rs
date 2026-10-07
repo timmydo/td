@@ -13,8 +13,8 @@ use td_ui::driven::{self, Binding, Input, Outcome, PointerPhase};
 use td_ui::finder;
 use td_ui::keys;
 use td_ui::raster::{
-    text_run, Composition, Draw, GlyphStyle, Primitive, Rect, Scale, Surface, CHROME, INK,
-    MISSPELLED, PAPER, SELECTED,
+    fill, text_run, Composition, Draw, GlyphStyle, Rect, Scale, Surface, CHROME, INK, MISSPELLED,
+    PAPER, SELECTED,
 };
 // One toolkit name per line: tests/confinement.rs reads the name after the
 // crate's path.
@@ -5448,15 +5448,6 @@ fn signed(value: &str) -> Result<i64, Error> {
     } else {
         -magnitude
     })
-}
-
-fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
-    if let Some(clip) = rect.intersection(damage) {
-        sink(Draw {
-            clip,
-            primitive: Primitive::Fill { rect, color },
-        });
-    }
 }
 
 /// What the window shows: the mode and filter strips, the grid or the single photo,

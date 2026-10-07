@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 
-use td_ui::raster::{Draw, Primitive, Rect};
+use td_ui::raster::{fill, Draw, Rect};
 
 use crate::tree::{Kind, Measure, NodeId, Tree, ROOT};
 
@@ -337,15 +337,6 @@ fn blend(color: u32, toward: u32, part: u32) -> u32 {
         ((a * (256 - part) + b * part) >> 8) << shift
     };
     channel(16) | channel(8) | channel(0)
-}
-
-fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
-    if let Some(clip) = rect.intersection(damage) {
-        sink(Draw {
-            clip,
-            primitive: Primitive::Fill { rect, color },
-        });
-    }
 }
 
 /// A tile with a light top and left edge and a dark bottom and right one,

@@ -8,7 +8,7 @@ use td_ui::chrome::{Buttons, TextEntry, ROW};
 use td_ui::entry_model::{Action, EntryModel, Outcome};
 use td_ui::keys::Section;
 use td_ui::raster::{
-    Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Surface, INK, PAPER, WARNING,
+    fill, Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Surface, INK, PAPER, WARNING,
 };
 use td_ui::window::{Clipboard, Flow, Input, PointerPhase};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
@@ -591,15 +591,6 @@ pub fn keys() -> Vec<Section> {
 
 struct Frame<'a> {
     dialog: &'a Dialog,
-}
-
-fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
-    if let Some(clip) = rect.intersection(damage) {
-        sink(Draw {
-            clip,
-            primitive: Primitive::Fill { rect, color },
-        });
-    }
 }
 
 /// One row of text from a cell in from the left, in `ink` on paper, a

@@ -340,7 +340,9 @@ of its own files may name each module.
   `MIME_BYTES`.
 - `raster`: `Rect`, `Scale` (1 through 4), `Weight`, `GlyphStyle`, `Primitive`
   (`Fill`, `Glyph`, and `Mark`, a scalar of the hint face in one ink),
-  `Draw`, `Surface`, the `Composition` trait, `Scrollbar`, `text_run`,
+  `Draw`, `fill` (a `Fill` of a whole rectangle clipped to the damage,
+  the one most widgets and clients stream), `Surface`, the `Composition`
+  trait, `Scrollbar`, `text_run`,
   `hint_run`, `Raster`, `Error`, the axis and frame-byte ceilings, the
   palette constants with the status inks `SUCCESS`, `WARNING` and
   `ACCENT`, and `rgb` and `ppm`, a painted frame as tight RGB rows

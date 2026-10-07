@@ -1,6 +1,6 @@
 //! Bounded time plots over caller-owned observations, with stable semantic hits.
 use crate::raster::{
-    text_run, Draw, GlyphStyle, Primitive, Rect, Surface, BORDER, CHROME, INK, PAPER, SELECTED,
+    fill, text_run, Draw, GlyphStyle, Rect, Surface, BORDER, CHROME, INK, PAPER, SELECTED,
 };
 use crate::{CELL_HEIGHT, CELL_WIDTH};
 pub const SAMPLES: usize = 1024;
@@ -495,14 +495,6 @@ fn interpolate(a: u64, b: u64, fraction: u128, span: u128) -> u64 {
     }
 }
 
-fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
-    if let Some(clip) = rect.intersection(damage) {
-        sink(Draw {
-            clip,
-            primitive: Primitive::Fill { rect, color },
-        });
-    }
-}
 impl<I: Copy + Eq> Chart<'_, I> {
     fn text(
         &self,

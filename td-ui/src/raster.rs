@@ -178,6 +178,18 @@ pub struct Draw {
     pub primitive: Primitive,
 }
 
+/// Streams `rect` filled with `color`, clipped to `damage`; nothing when
+/// the two do not meet. The fill carries the whole rect and the clip
+/// carries where it meets the damage.
+pub fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+    if let Some(clip) = rect.intersection(damage) {
+        sink(Draw {
+            clip,
+            primitive: Primitive::Fill { rect, color },
+        });
+    }
+}
+
 /// The surface a composition is laid out for and a raster paints: pixel
 /// axes and one integer scale. `new` holds the axes to the ceilings below;
 /// `Raster::new` holds them again, so a literal is admitted on the same

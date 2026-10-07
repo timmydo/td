@@ -11,7 +11,7 @@
 
 use crate::chrome::{Item, List, ROW};
 use crate::raster::{
-    text_run, Draw, GlyphStyle, Primitive, Rect, Surface, ACCENT, BORDER, CHROME, PAPER, SELECTED,
+    fill, text_run, Draw, GlyphStyle, Rect, Surface, ACCENT, BORDER, CHROME, PAPER, SELECTED,
 };
 use crate::xkb_symbols::COMMANDS;
 use crate::{theme, CELL_WIDTH};
@@ -653,13 +653,4 @@ impl Overlay {
 /// The lines a panel over `surface` shows at once; one without a panel.
 fn page(surface: Surface) -> usize {
     Panel::new(surface).map_or(1, |panel| panel.page())
-}
-
-fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
-    if let Some(clip) = rect.intersection(damage) {
-        sink(Draw {
-            clip,
-            primitive: Primitive::Fill { rect, color },
-        });
-    }
 }

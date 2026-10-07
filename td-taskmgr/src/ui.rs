@@ -14,9 +14,7 @@ use crate::worker::{Failure, Update};
 use std::fmt::Write;
 use std::sync::Arc;
 use td_ui::keys::{self, Section};
-use td_ui::raster::{
-    self, Draw, GlyphStyle, Primitive, Rect, Surface, CHROME, INK, PAPER, SELECTED,
-};
+use td_ui::raster::{self, fill, Draw, GlyphStyle, Rect, Surface, CHROME, INK, PAPER, SELECTED};
 use td_ui::{charts, chrome, split, tree_table as tree, CELL_WIDTH};
 const TABS: [&str; 5] = ["Overview", "CPU", "Memory", "Network", "Disk"];
 const LIVE: &str = "Live (C-l)";
@@ -260,14 +258,6 @@ fn below(rect: Rect, height: u32) -> Rect {
         y: rect.y + i64::from(offset),
         height: rect.height - offset,
         ..rect
-    }
-}
-fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
-    if let Some(clip) = rect.intersection(damage) {
-        sink(Draw {
-            clip,
-            primitive: Primitive::Fill { rect, color },
-        });
     }
 }
 fn label(
@@ -2618,6 +2608,7 @@ mod tests {
     use crate::collector::Batch;
     use crate::hierarchy::{Input, ProcessKey};
     use crate::snapshot::Observed;
+    use td_ui::raster::Primitive;
     fn key(pid: u32) -> ProcessKey {
         ProcessKey {
             generation: 1,

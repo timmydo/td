@@ -6,7 +6,7 @@
 
 use td_ui::chrome::{Item, Status};
 use td_ui::raster::{
-    Composition, Draw, GlyphStyle, Primitive, Rect, Surface, BORDER, CHROME, INK, PAPER,
+    fill, Composition, Draw, GlyphStyle, Primitive, Rect, Surface, BORDER, CHROME, INK, PAPER,
 };
 
 use super::layout;
@@ -14,15 +14,6 @@ use super::{App, Focus, Phase};
 
 pub struct Frame<'a> {
     pub app: &'a App,
-}
-
-fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
-    if let Some(clip) = rect.intersection(damage) {
-        sink(Draw {
-            clip,
-            primitive: Primitive::Fill { rect, color },
-        });
-    }
 }
 
 /// A `BORDER` bezel: the four bands of `outer` round `inner`, which the

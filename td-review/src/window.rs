@@ -52,8 +52,8 @@ use td_ui::editor_error::Error as PaneError;
 use td_ui::editor_model::TabId;
 use td_ui::pointer::DoubleClick;
 use td_ui::raster::{
-    self, Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scrollbar, Surface, Weight,
-    ACCENT, CHROME, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED, SUCCESS, WARNING,
+    self, fill, Composition, Draw, GlyphStyle, Raster, Rect, Scrollbar, Surface, Weight, ACCENT,
+    CHROME, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED, SUCCESS, WARNING,
 };
 #[cfg(test)]
 use td_ui::window::NoClipboard;
@@ -183,15 +183,6 @@ fn paint_of(style: Style) -> (Option<u32>, GlyphStyle) {
             weight: Weight::Medium,
         },
     )
-}
-
-fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
-    if let Some(clip) = rect.intersection(damage) {
-        sink(Draw {
-            clip,
-            primitive: Primitive::Fill { rect, color },
-        });
-    }
 }
 
 /// A frame laid out over a surface: what the window paints and a test reads.
@@ -1112,6 +1103,7 @@ pub fn run(app: App, title: String) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::view::Line;
+    use td_ui::raster::Primitive;
     use td_ui::raster::Scale;
 
     fn surface(width: usize, height: usize, scale: u8) -> Surface {
