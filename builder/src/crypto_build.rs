@@ -33,7 +33,7 @@ pub(crate) const CONTROLS: &[(&str, &str)] = &[
     ("AWS_LC_SYS_STATIC", "1"),
     ("AWS_LC_SYS_EXTERNAL_BINDGEN", "0"),
     ("LIBSQLITE3_SYS_USE_PKG_CONFIG", "0"),
-    ("LIBSQLITE3_FLAGS", "-DSQLITE_OMIT_LOAD_EXTENSION=1 -DSQLITE_TEMP_STORE=3 -DSQLITE_MAX_MEMORY=16777216 -DSQLITE_MAX_ALLOCATION_SIZE=2097152 -DSQLITE_MAX_LENGTH=69632 -DSQLITE_MAX_SQL_LENGTH=8192 -DSQLITE_MAX_PAGE_COUNT=2097152 -DSQLITE_DEFAULT_CACHE_SIZE=-128"),
+    ("LIBSQLITE3_FLAGS", "-DSQLITE_OMIT_LOAD_EXTENSION=1 -DSQLITE_TEMP_STORE=3 -DSQLITE_MAX_MEMORY=16777216 -DSQLITE_MAX_ALLOCATION_SIZE=9437184 -DSQLITE_MAX_LENGTH=69632 -DSQLITE_MAX_SQL_LENGTH=8192 -DSQLITE_MAX_PAGE_COUNT=2097152 -DSQLITE_DEFAULT_CACHE_SIZE=-128"),
 ];
 
 fn reserved_control(key: &str) -> bool {
@@ -293,6 +293,56 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn checkpoint_iterator_fits(flags: &str) -> Result<bool> {
+        let value = |name: &str| -> Result<u64> {
+            let prefix = format!("-DSQLITE_{name}=");
+            let mut values = flags
+                .split_whitespace()
+                .filter_map(|flag| flag.strip_prefix(&prefix));
+            let value = values.next().ok_or_else(|| format!("missing {name}"))?;
+            if values.next().is_some() {
+                return Err(format!("duplicate {name}"));
+            }
+            value
+                .parse()
+                .map_err(|error| format!("invalid {name}: {error}"))
+        };
+        let pages = value("MAX_PAGE_COUNT")?;
+        let allocation = value("MAX_ALLOCATION_SIZE")?;
+        let heap = value("MAX_MEMORY")?;
+        // Independent SQLite 3.53.2 x86-64 walIteratorInit layout oracle.
+        // The WAL ceiling permits two (page cap + 32) frame reservations.
+        let frames = pages
+            .checked_add(32)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or("frame overflow")?;
+        let segments = frames.checked_add(33).ok_or("segment overflow")? / 4096 + 1;
+        let request = segments
+            .checked_mul(32)
+            .and_then(|n| n.checked_add(8))
+            .and_then(|n| frames.checked_mul(2).and_then(|f| n.checked_add(f)))
+            .and_then(|n| n.checked_add(frames.min(4096) * 2))
+            .and_then(|n| n.checked_add(7))
+            .ok_or("iterator overflow")?
+            & !7;
+        Ok(request <= allocation && request < heap && allocation <= heap)
+    }
+    #[test]
+    fn sqlite_checkpoint_iterator_fits_forced_native_limits() -> Result<()> {
+        let flags = CONTROLS
+            .iter()
+            .find_map(|(name, value)| (*name == "LIBSQLITE3_FLAGS").then_some(*value))
+            .ok_or("missing SQLite controls")?;
+        assert!(checkpoint_iterator_fits(flags)?);
+        for insufficient in [2097152, 4194304, 8388608] {
+            let changed = flags.replace(
+                "-DSQLITE_MAX_ALLOCATION_SIZE=9437184",
+                &format!("-DSQLITE_MAX_ALLOCATION_SIZE={insufficient}"),
+            );
+            assert!(!checkpoint_iterator_fits(&changed)?);
+        }
+        Ok(())
+    }
     #[test]
     fn native_controls_refuse_fallbacks_and_target_overrides() {
         assert!(check_controls(CONTROLS.iter().map(|&(k, v)| (k.into(), v.into()))).is_ok());

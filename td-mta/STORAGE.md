@@ -54,7 +54,7 @@ storage, mmap disabled, cache spill enabled and zero busy timeout. Each
 connection requests a 128 KiB page-cache target, not a hard ceiling. Spilling
 permits a maximum body write without retaining its dirty pages in RAM.
 Compile-time limits cap SQLite's shared requested heap at 16 MiB and each
-allocation at 2 MiB. These limits do not measure allocator overhead or RSS.
+allocation at 9 MiB. These limits do not measure allocator overhead or RSS.
 SQL values are bounded to 69632 bytes (64 KiB chunks plus row headroom); SQL text is at most 8192 bytes. Application batches contain at most
 4096 operations and 1 MiB transient encoded metadata, with 1024-byte keys and
 65536-byte row values. Body content never enters these metadata buffers.
@@ -80,7 +80,20 @@ These native calls cannot guarantee a yield at a caller deadline. Return Busy
 before writing when the existing WAL leaves insufficient room. SQLite reuses
 already-spilled frames of the current transaction. journal_size_limit is not
 used as a live hard ceiling. Explicit TRUNCATE checkpoint requires no live
-views; automatic checkpointing is disabled.
+views; automatic WAL-size checkpoints are disabled. Closing the last native
+connection can still run SQLite's passive checkpoint and remove the WAL.
+That synchronous drop-time work has no application deadline and may copy up
+to the 8 GiB database ceiling; explicit maintenance before teardown avoids
+leaving that work to connection destruction.
+
+The 9 MiB individual allocation ceiling accommodates SQLite 3.53.2's
+contiguous checkpoint iterator. At the admitted WAL ceiling there can be
+4194368 frames and 1025 index segments. On x86-64 its request is
+`8 + 1025*32 + 4194368*2 + 4096*2 = 8429736` bytes, including merge scratch;
+it is already eight-byte aligned, and SQLite's fallback allocator adds an
+eight-byte C header. The shared 16 MiB heap cap still applies to this buffer
+and every retained connection together. Page-cache targets are not hard
+reservations: this calculation alone does not qualify their combined peak.
 
 Runtime scopes retain one original monotonic clock/deadline and 8000000
 interruptible VM steps. Opening validates only fixed schema/header state under that same bound. Full
@@ -467,6 +480,50 @@ all accounts. The writer preallocates 128 KiB row/reference scratch at cold
 startup; 64 KiB body chunks reuse it. Core blob metadata cannot admit a body
 above 32 MiB; caller policy enforces any lower message/upload ceiling.
 Writer fence acquisition refuses immediately when occupied.
+
+The ignored `large_wal_checkpoint_fits_native_allocation_cap` fixture is an
+explicit large-WAL qualification. It keeps all nine permitted native
+connections, retains an old snapshot while replacing one 32 MiB body per
+commit, then drops the snapshot and truncates the WAL. It bounds generation
+at 160 commits (5 GiB input), a 6 GiB WAL extent and 15 minutes checked
+between calls; native calls remain synchronous. It verifies the preserved
+snapshot, checkpoint refusal while borrowed, successful truncation, a
+sub-64-MiB database, and reopened sequence/integrity/body contents.
+Ordinary gates leave this multi-gigabyte fixture ignored.
+
+Build through the normal forced native driver with an optimized test profile
+so hashing does not dominate the qualification:
+
+```text
+CARGO_PROFILE_TEST_OPT_LEVEL=2 target/release/td-builder gate-crates crypto-cargo test --manifest-path td-mta/Cargo.toml
+```
+
+This command runs the ordinary mail suite to produce its test executables.
+Use the `td_mta-...` path on its `unittests src/lib.rs` line, not the
+`src/main.rs` executable, to set `td_mta_lib_test` below. Cargo prints a
+repository-relative path; run from the repository root. Select an existing
+private, disk-backed TMPDIR with at least 6 GiB free; a tmpfs consumes RAM
+outside the test process's RLIMIT_DATA. Apply an outer timeout for native calls:
+
+```text
+td_mta_lib_test=.td-build-cache/crypto-target/x86_64-unknown-linux-gnu/debug/deps/td_mta-LIB_TEST_HASH
+TMPDIR=/path/on/disk timeout --kill-after=5s 1200 target/release/td-builder run-capped "$td_mta_lib_test" --ignored --exact store_fs::index::tests::large_wal_checkpoint_fits_native_allocation_cap --nocapture --test-threads=1
+```
+
+Require exit status zero and a libtest summary of exactly one passed test
+and zero failures. Zero matched tests is a qualification failure. The fixture
+prints its private root. If external termination prevents Drop cleanup, first
+confirm that invocation and its descendants have exited, then remove only
+that printed root; never sweep other agents' temporary directories.
+
+The x86-64 GNU host run used rustc 1.99.0-nightly (6f72b5dd5), test
+opt-level 2 and Linux 7.0.14/btrfs. It generated 1050433 valid frames
+in a 4327783992-byte WAL. The original 2 MiB individual cap refused checkpoint
+with Capacity. With the 9 MiB cap the checkpoint took about two seconds;
+the complete fixture, including WAL generation and reopen/content checks,
+passed in 83.14 seconds with the shared 16 MiB limit unchanged. This qualifies that
+specific failure boundary, not maximum-WAL mapped memory, native stack/RSS,
+the complete 8 GiB database, or combined service overlap.
 
 Creation is exclusive but not crash-atomic. A failed initial creation can
 leave an incomplete database or a complete durable database whose startup

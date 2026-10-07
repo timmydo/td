@@ -2343,6 +2343,139 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "explicit qualification writes over 4 GiB of WAL; ordinary gates stay bounded"]
+    fn large_wal_checkpoint_fits_native_allocation_cap() {
+        use std::{
+            io::Read,
+            time::{Duration, Instant},
+        };
+        const TARGET_FRAMES: u64 = 1_048_576;
+        const MAX_ROUNDS: u64 = 160;
+        const MAX_FIXTURE_WAL: u64 = 6 * 1024 * 1024 * 1024;
+        let started = Instant::now();
+        let timeout = Duration::from_secs(900);
+        let fixture = Fixture::new();
+        eprintln!("large-wal: root={}", fixture.path.display());
+        let mut root = fixture.locked();
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            Arc::new(Timer(AtomicU64::new(1))),
+            8,
+            deadline(),
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        store.checkpoint(deadline()).unwrap();
+        let mut snapshot = store.view(ACCOUNT, deadline()).unwrap();
+        let chunk = [0x5a; super::super::MAX_FILE_STEP_BYTES];
+        let mut digest = td_crypto::Provider.sha256().unwrap();
+        for _ in 0..MAX_BODY_BYTES / chunk.len() as u64 {
+            digest.update(&chunk).unwrap();
+        }
+        let value = encode(Row::Blob(BlobRow {
+            kind: BlobKind::Message,
+            length: MAX_BODY_BYTES,
+            digest: digest.finish().unwrap(),
+            created_at: 0,
+        }));
+        let wal = db_path(store.root(), RootEntry::Wal).unwrap();
+        let mut previous: Option<BlobId> = None;
+        let mut sequence = 0;
+        let mut frames = 0;
+        while frames < TARGET_FRAMES {
+            assert!(
+                started.elapsed() < timeout,
+                "large WAL generation timed out"
+            );
+            assert!(
+                sequence < MAX_ROUNDS,
+                "large WAL fixture exceeded its write budget"
+            );
+            let mut identifier = [0x93; 16];
+            identifier[8..].copy_from_slice(&sequence.to_be_bytes());
+            let id = BlobId::from_bytes(identifier);
+            let put = Operation::put(Table::Blobs, id.as_bytes(), &value).unwrap();
+            let mut operations = vec![put];
+            if let Some(previous) = previous.as_ref() {
+                operations.insert(
+                    0,
+                    Operation::delete(Table::Blobs, previous.as_bytes()).unwrap(),
+                );
+            }
+            let mut source = std::io::repeat(0x5a).take(MAX_BODY_BYTES);
+            assert_eq!(
+                store.commit(
+                    &td_crypto::Provider,
+                    request(sequence),
+                    &operations,
+                    &mut [BlobSource {
+                        id,
+                        source: &mut source
+                    }],
+                ),
+                Ok(Sequence::from_u64(sequence + 1))
+            );
+            assert_eq!(source.limit(), 0);
+            previous = Some(id);
+            sequence += 1;
+            let bytes = fs::metadata(&wal).unwrap().len();
+            assert!(bytes <= MAX_FIXTURE_WAL);
+            frames = (bytes - 32) / (PAGE_BYTES + 24);
+            if sequence % 8 == 0 || frames >= TARGET_FRAMES {
+                eprintln!(
+                    "large-wal: commits={sequence} frames={frames} bytes={bytes} elapsed={:?}",
+                    started.elapsed()
+                );
+            }
+        }
+        let latest = previous.unwrap();
+        assert!(snapshot
+            .get(Key::Blob(latest), &mut [0; 64])
+            .unwrap()
+            .is_none());
+        assert_eq!(snapshot.identity().committed_sequence, Sequence::default());
+        assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
+        drop(snapshot);
+        let checkpoint = store.checkpoint(deadline());
+        eprintln!(
+            "large-wal: checkpoint={checkpoint:?} elapsed={:?}",
+            started.elapsed()
+        );
+        assert_eq!(checkpoint, Ok(()));
+        assert!(
+            started.elapsed() < timeout,
+            "large WAL checkpoint timed out"
+        );
+        assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
+        let database = db_path(store.root(), RootEntry::Database).unwrap();
+        assert!(fs::metadata(database).unwrap().len() < 64 * 1024 * 1024);
+        drop(store);
+        let reopened =
+            IndexStore::open(&mut root, Arc::new(Timer(AtomicU64::new(1))), 8, deadline()).unwrap();
+        reopened.validate_integrity(deadline()).unwrap();
+        let mut view = reopened.view(ACCOUNT, deadline()).unwrap();
+        assert_eq!(
+            view.identity().committed_sequence,
+            Sequence::from_u64(sequence)
+        );
+        let mut input = view
+            .open_blob_input(&td_crypto::Provider, latest, MAX_BODY_BYTES)
+            .unwrap();
+        let mut output = [0; super::super::MAX_FILE_STEP_BYTES];
+        while input.position() < input.len() {
+            let count = input.read(&mut output).unwrap();
+            assert!(count > 0);
+            assert!(output[..count].iter().all(|byte| *byte == 0x5a));
+        }
+        assert_eq!(
+            ports::BlobReader::len(&input.finish().unwrap()),
+            MAX_BODY_BYTES
+        );
+        assert!(started.elapsed() < timeout);
+    }
+
+    #[test]
     fn maximum_body_streams_with_fixed_scratch_and_reopens() {
         use std::io::Read;
         let fixture = Fixture::new();

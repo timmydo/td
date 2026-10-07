@@ -2595,7 +2595,7 @@ process locking does not alter the request pool or worker ledger.
 SQLite body I/O uses at most 64 KiB caller/writer chunks. Native cache spilling
 keeps a 32 MiB body transaction from retaining the entire dirty body in RAM.
 The writer's cold scratch is 128 KiB; process-wide SQLite requested heap is
-capped at 16 MiB with a 2 MiB individual allocation cap. The page-cache target
+capped at 16 MiB with a 9 MiB individual allocation cap. The page-cache target
 is 128 KiB per connection, not a hard peak. Bodies are stored in at-most-64-KiB
 chunk rows and seeks use the chunk ordinal; no whole-body zeroblob is created.
 Native page allocation and final durable commit remain synchronous work;
@@ -2607,7 +2607,13 @@ The physical database ceiling is 8 GiB and the conservative WAL ceiling is
 maximum WAL. Recovery can read the entire WAL before the application resumes,
 and a TRUNCATE checkpoint can copy up to 8 GiB. Neither operation promises
 mid-call deadline interruption; before/after deadline checks do not establish
-a strict 60-second or 2 GiB checkpoint bound. Maximum-WAL mapped-memory,
+a strict 60-second or 2 GiB checkpoint bound. At the admitted maximum WAL,
+SQLite's x86-64 checkpoint iterator requests 8429736 contiguous bytes,
+including its sorting scratch. The 9 MiB individual cap admits that request;
+the other native requested allocations must remain strictly below 8347480
+bytes under the unchanged shared 16 MiB hard limit.
+This is request arithmetic, not measured allocator overhead or a reservation
+for idle schemas/page caches. Maximum-WAL mapped-memory,
 recovery and checkpoint qualification remain pending. Startup avoids a full
 integrity scan; explicit validate_integrity maintenance owns quick_check and
 foreign_key_check with a physical-cap-sized finite VM allowance and the
