@@ -1048,11 +1048,13 @@ impl Session {
                     commit,
                     branch,
                     lease,
+                    asks,
                 }) => {
                     let push = crate::git::Push {
                         id: commit.clone(),
                         branch: branch.clone(),
                         lease: lease.clone(),
+                        asks: *asks,
                     };
                     if let Err(why) = self.push(&id, *call, worktree, push) {
                         self.supervisor.answer(
@@ -2391,7 +2393,12 @@ pub fn run(
         saved,
         remotes,
         stores: data.as_ref().ok().map(|data| {
-            crate::git::Service::start(git_dir, data.join("store"), crate::git::kept_env())
+            crate::git::Service::start(
+                git_dir,
+                data.join("store"),
+                crate::git::kept_env(),
+                crate::git::Prompt::here(),
+            )
         }),
         data,
         removals: Vec::new(),
@@ -3031,6 +3038,7 @@ mod tests {
             live: true,
         };
         let push = |commit: &str, branch: &str, lease: Option<&str>| crate::git::Push {
+            asks: false,
             id: commit.to_string(),
             branch: branch.to_string(),
             lease: lease.map(str::to_string),

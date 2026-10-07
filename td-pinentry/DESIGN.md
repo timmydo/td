@@ -199,6 +199,15 @@ configured `core.askPass` still answers git's own prompts. A display
 inherited but not in front of the person, as in tmux reattached over
 ssh, still gets the window, and ssh waits on it until its timeout.
 
+td-agent sets `GIT_ASKPASS` and `SSH_ASKPASS` naming td-pinentry and
+`SSH_ASKPASS_REQUIRE=force`, with its Wayland display, for the git a
+person is there for alone: a repository template's preparation and a
+push the person allowed on its card (td-agent/DESIGN.md §9, Prompts). It
+finds td-pinentry beside its own executable or, launched by td-net from
+`PREFIX/lib/td`, in `PREFIX/bin`, as `./install-apps` places them.
+Unlike td-review it keeps none of the person's own askpass variables,
+since its git keeps a fixed environment.
+
 ## Tests
 
 The crate's tests drive the window state headless: an answer typed and

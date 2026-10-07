@@ -306,13 +306,15 @@ pub enum Up {
     },
     /// Call `call`'s push, staged and decided: `commit` to branch
     /// `branch` of worktree `worktree`'s remote, `lease` the id expected
-    /// there when forced; answered with `Pushed`.
+    /// there when forced, `asks` when the person decided it on its card
+    /// (DESIGN.md §9, Prompts); answered with `Pushed`.
     Push {
         call: u64,
         worktree: String,
         commit: String,
         branch: String,
         lease: Option<String>,
+        asks: bool,
     },
 }
 
@@ -506,6 +508,7 @@ fn staged_pairs(staged: &crate::git::Staged) -> Vec<(String, Json)> {
     let or_null = |value: &Option<String>| value.as_deref().map_or(Json::Null, text);
     vec![
         ("tip".into(), or_null(&staged.tip)),
+        ("stale".into(), or_null(&staged.stale)),
         ("merge_base".into(), or_null(&evidence.merge_base)),
         (
             "commits".into(),
@@ -637,9 +640,17 @@ fn staged(value: &Json) -> Result<crate::git::Staged, String> {
             path: cell(row, 2, true)?,
         });
     }
+    let stale = maybe(value, "stale")?;
+    if stale
+        .as_ref()
+        .is_some_and(|why| why.len() > crate::git::MAX_STALE)
+    {
+        return Err(format!("stale is past {} bytes", crate::git::MAX_STALE));
+    }
     Ok(crate::git::Staged {
         tip: maybe(value, "tip")?,
         evidence,
+        stale,
     })
 }
 
@@ -1224,6 +1235,7 @@ impl Up {
                 commit,
                 branch,
                 lease,
+                asks,
             } => typed(
                 "push",
                 vec![
@@ -1232,6 +1244,7 @@ impl Up {
                     ("commit".into(), Json::Str(commit.clone())),
                     ("branch".into(), Json::Str(branch.clone())),
                     ("lease".into(), optional(lease)),
+                    ("asks".into(), Json::Bool(*asks)),
                 ],
             ),
             Self::Refetch {
@@ -1447,6 +1460,7 @@ impl Up {
                 commit: string(&value, "commit")?,
                 branch: string(&value, "branch")?,
                 lease: maybe(&value, "lease")?,
+                asks: value.get("asks").and_then(Json::as_bool).ok_or("no asks")?,
             },
             Some("refetch") => Self::Refetch {
                 call: number(&value, "call")?,
@@ -1618,6 +1632,7 @@ mod tests {
                 commit: "a".repeat(40),
                 branch: "agent".into(),
                 lease: Some("c".repeat(40)),
+                asks: true,
             },
             Up::Push {
                 call: 9,
@@ -1625,6 +1640,7 @@ mod tests {
                 commit: "a".repeat(40),
                 branch: "agent".into(),
                 lease: None,
+                asks: false,
             },
         ] {
             assert_eq!(Up::decode(&up.encode()).unwrap(), up);
@@ -1632,6 +1648,7 @@ mod tests {
         let worst = "\"".repeat(NAME);
         let id = "a".repeat(64);
         let staged = Staged {
+            stale: Some("\u{1}".repeat(crate::git::MAX_STALE)),
             tip: Some(id.clone()),
             evidence: Evidence {
                 merge_base: Some(id.clone()),
@@ -1661,6 +1678,7 @@ mod tests {
         assert!(bytes.len() <= crate::frame::MAX_FRAME, "{}", bytes.len());
         assert_eq!(Down::decode(&bytes).unwrap(), down);
         let mut small = Staged {
+            stale: None,
             tip: None,
             evidence: Evidence::default(),
         };
@@ -1695,6 +1713,7 @@ mod tests {
             Down::Staged {
                 call: 1,
                 result: Ok(Staged {
+                    stale: None,
                     tip: None,
                     evidence,
                 }),

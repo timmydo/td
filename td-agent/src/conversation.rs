@@ -2822,6 +2822,14 @@ impl Session {
         if lease.is_some() {
             reasons.push("it is forced".to_string());
         }
+        // Checked against the store as last fetched: a fetch that would
+        // have had to ask the person, with them there.
+        if let Some(why) = &staged.stale {
+            let first = why.lines().next().unwrap_or_default();
+            reasons.push(format!(
+                "the remote could not be fetched ({first}), so its branch is as last fetched"
+            ));
+        }
         if !evidence.found.is_empty()
             || evidence.more_found > 0
             || !evidence.binaries.is_empty()
@@ -2866,6 +2874,9 @@ impl Session {
         // one return to it.
         let mut verdict: Option<classifier::Outcome> = None;
         let mut jev = None;
+        // Whether the person decided it on its card, so its git may ask
+        // them (DESIGN.md §9, Prompts).
+        let by_person: bool;
         // Until a decision holds: one a rule or the classifier made,
         // which a policy taken since leaves to the person, goes round
         // again.
@@ -3017,6 +3028,7 @@ impl Session {
                     reason: Some(why),
                 })?;
             }
+            by_person = human;
             break;
         }
         let call = self.ask_id();
@@ -3026,6 +3038,7 @@ impl Session {
             commit: commit.clone(),
             branch: branch.clone(),
             lease,
+            asks: by_person,
         });
         let answer = match self.wait_for(
             |down| matches!(down, Down::Pushed { call: c, .. } if *c == call),

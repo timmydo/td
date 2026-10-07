@@ -52,6 +52,81 @@ const STALL: &[&str] = &[
     "core.sshCommand=ssh -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=4",
 ];
 
+/// What git a person started may ask past `STALL`'s and the fixed
+/// shape's settings (DESIGN.md §9, Prompts): ssh without `BatchMode`,
+/// so it asks its askpass, and git's own credential prompts.
+const ASKING: &[&str] = &[
+    "credential.interactive=true",
+    "core.sshCommand=ssh -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=4",
+];
+
+/// `text` cut to at most `max` bytes, on a character's boundary.
+fn bounded(text: &str, max: usize) -> String {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.get(..end).unwrap_or_default().to_string()
+}
+
+/// What git and ssh say of a prompt they could not ask: git's own with
+/// its terminal prompts off, and ssh's in batch mode or with no askpass.
+const REFUSED: &[&str] = &[
+    "terminal prompts disabled",
+    "could not read Username",
+    "could not read Password",
+    "Permission denied (publickey",
+    "Host key verification failed",
+    "read_passphrase",
+];
+
+/// The most bytes of why staging could not fetch that cross with it.
+pub const MAX_STALE: usize = 1024;
+
+/// td-pinentry, which answers a passphrase or password prompt in a
+/// window of its own, and the display that window opens on (DESIGN.md
+/// §9, Prompts).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Prompt {
+    program: PathBuf,
+    display: OsString,
+}
+
+impl Prompt {
+    /// td-pinentry where `./install-apps` places it, found from this
+    /// program's executable, links resolved, and this process's Wayland
+    /// display; none without either.
+    pub fn here() -> Option<Self> {
+        Self::find(
+            &std::env::current_exe().ok()?,
+            std::env::var_os("WAYLAND_DISPLAY"),
+        )
+    }
+
+    /// td-pinentry beside `exe`, or, for `exe` in `PREFIX/lib/td` as
+    /// td-net launches it, in `PREFIX/bin`, where `./install-apps` puts
+    /// td-pinentry: the first that is an executable file; and `display`,
+    /// when it is not empty.
+    fn find(exe: &Path, display: Option<OsString>) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        let display = display.filter(|display| !display.is_empty())?;
+        let dir = exe.parent()?;
+        let installed = dir
+            .ends_with("lib/td")
+            .then(|| dir.parent()?.parent())
+            .flatten()
+            .map(|prefix| prefix.join("bin").join("td-pinentry"));
+        let runs = |program: &Path| {
+            std::fs::metadata(program)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        };
+        std::iter::once(dir.join("td-pinentry"))
+            .chain(installed)
+            .find(|program| runs(program))
+            .map(|program| Self { program, display })
+    }
+}
+
 /// A transport td-agent admits: https, ssh, or a local repository named
 /// by its absolute path, fetched and pushed over git's file transport;
 /// never `ext`, `git`, plain `http` or a relative path.
@@ -426,7 +501,7 @@ pub fn branch_name(name: &str) -> Result<&str, String> {
 
 /// The git worker's outside half: the fixed shape of every git it runs
 /// on a repository no jail can write.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Worker {
     /// The global configuration td-agent writes: the human's identity and
     /// credential helpers, nothing else.
@@ -435,6 +510,12 @@ pub struct Worker {
     hooks: PathBuf,
     /// What an outside git keeps of td-agent's environment.
     env: Vec<(String, OsString)>,
+    /// What answers a prompt of git a person started; none without
+    /// td-pinentry or a display.
+    prompt: Option<Prompt>,
+    /// Whether this worker's git is a person's, which may ask
+    /// (`asking`).
+    asks: bool,
 }
 
 impl Worker {
@@ -467,9 +548,43 @@ impl Worker {
             .cloned()
             .collect();
         let config = dir.join("gitconfig");
-        let worker = Self { config, hooks, env };
+        let worker = Self {
+            config,
+            hooks,
+            env,
+            prompt: None,
+            asks: false,
+        };
         worker.copy_identity()?;
         Ok(worker)
+    }
+
+    /// This worker, its prompts answered by `prompt` when it is
+    /// `asking`.
+    pub fn with_prompt(self, prompt: Option<Prompt>) -> Self {
+        Self { prompt, ..self }
+    }
+
+    /// This worker for git a person started, preparing a workspace or
+    /// sending a push they decided: one that may ask for a passphrase or
+    /// password through td-pinentry.
+    pub fn asking(&self) -> Self {
+        Self {
+            asks: true,
+            ..self.clone()
+        }
+    }
+
+    /// `why` git failed, and, for git that could not ask and whose
+    /// failure was a prompt refused, what would have let it.
+    fn unasked(&self, why: String) -> String {
+        if self.asks && self.prompt.is_none() && REFUSED.iter().any(|said| why.contains(said)) {
+            format!(
+                "{why}; nothing could ask for a passphrase or password: td-pinentry, which ./install-apps installs, asks in a window of its own"
+            )
+        } else {
+            why
+        }
     }
 
     /// Writes the global configuration: the copied lines, each through
@@ -566,6 +681,18 @@ impl Worker {
         .chain(STALL)
         {
             command.arg("-c").arg(setting);
+        }
+        // A person's git asks through td-pinentry; git takes the last
+        // value given, so these replace the batch settings above.
+        if let (true, Some(prompt)) = (self.asks, &self.prompt) {
+            command
+                .env("GIT_ASKPASS", &prompt.program)
+                .env("SSH_ASKPASS", &prompt.program)
+                .env("SSH_ASKPASS_REQUIRE", "force")
+                .env("WAYLAND_DISPLAY", &prompt.display);
+            for setting in ASKING {
+                command.arg("-c").arg(setting);
+            }
         }
         command
     }
@@ -1028,13 +1155,18 @@ impl Service {
     /// Starts the thread, whose worker keeps its files in `worker` and
     /// its stores in `stores`; a worker that cannot be made answers every
     /// ask with why.
-    pub fn start(worker: PathBuf, stores: PathBuf, env: Vec<(String, OsString)>) -> Self {
+    pub fn start(
+        worker: PathBuf,
+        stores: PathBuf,
+        env: Vec<(String, OsString)>,
+        prompt: Option<Prompt>,
+    ) -> Self {
         let (jobs, asked) = mpsc::channel::<Job>();
         let (tell, done) = mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("td-agent-stores".into())
             .spawn(move || {
-                let made = Worker::new(&worker, &env);
+                let made = Worker::new(&worker, &env).map(|made| made.with_prompt(prompt));
                 let unmade = |why: &String| format!("the git worker: {why}");
                 let mut queue = std::collections::VecDeque::new();
                 loop {
@@ -1054,8 +1186,11 @@ impl Service {
                             remote,
                             bases,
                         } => Done::Prepared {
-                            result: match &made {
-                                Ok(made) => made.prepare(&stores, &remote, &bases),
+                            // The person's: it may ask.
+                            result: match made.as_ref().map(Worker::asking) {
+                                Ok(asking) => asking
+                                    .prepare(&stores, &remote, &bases)
+                                    .map_err(|why| asking.unasked(why)),
                                 Err(why) => Err(unmade(why)),
                             },
                             conversation,
@@ -1101,7 +1236,18 @@ impl Service {
                             push,
                         } => Done::Pushed {
                             result: match &made {
-                                Ok(made) => made.push(&publish, &remote, &push),
+                                // Decided by the person on its card: it may
+                                // ask, with them there.
+                                Ok(made) => {
+                                    let worker = if push.asks {
+                                        made.asking()
+                                    } else {
+                                        made.clone()
+                                    };
+                                    worker
+                                        .push(&publish, &remote, &push)
+                                        .map_err(|why| worker.unasked(why))
+                                }
                                 Err(why) => Err(unmade(why)),
                             },
                             asker,
@@ -2122,6 +2268,9 @@ const PUSH_TIME: Duration = Duration::from_secs(600);
 pub struct Staged {
     pub tip: Option<String>,
     pub evidence: Evidence,
+    /// Why the remote could not be fetched, when it could not: the tip
+    /// and evidence are then the store's as last fetched.
+    pub stale: Option<String>,
 }
 
 /// What a push sends (DESIGN.md §9, Pushing, step 5): one commit to one
@@ -2133,6 +2282,9 @@ pub struct Push {
     /// For a force push, the id the remote's branch must still name,
     /// carried by `--force-with-lease`.
     pub lease: Option<String>,
+    /// Decided by the person on its card, so its git may ask them
+    /// (DESIGN.md §9, Prompts).
+    pub asks: bool,
 }
 
 /// The branches a push to which is always the person's (DESIGN.md §9,
@@ -2197,11 +2349,43 @@ impl Worker {
     ) -> Result<Staged, String> {
         let branch = push_branch(branch)?;
         let store = self.store(stores, remote)?;
-        self.fetch(&store, remote)?;
+        // Batch, before anyone decides: a fetch that would have to ask
+        // leaves the store as last fetched, which the person then judges
+        // on a card, and the push is refused should the remote have moved.
+        let stale = self
+            .fetch(&store, remote)
+            .err()
+            .map(|why| bounded(&why, MAX_STALE));
+        // Refused for another reason too, the fetch's is said with it:
+        // a locked key may be why the store lacks what is needed.
+        let (tip, evidence) = self
+            .stage_on(&store, publish, pack, id, base, branch)
+            .map_err(|why| match &stale {
+                Some(fetch) => format!("{why}; the remote could not be fetched first: {fetch}"),
+                None => why,
+            })?;
+        Ok(Staged {
+            tip,
+            evidence,
+            stale,
+        })
+    }
+
+    /// `stage` past its fetch: the base checked in `store`, the remote
+    /// branch's tip there, the pack imported and the evidence computed.
+    fn stage_on(
+        &self,
+        store: &Path,
+        publish: &Path,
+        pack: &Path,
+        id: &str,
+        base: &str,
+        branch: &str,
+    ) -> Result<(Option<String>, Evidence), String> {
         // The base must be the store's, what came from the remote, not
         // a commit the export brought, which would hide those before it
         // from the evidence.
-        let mut known = self.command(&store);
+        let mut known = self.command(store);
         known
             .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
             .arg(format!("{base}^{{commit}}"));
@@ -2210,11 +2394,11 @@ impl Worker {
         if !object_id(base) || peeled.ok().as_deref() != Some(base) {
             return Err(format!("{base} is not a commit the remote's store holds"));
         }
-        let tip = self.branch_tip(&store, branch)?;
-        self.publish(publish, &store)?;
+        let tip = self.branch_tip(store, branch)?;
+        self.publish(publish, store)?;
         self.import(publish, pack, id)?;
         let evidence = self.evidence(publish, id, base, tip.as_deref())?;
-        Ok(Staged { tip, evidence })
+        Ok((tip, evidence))
     }
 
     /// Pushes `push` from the publish repository to `remote` with the
@@ -2598,6 +2782,135 @@ pub(crate) mod tests {
         }
     }
 
+    /// td-pinentry answers a person's git: found beside the executable
+    /// only when it runs and there is a display; a worker's git asks it
+    /// only once `asking`, and then git's own credential prompt reaches
+    /// it and ssh is no longer in batch mode; batch git never asks, and
+    /// an asking worker without it says what would have asked.
+    #[test]
+    fn a_persons_git_asks_through_td_pinentry_and_no_other_does() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("askpass");
+        let bin = scratch.0.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let exe = bin.join("td-agent");
+        let display = || Some(OsString::from("wayland-1"));
+        assert_eq!(Prompt::find(&exe, display()), None);
+        let program = bin.join("td-pinentry");
+        std::fs::write(&program, "#!/bin/sh\necho secret\n").unwrap();
+        assert_eq!(Prompt::find(&exe, display()), None);
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(Prompt::find(&exe, None), None);
+        assert_eq!(Prompt::find(&exe, Some(OsString::new())), None);
+        let prompt = Prompt::find(&exe, display()).unwrap();
+        assert_eq!(prompt.program, program);
+        // As `./install-apps` lays them out: td-agent in PREFIX/lib/td,
+        // which td-net launches, and td-pinentry in PREFIX/bin.
+        let lib = scratch.0.join("local/lib/td");
+        std::fs::create_dir_all(&lib).unwrap();
+        let installed = lib.join("td-agent");
+        assert_eq!(Prompt::find(&installed, display()), None);
+        let local_bin = scratch.0.join("local/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        std::fs::copy(&program, local_bin.join("td-pinentry")).unwrap();
+        assert_eq!(
+            Prompt::find(&installed, display()).map(|prompt| prompt.program),
+            Some(local_bin.join("td-pinentry"))
+        );
+        // Only from lib/td: a bin beside any other directory is not looked in.
+        let other = scratch.0.join("local/lib/other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert_eq!(Prompt::find(&other.join("td-agent"), display()), None);
+
+        let home = scratch.0.join("home");
+        std::fs::create_dir(&home).unwrap();
+        let env: Vec<(String, OsString)> = vec![
+            ("PATH".into(), std::env::var_os("PATH").unwrap()),
+            ("HOME".into(), home.into_os_string()),
+        ];
+        let worker = Worker::new(&scratch.0.join("worker"), &env)
+            .unwrap()
+            .with_prompt(Some(prompt));
+        let git_dir = scratch.0.join("repo.git");
+        let mut init = worker.bare();
+        init.args(["init", "--quiet", "--bare"]).arg(&git_dir);
+        run(&mut init, 4096, LOCAL_TIME).unwrap();
+        let fill = |worker: &Worker| {
+            let mut fill = worker.command(&git_dir);
+            fill.args(["credential", "fill"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = fill.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"protocol=https\nhost=example.org\n\n")
+                .unwrap();
+            child.wait_with_output().unwrap()
+        };
+        let envs = |command: &Command| -> Vec<String> {
+            command
+                .get_envs()
+                .filter(|(_, value)| value.is_some())
+                .map(|(name, _)| name.to_string_lossy().into_owned())
+                .collect()
+        };
+        let ssh = |command: &Command| -> String {
+            command
+                .get_args()
+                .filter_map(|arg| arg.to_str())
+                .filter(|arg| arg.starts_with("core.sshCommand="))
+                .last()
+                .unwrap()
+                .to_string()
+        };
+        // Batch: no askpass, ssh in batch mode, and git's prompt refused.
+        let batch = worker.command(&git_dir);
+        assert!(!envs(&batch).iter().any(|name| name.contains("ASKPASS")));
+        assert!(ssh(&batch).contains("BatchMode=yes"));
+        let refused = fill(&worker);
+        assert!(!refused.status.success());
+        assert!(!String::from_utf8_lossy(&refused.stdout).contains("secret"));
+        // Asking: td-pinentry for git and ssh, on the display.
+        let asking = worker.asking();
+        let command = asking.command(&git_dir);
+        for name in [
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "SSH_ASKPASS_REQUIRE",
+            "WAYLAND_DISPLAY",
+        ] {
+            assert!(envs(&command).iter().any(|n| n == name), "{name}");
+        }
+        assert!(!ssh(&command).contains("BatchMode"));
+        let answered = fill(&asking);
+        assert!(answered.status.success(), "{answered:?}");
+        let said = String::from_utf8_lossy(&answered.stdout);
+        assert!(said.contains("username=secret\npassword=secret"), "{said}");
+        assert_eq!(asking.unasked("x".into()), "x");
+        // Asking with nothing to ask: batch still, and said.
+        let alone = worker.clone().with_prompt(None).asking();
+        assert!(!envs(&alone.command(&git_dir))
+            .iter()
+            .any(|name| name.contains("ASKPASS")));
+        // The note, for a prompt refused alone.
+        let refused =
+            "fatal: could not read Username for 'https://example.org': terminal prompts disabled";
+        assert!(alone.unasked(refused.into()).contains("./install-apps"));
+        assert!(alone
+            .unasked("git@example.org: Permission denied (publickey).".into())
+            .contains("./install-apps"));
+        assert_eq!(alone.unasked("x".into()), "x");
+        assert_eq!(worker.unasked(refused.into()), refused);
+        assert_eq!(
+            worker.clone().with_prompt(None).unasked(refused.into()),
+            refused
+        );
+    }
+
     #[test]
     fn admission_is_exact_or_a_prefix_of_whole_segments() {
         let remote = |text| Remote::parse(text).unwrap();
@@ -2770,6 +3083,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         let push = |id: &str, branch: &str, lease: Option<&str>| Push {
+            asks: false,
             id: id.to_string(),
             branch: branch.to_string(),
             lease: lease.map(str::to_string),
@@ -2797,6 +3111,44 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(staged.tip.as_deref(), Some(two.as_str()));
         assert_eq!(staged.evidence.merge_base.as_deref(), Some(base.as_str()));
+        assert_eq!(staged.stale, None);
+        // The remote out of reach: staged against the store as last
+        // fetched, and why said, for the person to judge.
+        let away = root.join("away");
+        std::fs::rename(&up, &away).unwrap();
+        let stale = worker.stage(
+            &stores,
+            &publish,
+            &remote,
+            &packed(&three, "three-again.pack"),
+            &three,
+            &base,
+            "feature",
+        );
+        std::fs::rename(&away, &up).unwrap();
+        let stale = stale.unwrap();
+        assert_eq!(stale.tip.as_deref(), Some(two.as_str()));
+        let why = stale.stale.unwrap();
+        assert!(why.starts_with("fetching"), "{why}");
+        assert!(why.len() <= MAX_STALE);
+        assert_eq!(bounded("a\u{e9}b", 2), "a");
+        // Refused besides, the fetch's failure is said with it.
+        std::fs::rename(&up, &away).unwrap();
+        let refused = worker.stage(
+            &stores,
+            &publish,
+            &remote,
+            &packed(&three, "three-third.pack"),
+            &three,
+            &"0".repeat(40),
+            "feature",
+        );
+        std::fs::rename(&away, &up).unwrap();
+        let refused = refused.unwrap_err();
+        assert!(
+            refused.contains("not a commit the remote's store holds; the remote could not be fetched first: fetching"),
+            "{refused}"
+        );
         // A base the store never had, a commit the pack brought, is
         // refused: it would hide what comes before it from the scan.
         let four = commit("four");
@@ -3160,10 +3512,139 @@ pub(crate) mod tests {
         assert!(carried <= MAX_INSTRUCTIONS);
     }
 
+    /// The store thread's preparation, and a push the person decided,
+    /// ask through td-pinentry; a background refresh, a model's
+    /// `git_fetch`, staging and a push a rule allowed stay batch. A
+    /// stand-in `ssh` says which it was given and refuses the key; with
+    /// nothing to ask, an asking job's failure says what would have.
+    #[test]
+    fn only_preparation_and_a_persons_push_ask() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("asking-jobs");
+        let bin = scratch.0.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let log = scratch.0.join("ssh.log");
+        let ssh = bin.join("ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nif [ -n \"$SSH_ASKPASS\" ]; then echo asked >>{log}; else echo batch >>{log}; fi\necho 'git@example.invalid: Permission denied (publickey).' >&2\nexit 255\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        let program = bin.join("td-pinentry");
+        std::fs::write(&program, "#!/bin/sh\necho secret\n").unwrap();
+        for file in [&ssh, &program] {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let home = scratch.0.join("home");
+        std::fs::create_dir(&home).unwrap();
+        let mut path = bin.clone().into_os_string();
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap());
+        let env: Vec<(String, OsString)> = vec![
+            ("PATH".into(), path),
+            ("HOME".into(), home.into_os_string()),
+        ];
+        // A commit in a publish repository, for the pushes to send.
+        let worker = Worker::new(&scratch.0.join("maker"), &env).unwrap();
+        let publish = scratch.0.join("publish.git");
+        let mut init = worker.bare();
+        init.args(["init", "--quiet", "--bare"]).arg(&publish);
+        run(&mut init, 4096, LOCAL_TIME).unwrap();
+        let mut tree = worker.command(&publish);
+        tree.arg("mktree");
+        let tree = String::from_utf8(run(&mut tree, 256, LOCAL_TIME).unwrap()).unwrap();
+        let mut commit = worker.command(&publish);
+        commit
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(["commit-tree", "-m", "x", tree.trim()]);
+        let commit = String::from_utf8(run(&mut commit, 256, LOCAL_TIME).unwrap()).unwrap();
+        let push = |asks| Push {
+            id: commit.trim().to_string(),
+            branch: "agent".into(),
+            lease: None,
+            asks,
+        };
+        let remote = Remote::parse("ssh://git@example.invalid/a/td").unwrap();
+        let id = crate::store::Id::random().unwrap();
+        let each = |prompt: Option<Prompt>| {
+            let _ = std::fs::remove_file(&log);
+            let service = Service::start(
+                scratch.0.join("worker"),
+                scratch.0.join("stores"),
+                env.clone(),
+                prompt,
+            );
+            service
+                .ask(id.clone(), remote.clone(), vec!["main".into()])
+                .unwrap();
+            service
+                .refresh(remote.clone(), vec!["main".into()])
+                .unwrap();
+            service
+                .fetch_now(id.clone(), 1, remote.clone(), vec!["main".into()])
+                .unwrap();
+            service
+                .stage(
+                    id.clone(),
+                    2,
+                    remote.clone(),
+                    Staging {
+                        publish: scratch.0.join("staged.git"),
+                        pack: scratch.0.join("none.pack"),
+                        id: "1".repeat(40),
+                        base: "2".repeat(40),
+                        branch: "agent".into(),
+                    },
+                )
+                .unwrap();
+            service
+                .push(id.clone(), 3, remote.clone(), publish.clone(), push(true))
+                .unwrap();
+            service
+                .push(id.clone(), 4, remote.clone(), publish.clone(), push(false))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut answers = Vec::new();
+            while answers.len() < 6 {
+                assert!(Instant::now() < deadline, "no answer came");
+                answers.extend(service.answers());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let mut said: Vec<String> = std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            said.sort();
+            (answers, said)
+        };
+        // With td-pinentry: the preparation and the person's push ask.
+        let (_, said) = each(Some(Prompt {
+            program: program.clone(),
+            display: "wayland-1".into(),
+        }));
+        assert_eq!(said, ["asked", "asked", "batch", "batch", "batch", "batch"]);
+        // Without: none asks, and only theirs say what would have.
+        let (answers, said) = each(None);
+        assert!(said.iter().all(|line| line == "batch"), "{said:?}");
+        for done in answers {
+            let (asks, why) = match done {
+                Done::Prepared { result, .. } => (true, result.unwrap_err()),
+                Done::Pushed { result, asker } => (asker.1 == 3, result.unwrap_err()),
+                Done::Refreshed { result, .. } => (false, result.unwrap_err()),
+                Done::Staged { result, .. } => (false, result.unwrap_err()),
+            };
+            assert_eq!(why.contains("./install-apps"), asks, "{why}");
+        }
+    }
+
     #[test]
     fn the_store_service_answers_each_ask_for_its_conversation() {
         // A worker that cannot be made answers every ask with why.
-        let service = Service::start("relative".into(), "/nowhere".into(), Vec::new());
+        let service = Service::start("relative".into(), "/nowhere".into(), Vec::new(), None);
         let id = crate::store::Id::random().unwrap();
         let remote = Remote::parse("https://example.org/a/td").unwrap();
         service
@@ -3259,6 +3740,7 @@ pub(crate) mod tests {
             .stage(id.clone(), 8, remote.clone(), staging)
             .unwrap();
         let push = Push {
+            asks: false,
             id: "a".repeat(40),
             branch: "x".into(),
             lease: None,
@@ -3332,6 +3814,7 @@ pub(crate) mod tests {
                 remote: remote("h"),
                 publish: "/p".into(),
                 push: Push {
+                    asks: false,
                     id: "a".repeat(40),
                     branch: "x".into(),
                     lease: None,

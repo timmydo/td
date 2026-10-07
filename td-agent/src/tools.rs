@@ -1648,6 +1648,7 @@ mod tests {
             path: Some("a\tb".into()),
         };
         let staged = Staged {
+            stale: None,
             tip: Some(id('t')),
             evidence: Evidence {
                 merge_base: Some(id('m')),
@@ -1695,6 +1696,7 @@ mod tests {
         let forced = push_card("r", "agent", &id('a'), true, &staged).1;
         assert!(forced[3].starts_with(&format!("Forced: it replaces the remote's {}", id('t'))));
         let clean = Staged {
+            stale: None,
             tip: None,
             evidence: Evidence::default(),
         };

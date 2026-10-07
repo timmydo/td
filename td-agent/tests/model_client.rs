@@ -6650,6 +6650,8 @@ fn git_push_rules_and_protected_branches() {
                 Reply::sse("stream-sonnet.sse"),
                 push("stream-tool-git-push-feature.sse"),
                 Reply::sse("stream-sonnet.sse"),
+                push("stream-tool-git-push-feature.sse"),
+                Reply::sse("stream-sonnet.sse"),
             ]
         },
     );
@@ -6671,6 +6673,7 @@ fn git_push_rules_and_protected_branches() {
         h.down(&Down::Staged {
             call,
             result: Ok(Staged {
+                stale: None,
                 tip: None,
                 evidence: Evidence::default(),
             }),
@@ -6701,7 +6704,13 @@ fn git_push_rules_and_protected_branches() {
     h.say("Push it to feature.");
     clean(&mut h);
     let (call, branch) = h.until(|up| match up {
-        Up::Push { call, branch, .. } => Some((*call, branch.clone())),
+        // Allowed by a rule, with nobody there: batch.
+        Up::Push {
+            call,
+            branch,
+            asks: false,
+            ..
+        } => Some((*call, branch.clone())),
         Up::Ask { .. } => panic!("an allowed push was put to the person"),
         _ => None,
     });
@@ -6804,6 +6813,46 @@ fn git_push_rules_and_protected_branches() {
         .filter(|r| r.text().contains("gpt-oss-safeguard"))
         .count();
     assert_eq!(asked_classifier, 0);
+    // Staged against the store as last fetched, the fetch having had to
+    // ask: the person's on a card whatever the allow, and, allowed
+    // there, sent so it may ask them (DESIGN.md §9, Prompts).
+    h.say("Push feature with the key locked.");
+    let call = h.until(|up| match up {
+        Up::Stage { call, .. } => Some(*call),
+        _ => None,
+    });
+    h.down(&Down::Staged {
+        call,
+        result: Ok(Staged {
+            stale: Some("git@example.org: Permission denied (publickey).".into()),
+            tip: None,
+            evidence: Evidence::default(),
+        }),
+    });
+    let (card, _, details) = h.until_ask();
+    assert!(
+        details[0].contains(
+            "the remote could not be fetched (git@example.org: Permission denied (publickey).), so its branch is as last fetched"
+        ),
+        "{details:?}"
+    );
+    h.down(&Down::Decision {
+        call: card,
+        allow: true,
+        always: None,
+    });
+    let call = h.until(|up| match up {
+        Up::Push {
+            call, asks: true, ..
+        } => Some(*call),
+        Up::Push { .. } => panic!("a push the person allowed was sent batch"),
+        _ => None,
+    });
+    h.down(&Down::Pushed {
+        call,
+        result: Ok("pushed".into()),
+    });
+    h.turn();
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
@@ -6868,6 +6917,7 @@ fn a_clean_push_in_auto_mode_is_the_classifiers() {
     let staged = |call: u64, at: Option<String>| Down::Staged {
         call,
         result: Ok(Staged {
+            stale: None,
             tip: at,
             evidence: Evidence {
                 merge_base: Some(base.clone()),
@@ -7091,6 +7141,7 @@ fn a_push_is_exported_staged_asked_and_sent() {
     h.down(&Down::Staged {
         call,
         result: Ok(Staged {
+            stale: None,
             tip: None,
             evidence: Evidence {
                 commits: vec![(tip.clone(), "Add b".into())],
@@ -7119,12 +7170,14 @@ fn a_push_is_exported_staged_asked_and_sent() {
         always: None,
     });
     let (call, sent) = h.until(|up| match up {
+        // Decided on its card: it may ask.
         Up::Push {
             call,
             worktree,
             commit,
             branch,
             lease,
+            asks: true,
         } => Some((
             *call,
             (
@@ -7156,6 +7209,7 @@ fn a_push_is_exported_staged_asked_and_sent() {
     h.down(&Down::Staged {
         call,
         result: Ok(Staged {
+            stale: None,
             tip: Some(base.clone()),
             evidence: Evidence::default(),
         }),
@@ -7185,6 +7239,7 @@ fn a_push_is_exported_staged_asked_and_sent() {
     h.down(&Down::Staged {
         call,
         result: Ok(Staged {
+            stale: None,
             tip: Some(base.clone()),
             evidence: Evidence::default(),
         }),
@@ -7200,6 +7255,7 @@ fn a_push_is_exported_staged_asked_and_sent() {
             call,
             branch,
             lease,
+            asks: true,
             ..
         } => Some((*call, (branch.clone(), lease.clone()))),
         _ => None,
@@ -7224,6 +7280,7 @@ fn a_push_is_exported_staged_asked_and_sent() {
         h.down(&Down::Staged {
             call,
             result: Ok(Staged {
+                stale: None,
                 tip: Some(base.clone()),
                 evidence: Evidence::default(),
             }),

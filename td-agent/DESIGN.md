@@ -3094,7 +3094,8 @@ Every outside invocation is fixed in shape:
   below are added, so no inherited `GIT_SSH_COMMAND`, `GIT_EXEC_PATH`,
   `GIT_CONFIG_PARAMETERS` or `GIT_ALTERNATE_OBJECT_DIRECTORIES` applies;
   `GIT_TERMINAL_PROMPT=0` and SSH's `BatchMode=yes`, so a launch from a
-  terminal never waits on it;
+  terminal never waits on it, but for git a person started (Prompts,
+  below);
 - `GIT_DIR` set explicitly and no worktree;
 - `GIT_CONFIG_NOSYSTEM=1`, and `GIT_CONFIG_GLOBAL` naming a file td-agent
   writes, holding only the identity and credential-helper lines copied
@@ -3111,6 +3112,60 @@ Every outside invocation is fixed in shape:
 - the remote URL taken from td-agent's record of the admitted remote,
   never from a file a jail can write; ref names checked and placed after
   `--end-of-options`.
+
+**Prompts.** A key with a passphrase, or a password a credential helper
+does not hold, would leave a batch fetch or push failing with nothing
+asked. git a person is there for may therefore ask: a repository
+template's preparation, which the person's new conversation asks for,
+and a push the person allowed on its card. A push a rule or the
+classifier allowed stays batch, as do a background fetch, a model's
+`git_fetch` and staging a push: nothing a person did just then asked for
+them, the model chooses when a push is called, and a window opening
+unasked is one a person could answer without knowing why. Staging
+fetches before anyone decides, so when its batch fetch fails it is
+checked against the store as last fetched instead, and says why; such a
+push is the person's on its card whatever a rule or the classifier would
+say, the card giving the reason, so the push that then asks has them
+there. The remote refuses it should its branch have moved since: an
+unforced push must fast-forward, and a forced one leases the tip the
+person saw.
+
+Such git asks through td-pinentry (td-pinentry/DESIGN.md, Askpass),
+found once at the window's start: beside td-agent's executable, links
+resolved, or, for an executable in `PREFIX/lib/td` as td-net launches
+the `./install-apps` layout, in `PREFIX/bin`, where `./install-apps`
+puts td-pinentry; when it is an executable file and td-agent has a
+Wayland display. It is a host's: td-pinentry refuses to run on td itself
+(its Trust position). Their git is given `GIT_ASKPASS` and `SSH_ASKPASS`
+naming it, `SSH_ASKPASS_REQUIRE=force` (OpenSSH 8.4 or later; an older
+ssh ignores it and wants a `DISPLAY` td-agent does not pass, so stays
+without a prompt), the display, and, after the fixed shape's settings,
+so replacing them, `credential.interactive=true` and an ssh command
+without `BatchMode`; `GIT_TERMINAL_PROMPT=0` stays, since git asks its
+askpass first and td-agent has no terminal. The secret goes from
+td-pinentry's window to git or ssh; td-agent, the model and the
+transcript never see it. The store thread runs one git at a time, so
+while td-pinentry's window waits every other preparation, fetch and push
+waits behind it, up to the git's own time limit. A local repository's
+receive hooks, which run as the person (Local repositories), inherit the
+askpass variables, so an ssh they run may ask too. Without td-pinentry
+or a display, the person's git stays batch, and a failure whose words
+show a prompt refused (git's "terminal prompts disabled" or "could not
+read", ssh's "Permission denied (publickey" or "Host key verification
+failed") adds that td-pinentry, which `./install-apps` installs, would
+have asked. An askpass the person set in td-agent's own environment is
+not used: td-agent's git keeps only the variables above, where td-review
+keeps the person's.
+
+**As built (prompts).** `git::Prompt::here` finds td-pinentry and the
+display; `Worker::asking` is the worker for a person's git, which
+`Service` uses for `Job::Prepare` and for a `Job::Push` whose
+`git::Push::asks` is set, which the conversation sets, through
+`Up::Push`'s `asks`, for a push allowed on its card alone;
+`Worker::stage` answers a failed fetch as `Staged::stale`, at most 1
+KiB, which makes the push the person's; and `Worker::unasked` adds the
+note to an asking worker's failure with no prompt when its words show a
+prompt refused.
 
 **Commits** are made in the jail, by the model's own `git commit` through
 `shell`, under the read-only configuration of §8.
@@ -3334,7 +3389,8 @@ push carries no binary file.
 **As built (increment 14, staging and the push).** The git worker's two
 halves of a push are built, which nothing calls yet: `git_push` will.
 `Worker::stage` fetches the remote's store, so the branch's tip is the
-remote's as of that fetch, absent when the remote has no such branch;
+remote's as of that fetch, absent when the remote has no such branch
+(or, when the fetch fails, as last fetched: Prompts);
 makes the publish repository over the store if need be; imports the
 pack, which must hold the exported commit; and computes the evidence
 against that tip. `Worker::push` pushes exactly
