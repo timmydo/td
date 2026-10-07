@@ -759,7 +759,7 @@ fn reject_unsafe_clear_target(lw: &Path) -> Result<(), String> {
 
 /// Run the explicitly selected credential authority cases in fresh root VMs.
 pub fn qemu_secret_cli(args: &[String]) -> Result<(), String> {
-    let tpm = crate::checks::qemu_boot::secret::options(args)?;
+    let (tpm, only) = crate::checks::qemu_boot::secret::selection(args)?;
     let targets = crate::checks::qemu_boot::secret::TARGETS;
     crate::checks::accel::headless_from_env()?;
     ensure_targets_provenance(targets)?;
@@ -768,7 +768,7 @@ pub fn qemu_secret_cli(args: &[String]) -> Result<(), String> {
     let runner = RecipeCheckRunner::new(root, &name)?.with_streamed_progress();
     warm_operator_inputs(&runner, targets);
     let _lock = lock_ladder_for_run(&runner)?;
-    crate::checks::qemu_boot::secret::run(&runner, tpm.as_deref())
+    crate::checks::qemu_boot::secret::run(&runner, tpm.as_deref(), only.as_deref())
 }
 
 /// Exercise credentials through the full test-only deployment and stock services.

@@ -46,7 +46,7 @@ reached only by that unlock, and so has the lock surface with its login
 unlock ("Session lock"), which C7 made live. Increment 3 is complete; its
 desktop guest moved to increment 4 as `login-desktop`. Increment 4 is
 specified as twelve commits, C1 to C11 and C10b ("Increments"), of which
-C1 to C7 have landed: firstboot ensures the login directory at every
+C1 to C8 have landed: firstboot ensures the login directory at every
 boot, the live medium's included, through the shared login-state
 predicate, and rootcheck reports it on a marker of its own; td-authd
 answers request `1a` with the login state, through that predicate and
@@ -68,7 +68,9 @@ boot-time SSH render takes the enforced form there ("SSH"). The
 compositor starts every generation locked there too ("Session lock"):
 its first frame is the lock surface, with the answer's hostname and
 username above the state's rows, and on it the chord sends an unlock's
-`1b` only while the state is enrolled. Nothing else locks yet: `Super+l`,
+`1b` only while the state is enrolled. The `login-desktop` guest shows
+that start and the unlock through the production authority and worker
+in QEMU ("Evidence"). Nothing else locks yet: `Super+l`,
 `L`, a lid close and a resume come with C9 and C10. Those three refusals
 and the locked start are all that act on the state, and only where a
 record or an invalid directory exists. Nothing else below is
@@ -1079,8 +1081,8 @@ test-only UHID binding presents in a guest as a hidraw FIDO device
 speaking CTAPHID, with keepalives within the 100 ms ceiling while the
 key works, UPNEEDED during a scripted touch ("UHID binding").
 
-Eleven `qemu-secret` guests, none with a TPM, run the root worker's own
-operation over the production discovery, Session and HID worker with
+Twelve `qemu-secret` login guests run without a TPM. Eleven of them run
+the root worker's own operation over the production discovery, Session and HID worker with
 its operation lock, against those devices, with simulated root
 acknowledgements and both retained deployments taken to read this
 build's record version (`td-secret/DESIGN.md`, "Login-key worker
@@ -1107,7 +1109,35 @@ still unlinks the record. Host tests of the worker's operation over
 in-process virtual keys cover the same cases but the keepalives, which
 only a HID device sends.
 
-A twelfth TPM-free guest, `login-powercut` (`td-secret/DESIGN.md`,
+The twelfth, `login-desktop` (`td-secret/DESIGN.md`, "Login desktop
+guest"), pairs the production compositor and td-authd over a record
+that guest's worker enrolled, through a UHID key and a UHID keyboard,
+and the host checks the display through QMP `screendump` at each step
+the guest names, the guest acting only on the host's answer. After a
+screen of a colour no compositor paints, every capture shows only that
+colour, black or the lock surface's own pixels until the exact lock
+surface with the hostname and username rows appears, at boot and again
+after the pair restarts; a client window
+mapped behind the lock leaves the whole frame the lock surface's, and
+while the generation is locked every capture, between steps included,
+holds only those colours. The chord opens the unlock: a wrong PIN typed
+into the field, its empty field and its four masks seen, ends it with
+`WRONG PIN`, still locked; a key not in the record
+ends it with `THIS KEY IS NOT ENROLLED HERE` and no PIN step; the
+enrolled key's PIN and a slow touch, the touch request seen, unlock to
+the desktop with the client's window on glass. A damaged directory
+starts locked with its cause, and the chord shows the cause with no
+`1b`: td-authd reaps no child and has none, after the chord and after
+Escape, where during the unlock before it the worker was its only
+child. Once the worker removes the record, a generation starts unlocked,
+with no lock pixel in any capture. The captures are samples, so a frame
+shown for less than a capture's interval can be missed; the
+compositor's host tests hold every frame handed to the output. Escape
+after an unlock's commit is not timed in the guest, since the commit
+round follows the touch and the success follows the commit at once;
+the compositor's host tests cover it.
+
+A thirteenth TPM-free guest, `login-powercut` (`td-secret/DESIGN.md`,
 "Login power-cut guests"), boots twelve times on one disposable disk
 whose Btrfs `@var` holds the record and both persistent keys. Ten boots
 each make one write through the worker and are killed by the host, a
@@ -1405,9 +1435,11 @@ and the oracle that shows it.
      state, a state turned unenrolled while locked, and the pin. No
      oracle reaches the locked path, since the stock image is
      unenrolled: `login-desktop` (C8) and `qemu-login-system` (C11) do.
-   - C8: the `login-desktop` guest (below), which also updates the
-     login-guest counts that say eleven (here, "Evidence", and
-     `td-secret/DESIGN.md`, "Login-key worker guests").
+   - C8, landed: the `login-desktop` guest (below, and "Evidence"), a
+     twelfth `qemu-secret` login case that `td-recipe-eval qemu-secret
+     --case login-desktop` runs alone, whose host answers the display
+     checks the guest asks for over ttyS0 (`td-secret/DESIGN.md`,
+     "Login desktop guest").
    - C9: `Super+l`, the attention screen's `L`, locking an open lifetime
      ("Session lock") and the help sheet's row.
    - C10: lid-switch (`SW_LID`) and resume-gap detection.
@@ -1442,14 +1474,17 @@ and the oracle that shows it.
    - `login-desktop` (C8), increment 3's desktop guest: a diskless,
      TPM-free `qemu-secret` login case in the desktop harness without
      its TPM measurement, with a UHID keyboard and a UHID key, and a
-     record seeded before the paired generation starts. The first frame
-     is the lock surface; the chord, the PIN typed on the keyboard and
-     the key's touch unlock it through the production authority and
-     worker; a wrong PIN, a key not in the record and Escape after the
-     commit stay locked. The host checks the framebuffer at each step
-     with QMP `screendump`, as the boot oracles' `ScreenWatch` does: the
-     lock surface's rows, the PIN field's masks, no client pixel while
-     locked, and the desktop once unlocked.
+     record the worker enrolled before the paired generation starts.
+     The first frame is the lock surface; the chord, the PIN typed on
+     the keyboard and the key's touch unlock it through the production
+     authority and worker; a wrong PIN and a key not in the record stay
+     locked; a damaged directory locks with its cause and its chord
+     sends nothing; a restarted pair locks again, and an unenrolled one
+     does not. The host checks the framebuffer at each step with QMP
+     `screendump`: the lock surface's rows, the PIN step's prompt and
+     the field's masks, no client pixel while locked, and the desktop
+     once unlocked. Escape after the commit is the compositor's host
+     tests' ("Evidence").
    - `qemu-login-system` (C11): a full-system, TPM-free guest on a
      disposable volume: a cold boot whose first frame is the lock surface,
      whose serial greeter prints the exact refusal line and starts no

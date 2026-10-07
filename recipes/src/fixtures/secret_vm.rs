@@ -131,6 +131,45 @@ pub const LOGIN_CASES: &[(&str, &str)] = &[
         "login-eight",
         "login_operation::tests::vm::qemu_login_worker_adds_keys_to_eight_and_refuses_a_ninth_before_any_token",
     ),
+    (
+        LOGIN_DESKTOP,
+        "login_operation::tests::vm::qemu_login_desktop_starts_every_generation_locked_and_unlocks_with_the_key",
+    ),
+];
+/// The paired desktop over a record the worker enrolled: a login case
+/// whose host checks the display at each step the guest names.
+pub const LOGIN_DESKTOP: &str = "login-desktop";
+/// The guest's hostname, which the lock surface shows.
+pub const LOGIN_DESKTOP_HOST: &str = "td-login-desktop";
+/// The guest asks for a display check on its console as `SCREEN NAME
+/// [ARGUMENT...]` and waits on ttyS0 for the host's `SHOWN NAME`.
+pub const LOGIN_SCREEN: &str = "TD-LOGIN-SCREEN";
+pub const LOGIN_SHOWN: &str = "TD-LOGIN-SHOWN";
+/// The checks the guest asks for, in its order: the first generation
+/// locked from its first frame, a wrong PIN and an unlock; the relock of
+/// a restarted generation; a damaged directory's; and an unenrolled one.
+pub const LOGIN_DESKTOP_SCREENS: &[&str] = &[
+    "blank",
+    "locked",
+    "locked",
+    "pin",
+    "pin",
+    "wrong-pin",
+    "locked",
+    "not-enrolled",
+    "locked",
+    "pin",
+    "pin",
+    "touch",
+    "unlocked",
+    "blank",
+    "locked",
+    "blank",
+    "locked-damaged",
+    "damaged",
+    "locked-damaged",
+    "blank-unlocked",
+    "desktop",
 ];
 /// The login record store across power cuts: one TPM-free guest test,
 /// booted once per phase, in this order, on one disposable disk.

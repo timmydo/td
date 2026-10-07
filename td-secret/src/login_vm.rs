@@ -5,9 +5,11 @@
 // operation lock, against fido_virtual keys that fido_uhid presents as
 // hidraw devices. Root is the tests' own, over a socketpair Wire. The
 // power-cut guest ("Login power-cut guests") keeps its record and keys on a
-// disposable disk across cold boots.
+// disposable disk across cold boots, and login-desktop pairs the
+// production compositor and td-authd over a record the worker enrolled.
 
 use super::*;
+use crate::fido_device::vm_tests::desktop::{self, Diagnostics, Keyboard, Pair, Process};
 use crate::fido_device::Device;
 use crate::fido_uhid::{guard, Plugged, Served, KEEPALIVE_PERIOD};
 use std::cell::Cell;
@@ -1154,6 +1156,427 @@ fn qemu_login_worker_adds_keys_to_eight_and_refuses_a_ninth_before_any_token() {
     assert_eq!(plugged.remove(), Served::default());
     assert!(ninth.transcript().is_empty());
     assert_eq!(fingerprints(), order);
+    finish();
+}
+
+// login-desktop (td-secret/DESIGN.md, "Login desktop guest"): the
+// production compositor and td-authd paired over a record this worker
+// enrolled, root simulated, through a UHID key and a UHID keyboard. The
+// host checks the display through QMP at each step the guest names
+// (recipes/src/fixtures/secret_vm.rs, LOGIN_DESKTOP_SCREENS), and the
+// guest acts only once the host has seen it.
+
+/// The host's question on the console and its answer on ttyS0.
+const SCREEN: &str = "TD-LOGIN-SCREEN";
+const SHOWN: &str = "TD-LOGIN-SHOWN";
+/// The name the lock surface shows above the account's.
+const HOSTNAME: &str = "td-login-desktop";
+const FRAMEBUFFER: &str = "/dev/fb0";
+/// QEMU's fixed output: 1280x800 at 32 bits.
+const STRIDE: usize = 1280 * 4;
+/// Magenta, which no compositor paints: the screen a generation replaces.
+const BLANK: [u8; 4] = [0xff, 0x00, 0xff, 0];
+/// Long enough for the host to see the touch request.
+const SLOW_TOUCH: Duration = Duration::from_secs(5);
+/// A client behind the lock: the compositor's own demo.
+const DEMO: &str = "/bin/td-ui-demo";
+const DEMO_READY: &str = "/run/user/1000/demo-ready";
+const ENTER: u8 = 0x28;
+const ESCAPE: u8 = 0x29;
+const CAPS_LOCK: u8 = 0x39;
+
+/// The host, which checks the display when the guest asks.
+struct Host {
+    console: File,
+    tty: File,
+    read: Vec<u8>,
+}
+
+impl Host {
+    fn open() -> Self {
+        // Not a controlling terminal, and never blocking past the deadline.
+        Self {
+            console: OpenOptions::new().write(true).open("/dev/console").unwrap(),
+            tty: OpenOptions::new()
+                .read(true)
+                .custom_flags(0o400 | 0o4000)
+                .open("/dev/ttyS0")
+                .unwrap(),
+            read: Vec::new(),
+        }
+    }
+
+    /// Asks the host to see screen `name` and waits for its answer.
+    fn screen(&mut self, name: &str, arguments: &[&str]) {
+        let mut request = format!("{SCREEN} {name}");
+        for argument in arguments {
+            request.push(' ');
+            request.push_str(argument);
+        }
+        // One write: the host reads only finished lines.
+        request.push('\n');
+        self.console.write_all(request.as_bytes()).unwrap();
+        self.console.flush().unwrap();
+        let request = request.trim_end();
+        let answer = format!("{SHOWN} {name}");
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut chunk = [0; 256];
+        loop {
+            match self.tty.read(&mut chunk) {
+                Ok(count) => self.read.extend_from_slice(&chunk[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("read ttyS0: {error}"),
+            }
+            while let Some(end) = self.read.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = self.read.drain(..=end).collect();
+                let line = String::from_utf8_lossy(&line);
+                let line = line.trim();
+                if line == answer {
+                    return;
+                }
+                assert!(!line.starts_with(SHOWN), "{line:?} answered {request:?}");
+            }
+            assert!(Instant::now() < deadline, "no answer to {request:?}");
+        }
+    }
+}
+
+/// The usages that type `pin`'s digits.
+fn digits(pin: &[u8]) -> Vec<u8> {
+    pin.iter()
+        .map(|digit| match *digit {
+            b'1'..=b'9' => 0x1e + digit - b'1',
+            b'0' => 0x27,
+            _ => panic!("not a digit"),
+        })
+        .collect()
+}
+
+fn type_pin(keyboard: &mut Keyboard, pin: &[u8]) {
+    for usage in digits(pin) {
+        keyboard.key(usage);
+    }
+}
+
+/// Ctrl+Alt+Esc, after a fresh report that drains the quarantine a
+/// closing attention screen leaves.
+fn chord(keyboard: &mut Keyboard) {
+    keyboard.key(CAPS_LOCK);
+    keyboard.report(5, 0);
+    keyboard.report(5, ESCAPE);
+    keyboard.report(0, 0);
+}
+
+/// Nothing but the compositor draws on the framebuffer: the kernel's
+/// console lets go of it.
+fn release_console() {
+    for entry in fs::read_dir("/sys/class/vtconsole").unwrap() {
+        let path = entry.unwrap().path();
+        if fs::read_to_string(path.join("name"))
+            .unwrap()
+            .contains("frame buffer")
+        {
+            fs::write(path.join("bind"), "0").unwrap();
+        }
+    }
+    for (attribute, value) in [
+        ("virtual_size", "1280,800"),
+        ("bits_per_pixel", "32"),
+        ("stride", "5120"),
+    ] {
+        let read = fs::read_to_string(format!("/sys/class/graphics/fb0/{attribute}")).unwrap();
+        assert_eq!(read.trim(), value, "{attribute}");
+    }
+}
+
+/// The screen a generation starts over: the last one's frame stays in the
+/// framebuffer until the next paints.
+fn blank_screen() {
+    fs::write(FRAMEBUFFER, BLANK.repeat(STRIDE / 4 * 800)).unwrap();
+}
+
+/// The accounts the paired session's launch admission reads, its
+/// enrolled ledger and its application policy, as the image and
+/// firstboot leave them.
+fn accounts() {
+    let session = "td-principals-v1\nsession\t1000\t993\t992\t991\n";
+    fs::create_dir_all("/etc").unwrap();
+    for (name, text, mode) in [
+        ("td-principals.tsv", session, 0o444),
+        // The session's applications: none.
+        ("td-bus-applications.tsv", "td-bus-applications-v1\t1000\n", 0o444),
+        (
+            "passwd",
+            "tester:x:1000:1000::/home/tester:/bin/false\ntdc1000:x:993:993::/run/td-compositor/1000:/bin/false\ntdb1000:x:992:992::/var/empty:/bin/false\ntdp1000:x:991:991::/var/empty:/bin/false\n",
+            0o644,
+        ),
+        (
+            "group",
+            "tester:x:1000:\ntdc1000:x:993:\ntdb1000:x:992:\ntdp1000:x:991:\n",
+            0o644,
+        ),
+        (
+            "shadow",
+            "tester::0:0:99999:7:::\ntdc1000:!td-service:0:0:99999:7:::\ntdb1000:!td-service:0:0:99999:7:::\ntdp1000:!td-service:0:0:99999:7:::\n",
+            0o600,
+        ),
+    ] {
+        let path = Path::new("/etc").join(name);
+        fs::write(&path, text).unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(mode)).unwrap();
+    }
+    fs::write("/var/lib/td/principals.tsv", session).unwrap();
+    fs::set_permissions("/var/lib/td/principals.tsv", Permissions::from_mode(0o600)).unwrap();
+}
+
+/// The compositor's runtime directories and devices, given to its account
+/// as trusted seat setup gives them; the FIDO node stays root's.
+fn seat() {
+    for (path, owner, mode) in [
+        ("/run/td-compositor", 0, 0o755),
+        ("/run/td-compositor/1000", 993, 0o755),
+        ("/run/user", 0, 0o755),
+        ("/run/user/1000", 1000, 0o700),
+        ("/home/tester", 1000, 0o700),
+    ] {
+        fs::create_dir_all(path).unwrap();
+        std::os::unix::fs::chown(path, Some(owner), Some(owner)).unwrap();
+        fs::set_permissions(path, Permissions::from_mode(mode)).unwrap();
+    }
+    for entry in fs::read_dir("/dev/input").unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("event")
+        {
+            std::os::unix::fs::chown(&path, Some(993), Some(993)).unwrap();
+            fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    std::os::unix::fs::chown(FRAMEBUFFER, Some(993), Some(993)).unwrap();
+    fs::set_permissions(FRAMEBUFFER, Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink("/bin/td-compositor", DEMO).unwrap();
+}
+
+/// A window of the account's own behind whatever the output shows.
+fn demo() -> Process {
+    let mut command = Command::new("/bin/td-login");
+    command.args([
+        "exec-as",
+        "tester",
+        "--",
+        DEMO,
+        "run",
+        "--socket",
+        "/run/td-compositor/1000/wayland-0",
+        "--ready-socket",
+        DEMO_READY,
+    ]);
+    let mut process = Process::start(command, "/run/desktop-demo.log");
+    desktop::wait("the demo client's window", || {
+        assert!(
+            process.exited().is_none(),
+            "{}",
+            fs::read_to_string("/run/desktop-demo.log").unwrap()
+        );
+        Path::new(DEMO_READY).exists()
+    });
+    process
+}
+
+/// What td-authd's reaped children have faulted (`cminflt`), which grows
+/// with every child it reaps: the login worker, the state helper and
+/// Prepare's relock.
+fn reaped(authority: u32) -> u64 {
+    let stat = fs::read_to_string(format!("/proc/{authority}/stat")).unwrap();
+    let (_, fields) = stat.rsplit_once(')').unwrap();
+    // After the name: state, ppid, pgrp, session, tty, tpgid, flags,
+    // minflt, cminflt.
+    fields.split_whitespace().nth(8).unwrap().parse().unwrap()
+}
+
+/// td-authd's live children's argument vectors.
+fn live(authority: u32) -> Vec<Vec<String>> {
+    fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+        .filter(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+        .filter(|pid| {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let (_, fields) = stat.rsplit_once(')')?;
+                    fields.split_whitespace().nth(1)?.parse::<u32>().ok()
+                })
+                == Some(authority)
+        })
+        .filter_map(|pid| fs::read(format!("/proc/{pid}/cmdline")).ok())
+        .map(|line| {
+            line.split(|byte| *byte == 0)
+                .filter(|word| !word.is_empty())
+                .map(|word| String::from_utf8_lossy(word).into_owned())
+                .collect()
+        })
+        .collect()
+}
+
+/// td-authd at rest: no live child, and none reaped while its children
+/// were counted. What it has reaped, for the next look to compare.
+fn idle(authority: u32) -> u64 {
+    let before = reaped(authority);
+    let children = live(authority);
+    let after = reaped(authority);
+    assert!(children.is_empty(), "td-authd's children: {children:?}");
+    assert_eq!(before, after, "td-authd reaped a child while counting");
+    before
+}
+
+/// A paired generation, once td-authd has no live child at one look.
+fn settled() -> Pair {
+    let pair = Pair::start();
+    desktop::wait("the authority with no live child", || {
+        live(pair.authority()).is_empty()
+    });
+    pair
+}
+
+#[test]
+#[ignore = "requires qemu-secret with a disposable guest, UHID and the paired desktop"]
+fn qemu_login_desktop_starts_every_generation_locked_and_unlocks_with_the_key() {
+    guard("login-desktop");
+    let _diagnostics = Diagnostics;
+    applet(&["hostname", HOSTNAME]);
+    let mut host = Host::open();
+    let mut keyboard = Keyboard::new();
+    release_console();
+    prepare();
+    accounts();
+    seat();
+    // The record, as the fixture rule seeds one: a one-key enrollment
+    // through this worker, root simulated, both deployments reading this
+    // build's version.
+    let key = blank("desktop");
+    let plugged = Plugged::insert(&key, NAME);
+    let (result, _) = physical(begins(enrolling(1, 1, LoginStep::Connect)));
+    assert_eq!(result, Ok(()));
+    let id = newest(&key);
+    assert_eq!(stored(), Some(vec![id.clone()]));
+    let print = hex(&fingerprint(&id));
+
+    // Enrolled: the generation's first frame is the lock surface, and a
+    // client's window behind it shows nothing.
+    blank_screen();
+    host.screen("blank", &[]);
+    let pair = settled();
+    host.screen("locked", &[]);
+    let client = demo();
+    host.screen("locked", &[]);
+
+    // The chord runs the unlock: a wrong PIN ends it, still locked, and
+    // starts no touch.
+    chord(&mut keyboard);
+    host.screen("pin", &[&print, "8", "0"]);
+    type_pin(&mut keyboard, WRONG);
+    host.screen("pin", &[&print, "8", "4"]);
+    keyboard.key(ENTER);
+    host.screen("wrong-pin", &[]);
+    assert_eq!(key.state().retries, 7);
+    keyboard.key(ESCAPE);
+    host.screen("locked", &[]);
+
+    // A key holding none of the record's credentials ends it at identify,
+    // with no PIN step.
+    let served = plugged.remove();
+    // Enrollment's three sessions, then the wrong PIN's identify and
+    // assertion sessions.
+    assert_eq!(served.channels, 3 + 2);
+    let stranger = blank("stranger");
+    let plugged = Plugged::insert(&stranger, NAME);
+    chord(&mut keyboard);
+    host.screen("not-enrolled", &[]);
+    keyboard.key(ESCAPE);
+    host.screen("locked", &[]);
+    assert_eq!(plugged.remove().channels, 1);
+    assert_eq!(stranger.state().retries, 8);
+    let plugged = Plugged::insert(&key, NAME);
+
+    // The key's PIN and its touch unlock, to the client's window.
+    key.script(Script {
+        presence: Presence::Delayed(SLOW_TOUCH),
+        ..Script::default()
+    });
+    let before = reaped(pair.authority());
+    chord(&mut keyboard);
+    host.screen("pin", &[&print, "7", "0"]);
+    type_pin(&mut keyboard, PIN);
+    host.screen("pin", &[&print, "7", "4"]);
+    keyboard.key(ENTER);
+    host.screen("touch", &[&print, "7"]);
+    // Within the scripted touch, the one worker td-authd started for the
+    // unlock's 1b is its only child: what the damaged directory below
+    // must not see.
+    let children = live(pair.authority());
+    assert_eq!(children.len(), 1, "td-authd's children: {children:?}");
+    assert!(
+        children[0].iter().any(|word| word == "login-operation"),
+        "{children:?}"
+    );
+    host.screen("unlocked", &[]);
+    assert_eq!(key.state().retries, 8);
+    // Its reaping, among others, shows in what td-authd's reaped children
+    // faulted, which the check below reads.
+    assert!(reaped(pair.authority()) > before);
+    pair.disconnect();
+    drop(client);
+    // The unlock's identify and assertion sessions.
+    assert_eq!(plugged.remove().channels, 2);
+
+    // A restarted generation starts locked again.
+    blank_screen();
+    host.screen("blank", &[]);
+    let pair = settled();
+    host.screen("locked", &[]);
+    pair.disconnect();
+
+    // A damaged directory: locked with its cause, and the chord shows the
+    // cause and sends no unlock, so td-authd starts no worker.
+    fs::set_permissions(directory(), Permissions::from_mode(0o755)).unwrap();
+    blank_screen();
+    host.screen("blank", &[]);
+    let pair = settled();
+    host.screen("locked-damaged", &[]);
+    let before = idle(pair.authority());
+    chord(&mut keyboard);
+    host.screen("damaged", &[]);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(idle(pair.authority()), before);
+    keyboard.key(ESCAPE);
+    host.screen("locked-damaged", &[]);
+    // Nor on Escape, nor on the lock surface again.
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(idle(pair.authority()), before);
+    pair.disconnect();
+    fs::set_permissions(directory(), Permissions::from_mode(0o700)).unwrap();
+
+    // Unenrolled, the record removed through the worker: unlocked from the
+    // generation's first frame.
+    key.script(Script::default());
+    let plugged = Plugged::insert(&key, NAME);
+    let removed = slots(&[fingerprint(&id)], &[1]);
+    let (result, _) = physical(begins(removing(1, &removed, LoginStep::Identify)));
+    assert_eq!(result, Ok(()));
+    assert!(matches!(state(), State::Unenrolled));
+    plugged.remove();
+    blank_screen();
+    host.screen("blank-unlocked", &[]);
+    let pair = Pair::start();
+    host.screen("desktop", &[]);
+    pair.disconnect();
     finish();
 }
 

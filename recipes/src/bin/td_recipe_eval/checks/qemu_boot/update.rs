@@ -975,8 +975,8 @@ pub(super) fn row_matches(pixels: &[u8], top: usize, text: &str) -> Result<bool>
 }
 
 // The attention menu uses the small chrome face; consent uses Unifont.
-// Rows are space, colon, A through Z, then hyphen.
-const MENU_GLYPHS: [[u8; 7]; 29] = [
+// Rows are space, colon, A through Z, then hyphen and plus.
+const MENU_GLYPHS: [[u8; 7]; 30] = [
     [0, 0, 0, 0, 0, 0, 0],
     [0, 4, 4, 0, 4, 4, 0],
     [14, 17, 17, 31, 17, 17, 17],
@@ -1006,6 +1006,7 @@ const MENU_GLYPHS: [[u8; 7]; 29] = [
     [17, 17, 10, 4, 4, 4, 4],
     [31, 1, 2, 4, 8, 16, 31],
     [0, 0, 0, 31, 0, 0, 0],
+    [0, 4, 4, 31, 4, 4, 0],
 ];
 
 /// The chrome face's rows for `character`, top first, five bits each.
@@ -1015,6 +1016,7 @@ fn chrome_glyph(character: u8) -> Result<&'static [u8; 7]> {
         b':' => 1,
         b'A'..=b'Z' => usize::from(character - b'A') + 2,
         b'-' => 28,
+        b'+' => 29,
         _ => return Err("unsupported chrome glyph".into()),
     };
     MENU_GLYPHS
@@ -1683,11 +1685,19 @@ mod tests {
     }
 
     /// A notice row drawn from the compositor's own chrome glyphs, hyphen
-    /// included, matches only where and as it is drawn.
+    /// and plus included, matches only where and as it is drawn.
     #[test]
     fn menu_notice_rows_match_the_chrome_font_with_its_hyphen() {
+        for text in [
+            "SYSTEM INSTALLED - RESTART TO BOOT IT",
+            "PRESS CTRL+ALT+ESC TO UNLOCK",
+        ] {
+            notice_row_matches_the_chrome_font(text);
+        }
+    }
+
+    fn notice_row_matches_the_chrome_font(text: &str) {
         let chrome = include_str!("../../../../../../td-compositor/src/ui.rs");
-        let text = "SYSTEM INSTALLED - RESTART TO BOOT IT";
         let top = 312;
         let mut pixels = [24, 32, 40].repeat(1280 * 800);
         for (column, character) in text.chars().enumerate() {
@@ -1717,7 +1727,8 @@ mod tests {
         }
         assert!(menu_row_matches(&pixels, top, text).unwrap());
         assert!(!menu_row_matches(&pixels, top + 36, text).unwrap());
-        assert!(!menu_row_matches(&pixels, top, "SYSTEM INSTALLED   RESTART TO BOOT IT").unwrap());
+        let blanked = text.replace(['-', '+'], " ");
+        assert!(!menu_row_matches(&pixels, top, &blanked).unwrap());
         assert!(menu_row_matches(&pixels, top, "a").is_err());
     }
 

@@ -1689,7 +1689,7 @@ pub(crate) mod tests {
 }
 
 #[cfg(test)]
-mod vm_tests {
+pub(crate) mod vm_tests {
     use super::*;
     use crate::fido_uhid::{guard, Uhid, FIDO_DESCRIPTOR, FIDO_PRODUCT};
     use std::sync::{
@@ -2677,7 +2677,7 @@ mod vm_tests {
         private_operations(true);
     }
 
-    mod desktop {
+    pub(crate) mod desktop {
         use super::*;
         mod system {
             include!("system_vm.rs");
@@ -2686,7 +2686,7 @@ mod vm_tests {
         use std::path::Path;
         use std::sync::atomic::AtomicUsize;
 
-        struct Diagnostics;
+        pub(crate) struct Diagnostics;
         impl Drop for Diagnostics {
             fn drop(&mut self) {
                 if !thread::panicking() {
@@ -2700,6 +2700,7 @@ mod vm_tests {
                     "/run/desktop-portal.log",
                     "/run/desktop-mail.log",
                     "/run/desktop-news.log",
+                    "/run/desktop-demo.log",
                 ] {
                     if let Ok(file) = File::open(log) {
                         let mut bytes = Vec::new();
@@ -2711,7 +2712,7 @@ mod vm_tests {
             }
         }
 
-        fn wait(label: &str, mut done: impl FnMut() -> bool) {
+        pub(crate) fn wait(label: &str, mut done: impl FnMut() -> bool) {
             let deadline = Instant::now() + Duration::from_secs(15);
             while !done() {
                 assert!(
@@ -3104,9 +3105,9 @@ mod vm_tests {
             0, 0x29, 0x65, 0x81, 0, 0xc0,
         ];
 
-        struct Keyboard(Uhid);
+        pub(crate) struct Keyboard(Uhid);
         impl Keyboard {
-            fn new() -> Self {
+            pub(crate) fn new() -> Self {
                 let device = Uhid::create("td desktop keyboard", 2, KEYBOARD);
                 wait("keyboard enumeration", || {
                     fs::read_dir("/sys/class/input").unwrap().any(|entry| {
@@ -3122,11 +3123,11 @@ mod vm_tests {
                 });
                 Self(device)
             }
-            fn report(&mut self, modifiers: u8, key: u8) {
+            pub(crate) fn report(&mut self, modifiers: u8, key: u8) {
                 self.0.input(&[modifiers, 0, key, 0, 0, 0, 0, 0]);
                 thread::sleep(Duration::from_millis(100));
             }
-            fn key(&mut self, key: u8) {
+            pub(crate) fn key(&mut self, key: u8) {
                 self.report(0, key);
                 self.report(0, 0);
             }
@@ -3143,9 +3144,9 @@ mod vm_tests {
             }
         }
 
-        struct Process(std::process::Child);
+        pub(crate) struct Process(std::process::Child);
         impl Process {
-            fn start(mut command: Command, log: &str) -> Self {
+            pub(crate) fn start(mut command: Command, log: &str) -> Self {
                 let errors = OpenOptions::new()
                     .write(true)
                     .create(true)
@@ -3160,7 +3161,7 @@ mod vm_tests {
                     .stderr(errors);
                 Self(command.spawn().unwrap())
             }
-            fn exited(&mut self) -> Option<std::process::ExitStatus> {
+            pub(crate) fn exited(&mut self) -> Option<std::process::ExitStatus> {
                 self.0.try_wait().unwrap()
             }
         }
@@ -3171,12 +3172,12 @@ mod vm_tests {
             }
         }
 
-        struct Pair {
+        pub(crate) struct Pair {
             compositor: Process,
             authority: Process,
         }
         impl Pair {
-            fn start() -> Self {
+            pub(crate) fn start() -> Self {
                 let (root, peer) = UnixStream::pair().unwrap();
                 let mut command = Command::new("/bin/td-authd");
                 command
@@ -3246,7 +3247,11 @@ mod vm_tests {
                 no_release();
                 pair
             }
-            fn disconnect(mut self) {
+            /// The paired authority's process, whose children are its workers.
+            pub(crate) fn authority(&self) -> u32 {
+                self.authority.0.id()
+            }
+            pub(crate) fn disconnect(mut self) {
                 assert!(self.authority.exited().is_none());
                 assert!(self.compositor.exited().is_none());
                 self.compositor.0.kill().unwrap();

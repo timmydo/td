@@ -2519,8 +2519,9 @@ pins; safe code cannot observe freed memory.
 
 ### Login-key worker guests
 
-`td-recipe-eval qemu-secret` runs eleven more fresh, diskless guests, with
-or without `--tpm`, since none needs a TPM. Each boots the same kernel
+`td-recipe-eval qemu-secret` runs twelve more fresh, diskless login
+guests, with or without `--tpm`, since none needs a TPM: the eleven here
+and `login-desktop` (below). Each boots the same kernel
 and fixture init as the authority cases with `td.hid-fixture=1`, selects
 one ignored test of `login_vm.rs`, a module of the worker's tests, and
 holds the 180-second bound and the one-test passing summary. The test
@@ -2577,8 +2578,118 @@ acknowledgements are simulated root, the keys are software, and USB
 metadata and presence are fixtures: this proves no USB controller,
 YubiKey behaviour, physical presence or touch timing, and no td-authd
 supervision. td-authd's host tests drive its supervision against
-scripted workers, and its `supervise-login` authority case runs this worker's
-refusals through the real paired Session.
+scripted workers, its `supervise-login` authority case runs this worker's
+refusals through the real paired Session, and `login-desktop` runs its
+unlock under the production td-authd.
+
+### Login desktop guest
+
+`login-desktop`, the twelfth login case, is TOKEN-LOGIN.md increment
+4's C8 desktop guest: the paired production compositor and td-authd over
+a record this worker enrolled, through a UHID keyboard and a UHID key,
+with no TPM, no persistent disk and no portal.
+`td-recipe-eval qemu-secret --case login-desktop` runs it alone, on KVM
+as every boot oracle does; `--case NAME` selects any one guest, a TPM
+guest only beside `--tpm`, but not one that opens the disk or TPM state
+an earlier guest of the run leaves (`tpm-reopen`, `tpm-pcr`,
+`tpm-other`, `fido-cold-reopen`, `fido-cold-recovery-reopen`), which it
+refuses. Like the other secret guests it is run by
+hand and is in neither `check` nor `check integration`. Its one ignored
+test, `qemu_login_desktop_starts_every_generation_locked_and_unlocks_with_the_key`
+in `login_vm.rs`, holds the one-test passing summary within a
+300-second bound. The guest carries the production `td-authd`,
+`td-firstboot`, `td-login` and `td-compositor`, which the plain command
+now stages for every guest; the TPM desktop guests add the broker,
+portal and jail.
+
+The guest sets its hostname, releases the framebuffer from the kernel's
+console (its vtconsole unbound, so no cursor draws), and checks the
+fixed 1280x800, 32-bit output. It makes the login directory as the
+worker guests do, the session's accounts and enrolled principal ledger
+as firstboot leaves them, the image's bus application policy naming no
+application, the compositor's runtime directories, and
+gives the compositor's account the input and framebuffer nodes, as
+seat setup does; the FIDO node stays root's. The record is seeded by
+TOKEN-LOGIN.md's fixture rule: a one-key enrollment through this
+worker's own `operate`, root simulated and both retained deployments
+reading this build's version, as `login-enroll-one` does. The pair is
+the fido-desktop guest's (`Pair`, `Keyboard` and `Process` from
+`fido_device`'s desktop module), without its TPM measurement, store or
+portal.
+
+The host checks the display. The guest writes `TD-LOGIN-SCREEN NAME
+[ARGUMENT...]` to `/dev/console` and waits on ttyS0, read without
+becoming its controlling terminal, for `TD-LOGIN-SHOWN NAME`. The host
+(`guest_screens.rs`, beside the boot oracles) takes the request from a
+finished console line, requires the names in `LOGIN_DESKTOP_SCREENS`'
+order, captures the display through QMP `screendump` until that name's
+check accepts a whole 1280x800 capture, within 60 seconds, and only then
+types the answer into the serial socket, so the guest acts on nothing
+the host has not seen. A screen given arguments it does not take is
+refused at once. A screen may hold from its answer until the next is
+accepted: the host keeps capturing back to back whether or not the
+guest has asked for the next screen, and every capture meanwhile, the
+accepting one included, must satisfy the hold. Every screen of a
+locked generation holds only the guest's magenta, black, and the
+attention ground and white, which the lock surface, the attention
+screens and the PIN step paint, so no client or desktop pixel shows
+while locked, between steps included; `touch` holds nothing, since its
+successor is the unlock, `unlocked` and `blank-unlocked` hold no pixel
+of the attention ground, and `desktop`, the last, holds nothing. After
+the boot, a request left in the console's last lines fails. Host tests
+pin the guest's requests, in its source order, to that list, every
+check to an independently drawn frame, each screen's hold, and the
+judgement of holds across requests.
+
+| Screen | The host accepts |
+| --- | --- |
+| `blank` | every pixel the guest's magenta, which no compositor paints; holds the lock palette (magenta, black, the attention ground and white) until the next screen |
+| `blank-unlocked` | the same magenta |
+| `locked` | exactly the lock surface: `TD-LOGIN-DESKTOP`, `TESTER`, `LOCKED` and `PRESS CTRL+ALT+ESC TO UNLOCK` in the chrome rows from 276, every other pixel the ground |
+| `locked-damaged` | the same with `LOGIN KEY STATE UNAVAILABLE:` and `DIRECTORY DAMAGED` |
+| `pin FINGERPRINT RETRIES MASKS` | exactly the unlock's PIN step: consent's eight rows for that key and count and a time line, centred in doubled Unifont, `ENTER THE PIN FOR THIS KEY` a row gap below, and that many masks |
+| `touch FINGERPRINT RETRIES` | the same prompt with `TOUCH YOUR KEY` and no mask |
+| `wrong-pin`, `not-enrolled`, `damaged` | exactly the attention screen's title, `WRONG PIN`, `THIS KEY IS NOT ENROLLED HERE` or the cause's two rows, and `ESC TO RETURN` |
+| `unlocked` | no attention-ground pixel, the status bar's band mostly its ground, and a window's title band, focused or not, on glass |
+| `desktop` | the same without the window |
+
+The guest blanks the framebuffer before each generation, since the last
+one's frame stays there, and asks in this order:
+
+1. Enrolled: `blank`, then the pair's `locked`; the demo client
+   (`/bin/td-ui-demo`, the compositor's own, as the account) maps a
+   window, and `locked` again shows no pixel of it.
+2. The chord's unlock with the wrong PIN: `pin` with no mask and with
+   four, Enter, `wrong-pin`, the key's retries now 7, Escape, `locked`.
+3. A key that holds no credential of the record in the enrolled key's
+   place: the chord's `not-enrolled`, with no PIN step, Escape, `locked`.
+4. The enrolled key again, its touch scripted to take five seconds: the
+   chord, `pin` for 7 retries with no mask and with four, Enter,
+   `touch`, and within the touch td-authd's only live child is the
+   `login-operation` worker it started for the `1b`; then `unlocked`,
+   the retries 8 again. td-authd's reaped children's fault count
+   (`cminflt`) grew: reaping the worker, among others such as the state
+   helper the compositor's `1a` runs afterwards, shows there.
+5. The pair restarted: `blank`, `locked`.
+6. The login directory made mode 0755: `blank`, `locked-damaged`, the
+   chord's `damaged`, and a second later td-authd's reaped children's
+   fault count unchanged, read before and after its children are
+   counted, and no child of it alive, so no worker started and no `1b`
+   came; Escape, `locked-damaged`, and a second later the same again,
+   so none came on Escape or back on the lock surface. The mode is
+   restored.
+7. The record removed through the worker: `blank-unlocked`, then the
+   pair's `desktop`.
+
+Each key served exactly the sessions its operations need. This proves
+the paired desktop's locked start, unlock and refusals against the
+production compositor, authority and worker in a guest; it does not
+prove a frame the captures did not sample, which the compositor's host
+tests hold for every frame handed to the output, nor Escape after an
+unlock's commit, which the guest cannot time since the commit round
+follows the touch and success follows the commit at once. The keys and
+keyboard are UHID fixtures, presence is scripted, and enrollment's root
+is simulated; there is no physical-presence, USB or YubiKey claim.
 
 ### Login power-cut guests
 

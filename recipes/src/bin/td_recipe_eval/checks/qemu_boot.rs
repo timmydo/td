@@ -32,6 +32,7 @@ pub(crate) mod build_iso;
 pub(crate) mod efi;
 pub(crate) mod encrypted;
 pub(crate) mod encrypted_boot;
+pub(crate) mod guest_screens;
 pub(crate) mod install;
 pub(crate) mod live;
 pub(crate) mod media;
@@ -687,6 +688,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             answers: None,
             cut: false,
             keep_console: None,
+            screens: None,
             screen: None,
             shell: None,
         },
@@ -747,6 +749,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
             answers: None,
             cut: false,
             keep_console: None,
+            screens: None,
             screen: None,
             shell: None,
         },
@@ -887,6 +890,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             answers: None,
             cut: false,
             keep_console: None,
+            screens: None,
             screen: None,
             shell: None,
         },
@@ -1480,6 +1484,7 @@ fn boot_system_once(
             answers: None,
             cut: false,
             keep_console: None,
+            screens: None,
             screen: None,
             shell: None,
         },
@@ -1521,6 +1526,7 @@ fn boot_failed_target_once(
             answers: None,
             cut: false,
             keep_console: None,
+            screens: None,
             screen: None,
             shell: None,
         },
@@ -2744,6 +2750,7 @@ pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
             answers: None,
             cut: false,
             keep_console: None,
+            screens: None,
             screen: None,
             shell: None,
         },
@@ -2834,6 +2841,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             answers: None,
             cut: false,
             keep_console: None,
+            screens: None,
             screen: None,
             shell: None,
         },
@@ -2983,6 +2991,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
             answers: None,
             cut: false,
             keep_console: None,
+            screens: None,
             screen: None,
             shell: None,
         },
@@ -4561,6 +4570,9 @@ struct BootPlan<'a> {
     /// console to instead of the boot's scratch, so that it outlives the
     /// boot for a caller that must scan every byte. The caller removes it.
     keep_console: Option<&'a Path>,
+    /// Display checks the guest asks for on its console and waits for on
+    /// ttyS0 (`guest_screens`); a boot that ends before the last fails.
+    screens: Option<&'a guest_screens::GuestScreens<'a>>,
 }
 
 /// A capture the display must come to show: what it is, and the check of
@@ -4958,21 +4970,32 @@ fn boot_source(
     if input && plan.screen.is_some() {
         return Err("a screen expectation cannot share QMP with an input controller".into());
     }
-    let qmp_scratch =
-        if input || plan.screen.is_some() || plan.shell.is_some() || plan.answers.is_some() {
-            Some(Scratch {
-                dir: create_qmp_scratch_dir(&env::temp_dir(), &QMP_SEQ)?,
-            })
-        } else {
-            None
-        };
+    if plan.screens.is_some()
+        && (input || plan.screen.is_some() || plan.shell.is_some() || plan.answers.is_some())
+    {
+        return Err(
+            "guest screens cannot share QMP or the serial console with another controller".into(),
+        );
+    }
+    let qmp_scratch = if input
+        || plan.screen.is_some()
+        || plan.shell.is_some()
+        || plan.answers.is_some()
+        || plan.screens.is_some()
+    {
+        Some(Scratch {
+            dir: create_qmp_scratch_dir(&env::temp_dir(), &QMP_SEQ)?,
+        })
+    } else {
+        None
+    };
     let qmp_path = qmp_scratch
         .as_ref()
-        .filter(|_| input || plan.screen.is_some())
+        .filter(|_| input || plan.screen.is_some() || plan.screens.is_some())
         .map(|scratch| scratch.dir.join("qmp.sock"));
     let serial_path = qmp_scratch
         .as_ref()
-        .filter(|_| plan.shell.is_some() || plan.answers.is_some())
+        .filter(|_| plan.shell.is_some() || plan.answers.is_some() || plan.screens.is_some())
         .map(|scratch| scratch.dir.join("tty.sock"));
     // Every non-audit oracle disables audit initialization explicitly. Merely
     // leaving the kernel's audit state off still permits unconditional seccomp
@@ -5232,6 +5255,10 @@ fn boot_source(
     let mut responder = plan
         .answers
         .map(|answers| serial_shell::ConsoleResponder::new(answers, CAP));
+    let mut screens = plan
+        .screens
+        .zip(qmp_path.clone())
+        .map(|(steps, path)| guest_screens::ScreenSteps::new(steps, path, CAP));
     let mut setup_input = match (source, qmp_path) {
         (BootSource::LiveSetup { script, .. }, Some(path)) => {
             let capture = path.with_file_name("attention.ppm");
@@ -5340,6 +5367,17 @@ fn boot_source(
                 ));
             }
         }
+        if let (Some(steps), Some(port)) = (screens.as_mut(), serial_port.as_mut()) {
+            if let Err(error) = steps.poll(port, &buf) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let console = String::from_utf8_lossy(&buf);
+                return Err(format!(
+                    "{error}. Last serial output:\n{}",
+                    tail(&console, 80)
+                ));
+            }
+        }
         // The marker kill waits for the display, the shell and the answers,
         // and briefly for the side channel: QEMU drains the guest's virtio
         // queue on its own schedule, so a write the guest made before its
@@ -5356,6 +5394,7 @@ fn boot_source(
             || responder
                 .as_ref()
                 .is_some_and(|responder| !responder.done())
+            || screens.as_ref().is_some_and(|steps| !steps.done())
             || draining;
         if evidence.target && plan.kill_on_marker && !waits {
             let sent = child.kill().is_ok();
@@ -5412,7 +5451,11 @@ fn boot_source(
             end = EndReason::TimedOut(timeout.as_secs());
             break;
         }
-        thread::sleep(if plan.cut { CUT_POLL } else { POLL });
+        // A screen being watched is captured as fast as QMP gives captures.
+        let watching = screens
+            .as_ref()
+            .is_some_and(guest_screens::ScreenSteps::watching);
+        thread::sleep(if plan.cut || watching { CUT_POLL } else { POLL });
     }
 
     // Drain all final bytes qemu flushed before it was reaped. A marker-killed
@@ -5489,6 +5532,14 @@ fn boot_source(
                 tail(&console, 80)
             ));
         }
+    }
+    // The final drain's lines too: a request after the last answer, or
+    // one the display can no longer be checked for, fails.
+    if let Some(Err(error)) = screens.as_mut().map(|steps| steps.finish(&buf)) {
+        return Err(format!(
+            "{reason}; {error}. Last serial output:\n{}",
+            tail(&console, 80)
+        ));
     }
     if let Some(watch) = screen
         .as_ref()
@@ -13058,6 +13109,7 @@ mod tests {
             answers: None,
             cut: false,
             keep_console: None,
+            screens: None,
             screen: None,
             shell: None,
         };
@@ -13091,6 +13143,74 @@ mod tests {
             assert!(
                 error.contains("live setup boot"),
                 "{append} {read_only}: {error}"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Guest screens own QMP and the serial socket: a plan that also has
+    /// a screen, a shell, answers or input is refused before QEMU runs.
+    #[test]
+    fn guest_screens_refuse_every_other_qmp_or_serial_controller() {
+        let dir = std::env::temp_dir().join(format!(
+            "td-guest-screens-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let steps = guest_screens::GuestScreens {
+            prompt: "ASK",
+            answer: "SEEN",
+            screens: &[],
+            order: &[],
+            keep: None,
+        };
+        let check = |_: &[u8]| Ok(true);
+        let shell: [serial_shell::ShellStep; 0] = [];
+        let answers = serial_shell::ConsoleAnswers {
+            answers: &[],
+            refusal: "never",
+        };
+        let kernel = Path::new("/nonexistent/bzImage");
+        for other in ["screen", "shell", "answers", "input"] {
+            let plan = BootPlan {
+                disk: None,
+                mem: "64",
+                target_marker: "never",
+                kill_on_marker: false,
+                extra_append: "",
+                user_net: false,
+                audio: false,
+                physical_input: other == "input",
+                capture_firefox_audio: false,
+                tpm_socket: None,
+                side_channel: None,
+                answers: (other == "answers").then_some(&answers),
+                cut: false,
+                keep_console: None,
+                screens: Some(&steps),
+                screen: (other == "screen").then_some(ScreenExpect {
+                    what: "anything",
+                    check: &check,
+                }),
+                shell: (other == "shell").then_some(&shell[..]),
+            };
+            let source = BootSource::Direct {
+                kernel,
+                initramfs: kernel,
+            };
+            let error = boot_source(
+                "/nonexistent/qemu",
+                source,
+                plan,
+                &dir,
+                Duration::from_secs(1),
+            )
+            .err()
+            .unwrap();
+            assert!(
+                error.contains("guest screens cannot share"),
+                "{other}: {error}"
             );
         }
         fs::remove_dir_all(&dir).unwrap();

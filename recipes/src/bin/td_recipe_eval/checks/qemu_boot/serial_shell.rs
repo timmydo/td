@@ -106,7 +106,7 @@ impl SerialPort {
         })
     }
 
-    fn send(&mut self, line: &str) -> Result<(), String> {
+    pub(super) fn send(&mut self, line: &str) -> Result<(), String> {
         self.send_bytes(line.as_bytes())
     }
 
