@@ -22,7 +22,8 @@ implementation or compatibility claims.
 
 td-term is its own crate, `td-term/`, and its own static binary. Its manifest
 declares two dependencies, `td-fs = { path = "../td-fs" }`, whose atomic
-replace installs the runtime terminfo entry, and `td-ui = { path =
+replace installs the runtime terminfo entry and whose bounded read takes
+`/proc/self/status` and `/etc/passwd`, and `td-ui = { path =
 "../td-ui" }`, and its lock lists exactly td-term, td-fs and td-ui. It is a
 td-ui client like td-editor or td-portal's chooser: the Wayland wire codec,
 the connection and its SCM_RIGHTS transport, the object table, the seat,

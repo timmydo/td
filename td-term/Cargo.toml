@@ -7,7 +7,8 @@ license = "MIT"
 
 # Own workspace root, so cargo behaves the same from the main checkout as from
 # a worktree nested under it (see the root Cargo.toml). The toolkit and td-fs,
-# whose atomic replace installs the terminfo entry, are the two dependencies,
+# whose atomic replace installs the terminfo entry and whose bounded read
+# takes the status and passwd files, are the two dependencies,
 # sibling paths in the one spelling the lock guard admits (AGENTS.md 'Rust
 # code').
 [workspace]

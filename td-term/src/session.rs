@@ -7,8 +7,6 @@
 //! and the threads.
 
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use td_ui::proc_status::effective_uid;
 use td_ui::pty::ChildCommand;
@@ -17,8 +15,8 @@ use td_ui::pty::ChildCommand;
 pub const DEFAULT_SHELL: &str = "/bin/sh";
 
 /// Bounded reads of the two small files the child environment is derived from.
-const MAX_STATUS_BYTES: usize = 64 * 1024;
-const MAX_PASSWD_BYTES: usize = 1024 * 1024;
+const MAX_STATUS_BYTES: u64 = 64 * 1024;
+const MAX_PASSWD_BYTES: u64 = 1024 * 1024;
 
 /// The graphical account, as `/proc/self/status` and `/etc/passwd` agree it is.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,25 +26,9 @@ pub struct Account {
     pub home: String,
 }
 
-fn read_bounded(path: &Path, limit: usize) -> Result<String, String> {
-    let metadata = std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
-    if metadata.len() > limit as u64 {
-        return Err(format!(
-            "{} is larger than the {limit}-byte bound",
-            path.display()
-        ));
-    }
-    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let mut bytes = Vec::with_capacity(limit.min(4096));
-    file.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    if bytes.len() > limit {
-        return Err(format!(
-            "{} is larger than the {limit}-byte bound",
-            path.display()
-        ));
-    }
+/// The text of `path`, refused past `limit` bytes (`td_fs::read_bounded`).
+fn read_text(path: &Path, limit: u64) -> Result<String, String> {
+    let bytes = td_fs::read_bounded(path, limit).map_err(|e| e.to_string())?;
     String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))
 }
 
@@ -98,15 +80,12 @@ pub fn account(passwd: &str, uid: u32) -> Result<Account, String> {
 
 /// The uid td-term runs as, from the live process's status.
 pub fn current_uid(status: &Path) -> Result<u32, String> {
-    effective_uid(&read_bounded(status, MAX_STATUS_BYTES)?)
+    effective_uid(&read_text(status, MAX_STATUS_BYTES)?)
 }
 
 /// The account td-term runs as, read from the live process and account files.
 pub fn current_account(status: &Path, passwd: &Path) -> Result<Account, String> {
-    account(
-        &read_bounded(passwd, MAX_PASSWD_BYTES)?,
-        current_uid(status)?,
-    )
+    account(&read_text(passwd, MAX_PASSWD_BYTES)?, current_uid(status)?)
 }
 
 /// The child's whole environment: `spawn` clears and sets exactly this, so a

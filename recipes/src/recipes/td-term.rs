@@ -8,7 +8,8 @@ use crate::types::Recipe;
 /// and its record filter by relative `#[path]` and embeds the licence notices
 /// under `td-compositor/assets`, so both sibling trees are staged beside
 /// td-term: the td-photo shape. td-fs, whose atomic replace installs the
-/// runtime terminfo entry, is staged too. Its lock lists only itself, td-fs
+/// runtime terminfo entry and whose bounded read takes the status and
+/// passwd files, is staged too. Its lock lists only itself, td-fs
 /// and td-ui, so the closure is std and the vendor set is empty; the binary
 /// is linked fully static, as every td-owned program in the system tree is. The compiled
 /// terminfo entry is data this binary writes, so `td-term-terminfo` produces
