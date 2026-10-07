@@ -485,6 +485,9 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     ));
     runtime.set_launcher_application(options.launcher_application.as_deref());
     runtime.set_launcher_authority(options.terminal_authority);
+    if let launcher::LaunchBackend::Authority(authority) = &launches {
+        runtime.set_hostnames(authority.hostnames());
+    }
     if let Some((((path, app_id), content_rgb_a), content_rgb_b)) = options
         .application_ready_socket
         .as_deref()
@@ -1102,7 +1105,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0xa8d88b8e2fa4064e;
+    const AUTHORITY_FINGERPRINT: u64 = 0x6a026bb2620db17f;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -3311,13 +3314,14 @@ pub struct MappedRegion {
     }
 
     /// Elevation consent (DESIGN.md, "Elevation consent"): `B` asks root
-    /// for a rollback in every build, since L3, and `H` is not bound; and
-    /// an elevation's one commit, root's exact description and so its key,
-    /// follows only the two digits the evdev adapter offers. What a runtime
-    /// test cannot see is held here: that no test-only switch decides `B`,
-    /// and that no other path confirms.
+    /// for a rollback in every build, since L3, and `H` for the queued
+    /// hostname change, since L4; and an elevation's one commit, root's
+    /// exact description and so its key, follows only the two digits the
+    /// evdev adapter offers. What a runtime test cannot see is held here:
+    /// that no test-only switch decides `B` or `H`, and that no other path
+    /// confirms.
     #[test]
-    fn b_selects_a_rollback_and_only_the_typed_key_commits_an_elevation() {
+    fn b_and_h_select_elevations_and_only_the_typed_key_commits_one() {
         let input = production(include_str!("input.rs"));
         let client = production(include_str!("secret_client.rs"));
         let body = |source: &'static str, head: &str| -> &'static str {
@@ -3329,15 +3333,17 @@ pub struct MappedRegion {
                 .unwrap()
                 .0
         };
-        // `B`: the lifetime's one selection, root's rollback (L3), in
-        // every build; no test-only switch decides it.
+        // `B` and `H`: the lifetime's one selection, root's rollback (L3)
+        // and the queued hostname change (L4), in every build; no
+        // test-only switch decides either.
         let select = body(input, "    fn select(");
         assert!(select
             .contains("            KEY_B => Some(Selection::Elevation(Elevation::Rollback)),\n"));
-        // Neither `H` nor any other elevation is bound before L4.
-        assert!(!select.contains("KEY_H"));
-        assert_eq!(occurrences(input, "Selection::Elevation("), 1);
-        assert_eq!(occurrences(input, "Elevation::Hostname"), 0);
+        assert!(select
+            .contains("            KEY_H => Some(Selection::Elevation(Elevation::Hostname)),\n"));
+        assert_eq!(occurrences(select, "KEY_H"), 1);
+        assert_eq!(occurrences(input, "Selection::Elevation("), 2);
+        assert_eq!(occurrences(input, "Elevation::Hostname"), 1);
         assert_eq!(occurrences(input, "rollback_wired"), 0);
         assert_eq!(occurrences(input, "rollback: bool"), 0);
         // A digit is a fresh number-row 2 to 9 under no Control, Alt or

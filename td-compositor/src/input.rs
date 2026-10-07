@@ -724,6 +724,9 @@ impl KeyBindings {
             }
             // A rollback: root's `1d`.
             KEY_B => Some(Selection::Elevation(Elevation::Rollback)),
+            // The queued hostname change: root's `1e`, which refuses when
+            // none waits.
+            KEY_H => Some(Selection::Elevation(Elevation::Hostname)),
             // The lifetime's one selection: it ends attention into the
             // lock, or says why there is none and sends nothing.
             KEY_L => {
@@ -10227,8 +10230,8 @@ mod tests {
     }
 
     /// `B` asks root for a rollback, and that is the lifetime's one
-    /// selection: no later letter selects anything. `H` is L4's and
-    /// selects nothing yet. Outside attention both are ordinary keys.
+    /// selection: no later letter, `H` among them, selects anything.
+    /// Outside attention both are ordinary keys.
     #[test]
     fn b_selects_a_rollback_and_ends_the_lifetimes_choice() {
         use crate::secret_client::{Elevation, Selection};
@@ -10242,8 +10245,6 @@ mod tests {
         }
         read_reports(&target, &bindings, 0, &chord_reports(10));
         let typed = target.lock().unwrap().keys.len();
-        read_reports(&target, &bindings, 0, &presses(&[KEY_H], 20));
-        assert!(target.lock().unwrap().notices.is_empty());
         read_reports(
             &target,
             &bindings,
@@ -10263,7 +10264,6 @@ mod tests {
 
     /// `B`'s rollback is never selected by a repeat, a key held from
     /// before the screen opened, or another device's press of a held key.
-    /// `H` still selects nothing.
     #[test]
     fn b_selects_one_rollback_only_from_a_fresh_press() {
         use crate::secret_client::{Elevation, Selection};
@@ -10286,8 +10286,6 @@ mod tests {
             (0, key(KEY_B, KEY_PRESS)),
             (0, key(KEY_B, KEY_RELEASE)),
             (1, key(KEY_B, KEY_RELEASE)),
-            (0, key(KEY_H, KEY_PRESS)),
-            (0, key(KEY_H, KEY_RELEASE)),
         ] {
             deliver(&mut bindings, &mut target, device, event);
         }
@@ -10307,6 +10305,55 @@ mod tests {
         assert_eq!(
             target.secret_roles,
             [Selection::Elevation(Elevation::Rollback)]
+        );
+        assert!(target.notices.is_empty());
+    }
+
+    /// `H` selects the queued hostname change, root's `1e`, as the
+    /// lifetime's one selection, under the menu's rules: never from a
+    /// repeat, a key held from before the screen opened or another
+    /// device's press of a held key, and no letter selects after it. Root,
+    /// not the menu, says when none waits.
+    #[test]
+    fn h_selects_the_queued_hostname_change_only_from_a_fresh_press() {
+        use crate::secret_client::{Elevation, Selection};
+        let mut bindings = rollback_bindings().into_inner().unwrap();
+        let mut target = RecordingTarget::default();
+        deliver(&mut bindings, &mut target, 1, key(KEY_H, KEY_PRESS));
+        for event in [
+            key(KEY_LEFTCTRL, KEY_PRESS),
+            key(KEY_LEFTALT, KEY_PRESS),
+            key(KEY_ESC, KEY_PRESS),
+            key(KEY_ESC, KEY_RELEASE),
+            key(KEY_LEFTCTRL, KEY_RELEASE),
+            key(KEY_LEFTALT, KEY_RELEASE),
+        ] {
+            deliver(&mut bindings, &mut target, 0, event);
+        }
+        for (device, event) in [
+            (1, key(KEY_H, KEY_REPEAT)),
+            (0, key(KEY_H, KEY_PRESS)),
+            (0, key(KEY_H, KEY_RELEASE)),
+            (1, key(KEY_H, KEY_RELEASE)),
+        ] {
+            deliver(&mut bindings, &mut target, device, event);
+        }
+        assert!(target.secret_roles.is_empty() && target.notices.is_empty());
+        for event in [
+            key(KEY_H, KEY_PRESS),
+            key(KEY_H, KEY_REPEAT),
+            key(KEY_H, KEY_RELEASE),
+            key(KEY_B, KEY_PRESS),
+            key(KEY_B, KEY_RELEASE),
+            key(KEY_H, KEY_PRESS),
+            key(KEY_H, KEY_RELEASE),
+        ] {
+            deliver(&mut bindings, &mut target, 0, event);
+        }
+        assert_eq!(target.attention_events, [true]);
+        assert_eq!(
+            target.secret_roles,
+            [Selection::Elevation(Elevation::Hostname)]
         );
         assert!(target.notices.is_empty());
     }
@@ -10492,8 +10539,8 @@ mod tests {
         assert_eq!(target.approvals.len(), 2);
     }
 
-    /// A security key's own keyboard neither selects `B` nor types an
-    /// approval-key digit; the keyboard's do, and the key's Escape still
+    /// A security key's own keyboard neither selects `B` or `H` nor types
+    /// an approval-key digit; the keyboard's do, and the key's Escape still
     /// cancels.
     #[test]
     fn a_security_keys_keyboard_cannot_select_b_or_type_the_key() {
@@ -12254,7 +12301,7 @@ mod tests {
             let seat = LockedSeat::open(&[]);
             seat.login.answer(&root_answer(state)).unwrap();
             seat.chord(10);
-            assert_eq!(seat.shown(), Some(Notice::Menu));
+            assert_eq!(seat.shown(), Some(Notice::default()));
             seat.press(&[KEY_L], 20);
             assert!(seat.queued.attempt().is_none());
             if *locks {
@@ -12308,7 +12355,7 @@ mod tests {
         seat.chord(10);
         seat.read(KEY, 20, presses(&[KEY_L], 21));
         assert!(!seat.locked() && seat.attention_open());
-        assert_eq!(seat.shown(), Some(Notice::Menu));
+        assert_eq!(seat.shown(), Some(Notice::default()));
     }
 
     /// While attention is up `Super+l` is the attention screen's: on the
@@ -13623,7 +13670,7 @@ mod tests {
             3200,
             true,
             false,
-            crate::attention::Notice::Menu,
+            crate::attention::Notice::default(),
         );
         drained
     }

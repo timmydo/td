@@ -8431,8 +8431,10 @@ impl Qmp {
                         | "v"
                         | "w"
                         | "x"
-                        // `qemu-deploy-rollback`'s `B` and approval-key digits.
+                        // `qemu-deploy-rollback`'s `B`, `H` and approval-key
+                        // digits.
                         | "b"
+                        | "h"
                         | "2"
                         | "3"
                         | "4"

@@ -8731,7 +8731,8 @@ required before enabling consent or a WebAuthn grant.
 immutable presentation and a token assertion now mediate credential writes,
 enrollment and release. The broader operation vocabulary here remains a
 target; the compositor's randomized-key confirmation is live for
-`deploy-rollback`, the one elevation production performs (L3 below).
+`deploy-rollback` and `set-hostname`, the elevations production performs
+(L3 and L4 below).
 The kernel now carries USB PCI xHCI, generic HID,
 USB HID and hidraw. The root-only worker implements the narrow CTAP HID
 transport described in `td-secret/DESIGN.md`; it does not grant consent.
@@ -8747,9 +8748,9 @@ It says what the first operations are and why; the elevation
 increments below (L1 to L7) build them, and each part stays a target
 until the increment named for it lands with its evidence. So far the
 consent descriptions (L1), the compositor's approval-key confirmation
-(L2) and `deploy-rollback` with the principal table (L3) exist:
-`deploy-rollback` is live, and `set-hostname` and `deploy-publish`
-remain targets. The protocol, encodings and write rules are in
+(L2), `deploy-rollback` with the principal table (L3) and `set-hostname`
+with its intake and backoff (L4) exist: both operations are live, and
+`deploy-publish` remains a target. The protocol, encodings and write rules are in
 `td-authd/DESIGN.md`, "Elevation operations"; which key presses
 confirm is in `td-compositor/DESIGN.md`, "Elevation consent".
 
@@ -8889,8 +8890,8 @@ stock image's own boot health exercises that path under the QEMU
 autotest token with a disposable seeded key
 (`TD-OPENSSH-ADMIN-ROUNDTRIP`). Physical access is the other path.
 Since L3 the session owner can also return the machine to its previous
-deployment through `deploy-rollback`, which raises no privilege beyond
-that one operation.
+deployment through `deploy-rollback`, and since L4 rename it through
+`set-hostname`; neither raises privilege beyond its one operation.
 
 **Retiring the escape hatch.** The escape hatch is root's remaining
 administrative surface: the `su` applet, root's empty shadow field and
@@ -8929,8 +8930,8 @@ enrollment, follows L7.
 
 The workstream's commits, in landing order. Each is one landing, and
 none repairs an earlier one. Each amends the documents whose current
-statements it changes, including those named here. L0 to L3 have
-landed; L4 to L7 are targets.
+statements it changes, including those named here. L0 to L4 have
+landed; L5 to L7 are targets.
 
 - **L0**, documents only: this specification. Nothing ships.
 - **L1**, the consent codec, inert: consent tags 11 (`deploy-rollback`)

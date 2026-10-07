@@ -1536,8 +1536,9 @@ and the oracle that shows it.
      `Super+l` is read before the sheet's and launcher's capture, always
      consumed, and locks only an enrolled or unavailable session; the
      direct profile leaves it the client's. `L: LOCK SCREEN` sits below
-     `K` on the menu alone, where the menu's last row moves to 564 on
-     1280x800 and every other screen's stays at 528. A lock while a
+     `K` on the menu alone, where the menu's last row moved to 564 on
+     1280x800 (§L.1's `B` and `H` rows later moved it to 636) and every
+     other screen's stays at 528. A lock while a
      lifetime is open ends it through Escape's drain. Host tests cover
      `Super+l` on each state and profile, under the sheet and launcher
      and through the device dispatcher; `L` on each state, its refusal

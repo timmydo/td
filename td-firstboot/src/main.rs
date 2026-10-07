@@ -64,6 +64,7 @@ mod primary_home;
 mod primary_profile;
 mod principal_store;
 mod principals;
+mod saved;
 #[path = "../../td-secret/src/store.rs"]
 #[allow(dead_code, reason = "the console and portal share store entry points")]
 mod secret_store;
@@ -1091,62 +1092,7 @@ fn sync_directories(deepest: &Path, boundary: Option<&Path>) -> Result<(), Failu
 }
 
 fn read_hostname(path: &Path, owner: u32) -> Result<Option<hostname::Hostname>, Failure> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(Failure::Failed(format!(
-                "inspect {}: {error}",
-                path.display()
-            )))
-        }
-    };
-    if !metadata.is_file()
-        || metadata.uid() != owner
-        || metadata.permissions().mode() & 0o7777 != 0o644
-        || metadata.len() > 64
-    {
-        return Err(Failure::Failed(format!(
-            "{} is not a bounded owner-{owner} mode-0644 hostname file",
-            path.display()
-        )));
-    }
-    let file = std::fs::File::open(path)
-        .map_err(|error| Failure::Failed(format!("open {}: {error}", path.display())))?;
-    let opened = file
-        .metadata()
-        .map_err(|error| Failure::Failed(format!("inspect opened {}: {error}", path.display())))?;
-    if (
-        opened.dev(),
-        opened.ino(),
-        opened.uid(),
-        opened.mode(),
-        opened.len(),
-    ) != (
-        metadata.dev(),
-        metadata.ino(),
-        metadata.uid(),
-        metadata.mode(),
-        metadata.len(),
-    ) {
-        return Err(Failure::Failed(format!(
-            "{} changed while opening",
-            path.display()
-        )));
-    }
-    let mut text = String::new();
-    file.take(65)
-        .read_to_string(&mut text)
-        .map_err(|error| Failure::Failed(format!("read {}: {error}", path.display())))?;
-    if text.len() > 64 {
-        return Err(Failure::Failed(format!(
-            "{} exceeds the hostname file bound",
-            path.display()
-        )));
-    }
-    hostname::Hostname::parse(text.strip_suffix('\n').unwrap_or(&text))
-        .map(Some)
-        .map_err(|error| Failure::Failed(format!("{}: {error}", path.display())))
+    saved::read_hostname(path, owner).map_err(Failure::Failed)
 }
 
 fn provision_hostname(
@@ -1160,7 +1106,7 @@ fn provision_hostname(
     let name = read_hostname(default, owner)?.ok_or_else(|| {
         Failure::Failed(format!("missing hostname default {}", default.display()))
     })?;
-    write_durably(state, format!("{}\n", name.name()).as_bytes(), 0o644)?;
+    saved::write_hostname(state, &name).map_err(Failure::Failed)?;
     Ok(name)
 }
 
@@ -1527,55 +1473,8 @@ fn write_durably_owned(
     mode: u32,
     owner: Option<&ApplicationHome>,
 ) -> Result<(), Failure> {
-    let directory = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    let mut name = path.as_os_str().to_owned();
-    name.push(".new");
-    let temporary = PathBuf::from(name);
-
-    // Unlink any leftover and create EXCLUSIVELY: reusing an existing temporary
-    // would keep ITS mode (OpenOptions applies `mode` only when it creates the
-    // file), which is how a 0600 file ends up 0644.
-    match std::fs::remove_file(&temporary) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(Failure::Failed(format!(
-                "clear stale {}: {e}",
-                temporary.display()
-            )))
-        }
-    }
-    let write = || -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .open(&temporary)?;
-        // `OpenOptions::mode` is modulated by the umask, which can only make the
-        // file STRICTER — harmless for a private key, but machine-id must stay
-        // world-readable to serve its purpose, and a restrictive inherited umask
-        // would quietly make it root-only. Set the mode through the descriptor
-        // so none of these files depend on what umask PID 1 handed this job.
-        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        if let Some(owner) = owner {
-            std::os::unix::fs::fchown(&file, Some(owner.uid), Some(owner.gid))?;
-        }
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, path)?;
-        std::fs::File::open(directory)?.sync_all()
-    };
-    write().map_err(|e| {
-        Failure::Failed(format!(
-            "write {} (mode {mode:o}) through {}: {e}",
-            path.display(),
-            temporary.display()
-        ))
-    })
+    saved::write_synced(path, bytes, mode, owner.map(|owner| (owner.uid, owner.gid)))
+        .map_err(Failure::Failed)
 }
 
 /// The server policy for the admitted `primary` account, in the form the

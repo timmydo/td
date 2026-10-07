@@ -31,6 +31,22 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/tests/rollback.rs"),
     ),
     (
+        "src/set_hostname.rs",
+        include_str!("../../../td-authd/src/set_hostname.rs"),
+    ),
+    (
+        "tests/set_hostname.rs",
+        include_str!("../../../td-authd/tests/set_hostname.rs"),
+    ),
+    (
+        "src/backoff.rs",
+        include_str!("../../../td-authd/src/backoff.rs"),
+    ),
+    (
+        "tests/backoff.rs",
+        include_str!("../../../td-authd/tests/backoff.rs"),
+    ),
+    (
         "src/disk_install.rs",
         include_str!("../../../td-authd/src/disk_install.rs"),
     ),
@@ -229,6 +245,12 @@ pub fn recipe() -> Recipe {
         (
             "{src}/td-firstboot/src/hostname.rs",
             include_str!("../../../td-firstboot/src/hostname.rs"),
+        ),
+        // The saved hostname's bounded read and synced write, which
+        // set-hostname and the backoff file share with td-firstboot.
+        (
+            "{src}/td-firstboot/src/saved.rs",
+            include_str!("../../../td-firstboot/src/saved.rs"),
         ),
         (
             "{src}/td-secret/src/login_state.rs",

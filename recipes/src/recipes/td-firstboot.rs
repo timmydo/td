@@ -57,6 +57,7 @@ const MODULES: &[(&str, &str)] = &[
         "hostname",
         include_str!("../../../td-firstboot/src/hostname.rs"),
     ),
+    ("saved", include_str!("../../../td-firstboot/src/saved.rs")),
     (
         "login_directory",
         include_str!("../../../td-firstboot/src/login_directory.rs"),

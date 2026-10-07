@@ -1518,7 +1518,10 @@ root ownership. Parents are trusted root-owned system directories;
 concurrent privileged replacement is outside this boot-time contract.
 This operation has no alternate paths or name operand and is not a
 post-install rename interface. Provisioning remains a serialized startup
-operation, not a concurrent settings writer.
+operation, not a concurrent settings writer. Its read bounds and its
+write protocol live in `td-firstboot/src/saved.rs`, which td-authd's
+`set-hostname` also compiles, so the rename writes the same canonical
+file the same way.
 
 The provisioner sets the kernel name through the shipped `/bin/hostname`
 applet, then reads it back from procfs before reporting
@@ -1526,15 +1529,18 @@ applet, then reads it back from procfs before reporting
 succeed; the serial console retains its independent recovery path.
 `/etc/hostname`, the kernel name and the existing network/app-jail
 consumers therefore share the installed choice from boot;
-APPLICATIONS.md §L.1's target `set-hostname` says which of them a rename
+APPLICATIONS.md §L.1's `set-hostname` says which of them a rename
 changes at once and which at the next boot. Later defaults do not
 replace saved state. Malformed shared state therefore prevents
 acknowledgement across deployments; rolling back does not repair it.
 Recovery requires restoring a canonical, root-owned mode-0644
 `lib/td/hostname` in the volume's `@var` subvolume from a trusted
-recovery environment. There is no supported in-system rename or repair
-UI yet; APPLICATIONS.md §L.1's target `set-hostname` (its L4) is the
-planned rename, and repair keeps this recovery. The saved account and
+recovery environment. The in-system rename is `set-hostname`
+(APPLICATIONS.md §L.1, live since its L4): `td-authd request-hostname
+NAME` queues the name and, after the session owner's consent, root
+rewrites the saved file canonically, which the next boot activates. It
+replaces only a valid saved name, so repair keeps this recovery and has
+no in-system UI. The saved account and
 hostname activate at boot. The installer sets them up; a user-facing
 recovery flow remains to be implemented, and root SSH is not its
 intended API. The QEMU installer selects `td-qemu-installed`, checks its

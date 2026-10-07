@@ -3,6 +3,7 @@
 mod application;
 mod application_files;
 mod application_shell;
+mod backoff;
 mod channel;
 #[allow(
     dead_code,
@@ -33,6 +34,10 @@ mod mount_sys;
 mod portal_files;
 mod primary_account;
 mod rollback;
+// The saved hostname's bounded read and synced write, and the synced write
+// the backoff file shares: td-firstboot's provisioning source.
+#[path = "../../td-firstboot/src/saved.rs"]
+mod saved;
 mod secret_intake;
 #[allow(
     dead_code,
@@ -45,6 +50,7 @@ mod secret_request;
 )]
 mod secret_sys;
 mod session;
+mod set_hostname;
 #[allow(dead_code, reason = "shared dependency-free SHA-256 implementation")]
 #[path = "../../engine/src/sha256.rs"]
 mod sha256;
@@ -67,9 +73,14 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
     td-authd application-start OWNER APP direct|terminal|shell -- ARG... | \
      td-authd application-exec UID OWNER APP direct|terminal|shell -- ARG... | \
      td-authd application-client ARG... | td-authd application-probe | \
-     td-authd request-update SOURCE DEPLOYMENT-ID";
+     td-authd request-update SOURCE DEPLOYMENT-ID | td-authd request-hostname NAME";
 
 fn run(arguments: &[String]) -> Result<(), String> {
+    if let [verb, name] = arguments {
+        if verb == "request-hostname" {
+            return set_hostname::request(name);
+        }
+    }
     if let [verb, source, deployment] = arguments {
         if verb == "request-update" {
             return deployment::request(source, deployment);

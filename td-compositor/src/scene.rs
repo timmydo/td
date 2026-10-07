@@ -876,6 +876,9 @@ pub struct Scene {
     locked: bool,
     /// The lock surface's rows, which follow root's latest `1a` answer.
     lock_rows: Vec<String>,
+    /// Root's hostname intake as the authority worker last read it, which
+    /// the menu's `H` row shows from when the screen opens.
+    hostnames: crate::authority::Hostnames,
     /// This attention lifetime left the lock surface: its success notice
     /// stays above the drain row, which cancels nothing.
     attention_unlocked: bool,
@@ -918,10 +921,11 @@ impl Scene {
             attention_draining: false,
             attention_request: None,
             attention_request_attempted: false,
-            attention_notice: crate::attention::Notice::Menu,
+            attention_notice: crate::attention::Notice::default(),
             attention_field: None,
             locked: false,
             lock_rows: crate::attention::lock_rows(None),
+            hostnames: crate::authority::Hostnames::default(),
             attention_unlocked: false,
             status: String::new(),
             text: crate::text::Text::default(),
@@ -935,6 +939,10 @@ impl Scene {
 
     pub(crate) fn set_launcher_authority(&mut self, available: bool) {
         self.launcher.set_authority(available);
+    }
+
+    pub(crate) fn set_hostnames(&mut self, hostnames: crate::authority::Hostnames) {
+        self.hostnames = hostnames;
     }
 
     pub(crate) fn set_launcher_application(&mut self, application: Option<&str>) {
@@ -3259,7 +3267,7 @@ impl Scene {
             self.attention_notice = if self.locked {
                 crate::attention::Notice::Pending
             } else {
-                crate::attention::Notice::Menu
+                crate::attention::Notice::Menu(self.hostnames.current())
             };
         }
         if visible {
@@ -9936,6 +9944,37 @@ mod tests {
         blend_pixel(&mut frame, 1, 1, 4, 0, 0, [50, 25, 0, 128]);
         assert_eq!(frame, [99, 74, 49, 0]);
     }
+    /// The menu's `H` row is root's last `9f` answer as the screen opens,
+    /// kept for that lifetime; the next opening reads it again. The lock
+    /// surface's lifetime shows no menu.
+    #[test]
+    fn the_menu_opens_with_the_hostname_intake_root_last_described() {
+        use crate::attention::Notice;
+        use crate::authority::{HostnameIntake, Hostnames};
+        let mut scene = Scene::new();
+        scene.set_attention(true);
+        assert_eq!(scene.attention_shown(), Some(Notice::default()));
+        scene.set_attention(false);
+        let hostnames = Hostnames::default();
+        scene.set_hostnames(hostnames.clone());
+        hostnames.answer(&[0x9f, 1, 2]).unwrap();
+        scene.set_attention(true);
+        let waiting = Notice::Menu(HostnameIntake::decode(&[0x9f, 1, 2]).unwrap());
+        assert_eq!(scene.attention_shown(), Some(waiting));
+        hostnames.answer(&[0x9f, 0, 3]).unwrap();
+        assert_eq!(scene.attention_shown(), Some(waiting));
+        scene.set_attention(false);
+        scene.set_attention(true);
+        assert_eq!(
+            scene.attention_shown(),
+            Some(Notice::Menu(HostnameIntake::decode(&[0x9f, 0, 3]).unwrap()))
+        );
+        scene.set_attention(false);
+        scene.lock();
+        scene.set_attention(true);
+        assert_eq!(scene.attention_shown(), Some(Notice::Pending));
+    }
+
     #[test]
     fn trusted_pixels_are_display_only_and_cover_the_whole_scene() {
         let mut scene = Scene::new();

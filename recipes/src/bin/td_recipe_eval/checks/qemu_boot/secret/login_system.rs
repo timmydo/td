@@ -12,7 +12,8 @@ use super::*;
 const RECORD: &[&str] = &["LOGIN KEY STATE UNAVAILABLE:", "RECORD DAMAGED"];
 const UNREADABLE: &[&str] = &["LOGIN KEY STATE UNAVAILABLE:", "STATE COULD NOT BE READ"];
 /// The attention menu, as the update oracle reads it from 276: its
-/// selections 36 apart, and its last row two lower than other screens'.
+/// selections 36 apart, and its last row three lower than other screens'.
+/// No hostname change waits on this guest.
 const MENU: &[&str] = &[
     "TD SECURE ATTENTION",
     "U: UNLOCK  R: RECOVERY TOKEN",
@@ -23,6 +24,7 @@ const MENU: &[&str] = &[
     "K: LOGIN KEYS",
     "L: LOCK SCREEN",
     "B: ROLL BACK TO THE PREVIOUS SYSTEM",
+    "H: NO HOSTNAME CHANGE WAITING",
     "ESC TO RETURN",
 ];
 /// Every phase boots within this, its locked phase's steps included.

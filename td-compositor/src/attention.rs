@@ -1,10 +1,12 @@
 use crate::authority::consent::Request;
+use crate::authority::{HostnameIntake, Queue};
 use crate::ui;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Notice {
-    #[default]
-    Menu,
+    /// The menu, its `H` row as root's last `9f` answer gave it when the
+    /// screen opened.
+    Menu(HostnameIntake),
     Pending,
     Unlocked,
     Stored,
@@ -22,6 +24,10 @@ pub(crate) enum Notice {
     /// Root's `9d 02`: the boot selectors cannot be read or name one
     /// deployment, so there is no previous system to roll back to.
     NoPrevious,
+    /// Root's `9e 00`: no hostname change waits, or the slot is busy.
+    NoHostname,
+    /// Root's success for `set-hostname`.
+    HostnameSaved,
     /// A committed device-bound disk installation, before its recovery key:
     /// the screen then closes by itself (secret_client).
     Returning,
@@ -45,6 +51,12 @@ pub(crate) enum Notice {
     Login(&'static [&'static str]),
     /// A write whose outcome is uncertain, then its kind's rows.
     Uncertain(&'static [&'static str]),
+}
+
+impl Default for Notice {
+    fn default() -> Self {
+        Self::Menu(HostnameIntake::default())
+    }
 }
 
 /// The PIN field beneath a presented PIN step's prompt, or the touch
@@ -470,8 +482,8 @@ fn draw_rows(
 }
 
 /// Every screen's rows are padded to the title and six more, and its last
-/// row is drawn below them: where the menu's was before `L`. The menu, two
-/// rows longer since `B`, draws its last row two lower
+/// row is drawn below them: where the menu's was before `L`. The menu,
+/// three rows longer since `B` and `H`, draws its last row three lower
 /// (td-compositor/DESIGN.md, "Session lock and login-key entry", item 5,
 /// and "Elevation consent").
 const MENU_ROWS: usize = 7;
@@ -519,12 +531,28 @@ fn wrap(text: &str, columns: usize) -> Vec<String> {
     rows
 }
 
+/// The menu's `H` row (td-compositor/DESIGN.md, "Elevation consent"):
+/// whether a hostname change waits and, when there are any, the intake's
+/// consecutive unapproved requests; or that the intake refuses every
+/// request while root cannot read or write its backoff.
+fn hostname_row(intake: HostnameIntake) -> String {
+    let state = match intake.queue() {
+        Queue::Refusing => return "H: REFUSED - HOSTNAME BACKOFF UNUSABLE".into(),
+        Queue::Waiting => "H: REVIEW HOSTNAME CHANGE",
+        Queue::Empty => "H: NO HOSTNAME CHANGE WAITING",
+    };
+    match intake.denied() {
+        0 => state.into(),
+        denied => format!("{state} - {denied} DENIED"),
+    }
+}
+
 /// A notice's rows below the title. The menu's rows are fixed in place, `K`
-/// comes below `I`, `L` below `K` and `B` below `L`, so the boot oracles'
-/// rows do not move.
+/// comes below `I`, `L` below `K`, `B` below `L` and `H` below `B`, so the
+/// boot oracles' rows do not move.
 fn notice_rows(notice: Notice) -> Vec<String> {
     let first = match notice {
-        Notice::Menu => "U: UNLOCK  R: RECOVERY TOKEN",
+        Notice::Menu(_) => "U: UNLOCK  R: RECOVERY TOKEN",
         Notice::Pending => "PREPARING REQUEST",
         Notice::NoInstall => "NO INSTALLATION IS READY TO REVIEW",
         Notice::UpdateRefused => "UPDATE CANNOT READ LOGIN KEYS",
@@ -532,6 +560,8 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::RolledBack => "ROLLED BACK - RESTART TO BOOT IT",
         Notice::ElevationRefused => "REFUSED BY THE ELEVATION TABLE",
         Notice::NoPrevious => "NO PREVIOUS SYSTEM TO ROLL BACK TO",
+        Notice::NoHostname => "NO HOSTNAME CHANGE IS READY TO REVIEW",
+        Notice::HostnameSaved => "HOSTNAME SAVED",
         Notice::Returning => RETURNING_NOTICE,
         Notice::Stored => "CREDENTIAL STORED",
         Notice::NoWrite => "NO READY CREDENTIAL WRITE - RUN TD-SECRET SET FIRST",
@@ -564,7 +594,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         }
     };
     let rest: &[&str] = match notice {
-        Notice::Menu => &[
+        Notice::Menu(_) => &[
             "E: ENROLL TWO TOKENS (HAVE BOTH READY)",
             "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL",
             "W: REVIEW PENDING CREDENTIAL WRITE",
@@ -579,13 +609,18 @@ fn notice_rows(notice: Notice) -> Vec<String> {
             "A: ADD A KEY",
             "D: REMOVE KEYS",
         ],
+        Notice::HostnameSaved => &["A RESTART COMPLETES THE CHANGE"],
         Notice::Uncertain(rows) => rows,
         _ => &[],
     };
-    std::iter::once(first)
+    let mut rows: Vec<String> = std::iter::once(first)
         .chain(rest.iter().copied())
         .map(String::from)
-        .collect()
+        .collect();
+    if let Notice::Menu(intake) = notice {
+        rows.push(hostname_row(intake));
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -701,11 +736,11 @@ mod tests {
         // returning notice stays.
         assert_eq!(
             painted(true, Notice::Installed),
-            painted(true, Notice::Menu)
+            painted(true, Notice::default())
         );
         assert_ne!(
             painted(true, Notice::Returning),
-            painted(true, Notice::Menu)
+            painted(true, Notice::default())
         );
     }
 
@@ -838,12 +873,12 @@ mod tests {
     /// The menu's rows where the update and setup oracles read them on a
     /// 1280x800 output, as before `L`: the title at 276, the selections
     /// from 312 and `I` at 456, 36 apart; `K` below `I`, `L` below `K` at
-    /// 528, `B` below `L` at 564, and the last row, which every other
-    /// screen keeps at 528, two lower at 600. On 800x600 the ten rows start
-    /// at 176, and on 320x200, at single scale, the fit rule moves them up
-    /// to 0.
+    /// 528, `B` below `L` at 564, `H` below `B` at 600, and the last row,
+    /// which every other screen keeps at 528, three lower at 636. On
+    /// 800x600 the eleven rows start at 176, and on 320x200, at single
+    /// scale, the fit rule moves them up to 0.
     #[test]
-    fn the_menu_keeps_its_rows_and_adds_k_l_and_b_below_i() {
+    fn the_menu_keeps_its_rows_and_adds_k_l_b_and_h_below_i() {
         const MENU: &[&str] = &[
             "TD SECURE ATTENTION",
             "U: UNLOCK  R: RECOVERY TOKEN",
@@ -854,6 +889,7 @@ mod tests {
             "K: LOGIN KEYS",
             "L: LOCK SCREEN",
             "B: ROLL BACK TO THE PREVIOUS SYSTEM",
+            "H: NO HOSTNAME CHANGE WAITING",
             "ESC TO RETURN",
         ];
         for (width, height, top, scale) in
@@ -868,7 +904,7 @@ mod tests {
                 stride,
                 false,
                 false,
-                Notice::Menu,
+                Notice::default(),
             );
             let mut expected = vec![0; stride * height];
             let bounds = (0, 0, width, height);
@@ -896,12 +932,49 @@ mod tests {
             }
             assert!(painted == expected, "{width}x{height}");
         }
-        // Ten doubled rows, the last row's foot included, are 338 tall
-        // and keep their top on 800 and 600 lines; on 200 single rows fit
-        // only from the top.
-        assert_eq!(rows_top(800, 9 * 36 + 14), 276);
-        assert_eq!(rows_top(600, 9 * 36 + 14), 176);
-        assert_eq!(rows_top(200, 9 * 18 + 7), 0);
+        // Eleven doubled rows, the last row's foot included, are 374
+        // tall and keep their top on 800 and 600 lines; on 200 single rows
+        // fit only from the top.
+        assert_eq!(rows_top(800, 10 * 36 + 14), 276);
+        assert_eq!(rows_top(600, 10 * 36 + 14), 176);
+        assert_eq!(rows_top(200, 10 * 18 + 7), 0);
+    }
+
+    /// The `H` row says what root's last `9f` answer said: nothing waits,
+    /// a change waits, the count of consecutive unapproved requests when
+    /// there are any, or that the intake refuses. Every form fits the
+    /// narrowest output whole, 45 columns, in the chrome face.
+    #[test]
+    fn the_h_row_says_what_waits_and_the_denial_count() {
+        let row = |answer: &[u8]| hostname_row(HostnameIntake::decode(answer).unwrap());
+        for (answer, text) in [
+            (&[0x9f, 0, 0][..], "H: NO HOSTNAME CHANGE WAITING"),
+            (
+                &[0x9f, 0, 1][..],
+                "H: NO HOSTNAME CHANGE WAITING - 1 DENIED",
+            ),
+            (
+                &[0x9f, 0, 255][..],
+                "H: NO HOSTNAME CHANGE WAITING - 255 DENIED",
+            ),
+            (&[0x9f, 1, 0][..], "H: REVIEW HOSTNAME CHANGE"),
+            (&[0x9f, 1, 12][..], "H: REVIEW HOSTNAME CHANGE - 12 DENIED"),
+            (&[0x9f, 2, 0][..], "H: REFUSED - HOSTNAME BACKOFF UNUSABLE"),
+        ] {
+            assert_eq!(row(answer), text);
+            assert!(text.len() <= layout(320, 200).1, "{text}");
+            assert!(text.bytes().all(ui::is_mapped), "{text}");
+            assert_eq!(
+                notice_rows(Notice::Menu(HostnameIntake::decode(answer).unwrap()))
+                    .last()
+                    .map(String::as_str),
+                Some(text)
+            );
+        }
+        assert_eq!(
+            notice_rows(Notice::HostnameSaved),
+            ["HOSTNAME SAVED", "A RESTART COMPLETES THE CHANGE"]
+        );
     }
 
     /// HEAD's painter, before narrow outputs: every row doubled, 36 apart
@@ -976,7 +1049,7 @@ mod tests {
             (2560, 1440),
         ] {
             for draining in [false, true] {
-                for notice in SCREENS {
+                for notice in &screens() {
                     // Newer than HEAD's painter, which clipped it where it
                     // is now wrapped; where it fits one row it is the same.
                     if *notice == Notice::Returning && width < 24 + RETURNING_NOTICE.len() * 16 {
@@ -1000,8 +1073,23 @@ mod tests {
         assert_eq!(rows_top(200, 7 * 18 + 7), 0);
     }
 
+    fn menu(answer: &[u8]) -> Notice {
+        Notice::Menu(HostnameIntake::decode(answer).unwrap())
+    }
+
+    fn screens() -> Vec<Notice> {
+        let mut screens = vec![
+            Notice::default(),
+            menu(&[0x9f, 1, 0]),
+            menu(&[0x9f, 0, 255]),
+            menu(&[0x9f, 1, 255]),
+            menu(&[0x9f, 2, 0]),
+        ];
+        screens.extend_from_slice(SCREENS);
+        screens
+    }
+
     const SCREENS: &[Notice] = &[
-        Notice::Menu,
         Notice::Pending,
         Notice::Unlocked,
         Notice::Stored,
@@ -1012,6 +1100,8 @@ mod tests {
         Notice::RolledBack,
         Notice::ElevationRefused,
         Notice::NoPrevious,
+        Notice::NoHostname,
+        Notice::HostnameSaved,
         Notice::Returning,
         Notice::Enrolled,
         Notice::Unenrolled,
@@ -1039,7 +1129,7 @@ mod tests {
         for (width, height) in [(320, 200), (799, 600), (800, 600), (1280, 800)] {
             let (scale, columns) = layout(width, height);
             for draining in [false, true] {
-                for notice in SCREENS.iter().copied() {
+                for notice in screens() {
                     let stride = width * 4;
                     let mut frame = vec![0; stride * height];
                     paint(&mut frame, width, height, stride, draining, false, notice);

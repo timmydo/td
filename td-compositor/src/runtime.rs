@@ -955,6 +955,12 @@ impl Runtime {
         self.scene.set_launcher_authority(available);
     }
 
+    /// The handle the attention menu's `H` row reads, which the authority
+    /// worker keeps current.
+    pub(crate) fn set_hostnames(&mut self, hostnames: crate::authority::Hostnames) {
+        self.scene.set_hostnames(hostnames);
+    }
+
     pub(crate) fn set_launcher_application(&mut self, application: Option<&str>) {
         self.scene.set_launcher_application(application);
     }

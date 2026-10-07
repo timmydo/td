@@ -508,7 +508,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             Ok(Request::Poll(handle))
         }
         [3] => Ok(Request::Heartbeat),
-        [0x10..=0x1d, ..] => Ok(Request::Secret(crate::session::Request::decode(bytes)?)),
+        [0x10..=0x1f, ..] => Ok(Request::Secret(crate::session::Request::decode(bytes)?)),
         _ => Err("invalid terminal authority request".into()),
     }
 }
@@ -655,9 +655,19 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         request(&[0x1d])?,
         Request::Secret(crate::session::Request::Rollback)
     );
-    // `1d` takes no operand; `1e` is L4's.
+    assert_eq!(
+        request(&[0x1e])?,
+        Request::Secret(crate::session::Request::Hostname)
+    );
+    assert_eq!(
+        request(&[0x1f])?,
+        Request::Secret(crate::session::Request::HostnameState)
+    );
+    // None takes an operand, and nothing above `1f` is a request.
     assert!(request(&[0x1d, 0]).is_err());
-    assert!(request(&[0x1e]).is_err());
+    assert!(request(&[0x1e, 0]).is_err());
+    assert!(request(&[0x1f, 0]).is_err());
+    assert!(request(&[0x20]).is_err());
     assert!(request(&[0x16, 2]).is_err());
     Ok(())
 }

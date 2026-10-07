@@ -4,6 +4,7 @@ use crate::consent::{Recovery, Request as Description, Role};
 use crate::inspection::{Event as InspectionEvent, Inspection};
 use crate::login::{Login, Pin, Selection};
 use crate::rollback::{Refusal, Rollback};
+use crate::set_hostname::Change;
 use crate::unlock::{Event, Unlock};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -31,6 +32,10 @@ pub(crate) enum Request {
     Pin(Box<Description>, Pin),
     /// `1d`: roll back to the previous deployment.
     Rollback,
+    /// `1e`: the queued hostname change.
+    Hostname,
+    /// `1f`: whether a hostname change waits, and the intake's backoff.
+    HostnameState,
 }
 
 impl Request {
@@ -43,6 +48,8 @@ impl Request {
             [0x19] => Ok(Self::Install),
             [0x1a] => Ok(Self::LoginState),
             [0x1d] => Ok(Self::Rollback),
+            [0x1e] => Ok(Self::Hostname),
+            [0x1f] => Ok(Self::HostnameState),
             [0x12, 1] => Ok(Self::Begin(Role::Primary)),
             [0x12, 2] => Ok(Self::Begin(Role::Recovery)),
             [0x16, 0] => Ok(Self::Enroll(Recovery::Unrecoverable)),
@@ -93,6 +100,7 @@ enum Active {
     /// A login-key worker shares the one operation slot.
     Login(Box<Login>),
     Rollback(Box<Rollback>),
+    Hostname(Box<Change>),
 }
 impl Active {
     /// None only for a login operation awaiting its worker's baseline.
@@ -103,6 +111,7 @@ impl Active {
             Self::DiskInstall(op) => Some(op.request()),
             Self::Login(op) => op.request(),
             Self::Rollback(op) => Some(op.request()),
+            Self::Hostname(op) => Some(op.request()),
         }
     }
     fn nonce(&self) -> &[u8; 32] {
@@ -112,6 +121,7 @@ impl Active {
             Self::DiskInstall(op) => op.request().nonce(),
             Self::Login(op) => op.nonce(),
             Self::Rollback(op) => op.request().nonce(),
+            Self::Hostname(op) => op.request().nonce(),
         }
     }
     fn presented(&mut self, request: &Description) -> Result<(), String> {
@@ -121,6 +131,7 @@ impl Active {
             Self::DiskInstall(op) => op.presented(request),
             Self::Login(op) => op.presented(request),
             Self::Rollback(op) => op.presented(request),
+            Self::Hostname(op) => op.presented(request),
         }
     }
     fn commit(&mut self, request: &Description) -> Result<(), String> {
@@ -130,6 +141,7 @@ impl Active {
             Self::DiskInstall(op) => op.commit(request),
             Self::Login(op) => op.commit(request),
             Self::Rollback(op) => op.commit(request),
+            Self::Hostname(op) => op.commit(request),
         }
     }
     fn cancel(&mut self, reason: &str) -> Result<(), String> {
@@ -140,6 +152,7 @@ impl Active {
             // Every login cancellation is the person's: kill, reap, no relock.
             Self::Login(op) => op.cancel(),
             Self::Rollback(op) => op.cancel(),
+            Self::Hostname(op) => op.cancel(),
         }
     }
     fn poll(&mut self) -> Result<Event, String> {
@@ -149,6 +162,7 @@ impl Active {
             Self::DiskInstall(op) => op.poll(),
             Self::Login(op) => op.poll(),
             Self::Rollback(op) => op.poll(),
+            Self::Hostname(op) => op.poll(),
         }
     }
     fn reap_for_teardown(self) -> Result<(), String> {
@@ -159,6 +173,8 @@ impl Active {
             Self::DiskInstall(_) => Ok(()),
             Self::Login(op) => op.reap_for_teardown(),
             Self::Rollback(op) => op.reap_for_teardown(),
+            // Root saved the name itself: there is no child.
+            Self::Hostname(_) => Ok(()),
         }
     }
 }
@@ -243,6 +259,9 @@ pub(crate) struct Session {
     installing: bool,
     /// On a live boot, in place of the update intake.
     setup: Option<crate::disk_install::Intake>,
+    /// Beside the update intake; a live boot binds none.
+    hostnames: Option<crate::set_hostname::Intake>,
+    renaming: bool,
     activated: bool,
     prepared: bool,
     cleanup: Option<Cleanup>,
@@ -267,6 +286,8 @@ impl Session {
             installations: None,
             installing: false,
             setup: None,
+            hostnames: None,
+            renaming: false,
             activated: false,
             prepared: false,
             cleanup: None,
@@ -289,6 +310,7 @@ impl Session {
                 self.setup = Some(crate::disk_install::Intake::bind(self.owner)?);
             } else {
                 self.installations = Some(crate::deployment::Intake::bind(self.owner)?);
+                self.hostnames = Some(crate::set_hostname::Intake::bind(self.owner)?);
             }
         }
         let answer = self.answer_with(request, cleanup_command, Start::begin);
@@ -336,6 +358,15 @@ impl Session {
                 crate::elevation::Table::load,
                 Path::new(crate::login_tier::VOLUME),
             ),
+            Request::Hostname => self.begin_hostname(crate::elevation::Table::load),
+            // Beside any operation: the menu's row reads it.
+            Request::HostnameState => {
+                self.tick()?;
+                Ok(self
+                    .hostnames
+                    .as_mut()
+                    .map_or_else(|| vec![0x9f, 0, 0], |intake| intake.state()))
+            }
             // Beside any operation, which it neither needs nor takes. Only
             // a live boot binds the setup intake.
             Request::LoginState if self.prepared => self.login_state.answer(self.setup.is_some()),
@@ -396,6 +427,18 @@ impl Session {
                         return Ok(vec![0x94]);
                     }
                 }
+                if self.renaming {
+                    let intake = self.hostnames.as_mut().ok_or("missing hostname intake")?;
+                    intake.tick();
+                    if !intake.selected_alive() {
+                        self.operation
+                            .as_mut()
+                            .ok_or("no hostname change")?
+                            .cancel("hostname requester disappeared")?;
+                        self.event = Some(Event::Waiting);
+                        return Ok(vec![0x94]);
+                    }
+                }
                 if self.writing {
                     self.intake
                         .as_mut()
@@ -422,6 +465,12 @@ impl Session {
                     self.installations
                         .as_mut()
                         .ok_or("missing installation intake")?
+                        .committed();
+                }
+                if self.renaming {
+                    self.hostnames
+                        .as_mut()
+                        .ok_or("missing hostname intake")?
                         .committed();
                 }
                 self.event = Some(Event::Waiting);
@@ -530,6 +579,52 @@ impl Session {
         Ok(answer)
     }
 
+    /// Request `1e`: the principal table for the owner, then the queued
+    /// request and the table for its requester, before any description.
+    fn begin_hostname(
+        &mut self,
+        table: impl FnOnce() -> Result<crate::elevation::Table, String>,
+    ) -> Result<Vec<u8>, String> {
+        use crate::elevation::Operation::SetHostname;
+        use crate::set_hostname::Refusal;
+        if !self.prepared
+            || self.cleanup.is_some()
+            || self.operation.is_some()
+            || self.inspection.is_some()
+        {
+            return Ok(Refusal::Nothing.answer());
+        }
+        let Some(intake) = &mut self.hostnames else {
+            return Ok(Refusal::Nothing.answer());
+        };
+        let Ok(table) = table() else {
+            return Ok(Refusal::Principal.answer());
+        };
+        if !table.grants(self.owner, SetHostname) {
+            return Ok(Refusal::Principal.answer());
+        }
+        let Ok(ready) = intake.select() else {
+            return Ok(Refusal::Nothing.answer());
+        };
+        if !table.grants(ready.requester(), SetHostname) {
+            intake.finish(false);
+            return Ok(Refusal::Principal.answer());
+        }
+        let operation = match intake.describe(self.owner, ready) {
+            Ok(operation) => operation,
+            Err(_) => {
+                intake.finish(false);
+                return Ok(Refusal::Nothing.answer());
+            }
+        };
+        let mut answer = vec![0x92];
+        answer.extend_from_slice(&operation.request().encode());
+        self.operation = Some(Active::Hostname(Box::new(operation)));
+        self.renaming = true;
+        self.event = Some(Event::Waiting);
+        Ok(answer)
+    }
+
     fn begin_write(&mut self) -> Result<Vec<u8>, String> {
         if !self.prepared
             || self.cleanup.is_some()
@@ -629,6 +724,9 @@ impl Session {
         if let Some(intake) = &mut self.installations {
             intake.tick();
         }
+        if let Some(intake) = &mut self.hostnames {
+            intake.tick();
+        }
         if let Some(setup) = &mut self.setup {
             for (nonce, fate) in setup.tick() {
                 if let Some(Active::DiskInstall(operation)) = &mut self.operation {
@@ -654,6 +752,16 @@ impl Session {
         {
             if let Some(operation) = &mut self.operation {
                 operation.cancel("credential requester disappeared")?;
+            }
+        }
+        if self.renaming
+            && !self
+                .hostnames
+                .as_ref()
+                .is_some_and(|intake| intake.selected_alive())
+        {
+            if let Some(operation) = &mut self.operation {
+                operation.cancel("hostname requester disappeared")?;
             }
         }
         if let Some(cleanup) = &mut self.cleanup {
@@ -736,6 +844,12 @@ impl Session {
                 }
                 self.installing = false;
             }
+            if self.renaming {
+                if let Some(intake) = &mut self.hostnames {
+                    intake.finish(matches!(event, Event::Complete));
+                }
+                self.renaming = false;
+            }
             // However it ended, the next `1a` reads the login state afresh.
             if matches!(operation, Active::Login(_)) {
                 self.login_state.operation_ended();
@@ -762,6 +876,8 @@ impl Session {
         }
         self.intake = None;
         self.installations = None;
+        self.hostnames = None;
+        self.renaming = false;
         // Stops the installation service, as an update helper is stopped.
         self.setup = None;
         if let Some(inspection) = self.inspection.take() {

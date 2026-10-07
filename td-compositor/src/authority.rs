@@ -60,6 +60,7 @@ enum Work {
 pub(crate) struct Launcher {
     send: SyncSender<Work>,
     login: Login,
+    hostnames: Hostnames,
     /// Root's answer at connect, which the generation's start locks on:
     /// never a later poll's.
     connected: Option<Answer>,
@@ -222,6 +223,78 @@ impl Login {
     }
 }
 
+/// What root's hostname intake holds (td-authd/DESIGN.md, "Elevation
+/// operations"), as its `9f` answer says.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum Queue {
+    #[default]
+    Empty,
+    /// An admitted request waits for `H`.
+    Waiting,
+    /// Root cannot read or write the backoff, so the intake refuses.
+    Refusing,
+}
+
+/// Root's `9f` answer, which the attention menu's `H` row shows: the queue
+/// and the intake's consecutive unapproved requests.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HostnameIntake {
+    queue: Queue,
+    denied: u8,
+}
+
+impl HostnameIntake {
+    /// Exactly `9f`, the queue and the count, which is `00` while the
+    /// intake refuses; anything else ends the paired generation.
+    pub(crate) fn decode(answer: &[u8]) -> Result<Self, String> {
+        let (queue, denied) = match answer {
+            [0x9f, 0, denied] => (Queue::Empty, *denied),
+            [0x9f, 1, denied] => (Queue::Waiting, *denied),
+            [0x9f, 2, 0] => (Queue::Refusing, 0),
+            _ => return Err("invalid hostname intake answer".into()),
+        };
+        Ok(Self { queue, denied })
+    }
+
+    pub(crate) fn queue(self) -> Queue {
+        self.queue
+    }
+
+    pub(crate) fn denied(self) -> u8 {
+        self.denied
+    }
+}
+
+/// The last `9f` answer, shared: the authority worker writes it after each
+/// turn of its loop, and the attention screen reads it as its menu opens.
+#[derive(Clone, Default)]
+pub(crate) struct Hostnames(Arc<Mutex<HostnameIntake>>);
+
+impl Hostnames {
+    /// The last answer; the empty queue before the first, and in the
+    /// direct profile, which has no authority.
+    pub(crate) fn current(&self) -> HostnameIntake {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set(&self, intake: HostnameIntake) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = intake;
+    }
+
+    /// Takes `answer` as the worker takes root's.
+    #[cfg(test)]
+    pub(crate) fn answer(&self, answer: &[u8]) -> Result<(), String> {
+        self.set(HostnameIntake::decode(answer)?);
+        Ok(())
+    }
+
+    /// Asks root's `1f` and keeps the answer.
+    fn follow(&self, wire: &mut impl Exchange) -> Result<(), String> {
+        self.set(HostnameIntake::decode(&wire.exchange(&[0x1f])?)?);
+        Ok(())
+    }
+}
+
 /// When the worker asks `1a`: at connect, after every login operation's
 /// end, and every 250 ms while the state could not be read, so a transient
 /// helper failure resolves without a reboot.
@@ -286,11 +359,13 @@ impl Launcher {
         }
         let login = Login::default();
         let (poll, connected) = open_session(&mut wire, &login)?;
+        let hostnames = Hostnames::default();
+        let followed = hostnames.clone();
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("terminal-authority".into())
             .spawn(move || {
-                if let Err(error) = worker(wire, receive, poll) {
+                if let Err(error) = worker(wire, receive, poll, followed) {
                     let _ = writeln!(
                         std::io::stderr().lock(),
                         "td-compositor: program authority: {error}"
@@ -303,6 +378,7 @@ impl Launcher {
         Ok(Self {
             send,
             login,
+            hostnames,
             connected: Some(connected),
         })
     }
@@ -310,6 +386,11 @@ impl Launcher {
     /// The login state root last answered, which the worker keeps current.
     pub fn login(&self) -> Login {
         self.login.clone()
+    }
+
+    /// What root's hostname intake holds, which the worker keeps current.
+    pub(crate) fn hostnames(&self) -> Hostnames {
+        self.hostnames.clone()
     }
 
     /// Root's answer at connect, which no later answer replaces.
@@ -359,6 +440,7 @@ impl Queued {
             Launcher {
                 send,
                 login,
+                hostnames: Hostnames::default(),
                 connected: None,
             },
             Self(receive),
@@ -594,6 +676,7 @@ fn worker(
     mut wire: impl Exchange,
     receive: Receiver<Work>,
     mut login: LoginPoll,
+    hostnames: Hostnames,
 ) -> Result<(), String> {
     let mut processes = Processes::new();
     let mut secrets = crate::secret_client::Client::default();
@@ -613,6 +696,7 @@ fn worker(
         }
         secrets.tick(&mut wire)?;
         login.follow(&mut wire, &mut secrets)?;
+        hostnames.follow(&mut wire)?;
     }
 }
 
@@ -1077,10 +1161,54 @@ mod tests {
         assert!(worker(
             Broken(calls.clone()),
             receive,
-            LoginPoll::new(Login::default())
+            LoginPoll::new(Login::default()),
+            Hostnames::default(),
         )
         .is_err());
         assert_eq!(calls.get(), 1);
+    }
+
+    /// Root's `9f` answer, exactly: the queue, then the count, which is
+    /// `00` while the intake refuses. The worker asks `1f` after each turn
+    /// and keeps the answer for the menu.
+    #[test]
+    fn the_hostname_intake_answer_is_exact_and_kept_for_the_menu() {
+        for (answer, queue, denied) in [
+            (vec![0x9f, 0, 0], Queue::Empty, 0),
+            (vec![0x9f, 0, 3], Queue::Empty, 3),
+            (vec![0x9f, 1, 0], Queue::Waiting, 0),
+            (vec![0x9f, 1, 255], Queue::Waiting, 255),
+            (vec![0x9f, 2, 0], Queue::Refusing, 0),
+        ] {
+            let intake = HostnameIntake::decode(&answer).unwrap();
+            assert_eq!((intake.queue(), intake.denied()), (queue, denied));
+            let hostnames = Hostnames::default();
+            let mut wire = wire(vec![answer]);
+            hostnames.follow(&mut wire).unwrap();
+            assert_eq!(wire.requests, [vec![0x1f]]);
+            assert_eq!(hostnames.current(), intake);
+        }
+        for answer in [
+            vec![],
+            vec![0x9f],
+            vec![0x9f, 0],
+            vec![0x9f, 3, 0],
+            vec![0x9f, 2, 1],
+            vec![0x9f, 0, 0, 0],
+            vec![0x9e, 0, 0],
+        ] {
+            assert!(HostnameIntake::decode(&answer).is_err(), "{answer:?}");
+            let hostnames = Hostnames::default();
+            assert!(hostnames.follow(&mut wire(vec![answer])).is_err());
+            assert_eq!(hostnames.current(), HostnameIntake::default());
+        }
+        assert_eq!(
+            (
+                HostnameIntake::default().queue(),
+                HostnameIntake::default().denied()
+            ),
+            (Queue::Empty, 0)
+        );
     }
 
     #[test]
@@ -1089,6 +1217,7 @@ mod tests {
         let launcher = Launcher {
             send,
             login: Login::default(),
+            hostnames: Hostnames::default(),
             connected: None,
         };
         assert!(launcher.launch().is_ok());

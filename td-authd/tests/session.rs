@@ -317,6 +317,205 @@ fn rollback_admits_by_table_then_selectors_before_any_description() {
     session.close_with(|_| fixture("cleanup_child")).unwrap();
 }
 
+/// Request `1e` (td-authd/DESIGN.md, "Elevation operations"): a busy slot,
+/// then the principal table for the owner, then the queued request and the
+/// table for its requester, each refused with its `9e` byte before any
+/// description; admitted, tag 12, counted by the backoff before it is
+/// answered. A wrong digit, which the compositor sends as a cancellation,
+/// writes nothing; a new request's commit saves the name and clears the
+/// count. `1f` says what waits and the count throughout.
+#[test]
+fn a_hostname_change_is_admitted_by_the_table_then_described_then_saved_once() {
+    use crate::elevation::tests::V1;
+    use crate::elevation::Table;
+    use crate::set_hostname::tests::{submit_as, Fixture};
+    let fixture = Fixture::new("td");
+    let mut session = Session::new(1000, "tester").unwrap();
+    assert_eq!(Request::decode(&[0x1e]).unwrap(), Request::Hostname);
+    assert_eq!(Request::decode(&[0x1f]).unwrap(), Request::HostnameState);
+    assert!(Request::decode(&[0x1e, 0]).is_err());
+    assert!(Request::decode(&[0x1f, 0]).is_err());
+    let unasked = || -> Result<Table, String> { panic!("table read while busy") };
+    assert_eq!(session.begin_hostname(unasked).unwrap(), [0x9e, 0]);
+    prepare(&mut session);
+    // No intake, as on a live boot: nothing waits.
+    assert_eq!(
+        session.answer(Request::HostnameState).unwrap(),
+        [0x9f, 0, 0]
+    );
+    assert_eq!(
+        session.begin_hostname(|| Table::parse(V1)).unwrap(),
+        [0x9e, 0]
+    );
+    session.hostnames = Some(fixture.intake(crate::set_hostname::tests::granted));
+    assert_eq!(
+        session.begin_hostname(|| Table::parse(V1)).unwrap(),
+        [0x9e, 0]
+    );
+    let intake = session.hostnames.as_mut().unwrap();
+    let mut first = submit_as(&fixture, intake, "my-laptop", 1000);
+    // Counted at admission; the menu's count leaves the waiting one out.
+    assert_eq!(fixture.backoff().read().unwrap().count(), 1);
+    assert_eq!(
+        session.answer(Request::HostnameState).unwrap(),
+        [0x9f, 1, 0]
+    );
+    // A table that does not grant the owner refuses before the queue is
+    // touched or the backoff written again.
+    for table in [
+        Table::parse("td-elevation-v1\n1000\tdeploy-rollback\n"),
+        Table::parse("td-elevation-v1\n1001\tset-hostname\n"),
+        Err("no table".to_string()),
+    ] {
+        assert_eq!(session.begin_hostname(|| table).unwrap(), [0x9e, 1]);
+        assert!(session.operation.is_none());
+        assert_eq!(
+            session.answer(Request::HostnameState).unwrap(),
+            [0x9f, 1, 0]
+        );
+    }
+    assert_eq!(fixture.backoff().read().unwrap().count(), 1);
+    let answer = session.begin_hostname(|| Table::parse(V1)).unwrap();
+    assert_eq!(answer[0], 0x92);
+    let described = Description::decode(&answer[1..]).unwrap();
+    let Operation::SetHostname {
+        key,
+        requester,
+        old,
+        new,
+    } = described.operation()
+    else {
+        panic!("not a hostname change");
+    };
+    assert_eq!(
+        (old.as_str(), new.as_str(), *requester),
+        ("td", "my-laptop", 1000)
+    );
+    assert!(key
+        .digits()
+        .iter()
+        .all(|digit| (b'2'..=b'9').contains(digit)));
+    assert_eq!(described.owner(), 1000);
+    // Counted once, at admission, and still open.
+    assert_eq!(fixture.backoff().read().unwrap().count(), 1);
+    assert_eq!(
+        session.answer(Request::HostnameState).unwrap(),
+        [0x9f, 0, 0]
+    );
+    // The slot is held.
+    assert_eq!(session.begin_hostname(unasked).unwrap(), [0x9e, 0]);
+    assert_eq!(
+        session
+            .begin_rollback(unasked, std::path::Path::new("/absent"))
+            .unwrap(),
+        [0x9d, 0]
+    );
+    // A wrong digit ends it as Escape does: nothing is written, the count
+    // stays, and the requester reads 00.
+    assert_eq!(&poll_until(&mut session, 4)[2..], described.encode());
+    session
+        .answer(Request::Presented(described.clone()))
+        .unwrap();
+    assert_eq!(&poll_until(&mut session, 5)[2..], described.encode());
+    assert_eq!(
+        session.answer(Request::Cancel(*described.nonce())).unwrap(),
+        [0x95, 0]
+    );
+    assert!(session.answer(Request::Commit(described.clone())).is_err());
+    assert_eq!(&poll_until(&mut session, 7)[2..], described.encode());
+    let mut byte = [9];
+    first.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [0]);
+    assert_eq!(fixture.saved(), b"td\n");
+    assert_eq!(fixture.backoff().read().unwrap().count(), 1);
+    assert_eq!(
+        session.answer(Request::HostnameState).unwrap(),
+        [0x9f, 0, 1]
+    );
+    // Within the backoff a new request is refused at the intake, which
+    // says why.
+    let intake = session.hostnames.as_mut().unwrap();
+    assert_eq!(
+        fixture
+            .submit(intake, &[&[5][..], &b"other"[..]].concat())
+            .1,
+        Some(3)
+    );
+    // A requester the table does not grant: refused, and retired.
+    fixture.lapse();
+    let intake = session.hostnames.as_mut().unwrap();
+    let mut stranger = submit_as(&fixture, intake, "other", 1002);
+    assert_eq!(
+        session.begin_hostname(|| Table::parse(V1)).unwrap(),
+        [0x9e, 1]
+    );
+    stranger.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [0]);
+    assert_eq!(
+        session.answer(Request::HostnameState).unwrap(),
+        [0x9f, 0, 2]
+    );
+    // A new request's right key: one commit saves the name and clears the
+    // count.
+    fixture.lapse();
+    let intake = session.hostnames.as_mut().unwrap();
+    let mut second = submit_as(&fixture, intake, "my-laptop", 1000);
+    let answer = session.begin_hostname(|| Table::parse(V1)).unwrap();
+    let described = Description::decode(&answer[1..]).unwrap();
+    assert_eq!(fixture.backoff().read().unwrap().count(), 3);
+    assert_eq!(&poll_until(&mut session, 4)[2..], described.encode());
+    session
+        .answer(Request::Presented(described.clone()))
+        .unwrap();
+    assert_eq!(&poll_until(&mut session, 5)[2..], described.encode());
+    assert_eq!(
+        session.answer(Request::Commit(described.clone())).unwrap(),
+        [0x94]
+    );
+    assert!(session.answer(Request::Commit(described.clone())).is_err());
+    assert_eq!(&poll_until(&mut session, 6)[2..], described.encode());
+    second.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [1]);
+    assert_eq!(fixture.saved(), b"my-laptop\n");
+    assert_eq!(fixture.backoff().read().unwrap().count(), 0);
+    assert_eq!(
+        session.answer(Request::HostnameState).unwrap(),
+        [0x9f, 0, 0]
+    );
+    // A requester gone before commit: the commit acts on nothing.
+    let intake = session.hostnames.as_mut().unwrap();
+    let third = submit_as(&fixture, intake, "third", 1000);
+    let answer = session.begin_hostname(|| Table::parse(V1)).unwrap();
+    let described = Description::decode(&answer[1..]).unwrap();
+    assert_eq!(&poll_until(&mut session, 4)[2..], described.encode());
+    session
+        .answer(Request::Presented(described.clone()))
+        .unwrap();
+    drop(third);
+    // Another test's child, between its fork and exec, can hold the
+    // socket a moment longer: wait for root to see the requester gone.
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let intake = session.hostnames.as_mut().unwrap();
+        intake.tick();
+        if !intake.selected_alive() {
+            break;
+        }
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        session.answer(Request::Commit(described.clone())).unwrap(),
+        [0x94]
+    );
+    assert_eq!(&poll_until(&mut session, 7)[2..], described.encode());
+    assert_eq!(fixture.saved(), b"my-laptop\n");
+    assert_eq!(fixture.backoff().read().unwrap().count(), 1);
+    session
+        .close_with(|_| self::fixture("cleanup_child"))
+        .unwrap();
+}
+
 #[test]
 fn one_operation_retains_its_bound_description_until_terminal_delivery() {
     let mut session = Session::new(1000, "tester").unwrap();

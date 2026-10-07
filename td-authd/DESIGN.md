@@ -1755,17 +1755,18 @@ staged into the target authority recipe.
 
 ## Elevation operations
 
-Implemented and live (L3): `deploy-rollback`, from the principal table
-and request `1d` through its commit and td-boot's checked pair. The rest
-of this section is a target: tag 12, which `consent.rs` encodes, decodes
-and renders and nothing yet produces, `set-hostname`'s request `1e` and
-intake, `deploy-publish`'s row for request 19, and the backoff.
-APPLICATIONS.md §L.1, "The v1 operations (target)", says what
-`deploy-rollback`, `set-hostname` and `deploy-publish` are and why, and
-its "Elevation increments" which commit lands each part;
+Implemented and live: `deploy-rollback` (L3), from the principal table
+and request `1d` through its commit and td-boot's checked pair, and
+`set-hostname` (L4), from its intake and backoff through request `1e`'s
+commit and the canonical write. The rest of this section is a target:
+tag 5's key bytes, `deploy-publish`'s row for request 19 and the update
+intake's backoff (L5), and the login tags' key bytes (TOKEN-LOGIN.md's
+increment 5). APPLICATIONS.md §L.1, "The v1 operations (target)", says
+what `deploy-rollback`, `set-hostname` and `deploy-publish` are and why,
+and its "Elevation increments" which commit lands each part;
 `td-compositor/DESIGN.md`, "Elevation consent", says which presses
-confirm. The private channel routes requests `10` to `1d` to the secret
-session and refuses `1e` and above.
+confirm. The private channel routes requests `10` to `1f` to the secret
+session and refuses `20` and above.
 
 **Consent tags.** Tags 11 (`deploy-rollback`) and 12 (`set-hostname`)
 follow the login tags. Each carries, right after its tag byte, the
@@ -1822,7 +1823,21 @@ first, so a consumed nonce is never reused, even when the operation then
 fails. Escape, expiry or, for a hostname, requester loss before commit
 cancels without acting.
 
-**Principal table.** `elevation.rs` reads it at each `1d`. `/etc` is
+`1f`, which takes no operand and holds no slot, answers `9f`, the
+hostname intake's queue byte and its backoff count: `00` when nothing
+waits and `01` when an admitted request does, each followed by the count
+of consecutive requests that ended unapproved, 255 when it is larger,
+which leaves out the one admitted and not yet ended; or `02 00` while
+root cannot read the backoff or its last write failed, so the intake
+refuses. Root reads an unreadable backoff again at each `1f`. A session
+without the intake, a live boot's, answers `00 00`. This is how root
+tells the compositor that a request waits: the compositor asks `1f` on
+each turn of its authority worker and the attention menu's `H` row shows
+the answer it holds when the menu opens. The answer grants nothing; `1e`
+selects the request and checks the table again.
+
+**Principal table.** `elevation.rs` reads it at each `1d` and `1e`, and
+at each hostname admission. `/etc` is
 opened as a directory without following a link and must be root's and
 writable by neither group nor other; the table is opened through that
 descriptor's `/proc/self/fd` path with `O_NOFOLLOW | O_NONBLOCK` and
@@ -1892,37 +1907,107 @@ boot binds none. The client `td-authd request-hostname NAME` requires a
 root peer and the exact eight-byte `TDHST01` newline greeting, then
 sends one length byte and 1 to 63 name bytes. Root parses the name with
 `Hostname::parse`, refuses the current name and a requester the
-principal table does not grant, and sends admission byte 02. As for the
-update intake, one client, one accept and four nonblocking attempts per
-heartbeat bound socket work; admission expires in five seconds, and a
-sent receipt starts a sixty-second selection window. L4 defines how root
-tells the compositor that a request waits, with the backoff count the
-menu row shows.
+principal table does not grant, writes the backoff's increment and only
+then sends admission byte 02. As for the update intake, one client, one
+accept and four nonblocking attempts per heartbeat bound socket work;
+admission expires in five seconds, and a sent receipt starts a
+sixty-second selection window. Admission also refuses while the backoff
+refuses, cannot be read or cannot be written, and while
+`/var/lib/td/hostname` is missing or unreadable. A refused whole frame
+is answered with one byte before the connection closes: 03 while the
+backoff refuses, 04 for any other reason; a malformed frame is closed
+without one. The client prints which, or that the change waits and how
+to review it, then waits for one completion byte: 01 when the name is
+saved, 00 otherwise. `set_hostname.rs` holds the intake;
+its socket work is `deployment.rs`'s `bind_intake` and the shared
+`secret_sys.rs` transport, which refuses every descriptor.
+
+At `1e`, after the table grants the owner, root takes the waiting
+request and answers `9e 01` unless the table grants its requester, the
+sender's UID. It then reads the old name from `/var/lib/td/hostname`
+with `td-firstboot hostname`'s bounds, draws the nonce and key, and
+describes tag 12; a failure of any of these ends the request as
+`9e 00`, and the client reads 00. The request counted at admission, so
+one that fails here has counted though no prompt was shown.
 
 **Backoff.** The hostname intake from L4, and the update intake from L5,
-each queue one request at a time. After a request ends unapproved
-(declined, expired, a wrong key or requester loss), the intake refuses
-new requests for 30 seconds, doubling with each consecutive unapproved
-request to at most 960 seconds; an approval resets it. Each intake's
-count and wall-clock refusal deadline live in one root-owned mode-0600
-file, `/var/lib/td/authd/backoff`, in a root-owned mode-0700 directory
-on `@var`, so neither a new authority generation nor a reboot clears
-them. Root writes the increment, synced, when it presents a request,
-with a deadline past that request's own 120-second window plus the
-delay, and when a queued request expires unselected, and clears it only
-on approval; so a teardown between a wrong key and any later write
-cannot drop the count. A missing file reads as zero; a malformed one, or
-one root cannot read or write, refuses the intake with a named
-diagnostic. The menu row shows the count.
+each queue one request at a time. Every admitted request counts until an
+approval: the intake refuses new requests until 30 seconds after the
+latest an admitted request can end, doubling with each consecutive
+unapproved request to at most 960 seconds; an approval resets it. Each
+intake's count and wall-clock refusal deadline live in one root-owned
+mode-0600 file, `/var/lib/td/authd/backoff`, in a root-owned mode-0700
+directory on `@var`, so neither a new authority generation nor a reboot
+clears them. Root writes the increment, synced, at admission, before the
+admission byte, with a deadline 180 seconds on, the request's selection
+and consent windows, plus the delay, and clears it only on approval. The
+bound is approximate: sending the admission byte, within the five-second
+admission, can start the selection window up to five seconds after the
+write. So however a request ends, declined, expired, a wrong key,
+requester loss, a failure before its prompt, or a teardown or crash of
+the authority before or after selection, it has counted; a crash between
+the write and the admission byte counts a request the client never heard
+admitted. Any process of UID 1000 can spend that shared count: each
+request it gets admitted delays the person's own renames by up to 180
+plus 960 seconds, and one that asks again as each deadline passes can
+keep them waiting indefinitely; that is the accepted trade
+APPLICATIONS.md §L.1's prompt-spam row names. The file is the line
+`td-authd-backoff-v1`, then, while the hostname intake's count is not
+zero, one row: `hostname`, the count and the deadline in seconds since
+the epoch, each after a tab in canonical decimal; every line ends in a
+newline, and L5 adds the update queue's row. It is written through
+`td-firstboot/src/saved.rs`'s synced temporary and rename, and admitted
+only as one link of root's, mode 0600, at most 256 bytes, opened without
+following a link or waiting on a FIFO; a missing directory is created by
+std, mode 0700, beneath a parent of root's that no other may write. A
+missing directory or file reads as zero; a malformed file, or one root
+cannot read, refuses the intake with a named diagnostic on root's
+standard error and `1f`'s `02`. A failed write does the same and stays
+until a later write succeeds, whatever is read in between: admission
+retries the write, so the first one that succeeds admits again. The
+standing failure is the generation's: a new authority generation starts
+without it, and its first admission refuses again by failing the same
+write. The deadline is wall-clock. One set forward shortens the refusal;
+one set back cannot lengthen it past 180 plus 960 seconds from when
+admission reads it, since admission cuts a later deadline to that bound
+and writes the cut one back.
 
-**`set-hostname` after commit.** Root re-reads `/var/lib/td/hostname`
-with `td-firstboot hostname`'s bounds, refuses unless it holds the old
-name, and writes the new name with the provisioner's synced
-temporary-file and rename protocol, root-owned, mode 0644 and
-newline-terminated, from source shared with td-firstboot rather than a
-copy. The public client then reads byte 01, and 00 on failure, as for an
-update. Root changes neither the kernel name nor `/etc/hosts`;
-APPLICATIONS.md §L.1 says what reads which name until the next boot.
+**`set-hostname` after commit.** Root consumes the confirmation, then
+clears the backoff, then re-reads `/var/lib/td/hostname` with
+`td-firstboot hostname`'s bounds, refuses unless it holds the old name,
+and writes the new name with the provisioner's synced temporary-file and
+rename protocol, root-owned, mode 0644 and newline-terminated, from
+`td-firstboot/src/saved.rs`, which td-authd compiles by `#[path]` rather
+than copying and which runs no `td-firstboot` command. The public client
+then reads byte 01, and 00 on failure, as for an update. Root changes
+neither the kernel name nor `/etc/hosts`; APPLICATIONS.md §L.1 says what
+reads which name until the next boot.
+
+Host tests drive the intake's UID, greeting, name and sender rules, one
+request at a time, the refusal bytes, the backoff's grammar, file
+checks, doubling, persistence and clearing, the count written at
+admission and kept across a teardown before selection, a failed write
+refusing until one succeeds, a deadline cut to its bound, a malformed
+backoff refusing the intake and answering `1f`'s `02`, the table before
+any description and the
+requester before the old name is read, the key's digits, a wrong or
+missing key writing nothing, one commit writing once, and a saved name
+changed since selection left alone; confinement pins hold the socket,
+greeting, write path and order, and that the intake spawns nothing and
+names no kernel hostname interface. `qemu-deploy-rollback` then, as UID
+1000, sees a malformed name refused, requests a name and sees a second
+request turned away while it waits, reads tag 12's old and new names
+and its key off the screen, types a wrong digit and sees the request
+end unwritten with the menu's count at 1 and a new request refused with
+`03`, reboots and sees the count survive. By the guest's clock it
+requires `03` for every request made before the 210 seconds from the
+first admission end, less a margin, and admission only after; when the
+reboot itself outlasts that window it fails as a slow boot, naming both
+times, rather than as a refusal missing. It types the admitted
+request's key, sees
+`/etc/hostname` read the new name while
+the kernel keeps the old one and the count cleared, and reboots to
+`TD-HOSTNAME-READY` with the new name.
 
 ## Login keys and session lock (target)
 

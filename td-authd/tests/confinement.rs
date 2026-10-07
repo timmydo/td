@@ -30,6 +30,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "application.rs",
             "application_files.rs",
             "application_shell.rs",
+            "backoff.rs",
             "channel.rs",
             "consent.rs",
             "deployment.rs",
@@ -48,6 +49,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "secret_request.rs",
             "secret_sys.rs",
             "session.rs",
+            "set_hostname.rs",
             "shell_channel.rs",
             "sys.rs",
             "terminal.rs",
@@ -69,6 +71,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("disk_install.rs", 0),
         ("elevation.rs", 0),
         ("rollback.rs", 0),
+        ("set_hostname.rs", 0),
+        ("backoff.rs", 0),
         ("sys.rs", 4),
         ("launch.rs", 0),
         ("unlock.rs", 0),
@@ -172,7 +176,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0x26c9c73a09fe3f3c,
+        SESSION_FINGERPRINT,
         "paired secret controller changed"
     );
     assert_eq!(
@@ -352,6 +356,146 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(session.contains(
         "            Request::Rollback => self.begin_rollback(\n                crate::elevation::Table::load,\n                Path::new(crate::login_tier::VOLUME),\n            ),\n"
     ));
+    // Request 1e (td-authd/DESIGN.md, "Elevation operations"): the public
+    // intake on the update intake's binder and sender rules, refusing every
+    // descriptor; the backoff written before admission is sent, a failed
+    // write refusing until one succeeds; the table for the owner before
+    // the queue; and at commit, the confirmation consumed, the backoff
+    // cleared, the saved name read again and written through
+    // td-firstboot's shared source. Nothing is spawned.
+    let rename = include_str!("../src/set_hostname.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(fingerprint(rename), SET_HOSTNAME_FINGERPRINT);
+    for pin in [
+        "const SOCKET: &str = \"/run/td-authd/1000/hostname\";",
+        "const GREETING: &[u8; 8] = b\"TDHST01\\n\";",
+        "const SAVED: &str = \"/var/lib/td/hostname\";",
+        "let (listener, identity) = bind_intake(SOCKET, owner)?;",
+        "if sender.credentials.uid != self.owner || sender.descriptor.is_some() {",
+        "if sys::peer_uid(&stream)? != owner {",
+        "        if owner != 1000 {\n            return Err(\"unsupported hostname requester\".into());",
+        "            table: Table::load,",
+        "            backoff: Backoff::system(),",
+        "        self.committed = true;\n        self.result = Some(save(&self.saved, self.owner, &self.backoff, old, new).is_ok());",
+        "    backoff.approved()?;\n    let saved = saved::read_hostname(path, owner)?",
+        "    saved::write_hostname(path, &Hostname::parse(new)?)",
+        "ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))",
+    ] {
+        assert!(rename.contains(pin), "set_hostname.rs: {pin}");
+    }
+    // Admission only after the backoff counts the request: the write is
+    // admission's last step, and the admission byte follows its success.
+    let admit = rename.split("\nfn admit(").nth(1).unwrap();
+    let admit = admit.split("\n}\n").next().unwrap();
+    assert!(
+        admit.ends_with("    status.written(places.backoff.admitted(entry, now))?;\n    Ok(())")
+    );
+    assert!(
+        admit
+            .find("status.written(places.backoff.clamp(entry, now))?")
+            .unwrap()
+            < admit.find("if entry.refuses(now) {").unwrap()
+    );
+    assert!(rename.contains(
+        "                if let Err(refused) = admit(&name) {\n                    let _ = self.stream.write(&[refused.byte()]);\n                    return Err(error(refused));\n                }\n                self.name = Some(name);"
+    ));
+    assert_eq!(rename.matches("places.backoff.admitted(").count(), 1);
+    assert_eq!(rename.matches("self.unwritten = None;").count(), 1);
+    // A failed write is sticky: `1f` answers 02 while one stands.
+    assert!(rename.contains("            _ => vec![0x9f, 2, 0],"));
+    for forbidden in [
+        "Command",
+        "spawn",
+        "send_descriptor(",
+        "create_credential(",
+        "seal_credential(",
+        "pre_exec",
+        "fs::write",
+        "remove",
+        "rename(",
+        "set_permissions",
+        "chown",
+        "sethostname",
+        "/proc/sys/kernel",
+    ] {
+        assert!(!rename.contains(forbidden), "set_hostname.rs: {forbidden}");
+    }
+    assert!(session.contains(
+        "            Request::Hostname => self.begin_hostname(crate::elevation::Table::load),\n"
+    ));
+    let begin = session.split("    fn begin_hostname(").nth(1).unwrap();
+    let begin = begin.split("\n    }\n").next().unwrap();
+    assert!(
+        begin.find("let Ok(table) = table() else {").unwrap()
+            < begin.find("intake.select()").unwrap()
+    );
+    assert!(
+        begin
+            .find("table.grants(ready.requester(), SetHostname)")
+            .unwrap()
+            < begin.find("intake.describe(").unwrap()
+    );
+    let backoff = include_str!("../src/backoff.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(fingerprint(backoff), BACKOFF_FINGERPRINT);
+    for pin in [
+        "const DIRECTORY: &str = \"/var/lib/td/authd\";",
+        "const FILE: &str = \"backoff\";",
+        "const NOFOLLOW: i32 = 0x20000;",
+        "const NONBLOCK: i32 = 0x800;",
+        "const DIRECTORY_ONLY: i32 = 0x10000;",
+        "Self::at(Path::new(DIRECTORY), (0, 0))",
+        "|| metadata.mode() & 0o7777 != 0o600",
+        "|| metadata.mode() & 0o7777 != 0o700",
+        "saved::write_synced(&self.directory.join(FILE), &encode(entry), 0o600, None)?;",
+        // The directory, when missing, beneath an admitted parent: std's
+        // DirBuilder, mode 0700, then permissions set again by path.
+        "        std::fs::DirBuilder::new()\n            .mode(0o700)\n            .create(&self.directory)",
+        "        std::fs::set_permissions(&self.directory, std::fs::Permissions::from_mode(0o700))",
+    ] {
+        assert!(backoff.contains(pin), "backoff.rs: {pin}");
+    }
+    assert_eq!(backoff.matches("DirBuilder").count(), 2);
+    assert_eq!(backoff.matches("set_permissions(").count(), 1);
+    assert_eq!(backoff.matches("write_synced(").count(), 1);
+    for forbidden in [
+        "Command",
+        "spawn",
+        "fs::write",
+        "remove",
+        "rename(",
+        "chown",
+    ] {
+        assert!(!backoff.contains(forbidden), "backoff.rs: {forbidden}");
+    }
+    // td-firstboot's source for the saved name and the synced write, one
+    // reviewed copy compiled at the crate root.
+    assert_eq!(
+        include_str!("../src/main.rs")
+            .matches("#[path = \"../../td-firstboot/src/saved.rs\"]\nmod saved;\n")
+            .count(),
+        1
+    );
+    let shared = include_str!("../../td-firstboot/src/saved.rs");
+    assert_eq!(
+        fingerprint(shared),
+        SHARED_SAVED_FINGERPRINT,
+        "shared saved-name source changed: reconcile td-firstboot and this pin"
+    );
+    for forbidden in [
+        "unsafe",
+        "Command",
+        "spawn",
+        "#[path",
+        "include",
+        "remove_dir",
+    ] {
+        assert!(!shared.contains(forbidden), "saved.rs: {forbidden}");
+    }
     let table = include_str!("../src/elevation.rs")
         .split("#[cfg(test)]")
         .next()
@@ -703,7 +847,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0x88f13b690494563e,
+        MAIN_FINGERPRINT,
         "main.rs: production startup changed"
     );
     assert_eq!(
@@ -725,7 +869,9 @@ const LOGIN_STATE_FINGERPRINT: u64 = 0xf7d4c1e582d5ed83;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x82d5e067ac0d3cb6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
-const LAUNCH_FINGERPRINT: u64 = 0x1bb53c4921507828;
+const LAUNCH_FINGERPRINT: u64 = 0x8d0878401a4a3195;
+const MAIN_FINGERPRINT: u64 = 0x135c5f3446a5e962;
+const SESSION_FINGERPRINT: u64 = 0x2be3178662459652;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;
@@ -735,5 +881,8 @@ const INSTALLATION_FINGERPRINT: u64 = 0xef204bb2bf5e35a3;
 const SHARED_LOGIN_TIER_FINGERPRINT: u64 = 0x776bbefe45e5b0c4;
 const ROLLBACK_FINGERPRINT: u64 = 0xcd1fcb60e072626d;
 const ELEVATION_FINGERPRINT: u64 = 0x3a8baf08764bbaaf;
+const SET_HOSTNAME_FINGERPRINT: u64 = 0x414d01c48e579332;
+const BACKOFF_FINGERPRINT: u64 = 0x050d78d1bcc7c748;
+const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
 const DISK_INSTALL_FINGERPRINT: u64 = 0x4dffa721ec6b8471;
 const CONSENT_CODEC_FINGERPRINT: u64 = 0x19d3fcff02c2bb2a;

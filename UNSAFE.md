@@ -2863,6 +2863,31 @@ argv, the second selector read and the absence of any other process,
 descriptor or write API. No instruction, syscall, option or allowance is
 added.
 
+### Elevation: `set-hostname`
+
+`td-authd/src/set_hostname.rs` is a further safe consumer of the
+unchanged `secret_sys.rs` transport, on the intake
+`/run/td-authd/1000/hostname` and the private channel's requests `1e`
+and `1f`. Its root receiver binds through `deployment.rs`'s
+`bind_intake`; it and its human client use the fixed peer-UID query, and
+every request fragment uses the existing credentials/pidfd receive and
+liveness wrappers. It refuses all received SCM_RIGHTS owners, closing
+them by drop, and sends none; its replies are single bytes written
+through safe std. `td-authd/src/backoff.rs` opens its directory and file
+read-only through std with fixed `O_NOFOLLOW`, `O_NONBLOCK` and
+`O_DIRECTORY` flags. When the directory is missing it creates it with
+std's `DirBuilder`, mode 0700, beneath a parent it has checked by path,
+then sets mode 0700 again with std's path-based `set_permissions`.
+Otherwise both write files only through `td-firstboot/src/saved.rs`,
+compiled by `#[path]`: safe std's removal of a leftover temporary,
+create-new temporary, permissions, sync and rename, with no owner
+change. Nothing here spawns a process, calls `sethostname` or writes
+`/proc/sys/kernel`. Confinement tests pin the three sources, the socket,
+greeting and write paths, the directory creation and its permissions
+call, the backoff's write before admission, the order of consume, clear
+and write, and the absence of any other process, descriptor or write
+API. No instruction, syscall, option or allowance is added.
+
 ### Claude shell terminal boundary
 
 The Claude shell launcher is another unprivileged consumer of the unchanged

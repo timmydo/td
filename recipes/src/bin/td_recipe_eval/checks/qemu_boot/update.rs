@@ -547,6 +547,127 @@ impl Guest {
         Err("the rollback request stayed busy".into())
     }
 
+    /// Ctrl+Alt+Esc until the menu's `H` row reads `row`, which follows
+    /// root's intake within a heartbeat; the menu is left open.
+    fn hostname_menu(&mut self, path: &Path, row: &str) -> Result<()> {
+        for _ in 0..10 {
+            // A chord while a screen still closes would close it again.
+            self.screen_until(
+                path,
+                Duration::from_secs(20),
+                "the attention screen closing",
+                |pixels| {
+                    Ok(!menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?
+                        && !row_matches(pixels, ROLLBACK_TOP, "TD SECURE ATTENTION")?
+                        && !row_matches(pixels, HOSTNAME_TOP, "TD SECURE ATTENTION")?)
+                },
+            )?;
+            self.key(&["ctrl", "alt", "esc"])?;
+            let end = self.deadline.min(Instant::now() + Duration::from_secs(20));
+            self.qmp()?.move_absolute_until(0, 0, end)?;
+            let mut shown = false;
+            self.screen_until(
+                path,
+                Duration::from_secs(20),
+                "secure-attention menu",
+                |pixels| {
+                    shown = menu_row_matches(pixels, HOSTNAME_ROW, row)?;
+                    Ok(menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?
+                        && menu_row_matches(pixels, 564, "B: ROLL BACK TO THE PREVIOUS SYSTEM")?
+                        && menu_row_matches(pixels, HOSTNAME_ROW + 36, "ESC TO RETURN")?)
+                },
+            )?;
+            if shown {
+                return Ok(());
+            }
+            self.key(&["esc"])?;
+            thread::sleep(Duration::from_secs(1));
+        }
+        Err(format!("the menu's H row did not read {row}"))
+    }
+
+    /// The menu showing a waiting change, and `H`: the prompt for exactly
+    /// this change, and its key. A slot still held by a request that just
+    /// ended answers `9e 00`, which is closed and asked again.
+    fn hostname_prompt(
+        &mut self,
+        path: &Path,
+        old: &str,
+        new: &str,
+        denied: u8,
+    ) -> Result<[u8; 2]> {
+        for _ in 0..20 {
+            self.hostname_menu(path, &hostname_row(HOSTNAME_WAITING, denied))?;
+            self.key(&["h"])?;
+            let mut key = None;
+            let mut none = false;
+            self.screen_until(path, Duration::from_secs(20), "hostname prompt", |pixels| {
+                key = hostname_prompt_key(pixels, old, new)?;
+                none = menu_row_matches(pixels, 312, NO_HOSTNAME_NOTICE)?;
+                Ok(key.is_some() || none)
+            })?;
+            if let Some(key) = key {
+                return Ok(key);
+            }
+            self.key(&["esc"])?;
+            thread::sleep(Duration::from_secs(2));
+        }
+        Err("the hostname request stayed unavailable".into())
+    }
+
+    /// One `td-authd request-hostname` as the session user, in the
+    /// background since an admitted client waits for its receipt: whether
+    /// it was admitted, or the refusal it printed.
+    fn request_hostname(&mut self, name: &str, attempt: u32) -> Result<Requested> {
+        let output = format!("{CLIENT_OUTPUT}-{attempt}");
+        self.command(&format!(
+            "(/bin/td-authd request-hostname {name}; echo TD-HOSTNAME-CLIENT=$?) > {output} 2>&1 & true"
+        ))?;
+        let waits = format!(
+            "A hostname change to {name} waits. Press Ctrl+Alt+Escape, then H to review it."
+        );
+        let end = Instant::now() + Duration::from_secs(30);
+        loop {
+            let lines = self.command(&format!("cat {output}"))?;
+            if lines.contains(&waits) {
+                return Ok(Requested::Waiting(output));
+            }
+            if let Some(status) = lines
+                .iter()
+                .find_map(|line| line.strip_prefix("TD-HOSTNAME-CLIENT="))
+            {
+                if status == "0" {
+                    return Err(format!(
+                        "the hostname client succeeded unadmitted: {lines:?}"
+                    ));
+                }
+                return Ok(Requested::Refused(lines.join(" | ")));
+            }
+            if Instant::now() >= end {
+                return Err(format!("the hostname client did not answer: {lines:?}"));
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// The waiting client's last lines once it exits.
+    fn client_result(&mut self, output: &str) -> Result<(String, Vec<String>)> {
+        let end = Instant::now() + Duration::from_secs(30);
+        loop {
+            let lines = self.command(&format!("cat {output}"))?;
+            if let Some(status) = lines
+                .iter()
+                .find_map(|line| line.strip_prefix("TD-HOSTNAME-CLIENT="))
+            {
+                return Ok((status.to_string(), lines));
+            }
+            if Instant::now() >= end {
+                return Err(format!("the hostname client did not exit: {lines:?}"));
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     /// For two seconds every capture is still the prompt with `key`.
     fn hold_rollback_prompt(
         &mut self,
@@ -647,6 +768,223 @@ impl Guest {
     }
 }
 
+/// What a hostname request's client reported.
+enum Requested {
+    /// Admitted; its output file.
+    Waiting(String),
+    /// Refused, with what it printed.
+    Refused(String),
+}
+
+/// The menu's `H` row for a queue state and the intake's count.
+fn hostname_row(state: &str, denied: u8) -> String {
+    match denied {
+        0 => state.to_string(),
+        denied => format!("{state} - {denied} DENIED"),
+    }
+}
+
+/// The names `/etc/hostname` and the kernel hold.
+fn names(guest: &mut Guest) -> Result<(String, String)> {
+    let saved = guest.scalar("echo \"TD-SAVED-NAME=$(cat /etc/hostname)\"", |line| {
+        line.starts_with("TD-SAVED-NAME=")
+    })?;
+    let kernel = guest.scalar(
+        "echo \"TD-KERNEL-NAME=$(cat /proc/sys/kernel/hostname)\"",
+        |line| line.starts_with("TD-KERNEL-NAME="),
+    )?;
+    Ok((
+        saved.trim_start_matches("TD-SAVED-NAME=").to_string(),
+        kernel.trim_start_matches("TD-KERNEL-NAME=").to_string(),
+    ))
+}
+
+/// The guest's clock, in seconds since the epoch, which root's backoff
+/// deadlines are written in.
+fn guest_time(guest: &mut Guest) -> Result<u64> {
+    guest
+        .scalar("echo TD-GUEST-TIME=$(date +%s)", |line| {
+            line.strip_prefix("TD-GUEST-TIME=")
+                .is_some_and(|time| time.parse::<u64>().is_ok())
+        })?
+        .trim_start_matches("TD-GUEST-TIME=")
+        .parse()
+        .map_err(|_| "malformed guest time".into())
+}
+
+/// How long the first request's refusal runs past its admission: its
+/// 180-second life and the first 30-second delay (td-authd/DESIGN.md,
+/// "Backoff"); and the slack either side of that edge the oracle allows
+/// for the time between a request and root's reading of its clock.
+const FIRST_REFUSAL: u64 = 210;
+const EDGE: u64 = 10;
+
+/// The first `set-hostname` phase (td-authd/DESIGN.md, "Elevation
+/// operations"), as UID 1000 on a guest named `old`: a malformed name is
+/// refused by the client; a request waits and a second is turned away
+/// while it does; `H` shows tag 12 with both names and the key; a wrong
+/// digit ends it unwritten, the menu's count reads 1, and the backoff
+/// refuses a new request at once. The guest's clock just after the first
+/// admission, from which the refusal runs.
+fn hostname_denied(guest: &mut Guest, work: &Path, old: &str) -> Result<u64> {
+    let capture = work.join("hostname.ppm");
+    let uid = guest.scalar("echo TD-ORACLE-UID=$(id -u)", |line| {
+        line.starts_with("TD-ORACLE-UID=")
+    })?;
+    if uid != "TD-ORACLE-UID=1000" {
+        return Err(format!("the serial session is not UID 1000: {uid}"));
+    }
+    guest.hostname_menu(&capture, HOSTNAME_EMPTY)?;
+    guest.key(&["esc"])?;
+    match guest.request_hostname("Bad_Name", 0)? {
+        Requested::Refused(_) => {}
+        Requested::Waiting(_) => return Err("a malformed name was admitted".into()),
+    }
+    let Requested::Waiting(first) = guest.request_hostname(NEW_HOSTNAME, 1)? else {
+        return Err("the first hostname request was not admitted".into());
+    };
+    let admitted = guest_time(guest)?;
+    match guest.request_hostname("td-second", 2)? {
+        Requested::Refused(why) if why.contains("admission unavailable") => {}
+        Requested::Refused(why) => {
+            return Err(format!("a second request was refused otherwise: {why}"))
+        }
+        Requested::Waiting(_) => return Err("a second request was admitted while one waits".into()),
+    }
+    let key = guest.hostname_prompt(&capture, old, NEW_HOSTNAME, 0)?;
+    println!(
+        "[qemu-deploy-rollback] H shows tag 12 for {old} to {NEW_HOSTNAME}; key {}",
+        String::from_utf8_lossy(&key)
+    );
+    let [first_digit, _] = key;
+    let (wrong, _) = digit_key(other_digit(first_digit))?;
+    guest.key(&[wrong])?;
+    guest.screen_until(
+        &capture,
+        Duration::from_secs(20),
+        "the end of a wrong key's hostname request",
+        |pixels| {
+            Ok(hostname_prompt_key(pixels, old, NEW_HOSTNAME)?.is_none()
+                && !row_matches(pixels, HOSTNAME_TOP, "TD SECURE ATTENTION")?)
+        },
+    )?;
+    let (status, lines) = guest.client_result(&first)?;
+    if status == "0"
+        || !lines
+            .iter()
+            .any(|line| line.contains("declined, expired or failed"))
+    {
+        return Err(format!(
+            "the wrong key's client did not report failure: {lines:?}"
+        ));
+    }
+    if names(guest)? != (old.to_string(), old.to_string()) {
+        return Err("a wrong digit changed the hostname".into());
+    }
+    guest.hostname_menu(&capture, &hostname_row(HOSTNAME_EMPTY, 1))?;
+    guest.key(&["esc"])?;
+    match guest.request_hostname(NEW_HOSTNAME, 3)? {
+        Requested::Refused(why) if why.contains(BACKING_OFF) => {}
+        _ => return Err("the backoff did not refuse a request within its window".into()),
+    }
+    println!(
+        "[qemu-deploy-rollback] a wrong digit ended the hostname request unwritten; \
+         the count reads 1 and the backoff refused the next request"
+    );
+    Ok(admitted)
+}
+
+/// The second `set-hostname` phase, after a reboot: the count survived
+/// it, and so did the refusal, which runs 210 seconds from the first
+/// request's admission at `admitted` by the guest's clock. Every request
+/// made before that window closes, less the edge, is refused as backing
+/// off, root's own reason, and none after it; the first is required to
+/// come inside it, so at least one is refused, and a reboot that outlasts
+/// the window fails as a slow boot rather than as a missing refusal. The
+/// admitted request's key, typed, saves the name, which `/etc/hostname`
+/// reads at once while the kernel keeps `old`, and clears the count.
+fn hostname_approved(guest: &mut Guest, work: &Path, old: &str, admitted: u64) -> Result<()> {
+    let capture = work.join("hostname.ppm");
+    guest.hostname_menu(&capture, &hostname_row(HOSTNAME_EMPTY, 1))?;
+    guest.key(&["esc"])?;
+    println!("[qemu-deploy-rollback] the backoff's count survived the reboot");
+    let closes = admitted.saturating_add(FIRST_REFUSAL);
+    let mut refused = 0u32;
+    let waiting = loop {
+        let at = guest_time(guest)?;
+        if refused == 0 && at.saturating_add(EDGE) >= closes {
+            return Err(format!(
+                "the boot outlasted the backoff window (t0={admitted}, first={at}): \
+                 too slow to show the refusal surviving the reboot"
+            ));
+        }
+        match guest.request_hostname(NEW_HOSTNAME, 10 + refused)? {
+            Requested::Waiting(output) if at.saturating_add(EDGE) >= closes => break output,
+            Requested::Waiting(_) => {
+                return Err(format!(
+                    "a request was admitted inside the backoff window (t0={admitted}, at={at})"
+                ))
+            }
+            Requested::Refused(why) if why.contains(BACKING_OFF) => {
+                if at > closes.saturating_add(EDGE) {
+                    return Err(format!(
+                        "the backoff refused past its window (t0={admitted}, at={at})"
+                    ));
+                }
+                refused += 1;
+                thread::sleep(Duration::from_secs(10));
+            }
+            Requested::Refused(why) => {
+                return Err(format!("the hostname request was refused: {why}"))
+            }
+        }
+    };
+    println!("[qemu-deploy-rollback] the backoff refused {refused} requests after the reboot");
+    let key = guest.hostname_prompt(&capture, old, NEW_HOSTNAME, 1)?;
+    for digit in key {
+        let (name, _) = digit_key(digit)?;
+        guest.key(&[name])?;
+    }
+    guest.screen_until(
+        &capture,
+        Duration::from_secs(60),
+        "the hostname change's success",
+        |pixels| {
+            Ok(menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?
+                && menu_row_matches(pixels, 312, HOSTNAME_SAVED_NOTICE)?
+                && menu_row_matches(pixels, 348, RESTART_COMPLETES)?)
+        },
+    )?;
+    guest.key(&["esc"])?;
+    let (status, lines) = guest.client_result(&waiting)?;
+    let saved = format!("Hostname saved as {NEW_HOSTNAME}. A restart completes the change.");
+    if status != "0" || !lines.contains(&saved) {
+        return Err(format!(
+            "the approved client did not report the save: {lines:?}"
+        ));
+    }
+    if names(guest)? != (NEW_HOSTNAME.to_string(), old.to_string()) {
+        return Err("the approved change did not save the name, or renamed the kernel".into());
+    }
+    guest.hostname_menu(&capture, HOSTNAME_EMPTY)?;
+    guest.key(&["esc"])?;
+    println!(
+        "[qemu-deploy-rollback] the typed key {} saved {NEW_HOSTNAME} and cleared the count",
+        String::from_utf8_lossy(&key)
+    );
+    Ok(())
+}
+
+/// The `TD-HOSTNAME-READY` line a boot reports, once.
+fn hostname_ready(seen: &mut Option<String>, line: &str) -> Result<()> {
+    if let Some(name) = line.strip_prefix("TD-HOSTNAME-READY ") {
+        if seen.replace(name.to_string()).is_some() {
+            return Err("duplicate TD-HOSTNAME-READY".into());
+        }
+    }
+    Ok(())
+}
+
 fn git_id(text: &str) -> bool {
     matches!(text.len(), 40 | 64)
         && text
@@ -687,9 +1025,25 @@ fn selector(guest: &mut Guest, slot: &str) -> Result<String> {
 /// The rollback prompt at 1280x800: nine Unifont rows 40 apart, centred,
 /// the time line last (td-authd/src/consent.rs, tag 11).
 const ROLLBACK_TOP: usize = 224;
+/// The hostname prompt, tag 12's ten rows, one more than tag 11's.
+const HOSTNAME_TOP: usize = 204;
 const PROMPT_PITCH: usize = 40;
 const BUSY_NOTICE: &str = "PREVIOUS REQUEST IS STILL FINISHING";
 const ROLLED_BACK_NOTICE: &str = "ROLLED BACK - RESTART TO BOOT IT";
+/// The menu's `H` row, below `B` (td-compositor/DESIGN.md, "Elevation
+/// consent"), and its two queue states.
+const HOSTNAME_ROW: usize = 600;
+const HOSTNAME_EMPTY: &str = "H: NO HOSTNAME CHANGE WAITING";
+const HOSTNAME_WAITING: &str = "H: REVIEW HOSTNAME CHANGE";
+const NO_HOSTNAME_NOTICE: &str = "NO HOSTNAME CHANGE IS READY TO REVIEW";
+const HOSTNAME_SAVED_NOTICE: &str = "HOSTNAME SAVED";
+const RESTART_COMPLETES: &str = "A RESTART COMPLETES THE CHANGE";
+/// The name the oracle asks for; the fixture boots as `td`.
+const NEW_HOSTNAME: &str = "td-renamed";
+/// The client's refusal when root answers 03, the backoff running.
+const BACKING_OFF: &str = "the intake is backing off after unapproved requests";
+/// Where each request's client writes, in the session user's home.
+const CLIENT_OUTPUT: &str = "/var/home/tester/td-hostname-request";
 /// The compositor's control socket, which answers `td-ctl` for the session.
 const CONTROL_SOCKET: &str = "/run/td-compositor/1000/td-control";
 
@@ -700,16 +1054,46 @@ fn rollback_prompt_key(pixels: &[u8], current: &str, previous: &str) -> Result<O
     if !canonical_id(current) || !canonical_id(previous) {
         return Err("invalid expected rollback pair".into());
     }
-    for (row, text) in [
-        (0, "TD SECURE ATTENTION"),
-        (1, "SESSION USER 1000"),
-        (2, "ROLL BACK TO THE PREVIOUS SYSTEM"),
-        (3, &format!("CURRENT: {current}")),
-        (4, &format!("PREVIOUS: {previous}")),
-        (5, "TAKES EFFECT AT THE NEXT RESTART"),
-        (7, "ESC: CANCEL"),
-    ] {
-        if !row_matches(pixels, ROLLBACK_TOP + row * PROMPT_PITCH, text)? {
+    prompt_key(
+        pixels,
+        ROLLBACK_TOP,
+        &[
+            "ROLL BACK TO THE PREVIOUS SYSTEM",
+            &format!("CURRENT: {current}"),
+            &format!("PREVIOUS: {previous}"),
+            "TAKES EFFECT AT THE NEXT RESTART",
+        ],
+    )
+}
+
+/// Whether `pixels` are the hostname prompt (tag 12) for exactly this
+/// change, and if so the approval key it shows.
+fn hostname_prompt_key(pixels: &[u8], old: &str, new: &str) -> Result<Option<[u8; 2]>> {
+    prompt_key(
+        pixels,
+        HOSTNAME_TOP,
+        &[
+            "CHANGE HOSTNAME",
+            "REQUESTER UID 1000",
+            &format!("OLD NAME: {old}"),
+            &format!("NEW NAME: {new}"),
+            RESTART_COMPLETES,
+        ],
+    )
+}
+
+/// An elevation prompt from `top`: the title, the session row, `rows`,
+/// the key row and Escape's; the time line below is not read. The key is
+/// one of the 64, or an error when the row matches more than one.
+fn prompt_key(pixels: &[u8], top: usize, rows: &[&str]) -> Result<Option<[u8; 2]>> {
+    let key_row = rows.len() + 2;
+    for (row, text) in ["TD SECURE ATTENTION", "SESSION USER 1000"]
+        .iter()
+        .chain(rows)
+        .enumerate()
+        .chain(std::iter::once((key_row + 1, &"ESC: CANCEL")))
+    {
+        if !row_matches(pixels, top + row * PROMPT_PITCH, text)? {
             return Ok(None);
         }
     }
@@ -721,10 +1105,10 @@ fn rollback_prompt_key(pixels: &[u8], current: &str, previous: &str) -> Result<O
                 char::from(first),
                 char::from(second)
             );
-            if row_matches(pixels, ROLLBACK_TOP + 6 * PROMPT_PITCH, &text)?
+            if row_matches(pixels, top + key_row * PROMPT_PITCH, &text)?
                 && shown.replace([first, second]).is_some()
             {
-                return Err("the rollback prompt's key row matches two keys".into());
+                return Err("the prompt's key row matches two keys".into());
             }
         }
     }
@@ -844,7 +1228,9 @@ fn deploy_rollback(guest: &mut Guest, work: &Path, current: &str, previous: &str
 
 /// `qemu-deploy-rollback`: the system image on a fixture volume whose
 /// `current` is a second signed deployment and `previous` the recipe's
-/// own, the rollback phase, then a reboot that selects `previous`.
+/// own, the rollback phase and the first hostname phase, then a reboot
+/// that selects `previous` and the second hostname phase, then a reboot
+/// that reports the new name.
 pub(crate) fn run_deploy_rollback(runner: &crate::check_runner::RecipeCheckRunner) -> Result<()> {
     println!("[qemu-deploy-rollback] building the system image and the rollback fixture");
     use std::sync::atomic::AtomicU64;
@@ -901,21 +1287,54 @@ pub(crate) fn run_deploy_rollback(runner: &crate::check_runner::RecipeCheckRunne
     let deadline = Instant::now()
         .checked_add(options.timeout)
         .ok_or("oracle deadline overflow")?;
+    let disk = options.work.join("disk.qcow2");
     let run = || -> Result<()> {
-        let mut guest = Guest::start(&options, 1, deadline)?;
+        let mut ready = None;
+        let mut guest = Guest::healthy(&options, 1, deadline, &disk, |line| {
+            hostname_ready(&mut ready, line)
+        })?;
+        let old = ready.ok_or("the first boot reported no TD-HOSTNAME-READY")?;
+        if old == NEW_HOSTNAME {
+            return Err("the fixture already has the oracle's name".into());
+        }
         let cmdline = guest.scalar("cat /proc/cmdline", |line| kernel_id(line).is_some())?;
         if kernel_id(&cmdline) != Some(current.as_str()) {
             return Err("the fixture did not boot its current deployment".into());
         }
         deploy_rollback(&mut guest, &options.work, &current, &previous)?;
+        let admitted = hostname_denied(&mut guest, &options.work, &old)?;
         guest.command("sync")?;
         guest.stop()?;
-        let mut guest = Guest::start(&options, 2, deadline)?;
+        let mut ready = None;
+        let mut guest = Guest::healthy(&options, 2, deadline, &disk, |line| {
+            hostname_ready(&mut ready, line)
+        })?;
+        if ready.as_deref() != Some(old.as_str()) {
+            return Err("the second boot did not keep the old name".into());
+        }
         let cmdline = guest.scalar("cat /proc/cmdline", |line| kernel_id(line).is_some())?;
         if kernel_id(&cmdline) != Some(previous.as_str()) {
             return Err("the reboot after the rollback did not select previous".into());
         }
         unchanged(&mut guest, &previous, &previous, "the reboot")?;
+        hostname_approved(&mut guest, &options.work, &old, admitted)?;
+        guest.command("sync")?;
+        guest.stop()?;
+        let mut ready = None;
+        let mut guest = Guest::healthy(&options, 3, deadline, &disk, |line| {
+            hostname_ready(&mut ready, line)
+        })?;
+        if ready.as_deref() != Some(NEW_HOSTNAME) {
+            return Err(format!(
+                "the boot after the change reported {ready:?}, not TD-HOSTNAME-READY {NEW_HOSTNAME}"
+            ));
+        }
+        if names(&mut guest)? != (NEW_HOSTNAME.to_string(), NEW_HOSTNAME.to_string()) {
+            return Err("the boot after the change did not name the system".into());
+        }
+        guest.hostname_menu(&options.work.join("hostname.ppm"), HOSTNAME_EMPTY)?;
+        guest.key(&["esc"])?;
+        println!("[qemu-deploy-rollback] the next boot reported TD-HOSTNAME-READY {NEW_HOSTNAME}");
         guest.command("sync")?;
         guest.stop()
     };
@@ -926,9 +1345,12 @@ pub(crate) fn run_deploy_rollback(runner: &crate::check_runner::RecipeCheckRunne
             for name in [
                 "serial-1.log",
                 "serial-2.log",
+                "serial-3.log",
                 "qemu-1.log",
                 "qemu-2.log",
+                "qemu-3.log",
                 "rollback.ppm",
+                "hostname.ppm",
             ] {
                 let _ = fs::copy(options.work.join(name), keep.join(name));
             }
@@ -939,7 +1361,9 @@ pub(crate) fn run_deploy_rollback(runner: &crate::check_runner::RecipeCheckRunne
     println!(
         "[qemu-deploy-rollback] PASS (KVM): request 1d's prompt named the pair; Enter, \
          control-socket digits and a wrong digit committed nothing; the typed key rolled \
-         back and the next boot selected {previous}"
+         back and the next boot selected {previous}; request 1e's prompt named both names, \
+         a wrong digit wrote nothing and counted, the backoff refused and survived a \
+         reboot, the typed key saved {NEW_HOSTNAME} and the next boot reported it"
     );
     Ok(())
 }
@@ -1320,8 +1744,8 @@ pub(super) fn row_matches(pixels: &[u8], top: usize, text: &str) -> Result<bool>
 }
 
 // The attention menu uses the small chrome face; consent uses Unifont.
-// Rows are space, colon, A through Z, then hyphen and plus.
-const MENU_GLYPHS: [[u8; 7]; 30] = [
+// Rows are space, colon, A through Z, hyphen and plus, then 0 through 9.
+const MENU_GLYPHS: &[[u8; 7]] = &[
     [0, 0, 0, 0, 0, 0, 0],
     [0, 4, 4, 0, 4, 4, 0],
     [14, 17, 17, 31, 17, 17, 17],
@@ -1352,6 +1776,16 @@ const MENU_GLYPHS: [[u8; 7]; 30] = [
     [31, 1, 2, 4, 8, 16, 31],
     [0, 0, 0, 31, 0, 0, 0],
     [0, 4, 4, 31, 4, 4, 0],
+    [14, 17, 19, 21, 25, 17, 14],
+    [4, 12, 4, 4, 4, 4, 14],
+    [14, 17, 1, 2, 4, 8, 31],
+    [30, 1, 1, 14, 1, 1, 30],
+    [2, 6, 10, 18, 31, 2, 2],
+    [31, 16, 16, 30, 1, 1, 30],
+    [14, 16, 16, 30, 17, 17, 14],
+    [31, 1, 2, 4, 8, 8, 8],
+    [14, 17, 17, 14, 17, 17, 14],
+    [14, 17, 17, 15, 1, 1, 14],
 ];
 
 /// The chrome face's rows for `character`, top first, five bits each.
@@ -1362,6 +1796,7 @@ fn chrome_glyph(character: u8) -> Result<&'static [u8; 7]> {
         b'A'..=b'Z' => usize::from(character - b'A') + 2,
         b'-' => 28,
         b'+' => 29,
+        b'0'..=b'9' => usize::from(character - b'0') + 30,
         _ => return Err("unsupported chrome glyph".into()),
     };
     MENU_GLYPHS
@@ -1828,7 +2263,7 @@ mod tests {
     #[test]
     fn chrome_glyphs_are_the_compositors() {
         let chrome = include_str!("../../../../../../td-compositor/src/ui.rs");
-        for character in b" :ABCDEFGHIJKLMNOPQRSTUVWXYZ-" {
+        for character in b" :ABCDEFGHIJKLMNOPQRSTUVWXYZ-+0123456789" {
             let rows = chrome_glyph(*character).unwrap();
             let line = format!(
                 "b'{}' => [{}],",
@@ -1838,7 +2273,7 @@ mod tests {
             assert!(chrome.contains(&line), "{line}");
         }
         assert!(chrome_glyph(b'a').is_err());
-        assert!(chrome_glyph(b'0').is_err());
+        assert!(chrome_glyph(b'.').is_err());
         assert!(chrome.contains("pub(crate) const GLYPH_ADVANCE: usize = 6;"));
         assert!(chrome.contains("pub(crate) const GLYPH_WIDTH: usize = 5;"));
     }
@@ -2042,6 +2477,8 @@ mod tests {
             "SYSTEM INSTALLED - RESTART TO BOOT IT",
             "PRESS CTRL+ALT+ESC TO UNLOCK",
             ROLLED_BACK_NOTICE,
+            &hostname_row(HOSTNAME_EMPTY, 1),
+            &hostname_row(HOSTNAME_WAITING, 255),
         ] {
             notice_row_matches_the_chrome_font(text);
         }
@@ -2138,6 +2575,76 @@ mod tests {
         assert!(rollback_prompt_key(&pixels, "AB", &previous).is_err());
     }
 
+    /// The hostname prompt as td-authd renders tag 12 and the compositor
+    /// centres it with its time line.
+    fn hostname_rows(old: &str, new: &str, key: &str) -> Vec<(usize, String)> {
+        let [first, second] = key.as_bytes() else {
+            panic!("a key is two digits");
+        };
+        [
+            "TD SECURE ATTENTION".to_string(),
+            "SESSION USER 1000".into(),
+            "CHANGE HOSTNAME".into(),
+            "REQUESTER UID 1000".into(),
+            format!("OLD NAME: {old}"),
+            format!("NEW NAME: {new}"),
+            "A RESTART COMPLETES THE CHANGE".into(),
+            format!(
+                "APPROVE: TYPE {} THEN {}",
+                char::from(*first),
+                char::from(*second)
+            ),
+            "ESC: CANCEL".into(),
+            "TIME LEFT WHEN SHOWN: 120 S".into(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(row, text)| (204 + row * 40, text))
+        .collect()
+    }
+
+    #[test]
+    fn the_hostname_prompt_is_read_for_its_names_and_key() {
+        for key in ["47", "22", "99", "28"] {
+            let pixels = unifont_pixels(&hostname_rows("td", NEW_HOSTNAME, key));
+            assert_eq!(
+                hostname_prompt_key(&pixels, "td", NEW_HOSTNAME).unwrap(),
+                Some(<[u8; 2]>::try_from(key.as_bytes()).unwrap()),
+                "{key}"
+            );
+            // The names swapped, or another new name, are not this prompt.
+            assert_eq!(
+                hostname_prompt_key(&pixels, NEW_HOSTNAME, "td").unwrap(),
+                None
+            );
+            assert_eq!(
+                hostname_prompt_key(&pixels, "td", "td-other").unwrap(),
+                None
+            );
+        }
+        for missing in 0..9 {
+            let mut rows = hostname_rows("td", NEW_HOSTNAME, "47");
+            rows.remove(missing);
+            assert_eq!(
+                hostname_prompt_key(&unifont_pixels(&rows), "td", NEW_HOSTNAME).unwrap(),
+                None,
+                "row {missing}"
+            );
+        }
+        // A rollback's prompt is not a hostname's, nor the reverse.
+        let (current, previous) = ("ab".repeat(32), "cd".repeat(32));
+        let rollback = unifont_pixels(&rollback_rows(&current, &previous, "47"));
+        assert_eq!(
+            hostname_prompt_key(&rollback, "td", NEW_HOSTNAME).unwrap(),
+            None
+        );
+        let pixels = unifont_pixels(&hostname_rows("td", NEW_HOSTNAME, "47"));
+        assert_eq!(
+            rollback_prompt_key(&pixels, &current, &previous).unwrap(),
+            None
+        );
+    }
+
     #[test]
     fn approval_digits_are_typed_as_their_number_row_keys() {
         for (digit, name, code) in [(b'2', "2", 3), (b'5', "5", 6), (b'9', "9", 10)] {
@@ -2155,7 +2662,7 @@ mod tests {
 
     /// The rows read here are the ones td-authd and the compositor draw.
     #[test]
-    fn the_rollback_rows_are_td_authds_and_the_compositors() {
+    fn the_elevation_rows_are_td_authds_and_the_compositors() {
         let consent = include_str!("../../../../../../td-authd/src/consent.rs");
         for row in [
             "\"ROLL BACK TO THE PREVIOUS SYSTEM\"",
@@ -2167,9 +2674,43 @@ mod tests {
         ] {
             assert!(consent.contains(row), "{row}");
         }
+        for row in [
+            "\"CHANGE HOSTNAME\"",
+            "format!(\"REQUESTER UID {requester}\")",
+            "format!(\"OLD NAME: {old}\")",
+            "format!(\"NEW NAME: {new}\")",
+            "\"A RESTART COMPLETES THE CHANGE\"",
+        ] {
+            assert!(consent.contains(row), "{row}");
+        }
         let attention = include_str!("../../../../../../td-compositor/src/attention.rs");
-        for notice in [ROLLED_BACK_NOTICE, BUSY_NOTICE] {
+        for notice in [
+            ROLLED_BACK_NOTICE,
+            BUSY_NOTICE,
+            HOSTNAME_EMPTY,
+            HOSTNAME_WAITING,
+            NO_HOSTNAME_NOTICE,
+            HOSTNAME_SAVED_NOTICE,
+            RESTART_COMPLETES,
+        ] {
             assert!(attention.contains(&format!("\"{notice}\"")), "{notice}");
+        }
+        assert!(attention.contains("denied => format!(\"{state} - {denied} DENIED\"),"));
+        assert_eq!(
+            hostname_row(HOSTNAME_EMPTY, 3),
+            "H: NO HOSTNAME CHANGE WAITING - 3 DENIED"
+        );
+        // The client's lines the oracle waits on and the refusals it reads.
+        let client = include_str!("../../../../../../td-authd/src/set_hostname.rs");
+        for line in [
+            "\"A hostname change to {} waits. Press Ctrl+Alt+Escape, then H to review it.\"",
+            "\"Hostname saved as {}. A restart completes the change.\"",
+            "\"hostname admission unavailable (busy or disconnected): {e}\"",
+            "\"hostname change was not admitted: the intake is backing off \\\n                 after unapproved requests\"",
+            "\"hostname change was declined, expired or failed\"",
+            "const SOCKET: &str = \"/run/td-authd/1000/hostname\";",
+        ] {
+            assert!(client.contains(line), "{line}");
         }
         let main = include_str!("../../../../../../td-compositor/src/main.rs");
         assert!(main.contains(&format!(

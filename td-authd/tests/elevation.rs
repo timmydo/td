@@ -9,6 +9,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) const V1: &str =
     "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\n";
 
+/// A table granting `uid` every v1 operation, outside the grammar's UID
+/// range when a test runs as such a UID.
+pub(crate) fn granting(uid: u32) -> Table {
+    Table {
+        rows: vec![(uid, Operation::ALL.to_vec())],
+    }
+}
+
 /// A private directory holding `text` as the table, mode 0444, owned as
 /// the directory is; removed on drop.
 pub(crate) struct Etc {

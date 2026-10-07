@@ -35,7 +35,7 @@ const STEPS: &[Step] = &[
     Step {
         name: "qemu-deploy-rollback",
         argv: &["qemu-deploy-rollback"],
-        proves: "an approved deploy-rollback selects the previous system at the next boot",
+        proves: "an approved deploy-rollback selects the previous system, and an approved set-hostname names the system, at the next boot",
     },
     Step {
         name: "qemu-boot-live",

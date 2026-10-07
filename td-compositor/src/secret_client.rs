@@ -323,8 +323,9 @@ impl Selection {
 }
 
 /// An elevation (td-compositor/DESIGN.md, "Elevation consent"): what the
-/// attention menu's `B` asks root for, and from L4 what its `H` selects.
-/// Each description carries the approval key that alone confirms it.
+/// attention menu's `B` asks root for, and the queued request its `H`
+/// selects. Each description carries the approval key that alone confirms
+/// it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Elevation {
     Rollback,
@@ -1281,19 +1282,28 @@ impl Client {
         if attempt.selection == Selection::Install && response == [0x99, 1] {
             return attempt.notice(crate::attention::Notice::UpdateRefused);
         }
-        // Root refused the rollback before any description
+        // Root refused the elevation before any description
         // (td-authd/DESIGN.md, "Elevation operations"): a busy slot, the
-        // principal table, or no two deployments to choose between.
-        if attempt.selection == Selection::Elevation(Elevation::Rollback) {
-            let refused = match response.as_slice() {
-                [0x9d, 0] => Some(crate::attention::Notice::Busy),
-                [0x9d, 1] => Some(crate::attention::Notice::ElevationRefused),
-                [0x9d, 2] => Some(crate::attention::Notice::NoPrevious),
-                _ => None,
-            };
-            if let Some(notice) = refused {
-                return attempt.notice(notice);
+        // principal table, no two deployments to choose between, or no
+        // queued hostname change.
+        let refused = match (&attempt.selection, response.as_slice()) {
+            (Selection::Elevation(Elevation::Rollback), [0x9d, 0]) => {
+                Some(crate::attention::Notice::Busy)
             }
+            (Selection::Elevation(Elevation::Rollback), [0x9d, 1])
+            | (Selection::Elevation(Elevation::Hostname), [0x9e, 1]) => {
+                Some(crate::attention::Notice::ElevationRefused)
+            }
+            (Selection::Elevation(Elevation::Rollback), [0x9d, 2]) => {
+                Some(crate::attention::Notice::NoPrevious)
+            }
+            (Selection::Elevation(Elevation::Hostname), [0x9e, 0]) => {
+                Some(crate::attention::Notice::NoHostname)
+            }
+            _ => None,
+        };
+        if let Some(notice) = refused {
+            return attempt.notice(notice);
         }
         let Some((&0x92, bytes)) = response.split_first() else {
             return Err("invalid secret operation start response".into());
@@ -1439,17 +1449,16 @@ impl Client {
                     pending.cancel(wire)?;
                 }
             }
-            // A hostname change's success screen comes with its operation,
-            // from L4; until then root's success for one is out of order.
-            6 if pending.committed
-                && pending.attempt.selection != Selection::Elevation(Elevation::Hostname) =>
-            {
+            6 if pending.committed => {
                 pending.attempt.notice(
                     if matches!(pending.attempt.selection, Selection::Enroll(_)) {
                         crate::attention::Notice::Enrolled
                     } else if pending.attempt.selection == Selection::Elevation(Elevation::Rollback)
                     {
                         crate::attention::Notice::RolledBack
+                    } else if pending.attempt.selection == Selection::Elevation(Elevation::Hostname)
+                    {
+                        crate::attention::Notice::HostnameSaved
                     } else if pending.attempt.selection == Selection::Install {
                         crate::attention::Notice::Installed
                     } else if pending.attempt.selection == Selection::Write {
@@ -2240,8 +2249,7 @@ mod tests {
     /// Each elevation's prompt commits once, only after its two digits are
     /// typed in order on the presented prompt, and the commit is root's
     /// exact description, so it carries the key typed. The same digit
-    /// twice is two presses. Root's success shows a rollback's screen; a
-    /// hostname change's has none until L4.
+    /// twice is two presses. Root's success shows each one's own screen.
     #[test]
     fn each_elevation_commits_only_after_its_key_is_typed_in_order() {
         for (elevation, key, request) in [
@@ -2280,62 +2288,79 @@ mod tests {
             assert_eq!(commits, [&description(&[0x14], &described)]);
             assert_eq!(commits[0][46..48], key[..]);
             assert!(client.pending.as_ref().unwrap().committed);
-            if elevation == Elevation::Rollback {
-                client.tick(&mut wire).unwrap();
-                assert!(client.pending.is_none());
-                assert_eq!(
-                    screen.attempt.runtime.lock().unwrap().attention_shown(),
-                    Some(Notice::RolledBack)
-                );
-            } else {
-                assert_eq!(
-                    client.tick(&mut wire).unwrap_err(),
-                    "out-of-order secret operation status"
-                );
-            }
+            client.tick(&mut wire).unwrap();
+            assert!(client.pending.is_none());
+            assert_eq!(
+                screen.attempt.runtime.lock().unwrap().attention_shown(),
+                Some(match elevation {
+                    Elevation::Rollback => Notice::RolledBack,
+                    Elevation::Hostname => Notice::HostnameSaved,
+                })
+            );
             assert_eq!(sent(&wire, 0x14), 1);
         }
     }
 
-    /// Root's `9d` refusals of a rollback before any description: each
-    /// shows its text and presents nothing. `9d` answers no other
-    /// selection, and no other refusal byte is one.
+    /// Root's `9d` and `9e` refusals before any description: each shows
+    /// its text and presents nothing. Each answers its own elevation alone,
+    /// and no other refusal byte is one.
     #[test]
-    fn a_rollback_root_refuses_shows_its_text_and_presents_nothing() {
-        for (reply, notice) in [
-            (vec![0x9d, 0], Notice::Busy),
-            (vec![0x9d, 1], Notice::ElevationRefused),
-            (vec![0x9d, 2], Notice::NoPrevious),
+    fn an_elevation_root_refuses_shows_its_text_and_presents_nothing() {
+        for (elevation, reply, request, notice) in [
+            (Elevation::Rollback, vec![0x9d, 0], 0x1d, Notice::Busy),
+            (
+                Elevation::Rollback,
+                vec![0x9d, 1],
+                0x1d,
+                Notice::ElevationRefused,
+            ),
+            (Elevation::Rollback, vec![0x9d, 2], 0x1d, Notice::NoPrevious),
+            (Elevation::Hostname, vec![0x9e, 0], 0x1e, Notice::NoHostname),
+            (
+                Elevation::Hostname,
+                vec![0x9e, 1],
+                0x1e,
+                Notice::ElevationRefused,
+            ),
         ] {
-            let screen = elevation_screen(Elevation::Rollback);
+            let screen = elevation_screen(elevation);
             let mut client = Client::default();
             let mut wire = wire(vec![reply]);
             client
                 .start(&mut wire, Arc::clone(&screen.attempt))
                 .unwrap();
-            assert_eq!(wire.calls, [vec![0x1d]]);
+            assert_eq!(wire.calls, [vec![request]]);
             assert!(client.pending.is_none());
             assert_eq!(
                 screen.attempt.runtime.lock().unwrap().attention_shown(),
                 Some(notice)
             );
         }
-        for reply in [vec![0x9d, 3], vec![0x9d], vec![0x9d, 0, 0], vec![0x99, 1]] {
-            let screen = elevation_screen(Elevation::Rollback);
+        for (elevation, reply) in [
+            (Elevation::Rollback, vec![0x9d, 3]),
+            (Elevation::Rollback, vec![0x9d]),
+            (Elevation::Rollback, vec![0x9d, 0, 0]),
+            (Elevation::Rollback, vec![0x99, 1]),
+            (Elevation::Rollback, vec![0x9e, 0]),
+            (Elevation::Hostname, vec![0x9e, 2]),
+            (Elevation::Hostname, vec![0x9e]),
+            (Elevation::Hostname, vec![0x9e, 0, 0]),
+            (Elevation::Hostname, vec![0x9d, 0]),
+            (Elevation::Hostname, vec![0x9d, 2]),
+        ] {
+            let screen = elevation_screen(elevation);
             assert!(Client::default()
                 .start(&mut wire(vec![reply]), Arc::clone(&screen.attempt))
                 .is_err());
         }
-        for selection in [
-            Selection::Install,
-            Selection::Write,
-            Selection::Elevation(Elevation::Hostname),
-        ] {
-            let mut screen = Screen::new();
-            Arc::get_mut(&mut screen.attempt).unwrap().selection = selection;
-            assert!(Client::default()
-                .start(&mut wire(vec![vec![0x9d, 1]]), Arc::clone(&screen.attempt))
-                .is_err());
+        for selection in [Selection::Install, Selection::Write] {
+            for reply in [vec![0x9d, 1], vec![0x9e, 1]] {
+                let mut screen = Screen::new();
+                Arc::get_mut(&mut screen.attempt).unwrap().selection = selection.clone();
+                assert!(Client::default()
+                    .start(&mut wire(vec![reply]), Arc::clone(&screen.attempt))
+                    .is_err());
+            }
         }
     }
 
@@ -4006,7 +4031,7 @@ mod tests {
                 0x80 => (
                     LoginSelection::Unlock,
                     Point::Cancelled(false),
-                    Notice::Menu,
+                    Notice::default(),
                 ),
                 0x81 => (LoginSelection::Add, Point::Baseline, Notice::Login(rows)),
                 0x82 => (

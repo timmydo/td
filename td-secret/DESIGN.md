@@ -1735,7 +1735,11 @@ The unchanged `td-authd/src/secret_sys.rs` transport also serves the
 unprivileged Claude shell launch channel described in `td-authd/DESIGN.md`.
 That channel's named consumer transfers a fresh PTY master, never a
 credential. Named-write intake continues to require a sealed regular file
-and cannot accept that descriptor. See `UNSAFE.md` section 16.
+and cannot accept that descriptor. The transport further serves the
+`set-hostname` intake (`td-authd/DESIGN.md`, "Elevation operations"),
+which reads its sender's credentials and pidfd and refuses every
+descriptor, so no credential or descriptor reaches it. See `UNSAFE.md`
+section 16.
 
 ## Named-write intake and physical selection
 
