@@ -83,6 +83,34 @@ fn resolvable(path: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
+fn temporary_source_root(cwd: &Path) -> io::Result<PathBuf> {
+    for ancestor in cwd.ancestors() {
+        if !ancestor.starts_with("/tmp") || ancestor == Path::new("/tmp") {
+            break;
+        }
+        let marker = ancestor.join(".git");
+        match fs::symlink_metadata(&marker) {
+            Ok(metadata) if metadata.is_file() || metadata.is_dir() => {
+                return Ok(ancestor.to_owned());
+            }
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "invalid worktree Git marker {}",
+                    marker.display()
+                )))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("worktree Git marker {}: {error}", marker.display()),
+                ))
+            }
+        }
+    }
+    Ok(cwd.to_owned())
+}
+
 fn bindings(cwd: &Path, programs: &[PathBuf], temporary: &Path) -> io::Result<Vec<Bind>> {
     if cwd == Path::new("/tmp") {
         return Err(io::Error::other(
@@ -100,12 +128,13 @@ fn bindings(cwd: &Path, programs: &[PathBuf], temporary: &Path) -> io::Result<Ve
         }
     }
     paths.sort();
+    let source_root = temporary_source_root(cwd)?;
     if cwd.starts_with("/tmp") {
-        paths.push(cwd.to_owned());
+        paths.push(source_root.clone());
     }
     for program in programs {
         if program.starts_with("/tmp")
-            && !(cwd.starts_with("/tmp") && program.starts_with(cwd))
+            && !(cwd.starts_with("/tmp") && program.starts_with(&source_root))
             && !paths.contains(program)
         {
             paths.push(program.to_owned());
@@ -222,6 +251,76 @@ mod tests {
             .unwrap()
             .iter()
             .any(|b| b.src == "/tmp/artifacts/test"));
+    }
+
+    #[test]
+    fn nested_crate_preserves_the_worktree_and_sibling_sources() {
+        if let Some(path) = std::env::var_os("TD_TEST_ROOT_SIBLING") {
+            assert_eq!(fs::read(path).unwrap(), b"shared source");
+            assert_eq!(
+                std::env::current_dir().unwrap(),
+                PathBuf::from(std::env::var_os("TD_TEST_ROOT_CWD").unwrap())
+            );
+            return;
+        }
+        let directory = Scratch::new().unwrap();
+        let tree = directory.0.join("worktree");
+        let cwd = tree.join("consumer");
+        let sibling = tree.join("provider");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir(&sibling).unwrap();
+        fs::write(tree.join(".git"), b"gitdir: trusted external admin\n").unwrap();
+        let source = sibling.join("source.rs");
+        fs::write(&source, b"shared source").unwrap();
+        let binds = bindings(&cwd, &[], &directory.0.join("tmp")).unwrap();
+        assert!(binds.iter().any(|bind| bind.src == tree.to_str().unwrap()));
+        assert!(!binds.iter().any(|bind| bind.src == cwd.to_str().unwrap()));
+        let runner = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/release/td-builder");
+        let output = Command::new(runner)
+            .arg("run-capped")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "test_root::tests::nested_crate_preserves_the_worktree_and_sibling_sources",
+                "--nocapture",
+            ])
+            .current_dir(&cwd)
+            .env(ENV, "1")
+            .env("TD_TEST_ROOT_SIBLING", &source)
+            .env("TD_TEST_ROOT_CWD", &cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        fs::remove_file(tree.join(".git")).unwrap();
+        assert_eq!(temporary_source_root(&cwd).unwrap(), cwd);
+        fs::create_dir(tree.join(".git")).unwrap();
+        assert_eq!(temporary_source_root(&cwd).unwrap(), tree);
+        let nested = cwd.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(cwd.join(".git"), b"nested marker").unwrap();
+        assert_eq!(temporary_source_root(&nested).unwrap(), cwd);
+        fs::remove_file(cwd.join(".git")).unwrap();
+        symlink(tree.join(".git"), cwd.join(".git")).unwrap();
+        let error = temporary_source_root(&nested).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(cwd.join(".git").to_str().unwrap()));
+        assert_eq!(
+            temporary_source_root(Path::new("/tmp")).unwrap(),
+            Path::new("/tmp")
+        );
+        fs::remove_file(cwd.join(".git")).unwrap();
+        let executable = tree.join("target/release/td-builder");
+        let binds = bindings(&cwd, &[executable.clone()], &directory.0.join("tmp")).unwrap();
+        assert!(!binds
+            .iter()
+            .any(|bind| bind.src == executable.to_str().unwrap()));
     }
 
     #[test]

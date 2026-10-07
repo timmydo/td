@@ -757,9 +757,16 @@ invocation and does not acquire this setting from member metadata.
 
 The existing `run-capped` runner applies its memory ceiling first, then runs
 each test artifact through `sandbox::host_shell` with caller-owned mode-1777
-root and private `/tmp`. This matches the editor's trusted-owner plus sticky
-ancestor policy; components requiring mode-0755 root or forbidding all shared
-write bits must not use this fixture unchanged. An internal builder supervisor
+root and private `/tmp`. For a crate under `/tmp`, the fixture binds the
+nearest enclosing worktree marked by a regular `.git` file or directory,
+so tests can read sibling sources while keeping their original cwd. With
+no worktree marker, it binds only the cwd. Symlink or special-file Git
+markers fail setup; errors identify the marker path. The marker is not
+parsed to add Git administrative directory mounts; existing ambient mounts
+may expose those directories. This matches the editor's trusted-owner plus
+sticky ancestor policy; components requiring mode-0755 root or forbidding
+all shared write bits must not use this fixture unchanged. An internal
+builder supervisor
 is namespace PID 1 and starts the test as an ordinary child, preserving its
 default signal dispositions. The extra user/mount/PID namespaces are nested
 inside the check host's process-lifetime containment; parent-death handling
