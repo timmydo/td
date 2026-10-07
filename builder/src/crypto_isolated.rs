@@ -1627,7 +1627,9 @@ pub(crate) fn runtime_inner() -> Result<()> {
             .env_clear()
             .stdin(Stdio::null());
         crate::host_bin::arm_check_child(&mut command);
-        let output = bounded_output(&mut command, "sqlite-body-allocation", 8192, 300)?;
+        let domain = if native { "native" } else { "rust" };
+        let name = format!("sqlite-body-allocation-{domain}");
+        let output = bounded_output(&mut command, &name, 8192, 300)?;
         sqlite_body_evidence(&output, native)?;
         for line in output.lines() {
             println!("portable SQLite allocation diagnostic: {line}");
