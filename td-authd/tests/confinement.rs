@@ -167,7 +167,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0xdc852bb120b21cd2,
+        0xeb7d85d2dde589df,
         "paired secret controller changed"
     );
     assert_eq!(
@@ -232,6 +232,44 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .next()
         .unwrap();
     assert_eq!(fingerprint(installation), INSTALLATION_FINGERPRINT);
+    // Request 19's tier marker (amendment 8): one reviewed shared reader,
+    // reading only the queued deployment's held directory.
+    assert_eq!(installation.matches("#[path").count(), 1);
+    assert!(installation.contains("#[path = \"../../td-secret/src/login_tier.rs\"]"));
+    assert_eq!(installation.matches("login_tier::").count(), 1);
+    assert!(installation
+        .contains("login_tier::read(&self.source, &self.deployment, self.owner, self.give_up)"));
+    // The test seam: production sets the budget only from the constant.
+    assert_eq!(installation.matches("give_up").count(), 5);
+    assert_eq!(installation.matches("give_up: MARKER_GIVE_UP,").count(), 1);
+    assert_eq!(installation.matches("give_up: ready.give_up,").count(), 1);
+    assert_eq!(
+        installation
+            .matches("const MARKER_GIVE_UP: Duration = Duration::from_secs(2);")
+            .count(),
+        1
+    );
+    assert_eq!(
+        fingerprint(
+            include_str!("../../td-secret/src/login_tier.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap()
+        ),
+        SHARED_LOGIN_TIER_FINGERPRINT,
+        "shared tier reader changed: reconcile td-secret's confinement and this pin"
+    );
+    let session = include_str!("../src/session.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(
+        session
+            .matches("self.login_state.admits(|| ready.reads())")
+            .count(),
+        1
+    );
+    assert_eq!(session.matches("vec![0x99, 1]").count(), 1);
     assert_eq!(installation.matches("Command::new(").count(), 1);
     assert!(installation.contains("Command::new(\"/bin/td-update\")"));
     assert!(installation.contains(".args([\"apply-operation\", deployment])"));
@@ -591,7 +629,7 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LOGIN_STATE_FINGERPRINT: u64 = 0x3972919165b8d11f;
+const LOGIN_STATE_FINGERPRINT: u64 = 0x4f9fa256dee303f7;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x17e654b025c229b8;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
@@ -601,6 +639,7 @@ const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;
 const WRITE_REQUEST_FINGERPRINT: u64 = 0x188c619caba6ceb8;
 
-const INSTALLATION_FINGERPRINT: u64 = 0xbfb1c59262269fa1;
+const INSTALLATION_FINGERPRINT: u64 = 0x750e4dac01b1ca7e;
+const SHARED_LOGIN_TIER_FINGERPRINT: u64 = 0x14194603119be713;
 const DISK_INSTALL_FINGERPRINT: u64 = 0x1316a9936d903e94;
 const CONSENT_CODEC_FINGERPRINT: u64 = 0x19d3fcff02c2bb2a;

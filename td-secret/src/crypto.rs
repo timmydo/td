@@ -5,7 +5,7 @@
     dead_code,
     reason = "the shared hash also supports build artifact files"
 )]
-mod sha256;
+pub(super) mod sha256;
 
 pub fn digest(bytes: &[u8]) -> [u8; 32] {
     let mut hash = sha256::Sha256::new();

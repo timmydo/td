@@ -465,6 +465,13 @@ impl Session {
             Ok(ready) => ready,
             Err(_) => return Ok(vec![0x99, 0]),
         };
+        // Amendment 8: on an enrolled or unavailable machine, a deployment
+        // that cannot read the record never becomes current. Refused before
+        // any description, its requester's completion byte is 00.
+        if !self.login_state.admits(|| ready.reads()) {
+            intake.finish(false);
+            return Ok(vec![0x99, 1]);
+        }
         let operation = match crate::deployment::Installation::start(self.owner, ready) {
             Ok(operation) => operation,
             Err(_) => {

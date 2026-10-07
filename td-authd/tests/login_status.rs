@@ -53,6 +53,11 @@ impl Root {
         fs::remove_file(self.login().join("1000")).unwrap();
     }
 
+    /// A wrong mode: a damaged directory.
+    pub(crate) fn damage(&self) {
+        fs::set_permissions(self.login(), Permissions::from_mode(0o750)).unwrap();
+    }
+
     fn hostname(&self, bytes: &[u8]) {
         fs::write(self.root.join("hostname"), bytes).unwrap();
     }

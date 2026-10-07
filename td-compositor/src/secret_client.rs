@@ -1130,6 +1130,11 @@ impl Client {
         if attempt.selection == Selection::Install && response == [0x99, 0] {
             return attempt.notice(crate::attention::Notice::NoInstall);
         }
+        // Root refused the queued update before any description: nothing
+        // is presented (td-authd/DESIGN.md, amendment 8).
+        if attempt.selection == Selection::Install && response == [0x99, 1] {
+            return attempt.notice(crate::attention::Notice::UpdateRefused);
+        }
         let Some((&0x92, bytes)) = response.split_first() else {
             return Err("invalid secret operation start response".into());
         };
@@ -1682,6 +1687,35 @@ mod tests {
         Wire {
             typist: Some(Arc::clone(&screen.attempt)),
             ..wire(replies)
+        }
+    }
+
+    #[test]
+    fn an_update_root_refuses_shows_its_text_and_presents_nothing() {
+        for (reply, notice) in [
+            (vec![0x99, 1], Notice::UpdateRefused),
+            (vec![0x99, 0], Notice::NoInstall),
+        ] {
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+            let mut client = Client::default();
+            let mut wire = wire(vec![reply]);
+            client
+                .start(&mut wire, Arc::clone(&screen.attempt))
+                .unwrap();
+            assert_eq!(wire.calls, [vec![0x19]]);
+            assert!(client.pending.is_none());
+            let runtime = screen.attempt.runtime.lock().unwrap();
+            assert_eq!(runtime.attention_shown(), Some(notice));
+            assert!(!runtime.attention_request_visible(&request()));
+        }
+        // Neither refusal is a write's or another selection's answer.
+        for selection in [Selection::Write, Selection::Unlock(Role::Primary)] {
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = selection;
+            assert!(Client::default()
+                .start(&mut wire(vec![vec![0x99, 1]]), Arc::clone(&screen.attempt))
+                .is_err());
         }
     }
 

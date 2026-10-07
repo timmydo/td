@@ -10,6 +10,9 @@ pub(crate) enum Notice {
     Stored,
     NoWrite,
     NoInstall,
+    /// Root's `99 01`: the queued update cannot read the login record
+    /// (td-authd/DESIGN.md, amendment 8).
+    UpdateRefused,
     Installed,
     Enrolled,
     Unenrolled,
@@ -471,6 +474,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::Menu => "U: UNLOCK  R: RECOVERY TOKEN",
         Notice::Pending => "PREPARING REQUEST",
         Notice::NoInstall => "NO INSTALLATION IS READY TO REVIEW",
+        Notice::UpdateRefused => "UPDATE CANNOT READ LOGIN KEYS",
         Notice::Installed => "SYSTEM INSTALLED - RESTART TO BOOT IT",
         Notice::Stored => "CREDENTIAL STORED",
         Notice::NoWrite => "NO READY CREDENTIAL WRITE - RUN TD-SECRET SET FIRST",
@@ -842,6 +846,7 @@ mod tests {
         Notice::Stored,
         Notice::NoWrite,
         Notice::NoInstall,
+        Notice::UpdateRefused,
         Notice::Installed,
         Notice::Enrolled,
         Notice::Unenrolled,

@@ -14,6 +14,7 @@ use crate::fido_transaction::{
 };
 use crate::login_record::{self, NewKey, Phase, Record};
 use crate::login_store::{self, Baseline, Cause, Outcome, Owner, State, Store};
+use crate::login_tier;
 use crate::operation::{self, remaining, Wire};
 use crate::portable::VerificationKey;
 use crate::store;
@@ -28,10 +29,10 @@ const POLL: Duration = Duration::from_millis(100);
 /// invitation and again after root's acknowledgement: the write and the
 /// success frame then finish while root still waits for them.
 const COMMIT_MARGIN: Duration = Duration::from_secs(5);
-/// The record versions the retained deployments read. No deployment carries
-/// the tier marker yet (TOKEN-LOGIN.md, Deployments), so every write that
-/// leaves a record refuses as VERSION.
-const UNMARKED: &[u8] = &[];
+/// How long each retained deployment's marker read may take: the worker
+/// reads two, well inside its 120-second ceiling (TOKEN-LOGIN.md,
+/// "Deployments").
+const RETAINED_GIVE_UP: Duration = Duration::from_secs(10);
 /// The worker's first frame: the login state it read, before any token I/O.
 const BASELINE: u8 = 0x18;
 /// The worker's typed failure frame.
@@ -152,10 +153,32 @@ struct Context<'a> {
     /// production.
     margin: Duration,
     /// The record versions the current and previous deployments read.
-    current: &'a [u8],
-    previous: &'a [u8],
+    retained: &'a dyn Retained,
     /// The store's write; tests inject failures at its stages.
     write: &'a dyn Fn(&Store, Baseline, Change<'_>) -> Outcome,
+}
+
+/// Where the record versions the retained deployments read come from.
+trait Retained {
+    /// The current deployment's, then the previous one's; a deployment
+    /// whose marker does not verify reads none.
+    fn reads(&self) -> [Vec<u8>; 2];
+}
+
+/// The tier markers of the deployments the volume's `current` and
+/// `previous` selectors name (TOKEN-LOGIN.md, "Deployments"), their files
+/// owned by `owner`: `/run/td-volume/td` and root in production.
+struct Volume<'a> {
+    path: &'a Path,
+    owner: u32,
+}
+
+impl Retained for Volume<'_> {
+    fn reads(&self) -> [Vec<u8>; 2] {
+        [login_tier::CURRENT, login_tier::PREVIOUS].map(|slot| {
+            login_tier::retained(self.path, slot, self.owner, RETAINED_GIVE_UP).unwrap_or_default()
+        })
+    }
 }
 
 /// What a commit writes against the baseline.
@@ -214,8 +237,10 @@ pub(super) fn run(uid: u32) -> Result<(), String> {
         started,
         lifetime: fido_device::MAX_LIFETIME,
         margin: COMMIT_MARGIN,
-        current: UNMARKED,
-        previous: UNMARKED,
+        retained: &Volume {
+            path: Path::new(login_tier::VOLUME),
+            owner: 0,
+        },
         write: &write,
     };
     let result = match File::open("/dev/urandom") {
@@ -352,9 +377,12 @@ fn perform<D: Devices>(
     }
 }
 
-/// The version a write that leaves a record uses, chosen before any token I/O.
+/// The version a write that leaves a record uses, chosen before any token
+/// I/O from the retained deployments' markers, read only here: an unlock
+/// and a removal of every key need none.
 fn version(context: &Context<'_>) -> Result<u8, Failure> {
-    login_record::write_version(context.current, context.previous).map_err(|_| Failure::Version)
+    let [current, previous] = context.retained.reads();
+    login_record::write_version(&current, &previous).map_err(|_| Failure::Version)
 }
 
 /// A step to present, as root will admit it.
@@ -1102,6 +1130,13 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// Fixed read sets, the current deployment's then the previous one's.
+    impl Retained for (&[u8], &[u8]) {
+        fn reads(&self) -> [Vec<u8>; 2] {
+            [self.0.to_vec(), self.1.to_vec()]
+        }
+    }
+
     const UID: u32 = 1000;
     const NONCE: [u8; 32] = [42; 32];
     const PIN: &[u8] = b"1234";
@@ -1165,8 +1200,7 @@ mod tests {
                 started: Instant::now(),
                 lifetime: fido_device::MAX_LIFETIME,
                 margin: COMMIT_MARGIN,
-                current: READS,
-                previous: READS,
+                retained: &(READS, READS),
                 write: &write,
             }
         }
@@ -2065,17 +2099,147 @@ mod tests {
         );
         assert_eq!(run.matches("margin: COMMIT_MARGIN,").count(), 1);
         assert_eq!(COMMIT_MARGIN, Duration::from_secs(5));
-        // Until a deployment carries the tier marker, a write that leaves a
-        // record has no version to write.
-        assert_eq!(UNMARKED, &[] as &[u8]);
+        // Production reads the retained deployments' markers through the
+        // read-only volume, as root's files.
+        assert_eq!(run.matches("retained: &Volume {").count(), 1);
+        assert_eq!(
+            run.matches("path: Path::new(login_tier::VOLUME),").count(),
+            1
+        );
+        assert_eq!(run.matches("owner: 0,").count(), 1);
+        assert_eq!(login_tier::VOLUME, "/run/td-volume/td");
+        assert_eq!(RETAINED_GIVE_UP, Duration::from_secs(10));
         let fixture = Fixture::new();
         let production = Context {
-            current: UNMARKED,
-            previous: UNMARKED,
+            retained: &(&[][..], &[][..]),
             ..fixture.context()
         };
         assert_eq!(super::version(&production), Err(Failure::Version));
         assert_eq!(super::version(&fixture.context()), Ok(VERSION));
+    }
+
+    #[test]
+    fn a_write_takes_its_version_from_both_retained_markers() {
+        use crate::login_tier::tests::{fifo, marker, Volume as Tree};
+        let fixture = Fixture::new();
+        let version = |tree: &Tree| {
+            let volume = Volume {
+                path: tree.path(),
+                owner: tree.scratch.owner,
+            };
+            (
+                volume.reads(),
+                super::version(&Context {
+                    retained: &volume,
+                    ..fixture.context()
+                }),
+            )
+        };
+        let (this, later) = (marker(READS), marker(&[VERSION, VERSION + 1]));
+        // Both markers read this build's version.
+        let tree = Tree::new();
+        tree.retain(Some(&this), Some(&later));
+        assert_eq!(
+            version(&tree),
+            ([READS.to_vec(), vec![VERSION, VERSION + 1]], Ok(VERSION))
+        );
+        // Either one missing, or neither listing this build's version.
+        for (current, previous) in [
+            (Some(&this), None),
+            (None, Some(&this)),
+            (None, None),
+            (Some(&marker(&[VERSION + 1])), Some(&this)),
+        ] {
+            let tree = Tree::new();
+            tree.retain(current.map(Vec::as_slice), previous.map(Vec::as_slice));
+            assert_eq!(version(&tree).1, Err(Failure::Version));
+        }
+        // A malformed selector, a deployment that is a link, a FIFO archive
+        // and no volume at all read nothing.
+        let tree = Tree::new();
+        tree.retain(Some(&this), Some(&this));
+        let id = tree.deploy(Some(&marker(&[VERSION, 2])));
+        tree.select(
+            login_tier::PREVIOUS,
+            &format!("../deployments/{}", id.to_uppercase()),
+        );
+        assert_eq!(
+            version(&tree),
+            ([READS.to_vec(), vec![]], Err(Failure::Version))
+        );
+        let deployments = tree.path().join("deployments");
+        let link = deployments.join("a".repeat(64));
+        std::os::unix::fs::symlink(deployments.join(&id), &link).unwrap();
+        tree.select(
+            login_tier::PREVIOUS,
+            &format!("../deployments/{}", "a".repeat(64)),
+        );
+        assert_eq!(
+            version(&tree),
+            ([READS.to_vec(), vec![]], Err(Failure::Version))
+        );
+        tree.select(login_tier::PREVIOUS, &format!("../deployments/{id}"));
+        assert_eq!(
+            version(&tree),
+            ([READS.to_vec(), vec![VERSION, 2]], Ok(VERSION))
+        );
+        let archive = deployments.join(&id).join("initramfs.cpio");
+        fs::remove_file(&archive).unwrap();
+        if fifo(&archive) {
+            assert_eq!(
+                version(&tree),
+                ([READS.to_vec(), vec![]], Err(Failure::Version))
+            );
+        }
+        let absent = Volume {
+            path: &tree.path().join("absent"),
+            owner: tree.scratch.owner,
+        };
+        assert_eq!(absent.reads(), [vec![], vec![]]);
+        // Through the worker: a first enrollment reads both markers before
+        // any token and refuses, the record untouched, while one is
+        // missing; an unlock reads none.
+        let key = blank("tier");
+        let unmarked = Tree::new();
+        unmarked.retain(Some(&this), None);
+        let volume = Volume {
+            path: unmarked.path(),
+            owner: unmarked.scratch.owner,
+        };
+        let context = Context {
+            retained: &volume,
+            ..fixture.context()
+        };
+        let start = key.transcript().len();
+        let (result, seen) = run(
+            &context,
+            &mut Keys::all(&[&key]),
+            begins(enrolling(1, 1, LoginStep::Connect)),
+            TIME,
+        );
+        assert_eq!(result, Err(Failure::Version));
+        assert_eq!(seen, [vec![0x18, 0], Failure::Version.frame()]);
+        assert_eq!(key.transcript().len(), start);
+        assert!(matches!(fixture.state(), State::Unenrolled));
+        let marked = Tree::new();
+        marked.retain(Some(&this), Some(&this));
+        let volume = Volume {
+            path: marked.path(),
+            owner: marked.scratch.owner,
+        };
+        let context = Context {
+            retained: &volume,
+            ..fixture.context()
+        };
+        let mut keys = Keys::all(&[&key]);
+        let (result, _) = run(
+            &context,
+            &mut keys,
+            begins(enrolling(1, 1, LoginStep::Connect)),
+            TIME,
+        );
+        assert_eq!(result, Ok(()));
+        assert!(matches!(fixture.state(), State::Enrolled(_)));
     }
 
     #[test]
@@ -2935,8 +3099,7 @@ mod tests {
         let order = fixture.fingerprints();
         let removed = slots(&order, &[1]);
         let context = Context {
-            current: UNMARKED,
-            previous: UNMARKED,
+            retained: &(&[][..], &[][..]),
             ..fixture.context()
         };
         let (result, seen) = run(
@@ -3506,8 +3669,7 @@ mod tests {
             ] {
                 replace(&fixture.dir, bytes.as_deref());
                 let context = Context {
-                    current,
-                    previous,
+                    retained: &(current, previous),
                     write: &counted,
                     ..fixture.context()
                 };

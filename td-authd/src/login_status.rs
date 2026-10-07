@@ -40,20 +40,22 @@ pub(crate) enum State {
 }
 
 impl State {
-    /// The state as the helper's result shows it, with its version byte
-    /// dropped (`9a` carries none); anything else could not be read.
-    fn inspected(result: Option<&[u8]>) -> Self {
+    /// The state as the helper's result shows it, and an enrolled
+    /// record's version, which `9a` does not carry and the cache does not
+    /// keep; anything else could not be read.
+    fn inspected(result: Option<&[u8]>) -> (Self, Option<u8>) {
+        let unreadable = (Self::Unavailable(Cause::Unreadable), None);
         match result {
-            Some([0x1a, 0]) => Self::Unavailable(Cause::RecordDamaged),
-            Some([0x1a, 1, _version, count, keys @ ..])
+            Some([0x1a, 0]) => (Self::Unavailable(Cause::RecordDamaged), None),
+            Some([0x1a, 1, version, count, keys @ ..])
                 if (1..=8).contains(count) && keys.len() == usize::from(*count) * 4 =>
             {
                 let (keys, []) = keys.as_chunks::<4>() else {
-                    return Self::Unavailable(Cause::Unreadable);
+                    return unreadable;
                 };
-                Self::Enrolled(keys.to_vec())
+                (Self::Enrolled(keys.to_vec()), Some(*version))
             }
-            _ => Self::Unavailable(Cause::Unreadable),
+            _ => unreadable,
         }
     }
 
@@ -172,32 +174,46 @@ impl Status {
     fn current(&mut self) -> State {
         match &self.cached {
             Some(state) if !self.stale && !state.unreadable() => state.clone(),
-            _ => self.refresh(),
+            _ => self.refresh().0,
+        }
+    }
+
+    /// Request 19's selection (amendment 8): whether a queued deployment
+    /// whose tier marker lists `reads` may become current. The state is
+    /// read afresh, and cached, as `refresh` reads it. An unenrolled
+    /// machine reads no marker; an enrolled one needs the record's version
+    /// listed, and an unavailable one a marker.
+    pub fn admits(&mut self, reads: impl FnOnce() -> Vec<u8>) -> bool {
+        match self.refresh() {
+            (State::Unenrolled, _) => true,
+            (State::Enrolled(_), Some(version)) => reads().contains(&version),
+            _ => !reads().is_empty(),
         }
     }
 
     /// Reads the state and caches it: the predicate, then the helper only
     /// when the record's name exists. Request 19's fresh read (amendment
-    /// 8, TOKEN-LOGIN.md increment 4's C4) is this too.
-    fn refresh(&mut self) -> State {
-        let state = match login_state::state_as(&self.root, self.directory_owner, self.owner) {
-            login_state::State::Unenrolled => State::Unenrolled,
-            login_state::State::Unavailable(cause) => State::Unavailable(cause),
-            login_state::State::Enrolled => self.inspect(),
-        };
+    /// 8) is this too, and takes the enrolled record's version with it.
+    fn refresh(&mut self) -> (State, Option<u8>) {
+        let (state, version) =
+            match login_state::state_as(&self.root, self.directory_owner, self.owner) {
+                login_state::State::Unenrolled => (State::Unenrolled, None),
+                login_state::State::Unavailable(cause) => (State::Unavailable(cause), None),
+                login_state::State::Enrolled => self.inspect(),
+            };
         if !state.unreadable() {
             self.misses = 0;
         }
         self.cached = Some(state.clone());
         self.stale = false;
-        state
+        (state, version)
     }
 
     /// The record's state as the helper reads it. A helper that cannot
     /// start, fails, answers malformed bytes or runs out its deadline
     /// leaves it unreadable; while it reads unreadable, the helper waits out
     /// its pause, and a killed one its reaping, before it runs again.
-    fn inspect(&mut self) -> State {
+    fn inspect(&mut self) -> (State, Option<u8>) {
         self.tick();
         let unreadable = self.cached.as_ref().is_some_and(State::unreadable);
         let pausing = unreadable
@@ -207,11 +223,11 @@ impl Status {
                     .is_none_or(|resume| Instant::now() < resume)
             });
         if pausing || self.running.is_some() {
-            return State::Unavailable(Cause::Unreadable);
+            return (State::Unavailable(Cause::Unreadable), None);
         }
         let Ok(mut helper) = (self.helper)(self.owner) else {
             self.helped = Some(Instant::now());
-            return State::Unavailable(Cause::Unreadable);
+            return (State::Unavailable(Cause::Unreadable), None);
         };
         let result = helper.wait();
         self.helped = Some(Instant::now());

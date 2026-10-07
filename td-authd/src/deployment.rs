@@ -12,6 +12,13 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "../../td-secret/src/login_tier.rs"]
+#[allow(
+    dead_code,
+    reason = "the retained-deployment reader serves td-secret's login worker"
+)]
+mod login_tier;
+
 const SOCKET: &str = "/run/td-authd/1000/install";
 const GREETING: &[u8; 8] = b"TDUPD01\n";
 const LIMIT: usize = 64 + 4096;
@@ -19,6 +26,11 @@ const NOFOLLOW: i32 = 0x20000;
 const NONBLOCK: i32 = 0x800;
 const PATH_ONLY: i32 = 0x200000;
 const ADMITTED: u8 = 2;
+/// Request 19's marker read gives up here, reading no version, so the
+/// request refuses: beside amendment 1's two-second helper it stays inside
+/// the compositor's five-second channel receive (TOKEN-LOGIN.md,
+/// "Deployments").
+const MARKER_GIVE_UP: Duration = Duration::from_secs(2);
 
 fn error(why: impl std::fmt::Display) -> io::Error {
     io::Error::other(why.to_string())
@@ -46,8 +58,19 @@ fn normalized(path: &str) -> io::Result<PathBuf> {
 pub(crate) struct Ready {
     source: File,
     deployment: String,
+    owner: u32,
+    /// `MARKER_GIVE_UP`; a field so a test can exhaust it.
+    give_up: Duration,
 }
 impl Ready {
+    /// The record versions the queued deployment's tier marker lists
+    /// (TOKEN-LOGIN.md, "Deployments"), read afresh through the held
+    /// directory against the admitted ID, its files the requester's; a
+    /// deployment whose marker does not verify lists none.
+    pub fn reads(&self) -> Vec<u8> {
+        login_tier::read(&self.source, &self.deployment, self.owner, self.give_up)
+            .unwrap_or_default()
+    }
     fn capture(bytes: &[u8], owner: u32) -> io::Result<Self> {
         let deployment =
             std::str::from_utf8(bytes.get(..64).ok_or_else(|| error("missing update ID"))?)
@@ -93,6 +116,8 @@ impl Ready {
         Ok(Self {
             source,
             deployment: deployment.into(),
+            owner,
+            give_up: MARKER_GIVE_UP,
         })
     }
 }
@@ -353,6 +378,8 @@ impl Intake {
         let captured = Ready {
             source: ready.source.try_clone().map_err(|e| e.to_string())?,
             deployment: ready.deployment.clone(),
+            owner: ready.owner,
+            give_up: ready.give_up,
         };
         pending.selected = true;
         pending.deadline = Some(expires(120).map_err(|e| e.to_string())?);
@@ -576,4 +603,4 @@ impl Drop for Installation {
 
 #[cfg(test)]
 #[path = "../tests/deployment.rs"]
-mod tests;
+pub(crate) mod tests;

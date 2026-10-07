@@ -1265,6 +1265,173 @@ fn a_live_session_answers_unenrolled_without_reading() {
     session.close_with(|_| fixture("cleanup_child")).unwrap();
 }
 
+/// What the queued update's requester reads once root is done with it: its
+/// completion byte, then the end.
+fn retired(requester: &mut UnixStream) -> Vec<u8> {
+    requester
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut rest = Vec::new();
+    requester.read_to_end(&mut rest).unwrap();
+    rest
+}
+
+#[test]
+fn an_update_that_cannot_read_the_record_is_refused_before_any_description() {
+    use crate::deployment::tests::{marker, queued, Fixture};
+    use crate::inspection::tests::{LOGIN_DAMAGED, LOGIN_FAILED, LOGIN_LATER, LOGIN_TWO};
+    use crate::login_status::tests::{counting, never, Root};
+    #[derive(Clone, Copy, Debug)]
+    enum Machine {
+        Unenrolled,
+        /// The helper's result, version 1 or 2.
+        Enrolled(u8),
+        RecordDamaged,
+        DirectoryDamaged,
+        Unreadable,
+    }
+    let unmarked = None;
+    let (one, two, both) = (marker(&[1]), marker(&[2]), marker(&[1, 2]));
+    let cases: &[(Machine, Option<&[u8]>, bool)] = &[
+        // Unenrolled: unchanged, whatever the deployment carries.
+        (Machine::Unenrolled, unmarked, true),
+        (Machine::Unenrolled, Some(&two), true),
+        (Machine::Unenrolled, Some(&one), true),
+        // Enrolled: the marker must list the record's version.
+        (Machine::Enrolled(1), unmarked, false),
+        (Machine::Enrolled(1), Some(&two), false),
+        (Machine::Enrolled(1), Some(&one), true),
+        (Machine::Enrolled(1), Some(&both), true),
+        (Machine::Enrolled(2), Some(&one), false),
+        (Machine::Enrolled(2), Some(&both), true),
+        // Unavailable: any marker, since the record cannot be read.
+        (Machine::RecordDamaged, unmarked, false),
+        (Machine::RecordDamaged, Some(&two), true),
+        (Machine::DirectoryDamaged, unmarked, false),
+        (Machine::DirectoryDamaged, Some(&one), true),
+        (Machine::Unreadable, unmarked, false),
+        (Machine::Unreadable, Some(&two), true),
+    ];
+    for &(machine, tier, admitted) in cases {
+        let root = Root::new();
+        let helper = match machine {
+            Machine::Unenrolled | Machine::DirectoryDamaged => never(),
+            Machine::Enrolled(1) => counting(LOGIN_TWO).0,
+            Machine::Enrolled(_) => counting(LOGIN_LATER).0,
+            Machine::RecordDamaged => counting(LOGIN_DAMAGED).0,
+            Machine::Unreadable => counting(LOGIN_FAILED).0,
+        };
+        match machine {
+            Machine::Unenrolled => (),
+            Machine::DirectoryDamaged => root.damage(),
+            _ => root.enroll(),
+        }
+        let mut session = Session::new(1000, "tester").unwrap();
+        session.login_state = root.status(helper);
+        prepare(&mut session);
+        let update = Fixture::marked(tier);
+        let (intake, mut requester) = queued(&update);
+        session.installations = Some(intake);
+        let answer = session.answer(Request::Install).unwrap();
+        let case = format!("{machine:?} {tier:?}");
+        if admitted {
+            assert_eq!(answer[0], 0x92, "{case}");
+            let description = Description::decode(&answer[1..]).unwrap();
+            assert_eq!(
+                description.operation(),
+                &Operation::Install {
+                    deployment: update.id().into(),
+                    requester: 1000,
+                },
+                "{case}"
+            );
+            assert!(matches!(session.operation, Some(Active::Install(_))));
+            assert!(session.installing);
+        } else {
+            // 99 01: no description, nothing to present or commit, and the
+            // requester's completion byte is 00.
+            assert_eq!(answer, [0x99, 1], "{case}");
+            assert!(session.operation.is_none() && session.event.is_none());
+            assert!(!session.installing);
+            assert!(!session.installations.as_ref().unwrap().selected_alive());
+            assert_eq!(retired(&mut requester), [0], "{case}");
+            // Retired: there is nothing left to select.
+            assert_eq!(session.answer(Request::Install).unwrap(), [0x99, 0]);
+        }
+        session.close_with(|_| fixture("cleanup_child")).unwrap();
+    }
+}
+
+#[test]
+fn a_marker_read_past_its_budget_refuses_inside_the_channels_receive() {
+    use crate::deployment::tests::{hurry, marker, queued, Fixture};
+    use crate::inspection::tests::LOGIN_TWO;
+    use crate::login_status::tests::{counting, Root};
+    let root = Root::new();
+    root.enroll();
+    let mut session = Session::new(1000, "tester").unwrap();
+    session.login_state = root.status(counting(LOGIN_TWO).0);
+    prepare(&mut session);
+    // A marker this record admits, read with its budget already spent:
+    // the read reads no version, and the request refuses rather than
+    // outlasting the compositor's five-second receive.
+    let update = Fixture::marked(Some(&marker(&[1])));
+    let (mut intake, mut requester) = queued(&update);
+    hurry(&mut intake, Duration::ZERO);
+    session.installations = Some(intake);
+    let started = Instant::now();
+    let answer = session.answer(Request::Install).unwrap();
+    let took = started.elapsed();
+    assert_eq!(answer, [0x99, 1]);
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    assert_eq!(retired(&mut requester), [0]);
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+#[test]
+fn an_updates_fresh_read_refreshes_the_cached_state() {
+    use crate::deployment::tests::{marker, queued, Fixture};
+    use crate::inspection::tests::LOGIN_TWO;
+    use crate::login_status::tests::{answer, counting, Root};
+    let root = Root::new();
+    root.enroll();
+    let (helper, runs) = counting(LOGIN_TWO);
+    let mut session = Session::new(1000, "tester").unwrap();
+    session.login_state = root.status(helper);
+    prepare(&mut session);
+    let enrolled = answer(&[&[1, 2][..], &[0xa1; 4], &[0xa2; 4]].concat(), "td-laptop");
+    assert_eq!(session.answer(Request::LoginState).unwrap(), enrolled);
+    assert_eq!(runs.get(), 1);
+    // The cache holds enrolled; request 19 reads afresh, and runs the
+    // helper again.
+    let update = Fixture::marked(Some(&marker(&[1])));
+    let (intake, _requester) = queued(&update);
+    session.installations = Some(intake);
+    assert_eq!(session.answer(Request::Install).unwrap()[0], 0x92);
+    assert_eq!(runs.get(), 2);
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+    // The record gone: request 19's read is unenrolled, refusing nothing,
+    // and the next 1a answers it from the cache without the helper.
+    let root = Root::new();
+    root.enroll();
+    let (helper, runs) = counting(LOGIN_TWO);
+    let mut session = Session::new(1000, "tester").unwrap();
+    session.login_state = root.status(helper);
+    prepare(&mut session);
+    assert_eq!(session.answer(Request::LoginState).unwrap(), enrolled);
+    root.unenroll();
+    let update = Fixture::marked(None);
+    let (intake, _requester) = queued(&update);
+    session.installations = Some(intake);
+    assert_eq!(session.answer(Request::Install).unwrap()[0], 0x92);
+    assert_eq!(
+        session.answer(Request::LoginState).unwrap(),
+        answer(&[0], "td-laptop")
+    );
+    assert_eq!(runs.get(), 1);
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
 #[test]
 #[ignore = "requires the explicitly marked disposable root VM and production td-secret"]
 fn root_login_supervision_meets_the_production_worker() {
@@ -1322,8 +1489,8 @@ fn root_login_supervision_meets_the_production_worker() {
     assert_eq!(state(&mut session), [2, 0x0b]);
     fs::remove_file(&record).unwrap();
     assert_eq!(state(&mut session), [2, 0x0b]);
-    // Root's first step reaches the worker, which refuses to write while no
-    // deployment carries the tier marker.
+    // Root's first step reaches the worker, which refuses to write: this
+    // guest has no /run/td-volume, so no retained deployment's marker reads.
     let reply = end(&mut session, Selection::Enroll(1));
     assert_eq!(reply[..4], [0x91, 0x0d, 0x12, 0]);
     assert_eq!(

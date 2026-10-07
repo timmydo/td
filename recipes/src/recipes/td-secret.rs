@@ -92,6 +92,10 @@ const MODULES: &[(&str, &str)] = &[
         "login_store",
         include_str!("../../../td-secret/src/login_store.rs"),
     ),
+    (
+        "login_tier",
+        include_str!("../../../td-secret/src/login_tier.rs"),
+    ),
     ("pin_sys", include_str!("../../../td-secret/src/pin_sys.rs")),
     (
         "pin_terminal",

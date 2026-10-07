@@ -1,14 +1,15 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+pub(crate) use super::login_tier::tests::marker;
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-struct Fixture {
+pub(crate) struct Fixture {
     path: PathBuf,
     owner: u32,
     id: String,
 }
 impl Fixture {
-    fn new() -> Self {
+    fn directory() -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "td-install-intake-{}-{}",
@@ -16,12 +17,30 @@ impl Fixture {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
+        path
+    }
+    fn new() -> Self {
+        let path = Self::directory();
         fs::write(path.join("manifest"), b"approved manifest").unwrap();
         Self {
             owner: fs::metadata(&path).unwrap().uid(),
             path,
             id: crate::sha256::hex_digest(b"approved manifest"),
         }
+    }
+    /// A built deployment whose initramfs carries `tier` as its marker.
+    pub(crate) fn marked(tier: Option<&[u8]>) -> Self {
+        use super::login_tier::tests::{bundle, initramfs};
+        let path = Self::directory();
+        let id = bundle(&path, &initramfs(tier));
+        Self {
+            owner: fs::metadata(&path).unwrap().uid(),
+            path,
+            id,
+        }
+    }
+    pub(crate) fn id(&self) -> &str {
+        &self.id
     }
     fn body(&self) -> Vec<u8> {
         format!("{}{}", self.id, self.path.display()).into_bytes()
@@ -42,6 +61,87 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+/// An intake holding `fixture`'s update, admitted and acknowledged as
+/// the real transport does, and its requester's end.
+pub(crate) fn queued(fixture: &Fixture) -> (Intake, UnixStream) {
+    let (server, mut client) = UnixStream::pair().unwrap();
+    let mut pending = Pending::new(server, fixture.owner).unwrap();
+    pending.poll().unwrap();
+    let mut greeting = [0; 8];
+    client.read_exact(&mut greeting).unwrap();
+    client.write_all(&fixture.frame()).unwrap();
+    for _ in 0..8 {
+        pending.poll().unwrap();
+    }
+    assert!(pending.acknowledged);
+    let mut admitted = [0];
+    client.read_exact(&mut admitted).unwrap();
+    assert_eq!(admitted, [ADMITTED]);
+    let socket = fixture.path.join("intake");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let metadata = fs::symlink_metadata(&socket).unwrap();
+    let intake = Intake {
+        listener,
+        owner: fixture.owner,
+        pending: Some(pending),
+        in_flight: false,
+        identity: (metadata.dev(), metadata.ino()),
+    };
+    (intake, client)
+}
+
+/// Gives `intake`'s queued update's marker read `give_up` in place of
+/// `MARKER_GIVE_UP`.
+pub(crate) fn hurry(intake: &mut Intake, give_up: Duration) {
+    let pending = intake.pending.as_mut().unwrap();
+    pending.ready.as_mut().unwrap().give_up = give_up;
+}
+
+#[test]
+fn a_queued_update_reads_its_marker_through_the_held_directory() {
+    use super::login_tier::tests::{bundle, fifo, initramfs, marker};
+    let fixture = Fixture::marked(Some(&marker(&[1, 2])));
+    let ready = fixture.ready();
+    assert_eq!(ready.reads(), [1, 2]);
+    // Read afresh at selection, against the admitted ID, not the path.
+    bundle(&fixture.path, &initramfs(Some(&marker(&[1]))));
+    assert_eq!(ready.reads(), [] as [u8; 0]);
+    let swapped = Fixture::marked(None);
+    assert_eq!(swapped.ready().reads(), [] as [u8; 0]);
+    // The requester's files only, never a FIFO or a file past its bound.
+    let fixture = Fixture::marked(Some(&marker(&[1])));
+    let ready = fixture.ready();
+    assert_eq!(ready.reads(), [1]);
+    let foreign = Ready {
+        source: ready.source.try_clone().unwrap(),
+        deployment: ready.deployment.clone(),
+        owner: ready.owner.wrapping_add(1),
+        give_up: ready.give_up,
+    };
+    assert_eq!(ready.give_up, MARKER_GIVE_UP);
+    assert_eq!(foreign.reads(), [] as [u8; 0]);
+    let archive = fixture.path.join("initramfs.cpio");
+    let bytes = fs::read(&archive).unwrap();
+    fs::remove_file(&archive).unwrap();
+    if fifo(&archive) {
+        assert_eq!(ready.reads(), [] as [u8; 0]);
+        fs::remove_file(&archive).unwrap();
+    }
+    File::create(&archive)
+        .unwrap()
+        .set_len(super::login_tier::ARCHIVE_LIMIT + 1)
+        .unwrap();
+    assert_eq!(ready.reads(), [] as [u8; 0]);
+    fs::remove_file(&archive).unwrap();
+    std::os::unix::fs::symlink(fixture.path.join("elsewhere"), &archive).unwrap();
+    fs::write(fixture.path.join("elsewhere"), &bytes).unwrap();
+    assert_eq!(ready.reads(), [] as [u8; 0]);
+    fs::remove_file(&archive).unwrap();
+    fs::write(&archive, &bytes).unwrap();
+    assert_eq!(ready.reads(), [1]);
 }
 
 #[test]

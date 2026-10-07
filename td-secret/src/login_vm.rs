@@ -104,8 +104,7 @@ fn writing(write: &dyn Fn(&Store, Baseline, Change<'_>) -> Outcome) -> Context<'
         started: Instant::now(),
         lifetime: fido_device::MAX_LIFETIME,
         margin: COMMIT_MARGIN,
-        current: READS,
-        previous: READS,
+        retained: &(READS, READS),
         write,
     }
 }
@@ -1045,8 +1044,7 @@ fn qemu_login_worker_refuses_a_changed_record_or_an_unshared_version_without_wri
         ] {
             replace(directory(), seeded.map(Vec::as_slice));
             let context = Context {
-                current,
-                previous,
+                retained: &(current, previous),
                 ..writing(&counted)
             };
             assert_eq!(
@@ -1061,8 +1059,7 @@ fn qemu_login_worker_refuses_a_changed_record_or_an_unshared_version_without_wri
     // with none read: the one write of this guest.
     replace(directory(), Some(&bytes));
     let context = Context {
-        current: &[],
-        previous: &[],
+        retained: &(&[][..], &[][..]),
         ..writing(&counted)
     };
     let every = slots(&order, &[1, 2]);

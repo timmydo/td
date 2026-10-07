@@ -6210,7 +6210,8 @@ and out-of-order `06`s. The desktop guest is increment 4's
 
 Partly implemented: items 1 to 4 are "Login-key operations" above, and
 item 5's lock surface and unlock are "The lock surface" above, and its
-`1a` requests (not yet its lock) are implemented.
+`1a` requests (not yet its lock) and request 19's refusal text are
+implemented.
 [td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier, including when the session locks and what
 clients receive while locked ("Session lock"). The rules in this section
@@ -6305,9 +6306,14 @@ excluded from every selection, confirmation and field below.
      pre-commit cancellation (`15`), a drain without the result after a
      commit, or Escape within a login unlock. C9 implements it for
      `Super+l` and `L`, and C10 for a lid close and a resume.
-   - **Request 19's refusal.** `99 01` shows `UPDATE CANNOT READ LOGIN
-     KEYS` on the attention screen, as `99 00` shows its no-installation
-     notice (`td-authd/DESIGN.md`, amendment 8).
+   - **Request 19's refusal.** Implemented (increment 4's C4): `99 01`,
+     answered to the installation review's `19` before any description,
+     shows `UPDATE CANNOT READ LOGIN KEYS` on the attention screen, as
+     `99 00` shows its no-installation notice, and presents nothing
+     (`td-authd/DESIGN.md`, amendment 8). The row is 29 columns, within
+     the 45 the narrowest output gives a chrome row; `99 01` answering
+     any other selection is a protocol violation, as any unknown start
+     answer is.
 
    On an unenrolled account a lid close or resume does nothing, since
    neither is read (items 6 and 7). The live medium's root answers

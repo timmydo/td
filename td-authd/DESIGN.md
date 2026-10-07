@@ -1588,7 +1588,10 @@ receipt starts a sixty-second selection window. Extra traffic, foreign
 senders, descriptors, disconnect or expiry retire the pending request.
 
 Only private request 19 selects a queued installation; no ready request or
-a busy operation slot answers 99 00. A selection holds the directory File,
+a busy operation slot answers 99 00. On an enrolled or unavailable
+machine, a queued deployment that cannot read the login record answers
+99 01 and is retired with completion byte 00 ("Login keys and session
+lock", amendment 8). A selection holds the directory File,
 generates a fresh 32-byte nonce and answers 92 DESCRIPTION. The description
 is consent tag 5: owner, nonce, requester UID and full deployment ID. It
 shares one operation slot with secret operations and read-only inspection.
@@ -1723,8 +1726,12 @@ production operation reaches (`td-compositor/DESIGN.md`, "The PIN
 field"). Login state (1) is implemented and live: request `1a`, its
 cache and the `9a` answer, which the compositor asks at connect and
 uses only for `D`'s key list until TOKEN-LOGIN.md increment 4's C7
-locks on it. Its request 19 read is C4's. Revocation (7) and update
-consent (8) are not implemented.
+locks on it. Update consent (8) is implemented (C4) and live: on an
+enrolled or unavailable machine request 19 refuses a queued deployment
+that cannot read the record. No deployment carries the tier marker
+before TOKEN-LOGIN.md increment 4's C10b, so until then that is every
+queued deployment, which is moot since nothing enrolls before increment
+5. Revocation (7) is not implemented.
 [`td-login/TOKEN-LOGIN.md`](../td-login/TOKEN-LOGIN.md)
 owns the planned login-key tier. "Session lock" there is the compositor's
 display and input lock; it is unrelated to this document's secret-session
@@ -1957,6 +1964,31 @@ TOKEN-LOGIN.md's.
    unchanged. TOKEN-LOGIN.md cites this as the update-consent rule. No
    key is required; consent is otherwise unchanged.
 
+   Implemented in increment 4's C4. `deployment.rs` compiles td-secret's
+   `login_tier.rs` through one reviewed `#[path]`, and `Ready::reads`
+   reads the marker afresh at selection, through the held directory, as
+   the requester's files, against the admitted ID; the selection is
+   already taken, so a refusal is `Intake::finish(false)`. The status's
+   `admits` is amendment 1's `refresh`, which also returns an enrolled
+   record's version, and reads no marker on an unenrolled machine. The
+   read is synchronous inside the request, on the serialized channel
+   whose compositor end waits five seconds for an answer, so it gives up
+   after two seconds (`MARKER_GIVE_UP`), reading no version: with
+   amendment 1's two-second helper before it, a requester's archive too
+   large or slow to hash in time is refused with `99 01` inside that
+   receive rather than ending the paired generation (TOKEN-LOGIN.md,
+   "Deployments"). The worker's own reads keep ten seconds each.
+
+   The system recipe writes the marker only from TOKEN-LOGIN.md
+   increment 4's C10b, after C10, since the marker claims that a
+   deployment honours the record at every entry point (console, SSH,
+   locked start and session lock), which no build before C10 does.
+   Until C10b, request 19 on an enrolled or unavailable machine
+   therefore refuses every queued deployment with `99 01`; that is moot,
+   since no machine enrolls before increment 5, and an unenrolled
+   machine reads no marker. The full-system refusal, in
+   `qemu-login-system` (C11), depends on C10b's marked deployments.
+
 TOKEN-LOGIN.md, "Placement", owns the rule that only physical input starts
 a login operation.
 
@@ -2082,17 +2114,18 @@ staying a failure, malformed and out-of-order frames, stale
 acknowledgements and PINs, the slot, teardown and the production
 refusal. The ignored root fixture
 `session::tests::root_login_supervision_meets_the_production_worker`,
-qemu-secret's `supervise-login` authority case, runs the production worker through
-the real Session in the disposable root VM: a missing login directory's
-typed refusal before any baseline, NO RECORD from an unenrolled baseline
-for an unlock and an addition, and a one-key enrollment whose first step
-reaches the worker, which refuses it as VERSION while no deployment
-carries the tier marker. No token takes part; the worker's own guests
-cover token I/O with simulated root acknowledgements. The same case reads
-`1a` between those operations: the missing directory's damage, unenrolled
-once it exists, and a record name the production `inspect-login` helper
-reads as a damaged record, held by the cache until the next operation
-ends.
+qemu-secret's `supervise-login` authority case, runs the production
+worker through the real Session in the disposable root VM: a missing
+login directory's typed refusal before any baseline, NO RECORD from an
+unenrolled baseline for an unlock and an addition, and a one-key
+enrollment whose first step reaches the worker, which refuses it as
+VERSION since the guest has no `/run/td-volume` and so no retained
+deployment's marker reads. No token takes part; the worker's own guests
+cover token I/O with simulated root acknowledgements. The same case
+reads `1a` between those operations: the missing directory's damage,
+unenrolled once it exists, and a record name the production
+`inspect-login` helper reads as a damaged record, held by the cache
+until the next operation ends.
 
 Request `1a`'s host tests (`tests/login_status.rs`, and the paired
 Session's in `tests/session.rs`) run the predicate over a temporary root
@@ -2104,4 +2137,20 @@ refresh after a login operation's end, the helper's pause while
 unreadable, the live boot, every hostname rule and the username rule;
 and through the Session, `1a` refused before preparation, answered beside
 a login operation without its slot, and refreshed only by a login
-operation's end.
+operation's end or request 19.
+
+Request 19's host tests (`tests/session.rs`, `tests/deployment.rs`) drive
+a real admitted intake over a deployment directory whose archive the
+test builds with `login_tier.rs`'s fixtures, not the system recipe's
+(which carries no marker before C10b): a marker-less
+deployment, one whose marker lists another version, and one listing the
+record's, each under an unenrolled machine (always selectable), an
+enrolled record of version 1 or 2, and a damaged record, a damaged
+directory and an unreadable helper (any marker selectable); a refusal's
+exact `99 01`, no description, no operation, the requester's completion
+byte `00` and nothing left to select; the cache refreshed by the read;
+a deployment whose marker admits the record, refused with `99 01` well
+inside the receive when its read's budget is spent, through the selected
+update's `give_up` field, which production sets only from
+`MARKER_GIVE_UP`; and the marker read afresh through the held directory,
+never a link, a FIFO, another owner's file or one past its bound.

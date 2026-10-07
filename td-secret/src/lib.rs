@@ -49,6 +49,11 @@ mod login_record;
 )]
 mod login_state;
 mod login_store;
+#[allow(
+    dead_code,
+    reason = "the queued-update reader serves td-authd's request 19"
+)]
+mod login_tier;
 #[path = "../../td-busd/src/message.rs"]
 #[allow(dead_code, reason = "shared bounded D-Bus codec")]
 mod message;
@@ -84,6 +89,8 @@ mod tpm;
 mod wire;
 mod write_operation;
 
+/// The one SHA-256 copy, by the name the shared tier reader uses.
+use crypto::sha256;
 use std::io;
 
 /// The td-secret command line, `main.rs`'s whole body.
@@ -248,7 +255,7 @@ mod confinement {
         );
         assert_eq!(
             fingerprint(include_str!("login_operation.rs")),
-            0xf90be09cc91e82a9
+            0xb8c03675ebcf7f75
         );
         assert_eq!(
             fingerprint(include_str!("write_operation.rs")),
@@ -259,6 +266,51 @@ mod confinement {
             0x30dcb428ed75a535
         );
         assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x0c9abd729126791a, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+    }
+
+    /// TOKEN-LOGIN.md, "Deployments": the shared tier reader only opens and
+    /// reads, never following a link or waiting on a FIFO.
+    #[test]
+    fn the_tier_reader_only_reads_through_held_descriptors() {
+        let tier = include_str!("login_tier.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(tier.contains("\n#![forbid(unsafe_code)]\n"));
+        for forbidden in [
+            "Command",
+            "spawn",
+            "write",
+            "remove",
+            "create",
+            "rename",
+            "set_len",
+            "permissions",
+            "chown",
+            "include",
+        ] {
+            assert!(!tier.contains(forbidden), "login_tier.rs: {forbidden}");
+        }
+        for pin in [
+            "const NOFOLLOW: i32 = 0o400000;",
+            "const NONBLOCK: i32 = 0o4000;",
+            "const OPEN_DIRECTORY: i32 = 0o200000;",
+            "const FD_ROOT: &str = \"/proc/self/fd\";",
+        ] {
+            assert_eq!(tier.matches(pin).count(), 1, "{pin}");
+        }
+        assert_eq!(tier.matches(".custom_flags(").count(), 2);
+        assert_eq!(
+            tier.matches(".custom_flags(NOFOLLOW | NONBLOCK)").count(),
+            1
+        );
+        assert_eq!(
+            tier.matches(".custom_flags(OPEN_DIRECTORY | NOFOLLOW)")
+                .count(),
+            1
+        );
+        assert_eq!(tier.matches("OpenOptions::new()").count(), 2);
+        assert_eq!(tier.matches(".read(true)").count(), 2);
     }
 
     #[test]
@@ -408,6 +460,7 @@ mod confinement {
             ("login_record.rs", include_str!("login_record.rs")),
             ("login_state.rs", include_str!("login_state.rs")),
             ("login_store.rs", include_str!("login_store.rs")),
+            ("login_tier.rs", include_str!("login_tier.rs")),
             ("pin_sys.rs", include_str!("pin_sys.rs")),
             ("pin_terminal.rs", include_str!("pin_terminal.rs")),
             ("token_check.rs", include_str!("token_check.rs")),
@@ -542,6 +595,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "login_record.rs",
                 "login_state.rs",
                 "login_store.rs",
+                "login_tier.rs",
                 "login_vm.rs",
                 "main.rs",
                 "operation.rs",

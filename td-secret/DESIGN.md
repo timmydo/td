@@ -1841,6 +1841,55 @@ verifiers, fingerprints and every phase's client-data hash with Python's
 `hashlib`, `hmac` and its own integer P-256 arithmetic; the committed
 `tests/login_record_vectors.txt` is what the tests read.
 
+## Tier marker reader
+
+`login_tier.rs` is TOKEN-LOGIN.md's "Deployments" reader, std-only and
+`forbid(unsafe_code)`: the marker's grammar, and the bounded newc reader
+that finds it. The worker's module, it is compiled by td-authd through a
+reviewed `#[path]` for request 19, and hashes with the `engine/src/sha256.rs`
+copy each crate already compiles (td-secret names `crypto`'s as
+`crate::sha256`). `read` takes a held deployment directory, the ID it is
+read against and the owner its files must have; `retained` takes the
+volume and a selector name, `current` or `previous`, and reads the
+deployment it names by that name. Any failure reads no version. The
+system recipe writes no marker before TOKEN-LOGIN.md increment 4's C10b,
+which follows the enforcement the marker claims, so until then these
+readers find none in a td-built deployment; the tests below build their
+own archives.
+
+Each of `manifest` and `initramfs.cpio` is opened through the
+directory's `/proc/self/fd` path with `O_NOFOLLOW | O_NONBLOCK` and
+admitted only as a nonempty regular file of that owner within its bound,
+4096 bytes and 512 MiB, before a byte is read. The manifest must hash to
+the ID and be td-boot's exact four lines; the archive is then streamed
+once through a fixed 64 KiB buffer, hashed as it is parsed, and must hash
+to the manifest's `initramfs.cpio` entry. Its size is read again when
+the read ends, and the stream must end exactly there: a file that shrank
+ends the read early and one that grew is found by one more read. Each
+read, each retry of that last probe, and the verdict once the stream
+ends first check the caller's give-up, a parameter (the worker's ten
+seconds per deployment, td-authd's two for request 19), so a read that
+finishes late reads nothing; the give-up cannot interrupt a stalled
+filesystem. The newc reader takes magic `070701` only, a name
+field of 2 to 4096 bytes with its NUL last and no other, at most 65536
+members before `TRAILER!!!` and only NUL bytes after it; other members'
+data is passed through the buffer unkept. The marker is the one member
+named exactly `etc/td-login-tier`, a single-link regular file of at most
+256 bytes whose bytes are exactly the grammar; a second one, another
+type or a malformed one refuses.
+
+Host tests, run in both crates, cover the grammar's every rule, archives
+with and without the marker and under other spellings of its name, every
+bound at and past its limit (the archive's by a sparse file), a bad
+magic, bytes after the trailer, truncation at each member boundary and
+inside each header, a budget spent by the last read or the end probe, a
+duplicated or odd marker, a size change in both directions and the
+give-up, the digest chain both ways, links, a FIFO, a directory and the
+wrong owner in each file's place, and retained deployments through
+fixture volumes: both markers, one missing, malformed selectors, a
+deployment directory that is a link, contents that are another
+deployment's and no volume at all.
+
 ## Login record store
 
 `login_store.rs` is the second piece of the root login worker: it
@@ -2186,13 +2235,26 @@ PIN step's acknowledgement. `17` stays store inspection's.
    deadline (below). A write that leaves a record then takes its version
    from `write_version` over the record versions the current and
    previous deployments read, and fails as VERSION when there is none,
-   before any presentation; removing every key writes none. No
-   deployment carries the tier marker yet, so `run` passes empty read
-   sets and every such write refuses until increment 4 reads the marker.
-   From then on `run` reads the `current` and `previous` deployments'
-   markers through `/run/td-volume/td/boot` as TOKEN-LOGIN.md,
-   "Deployments", specifies, in place of the empty `UNMARKED`; a
-   deployment whose marker does not verify reads no version.
+   before any presentation; removing every key writes none. `run`'s
+   read sets are the `current` and `previous` deployments' tier markers
+   (increment 4's C4), read only when such a write asks for its version,
+   so an unlock reads no deployment. Each is read through a held
+   `/run/td-volume/td` descriptor as TOKEN-LOGIN.md, "Deployments",
+   specifies: the `boot/` selector read once and required to be exactly
+   `../deployments/` and 64 lowercase hex digits, `deployments/<id>`
+   opened by that name, its `manifest` and `initramfs.cpio` root's
+   regular files opened without following a link or waiting on a FIFO,
+   the manifest hashing to the ID and the archive to the manifest, and
+   the marker taken by the shared bounded newc reader,
+   `login_tier.rs`, which td-authd compiles for request 19. A
+   deployment whose marker does not verify, or a machine with no volume,
+   reads no version. No deployment carries the marker before
+   TOKEN-LOGIN.md increment 4's C10b, which follows the enforcement it
+   claims ("Deployments"), so until then `run` reads no version from
+   any td-built deployment and every such write fails as VERSION.
+   Production still refuses every write before it reaches the worker
+   (`td-authd/DESIGN.md`, `login::WRITES`), so this changes no
+   production answer until activation.
 3. It presents root's own first step (identify, or an enrollment's
    first connect), then reads the record again: if it no longer reads as
    the baseline, an unavailable state included, it fails as RECORD
@@ -2431,7 +2493,7 @@ creation and at an unlock's assertion, each after its PIN, as DENIED
 with no retry spent; a list too small for the exclusions; an enrolled
 key offered as the new one; a repeat with a different output; the record
 changed before any token I/O and at the commit, with no write attempted;
-every version refusal, production's own empty read sets among them, with
+every version refusal, empty read sets among them, with
 the store's write never called; a failure injected at each publication
 and removal stage, rejected as FAILED or reported UNCERTAIN with each
 re-read detail, and a concurrent change rejected as RECORD CHANGED; root
@@ -2470,9 +2532,11 @@ socketpair `Wire`, and every frame it sees is asserted as the host tests
 assert it. The record is the production `/var/lib/td/login/1000`, the
 directory made root's with mode 0700 as firstboot does. The departure
 from `run` is the versions: both retained deployments read this
-build's, standing for increment 4's tier marker, since production still
-refuses every write that leaves a record; `login-changed` also runs
-production's own empty read sets and others that share no version, and
+build's, standing for the tier markers `run` reads from the volume,
+which these guests have none of, since production still refuses every
+write that leaves a record; `login-changed` also runs empty read sets,
+as a machine without marked deployments reads, and others that share no
+version, and
 departs once more, wrapping the store's write in a counter that its
 refusals must leave at zero.
 After each operation the lock is root's, mode 0600 and free.
@@ -2499,7 +2563,7 @@ the new key in that order.
 | `login-probe` | a key whose default credProtect hides its credential from a silent assertion is KEY REFUSED `06` at the probe, and nothing is published |
 | `login-refusals` | a key advertising `alwaysUv` is KEY REFUSED `02` at its one session, before any PIN step or makeCredential; presence denied at a creation, after its PIN, is DENIED with no credential made; a key advertising `alwaysUv` false enrolls and unlocks, is DENIED when it denies presence at the unlock assertion, unlocks again with its count reported 8, and once reconfigured to advertise `alwaysUv` true is KEY REFUSED `02` at the unlock's identify with no PIN step; a new key whose list cannot hold a two-key record's exclusions is KEY REFUSED `05` after the gated swap, before any PIN, the record unchanged |
 | `login-verify` | the production record rewritten between operations with a slot verifier, then a public key, not the key's; a signature over other data, the identify's; and a replay, the current data signed over the client-data hash of an earlier unlock, which the worker's fresh challenge does not match: each FAILED after a right PIN, as a valid record before the signature cases unlocks |
-| `login-changed` | the record replaced between the baseline frame and the description: RECORD CHANGED at the first step with no report to the key; replaced at an addition's commit round, removed at a removal's, and appearing at a first enrollment's: RECORD CHANGED after the whole ceremony, the store's write never called; VERSION before any token I/O for an addition, a removal that leaves a key and a first enrollment, under production's own empty read sets and four pairs that share no version, the counted write never called; removing every key under empty read sets unlinks the record, the guest's one write |
+| `login-changed` | the record replaced between the baseline frame and the description: RECORD CHANGED at the first step with no report to the key; replaced at an addition's commit round, removed at a removal's, and appearing at a first enrollment's: RECORD CHANGED after the whole ceremony, the store's write never called; VERSION before any token I/O for an addition, a removal that leaves a key and a first enrollment, under empty read sets and four pairs that share no version, the counted write never called; removing every key under empty read sets unlinks the record, the guest's one write |
 | `login-eight` | seven additions over gated swaps, each authorized by the key added before it, to eight keys, each of which then unlocks; a ninth refused as INTERNAL from root's description, no report reaching the plugged key |
 
 A record written in one guest's step is read back in its next; these

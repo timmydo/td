@@ -41,6 +41,9 @@ fn child() {
             wire.write_all(&bytes).unwrap();
         }
         LOGIN_FAILED => std::process::exit(1),
+        LOGIN_LATER => wire
+            .write_all(&[&[0x1a, 1, 2, 1][..], &[0xa1; 4]].concat())
+            .unwrap(),
         HELD => std::thread::sleep(Duration::from_secs(3)),
         _ => panic!("unknown fixture"),
     }
@@ -51,6 +54,8 @@ pub(crate) const LOGIN_TWO: u8 = 11;
 pub(crate) const LOGIN_EIGHT: u8 = 12;
 pub(crate) const LOGIN_OVERSIZED: u8 = 13;
 pub(crate) const LOGIN_FAILED: u8 = 14;
+/// One key, in a record of version 2.
+pub(crate) const LOGIN_LATER: u8 = 16;
 /// Writes nothing and outlives every deadline.
 pub(crate) const STALLED: u8 = 8;
 /// Writes nothing and outlives a short deadline, then exits; `stuck`'s.

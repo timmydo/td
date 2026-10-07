@@ -216,6 +216,11 @@ pub fn recipe() -> Recipe {
             "{src}/td-secret/src/login_state.rs",
             include_str!("../../../td-secret/src/login_state.rs"),
         ),
+        // Request 19's tier marker reader.
+        (
+            "{src}/td-secret/src/login_tier.rs",
+            include_str!("../../../td-secret/src/login_tier.rs"),
+        ),
         (
             "{src}/engine/src/sha256.rs",
             include_str!("../../../engine/src/sha256.rs"),
