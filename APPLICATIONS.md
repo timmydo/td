@@ -8662,10 +8662,11 @@ requester ──request──▶ td-authd (root)
 #### What proves a human is present
 
 The paired stock compositor reserves **Ctrl+Alt+Esc** for an opaque,
-compositor-owned screen. The evdev adapter enters it before client, launcher
-or help bindings; it withdraws keyboard/pointer focus and grabs. It currently
-says `NO AUTHORIZATION REQUEST` and accepts no approval. Direct development
-mode leaves the chord alone.
+compositor-owned screen. The evdev adapter enters it before client,
+launcher or help bindings; it withdraws keyboard/pointer focus and
+grabs. It shows a menu of one-letter operations and approves only what
+`td-compositor/DESIGN.md`, "Physical secure attention", specifies for
+each. Direct development mode leaves the chord alone.
 
 Escape requests cancellation and displays `RELEASE KEYS AND BUTTONS` while
 known held input drains. Device loss clears its contribution without itself
@@ -8702,9 +8703,10 @@ nothing.
 **The approval key is randomized, and that is not a refinement.** If any
 keystroke approves, a rogue application draws "Press Enter to continue",
 waits for the primed user, and fires its request so the compositor reads
-that Enter as consent. A minimum display time does not help — the user is
-already reaching. So the prompt names a key chosen at random per request,
-which a fake prompt cannot know and a primed reflex cannot supply.
+that Enter as consent. A minimum display time does not help — the user
+is already reaching. So the prompt names a key chosen at random per
+request, which a fake prompt cannot know and a primed reflex supplies
+only by chance ("The v1 operations (target)", Consent).
 
 **A security key remains optional and stronger**: a full assertion over a
 domain-separated, versioned, length-prefixed canonical encoding of the
@@ -8737,11 +8739,108 @@ secure attention never selects or confirms with (`td-compositor/DESIGN.md`,
 "Physical secure attention"). Physical input hardware remains trusted;
 keyboard events never prove a FIDO assertion.
 
+#### The v1 operations (target)
+
+Nothing in this subsection is implemented. It says what the first
+operations are and why; the elevation increments below (L1 to L7) build
+them, and each part stays a target until the increment named for it
+lands with its evidence. The protocol, encodings and write rules are in
+`td-authd/DESIGN.md`, "Elevation operations (target)"; which key presses
+confirm is in `td-compositor/DESIGN.md`, "Elevation consent (target)".
+
+| operation | how it arrives | arguments, as shown | what root performs |
+|---|---|---|---|
+| `deploy-rollback` | the attention menu's `B`; there is no requester process | the full current and previous deployment IDs, which root reads from the `boot/current` and `boot/previous` selectors under the read-only `/run/td-volume/td` | `/bin/td-boot on-volume rollback /run/td-update CURRENT PREVIOUS` |
+| `set-hostname` | a typed public intake modelled on the update queue, with a notice; the attention menu's `H` selects it | the new name, a `Hostname` parsed by the shared `td-firstboot/src/hostname.rs`, beside the old name | root writes `/var/lib/td/hostname` canonically |
+| `deploy-publish`, from L5 | today's update queue (request 19) and the menu's `I` | the full deployment ID of a locally built system, as today | today's `/bin/td-update apply-operation ID` |
+
+**`deploy-rollback`.** The person opens secure attention and presses
+`B`; nothing outside the compositor asks, so there is no requester to
+rate-limit. The prompt shows both IDs in full and that the change takes
+effect at the next restart. The guarantee is that the rollback acts only
+on the exact pair shown: if an update or another rollback has moved
+either selector since, it refuses rather than undoing that change
+unseen. `td-authd/DESIGN.md` states how. On an enrolled machine
+`previous` carries the login-tier marker even if it predates enrollment,
+since enrollment requires the marker of both selectors and td's update
+consent keeps a deployment that cannot read the record out of both
+afterwards (`td-login/TOKEN-LOGIN.md`, "Deployments").
+
+**`set-hostname`.** `td-authd request-hostname NAME` queues one request
+on a root intake. The client tells its caller, and the attention menu's
+row tells the person, that a hostname change waits; that notice grants
+nothing. The prompt shows the old name beside the new one. After consent
+`/etc/hostname`, a link to the written file, reads the new name at once.
+The kernel name, `/etc/hosts` (td-netd writes it only from its boot-time
+`loopback` and `up` runs) and every application jail (td-jail copies the
+kernel name) keep the old name until the next boot, whose `hostname`
+unit activates the new one and reports `TD-HOSTNAME-READY NAME`. Until
+that restart `/etc/hostname` and the kernel name disagree, and the
+prompt says a restart completes the change.
+
+**Consent.** The same for every v1 operation: Ctrl+Alt+Esc, the menu's
+letter, the request's rows, then a per-request random approval key of
+two digits, each 2 to 9, typed in order. Root draws the key and carries
+it in the description only the compositor's private prompt shows, so the
+requester never sees it. Enter never confirms, and neither does a press
+before the prompt is on glass or any injected input
+(`td-compositor/DESIGN.md`, "Elevation consent (target)"). A wrong digit
+at either position ends the request, so a guess is one try per presented
+request, right one time in 64, and a queued request's retries are
+bounded by its intake's backoff. The key's job is to defeat a habituated
+or primed reflex, which no fixed key can. The alphabet also keeps a
+security key's OTP interface from approving even where the compositor
+fails to exclude it (`td-compositor/DESIGN.md`, "A security key's own
+keyboard"): it types modhex letters and Enter, never a digit 2 to 9.
+What such a missed device keeps is selecting `B` or `H`, both modhex,
+and, if its static-password slot was reprogrammed to type fixed digits,
+one guess per request like any other. Consent is the same with or
+without an enrolled login key: a login-key assertion over the request is
+deferred, and nothing here claims one.
+
+**Backoff.** Every intake a requester can queue on rate-limits
+unapproved requests with a backoff that survives a new generation and a
+reboot: the hostname intake from L4 and the update queue from L5
+(`td-authd/DESIGN.md`, "Elevation operations (target)").
+`deploy-rollback` has no requester and needs none.
+
+**Principal table.** Before any prompt, td-authd consults a root-owned,
+immutable file in the deployment image, `/etc/td-elevation.tsv`, mode
+0444 like `/etc/td-principals.tsv`. A missing, malformed or unreadable
+table, or no row granting the operation to the session owner and, for a
+queued request, to its requester, refuses with a named diagnostic
+(property 4). Its v1 row is "UID 1000 may perform every v1 operation":
+`deploy-rollback` from L3, `set-hostname` from L4 and `deploy-publish`,
+today's update installation, from L5. A machine with other rows builds
+them into its own image; no user's home or setting adds one.
+
+**Recovery.** When consent is unavailable (no seat, a compositor that
+cannot reach the secure path, a refusing table) the operations refuse;
+nothing falls back. What remains is physical access, as
+`td-login/TOKEN-LOGIN.md`'s "Recovery" describes it, and td-boot's
+automatic rollback, which consumes a boot attempt before kexec and
+returns to `previous` when a deployment's attempts are exhausted
+(`td-install/DESIGN.md`).
+
+**Update installation and login-key disclosures take the approval key.**
+Today `I` selects a queued update and a fresh Enter after full
+presentation installs it (`td-compositor/DESIGN.md`, "Physical
+installation confirmation"). L5 replaces that Enter with the approval
+key, atomically, and makes the update `deploy-publish` in the principal
+table. The login-key disclosures, enrollment's and the one-key and
+remove-every-key removal disclosures (`td-login/TOKEN-LOGIN.md`,
+increment 5, after L7), take the approval key from the start. The live
+medium's whole-disk installation, which `I` selects on a live boot,
+keeps its fresh Enter: it runs on the live medium, before any installed
+principal exists, so there is no principal table to consult. It keeps
+Enter's weaker answer to a reflex press, which the approval key closes
+on the installed system.
+
 #### Threats a consent dialog invites
 
 | threat | answer |
 |---|---|
-| **Prompt fatigue** — a rogue app requests repeatedly until the user approves to stop it | Rate-limit per requester with backoff; show a denial count; and above all keep the legitimate prompt RARE, which is why application launch never routes through it |
+| **Prompt fatigue** — a rogue app requests repeatedly until the user approves to stop it | Rate-limit every intake a requester can queue on, with a durable backoff and a denial count ("The v1 operations (target)", Backoff); and above all keep the legitimate prompt RARE, which is why application launch never routes through it |
 | **Confused timing** — a request fired as the user reaches to approve another | Requests QUEUE rather than stack, the prompt names the requester, and a new request cannot replace a displayed one. The randomized key is what actually answers this |
 | **Fake prompt to train the habit** | An imitation cannot learn the randomized key and cannot receive the keystroke while the real prompt holds input. NOT answered by "a touch goes to the token regardless of what is on screen" — that same fact is the hidraw race above |
 | **Input-focus theft** | Exclusive input for the prompt's lifetime; no client receives those events at all |
@@ -8749,10 +8848,12 @@ keyboard events never prove a FIDO assertion.
 | **Replay of a captured approval** | The assertion covers requester, operation, pinned arguments and a nonce, **length-prefixed rather than concatenated** (or `("a","bc")` and `("ab","c")` collide), and the nonce is consumed before the operation starts |
 | **The requester lies about what it is** | It never says which PROCESS it is — that is `SO_PEERCRED` plus lineage. It does say which APPLICATION, and §D binds that name to the assigned external UID and immutable grants. A draft wrote this row the other way round, claiming an escaped app is "promoted to `Unconfined`" where the prompt can only say "a process"; under §E's own definition that is wrong, because an escapee is still a descendant of a live registered stage-2 pid and resolves `Jailed` — the filter denies `unshare`, `setns` and `clone(CLONE_NEWUSER)`, and killing PID 1 of a pid namespace kills the namespace. The exposure is the id, not the lineage |
 | **Walk-up attacker at an unlocked session** | **Out of scope by decision.** A password model would resist it and this one does not; that is the accepted trade. A screen lock is where to address it, and it belongs to the session rather than to elevation |
-| **Prompt spam from an unidentifiable requester** | **Partly unanswerable as specified.** Rate-limiting assumes a stable requester identity, and `Unconfined` code can fork a fresh process per request. Rate-limit the jailed case per app id; for `Unconfined` the limit can only be global, which degrades into denying elevation to everyone while an attacker spams |
+| **Prompt spam from an unidentifiable requester** | **Partly unanswerable as specified.** Rate-limiting assumes a stable requester identity, and `Unconfined` code can fork a fresh process per request. Rate-limit the jailed case per app id; for `Unconfined` the limit can only be global, which degrades into denying elevation to everyone while an attacker spams. The v1 intakes are already global: each queues one request at a time and keeps one backoff for the whole intake, whoever asks |
 
 The session lock the walk-up row calls for is specified, as a target, in
 `td-login/TOKEN-LOGIN.md`.
+
+#### What this design excludes and costs
 
 **Deliberately NOT in this design**: a `sudo`-equivalent running an
 arbitrary command; remembered or timed authority; per-application
@@ -8762,18 +8863,109 @@ table is code, reviewed as code. Hardware PIN and recovery policy belong to
 `td-install/ENCRYPTION.md` and, for login keys, `td-login/TOKEN-LOGIN.md`;
 the application-secret policy remains in §W.4.
 
-**Retiring the escape hatch.** The increment that implements the
-ordinary-consent mechanism above (named operations behind Ctrl+Alt+Esc with
-a per-request random approval key, no password and no required security
-key) also removes `su` as an administrative path and root's empty shadow
-field, atomically, so no deployment is left without an administrative
-path. Until then both remain. `td-login/TOKEN-LOGIN.md` makes this
-increment a prerequisite of login-key enrollment.
-
 **Cost, honestly.** The credential operation adds a root authority, typed
 request intake and hardware transport to the trust surface. It grants only
 the credential operation specified in §W.4; broader elevation remains
 unimplemented and supplies no account-password prompt.
+
+#### Administration today, and retiring the escape hatch
+
+**What administers a td machine today.** td-login's `su` cannot raise
+privilege: `creds::may_switch` refuses a caller that is not root in all
+four uid columns (`td-login/THREAT-MODEL.md` §4), so it is a root-only
+privilege drop. Its callers are root-run boot-health probes, thirteen
+`/etc/bootsuccess` legs, the `TD-LOGIN-RUN-OK` one among them, and the
+network self-test. Root's empty shadow field opens no console session,
+since the console logs in only through `login-primary`. The one
+interactive administrative path is root SSH, which the ordinary policy's
+`PermitRootLogin prohibit-password` admits only for a key someone seeded
+into `/var/lib/td/ssh/authorized_keys`; a fresh install has none. The
+stock image's own boot health exercises that path under the QEMU
+autotest token with a disposable seeded key
+(`TD-OPENSSH-ADMIN-ROUNDTRIP`). Physical access is the other path.
+
+**Retiring the escape hatch.** The escape hatch is root's remaining
+administrative surface: the `su` applet, root's empty shadow field and
+root SSH. Until the steps below land, all three remain. Both steps land
+only after `deploy-rollback` is live (L3), so no build is left without
+an administrative path:
+
+1. **L6 deletes the `su` applet** and its `/bin/su` link. Its probes
+   move to `td-login exec-primary -- /bin/sh -c '…'`, which differs from
+   a non-login `su` in three ways (`td-login/THREAT-MODEL.md` §5): the
+   environment holds only the five identity variables, where `su` kept
+   the caller's and overwrote five; the working directory is `/`; and
+   `SHELL` is the account's shell. L6 adds a recipe unit test that each
+   moved probe body reads only variables it assigns or those five, and
+   flags any read of `$SHELL`, whose value changes.
+2. **L7 locks root.** Root's shadow field becomes `!`, which every
+   td-login path refuses, and both SSH forms carry `PermitRootLogin no`,
+   so they differ only by `AllowUsers`. Boot-health probes already run
+   as root under td-svc and need no root login. L7 deletes the
+   `TD-OPENSSH-ADMIN-ROUNDTRIP` leg, which tests a path that no longer
+   exists, and puts the refusal evidence in the same stock-image
+   `/etc/bootsuccess` run under the autotest token, which
+   `qemu-boot-system` and the installed-system QEMU path drive: the root
+   key the existing fixture seeds (`stage_openssh_admin_fixture` in
+   `qemu_boot.rs`, and `td-install-qemu-test`'s `seed_system_autotest`
+   for an installed volume) is refused, and `/bin/su` is absent. Nothing
+   else uses that key, so no test-only fixture unit replaces it; a later
+   test that needs root in the guest uses a root-owned fixture unit in
+   the test-only system image, as `qemu-login-system` does. The stock
+   image has no root login at all.
+
+`td-login/TOKEN-LOGIN.md`'s increment 5, which activates login-key
+enrollment, follows L7.
+
+#### Elevation increments
+
+The workstream's commits, in landing order. Each is one landing, and
+none repairs an earlier one. Each amends the documents whose current
+statements it changes, including those named here.
+
+- **L0**, documents only: this specification. Nothing ships.
+- **L1**, the consent codec, inert: consent tags 11 (`deploy-rollback`)
+  and 12 (`set-hostname`) and the two-byte approval-key field
+  (`td-authd/DESIGN.md`, "Elevation operations (target)"). After L0.
+- **L2**, the compositor's approval-key confirmation, inert: freshness
+  rules generalised from physical installation confirmation, and the
+  menu letter `B`, which production refuses until L3
+  (`td-compositor/DESIGN.md`, "Elevation consent (target)"). After L1.
+- **L3**, `deploy-rollback` live: the principal table and its UID-1000
+  row, request `1d`, nonce and key, presentation `13` then commit `14`,
+  the spawn with td-boot's new CURRENT and PREVIOUS operands, a QEMU
+  phase that reads the key off the screen, and integration evidence. It
+  amends `UNSAFE.md` §16, whose confinement-pinned fixed child argv the
+  td-boot spawn joins, and `td-secret/DESIGN.md` (tags its workers
+  reject, and `login_tier.rs`'s selector reader in td-authd). After L2.
+- **L4**, `set-hostname` through its typed intake, request `1e`, the
+  menu letter `H` and the intake's backoff, with the next boot's
+  `TD-HOSTNAME-READY` as its oracle. It amends `UNSAFE.md` §16 (the
+  intake is a further `secret_sys.rs` transport consumer),
+  `td-secret/DESIGN.md`'s consumers of that transport, and
+  `td-install/INSTALLER.md`'s hostname contract. After L3.
+- **L5**, update installation moves from Enter to the approval key,
+  atomically, gains the update queue's backoff and becomes
+  `deploy-publish` in the principal table; the live disk installation
+  keeps Enter. It amends td-authd's "Consent for a locally built system"
+  and the disk intake's "as for an update", the compositor's "Physical
+  installation confirmation", `td-install/DESIGN.md`'s "Privileged
+  local installation mechanism", `td-login/THREAT-MODEL.md` §3,
+  `td-secret/DESIGN.md`'s tag-5 note, and `td-update/DESIGN.md` with its
+  `qemu-update` oracle. After L3.
+- **L6**, the `su` applet deleted and its probes moved to
+  `exec-primary`, with the probe-variable test and integration evidence.
+  It amends `td-login/THREAT-MODEL.md`'s introduction, §1's A3 and
+  fixture paragraph, §3's forced-path `su` column and its consequences,
+  its enrolled-machine paragraph and applet roster,
+  §4, §5's non-login `su` paragraph and §8; `UNSAFE.md` §4;
+  `td-svc/DESIGN.md`'s handed-off leaders; `td-install/INSTALLER.md`'s
+  boot-health probes; §D's "eighth `su` block" and this section's
+  account of today; and `AGENTS.md`'s principle 7 paragraph. After L3.
+- **L7**, root locked and root SSH refused in both forms, with the
+  roundtrip's deletion and the refusal evidence above. It amends the
+  principle 7 paragraph of `AGENTS.md`, `td-login/THREAT-MODEL.md` §1
+  and §3 and `td-login/TOKEN-LOGIN.md`'s "SSH". After L3 and L6.
 
 ## M. Hardware rendering — not painting into the corner
 
@@ -9929,17 +10121,17 @@ there as read-only copies.
 
 **Diagnosis.** `mail` and `news` are started once at boot by td-svc
 units with `restart=never`, so a client that exits stays gone until the
-operator starts it again. Today the two ways to do that are a reboot
-and `td-svc restart` from the `su` escape hatch, and AGENTS.md forbids
-making a user-facing flow depend on the latter. Both programs now draw
-in td-ui windows of their own (§W.8, "Reworked"), so the pty the
-terminal grant insisted on is no longer in the way; what is missing is
-a user-level request that starts the program in a fresh window. Claude
-remains the terminal case: running it from a shell in the terminal
-window does not work, since td-jail's `devices=tty` grant makes the
-entry a session leader on a fresh pty and acquires that pty with
-`TIOCSCTTY`, which fails when the pty is already the shell's
-controlling terminal.
+operator starts it again. Today the two ways to do that are a reboot and
+`td-svc restart` from a root shell, which in a session means root SSH
+with a key (§L.1), and AGENTS.md forbids making a user-facing flow
+depend on the latter. Both programs now draw in td-ui windows of their
+own (§W.8, "Reworked"), so the pty the terminal grant insisted on is no
+longer in the way; what is missing is a user-level request that starts
+the program in a fresh window. Claude remains the terminal case: running
+it from a shell in the terminal window does not work, since td-jail's
+`devices=tty` grant makes the entry a session leader on a fresh pty and
+acquires that pty with `TIOCSCTTY`, which fails when the pty is already
+the shell's controlling terminal.
 
 **Plan.** (1) The compositor's launcher already builds `td-term run`
 for a new terminal window on a key chord; it gains a request that

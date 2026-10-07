@@ -99,11 +99,13 @@ evidence exists.
 **Enrollment requires §L.1 elevation.** Enrolling a key refuses every
 interactive login, and on a fresh install `su` cannot elevate from a
 session and root has no SSH key, so an enrolled machine would otherwise
-have no administrative path. The activation increment therefore lands only
-after the `APPLICATIONS.md` §L.1 consent-only elevation increment, which
-also retires `su` and root's empty shadow field ("Retiring the escape
-hatch"). Enrollment does not exist on any build without that elevation.
-Root login is never re-enabled as an administrative path.
+have no administrative path. The activation increment therefore lands
+only after the `APPLICATIONS.md` §L.1 consent-only elevation workstream,
+whose "Elevation increments" L1 to L7 make `deploy-rollback`,
+`set-hostname` and `deploy-publish` approval-key operations and then
+delete `su` and lock root ("Retiring the escape hatch"). Enrollment does
+not exist on any build without that elevation. Root login is never
+re-enabled as an administrative path.
 
 ## The tier
 
@@ -794,6 +796,10 @@ with root:root as the owner. The predicate answers every failure to read
 as unavailable, never as unenrolled, so a read that fails renders the
 enforced form and nothing falls back to the ordinary one. The realized
 OpenSSH recipe test checks both forms with the built `sshd -T`.
+`APPLICATIONS.md` §L.1's L7 will give the ordinary policy
+`PermitRootLogin no` too, so the forms then differ only by `AllowUsers
+NAME`, and turn the persistent-administrator fixture into refusal
+evidence.
 
 ## Cutover
 
@@ -984,18 +990,19 @@ scope. The person chooses:
   hardware.
 - `1`, one key.
 
-Either choice first shows an enrollment disclosure, confirmed by a fresh
-physical Enter under `td-compositor/DESIGN.md`, "Physical installation
-confirmation". It states that from then on the machine boots and locks to
-a screen only an enrolled key and its PIN open; that open console and SSH
-sessions end now, and root and non-primary SSH, including persistent
-administrator keys, are refused from then on; that administration then
-needs a login; and that a PIN set on another keyboard layout may not be
-typable here. The one-key choice adds that losing this key, or blocking
-its PIN, leaves no way to log in, locally or over SSH; that recovery then
-needs someone who can start other code on this machine (a firmware boot
-menu or UEFI shell suffices on an unencrypted disk), the same access that
-bypasses the lock; and that a backup key can be added later.
+Either choice first shows an enrollment disclosure, confirmed by the
+root-drawn approval key under `td-compositor/DESIGN.md`, "Elevation
+consent (target)", never by Enter. It states that from then on the
+machine boots and locks to a screen only an enrolled key and its PIN
+open; that open console and SSH sessions end now, and SSH for any
+account but the primary is refused from then on (root SSH already is,
+since §L.1's L7); that administration then needs a login; and that a PIN
+set on another keyboard layout may not be typable here. The one-key
+choice adds that losing this key, or blocking its PIN, leaves no way to
+log in, locally or over SSH; that recovery then needs someone who can
+start other code on this machine (a firmware boot menu or UEFI shell
+suffices on an unencrypted disk), the same access that bypasses the
+lock; and that a backup key can be added later.
 
 Every key is created, proved, repeated and probed before anything is
 published; publication then makes the cutover above.
@@ -1092,15 +1099,15 @@ is not backed up, and a key is not a backup of anything.
 
 A key and its PIN are required only to unlock and to add or remove keys,
 which is how recovery policy changes. Ordinary elevation is the §L.1
-consent-only mechanism, which an enrolled machine always has ("Enrollment
-requires §L.1 elevation", above, owns that prerequisite). On such a
-machine `su` is no administrative path and root has no empty shadow
-field, interactive root login is refused
+consent-only mechanism, which an enrolled machine always has
+("Enrollment requires §L.1 elevation", above, owns that prerequisite).
+On such a machine `su` no longer exists and root's shadow field is
+locked (§L.1's L6 and L7), interactive root login is refused
 (`THREAT-MODEL.md` §3) and root SSH is refused (SSH). Root remains
 reachable only through root-owned services and physical access, and root
 can remove or rewrite the record, so a change made as root bypasses the
-key requirement. Software in an unlocked session acts as UID 1000 with all
-of that account's data, which needs no root (§L.1 scope).
+key requirement. Software in an unlocked session acts as UID 1000 with
+all of that account's data, which needs no root (§L.1 scope).
 
 ## Other contracts
 
@@ -1253,8 +1260,8 @@ host (`td-firstboot/src/login_directory.rs`).
 The stock VM stays unenrolled: no recipe or firstboot path writes a record,
 and its valid, empty directory is decided unenrolled without any helper,
 so this tier leaves the existing serial-console and SSH oracles unchanged.
-The §L.1 increment's retirement of root's empty shadow field may change
-them on its own account.
+`APPLICATIONS.md` §L.1's L7, which locks root and refuses root SSH in
+both forms, changes them on its own account.
 
 QEMU proves protocol composition, td's state machine, the refusal paths,
 the trusted input and display path, relock on crash and resume, console
@@ -1685,24 +1692,26 @@ and the oracle that shows it.
      reasoned `dead_code` allowance, as td-secret compiles the shared
      hash.
 
-**Prerequisite:** the §L.1 elevation increment lands next, as "Enrollment
+**Prerequisite:** the §L.1 elevation workstream lands next, through its
+L7 (`APPLICATIONS.md` §L.1, "Elevation increments"), as "Enrollment
 requires §L.1 elevation" above requires.
 
 5. **Activation:** enrollment UI and automatic-login cutover, the
    in-boot SSH render (`td-firstboot render-ssh-policy`), the `stop=leaf`
    key and `sshd`'s use of it (`td-svc/DESIGN.md`), the `K` screens, the
-   disclosures, addition and removal, the deployment-marker check on
-   enrollment, and revocation with its reboot guard, which returns the
-   greeter's line to root:root with the pinned mode before it restarts
-   the greeter ("Cutover"). It lands only after
+   disclosures with their approval key, addition and removal, the
+   deployment-marker check on enrollment, and revocation with its reboot
+   guard, which returns the greeter's line to root:root with the pinned
+   mode before it restarts the greeter ("Cutover"). It lands only after
    the prerequisite, and its oracle uses the §L.1 operations; this
    activates the tier.
    - Full-system QEMU: both enrollment choices through the attention
      screen; enrollment in a boot whose serial session was logged in and
-     runs a process that ignores TERM, and in which a root SSH session is
-     open, followed by observation that both sessions and every process in
-     their containments are gone, the greeter refuses and root SSH is
-     refused; a cold reboot that is locked with the enforced SSH form;
+     runs a process that ignores TERM, and in which a primary SSH
+     session is open, followed by observation that both sessions and
+     every process in their containments are gone and the greeter
+     refuses; a root SSH attempt, refused before enrollment (§L.1's L7)
+     and after; a cold reboot that is locked with the enforced SSH form;
      additions to eight; removal disclosures; removal of every key
      followed by immediate serial login and an unlocked next boot;
      enrollment refused while `previous` lacks the marker.

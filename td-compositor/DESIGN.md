@@ -5934,6 +5934,57 @@ transaction until completion. This confirmation does not authorize any
 secret-store operation or enroll or rotate a signing key. The installation
 protocol is in td-authd/DESIGN.md.
 
+### Elevation consent (target)
+
+Nothing in this section is implemented. APPLICATIONS.md §L.1, "The v1
+operations (target)", says what the operations are and why, and
+"Elevation increments" when each part lands; td-authd/DESIGN.md,
+"Elevation operations (target)", gives the protocol. This section alone
+says which input confirms.
+
+A fresh physical `B` on the attention menu asks root for a rollback
+(`1d`), and from L4 a fresh physical `H` selects the queued hostname
+request (`1e`), each under the menu's rules for a selection: one per
+attention lifetime, never from a held key or a repeat. Both letters are
+modhex, so the exclusion of a security key's own keyboard above extends
+to them. L2 adds `B` and a production build refuses it, showing `NOT
+AVAILABLE IN THIS BUILD`, until L3. Root's description must be the
+selected operation for owner 1000.
+
+The prompt shows the description's rows and then the approval key it
+carries, two digits from 2 to 9, as the keys to press in order, with
+Escape to cancel. Confirmation generalises "Physical installation
+confirmation" above. The completed presentation carries a
+CLOCK_MONOTONIC sample taken after successful full-frame submission, and
+only the evdev adapter can offer the selected Attempt a press. A digit
+counts only when it is a number-row key, pressed on a device secure
+attention reads, of a key no other such device holds, with no Control,
+Alt or Super held (Shift is allowed, for layouts that shift digits),
+stamped strictly later than that sample, while the exact request is
+still visible outside drain and the attention lifetime remains. The
+second digit must be a fresh press after the first, so a repeat never
+supplies it; the same digit twice is two presses. A counted digit that
+matches its position advances; the second completes the key, and the
+existing atomic cancellation/commit transition then consumes the
+confirmation before sending the exact commit, as for an installation. A
+counted digit from 2 to 9 that does not match, at either position, ends
+the request unapproved, as Escape does.
+
+Everything else neither advances nor ends the request: Enter, which
+never confirms; a digit stamped before presentation, or held from before
+it; 0, 1 and the keypad; a digit under Control, Alt or Super; repeats
+and held logical keys; and injected, automation, control, Wayland and
+bridge input. A security key's own keyboard neither advances nor ends
+the key, though its Escape still cancels. A replaced or hidden prompt
+confirms nothing.
+
+The approval key appears only on the private prompt, so ordinary
+rendering never carries it. In L5 an update's confirmation moves from
+Enter to the key under these rules, atomically, and the login-key
+disclosures, enrollment's and the one-key and remove-every-key removal
+disclosures (TOKEN-LOGIN.md increment 5), use it from the start; a live
+boot's whole-disk installation keeps its fresh Enter.
+
 ### Login-key operations
 
 TOKEN-LOGIN.md's key management starts on the attention menu, inert in
@@ -6392,8 +6443,9 @@ excluded from every selection, confirmation and field below.
 
 1. **One operation per lifetime (3).** Implemented for the key-management
    screen and the lock surface, whose chord opens a login unlock with no
-   selection at all. Still to come: a disclosure's fresh Enter confirms
-   its operation (TOKEN-LOGIN.md increment 5).
+   selection at all. Still to come: a disclosure's approval key
+   ("Elevation consent (target)") confirms its operation (TOKEN-LOGIN.md
+   increment 5).
 2. **The PIN field (3).** Implemented, inert: "The PIN field" above.
    "The screen accepts no credential bytes" gains
    one exception. The field opens only after the current step has its

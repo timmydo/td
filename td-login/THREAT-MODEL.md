@@ -90,7 +90,10 @@ login. The persistent administrator path is exercised separately only in the
 disposable, unenrolled QEMU volume: it is preseeded with a
 loopback-restricted public key and a root-only matching private fixture
 before boot. Boot health reads those fixtures but never rewrites live
-administrator authorization state.
+administrator authorization state. Root SSH with a key is today's one
+interactive administrative path (§4: `su` is none);
+[`APPLICATIONS.md`](../APPLICATIONS.md) §L.1's L7 refuses it in both
+forms, and the same seeded key then proves the refusal.
 
 The resource boundary is also an asset. The application identity must enter
 its delegated session cgroup before it loses root, otherwise a
@@ -382,7 +385,9 @@ Consequences worth stating plainly:
   configuration**, not by td-login. The service identities above are
   locked. These are properties of the shipped `SYSTEM` const, and the
   interactive behavior is unchanged from the busybox chain this replaces,
-  which also accepted the empty shadow field without prompting.
+  which also accepted the empty shadow field without prompting. Root's
+  empty field opens no console session, since the console logs in only
+  through `login-primary`; `APPLICATIONS.md` §L.1's L7 makes it `!`.
 
 **Login keys: the console refusal.** Under
 [`TOKEN-LOGIN.md`](TOKEN-LOGIN.md), enrolling a FIDO2 login key publishes
@@ -420,23 +425,24 @@ and its td-svc unit restarts it whenever it ends (`restart=always`), so
 any exit would be a reboot or a respawn loop. A signal still ends it:
 Ctrl-C or Ctrl-\ typed on the serial line, `SIGHUP` or `SIGTERM` ends
 td-login with a non-zero status, so the `&&` skips the reboot and td-svc
-respawns the greeter into the same gate. Neither `su` nor root's
-empty shadow field exists as an administrative path on an enrolled
-machine (TOKEN-LOGIN.md, "Enrollment requires §L.1 elevation"). The
-forced paths (`login -f`, `su`, `exec-as`, `exec-primary`,
-`exec-service-as`) keep this section's rules: they change credentials only
-for an all-root caller (§4) and are otherwise no-ops. A greeter must
-therefore use `login-primary`: `build_autologin` has no `login -f`
-fallback for a non-primary autologin account, refuses the build for one,
-and `system_def_is_self_consistent` requires the autologin account to be
-the primary one. A console session started before enrollment does not
-survive it; TOKEN-LOGIN.md's "Cutover" owns how. The stock image never
-contains a record and firstboot ensures the directory at every boot, so
-its console behaviour and the table above stand; the refusal acts only
-where a record or an invalid directory exists. Since TOKEN-LOGIN.md's
-increment 4 (C7) the compositor starts every generation locked on
-exactly those states, so this refusal and the enforced SSH form are
-what keep the serial line and SSH from passing a lock screen there.
+respawns the greeter into the same gate. `su` is an administrative path
+on no machine (§4), and root SSH and root's empty shadow field are
+retired before any machine can enroll (TOKEN-LOGIN.md, "Enrollment
+requires §L.1 elevation"). The forced paths (`login -f`, `su`,
+`exec-as`, `exec-primary`, `exec-service-as`) keep this section's rules:
+they change credentials only for an all-root caller (§4) and are
+otherwise no-ops. A greeter must therefore use `login-primary`:
+`build_autologin` has no `login -f` fallback for a non-primary autologin
+account, refuses the build for one, and `system_def_is_self_consistent`
+requires the autologin account to be the primary one. A console session
+started before enrollment does not survive it; TOKEN-LOGIN.md's
+"Cutover" owns how. The stock image never contains a record and
+firstboot ensures the directory at every boot, so its console behaviour
+and the table above stand; the refusal acts only where a record or an
+invalid directory exists. Since TOKEN-LOGIN.md's increment 4 (C7) the
+compositor starts every generation locked on exactly those states, so
+this refusal and the enforced SSH form are what keep the serial line and
+SSH from passing a lock screen there.
 
 The future hardware-backed disk and session unlock contract lives in
 [`td-install/ENCRYPTION.md`](../td-install/ENCRYPTION.md). It binds primary
@@ -529,6 +535,10 @@ It follows that:
   refuse the syscalls anyway; the check exists so the failure is a named
   diagnostic rather than an `EPERM` from somewhere in the middle of a
   switch.
+- `su` is therefore no administrative path: it is a root-only privilege
+  drop, whose callers on a td image are root-run boot-health probes
+  (§8). `APPLICATIONS.md` §L.1's L6 deletes the applet and moves those
+  probes to `exec-primary`.
 - The `-s SHELL` and `-c CMD` options of `su`, which in a setuid
   program would be an escalation surface (choose the program root
   runs), are inert: only root can reach the credential switch at all,

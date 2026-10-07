@@ -11,7 +11,8 @@ consent bound to that request, no remembered approval. Protector changes
 add fresh hardware-backed authentication under
 [`td-install/ENCRYPTION.md`](../td-install/ENCRYPTION.md). Separate
 compositor/application identities and exclusive device ownership precede
-enabling that path.
+enabling that path. Its first operations are specified, as a target, in
+"Elevation operations (target)".
 
 ## Portal file preparation
 
@@ -1751,6 +1752,122 @@ and null standard descriptors. Real compositor keyboard input and
 correlated captures check live repaint, default Cancel, and confirmed
 suspend/resume of a child owned by the driver. Host fixture source is not
 staged into the target authority recipe.
+
+## Elevation operations (target)
+
+Nothing in this section is implemented. APPLICATIONS.md §L.1, "The v1
+operations (target)", says what `deploy-rollback`, `set-hostname` and
+`deploy-publish` are and why, and its "Elevation increments" which
+commit lands each part; `td-compositor/DESIGN.md`, "Elevation consent
+(target)", says which presses confirm. Today the private channel routes
+requests `10` to `1c` to the secret session and refuses `1d` and above.
+
+**Consent tags.** Tags 11 (`deploy-rollback`) and 12 (`set-hostname`)
+follow the login tags. Each carries, right after its tag byte, the
+two-byte approval key: two ASCII digits, each `2` to `9` (0x32 to 0x39),
+every other value refused by the decoder. Root draws each digit from its
+own byte of `/dev/urandom` as `2` plus the byte modulo 8; 256 is a
+multiple of 8, so every digit is equally likely and no byte is rejected.
+The key is never derived from the nonce.
+
+- Tag 11 then carries the current and the previous deployment ID, each
+  64 lowercase hexadecimal bytes as tag 5 carries one, and the two
+  differ: 175 bytes in all.
+- Tag 12 then carries a big-endian u32 requester, which must equal the
+  owner, then the old and the new name, each a one-byte length and 1 to
+  63 bytes that `Hostname::parse` (`td-firstboot/src/hostname.rs`)
+  admits, and the two differ: at most 179 bytes.
+
+Both stay under the 256-byte bound. In L5 tag 5 gains the same two bytes
+after its tag byte, 115 bytes in all, so an update's description carries
+its key. Tag 6, the live disk installation, gains none. TOKEN-LOGIN.md's
+increment 5 adds the same two bytes, right after the tag byte, to the
+login tags whose descriptions carry a disclosure: enrollment (8) and
+removal (10), whose one-key and remove-every-key disclosures it
+confirms. Root draws a fresh key for each presented description, so each
+step of a multi-step enrollment has its own. The widest login value, a
+removal of eight keys at its authorize step, becomes 100 bytes.
+
+**Requests.** `1d` asks for a rollback and `1e` selects the queued
+hostname request; neither takes an operand. Each answers `92` and the
+root-generated description, holding the one operation slot that secret
+operations, inspection and request 19 share, or `9d` (for `1d`) or `9e`
+(for `1e`) and one refusal byte: `00` when there is nothing to approve
+or the slot is busy, `01` when the principal table refuses or cannot be
+read, and for `1d` `02` when the selectors cannot be read or name one
+deployment. Root reads `/etc/td-elevation.tsv` here, before any
+description exists; from L5 request 19 consults its `deploy-publish` row
+the same way and answers a miss with a new `99 02`, beside today's
+`99 00` (nothing ready or busy) and `99 01` (cannot read the login
+record). Presentation (`13`), then one commit (`14`), each with the
+exact description and so its key, follow within 120 seconds of selection
+and are answered `93` and `94`, as for request 19. The compositor sends
+commit only after the key is typed on the fully presented prompt. Root
+cannot observe those presses: it trusts the paired compositor for them,
+as it trusts that compositor's Enter for request 19. Root rechecks the
+submitting process immediately before acting and consumes the nonce
+first, so a consumed nonce is never reused, even when the operation then
+fails. Escape, expiry or, for a hostname, requester loss before commit
+cancels without acting.
+
+**`deploy-rollback` after commit.** Root spawns only `/bin/td-boot
+on-volume rollback /run/td-update CURRENT PREVIOUS`, the two IDs the
+person approved. Under its transaction lock and before any mutation,
+td-boot requires `current` to name CURRENT and `previous` to name
+PREVIOUS, and refuses otherwise. Both are needed: when `current` is
+still pending, an update replaces `current` and keeps `previous`
+(td-boot's `install_deployment` and `activate_install`), so after
+approving `current` B over `previous` A, publishing C leaves `previous`
+A, and a check of `previous` alone would let the rollback silently undo
+C. Today `rollback` takes neither operand and moves `current` to
+whatever `previous` names; L3 adds them. The spawn reuses request 19's
+rules: an empty environment, cwd `/`, null stdin and stdout and
+authority stderr; the confirmation consumed even if spawn fails; the
+slot held until the helper exits, with no automatic retry; and on
+failed-generation teardown the direct helper killed and reaped before
+secret-session cleanup, inside td-svc's authority cgroup. Only a
+successful exit permits the success screen, which asks for a restart;
+td-authd never reboots.
+
+**`set-hostname` intake.** On an installed system Prepare binds
+`/run/td-authd/1000/hostname` beside the update intake, with the same
+binder, owner UID 1000, mode 0600, per-fragment UID and live
+sender-pidfd policy, and every SCM_RIGHTS descriptor refused; a live
+boot binds none. The client `td-authd request-hostname NAME` requires a
+root peer and the exact eight-byte `TDHST01` newline greeting, then
+sends one length byte and 1 to 63 name bytes. Root parses the name with
+`Hostname::parse`, refuses the current name and a requester the
+principal table does not grant, and sends admission byte 02. As for the
+update intake, one client, one accept and four nonblocking attempts per
+heartbeat bound socket work; admission expires in five seconds, and a
+sent receipt starts a sixty-second selection window. L4 defines how root
+tells the compositor that a request waits, with the backoff count the
+menu row shows.
+
+**Backoff.** The hostname intake from L4, and the update intake from L5,
+each queue one request at a time. After a request ends unapproved
+(declined, expired, a wrong key or requester loss), the intake refuses
+new requests for 30 seconds, doubling with each consecutive unapproved
+request to at most 960 seconds; an approval resets it. Each intake's
+count and wall-clock refusal deadline live in one root-owned mode-0600
+file, `/var/lib/td/authd/backoff`, in a root-owned mode-0700 directory
+on `@var`, so neither a new authority generation nor a reboot clears
+them. Root writes the increment, synced, when it presents a request,
+with a deadline past that request's own 120-second window plus the
+delay, and when a queued request expires unselected, and clears it only
+on approval; so a teardown between a wrong key and any later write
+cannot drop the count. A missing file reads as zero; a malformed one, or
+one root cannot read or write, refuses the intake with a named
+diagnostic. The menu row shows the count.
+
+**`set-hostname` after commit.** Root re-reads `/var/lib/td/hostname`
+with `td-firstboot hostname`'s bounds, refuses unless it holds the old
+name, and writes the new name with the provisioner's synced
+temporary-file and rename protocol, root-owned, mode 0644 and
+newline-terminated, from source shared with td-firstboot rather than a
+copy. The public client then reads byte 01, and 00 on failure, as for an
+update. Root changes neither the kernel name nor `/etc/hosts`;
+APPLICATIONS.md §L.1 says what reads which name until the next boot.
 
 ## Login keys and session lock (target)
 

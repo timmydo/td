@@ -1337,7 +1337,7 @@ td-mta presents the certificate and the client verifies it. Credentials do not
 grant local OS login or td elevation. Service-owned ACME keys and smart-host
 secrets are unattended server credentials, distinct from td's human-session
 credential portal. A later td image integration must specify provisioning
-under that platform's credential policy rather than using its su escape hatch.
+under that platform's credential policy rather than a root shell.
 
 ACME runs inside the executable using HTTPS, JWS, and the crypto provider.
 Start with HTTP-01 on port 80; DNS-01 and TLS-ALPN-01 are deferred. The operator

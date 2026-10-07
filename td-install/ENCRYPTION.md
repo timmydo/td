@@ -70,7 +70,8 @@ exists, by the planned login-key tier), and this tier neither changes nor
 strengthens either. Root on the booted system holds the volume key and can
 change any protector, so this tier makes no authorization claim about
 protector changes. Its own protector changes happen only in the selector,
-as described below, and never through the administrative escape hatch.
+as described below, and never through root's administrative path on the
+booted system (APPLICATIONS.md §L.1).
 
 The installer generates the volume key on the machine and formats the
 volume with a **first-boot protector** and a **recovery key**. Neither the
@@ -287,7 +288,8 @@ could have taken it, and no new protector would protect a key already
 taken. Re-encryption defeats retained copies of the old key and header
 for what the volume holds afterwards, not old ciphertext an SSD keeps in
 stale flash pages; it does not remove persistence left by anyone who was
-root on the device-bound system, which with automatic login and `su` is
+root on the device-bound system, which with automatic login and physical
+update installation (`I`, which installs a locally built system) is
 anyone at the keyboard. Such prior compromise is outside Scope, so a
 protected-tier claim on an upgraded volume is no stronger than the
 device-bound system's integrity before the upgrade.
@@ -2163,9 +2165,9 @@ commit.
    (td-login/TOKEN-LOGIN.md) and operation consent, with no automatic login
    in that profile, and only after `su` and root's empty shadow field have
    retired as APPLICATIONS.md §L.1, "Retiring the escape hatch",
-   specifies. Activation lifts td-authd's refusal of increment 8's
-   storage operations and adds their disclosures; it requires 8a to 8h
-   and their hardware evidence, not 8i.
+   specifies (its L6 and L7). Activation lifts td-authd's refusal of
+   increment 8's storage operations and adds their disclosures; it
+   requires 8a to 8h and their hardware evidence, not 8i.
 
 ## Acceptance evidence
 
