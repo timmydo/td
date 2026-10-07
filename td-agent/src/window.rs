@@ -317,7 +317,8 @@ pub struct Session {
     show_keys: bool,
     /// Where no workspace may be, or why there are no workspaces.
     places: Result<Places, String>,
-    /// The configured workspace templates (DESIGN.md §7).
+    /// The templates the chooser lists (DESIGN.md §7): the configured
+    /// ones, then those made in the window.
     templates: Vec<Template>,
     /// The remotes admitted (DESIGN.md §7): the configuration's, then
     /// those the human admitted on a card.
@@ -2129,6 +2130,33 @@ pub fn run(
             app.note(said);
         }
     }
+    // The configuration's templates, then those made in the window.
+    let saved = state.load_templates().or_else(|e| {
+        let (said, saved) = match state.set_templates_aside() {
+            Ok(to) => (
+                format!(
+                    "the templates made in the window are set aside, as {}: {e}",
+                    to.display()
+                ),
+                Ok(Vec::new()),
+            ),
+            Err(moved) => (
+                format!(
+                    "the templates made in the window are not listed, and none can be saved until the file is mended: {e}; {moved}"
+                ),
+                Err(format!("the templates file cannot be read: {e}")),
+            ),
+        };
+        eprintln!("td-agent: {said}");
+        app.note(said);
+        saved
+    });
+    let (templates, clashes) =
+        merged_templates(&config.templates, saved.as_deref().unwrap_or_default());
+    for clash in clashes {
+        eprintln!("td-agent: {clash}");
+        app.note(clash);
+    }
     let mut client = config.client.clone();
     // Workspaces, and the shared directories each gets, admitted once
     // here; without the jail there are none, and asking says why. No
@@ -2140,8 +2168,9 @@ pub fn run(
     match &places {
         Ok(places) => {
             let (shared, mut notes) = workspace::admit_shared(&config.shared(&places.home), places);
-            // A template's own list, admitted as the top-level one is.
-            for template in &config.templates {
+            // A template's own list, admitted as the top-level one is; one
+            // made in the window has none, and takes the top level's.
+            for template in &templates {
                 let shared = template.shared(&places.home).map(|own| {
                     let (admitted, refused) = workspace::admit_shared(&own, places);
                     notes.extend(
@@ -2184,8 +2213,7 @@ pub fn run(
         }
     }
     app.set_templates(
-        config
-            .templates
+        templates
             .iter()
             .map(|template| (template.name.clone(), !template.repos.is_empty()))
             .collect(),
@@ -2257,7 +2285,7 @@ pub fn run(
         keys: key.iter().cloned().collect(),
         show_keys: false,
         places,
-        templates: config.templates.clone(),
+        templates,
         remotes,
         stores: data.as_ref().ok().map(|data| {
             crate::git::Service::start(git_dir, data.join("store"), crate::git::kept_env())
@@ -2306,6 +2334,29 @@ pub fn run(
         std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
     );
     td_ui::window::run(&mut session, stream, std::env::temp_dir(), typeface)
+}
+
+/// The templates the chooser lists (DESIGN.md §7): `configured`, then
+/// those made in the window, `saved`, but for one named as a configured
+/// one is, ASCII case aside, which is said and left out; at most
+/// `config::MAX_TEMPLATES` of each.
+fn merged_templates(configured: &[Template], saved: &[Template]) -> (Vec<Template>, Vec<String>) {
+    let mut templates = configured.to_vec();
+    let mut clashes = Vec::new();
+    for template in saved {
+        if templates
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case(&template.name))
+        {
+            clashes.push(format!(
+                "the template {:?} made in the window is not listed: the configuration names one so",
+                template.name
+            ));
+        } else {
+            templates.push(template.clone());
+        }
+    }
+    (templates, clashes)
 }
 
 /// The local repositories `remotes` admit, each by its path.
@@ -2465,8 +2516,8 @@ fn remember_crossing(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
-        as_staged, default_model, ended_pushes, forget_rules, held, local_remote, names,
-        pushing_entry, reached, refetched, remember, remember_crossing, set_mode, Client,
+        as_staged, default_model, ended_pushes, forget_rules, held, local_remote, merged_templates,
+        names, pushing_entry, reached, refetched, remember, remember_crossing, set_mode, Client,
     };
     use crate::protocol::Down;
     use crate::workspace::Workspace;
@@ -2575,6 +2626,25 @@ mod tests {
         assert!(remember(&state, &id, false, true, &bodies).is_err());
         assert!(forget_rules(&state, Some("workspace td-1-ab"), &id).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[x]\n");
+    }
+
+    /// The chooser lists the configuration's templates, then those made
+    /// in the window, but for one named as a configured one is.
+    #[test]
+    fn templates_made_in_the_window_follow_the_configurations() {
+        let template = |name: &str| crate::config::Template {
+            name: name.into(),
+            repos: Vec::new(),
+            shared: None,
+        };
+        let (merged, clashes) = merged_templates(
+            &[template("td"), template("notes")],
+            &[template("TD"), template("own")],
+        );
+        let names: Vec<&str> = merged.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["td", "notes", "own"]);
+        assert_eq!(clashes.len(), 1);
+        assert!(clashes.first().unwrap().contains("\"TD\""), "{clashes:?}");
     }
 
     /// A local remote is fetched and pushed only where no workspace

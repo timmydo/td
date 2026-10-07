@@ -764,7 +764,7 @@ pub struct Repo {
 /// The longest template name.
 pub const MAX_TEMPLATE_NAME: usize = 64;
 /// The most templates a configuration lists.
-const MAX_TEMPLATES: usize = 64;
+pub const MAX_TEMPLATES: usize = 64;
 /// The chooser's built-ins, which no template may be named.
 pub const EMPTY: &str = "Empty";
 pub const DIRECTORY: &str = "Directory\u{2026}";
@@ -907,6 +907,171 @@ fn templates(value: &Toml, notes: &mut Vec<String>) -> Result<Vec<Template>, Str
             repos,
             shared,
         });
+    }
+    Ok(templates)
+}
+
+/// A repository of a template made in the window (DESIGN.md §7,
+/// Templates made in the window), checked whole as preparing it would
+/// check it: its remote as td-agent records it, its base a git branch
+/// name, its branch one a push could name, and its sparse paths, none
+/// being the whole tree.
+pub fn checked_repo(
+    remote: &str,
+    base: &str,
+    branch: &str,
+    sparse: Option<Vec<String>>,
+) -> Result<Repo, String> {
+    let remote = crate::git::Remote::parse(remote)?.url();
+    crate::git::branch_name(base).map_err(|e| format!("the base: {e}"))?;
+    if base.len() > MAX_NAME {
+        return Err(format!("the base is past {MAX_NAME} bytes"));
+    }
+    // The branch is the one its pushes name.
+    crate::git::push_branch(branch).map_err(|e| format!("the branch: {e}"))?;
+    let sparse = match sparse {
+        None => None,
+        Some(paths) if paths.len() > MAX_SPARSE => {
+            return Err(format!("at most {MAX_SPARSE} sparse paths"))
+        }
+        Some(paths) => Some(
+            paths
+                .iter()
+                .map(|path| sparse_path(path).ok_or(SPARSE))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    };
+    // As the checkout takes them: no `.`, empty segment or pattern.
+    crate::repo::cone(sparse.as_deref())?;
+    Ok(Repo {
+        remote,
+        base: base.to_string(),
+        branch: branch.to_string(),
+        sparse,
+    })
+}
+
+/// The most sparse paths a template made in the window names.
+pub const MAX_SPARSE: usize = 64;
+
+/// Templates made in the window as their file holds them: a name and its
+/// repositories each, the shared directories always the top level's.
+pub fn templates_json(templates: &[Template]) -> Json {
+    Json::Arr(
+        templates
+            .iter()
+            .map(|template| {
+                Json::Obj(vec![
+                    ("name".into(), Json::Str(template.name.clone())),
+                    (
+                        "repos".into(),
+                        Json::Arr(
+                            template
+                                .repos
+                                .iter()
+                                .map(|repo| {
+                                    Json::Obj(vec![
+                                        ("remote".into(), Json::Str(repo.remote.clone())),
+                                        ("base".into(), Json::Str(repo.base.clone())),
+                                        ("branch".into(), Json::Str(repo.branch.clone())),
+                                        (
+                                            "sparse".into(),
+                                            repo.sparse.as_ref().map_or(Json::Null, |paths| {
+                                                Json::Arr(
+                                                    paths.iter().cloned().map(Json::Str).collect(),
+                                                )
+                                            }),
+                                        ),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// Whether `value` is an object whose keys are all among `keys`.
+fn only_keys(value: &Json, keys: &[&str]) -> bool {
+    match value {
+        Json::Obj(fields) => fields.iter().all(|(key, _)| keys.contains(&key.as_str())),
+        _ => false,
+    }
+}
+
+/// Where a template's workspace is planned when it is only checked: paths
+/// longer than a typical state directory's; the window plans it again
+/// where it would be made before saving it.
+const CHECK_PATH: usize = 256;
+
+/// `templates_json`'s value back, each template checked as one made in
+/// the window is: at most `MAX_TEMPLATES`, each named once, ASCII case
+/// aside, its keys only those td-agent writes, and planned as a
+/// workspace would be (`workspace::plan`), shared directories aside.
+pub fn templates_from_json(value: &Json) -> Result<Vec<Template>, String> {
+    let wrong = "not a list of templates, each a name and its repositories";
+    let items = value.as_arr().ok_or(wrong)?;
+    if items.len() > MAX_TEMPLATES {
+        return Err(format!("more than {MAX_TEMPLATES} templates"));
+    }
+    let mut templates: Vec<Template> = Vec::new();
+    let id = crate::store::Id::parse(&"0".repeat(32)).ok_or("no placeholder id")?;
+    let place = std::path::PathBuf::from(format!("/{}", "x".repeat(CHECK_PATH)));
+    for item in items {
+        if !only_keys(item, &["name", "repos"]) {
+            return Err(wrong.into());
+        }
+        let name = template_name(item.get("name").and_then(Json::as_str).ok_or(wrong)?)?;
+        if templates.iter().any(|t| t.name.eq_ignore_ascii_case(&name)) {
+            return Err(format!("two templates are named {name:?}"));
+        }
+        let repos = item.get("repos").and_then(Json::as_arr).ok_or(wrong)?;
+        if repos.is_empty() || repos.len() > crate::workspace::MAX_ENTRIES {
+            return Err(format!(
+                "template {name:?} has no repository, or more than {}",
+                crate::workspace::MAX_ENTRIES
+            ));
+        }
+        let repos = repos
+            .iter()
+            .map(|repo| {
+                if !only_keys(repo, &["remote", "base", "branch", "sparse"]) {
+                    return Err(wrong.into());
+                }
+                let text = |key: &str| repo.get(key).and_then(Json::as_str).ok_or(wrong);
+                let sparse = match repo.get("sparse") {
+                    None | Some(Json::Null) => None,
+                    Some(paths) => Some(
+                        paths
+                            .as_arr()
+                            .ok_or(wrong)?
+                            .iter()
+                            .map(|path| path.as_str().map(str::to_string).ok_or(wrong))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    ),
+                };
+                let checked =
+                    checked_repo(text("remote")?, text("base")?, text("branch")?, sparse)?;
+                // As td-agent records it, so the file reads back as written.
+                if Some(checked.remote.as_str()) != repo.get("remote").and_then(Json::as_str) {
+                    return Err(format!(
+                        "{:?} is not a remote as td-agent records one",
+                        checked.remote
+                    ));
+                }
+                Ok(checked)
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|e| format!("template {name:?}: {e}"))?;
+        let template = Template {
+            name,
+            repos,
+            shared: None,
+        };
+        crate::workspace::plan(&template, &id, &place, &place, 0)?;
+        templates.push(template);
     }
     Ok(templates)
 }
@@ -1615,6 +1780,201 @@ mod tests {
             let refused = parse(&format!("background_output_bytes = {text}")).unwrap_err();
             assert!(refused.contains("`background_output_bytes`"), "{refused}");
         }
+    }
+
+    /// A template made in the window is checked as preparing it would
+    /// check it, its remote recorded as td-agent records one, and reads
+    /// back from its file as written; a file td-agent would not have
+    /// written is refused whole.
+    #[test]
+    fn templates_made_in_the_window_are_checked_and_read_back() {
+        let repo = checked_repo("git@Example.org:/a/td.git", "main", "agent", None).unwrap();
+        assert_eq!(repo.remote, "ssh://git@example.org/a/td.git");
+        let local = checked_repo(
+            "/srv/git/td",
+            "main",
+            "agent",
+            Some(vec!["td-agent".into()]),
+        )
+        .unwrap();
+        assert_eq!(local.remote, "file:///srv/git/td");
+        for (remote, base, branch, sparse, why) in [
+            ("http://h/a", "main", "a", None, "no other transport"),
+            ("/srv/td", "-main", "a", None, "the base"),
+            ("/srv/td", "main", "refs/heads/a", None, "the branch"),
+            (
+                "/srv/td",
+                "main",
+                "a",
+                Some(vec!["../x".to_string()]),
+                "sparse",
+            ),
+            (
+                "/srv/td",
+                "main",
+                "a",
+                Some(vec!["/x".to_string()]),
+                "sparse",
+            ),
+            // What the checkout's cone refuses, which `sparse_path` takes.
+            (
+                "/srv/td",
+                "main",
+                "a",
+                Some(vec!["./x".to_string()]),
+                "checks out",
+            ),
+            (
+                "/srv/td",
+                "main",
+                "a",
+                Some(vec!["x*".to_string()]),
+                "checks out",
+            ),
+            (
+                "/srv/td",
+                "main",
+                "a",
+                Some(vec!["a//b".to_string()]),
+                "checks out",
+            ),
+            (
+                "/srv/td",
+                "main",
+                "a",
+                Some(vec!["x".to_string(); MAX_SPARSE + 1]),
+                "sparse paths",
+            ),
+        ] {
+            let e = checked_repo(remote, base, branch, sparse).unwrap_err();
+            assert!(e.contains(why), "{remote} {base} {branch}: {e}");
+        }
+        let templates = vec![
+            Template {
+                name: "td".into(),
+                repos: vec![repo.clone(), local.clone()],
+                shared: None,
+            },
+            Template {
+                name: "notes".into(),
+                repos: vec![local],
+                shared: None,
+            },
+        ];
+        let value = templates_json(&templates);
+        assert_eq!(templates_from_json(&value).unwrap(), templates);
+        let one = |name: &str, remote: &str| {
+            Json::Arr(vec![Json::Obj(vec![
+                ("name".into(), Json::Str(name.into())),
+                (
+                    "repos".into(),
+                    Json::Arr(vec![Json::Obj(vec![
+                        ("remote".into(), Json::Str(remote.into())),
+                        ("base".into(), Json::Str("main".into())),
+                        ("branch".into(), Json::Str("a".into())),
+                    ])]),
+                ),
+            ])])
+        };
+        templates_from_json(&one("td", "file:///srv/td")).unwrap();
+        for (value, why) in [
+            (one("td", "/srv/td"), "as td-agent records"),
+            (one("Empty", "file:///srv/td"), "no template may be named"),
+            (one(" td", "file:///srv/td"), "visible text"),
+            (Json::Str("x".into()), "not a list"),
+            (
+                Json::Arr(vec![Json::Obj(vec![
+                    ("name".into(), Json::Str("td".into())),
+                    ("repos".into(), Json::Arr(Vec::new())),
+                ])]),
+                "no repository",
+            ),
+        ] {
+            let e = templates_from_json(&value).unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+        }
+        let mut twice = templates_json(templates.get(..1).unwrap());
+        if let (Json::Arr(items), Json::Arr(more)) = (
+            &mut twice,
+            templates_json(&[Template {
+                name: "TD".into(),
+                ..templates.get(1).unwrap().clone()
+            }]),
+        ) {
+            items.extend(more);
+        }
+        assert!(templates_from_json(&twice)
+            .unwrap_err()
+            .contains("two templates"));
+        let many = Json::Arr(
+            (0..=MAX_TEMPLATES)
+                .map(|n| match one(&format!("t{n}"), "file:///srv/td") {
+                    Json::Arr(mut items) => items.remove(0),
+                    other => other,
+                })
+                .collect(),
+        );
+        assert!(templates_from_json(&many)
+            .unwrap_err()
+            .contains("more than"));
+        // Only the keys td-agent writes.
+        let mut extra = one("td", "file:///srv/td");
+        if let Json::Arr(items) = &mut extra {
+            if let Some(Json::Obj(fields)) = items.first_mut() {
+                fields.push(("shared".into(), Json::Arr(Vec::new())));
+            }
+        }
+        assert!(templates_from_json(&extra)
+            .unwrap_err()
+            .contains("not a list"));
+        let mut extra = one("td", "file:///srv/td");
+        if let Json::Arr(items) = &mut extra {
+            if let Some(Json::Obj(fields)) = items.first_mut() {
+                if let Some((_, Json::Arr(repos))) = fields.get_mut(1) {
+                    if let Some(Json::Obj(repo)) = repos.first_mut() {
+                        repo.push(("network".into(), Json::Null));
+                    }
+                }
+            }
+        }
+        assert!(templates_from_json(&extra)
+            .unwrap_err()
+            .contains("not a list"));
+        // Planned as a workspace: one branch of a remote named twice, and
+        // a record past its bound, refused; no sparse path reads back.
+        let twice = Template {
+            name: "td".into(),
+            repos: vec![repo.clone(), repo.clone()],
+            shared: None,
+        };
+        assert!(templates_from_json(&templates_json(&[twice]))
+            .unwrap_err()
+            .contains("twice"));
+        let long = checked_repo(
+            "/srv/td",
+            "main",
+            "a",
+            Some(
+                (0..MAX_SPARSE)
+                    .map(|n| format!("{n}{}", "x".repeat(300)))
+                    .collect(),
+            ),
+        )
+        .unwrap();
+        let long = Template {
+            name: "td".into(),
+            repos: vec![long],
+            shared: None,
+        };
+        assert!(templates_from_json(&templates_json(&[long]))
+            .unwrap_err()
+            .contains("fewer sparse paths"));
+        let none = vec![Template {
+            name: "td".into(),
+            repos: vec![checked_repo("/srv/td", "main", "a", Some(Vec::new())).unwrap()],
+            shared: None,
+        }];
+        assert_eq!(templates_from_json(&templates_json(&none)).unwrap(), none);
     }
 
     /// `protected_branches` names branches a push could, each once, and

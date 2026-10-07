@@ -599,6 +599,53 @@ impl StateDir {
     }
 }
 
+/// The templates made in the window (DESIGN.md §7): the file, and the
+/// most bytes it may take.
+const TEMPLATES: &str = "templates";
+const MAX_TEMPLATES_BYTES: u64 = 1024 * 1024;
+
+impl StateDir {
+    /// The templates made in the window, as `config::templates_from_json`
+    /// reads them; none when there is no file. A file it refuses is
+    /// refused whole, and why.
+    pub fn load_templates(&self) -> Result<Vec<crate::config::Template>, String> {
+        let path = self.root.join(TEMPLATES);
+        let bytes = match read_bounded(&path, MAX_TEMPLATES_BYTES) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            read => read.map_err(|e| format!("{}: {e}", path.display()))?,
+        };
+        let text =
+            String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))?;
+        let value = td_json::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        crate::config::templates_from_json(&value).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Replaces the templates made in the window with `templates`, which
+    /// must read back as written.
+    pub fn save_templates(&self, templates: &[crate::config::Template]) -> Result<(), String> {
+        let value = crate::config::templates_json(templates);
+        if crate::config::templates_from_json(&value)? != templates {
+            return Err("a template that would not read back as written".into());
+        }
+        let text = format!("{value}\n");
+        if text.len() as u64 > MAX_TEMPLATES_BYTES {
+            return Err(format!(
+                "the templates are past {MAX_TEMPLATES_BYTES} bytes"
+            ));
+        }
+        replace(&self.root, TEMPLATES, text.as_bytes())
+    }
+
+    /// Moves the templates file aside, to `templates.set-aside-<time>`,
+    /// after it could not be read, so saving one does not lose the rest.
+    pub fn set_templates_aside(&self) -> Result<PathBuf, String> {
+        let from = self.root.join(TEMPLATES);
+        let to = self.root.join(format!("{TEMPLATES}.set-aside-{}", now()));
+        std::fs::rename(&from, &to).map_err(|e| format!("{}: {e}", from.display()))?;
+        Ok(to)
+    }
+}
+
 /// The remotes admitted on cards: the file, and how many it holds, each
 /// at most a remote's longest text and its newline.
 const ADMITTED: &str = "remotes";
@@ -3715,6 +3762,41 @@ pub mod tests {
         assert!(state.load_rules().is_err());
         std::fs::write(&path, [0xff]).unwrap();
         assert!(state.load_rules().unwrap_err().ends_with("is not UTF-8"));
+    }
+
+    /// The templates made in the window are none until saved, read back as
+    /// saved, and a file td-agent would not have written is refused and
+    /// can be set aside.
+    #[test]
+    fn templates_made_in_the_window_are_saved_and_read_back() {
+        let scratch = Scratch::new("templates");
+        let state = scratch.state();
+        assert!(state.load_templates().unwrap().is_empty());
+        let templates = vec![crate::config::Template {
+            name: "td".into(),
+            repos: vec![crate::config::checked_repo("/srv/git/td", "main", "agent", None).unwrap()],
+            shared: None,
+        }];
+        state.save_templates(&templates).unwrap();
+        assert_eq!(state.load_templates().unwrap(), templates);
+        state.save_templates(&[]).unwrap();
+        assert!(state.load_templates().unwrap().is_empty());
+        let unchecked = vec![crate::config::Template {
+            name: "td".into(),
+            repos: vec![crate::config::Repo {
+                remote: "/srv/git/td".into(),
+                base: "main".into(),
+                branch: "agent".into(),
+                sparse: None,
+            }],
+            shared: None,
+        }];
+        assert!(state.save_templates(&unchecked).is_err());
+        std::fs::write(state.root().join(TEMPLATES), "[{\"name\":\"td\"}]").unwrap();
+        assert!(state.load_templates().is_err());
+        let aside = state.set_templates_aside().unwrap();
+        assert!(aside.is_file());
+        assert!(state.load_templates().unwrap().is_empty());
     }
 
     #[test]

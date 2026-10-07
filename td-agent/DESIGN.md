@@ -1785,9 +1785,10 @@ workspace, and then has no file, shell or git tools.
 **Templates.** Every new conversation starts from a workspace template
 the human chooses. `C-n` and File → `New conversation…` open a chooser,
 td-ui's finder as the model picker uses it (§4), listing the built-ins
-first and then the configuration's `[[template]]` entries (§15) in the
-order written; `Return` creates the conversation from the one selected
-and `Escape` creates nothing.
+first, then the configuration's `[[template]]` entries (§15) in the
+order written, then the templates made in the window (below);
+`Return` creates the conversation from the one selected and `Escape`
+creates nothing.
 
 - **Empty** is always listed: a private, empty scratch directory in the
   conversation's jail directory, with the file and shell tools and no
@@ -1802,6 +1803,10 @@ and `Escape` creates nothing.
   network policy (§10). A
   template that names no repository makes an Empty workspace with its
   own shared directories.
+- **A template made in the window** is listed by its name after the
+  configured ones, and is one as a configured template is but for naming
+  no shared directories of its own: its workspaces bind the configured
+  `shared` list.
 
 Choosing is the decision: no card follows it but a remote's admission
 (below). A template's repositories are prepared by increment 11's git
@@ -1810,6 +1815,51 @@ starts on the human's first message,
 which can be sent at once. Two workspaces made from one template work
 on branches of the same name, each in a repository of its own (below),
 and a push names the remote branch it writes (§9).
+
+**Templates made in the window.** The human makes a repository template
+without editing the configuration, which td-agent never writes: File →
+`New template…`, or the chooser's `New template…` row, opens a dialog of
+td-ui's entries asking a name, a remote, a base, a branch and,
+optionally, sparse paths parted by spaces, and Save checks them as
+preparing the template would (the remote parsed as §7 admits one, the
+base a branch name, the branch one a push could name, each sparse path
+one the checkout's cone takes, and the template planned as its workspace
+would be, its record within bounds) and keeps the template, or says what
+is wrong and keeps the dialog. A remote may be a local repository's path
+(Local repositories, below); saving it admits nothing, the template's
+first conversation asking as any does. Directory… over a git repository,
+which it refuses (§8), opens the same dialog with that repository's path
+as the remote. File → `Edit template…` lists the templates made in the
+window and opens one in the dialog, its fields its first repository's,
+where Save replaces it, its other repositories kept, and Remove,
+confirmed, removes it. A template saved takes the top-level shared
+directories from then on; one removed or renamed leaves its workspaces
+as they are but for those, which they bind no more, so a removal never
+widens what a workspace reaches. They are kept in the state directory's
+`templates` file, a JSON list of each template's name and repositories
+with no other key, rewritten whole from the file's own list, never from
+the chooser's, and read back as written; one past 64, a name a template
+in the file has, ASCII case aside, a built-in's name, a template with no
+repository or more than a workspace takes, or one its plan refuses is
+refused. Save in the window also refuses a name a configured template
+has. A file td-agent would not have written is set aside at start, said,
+and listed as none, or, when it cannot be moved, none is saved until it
+is mended; a template in the file named as a configured one is said, not
+listed, and kept.
+
+**As built (templates made in the window, storage).** The first step is
+the file and the chooser's list: `config::checked_repo` checks one
+repository as above, the remote recorded as `Remote::url` gives it and
+the sparse paths through `repo::cone`; `config::templates_json` and
+`templates_from_json` write and read the file, the latter refusing a key
+td-agent does not write, a template whose remote is not so recorded, and
+one `workspace::plan` refuses when planned with a placeholder id under
+paths of 257 bytes and no shared directories;
+`StateDir::load_templates`, `save_templates`, which refuses what would
+not read back as written, and `set_templates_aside`; and the window
+lists them after the configuration's (`merged_templates`), each taking
+the top-level shared directories (a `template_shared` entry of `None`).
+The dialog, its menu items and the chooser's row follow.
 
 The templates step builds the chooser, `[[template]]` and the two
 built-ins, which replace File's two workspace items (As built
