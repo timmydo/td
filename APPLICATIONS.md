@@ -5970,7 +5970,9 @@ is `1.0`, served as a plain D-Bus `d`, and the bounds are the GNOME schema's
 own 0.5 to 3.0.
 
 The service compiles td-busd's canonical bounded message, name, and wire
-modules directly rather than growing a second D-Bus codec. One decoded frame
+modules directly rather than growing a second D-Bus codec, and its
+`bus_client` module for the bounded connect and the `AUTH EXTERNAL` line,
+which td-open, td-secret and td-busd's own probe share. One decoded frame
 is capped at 256 KiB. A larger broker-valid frame retains at most its bounded
 header, drains its body without allocating, and keeps the service available. A
 reply-expected method call receives `LimitsExceeded`; a call carrying
@@ -9864,8 +9866,8 @@ remote-control `OpenURL` itself, after the broker authenticates the
 holder, and the §B.2 suffix grant lets Firefox hold that
 profile-suffixed name. (2) **LANDED.**
 `td-open LINK` is a td-owned static program, dependency-free Rust that
-mounts td-busd's message codec (and, since (3), td-secret's descriptor
-module), built by its own recipe and copied with
+mounts td-busd's message codec and client opening (and, since (3),
+td-secret's descriptor module), built by its own recipe and copied with
 its debug companion into both the `mail` and `news` closures at
 `/app/bin/td-open`; both manifests set `BROWSER=/app/bin/td-open`. It
 authenticates to the session bus as the application's UID, calls

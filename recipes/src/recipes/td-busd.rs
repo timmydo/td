@@ -12,6 +12,10 @@ const MODULES: &[(&str, &str)] = &[
         "authscript",
         include_str!("../../../td-busd/src/authscript.rs"),
     ),
+    (
+        "bus_client",
+        include_str!("../../../td-busd/src/bus_client.rs"),
+    ),
     ("corpus", include_str!("../../../td-busd/src/corpus.rs")),
     ("lineage", include_str!("../../../td-busd/src/lineage.rs")),
     (

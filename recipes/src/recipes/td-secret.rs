@@ -108,6 +108,10 @@ const MODULES: &[(&str, &str)] = &[
     ("tpm", include_str!("../../../td-secret/src/tpm.rs")),
     ("store", include_str!("../../../td-secret/src/store.rs")),
     ("sys", include_str!("../../../td-secret/src/sys.rs")),
+    (
+        "bus_client",
+        include_str!("../../../td-busd/src/bus_client.rs"),
+    ),
     ("name", include_str!("../../../td-busd/src/name.rs")),
     ("message", include_str!("../../../td-busd/src/message.rs")),
     ("wire", include_str!("../../../td-busd/src/wire.rs")),
@@ -166,6 +170,7 @@ pub fn recipe() -> Recipe {
                 "consent" => "{src}/td-authd/src/consent.rs".into(),
                 "crypto" => "{src}/td-secret/src/crypto.rs".into(),
                 "store" => "{src}/td-secret/src/store.rs".into(),
+                "bus_client" => "{src}/td-busd/src/bus_client.rs".into(),
                 "name" => "{src}/td-busd/src/name.rs".into(),
                 "message" => "{src}/td-busd/src/message.rs".into(),
                 "wire" => "{src}/td-busd/src/wire.rs".into(),

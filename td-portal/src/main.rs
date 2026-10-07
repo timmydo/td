@@ -20,6 +20,12 @@
 #[path = "../../td-busd/src/app_policy.rs"]
 #[allow(dead_code)]
 mod app_policy;
+#[path = "../../td-busd/src/bus_client.rs"]
+#[allow(
+    dead_code,
+    reason = "the portal is handed its bus socket and parses no address"
+)]
+mod bus_client;
 #[path = "../../td-secret/src/crypto.rs"]
 mod crypto;
 #[path = "../../td-secret/src/fido_cbor.rs"]
@@ -555,12 +561,13 @@ impl Connection {
         let until = Instant::now()
             .checked_add(EXCHANGE_TIMEOUT)
             .ok_or_else(|| io::Error::other("the D-Bus deadline is not representable"))?;
-        let stream = connect_within(socket, EXCHANGE_TIMEOUT).map_err(|error| {
-            io::Error::other(format!(
-                "connect to session bus {}: {error}",
-                socket.display()
-            ))
-        })?;
+        let stream = bus_client::connect_within(socket, EXCHANGE_TIMEOUT, "td-portal-connect")
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "connect to session bus {}: {error}",
+                    socket.display()
+                ))
+            })?;
         let mut connection = Self {
             stream,
             serial: 0,
@@ -589,7 +596,8 @@ impl Connection {
     }
 
     fn handshake(&mut self, uid: u32) -> io::Result<()> {
-        self.timed()?.write_all(auth_line(uid).as_bytes())?;
+        self.timed()?
+            .write_all(bus_client::auth_line(uid).as_bytes())?;
         let line = self.read_line()?;
         if !line.starts_with("OK ") {
             return Err(io::Error::other(format!(
@@ -882,36 +890,6 @@ fn next_serial_value(serial: &mut u32) -> io::Result<u32> {
         .checked_add(1)
         .ok_or_else(|| io::Error::other("this D-Bus connection ran out of serials"))?;
     Ok(*serial)
-}
-
-fn connect_within(socket: &Path, timeout: Duration) -> io::Result<UnixStream> {
-    let socket = socket.to_path_buf();
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::Builder::new()
-        .name("td-portal-connect".into())
-        .spawn(move || {
-            let _ = sender.send(UnixStream::connect(socket));
-        })
-        .map_err(|error| io::Error::other(format!("start the bounded connect worker: {error}")))?;
-    receiver
-        .recv_timeout(timeout)
-        .map_err(|error| match error {
-            mpsc::RecvTimeoutError::Timeout => {
-                io::Error::new(io::ErrorKind::TimedOut, "the session-bus connect timed out")
-            }
-            mpsc::RecvTimeoutError::Disconnected => {
-                io::Error::other("the session-bus connect worker exited without a result")
-            }
-        })?
-}
-
-fn auth_line(uid: u32) -> String {
-    let identity: String = uid
-        .to_string()
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("\0AUTH EXTERNAL {identity}\r\n")
 }
 
 /// The descriptor count a frame read without its descriptors declares.
@@ -3730,6 +3708,10 @@ mod confinement {
             "app_policy.rs",
             include_str!("../../td-busd/src/app_policy.rs"),
         ),
+        (
+            "bus_client.rs",
+            include_str!("../../td-busd/src/bus_client.rs"),
+        ),
     ];
     const SYS: &str = include_str!("../../td-secret/src/sys.rs");
 
@@ -3844,7 +3826,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
         actual.sort();
         let mut expected = SOURCES
             .iter()
-            .filter(|(name, _)| !["sys.rs", "app_policy.rs"].contains(name))
+            .filter(|(name, _)| !["sys.rs", "app_policy.rs", "bus_client.rs"].contains(name))
             .map(|(name, _)| (*name).to_string())
             .collect::<Vec<_>>();
         expected.sort();

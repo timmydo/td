@@ -7,6 +7,7 @@
 //! maximum delay still bounds that wait. Setup and every method call have
 //! a deadline; waiting for a signal does not.
 
+use crate::bus_client;
 use crate::message::{self, Builder, Message, MessageType};
 use crate::sys::{self, ReceiveError};
 use crate::wire::{Endian, Value, WireError, Writer};
@@ -56,8 +57,7 @@ pub(super) fn system_bus(address: Option<&OsStr>) -> Result<PathBuf, String> {
     };
     address
         .to_str()
-        .and_then(|address| address.strip_prefix("unix:path="))
-        .filter(|path| path.starts_with('/') && !path.contains([';', ',', '%', '\0']))
+        .and_then(bus_client::unix_path)
         .map(PathBuf::from)
         .ok_or_else(|| "DBUS_SYSTEM_BUS_ADDRESS is not one absolute unix:path= address".to_owned())
 }
@@ -80,17 +80,14 @@ impl Drop for Stop {
 pub(super) fn watch() -> Result<(Receiver<Event>, bool, Stop), String> {
     let path = system_bus(std::env::var_os("DBUS_SYSTEM_BUS_ADDRESS").as_deref())?;
     let shown = path.display().to_string();
-    let (connected, connecting) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("host-bus-connect".to_owned())
-        .spawn(move || {
-            let _ = connected.send(UnixStream::connect(path));
-        })
-        .map_err(|error| format!("cannot reach the system bus: {error}"))?;
-    let stream = connecting
-        .recv_timeout(DEADLINE)
-        .map_err(|_| format!("the system bus at {shown} did not answer"))?
-        .map_err(|error| format!("the system bus at {shown}: {error}"))?;
+    let stream =
+        bus_client::connect_within(&path, DEADLINE, "host-bus-connect").map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                format!("the system bus at {shown} did not answer")
+            } else {
+                format!("the system bus at {shown}: {error}")
+            }
+        })?;
     let uid = std::fs::metadata("/proc/self")
         .map_err(|error| format!("this process's account: {error}"))?
         .uid();
@@ -168,12 +165,7 @@ impl Watcher {
             pending: VecDeque::new(),
             inhibitor: None,
         };
-        let hex: String = uid
-            .to_string()
-            .bytes()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        watcher.write(format!("\0AUTH EXTERNAL {hex}\r\n").as_bytes())?;
+        watcher.write(bus_client::auth_line(uid).as_bytes())?;
         if !watcher.line()?.starts_with("OK ") {
             return Err("the system bus refused this account".to_owned());
         }

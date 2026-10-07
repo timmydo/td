@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::auth::{Guid, Handshake, PeerIdentity, GUID_LEN};
+use crate::bus_client;
 use crate::lineage::{
     Caller, Identity, Instances, Named, Procfs, Reading, RealProcfs, Registration, Stat,
 };
@@ -3696,68 +3697,15 @@ pub fn probe(path: &Path, uid: u32) -> Result<String, String> {
 }
 
 /// `UnixStream::connect` with a deadline, which `std` does not offer for a
-/// unix socket the way it does for TCP.
-///
-/// The connect runs on a thread of its own and the caller waits on a channel.
-/// A thread blocked in `connect` is NOT joined and cannot be: the call it is
-/// in has no timeout, which is the whole reason this exists. It is left
-/// running, and that is sound only because of what this function is for —
-/// `probe` is one short-lived process whose next act is to exit, so the thread
-/// is reclaimed by process teardown a moment later. Do not lift this into a
-/// long-lived process without giving the thread a way to be cancelled.
-///
-/// The `send` on the far side is deliberately ignored: after a timeout nobody
-/// is receiving, and a connect that succeeds late has its stream dropped by
-/// the channel, which closes it.
+/// unix socket the way it does for TCP: `bus_client::connect_within`, whose
+/// helper thread is left to a connect that never returns. That is sound
+/// only because of what this is for: `probe` is one short-lived process
+/// whose next act is to exit, so the thread is reclaimed by process teardown
+/// a moment later. Do not lift this into a long-lived process without giving
+/// the thread a way to be cancelled.
 fn connect_within(path: &Path, timeout: std::time::Duration) -> Result<UnixStream, String> {
-    let owned = path.to_path_buf();
-    connect_by(path, timeout, move || {
-        UnixStream::connect(&owned).map_err(|error| format!("connect {}: {error}", owned.display()))
-    })
-}
-
-/// `connect_within` with the connect itself as an argument.
-///
-/// The seam is here for the same reason `probe_within` takes its wait as an
-/// argument: the branch worth testing is the one where the connect NEVER
-/// returns, and provoking that through a real socket means filling a listen
-/// backlog whose depth is a property of the std version and the host. A test
-/// that needs several thousand threads to be reliable is not a test of this
-/// logic. So the timeout is proven against a connect that is defined not to
-/// return, and what stays outside the test is the kernel fact that a real one
-/// can behave that way — `unix_stream_connect` waits on the connecting
-/// socket's `SO_SNDTIMEO`, which is unset until after `connect` returns.
-fn connect_by<F>(
-    path: &Path,
-    timeout: std::time::Duration,
-    connect: F,
-) -> Result<UnixStream, String>
-where
-    F: FnOnce() -> Result<UnixStream, String> + Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("td-busd-probe-connect".into())
-        .spawn(move || {
-            let _ = tx.send(connect());
-        })
-        .map_err(|error| format!("cannot start the connect thread: {error}"))?;
-    match rx.recv_timeout(timeout) {
-        Ok(outcome) => outcome,
-        // The listener exists — otherwise `connect` would have refused at once
-        // — and is not accepting. Said as its own sentence because it is a
-        // different fault from a bus that accepts and then says nothing, and
-        // the console line is all the operator gets.
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
-            "connect {}: the bus did not accept in time",
-            path.display()
-        )),
-        // The thread died without sending, which it has no path to do.
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(format!(
-            "connect {}: the connect thread ended without an answer",
-            path.display()
-        )),
-    }
+    bus_client::connect_within(path, timeout, "td-busd-probe-connect")
+        .map_err(|error| format!("connect {}: {error}", path.display()))
 }
 
 /// `probe` with the wait as an argument, so a test can prove the timeout
@@ -3796,15 +3744,10 @@ fn authenticate_probe(
         .set_write_timeout(Some(timeout))
         .map_err(|error| format!("set write timeout: {error}"))?;
     let mut stream = stream;
-    let hex: String = uid
-        .to_string()
-        .bytes()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
     probe_write_all(
         &mut stream,
         deadline,
-        format!("\0AUTH EXTERNAL {hex}\r\n").as_bytes(),
+        bus_client::auth_line(uid).as_bytes(),
         "AUTH",
     )?;
 
@@ -13572,14 +13515,17 @@ mod tests {
         thread::spawn(move || {
             // Run it on its own thread so that a `connect_by` which does NOT
             // give up fails this test rather than hanging it.
-            let outcome = connect_by(
-                Path::new("/nonexistent/bus"),
+            let outcome = bus_client::connect_by(
                 std::time::Duration::from_millis(150),
+                "td-busd-probe-connect",
                 || {
                     thread::sleep(std::time::Duration::from_secs(30));
-                    Err("waited for a connect that should have been abandoned".into())
+                    Err(io::Error::other(
+                        "waited for a connect that should have been abandoned",
+                    ))
                 },
-            );
+            )
+            .map_err(|error| error.to_string());
             let _ = tell.send(outcome);
         });
         match hear.recv_timeout(std::time::Duration::from_secs(10)) {

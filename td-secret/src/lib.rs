@@ -11,6 +11,8 @@
     )
 )]
 
+#[path = "../../td-busd/src/bus_client.rs"]
+mod bus_client;
 mod client;
 #[path = "../../td-authd/src/consent.rs"]
 #[allow(dead_code, reason = "shared immutable consent description")]
@@ -416,6 +418,10 @@ mod confinement {
         let sources = [
             ("lib.rs", include_str!("lib.rs")),
             ("main.rs", include_str!("main.rs")),
+            (
+                "bus_client.rs",
+                include_str!("../../td-busd/src/bus_client.rs"),
+            ),
             ("client.rs", include_str!("client.rs")),
             ("set_client.rs", include_str!("set_client.rs")),
             (

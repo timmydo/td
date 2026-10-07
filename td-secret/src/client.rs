@@ -1,6 +1,6 @@
 //! Bounded credential client; the broker supplies identity, never the environment.
 
-use crate::{message, name, store, sys, wire};
+use crate::{bus_client, message, name, store, sys, wire};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::RawFd;
@@ -193,35 +193,28 @@ pub fn retrieve(name: &str) -> Result<Vec<u8>, String> {
     }
     let address = std::env::var("DBUS_SESSION_BUS_ADDRESS")
         .map_err(|_| "no session bus in this application")?;
-    let path = address
-        .strip_prefix("unix:path=")
-        .filter(|p| p.starts_with('/') && !p.contains([';', ',', '%', '\0']))
+    let path = bus_client::unix_path(&address)
         .ok_or("credential client needs one absolute unix:path bus")?;
     retrieve_at(PathBuf::from(path), name)
 }
 
 fn retrieve_at(path: PathBuf, name: &str) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + Duration::from_secs(20);
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = tx.send(UnixStream::connect(path));
-    });
-    let stream = rx
-        .recv_timeout(Duration::from_secs(20))
-        .map_err(|_| "credential bus connect timed out")?
-        .map_err(|e| e.to_string())?;
+    let stream = bus_client::connect_within(&path, Duration::from_secs(20), "td-secret-connect")
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                "credential bus connect timed out".to_owned()
+            } else {
+                error.to_string()
+            }
+        })?;
     let mut client = Client {
         stream,
         deadline,
         serial: 0,
     };
     let uid = fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid();
-    let identity = uid
-        .to_string()
-        .bytes()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    client.write(format!("\0AUTH EXTERNAL {identity}\r\n").as_bytes())?;
+    client.write(bus_client::auth_line(uid).as_bytes())?;
     if !client.line()?.starts_with("OK ") {
         return Err("credential bus authentication failed".into());
     }

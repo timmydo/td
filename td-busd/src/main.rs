@@ -32,6 +32,11 @@
 mod app_policy;
 mod auth;
 mod authscript;
+#[allow(
+    dead_code,
+    reason = "the shared client primitives also serve td-open, td-portal and td-secret"
+)]
+mod bus_client;
 mod corpus;
 mod lineage;
 mod match_rule;
@@ -329,6 +334,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("sys", include_str!("sys.rs")),
     ("transport", include_str!("transport.rs")),
     ("authscript", include_str!("authscript.rs")),
+    ("bus_client", include_str!("bus_client.rs")),
     ("corpus", include_str!("corpus.rs")),
     ("lineage", include_str!("lineage.rs")),
     ("match_rule", include_str!("match_rule.rs")),

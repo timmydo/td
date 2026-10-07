@@ -64,13 +64,13 @@ mod tests {
             .lines()
             .filter_map(|line| line.strip_prefix("#[path = \""))
             .collect();
-        assert_eq!(mounts.len(), 4);
+        assert_eq!(mounts.len(), 5);
         assert_eq!(
             mounts
                 .iter()
                 .filter(|mount| mount.starts_with("../../td-busd/src/"))
                 .count(),
-            3
+            4
         );
         assert!(mounts.contains(&"../../td-secret/src/sys.rs\"]"));
     }

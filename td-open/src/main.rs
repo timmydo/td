@@ -18,6 +18,9 @@
 //! its descriptor goes to `OpenFile`, which copies it for the browser. The
 //! portal, not this program, decides what is opened and by whom.
 
+// The bus address, bounded connect and SASL opening every td client shares.
+#[path = "../../td-busd/src/bus_client.rs"]
+mod bus_client;
 #[path = "../../td-busd/src/message.rs"]
 #[allow(
     dead_code,
@@ -192,9 +195,7 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
 
 /// The one absolute `unix:path=` socket a session bus address names.
 fn bus_path(address: &str) -> Result<PathBuf, String> {
-    address
-        .strip_prefix("unix:path=")
-        .filter(|path| path.starts_with('/') && !path.contains([';', ',', '%', '\0']))
+    bus_client::unix_path(address)
         .map(PathBuf::from)
         .ok_or_else(|| "td-open needs one absolute unix:path session bus".into())
 }
@@ -277,12 +278,7 @@ impl Client {
     /// Authenticates as `uid`, asking for descriptor passing when this
     /// client will send one.
     fn authenticate(&mut self, uid: u32, descriptors: bool) -> Result<(), String> {
-        let identity = uid
-            .to_string()
-            .bytes()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        self.write(format!("\0AUTH EXTERNAL {identity}\r\n").as_bytes())?;
+        self.write(bus_client::auth_line(uid).as_bytes())?;
         if !self.line()?.starts_with("OK ") {
             return Err("the session bus refused authentication".into());
         }
@@ -492,22 +488,16 @@ fn open(bus: &Path, uid: u32, target: &Target, deadline: Instant) -> Result<(), 
 /// otherwise hold the connect without bound. A connect still pending at
 /// the deadline is left to this process's exit.
 fn connect(bus: &Path, deadline: Instant) -> Result<UnixStream, String> {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let bus = bus.to_path_buf();
-    std::thread::Builder::new()
-        .name("td-open-connect".into())
-        .spawn(move || {
-            let _ = sender.send(UnixStream::connect(bus));
-        })
-        .map_err(|e| format!("cannot reach the session bus: {e}"))?;
     let left = deadline
         .checked_duration_since(Instant::now())
         .unwrap_or_default();
-    match receiver.recv_timeout(left) {
-        Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(error)) => Err(format!("cannot reach the session bus: {error}")),
-        Err(_) => Err("the session bus did not answer in time".into()),
-    }
+    bus_client::connect_within(bus, left, "td-open-connect").map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            "the session bus did not answer in time".into()
+        } else {
+            format!("cannot reach the session bus: {error}")
+        }
+    })
 }
 
 #[cfg(test)]
