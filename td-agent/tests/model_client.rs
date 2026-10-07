@@ -2868,6 +2868,148 @@ fn a_commands_connection_off_the_allowlist_waits_on_a_card() {
     assert!(approvals[1].2.contains("deny network third.test:80"));
 }
 
+/// In `auto`, a connection the allowlist alone asks about goes to the
+/// classifier, told the destination and the command: allowed, it opens
+/// with no card, the approval the classifier's; not allowed, the card
+/// goes to the person saying why, the verdict logged before theirs.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn the_classifier_decides_a_connection_in_auto_mode() {
+    let mut h = Harness::new_in(
+        "network-auto",
+        Role::Conversation,
+        Some("scratch"),
+        true,
+        vec![
+            Reply::sse("stream-tool-network.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.mock.route(
+        "typesafe/jev",
+        vec![Reply::ok("jev-matches.json"), Reply::ok("jev-exceeds.json")],
+    );
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![
+            Reply::ok("classifier-allow.json"),
+            Reply::ok("classifier-allow.json"),
+        ],
+    );
+    h.setup(Client {
+        allow_data_collection: true,
+        ..Client::default()
+    });
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    h.say("List the remotes.");
+    let (card, title, details) = h.until_ask();
+    assert_eq!(title, "Let a command connect to third.test:80?");
+    assert!(
+        details[0].starts_with("Jev: request exceeds"),
+        "{details:?}"
+    );
+    assert!(
+        details[2].starts_with("Asked because the classifier did not allow it: "),
+        "{details:?}"
+    );
+    h.down(&Down::Decision {
+        call: card,
+        allow: false,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let approvals: Vec<(String, String, String)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::Approval {
+                outcome,
+                by,
+                reason: Some(reason),
+                ..
+            } if reason.starts_with("connecting to") => {
+                Some((outcome.clone(), by.clone(), reason.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let at = |n: usize| (approvals[n].0.as_str(), approvals[n].1.as_str());
+    assert_eq!(approvals.len(), 3, "{approvals:?}");
+    assert_eq!(at(0), ("allow", "classifier"));
+    assert!(approvals[0]
+        .2
+        .starts_with("connecting to other.test:80: Jev allows"));
+    assert_eq!(at(1), ("ask", "classifier"));
+    assert!(approvals[1].2.starts_with("connecting to third.test:80"));
+    assert_eq!(at(2), ("deny", "human"));
+    // The classifier was told the destination and the command.
+    let jev = h
+        .mock
+        .requests()
+        .into_iter()
+        .find(|r| r.text().contains("typesafe/jev"))
+        .unwrap();
+    let body = flat(&jev.text());
+    assert_eq!(body["state.action.kind"], "network");
+    assert_eq!(body["state.action.destination"], "other.test:80");
+    assert_eq!(body["state.policy.network"], "allowlist");
+    assert!(
+        body["state.untrusted.command"].contains("ls-remote http://other.test/r.git"),
+        "{body:?}"
+    );
+}
+
+/// In `auto`, a connection a background process makes while the
+/// conversation is idle goes to the person at once, with no turn to ask
+/// the classifier in, which is not asked.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn an_idle_conversations_connection_goes_to_the_person_in_auto_mode() {
+    let mut h = Harness::new_in(
+        "network-idle",
+        Role::Conversation,
+        Some("scratch"),
+        true,
+        vec![
+            Reply::sse("stream-tool-network-idle.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client {
+        allow_data_collection: true,
+        ..Client::default()
+    });
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    h.say("List the remote in the background.");
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let (card, title, details) = h.until_ask();
+    assert_eq!(title, "Let a command connect to other.test:80?");
+    assert!(details[0].starts_with("The command of"), "{details:?}");
+    h.down(&Down::Decision {
+        call: card,
+        allow: false,
+        always: None,
+    });
+    assert!(
+        h.mock
+            .requests()
+            .iter()
+            .all(|r| !r.text().contains("typesafe/jev")),
+        "the classifier was asked"
+    );
+}
+
 /// A card for a connection no one answers is taken back when its
 /// command ends, and logged as withdrawn against the command's call.
 #[test]

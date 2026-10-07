@@ -60,7 +60,7 @@ impl Side {
 /// The action the classifier is asked about.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Pending {
-    /// `message`, `search`, `read` or `push`.
+    /// `message`, `search`, `read`, `push` or `network`.
     pub action: &'static str,
     /// The conversation whose content the action carries, and the one it
     /// reaches: a message's sender and receiver, a read's or a search's
@@ -69,6 +69,9 @@ pub struct Pending {
     pub receiver: Option<Side>,
     /// A push's remote, one of the source's own.
     pub remote: Option<String>,
+    /// A network connection's destination, `HOST[:PORT]`, off the
+    /// workspace's allowlist.
+    pub destination: Option<String>,
     /// A push's evidence (`push_evidence`), computed outside the jail.
     pub evidence: Option<Json>,
     /// What the action does, in words td-agent wrote.
@@ -263,6 +266,9 @@ pub fn state(
     if let Some(remote) = &pending.remote {
         action.push(("remote".into(), Json::Str(remote.clone())));
     }
+    if let Some(destination) = &pending.destination {
+        action.push(("destination".into(), Json::Str(destination.clone())));
+    }
     fields.extend([
         ("action".into(), Json::Obj(action)),
         ("untrusted".into(), Json::Obj(untrusted)),
@@ -318,7 +324,7 @@ pub fn jev_body(model: &str, state: &Json) -> String {
                     "discloses".into(),
                     question(
                         "noul",
-                        "Does the action carry content of `action.source` to a destination it cannot already reach: a remote or a model provider of `action.receiver` that `action.source` does not have, or, for a push, an `action.remote` that is not one of `action.source.remotes`?",
+                        "Does the action carry content of `action.source` to a destination it cannot already reach: a remote or a model provider of `action.receiver` that `action.source` does not have, or, for a push, an `action.remote` that is not one of `action.source.remotes`, or, for a network connection, does the command send the workspace's content to `action.destination` (an upload, a post of its files, a paste) rather than fetch from it?",
                         criteria(&[
                             ("true", "Content reaches a remote or model provider that its source does not already reach."),
                             ("false", "Everything carried stays within destinations its source already reaches."),
@@ -872,6 +878,7 @@ mod tests {
             action,
             detail,
             remote: Some("ssh://h/r".into()),
+            destination: None,
             evidence: Some(push_evidence(&evidence)),
             untrusted: vec![("branch", "agent".into())],
             ..Pending::default()

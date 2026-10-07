@@ -171,6 +171,15 @@ impl Bench {
         }
     }
 
+    /// The network commands are given and the allowlist, as the
+    /// classifier is told them.
+    pub fn network(&self) -> (crate::config::Network, Vec<crate::config::Destination>) {
+        self.judge.lock().map_or_else(
+            |_| (crate::config::Network::Off, Vec::new()),
+            |egress| (egress.network, egress.allowlist.clone()),
+        )
+    }
+
     /// Whom a connection that waits is handed to.
     pub fn set_asker(&mut self, asker: crate::egress::Asker) {
         self.asker = Some(asker);

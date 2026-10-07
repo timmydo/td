@@ -37,12 +37,11 @@ cards, modes, the two-stage classifier with its calibrated threshold,
 the circuit breaker and the trust mark (§11); and increment 16,
 compaction, by hand and past `compact_at`, and the card that asks how to
 resume a conversation whose cache has gone cold (§14). Increment 14,
-the push and fetch tools, is built; increment 15, the network, is built
-but for the classifier's part in its crossings, so a workspace's
-commands reach its allowlist, or
-anywhere under `open`, through its proxy and the egress relay, and a
-destination off the allowlist waits on the person's card, in `auto` as
-in `ask` until the classifier takes its row (§10, §11). Where building
+the push and fetch tools, is built; increment 15, the network, is
+built, so a workspace's commands reach its allowlist, or anywhere under
+`open`, through its proxy and the egress relay, and a destination off
+the allowlist waits on the person's card in `ask`, and on the
+classifier in `auto` (§10, §11). Where building
 an increment settled a point the design left open, the section says so
 under "As built". No recipe names td-agent yet. The decisions below that
 were the user's to make were made on 2026-10-01, 2026-10-02 and
@@ -3797,9 +3796,35 @@ taken back. Each card's outcome is logged as an approval of each call
 whose command made one of its connections, `by` `human`, `rule` or,
 when taken back as gone or refused past the cards' bound, `td-agent`,
 its reason naming the destination; they are logged between calls or
-while the conversation is idle, never inside a request. In `auto` the card still goes to the person: the classifier's
-row in §11's table comes with a later commit, as the crossings between
-conversations did. A conversation's system prompt names the policy, the
+while the conversation is idle, never inside a request.
+
+In `auto` (not braked), a destination the allowlist alone asks about,
+no rule asking, goes to the classifier, §11's table's row, before any
+card: its card is made but held back, and asked of at the next point
+the conversation waits within a turn, between its steps, in a
+foreground command's wait or in `process_wait`, the command's time
+running meanwhile as it does while the person answers (the tool host
+keeps its own deadline). Interrupted, it is not asked. Asked, it is
+judged again first, a rule's answer settling it, and out of `auto`
+now, a rule asking, or a call whose command cannot be read, put to the
+person. The verdict is on the commands that asked when it was asked:
+one that joins the card meanwhile has it asked of again with the rest. The classifier is told
+the action `network`, its `destination`, this conversation as the
+source, the policy's `network` and `allowlist` beside the mode and
+rules, and the commands that asked, whole, each headed by its call, untrusted
+(the destination, which a command chose, is the agent's too); Jev's
+`discloses` asks whether the command sends the workspace's content
+there rather than fetching. Its allow opens the connections and holds
+for the rest of each command, as the person's does, logged `by`
+`classifier` with its probabilities; anything else puts the card to the
+person with Jev's probabilities and why, the verdict logged first and
+counted by the breaker. A verdict is logged once, at the first call
+whose command asked, naming the others, so the breaker counts
+verdicts. A held-back card goes to the person at once when no turn
+runs, the conversation idle, there being no turn to ask in, and while
+the turn waits on the person's answer to another card or to resuming
+cold; a card made while a model's reply streams waits for the next
+step. A conversation's system prompt names the policy, the
 allowlist under `allowlist`, and that a connection elsewhere waits on
 the person and may be refused.
 

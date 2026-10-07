@@ -434,6 +434,10 @@ struct LinkCard {
     /// Whether the card offers an "always allow".
     allow: bool,
     waiting: Vec<Waiting>,
+    /// Put before the person; until then, waiting for the classifier.
+    shown: bool,
+    /// The classifier's probabilities, when it did not allow it.
+    jev: Option<String>,
 }
 
 /// A connection waiting on a card: its instance's links, its id there,
@@ -578,6 +582,7 @@ pub fn serve_in(
         exited: VecDeque::new(),
         link_cards: BTreeMap::new(),
         next_link_card: LINK_CARDS,
+        to_classify: VecDeque::new(),
         link_approvals: VecDeque::new(),
         human: (0, Ok(crate::rules::Policy::default())),
         mode: crate::config::Mode::Ask,
@@ -882,6 +887,9 @@ struct Session {
     /// §11), by card id, and the next id.
     link_cards: BTreeMap<u64, LinkCard>,
     next_link_card: u64,
+    /// Cards for the classifier, in `auto`, asked at the next point
+    /// between a turn's steps or in a command's wait (DESIGN.md §11).
+    to_classify: VecDeque<u64>,
     /// Approvals of connections, logged at the next step between calls
     /// or while idle, never inside a request.
     link_approvals: VecDeque<Kind>,
@@ -961,6 +969,8 @@ impl Session {
         if let Some(end) = self.exited.pop_front() {
             return Ok(Some(Work::Ended(end)));
         }
+        // No turn runs to ask the classifier in: the person is asked.
+        self.unclassified();
         if !self.link_approvals.is_empty() {
             return Ok(Some(Work::Logged));
         }
@@ -981,6 +991,7 @@ impl Session {
                 }
                 Ok(Inbound::Link(asked)) => {
                     self.link(asked);
+                    self.unclassified();
                     if !self.link_approvals.is_empty() {
                         return Ok(Some(Work::Logged));
                     }
@@ -2139,7 +2150,12 @@ impl Session {
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
-                Ok(Inbound::Link(asked)) => self.link(asked),
+                // The person is asked already: a card held back for the
+                // classifier is put to them too.
+                Ok(Inbound::Link(asked)) => {
+                    self.link(asked);
+                    self.unclassified();
+                }
                 Ok(Inbound::Broken(why)) => {
                     eprintln!("td-agent: the window: {why}");
                     self.gone = true;
@@ -3425,6 +3441,7 @@ impl Session {
     /// request reads it (DESIGN.md §7); whether there was one.
     fn between(&mut self) -> Result<bool, String> {
         self.hear();
+        self.classify_links()?;
         self.log_links()?;
         while let Some(end) = self.exited.pop_front() {
             self.ended(end, false)?;
@@ -3941,6 +3958,9 @@ impl Session {
         let mut cancelled = false;
         loop {
             self.hear();
+            // A connection the command waits on is asked of here, its
+            // time running meanwhile as it does while the person answers.
+            self.classify_links()?;
             if self.interrupt && !cancelled {
                 cancelled = true;
                 deadline = deadline.min(Instant::now() + CANCEL_GRACE);
@@ -4193,15 +4213,14 @@ impl Session {
                 {
                     let joins = !card.waiting.iter().any(|one| one.call == waiting.call);
                     card.waiting.push(waiting);
-                    if joins {
+                    if joins && card.shown {
                         self.show_link_card(id);
                     }
                     return;
                 }
                 if self.link_cards.len() >= MAX_LINK_CARDS {
-                    let refused = format!(
-                        "{MAX_LINK_CARDS} destinations already wait for the person's answer"
-                    );
+                    let refused =
+                        format!("{MAX_LINK_CARDS} destinations already wait for an answer");
                     Self::give(
                         std::slice::from_ref(&waiting),
                         &destination,
@@ -4219,6 +4238,10 @@ impl Session {
                 }
                 let id = self.next_link_card;
                 self.next_link_card += 1;
+                // `auto`'s column is the classifier's for a destination
+                // the allowlist alone asks about; a rule's ask, or a
+                // rules file not read, is the person's (§11).
+                let classified = allow && self.workspace_mode() == crate::config::Mode::Auto;
                 self.link_cards.insert(
                     id,
                     LinkCard {
@@ -4226,9 +4249,15 @@ impl Session {
                         why,
                         allow,
                         waiting: vec![waiting],
+                        shown: false,
+                        jev: None,
                     },
                 );
-                self.show_link_card(id);
+                if classified {
+                    self.to_classify.push_back(id);
+                } else {
+                    self.show_link_card(id);
+                }
             }
             crate::egress::Asked::Gone { links, link, .. } => {
                 let mut empty = Vec::new();
@@ -4252,8 +4281,10 @@ impl Session {
                     }
                 }
                 for (id, gone) in empty {
-                    self.send(&Up::Withdraw { call: id });
                     if let Some(card) = self.link_cards.remove(&id) {
+                        if card.shown {
+                            self.send(&Up::Withdraw { call: id });
+                        }
                         self.link_approval(
                             &card.destination,
                             &gone,
@@ -4271,9 +4302,11 @@ impl Session {
     /// changed: its destination, why it asks, the calls whose commands
     /// wait on it, and what an answer does.
     fn show_link_card(&mut self, id: u64) {
-        let Some(card) = self.link_cards.get(&id) else {
+        let Some(card) = self.link_cards.get_mut(&id) else {
             return;
         };
+        card.shown = true;
+        let card = &*card;
         let named = card.destination.text();
         let mut calls: Vec<u64> = card.waiting.iter().map(|one| one.call).collect();
         calls.sort_unstable();
@@ -4309,11 +4342,16 @@ impl Session {
         let up = Up::Ask {
             call: id,
             title: format!("Let a command connect to {named}?"),
-            details: vec![
-                format!("{who} to connect to {named} through the workspace's proxy."),
-                format!("Asked because {}.", card.why),
-                "Allow lets each command that asked reach it until that command ends, a background process's included, and Deny refuses it as long.".into(),
-            ],
+            details: card
+                .jev
+                .iter()
+                .map(|jev| format!("Jev: {jev}."))
+                .chain([
+                    format!("{who} to connect to {named} through the workspace's proxy."),
+                    format!("Asked because {}.", card.why),
+                    "Allow lets each command that asked reach it until that command ends, a background process's included, and Deny refuses it as long.".into(),
+                ])
+                .collect(),
             always,
         };
         self.send(&up);
@@ -4429,15 +4467,19 @@ impl Session {
                     if why != card.why || allow != card.allow {
                         card.why = why;
                         card.allow = allow;
-                        self.show_link_card(id);
+                        if card.shown {
+                            self.show_link_card(id);
+                        }
                     }
                     continue;
                 }
                 crate::egress::Judgment::Open => (Ok(()), RULES_CHANGED.to_string()),
                 crate::egress::Judgment::Refuse(why) => (Err(why.clone()), why),
             };
-            self.send(&Up::Withdraw { call: id });
             if let Some(card) = self.link_cards.remove(&id) {
+                if card.shown {
+                    self.send(&Up::Withdraw { call: id });
+                }
                 self.settle_by_rule(&card.destination, &card.waiting, answer, reason);
             }
         }
@@ -4453,18 +4495,224 @@ impl Session {
         by: &str,
         reason: String,
     ) {
+        self.link_verdict(destination, waiting, outcome, by, None, reason);
+    }
+
+    /// `link_approval`, with the classifier's probabilities.
+    fn link_verdict(
+        &mut self,
+        destination: &crate::config::Destination,
+        waiting: &[Waiting],
+        outcome: &str,
+        by: &str,
+        probabilities: Option<String>,
+        reason: String,
+    ) {
         let mut calls: Vec<u64> = waiting.iter().map(|one| one.call).collect();
         calls.sort_unstable();
         calls.dedup();
+        // The classifier gives one verdict, which the breaker counts
+        // once: logged at the first call, naming the others.
+        if by == "classifier" {
+            let Some((first, rest)) = calls.split_first() else {
+                return;
+            };
+            let also = if rest.is_empty() {
+                String::new()
+            } else {
+                let rest: Vec<String> = rest.iter().map(|call| format!("#{call}")).collect();
+                format!(" (the commands of calls {} asked too)", rest.join(", "))
+            };
+            self.link_approvals.push_back(Kind::Approval {
+                call: *first,
+                outcome: outcome.into(),
+                by: by.into(),
+                probabilities,
+                reason: Some(format!(
+                    "connecting to {}{also}: {reason}",
+                    destination.text()
+                )),
+            });
+            return;
+        }
         for call in calls {
             self.link_approvals.push_back(Kind::Approval {
                 call,
                 outcome: outcome.into(),
                 by: by.into(),
-                probabilities: None,
+                probabilities: probabilities.clone(),
                 reason: Some(format!("connecting to {}: {reason}", destination.text())),
             });
         }
+    }
+
+    /// The cards waiting for the classifier, each asked in turn
+    /// (DESIGN.md §11): judged again first, a rule's answer settling it;
+    /// out of `auto` now, or a rule asking, put to the person; else the
+    /// classifier's allow opens its connections, kept for the rest of
+    /// each command as the person's would be, and anything else puts it
+    /// to the person saying why, a verdict counted by the breaker.
+    fn classify_links(&mut self) -> Result<(), String> {
+        // Interrupted, the turn ends and the person is asked (`next`).
+        while !self.interrupt {
+            let Some(id) = self.to_classify.pop_front() else {
+                break;
+            };
+            let Some(destination) = self
+                .link_cards
+                .get(&id)
+                .filter(|card| !card.shown)
+                .map(|card| card.destination.clone())
+            else {
+                continue;
+            };
+            match self.bench.judge(&destination) {
+                crate::egress::Judgment::Ask { allow: true, .. }
+                    if self.workspace_mode() == crate::config::Mode::Auto => {}
+                crate::egress::Judgment::Ask { .. } => {
+                    self.show_link_card(id);
+                    continue;
+                }
+                // The policy changed meanwhile and `rejudge_links` will
+                // settle it; nothing to ask.
+                _ => continue,
+            }
+            // The verdict is on these commands alone: one that joins while
+            // it is asked is asked of again with the rest.
+            let asked = self.link_calls(id);
+            // A command the classifier cannot be shown is the person's.
+            if asked.iter().any(|call| self.call_command(*call).is_none()) {
+                self.show_link_card(id);
+                continue;
+            }
+            let ruled_at = self.human.0;
+            let outcome = self.classify(|me, client| me.network_pending(id, client))?;
+            self.hear();
+            // Gone, or decided by a policy taken meanwhile.
+            if !self.link_cards.contains_key(&id) {
+                continue;
+            }
+            if self.human.0 != ruled_at || self.link_calls(id) != asked {
+                self.to_classify.push_front(id);
+                continue;
+            }
+            if outcome.allow {
+                if let Some(card) = self.link_cards.remove(&id) {
+                    Self::give(&card.waiting, &card.destination, Ok(()), true);
+                    self.link_verdict(
+                        &card.destination,
+                        &card.waiting,
+                        "allow",
+                        "classifier",
+                        outcome.probabilities,
+                        outcome.reason,
+                    );
+                }
+                continue;
+            }
+            if outcome.asked {
+                if let Some(card) = self.link_cards.get(&id) {
+                    let (destination, waiting) = (card.destination.clone(), card.waiting.clone());
+                    self.link_verdict(
+                        &destination,
+                        &waiting,
+                        "ask",
+                        "classifier",
+                        outcome.probabilities.clone(),
+                        outcome.reason.clone(),
+                    );
+                }
+                self.log_links()?;
+                self.brake()?;
+            }
+            if let Some(card) = self.link_cards.get_mut(&id) {
+                card.jev = outcome.probabilities;
+                card.why = format!("the classifier did not allow it: {}", outcome.reason);
+            }
+            self.show_link_card(id);
+        }
+        Ok(())
+    }
+
+    /// The calls whose commands wait on card `id`, in order.
+    fn link_calls(&self, id: u64) -> Vec<u64> {
+        let mut calls: Vec<u64> = self
+            .link_cards
+            .get(&id)
+            .map(|card| card.waiting.iter().map(|one| one.call).collect())
+            .unwrap_or_default();
+        calls.sort_unstable();
+        calls.dedup();
+        calls
+    }
+
+    /// The cards still waiting for the classifier, put to the person:
+    /// no turn runs to ask it in.
+    fn unclassified(&mut self) {
+        while let Some(id) = self.to_classify.pop_front() {
+            if self.link_cards.get(&id).is_some_and(|card| !card.shown) {
+                self.show_link_card(id);
+            }
+        }
+    }
+
+    /// Connection card `id` as the classifier is asked it: this
+    /// conversation's content possibly carried to the destination, the
+    /// command that asked, and what else a model wrote, untrusted.
+    fn network_pending(&self, id: u64, client: &Client) -> classifier::Pending {
+        let card = self.link_cards.get(&id);
+        let named = card.map(|card| card.destination.text()).unwrap_or_default();
+        let commands: Vec<String> = self
+            .link_calls(id)
+            .into_iter()
+            .filter_map(|call| {
+                self.call_command(call)
+                    .map(|command| format!("[the command of call #{call}]\n{command}"))
+            })
+            .collect();
+        let mut untrusted = Vec::new();
+        if let Some(received) = self.received() {
+            untrusted.push(("received", received));
+        }
+        classifier::Pending {
+            action: "network",
+            source: side(self.conversation.meta(), client),
+            receiver: None,
+            remote: None,
+            destination: Some(named.clone()),
+            evidence: None,
+            detail: format!(
+                "let a command this conversation runs connect to {named} through the workspace's proxy; the workspace's policy is allowlist and {named} is not on its allowlist"
+            ),
+            payload: Some(("command", commands.join("\n"))),
+            untrusted,
+        }
+    }
+
+    /// The command a shell call, logged as `call`, ran, as the model
+    /// wrote it.
+    fn call_command(&self, call: u64) -> Option<String> {
+        let events = self.conversation.events();
+        let (reply, id) = events
+            .iter()
+            .find(|e| e.seq == call)
+            .and_then(|e| match &e.kind {
+                Kind::ToolCall { reply, id, .. } => Some((*reply, id.clone())),
+                _ => None,
+            })?;
+        let calls = events
+            .iter()
+            .find(|e| e.seq == reply)
+            .and_then(|e| match &e.kind {
+                Kind::Assistant { calls, .. } => Some(calls),
+                _ => None,
+            })?;
+        let arguments = &calls.iter().find(|one| one.id == id)?.arguments;
+        td_json::parse_slice(arguments.as_bytes())
+            .ok()?
+            .get("command")
+            .and_then(td_json::Json::as_str)
+            .map(str::to_string)
     }
 
     /// The approvals of connections decided meanwhile, logged.
@@ -4618,6 +4866,7 @@ impl Session {
         let deadline = Instant::now().checked_add(time);
         let waited = loop {
             self.hear();
+            self.classify_links()?;
             if !self.processes.contains_key(&number) {
                 break None;
             }
@@ -4683,6 +4932,10 @@ impl Session {
         always: Option<crate::rules::Offer>,
         judged: Option<&Judged<'_>>,
     ) -> Result<Decided, String> {
+        // The person is asked already: what waits for the classifier is
+        // put to them too.
+        self.unclassified();
+        self.unclassified();
         self.send(&Up::Ask {
             call: started,
             title,
@@ -4732,7 +4985,12 @@ impl Session {
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
-                Ok(Inbound::Link(asked)) => self.link(asked),
+                // The person is asked already: a card held back for the
+                // classifier is put to them too.
+                Ok(Inbound::Link(asked)) => {
+                    self.link(asked);
+                    self.unclassified();
+                }
                 Ok(Inbound::Broken(why)) => {
                     eprintln!("td-agent: the window: {why}");
                     self.gone = true;
@@ -6010,6 +6268,14 @@ impl Session {
                 ),
             ),
         ];
+        if pending.action == "network" {
+            let (network, allowlist) = self.bench.network();
+            policy.push(("network".into(), Json::Str(network.name().into())));
+            policy.push((
+                "allowlist".into(),
+                Json::Arr(allowlist.iter().map(|d| Json::Str(d.text())).collect()),
+            ));
+        }
         if let Some(remote) = &pending.remote {
             policy.push((
                 "protected_branches".into(),
@@ -6046,6 +6312,7 @@ impl Session {
             source,
             receiver: Some(receiver),
             remote: None,
+            destination: None,
             evidence: None,
             detail,
             payload,
@@ -6113,6 +6380,7 @@ impl Session {
             source: side(self.conversation.meta(), client),
             receiver: None,
             remote: Some(entry.remote.clone()),
+            destination: None,
             evidence: Some(classifier::push_evidence(evidence)),
             detail,
             payload: None,

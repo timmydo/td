@@ -525,6 +525,7 @@ mod tests {
                 action,
                 source: side,
                 remote: Some("r".into()),
+                destination: None,
                 evidence: Some(classifier::push_evidence(&crate::git::Evidence::default())),
                 detail,
                 untrusted: vec![
