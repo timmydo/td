@@ -30,7 +30,7 @@ td-mta (library and packaging executable)
   -> td-json (std-only bounded JSON string framing)
   -> td-mime (std-only MIME/header/charset/Unicode implementation)
   -> td-nfc (std-only bounded canonical composition)
-  -> rusqlite (private bundled SQLite metadata backend)
+  -> rusqlite (private bundled SQLite body/metadata backend)
   -> td-crypto (td-owned API and private backend)
        -> rustls + aws-lc-rs + reviewed root data
 ```

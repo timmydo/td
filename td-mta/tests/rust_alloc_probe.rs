@@ -130,55 +130,19 @@ fn hot_paths() {
 }
 
 fn store_paths() {
-    use td_mta::{
-        format::row::BlobKind,
-        ids::{AccountId, BlobId},
-        store_paths::{parse_blob_name, AccountEntry, Name, Number, RootEntry},
-    };
-    let account = AccountId::from_bytes(black_box([0xff; 16]));
-    let blob = BlobId::from_bytes(black_box([0xab; 16]));
-    let generation = Number::new(black_box(u64::MAX)).unwrap();
+    use td_mta::store_paths::{Name, RootEntry};
     for entry in [
         RootEntry::Database,
         RootEntry::Wal,
         RootEntry::SharedMemory,
         RootEntry::Lock,
-        RootEntry::Accounts,
     ] {
-        black_box(Name::root(black_box(entry)).unwrap());
-    }
-    for entry in [
-        AccountEntry::Root,
-        AccountEntry::Shard(BlobKind::Message, 0xab),
-        AccountEntry::Blob(BlobKind::Message, blob),
-        AccountEntry::Blob(BlobKind::Upload, blob),
-    ] {
-        let name = Name::account(account, black_box(entry)).unwrap();
+        let name = Name::root(black_box(entry)).unwrap();
         black_box(name.as_bytes().unwrap());
         black_box(name.as_str().unwrap());
         black_box(name.as_path().unwrap());
         black_box(name.as_c_str().unwrap());
     }
-    assert_eq!(
-        Number::parse(black_box("18446744073709551615")).unwrap(),
-        generation
-    );
-    assert_eq!(
-        Number::parse(black_box("00000000000000000042"))
-            .unwrap()
-            .value(),
-        42
-    );
-    assert!(Number::parse(black_box("18446744073709551616")).is_err());
-    assert!(Number::parse(black_box("0000001")).is_err());
-    let text = black_box("abababababababababababababababab.eml");
-    assert_eq!(
-        parse_blob_name(BlobKind::Message, 0xab, text).unwrap(),
-        blob
-    );
-    assert!(parse_blob_name(BlobKind::Message, 0xac, text).is_err());
-    assert!(parse_blob_name(BlobKind::Upload, 0xab, text).is_err());
-    assert!(parse_blob_name(BlobKind::Message, 0xab, black_box("../bad.eml")).is_err());
 }
 
 fn tls_clients() {
@@ -362,14 +326,9 @@ fn entropy_workers() {
 }
 
 fn store_directories() {
-    use td_mta::{
-        store_fs::{Directory, MAX_PATH_BYTES},
-        store_paths::{Name, RootEntry},
-    };
+    use td_mta::store_fs::{Directory, MAX_PATH_BYTES};
     let path = std::env::temp_dir().join(format!("td-mta-dir-alloc-{}", std::process::id()));
     std::fs::create_dir(&path).unwrap();
-    std::fs::create_dir(path.join("accounts")).unwrap();
-    let root = Directory::from_path(path.to_str().unwrap()).unwrap();
     // Exercise std's conversion at the service's full path bound, not just
     // common short deployment paths. Construct fixture paths before measuring.
     let prefix = path.join("x".repeat(160));
@@ -381,12 +340,10 @@ fn store_directories() {
         .expect("allocation fixture TMPDIR must leave a valid maximum-path component");
     let long = prefix.join("y".repeat(tail_length));
     std::fs::create_dir(&long).unwrap();
-    let present = Name::root(RootEntry::Accounts).unwrap();
-    let missing = Name::root(RootEntry::Lock).unwrap();
     let absent = long.with_file_name("z".repeat(long.file_name().unwrap().len()));
     let before = COUNTERS.snapshot();
     for _ in 0..64 {
-        let directory = root.open(black_box(&present)).unwrap();
+        let directory = Directory::from_path(black_box(path.to_str().unwrap())).unwrap();
         assert!(directory.metadata().unwrap().is_dir());
         drop(directory);
         drop(Directory::from_path(black_box(long.to_str().unwrap())).unwrap());
@@ -396,17 +353,12 @@ fn store_directories() {
                 .kind(),
             std::io::ErrorKind::NotFound
         );
-        assert_eq!(
-            root.open(black_box(&missing)).unwrap_err().kind(),
-            std::io::ErrorKind::NotFound
-        );
     }
     assert_eq!(
         COUNTERS.snapshot(),
         before,
         "std directory lookup allocated"
     );
-    drop(root);
     std::fs::remove_dir_all(path).unwrap();
 }
 
@@ -9600,7 +9552,8 @@ fn grouped_header_values() {
     let source = format!("To:{name}:{name} <{address}>,bad; Empty:;\nTo:a@b(Name)\n\n");
     let expected = format!(
         "[[{{\"name\":\"{}\",\"addresses\":[{{\"name\":\"{}\",\"email\":\"{address}\"}},{{\"name\":null,\"email\":\"bad\"}}]}},{{\"name\":\"Empty\",\"addresses\":[]}}],[{{\"name\":null,\"addresses\":[{{\"name\":\"Name\",\"email\":\"a@b\"}}]}}]]",
-        "é".repeat(4096), "é".repeat(4096),
+        "é".repeat(4096),
+        "é".repeat(4096),
     );
     let mut work = Meter::new(
         Deadline::after(Tick(0), 100).unwrap(),
@@ -10878,7 +10831,8 @@ fn dispatched_header_values() {
     };
     let source = format!(
         "Subject:a{}\nTo:a{} <a@b>\nDate:1 Jan 2000 00:00 +0000\nMessage-ID:<a@b>\nList-Help:<https://x.test/>\n\n",
-        "\u{301}".repeat(512), "\u{301}".repeat(512)
+        "\u{301}".repeat(512),
+        "\u{301}".repeat(512)
     );
     let mut scratch = Scratch::new();
     for key in [
@@ -10975,7 +10929,10 @@ fn date_header_values() {
         nfc::HeaderBudget,
         ports::{Deadline, Tick},
     };
-    let source = format!("Date: ({})21 Nov 1997 09:55:06 CST\nDate: 31 Dec 2020 23:59:60 +0000\nDate: 31 Dec 2016 23:59:60 +0000\n\n", "🐈".repeat(4096));
+    let source = format!(
+        "Date: ({})21 Nov 1997 09:55:06 CST\nDate: 31 Dec 2020 23:59:60 +0000\nDate: 31 Dec 2016 23:59:60 +0000\n\n",
+        "🐈".repeat(4096)
+    );
     let expected = b"[\"1997-11-21T15:55:06Z\",null,\"2016-12-31T23:59:60Z\"]";
     let mut work = Meter::new(
         Deadline::after(Tick(0), 100).unwrap(),
@@ -11090,7 +11047,9 @@ fn text_header_values() {
         };
         let structured = mime || matches!(field, "Keywords" | "List-Id");
         let extra = if structured {
-            format!("{field}: \" =?utf-8?Q?literal?= \" (=?utf-8?Q?cafe=CC=81?=) < =?utf-8?Q?literal?= >\r\n")
+            format!(
+                "{field}: \" =?utf-8?Q?literal?= \" (=?utf-8?Q?cafe=CC=81?=) < =?utf-8?Q?literal?= >\r\n"
+            )
         } else {
             String::new()
         };
@@ -12174,28 +12133,20 @@ fn retained_requested_source_bound_properties() {
     }
 }
 
-fn raw_file_io() {
-    let mut file_samples = [COUNTERS.snapshot(); 16];
-    let mut file_slots = file_samples.iter_mut();
-    store_fs::probe_temporary_io(|| *file_slots.next().unwrap() = COUNTERS.snapshot());
-    assert!(file_slots.next().is_none());
-    for pair in file_samples.as_chunks::<2>().0 {
-        assert_eq!(
-            pair.first(),
-            pair.get(1),
-            "raw-file publication/input allocated Rust memory"
-        );
-    }
-}
-
 fn main() {
     allocation_counter::Counters::verify_model();
     forwarding();
     if std::env::args()
         .nth(1)
-        .is_some_and(|arg| arg == "--store-files")
+        .is_some_and(|arg| arg == "--sqlite-body")
     {
-        raw_file_io();
+        sqlite_body();
+        return;
+    }
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|arg| arg == "--mime-only")
+    {
         mime_base64();
         mime_qp();
         mime_qp_input();
@@ -12294,7 +12245,7 @@ fn main() {
         mime_checkpoints();
         mime_unfold();
         header_raw();
-        println!("std-temporary-allocation-v1: passed");
+        println!("mime-allocation-v1: passed");
         return;
     }
     if std::env::args()
@@ -12368,7 +12319,6 @@ fn main() {
         return;
     }
     store_directories();
-    raw_file_io();
 
     pinned_source_binding();
     source_bound_members();
@@ -12747,4 +12697,34 @@ fn mailbox_parent_walks() {
         assert_eq!(result.err(), expected);
     }
     assert_eq!(COUNTERS.snapshot(), before, "mailbox parent walk allocated");
+}
+
+#[path = "support/sqlite_body_scenario.rs"]
+mod sqlite_body_scenario;
+
+fn sqlite_body() {
+    let mut samples = vec![COUNTERS.snapshot(); sqlite_body_scenario::PHASES.len()];
+    let mut slots = samples.iter_mut();
+    sqlite_body_scenario::run(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|s| !s.invalid));
+    let baseline = *samples.first().unwrap();
+    for sample in &samples {
+        assert!(
+            sample.peak.saturating_sub(baseline.live) <= 2 * 1024 * 1024,
+            "streamed body exceeded Rust requested-byte envelope"
+        );
+    }
+    assert_eq!(
+        samples.last().unwrap().live,
+        baseline.live,
+        "SQLite teardown retained Rust allocations"
+    );
+    for (phase, s) in sqlite_body_scenario::PHASES.iter().zip(samples) {
+        println!(
+            "sqlite-rust {phase} {} {} {} {} {} {} {}",
+            s.alloc, s.zeroed, s.realloc, s.free, s.failed, s.live, s.peak
+        );
+    }
+    println!("sqlite-body-allocation-v1: rust passed");
 }

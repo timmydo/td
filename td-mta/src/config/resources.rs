@@ -13,9 +13,12 @@ pub enum Section {
     Network,
 }
 impl Section {
-    pub const ALL: [Self; 4] = [Self::Limits, Self::Disk, Self::Work, Self::Network];
+    pub const ALL: &[Self] = &[Self::Limits, Self::Disk, Self::Work, Self::Network];
     pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|section| section.name() == name)
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|section| section.name() == name)
     }
     pub const fn name(self) -> &'static str {
         match self {
@@ -374,9 +377,9 @@ mod tests {
     fn decoded_statements_reach_all_three_plans() {
         let lines = [
             "[limits]",
-            "message_bytes=67108864",
+            "message_bytes=16777216",
             "[disk]",
-            "body_bytes=8589934592",
+            "body_bytes=2147483648",
             "[work]",
             "request_seconds=600",
             "[network]",
@@ -411,12 +414,12 @@ mod tests {
         let actual = builder
             .finish(admission::ViewMode::OnlineBackground)
             .unwrap();
-        assert_eq!(actual.resources().limits().message_bytes, 67108864);
-        assert_eq!(actual.admission().disk().body_bytes, 8589934592);
+        assert_eq!(actual.resources().limits().message_bytes, 16777216);
+        assert_eq!(actual.admission().disk().body_bytes, 2147483648);
         assert_eq!(actual.admission().work().request_seconds, 600);
         assert_eq!(actual.timeouts().execution_seconds(), 600);
         assert_eq!(actual.timeouts().limits().minimum_rate, 32768);
-        assert_eq!(actual.resources().total_bytes(), 100_058_368);
+        assert_eq!(actual.resources().total_bytes(), 131_515_648);
     }
     #[test]
     fn duplicates_keep_first_location_and_poison_candidate() {
@@ -462,7 +465,7 @@ mod tests {
     }
     #[test]
     fn unknown_type_and_section_errors_do_not_echo_input() {
-        for section in Section::ALL {
+        for &section in Section::ALL {
             let mut b = Builder::default();
             b.begin(section, location(1)).unwrap();
             let e = b
@@ -635,8 +638,8 @@ mod tests {
             Section::Disk.fields(),
             &[
                 "body_bytes",
-                "body_files",
-                "metadata_bytes",
+                "blob_count",
+                "database_bytes",
                 "wal_bytes",
                 "response_bytes",
                 "response_total_bytes",
@@ -663,7 +666,7 @@ mod tests {
                 "gc_seconds",
                 "gc_io_bytes",
                 "gc_records",
-                "gc_unlinks",
+                "gc_blobs",
                 "backup_seconds",
                 "backup_io_bytes",
                 "admission_seconds"
@@ -694,7 +697,7 @@ mod tests {
                 "minimum_rate"
             ]
         );
-        for section in Section::ALL {
+        for &section in Section::ALL {
             assert!(section.fields().len() <= MAX_FIELDS);
             for (index, field) in section.fields().iter().enumerate() {
                 assert_eq!(
@@ -741,7 +744,7 @@ mod tests {
                 Code::UnknownField
             );
         }
-        for section in Section::ALL {
+        for &section in Section::ALL {
             for value in [
                 Value::Boolean(true),
                 Value::Boolean(false),
@@ -762,7 +765,7 @@ mod tests {
                 "ambiguous admission field: {field}"
             );
         }
-        for section in Section::ALL {
+        for &section in Section::ALL {
             assert_eq!(Section::from_name(section.name()), Some(section));
         }
         assert_eq!(Section::from_name("LIMITS"), None);

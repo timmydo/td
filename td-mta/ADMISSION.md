@@ -3,22 +3,22 @@
 This is the normative companion to RESOURCES.md, API.md and STORAGE.md.
 admission.rs validates an immutable disk/work plan without allocating pools
 or inspecting free space. Fixed logical leases and effect tickets provide
-coordinator accounting; SQLite owns actual metadata transaction/recovery state.
+coordinator accounting; SQLite owns actual body/metadata transaction/recovery state.
 The low-level IndexStore does not implement the service reservation coordinator.
 
 ## 1. Disk accounting
 
 Lengths, offsets, quotas and arithmetic use checked u64. Only bounded I/O
 chunks convert to usize. One future coordinator serializes used and pending
-logical charges, including raw orphans, scratch and logs. Logical quotas do
+logical charges, including database/WAL growth, scratch and logs. Logical quotas do
 not promise successful I/O or reserve filesystem blocks.
 
 | Resource | Default ceiling |
 | --- | ---: |
-| Raw message/upload/private/orphan bytes | 4 GiB |
-| Raw body files | 250000 |
-| SQLite main database | 32 MiB |
-| SQLite WAL | 67502144 bytes |
+| Logical stored body bytes | 4 GiB |
+| Stored blob count | 250000 |
+| SQLite main database, bodies and metadata | 8 GiB |
+| SQLite WAL | 17280796224 bytes |
 | Upload category | 128 MiB |
 | Queue category | 256 MiB, 1000 retained submissions |
 | Sort scratch | 64 MiB |
@@ -27,25 +27,27 @@ not promise successful I/O or reserve filesystem blocks.
 | Logs | Five 8 MiB files |
 | Mutable cold state | 16 MiB |
 
-DiskLimits caps body bytes at 1 TiB and files at 1000000, metadata at 32 MiB,
-WAL policy at 128 MiB, responses at 1 GiB/request and 4 GiB aggregate, caches
-at 1 GiB and cold state at 64 MiB. Native SQLite's fixed 32 MiB page limit
-and 67502144-byte WAL bound are fixed. Metadata configuration must equal
-32 MiB, and WAL configuration must cover that fixed bound; raising WAL's
-logical budget does not enlarge the core. Other quota reductions below actual
-usage refuse; coordinator admission still owns logical body/queue/response
-policy before invoking the core.
+DiskLimits caps logical body bytes at 4 GiB and blobs at 1000000. The combined
+database ceiling is 8 GiB and WAL logical admission may be at most 32 GiB.
+Responses remain at most 1 GiB/request and 4 GiB aggregate, caches 1 GiB and
+cold state 64 MiB. database_bytes must equal the fixed 8 GiB native ceiling;
+wal_bytes must cover the conservative fixed 17280796224-byte core bound.
+These values do not reserve filesystem space. SQLite may refuse earlier on
+page, native heap, deadline or I/O exhaustion. The body quota is independent
+of relational/page overhead; physical database usage includes both. Logical
+reductions below actual usage refuse. Service coordination still owns logical
+body, category and response admission before invoking the core.
 Raw quota must cover message_bytes, aggregate response quota must cover its
 per-request quota, and per-request response quota must fit
 32 * json_bytes + 4096 * json_methods + 64 KiB. OnlineBackground requires at
 least two storage views; ForegroundOnly requires one. The cache must fit the
 1 KiB maintenance cursor reserve. These relationships do not enlarge RAM.
 
-Upload/queue are subquotas of raw bodies: one file is charged physically once,
+Upload/queue are subquotas of raw bodies: one body is charged logically once,
 even when both categories reference it. Completed retained submissions still
 consume queue count and body categories. Releasing a lease/category does not
-release raw disk charge until proven unlink. Interrupted writes/publications
-remain charged. Cancel releases only unused reservations; uncertainty cannot
+release body charge until proven transactional body deletion. Rolled-back
+writes may leave allocated database/WAL space, which remains physically charged. Cancel releases only unused reservations; uncertainty cannot
 be reconciled as a zero effect. Quota reductions below actual use refuse
 configuration rather than deleting data. Effective admission intersects all
 applicable quotas; maxSizeUpload does not guarantee available capacity.
@@ -72,10 +74,10 @@ an uncertain effect conservatively consumes the planned charges. Invalid
 completion leaves the ticket and reservation pinned. Completion can run after
 the lease deadline; expiration refuses new work and cannot undo effects.
 
-Writing raw/private bytes and publishing logical references are separate
-transitions with separate tickets/charges. A syscall error alone does not
-prove zero growth. Cancel releases only unused reservations; used raw/orphan
-charges remain. The logical helper has no public operation to release used
+Streaming body bytes and publishing references belong to one SQLite
+transaction. A known rollback proves no logical body was added, but does not
+prove zero physical database/WAL growth. Cancel releases only unused
+reservations; used physical charges require measured reconciliation. The logical helper has no public operation to release used
 charges. M05/M08's object ledger and proven cleanup/commit transitions own
 that later integration; a freed lease token cannot authenticate object cleanup.
 The writer and future runtime coordinator wrap this same logical ledger,
@@ -100,40 +102,41 @@ No syscall, publication or authoritative cleanup is implemented here.
 
 ## 2. Reservations and I/O failure
 
-Reserve body/file, metadata/WAL, response and category growth before taking
+Reserve logical bodies/count, combined database/WAL, response and category growth before taking
 responsibility. An account/size/deadline lease grants only its named operation.
 Before starting a SQL write the core reserves worst-case WAL room; Busy asks
 for bounded maintenance rather than allowing growth past the ceiling.
-PublishedFile is physical publication evidence, not a logical quota ticket.
-Service callers must couple both proofs before mutation admission is activated.
+BlobSource supplies provisional bytes, not a durable publication proof or
+logical quota ticket. Service callers must couple reservations to the actual
+SQLite result before mutation admission is activated.
 
 Known rejection before COMMIT requires rollback. Deferred constraint or busy
 refusal with an intact transaction also rejects only after rollback. A proven
 successful COMMIT reports its durable result even if its deadline expired
 during completion. Other COMMIT errors remain indeterminate and stop writes
 until reopen/recovery; new snapshots remain available. Preserve actual
-raw-file charges on both outcomes. File I/O, native memory/page exhaustion,
-metadata corruption and missing/damaged bodies are distinct failure domains;
-SQLite metadata integrity does not prove the immutable files are intact.
+database/WAL charges on both outcomes. Native memory/page exhaustion, I/O,
+SQL integrity and body digest corruption remain distinct failure domains.
 
-Checkpoint and file collection refuse while views are held. Bound the wait
+Checkpoint refuses while views are held; transactional body deletion preserves
+old body snapshots through SQLite. Bound the wait
 within the enclosing deadline; a timeout returns Busy/error, never a claim of
 successful cleanup. Hold the writer fence only for the actual exclusive step;
 a scheduler must establish quiescence without canceling durable effects.
-Whole-service recovery, startup orphan scans and quota reconciliation remain
+Whole-service recovery and quota reconciliation remain
 unimplemented; do not infer them from pure accounting helper tests.
 
 ## 3. Work budgets and deadlines
 
 WorkLimits retains finite job budgets: foreground 120s/8 GiB/2000000 records;
 changes 30s/128 MiB/1000000 records; request 300s; commit 30s/256 MiB/250000
-records; checkpoint 60s/2 GiB; GC drain 30s, exclusive 120s/8 GiB/128000000
-records/1000 unlinks; backup 900s/16 GiB; admission wait 1s. Raised values
+records; checkpoint 60s scheduling target/up to 8 GiB native page writes; GC drain 30s, exclusive 120s/8 GiB/128000000
+records/1000 blob removals; backup 900s/16 GiB; admission wait 1s. Raised values
 are at most 16 times defaults. These are future coordinator job ceilings,
 not evidence that full jobs or native resource limits have been qualified.
 
 The core retains one deadline and 8000000 SQLite VM steps per view or commit.
-Cold schema/integrity validation has 128000000 steps under the same startup
+Cold schema/header validation uses that same fixed work limit under its startup
 deadline. Per-instruction callbacks sample the original monotonic clock.
 Queries check before and after work. Clock and VM-fuel failures are sticky;
 retries
@@ -364,7 +367,7 @@ separate mechanisms and both need exact retention.
 Before activation, qualify native heap/stack/RSS with combined owners; full
 logical quota reconciliation; exact result retention; metadata page/WAL
 capacity refusal; injected COMMIT/rollback/IO faults and reopen recovery;
-body publication and orphan cleanup; snapshot/pool exhaustion and bounded
+atomic body/metadata writes and transactional deletion; snapshot/pool exhaustion and bounded
 maintenance progress. Record independent failure domains and verified red
 controls. Pure Rust/MIME zero-allocation evidence excludes SQLite native
 allocation and does not establish whole-service admission or durability.

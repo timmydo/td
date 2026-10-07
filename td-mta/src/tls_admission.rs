@@ -100,6 +100,14 @@ mod tests {
         for capacity in 0..=9 {
             let limits = crate::limits::Limits {
                 tls_handshakes: capacity,
+                smtp_sessions: 7,
+                smtp_per_peer: 1,
+                https_connections: 1,
+                event_streams: 0,
+                header_bytes: 1024,
+                json_bytes: 1024,
+                json_tokens: 64,
+                index_cache_bytes: 1024,
                 memory_budget_bytes: 128 * 1024 * 1024,
                 ..Default::default()
             };

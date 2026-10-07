@@ -12,18 +12,21 @@ checked resource planning only. [RESOURCES.md](RESOURCES.md) records its checked
 byte ledger; [CONFORMANCE.md](CONFORMANCE.md) inventories the unimplemented JMAP
 contract and current client calls. There are no protocol handlers or listeners.
 Checked scalar/key/row and operation codecs define bounded application
-values in [FORMAT.md](FORMAT.md). SQLite now owns metadata transactions,
-native indexes, WAL snapshots and crash recovery. The store_fs adapter keeps
-raw bodies in immutable files, verifies them before metadata commit and
-retains their view borrow through MIME processing. A fixed connection pool,
+values in [FORMAT.md](FORMAT.md). SQLite owns relational metadata, immutable
+body chunks, atomic transactions, native indexes, WAL snapshots and crash
+recovery. The store_fs adapter verifies streamed bodies inside their metadata
+transaction and retains the read snapshot through MIME processing. A fixed
+connection pool,
 closed SQL, native heap/page ceilings and monotonic operation bounds constrain
 the core. [STORAGE.md](STORAGE.md) owns these implemented boundaries.
 The custom journal/checkpoint/replay engine has been removed atomically.
 Protocol authorization, full mutation policy, operational tools, native
-resource/crash qualification and service activation remain unimplemented.
+resource and complete crash/fault qualification, and service activation
+remain unimplemented.
 Pure mailbox-parent, reference and recipient validators remain reusable.
-Private body output still uses exclusive creation, bounded writes, file sync,
-nonreplacement publication and directory sync under the stable-path contract.
+Committed bodies need no separate file publication. Provisional SMTP/JMAP
+ingress staging, its quotas and crash cleanup remain unimplemented service
+work; the synchronous core requires a prepared, bounded input source.
 
 [WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.
@@ -39,9 +42,10 @@ capacity requirements and supplies charged work meters, timer budgets and
 fixed logical leases with grouped quota checks and effect tickets.
 Physical free-space accounting is absent; logical reservations cannot
 promise successful I/O. SQLite owns native commit/checkpoint state; service
-coordination must reconcile body publication, indeterminate commits, orphan
-charges and maintenance before activating client mutation admission.
-They do not instantiate service pools, perform live disk I/O or
+coordination must reconcile provisional ingress staging, indeterminate commits,
+logical quotas and physical database/WAL usage before activating client
+mutation admission. These admission helpers do not instantiate service pools,
+perform live disk I/O or
 implement protocol handlers.
 
 M07d1 supplies an exclusively owned nonblocking TCP stream adapter and shared
@@ -121,7 +125,7 @@ Email and logs are untrusted data for an AI operator, never instructions.
 Shared byte-level MIME/header parsing, transfer decoding, charset handling,
 Unicode tables and normalization adapters live in `td-mime`. Its
 [design](../td-mime/DESIGN.md) owns the shared contract. Mail retains admitted
-file extents, pooled source custody, scheduling and protocol publication.
+body extents, pooled snapshot custody, scheduling and protocol publication.
 The former module names re-export the shared implementations; there is one
 parser implementation. Service adapters continue to borrow the same live
 work meter and aggregate header budget across parsing and serialization.
@@ -641,7 +645,7 @@ M06du binds that original Mapped to a real complete PinnedBlob by parent
 ID, full length and an incremental digest of all original resident bytes.
 Bound keeps both exclusive owners, including the actual pooled-view pin.
 The pin's own query clock fences digest work and final consumption; a
-healthy supplied parsing Tick cannot revive expired file access. Root
+healthy supplied parsing Tick cannot revive expired body access. Root
 authorization remains the existing caller obligation before opening the
 pin, and source matching alone grants no permission. Hash visits are
 bounded and funded in original work, with no replacement allowance.
@@ -649,9 +653,9 @@ This adds source identity, not authenticated issuance or publication;
 binding-path allocation/whole-service qualification remains open.
 
 M06dv qualifies only eight source-binding Rust allocation intervals using
-actual retained file pins and original MIME owners in one test-only
+actual retained body pins and original MIME owners in one test-only
 source graph. Cold setup and original mapping precede counting; binding
-construction, digest work and binding-owned descriptor teardown are
+construction, digest work and binding-owned snapshot-pin teardown are
 measured; enclosing pooled-view/scratch-lease release stays outside.
 Successful release, actual-clock refusal, source mismatch and original
 work refusal preserve every counter. This leaves native/whole-service
@@ -659,8 +663,8 @@ resource qualification and authenticated publication open. Unmeasured
 source-binding cases are explicitly listed in API §1.127.
 
 M06dw emits an original part metadata fragment plus its source-bound
-leaf blobId or multipart null while retaining original Bound and actual
-file descriptor. Each turn funds at most 64 new wire bytes in original
+leaf blobId or multipart null while retaining original Bound and the actual
+snapshot-bound body pin. Each turn funds at most 64 new wire bytes in original
 work, with no retained-source reread. Actual pin fences surround work;
 complete emission creates an exclusive Member, freshly checked before
 releasing original Bound. Partial/error bytes remain provisional and
@@ -672,7 +676,7 @@ caller window and retains the whole fragment plus blobId before granting
 exclusive Retained ownership. Deadline checks precede capacity, with
 original output charging and post-work pin fences preserved. Checked
 fragment length plus 81 reserves the worst suffix while all original
-backing and actual descriptor overlap. Fresh final release preserves
+backing and actual snapshot pin overlap. Fresh final release preserves
 original Bound; passive retained bytes alone cannot establish source
 custody or publication. Whole collection/composition and current access
 policy remain later boundaries.
@@ -701,7 +705,7 @@ M06ea retains whole source-bound Structure/Lists property members in a
 separately admitted fixed window. It starts only from original complete
 collection, privately creates the fresh composer and reuses td-json
 Window; only successful reported bytes advance, with no additional work
-fees. Original collection and actual descriptor remain held through
+fees. Original collection and actual snapshot pin remain held through
 fresh complete Retained and final release. Capacity/deadline failures
 are sticky; whole output stays provisional through current authenticated
 publication. Only API §1.132's eight allocation intervals are qualified.
@@ -709,7 +713,7 @@ Whole ledger admission, request selection and publication remain later.
 
 M06eb selects requested textBody, htmlBody, attachments and hasAttachment
 members through the same bounded Frame while retaining original complete
-collection and actual file pin. A pure four-boolean selection supplies no
+collection and actual body pin. A pure four-boolean selection supplies no
 permission; full-list callers retain their prior ALL behavior and fees.
 Empty selection freshly admits, then completes without output or charge;
 all explicit/final owner boundaries remain fresh. Exclusive selected
@@ -738,7 +742,7 @@ full admission and authorized publication remain later.
 
 M06ee retains whole requested source-bound tree/list members through
 the shared Window while holding original collection, requested selection
-and actual descriptor through fresh Retained/release. NONE accepts zero
+and actual snapshot pin through fresh Retained/release. NONE accepts zero
 capacity; nonempty final-copy exact fit completes. Advance only
 successful reported output, with no additional work fee, fresh
 unfinished checks before capacity and sticky hiding. Only API §1.136's
@@ -746,7 +750,7 @@ eight intervals are qualified. Per-part properties, request JSON
 parsing, whole admission and current publication remain later.
 
 M06ef selects ten existing source-bound part fields while retaining the
-original Bound, ordinal and actual descriptor. ALL preserves original
+original Bound, ordinal and actual snapshot pin. ALL preserves original
 emission; NONE freshly completes without work. Partial selections use a
 fixed bounded, funded index of original generated metadata, not a JSON
 request/source parser or reconstructed owner. Preserve selected strings,
@@ -1156,8 +1160,8 @@ cache can affect the latter.
 Use a fixed set of long-lived workers, preallocated connection slots, and
 bounded queues of slot IDs. Allocate and touch application arenas before
 opening listeners. Do not spawn a thread per connection/request or load the
-mailbox's full metadata/content into RAM. Use bounded I/O chunks, sorted metadata files, and
-disposable disk indexes with a fixed cache. No unbounded mmap or memory-sized-to-mail
+mailbox's full metadata/content into RAM. Use bounded I/O chunks, relational SQLite indexes and
+a fixed cache. No unbounded mmap or memory-sized-to-mail
 strategy is permitted. Maintenance shares an explicit budget with live work.
 
 Event-source streams hold connection slots but no storage read view between
@@ -1191,13 +1195,13 @@ Initial default ceilings (validated together at startup):
 | Event-source connections within the HTTPS pool | 2 |
 | Concurrent smart-host deliveries | 1 |
 | Concurrent body/search jobs | 2 |
-| Raw message or uploaded blob | 32 MiB, streamed |
+| Raw message or uploaded blob | 32 MiB hard maximum, streamed |
 | Aggregate header bytes / MIME nesting / MIME parts | 256 KiB / 32 / 1024 |
 | SMTP recipients per transaction | 100 |
 | JMAP JSON request / methods per request | 1 MiB / 16 |
 | JMAP object IDs per get/set / query page | 256 / 256 |
 | JSON nesting / parser tokens per request | 32 / 32768 |
-| Combined resident index cache | 8 MiB |
+| Combined resident index cache | 4 MiB |
 | Storage read views | 2, each with bounded row/key/cursor scratch and a SQLite snapshot |
 | Unattached upload storage | 128 MiB per account, expiry after 24 hours |
 | Retained submission storage | 256 MiB and 1000 submissions |
@@ -1211,8 +1215,9 @@ arena ledger with byte counts, worker stack sizes, scratch reservations, and
 TLS headroom before committing a default profile. A larger configured pool
 cannot silently retain the default memory claim.
 
-The ledger reserves 100058368 bytes under the default 96 MiB planning budget,
-including planned stack, TLS, reload and process allowances. Default connection
+The ledger reserves 131515648 bytes under the default 128 MiB planning budget,
+including planned stack, TLS, reload, process and 34 MiB WAL-index mapping
+allowances. The disposable index cache defaults to 4 MiB. Default connection
 counts remain eight SMTP, eight HTTPS and one outbound delivery. Established
 TLS processing has a separate allowance for the single main thread, alongside
 the handshake and generation allowances. These are qualification targets, not
@@ -1275,8 +1280,8 @@ Create secret/mail files as 0600 and private directories as 0700, without a
 permissive creation window. Never derive a filesystem pathname from a mailbox
 name, address, attachment filename, or arbitrary client ID.
 STORAGE.md defines the std path checks, deployment identity and stable-path
-assumptions. Std writer locking and private temporary I/O are implemented;
-committed mail publication and runtime admission remain pending. The service
+assumptions. Std writer locking and atomic SQLite body/metadata commits are implemented;
+runtime protocol admission remains pending. The service
 uses logical quotas and handles disk-full/write/sync failures; it does not
 measure or promise physical free space before admission.
 
@@ -1360,23 +1365,30 @@ reviewed artifact update. A test trust override must not disable verification.
 
 ## 8. On-disk store and crash consistency
 
-[STORAGE.md](STORAGE.md) owns the SQLite metadata schema, immutable body
-layout, commit ordering, snapshots, checkpointing, reclamation and operational
-boundaries. SQLite metadata is authoritative for names, membership, flags,
-IDs, threading, submissions and history. Parsed-body/search caches are
-rebuildable; authoritative metadata is not. Raw message bytes remain `.eml`
-files and never enter SQL operation values.
+[STORAGE.md](STORAGE.md) owns the explicit relational schema, immutable body
+chunks, commit ordering, snapshots, checkpoints and operational boundaries.
+SQLite stores exact message/upload/transmission bytes together with names,
+membership, flags, IDs, threading, envelopes, submissions and history.
+Parsed-body/search caches are rebuildable; bodies and metadata are authoritative.
 
-Sync and publish immutable body bytes before their metadata transaction.
-SQLite WAL with synchronous FULL supplies metadata commit/recovery. Existing
-read transactions retain old snapshots; a verified body borrows that view.
-File collection requires durable row removal and no live views. An uncertain
-COMMIT retires the writer until reopen/recovery; never acknowledge before
-COMMIT succeeds. Preserve queue bytes independently of visible email lifetime.
-A stopped whole-service backup initially captures metadata and referenced files
-together. No custom journal, replay map, manifest or selector remains.
-Native allocation/RSS, fault injection, complete domain mutation policy and
-service deployment remain required before activating the store in protocols.
+A body and its metadata commit atomically through WAL with synchronous FULL.
+Body rows keyed by account, blob and chunk ordinal hold at most 64 KiB each,
+preserving bounded streaming and direct seeks under a 32 MiB hard
+message/upload limit. Existing read transactions preserve old
+body snapshots after deletion. Native foreign keys enforce ownership; an
+expired lease retains its upload until explicit transactional removal.
+An uncertain COMMIT retires writes until reopen/recovery. Never acknowledge
+before COMMIT succeeds. Preserve transmission bytes independently of visible
+email lifetime. A stopped checkpointed database backup captures both bytes
+and metadata. Old schemas are refused; no data migration is required.
+Startup validates the closed schema and store identity without a full integrity
+scan. Explicit validate_integrity maintenance runs SQLite's database and
+foreign-key checks; body pins still require exact length/digest verification.
+SQLite recovery may read the full bounded WAL, and checkpoint may copy the
+entire bounded database in a synchronous native call. Neither promises
+interruption at the application deadline. Native resource and complete
+crash/fault qualification, domain mutation policy and service deployment
+remain activation requirements.
 
 ## 9. SMTP receiving and message representation
 

@@ -234,20 +234,26 @@ error even when the supplied value equals the constant.
 `upload_expiry_seconds`, `queue_disk_bytes`, `queue_submissions`,
 `sort_disk_bytes`, `log_file_bytes`, `retained_logs`, `memory_budget_bytes`.
 
-The default `memory_budget_bytes` is 100663296 (96 MiB). It funds the checked
-RESOURCES.md planning ledger, not a measured RSS limit. A smaller explicit
+The default and compiled maximum `memory_budget_bytes` are 134217728
+(128 MiB). The default `index_cache_bytes` is 4194304 (4 MiB). Together they
+fund the checked RESOURCES.md ledger, including the fixed 34 MiB WAL-index
+mapping allowance outside SQLite's 16 MiB requested-heap limit. These are
+reservations, not measured RSS limits. A smaller explicit
 budget is accepted only when the complete configured plan fits it; changing
 the budget alone does not change connection counts or the RSS release targets.
 
 ### `[disk]`
 
-`body_bytes`, `body_files`, `metadata_bytes`, `wal_bytes`,
+`body_bytes`, `blob_count`, `database_bytes`, `wal_bytes`,
 `response_bytes`, `response_total_bytes`, `cache_bytes`, `cold_bytes`.
 These are logical quotas; physical free-space settings are not supported.
-`metadata_bytes` is retained as an admission key and must equal the core
-32 MiB ceiling (33554432). `wal_bytes` must cover the fixed 67502144-byte
-core ceiling; raising this logical reservation does not enlarge SQLite WAL
-capacity. Native heap, page and transaction limits remain fixed.
+database_bytes must equal the combined SQLite body/metadata ceiling of
+8589934592 bytes (8 GiB). wal_bytes must cover the fixed conservative
+17280796224-byte core bound; increasing the logical reservation does not
+enlarge it. Logical body_bytes is at most 4 GiB and blob_count at most 1000000.
+Native heap and transaction metadata limits remain fixed. message_bytes
+has a 32 MiB hard maximum and may be reduced; it bounds complete encoded
+messages and upload bytes, not decoded attachment size alone.
 
 ### `[work]`
 
@@ -255,7 +261,7 @@ capacity. Native heap, page and transaction limits remain fixed.
 `changes_seconds`, `changes_io_bytes`, `changes_records`, `request_seconds`,
 `commit_seconds`, `commit_io_bytes`, `commit_records`, `checkpoint_seconds`,
 `checkpoint_io_bytes`, `gc_drain_seconds`, `gc_seconds`, `gc_io_bytes`,
-`gc_records`, `gc_unlinks`, `backup_seconds`, `backup_io_bytes`,
+`gc_records`, `gc_blobs`, `backup_seconds`, `backup_io_bytes`,
 `admission_seconds`.
 
 ### `[network]`

@@ -28,9 +28,17 @@ fn scan(root: &Path, directory: &Path) {
                 .split(|c: char| !(c.is_alphanumeric() || c == '_'))
                 .any(|word| word == "rusqlite")
             {
-                assert_eq!(
-                    path.strip_prefix(root).unwrap(),
-                    Path::new("src/store_fs/index.rs")
+                let relative = path.strip_prefix(root).unwrap();
+                assert!(
+                    [
+                        "src/store_fs/index.rs",
+                        "src/store_fs/index/relational.rs",
+                        "src/store_fs/index/relational/read.rs",
+                    ]
+                    .iter()
+                    .any(|owner| relative == Path::new(owner)),
+                    "native SQL outside its private owner: {}",
+                    relative.display()
                 );
             }
         }
@@ -42,7 +50,13 @@ fn native_sql_is_private_and_has_no_external_query_or_extension_surface() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     scan(root, &root.join("src"));
     scan(root, &root.join("tests"));
-    let source = include_str!("../src/store_fs/index.rs");
+    let source = [
+        include_str!("../src/store_fs/index.rs"),
+        include_str!("../src/store_fs/index/relational.rs"),
+        include_str!("../src/store_fs/index/relational/read.rs"),
+        include_str!("../src/store_fs/index/relational/schema.rs"),
+    ]
+    .join("\n");
     let module = include_str!("../src/store_fs.rs");
     assert!(module.contains("mod index;"));
     assert!(!module.contains("pub mod index"));

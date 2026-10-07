@@ -5,11 +5,11 @@ use super::{add, Error, Plan};
 #[repr(u8)]
 pub enum Kind {
     BodyBytes,
-    BodyFiles,
+    BlobCount,
     UploadBytes,
     QueueBytes,
     QueueSubmissions,
-    MetadataBytes,
+    DatabaseBytes,
     WalBytes,
     SortBytes,
     ResponseBytes,
@@ -20,11 +20,11 @@ pub enum Kind {
 pub const COUNT: usize = 12;
 pub const ALL: [Kind; COUNT] = [
     Kind::BodyBytes,
-    Kind::BodyFiles,
+    Kind::BlobCount,
     Kind::UploadBytes,
     Kind::QueueBytes,
     Kind::QueueSubmissions,
-    Kind::MetadataBytes,
+    Kind::DatabaseBytes,
     Kind::WalBytes,
     Kind::SortBytes,
     Kind::ResponseBytes,
@@ -87,11 +87,11 @@ impl Quotas {
         let caps = Usage {
             values: [
                 d.body_bytes,
-                d.body_files,
+                d.blob_count,
                 plan.upload_bytes(),
                 plan.queue_bytes(),
                 plan.queue_submissions(),
-                d.metadata_bytes,
+                d.database_bytes,
                 d.wal_bytes,
                 plan.sort_bytes(),
                 d.response_total_bytes,
@@ -183,9 +183,9 @@ mod tests {
         }
         .plan()?;
         let plan = DiskLimits {
-            body_files: 250003,
-            metadata_bytes: 32 * MIB,
-            wal_bytes: 80 * MIB,
+            blob_count: 250003,
+            database_bytes: super::super::DATABASE_BYTES,
+            wal_bytes: 20 * super::super::GIB,
             response_total_bytes: 270 * MIB,
             cache_bytes: 140 * MIB,
             cold_bytes: 18 * MIB,
@@ -198,8 +198,18 @@ mod tests {
         )?;
         let quotas = Quotas::new(&plan, Usage::default()).map_err(|_| "invalid fixture caps")?;
         let expected = [
-            4294967296, 250003, 138412032, 272629760, 1003, 33554432, 83886080, 71303168,
-            283115520, 146800640, 66060288, 18874368,
+            4294967296,
+            250003,
+            138412032,
+            272629760,
+            1003,
+            8589934592,
+            21474836480,
+            71303168,
+            283115520,
+            146800640,
+            66060288,
+            18874368,
         ];
         for (kind, cap) in ALL.into_iter().zip(expected) {
             assert_eq!(quotas.caps().get(kind)?, cap, "{kind:?}");

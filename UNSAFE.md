@@ -59,7 +59,7 @@ The twenty-first, `td-install`, has one function-scoped instruction for two
 value-pinned loop-device requests, which reach a freshly formatted volume
 through the disk claim the installer already holds.
 The twenty-second, `td-mta`, keeps no owned production unsafe surface: its
-library and binary forbid the keyword. Safe std owns raw-file operations;
+library and binary forbid the keyword. Safe std owns database-path and lock operations;
 §22 records the admitted private SQLite upstream FFI. The crypto admission
 is specified in [td-crypto/DESIGN.md](td-crypto/DESIGN.md). Test allocators
 remain separate. The twenty-third, `td-open`, compiles §12's module to send one
@@ -153,7 +153,7 @@ one.
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with five value-pinned PTY requests for the terminal's device, `setsid(2)` for a PTY child; plus one scoped descriptor adoption and one scoped pre-exec hook — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 | 21 | `td-install` | `ioctl(2)` with two value-pinned loop requests, `LOOP_CTL_GET_FREE` and `LOOP_CONFIGURE` — see [§21](#21-td-install--publishing-through-a-loop-over-the-claim) |
-| 22 | `td-mta` | no owned production unsafe: safe std raw files and admitted private SQLite FFI; see [§22](#22-td-mta--safe-owned-code-private-sqlite-backend) |
+| 22 | `td-mta` | no owned production unsafe: safe std paths/locks and admitted private SQLite FFI; see [§22](#22-td-mta--safe-owned-code-private-sqlite-backend) |
 | 23 | `td-open` | the shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` module of §12, called only to send one descriptor; no adoption or disposal call — see [§23](#23-td-open--one-descriptor-to-the-portal) |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
@@ -3266,8 +3266,10 @@ Only the separate test executables retain the T1/T2 exceptions below.
 The user-approved private rusqlite 0.40.2/libsqlite3-sys 0.38.2 closure
 contains upstream unsafe FFI and bundled SQLite 3.53.2 C, including its Unix
 VFS. Exact manifests, archives, lock and active features are pinned by
-builder/src/crypto_policy.rs. The only owned consumer is store_fs/index.rs,
-through rusqlite's safe API. Native connections, callbacks, SQL and backend
+builder/src/crypto_policy.rs. The owned consumers are store_fs/index.rs and its private
+index/relational.rs and index/relational/read.rs adapters. The schema-only
+index/relational/schema.rs supplies closed statements. They use rusqlite's
+safe API with bounded body-chunk inserts and indexed reads. Native connections, callbacks, SQL and backend
 types do not cross the mail port boundary. There is no td-owned FFI, scoped
 allow or additional syscall surface. Source-built bundled linking, disabled
 extension loading, fixed native heap/allocation limits and closed queries

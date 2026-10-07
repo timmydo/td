@@ -943,7 +943,8 @@ Both allocation executables and the unwrapped RSS executable additionally run
 `--tls-generation-trust` in fresh processes. It constructs sixteen admitted
 large file profiles, fifteen gateway policies with full 128-anchor private
 bundles, one HTTPS listener and relay trust. The fixture's explicit fifteen
-SMTP slots and 128 MiB planner budget do not change shipped defaults. Its
+SMTP slots, 512 KiB disposable index cache and 128 MiB planner budget form
+a fixture profile, not a change to shipped concurrency/cache defaults. Its
 external MX configuration needs no direct SMTP listener. This measures cold
 configuration retention without claiming peer authentication.
 
@@ -988,3 +989,24 @@ Earlier portable crypto/TLS, native-allocation, stack and RSS observations do
 not qualify SQLite. A fresh isolated mail build and native SQLite resource,
 crash/fault and combined-owner measurements are required before packaging an
 activated persistence service. Host SQLite tests are not target evidence.
+
+The mail Rust/native/RSS executables also accept --sqlite-body. This scenario
+is registered in the isolated runtime, but its native compilation and
+thresholds remain pending and unqualified until that build and runtime pass.
+It generates an exact 32 MiB body in 64 KiB chunks, commits it, verifies
+bytes/digest, reopens, rejects a short source and an oversized source, and
+successfully reuses the rolled-back ID. Eight ordered observations bracket
+opening, midpoint streaming, commit, verification, reopen, rejection and
+teardown. No whole-message allocation enters the source or oracle.
+
+The unqualified acceptance thresholds require a Rust requested-byte
+high-water increase of at most 2 MiB and teardown return to its warmed
+baseline. They require wrapped native requested-byte growth of at most
+17 MiB (SQLite's 16 MiB shared heap plus 1 MiB C runtime allowance), positive
+allocation evidence and exact warmed byte/block return. Unwrapped RSS
+samples at those eight points must grow by at most 24 MiB. These are test
+requirements, not measurements established by adding the probes. RSS samples
+do not establish a transient peak; native counters observe
+wrapped allocation lifetime high-water separately. Host native builds remain
+UNQUALIFIED; only the isolated static-musl wrappers can qualify their native
+observations. Guarded stack and combined-service workload remain separate.

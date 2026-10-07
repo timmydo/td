@@ -22,8 +22,8 @@ the checked ledger and pass the budget gate before admission is enabled.
 | HTTPS slots | 8 | 1703936 | 13631488 |
 | Body/search jobs | 2 | 425984 | 851968 |
 | Storage read views | 2 | 299008 | 598016 |
-| SQLite writer | 1 | 19267584 | 19267584 |
-| Resident index cache | 1 | 8388608 | 8388608 |
+| SQLite writer and WAL-index mapping | 1 | 54919168 | 54919168 |
+| Resident index cache | 1 | 4194304 | 4194304 |
 | Outbound slots | 1 | 572672 | 572672 |
 | Sort runs and merge buffers | 1 | 1048576 | 1048576 |
 | Log queue and formatting | 1 | 131072 | 131072 |
@@ -37,13 +37,15 @@ the checked ledger and pass the budget gate before admission is enabled.
 | Certificate generations | 2 | 8388608 | 16777216 |
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
-| **Total** | | | **100058368** |
+| **Total** | | | **131515648** |
 
-The total is approximately 95.42 MiB against a 96 MiB configured budget;
-the remaining 604928 bytes are unassigned headroom, not another cache.
-With all other defaults, three TLS handshake slots require 104252672 bytes;
-the default 96 MiB budget refuses that profile. Increase the configured memory
-budget explicitly when adding that third handshake slot.
+The total is approximately 125.42 MiB against a 128 MiB configured budget;
+the remaining 2702080 bytes are unassigned headroom, not another cache.
+The default includes SQLite's separate 34 MiB WAL-index mapping reservation
+and a 4 MiB disposable index cache. Default connection counts are unchanged.
+With all other defaults, three TLS handshake slots require 135709952 bytes,
+exceeding the unchanged 128 MiB compiled maximum. Reduce other configured
+reservations, such as the disposable cache, before adding that third slot.
 The 64 MiB idle and 128 MiB workload RSS release ceilings remain independent
 and unverified. The TLS entries are demand headroom, not additional arenas to
 allocate and touch at startup. Idle retains its actual current generation;
@@ -152,6 +154,7 @@ encoded-header adapters or combined service RSS.
   and each lookup's full physical work. Allocation probes cover rooted shared
   chains and an empty forest using fixed slices and result scratch.
 - SQLite writer: a process-wide 16 MiB requested-native-heap ceiling,
+  a separate fixed 34 MiB shared-memory WAL-index mapping allowance,
   two separate 1 MiB transaction/input arenas, 4096 operation slots of
   32 bytes and 256 KiB row/validation scratch. Native connections share
   this heap cap; it is not 16 MiB per view and does not measure RSS,
@@ -303,7 +306,7 @@ retained). ADMISSION.md freezes logical byte/file quotas, logical completion
 reserves and maintenance work/deadlines, enforced by M05/M08 before mail can
 be accepted.
 
-The per-upload byte ceiling is `message_bytes`, initially 32 MiB; M13 publishes
+The per-upload byte ceiling is `message_bytes`, at most 32 MiB; M13 publishes
 that value as `maxSizeUpload` and enforces it even for attachment uploads.
 `upload_disk_bytes` is the separate aggregate quota for retained upload blobs.
 
@@ -368,10 +371,10 @@ Pending requires a new credit. Queue saturation returns a typed temporary
 error before side effects. Do not use blocking send from main or hold a pool
 free-list lock across I/O/another queue wait. An exclusively owned per-slot
 lock may span its worker's I/O; main uses try_lock and skips busy slots.
-Writers never wait
-for body workers while holding the commit lock. Body publication completes
-before the metadata request enters that lock; reservations remain independently
-charged while their slot waits. Checkpointing uses the writer's own buffers.
+Writers never wait for another worker while holding the commit lock. Body
+sources must be ready for bounded synchronous reads when the writer begins
+the atomic body/metadata transaction; reservations remain charged while their
+slot waits. Checkpointing uses the writer's own buffers.
 
 Body/read workers advance protocol CPU work by at most 16 KiB input/output or
 256 parser/token/object transitions per step, whichever comes first. Parsing a
@@ -1033,7 +1036,7 @@ ceilings are 352 I/O/header visits, 512 aggregate interpretation steps,
 32 job records and 96 output bytes per turn. Raw delimiter work retains its
 separate 128-body-byte turn and original I/O charging. Transfer size counting
 uses a 32-byte reusable output window and at most 256 decoder transitions;
-retained descriptor copies also fund their actual cell bytes. Identity sizes
+retained snapshot copies also fund their actual cell bytes. Identity sizes
 come directly from checked extents without an unnecessary byte scan. No
 charset or NFC workspace overlaps traversal state.
 
@@ -2095,9 +2098,9 @@ complete response/service bounds are not qualified by this increment.
 M06dv adds eight dedicated sequential Rust allocation intervals around
 original source-binding construction, funded digest turns and consuming
 release/refusal. Real complete PinnedBlob and original Mapped belong to
-one test-only compilation of production sources. Cold filesystem setup,
+one test-only compilation of production sources. Cold database setup,
 pin verification, resident-source construction, original mapping and all
-backing are outside counting; binding ownership and PinnedBlob descriptor
+backing are outside counting; binding ownership and PinnedBlob snapshot-pin
 teardown are inside. Enclosing PooledRead/CommittedView and scratch lease release
 remain outside. Healthy zero/near-u64 bases, partial/completed/Bound expiry,
 same-length source mismatch, original I/O refusal and constructor expiry
@@ -2108,7 +2111,7 @@ complete request admission and access-policy/publication wiring remain
 unqualified.
 
 M06dw original source-bound part-member emission consumes only Bound and
-retains its actual descriptor plus all original source/windows/candidate
+retains its actual snapshot pin plus all original source/windows/candidate
 backing. One funded turn uses at most 64 new wire bytes, one interpretation
 step with carried control credit and one explicit record; there is no
 source/I/O debit for retained generated bytes. Cursor plus HeaderBudget,
@@ -2128,7 +2131,7 @@ fresh from original Bound and advances a shared fixed Window only by
 reported bytes. It adds no wire charge or replacement allowance. A
 checked fragment length plus 81 bounds the largest blobId suffix and
 covers multipart null; that separate caller reservation overlaps every
-original source/window/candidate and actual descriptor/pool borrow.
+original source/window/candidate and actual snapshot pin/pool borrow.
 Cursor plus HeaderBudget, five borrowed segments and 64 output bytes
 fits 1 KiB; Retained fits 768 bytes. Complete ledger and worker-stack
 bounds remain open. Eight sequential Rust allocation intervals measure
@@ -2142,7 +2145,7 @@ remaining unmeasured boundaries. Existing 65 metadata/locator, eight
 binding and eight member intervals remain separate.
 
 M06dy whole original source-bound collection overlaps original Bound,
-actual descriptor, prior source/windows/candidates and separately
+actual snapshot pin, prior source/windows/candidates and separately
 admitted member cells. Each child retains one fresh emitter/window;
 acceptance starts fresh zero credit and adds exactly one original
 interpretation step, one prepaid control record and one explicit record
@@ -2161,7 +2164,7 @@ admission/publication qualification remain open.
 
 M06dz source-bound whole tree/list emission shares bounded framing with
 metadata emission and retains original Serialized, all source-bound
-member cells and actual descriptor. Every turn funds one original
+member cells and actual snapshot pin. Every turn funds one original
 interpretation step with carried control-record credit and at most 64
 new wire bytes, with no source/I/O debit. Cursor plus HeaderBudget and
 64 output bytes fit 1 KiB; Composed fits 768 bytes. These size envelopes
@@ -2195,7 +2198,7 @@ allocation, worker stack/RSS, full request admission, selection and
 current authorized publication remain open.
 
 M06eb requested source-bound list selection overlaps original complete
-collection, source/fragments and member cells with the actual descriptor
+collection, source/fragments and member cells with the actual snapshot pin
 and small pure selection. One shared Frame produces only requested keys;
 full-list callers retain prior ALL bytes/turns/fees. Each unfinished
 nonempty turn funds one original step and at most 64 actual wire bytes;
@@ -2572,8 +2575,8 @@ whole-process memory usage or execution-time enforcement.
 Logical reservation records and grouped quota checks use fixed caller-owned
 cells and linear effect tickets. Each cell plus slot fits within 128 bytes;
 there is no physical-filesystem binding or free-space probe. SQLite owns
-metadata writer/checkpoint state. The coordinator must couple logical charges
-to durable SQL outcomes and raw-file publication/cleanup before activation.
+body/metadata writer/checkpoint state. The coordinator must couple logical
+charges to durable SQL outcomes and physical page/WAL usage before activation.
 
 The std directory adapter owns a File and a 383-byte path buffer per retained
 directory. Complete operational paths are bounded at 383 bytes and data roots
@@ -2589,18 +2592,56 @@ buffer and retains one additional File inside LockedRoot. No per-request
 lock-file open or descriptor cloning is permitted. Cooperative
 process locking does not alter the request pool or worker ledger.
 
-Immutable-file primitives retain bounded descriptors/names and use caller
-I/O slices. SQLite setup and query calls may allocate Rust and native memory;
-they are excluded from the pure MIME zero-allocation claim. The removed
-custom-engine probe intervals no longer qualify storage transactions. Existing
-MIME fixtures create and verify a real SQLite-bound body pin during cold
-preparation, then measure only the parser/adapters and retained file reads.
-Native SQLite heap/stack/RSS, capacity and fault qualification remain required
-before activating the service. Default resource planning is a checked ledger,
-not measured combined-process usage or a durability proof.
+SQLite body I/O uses at most 64 KiB caller/writer chunks. Native cache spilling
+keeps a 32 MiB body transaction from retaining the entire dirty body in RAM.
+The writer's cold scratch is 128 KiB; process-wide SQLite requested heap is
+capped at 16 MiB with a 2 MiB individual allocation cap. The page-cache target
+is 128 KiB per connection, not a hard peak. Bodies are stored in at-most-64-KiB
+chunk rows and seeks use the chunk ordinal; no whole-body zeroblob is created.
+Native page allocation and final durable commit remain synchronous work;
+fixed chunks do not promise per-page scheduling during those operations.
 
-Pending/failed body files retain charges until durable explicit cleanup,
-including when syncing consumed and closed their handles.
+The physical database ceiling is 8 GiB and the conservative WAL ceiling is
+17280796224 bytes. SQLite's WAL index maps shared-memory pages outside its
+16 MiB requested-heap cap; reserve another 34 MiB for this mapping at the
+maximum WAL. Recovery can read the entire WAL before the application resumes,
+and a TRUNCATE checkpoint can copy up to 8 GiB. Neither operation promises
+mid-call deadline interruption; before/after deadline checks do not establish
+a strict 60-second or 2 GiB checkpoint bound. Maximum-WAL mapped-memory,
+recovery and checkpoint qualification remain pending. Startup avoids a full
+integrity scan; explicit validate_integrity maintenance owns quick_check and
+foreign_key_check with a physical-cap-sized finite VM allowance and the
+caller's deadline.
+
+SQLite setup and query calls may allocate Rust/native memory and are excluded
+from pure MIME zero-allocation claims. MIME fixtures prepare a real verified
+snapshot body pin cold; their existing intervals measure parser/adapter work
+and retained ownership, not SQL read allocations. The separate --sqlite-body
+probes define the explicit maximum-body acceptance scenario. Their isolated
+native thresholds remain pending and unqualified until that build and runtime
+actually pass. Combined service overlap, guarded native stack and complete
+fault qualification remain activation requirements. The resource ledger is
+planning, not measured combined-process usage or proof of durability.
+
+The forced x86-64 GNU host debug build with indexed chunk rows recorded
+these --sqlite-body observations:
+198484 requested Rust peak bytes with 1060 live bytes at the warmed baseline
+and after teardown. Eight unwrapped RSS samples ranged from an 8352 KiB
+baseline to 9328 KiB, with 9032 KiB after teardown. The 32 MiB input and
+oracle both used fixed chunks. These are host observations, not a portable
+native-allocation, transient RSS peak or whole-service qualification.
+
+The synchronous core holds its writer while consuming prepared source bytes.
+An arbitrary Read implementation may block beyond the core's deadline checks;
+network ingress therefore needs separate bounded provisional staging before
+commit. That staging store, its temporary-byte quota and its crash cleanup
+are not implemented or included in the measured body-core evidence.
+
+Logical body deletion releases ownership at commit. Freed SQLite pages remain
+in the database for reuse; only physical reconciliation can release physical
+database/WAL charges. Committed bodies have no per-body file or orphan unlink
+step. This removes no future obligation to account for and reclaim unfinished
+provisional ingress staging.
 
 M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire
 buffers and atomic text formatting. They neither allocate backing storage nor
@@ -3088,8 +3129,9 @@ PEM size is greater than 112 KiB and at most the admitted 128 KiB. Every load
 parses the complete bundle. No peer handshake or successful authentication is
 claimed by this configuration-only fixture.
 
-The fixture explicitly declares fifteen SMTP slots and a 128 MiB planner
-budget so the fifteen one-slot gateway listeners are admitted. It supplies an
+The fixture explicitly declares fifteen SMTP slots, a 512 KiB disposable
+index cache and a 128 MiB planner budget so the fifteen one-slot gateway
+listeners are admitted. It supplies an
 external MX for every domain, with no direct SMTP listener. These settings
 belong to the fixture. Assertions check the decoded profile/listener/gateway
 counts, material-open counts and complete seventeen-entry policy table.
@@ -3208,3 +3250,9 @@ can miss allocations already freed by a refused call. This single TLS 1.2
 pre-ServerHello case does not bound encrypted TLS 1.3 certificate lists,
 post-handshake messages, concurrent sessions or total service memory. M07e
 retains the aggregate admission requirement.
+
+STORAGE.md section 2 admits up to two full 64 KiB native chunk materializations
+per small or unaligned body read, separately from logical MIME byte meters.
+Those buffers use the existing SQLite heap allowance; there is no per-pin
+chunk cache. Full integrity maintenance holds the writer fence and reports
+Busy to new view capture and commits until it finishes.

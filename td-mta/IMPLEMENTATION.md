@@ -159,7 +159,7 @@ writing production mail or advertising capabilities.
 fixture descriptions. **Read:** DESIGN sections 8-11 and standards inventory.
 
 Complete FORMAT.md's numeric key/row registry and literal application
-encodings. Preserve SQLite metadata authority and immutable body publication,
+encodings. Preserve SQLite body/metadata authority and atomic publication,
 with fixed batch/key/value ceilings and sequence exhaustion. Pin immutable thread assignment/anchor lookup, duplicated Message-ID handling,
 and multi-mailbox membership. Freeze typed MIME part blob locators, checked
 streaming decode and parent pin/reuse rules. Define the submission state transition table and
@@ -524,34 +524,38 @@ log truncation are deterministic. Inject hostile strings to verify JSON escaping
 Bounded structures never increase capacity after construction. No networking,
 store mutations, live reload or filesystem log rotation in this task.
 
-## M05 — SQLite metadata and immutable bodies
+## M05 — Relational SQLite metadata and immutable bodies
 
-The implemented private-root validation, bounded typed paths, persistent LOCK,
-exclusive temporary output and directory creation, immutable blob publication,
-and streamed file/digest readers from M05b/M05c remain. Their raw-file contract
-and coverage continue under SQLite. Metadata-container publication and CURRENT
-selection were removed; SQLite owns their transaction/recovery responsibilities.
+Private-root validation, bounded database paths and the persistent LOCK remain.
+SQLite owns exact message/upload/transmission bytes as immutable chunk rows
+alongside explicit relational domain columns and native indexes. Generic
+encoded record and reference tables, permanent raw-file publication and
+committed-body file collection are removed. Application codecs remain
+transient typed operation/read adapters. The private dependency retains its
+existing pinned source closure; no package is added.
 
-The custom container, manifest, journal/replay, selected-table and checkpoint
-engine has been replaced by store_fs/index.rs. SQLite owns transactions,
-native indexes, WAL snapshots and recovery. Raw mail remains immutable files;
-store_fs/pinned.rs binds verified file access to the captured database view.
-The application scalar/key/row/operation codecs remain useful bounded values.
-The private rusqlite/SQLite closure is exactly pinned and built offline.
+Implemented boundaries include fresh create/reopen and schema-2 refusal of older
+stores, expected-sequence transactions, deferred owning foreign keys, parent
+cycle checks, 32 MiB body limit and 64 KiB streaming, exact length/EOF/digest
+verification, snapshot-borrowed body readers, permanent blob IDs, native indexed
+changes and explicit WAL checkpoint. Startup checks the closed schema/header
+and epoch; full quick_check/foreign_key_check belong to the explicit
+validate_integrity maintenance operation. WAL recovery/checkpoint are
+synchronous native boundaries; deadline checks cannot interrupt their
+individual calls. Body/source failure rolls back metadata
+and bytes together. Expired leases require explicit deletion before body removal.
 
-Implemented core boundaries: fresh create/reopen and closed schema validation;
-serialized expected-sequence commits; final direct references and parent cycles;
-fixed reader pool and original deadlines; immutable-file publication proof,
-whole-file digest verification and snapshot borrows; explicit WAL checkpoint;
-coarse view exclusion for one-file orphan collection; permanent blob IDs and
-native indexed change rows. Schema, heap, page, WAL, batch and VM ceilings are
-fixed. The old engine and its tests/allocation claims are deleted together.
-
-Before protocol activation, implement the authenticated ports::Store adapter,
-full mutation/queue policy, quota/result reconciliation, native allocation/RSS
-and guarded-stack qualification, complete crash/fault matrix, bounded orphan
-walk, history maintenance, inspection/backup and explicit legacy migration.
-SQLite's durability is not a body-publication, authorization or memory proof.
+Before protocol activation, implement bounded provisional ingress staging,
+its quota accounting and crash cleanup, and the authenticated ports::Store
+adapter. The current begin_blob/finish/StagedBlob contracts do not implement
+that store. The synchronous core accepts prepared bounded sources; it must
+not hold its global writer while an untrusted network peer supplies bytes.
+Also complete mutation/queue policy, quota/result reconciliation,
+guarded-stack and combined
+native/RSS qualification, maximum-WAL mapped-memory/recovery/checkpoint
+qualification, full crash/fault matrix, history maintenance and operational
+inspection/backup/restore. No legacy store migration is required.
+SQLite durability alone grants neither authorization nor a memory qualification.
 
 ## M06 — Streaming message and MIME representation
 
@@ -1622,7 +1626,7 @@ Initial independently landable increments:
 - **M06dw — original source-bound part-member emission:** consume only
   original Bound and select one original ordinal after fresh admission.
   Emit retained metadata plus canonical direct-leaf blobId or multipart
-  null in funded 64-byte turns while keeping the actual descriptor.
+  null in funded 64-byte turns while keeping the actual snapshot body pin.
   Retain exclusive Member completion through fresh final release of
   original Bound. Pin literal bytes/costs, final-byte completion, every
   funded prefix, quota cutoffs, actual-clock post-copy refusal, original
@@ -1680,7 +1684,7 @@ Initial independently landable increments:
   request property selection and authenticated publication follow.
 
 - **M06eb — requested source-bound body-list member selection:** keep
-  original complete collection and actual descriptor while selecting
+  original complete collection and actual snapshot body pin while selecting
   textBody/htmlBody/attachments/hasAttachment through one shared Frame.
   Preserve existing ALL bytes, turns and funding; frame selected keys in
   canonical order and finish on the final selected copy. Freshly admit
@@ -2254,7 +2258,8 @@ Implement the remaining work as independently reviewable increments:
     session accounting remain pending.
 
   - **M07e4j — revised TLS planning ledger:** retain default connection counts
-    with a 96 MiB planning budget. Reserve 512 KiB per TLS session, 4 MiB per
+    within the current 128 MiB planning budget, which also accounts for the
+    SQLite WAL-index mapping. Reserve 512 KiB per TLS session, 4 MiB per
     admitted handshake, 8 MiB per certificate generation and one 4 MiB
     established-processing allowance for the main thread. Generation,
     remote-client and decoded-list allocation fixtures check their measured
@@ -2279,21 +2284,23 @@ dependency.
 ## M08 — Store policy and maintenance
 
 **Depends on:** M05/M06. **Own:** authenticated object transactions, query
-planning, bounded history pruning, backup and orphan reclamation scheduling.
+planning, bounded history pruning, backup and unreferenced-blob deletion scheduling.
 
 Use the existing SQLite core for mailbox/email/thread/submission metadata;
 do not add a second replay or checkpoint implementation. Complete aggregate
 recipient and queue-transition validation, changed-object coverage, category
-quota reconciliation and request idempotence. Native indexes serve metadata
+quota reconciliation and request idempotence. Implement provisional ingress
+staging with bounded capacity and restart cleanup before wiring body sources
+to the serialized commit. Native indexes serve metadata
 queries; parsed-body/search caches remain disposable. Authoritative database
 values must survive cache rebuilds. Maintenance respects captured SQLite
-snapshots, fixed disk/heap ceilings and immutable-file publication ordering.
+snapshots, fixed disk/heap ceilings and atomic body/metadata commits.
 
 **Acceptance:** snapshots across commits/checkpoints, pool exhaustion, native
-page/WAL/heap capacity, failed publication, indeterminate COMMIT recovery,
-queue references after visible email deletion, history resync, bounded orphan
-progress and stopped backups of database plus bodies. Inject actual failures
-at each commit/publication/checkpoint/unlink/sync boundary. Do not advertise
+page/WAL/heap capacity, failed body streaming, indeterminate COMMIT recovery,
+queue references after visible email deletion, history resync, bounded reclamation
+progress and stopped database backups containing bodies. Inject actual failures
+at each body-write/commit/checkpoint/sync boundary. Do not advertise
 JMAP or deployment before the corresponding protocol/resource evidence.
 
 ## M09 — Bounded DNS and outbound HTTPS transport

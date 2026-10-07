@@ -464,7 +464,7 @@ impl<'a> Leases<'a> {
         Ok(count)
     }
 
-    /// Release only unspent charges, never used (including orphan) charges.
+    /// Release only unspent charges, never used physical charges.
     pub fn cancel(&mut self, lease: LeaseId) -> Result<(), Error> {
         let root = self.root(lease)?;
         let mut unused = Usage::default();
@@ -584,7 +584,7 @@ mod tests {
                 amount: 100,
             },
             Charge {
-                kind: Kind::BodyFiles,
+                kind: Kind::BlobCount,
                 amount: 1,
             },
             Charge {
@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(book.used(Kind::UploadBytes)?, 0);
         book.cancel(lease)?;
         assert_eq!(book.used(Kind::BodyBytes)?, 40);
-        assert_eq!(book.used(Kind::BodyFiles)?, 1);
+        assert_eq!(book.used(Kind::BlobCount)?, 1);
         assert_eq!(book.pending(Kind::UploadBytes)?, 0);
         assert_eq!(
             book.complete_effect(&mut ticket, EffectResult::Uncertain),

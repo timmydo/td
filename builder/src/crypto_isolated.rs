@@ -518,6 +518,45 @@ const NATIVE_WRAPPERS: &[&str] = &[
 ];
 const NATIVE_SUCCESS: &str = "native-allocation-probe-v1: forwarding provider diagnostic passed\n";
 
+const SQLITE_BODY_PHASES: &[&str] = &[
+    "baseline",
+    "opened",
+    "writing",
+    "committed",
+    "verified",
+    "reopened",
+    "rolled_back",
+    "dropped",
+];
+
+fn sqlite_body_evidence(output: &str, native: bool) -> Result<()> {
+    let domain = if native { "native" } else { "rust" };
+    let width = if native { 9 } else { 7 };
+    let mut lines = output.lines();
+    for phase in SQLITE_BODY_PHASES {
+        let prefix = format!("sqlite-{domain} {phase} ");
+        let row = lines
+            .next()
+            .and_then(|line| line.strip_prefix(&prefix))
+            .ok_or("missing or reordered SQLite allocation phase")?;
+        let columns: Vec<&str> = row.split(' ').collect();
+        if columns.len() != width
+            || columns.iter().any(|value| {
+                value.is_empty()
+                    || !value.bytes().all(|b| b.is_ascii_digit())
+                    || value.parse::<usize>().is_err()
+            })
+        {
+            return Err("invalid SQLite allocation measurement".into());
+        }
+    }
+    let success = format!("sqlite-body-allocation-v1: {domain} passed");
+    if lines.next() != Some(success.as_str()) || lines.next().is_some() || !output.ends_with('\n') {
+        return Err("invalid SQLite allocation completion".into());
+    }
+    Ok(())
+}
+
 fn tls_allocation_evidence(output: &str, native: bool) -> Result<()> {
     let phases = [
         "baseline",
@@ -778,6 +817,7 @@ fn rss_symbols(symbols: &str, probe: bool) -> Result<()> {
 fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
     let phases: &[&str] = match scenario {
         "control" => &["baseline", "touched", "dropped"],
+        "sqlite-body" => SQLITE_BODY_PHASES,
         "client" => &[
             "baseline",
             "config",
@@ -1577,8 +1617,26 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
     }
 
+    for (native, path) in [
+        (false, "/artifacts/td-mta-rust-allocation-probe"),
+        (true, "/artifacts/td-mta-native-allocation-probe"),
+    ] {
+        let mut command = Command::new(path);
+        command
+            .arg("--sqlite-body")
+            .env_clear()
+            .stdin(Stdio::null());
+        crate::host_bin::arm_check_child(&mut command);
+        let output = bounded_output(&mut command, "sqlite-body-allocation", 8192, 300)?;
+        sqlite_body_evidence(&output, native)?;
+        for line in output.lines() {
+            println!("portable SQLite allocation diagnostic: {line}");
+        }
+    }
+
     for (scenario, argument) in [
         ("control", None),
+        ("sqlite-body", Some("--sqlite-body")),
         ("client", Some("--tls-clients")),
         ("handshake", Some("--tls-handshake")),
         ("entropy", Some("--entropy-workers")),
@@ -1596,7 +1654,8 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
         crate::host_bin::arm_check_child(&mut command);
         let name = format!("rss-probe-{scenario}");
-        let output = bounded_output(&mut command, &name, 8192, 30)?;
+        let timeout = if scenario == "sqlite-body" { 300 } else { 30 };
+        let output = bounded_output(&mut command, &name, 8192, timeout)?;
         rss_evidence(&output, scenario)?;
         for line in output.lines() {
             println!("portable RSS diagnostic (KiB): {line}");
@@ -2385,6 +2444,30 @@ mod tests {
         }
         assert!(allocation_evidence(&format!("{ALLOCATION_SUCCESS}{ALLOCATION_SUCCESS}")).is_err());
         assert!(allocation_evidence(&format!("{ALLOCATION_SUCCESS}failed\n")).is_err());
+    }
+
+    #[test]
+    fn sqlite_body_measurements_require_every_phase_and_exact_completion() {
+        for native in [false, true] {
+            let domain = if native { "native" } else { "rust" };
+            let columns = if native {
+                "1 2 3 4 5 6 7 8 9"
+            } else {
+                "1 2 3 4 5 6 7"
+            };
+            let mut output = String::new();
+            for phase in SQLITE_BODY_PHASES {
+                output.push_str(&format!("sqlite-{domain} {phase} {columns}\n"));
+            }
+            output.push_str(&format!("sqlite-body-allocation-v1: {domain} passed\n"));
+            assert!(sqlite_body_evidence(&output, native).is_ok());
+            assert!(sqlite_body_evidence(&output.replace("writing", "opened"), native).is_err());
+            assert!(sqlite_body_evidence(&output.replace("1 2", "-1 2"), native).is_err());
+            assert!(sqlite_body_evidence(&output.replace(columns, "1"), native).is_err());
+            assert!(sqlite_body_evidence(output.trim_end(), native).is_err());
+            assert!(sqlite_body_evidence(&format!("{output}extra\n"), native).is_err());
+            assert!(sqlite_body_evidence(&output, !native).is_err());
+        }
     }
 
     #[test]

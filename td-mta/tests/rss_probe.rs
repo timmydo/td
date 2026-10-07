@@ -109,6 +109,7 @@ fn observe<const N: usize>(scenario: &str, phases: [&str; N], run: impl FnOnce(&
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
+        Some("--sqlite-body") => sqlite_body(),
         Some("--tls-clients") => observe("client", tls_allocation_scenario::PHASES, |f| {
             tls_allocation_scenario::run(f)
         }),
@@ -158,3 +159,32 @@ mod tls_generation_scenario;
 
 #[path = "support/tls_remote_chain_scenario.rs"]
 mod tls_remote_chain_scenario;
+
+use td_mta::{
+    bounded, config, format, ids, limits, mailbox_parents, ports, row_references, store_paths,
+};
+#[path = "support/sqlite_body_scenario.rs"]
+mod sqlite_body_scenario;
+#[path = "../src/store_fs.rs"]
+#[allow(unused)]
+pub mod store_fs;
+
+fn sqlite_body() {
+    let mut observer = Observer::new();
+    let mut samples = vec![0; sqlite_body_scenario::PHASES.len()];
+    let mut slots = samples.iter_mut();
+    sqlite_body_scenario::run(|| *slots.next().unwrap() = observer.sample());
+    assert!(slots.next().is_none());
+    let baseline = *samples.first().unwrap();
+    for rss in &samples {
+        // Sampled anonymous/file-backed process RSS, not a transient peak proof.
+        assert!(
+            rss.saturating_sub(baseline) <= 24 * 1024,
+            "32 MiB streamed body grew observed RSS by more than 24 MiB"
+        );
+    }
+    for (phase, rss) in sqlite_body_scenario::PHASES.iter().zip(samples) {
+        println!("rss sqlite-body {phase} {rss}");
+    }
+    println!("rss-observation-v2: sqlite-body passed");
+}

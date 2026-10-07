@@ -26,7 +26,8 @@ cases where applicable. Each property in its CONFORMANCE.md group gets an
 individual assertion, including omitted versus null, read-only and empty
 values. An inapplicable dimension must have a reason; a method-level green
 cannot stand for an untested property. Mutation cases additionally compare
-raw files/metadata after restart and fault injection. Method responses retain
+exact stored body bytes and relational metadata after restart and fault
+injection. Method responses retain
 call IDs and ordered implicit responses exactly as ADMISSION.md defines.
 
 ## Interpretation cases and literal oracles

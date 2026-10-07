@@ -7,22 +7,9 @@ use std::{
     path::Path,
 };
 
-#[path = "store_fs/create_directory.rs"]
-mod create_directory;
-#[path = "store_fs/input.rs"]
-mod input;
-pub use input::{CompleteFile, StoreReader};
-#[path = "store_fs/blob.rs"]
-mod blob;
-pub use blob::{BlobInput, BlobInputError, CompleteBlob};
-#[path = "store_fs/temporary.rs"]
-mod temporary;
-pub use temporary::{
-    CreateError, PublishError, PublishedFile, SyncedTemporary, TemporaryFile, MAX_FILE_STEP_BYTES,
-};
 #[path = "store_fs/index.rs"]
 mod index;
-pub use index::{CommitError, CommitRequest, IndexReadView, IndexStore};
+pub use index::{BlobSource, CommitError, CommitRequest, IndexReadView, IndexStore};
 #[path = "store_fs/pinned.rs"]
 mod pinned;
 #[cfg(test)]
@@ -155,13 +142,6 @@ impl Directory {
         })
     }
 
-    /// A generated name is relative to this stored path. Keep every ancestor
-    /// stable while serving; this lookup does not follow the retained File.
-    pub fn open(&self, name: &Name) -> io::Result<Self> {
-        let mut path = [0; MAX_PATH_BYTES];
-        let path = self.join(name, &mut path)?;
-        Self::from_path(path.to_str().ok_or(io::ErrorKind::InvalidInput)?)
-    }
     fn join<'a>(&self, name: &Name, path: &'a mut [u8; MAX_PATH_BYTES]) -> io::Result<&'a Path> {
         let mut output = crate::bounded::TextBuffer::new(path);
         let root = std::str::from_utf8(
@@ -182,47 +162,6 @@ impl Directory {
     }
     pub fn metadata(&self) -> io::Result<Metadata> {
         self.file.metadata()
-    }
-    fn destination<'a>(
-        &self,
-        name: &Name,
-        buffer: &'a mut [u8; MAX_PATH_BYTES],
-    ) -> io::Result<Destination<'a>> {
-        let path = self.join(name, buffer)?;
-        let parent_path = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
-        let owner = self.metadata()?.uid();
-        for ancestor in parent_path.ancestors() {
-            if ancestor.as_os_str().len() < self.length {
-                break;
-            }
-            private_directory(ancestor, owner)?;
-        }
-        let parent =
-            Directory::from_path(parent_path.to_str().ok_or(io::ErrorKind::InvalidInput)?)?;
-        Ok(Destination {
-            path,
-            parent,
-            owner,
-        })
-    }
-}
-struct Destination<'a> {
-    path: &'a Path,
-    parent: Directory,
-    owner: u32,
-}
-fn private_directory(path: &Path, owner: u32) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.uid() != owner || metadata.mode() & 0o7777 != 0o700 {
-        return Err(io::ErrorKind::PermissionDenied.into());
-    }
-    Ok(())
-}
-fn require_absent(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Err(io::ErrorKind::AlreadyExists.into()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
     }
 }
 /// Cooperative process exclusion only; store-format recovery is still required.
@@ -328,8 +267,27 @@ fn trusted_owner(owner: u32, service: u32) -> bool {
     owner == 0 || owner == service
 }
 
+/// Maximum bytes copied by one body read or write step.
+pub const MAX_FILE_STEP_BYTES: usize = crate::limits::SQLITE_BODY_CHUNK_BYTES;
+
 #[cfg(test)]
-pub use temporary::probe::run as probe_temporary_io;
+pub fn with_probe_root(run: impl FnOnce(&mut LockedRoot)) {
+    let fixture = tests::Fixture::new();
+    run(&mut fixture.locked());
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub fn with_probe_root_path(path: &Path, run: impl FnOnce(&mut LockedRoot)) {
+    let directory = Directory::from_path(path.to_str().unwrap()).unwrap();
+    let owner = directory.metadata().unwrap().uid();
+    let lock = acquire_lock(&directory, owner).unwrap();
+    let mut root = LockedRoot {
+        root: PrivateRoot { directory },
+        _lock: lock,
+    };
+    run(&mut root);
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

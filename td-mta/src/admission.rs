@@ -3,6 +3,8 @@ use crate::limits::ResourcePlan;
 
 pub const MIB: u64 = 1 << 20;
 pub const GIB: u64 = 1 << 30;
+pub const DATABASE_BYTES: u64 = crate::limits::SQLITE_DATABASE_BYTES;
+pub const WAL_BYTES: u64 = crate::limits::SQLITE_WAL_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -62,10 +64,10 @@ pub mod timers;
 pub mod work;
 
 settings! { DiskLimits {
-    body_bytes: 4 * GIB, 1, 1024 * GIB;
-    body_files: 250000, 1, 1000000;
-    metadata_bytes: 32 * MIB, 1, 32 * MIB;
-    wal_bytes: 2 * (8192 * (4096 + 24) + 32), 1, 128 * MIB;
+    body_bytes: 4 * GIB, 1, 4 * GIB;
+    blob_count: 250000, 1, 1000000;
+    database_bytes: DATABASE_BYTES, 1, DATABASE_BYTES;
+    wal_bytes: WAL_BYTES, 1, 32 * GIB;
     response_bytes: 128 * MIB, 1, GIB;
     response_total_bytes: 256 * MIB, 1, 4 * GIB;
     cache_bytes: 128 * MIB, 1024, GIB;
@@ -84,12 +86,12 @@ settings! { WorkLimits {
     commit_io_bytes: 256 * MIB, 256 * MIB, 16 * 256 * MIB;
     commit_records: 250000, 250000, 16 * 250000;
     checkpoint_seconds: 60, 60, 16 * 60;
-    checkpoint_io_bytes: 2 * GIB, 2 * GIB, 16 * 2 * GIB;
+    checkpoint_io_bytes: DATABASE_BYTES, DATABASE_BYTES, 16 * DATABASE_BYTES;
     gc_drain_seconds: 30, 30, 16 * 30;
     gc_seconds: 120, 120, 16 * 120;
     gc_io_bytes: 8 * GIB, 8 * GIB, 16 * 8 * GIB;
     gc_records: 128000000, 128000000, 16 * 128000000;
-    gc_unlinks: 1000, 1000, 16 * 1000;
+    gc_blobs: 1000, 1000, 16 * 1000;
     backup_seconds: 900, 900, 16 * 900;
     backup_io_bytes: 16 * GIB, 16 * GIB, 16 * 16 * GIB;
     admission_seconds: 1, 1, 16;
@@ -174,11 +176,11 @@ impl DiskLimits {
         work.validate()?;
         let limits = resources.limits();
         require(
-            self.metadata_bytes >= 32 * MIB,
-            "metadata quota must fit SQLite page ceiling",
+            self.database_bytes == DATABASE_BYTES,
+            "database quota must equal SQLite page ceiling",
         )?;
         require(
-            self.wal_bytes >= 2 * (8192 * (4096 + 24) + 32),
+            self.wal_bytes >= WAL_BYTES,
             "WAL quota must fit bounded transaction overlap",
         )?;
         require(
@@ -241,14 +243,14 @@ mod tests {
             .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
             .is_ok());
         let disk = DiskLimits {
-            metadata_bytes: 32 * MIB - 1,
+            database_bytes: DATABASE_BYTES - 1,
             ..DiskLimits::default()
         };
         assert!(disk
             .plan(&resources, WorkLimits::default(), ViewMode::ForegroundOnly)
             .is_err());
         let disk = DiskLimits {
-            wal_bytes: 2 * (8192 * (4096 + 24) + 32) - 1,
+            wal_bytes: WAL_BYTES - 1,
             ..DiskLimits::default()
         };
         assert!(disk
@@ -333,11 +335,11 @@ mod tests {
                 ..DiskLimits::default()
             },
             DiskLimits {
-                body_files: 1000001,
+                blob_count: 1000001,
                 ..DiskLimits::default()
             },
             DiskLimits {
-                body_bytes: 1024 * GIB + 1,
+                body_bytes: 4 * GIB + 1,
                 ..DiskLimits::default()
             },
             DiskLimits {
@@ -378,7 +380,7 @@ mod tests {
             })
         ));
         let minimum = DiskLimits {
-            metadata_bytes: 32 * MIB,
+            database_bytes: DATABASE_BYTES,
             cache_bytes: 1024,
             ..DiskLimits::default()
         };
@@ -387,7 +389,7 @@ mod tests {
             .is_ok());
         for disk in [
             DiskLimits {
-                metadata_bytes: 32 * MIB - 1,
+                database_bytes: DATABASE_BYTES - 1,
                 ..minimum
             },
             DiskLimits {

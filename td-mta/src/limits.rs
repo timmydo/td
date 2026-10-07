@@ -3,6 +3,18 @@ use std::fmt;
 
 pub const KIB: usize = 1024;
 pub const MIB: usize = 1024 * KIB;
+/// Fixed WAL-index mapping ceiling outside SQLite's requested native heap.
+pub const SQLITE_WAL_INDEX_BYTES: usize = 34 * MIB;
+/// Shared physical storage and message bounds; SQL/native literals are pinned in tests.
+pub const MAX_MESSAGE_BYTES: usize = 32 * MIB;
+pub const SQLITE_BODY_CHUNK_BYTES: usize = 64 * KIB;
+pub const SQLITE_VALUE_BYTES: i32 = 69_632;
+pub const SQLITE_PAGE_BYTES: u64 = 4096;
+pub const SQLITE_MAX_PAGES: u64 = 2_097_152;
+pub const SQLITE_DATABASE_BYTES: u64 = SQLITE_PAGE_BYTES * SQLITE_MAX_PAGES;
+pub const SQLITE_TRANSACTION_WAL_BYTES: u64 =
+    (SQLITE_MAX_PAGES + 32) * (SQLITE_PAGE_BYTES + 24) + 32;
+pub const SQLITE_WAL_BYTES: u64 = 2 * SQLITE_TRANSACTION_WAL_BYTES;
 /// QUEUE.md's fixed per-attempt ceiling, independent of inbound envelope size.
 pub const OUTBOUND_RECIPIENT_BATCH: usize = 100;
 /// Owned operation offsets/ordinal/type/kind, including Option layout.
@@ -95,7 +107,7 @@ limits! {
         event_streams: 2, 0, 8;
         body_jobs: 2, 1, 8;
         storage_views: 2, 1, 8;
-        message_bytes: 32 * MIB, 1, 128 * MIB;
+        message_bytes: MAX_MESSAGE_BYTES, 1, MAX_MESSAGE_BYTES;
         header_bytes: 256 * KIB, 1, MIB;
         mime_depth: 32, 1, 64;
         mime_parts: 1024, 1, 4096;
@@ -106,7 +118,7 @@ limits! {
         json_tokens: 32768, 1, 131072;
         objects_per_method: 256, 1, 1024;
         query_page: 256, 1, 1024;
-        index_cache_bytes: 8 * MIB, 1, 32 * MIB;
+        index_cache_bytes: 4 * MIB, 1, 32 * MIB;
         upload_disk_bytes: 128 * MIB, 1, 1024 * MIB;
         upload_expiry_seconds: 86400, 1, 604800;
         queue_disk_bytes: 256 * MIB, 1, 1024 * MIB;
@@ -114,7 +126,7 @@ limits! {
         sort_disk_bytes: 64 * MIB, 1, 256 * MIB;
         log_file_bytes: 8 * MIB, 1, 64 * MIB;
         retained_logs: 4, 1, 16;
-        memory_budget_bytes: 96 * MIB, 1, 128 * MIB;
+        memory_budget_bytes: 128 * MIB, 1, 128 * MIB;
     }
     fixed {
         outbound_deliveries: 1;
@@ -285,6 +297,7 @@ impl Limits {
                     "SQLite writer",
                     &[
                         self.sqlite_heap_bytes,
+                        SQLITE_WAL_INDEX_BYTES,
                         self.transaction_bytes,
                         self.transaction_bytes, // Borrowed key/value staging, separate from transaction output.
                         mutation_slots,
@@ -393,9 +406,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn schema_literals_match_shared_storage_bounds() {
+        let schema = include_str!("store_fs/index/relational/schema.rs");
+        assert!(schema.contains(&format!("length BETWEEN 0 AND {MAX_MESSAGE_BYTES}")));
+        assert!(schema.contains(&format!(
+            "length(body) BETWEEN 1 AND {SQLITE_BODY_CHUNK_BYTES}"
+        )));
+        assert!(schema.contains(&format!(
+            "ordinal BETWEEN 0 AND {}",
+            MAX_MESSAGE_BYTES / SQLITE_BODY_CHUNK_BYTES - 1
+        )));
+        assert_eq!(MAX_MESSAGE_BYTES % SQLITE_BODY_CHUNK_BYTES, 0);
+    }
+
+    #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 100_058_368);
+        assert_eq!(plan.total_bytes(), 131_515_648);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
@@ -405,7 +432,7 @@ mod tests {
                 + 63 * KIB
                 + CHANGE_SLOT_BYTES * crate::format::MAX_TRANSACTION_OPERATIONS
         );
-        assert_eq!(plan.limits().memory_budget_bytes, 96 * MIB);
+        assert_eq!(plan.limits().memory_budget_bytes, 128 * MIB);
         assert!(plan.total_bytes() < plan.limits().memory_budget_bytes);
         assert_eq!(plan.log_disk_bytes(), 40 * MIB);
         Ok(())
@@ -444,13 +471,13 @@ mod tests {
             }
             .plan(),
             Err(ResourceError::MemoryBudget {
-                required: 104_252_672,
-                available: 96 * MIB
+                required: 135_709_952,
+                available: 128 * MIB
             })
         );
         assert!(Limits {
             tls_handshakes: 3,
-            memory_budget_bytes: 104_252_672,
+            index_cache_bytes: 2 * MIB,
             ..defaults
         }
         .plan()
@@ -461,7 +488,7 @@ mod tests {
     #[test]
     fn tls_slot_growth_does_not_multiply_serial_record_work() -> Result<(), ResourceError> {
         let defaults = Limits {
-            memory_budget_bytes: 128 * MIB,
+            index_cache_bytes: MIB,
             ..Limits::default()
         };
         let original = defaults.plan()?;
@@ -526,7 +553,7 @@ mod tests {
                 .iter()
                 .find(|r| r.name == "SQLite writer")
                 .ok_or(ResourceError::Inconsistent("missing writer reservation"))?;
-            assert_eq!(writer.bytes_each, 19_267_584);
+            assert_eq!(writer.bytes_each, 54_919_168);
         }
         assert_eq!(
             larger_inbound.total_bytes() - plan.total_bytes(),
@@ -663,7 +690,7 @@ mod tests {
     ) -> Result<(), ResourceError> {
         let original = Limits::default().plan()?;
         let changed = Limits {
-            message_bytes: 64 * MIB,
+            message_bytes: 16 * MIB,
             upload_disk_bytes: 256 * MIB,
             queue_submissions: 2000,
             ..Limits::default()
@@ -674,9 +701,9 @@ mod tests {
     }
 
     #[test]
-    fn larger_pool_cannot_keep_default_memory_claim() -> Result<(), ResourceError> {
+    fn larger_pool_requires_capacity_rebalancing() -> Result<(), ResourceError> {
         let limits = Limits {
-            https_connections: 23,
+            https_connections: 10,
             ..Limits::default()
         };
         assert!(matches!(
@@ -684,11 +711,11 @@ mod tests {
             Err(ResourceError::MemoryBudget { .. })
         ));
         let plan = Limits {
-            memory_budget_bytes: 128 * MIB,
+            index_cache_bytes: MIB,
             ..limits
         }
         .plan()?;
-        assert!(plan.total_bytes() > Limits::default().memory_budget_bytes);
+        assert!(plan.total_bytes() > Limits::default().plan()?.total_bytes());
         assert!(matches!(
             Limits {
                 https_connections: 32,

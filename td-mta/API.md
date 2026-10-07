@@ -713,7 +713,7 @@ authorization and reproduce the exact MIME descriptor; a bounds check alone
 grants none of those. Identity, base64 and quoted-printable are implemented.
 Unknown transfer tokens use identity bytes with a diagnostic supplied by the
 MIME parser. The source borrow retains the underlying body owner's pin. No
-raw file accessor or complete body allocation is added.
+raw storage accessor or complete body allocation is added.
 
 Each poll performs either one source read of at most 6 KiB or one decoder
 turn of at most 256 transitions; identity copies at most 256 bytes. Refill
@@ -1395,7 +1395,7 @@ remaining message or a subsequent field. This lexical helper does not
 discover field boundaries. The caller invokes it only where its structured
 field grammar permits optional CFWS, never inside a quoted string or
 arbitrarily across a field. It skips SP/HTAB and CRLF or bare-LF folds
-followed by SP/HTAB under the raw-file policy. The first non-CFWS byte is
+followed by SP/HTAB under the raw-message policy. The first non-CFWS byte is
 left untouched. Complete returns that position and whether any CFWS was
 consumed, allowing the enclosing grammar to require a nonempty run where
 appropriate.
@@ -5357,19 +5357,19 @@ policy, nested p2 contexts and authenticated response publication follow.
 
 M06dv measures eight source-binding intervals in the dedicated sequential
 Rust allocation process. The probe compiles the production MIME owners
-and filesystem pin in one test-only source graph, preserving their
-private constructors and real pooled-view custody. File creation,
+and snapshot body pin in one test-only source graph, preserving their
+private constructors and real pooled-view custody. Database preparation,
 complete pin verification, source construction, original mapping and
 all backing precede the measured interval. Counting starts before
 binding construction and ends after consuming release or refusal drops
-its retained state and PinnedBlob descriptor. The enclosing PooledRead,
+its retained state and PinnedBlob snapshot borrow. The enclosing PooledRead,
 CommittedView and scratch lease release stay outside this interval.
 
 Cover healthy zero and near-u64 source bases, partial expiry, completed
 cursor expiry, Bound expiry, a same-length changed resident byte, exhausted
 original I/O work and constructor pin expiry. Each interval compares all
 Rust allocation counters unchanged. These eight intervals supplement the
-existing 65 metadata/locator trials. They do not qualify filesystem setup,
+existing 65 metadata/locator trials. They do not qualify database setup,
 native allocation, worker stacks, RSS, whole-job admission or authorized
 locator publication. The production API and allocation shim are unchanged.
 
@@ -5402,7 +5402,7 @@ Sticky refusal hides values and cannot refund or renew original work.
 Completion is reported with the final byte, including exact output fit.
 
 Fresh consuming finish creates private Member retaining original Bound,
-actual descriptor and chosen ordinal. Member explicit checks and checked
+actual snapshot pin and chosen ordinal. Member explicit checks and checked
 release remain fresh; release returns the original Bound and ordinal.
 This proves completed emission, not retained output or access permission.
 Original source, fragments, candidate cells, prior whole-member window
@@ -5487,7 +5487,7 @@ Abandoned. Cell values remain passive and provisional; used cells
 cannot renew custody. Failure hides child values and poisons the parent.
 
 Whole finish freshly requires every ordinal, yielding exclusive
-Serialized with original Bound, all cells and actual descriptor. Its
+Serialized with original Bound, all cells and actual snapshot pin. Its
 explicit admission and consuming low-level release stay fresh. The
 released cells alone supply no whole collection/source/composition or
 current access authority. Tree/list composition, request property
@@ -5512,7 +5512,7 @@ eight each binding, emission and whole-retention intervals are separate.
 
 M06dz adds mime_response::metadata_json. Cursor consumes
 only original Serialized, selecting Structure or Lists, and retains
-that whole collection and actual descriptor throughout emission.
+that whole collection and actual snapshot pin throughout emission.
 The existing metadata composer and this source-bound composer share
 one crate-private bounded Frame and source adapters. Framing, checked
 ordinal/depth/parent walk, ordered list membership, commas, braces,
@@ -5559,7 +5559,7 @@ M06ea adds mime_response::metadata_json_window.
 Only original complete Serialized can start a fresh private composer
 and shared td-json Window. Advanced emission or Composed cannot establish
 retention of a lost prefix. Keep original collection, source/fragments,
-all fixed member cells and actual descriptor alongside the whole output
+all fixed member cells and actual snapshot pin alongside the whole output
 window. The separately admitted window is additional overlapping backing,
 not a new source arena or a publication capability.
 
@@ -5572,7 +5572,7 @@ An exact window completes; cached Complete is inert. Fresh complete
 finish creates exclusive Retained. Explicit checks and consuming final
 release freshly admit both deadline domains, returning original
 Serialized, Mode and the complete borrowed window bytes. The released
-collection retains the actual descriptor; passive ViewBytes has no
+collection retains the actual snapshot pin; passive ViewBytes has no
 current access or publication authority. These bytes are whole property
 members, not a complete JMAP response object.
 
@@ -5938,7 +5938,7 @@ M06ei adds
 `mime_response::selected_metadata_json`.
 Only complete §1.139 selected Serialized and an explicit Mode construct
 exclusive Cursor. Preserve immutable per-part Properties, original
-collection/cells/backing and actual descriptor through Cursor, Composed
+collection/cells/backing and actual snapshot pin through Cursor, Composed
 and fresh complete release back to the selected Serialized. Passive
 views and advanced legacy cursors cannot reconstruct the selected owner.
 
@@ -6053,7 +6053,7 @@ per-part metadata selection. Retained ViewBytes exposes outer
 properties, complete provisional members and the original selected view.
 Fresh release returns selected Serialized, unchanged outer properties
 and the same complete borrowed output bytes; the collection still owns
-original cells/backing and actual descriptor custody.
+original cells/backing and actual snapshot pin custody.
 
 Reuse at-most-64-byte funded copies, exact five-cost debits and sticky
 window/work/freshness errors. Exact windows succeed, spare tails remain
@@ -6495,9 +6495,14 @@ publication, native allocation and stack/RSS remain unqualified.
 
 store_fs::IndexStore owns a locked root, one serialized SQLite writer and
 one to eight cold reader connections. create requires a fresh database;
-open validates the physical files and exact schema before accepting metadata.
-Both borrow LockedRoot exclusively for the owner's lifetime, preventing
-independent owners from bypassing its checkpoint/collection fence.
+open validates the physical files, closed schema, database header and store
+epoch before accepting metadata. It does not run a full database integrity or
+foreign-key scan at startup. SQLite checks pages as accessed; the separate
+validate_integrity(deadline) maintenance operation runs quick_check and
+foreign_key_check under an explicit deadline and a finite VM allowance sized
+for the physical database cap. Complete body verification still precedes a
+body pin. Both borrow LockedRoot exclusively for the owner's lifetime, preventing
+independent owners from bypassing its transaction/checkpoint fence.
 
 view captures a real SQLite WAL read transaction under the writer mutex.
 ViewIdentity contains account, epoch, committed_sequence and history_floor.
@@ -6517,18 +6522,24 @@ before returning its connection; failed rollback retires the slot.
 IndexReadView::open_blob_input takes the crypto provider, blob ID and byte
 ceiling. The snapshot supplies the BlobRow, account, original clock and
 deadline. Complete length/digest/EOF verification yields PinnedBlob random
-reads from the same file. The input and completed pin borrow the view, which
-blocks slot release and orphan collection until that borrow ends. A caller
+reads from the same SQLite snapshot. The input and completed pin borrow the
+view, preventing slot release until that borrow ends. A caller
 cannot renew the deadline by supplying another clock or duration.
 
 checkpoint takes the writer fence and refuses while any view is held. A
 successful SQLite WAL TRUNCATE plus root sync permits further bounded writes.
-collect_orphan requires a durably absent current BlobRow, no live views,
-validated immutable path, unlink and parent sync. The core does not implement
-an online backup, complete orphan walk, history-pruning scheduler or runtime
-slot arbitration; operational callers must provide those admission policies.
+The fixed WAL ceiling is 17280796224 bytes; recovery can reread that entire
+WAL, and a checkpoint can copy up to the 8 GiB database ceiling. These native
+operations cannot be interrupted at an application chunk boundary. Deadline
+checks before and after do not promise a 60-second checkpoint or a 2 GiB I/O
+ceiling. Large-WAL recovery and checkpoint resource qualification is pending.
+Blob deletion is part of the metadata transaction; existing views retain the
+old body through WAL. Committed bodies need no external-file collector.
+Provisional ingress staging and its cleanup remain separate, unimplemented
+service responsibilities. The core does not implement online backup, history
+maintenance or runtime slot arbitration.
 
-## 3. Reserve, publish, commit
+## 3. Reserve, stage, commit
 
 The existing ports::Store trait is the future authenticated service boundary;
 IndexStore is its low-level persistence core, not an implementation of device
@@ -6541,15 +6552,32 @@ durable attempt fence even if credentials change after transmission.
 Reserve body, operation, response and category capacity before accepting
 responsibility. ReservationId retains coordinator instance, slot and checked
 generation. Linear logical effect tickets prevent double reconciliation;
-physical I/O can still fail. Published but unreferenced files stay charged
-until durable cleanup, independently of unused logical reservations.
+physical I/O can still fail. The future authenticated port calls provisional
+body completion StagedBlob; finishing staging never establishes durability.
+Only the SQLite transaction publishes authoritative bodies and references.
+The port's begin_blob, BlobWriter::finish and StagedBlob are contracts for a
+future coordinator; they have no staging-store implementation yet. That work
+must specify bounded storage, quota accounting, failure cleanup and recovery
+before SMTP/JMAP ingress is activated. The future coordinator must keep
+slow peers outside the global writer while they deliver their messages.
 
 IndexStore::commit accepts Crypto, CommitRequest, a bounded Operation slice
-and owner-bound PublishedFile proofs. CommitRequest carries account, expected
-sequence, UTC validation time and one monotonic deadline. Every fresh BlobRow
-requires a matching durably published, exact-length and digest-verified file.
-A permanent SQLite ID registry prevents recreating deleted blob IDs. No
-message bytes are copied into database values or transaction staging.
+and a mutable slice of BlobSource { id, source: &mut dyn std::io::Read }.
+CommitRequest carries account, expected sequence, UTC validation time and
+one monotonic deadline. Every fresh BlobRow requires a matching source with
+exact length, digest and EOF; a supplied source matches exactly one Blob PUT.
+A 32 MiB hard maximum applies before reading;
+chunks are at most 64 KiB. A permanent SQLite registry prevents deleted blob
+ID reuse. Bodies stream into relational chunk rows keyed by account, blob and
+ordinal inside the transaction; they never enter encoded metadata operation
+buffers. Each stored chunk is at most 64 KiB and readers seek its ordinal
+directly. Native page allocation and durable finalization are synchronous,
+with checks before/after but no guarantee of interruption inside a native
+operation. The core holds the global writer while consuming the source. Its
+Read trait cannot enforce deadlines inside an arbitrary implementation:
+callers must supply prepared sources with bounded synchronous reads, not
+untrusted network streams. Provisional ingress preparation is future service
+work, not a durability claim of this low-level API.
 
 The serialized transaction checks the expected sequence, applies operations
 in caller order, validates final owning references and parent chains, records
@@ -6726,3 +6754,8 @@ future adapter and protocol suites must prove these operational mappings.
 
 Sources: [JMAP Core, RFC 8620 §5](https://www.rfc-editor.org/rfc/rfc8620.html#section-5)
 and [JMAP Mail, RFC 8621](https://www.rfc-editor.org/rfc/rfc8621.html).
+
+Physical chunk-read amplification and the exclusive validate_integrity
+maintenance fence are specified in STORAGE.md section 2. Logical MIME byte
+meters do not measure SQLite copying. Full integrity maintenance refuses a
+stopped writer; new view capture and commits return Busy during its scan.

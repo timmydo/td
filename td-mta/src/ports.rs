@@ -200,7 +200,7 @@ pub enum ChangeStep {
 pub trait ReadView: Send + Sync {
     fn identity(&self) -> ViewIdentity;
     /// Scan strictly after the cursor, within the pinned history and endpoint.
-    /// The backend uses its native change index; blob payloads remain files.
+    /// The backend uses native change indexes and bounded body-chunk rows.
     fn next_change(&mut self, after: ChangeCursor, kind: ObjectType) -> Result<ChangeStep, Error>;
     /// Decode and validate into caller storage; None means absent in this view.
     fn get<'a>(
@@ -278,12 +278,12 @@ pub struct Access {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DiskBudget {
     pub new_blob_bytes: u64,
-    pub new_blob_files: u32,
+    pub new_blobs: u32,
     /// Logical quota increases, including pins on an already existing blob.
     pub upload_bytes: u64,
     pub queue_bytes: u64,
-    pub metadata_bytes: u64,
-    pub metadata_files: u32,
+    pub database_bytes: u64,
+    pub wal_bytes: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReservationSize {
@@ -355,8 +355,8 @@ pub trait Store: Send + Sync {
         view: &'a Self::View<'_>,
         id: BlobId,
     ) -> Result<Self::Reader<'a>, Error>;
-    /// Charges the reservation before exclusive creation; the writer borrows
-    /// it until publication/drop, preventing concurrent use by a commit.
+    /// Charges staging before writing; the writer borrows the reservation
+    /// until finish/drop, preventing concurrent use by a commit.
     fn begin_blob<'a>(
         &'a self,
         reservation: &'a mut Self::Reserved<'_>,
@@ -377,7 +377,7 @@ pub trait Store: Send + Sync {
         access: Access,
         reservation: &mut Self::Reserved<'_>,
         expected: Sequence,
-        published: &[PublishedBlob],
+        staged: &[StagedBlob],
         transaction: TransactionInput<'_>,
     ) -> Result<Commit, CommitFailure>;
 }
@@ -390,14 +390,14 @@ pub trait BlobReader: Send {
     fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<usize, Error>;
 }
 #[derive(Debug, Eq, PartialEq)]
-pub struct PublishedBlob {
+pub struct StagedBlob {
     pub(crate) reservation: ReservationId,
     pub(crate) account: AccountId,
     pub(crate) id: BlobId,
     pub(crate) length: u64,
     pub(crate) digest: [u8; 32],
 }
-impl PublishedBlob {
+impl StagedBlob {
     pub const fn reservation(&self) -> ReservationId {
         self.reservation
     }
@@ -417,8 +417,8 @@ impl PublishedBlob {
 pub trait BlobWriter: Send {
     /// All-or-error: no caller retry of the same chunk after an error.
     fn write(&mut self, bytes: &[u8]) -> Result<(), Error>;
-    /// Sync file and publication directories; does not create a metadata reference.
-    fn publish(self) -> Result<PublishedBlob, Error>;
+    /// Finish provisional staging. Only the later SQLite commit is durable.
+    fn finish(self) -> Result<StagedBlob, Error>;
 }
 
 #[cfg(test)]

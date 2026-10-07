@@ -2,7 +2,9 @@
 
 This is the normative application-byte companion to [STORAGE.md](STORAGE.md).
 SQLite owns physical pages, WAL, transactions and recovery. The allocation-free
-scalar, key, row and operation codecs define only bounded application values.
+scalar, key, row and operation codecs define only bounded transient application
+values. Schema version 2 persists explicit SQL columns, never encoded row
+payloads or canonical-key shadow blobs. STORAGE.md owns that physical schema.
 No custom FORMAT/CURRENT/table/manifest/journal container is emitted.
 
 ## 1. Conventions
@@ -32,8 +34,6 @@ validation and presentation are separate. Account sequence 0 denotes an
 empty store; the first transaction is 1. Every later transaction is the exact
 checked successor. On u64 exhaustion stop mutation, keep reads available and
 require explicit migration to a fresh epoch. Never wrap or reset in place.
-Temporary-file numbers are nonzero u64, exclusively created and rendered
-as 20 zero-padded decimal digits. They convey no database generation.
 
 The checked scalar readers borrow their input; writers use caller-owned
 buffers. After any scalar codec error discard that cursor and its partial
@@ -43,7 +43,7 @@ and does not prove that a referenced row exists.
 
 ## 2. Table and primary-key registry
 
-Table tags are u16. A SQLite record and an application operation identify the table;
+Table tags are u16. An application operation identifies the logical table;
 the primary-key bytes do not contain another table tag. Keys are unique and
 sorted by unsigned bytewise comparison of their complete encoded form.
 Logical ordering uses `Table::tag()`, never Rust enum declaration order.
@@ -90,7 +90,7 @@ bytes. Truncated fixed/length-prefixed keys, unknown kinds, trailing bytes,
 invalid UTF-8, empty IDs and oversized keys refuse. Caller output remains
 unchanged when it cannot hold a key.
 
-The scalar golden stream is the following hex, with no spaces on disk:
+The scalar golden stream is the following hex, with no spaces in the caller buffer:
 
 ```text
 3412 78563412 0100000000000000 feffffffffffffff 01 02000000 c3a9
@@ -112,7 +112,8 @@ or live-reference proof. SQL transaction validation checks final rows,
 owning references, parent cycles and change-action existence.
 
 At most 4096 operations and 1048576 encoded bytes form one caller batch.
-Repeated row keys are applied in caller order; their last effect determines
+Each supplied fresh body source matches exactly one Blob PUT. Other repeated
+row keys are applied in caller order; their last effect determines
 final reference validation. Each changed object has at most one CHANGE.
 A batch is not a disk journal format and contains no custom frame header,
 footer, checksum, generation or replay descriptor.
@@ -136,12 +137,13 @@ All text below forbids Unicode control characters. Addresses are ASCII with
 at most 254 bytes; reverse-path may be empty, recipient addresses may not.
 SMTP grammar and configured identity permission are additional checks, not
 properties inferred from this framing codec. No input is silently truncated.
-Blob length is u64 on disk; configured admission limits apply to new bodies,
+Blob length is u64 in the adapter and a bounded SQL INTEGER on disk;
+configured admission limits apply to new bodies,
 not to the ability to read previously accepted bodies after limits decrease.
 
 | Table | Ordered fields |
 | --- | --- |
-| blobs | 1 kind:u8; 2 length:u64; 3 raw-file SHA-256:H; 4 createdAt:i64 |
+| blobs | 1 kind:u8; 2 length:u64; 3 raw-body SHA-256:H; 4 createdAt:i64 |
 | mailboxes | 1 name:text(1024); 2 parent:?ID; 3 role:?text(64); 4 sortOrder:u32; 5 subscribed:bool |
 | emails | 1 blob:ID; 2 thread:ID; 3 receivedAt:i64; 4 origin:u8; 5 receipt only for SMTP origin |
 | memberships | Empty value; the key is the complete relationship |
@@ -256,5 +258,6 @@ thread assignment, cache, SMTP receipt, or export time enters this digest.
 
 format_operations and format_rows exercise literal application values and
 rejections; inline scalar/key tests pin numeric and primary-key encodings.
-Actual SQLite and immutable-file tests exercise persistence separately.
+Actual SQLite transaction and chunked-body tests exercise persistence
+separately.
 A row codec does not establish SQLite integrity, authorization or durability.

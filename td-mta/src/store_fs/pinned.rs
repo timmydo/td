@@ -1,12 +1,12 @@
-//! Snapshot-bound integrity checking and immutable message file reads.
-use super::{BlobInput, BlobInputError, CompleteBlob, IndexReadView};
+//! Snapshot-bound verification and bounded random reads of immutable SQLite bodies.
+use super::{index::Native, IndexReadView};
 use crate::{
     format::{
         key::Key,
-        row::{BlobKind, Row},
+        row::{BlobKind, BlobRow, Row},
     },
     ids::BlobId,
-    ports::{BlobReader, Clock, Crypto, Deadline, Error as PolicyError, ReadView, Time},
+    ports::{BlobReader, Clock, Crypto, Deadline, Digest, Error as PolicyError, ReadView, Time},
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 struct VerifyClock<'a> {
@@ -27,21 +27,6 @@ impl Clock for VerifyClock<'_> {
         Ok(now)
     }
 }
-fn blob_io_error(error: std::io::Error) -> PolicyError {
-    match error.kind() {
-        std::io::ErrorKind::NotFound
-        | std::io::ErrorKind::UnexpectedEof
-        | std::io::ErrorKind::InvalidData => PolicyError::Corrupt,
-        _ => error.into(),
-    }
-}
-pub(in crate::store_fs) fn blob_error(error: BlobInputError) -> PolicyError {
-    match error {
-        BlobInputError::Io(error) => blob_io_error(error),
-        BlobInputError::Crypto(error) => error.into(),
-        BlobInputError::Checksum => PolicyError::Corrupt,
-    }
-}
 fn checked<T>(
     clock: &VerifyClock<'_>,
     run: impl FnOnce() -> Result<T, PolicyError>,
@@ -52,7 +37,7 @@ fn checked<T>(
     result
 }
 impl IndexReadView<'_, '_> {
-    /// The original snapshot clock and deadline cover verification and reads.
+    /// The original snapshot and deadline cover verification and subsequent reads.
     pub fn open_blob_input<'a, 'c, C: Crypto>(
         &'a mut self,
         crypto: &'c C,
@@ -71,87 +56,128 @@ impl IndexReadView<'_, '_> {
         if row.length > max_bytes {
             return Err(PolicyError::Capacity);
         }
-        let account = self.identity().account;
-        let (root, source, deadline) = self.blob_scope()?;
+        let rowid = self.blob_rowid(id)?;
+        let (native, deadline) = self.blob_scope()?;
         let clock = VerifyClock {
-            source,
+            source: native,
             deadline,
             last: AtomicU64::new(0),
         };
-        let input = checked(&clock, || {
-            root.open_blob_input(crypto, account, id, row, max_bytes)
-                .map_err(blob_error)
-        })?;
+        let digest = checked(&clock, || crypto.sha256().map_err(PolicyError::from))?;
         Ok(PinnedBlobInput {
-            input,
+            native,
+            crypto,
+            digest,
+            id,
+            row,
+            rowid,
+            position: 0,
             clock,
             failed: None,
         })
     }
 }
-/// Retains the pooled view borrow; an error retires this input without more I/O.
+/// Retains the pooled view borrow; an error retires input without further I/O.
 pub struct PinnedBlobInput<'a, 'c, C: Crypto> {
-    input: BlobInput<'a, 'c, C>,
+    native: &'a Native,
+    crypto: &'c C,
+    digest: C::Sha256,
+    id: BlobId,
+    row: BlobRow,
+    rowid: i64,
+    position: u64,
     clock: VerifyClock<'c>,
     failed: Option<PolicyError>,
 }
 impl<'a, 'c, C: Crypto> PinnedBlobInput<'a, 'c, C> {
     pub fn len(&self) -> u64 {
-        self.input.len()
+        self.row.length
     }
     pub fn is_empty(&self) -> bool {
-        self.input.is_empty()
+        self.row.length == 0
     }
     pub fn position(&self) -> u64 {
-        self.input.position()
+        self.position
     }
     pub fn is_failed(&self) -> bool {
         self.failed.is_some()
     }
-    /// Errors may overwrite output; no returned byte is verified until finish.
+    /// Output remains provisional until complete digest verification succeeds.
     pub fn read(&mut self, output: &mut [u8]) -> Result<usize, PolicyError> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        let result = checked(&self.clock, || self.input.read(output).map_err(blob_error));
+        let result = checked(&self.clock, || {
+            let count =
+                self.native
+                    .read_body(self.rowid, self.row.length, self.position, output)?;
+            self.digest
+                .update(output.get(..count).ok_or(PolicyError::Corrupt)?)?;
+            self.position = self
+                .position
+                .checked_add(count as u64)
+                .ok_or(PolicyError::Corrupt)?;
+            Ok(count)
+        });
         if let Err(error) = result {
             self.failed = Some(error);
         }
         result
     }
-    /// Observe exact EOF and digest before lending random reads of the same file.
+    /// Whole-body integrity grants random reads under the same live snapshot.
     pub fn finish(self) -> Result<PinnedBlob<'a, 'c>, PolicyError> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        let complete = checked(&self.clock, || self.input.finish().map_err(blob_error))?;
+        checked(&self.clock, || {
+            if self.position != self.row.length {
+                return Err(PolicyError::Invalid);
+            }
+            if !self
+                .crypto
+                .equal_digest(&self.digest.finish()?, &self.row.digest)
+            {
+                return Err(PolicyError::Corrupt);
+            }
+            Ok(())
+        })?;
         Ok(PinnedBlob {
-            complete,
+            native: self.native,
+            id: self.id,
+            row: self.row,
+            rowid: self.rowid,
             clock: self.clock,
             failed: None,
         })
     }
 }
-/// One checked immutable descriptor. Its lifetime retains the pooled view borrow.
+/// One verified immutable body. Its borrow retains the pooled SQLite snapshot.
 pub struct PinnedBlob<'a, 'c> {
-    complete: CompleteBlob<'a>,
+    native: &'a Native,
+    id: BlobId,
+    row: BlobRow,
+    rowid: i64,
     clock: VerifyClock<'c>,
     failed: Option<PolicyError>,
 }
+// Drop checking keeps the snapshot loan until this owner (or its MIME owner)
+// is destroyed, even after its last read. The view owns the native connection.
+impl Drop for PinnedBlob<'_, '_> {
+    fn drop(&mut self) {}
+}
 impl PinnedBlob<'_, '_> {
     pub fn id(&self) -> BlobId {
-        self.complete.id()
+        self.id
     }
     pub fn kind(&self) -> BlobKind {
-        self.complete.kind()
+        self.row.kind
     }
     pub fn digest(&self) -> &[u8; 32] {
-        self.complete.digest()
+        &self.row.digest
     }
     pub fn is_failed(&self) -> bool {
         self.failed.is_some()
     }
-    /// Freshly fence this pin without reading bytes; failures remain terminal.
     pub fn check_deadline(&mut self) -> Result<(), PolicyError> {
         if let Some(error) = self.failed {
             return Err(error);
@@ -165,17 +191,15 @@ impl PinnedBlob<'_, '_> {
 }
 impl BlobReader for PinnedBlob<'_, '_> {
     fn len(&self) -> u64 {
-        self.complete.file().len()
+        self.row.length
     }
     fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<usize, PolicyError> {
         if let Some(error) = self.failed {
             return Err(error);
         }
         let result = checked(&self.clock, || {
-            self.complete
-                .file()
-                .read_at(offset, output)
-                .map_err(blob_io_error)
+            self.native
+                .read_body(self.rowid, self.row.length, offset, output)
         });
         if let Err(error) = result {
             self.failed = Some(error);
@@ -195,7 +219,6 @@ pub fn with_pinned_fixture(bytes: &[u8], clock: &dyn Clock, run: impl FnOnce(Pin
         },
         ids::{AccountId, BlobId, StoreEpoch},
         ports::{Digest, Tick},
-        store_paths::{AccountEntry, Number},
     };
     struct Fixed;
     impl Clock for Fixed {
@@ -210,15 +233,6 @@ pub fn with_pinned_fixture(bytes: &[u8], clock: &dyn Clock, run: impl FnOnce(Pin
     let mut root = fixture.locked();
     let account = AccountId::from_bytes([1; 16]);
     let id = BlobId::from_bytes([0x44; 16]);
-    root.create_accounts_directory().unwrap();
-    for entry in [
-        AccountEntry::Root,
-        AccountEntry::Messages,
-        AccountEntry::Temporary,
-        AccountEntry::Shard(BlobKind::Message, 0x44),
-    ] {
-        root.create_account_directory(account, entry).unwrap();
-    }
     let deadline = Deadline::after(Tick(0), 100).unwrap();
     let store = super::IndexStore::create(
         &mut root,
@@ -229,18 +243,6 @@ pub fn with_pinned_fixture(bytes: &[u8], clock: &dyn Clock, run: impl FnOnce(Pin
     )
     .unwrap();
     store.create_account(account, deadline).unwrap();
-    let mut temp = store
-        .root()
-        .create_temporary(account, Number::new(1).unwrap(), bytes.len() as u64)
-        .unwrap();
-    for chunk in bytes.chunks(super::MAX_FILE_STEP_BYTES) {
-        temp.write(chunk).unwrap();
-    }
-    let published = temp
-        .sync()
-        .unwrap()
-        .publish_blob(BlobKind::Message, id)
-        .unwrap();
     let mut digest = td_crypto::Provider.sha256().unwrap();
     digest.update(bytes).unwrap();
     let row = Row::Blob(BlobRow {
@@ -254,6 +256,7 @@ pub fn with_pinned_fixture(bytes: &[u8], clock: &dyn Clock, run: impl FnOnce(Pin
     let mut value = [0; 64];
     let length = row.encode(&mut value).unwrap();
     let op = Operation::put(crate::format::Table::Blobs, &key[..len], &value[..length]).unwrap();
+    let mut source = bytes;
     store
         .commit(
             &td_crypto::Provider,
@@ -264,7 +267,10 @@ pub fn with_pinned_fixture(bytes: &[u8], clock: &dyn Clock, run: impl FnOnce(Pin
                 deadline,
             },
             &[op],
-            &[published],
+            &mut [super::BlobSource {
+                id,
+                source: &mut source,
+            }],
         )
         .unwrap();
     let mut view = store.view(account, deadline).unwrap();

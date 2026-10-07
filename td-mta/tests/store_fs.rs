@@ -9,11 +9,7 @@ use std::{
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
 };
-use td_mta::{
-    ids::AccountId,
-    store_fs::Directory,
-    store_paths::{AccountEntry, Name, RootEntry},
-};
+use td_mta::store_fs::Directory;
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -48,64 +44,49 @@ fn descriptors_for(path: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn retained_metadata_and_path_lookup_have_distinct_lifetimes() {
+fn retained_root_metadata_survives_path_replacement() {
     let fixture = Fixture::new();
     let original = fixture.0.join("root");
     let moved = fixture.0.join("moved");
-    let name = Name::account(AccountId::from_bytes([7; 16]), AccountEntry::Temporary).unwrap();
-    fs::create_dir_all(original.join(name.as_path().unwrap())).unwrap();
-    let root = Directory::from_path(original.to_str().unwrap()).unwrap();
-    let before = root.open(&name).unwrap();
+    fs::create_dir(&original).unwrap();
+    let before = Directory::from_path(original.to_str().unwrap()).unwrap();
     let expected = identity(before.metadata().unwrap());
     fs::rename(&original, &moved).unwrap();
-    fs::create_dir_all(original.join(name.as_path().unwrap())).unwrap();
-    let after = root.open(&name).unwrap();
+    fs::create_dir(&original).unwrap();
+    let after = Directory::from_path(original.to_str().unwrap()).unwrap();
     assert_ne!(identity(after.metadata().unwrap()), expected);
-    assert_ne!(
-        identity(fs::metadata(original.join(name.as_path().unwrap())).unwrap()),
-        expected
-    );
+    assert_eq!(identity(fs::metadata(&moved).unwrap()), expected);
     assert_eq!(identity(before.metadata().unwrap()), expected);
 }
 
 #[test]
-fn reject_existing_final_and_intermediate_links() {
+fn root_paths_reject_final_and_intermediate_links() {
     let fixture = Fixture::new();
-    let root = fixture.anchor();
-    let account = AccountId::from_bytes([8; 16]);
-    let nested = Name::account(account, AccountEntry::Temporary).unwrap();
-    let accounts = Name::root(RootEntry::Accounts).unwrap();
-    fs::create_dir_all(fixture.0.join(format!("real/{account}/tmp"))).unwrap();
-    symlink("real", fixture.0.join("accounts")).unwrap();
-    for name in [&accounts, &nested] {
+    let real = fixture.0.join("real");
+    fs::create_dir_all(real.join("nested")).unwrap();
+    let link = fixture.0.join("link");
+    symlink(&real, &link).unwrap();
+    for path in [&link, &link.join("nested")] {
         assert_eq!(
-            root.open(name).unwrap_err().kind(),
+            Directory::from_path(path.to_str().unwrap())
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::NotADirectory
         );
     }
-    fs::remove_file(fixture.0.join("accounts")).unwrap();
-    symlink("/", fixture.0.join("accounts")).unwrap();
-    assert_eq!(
-        root.open(&accounts).unwrap_err().kind(),
-        io::ErrorKind::NotADirectory
-    );
 }
 
 #[test]
-fn refuse_regular_files_missing_entries_and_nondirectory_anchors() {
+fn root_paths_refuse_missing_entries_and_regular_files() {
     let fixture = Fixture::new();
-    let root = fixture.anchor();
-    let name = Name::root(RootEntry::Accounts).unwrap();
+    let path = fixture.0.join("not-a-directory");
     assert_eq!(
-        root.open(&name).unwrap_err().kind(),
+        Directory::from_path(path.to_str().unwrap())
+            .unwrap_err()
+            .kind(),
         io::ErrorKind::NotFound
     );
-    let path = fixture.0.join("accounts");
     fs::write(&path, b"unchanged").unwrap();
-    assert_eq!(
-        root.open(&name).unwrap_err().kind(),
-        io::ErrorKind::NotADirectory
-    );
     assert_eq!(
         Directory::from_path(path.to_str().unwrap())
             .unwrap_err()
@@ -124,12 +105,8 @@ fn descriptor_ownership_closes_on_drop_and_does_not_cross_exec() {
         return;
     }
     let fixture = Fixture::new();
-    let path = fixture.0.join("accounts");
-    fs::create_dir(&path).unwrap();
-    let path = fs::canonicalize(path).unwrap();
+    let path = fs::canonicalize(&fixture.0).unwrap();
     let root = fixture.anchor();
-    let name = Name::root(RootEntry::Accounts).unwrap();
-    let child = root.open(&name).unwrap();
     assert_eq!(descriptors_for(&path).len(), 1);
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -152,7 +129,7 @@ fn descriptor_ownership_closes_on_drop_and_does_not_cross_exec() {
         "{stdout}"
     );
     assert_eq!(descriptors_for(&path).len(), 1);
-    drop(child);
+    drop(root);
     assert!(descriptors_for(&path).is_empty());
 }
 

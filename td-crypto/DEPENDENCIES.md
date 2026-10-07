@@ -103,8 +103,12 @@ The shared offline vendor is prepared from the full mail lock; crypto's active
 graph remains unchanged. Both drivers force LIBSQLITE3_SYS_USE_PKG_CONFIG=0
 and reviewed native flags: OMIT_LOAD_EXTENSION, TEMP_STORE=3, MAX_MEMORY=16 MiB,
 MAX_ALLOCATION_SIZE=2 MiB, MAX_LENGTH=69632, MAX_SQL_LENGTH=8192,
-MAX_PAGE_COUNT=8192 and DEFAULT_CACHE_SIZE=-128. Ambient SQLite selection
+MAX_PAGE_COUNT=2097152 and DEFAULT_CACHE_SIZE=-128. Ambient SQLite selection
 controls fail before Cargo. pkg-config/vcpkg support crates compile without
 selecting system SQLite. The same C frame-pointer/debug/remapping policy
 applies to the bundled amalgamation. Host tests establish neither an isolated
 portable SQLite build nor native maximum-input resource qualification.
+
+Bodies use indexed 64 KiB chunk rows with the existing safe query API.
+The native value ceiling covers one chunk plus bounded row overhead;
+spilling and the 8 GiB combined page ceiling are specified in mail STORAGE.md.

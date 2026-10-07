@@ -1,5 +1,5 @@
-//! SQLite metadata transactions and WAL snapshots; message bytes stay in files.
-use super::{LockedRoot, PublishedFile};
+//! Relational mail transactions, immutable body BLOBs and WAL snapshots.
+use super::LockedRoot;
 use crate::{
     format::{
         self,
@@ -8,13 +8,13 @@ use crate::{
         row::Row,
         ObjectType, Sequence, Table,
     },
-    ids::{AccountId, StoreEpoch},
+    ids::{AccountId, BlobId, StoreEpoch},
     ports::{
         self, Change, ChangeAction, ChangeCursor, ChangeRecord, ChangeStep, Clock, Deadline,
-        Mutation, ReadView, Record, ViewIdentity,
+        Digest, Mutation, ReadView, Record, ViewIdentity,
     },
     row_references::ReferenceCheck,
-    store_paths::{AccountEntry, Name, RootEntry},
+    store_paths::{Name, RootEntry},
 };
 use rusqlite::{params, types::ValueRef, Connection, OpenFlags};
 use std::{
@@ -24,34 +24,32 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, TryLockError},
 };
 
-const PAGE_BYTES: u64 = 4096;
-const MAX_PAGES: u64 = 8192;
-const TRANSACTION_WAL_BYTES: u64 = MAX_PAGES * (PAGE_BYTES + 24) + 32;
-const MAX_WAL_BYTES: u64 = 2 * TRANSACTION_WAL_BYTES;
+use crate::limits::{
+    SQLITE_MAX_PAGES as MAX_PAGES, SQLITE_PAGE_BYTES as PAGE_BYTES,
+    SQLITE_TRANSACTION_WAL_BYTES as TRANSACTION_WAL_BYTES, SQLITE_WAL_BYTES as MAX_WAL_BYTES,
+};
 const MAX_OPERATIONS: usize = 4096;
 const MAX_TRANSACTION_BYTES: usize = 1_048_576;
 const VM_STEPS: u64 = 8_000_000;
-const STARTUP_VM_STEPS: u64 = 128_000_000;
-const MAX_BODY_BYTES: u64 = 128 * 1024 * 1024;
+const INTEGRITY_VM_STEPS: u64 = MAX_PAGES * PAGE_BYTES * 128;
+const MAX_SHM_BYTES: u64 = crate::limits::SQLITE_WAL_INDEX_BYTES as u64;
+const MAX_BODY_BYTES: u64 = crate::limits::MAX_MESSAGE_BYTES as u64;
 const APP_ID: i64 = 0x54444d41;
-const UPSERT_RECORD: &str = "INSERT INTO records VALUES(?1,?2,?3,?4,?5) ON CONFLICT(account,t,k) DO UPDATE SET v=excluded.v,changed=excluded.changed";
-const DELETE_OWNING_REFS: &str =
-    "DELETE FROM owning_refs WHERE account=?1 AND owner_t=?2 AND owner_k=?3";
-const NEXT_RECORD: &str =
-    "SELECT k,v,changed FROM records WHERE account=?1 AND t=?2 AND k>?3 ORDER BY k LIMIT 1";
 const NEXT_CHANGE: &str = "SELECT sequence,operation,action,object FROM changes INDEXED BY changes_kind WHERE account=?1 AND kind=?2 AND (sequence>?3 OR (sequence=?3 AND operation>?4)) AND sequence<=?5 ORDER BY sequence,operation LIMIT 1";
-const SCHEMA: &str = "
-CREATE TABLE store(id INTEGER PRIMARY KEY CHECK(id=1), epoch BLOB NOT NULL CHECK(length(epoch)=16));
-CREATE TABLE accounts(id BLOB PRIMARY KEY CHECK(length(id)=16), sequence BLOB NOT NULL CHECK(length(sequence)=8), floor BLOB NOT NULL CHECK(length(floor)=8)) WITHOUT ROWID;
-CREATE TABLE blob_ids(account BLOB NOT NULL, id BLOB NOT NULL CHECK(length(id)=16), PRIMARY KEY(account,id), FOREIGN KEY(account) REFERENCES accounts(id)) WITHOUT ROWID;
-CREATE TABLE records(account BLOB NOT NULL, t INTEGER NOT NULL CHECK(t BETWEEN 1 AND 11), k BLOB NOT NULL CHECK(length(k) BETWEEN 16 AND 1024), v BLOB NOT NULL CHECK(length(v)<=65536), changed BLOB NOT NULL CHECK(length(changed)=8), PRIMARY KEY(account,t,k), FOREIGN KEY(account) REFERENCES accounts(id)) WITHOUT ROWID;
-CREATE TABLE owning_refs(account BLOB NOT NULL, owner_t INTEGER NOT NULL, owner_k BLOB NOT NULL, slot INTEGER NOT NULL CHECK(slot BETWEEN 0 AND 1), target_t INTEGER NOT NULL, target_k BLOB NOT NULL, PRIMARY KEY(account,owner_t,owner_k,slot), FOREIGN KEY(account,owner_t,owner_k) REFERENCES records(account,t,k) ON DELETE CASCADE, FOREIGN KEY(account,target_t,target_k) REFERENCES records(account,t,k) DEFERRABLE INITIALLY DEFERRED) WITHOUT ROWID;
-CREATE INDEX references_target ON owning_refs(account,target_t,target_k);
-CREATE INDEX memberships_mailbox ON records(account,substr(k,17,16),substr(k,1,16)) WHERE t=4;
-CREATE TABLE changes(account BLOB NOT NULL, sequence BLOB NOT NULL CHECK(length(sequence)=8), operation INTEGER NOT NULL CHECK(operation BETWEEN 0 AND 4095), kind INTEGER NOT NULL CHECK(kind IN (1,2,3,5)), action INTEGER NOT NULL CHECK(action BETWEEN 1 AND 3), object BLOB NOT NULL CHECK(length(object)=16), PRIMARY KEY(account,sequence,operation), FOREIGN KEY(account) REFERENCES accounts(id)) WITHOUT ROWID;
-CREATE INDEX changes_kind ON changes(account,kind,sequence,operation);
-CREATE UNIQUE INDEX changes_object ON changes(account,sequence,kind,object);
-";
+#[path = "index/relational.rs"]
+mod relational;
+use relational::SCHEMA;
+#[cfg(test)]
+#[path = "index/crash_tests.rs"]
+mod crash_tests;
+
+/// Borrowed stream for one new body. Its claimed length and digest come from
+/// the transaction's BlobRow and are independently checked before commit.
+pub struct BlobSource<'a> {
+    pub id: BlobId,
+    pub source: &'a mut dyn std::io::Read,
+}
+
 fn lock<T>(value: &Mutex<T>) -> Result<MutexGuard<'_, T>, ports::Error> {
     value.lock().map_err(|_| ports::Error::WriterStopped)
 }
@@ -106,7 +104,7 @@ struct Budget {
     failure: Option<ports::Error>,
     finishing_transaction: bool,
 }
-struct Native {
+pub(in crate::store_fs) struct Native {
     connection: Mutex<Connection>,
     budget: Arc<Mutex<Budget>>,
     clock: Arc<dyn Clock>,
@@ -175,16 +173,25 @@ impl Native {
             .execute_batch(concat!(
                 "PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; ",
                 "PRAGMA temp_store=MEMORY; PRAGMA mmap_size=0; ",
-                "PRAGMA cache_size=-128; PRAGMA cache_spill=OFF; ",
+                "PRAGMA cache_size=-128; PRAGMA cache_spill=ON; ",
                 "PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=0; ",
-                "PRAGMA max_page_count=8192;"
+                "PRAGMA max_page_count=2097152;"
             ))
             .map_err(sql)?;
+        let pages: i64 = connection
+            .pragma_query_value(None, "max_page_count", |row| row.get(0))
+            .map_err(sql)?;
+        if u64::try_from(pages).ok() != Some(MAX_PAGES) {
+            return Err(ports::Error::Invalid);
+        }
         connection
             .set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
             .map_err(sql)?;
         connection
-            .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, 69632)
+            .set_limit(
+                rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
+                crate::limits::SQLITE_VALUE_BYTES,
+            )
             .map_err(sql)?;
         connection
             .set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_SQL_LENGTH, 8192)
@@ -352,11 +359,13 @@ impl<'r> IndexStore<'r> {
         let native = Native::open(&path, Arc::clone(&clock), deadline)?;
         native.run(|db| {
             db.execute_batch(
-                "PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA max_page_count=8192;",
+                "PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA max_page_count=2097152;",
             )
             .map_err(sql)?;
             db.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
-            db.execute_batch(SCHEMA).map_err(sql)?;
+            for statement in SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                db.execute_batch(statement).map_err(sql)?;
+            }
             db.execute(
                 "INSERT INTO store VALUES(1,?1)",
                 [epoch.as_bytes().as_slice()],
@@ -364,7 +373,7 @@ impl<'r> IndexStore<'r> {
             .map_err(sql)?;
             db.pragma_update(None, "application_id", APP_ID)
                 .map_err(sql)?;
-            db.pragma_update(None, "user_version", 1).map_err(sql)?;
+            db.pragma_update(None, "user_version", 2).map_err(sql)?;
             db.execute_batch("COMMIT").map_err(sql)
         })?;
         root.root.directory.file.sync_all()?;
@@ -384,7 +393,12 @@ impl<'r> IndexStore<'r> {
         for name in [RootEntry::Wal, RootEntry::SharedMemory] {
             let sidecar = db_path(root, name)?;
             if optional_metadata(&sidecar)?.is_some() {
-                validate_file(root, &sidecar, MAX_WAL_BYTES)?;
+                let maximum = if name == RootEntry::SharedMemory {
+                    MAX_SHM_BYTES
+                } else {
+                    MAX_WAL_BYTES
+                };
+                validate_file(root, &sidecar, maximum)?;
             }
         }
         let native = Native::open(&path, Arc::clone(&clock), deadline)?;
@@ -400,7 +414,6 @@ impl<'r> IndexStore<'r> {
         if !(1..=8).contains(&views) {
             return Err(ports::Error::Invalid);
         }
-        lock(&native.budget)?.remaining = STARTUP_VM_STEPS;
         let epoch = native.run(|db| {
             let app: i64 = db
                 .pragma_query_value(None, "application_id", |row| row.get(0))
@@ -414,7 +427,7 @@ impl<'r> IndexStore<'r> {
             let page_size: i64 = db
                 .pragma_query_value(None, "page_size", |row| row.get(0))
                 .map_err(sql)?;
-            if app != APP_ID || version != 1 || mode != "wal" || page_size != PAGE_BYTES as i64 {
+            if app != APP_ID || version != 2 || mode != "wal" || page_size != PAGE_BYTES as i64 {
                 return Err(ports::Error::Corrupt);
             }
             let expected = SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty());
@@ -448,22 +461,6 @@ impl<'r> IndexStore<'r> {
                 if actual != statement {
                     return Err(ports::Error::Corrupt);
                 }
-            }
-            let check: String = db
-                .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
-                .map_err(sql)?;
-            if check != "ok" {
-                return Err(ports::Error::Corrupt);
-            }
-            let mut statement = db.prepare("PRAGMA foreign_key_check").map_err(sql)?;
-            if statement
-                .query([])
-                .map_err(sql)?
-                .next()
-                .map_err(sql)?
-                .is_some()
-            {
-                return Err(ports::Error::Corrupt);
             }
             let bytes: [u8; 16] = db
                 .query_row("SELECT epoch FROM store WHERE id=1", [], |row| row.get(0))
@@ -581,6 +578,7 @@ impl<'r> IndexStore<'r> {
                 slot,
                 native: Some(native),
                 identity,
+                failed: None,
             }),
             Err(error) => {
                 let returned = if native.rollback() {
@@ -596,14 +594,14 @@ impl<'r> IndexStore<'r> {
             }
         }
     }
-    /// Atomic metadata-only operation batch. Newly inserted blob rows require a
-    /// matching durably published file from this root, verified before COMMIT.
+    /// Atomically store relational metadata and complete verified body streams.
+    /// Every fresh blob requires exactly one matching source; no body survives rejection.
     pub fn commit<C: ports::Crypto>(
         &self,
         crypto: &C,
         request: CommitRequest,
         operations: &[Operation<'_>],
-        published: &[PublishedFile<'_>],
+        sources: &mut [BlobSource<'_>],
     ) -> Result<Sequence, CommitError> {
         let mut writer = self
             .writer(request.deadline)
@@ -618,7 +616,7 @@ impl<'r> IndexStore<'r> {
         let Writer {
             native, scratch, ..
         } = &mut *writer;
-        let result = self.apply(native, crypto, request, operations, published, scratch);
+        let result = self.apply(native, crypto, request, operations, sources, scratch);
         match result {
             Ok(next) => {
                 finish_commit(&mut writer)?;
@@ -638,7 +636,7 @@ impl<'r> IndexStore<'r> {
         crypto: &C,
         request: CommitRequest,
         operations: &[Operation<'_>],
-        published: &[PublishedFile<'_>],
+        sources: &mut [BlobSource<'_>],
         scratch: &mut [u8],
     ) -> Result<Sequence, ports::Error> {
         let (scratch, values) = scratch
@@ -650,8 +648,29 @@ impl<'r> IndexStore<'r> {
             utc_ms,
             ..
         } = request;
-        if operations.is_empty() || operations.len() > MAX_OPERATIONS {
+        if sources.len() > MAX_OPERATIONS
+            || operations.is_empty()
+            || operations.len() > MAX_OPERATIONS
+        {
             return Err(ports::Error::Capacity);
+        }
+        for (ordinal, source) in sources.iter().enumerate() {
+            if sources
+                .get(..ordinal)
+                .ok_or(ports::Error::Invalid)?
+                .iter()
+                .any(|other| other.id == source.id)
+                || operations
+                    .iter()
+                    .filter(|operation| {
+                        matches!(operation.value(),
+                    Value::Row(Mutation::Put { key: Key::Blob(id), .. }) if id == source.id)
+                    })
+                    .count()
+                    != 1
+            {
+                return Err(ports::Error::Invalid);
+            }
         }
         let bytes = operations.iter().try_fold(0usize, |n, op| {
             n.checked_add(op.encoded_len().map_err(|_| ports::Error::Invalid)?)
@@ -685,41 +704,20 @@ impl<'r> IndexStore<'r> {
             native.check()?;
             match op.value() {
                 Value::Row(Mutation::Put { key, row }) => {
-                    if let Row::Blob(blob) = row {
+                    let fresh = if let (Key::Blob(id), Row::Blob(blob)) = (key, row) {
                         if blob.length > MAX_BODY_BYTES {
                             return Err(ports::Error::Capacity);
                         }
-                        let Key::Blob(id) = key else {
-                            return Err(ports::Error::Invalid);
-                        };
                         let mut old = [0; 64];
                         match view.get(key, &mut old)? {
-                            Some((Row::Blob(previous), _)) if previous == blob => (),
+                            Some((Row::Blob(previous), _)) if previous == blob => {
+                                if sources.iter().any(|source| source.id == id) {
+                                    return Err(ports::Error::Invalid);
+                                }
+                                None
+                            }
                             Some(_) => return Err(ports::Error::Conflict),
                             None => {
-                                let name =
-                                    Name::account(account, AccountEntry::Blob(blob.kind, id))
-                                        .map_err(|_| ports::Error::Invalid)?;
-                                let file = published
-                                    .iter()
-                                    .find(|file| file.name() == &name)
-                                    .ok_or(ports::Error::Invalid)?;
-                                file.verify_owner(self.root)?;
-                                if file.len() != blob.length {
-                                    return Err(ports::Error::Corrupt);
-                                }
-                                let mut input = self
-                                    .root
-                                    .open_blob_input(crypto, account, id, blob, blob.length)
-                                    .map_err(super::pinned::blob_error)?;
-                                while input.position() != input.len() {
-                                    native.check()?;
-                                    if input.read(scratch).map_err(super::pinned::blob_error)? == 0
-                                    {
-                                        return Err(ports::Error::Corrupt);
-                                    }
-                                }
-                                input.finish().map_err(super::pinned::blob_error)?;
                                 native.run(|db| {
                                     db.execute(
                                         "INSERT INTO blob_ids VALUES(?1,?2)",
@@ -731,46 +729,23 @@ impl<'r> IndexStore<'r> {
                                     .map_err(sql)?;
                                     Ok(())
                                 })?;
+                                Some((id, blob))
                             }
                         }
+                    } else {
+                        None
+                    };
+                    native.run(|db| relational::put(db, account, key, row, next))?;
+                    if let Some((id, blob)) = fresh {
+                        let source = sources
+                            .iter_mut()
+                            .find(|source| source.id == id)
+                            .ok_or(ports::Error::Invalid)?;
+                        write_body(native, crypto, account, id, blob, source.source, scratch)?;
                     }
-                    native.run(|db| {
-                        db.execute(
-                            UPSERT_RECORD,
-                            params![
-                                account.as_bytes().as_slice(),
-                                key.table().tag(),
-                                op.key_bytes(),
-                                op.value_bytes(),
-                                next.number().to_be_bytes().as_slice()
-                            ],
-                        )
-                        .map_err(sql)?;
-                        db.execute(
-                            DELETE_OWNING_REFS,
-                            params![
-                                account.as_bytes().as_slice(),
-                                key.table().tag(),
-                                op.key_bytes()
-                            ],
-                        )
-                        .map_err(sql)?;
-                        Ok(())
-                    })?;
                 }
                 Value::Row(Mutation::Delete(key)) => {
-                    native.run(|db| {
-                        db.execute(
-                            "DELETE FROM records WHERE account=?1 AND t=?2 AND k=?3",
-                            params![
-                                account.as_bytes().as_slice(),
-                                key.table().tag(),
-                                op.key_bytes()
-                            ],
-                        )
-                        .map_err(sql)?;
-                        Ok(())
-                    })?;
+                    native.run(|db| relational::delete(db, account, key))?;
                 }
                 Value::Change(change) => {
                     if change.kind == ObjectType::Identity {
@@ -807,7 +782,6 @@ impl<'r> IndexStore<'r> {
                 }
             }
         }
-        let mut target = [0; 1024];
         for op in operations.iter().copied() {
             let Value::Row(Mutation::Put { key, .. }) = op.value() else {
                 continue;
@@ -817,7 +791,6 @@ impl<'r> IndexStore<'r> {
             };
             let mut references = ReferenceCheck::new(identity, key, row, changed, utc_ms)
                 .map_err(|_| ports::Error::Invalid)?;
-            let targets = *references.targets();
             while !references
                 .advance(&mut view, values)
                 .map_err(|error| match error {
@@ -826,28 +799,6 @@ impl<'r> IndexStore<'r> {
                     _ => ports::Error::Conflict,
                 })?
             {}
-            for (slot, reference) in targets.into_iter().enumerate() {
-                let Some(reference) = reference else {
-                    continue;
-                };
-                let key = reference.key();
-                let len = key.encode(&mut target).map_err(|_| ports::Error::Invalid)?;
-                native.run(|db| {
-                    db.execute(
-                        "INSERT OR REPLACE INTO owning_refs VALUES(?1,?2,?3,?4,?5,?6)",
-                        params![
-                            account.as_bytes().as_slice(),
-                            op.type_tag(),
-                            op.key_bytes(),
-                            slot as i64,
-                            key.table().tag(),
-                            target.get(..len).ok_or(ports::Error::Invalid)?
-                        ],
-                    )
-                    .map_err(sql)?;
-                    Ok(())
-                })?;
-            }
             if let Key::Mailbox(id) = key {
                 let mut walk =
                     crate::mailbox_parents::ParentWalk::new(identity, id, MAX_OPERATIONS as u64)
@@ -876,61 +827,33 @@ impl<'r> IndexStore<'r> {
         })?;
         Ok(next)
     }
-    /// Remove one orphan only after the durable database has no blob row and no
-    /// live view can still read an older row. A failed unlink/sync stays charged.
-    pub fn collect_orphan(
-        &self,
-        account: AccountId,
-        kind: crate::format::row::BlobKind,
-        id: crate::ids::BlobId,
-        deadline: Deadline,
-    ) -> Result<(), ports::Error> {
+    /// Full validation under the writer fence; new views and commits return Busy.
+    pub fn validate_integrity(&self, deadline: Deadline) -> Result<(), ports::Error> {
         let writer = self.writer(deadline)?;
         if writer.stopped {
             return Err(ports::Error::WriterStopped);
         }
-        if lock(&self.readers)?
-            .iter()
-            .any(|slot| matches!(slot, ReaderSlot::Borrowed))
-        {
-            return Err(ports::Error::Busy);
-        }
         writer.native.begin_work(deadline)?;
+        lock(&writer.native.budget)?.remaining = INTEGRITY_VM_STEPS;
         writer.native.run(|db| {
-            identity(db, account, self.epoch)?;
-            let present: bool = db
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM records WHERE account=?1 AND t=1 AND k=?2)",
-                    params![account.as_bytes().as_slice(), id.as_bytes().as_slice()],
-                    |row| row.get(0),
-                )
+            let check: String = db
+                .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
                 .map_err(sql)?;
-            if present {
-                return Err(ports::Error::Conflict);
+            if check != "ok" {
+                return Err(ports::Error::Corrupt);
+            }
+            let mut statement = db.prepare("PRAGMA foreign_key_check").map_err(sql)?;
+            if statement
+                .query([])
+                .map_err(sql)?
+                .next()
+                .map_err(sql)?
+                .is_some()
+            {
+                return Err(ports::Error::Corrupt);
             }
             Ok(())
-        })?;
-        let name = Name::account(account, AccountEntry::Blob(kind, id))
-            .map_err(|_| ports::Error::Invalid)?;
-        let mut buffer = [0; super::MAX_PATH_BYTES];
-        let destination = self.root.root.directory.destination(&name, &mut buffer)?;
-        match fs::symlink_metadata(destination.path) {
-            Ok(metadata) => {
-                if !metadata.is_file()
-                    || metadata.uid() != destination.owner
-                    || metadata.mode() & 0o7777 != 0o600
-                    || metadata.nlink() != 1
-                {
-                    return Err(ports::Error::Corrupt);
-                }
-                writer.native.check()?;
-                fs::remove_file(destination.path)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error.into()),
-        }
-        destination.parent.file.sync_all()?;
-        writer.native.check()
+        })
     }
     /// Reclaim WAL only when no view owns a SQLite read transaction.
     pub fn checkpoint(&self, deadline: Deadline) -> Result<(), ports::Error> {
@@ -960,6 +883,108 @@ impl<'r> IndexStore<'r> {
         Ok(())
     }
 }
+fn body_rowid(db: &Connection, account: AccountId, id: BlobId) -> Result<i64, ports::Error> {
+    db.query_row(
+        "SELECT rowid FROM blobs WHERE account=?1 AND id=?2",
+        params![account.as_bytes().as_slice(), id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )
+    .map_err(sql)
+}
+fn write_body<C: ports::Crypto>(
+    native: &Native,
+    crypto: &C,
+    account: AccountId,
+    id: BlobId,
+    expected: format::row::BlobRow,
+    source: &mut dyn std::io::Read,
+    scratch: &mut [u8],
+) -> Result<(), ports::Error> {
+    let mut digest = crypto.sha256()?;
+    native.run(|db| {
+        let mut insert = db
+            .prepare("INSERT INTO blob_chunks(account,blob,ordinal,body) VALUES(?1,?2,?3,?4)")
+            .map_err(sql)?;
+        let mut position = 0_u64;
+        let mut ordinal = 0_i64;
+        while position < expected.length {
+            let count = usize::try_from(expected.length - position)
+                .map_err(|_| ports::Error::Capacity)?
+                .min(super::MAX_FILE_STEP_BYTES);
+            let bytes = scratch.get_mut(..count).ok_or(ports::Error::Capacity)?;
+            let mut filled = 0;
+            while filled < count {
+                native.check()?;
+                let read = source.read(bytes.get_mut(filled..).ok_or(ports::Error::Corrupt)?)?;
+                native.check()?;
+                if read == 0 || read > count - filled {
+                    return Err(ports::Error::Corrupt);
+                }
+                filled += read;
+            }
+            digest.update(bytes)?;
+            insert
+                .execute(params![
+                    account.as_bytes().as_slice(),
+                    id.as_bytes().as_slice(),
+                    ordinal,
+                    &*bytes
+                ])
+                .map_err(sql)?;
+            position += count as u64;
+            ordinal += 1;
+            native.check()?;
+        }
+        let mut extra = [0; 1];
+        native.check()?;
+        let count = source.read(&mut extra)?;
+        native.check()?;
+        if count != 0 || !crypto.equal_digest(&digest.finish()?, &expected.digest) {
+            return Err(ports::Error::Corrupt);
+        }
+        Ok(())
+    })
+}
+impl Native {
+    pub(in crate::store_fs) fn read_body(
+        &self,
+        rowid: i64,
+        length: u64,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, ports::Error> {
+        let remaining = length.checked_sub(offset).ok_or(ports::Error::Invalid)?;
+        let count = usize::try_from(remaining)
+            .map_err(|_| ports::Error::Capacity)?
+            .min(output.len())
+            .min(super::MAX_FILE_STEP_BYTES);
+        self.run(|db| {
+            let mut query = db.prepare("SELECT c.body FROM blobs AS b JOIN blob_chunks AS c ON c.account=b.account AND c.blob=b.id WHERE b.rowid=?1 AND c.ordinal=?2").map_err(sql)?;
+            let mut copied = 0;
+            while copied < count {
+                let position = offset + copied as u64;
+                let chunk_bytes = super::MAX_FILE_STEP_BYTES as u64;
+                let ordinal = position / chunk_bytes;
+                let within = (position % chunk_bytes) as usize;
+                let expected = (length - ordinal * chunk_bytes).min(chunk_bytes) as usize;
+                let mut rows = query.query(params![rowid, i64::try_from(ordinal).map_err(|_| ports::Error::Invalid)?]).map_err(sql)?;
+                let row = rows.next().map_err(sql)?.ok_or(ports::Error::Corrupt)?;
+                let ValueRef::Blob(bytes) = row.get_ref(0).map_err(sql)? else {
+                    return Err(ports::Error::Corrupt);
+                };
+                if bytes.len() != expected {
+                    return Err(ports::Error::Corrupt);
+                }
+                let take = (expected - within).min(count - copied);
+                output.get_mut(copied..copied + take).ok_or(ports::Error::Corrupt)?
+                    .copy_from_slice(bytes.get(within..within + take).ok_or(ports::Error::Corrupt)?);
+                copied += take;
+            }
+            Ok(count)
+        })
+    }
+}
+
 fn db_path(root: &LockedRoot, entry: RootEntry) -> Result<std::path::PathBuf, ports::Error> {
     let path = std::str::from_utf8(
         root.root
@@ -1141,21 +1166,49 @@ pub struct IndexReadView<'s, 'r> {
     slot: usize,
     native: Option<Native>,
     identity: ViewIdentity,
+    failed: Option<ports::Error>,
 }
 impl IndexReadView<'_, '_> {
     fn native(&self) -> Result<&Native, ports::Error> {
         self.native.as_ref().ok_or(ports::Error::WriterStopped)
     }
-    pub(in crate::store_fs) fn blob_scope(
-        &self,
-    ) -> Result<(&LockedRoot, &dyn Clock, Deadline), ports::Error> {
+    fn read_snapshot<T>(
+        &mut self,
+        read: impl FnOnce(&Native) -> Result<T, ports::Error>,
+    ) -> Result<T, ports::Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
         let native = self.native()?;
-        native.check()?;
-        Ok((
-            self.store.root,
-            native as &dyn Clock,
-            lock(&native.budget)?.deadline,
-        ))
+        // SQLite may end a read transaction after NOMEM, IOERR or FULL.
+        let live = lock(&native.connection).map(|db| !db.is_autocommit());
+        if !matches!(live, Ok(true)) {
+            let error = live.err().unwrap_or(ports::Error::Corrupt);
+            self.failed = Some(error);
+            return Err(error);
+        }
+        let result = read(native);
+        let live = lock(&native.connection).map(|db| !db.is_autocommit());
+        if !matches!(live, Ok(true)) {
+            let error = live
+                .err()
+                .or_else(|| result.as_ref().err().copied())
+                .unwrap_or(ports::Error::Corrupt);
+            self.failed = Some(error);
+            return Err(error);
+        }
+        result
+    }
+    pub(in crate::store_fs) fn blob_scope(&mut self) -> Result<(&Native, Deadline), ports::Error> {
+        let deadline = self.read_snapshot(|native| {
+            native.check()?;
+            Ok(lock(&native.budget)?.deadline)
+        })?;
+        Ok((self.native()?, deadline))
+    }
+    pub(in crate::store_fs) fn blob_rowid(&mut self, id: BlobId) -> Result<i64, ports::Error> {
+        let account = self.identity.account;
+        self.read_snapshot(|native| native.run(|db| body_rowid(db, account, id)))
     }
     pub fn root(&self) -> &LockedRoot {
         self.store.root
@@ -1170,7 +1223,8 @@ impl ReadView for IndexReadView<'_, '_> {
         key: Key<'_>,
         value: &'a mut [u8],
     ) -> Result<Option<(Row<'a>, Sequence)>, ports::Error> {
-        get(self.native()?, self.identity, key, value)
+        let identity = self.identity;
+        self.read_snapshot(|native| get(native, identity, key, value))
     }
     fn next<'a>(
         &mut self,
@@ -1179,20 +1233,25 @@ impl ReadView for IndexReadView<'_, '_> {
         key: &'a mut [u8],
         value: &'a mut [u8],
     ) -> Result<Option<Record<'a>>, ports::Error> {
-        next(self.native()?, self.identity, table, after, key, value)
+        let identity = self.identity;
+        self.read_snapshot(|native| next(native, identity, table, after, key, value))
     }
     fn next_change(
         &mut self,
         after: ChangeCursor,
         kind: ObjectType,
     ) -> Result<ChangeStep, ports::Error> {
-        next_change(self.native()?, self.identity, after, kind)
+        let identity = self.identity;
+        self.read_snapshot(|native| next_change(native, identity, after, kind))
     }
 }
 impl Drop for IndexReadView<'_, '_> {
     fn drop(&mut self) {
         if let Some(native) = self.native.take() {
-            let returned = if native.rollback() {
+            let returned = if self.failed.is_some() {
+                drop(native);
+                ReaderSlot::Retired
+            } else if native.rollback() {
                 ReaderSlot::Available(native)
             } else {
                 drop(native);
@@ -1213,29 +1272,7 @@ fn get<'a>(
     value: &'a mut [u8],
 ) -> Result<Option<(Row<'a>, Sequence)>, ports::Error> {
     key.validate_local().map_err(|_| ports::Error::Invalid)?;
-    let mut encoded = [0; 1024];
-    let len = key
-        .encode(&mut encoded)
-        .map_err(|_| ports::Error::Invalid)?;
-    let result = native.run(|db| {
-        let mut statement = db
-            .prepare("SELECT v,changed FROM records WHERE account=?1 AND t=?2 AND k=?3")
-            .map_err(sql)?;
-        let mut rows = statement
-            .query(params![
-                identity.account.as_bytes().as_slice(),
-                key.table().tag(),
-                encoded.get(..len).ok_or(ports::Error::Invalid)?
-            ])
-            .map_err(sql)?;
-        let Some(row) = rows.next().map_err(sql)? else {
-            return Ok(None);
-        };
-        let length = copy_blob(row, 0, value)?;
-        let mut changed = [0; 8];
-        copy_blob(row, 1, &mut changed)?;
-        Ok(Some((length, sequence(&changed)?)))
-    })?;
+    let result = native.run(|db| relational::get(db, identity.account, key, value))?;
     let Some((length, changed)) = result else {
         return Ok(None);
     };
@@ -1263,24 +1300,8 @@ fn next<'a>(
             .and_then(Key::validate_local)
             .map_err(|_| ports::Error::Invalid)?;
     }
-    let found = native.run(|db| {
-        let mut statement = db.prepare(NEXT_RECORD).map_err(sql)?;
-        let mut rows = statement
-            .query(params![
-                identity.account.as_bytes().as_slice(),
-                table.tag(),
-                after.unwrap_or(&[])
-            ])
-            .map_err(sql)?;
-        let Some(row) = rows.next().map_err(sql)? else {
-            return Ok(None);
-        };
-        let kl = copy_blob(row, 0, key)?;
-        let vl = copy_blob(row, 1, value)?;
-        let mut changed = [0; 8];
-        copy_blob(row, 2, &mut changed)?;
-        Ok(Some((kl, vl, sequence(&changed)?)))
-    })?;
+    let found =
+        native.run(|db| relational::next(db, identity.account, table, after, key, value))?;
     let Some((kl, vl, last_change)) = found else {
         return Ok(None);
     };
@@ -1389,7 +1410,6 @@ mod tests {
         format::row::{BlobKind, BlobRow, EmailOrigin, EmailRow, LeaseRow, LeaseUse, MailboxRow},
         ids::{BlobId, DeviceId, EmailId, MailboxId, ThreadId},
         ports::{Crypto, Digest, Tick, Time},
-        store_paths::Number,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     struct Timer(AtomicU64);
@@ -1421,7 +1441,112 @@ mod tests {
     }
     const ACCOUNT: AccountId = AccountId::from_bytes([1; 16]);
     const ID: MailboxId = MailboxId::from_bytes([2; 16]);
-    const MEMBERSHIP_EMAIL: &str = "SELECT substr(k,1,16) FROM records INDEXED BY memberships_mailbox WHERE account=?1 AND t=4 AND substr(k,17,16)=?2";
+    const MEMBERSHIP_EMAIL: &str = "SELECT email_id FROM memberships INDEXED BY memberships_mailbox WHERE account=?1 AND mailbox_id=?2";
+    #[test]
+    fn lost_read_transactions_never_resume_under_an_old_view_identity() {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let clock = Arc::new(Timer(AtomicU64::new(1)));
+        let epoch = StoreEpoch::from_bytes([9; 16]);
+        let store = IndexStore::create(&mut root, epoch, clock.clone(), 2, deadline()).unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        let old = mailbox("old", None);
+        let operation = Operation::put(Table::Mailboxes, ID.as_bytes(), &old).unwrap();
+        store
+            .commit(
+                &td_crypto::Provider,
+                CommitRequest {
+                    account: ACCOUNT,
+                    expected: Sequence::default(),
+                    utc_ms: 0,
+                    deadline: deadline(),
+                },
+                &[operation],
+                &mut [],
+            )
+            .unwrap();
+        let mut failed = store.view(ACCOUNT, deadline()).unwrap();
+        let mut vanished = store.view(ACCOUNT, deadline()).unwrap();
+        let interrupted: Result<(), ports::Error> = failed.read_snapshot(|native| {
+            native.run(|db| {
+                db.execute_batch("ROLLBACK").map_err(sql)?;
+                Err(ports::Error::Capacity)
+            })
+        });
+        assert_eq!(interrupted, Err(ports::Error::Capacity));
+        vanished
+            .native()
+            .unwrap()
+            .run(|db| db.execute_batch("ROLLBACK").map_err(sql))
+            .unwrap();
+        let updated = mailbox("new", None);
+        let operation = Operation::put(Table::Mailboxes, ID.as_bytes(), &updated).unwrap();
+        store
+            .commit(
+                &td_crypto::Provider,
+                CommitRequest {
+                    account: ACCOUNT,
+                    expected: Sequence::from_u64(1),
+                    utc_ms: 0,
+                    deadline: deadline(),
+                },
+                &[operation],
+                &mut [],
+            )
+            .unwrap();
+        assert_eq!(failed.identity().committed_sequence, Sequence::from_u64(1));
+        assert_eq!(
+            vanished.identity().committed_sequence,
+            Sequence::from_u64(1)
+        );
+        assert_eq!(
+            failed.get(Key::Mailbox(ID), &mut [0; 128]),
+            Err(ports::Error::Capacity)
+        );
+        assert_eq!(
+            vanished.get(Key::Mailbox(ID), &mut [0; 128]),
+            Err(ports::Error::Corrupt)
+        );
+        fn assert_lost_view(view: &mut IndexReadView<'_, '_>, expected: ports::Error) {
+            view.native()
+                .unwrap()
+                .run(|db| db.execute_batch("BEGIN DEFERRED").map_err(sql))
+                .unwrap();
+            assert_eq!(
+                view.next(Table::Mailboxes, None, &mut [0; 64], &mut [0; 128]),
+                Err(expected)
+            );
+            assert_eq!(
+                view.next_change(
+                    ChangeCursor {
+                        sequence: Sequence::default(),
+                        operation: u32::MAX,
+                    },
+                    ObjectType::Mailbox,
+                ),
+                Err(expected)
+            );
+            assert!(matches!(
+                view.open_blob_input(&td_crypto::Provider, BlobId::from_bytes([3; 16]), 32),
+                Err(error) if error == expected
+            ));
+        }
+        assert_lost_view(&mut failed, ports::Error::Capacity);
+        assert_lost_view(&mut vanished, ports::Error::Corrupt);
+        drop(failed);
+        drop(vanished);
+        assert!(matches!(
+            store.view(ACCOUNT, deadline()),
+            Err(ports::Error::Busy)
+        ));
+        drop(store);
+        let reopened = IndexStore::open(&mut root, clock, 1, deadline()).unwrap();
+        let mut fresh = reopened.view(ACCOUNT, deadline()).unwrap();
+        assert!(matches!(
+            fresh.get(Key::Mailbox(ID), &mut [0; 128]).unwrap(),
+            Some((Row::Mailbox(MailboxRow { name: "new", .. }), _))
+        ));
+    }
     #[test]
     fn sqlite_transactions_reopen_and_snapshot_real_metadata() {
         let fixture = Fixture::maximum_root();
@@ -1448,7 +1573,7 @@ mod tests {
                     deadline: deadline()
                 },
                 &[op],
-                &[]
+                &mut []
             ),
             Ok(Sequence::from_u64(1))
         );
@@ -1465,7 +1590,7 @@ mod tests {
                     deadline: deadline(),
                 },
                 &[op],
-                &[],
+                &mut [],
             )
             .unwrap();
         let mut second = store.view(ACCOUNT, deadline()).unwrap();
@@ -1525,7 +1650,7 @@ mod tests {
                     deadline: deadline()
                 },
                 &[child],
-                &[]
+                &mut []
             ),
             Err(CommitError::Rejected(ports::Error::Conflict))
         ));
@@ -1541,7 +1666,7 @@ mod tests {
                     deadline: deadline(),
                 },
                 &[child, parent_op],
-                &[],
+                &mut [],
             )
             .unwrap();
         let delete = Operation::delete(Table::Mailboxes, parent.as_bytes()).unwrap();
@@ -1555,7 +1680,7 @@ mod tests {
                     deadline: deadline()
                 },
                 &[delete],
-                &[]
+                &mut []
             ),
             Err(CommitError::Rejected(ports::Error::Conflict))
         ));
@@ -1571,7 +1696,7 @@ mod tests {
                     deadline: deadline()
                 },
                 &[op],
-                &[]
+                &mut []
             ),
             Err(CommitError::Rejected(ports::Error::Conflict))
         ));
@@ -1637,7 +1762,7 @@ mod tests {
                     deadline: deadline()
                 },
                 &[op],
-                &[]
+                &mut []
             ),
             Ok(Sequence::from_u64(u64::MAX))
         );
@@ -1651,7 +1776,7 @@ mod tests {
                     deadline: deadline()
                 },
                 &[op],
-                &[]
+                &mut []
             ),
             Err(CommitError::Rejected(ports::Error::Capacity))
         );
@@ -1679,7 +1804,7 @@ mod tests {
             deadline: deadline(),
         };
         assert_eq!(
-            store.commit(&td_crypto::Provider, request, &[put, created], &[]),
+            store.commit(&td_crypto::Provider, request, &[put, created], &mut []),
             Ok(Sequence::from_u64(1))
         );
         let mut old = store.view(ACCOUNT, deadline()).unwrap();
@@ -1688,19 +1813,24 @@ mod tests {
             ..request
         };
         assert_eq!(
-            store.commit(&td_crypto::Provider, request, &[created], &[]),
+            store.commit(&td_crypto::Provider, request, &[created], &mut []),
             Err(CommitError::Rejected(ports::Error::Invalid))
         );
         let updated = Operation::change(ObjectType::Mailbox, ChangeAction::Updated, ID.as_bytes());
         assert_eq!(
-            store.commit(&td_crypto::Provider, request, &[updated, updated], &[]),
+            store.commit(&td_crypto::Provider, request, &[updated, updated], &mut []),
             Err(CommitError::Rejected(ports::Error::Conflict))
         );
         let deleted = Operation::delete(Table::Mailboxes, ID.as_bytes()).unwrap();
         let destroyed =
             Operation::change(ObjectType::Mailbox, ChangeAction::Destroyed, ID.as_bytes());
         assert_eq!(
-            store.commit(&td_crypto::Provider, request, &[deleted, destroyed], &[]),
+            store.commit(
+                &td_crypto::Provider,
+                request,
+                &[deleted, destroyed],
+                &mut []
+            ),
             Ok(Sequence::from_u64(2))
         );
         let start = ChangeCursor {
@@ -1844,12 +1974,12 @@ mod tests {
             deadline: deadline(),
         };
         assert_eq!(
-            store.commit(&td_crypto::Provider, request, &[op], &[]),
+            store.commit(&td_crypto::Provider, request, &[op], &mut []),
             Ok(Sequence::from_u64(1))
         );
         timer.0.store(1, Ordering::Relaxed);
         assert_eq!(
-            store.commit(&td_crypto::Provider, request, &[op], &[]),
+            store.commit(&td_crypto::Provider, request, &[op], &mut []),
             Err(CommitError::Rejected(ports::Error::Conflict))
         );
         assert_eq!(
@@ -1876,20 +2006,245 @@ mod tests {
             ))
         ));
     }
+    fn body_row(bytes: &[u8], kind: BlobKind) -> BlobRow {
+        let mut digest = td_crypto::Provider.sha256().unwrap();
+        digest.update(bytes).unwrap();
+        BlobRow {
+            kind,
+            length: bytes.len() as u64,
+            digest: digest.finish().unwrap(),
+            created_at: 0,
+        }
+    }
+    fn request(sequence: u64) -> CommitRequest {
+        CommitRequest {
+            account: ACCOUNT,
+            expected: Sequence::from_u64(sequence),
+            utc_ms: 0,
+            deadline: deadline(),
+        }
+    }
     #[test]
-    fn raw_mail_files_are_verified_before_commit_and_pinned_until_gc() {
+    fn database_bodies_are_verified_atomic_and_survive_old_snapshots() {
         let fixture = Fixture::new();
         let mut root = fixture.locked();
+        let timer = Arc::new(Timer(AtomicU64::new(1)));
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            timer.clone(),
+            2,
+            deadline(),
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
         let id = BlobId::from_bytes([4; 16]);
-        root.create_accounts_directory().unwrap();
-        for entry in [
-            AccountEntry::Root,
-            AccountEntry::Messages,
-            AccountEntry::Temporary,
-            AccountEntry::Shard(BlobKind::Message, 4),
+        let raw = b"Subject: test\r\n\r\nbody\r\n";
+        let row = body_row(raw, BlobKind::Message);
+        let value = encode(Row::Blob(row));
+        let op = Operation::put(Table::Blobs, id.as_bytes(), &value).unwrap();
+        assert_eq!(
+            store.commit(&td_crypto::Provider, request(0), &[op], &mut []),
+            Err(CommitError::Rejected(ports::Error::Invalid))
+        );
+        for mut bad in [
+            &raw[..raw.len() - 1],
+            &raw[..0],
+            b"incorrect digest bytes!".as_slice(),
         ] {
-            root.create_account_directory(ACCOUNT, entry).unwrap();
+            assert_eq!(
+                store.commit(
+                    &td_crypto::Provider,
+                    request(0),
+                    &[op],
+                    &mut [BlobSource {
+                        id,
+                        source: &mut bad
+                    }]
+                ),
+                Err(CommitError::Rejected(ports::Error::Corrupt))
+            );
+            let mut view = store.view(ACCOUNT, deadline()).unwrap();
+            assert!(view.get(Key::Blob(id), &mut [0; 64]).unwrap().is_none());
+            assert_eq!(view.identity().committed_sequence, Sequence::default());
         }
+        let wrong_digest = encode(Row::Blob(BlobRow {
+            digest: [0; 32],
+            ..row
+        }));
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                request(0),
+                &[Operation::put(Table::Blobs, id.as_bytes(), &wrong_digest).unwrap()],
+                &mut [BlobSource {
+                    id,
+                    source: &mut raw.as_slice()
+                }]
+            ),
+            Err(CommitError::Rejected(ports::Error::Corrupt))
+        );
+        let longer = [raw.as_slice(), b"extra"].concat();
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                request(0),
+                &[op],
+                &mut [BlobSource {
+                    id,
+                    source: &mut longer.as_slice()
+                }]
+            ),
+            Err(CommitError::Rejected(ports::Error::Corrupt))
+        );
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                request(0),
+                &[op],
+                &mut [BlobSource {
+                    id,
+                    source: &mut raw.as_slice()
+                }]
+            ),
+            Ok(Sequence::from_u64(1))
+        );
+        let mut view = store.view(ACCOUNT, deadline()).unwrap();
+        let mut input = view
+            .open_blob_input(&td_crypto::Provider, id, row.length)
+            .unwrap();
+        let mut bytes = [0; 128];
+        assert_eq!(input.read(&mut bytes).unwrap(), raw.len());
+        let mut body = input.finish().unwrap();
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                request(1),
+                &[Operation::delete(Table::Blobs, id.as_bytes()).unwrap()],
+                &mut []
+            ),
+            Ok(Sequence::from_u64(2))
+        );
+        assert_eq!(
+            ports::BlobReader::read_at(&mut body, 0, &mut bytes).unwrap(),
+            raw.len()
+        );
+        assert_eq!(&bytes[..raw.len()], raw);
+        {
+            let mut fresh = store.view(ACCOUNT, deadline()).unwrap();
+            assert!(fresh.get(Key::Blob(id), &mut [0; 64]).unwrap().is_none());
+        }
+        assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                request(2),
+                &[op],
+                &mut [BlobSource {
+                    id,
+                    source: &mut raw.as_slice()
+                }]
+            ),
+            Err(CommitError::Rejected(ports::Error::Conflict))
+        );
+        timer.0.store(100, Ordering::Relaxed);
+        assert_eq!(body.check_deadline(), Err(ports::Error::Deadline));
+        timer.0.store(1, Ordering::Relaxed);
+        assert_eq!(body.check_deadline(), Err(ports::Error::Deadline));
+        drop(body);
+        drop(view);
+        store.checkpoint(deadline()).unwrap();
+        assert!(!fixture.path.join("accounts").exists());
+    }
+
+    #[test]
+    fn maximum_body_streams_with_fixed_scratch_and_reopens() {
+        use std::io::Read;
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            Arc::new(Timer(AtomicU64::new(1))),
+            1,
+            deadline(),
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        let id = BlobId::from_bytes([4; 16]);
+        let chunk = [0x5a; super::super::MAX_FILE_STEP_BYTES];
+        let mut digest = td_crypto::Provider.sha256().unwrap();
+        for _ in 0..MAX_BODY_BYTES / chunk.len() as u64 {
+            digest.update(&chunk).unwrap();
+        }
+        let value = encode(Row::Blob(BlobRow {
+            kind: BlobKind::Message,
+            length: MAX_BODY_BYTES,
+            digest: digest.finish().unwrap(),
+            created_at: 0,
+        }));
+        let op = Operation::put(Table::Blobs, id.as_bytes(), &value).unwrap();
+        let mut source = std::io::repeat(0x5a).take(MAX_BODY_BYTES);
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                request(0),
+                &[op],
+                &mut [BlobSource {
+                    id,
+                    source: &mut source
+                }]
+            ),
+            Ok(Sequence::from_u64(1))
+        );
+        assert_eq!(
+            store.commit(&td_crypto::Provider, request(1), &[op], &mut []),
+            Ok(Sequence::from_u64(2))
+        );
+        {
+            let mut view = store.view(ACCOUNT, deadline()).unwrap();
+            let mut row = [0; 64];
+            assert_eq!(
+                view.get(Key::Blob(id), &mut row).unwrap().unwrap().1,
+                Sequence::from_u64(1)
+            );
+        }
+        drop(store);
+        let reopened =
+            IndexStore::open(&mut root, Arc::new(Timer(AtomicU64::new(1))), 1, deadline()).unwrap();
+        let mut view = reopened.view(ACCOUNT, deadline()).unwrap();
+        let mut input = view
+            .open_blob_input(&td_crypto::Provider, id, MAX_BODY_BYTES)
+            .unwrap();
+        let mut output = [0; super::super::MAX_FILE_STEP_BYTES];
+        while input.position() < input.len() {
+            let count = input.read(&mut output).unwrap();
+            assert!(count > 0);
+            assert!(output[..count].iter().all(|byte| *byte == 0x5a));
+        }
+        let mut pin = input.finish().unwrap();
+        assert_eq!(
+            ports::BlobReader::read_at(&mut pin, 4093, &mut output).unwrap(),
+            output.len()
+        );
+        assert!(output.iter().all(|byte| *byte == 0x5a));
+    }
+
+    #[test]
+    fn deadline_during_body_copy_rolls_back_content_and_metadata() {
+        struct Expiring<'a> {
+            timer: &'a Timer,
+            bytes: &'a [u8],
+        }
+        impl std::io::Read for Expiring<'_> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let n = std::io::Read::read(&mut self.bytes, output)?;
+                self.timer.0.store(100, Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
         let timer = Arc::new(Timer(AtomicU64::new(1)));
         let store = IndexStore::create(
             &mut root,
@@ -1900,138 +2255,107 @@ mod tests {
         )
         .unwrap();
         store.create_account(ACCOUNT, deadline()).unwrap();
-        let raw = b"Subject: test\r\n\r\nbody\r\n";
-        let mut digest = td_crypto::Provider.sha256().unwrap();
-        digest.update(raw).unwrap();
-        let row = BlobRow {
-            kind: BlobKind::Message,
-            length: raw.len() as u64,
-            digest: digest.finish().unwrap(),
-            created_at: 0,
-        };
-        let value = encode(Row::Blob(row));
+        let id = BlobId::from_bytes([4; 16]);
+        let value = encode(Row::Blob(body_row(b"body", BlobKind::Message)));
         let op = Operation::put(Table::Blobs, id.as_bytes(), &value).unwrap();
-        assert!(matches!(
-            store.commit(
-                &td_crypto::Provider,
-                CommitRequest {
-                    account: ACCOUNT,
-                    expected: Sequence::default(),
-                    utc_ms: 0,
-                    deadline: deadline()
-                },
-                &[op],
-                &[]
-            ),
-            Err(CommitError::Rejected(ports::Error::Invalid))
-        ));
-        let mut temp = store
-            .root()
-            .create_temporary(ACCOUNT, Number::new(1).unwrap(), raw.len() as u64)
-            .unwrap();
-        temp.write(raw).unwrap();
-        let published = [temp
-            .sync()
-            .unwrap()
-            .publish_blob(BlobKind::Message, id)
-            .unwrap()];
-        let bad = encode(Row::Blob(BlobRow {
-            digest: [0; 32],
-            ..row
-        }));
-        let bad_op = Operation::put(Table::Blobs, id.as_bytes(), &bad).unwrap();
+        let mut expiring = Expiring {
+            timer: &timer,
+            bytes: b"body",
+        };
         assert_eq!(
             store.commit(
                 &td_crypto::Provider,
-                CommitRequest {
-                    account: ACCOUNT,
-                    expected: Sequence::default(),
-                    utc_ms: 0,
-                    deadline: deadline()
-                },
-                &[bad_op],
-                &published
-            ),
-            Err(CommitError::Rejected(ports::Error::Corrupt))
-        );
-        store
-            .commit(
-                &td_crypto::Provider,
-                CommitRequest {
-                    account: ACCOUNT,
-                    expected: Sequence::default(),
-                    utc_ms: 0,
-                    deadline: deadline(),
-                },
+                request(0),
                 &[op],
-                &published,
-            )
-            .unwrap();
-        let mut view = store.view(ACCOUNT, deadline()).unwrap();
-        let mut input = view
-            .open_blob_input(&td_crypto::Provider, id, row.length)
-            .unwrap();
-        let mut bytes = [0; 128];
-        assert_eq!(input.read(&mut bytes).unwrap(), raw.len());
-        let mut body = input.finish().unwrap();
-        store
-            .commit(
-                &td_crypto::Provider,
-                CommitRequest {
-                    account: ACCOUNT,
-                    expected: Sequence::from_u64(1),
-                    utc_ms: 0,
-                    deadline: deadline(),
-                },
-                &[Operation::delete(Table::Blobs, id.as_bytes()).unwrap()],
-                &[],
-            )
-            .unwrap();
-        assert_eq!(
-            store.commit(
-                &td_crypto::Provider,
-                CommitRequest {
-                    account: ACCOUNT,
-                    expected: Sequence::from_u64(2),
-                    utc_ms: 0,
-                    deadline: deadline()
-                },
-                &[op],
-                &published
+                &mut [BlobSource {
+                    id,
+                    source: &mut expiring
+                }]
             ),
-            Err(CommitError::Rejected(ports::Error::Conflict))
+            Err(CommitError::Rejected(ports::Error::Deadline))
         );
-        assert_eq!(
-            store.collect_orphan(ACCOUNT, BlobKind::Message, id, deadline()),
-            Err(ports::Error::Busy)
-        );
-        assert_eq!(
-            ports::BlobReader::read_at(&mut body, 0, &mut bytes).unwrap(),
-            raw.len()
-        );
-        assert_eq!(&bytes[..raw.len()], raw);
-        timer.0.store(100, Ordering::Relaxed);
-        assert_eq!(body.check_deadline(), Err(ports::Error::Deadline));
         timer.0.store(1, Ordering::Relaxed);
-        assert_eq!(body.check_deadline(), Err(ports::Error::Deadline));
-        drop(body);
+        {
+            let mut view = store.view(ACCOUNT, deadline()).unwrap();
+            assert_eq!(view.identity().committed_sequence, Sequence::default());
+            assert!(view.get(Key::Blob(id), &mut [0; 64]).unwrap().is_none());
+        }
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                request(0),
+                &[op],
+                &mut [BlobSource {
+                    id,
+                    source: &mut b"body".as_slice()
+                }]
+            ),
+            Ok(Sequence::from_u64(1))
+        );
+    }
+
+    #[test]
+    fn empty_body_and_stream_errors_preserve_atomic_metadata() {
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::StorageFull.into())
+            }
+        }
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            Arc::new(Timer(AtomicU64::new(1))),
+            1,
+            deadline(),
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        let id = BlobId::from_bytes([4; 16]);
+        let value = encode(Row::Blob(body_row(b"", BlobKind::Upload)));
+        let mailbox = mailbox("must roll back", None);
+        let ops = [
+            Operation::put(Table::Mailboxes, ID.as_bytes(), &mailbox).unwrap(),
+            Operation::put(Table::Blobs, id.as_bytes(), &value).unwrap(),
+        ];
         assert!(matches!(
-            view.get(Key::Blob(id), &mut bytes),
-            Err(ports::Error::Deadline)
+            store.commit(
+                &td_crypto::Provider,
+                request(0),
+                &ops,
+                &mut [BlobSource {
+                    id,
+                    source: &mut Broken
+                }]
+            ),
+            Err(CommitError::Rejected(ports::Error::Io {
+                kind: std::io::ErrorKind::StorageFull,
+                ..
+            }))
         ));
-        drop(view);
-        store
-            .collect_orphan(ACCOUNT, BlobKind::Message, id, deadline())
-            .unwrap();
-        assert!(!fixture
-            .path
-            .join(
-                Name::account(ACCOUNT, AccountEntry::Blob(BlobKind::Message, id))
-                    .unwrap()
-                    .as_path()
-                    .unwrap()
-            )
-            .exists());
+        {
+            let mut view = store.view(ACCOUNT, deadline()).unwrap();
+            assert!(view.get(Key::Mailbox(ID), &mut [0; 128]).unwrap().is_none());
+            assert!(view.get(Key::Blob(id), &mut [0; 128]).unwrap().is_none());
+        }
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                request(0),
+                &ops,
+                &mut [BlobSource {
+                    id,
+                    source: &mut b"".as_slice()
+                }]
+            ),
+            Ok(Sequence::from_u64(1))
+        );
+        let mut view = store.view(ACCOUNT, deadline()).unwrap();
+        let input = view.open_blob_input(&td_crypto::Provider, id, 0).unwrap();
+        assert!(input.is_empty());
+        assert_eq!(ports::BlobReader::len(&input.finish().unwrap()), 0);
     }
 
     #[test]
@@ -2089,29 +2413,6 @@ mod tests {
     fn retired_reader_slots_release_the_maintenance_fence() {
         let fixture = Fixture::new();
         let mut root = fixture.locked();
-        root.create_accounts_directory().unwrap();
-        for entry in [
-            AccountEntry::Root,
-            AccountEntry::Messages,
-            AccountEntry::Shard(BlobKind::Message, 4),
-        ] {
-            root.create_account_directory(ACCOUNT, entry).unwrap();
-        }
-        let id = BlobId::from_bytes([4; 16]);
-        let path = fixture.path.join(
-            Name::account(ACCOUNT, AccountEntry::Blob(BlobKind::Message, id))
-                .unwrap()
-                .as_path()
-                .unwrap(),
-        );
-        drop(
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-                .unwrap(),
-        );
         let store = IndexStore::create(
             &mut root,
             StoreEpoch::from_bytes([9; 16]),
@@ -2133,10 +2434,6 @@ mod tests {
             Some(ReaderSlot::Retired)
         ));
         store.checkpoint(deadline()).unwrap();
-        store
-            .collect_orphan(ACCOUNT, BlobKind::Message, id, deadline())
-            .unwrap();
-        assert!(!path.exists());
         let healthy = store.view(ACCOUNT, deadline()).unwrap();
         assert_eq!(healthy.identity().committed_sequence, Sequence::default());
     }
@@ -2239,7 +2536,7 @@ mod tests {
                     deadline: deadline()
                 },
                 &[operation],
-                &[]
+                &mut []
             ),
             Err(CommitError::Rejected(ports::Error::Capacity))
         );
@@ -2258,14 +2555,13 @@ mod tests {
         )
         .unwrap();
         store.create_account(ACCOUNT, deadline()).unwrap();
-        let value = mailbox("existing", None);
         lock(&store.writer)
             .unwrap()
             .native
             .run(|db| {
                 db.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
                 let mut statement = db
-                    .prepare("INSERT INTO records VALUES(?1,2,?2,?3,?4)")
+                    .prepare("INSERT INTO mailboxes(account,id,name,parent_id,role,sort_order,subscribed,changed) VALUES(?1,?2,?3,NULL,NULL,0,1,?4)")
                     .map_err(sql)?;
                 for i in 0_u64..5000 {
                     let mut key = [0; 16];
@@ -2274,7 +2570,7 @@ mod tests {
                         .execute(params![
                             ACCOUNT.as_bytes().as_slice(),
                             key.as_slice(),
-                            value.as_slice(),
+                            "existing",
                             [0_u8; 8].as_slice()
                         ])
                         .map_err(sql)?;
@@ -2295,7 +2591,7 @@ mod tests {
                     deadline: deadline()
                 },
                 &[op],
-                &[]
+                &mut []
             ),
             Ok(Sequence::from_u64(1))
         );
@@ -2374,15 +2670,6 @@ mod tests {
     fn native_two_target_references_cascade_and_membership_index() {
         let fixture = Fixture::new();
         let mut root = fixture.locked();
-        root.create_accounts_directory().unwrap();
-        for entry in [
-            AccountEntry::Root,
-            AccountEntry::Messages,
-            AccountEntry::Temporary,
-            AccountEntry::Shard(BlobKind::Message, 4),
-        ] {
-            root.create_account_directory(ACCOUNT, entry).unwrap();
-        }
         let store = IndexStore::create(
             &mut root,
             StoreEpoch::from_bytes([9; 16]),
@@ -2415,16 +2702,6 @@ mod tests {
         let membership_value = encode(Row::Membership);
         let mut member_key = [0; 32];
         Key::Membership(email, ID).encode(&mut member_key).unwrap();
-        let mut temp = store
-            .root()
-            .create_temporary(ACCOUNT, Number::new(1).unwrap(), raw.len() as u64)
-            .unwrap();
-        temp.write(raw).unwrap();
-        let published = [temp
-            .sync()
-            .unwrap()
-            .publish_blob(BlobKind::Message, blob)
-            .unwrap()];
         let request = |sequence| CommitRequest {
             account: ACCOUNT,
             expected: Sequence::from_u64(sequence),
@@ -2439,7 +2716,15 @@ mod tests {
             Operation::put(Table::Memberships, &member_key, &membership_value).unwrap(),
         ];
         assert_eq!(
-            store.commit(&td_crypto::Provider, request(0), &ops, &published),
+            store.commit(
+                &td_crypto::Provider,
+                request(0),
+                &ops,
+                &mut [BlobSource {
+                    id: blob,
+                    source: &mut raw.as_slice()
+                }]
+            ),
             Ok(Sequence::from_u64(1))
         );
         lock(&store.writer)
@@ -2456,12 +2741,12 @@ mod tests {
                 assert_eq!(found, email.as_bytes());
                 let count: i64 = db
                     .query_row(
-                        "SELECT count(*) FROM owning_refs WHERE account=?1",
+                        "SELECT count(*) FROM memberships WHERE account=?1",
                         [ACCOUNT.as_bytes().as_slice()],
                         |row| row.get(0),
                     )
                     .map_err(sql)?;
-                assert_eq!(count, 4);
+                assert_eq!(count, 1);
                 Ok(())
             })
             .unwrap();
@@ -2476,7 +2761,7 @@ mod tests {
                     &td_crypto::Provider,
                     request(1),
                     &[Operation::delete(table, key).unwrap()],
-                    &[]
+                    &mut []
                 ),
                 Err(CommitError::Rejected(ports::Error::Conflict))
             );
@@ -2491,7 +2776,7 @@ mod tests {
                     Operation::delete(Table::Threads, thread.as_bytes()).unwrap(),
                     Operation::delete(Table::Blobs, blob.as_bytes()).unwrap(),
                 ],
-                &[]
+                &mut []
             ),
             Ok(Sequence::from_u64(2))
         );
@@ -2501,7 +2786,7 @@ mod tests {
             .run(|db| {
                 let count: i64 = db
                     .query_row(
-                        "SELECT count(*) FROM owning_refs WHERE account=?1",
+                        "SELECT count(*) FROM memberships WHERE account=?1",
                         [ACCOUNT.as_bytes().as_slice()],
                         |row| row.get(0),
                     )
@@ -2520,15 +2805,6 @@ mod tests {
     fn native_lease_references_follow_the_commit_utc_boundary() {
         let fixture = Fixture::new();
         let mut root = fixture.locked();
-        root.create_accounts_directory().unwrap();
-        for entry in [
-            AccountEntry::Root,
-            AccountEntry::Uploads,
-            AccountEntry::Temporary,
-            AccountEntry::Shard(BlobKind::Upload, 4),
-        ] {
-            root.create_account_directory(ACCOUNT, entry).unwrap();
-        }
         let store = IndexStore::create(
             &mut root,
             StoreEpoch::from_bytes([9; 16]),
@@ -2553,16 +2829,6 @@ mod tests {
             expires_at: 10,
             uses: LeaseUse::Both,
         }));
-        let mut temp = store
-            .root()
-            .create_temporary(ACCOUNT, Number::new(1).unwrap(), 6)
-            .unwrap();
-        temp.write(b"upload").unwrap();
-        let published = [temp
-            .sync()
-            .unwrap()
-            .publish_blob(BlobKind::Upload, blob)
-            .unwrap()];
         let request = |sequence, utc_ms| CommitRequest {
             account: ACCOUNT,
             expected: Sequence::from_u64(sequence),
@@ -2578,24 +2844,35 @@ mod tests {
                     Operation::put(Table::Blobs, blob.as_bytes(), &blob_value).unwrap(),
                     lease,
                 ],
-                &published
+                &mut [BlobSource {
+                    id: blob,
+                    source: &mut b"upload".as_slice()
+                }]
             ),
             Ok(Sequence::from_u64(1))
         );
         let delete = Operation::delete(Table::Blobs, blob.as_bytes()).unwrap();
         assert_eq!(
-            store.commit(&td_crypto::Provider, request(1, 9), &[delete], &[]),
+            store.commit(&td_crypto::Provider, request(1, 9), &[delete], &mut []),
             Err(CommitError::Rejected(ports::Error::Conflict))
         );
-        // Rewriting at expiry removes the persisted owning reference.
+        // Expiry never bypasses the foreign key: explicit lease deletion releases content.
         assert_eq!(
-            store.commit(&td_crypto::Provider, request(1, 10), &[lease, delete], &[]),
+            store.commit(
+                &td_crypto::Provider,
+                request(1, 10),
+                &[
+                    Operation::delete(Table::Leases, blob.as_bytes()).unwrap(),
+                    delete
+                ],
+                &mut []
+            ),
             Ok(Sequence::from_u64(2))
         );
         let mut view = store.view(ACCOUNT, deadline()).unwrap();
         let mut bytes = [0; 128];
         assert!(view.get(Key::Blob(blob), &mut bytes).unwrap().is_none());
-        assert!(view.get(Key::Lease(blob), &mut bytes).unwrap().is_some());
+        assert!(view.get(Key::Lease(blob), &mut bytes).unwrap().is_none());
     }
 
     #[test]
@@ -2625,11 +2902,21 @@ mod tests {
         struct AfterPublication(std::path::PathBuf);
         impl Clock for AfterPublication {
             fn sample(&self) -> Result<Time, ports::Error> {
-                let tick = if fs::metadata(&self.0).is_ok_and(|m| m.len() > 0) {
-                    100
-                } else {
-                    1
-                };
+                use std::os::unix::fs::FileExt;
+                let committed = fs::File::open(&self.0).is_ok_and(|file| {
+                    let length = file.metadata().unwrap().len();
+                    let mut offset = 32_u64;
+                    let mut size = [0; 4];
+                    while offset + 24 + PAGE_BYTES <= length {
+                        file.read_exact_at(&mut size, offset + 4).unwrap();
+                        if u32::from_be_bytes(size) != 0 {
+                            return true;
+                        }
+                        offset += 24 + PAGE_BYTES;
+                    }
+                    false
+                });
+                let tick = if committed { 100 } else { 1 };
                 Ok(Time {
                     utc_ms: 0,
                     monotonic: Tick(tick),
@@ -2654,6 +2941,78 @@ mod tests {
         store.create_account(ACCOUNT, deadline()).unwrap();
         let view = store.view(ACCOUNT, deadline()).unwrap();
         assert_eq!(view.identity().epoch, StoreEpoch::from_bytes([9; 16]));
+    }
+
+    #[test]
+    fn integrity_scan_refuses_a_stopped_writer_without_reading_it() {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            Arc::new(Timer(AtomicU64::new(1))),
+            1,
+            deadline(),
+        )
+        .unwrap();
+        let before;
+        {
+            let mut writer = lock(&store.writer).unwrap();
+            writer.stopped = true;
+            before = lock(&writer.native.budget).unwrap().remaining;
+        }
+        assert_eq!(
+            store.validate_integrity(deadline()),
+            Err(ports::Error::WriterStopped)
+        );
+        assert_eq!(
+            lock(&lock(&store.writer).unwrap().native.budget)
+                .unwrap()
+                .remaining,
+            before
+        );
+    }
+
+    #[test]
+    fn opening_does_not_scan_rows_and_integrity_is_explicit_maintenance() {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let clock: Arc<dyn Clock> = Arc::new(Timer(AtomicU64::new(1)));
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            clock.clone(),
+            1,
+            deadline(),
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        store.validate_integrity(deadline()).unwrap();
+        {
+            let writer = lock(&store.writer).unwrap();
+            writer
+                .native
+                .run(|db| {
+                    db.execute_batch("PRAGMA foreign_keys=OFF").map_err(sql)?;
+                    db.execute(
+                        "INSERT INTO keywords VALUES(?1,?2,'bad',?3)",
+                        params![
+                            ACCOUNT.as_bytes().as_slice(),
+                            [7u8; 16].as_slice(),
+                            1u64.to_be_bytes().as_slice()
+                        ],
+                    )
+                    .map_err(sql)?;
+                    db.execute_batch("PRAGMA foreign_keys=ON").map_err(sql)
+                })
+                .unwrap();
+        }
+        drop(store);
+        let store = IndexStore::open(&mut root, clock, 1, deadline()).unwrap();
+        assert_eq!(
+            store.validate_integrity(deadline()),
+            Err(ports::Error::Corrupt)
+        );
     }
 
     #[test]
@@ -2726,7 +3085,7 @@ mod tests {
                     deadline: deadline(),
                 };
                 store
-                    .commit(&td_crypto::Provider, request, &[op], &[])
+                    .commit(&td_crypto::Provider, request, &[op], &mut [])
                     .unwrap();
                 request.expected = Sequence::from_u64(1);
                 let child_id = MailboxId::from_bytes([3; 16]);
@@ -2752,7 +3111,7 @@ mod tests {
                 // SELECT 1 captures account identity, 2 fetches the source;
                 // 3 is reference target lookup, 4 is the parent walk's first get.
                 assert_eq!(
-                    store.commit(&td_crypto::Provider, request, &[op], &[]),
+                    store.commit(&td_crypto::Provider, request, &[op], &mut []),
                     Err(CommitError::Rejected(error))
                 );
                 assert_eq!(seen.load(Ordering::Relaxed), select);
@@ -2770,7 +3129,7 @@ mod tests {
                 assert!(view.get(Key::Mailbox(ID), &mut value).unwrap().is_some());
                 drop(view);
                 assert_eq!(
-                    store.commit(&td_crypto::Provider, request, &[op], &[]),
+                    store.commit(&td_crypto::Provider, request, &[op], &mut []),
                     Ok(Sequence::from_u64(2))
                 );
             }
@@ -2804,7 +3163,12 @@ mod tests {
             deadline: deadline(),
         };
         store
-            .commit(&td_crypto::Provider, request, &[parent_op, child_op], &[])
+            .commit(
+                &td_crypto::Provider,
+                request,
+                &[parent_op, child_op],
+                &mut [],
+            )
             .unwrap();
         request.expected = Sequence::from_u64(1);
         let hook = timer.clone();
@@ -2820,7 +3184,7 @@ mod tests {
         )).unwrap();
         let delete = Operation::delete(Table::Mailboxes, ID.as_bytes()).unwrap();
         assert_eq!(
-            store.commit(&td_crypto::Provider, request, &[delete], &[]),
+            store.commit(&td_crypto::Provider, request, &[delete], &mut []),
             Err(CommitError::Rejected(ports::Error::Conflict))
         );
         assert_eq!(timer.0.load(Ordering::Relaxed), 100);
@@ -2863,14 +3227,14 @@ mod tests {
             deadline: deadline(),
         };
         assert_eq!(
-            store.commit(&td_crypto::Provider, request, &[op], &[]),
+            store.commit(&td_crypto::Provider, request, &[op], &mut []),
             Err(CommitError::Indeterminate(ports::Error::Io {
                 kind: std::io::ErrorKind::Other,
                 os_code: None
             }))
         );
         assert_eq!(
-            store.commit(&td_crypto::Provider, request, &[op], &[]),
+            store.commit(&td_crypto::Provider, request, &[op], &mut []),
             Err(CommitError::Rejected(ports::Error::WriterStopped))
         );
         let mut view = store.view(ACCOUNT, deadline()).unwrap();
@@ -2882,7 +3246,7 @@ mod tests {
         let reopened =
             IndexStore::open(&mut root, Arc::new(Timer(AtomicU64::new(1))), 1, deadline()).unwrap();
         assert_eq!(
-            reopened.commit(&td_crypto::Provider, request, &[op], &[]),
+            reopened.commit(&td_crypto::Provider, request, &[op], &mut []),
             Ok(Sequence::from_u64(1))
         );
     }

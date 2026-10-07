@@ -76,9 +76,6 @@ pub struct ReferenceCheck<'k> {
     failed: bool,
 }
 impl<'k> ReferenceCheck<'k> {
-    pub(crate) fn targets(&self) -> &[Option<Target>; 2] {
-        &self.targets
-    }
     /// The caller supplies the final source row and an admitted wall-time sample.
     pub fn new(
         identity: ViewIdentity,
@@ -122,14 +119,10 @@ impl<'k> ReferenceCheck<'k> {
                     return Err(Error::Format(format::Error::InvalidValue));
                 }
                 [
-                    if row.expires_at > utc_ms {
-                        Some(Target::Blob {
-                            id,
-                            kind: BlobKind::Upload,
-                        })
-                    } else {
-                        None
-                    },
+                    Some(Target::Blob {
+                        id,
+                        kind: BlobKind::Upload,
+                    }),
                     None,
                 ]
             }
@@ -419,7 +412,7 @@ pub(crate) mod tests {
             (Key::Submission(SUBMISSION), submission(), 1),
             (Key::Recipient(SUBMISSION, 1), recipient(), 1),
             (Key::Lease(UPLOAD), lease(101), 1),
-            (Key::Lease(UPLOAD), lease(100), 0),
+            (Key::Lease(UPLOAD), lease(100), 1),
             (
                 Key::Import {
                     instance: InstanceId::from_bytes([11; 16]),
