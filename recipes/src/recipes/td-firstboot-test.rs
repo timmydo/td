@@ -1,4 +1,4 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-firstboot-test: build-shape AND behavioural validation of the per-machine
@@ -33,7 +33,7 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // pure decision over /proc/mounts text, unit-tested in td-firstboot's own
 // `mounts` module, and the build sandbox cannot present an arbitrary mount table.
 pub fn recipe() -> Recipe {
-    let post_bootstrap_shebang = format!("#!{POST_BOOTSTRAP_SH}");
+    let shebang = format!("#!{POST_RUST_SH}");
     let bin = "{in:td-firstboot}/bin/td-firstboot";
     // The two programs the provisioned configurations are for, built from
     // the checkout's own trees: the proof that a template parses is the
@@ -41,13 +41,13 @@ pub fn recipe() -> Recipe {
     let mail = "{in:td-mail}/bin/td-mail";
     let news = "{in:td-news}/bin/td-news";
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let mut steps = Vec::new();
+    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-firstboot' >&2; exit 1; }}; \
@@ -57,13 +57,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-firstboot (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -73,7 +73,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // The keygen stub: the three standard OpenSSH operations td-firstboot uses, in
@@ -83,7 +83,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/keygen-stub".into(),
         content: format!(
-            "{post_bootstrap_shebang}\n{}",
+            "{shebang}\n{}",
             "# generation: -q -t ed25519 -N '' -C COMMENT -f PATH\n\
              # derivation: -y -P '' -f PATH\n\
              # fingerprint: -l -E sha256 -f PATH.pub\n\
@@ -121,18 +121,18 @@ pub fn recipe() -> Recipe {
     // make td-firstboot refuse rather than report an identity the machine lacks.
     steps.push(Step::WriteFile {
         path: "{root}/keygen-fails".into(),
-        content: format!("{post_bootstrap_shebang}\necho 'stub: no entropy' >&2\nexit 3\n"),
+        content: format!("{shebang}\necho 'stub: no entropy' >&2\nexit 3\n"),
         exec: true,
     });
     steps.push(Step::WriteFile {
         path: "{root}/keygen-lies".into(),
-        content: format!("{post_bootstrap_shebang}\nexit 0\n"),
+        content: format!("{shebang}\nexit 0\n"),
         exec: true,
     });
     steps.push(Step::WriteFile {
         path: "{root}/keygen-bad-fingerprint".into(),
         content: format!(
-            "{post_bootstrap_shebang}\n{}",
+            "{shebang}\n{}",
             "mode=generate; file=\n\
              while [ $# -gt 0 ]; do\n\
                case $1 in\n\
@@ -157,7 +157,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "state='{{root}}/state'; stub='{{root}}/keygen-stub'; \
@@ -198,7 +198,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // The applications' first configuration. The flag pair adds the
@@ -218,7 +218,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "state='{{root}}/state'; stub='{{root}}/keygen-stub'; err=\"{{root}}/apps.err\"; \
@@ -268,7 +268,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // The refusals. A machine that believes it has an identity it does not have is
@@ -278,7 +278,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "for case in fails lies bad-fingerprint; do \
@@ -334,7 +334,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     steps.push(Step::MkDir {
@@ -351,13 +351,10 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-firstboot-test", "1.0")
-        .native_inputs(&[
-            "td-firstboot",
-            "binutils-x86-64-self",
-            "busybox-x86-64",
-            "td-mail",
-            "td-news",
-        ])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &["td-firstboot", "binutils-x86-64-self", "td-mail", "td-news"],
+        ))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"

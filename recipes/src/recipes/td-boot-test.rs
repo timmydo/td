@@ -1,4 +1,4 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 const GOOD_ID: &str = "ba7dfe039aae6703b7c58003bf32909c9b9df7801d4d18bd72bf3fa8425ecd0b";
@@ -12,6 +12,7 @@ pub fn recipe() -> Recipe {
     let good = format!("{{root}}/volume/td/deployments/{GOOD_ID}");
     let bad = format!("{{root}}/volume/td/deployments/{BAD_ID}");
     let mut steps = vec![
+        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
         Step::MkDir { path: good.clone() },
         Step::MkDir { path: bad.clone() },
         Step::MkDir {
@@ -60,7 +61,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "'{bin}' verify '{{root}}/volume' > '{{root}}/selected' 2> '{{root}}/warning' || exit 1; \
@@ -69,7 +70,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(Step::WriteFile {
         path: format!("{good}/root.erofs"),
@@ -80,7 +81,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "if '{bin}' verify '{{root}}/volume' > '{{root}}/tampered-out' 2> '{{root}}/tampered-error'; then echo 'td-boot accepted a tampered payload' >&2; exit 1; fi; \
@@ -88,13 +89,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-boot' >&2; exit 1; }}; \
@@ -108,7 +109,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.extend([
         Step::MkDir {
@@ -126,7 +127,7 @@ pub fn recipe() -> Recipe {
     ]);
 
     Recipe::mesboot("td-boot-test", "1.0")
-        .native_inputs(&["td-boot", "binutils-x86-64-self", "busybox-x86-64"])
+        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["td-boot", "binutils-x86-64-self"]))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"

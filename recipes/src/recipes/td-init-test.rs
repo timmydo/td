@@ -1,4 +1,4 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-init-test: build-shape AND behavioural validation of the boot-glue multicall.
@@ -49,13 +49,13 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 pub fn recipe() -> Recipe {
     let bin = "{in:td-init}/bin/td-init";
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let mut steps = Vec::new();
+    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-init' >&2; exit 1; }}; \
@@ -65,13 +65,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-init (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -79,13 +79,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "dout=$('{readelf}' -d '{bin}' 2>/dev/null) || {{ echo 'readelf -d failed on td-init (cannot verify absence of dynamic NEEDED)' >&2; exit 1; }}; \
@@ -93,7 +93,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // Applet roster: the /bin symlink farm this multicall will back is generated
@@ -103,7 +103,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-init --list failed' >&2; exit 1; }}; \
@@ -115,7 +115,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // The inittab fixtures `init --dry-run` parses. Written as files rather than
@@ -144,7 +144,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "'{bin}' no-such-applet >/dev/null 2>&1; \
@@ -204,7 +204,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // init's inittab validator, through the argv[0] form the kernel uses for
@@ -219,7 +219,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "d='{{root}}/argv0'; \
@@ -237,7 +237,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // switch_root's fail-early contract: a new root that cannot exec its init
@@ -247,7 +247,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "e=$('{bin}' switch_root '{{root}}/absent' /sbin/init 2>&1); \
@@ -287,7 +287,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // mount/umount: the rejection paths, then the read-only table listing where
@@ -300,7 +300,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "e=$('{bin}' mount --not-an-option 2>&1); \
@@ -336,7 +336,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // hostname: the rejection paths, then printing where /proc is mounted. The
@@ -345,7 +345,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "'{bin}' hostname -F '{{root}}/no-such-file' >/dev/null 2>&1; \
@@ -365,7 +365,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     steps.push(Step::MkDir {
@@ -382,7 +382,7 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-init-test", "1.0")
-        .native_inputs(&["td-init", "binutils-x86-64-self", "busybox-x86-64"])
+        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["td-init", "binutils-x86-64-self"]))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"

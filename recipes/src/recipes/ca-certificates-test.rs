@@ -77,7 +77,10 @@ END {
 }
 "#;
     let steps = vec![
-        Step::run("{root}", &["{in:busybox-x86-64}/bin/awk", parser, bundle]),
+        Step::run(
+            "{root}",
+            &["{in:gawk-x86-64-self}/bin/gawk", parser, bundle],
+        ),
         Step::WriteFile {
             path: "{out}/result".into(),
             content: "PASS: installed CA bundle contains complete PEM certificates\n".into(),
@@ -90,7 +93,7 @@ END {
     ];
 
     Recipe::mesboot("ca-certificates-test", "1.0")
-        .native_inputs(&["busybox-x86-64"])
+        .native_inputs(&["gawk-x86-64-self"])
         .inputs(&["ca-certificates"])
         .steps(steps)
         .checks(vec![

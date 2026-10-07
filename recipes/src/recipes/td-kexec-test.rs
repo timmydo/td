@@ -1,4 +1,4 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-kexec-test: behavioral validation of the target-built guest kexec helper.
@@ -18,13 +18,13 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 pub fn recipe() -> Recipe {
     let bin = "{in:td-kexec}/bin/td-kexec";
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let mut steps = Vec::new();
+    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-kexec' >&2; exit 1; }}; \
@@ -34,13 +34,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-kexec (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -48,13 +48,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "dout=$('{readelf}' -d '{bin}' 2>/dev/null) || {{ echo 'readelf -d failed on td-kexec (cannot verify absence of dynamic NEEDED)' >&2; exit 1; }}; \
@@ -62,7 +62,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     steps.push(Step::MkDir {
@@ -79,7 +79,7 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-kexec-test", "1.0")
-        .native_inputs(&["td-kexec", "binutils-x86-64-self", "busybox-x86-64"])
+        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["td-kexec", "binutils-x86-64-self"]))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"

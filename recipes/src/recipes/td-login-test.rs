@@ -1,4 +1,4 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-login-test: build-shape AND behavioural validation of the credential
@@ -28,13 +28,13 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 pub fn recipe() -> Recipe {
     let bin = "{in:td-login}/bin/td-login";
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let mut steps = Vec::new();
+    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-login' >&2; exit 1; }}; \
@@ -44,13 +44,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-login (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -58,13 +58,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "dout=$('{readelf}' -d '{bin}' 2>/dev/null) || {{ echo 'readelf -d failed on td-login (cannot verify absence of dynamic NEEDED)' >&2; exit 1; }}; \
@@ -72,7 +72,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // Applet roster: the /bin symlink farm this multicall backs is generated
@@ -84,7 +84,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-login --list failed' >&2; exit 1; }}; \
@@ -97,7 +97,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // Dispatch through BOTH entry forms, plus the documented exit codes and the
@@ -107,7 +107,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "'{bin}' no-such-applet >/dev/null 2>&1; \
@@ -137,7 +137,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // The readback probe, asserted BOTH ways against this sandbox's own
@@ -148,7 +148,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "if [ -r /proc/self/status ]; then \
@@ -183,7 +183,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     steps.push(Step::MkDir {
@@ -200,7 +200,7 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-login-test", "1.0")
-        .native_inputs(&["td-login", "binutils-x86-64-self", "busybox-x86-64"])
+        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["td-login", "binutils-x86-64-self"]))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
