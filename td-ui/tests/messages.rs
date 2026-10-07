@@ -17,7 +17,8 @@ use std::sync::Arc;
 use td_ui::chrome::{ROW, SELECTED_ROW};
 use td_ui::messages::{
     Controller, Error, Event, Key, Message, Outcome, Point, Shown, Tone, COPY_LABEL, EXCERPT_ROWS,
-    GAP, MAX_LABEL_BYTES, MAX_LINES, MAX_SECTIONS, MAX_TEXT_BYTES, MAX_TOTAL_BYTES, MORE,
+    GAP, MAX_LABEL_BYTES, MAX_LINES, MAX_SECTIONS, MAX_TEXT_BYTES, MAX_TOTAL_BYTES, MIN_COLUMNS,
+    MORE,
 };
 use td_ui::raster::{
     Composition, Draw, Primitive, Raster, Rect, Scale, Surface, BORDER, CHROME, INACTIVE_SELECTION,
@@ -665,6 +666,105 @@ fn an_excerpt_shows_its_bound_and_chrome_is_never_selected() {
     press(&mut list, &mut board, last, false, 3000);
     list.event(Event::Move { x: 0, y: i64::MAX }, &mut board);
     assert_eq!(list.selected_text().unwrap().as_deref(), Some("7"));
+}
+
+/// A message may carry one action button of its owner's, a cell before
+/// its copy button: a press on it is reported for the owner to act on and
+/// copies nothing, the copy button still copies, and a message without
+/// one has none. A caption is short and one line.
+#[test]
+fn an_action_button_sits_before_copy_and_is_reported() {
+    for scale in 1..=4 {
+        let mut board = Board::default();
+        let mut list = list(scale, 40, 200);
+        list.push(text("assistant", "a reply").action("Debug").unwrap())
+            .unwrap();
+        list.push(text("user", "a question")).unwrap();
+        let action = list.action_button(0).unwrap();
+        let copy = list.copy_button(0).unwrap();
+        let cell = (CELL_WIDTH * usize::from(scale)) as i64;
+        assert_eq!(action.x + i64::from(action.width) + cell, copy.x);
+        assert_eq!((action.y, action.height), (copy.y, copy.height));
+        assert_eq!(
+            action.width,
+            (("Debug".len() + 2) * CELL_WIDTH * usize::from(scale)) as u32
+        );
+        assert_eq!(
+            press(
+                &mut list,
+                &mut board,
+                (action.x + 2, action.y + 2),
+                false,
+                0
+            ),
+            Outcome::Action(0)
+        );
+        assert!(board.copies.is_empty());
+        assert_eq!(list.focused_message(), Some(0));
+        assert_eq!(
+            press(&mut list, &mut board, (copy.x + 2, copy.y + 2), false, 1000),
+            Outcome::Copied
+        );
+        assert!(list.action_button(1).is_none());
+        assert!(list.copy_button(1).is_some());
+        // Set on a message already shown, and taken away.
+        list.set_action(1, Some("Debug")).unwrap();
+        let later = list.action_button(1).unwrap();
+        assert_eq!(
+            press(
+                &mut list,
+                &mut board,
+                (later.x + 2, later.y + 2),
+                false,
+                2000
+            ),
+            Outcome::Action(1)
+        );
+        list.set_action(1, None).unwrap();
+        assert!(list.action_button(1).is_none());
+        assert!(matches!(
+            list.set_action(9, Some("Debug")),
+            Err(Error::NoMessage)
+        ));
+    }
+    // At the narrowest layout, a caption that would reach the fold mark
+    // is neither drawn nor pressed: a press there folds the message.
+    for scale in 1..=4 {
+        let mut board = Board::default();
+        let mut list = list(scale, MIN_COLUMNS as u32, 200);
+        assert!(list.has_layout());
+        list.push(text("assistant", "first").action("twelve chars").unwrap())
+            .unwrap();
+        list.push(text("assistant", "a reply").action("Debug").unwrap())
+            .unwrap();
+        assert!(list.action_button(0).is_none(), "{scale}");
+        let debug = list.action_button(1).unwrap();
+        let header = list
+            .shown()
+            .find(|(_, shown)| matches!(shown, Shown::Header { message: 0 }))
+            .unwrap()
+            .0;
+        let cell = (CELL_WIDTH * usize::from(scale)) as i64;
+        assert!(debug.x >= header.x + 3 * cell, "{scale}");
+        let mark = (header.x + cell + 1, header.y + 2);
+        assert_eq!(
+            press(&mut list, &mut board, mark, false, 0),
+            Outcome::Changed
+        );
+        assert!(!rows(&list).iter().any(|row| row == "first"), "{scale}");
+    }
+    assert!(matches!(
+        Message::new("m").unwrap().action("a caption too long"),
+        Err(Error::Limit)
+    ));
+    assert!(matches!(
+        Message::new("m").unwrap().action(""),
+        Err(Error::Empty)
+    ));
+    assert!(matches!(
+        Message::new("m").unwrap().action("a\nb"),
+        Err(Error::Control)
+    ));
 }
 
 #[test]

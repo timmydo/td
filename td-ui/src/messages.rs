@@ -41,6 +41,8 @@ pub const GAP: usize = 8;
 pub const MULTI_CLICK_MS: u64 = 500;
 /// The copy button's caption.
 pub const COPY_LABEL: &str = "Copy";
+/// The most characters an action button's caption has.
+pub const MAX_ACTION_CHARS: usize = 12;
 /// What an excerpt cut short shows below its last row.
 pub const MORE: &str = "\u{2026} excerpt; Copy takes the whole";
 
@@ -135,6 +137,9 @@ pub struct Message {
     sections: Vec<Section>,
     source: Option<Arc<str>>,
     collapsed: bool,
+    /// The caption of the button before the copy button, when the
+    /// message has an action of its owner's.
+    action: Option<String>,
 }
 
 fn copied(text: &str, bound: usize) -> Result<String, Error> {
@@ -146,6 +151,14 @@ fn copied(text: &str, bound: usize) -> Result<String, Error> {
         .map_err(|_| Error::Limit)?;
     out.push_str(text);
     Ok(out)
+}
+
+/// An action button's caption: a label of at most `MAX_ACTION_CHARS`.
+fn caption_of(text: &str) -> Result<String, Error> {
+    if text.chars().count() > MAX_ACTION_CHARS {
+        return Err(Error::Limit);
+    }
+    label(text)
 }
 
 fn label(text: &str) -> Result<String, Error> {
@@ -168,7 +181,15 @@ impl Message {
             sections: Vec::new(),
             source: None,
             collapsed: false,
+            action: None,
         })
+    }
+
+    /// A button captioned `caption` before the copy button, whose press
+    /// the list reports as `Outcome::Action` for its owner to act on.
+    pub fn action(mut self, caption: &str) -> Result<Self, Error> {
+        self.action = Some(caption_of(caption)?);
+        Ok(self)
     }
 
     fn with(mut self, section: Section) -> Result<Self, Error> {
@@ -277,6 +298,7 @@ impl Message {
             .sum::<usize>()
             + self.label.len()
             + marks
+            + self.action.as_ref().map_or(0, String::len)
             + self.source.as_ref().map_or(0, |source| source.len())
     }
 
@@ -488,6 +510,8 @@ pub enum Outcome {
     Refused(Refusal),
     /// Nothing is selected or focused to copy.
     NothingToCopy,
+    /// The action button of the message at this index was pressed.
+    Action(usize),
 }
 
 /// The message list over one rectangle of a surface.
@@ -806,6 +830,19 @@ impl Controller {
             message.verdict = mark;
         } else {
             message.status = mark;
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    /// Sets or removes a message's action button (`Message::action`).
+    pub fn set_action(&mut self, index: usize, caption: Option<&str>) -> Result<(), Error> {
+        let caption = caption.map(caption_of).transpose()?;
+        let message = self.messages.get(index).ok_or(Error::NoMessage)?;
+        let old = message.action.as_ref().map_or(0, String::len);
+        let bytes = self.admit(caption.as_ref().map_or(0, String::len), old)?;
+        if let Some(message) = self.messages.get_mut(index) {
+            message.action = caption;
         }
         self.bytes = bytes;
         Ok(())
@@ -1281,6 +1318,27 @@ impl Controller {
             .map(|(_, _, rect)| self.button(rect))
     }
 
+    /// The action button of message `message` on a header at `header`,
+    /// a cell before its copy button, when it has one and the header has
+    /// room for it past the fold mark's three cells: a header too narrow
+    /// neither draws it nor takes a press for it.
+    fn action_rect(&self, header: Rect, message: usize) -> Option<Rect> {
+        let caption = self.messages.get(message)?.action.as_ref()?;
+        let copy = self.button(header);
+        let s = self.surface.scale.value();
+        let width = ((caption.chars().count() + 2) * CELL_WIDTH * s) as u32;
+        let x = copy.x - self.cell() - i64::from(width);
+        (x >= header.x + 3 * self.cell()).then_some(Rect { x, width, ..copy })
+    }
+
+    /// The action button of a message whose header is shown, when it has
+    /// one.
+    pub fn action_button(&self, index: usize) -> Option<Rect> {
+        self.rows()
+            .find(|(_, line, _)| line.kind == Kind::Header && line.message as usize == index)
+            .and_then(|(_, _, rect)| self.action_rect(rect, index))
+    }
+
     /// The column a pointer at `x` falls before, rounded to the nearer
     /// cell edge, as a byte of the row.
     fn byte_at(&self, line: Line, x: i64, round: bool) -> usize {
@@ -1644,6 +1702,12 @@ impl Controller {
         self.focus = Some(message);
         match line.kind {
             Kind::Header => {
+                if self
+                    .action_rect(rect, message)
+                    .is_some_and(|action| action.contains(x, y))
+                {
+                    return Outcome::Action(message);
+                }
                 if self.button(rect).contains(x, y) {
                     return self.copy_message(message, clipboard);
                 }
@@ -1907,6 +1971,9 @@ impl Controller {
             sink,
         );
         let button = self.button(rect);
+        let action = self.action_rect(rect, line.message as usize);
+        // What the header's text stops before: the leftmost button.
+        let buttons = action.map_or(button.x, |action| action.x);
         let y = rect.y + 4 * s;
         let glyphs = |chars: &mut dyn Iterator<Item = char>,
                       x: i64,
@@ -1933,13 +2000,13 @@ impl Controller {
         glyphs(
             &mut std::iter::once(mark),
             rect.x + cell,
-            button.x,
+            buttons,
             INK,
             sink,
         );
-        // The verdict ends a cell before the button; the label and status
+        // The verdict ends a cell before the buttons; the label and status
         // stop a cell before the verdict.
-        let right = button.x - cell;
+        let right = buttons - cell;
         let verdict_x = message.verdict.as_ref().map_or(right, |(text, _)| {
             (right - (text.chars().count() as i64 + 2) * cell).max(rect.x + 3 * cell)
         });
@@ -1961,6 +2028,12 @@ impl Controller {
         }
         if let Some(button) = Button::new(self.surface, button) {
             button.emit(COPY_LABEL, false, true, clip, sink);
+        }
+        if let (Some(caption), Some(action)) = (
+            message.action.as_deref(),
+            action.and_then(|action| Button::new(self.surface, action)),
+        ) {
+            action.emit(caption, false, true, clip, sink);
         }
     }
 }

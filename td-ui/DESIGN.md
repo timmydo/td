@@ -576,9 +576,10 @@ of its own files may name each module.
   no row highlighted when nothing is selected. Activation, a double
   press and filtering stay with the consumer.
 - `messages`: `Message` (built from `new` with `text`, `section`,
-  `excerpt`, `status`, `verdict`, `source` and `collapsed`), `Tone`,
-  `Point`, `Shown`, `Key` with `from_chord`, `Event`, `Outcome`, `Error`,
-  the budgets and `COPY_LABEL` and `MORE`, and `Controller`, the message
+  `excerpt`, `status`, `verdict`, `action`, `source` and `collapsed`),
+  `Tone`, `Point`, `Shown`, `Key` with `from_chord`, `Event`, `Outcome`,
+  `Error`, the budgets and `COPY_LABEL`, `MAX_ACTION_CHARS` and `MORE`,
+  and `Controller`, the message
   list under "Shared message list" below.
 - `notices`: `FONT_PROVENANCE`, `FONT_COPYING` and `FONT_LICENSE`, the
   texts beside the face in `td-compositor/assets`, embedded at compile
@@ -2978,7 +2979,11 @@ any program that shows one. It owns its messages and their layout. A
 assistant, a tool's name), an optional status shown after the label and
 an optional verdict shown before the copy button, each in a `Tone`'s ink
 (a verdict with its mark, a tick, a cross or a dot), and up to
-`MAX_SECTIONS` sections of caller-supplied text in order. A section is
+`MAX_SECTIONS` sections of caller-supplied text in order. A message
+may also carry one action button of its owner's (`Message::action`, or
+`set_action` on one shown), captioned in at most `MAX_ACTION_CHARS`
+characters of a label: the list draws it and reports its press, and the
+owner decides what it does (td-agent's Debug). A section is
 untitled body text, or titled (reasoning, a tool's arguments), which
 collapses to its title row; an excerpt section shows at most
 `EXCERPT_ROWS` rows and `MORE` below them when it has more. A message
@@ -2992,7 +2997,8 @@ text, a tab drawn as a space and another control scalar as the
 replacement character; at most `MAX_MESSAGES` messages and
 `MAX_TOTAL_BYTES` of text between them, and at most `MAX_LINES` laid-out
 rows. `push` appends, `append` adds text to a section as a reply streams
-in, `replace`, `set_status`, `set_verdict` and `set_source` change one,
+in, `replace`, `set_status`, `set_verdict`, `set_action` and
+`set_source` change one,
 `set_collapsed` and `set_section_collapsed` fold one; each allocates
 fallibly and leaves the list as it was when refused. `remove_first`
 trims the oldest and is never refused: a trim cannot grow a layout, and
@@ -3015,9 +3021,14 @@ shown row on, since a row starts with nothing carried from the one
 before, so a reply streamed in small pieces is laid out as it arrives
 rather than rewrapped whole, and lays out as the whole text would. A
 header shows its open or shut mark, the
-label, the status two cells after it, the verdict a cell before a
-`chrome::Button` reading `COPY_LABEL` at the right, inset by
-`BUTTON_MARGIN`; the label and status stop a cell short of the verdict.
+label, the status two cells after it, the verdict a cell before the
+buttons: a `chrome::Button` reading `COPY_LABEL` at the right, inset by
+`BUTTON_MARGIN`, and a message's action button, as wide as its caption
+and a cell either side, a cell before it, when the header has room for
+it past the fold mark's three cells (a narrower header neither draws it
+nor takes its press, so the mark still folds); the label and status
+stop a cell short of the verdict, so at the narrowest layouts the
+buttons may leave the label no room.
 Headers are `CHROME` under a `BORDER` rule, the focused message's
 `SELECTED_ROW`; text is `INK` on `PAPER`, selected text the text entry's
 `SELECTED` with paper ink while the list has focus and
@@ -3067,8 +3078,11 @@ first nor its last section empty, and no header, title, status,
 verdict, button or more row is ever copied; a collapsed section's and
 an excerpt's hidden text are not selected. A press on a header focuses its
 message and starts no selection; on its first three cells it folds the
-message, and on the copy button it copies the message whole. A press on
-a title row folds the section.
+message, on the copy button it copies the message whole, and on an
+action button it copies nothing and `Outcome` is `Action` with the
+message's index, at the press as a copy is. The list has no key for
+an action: its owner binds one if it wants, on `focused_message`, as
+td-agent does. A press on a title row folds the section.
 
 Copies go through the window's `Clipboard` (see "Widget window") while
 the event is delivered, the button's at its press and the keys' at
@@ -3091,9 +3105,9 @@ and `C-End`; `M-Up` and `M-Down`; `Return` to fold; `C-c`, `C-S-c` and
 itself (`Event::Focus`), and what a message means. Painting and input
 allocate nothing, but for the text a copy hands the clipboard and the
 rows a fold lays out, which it reserves fallibly as its setter does;
-nothing reads a clock, a file or the environment. `shown` and
-`copy_button` give a consumer the shown rows and a header's button for
-its driven read-back and its tests.
+nothing reads a clock, a file or the environment. `shown`,
+`copy_button` and `action_button` give a consumer the shown rows and a
+header's buttons for its driven read-back and its tests.
 
 ## Task-manager widgets
 
