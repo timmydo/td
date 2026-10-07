@@ -1649,6 +1649,224 @@ pub(crate) mod tests {
         assert!(out.is_empty());
     }
 
+    /// A push's evidence (DESIGN.md §9, Pushing, step 3): the commits it
+    /// adds and the paths they change, every binary file it carries, and
+    /// the scan, which finds a secret in a binary file, behind a `-diff`
+    /// attribute, added in one commit and removed in the next, in a
+    /// message whatever its encoding says, in an author's name, on an
+    /// added line that looks like a diff's header, in a path git quotes,
+    /// in UTF-16, in a merge's own change, and a private key's armour
+    /// that only the file's whole text shows.
+    #[test]
+    fn a_pushs_evidence_names_its_changes_and_finds_its_secrets() {
+        if !git::tests::have_git() {
+            return;
+        }
+        let scratch = Scratch::new("repo-evidence");
+        let (store, base) = store_fixture(&scratch.0);
+        let work = scratch.0.join("work");
+        plain(
+            &scratch.0,
+            &["clone", "--quiet", store.to_str().unwrap(), "work"],
+        );
+        let commit = |files: &[(&str, &[u8])], message: &str| {
+            for (path, bytes) in files {
+                fs::write(work.join(path), bytes).unwrap();
+                plain(&work, &["add", path]);
+            }
+            plain(
+                &work,
+                &["commit", "--quiet", "--allow-empty", "-m", message],
+            );
+            plain(&work, &["rev-parse", "HEAD"]).trim().to_string()
+        };
+        let removing = |path: &str, message: &str| {
+            plain(&work, &["rm", "--quiet", path]);
+            commit(&[], message)
+        };
+        let token = |prefix: &str, n: usize| format!("{prefix}{}", "a".repeat(n));
+        let clean = commit(&[("notes.txt", b"ok\n")], "notes");
+        let hidden = commit(
+            &[
+                (".gitattributes", b"secret.txt -diff\n"),
+                ("secret.txt", token("ghp_", 36).as_bytes()),
+            ],
+            "hidden",
+        );
+        removing("secret.txt", "removed");
+        let mut binary = vec![0u8, 1, 2, 0xff];
+        binary.extend_from_slice(format!("AKIA{}", "B".repeat(16)).as_bytes());
+        let binary_commit = commit(&[("blob.bin", &binary)], "binary");
+        let told = commit(&[], &format!("told\n\n{}", token("xoxb-1-", 24)));
+        // A line that looks like a header names no path for the next.
+        let plus = format!(
+            "++ {}\n{}\n",
+            token("glpat-", 20),
+            token("sk-ant-api03-", 40)
+        );
+        let header = commit(&[("plus.txt", plus.as_bytes())], "plus");
+        // A path is published too, and a match in a later file's header
+        // names no earlier file's path.
+        let named = commit(
+            &[("a.txt", b"a\n"), (&token("sk_live_", 24), b"x\n")],
+            "named",
+        );
+        // A binary file the push carries, though gone at its end.
+        commit(&[("archive.bin", &[0, 1, 2, 3])], "archive");
+        removing("archive.bin", "unarchived");
+        // A path git quotes, `"b/\tghp_..."`.
+        let tabbed = format!("\t{}", token("ghp_", 36).replace('a', "b"));
+        let quoted = commit(&[(&tabbed, b"x\n")], "quoted");
+        // A message whose header says it is not ASCII, and a token in an
+        // author's name: in the object as it is stored.
+        plain(
+            &work,
+            &[
+                "-c",
+                &format!("user.name={}", token("sk-proj-", 32)),
+                "-c",
+                "i18n.commitEncoding=IBM037",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                &format!("encoded {}", token("glrt-", 20)),
+            ],
+        );
+        let encoded = plain(&work, &["rev-parse", "HEAD"]).trim().to_string();
+        // UTF-16, added and removed.
+        let wide: Vec<u8> = [0xff, 0xfe]
+            .into_iter()
+            .chain(
+                format!("x {}", token("ghp_", 36).replace('a', "c"))
+                    .bytes()
+                    .flat_map(|b| [b, 0]),
+            )
+            .collect();
+        let utf16 = commit(&[("u16.txt", &wide)], "utf16");
+        removing("u16.txt", "narrowed");
+        // A text file overwritten as binary.
+        commit(&[("plus.txt", &[0, 0, 0])], "overwritten");
+        // A merge whose own change, against its first parent, adds one.
+        plain(&work, &["checkout", "--quiet", "-b", "side", &base]);
+        commit(&[("side.txt", b"side\n")], "side");
+        plain(&work, &["checkout", "--quiet", "main"]);
+        plain(
+            &work,
+            &["merge", "--quiet", "--no-ff", "--no-commit", "side"],
+        );
+        let merge = commit(&[("evil.txt", token("npm_", 36).as_bytes())], "merge");
+        // A key's file whose change is far from its armour.
+        plain(&work, &["checkout", "--quiet", "-b", "keys", &base]);
+        let body = |changed: &str| {
+            let mut text = "-----BEGIN RSA PRIVATE KEY-----\n".to_string();
+            for line in 0..30 {
+                text.push_str(if line == 20 { changed } else { "QUJDREVGR0g=" });
+                text.push('\n');
+            }
+            text + "-----END RSA PRIVATE KEY-----\n"
+        };
+        let first_key = commit(&[("key.pem", body("QUJD").as_bytes())], "key");
+        let second_key = commit(&[("key.pem", body("REVG").as_bytes())], "rekey");
+        let publish = scratch.0.join("publish/w/r.git");
+        let worker = git::Worker::new(&scratch.0.join("git"), &git::kept_env()).unwrap();
+        worker.publish(&publish, &store).unwrap();
+        plain(
+            &publish,
+            &[
+                "fetch",
+                "--quiet",
+                work.to_str().unwrap(),
+                "+main:refs/heads/pushed",
+                "+keys:refs/heads/keys",
+            ],
+        );
+        let evidence = worker.evidence(&publish, &merge, &base, None).unwrap();
+        assert_eq!(evidence.merge_base, None);
+        assert_eq!(
+            evidence.commits.first().unwrap(),
+            &(merge.clone(), "merge".to_string())
+        );
+        assert!(evidence
+            .commits
+            .contains(&(encoded.clone(), format!("encoded {}", token("glrt-", 20)))));
+        assert_eq!(evidence.commits.len(), 16);
+        assert_eq!(evidence.more_commits, 0);
+        let path = |name: &str| {
+            evidence
+                .paths
+                .iter()
+                .find(|(p, _)| p == name)
+                .map(|(_, l)| *l)
+        };
+        assert_eq!(path("notes.txt"), Some(Some((1, 0))));
+        assert_eq!(path("blob.bin"), Some(None));
+        assert_eq!(path("plus.txt"), Some(None));
+        assert_eq!(path("secret.txt"), None, "added and removed");
+        let mut binaries = evidence.binaries.clone();
+        binaries.sort();
+        assert_eq!(binaries, ["archive.bin", "blob.bin", "plus.txt", "u16.txt"]);
+        let found: Vec<(&str, Option<&str>, Option<&str>)> = evidence
+            .found
+            .iter()
+            .map(|f| (f.kind, f.commit.as_deref(), f.path.as_deref()))
+            .collect();
+        let at = |commit: &str| Some(commit.to_string());
+        let wanted = [
+            ("a GitHub token", at(&hidden), Some("secret.txt")),
+            ("an AWS access key", at(&binary_commit), Some("blob.bin")),
+            ("a Slack token", at(&told), None),
+            ("a GitLab token", at(&header), Some("plus.txt")),
+            ("an Anthropic key", at(&header), Some("plus.txt")),
+            ("a Stripe key", at(&named), None),
+            // In the top directory's names.
+            ("a Stripe key", None, None),
+            ("a GitHub token", at(&quoted), None),
+            ("a GitHub token", None, None),
+            ("an OpenAI key", at(&encoded), None),
+            ("a GitLab token", at(&encoded), None),
+            ("a GitHub token", at(&utf16), Some("u16.txt")),
+            ("an npm token", at(&merge), Some("evil.txt")),
+        ];
+        for (kind, commit, path) in &wanted {
+            let want = (*kind, commit.as_deref(), *path);
+            assert!(found.contains(&want), "{want:?} not in {found:?}");
+        }
+        assert_eq!(found.len(), wanted.len(), "{found:?}");
+        assert!(!evidence.clean());
+        // Onto a branch whose tip upstream holds the first two commits:
+        // only what it lacks, and the paths from where they meet.
+        let evidence = worker
+            .evidence(&publish, &merge, &base, Some(&hidden))
+            .unwrap();
+        assert_eq!(evidence.merge_base.as_deref(), Some(hidden.as_str()));
+        assert_eq!(evidence.commits.len(), 14);
+        assert_eq!(evidence.paths.iter().find(|(p, _)| p == "notes.txt"), None);
+        assert!(!evidence
+            .found
+            .iter()
+            .any(|f| f.commit.as_deref() == Some(hidden.as_str())));
+        // A key's armour, which no added line shows.
+        let evidence = worker
+            .evidence(&publish, &second_key, &base, Some(&first_key))
+            .unwrap();
+        assert_eq!(
+            evidence.found,
+            [git::Found {
+                kind: "a private key",
+                commit: None,
+                path: Some("key.pem".into()),
+            }]
+        );
+        assert!(evidence.binaries.is_empty());
+        // Nothing found, it is clean.
+        let evidence = worker.evidence(&publish, &clean, &base, None).unwrap();
+        assert!(evidence.clean(), "{evidence:?}");
+        assert_eq!(evidence.commits, [(clean.clone(), "notes".to_string())]);
+        // An id that is not one is refused before git runs.
+        assert!(worker.evidence(&publish, "HEAD", &base, None).is_err());
+    }
+
     /// An export's frames, the pack alone.
     fn unframe_pack(bytes: &[u8]) -> Vec<u8> {
         let mut pack = Vec::new();

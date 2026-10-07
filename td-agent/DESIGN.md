@@ -2992,15 +2992,17 @@ an approval of it is bound to immutable values:
    memory limit of its own when they do.
 3. It computes the evidence there, outside the jail, against the
    merge-base with the remote's current tip as well as the base: the
-   commit subjects, the paths changed with their line counts, every added
-   binary file, and a deterministic scan for credential shapes (private
-   keys, tokens of the common forges and clouds) over every commit's own
-   diff and full message, not only the overall difference, so a secret
-   added in one commit and removed in a later one is still found. The
-   diff runs with `--text --no-textconv --no-ext-diff` and attributes
+   commit subjects, the paths changed with their line counts, every
+   binary file the push carries, and a deterministic scan for credential
+   shapes (private keys, tokens of the common forges and clouds) over
+   every commit object as it is stored, headers and full message, every
+   new tree's names, every new file's whole text for private-key armour,
+   and every commit's own diff, not only the overall difference, so a
+   secret added in one commit and removed in a later one is still found.
+   The diff runs with `--text --no-textconv --no-ext-diff` and attributes
    taken from an empty tree, so a commit's own `.gitattributes` cannot
-   hide content from the scan; an added binary file counts as a scan
-   match.
+   hide content from the scan; a binary file the push carries, in any of
+   its commits, counts as a scan match.
 4. The approval (§11) names the commit id, the admitted remote, and the
    destination `refs/heads/<branch>`, the branch validated and never
    starting with `+`, `:` or `-`; a force push names the remote's current
@@ -3147,6 +3149,49 @@ It imports the file with `index-pack --strict --max-input-size`, which
 refuses a malformed object and an object naming one neither the pack nor
 the store has, and then requires the exported commit to be a commit
 there.
+
+**As built (increment 14, evidence and scan).** The third step computes
+a push's evidence in its publish repository once the export is imported,
+which nothing calls yet either. What the push carries is what `rev-list
+--objects` names from the exported commit, not reachable from the base
+or, when the remote branch is there, from its tip, both commits of the
+store. The scan reads it in two passes, each at most 512 MiB, streamed.
+The first reads those objects as `cat-file --batch` says them, as they
+are stored: every commit whole, its headers (authors, signatures, any
+extra header) and its message in whatever bytes it holds, so no encoding
+header or rendering hides one; every tree whole, so a file's name is
+read as its bytes, never as git quotes it; and every file's whole text
+for private-key armour alone, so a key's file whose change lies far from
+its armour is still found. A file git would call binary, a NUL in its
+first 8000 bytes, is listed, in whichever commit it came and though a
+later one removes it, so UTF-16 and a text file overwritten as binary
+are listed too. The commits are named from these objects, newest first
+by id and the first line of the message, 200 at most and the rest
+counted. The second pass reads every commit's own diff, a merge's
+against its first parent, with `--text --no-textconv --no-ext-diff
+--no-renames` and `--attr-source` naming the empty tree, so no
+`.gitattributes` a commit carries applies. In it a hunk's header says
+how many of the following lines are the file's, so those are told from
+headers by counting, never by how they look; of a file's lines only the
+added ones are scanned, read without their NULs as well, as UTF-16 is,
+so a token already public in the base is not found again when its file
+changes; every header line is scanned. A line longer than 64 KiB is
+scanned in pieces that overlap by 512 bytes and one byte of context, a
+shape whose length is bounded and that runs to a piece's end left to the
+next piece. The paths, at most 500 and the rest counted, are changed
+from the commit's merge-base with the tip, or from the base, each with
+its lines added and removed or as binary. The shapes (`scan.rs`) are a
+fixed list matched by hand: private-key armour, PGP's and PuTTY's
+included, and the tokens of GitHub, GitLab, AWS, Google, Slack,
+OpenRouter, Anthropic, OpenAI, Stripe, npm, PyPI, crates.io and Hugging
+Face by prefix, the characters that may follow and their count, each run
+counted no further than decides it. Only the short prefixes, which sit
+inside ordinary words, count where a word starts alone; a Slack token's
+first part is a number. A match is named by its kind, its commit and its
+path, never its text, a name in a tree or a file's armour by its path
+alone, at most 50 and the rest counted; output past a pass's bound is a
+match of its own. The evidence is clean when nothing matched and the
+push carries no binary file.
 
 ## 10. Network policy
 
@@ -4909,8 +4954,9 @@ kind. td-agent's position on its features:
   `~/.gitconfig` hook or fsmonitor in the workspace HOME must never run in
   a maintenance instance; a new worktree's admin files must be td-agent's
   even when the jail pre-planted the names; and the push scan must catch a
-  secret in a binary file, behind a `-diff` attribute, and added in one
-  commit and removed in the next; and no source inside another
+  secret in a binary file, behind a `-diff` attribute, added in one
+  commit and removed in the next, in a commit's headers or a message
+  whose encoding header says otherwise, and in a path git would quote; and no source inside another
   workspace's tree is admitted.
 - **Offline loop tests:** a mock fetch service replays recorded OpenRouter
   exchanges, Jev decisions included. td-mail's `tests/mock_fetch.rs` is the

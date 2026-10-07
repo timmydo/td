@@ -1221,6 +1221,687 @@ impl Worker {
     }
 }
 
+/// The most commits, paths, binary files and matches the evidence names;
+/// the rest are counted.
+const MAX_COMMITS: usize = 200;
+const MAX_PATHS: usize = 500;
+const MAX_FOUND: usize = 50;
+/// The most bytes the scan reads in each of its passes; what is past it
+/// is a match of its own, unscanned.
+pub const MAX_SCANNED: u64 = 512 << 20;
+/// The most bytes of the list of objects a push carries.
+const MAX_OBJECTS: u64 = 64 << 20;
+/// How long the evidence's git may take, each run.
+const EVIDENCE_TIME: Duration = Duration::from_secs(600);
+/// The longest line kept whole for the scan; a longer one is scanned in
+/// pieces that overlap by `OVERLAP`, so no shape is cut in two.
+const SCAN_LINE: usize = 64 * 1024;
+pub(crate) const OVERLAP: usize = 512;
+/// The longest subject named, in characters.
+const SUBJECT: usize = 200;
+/// How much of a commit object is kept for its subject.
+const COMMIT_HEAD: usize = 64 * 1024;
+/// How much of a blob git reads to call it binary: a NUL among them.
+const SNIFF: usize = 8000;
+/// The longest path record kept; a longer one's path is cut.
+const RECORD: usize = 64 * 1024;
+/// The longest header `cat-file` says before an object.
+const OBJECT_HEADER: usize = 512;
+
+/// What a push publishes, found in the publish repository outside any
+/// jail (DESIGN.md §9, Pushing, step 3).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Evidence {
+    /// Where the commit and the remote branch's tip meet, when the
+    /// branch is there and they do.
+    pub merge_base: Option<String>,
+    /// The commits the push adds, newest first, by id and subject.
+    pub commits: Vec<(String, String)>,
+    /// How many more commits it adds than are named.
+    pub more_commits: u64,
+    /// Each path changed from the merge-base, else the base, with its
+    /// lines added and removed, none for a binary file.
+    pub paths: Vec<(String, Option<(u64, u64)>)>,
+    pub more_paths: u64,
+    /// Each binary file the push carries, by its path: every blob it
+    /// adds that git would call binary, in whichever commit, though a
+    /// later one removes it.
+    pub binaries: Vec<String>,
+    pub more_binaries: u64,
+    /// Each credential shape found: its kind, the commit, and the path.
+    pub found: Vec<Found>,
+    pub more_found: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Found {
+    pub kind: &'static str,
+    /// The commit whose object or own diff holds it; none for a file's
+    /// whole text or a directory's names, which commits share.
+    pub commit: Option<String>,
+    /// The file or directory, none for a commit's own object or the top
+    /// directory.
+    pub path: Option<String>,
+}
+
+impl Evidence {
+    /// Whether the scan matched nothing: no credential shape, no binary
+    /// file, nothing left unscanned.
+    pub fn clean(&self) -> bool {
+        self.found.is_empty()
+            && self.more_found == 0
+            && self.binaries.is_empty()
+            && self.more_binaries == 0
+    }
+}
+
+/// How the scan reads a text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mode {
+    /// A diff: a hunk's header says how many of the lines after it are
+    /// the file's, so those are told from headers by counting, never by
+    /// how they look. Of the file's lines only the added ones are
+    /// scanned, read without NULs too, as text in UTF-16 is; every
+    /// header line is scanned. A commit starts at a line `\0commit <id>`,
+    /// which no line of a file's can be, each carrying its `+`, `-` or
+    /// space.
+    Diff,
+    /// An object as it is stored, every line scanned.
+    Raw,
+    /// A file's whole text, for private-key armour alone.
+    Armour,
+}
+
+/// The scan of a text, a line at a time.
+struct Scanner {
+    mode: Mode,
+    line: Vec<u8>,
+    /// Whether the line kept is a long line's later piece: its first
+    /// byte, which says what it is, then one byte of context, then what
+    /// is left to scan.
+    cut: bool,
+    commit: Option<String>,
+    path: Option<String>,
+    /// The file's lines left in the hunk: old, then new.
+    left: (u64, u64),
+    found: Vec<Found>,
+    more: u64,
+}
+
+impl Scanner {
+    fn new(mode: Mode, found: Vec<Found>, more: u64) -> Self {
+        Self {
+            mode,
+            line: Vec::new(),
+            cut: false,
+            commit: None,
+            path: None,
+            left: (0, 0),
+            found,
+            more,
+        }
+    }
+
+    /// Ends the text read so far and starts another, read as `mode`.
+    fn start(&mut self, mode: Mode, commit: Option<String>, path: Option<String>) {
+        self.finish();
+        self.mode = mode;
+        self.commit = commit;
+        self.path = path;
+        self.left = (0, 0);
+    }
+
+    /// Takes the next of the text.
+    fn take(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if b == b'\n' {
+                self.end_line();
+                continue;
+            }
+            self.line.push(b);
+            // A line too long to keep is scanned so far, and its first
+            // byte kept with its end.
+            if self.line.len() >= SCAN_LINE {
+                if self.scanned() {
+                    self.scan(false);
+                }
+                let end = self
+                    .line
+                    .split_off(self.line.len().saturating_sub(OVERLAP + 1));
+                self.line.truncate(1);
+                self.line.extend_from_slice(&end);
+                self.cut = true;
+            }
+        }
+    }
+
+    /// Ends the text: a last line without its newline.
+    fn finish(&mut self) {
+        if !self.line.is_empty() {
+            self.end_line();
+        }
+    }
+
+    fn in_hunk(&self) -> bool {
+        self.mode == Mode::Diff && (self.left.0 > 0 || self.left.1 > 0)
+    }
+
+    /// Whether the line kept is one the scan reads.
+    fn scanned(&self) -> bool {
+        !self.in_hunk() || self.line.first() == Some(&b'+')
+    }
+
+    fn end_line(&mut self) {
+        let header = self.mode == Mode::Diff && !self.in_hunk();
+        // A file's path is known at its `+++` line: from its `diff --git`
+        // line on, or a header too long to read, none is named.
+        if header && (self.cut || self.line.starts_with(b"diff --git ")) {
+            self.path = None;
+        }
+        if self.scanned() {
+            self.scan(true);
+        }
+        if self.mode == Mode::Diff {
+            self.follow();
+        }
+        self.line.clear();
+        self.cut = false;
+    }
+
+    /// Follows a diff's state past the line kept.
+    fn follow(&mut self) {
+        if let Some(rest) = self.line.strip_prefix(b"\0commit ") {
+            self.commit = Some(String::from_utf8_lossy(rest).trim().to_string());
+            self.path = None;
+            self.left = (0, 0);
+        } else if self.in_hunk() {
+            let (old, new) = &mut self.left;
+            match self.line.first() {
+                Some(b'+') => *new = new.saturating_sub(1),
+                Some(b'-') => *old = old.saturating_sub(1),
+                Some(b' ') => {
+                    *old = old.saturating_sub(1);
+                    *new = new.saturating_sub(1);
+                }
+                // `\ No newline at end of file` counts as neither.
+                Some(b'\\') => {}
+                // Not a file's line: the hunk was not as said.
+                _ => self.left = (0, 0),
+            }
+        } else if let Some(path) = self.line.strip_prefix(b"+++ ").filter(|_| !self.cut) {
+            let path = String::from_utf8_lossy(path);
+            let path = path
+                .strip_prefix('"')
+                .and_then(|path| path.strip_suffix('"'))
+                .unwrap_or(&path);
+            let path = path.strip_prefix("b/").unwrap_or(path);
+            self.path = Some(crate::tools::visible(path));
+        } else if let Some(left) = hunk(&self.line) {
+            self.left = left;
+        }
+    }
+
+    /// Scans the line kept, `whole` when it has ended.
+    fn scan(&mut self, whole: bool) {
+        let start = if self.cut { 2 } else { 0 };
+        let line = &self.line;
+        let kind = match self.mode {
+            Mode::Armour => crate::scan::armour(line, start),
+            Mode::Raw => crate::scan::within(line, start, whole),
+            Mode::Diff => crate::scan::within(line, start, whole).or_else(|| {
+                if !line.contains(&0) {
+                    return None;
+                }
+                let skipped = line.iter().take(start).filter(|b| **b == 0).count();
+                let bare: Vec<u8> = line.iter().copied().filter(|b| *b != 0).collect();
+                crate::scan::within(&bare, start.saturating_sub(skipped), whole)
+            }),
+        };
+        if let Some(kind) = kind {
+            self.note(kind);
+        }
+    }
+
+    /// Notes a match of `kind` where the scan is, once.
+    fn note(&mut self, kind: &'static str) {
+        let found = Found {
+            kind,
+            commit: self.commit.clone(),
+            path: self.path.clone(),
+        };
+        if self.found.contains(&found) {
+            return;
+        }
+        if self.found.len() < MAX_FOUND {
+            self.found.push(found);
+        } else {
+            self.more = self.more.saturating_add(1);
+        }
+    }
+}
+
+/// A hunk header's counts, `@@ -start[,old] +start[,new] @@`: how many of
+/// the file's old and new lines follow it.
+fn hunk(line: &[u8]) -> Option<(u64, u64)> {
+    let text = std::str::from_utf8(line).ok()?;
+    let rest = text.strip_prefix("@@ -")?;
+    let (ranges, _) = rest.split_once(" @@")?;
+    let (old, new) = ranges.split_once(" +")?;
+    let count = |range: &str| {
+        let (start, count) = range.split_once(',').unwrap_or((range, "1"));
+        start.parse::<u64>().ok()?;
+        count.parse::<u64>().ok()
+    };
+    Some((count(old)?, count(new)?))
+}
+
+/// Where `cat-file --batch`'s answer is.
+enum At {
+    /// In an object's header line.
+    Header,
+    /// In its contents, this many bytes left.
+    Body(u64),
+    /// At the newline after them.
+    Newline,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Commit,
+    Tree,
+    Blob,
+    Other,
+}
+
+/// The objects a push carries, read as `cat-file --batch` says them, in
+/// the order `rev-list --objects` named them, commits first: each handed
+/// to the scan as it comes, a commit or a tree as it is stored, so no
+/// encoding, quoting or header git would show differently hides what
+/// is published; a blob for private-key armour, and as binary when git
+/// would call it so.
+struct Objects<'a> {
+    names: &'a std::collections::HashMap<String, String>,
+    scanner: Scanner,
+    header: Vec<u8>,
+    at: At,
+    kind: Kind,
+    id: String,
+    /// A commit's start, for its subject.
+    head: Vec<u8>,
+    sniffed: usize,
+    binary: bool,
+    commits: Vec<(String, String)>,
+    more_commits: u64,
+    binaries: Vec<String>,
+    more_binaries: u64,
+    named: std::collections::HashSet<String>,
+}
+
+impl<'a> Objects<'a> {
+    fn new(names: &'a std::collections::HashMap<String, String>) -> Self {
+        Self {
+            names,
+            scanner: Scanner::new(Mode::Raw, Vec::new(), 0),
+            header: Vec::new(),
+            at: At::Header,
+            kind: Kind::Other,
+            id: String::new(),
+            head: Vec::new(),
+            sniffed: 0,
+            binary: false,
+            commits: Vec::new(),
+            more_commits: 0,
+            binaries: Vec::new(),
+            more_binaries: 0,
+            named: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Takes the next of `cat-file`'s answer.
+    fn take(&mut self, mut bytes: &[u8]) -> Result<(), String> {
+        while !bytes.is_empty() {
+            match self.at {
+                At::Header => {
+                    let end = bytes.iter().position(|b| *b == b'\n');
+                    let (part, rest) = bytes
+                        .split_at_checked(end.unwrap_or(bytes.len()))
+                        .unwrap_or((bytes, &[]));
+                    if self.header.len().saturating_add(part.len()) > OBJECT_HEADER {
+                        return Err("cat-file said a header too long".into());
+                    }
+                    self.header.extend_from_slice(part);
+                    bytes = rest;
+                    if end.is_some() {
+                        bytes = bytes.get(1..).unwrap_or_default();
+                        self.open()?;
+                    }
+                }
+                At::Body(left) => {
+                    let n = usize::try_from(left).unwrap_or(usize::MAX).min(bytes.len());
+                    let (part, rest) = bytes.split_at_checked(n).unwrap_or((bytes, &[]));
+                    self.body(part);
+                    bytes = rest;
+                    let left = left.saturating_sub(n as u64);
+                    self.at = if left == 0 {
+                        self.close();
+                        At::Newline
+                    } else {
+                        At::Body(left)
+                    };
+                }
+                At::Newline => {
+                    bytes = bytes.get(1..).unwrap_or_default();
+                    self.at = At::Header;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens the object the header kept names.
+    fn open(&mut self) -> Result<(), String> {
+        let header = String::from_utf8_lossy(&std::mem::take(&mut self.header)).into_owned();
+        let mut words = header.split(' ');
+        let (id, kind, size) = (words.next(), words.next(), words.next());
+        let size = size.and_then(|size| size.parse::<u64>().ok());
+        let (id, kind, size) = match (id, kind, size) {
+            (Some(id), Some(kind), Some(size)) if object_id(id) => (id, kind, size),
+            // A line of the list that was a path's, not an object's.
+            (Some(id), Some("missing"), None) if object_id(id) => return Ok(()),
+            _ => {
+                return Err(format!(
+                    "cat-file said {:?}",
+                    crate::tools::visible(&header)
+                ))
+            }
+        };
+        self.id = id.to_string();
+        self.kind = match kind {
+            "commit" => Kind::Commit,
+            "tree" => Kind::Tree,
+            "blob" => Kind::Blob,
+            _ => Kind::Other,
+        };
+        let path = self
+            .names
+            .get(id)
+            .filter(|name| !name.is_empty())
+            .map(|name| crate::tools::visible(name));
+        let (mode, commit, path) = match self.kind {
+            Kind::Commit => (Mode::Raw, Some(self.id.clone()), None),
+            Kind::Blob => (Mode::Armour, None, path),
+            Kind::Tree | Kind::Other => (Mode::Raw, None, path),
+        };
+        self.scanner.start(mode, commit, path);
+        self.head.clear();
+        self.sniffed = 0;
+        self.binary = false;
+        self.at = At::Body(size);
+        Ok(())
+    }
+
+    fn body(&mut self, part: &[u8]) {
+        if self.kind == Kind::Commit {
+            let room = COMMIT_HEAD.saturating_sub(self.head.len()).min(part.len());
+            self.head
+                .extend_from_slice(part.get(..room).unwrap_or_default());
+        }
+        if self.kind == Kind::Blob && self.sniffed < SNIFF {
+            let look = SNIFF.saturating_sub(self.sniffed).min(part.len());
+            self.binary |= part.get(..look).unwrap_or_default().contains(&0);
+            self.sniffed = self.sniffed.saturating_add(look);
+        }
+        self.scanner.take(part);
+    }
+
+    fn close(&mut self) {
+        self.scanner.finish();
+        match self.kind {
+            Kind::Commit if self.commits.len() < MAX_COMMITS => {
+                self.commits.push((self.id.clone(), subject(&self.head)));
+            }
+            Kind::Commit => self.more_commits = self.more_commits.saturating_add(1),
+            Kind::Blob if self.binary => {
+                let path = self
+                    .names
+                    .get(&self.id)
+                    .map_or_else(|| self.id.clone(), |name| crate::tools::visible(name));
+                if self.named.insert(path.clone()) {
+                    if self.binaries.len() < MAX_PATHS {
+                        self.binaries.push(path);
+                    } else {
+                        self.more_binaries = self.more_binaries.saturating_add(1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A commit object's subject: the first line of its message, as stored.
+fn subject(head: &[u8]) -> String {
+    let text = String::from_utf8_lossy(head);
+    let message = text.split_once("\n\n").map_or("", |(_, message)| message);
+    let line = message.lines().next().unwrap_or_default();
+    crate::tools::visible(line.trim())
+        .chars()
+        .take(SUBJECT)
+        .collect()
+}
+
+impl Worker {
+    /// The evidence of pushing commit `id` from publish repository
+    /// `publish`, its export imported, onto a branch whose remote tip is
+    /// `tip`, if it is there, from `base`, both commits of the store
+    /// (DESIGN.md §9, Pushing, step 3). It reads the objects the push
+    /// carries as they are stored, then every commit's own diff, text,
+    /// without textconv or external diff, its attributes from an empty
+    /// tree, so nothing a commit carries hides content from the scan.
+    pub fn evidence(
+        &self,
+        publish: &Path,
+        id: &str,
+        base: &str,
+        tip: Option<&str>,
+    ) -> Result<Evidence, String> {
+        for commit in [Some(id), Some(base), tip].into_iter().flatten() {
+            if !object_id(commit) {
+                return Err(format!("{commit:?} is not a full commit id"));
+            }
+        }
+        let text = |command: &mut Command, limit: u64| {
+            run(command, limit, EVIDENCE_TIME).map(|out| String::from_utf8_lossy(&out).into_owned())
+        };
+        let empty = text(
+            self.command(publish)
+                .args(["hash-object", "-t", "tree", "--stdin"])
+                .stdin(Stdio::null()),
+            MAX_TEXT as u64,
+        )
+        .map_err(|e| format!("the empty tree: {e}"))?
+        .trim()
+        .to_string();
+        let attributes = format!("--attr-source={empty}");
+        // What the push adds: neither the base's nor the remote's.
+        let mut range = vec![id.to_string(), format!("^{base}")];
+        range.extend(tip.map(|tip| format!("^{tip}")));
+        let merge_base = match tip {
+            None => None,
+            Some(tip) => match run(
+                self.command(publish)
+                    .args(["merge-base", "--end-of-options", id, tip]),
+                MAX_TEXT as u64,
+                EVIDENCE_TIME,
+            ) {
+                Ok(out) => Some(String::from_utf8_lossy(&out).trim().to_string()),
+                // Unrelated histories meet nowhere.
+                Err(Failure::Exit(1, _)) => None,
+                Err(e) => return Err(format!("the merge-base: {e}")),
+            },
+        };
+        let from = merge_base.clone().unwrap_or_else(|| base.to_string());
+        let mut evidence = Evidence {
+            merge_base,
+            ..Evidence::default()
+        };
+        let count = text(
+            self.command(publish)
+                .args(["rev-list", "--count", "--end-of-options"])
+                .args(&range),
+            MAX_TEXT as u64,
+        )
+        .map_err(|e| format!("counting the commits: {e}"))?;
+        let total: u64 = count
+            .trim()
+            .parse()
+            .map_err(|_| "counting the commits: no number")?;
+        // The objects, as they are stored.
+        let listed = run(
+            self.command(publish)
+                .args(["rev-list", "--objects", "--end-of-options"])
+                .args(&range),
+            MAX_OBJECTS,
+            EVIDENCE_TIME,
+        );
+        let mut names = std::collections::HashMap::new();
+        let mut wanted = Vec::new();
+        let (found, more) = match listed {
+            Ok(out) => {
+                for line in out.split(|b| *b == b'\n') {
+                    let (object, name) = match line.iter().position(|b| *b == b' ') {
+                        Some(at) => (line.get(..at), line.get(at + 1..)),
+                        None => (Some(line), None),
+                    };
+                    let object = String::from_utf8_lossy(object.unwrap_or_default()).into_owned();
+                    if !object_id(&object) {
+                        continue;
+                    }
+                    wanted.extend_from_slice(object.as_bytes());
+                    wanted.push(b'\n');
+                    if let Some(name) = name {
+                        names
+                            .entry(object)
+                            .or_insert_with(|| String::from_utf8_lossy(name).into_owned());
+                    }
+                }
+                let mut objects = Objects::new(&names);
+                let mut cat = self.command(publish);
+                cat.args(["cat-file", "--batch"]);
+                let read = run_into(
+                    &mut cat,
+                    Some(wanted),
+                    MAX_SCANNED,
+                    EVIDENCE_TIME,
+                    &mut |bytes| objects.take(bytes),
+                );
+                objects.scanner.finish();
+                match read {
+                    Ok(()) => {}
+                    Err(Failure::TooLong) => objects.scanner.note(UNSCANNED),
+                    Err(e) => return Err(format!("reading the objects: {e}")),
+                }
+                evidence.commits = objects.commits;
+                evidence.binaries = objects.binaries;
+                evidence.more_binaries = objects.more_binaries;
+                (objects.scanner.found, objects.scanner.more)
+            }
+            Err(Failure::TooLong) => {
+                let mut scanner = Scanner::new(Mode::Raw, Vec::new(), 0);
+                scanner.note(UNSCANNED);
+                (scanner.found, scanner.more)
+            }
+            Err(e) => return Err(format!("listing the objects: {e}")),
+        };
+        evidence.more_commits = total.saturating_sub(evidence.commits.len() as u64);
+        // Every commit's own diff, a merge's against its first parent, so
+        // what one commit adds and a later one removes is still found;
+        // only what is added, so what was there already is not.
+        let mut scanner = Scanner::new(Mode::Diff, found, more);
+        let mut log = self.command(publish);
+        log.arg(&attributes).args([
+            "log",
+            "--no-show-signature",
+            "--no-color",
+            "--format=%x00commit %H",
+            "-p",
+            "--diff-merges=first-parent",
+            "--text",
+            "--no-textconv",
+            "--no-ext-diff",
+            "--no-renames",
+            "--end-of-options",
+        ]);
+        log.args(&range);
+        let scanned = run_into(&mut log, None, MAX_SCANNED, EVIDENCE_TIME, &mut |bytes| {
+            scanner.take(bytes);
+            Ok(())
+        });
+        scanner.finish();
+        match scanned {
+            Ok(()) => {}
+            Err(Failure::TooLong) => scanner.note(UNSCANNED),
+            Err(e) => return Err(format!("scanning the commits: {e}")),
+        }
+        evidence.found = scanner.found;
+        evidence.more_found = scanner.more;
+        // The paths, from where the push and the remote meet.
+        let mut diff = self.command(publish);
+        diff.arg(&attributes).args([
+            "diff",
+            "--numstat",
+            "-z",
+            "--no-renames",
+            "--no-textconv",
+            "--no-ext-diff",
+            "--end-of-options",
+            &from,
+            id,
+        ]);
+        let mut record = Vec::new();
+        let (paths, more_paths) = (&mut evidence.paths, &mut evidence.more_paths);
+        run_into(&mut diff, None, MAX_SCANNED, EVIDENCE_TIME, &mut |bytes| {
+            for &b in bytes {
+                if b != 0 {
+                    if record.len() < RECORD {
+                        record.push(b);
+                    }
+                    continue;
+                }
+                if let Some(entry) = numstat(&record) {
+                    if paths.len() < MAX_PATHS {
+                        paths.push(entry);
+                    } else {
+                        *more_paths = more_paths.saturating_add(1);
+                    }
+                }
+                record.clear();
+            }
+            Ok(())
+        })
+        .map_err(|e| format!("the paths changed: {e}"))?;
+        Ok(evidence)
+    }
+}
+
+/// What a match past the scan's bound is called.
+const UNSCANNED: &str = "more than the scan reads, unscanned";
+
+/// One record of `diff --numstat -z`: a path with its lines added and
+/// removed, none for a binary file.
+fn numstat(record: &[u8]) -> Option<(String, Option<(u64, u64)>)> {
+    let text = String::from_utf8_lossy(record);
+    let mut fields = text.splitn(3, '\t');
+    let added = fields.next()?;
+    let removed = fields.next()?;
+    let path = fields.next()?;
+    let lines = match (added.parse::<u64>(), removed.parse::<u64>()) {
+        (Ok(a), Ok(r)) => Some((a, r)),
+        _ => None,
+    };
+    Some((crate::tools::visible(path), lines))
+}
+
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1956,6 +2637,66 @@ pub(crate) mod tests {
                 "refresh https://example.org/b"
             ]
         );
+    }
+
+    /// A line longer than the scan keeps is scanned in pieces that
+    /// overlap, so a shape across where one is cut is still found, in
+    /// an added line; in a removed one it is not. A piece's end decides
+    /// nothing a longer line would undo, and the byte before what a
+    /// later piece scans is still context.
+    #[test]
+    fn a_long_lines_shape_is_found_across_its_pieces() {
+        let github = format!("ghp_{}", "a".repeat(36));
+        let aws = |n: usize| format!("AKIA{}", "B".repeat(n));
+        for (at, token, sign, found) in [
+            (SCAN_LINE - 10, github.clone(), b'+', true),
+            (3 * SCAN_LINE + 7, github.clone(), b'+', true),
+            (SCAN_LINE - 10, github.clone(), b'-', false),
+            // Cut when 16 of its 17 letters are in: too long, all told.
+            (SCAN_LINE - 21, aws(17), b'+', false),
+            (SCAN_LINE - 21, aws(16), b'+', true),
+            // The tail of a word, just inside what the next piece keeps.
+            (
+                SCAN_LINE - OVERLAP - 2,
+                format!("x{}", aws(16)),
+                b'+',
+                false,
+            ),
+        ] {
+            let mut line = vec![sign];
+            line.extend(std::iter::repeat_n(b' ', at));
+            line.extend_from_slice(token.as_bytes());
+            line.extend(std::iter::repeat_n(b' ', 1000));
+            line.push(b'\n');
+            let mut scanner = Scanner::new(Mode::Diff, Vec::new(), 0);
+            let mut text = b"\0commit c\n+++ b/f\n@@ -1,1 +1,1 @@\n".to_vec();
+            if sign == b'+' {
+                text.extend_from_slice(b"- old\n");
+            } else {
+                text.extend_from_slice(b"+ new\n");
+            }
+            text.extend_from_slice(&line);
+            // In pieces of any size.
+            for piece in text.chunks(4093) {
+                scanner.take(piece);
+            }
+            scanner.finish();
+            assert_eq!(!scanner.found.is_empty(), found, "{at} {token} {sign}");
+            if found {
+                assert_eq!(scanner.found[0].path.as_deref(), Some("f"));
+            }
+        }
+    }
+
+    /// A hunk's header says how many of the file's lines follow it.
+    #[test]
+    fn a_hunks_header_counts_its_lines() {
+        assert_eq!(hunk(b"@@ -12,3 +12,4 @@ fn main()"), Some((3, 4)));
+        assert_eq!(hunk(b"@@ -1 +1 @@"), Some((1, 1)));
+        assert_eq!(hunk(b"@@ -0,0 +1,2 @@"), Some((0, 2)));
+        for line in [&b"+++ b/x"[..], b"@@ -a,1 +1 @@", b"@@ -1,1 +1,1", b""] {
+            assert_eq!(hunk(line), None, "{line:?}");
+        }
     }
 
     /// A sink slower than git's grace still takes all git said, though
