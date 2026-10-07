@@ -6487,45 +6487,58 @@ fn git_push_is_refused_until_it_can_export() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// A push, in a prepared repository workspace: the branch exported as a
-/// pack the window's worker reads, staged, put to the person with what
-/// the stage found, and sent as staged, the pack gone; a forced push to
-/// a protected branch is asked why, and a refusal sends nothing.
-#[test]
-#[ignore = "needs user namespaces, TD_AGENT_JAIL, TD_AGENT_TXT and a host git"]
-fn a_push_is_exported_staged_asked_and_sent() {
-    use td_agent::git::{Evidence, Found, Staged};
+/// A jailed conversation's repository workspace, prepared, with the
+/// agent's work committed on its branch at `tip`: its harness, its
+/// worktree, the base's commit, and the scratch tree to remove.
+struct Prepared {
+    h: Harness,
+    entry: td_agent::workspace::Entry,
+    base: String,
+    tip: String,
+    scratch: PathBuf,
+    remote: String,
+}
+
+/// git on the host, in `dir`, with no configuration but the test's.
+fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(["-c", "init.defaultBranch=main"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{args:?}: {out:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// `Prepared`, its harness `tag`, set up with `client`, its model
+/// replies `script` given the call to `git_push` a fixture makes.
+fn prepared(
+    tag: &str,
+    client: Client,
+    script: impl FnOnce(&dyn Fn(&str) -> Reply) -> Vec<Reply>,
+) -> Prepared {
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "td-agent-model-pushed-{}-{}",
+        "td-agent-model-{tag}-{}-{}",
         std::process::id(),
         td_agent::store::random_hex(4).unwrap()
     ));
     std::fs::create_dir_all(&scratch).unwrap();
     let scratch = std::fs::canonicalize(&scratch).unwrap();
-    let git = |dir: &std::path::Path, args: &[&str]| -> String {
-        let out = Command::new("git")
-            .current_dir(dir)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-            .args(["-c", "init.defaultBranch=main"])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{args:?}: {out:?}");
-        String::from_utf8(out.stdout).unwrap().trim().to_string()
-    };
     let up = scratch.join("up");
     std::fs::create_dir_all(&up).unwrap();
     std::fs::write(up.join("a.txt"), "a\n").unwrap();
-    git(&up, &["init", "--quiet"]);
-    git(&up, &["add", "."]);
-    git(&up, &["commit", "--quiet", "-m", "one"]);
-    let remote = "https://example.org/a/td";
+    git_in(&up, &["init", "--quiet"]);
+    git_in(&up, &["add", "."]);
+    git_in(&up, &["commit", "--quiet", "-m", "one"]);
+    let remote = "https://example.org/a/td".to_string();
     let template = td_agent::config::Template {
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
-            remote: remote.into(),
+            remote: remote.clone(),
             base: "main".into(),
             branch: "agent".into(),
             sparse: None,
@@ -6544,32 +6557,24 @@ fn a_push_is_exported_staged_asked_and_sent() {
     let entry = made.entries[0].clone();
     // The store as the window's worker leaves it.
     std::fs::create_dir_all(&entry.store).unwrap();
-    git(&entry.store, &["init", "--quiet", "--bare"]);
+    git_in(&entry.store, &["init", "--quiet", "--bare"]);
     let from = up.display().to_string();
-    git(
+    git_in(
         &entry.store,
         &["fetch", "--quiet", &from, "+refs/heads/*:refs/heads/*"],
     );
-    let base = git(&entry.store, &["rev-parse", "main"]);
+    let base = git_in(&entry.store, &["rev-parse", "main"]);
     let checkout = entry.checkout.display().to_string();
     let argument = td_agent::workspace::Workspace::Repositories(made).argument();
     let push = |fixture: &str| Reply::sse_with(fixture, "WORKTREE", &checkout);
     let mut h = Harness::new_in(
-        "pushed",
+        tag,
         Role::Conversation,
         Some(argument.to_str().unwrap()),
         true,
-        vec![
-            push("stream-tool-git-push.sse"),
-            Reply::sse("stream-sonnet.sse"),
-            Reply::ok("title.json"),
-            push("stream-tool-git-push-forced.sse"),
-            Reply::sse("stream-sonnet.sse"),
-            push("stream-tool-git-push-forced.sse"),
-            Reply::sse("stream-sonnet.sse"),
-        ],
+        script(&push),
     );
-    h.setup(Client::default());
+    h.setup(client);
     // Prepared: the worktree checked out at the base.
     let (remote_asked, bases) = h.until(|up| match up {
         Up::Fetch { remote, bases } => Some((remote.clone(), bases.clone())),
@@ -6577,10 +6582,10 @@ fn a_push_is_exported_staged_asked_and_sent() {
     });
     assert_eq!(
         (remote_asked.as_str(), bases),
-        (remote, vec!["main".to_string()])
+        (remote.as_str(), vec!["main".to_string()])
     );
     h.down(&Down::Fetched {
-        remote: remote.into(),
+        remote: remote.clone(),
         result: Ok(td_agent::protocol::Fetched {
             rules: vec![td_agent::rules::Read::Absent],
             identity: td_agent::repo::Identity {
@@ -6594,9 +6599,258 @@ fn a_push_is_exported_staged_asked_and_sent() {
     h.until(|up| matches!(up, Up::Prepared { .. }).then_some(()));
     // The agent's work, committed on its branch.
     std::fs::write(entry.checkout.join("b.txt"), "b\n").unwrap();
-    git(&entry.checkout, &["add", "b.txt"]);
-    git(&entry.checkout, &["commit", "--quiet", "-m", "Add b"]);
-    let tip = git(&entry.checkout, &["rev-parse", "HEAD"]);
+    git_in(&entry.checkout, &["add", "b.txt"]);
+    git_in(&entry.checkout, &["commit", "--quiet", "-m", "Add b"]);
+    let tip = git_in(&entry.checkout, &["rev-parse", "HEAD"]);
+    Prepared {
+        h,
+        entry,
+        base,
+        tip,
+        scratch,
+        remote,
+    }
+}
+
+/// In `auto` mode a clean push to an unprotected branch, not forced, is
+/// the classifier's (DESIGN.md §11): both stages allowing, it goes with
+/// no card, the approval the classifier's, both stages given the push's
+/// state, its evidence td-agent's and its branch, subjects and paths
+/// untrusted; Jev not allowing, it goes to a card that says why; and a
+/// forced push to main goes to the person, the classifier not asked.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL, TD_AGENT_TXT and a host git"]
+fn a_clean_push_in_auto_mode_is_the_classifiers() {
+    use td_agent::git::{Evidence, Staged};
+    let Prepared {
+        mut h,
+        base,
+        tip,
+        scratch,
+        remote,
+        ..
+    } = prepared(
+        "classified",
+        Client {
+            allow_data_collection: true,
+            ..Client::default()
+        },
+        |push| {
+            vec![
+                push("stream-tool-git-push.sse"),
+                Reply::sse("stream-sonnet.sse"),
+                Reply::ok("title.json"),
+                push("stream-tool-git-push.sse"),
+                Reply::sse("stream-sonnet.sse"),
+                push("stream-tool-git-push-forced.sse"),
+                Reply::sse("stream-sonnet.sse"),
+                push("stream-tool-git-push.sse"),
+                Reply::sse("stream-sonnet.sse"),
+            ]
+        },
+    );
+    h.mock.route(
+        "typesafe/jev",
+        vec![
+            Reply::ok("jev-matches.json"),
+            Reply::ok("jev-exceeds.json"),
+            Reply::ok("jev-matches.json"),
+        ],
+    );
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![
+            Reply::ok("classifier-allow.json"),
+            Reply::ok("classifier-allow.json"),
+            Reply::ok("classifier-allow.json"),
+        ],
+    );
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    let staged = |call: u64, at: Option<String>| Down::Staged {
+        call,
+        result: Ok(Staged {
+            tip: at,
+            evidence: Evidence {
+                merge_base: Some(base.clone()),
+                commits: vec![(tip.clone(), "Add b".into())],
+                paths: vec![("b.txt".into(), Some((1, 0)))],
+                lines: (1, 0),
+                ..Evidence::default()
+            },
+        }),
+    };
+    let stage = |h: &mut Harness| {
+        h.until(|up| match up {
+            Up::Stage { call, .. } => Some(*call),
+            _ => None,
+        })
+    };
+    let asked = "Add b.txt and push it.";
+    h.say(asked);
+    let call = stage(&mut h);
+    h.down(&staged(call, None));
+    let (call, lease) = h.until(|up| match up {
+        Up::Push { call, lease, .. } => Some((*call, lease.clone())),
+        Up::Ask { .. } => panic!("a clean push in auto mode was put to the person"),
+        _ => None,
+    });
+    assert_eq!(lease, None);
+    h.down(&Down::Pushed {
+        call,
+        result: Ok("pushed".into()),
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let approvals: Vec<(String, String)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::Approval { outcome, by, .. } => Some((outcome.clone(), by.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(approvals, [("allow".to_string(), "classifier".to_string())]);
+    let requests = h.mock.requests();
+    let jev = requests
+        .iter()
+        .find(|r| r.text().contains("typesafe/jev"))
+        .unwrap();
+    let body = flat(&jev.text());
+    assert_eq!(body["state.human.0"], asked);
+    assert_eq!(body["state.action.kind"], "push");
+    assert_eq!(body["state.action.remote"], remote);
+    assert_eq!(
+        body["state.action.detail"],
+        format!("push commit {tip} to a new branch of {remote}, this worktree's own remote")
+    );
+    assert!(!body.keys().any(|k| k.starts_with("state.action.receiver")));
+    assert_eq!(body["state.evidence.commits"], "1");
+    assert_eq!(body["state.evidence.lines"], "+1 -0");
+    assert!(!body.contains_key("state.evidence.merge_base"));
+    assert_eq!(body["state.policy.protected_branches.0"], "main");
+    assert_eq!(body["state.policy.protected_branches.1"], "master");
+    assert!(!body.contains_key("state.policy.protected_branches.2"));
+    assert_eq!(body["state.untrusted.branch"], "agent");
+    assert_eq!(body["state.untrusted.subjects"], "Add b");
+    assert_eq!(body["state.untrusted.paths"], "b.txt");
+    assert_eq!(body["state.untrusted.calls.0.tool"], "git_push");
+    let reasoning = requests
+        .iter()
+        .find(|r| r.text().contains("gpt-oss-safeguard"))
+        .unwrap();
+    let state = flat(&flat(&reasoning.text())["messages.1.content"]);
+    assert_eq!(state["action.kind"], "push");
+    assert_eq!(state["evidence.scan"], "nothing found, all of it read");
+    // Jev not allowing, the person is asked why.
+    h.say("Push it again.");
+    let call = stage(&mut h);
+    h.down(&staged(call, Some(base.clone())));
+    let (card, _, details) = h.until_ask();
+    assert!(
+        details[0].starts_with("Asked because the classifier did not allow it: "),
+        "{details:?}"
+    );
+    assert!(
+        details[1].starts_with("Jev: request exceeds"),
+        "{details:?}"
+    );
+    h.down(&Down::Decision {
+        call: card,
+        allow: false,
+        always: None,
+    });
+    h.turn();
+    // Forced onto main: the person's, the classifier not asked again.
+    h.say("Force it onto main.");
+    let call = stage(&mut h);
+    h.down(&staged(call, Some(base.clone())));
+    let (card, _, details) = h.until_ask();
+    assert_eq!(
+        details[0],
+        "Asked because it pushes to main, a protected branch, and it is forced."
+    );
+    h.down(&Down::Decision {
+        call: card,
+        allow: false,
+        always: None,
+    });
+    h.turn();
+    let asked_classifier = h
+        .mock
+        .requests()
+        .iter()
+        .filter(|r| r.text().contains("gpt-oss-safeguard"))
+        .count();
+    assert_eq!(asked_classifier, 2);
+    // Set to `ask` while the classifier is asked, which then allows: the
+    // person's, its verdict not taken.
+    h.say("Push it once more.");
+    let call = stage(&mut h);
+    h.down(&staged(call, Some(base.clone())));
+    h.down(&Down::Policy {
+        version: 2,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Ask,
+    });
+    let card = h.until(|up| match up {
+        Up::Ask { call, .. } => Some(*call),
+        Up::Push { .. } => panic!("pushed on the classifier's word in ask mode"),
+        _ => None,
+    });
+    h.down(&Down::Decision {
+        call: card,
+        allow: false,
+        always: None,
+    });
+    let (events, _, _) = h.turn();
+    assert!(!events.iter().any(|e| matches!(
+        &e.kind,
+        Kind::Approval { by, .. } if by == "classifier"
+    )));
+    // Asked, a third time, though its allow was not taken.
+    let asked_classifier = h
+        .mock
+        .requests()
+        .iter()
+        .filter(|r| r.text().contains("gpt-oss-safeguard"))
+        .count();
+    assert_eq!(asked_classifier, 3);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// A push, in a prepared repository workspace: the branch exported as a
+/// pack the window's worker reads, staged, put to the person with what
+/// the stage found, and sent as staged, the pack gone; a forced push to
+/// a protected branch is asked why, and a refusal sends nothing.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL, TD_AGENT_TXT and a host git"]
+fn a_push_is_exported_staged_asked_and_sent() {
+    use td_agent::git::{Evidence, Found, Staged};
+    let Prepared {
+        mut h,
+        entry,
+        base,
+        tip,
+        scratch,
+        remote,
+    } = prepared("pushed", Client::default(), |push| {
+        vec![
+            push("stream-tool-git-push.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            push("stream-tool-git-push-forced.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            push("stream-tool-git-push-forced.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            push("stream-tool-git-push.sse"),
+            push("stream-tool-git-push.sse"),
+            push("stream-tool-git-push.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ]
+    });
     let pack = h.state.push_pack(&h.id);
     // A pack an earlier push left is not in the way.
     std::fs::write(&pack, b"stale").unwrap();
@@ -6764,6 +7018,33 @@ fn a_push_is_exported_staged_asked_and_sent() {
         results(&events)[0].1,
         format!("error: the push to {remote} failed: the push was refused: stale info")
     );
+    // The same push three times in a row: the third is asked as a loop.
+    h.say("Push it, and keep trying.");
+    for n in 0..3 {
+        let call = h.until(|up| match up {
+            Up::Stage { call, .. } => Some(*call),
+            _ => None,
+        });
+        h.down(&Down::Staged {
+            call,
+            result: Ok(Staged {
+                tip: Some(base.clone()),
+                evidence: Evidence::default(),
+            }),
+        });
+        let (card, _, details) = h.until_ask();
+        assert_eq!(
+            details[0].starts_with("Asked because the model made this same call"),
+            n == 2,
+            "{details:?}"
+        );
+        h.down(&Down::Decision {
+            call: card,
+            allow: false,
+            always: None,
+        });
+    }
+    h.turn();
     let _ = std::fs::remove_dir_all(&scratch);
 }
 

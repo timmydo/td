@@ -534,6 +534,8 @@ fn staged_pairs(staged: &crate::git::Staged) -> Vec<(String, Json)> {
             ),
         ),
         ("more_paths".into(), Json::from(evidence.more_paths)),
+        ("added".into(), Json::from(evidence.lines.0)),
+        ("removed".into(), Json::from(evidence.lines.1)),
         (
             "binaries".into(),
             Json::Arr(evidence.binaries.iter().map(|path| text(path)).collect()),
@@ -595,6 +597,7 @@ fn staged(value: &Json) -> Result<crate::git::Staged, String> {
         merge_base: maybe(value, "merge_base")?,
         more_commits: number(value, "more_commits")?,
         more_paths: number(value, "more_paths")?,
+        lines: (number(value, "added")?, number(value, "removed")?),
         more_binaries: number(value, "more_binaries")?,
         more_found: number(value, "more_found")?,
         ..crate::git::Evidence::default()
@@ -1636,6 +1639,7 @@ mod tests {
                 more_commits: u64::MAX,
                 paths: vec![(worst.clone(), Some((u64::MAX, u64::MAX))); MAX_PATHS],
                 more_paths: u64::MAX,
+                lines: (u64::MAX, u64::MAX),
                 binaries: vec![worst.clone(); MAX_PATHS],
                 more_binaries: u64::MAX,
                 found: vec![
@@ -1726,7 +1730,7 @@ mod tests {
         }
         for paths in [r#"[["a",1]]"#, r#"[["a",null,1]]"#, r#"[["a",1,null]]"#] {
             let short = format!(
-                r#"{{"type":"staged","call":1,"error":null,"tip":null,"merge_base":null,"commits":[],"more_commits":0,"paths":{paths},"more_paths":0,"binaries":[],"more_binaries":0,"found":[],"more_found":0}}"#
+                r#"{{"type":"staged","call":1,"error":null,"tip":null,"merge_base":null,"commits":[],"more_commits":0,"paths":{paths},"more_paths":0,"added":0,"removed":0,"binaries":[],"more_binaries":0,"found":[],"more_found":0}}"#
             );
             assert!(Down::decode(short.as_bytes()).is_err(), "{paths}");
         }

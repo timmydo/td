@@ -1479,7 +1479,10 @@ pub fn push_card(
     let left = (evidence.commits.len() - shown) as u64;
     more(&mut card, shown, left.saturating_add(evidence.more_commits));
     let paths = count(evidence.paths.len(), evidence.more_paths);
-    card.line(format!("Files changed: {paths}"));
+    card.line(format!(
+        "Files changed: {paths}, +{} -{} lines",
+        evidence.lines.0, evidence.lines.1
+    ));
     let shown = evidence.paths.len().min(PUSH_PART);
     for (path, lines) in evidence.paths.iter().take(shown) {
         card.line(match lines {
@@ -1652,6 +1655,7 @@ mod tests {
                 more_commits: 3,
                 paths: vec![("a.txt".into(), Some((2, 1))), ("b.bin".into(), None)],
                 more_paths: 0,
+                lines: (2, 1),
                 binaries: vec!["b.bin".into(); 100],
                 more_binaries: 0,
                 found: vec![found; 50],
@@ -1683,6 +1687,7 @@ mod tests {
         assert!(lines.contains(&"Commits: 203".to_string()));
         assert_eq!(shown(&format!("  {} Add it", id('c'))), PUSH_PART);
         assert!(lines.contains(&"  \u{2026} and 163 more, not shown".to_string()));
+        assert!(lines.contains(&"Files changed: 2, +2 -1 lines".to_string()));
         assert!(lines.contains(&"  +2 -1 a.txt".to_string()));
         assert!(lines.contains(&"  binary b.bin".to_string()));
         assert!(!lines.iter().any(|l| l.contains("not shown.")), "{lines:?}");

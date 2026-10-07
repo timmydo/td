@@ -3270,21 +3270,57 @@ bytes and a remote whose visible URL is past 1024 refused so that each
 shows whole; whether the branch is new, must fast-forward, or is forced,
 replacing the tip it was staged against; the merge base; every match the
 scan kept and the count of the rest; and then the binary files, the
-commits and the files changed, at most 40 lines each and the rest
-counted, so every part shows. Its first line says why it is asked when
-the push is to a protected branch (`main` or `master` until
-`protected_branches` lands), forced against a tip the remote has, or the
-scan matched, a binary file counting. Until the classifier judges pushes
-and rules can name `git_push`, every push is the person's, in either
-mode, and the card offers no "always". Allowed and not interrupted, the
-conversation sends `Up::Push` with the commit, the branch and, when
-forced against a tip, that tip as the lease; to a branch the remote does
-not have, a forced push is a plain one. The model is told what git and
-the remote said, or why the push failed; an interrupt or a closed window
-while it waits says the push may still reach the remote. The export runs
-in the conversation process, as a preparation's checkout does, for at
-most twelve minutes in all, and an interrupt said meanwhile is heard
-when it ends, before anything is staged.
+commits and the files changed with the lines added and removed over all
+of them, at most 40 lines each and the rest counted, so every part
+shows. Its first line says why it is asked when the push is to a
+protected branch (`main`, `master` and every base the workspace tracks
+on that remote, until `protected_branches` lands), forced against a tip
+the remote has, or the scan matched, a binary file counting. Every other
+push is the person's in `ask` mode and the classifier's in `auto` mode
+(As built (increment 14, the classifier for pushes)); until rules can
+name `git_push`, the card offers no "always". Allowed and not
+interrupted, the conversation sends `Up::Push` with the commit, the
+branch and, when forced against a tip, that tip as the lease; to a
+branch the remote does not have, a forced push is a plain one. The model
+is told what git and the remote said, or why the push failed; an
+interrupt or a closed window while it waits says the push may still
+reach the remote. The export runs in the conversation process, as a
+preparation's checkout does, for at most twelve minutes in all, and an
+interrupt said meanwhile is heard when it ends, before anything is
+staged.
+
+**As built (increment 14, the classifier for pushes).** The table's push
+row is the classifier's second: in `auto` mode a push with no reason to
+ask, to a branch not protected, not forced against a tip, its scan
+clean, goes to both stages, unless it is the third same call in a row or
+the person's rules could not be read, which go to the person as a
+crossing's do. The state is a crossing's but for three things: `policy`
+also names the protected branches, `main`, `master` and the workspace's
+bases on that remote; an `evidence` field, after `project` and before
+`action`, holds what td-agent computed outside the jail, every value a
+string: the commits and files changed, counted with those past the
+evidence's lists, the lines added and removed over every file changed,
+listed or not (`Evidence::lines`), the binary files, and the scan,
+`nothing found, all of it read`; and the action, kind `push`, names the
+source and its `remote`, one of the source's own, and no receiver, its
+detail td-agent's (`classifier::pushed`): the commit, the remote, and
+whether the branch is new there or fast-forwards from its tip. The
+branch's name, the commits' subjects and the paths changed are the
+model's and go to `untrusted`, each cut as its other fields are. Jev's
+`discloses` question and the reasoning stage's policy text say that a
+push to one of the source's own remotes is not by itself a disclosure,
+and the policy text says when a push matches the person's request. Both
+allowing, the push goes with no card, its approval logged `by`
+`classifier`; otherwise the verdict is logged `ask`, counted by the
+breaker, and the card says why with Jev's probabilities. A policy that
+came while the classifier was asked is heard before its verdict is
+taken: out of `auto` mode then, the verdict is neither logged nor
+counted and the push goes to a card; and one heard after the verdict,
+just before the push, sends a push the classifier allowed to a card too.
+`td-agent/calibration/pushes.json` is the shipped set of pushes, held to
+the push's state in shape, its detail to `classifier::pushed`, and its
+calls to end with `git_push`; `td-agent calibrate` takes it as it takes
+the crossings.
 
 ## 10. Network policy
 

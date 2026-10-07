@@ -1786,6 +1786,15 @@ pub(crate) mod tests {
         );
         let evidence = worker.evidence(&publish, &merge, &base, None).unwrap();
         assert_eq!(evidence.merge_base, None);
+        // Every path listed here, so the totals are theirs.
+        assert_eq!(evidence.more_paths, 0);
+        let summed = evidence
+            .paths
+            .iter()
+            .filter_map(|(_, lines)| *lines)
+            .fold((0, 0), |(a, r), (x, y)| (a + x, r + y));
+        assert!(summed.0 > 0);
+        assert_eq!(evidence.lines, summed);
         assert_eq!(
             evidence.commits.first().unwrap(),
             &(merge.clone(), "merge".to_string())

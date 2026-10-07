@@ -46,7 +46,7 @@ pub struct Case {
 
 /// A fixture file's cases, each with a name of its own, an `expected`
 /// of `allow` or `ask`, and a state with the fields a classifier state
-/// has, `project` the only optional one.
+/// has, `project` and a push's `evidence` the only optional ones.
 pub fn cases(text: &str) -> Result<Vec<Case>, String> {
     let value = td_json::parse_slice(text.as_bytes()).map_err(|e| format!("not JSON: {e}"))?;
     let items = value.as_arr().ok_or("not an array of cases")?;
@@ -73,11 +73,11 @@ pub fn cases(text: &str) -> Result<Vec<Case>, String> {
         let named: Vec<&str> = fields
             .iter()
             .map(|(name, _)| name.as_str())
-            .filter(|name| *name != "project")
+            .filter(|name| !["project", "evidence"].contains(name))
             .collect();
         if named != FIELDS {
             return Err(said(&format!(
-                "its state's fields are {named:?}, not {FIELDS:?} and an optional project"
+                "its state's fields are {named:?}, not {FIELDS:?} and an optional project and evidence"
             )));
         }
         out.push(Case {
@@ -490,6 +490,102 @@ mod tests {
         }
     }
 
+    /// The shipped pushes: each the state `classifier::state` builds for
+    /// a push in shape, the protected branches in its policy
+    /// and its evidence before the action; its detail what td-agent says
+    /// of the push; and its calls ending with `git_push`.
+    #[test]
+    fn the_shipped_pushes_are_states_the_classifier_is_given() {
+        let shipped = include_str!("../calibration/pushes.json");
+        let cases = cases(shipped).unwrap();
+        assert!(cases.len() >= 12, "{}", cases.len());
+        assert!(cases.iter().any(|case| case.allow));
+        assert!(cases.iter().any(|case| !case.allow));
+        let side = classifier::Side {
+            conversation: "x".into(),
+            workspace: "w".into(),
+            remotes: vec!["r".into()],
+            model: "m".into(),
+        };
+        let policy = Json::Obj(vec![
+            ("mode".into(), Json::Str("auto".into())),
+            ("rules".into(), Json::Arr(vec![Json::Str("r".into())])),
+            (
+                "protected_branches".into(),
+                Json::Arr(vec![Json::Str("main".into())]),
+            ),
+        ]);
+        let (action, detail) = classifier::pushed("c", "r", None);
+        let reference = classifier::state(
+            &["h".to_string()],
+            policy,
+            Some("p".into()),
+            &[("t".to_string(), Some("p".to_string()))],
+            &classifier::Pending {
+                action,
+                source: side,
+                remote: Some("r".into()),
+                evidence: Some(classifier::push_evidence(&crate::git::Evidence::default())),
+                detail,
+                untrusted: vec![
+                    ("branch", "b".into()),
+                    ("subjects", "s".into()),
+                    ("paths", "p".into()),
+                    ("received", "r".into()),
+                ],
+                ..classifier::Pending::default()
+            },
+        );
+        for case in &cases {
+            let at = |path: &[&str]| case.state.get_path(path).and_then(Json::as_str).unwrap();
+            assert_eq!(at(&["action", "kind"]), "push", "{}", case.name);
+            shaped(&case.state, &reference, "state")
+                .unwrap_or_else(|why| panic!("{}: {why}", case.name));
+            let detail = at(&["action", "detail"]);
+            let remote = at(&["action", "remote"]);
+            let commit = detail
+                .strip_prefix("push commit ")
+                .and_then(|rest| rest.get(..40))
+                .unwrap();
+            let tip = detail
+                .rsplit_once("fast-forwarding it from ")
+                .map(|(_, tip)| tip);
+            assert_eq!(
+                detail,
+                classifier::pushed(commit, remote, tip).1,
+                "{}",
+                case.name
+            );
+            let remotes = case
+                .state
+                .get_path(&["action", "source", "remotes"])
+                .and_then(Json::as_arr)
+                .unwrap();
+            assert!(
+                remotes.iter().any(|r| r.as_str() == Some(remote)),
+                "{}",
+                case.name
+            );
+            // Only a clean push reaches the classifier.
+            assert_eq!(at(&["evidence", "scan"]), "nothing found, all of it read");
+            assert_eq!(at(&["evidence", "binary_files"]), "0");
+            let calls = case
+                .state
+                .get_path(&["untrusted", "calls"])
+                .and_then(Json::as_arr)
+                .unwrap();
+            assert_eq!(
+                calls
+                    .last()
+                    .and_then(|call| call.get("tool"))
+                    .and_then(Json::as_str),
+                Some("git_push"),
+                "{}",
+                case.name
+            );
+        }
+    }
+
     /// Every shipped fixture parses, names itself once, and has the shape,
     /// at every level, of the state `classifier::state` builds for its
     /// kind of crossing; its detail is what td-agent says of it; and its
@@ -528,10 +624,11 @@ mod tests {
                 &classifier::Pending {
                     action,
                     source: side.clone(),
-                    receiver: side.clone(),
+                    receiver: Some(side.clone()),
                     detail,
                     payload,
                     untrusted: vec![("title", "t".into()), ("received", "r".into())],
+                    ..classifier::Pending::default()
                 },
             )
         };

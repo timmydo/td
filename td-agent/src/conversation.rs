@@ -2712,6 +2712,7 @@ impl Session {
         worktree: &str,
         remote_branch: Option<String>,
         force: bool,
+        repeated: bool,
     ) -> Result<Result<String, String>, String> {
         let meta = self.conversation.meta().clone();
         let entry = match prepared_entry(&meta, "git_push", worktree) {
@@ -2791,7 +2792,7 @@ impl Session {
         let lease = if force { staged.tip.clone() } else { None };
         let evidence = &staged.evidence;
         let mut reasons = Vec::new();
-        if crate::git::PROTECTED.contains(&branch.as_str()) {
+        if protected_branches(meta.workspace.as_ref(), &remote).contains(&branch) {
             reasons.push(format!("it pushes to {branch}, a protected branch"));
         }
         if lease.is_some() {
@@ -2804,23 +2805,96 @@ impl Session {
         {
             reasons.push("the scan matched".to_string());
         }
-        let asked = (!reasons.is_empty()).then(|| reasons.join(", and "));
-        let (title, mut details) = tools::push_card(&remote, &branch, &commit, force, &staged);
-        if let Some(why) = &asked {
-            details.insert(0, format!("Asked because {why}."));
+        let mut asked = (!reasons.is_empty()).then(|| reasons.join(", and "));
+        // The table (DESIGN.md §11): any other push is the classifier's
+        // in `auto` mode, unless it is a repeated call or the person's
+        // rules could not be read.
+        if asked.is_none() && repeated {
+            asked = Some(REPEATED_WHY.into());
         }
-        match self.decide(started, title, details, asked.as_deref(), None, None)? {
-            Decided::Allowed | Decided::Released => {}
-            Decided::Refused => return Ok(Err(CALL_REFUSED.into())),
-            Decided::Undecided => return Ok(Err(CALL_UNDECIDED.into())),
-            Decided::Ruled(why) => return Ok(Err(ruled(&why))),
+        if let (None, Err(why)) = (&asked, &self.human.1) {
+            asked = Some(tools::visible(&format!(
+                "your rules could not be read: {why}"
+            )));
         }
-        self.hear();
-        if self.interrupt {
-            return Ok(Err(CALL_SKIPPED.into()));
-        }
-        if self.gone {
-            return Ok(Err("the window has closed; nothing was pushed".into()));
+        let mut jev = None;
+        // Allowed by the classifier, not the person; asked at most once.
+        let mut allowed = false;
+        let mut classified = false;
+        loop {
+            let auto = self.workspace_mode() == crate::config::Mode::Auto;
+            if asked.is_none() && auto && !classified {
+                classified = true;
+                let outcome = self.classify(|me, client| {
+                    me.push_pending(&entry, &branch, &commit, &staged, client)
+                })?;
+                // A policy the person set while it was asked comes first:
+                // out of `auto` mode now, the verdict is not theirs.
+                self.hear();
+                if self.workspace_mode() != crate::config::Mode::Auto {
+                    continue;
+                }
+                if outcome.allow {
+                    self.log(Kind::Approval {
+                        call: started,
+                        outcome: "allow".into(),
+                        by: "classifier".into(),
+                        probabilities: outcome.probabilities,
+                        reason: Some(outcome.reason),
+                    })?;
+                    allowed = true;
+                } else {
+                    // A verdict is logged, and counted by the breaker; a
+                    // classifier not asked gave none.
+                    if outcome.asked {
+                        self.log(Kind::Approval {
+                            call: started,
+                            outcome: "ask".into(),
+                            by: "classifier".into(),
+                            probabilities: outcome.probabilities.clone(),
+                            reason: Some(outcome.reason.clone()),
+                        })?;
+                        self.brake()?;
+                    }
+                    jev = outcome.probabilities;
+                    asked = Some(format!(
+                        "the classifier did not allow it: {}",
+                        outcome.reason
+                    ));
+                }
+            }
+            if !allowed {
+                let (title, mut details) =
+                    tools::push_card(&remote, &branch, &commit, force, &staged);
+                if let Some(jev) = &jev {
+                    details.insert(0, format!("Jev: {jev}."));
+                }
+                if let Some(why) = &asked {
+                    details.insert(0, format!("Asked because {why}."));
+                }
+                match self.decide(started, title, details, asked.as_deref(), None, None)? {
+                    Decided::Allowed | Decided::Released => {}
+                    Decided::Refused => return Ok(Err(CALL_REFUSED.into())),
+                    Decided::Undecided => return Ok(Err(CALL_UNDECIDED.into())),
+                    Decided::Ruled(why) => return Ok(Err(ruled(&why))),
+                }
+            }
+            self.hear();
+            if self.interrupt {
+                return Ok(Err(CALL_SKIPPED.into()));
+            }
+            if self.gone {
+                return Ok(Err("the window has closed; nothing was pushed".into()));
+            }
+            // Out of `auto` mode since the classifier allowed it: the
+            // person's.
+            if allowed && self.workspace_mode() != crate::config::Mode::Auto {
+                allowed = false;
+                asked =
+                    Some("this workspace left auto mode after the classifier allowed it".into());
+                continue;
+            }
+            break;
         }
         let call = self.ask_id();
         self.send(&Up::Push {
@@ -4190,7 +4264,7 @@ impl Session {
                 worktree,
                 remote_branch,
                 force,
-            } => self.git_push(started, &worktree, remote_branch, force)?,
+            } => self.git_push(started, &worktree, remote_branch, force, repeated)?,
             Args::Todo(items) => {
                 let text = tools::todo_text(&items);
                 self.log(Kind::Todo {
@@ -4336,7 +4410,7 @@ impl Session {
                 // a repeated call is the human's.
                 Ruling::Auto if repeated => Some(Some(REPEATED_WHY.to_string())),
                 Ruling::Auto => {
-                    let outcome = self.classify(&meta, reach)?;
+                    let outcome = self.classify(|me, client| me.crossing(&meta, reach, client))?;
                     // A policy taken while it was asked is judged first:
                     // a deny in force is never put to the person.
                     if self.human.0 != ruled_at {
@@ -5044,7 +5118,10 @@ impl Session {
     /// once, each request reserved, logged and settled as a title's is,
     /// and what the two came to. Whatever stops a stage from being asked
     /// leaves the action to the human, said in the outcome's reason.
-    fn classify(&mut self, to: &store::Meta, reach: Reach) -> Result<classifier::Outcome, String> {
+    fn classify(
+        &mut self,
+        pending: impl FnOnce(&Self, &Client) -> classifier::Pending,
+    ) -> Result<classifier::Outcome, String> {
         let refused = |reason: String| classifier::Outcome {
             asked: false,
             allow: false,
@@ -5105,7 +5182,8 @@ impl Session {
                 client.classifier_model
             )));
         }
-        if let Reach::Message(text) | Reach::Search(text) = reach {
+        let pending = pending(self, &client);
+        if let Some((_, text)) = &pending.payload {
             if text.len() > classifier::MAX_PAYLOAD {
                 return Ok(refused(format!(
                     "what it carries is longer than the {} bytes it is shown",
@@ -5113,7 +5191,7 @@ impl Session {
                 )));
             }
         }
-        let state = self.classifier_state(to, reach, &client);
+        let state = self.classifier_state(&pending);
         let head = classifier::reasoning_head(&client, &state);
         let bytes = head.len() as u64 + 2;
         let pricing = model.as_ref().and_then(|m| m.pricing);
@@ -5276,12 +5354,12 @@ impl Session {
         ))
     }
 
-    /// The state the classifier sees of this conversation reaching `to`
-    /// as `reach` says (DESIGN.md §11): the person's messages, this
-    /// workspace's rules, its project instructions when the human trusts
-    /// them, the calls made by tool and path, the action and both sides,
+    /// The state the classifier sees of `pending` (DESIGN.md §11): the
+    /// person's messages, this workspace's rules, and for a push the
+    /// branches always the person's, its project instructions when the
+    /// human trusts them, the calls made by tool and path, the action,
     /// and what a model wrote apart, untrusted.
-    fn classifier_state(&self, to: &store::Meta, reach: Reach, client: &Client) -> td_json::Json {
+    fn classifier_state(&self, pending: &classifier::Pending) -> td_json::Json {
         use td_json::Json;
         let events = self.conversation.events();
         let human: Vec<String> = events
@@ -5310,7 +5388,7 @@ impl Session {
             })
             .collect();
         let (rules, _) = self.rules();
-        let policy = Json::Obj(vec![
+        let mut policy = vec![
             (
                 "mode".into(),
                 Json::Str(self.workspace_mode().word().into()),
@@ -5324,40 +5402,35 @@ impl Session {
                         .collect(),
                 ),
             ),
-        ]);
-        let side = |meta: &store::Meta| classifier::Side {
-            conversation: meta.id.as_str().to_string(),
-            workspace: match &meta.workspace {
-                None => "none".into(),
-                Some(Workspace::Scratch) => "scratch".into(),
-                Some(Workspace::Template(name)) => format!("template {name}"),
-                Some(Workspace::Directory(path)) => format!("directory {}", path.display()),
-                Some(Workspace::Repositories(r)) => {
-                    format!("repositories of template {}", r.template)
-                }
-            },
-            remotes: match &meta.workspace {
-                Some(Workspace::Repositories(r)) => {
-                    r.entries.iter().map(|e| e.remote.clone()).collect()
-                }
-                _ => Vec::new(),
-            },
-            model: meta.model.clone().unwrap_or_else(|| client.model.clone()),
-        };
+        ];
+        if let Some(remote) = &pending.remote {
+            policy.push((
+                "protected_branches".into(),
+                Json::Arr(
+                    protected_branches(self.conversation.meta().workspace.as_ref(), remote)
+                        .into_iter()
+                        .map(Json::Str)
+                        .collect(),
+                ),
+            ));
+        }
+        classifier::state(
+            &human,
+            Json::Obj(policy),
+            self.trusted_project(),
+            &calls,
+            pending,
+        )
+    }
+
+    /// A crossing of this conversation to `to` as `reach` says, as the
+    /// classifier is asked it: both sides, and what a model wrote apart.
+    fn crossing(&self, to: &store::Meta, reach: Reach, client: &Client) -> classifier::Pending {
+        let side = |meta: &store::Meta| side(meta, client);
         let (action, detail, payload) = classifier::described(to.id.as_str(), reach);
         let mut untrusted = vec![("title", to.title.clone())];
-        // What other conversations sent this one, the latest few.
-        let received: Vec<&str> = events
-            .iter()
-            .rev()
-            .filter_map(|e| match &e.kind {
-                Kind::Message { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .take(4)
-            .collect();
-        if !received.is_empty() {
-            untrusted.push(("received", received.join("\n---\n")));
+        if let Some(received) = self.received() {
+            untrusted.push(("received", received));
         }
         // Where the content comes from and goes: a message carries this
         // conversation's, a read or a search the other's.
@@ -5366,15 +5439,69 @@ impl Session {
             Reach::Message(_) => (here, there),
             Reach::Search(_) | Reach::Read { .. } => (there, here),
         };
-        let pending = classifier::Pending {
+        classifier::Pending {
             action,
             source,
-            receiver,
+            receiver: Some(receiver),
+            remote: None,
+            evidence: None,
             detail,
             payload,
             untrusted,
-        };
-        classifier::state(&human, policy, self.trusted_project(), &calls, &pending)
+        }
+    }
+
+    /// What other conversations sent this one, the latest few, for the
+    /// classifier's untrusted field.
+    fn received(&self) -> Option<String> {
+        let received: Vec<&str> = self
+            .conversation
+            .events()
+            .iter()
+            .rev()
+            .filter_map(|e| match &e.kind {
+                Kind::Message { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .take(4)
+            .collect();
+        (!received.is_empty()).then(|| received.join("\n---\n"))
+    }
+
+    /// A push of `commit` to `branch` of `entry`'s remote, staged as
+    /// `staged`, as the classifier is asked it (DESIGN.md §9, §11): the
+    /// evidence and the remote td-agent's; the branch, the subjects and
+    /// the paths a model's, untrusted.
+    fn push_pending(
+        &self,
+        entry: &Entry,
+        branch: &str,
+        commit: &str,
+        staged: &crate::git::Staged,
+        client: &Client,
+    ) -> classifier::Pending {
+        let (action, detail) = classifier::pushed(commit, &entry.remote, staged.tip.as_deref());
+        let evidence = &staged.evidence;
+        let subjects: Vec<&str> = evidence.commits.iter().map(|(_, s)| s.as_str()).collect();
+        let paths: Vec<&str> = evidence.paths.iter().map(|(p, _)| p.as_str()).collect();
+        let mut untrusted = vec![
+            ("branch", branch.to_string()),
+            ("subjects", subjects.join("\n")),
+            ("paths", paths.join("\n")),
+        ];
+        if let Some(received) = self.received() {
+            untrusted.push(("received", received));
+        }
+        classifier::Pending {
+            action,
+            source: side(self.conversation.meta(), client),
+            receiver: None,
+            remote: Some(entry.remote.clone()),
+            evidence: Some(classifier::push_evidence(evidence)),
+            detail,
+            payload: None,
+            untrusted,
+        }
     }
 
     /// This repository workspace's project instructions as the model is
@@ -5390,6 +5517,48 @@ impl Session {
         let trusted = policy.trust(&workspace.key(&meta.id))?;
         let (text, digest) = crate::card::project(repositories, self.conversation.instructions())?;
         (digest == trusted).then_some(text)
+    }
+}
+
+/// The branches of `remote` a push to which is always the person's
+/// (DESIGN.md §9, Pushing): `git::PROTECTED`, and every base
+/// `workspace` tracks there.
+fn protected_branches(workspace: Option<&Workspace>, remote: &str) -> Vec<String> {
+    let mut branches: Vec<String> = crate::git::PROTECTED
+        .iter()
+        .map(|branch| (*branch).to_string())
+        .collect();
+    if let Some(Workspace::Repositories(repositories)) = workspace {
+        for entry in &repositories.entries {
+            if entry.remote == remote && !branches.contains(&entry.base) {
+                branches.push(entry.base.clone());
+            }
+        }
+    }
+    branches
+}
+
+/// One side of a crossing, or a push's source, as the classifier sees
+/// it: the conversation, its workspace, its remotes and its model.
+fn side(meta: &store::Meta, client: &Client) -> classifier::Side {
+    classifier::Side {
+        conversation: meta.id.as_str().to_string(),
+        workspace: match &meta.workspace {
+            None => "none".into(),
+            Some(Workspace::Scratch) => "scratch".into(),
+            Some(Workspace::Template(name)) => format!("template {name}"),
+            Some(Workspace::Directory(path)) => format!("directory {}", path.display()),
+            Some(Workspace::Repositories(r)) => {
+                format!("repositories of template {}", r.template)
+            }
+        },
+        remotes: match &meta.workspace {
+            Some(Workspace::Repositories(r)) => {
+                r.entries.iter().map(|e| e.remote.clone()).collect()
+            }
+            _ => Vec::new(),
+        },
+        model: meta.model.clone().unwrap_or_else(|| client.model.clone()),
     }
 }
 
@@ -5902,6 +6071,39 @@ fn canonical(value: td_json::Json) -> td_json::Json {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
+
+    /// A push to `main`, `master` or a base the workspace tracks on that
+    /// remote is the person's; another remote's bases are not this one's.
+    #[test]
+    fn a_workspaces_bases_are_protected() {
+        let repo = |remote: &str, base: &str| crate::config::Repo {
+            remote: remote.into(),
+            base: base.into(),
+            branch: format!("agent-{base}"),
+            sparse: None,
+        };
+        let template = crate::config::Template {
+            name: "td".into(),
+            repos: vec![
+                repo("https://example.org/a/td", "develop"),
+                repo("https://example.org/a/td", "main"),
+                repo("https://example.org/a/other", "release"),
+            ],
+            shared: None,
+        };
+        let id = Id::random().unwrap();
+        let made = crate::workspace::plan(&template, &id, "/d".as_ref(), "/h".as_ref(), 0).unwrap();
+        let workspace = Workspace::Repositories(made);
+        assert_eq!(
+            protected_branches(Some(&workspace), "https://example.org/a/td"),
+            ["main", "master", "develop"]
+        );
+        assert_eq!(
+            protected_branches(Some(&Workspace::Scratch), "https://example.org/a/td"),
+            ["main", "master"]
+        );
+        assert_eq!(protected_branches(None, "r"), ["main", "master"]);
+    }
 
     /// `git_fetch`'s result: each base where it is, unchanged, moved or
     /// newly recorded, or not found upstream.

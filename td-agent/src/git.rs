@@ -1402,6 +1402,9 @@ pub struct Evidence {
     /// lines added and removed, none for a binary file.
     pub paths: Vec<(String, Option<(u64, u64)>)>,
     pub more_paths: u64,
+    /// The lines added and removed over every path changed, listed or
+    /// not.
+    pub lines: (u64, u64),
     /// Each binary file the push carries, by its path: every blob it
     /// adds that git would call binary, in whichever commit, though a
     /// later one removes it.
@@ -1410,6 +1413,24 @@ pub struct Evidence {
     /// Each credential shape found: its kind, the commit, and the path.
     pub found: Vec<Found>,
     pub more_found: u64,
+}
+
+impl Evidence {
+    /// Takes one path changed: listed while there is room, counted past
+    /// it, its lines added to the totals either way.
+    fn tally(&mut self, (path, lines): (String, Option<(u64, u64)>)) {
+        if let Some((added, removed)) = lines {
+            self.lines = (
+                self.lines.0.saturating_add(added),
+                self.lines.1.saturating_add(removed),
+            );
+        }
+        if self.paths.len() < MAX_PATHS {
+            self.paths.push((path, lines));
+        } else {
+            self.more_paths = self.more_paths.saturating_add(1);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2045,7 +2066,6 @@ impl Worker {
             id,
         ]);
         let mut record = Vec::new();
-        let (paths, more_paths) = (&mut evidence.paths, &mut evidence.more_paths);
         run_into(&mut diff, None, MAX_SCANNED, EVIDENCE_TIME, &mut |bytes| {
             for &b in bytes {
                 if b != 0 {
@@ -2055,11 +2075,7 @@ impl Worker {
                     continue;
                 }
                 if let Some(entry) = numstat(&record) {
-                    if paths.len() < MAX_PATHS {
-                        paths.push(entry);
-                    } else {
-                        *more_paths = more_paths.saturating_add(1);
-                    }
+                    evidence.tally(entry);
                 }
                 record.clear();
             }
@@ -3404,6 +3420,20 @@ pub(crate) mod tests {
             .take(format!("{one} blob 2\n\0\0\n{two} blob 2\n\0\0\n").as_bytes())
             .unwrap();
         assert_eq!(objects.binaries.len(), 2, "{:?}", objects.binaries);
+    }
+
+    /// Every path's lines count in the totals, those past the list too.
+    #[test]
+    fn every_paths_lines_are_counted() {
+        let mut evidence = Evidence::default();
+        for n in 0..=MAX_PATHS {
+            evidence.tally((format!("f{n}"), Some((2, 1))));
+        }
+        evidence.tally(("blob".into(), None));
+        assert_eq!(evidence.paths.len(), MAX_PATHS);
+        assert_eq!(evidence.more_paths, 2);
+        let all = (MAX_PATHS as u64) + 1;
+        assert_eq!(evidence.lines, (2 * all, all));
     }
 
     /// A hunk's header says how many of the file's lines follow it.
