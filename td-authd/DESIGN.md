@@ -559,8 +559,9 @@ the trusted validator and closes the channel. There is no caller-provided
 executable, environment, directory path, account, uid or argument vector. A
 typed program kind selects a fixed executable and, for terminals, either
 the account home or td's fixed task worktree; the editor, photo tool,
-review window and disk usage analyzer start in the account home, and the
-review window's one argument is fixed by the authority. All
+review window, disk usage analyzer and coding agent start in the account
+home, and the review window's one argument and the coding agent's three
+variables are fixed by the authority. All
 authority-spawned credential-helper children replace stdin, stdout and stderr
 with `/dev/null`, clear the environment, and start from `/`. The task variant's
 eventual td-term child enters only the fixed worktree described below. Replacing
@@ -588,6 +589,7 @@ Subsequent payloads are exact byte records:
 | `09` | `81` plus a process handle for the human photo tool |
 | `0a` | `81` plus a process handle for the human code review window |
 | `0b` | `81` plus a process handle for the human disk usage analyzer |
+| `0c` | `81` plus a process handle for the human coding agent |
 
 A full table returns `ff 01`; a spawn failure returns `ff 02`. Every other
 request, trailing byte, unknown handle, wait error, timeout or transport
@@ -611,8 +613,8 @@ request or heartbeat within each five-second receive deadline.
 
 The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
 terminal-exec UID GENERATION HANDLE
-[task|claude|taskmgr|editor|photo|review|dua]` in a new process group.
-The optional literal selects requests `04` and `06` through `0b`; it is not a
+[task|claude|taskmgr|editor|photo|review|dua|agent]` in a new process
+group. The optional literal selects requests `04` and `06` through `0c`; it is not a
 pathname.
 td-login checks
 the human account policy and drops and verifies credentials. Its exact
@@ -680,7 +682,37 @@ link, so the entries deleted can lie outside the tree the human chose
 exposure; the card adds a way to start, not a new way to delete. What
 td-dua finds there is data it lists and measures, never runs.
 
-An authority older than one of requests `07` through `0b` closes the
+Request `0c` is the same shape for td-agent, the coding agent's window
+(td-agent/DESIGN.md), and the one desktop program with more than
+`WAYLAND_DISPLAY` added: it execs `/bin/td-agent` with no arguments from
+the verified account home, with `XDG_RUNTIME_DIR=/run/user/UID`, where
+the fetch service's and the egress relay's sockets are, and
+`TD_AGENT_JAIL=/bin/td-jail` and `TD_AGENT_TXT=/bin/td-txt`, the image's
+programs its tools run through, each fixed by the authority; the request
+carries none of them. td-agent runs as the human, outside application
+confinement, as td-review does: it reads its API key from its own file
+in the human's configuration, keeps its conversations in the human's
+state directory, sends model requests through the fetch service, and
+runs every tool a model asks for inside `td-jail --workspace`, which on
+td serves this account alone (APPLICATIONS.md §C), under its approval
+policy (td-agent/DESIGN.md §11); a workspace reaches the network only
+through the relay, per connection, as its policy, the person, or in
+`auto` the classifier allows. What a model writes reaches the human's
+files through the directories a workspace grants, which the person
+decides, and through td-agent's git worker, which runs outside any jail
+as the human. That worker pushes to a local repository the person admitted
+as a remote, running that repository's receive hooks as the human
+(td-agent/DESIGN.md §7, "Local repositories"), and every repository
+under `~/src` is one Claude's application view can write: an
+application that plants or swaps such a hook has it run as the human at
+the next push there, the class the `0a` paragraph names for git's
+repository configuration. Its environment is the card's alone, as `0a`'s
+is: no ssh agent, so a remote that needs one fails from the card, and
+no passphrase prompt, since td-pinentry runs only on a host. A terminal
+start of td-agent with those variables has the same reach; the card
+adds a way to start.
+
+An authority older than one of requests `07` through `0c` closes the
 entire launch channel on it; its paired compositor then restarts. The image ships
 both peers atomically. Those records were additive within TDLA002, without
 negotiation or mixed-version compatibility. The login requests `1b` and `1c`

@@ -19,7 +19,8 @@ const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
 td-agent is td's agent harness (td-agent/DESIGN.md). Its window lists the\n\
 conversations, the most recently active first, beside the open one.\n\
 Each message is a turn with the configured model through OpenRouter, by\n\
-way of td's fetch service: run it as ./install-apps installs it from a td\n\
+way of td's fetch service: on td, start it from the launcher's CODING\n\
+AGENT card; on a host, run it as ./install-apps installs it from a td\n\
 checkout, whose launch serves that.\n\
 \n\
 Keys: Return in the composer sends it (S-Return is a newline, and\n\

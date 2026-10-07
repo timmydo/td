@@ -45,14 +45,16 @@ classifier in `auto` (§10, §11). Where building
 an increment settled a point the design left open, the section says so
 under "As built". The `td-agent` recipe builds it for the image (§17).
 The decisions below that
-were the user's to make were made on 2026-10-01, 2026-10-02 and
-2026-10-04:
+were the user's to make were made on 2026-10-01, 2026-10-02,
+2026-10-04 and 2026-10-07:
 
 - **Use:** both coding and general assistance, coding first.
 - **Run target:** an unjailed installed launch on a development host first
   (`./install-apps`, as td-news and td-mail, APPLICATIONS.md §X.7), so
-  the harness can be exercised against OpenRouter at once; packaging as a
-  jailed td application follows as its own increment.
+  the harness can be exercised against OpenRouter at once; on td, a
+  program of td's account outside application confinement, as td-review
+  is, started from the launcher's card, rather than a jailed application
+  (2026-10-07; §8, "On td").
 - **Coordination:** no orchestrator. Every conversation is a peer with
   the same tools and prompt; the human creates each and can archive or
   delete any; and reading or messaging another conversation is a
@@ -232,8 +234,8 @@ limit through the window process (§5); it is the only writer of its
 conversation's directory (§6), which it holds an exclusive lock on, so a
 restarted window process cannot start a second writer while an old
 conversation process is still exiting; it runs the rules and the
-classifier of §11; and it starts, or inside td asks the listener of §8
-to start, every jail instance the conversation uses: its own file-tool
+classifier of §11; and it starts every jail instance the conversation
+uses, on a host and on td alike (§8): its own file-tool
 instance, `shell`, `grep`, `sed`, snapshot, background and maintenance
 instances, forks included. Workspace maintenance that no turn asks for
 (the periodic remote-tracking update, the counts `conversations` shows,
@@ -886,8 +888,10 @@ is a bearer credential the human copies from their provider, the bytes
 the key file holds, which any process of theirs can read on the
 host launch the dialog serves. Masking keeps it off the screen and
 out of what the window shows the driven seam; it does not stop another
-client drawing a look-alike, which is why the dialog is the host
-launch's alone and the key on td is the portal credential (§6).
+client drawing a look-alike. On td it serves as well, td-agent being a
+program of td's account there (§8), with that residual: a jailed
+application's window could imitate it, and a key typed into the
+imitation is the application's.
 
 Without a key the status row says `no key: F10` after the state, until
 one is stored, when a note says where it was stored and that every
@@ -1575,11 +1579,13 @@ any request, naming the setting that chose it.
   directory. Anything else is refused by name. There is no
   environment-variable form: one mechanism, and nothing that a child
   could inherit.
-- **On td:** the `td.Secret1` portal credential `agent/openrouter`,
-  retrieved the way td-mail retrieves `mail/main` (APPLICATIONS.md §W.4),
-  and written with `td-secret set agent/openrouter`. The stock VM is
-  unenrolled, so there the portal's refusal is the expected outcome and is
-  shown as such.
+- **On td:** the same file. td-agent is a program of td's account there,
+  outside application confinement (§8). An application's home is its
+  own (APPLICATIONS.md §C), and the image's grants of the human's
+  (Downloads, `~/Opened` read-only, Claude's `~/src`) leave
+  `~/.config` out; nothing enforces that a later reviewed grant does,
+  so one that reached `~/.config/td-agent` would expose the key and
+  needs this section's amendment.
 
 The key is never logged, rendered, written into a conversation, sent to
 the classifier, or present in any jail instance's environment or
@@ -1587,8 +1593,9 @@ filesystem; §8's admission rules keep its file out of every source a jail
 binds. Git credentials are the human's own and are used only by the git
 worker outside any jail (§9).
 
-**The conversation store** is `$XDG_STATE_HOME/td-agent/` on a host, and
-the application's persistent state directory on td. No jail instance ever
+**The conversation store** is `$XDG_STATE_HOME/td-agent/` (its
+`~/.local/state` default on td, where the card's environment names no
+`XDG_STATE_HOME`). No jail instance ever
 sees it. Each conversation is a directory named by a random id (one the
 human deleted (§4) is renamed `.deleting-<id>` under its lock and then
 removed; a listing skips it, and the window at its start finishes a
@@ -1850,12 +1857,8 @@ window process, from the key dialog of §4. Nothing else writes it.
   notice, the driven state, the clipboard, an argument, the environment
   or any file but `openrouter.key` (and the temporary file a save cut
   short leaves).
-- **On td** the key is the portal credential (above), and the file is
-  not read. td-agent runs only as `./install-apps` installs it on a
-  host until the packaging increment, so there is no jailed run for the
-  window to tell apart today and the item is always shown; the packaging
-  increment hides it in the jailed run, or has it say that the key is
-  set with `td-secret set agent/openrouter`.
+- **On td** the file is read and written as on a host, and the item is
+  shown: td-agent is a program of td's account there (§8).
 
 ## 7. Workspaces
 
@@ -2899,20 +2902,19 @@ design is then additive:
   counterpart that throttles (`RLIMIT_CPU` kills). Setting it needs
   `unsafe` that td-agent does not carry, so it would be td-jail's to
   apply to an instance's entry.
-- **Inside td**, instances are started by a root request listener, not
-  as descendants of the conversation process ("Inside td" below), so
-  that listener must place them under the conversation's node; the
-  packaging increment designs that.
+- **On td**, td-agent runs td-jail itself, as on a host ("On td"
+  below), so instances are the conversation process's descendants
+  there too.
 
 To keep this open, the rule is placement: everything a conversation
-causes is placed under that conversation's node, and on a host the means
-is ancestry. So on a host no increment may run a conversation's work in
-the window process or in any process not descended from that
+causes is placed under that conversation's node, and on a host and on td
+the means is ancestry. So there no increment may run a conversation's
+work in the window process or in any process not descended from that
 conversation's own; and nowhere may one conversation process serve two
 conversations, or an increment depend on td-jail moving an instance out
-of its launcher's cgroup on a host. The
-git worker's imports and pushes are children of the window process,
-which would take a limit of their own (§9).
+of its launcher's cgroup on a host. The git worker's imports and pushes
+are children of the window process, which would take a limit of their
+own (§9).
 
 **Mechanism.** td has one confinement implementation, td-jail
 (APPLICATIONS.md §C), and td-agent does not grow a second one. The jail is
@@ -3140,12 +3142,19 @@ egress sockets, the human's SSH agent, and the control socket, through
 which they could answer their own cards; it is a decision to trust the
 model with everything the human has, and its card says so.
 
-**Inside td.** As a jailed application, td-agent cannot run td-jail
-itself, and td-authd's `application-start` is configured by root, which
-accepts no requests. Starting a workspace instance on td-agent's behalf
-needs a new root request listener with an amendment to
-`td-authd/DESIGN.md`, and the workspace root becomes a portal grant. The
-packaging increment designs that (§18, §19).
+**On td.** td-agent is a program of td's account outside application
+confinement, as td-review and td-editor are, which the user chose
+(2026-10-07) over a jailed application whose instances a new root
+request listener would start. The launcher's card starts it through
+td-authd's request `0c` (td-authd/DESIGN.md) from the account home, with
+`TD_AGENT_JAIL=/bin/td-jail`, `TD_AGENT_TXT=/bin/td-txt` and
+`XDG_RUNTIME_DIR=/run/user/1000`, where the fetch service's and the
+egress relay's sockets are. It runs `td-jail --workspace` itself, which
+td admits for its account alone (APPLICATIONS.md §C), with td's `/td`
+bound where its `/bin` links resolve; its tools' `PATH` is td's `/bin`.
+td-agent so holds what the human holds; what keeps the model to a
+workspace is the workspace jail and the approval policy (§11), as on a
+host, not an application jail around td-agent itself.
 
 ## 9. Git
 
@@ -3242,10 +3251,13 @@ askpass variables, so an ssh they run may ask too. Without td-pinentry
 or a display, the person's git stays batch, and a failure whose words
 show a prompt refused (git's "terminal prompts disabled" or "could not
 read", ssh's "Permission denied (publickey" or "Host key verification
-failed") adds that td-pinentry, which `./install-apps` installs, would
-have asked. An askpass the person set in td-agent's own environment is
-not used: td-agent's git keeps only the variables above, where td-review
-keeps the person's.
+failed") adds that td-pinentry, which `./install-apps` installs on a
+host, would have asked, and that td has no prompt for git: there a
+remote needs a credential that asks nothing (an ssh key without a
+passphrase, or a stored https credential). The card's environment on td
+holds no ssh agent either (td-authd/DESIGN.md, request `0c`). An askpass
+the person set in td-agent's own environment is not used: td-agent's git
+keeps only the variables above, where td-review keeps the person's.
 
 **As built (prompts).** `git::Prompt::here` finds td-pinentry and the
 display; `Worker::asking` is the worker for a person's git, which

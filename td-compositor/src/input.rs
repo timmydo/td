@@ -6315,6 +6315,7 @@ mod tests {
                 Bound::Launch(LaunchRequest::Photo) => "PHOTOS",
                 Bound::Launch(LaunchRequest::Review) => "CODE REVIEW",
                 Bound::Launch(LaunchRequest::Dua) => "DISK USAGE",
+                Bound::Launch(LaunchRequest::Agent) => "CODING AGENT",
                 Bound::Launcher(_) | Bound::Pointer(_, Pointing::Launcher) => "OPEN LAUNCHER",
                 Bound::Help(_) => "THIS HELP",
                 Bound::Lock => "LOCK SCREEN",

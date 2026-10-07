@@ -144,6 +144,7 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
     assert_eq!(request(&[9]).unwrap(), Request::Start(Program::Photo));
     assert_eq!(request(&[0x0a]).unwrap(), Request::Start(Program::Review));
     assert_eq!(request(&[0x0b]).unwrap(), Request::Start(Program::Dua));
+    assert_eq!(request(&[0x0c]).unwrap(), Request::Start(Program::Agent));
     assert_eq!(request(&[3]).unwrap(), Request::Heartbeat);
     let mut poll = vec![2];
     poll.extend_from_slice(&17u64.to_be_bytes());
@@ -162,7 +163,8 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         vec![9, 0],
         vec![0x0a, 0],
         vec![0x0b, 0],
-        vec![0x0c],
+        vec![0x0c, 0],
+        vec![0x0d],
         vec![2],
         vec![2, 0],
         vec![2; 10],
@@ -603,6 +605,7 @@ fn every_selection_literal_names_its_program_back() {
         Program::Photo,
         Program::Review,
         Program::Dua,
+        Program::Agent,
     ] {
         let literal = program.selection().unwrap();
         assert_eq!(Program::from_selection(literal), Some(program), "{literal}");
@@ -616,6 +619,7 @@ fn every_selection_literal_names_its_program_back() {
         "/bin/td-review",
         "review ",
         "td-dua",
+        "td-agent",
     ] {
         assert_eq!(Program::from_selection(literal), None, "{literal:?}");
     }
@@ -634,6 +638,7 @@ fn desktop_programs_exec_fixed_binaries_from_the_validated_home() {
             &["--choose-repo"][..],
         ),
         (Program::Dua, "dua", "/bin/td-dua", none),
+        (Program::Agent, "agent", "/bin/td-agent", none),
     ] {
         let wrapper = config().terminal("000102030405060708090a0b0c0d0e0f", 17, program);
         assert_eq!(wrapper.get_program(), "/bin/td-login");
@@ -652,13 +657,22 @@ fn desktop_programs_exec_fixed_binaries_from_the_validated_home() {
             assert_eq!(command.get_current_dir(), Some(std::path::Path::new(&home)));
             let arguments: Vec<_> = command.get_args().collect();
             assert_eq!(arguments, expected, "{binary}");
-            assert_eq!(
-                command.get_envs().collect::<Vec<_>>(),
-                vec![(
-                    std::ffi::OsStr::new("WAYLAND_DISPLAY"),
-                    Some(std::ffi::OsStr::new("/run/td-compositor/1000/wayland-0"))
-                )]
-            );
+            let os = std::ffi::OsStr::new;
+            let mut envs = vec![(
+                os("WAYLAND_DISPLAY"),
+                Some(os("/run/td-compositor/1000/wayland-0")),
+            )];
+            // td-agent alone: its runtime directory, and the jail and
+            // td-txt its tools run through.
+            if program == Program::Agent {
+                envs = vec![
+                    (os("TD_AGENT_JAIL"), Some(os("/bin/td-jail"))),
+                    (os("TD_AGENT_TXT"), Some(os("/bin/td-txt"))),
+                    envs[0],
+                    (os("XDG_RUNTIME_DIR"), Some(os("/run/user/1000"))),
+                ];
+            }
+            assert_eq!(command.get_envs().collect::<Vec<_>>(), envs, "{binary}");
         }
     }
 }
@@ -698,6 +712,7 @@ fn only_launches_placed_in_the_account_require_the_primary_account() {
         Program::Photo,
         Program::Review,
         Program::Dua,
+        Program::Agent,
     ] {
         let mut loaded = false;
         let result = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 1, program, || {

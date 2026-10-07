@@ -49,8 +49,10 @@ none, minimal, low, medium, high or xhigh, is sent only when given; N\n\
 defaults to 32768, cut to the model's own limit. Its worst case must fit\n\
 max_cost_per_turn, priced from the API's models list: for a dear model,\n\
 ask a smaller N or raise that limit. It exits non-zero unless the review\n\
-finished whole. Run it as ./install-apps installs it from a td\n\
-checkout, whose launch serves the fetch service it needs, for example:\n\
+finished whole. It needs td's fetch service: on td, run it from a\n\
+terminal with XDG_RUNTIME_DIR naming /run/user/1000; on a host, as\n\
+./install-apps installs it from a td checkout, whose launch serves it,\n\
+for example:\n\
 \n\
   git show HEAD | td-agent review --model google/gemini-3.8-flash --effort high\n";
 

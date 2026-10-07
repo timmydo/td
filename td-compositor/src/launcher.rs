@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 const CARD_WIDTH: usize = 480;
-const CARD_HEIGHT: usize = 420;
+const CARD_HEIGHT: usize = 462;
 const CARD: [u8; 4] = [0x20, 0x18, 0x28, 0];
 const HIGHLIGHT: [u8; 4] = [0x58, 0x30, 0x70, 0];
 const CARD_PADDING: usize = 24;
@@ -54,6 +54,7 @@ pub enum LaunchRequest {
     Photo,
     Review,
     Dua,
+    Agent,
 }
 
 impl LaunchRequest {
@@ -66,6 +67,7 @@ impl LaunchRequest {
             Self::Photo => Some(crate::authority::Program::Photo),
             Self::Review => Some(crate::authority::Program::Review),
             Self::Dua => Some(crate::authority::Program::Dua),
+            Self::Agent => Some(crate::authority::Program::Agent),
             Self::UiDemo | Self::Terminal => None,
         }
     }
@@ -119,6 +121,11 @@ const AUTHORITY_ENTRIES: &[Entry] = &[
         label: "DISK USAGE",
         search: "disk usage space storage analyzer size clean up",
         request: Some(LaunchRequest::Dua),
+    },
+    Entry {
+        label: "CODING AGENT",
+        search: "coding agent ai assistant model llm openrouter",
+        request: Some(LaunchRequest::Agent),
     },
 ];
 
@@ -744,7 +751,8 @@ pub(crate) fn launch_command(
             | LaunchRequest::Editor
             | LaunchRequest::Photo
             | LaunchRequest::Review
-            | LaunchRequest::Dua,
+            | LaunchRequest::Dua
+            | LaunchRequest::Agent,
             _,
         ) => {
             return Err("desktop programs are not configured for this development launcher".into());
@@ -1435,6 +1443,7 @@ mod authority_entry_tests {
                 "PHOTOS",
                 "CODE REVIEW",
                 "DISK USAGE",
+                "CODING AGENT",
                 "CLOSE LAUNCHER",
             ]
         );
@@ -1444,6 +1453,7 @@ mod authority_entry_tests {
             ("picture", "PHOTOS", LaunchRequest::Photo),
             ("git", "CODE REVIEW", LaunchRequest::Review),
             ("storage", "DISK USAGE", LaunchRequest::Dua),
+            ("coding", "CODING AGENT", LaunchRequest::Agent),
         ] {
             launcher.apply(LauncherAction::Open);
             for character in word.chars() {
@@ -1475,6 +1485,7 @@ mod authority_entry_tests {
             LaunchRequest::Photo,
             LaunchRequest::Review,
             LaunchRequest::Dua,
+            LaunchRequest::Agent,
         ] {
             assert!(launch_command(&options, request, 1).is_err(), "{request:?}");
         }

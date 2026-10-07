@@ -100,7 +100,8 @@ impl Programs {
                 .ok_or_else(|| {
                     format!(
                         "no workspace jail: {var} is not set, so tools cannot run confined \
-                         and are refused (./install-apps installs td-jail and td-txt and the launch sets it)"
+                         and are refused (td's launcher card sets it; on a host, ./install-apps \
+                         installs td-jail and td-txt and the launch does)"
                     )
                 })
         };

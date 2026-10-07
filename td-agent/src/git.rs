@@ -580,7 +580,7 @@ impl Worker {
     fn unasked(&self, why: String) -> String {
         if self.asks && self.prompt.is_none() && REFUSED.iter().any(|said| why.contains(said)) {
             format!(
-                "{why}; nothing could ask for a passphrase or password: td-pinentry, which ./install-apps installs, asks in a window of its own"
+                "{why}; nothing could ask for a passphrase or password: on a host td-pinentry, which ./install-apps installs, asks in a window of its own; td has no prompt for git, so a remote there needs a credential that asks nothing (an ssh key without a passphrase, or a stored https credential)"
             )
         } else {
             why
@@ -2900,6 +2900,9 @@ pub(crate) mod tests {
         let refused =
             "fatal: could not read Username for 'https://example.org': terminal prompts disabled";
         assert!(alone.unasked(refused.into()).contains("./install-apps"));
+        assert!(alone
+            .unasked(refused.into())
+            .contains("td has no prompt for git"));
         assert!(alone
             .unasked("git@example.org: Permission denied (publickey).".into())
             .contains("./install-apps"));

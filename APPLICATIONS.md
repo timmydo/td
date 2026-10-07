@@ -8455,7 +8455,9 @@ same checks, starting in the account home rather than at `/`, each with its
 own card in authority mode; td-review by request 0a, the same way, with
 its fixed `--choose-repo` so the human picks the repository (see
 td-authd/DESIGN.md); td-dua by request 0b, the same way, scanning the
-account home.
+account home; td-agent by request 0c, the same way, with its runtime
+directory and the image's td-jail and td-txt named in its environment,
+running its tools through the workspace kind (§C).
 
 ### L.1 Elevation — consent without a secret
 

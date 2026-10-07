@@ -229,6 +229,7 @@ fn terminal_command(
             "WAYLAND_DISPLAY",
             format!("/run/td-compositor/{uid}/wayland-0"),
         );
+        command.envs(terminal.desktop_environment(uid));
         if terminal.starts_in_account_home() {
             command.current_dir(account()?.home());
         }
@@ -261,7 +262,8 @@ fn terminal_command(
         | Program::Editor
         | Program::Photo
         | Program::Review
-        | Program::Dua => {}
+        | Program::Dua
+        | Program::Agent => {}
     }
     Ok(command)
 }
@@ -269,7 +271,7 @@ fn terminal_command(
 /// Runs only after td-login dropped credentials, before any terminal code.
 pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
     const USAGE: &str = "terminal-exec requires UID GENERATION HANDLE \
-                         [task|claude|taskmgr|editor|photo|review|dua]";
+                         [task|claude|taskmgr|editor|photo|review|dua|agent]";
     let (uid, generation, handle, terminal) = match arguments {
         [uid, generation, handle] => (uid, generation, handle, Some(Program::Home)),
         [uid, generation, handle, literal] => {
@@ -388,6 +390,7 @@ enum Program {
     Photo,
     Review,
     Dua,
+    Agent,
 }
 
 impl Program {
@@ -401,6 +404,7 @@ impl Program {
             Self::Photo => Some("photo"),
             Self::Review => Some("review"),
             Self::Dua => Some("dua"),
+            Self::Agent => Some("agent"),
         }
     }
 
@@ -415,6 +419,7 @@ impl Program {
             "photo" => Self::Photo,
             "review" => Self::Review,
             "dua" => Self::Dua,
+            "agent" => Self::Agent,
             _ => return None,
         })
     }
@@ -428,6 +433,7 @@ impl Program {
             Self::Photo => Some("/bin/td-photo"),
             Self::Review => Some("/bin/td-review"),
             Self::Dua => Some("/bin/td-dua"),
+            Self::Agent => Some("/bin/td-agent"),
             Self::Home | Self::Task | Self::Claude => None,
         }
     }
@@ -443,16 +449,39 @@ impl Program {
             | Self::TaskManager
             | Self::Editor
             | Self::Photo
-            | Self::Dua => &[],
+            | Self::Dua
+            | Self::Agent => &[],
+        }
+    }
+
+    /// The fixed variables a desktop program is started with beside
+    /// `WAYLAND_DISPLAY`: none, but td-agent's runtime directory, where the
+    /// fetch service's and egress relay's sockets are, and the image's
+    /// td-jail and td-txt, which its tools run through.
+    fn desktop_environment(self, uid: u32) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Agent => vec![
+                ("XDG_RUNTIME_DIR", format!("/run/user/{uid}")),
+                ("TD_AGENT_JAIL", "/bin/td-jail".into()),
+                ("TD_AGENT_TXT", "/bin/td-txt".into()),
+            ],
+            Self::Home
+            | Self::Task
+            | Self::Claude
+            | Self::TaskManager
+            | Self::Editor
+            | Self::Photo
+            | Self::Review
+            | Self::Dua => Vec::new(),
         }
     }
 
     /// Whether a desktop program starts in the account home, where its file
-    /// dialogs begin and the disk usage analyzer scans. The task manager has
-    /// no files to open.
+    /// dialogs begin, the disk usage analyzer scans and td-agent's state
+    /// and configuration are found. The task manager has no files to open.
     fn starts_in_account_home(self) -> bool {
         match self {
-            Self::Editor | Self::Photo | Self::Review | Self::Dua => true,
+            Self::Editor | Self::Photo | Self::Review | Self::Dua | Self::Agent => true,
             Self::Home | Self::Task | Self::Claude | Self::TaskManager => false,
         }
     }
@@ -469,6 +498,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
         [9] => Ok(Request::Start(Program::Photo)),
         [0x0a] => Ok(Request::Start(Program::Review)),
         [0x0b] => Ok(Request::Start(Program::Dua)),
+        [0x0c] => Ok(Request::Start(Program::Agent)),
         [2, rest @ ..] if rest.len() == 8 => {
             let handle =
                 u64::from_be_bytes(rest.try_into().map_err(|_| "invalid terminal handle")?);
