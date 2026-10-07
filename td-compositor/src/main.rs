@@ -3310,15 +3310,14 @@ pub struct MappedRegion {
         );
     }
 
-    /// Elevation consent, L2 (DESIGN.md, "Elevation consent"): no
-    /// production build asks root for a rollback, so `B` shows NOT
-    /// AVAILABLE IN THIS BUILD and `H` is not bound; and an elevation's one
-    /// commit, root's exact description and so its key, follows only the
-    /// two digits the evdev adapter offers. What a runtime test cannot see
-    /// is held here: the production half of `rollback_wired`, and that no
-    /// other path confirms.
+    /// Elevation consent (DESIGN.md, "Elevation consent"): `B` asks root
+    /// for a rollback in every build, since L3, and `H` is not bound; and
+    /// an elevation's one commit, root's exact description and so its key,
+    /// follows only the two digits the evdev adapter offers. What a runtime
+    /// test cannot see is held here: that no test-only switch decides `B`,
+    /// and that no other path confirms.
     #[test]
-    fn production_refuses_b_and_only_the_typed_key_commits_an_elevation() {
+    fn b_selects_a_rollback_and_only_the_typed_key_commits_an_elevation() {
         let input = production(include_str!("input.rs"));
         let client = production(include_str!("secret_client.rs"));
         let body = |source: &'static str, head: &str| -> &'static str {
@@ -3330,43 +3329,17 @@ pub struct MappedRegion {
                 .unwrap()
                 .0
         };
-        // `B`: the lifetime's one selection, a rollback only where wired.
+        // `B`: the lifetime's one selection, root's rollback (L3), in
+        // every build; no test-only switch decides it.
         let select = body(input, "    fn select(");
-        assert!(select.contains(
-            "            KEY_B => {\n                self.secret_selected = true;\n                \
-             if self.rollback_wired() {\n                    \
-             Some(Selection::Elevation(Elevation::Rollback))\n                } else {\n                    \
-             decision.notice = Some(Notice::NotAvailable);\n                    None\n                }\n            }\n"
-        ));
+        assert!(select
+            .contains("            KEY_B => Some(Selection::Elevation(Elevation::Rollback)),\n"));
         // Neither `H` nor any other elevation is bound before L4.
         assert!(!select.contains("KEY_H"));
         assert_eq!(occurrences(input, "Selection::Elevation("), 1);
         assert_eq!(occurrences(input, "Elevation::Hostname"), 0);
-        // Wired only in the tests: production's answer is a literal false,
-        // and the tests' switch does not exist outside them.
-        assert_eq!(occurrences(input, "fn rollback_wired("), 2);
-        assert_eq!(
-            occurrences(
-                input,
-                "    #[cfg(not(test))]\n    fn rollback_wired(&self) -> bool {\n        false\n    }\n"
-            ),
-            1
-        );
-        assert_eq!(
-            occurrences(
-                input,
-                "    #[cfg(test)]\n    fn rollback_wired(&self) -> bool {\n        self.rollback\n    }\n"
-            ),
-            1
-        );
-        assert_eq!(
-            occurrences(input, "    #[cfg(test)]\n    rollback: bool,\n"),
-            1
-        );
-        assert_eq!(occurrences(input, "rollback: bool"), 1);
-        assert_eq!(occurrences(input, "rollback: true"), 0);
-        assert_eq!(occurrences(input, ".rollback "), 0);
-        assert_eq!(occurrences(input, ".rollback\n"), 1);
+        assert_eq!(occurrences(input, "rollback_wired"), 0);
+        assert_eq!(occurrences(input, "rollback: bool"), 0);
         // A digit is a fresh number-row 2 to 9 under no Control, Alt or
         // Super, offered only on the open screen after the selection.
         let digit = body(

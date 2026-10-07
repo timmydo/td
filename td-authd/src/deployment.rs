@@ -1,6 +1,7 @@
 //! One queued local build and one physically confirmed installation.
 
 use crate::consent::{self, Operation as Description, Request};
+use crate::login_tier;
 use crate::secret_sys as sys;
 use crate::unlock::Event;
 use std::fs::{self, File, OpenOptions};
@@ -11,13 +12,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-
-#[path = "../../td-secret/src/login_tier.rs"]
-#[allow(
-    dead_code,
-    reason = "the retained-deployment reader serves td-secret's login worker"
-)]
-mod login_tier;
 
 const SOCKET: &str = "/run/td-authd/1000/install";
 const GREETING: &[u8; 8] = b"TDUPD01\n";

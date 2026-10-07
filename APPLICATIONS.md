@@ -8730,9 +8730,9 @@ required before enabling consent or a WebAuthn grant.
 **Current credential consent is specified in §W.4.** Physical selection,
 immutable presentation and a token assertion now mediate credential writes,
 enrollment and release. The broader operation vocabulary here remains a
-target; the compositor's randomized-key confirmation is implemented but
-inert, since nothing in production yet produces a prompt that takes it
-(L2 below). The kernel now carries USB PCI xHCI, generic HID,
+target; the compositor's randomized-key confirmation is live for
+`deploy-rollback`, the one elevation production performs (L3 below).
+The kernel now carries USB PCI xHCI, generic HID,
 USB HID and hidraw. The root-only worker implements the narrow CTAP HID
 transport described in `td-secret/DESIGN.md`; it does not grant consent.
 USB keyboard interfaces follow the compositor's seat-assigned startup
@@ -8745,12 +8745,13 @@ keyboard events never prove a FIDO assertion.
 
 It says what the first operations are and why; the elevation
 increments below (L1 to L7) build them, and each part stays a target
-until the increment named for it lands with its evidence. So far only
-the consent descriptions (L1) and the compositor's approval-key
-confirmation (L2) exist, and both are inert: nothing produces an
-elevation request. The protocol, encodings and write rules are in
-`td-authd/DESIGN.md`, "Elevation operations (target)"; which key presses
-confirm is in `td-compositor/DESIGN.md`, "Elevation consent (target)".
+until the increment named for it lands with its evidence. So far the
+consent descriptions (L1), the compositor's approval-key confirmation
+(L2) and `deploy-rollback` with the principal table (L3) exist:
+`deploy-rollback` is live, and `set-hostname` and `deploy-publish`
+remain targets. The protocol, encodings and write rules are in
+`td-authd/DESIGN.md`, "Elevation operations"; which key presses
+confirm is in `td-compositor/DESIGN.md`, "Elevation consent".
 
 | operation | how it arrives | arguments, as shown | what root performs |
 |---|---|---|---|
@@ -8788,7 +8789,7 @@ two digits, each 2 to 9, typed in order. Root draws the key and carries
 it in the description only the compositor's private prompt shows, so the
 requester never sees it. Enter never confirms, and neither does a press
 before the prompt is on glass or any injected input
-(`td-compositor/DESIGN.md`, "Elevation consent (target)"). A wrong digit
+(`td-compositor/DESIGN.md`, "Elevation consent"). A wrong digit
 at either position ends the request, so a guess is one try per presented
 request, right one time in 64, and a queued request's retries are
 bounded by its intake's backoff. The key's job is to defeat a habituated
@@ -8805,7 +8806,7 @@ deferred, and nothing here claims one.
 **Backoff.** Every intake a requester can queue on rate-limits
 unapproved requests with a backoff that survives a new generation and a
 reboot: the hostname intake from L4 and the update queue from L5
-(`td-authd/DESIGN.md`, "Elevation operations (target)").
+(`td-authd/DESIGN.md`, "Elevation operations").
 `deploy-rollback` has no requester and needs none.
 
 **Principal table.** Before any prompt, td-authd consults a root-owned,
@@ -8887,6 +8888,9 @@ into `/var/lib/td/ssh/authorized_keys`; a fresh install has none. The
 stock image's own boot health exercises that path under the QEMU
 autotest token with a disposable seeded key
 (`TD-OPENSSH-ADMIN-ROUNDTRIP`). Physical access is the other path.
+Since L3 the session owner can also return the machine to its previous
+deployment through `deploy-rollback`, which raises no privilege beyond
+that one operation.
 
 **Retiring the escape hatch.** The escape hatch is root's remaining
 administrative surface: the `su` applet, root's empty shadow field and
@@ -8925,18 +8929,19 @@ enrollment, follows L7.
 
 The workstream's commits, in landing order. Each is one landing, and
 none repairs an earlier one. Each amends the documents whose current
-statements it changes, including those named here.
+statements it changes, including those named here. L0 to L3 have
+landed; L4 to L7 are targets.
 
 - **L0**, documents only: this specification. Nothing ships.
 - **L1**, the consent codec, inert: consent tags 11 (`deploy-rollback`)
   and 12 (`set-hostname`) and the two-byte approval-key field
-  (`td-authd/DESIGN.md`, "Elevation operations (target)"). It amends
+  (`td-authd/DESIGN.md`, "Elevation operations"). It amends
   `td-secret/DESIGN.md` (tags its workers reject), whose shared codec
   then decodes both tags. After L0.
 - **L2**, the compositor's approval-key confirmation, inert: freshness
   rules generalised from physical installation confirmation, and the
   menu letter `B`, which production refuses until L3
-  (`td-compositor/DESIGN.md`, "Elevation consent (target)"). After L1.
+  (`td-compositor/DESIGN.md`, "Elevation consent"). After L1.
 - **L3**, `deploy-rollback` live: the principal table and its UID-1000
   row, request `1d`, nonce and key, presentation `13` then commit `14`,
   the menu's `B` row, the compositor's reading of `9d` and the success

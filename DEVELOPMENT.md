@@ -439,17 +439,18 @@ and single-quoted target paths.
 The system-level qemu oracles are a separate tier, `td-builder check
 integration`, which `check` alone does not include. It runs on the host,
 never in the gate sandbox: it warms the system image's inputs, then runs
-`qemu-boot-system`, `qemu-boot-live` and `qemu-install-system`, each
-with a banner saying what it proves, its outcome and wall time, recorded
-in the check history as `integration:STEP` (`td-recipe-eval
-check-history integration`). On its own it runs only those steps; beside
-gate goals (`td-builder check check integration`), it runs after the
-gates pass and says so when they do not. Every boot runs on KVM alone,
-which needs the run to open `/dev/kvm` (membership in the `kvm` group,
-from a login started after joining it): an oracle never falls back to
-TCG, several times slower, and without KVM it is a host gap. A q35
-firmware boot splits the irqchip under KVM (`checks/accel.rs`): with it
-in the host kernel, OVMF hung polling AHCI on QEMU 10.2.1.
+`qemu-boot-system`, `qemu-deploy-rollback`, `qemu-boot-live` and
+`qemu-install-system`, each with a banner saying what it proves, its
+outcome and wall time, recorded in the check history as
+`integration:STEP` (`td-recipe-eval check-history integration`). On its
+own it runs only those steps; beside gate goals (`td-builder check check
+integration`), it runs after the gates pass and says so when they do
+not. Every boot runs on KVM alone, which needs the run to open
+`/dev/kvm` (membership in the `kvm` group, from a login started after
+joining it): an oracle never falls back to TCG, several times slower,
+and without KVM it is a host gap. A q35 firmware boot splits the
+irqchip under KVM (`checks/accel.rs`): with it in the host kernel, OVMF
+hung polling AHCI on QEMU 10.2.1.
 `TD_QEMU_ACCEL=tcg` emulates on purpose, keyed apart. It needs the
 host's qemu, and OVMF for the last two (found beside qemu or in
 /usr/share/OVMF, or named by
@@ -459,7 +460,7 @@ which is not a pass. An oracle that passed before
 with every input it boots unchanged (the same components as a recipe
 check's key over its recipes, beside its name, its accelerator list and
 `TD_QEMU_BOOT_TIMEOUT_SECS`) answers from its memo and boots nothing,
-as `td-recipe-eval oracle-memo ORACLE` reports; when all three do, the
+as `td-recipe-eval oracle-memo ORACLE` reports; when all of them do, the
 warm is skipped too. Each is asked again when its step is reached, its
 pass is forgotten before it boots, and `TD_CHECK_FULL=1` boots them all,
 so a doubted pass that fails is gone, though a host without KVM, which

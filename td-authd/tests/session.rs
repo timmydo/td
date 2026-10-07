@@ -215,6 +215,108 @@ fn poll_until(session: &mut Session, status: u8) -> Vec<u8> {
     }
 }
 
+/// Request `1d` (td-authd/DESIGN.md, "Elevation operations"): a busy slot,
+/// then the principal table, then the selectors, each refused with its
+/// `9d` byte before any description or operation exists; admitted, the
+/// description of the pair under a fresh nonce and key, holding the slot.
+#[test]
+fn rollback_admits_by_table_then_selectors_before_any_description() {
+    use crate::elevation::tests::V1;
+    use crate::elevation::Table;
+    use crate::rollback::tests::volume;
+    let (a, b) = ("a".repeat(64), "b".repeat(64));
+    let pair = volume(&a, &b);
+    let mut session = Session::new(1000, "tester").unwrap();
+    assert_eq!(Request::decode(&[0x1d]).unwrap(), Request::Rollback);
+    assert!(Request::decode(&[0x1d, 0]).is_err());
+    // Not yet prepared: the slot is not free.
+    let unasked = || -> Result<Table, String> { panic!("table read while busy") };
+    assert_eq!(
+        session.begin_rollback(unasked, pair.path()).unwrap(),
+        [0x9d, 0]
+    );
+    prepare(&mut session);
+    // No row for the owner, an unreadable table, or a row without the
+    // operation: refused before the selectors are read.
+    for table in [
+        Table::parse("td-elevation-v1\n1001\tdeploy-rollback\n"),
+        Table::parse("td-elevation-v1\n1000\tset-hostname\n"),
+        Err("no table".to_string()),
+    ] {
+        assert_eq!(
+            session
+                .begin_rollback(|| table, &pair.path().join("absent"))
+                .unwrap(),
+            [0x9d, 1]
+        );
+        assert!(session.operation.is_none());
+    }
+    // One deployment named twice, or no volume.
+    let one = volume(&a, &a);
+    assert_eq!(
+        session
+            .begin_rollback(|| Table::parse(V1), one.path())
+            .unwrap(),
+        [0x9d, 2]
+    );
+    assert_eq!(
+        session
+            .begin_rollback(|| Table::parse(V1), &pair.path().join("absent"))
+            .unwrap(),
+        [0x9d, 2]
+    );
+    assert!(session.operation.is_none());
+    assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
+    // Admitted.
+    let answer = session
+        .begin_rollback(|| Table::parse(V1), pair.path())
+        .unwrap();
+    assert_eq!(answer[0], 0x92);
+    let described = Description::decode(&answer[1..]).unwrap();
+    let Operation::DeployRollback {
+        key,
+        current,
+        previous,
+    } = described.operation()
+    else {
+        panic!("not a rollback");
+    };
+    assert_eq!((current, previous), (&a, &b));
+    assert!(key
+        .digits()
+        .iter()
+        .all(|digit| (b'2'..=b'9').contains(digit)));
+    assert_eq!(described.owner(), 1000);
+    // The slot is held: another selection, of any kind, is busy.
+    assert_eq!(
+        session.begin_rollback(unasked, pair.path()).unwrap(),
+        [0x9d, 0]
+    );
+    assert_eq!(session.answer(Request::Install).unwrap(), [0x99, 0]);
+    // Presented, then invited to commit; Escape cancels and fails it.
+    assert_eq!(&poll_until(&mut session, 4)[2..], described.encode());
+    session
+        .answer(Request::Presented(described.clone()))
+        .unwrap();
+    assert_eq!(&poll_until(&mut session, 5)[2..], described.encode());
+    assert_eq!(
+        session.answer(Request::Cancel(*described.nonce())).unwrap(),
+        [0x95, 0]
+    );
+    assert!(session.answer(Request::Commit(described.clone())).is_err());
+    assert_eq!(&poll_until(&mut session, 7)[2..], described.encode());
+    assert!(session.operation.is_none());
+    // A new selection draws a new nonce.
+    let again = session
+        .begin_rollback(|| Table::parse(V1), pair.path())
+        .unwrap();
+    assert_ne!(
+        Description::decode(&again[1..]).unwrap().nonce(),
+        described.nonce()
+    );
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
 #[test]
 fn one_operation_retains_its_bound_description_until_terminal_delivery() {
     let mut session = Session::new(1000, "tester").unwrap();

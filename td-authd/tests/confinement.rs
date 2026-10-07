@@ -34,6 +34,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "consent.rs",
             "deployment.rs",
             "disk_install.rs",
+            "elevation.rs",
             "inspection.rs",
             "launch.rs",
             "login.rs",
@@ -42,6 +43,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "mount_sys.rs",
             "portal_files.rs",
             "primary_account.rs",
+            "rollback.rs",
             "secret_intake.rs",
             "secret_request.rs",
             "secret_sys.rs",
@@ -65,6 +67,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("consent.rs", 0),
         ("deployment.rs", 0),
         ("disk_install.rs", 0),
+        ("elevation.rs", 0),
+        ("rollback.rs", 0),
         ("sys.rs", 4),
         ("launch.rs", 0),
         ("unlock.rs", 0),
@@ -105,6 +109,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "application.rs"
                     | "unlock.rs"
                     | "login.rs"
+                    | "rollback.rs"
                     | "session.rs"
                     | "inspection.rs"
                     | "application_shell.rs"
@@ -167,7 +172,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0xeb7d85d2dde589df,
+        0x26c9c73a09fe3f3c,
         "paired secret controller changed"
     );
     assert_eq!(
@@ -238,9 +243,16 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert_eq!(fingerprint(installation), INSTALLATION_FINGERPRINT);
     // Request 19's tier marker (amendment 8): one reviewed shared reader,
-    // reading only the queued deployment's held directory.
-    assert_eq!(installation.matches("#[path").count(), 1);
-    assert!(installation.contains("#[path = \"../../td-secret/src/login_tier.rs\"]"));
+    // compiled once at the crate root, reading only the queued deployment's
+    // held directory.
+    assert_eq!(installation.matches("#[path").count(), 0);
+    assert!(installation.contains("\nuse crate::login_tier;\n"));
+    assert_eq!(
+        include_str!("../src/main.rs")
+            .matches("#[path = \"../../td-secret/src/login_tier.rs\"]\n")
+            .count(),
+        1
+    );
     assert_eq!(installation.matches("login_tier::").count(), 1);
     assert!(installation
         .contains("login_tier::read(&self.source, &self.deployment, self.owner, self.give_up)"));
@@ -292,6 +304,81 @@ fn the_production_source_and_raw_boundary_are_closed() {
             !installation.contains(forbidden),
             "installation: {forbidden}"
         );
+    }
+    // Request 1d (td-authd/DESIGN.md, "Elevation operations"): the table
+    // before the selectors, both before a description; the selectors only
+    // through the shared reader's held volume, read again before acting;
+    // and one fixed helper on exactly the approved pair.
+    let rollback = include_str!("../src/rollback.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(fingerprint(rollback), ROLLBACK_FINGERPRINT);
+    assert_eq!(rollback.matches("Command::new(").count(), 1);
+    assert!(rollback.contains(
+        "            Command::new(\"/bin/td-boot\")\n                .args([\"on-volume\", \"rollback\", \"/run/td-update\", current, previous])\n                .env_clear()\n                .current_dir(\"/\")\n                .stdin(Stdio::null())\n                .stdout(Stdio::null())\n                .stderr(Stdio::inherit())\n                .spawn()\n"
+    ));
+    assert_eq!(rollback.matches(".spawn()").count(), 1);
+    assert_eq!(rollback.matches("login_tier::open_volume(").count(), 1);
+    assert_eq!(rollback.matches("login_tier::selected(").count(), 2);
+    assert_eq!(rollback.matches("login_tier::").count(), 5);
+    assert!(rollback
+        .contains("        self.committed = true;\n        if !self.selectors.unchanged() {\n"));
+    assert!(rollback.contains(
+        "    if !table.is_ok_and(|table| table.grants(owner, elevation::Operation::DeployRollback)) {\n        return Err(Refusal::Principal);\n    }\n    Selectors::read(volume).map_err(|_| Refusal::Selectors)\n"
+    ));
+    assert!(rollback.contains("ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))"));
+    for forbidden in [
+        "send_descriptor(",
+        "sys::",
+        "pre_exec",
+        "CommandExt",
+        "setsid",
+        "process_group",
+        ".arg(",
+        ".env(",
+        "fs::write",
+        "remove",
+        "rename",
+    ] {
+        assert!(!rollback.contains(forbidden), "rollback.rs: {forbidden}");
+    }
+    assert_eq!(
+        session
+            .matches("crate::rollback::admit(self.owner, table(), volume)")
+            .count(),
+        1
+    );
+    assert!(session.contains(
+        "            Request::Rollback => self.begin_rollback(\n                crate::elevation::Table::load,\n                Path::new(crate::login_tier::VOLUME),\n            ),\n"
+    ));
+    let table = include_str!("../src/elevation.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(fingerprint(table), ELEVATION_FINGERPRINT);
+    for pin in [
+        "const DIRECTORY: &str = \"/etc\";",
+        "const TABLE: &str = \"td-elevation.tsv\";",
+        "const NOFOLLOW: i32 = 0x20000;",
+        "const NONBLOCK: i32 = 0x800;",
+        "const DIRECTORY_ONLY: i32 = 0x10000;",
+        "Self::load_from(Path::new(DIRECTORY), (0, 0))",
+        "|| metadata.mode() & 0o7777 != 0o444",
+    ] {
+        assert!(table.contains(pin), "elevation.rs: {pin}");
+    }
+    for forbidden in [
+        "Command",
+        "spawn",
+        "write",
+        "remove",
+        "create",
+        "rename",
+        "chmod",
+        "set_permissions",
+    ] {
+        assert!(!table.contains(forbidden), "elevation.rs: {forbidden}");
     }
     // The live installer's service: one fixed program and operands, the
     // installer's socket and td-authd's channel as its only descriptors.
@@ -616,7 +703,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0x5fcac884f2789cf7,
+        0x88f13b690494563e,
         "main.rs: production startup changed"
     );
     assert_eq!(
@@ -638,13 +725,15 @@ const LOGIN_STATE_FINGERPRINT: u64 = 0xf7d4c1e582d5ed83;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x82d5e067ac0d3cb6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
-const LAUNCH_FINGERPRINT: u64 = 0x5057b12991a756e7;
+const LAUNCH_FINGERPRINT: u64 = 0x1bb53c4921507828;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;
 const WRITE_REQUEST_FINGERPRINT: u64 = 0x188c619caba6ceb8;
 
-const INSTALLATION_FINGERPRINT: u64 = 0x750e4dac01b1ca7e;
-const SHARED_LOGIN_TIER_FINGERPRINT: u64 = 0x14194603119be713;
+const INSTALLATION_FINGERPRINT: u64 = 0xef204bb2bf5e35a3;
+const SHARED_LOGIN_TIER_FINGERPRINT: u64 = 0x776bbefe45e5b0c4;
+const ROLLBACK_FINGERPRINT: u64 = 0xcd1fcb60e072626d;
+const ELEVATION_FINGERPRINT: u64 = 0x3a8baf08764bbaaf;
 const DISK_INSTALL_FINGERPRINT: u64 = 0x4dffa721ec6b8471;
 const CONSENT_CODEC_FINGERPRINT: u64 = 0x19d3fcff02c2bb2a;

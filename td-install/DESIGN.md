@@ -1216,6 +1216,20 @@ disk it installed.
 `boot`, `install`, `update`, `rollback`, `success`, `mount-root` or `mount-var`.
 The operation keeps the existing authentication, transaction locking and
 publication semantics. Other verbs and nested `on-volume` are refused.
+
+`rollback` names the pair it acts on: `td-boot rollback DEVICE
+MOUNTPOINT CURRENT PREVIOUS`, and `on-volume rollback MOUNTPOINT
+CURRENT PREVIOUS`, two different canonical deployment IDs. Under the
+transaction lock, before any change, a stale selector temporary's
+reaping included, it requires `current` to name CURRENT and `previous`
+to name PREVIOUS, and refuses otherwise, so a rollback approved for one
+pair never acts on another (td-authd/DESIGN.md, "Elevation
+operations"). It then makes `previous`, which must be verified and not
+pending, current, leaving `previous` naming it, and prints its ID. There
+is no form without the pair. Its callers are td-authd's
+`deploy-rollback` and the boot-health pass, which names the deployment
+it just installed and the running one. The automatic rollback of an
+exhausted candidate is `select_boot_deployment`'s, not this verb's.
 Explicit-device verbs remain low-level interfaces for formatting and
 controlled diagnostics; the full-system profile uses `on-volume` throughout.
 The explicit mount forms are `td-boot mount-root DEVICE MOUNTPOINT` and

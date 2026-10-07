@@ -33,6 +33,11 @@ const STEPS: &[Step] = &[
         proves: "the system image boots to its services and session",
     },
     Step {
+        name: "qemu-deploy-rollback",
+        argv: &["qemu-deploy-rollback"],
+        proves: "an approved deploy-rollback selects the previous system at the next boot",
+    },
+    Step {
         name: "qemu-boot-live",
         argv: &["qemu-boot-live"],
         proves: "the live medium boots through UEFI firmware",
@@ -329,7 +334,7 @@ mod tests {
         assert_eq!(code, 0);
         assert!(
             line.contains(
-                "of 3 oracle(s), 1 passed (0 from the memo), 1 unprovisioned, 0 failed, 1 not run"
+                "of 4 oracle(s), 1 passed (0 from the memo), 1 unprovisioned, 0 failed, 2 not run"
             ),
             "{line}"
         );
@@ -341,20 +346,21 @@ mod tests {
         let (line, code) = verdict(&warm_gap);
         assert_eq!(code, td_engine::exit::EXIT_UNPROVISIONED);
         assert!(
-            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 3 not run"),
+            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 4 not run"),
             "{line}"
         );
         // Every oracle from the memo, warm skipped: a pass that booted nothing,
         // counted as passed and said to be the memo's.
         let all_memo = [
             ("qemu-boot-system", Outcome::Memo, s(0)),
+            ("qemu-deploy-rollback", Outcome::Memo, s(0)),
             ("qemu-boot-live", Outcome::Memo, s(0)),
             ("qemu-install-system", Outcome::Memo, s(0)),
         ];
         let (line, code) = verdict(&all_memo);
         assert_eq!(code, 0);
         assert!(
-            line.contains("3 passed (3 from the memo), 0 unprovisioned"),
+            line.contains("4 passed (4 from the memo), 0 unprovisioned"),
             "{line}"
         );
         assert_eq!(Outcome::Memo.word(), "memo");
@@ -402,7 +408,12 @@ mod tests {
     #[test]
     fn the_deferred_note_names_the_oracles_and_the_command() {
         let note = deferred_note();
-        for name in ["qemu-boot-system", "qemu-boot-live", "qemu-install-system"] {
+        for name in [
+            "qemu-boot-system",
+            "qemu-deploy-rollback",
+            "qemu-boot-live",
+            "qemu-install-system",
+        ] {
             assert!(note.contains(name), "{note}");
         }
         assert!(note.contains("td-builder check integration"), "{note}");

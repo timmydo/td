@@ -11,6 +11,7 @@ mod channel;
 mod consent;
 mod deployment;
 mod disk_install;
+mod elevation;
 // Request 1a's kernel name and consent's hostname descriptions.
 #[path = "../../td-firstboot/src/hostname.rs"]
 mod hostname;
@@ -21,9 +22,17 @@ mod installation_consent;
 mod launch;
 mod login;
 mod login_status;
+// Request 19's tier marker and request 1d's selectors, one reviewed copy.
+#[path = "../../td-secret/src/login_tier.rs"]
+#[allow(
+    dead_code,
+    reason = "the retained-deployment reader serves td-secret's login worker"
+)]
+mod login_tier;
 mod mount_sys;
 mod portal_files;
 mod primary_account;
+mod rollback;
 mod secret_intake;
 #[allow(
     dead_code,

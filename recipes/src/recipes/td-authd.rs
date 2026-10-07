@@ -15,6 +15,22 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/src/deployment.rs"),
     ),
     (
+        "src/elevation.rs",
+        include_str!("../../../td-authd/src/elevation.rs"),
+    ),
+    (
+        "tests/elevation.rs",
+        include_str!("../../../td-authd/tests/elevation.rs"),
+    ),
+    (
+        "src/rollback.rs",
+        include_str!("../../../td-authd/src/rollback.rs"),
+    ),
+    (
+        "tests/rollback.rs",
+        include_str!("../../../td-authd/tests/rollback.rs"),
+    ),
+    (
         "src/disk_install.rs",
         include_str!("../../../td-authd/src/disk_install.rs"),
     ),
@@ -218,7 +234,7 @@ pub fn recipe() -> Recipe {
             "{src}/td-secret/src/login_state.rs",
             include_str!("../../../td-secret/src/login_state.rs"),
         ),
-        // Request 19's tier marker reader.
+        // Request 19's tier marker and request 1d's selector reader.
         (
             "{src}/td-secret/src/login_tier.rs",
             include_str!("../../../td-secret/src/login_tier.rs"),

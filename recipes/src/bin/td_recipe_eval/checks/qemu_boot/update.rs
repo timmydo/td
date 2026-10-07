@@ -1,4 +1,5 @@
-//! Host-only release update oracle over a disposable overlay of an installation.
+//! Host-only release update oracle over a disposable overlay of an installation,
+//! and `qemu-deploy-rollback`, which drives request `1d` on the system image.
 use super::{find_qemu, find_qemu_tool, qmp_json_path, Qmp};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -483,6 +484,90 @@ impl Guest {
         }
     }
 
+    /// A screendump within `budget` that `accept` takes, captured as fast
+    /// as QMP gives them.
+    fn screen_until(
+        &mut self,
+        path: &Path,
+        budget: Duration,
+        what: &str,
+        mut accept: impl FnMut(&[u8]) -> Result<bool>,
+    ) -> Result<Vec<u8>> {
+        let end = self.deadline.min(Instant::now() + budget);
+        let filename = qmp_json_path(path)?;
+        loop {
+            self.qmp()?
+                .exchange_until(
+                    &format!(
+                        "{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":{filename}}}}}"
+                    ),
+                    end,
+                )
+                .map_err(|error| format!("capture {what}: {error}"))?;
+            let bytes = read_capture(path)?;
+            if accept(ppm(&bytes)?)? {
+                return Ok(bytes);
+            }
+            if Instant::now() >= end {
+                return Err(format!("{what} did not show"));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Ctrl+Alt+Esc, the menu, and `B`: the rollback prompt for exactly
+    /// this pair, and the key it shows. A busy slot, which a request that
+    /// just ended holds until its end is delivered, is closed and asked
+    /// again.
+    fn rollback_prompt(&mut self, path: &Path, current: &str, previous: &str) -> Result<[u8; 2]> {
+        for _ in 0..20 {
+            self.key(&["ctrl", "alt", "esc"])?;
+            let end = self.deadline.min(Instant::now() + Duration::from_secs(20));
+            self.qmp()?.move_absolute_until(0, 0, end)?;
+            self.screen_until(
+                path,
+                Duration::from_secs(20),
+                "secure-attention menu",
+                |pixels| menu_pixels_match(pixels),
+            )?;
+            self.key(&["b"])?;
+            let mut key = None;
+            let mut busy = false;
+            self.screen_until(path, Duration::from_secs(20), "rollback prompt", |pixels| {
+                key = rollback_prompt_key(pixels, current, previous)?;
+                busy = menu_row_matches(pixels, 312, BUSY_NOTICE)?;
+                Ok(key.is_some() || busy)
+            })?;
+            if let Some(key) = key {
+                return Ok(key);
+            }
+            self.key(&["esc"])?;
+            thread::sleep(Duration::from_secs(2));
+        }
+        Err("the rollback request stayed busy".into())
+    }
+
+    /// For two seconds every capture is still the prompt with `key`.
+    fn hold_rollback_prompt(
+        &mut self,
+        path: &Path,
+        current: &str,
+        previous: &str,
+        key: [u8; 2],
+        after: &str,
+    ) -> Result<()> {
+        let end = Instant::now() + Duration::from_secs(2);
+        let mut left = false;
+        self.screen_until(path, Duration::from_secs(4), after, |pixels| {
+            left = rollback_prompt_key(pixels, current, previous)? != Some(key);
+            Ok(left || Instant::now() >= end)
+        })?;
+        if left {
+            return Err(format!("the rollback prompt left after {after}"));
+        }
+        Ok(())
+    }
+
     fn update_ready(&mut self, attempt: u64) -> Result<String> {
         self.send(&format!(
             "/bin/sh -c './update; echo TD-UPDATE-ORACLE-DONE-{attempt}=$?' &"
@@ -597,6 +682,266 @@ fn selector(guest: &mut Guest, slot: &str) -> Result<String> {
                 .is_some_and(canonical_id)
         })
         .map(|line| line.trim_start_matches("../deployments/").to_string())
+}
+
+/// The rollback prompt at 1280x800: nine Unifont rows 40 apart, centred,
+/// the time line last (td-authd/src/consent.rs, tag 11).
+const ROLLBACK_TOP: usize = 224;
+const PROMPT_PITCH: usize = 40;
+const BUSY_NOTICE: &str = "PREVIOUS REQUEST IS STILL FINISHING";
+const ROLLED_BACK_NOTICE: &str = "ROLLED BACK - RESTART TO BOOT IT";
+/// The compositor's control socket, which answers `td-ctl` for the session.
+const CONTROL_SOCKET: &str = "/run/td-compositor/1000/td-control";
+
+/// Whether `pixels` are the rollback prompt for exactly this pair, and if
+/// so the approval key its key row shows: one of the 64 keys, or an error
+/// when the row matches more than one.
+fn rollback_prompt_key(pixels: &[u8], current: &str, previous: &str) -> Result<Option<[u8; 2]>> {
+    if !canonical_id(current) || !canonical_id(previous) {
+        return Err("invalid expected rollback pair".into());
+    }
+    for (row, text) in [
+        (0, "TD SECURE ATTENTION"),
+        (1, "SESSION USER 1000"),
+        (2, "ROLL BACK TO THE PREVIOUS SYSTEM"),
+        (3, &format!("CURRENT: {current}")),
+        (4, &format!("PREVIOUS: {previous}")),
+        (5, "TAKES EFFECT AT THE NEXT RESTART"),
+        (7, "ESC: CANCEL"),
+    ] {
+        if !row_matches(pixels, ROLLBACK_TOP + row * PROMPT_PITCH, text)? {
+            return Ok(None);
+        }
+    }
+    let mut shown = None;
+    for first in b'2'..=b'9' {
+        for second in b'2'..=b'9' {
+            let text = format!(
+                "APPROVE: TYPE {} THEN {}",
+                char::from(first),
+                char::from(second)
+            );
+            if row_matches(pixels, ROLLBACK_TOP + 6 * PROMPT_PITCH, &text)?
+                && shown.replace([first, second]).is_some()
+            {
+                return Err("the rollback prompt's key row matches two keys".into());
+            }
+        }
+    }
+    Ok(shown)
+}
+
+/// A digit's QMP key name and its evdev code (`KEY_2` is 3).
+fn digit_key(digit: u8) -> Result<(&'static str, u8)> {
+    const NAMES: &[&str] = &["2", "3", "4", "5", "6", "7", "8", "9"];
+    let index = digit
+        .checked_sub(b'2')
+        .filter(|index| *index < 8)
+        .ok_or("approval-key digits are 2 to 9")?;
+    let name = NAMES
+        .get(usize::from(index))
+        .ok_or("approval-key digits are 2 to 9")?;
+    Ok((name, index + 3))
+}
+
+/// A digit from 2 to 9 other than `digit`.
+fn other_digit(digit: u8) -> u8 {
+    if digit == b'2' {
+        b'3'
+    } else {
+        b'2'
+    }
+}
+
+fn selectors(guest: &mut Guest) -> Result<(String, String)> {
+    Ok((selector(guest, "current")?, selector(guest, "previous")?))
+}
+
+fn unchanged(guest: &mut Guest, current: &str, previous: &str, after: &str) -> Result<()> {
+    if selectors(guest)? != (current.to_string(), previous.to_string()) {
+        return Err(format!("{after} changed the deployment selectors"));
+    }
+    Ok(())
+}
+
+/// The `deploy-rollback` phase (td-authd/DESIGN.md, "Elevation
+/// operations"): on a guest whose selectors name `current` and `previous`,
+/// the prompt names exactly that pair; Enter, the control socket's key
+/// requests (the right first digit, then a wrong one) and a physical wrong
+/// digit commit nothing and leave both selectors, the wrong digit ending
+/// the request; a new request's key, read off the screen and typed,
+/// makes `previous` current and shows the success screen.
+fn deploy_rollback(guest: &mut Guest, work: &Path, current: &str, previous: &str) -> Result<()> {
+    let capture = work.join("rollback.ppm");
+    unchanged(guest, current, previous, "the boot")?;
+    let key = guest.rollback_prompt(&capture, current, previous)?;
+    println!(
+        "[qemu-deploy-rollback] prompt names current {current} and previous {previous}; key {}",
+        String::from_utf8_lossy(&key)
+    );
+    guest.key(&["ret"])?;
+    guest.hold_rollback_prompt(&capture, current, previous, key, "Enter")?;
+    unchanged(guest, current, previous, "Enter")?;
+    let [first, _] = key;
+    for digit in [first, other_digit(first)] {
+        let (_, code) = digit_key(digit)?;
+        for state in ["down", "up"] {
+            let answer = guest.scalar(
+                &format!(
+                    "out=$(/bin/td-ctl --socket {CONTROL_SOCKET} key \
+                     0123456789abcdef0123456789abcdef 1 {code} {state} 2>&1); \
+                     echo \"TD-ROLLBACK-INJECTED=$? $out\""
+                ),
+                |line| line.starts_with("TD-ROLLBACK-INJECTED="),
+            )?;
+            if !answer.starts_with("TD-ROLLBACK-INJECTED=2 ")
+                || !answer.contains("input automation is disabled")
+            {
+                return Err(format!("the control socket did not refuse a key: {answer}"));
+            }
+        }
+    }
+    guest.hold_rollback_prompt(&capture, current, previous, key, "injected digits")?;
+    unchanged(guest, current, previous, "injected digits")?;
+    println!("[qemu-deploy-rollback] Enter and injected digits left the prompt and both selectors");
+    let (wrong, _) = digit_key(other_digit(first))?;
+    guest.key(&[wrong])?;
+    guest.screen_until(
+        &capture,
+        Duration::from_secs(20),
+        "the end of a wrong key's request",
+        |pixels| {
+            Ok(rollback_prompt_key(pixels, current, previous)?.is_none()
+                && !row_matches(pixels, ROLLBACK_TOP, "TD SECURE ATTENTION")?
+                && !menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?)
+        },
+    )?;
+    unchanged(guest, current, previous, "a wrong digit")?;
+    println!("[qemu-deploy-rollback] a wrong digit ended the request and left both selectors");
+    let key = guest.rollback_prompt(&capture, current, previous)?;
+    for digit in key {
+        let (name, _) = digit_key(digit)?;
+        guest.key(&[name])?;
+    }
+    guest.screen_until(
+        &capture,
+        Duration::from_secs(60),
+        "the rollback's success",
+        |pixels| {
+            Ok(menu_row_matches(pixels, 312, ROLLED_BACK_NOTICE)?
+                && menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?)
+        },
+    )?;
+    guest.key(&["esc"])?;
+    unchanged(guest, previous, previous, "the approved rollback")
+        .map_err(|_| "the approved rollback did not make previous current".to_string())?;
+    println!(
+        "[qemu-deploy-rollback] the typed key {} rolled back to {previous}",
+        String::from_utf8_lossy(&key)
+    );
+    Ok(())
+}
+
+/// `qemu-deploy-rollback`: the system image on a fixture volume whose
+/// `current` is a second signed deployment and `previous` the recipe's
+/// own, the rollback phase, then a reboot that selects `previous`.
+pub(crate) fn run_deploy_rollback(runner: &crate::check_runner::RecipeCheckRunner) -> Result<()> {
+    println!("[qemu-deploy-rollback] building the system image and the rollback fixture");
+    use std::sync::atomic::AtomicU64;
+    // The tier's selection: KVM, or software emulation when
+    // `TD_QEMU_ACCEL=tcg` asks for it.
+    let accel = match crate::checks::accel::headless_from_env()?.names {
+        ["kvm"] => "kvm",
+        ["tcg"] => "tcg",
+        names => {
+            return Err(format!("qemu-deploy-rollback: no single accelerator in {names:?}").into())
+        }
+    };
+    let (kernel, selector_template, deployment) = super::build_system(runner)?;
+    let (mkfs, btrfs) = super::build_btrfs_tools(runner)?;
+    let trust = super::RunTrust::generate()?;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let scratch = super::Scratch {
+        dir: super::create_qmp_scratch_dir(&std::env::temp_dir(), &SEQ)?,
+    };
+    let initramfs = super::provision_selector(&selector_template, &scratch.dir, &trust)?;
+    let volume = scratch.dir.join("rollback.btrfs");
+    let fixture = super::create_persistent_volume_layout(
+        &deployment,
+        &mkfs,
+        &btrfs,
+        &volume,
+        super::VolumeLayout::Rollback,
+        false,
+        &trust,
+        None,
+        super::VolumePurpose::Fixture,
+        None,
+    )?;
+    let (current, previous) = (fixture.alternate_id, fixture.initial_id);
+    if current == previous {
+        return Err("the rollback fixture's current did not differ from previous".into());
+    }
+    let work = scratch.dir.join("w");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&work)
+        .map_err(|e| format!("create oracle directory: {e}"))?;
+    overlay(&volume, "raw", &work.join("disk.qcow2"))?;
+    let options = Options {
+        kernel,
+        selector: initramfs,
+        disk: volume,
+        format: "raw".into(),
+        work,
+        timeout: Duration::from_secs(5400),
+        rollback: false,
+        accel,
+    };
+    let deadline = Instant::now()
+        .checked_add(options.timeout)
+        .ok_or("oracle deadline overflow")?;
+    let run = || -> Result<()> {
+        let mut guest = Guest::start(&options, 1, deadline)?;
+        let cmdline = guest.scalar("cat /proc/cmdline", |line| kernel_id(line).is_some())?;
+        if kernel_id(&cmdline) != Some(current.as_str()) {
+            return Err("the fixture did not boot its current deployment".into());
+        }
+        deploy_rollback(&mut guest, &options.work, &current, &previous)?;
+        guest.command("sync")?;
+        guest.stop()?;
+        let mut guest = Guest::start(&options, 2, deadline)?;
+        let cmdline = guest.scalar("cat /proc/cmdline", |line| kernel_id(line).is_some())?;
+        if kernel_id(&cmdline) != Some(previous.as_str()) {
+            return Err("the reboot after the rollback did not select previous".into());
+        }
+        unchanged(&mut guest, &previous, &previous, "the reboot")?;
+        guest.command("sync")?;
+        guest.stop()
+    };
+    if let Err(error) = run() {
+        // The serial logs and last capture outlive the scratch directory.
+        let keep = runner.scratch_dir().join("deploy-rollback");
+        if fs::create_dir_all(&keep).is_ok() {
+            for name in [
+                "serial-1.log",
+                "serial-2.log",
+                "qemu-1.log",
+                "qemu-2.log",
+                "rollback.ppm",
+            ] {
+                let _ = fs::copy(options.work.join(name), keep.join(name));
+            }
+            eprintln!("[qemu-deploy-rollback] evidence kept in {}", keep.display());
+        }
+        return Err(error);
+    }
+    println!(
+        "[qemu-deploy-rollback] PASS (KVM): request 1d's prompt named the pair; Enter, \
+         control-socket digits and a wrong digit committed nothing; the typed key rolled \
+         back and the next boot selected {previous}"
+    );
+    Ok(())
 }
 
 fn once(flag: &mut bool, matches: bool, action: &str) -> Result<()> {
@@ -1696,9 +2041,144 @@ mod tests {
         for text in [
             "SYSTEM INSTALLED - RESTART TO BOOT IT",
             "PRESS CTRL+ALT+ESC TO UNLOCK",
+            ROLLED_BACK_NOTICE,
         ] {
             notice_row_matches_the_chrome_font(text);
         }
+    }
+
+    /// Unifont rows at their tops on the prompt's ground, as RGB pixels.
+    fn unifont_pixels(rows: &[(usize, String)]) -> Vec<u8> {
+        let mut pixels = [24, 32, 40].repeat(1280 * 800);
+        for (top, text) in rows {
+            for (column, character) in text.bytes().enumerate() {
+                for y in 0..32 {
+                    for x in 0..16 {
+                        if ascii_pixel(character, x / 2, y / 2).unwrap() {
+                            let offset = ((top + y) * 1280 + 24 + column * 16 + x) * 3;
+                            pixels[offset..offset + 3].copy_from_slice(&[255; 3]);
+                        }
+                    }
+                }
+            }
+        }
+        pixels
+    }
+
+    /// The rollback prompt as td-authd renders tag 11 and the compositor
+    /// centres it with its time line.
+    fn rollback_rows(current: &str, previous: &str, key: &str) -> Vec<(usize, String)> {
+        let [first, second] = key.as_bytes() else {
+            panic!("a key is two digits");
+        };
+        [
+            "TD SECURE ATTENTION".to_string(),
+            "SESSION USER 1000".into(),
+            "ROLL BACK TO THE PREVIOUS SYSTEM".into(),
+            format!("CURRENT: {current}"),
+            format!("PREVIOUS: {previous}"),
+            "TAKES EFFECT AT THE NEXT RESTART".into(),
+            format!(
+                "APPROVE: TYPE {} THEN {}",
+                char::from(*first),
+                char::from(*second)
+            ),
+            "ESC: CANCEL".into(),
+            "TIME LEFT WHEN SHOWN: 120 S".into(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(row, text)| (224 + row * 40, text))
+        .collect()
+    }
+
+    #[test]
+    fn the_rollback_prompt_is_read_for_its_pair_and_key() {
+        let (current, previous) = ("ab".repeat(32), "cd".repeat(32));
+        for key in ["47", "22", "99", "28", "83"] {
+            let pixels = unifont_pixels(&rollback_rows(&current, &previous, key));
+            assert_eq!(
+                rollback_prompt_key(&pixels, &current, &previous).unwrap(),
+                Some(<[u8; 2]>::try_from(key.as_bytes()).unwrap()),
+                "{key}"
+            );
+            // Another pair, or this one swapped, is not this prompt.
+            assert_eq!(
+                rollback_prompt_key(&pixels, &previous, &current).unwrap(),
+                None
+            );
+            assert_eq!(
+                rollback_prompt_key(&pixels, &current, &"ef".repeat(32)).unwrap(),
+                None
+            );
+        }
+        // Every row but the time line is required.
+        for missing in 0..8 {
+            let mut rows = rollback_rows(&current, &previous, "47");
+            rows.remove(missing);
+            let pixels = unifont_pixels(&rows);
+            assert_eq!(
+                rollback_prompt_key(&pixels, &current, &previous).unwrap(),
+                None,
+                "row {missing}"
+            );
+        }
+        // A digit outside the alphabet is no key.
+        let pixels = unifont_pixels(&rollback_rows(&current, &previous, "17"));
+        assert_eq!(
+            rollback_prompt_key(&pixels, &current, &previous).unwrap(),
+            None
+        );
+        // The installation prompt is not a rollback's.
+        let install = screenshot(&current);
+        assert_eq!(
+            rollback_prompt_key(ppm(&install).unwrap(), &current, &previous).unwrap(),
+            None
+        );
+        assert!(rollback_prompt_key(&pixels, "AB", &previous).is_err());
+    }
+
+    #[test]
+    fn approval_digits_are_typed_as_their_number_row_keys() {
+        for (digit, name, code) in [(b'2', "2", 3), (b'5', "5", 6), (b'9', "9", 10)] {
+            assert_eq!(digit_key(digit).unwrap(), (name, code));
+        }
+        for digit in [b'0', b'1', b':', b'a'] {
+            assert!(digit_key(digit).is_err());
+        }
+        for digit in b'2'..=b'9' {
+            let other = other_digit(digit);
+            assert_ne!(other, digit);
+            assert!(digit_key(other).is_ok());
+        }
+    }
+
+    /// The rows read here are the ones td-authd and the compositor draw.
+    #[test]
+    fn the_rollback_rows_are_td_authds_and_the_compositors() {
+        let consent = include_str!("../../../../../../td-authd/src/consent.rs");
+        for row in [
+            "\"ROLL BACK TO THE PREVIOUS SYSTEM\"",
+            "format!(\"CURRENT: {current}\")",
+            "format!(\"PREVIOUS: {previous}\")",
+            "\"TAKES EFFECT AT THE NEXT RESTART\"",
+            "\"APPROVE: TYPE {} THEN {}\"",
+            "\"ESC: CANCEL\"",
+        ] {
+            assert!(consent.contains(row), "{row}");
+        }
+        let attention = include_str!("../../../../../../td-compositor/src/attention.rs");
+        for notice in [ROLLED_BACK_NOTICE, BUSY_NOTICE] {
+            assert!(attention.contains(&format!("\"{notice}\"")), "{notice}");
+        }
+        let main = include_str!("../../../../../../td-compositor/src/main.rs");
+        assert!(main.contains(&format!(
+            "const CONTROL_SOCKET_ENV: &str = \"TD_CONTROL_SOCKET\";"
+        )));
+        let system = include_str!("../../../../../../recipes/src/recipes/system-x86-64.rs");
+        assert!(system.contains(&format!(
+            "const CONTROL_SOCKET: &str = \"{CONTROL_SOCKET}\";"
+        )));
     }
 
     fn notice_row_matches_the_chrome_font(text: &str) {

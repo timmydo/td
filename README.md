@@ -31,7 +31,9 @@ nothing in the root is mutable.
   trusted because it has nowhere to roll back. A healthy target acknowledges
   its exact deployment, while an exhausted candidate automatically rolls back.
   A corrupt current selector is durably repaired to its verified previous
-  deployment, and an explicit `td-boot rollback` remains available. Update
+  deployment, and an explicit `td-boot rollback` of a named current and
+  previous pair remains available, which the session owner reaches through
+  secure attention's `B` (`deploy-rollback`). Update
   transactions and boot selection are serialized per block device through
   unmount; verified read-only recovery remains available when a writable
   bookkeeping transaction is unavailable and confirms health without attempting
@@ -225,10 +227,10 @@ td-recipe-eval qemu-boot-live        # live wizard installs a disk, which then b
 ```
 
 `td-builder check integration` runs the system-level oracles —
-`qemu-boot-system`, `qemu-boot-live` and `qemu-install-system` — on the
-host; `td-builder main-integration run` runs it on main after landings,
-after every recipe check, and a branch's `ready` never does
-(`DEVELOPMENT.md`).
+`qemu-boot-system`, `qemu-deploy-rollback`, `qemu-boot-live` and
+`qemu-install-system` — on the host; `td-builder main-integration run`
+runs it on main after landings, after every recipe check, and a branch's
+`ready` never does (`DEVELOPMENT.md`).
 
 To build a bootable live ISO of the system, signed with a key made for that
 ISO alone:

@@ -301,10 +301,6 @@ struct KeyBindings {
     /// an enrolled record's keys in canonical slot order, which removal
     /// digits name, or why there are none.
     login: crate::authority::Login,
-    /// The tests' stand-in for root's `1d`, which L3 wires: with it `B`
-    /// asks root for a rollback (`rollback_wired`).
-    #[cfg(test)]
-    rollback: bool,
     /// Resume detection, checked before each batch is routed; the paired
     /// profile's alone.
     resume: Option<Arc<Resume>>,
@@ -726,18 +722,8 @@ impl KeyBindings {
                 decision.notice = Some(Notice::LoginKeys);
                 None
             }
-            // A rollback, which no build asks root for until L3 wires root's
-            // `1d`: until then this build refuses it, and the refusal is
-            // the lifetime's one selection.
-            KEY_B => {
-                self.secret_selected = true;
-                if self.rollback_wired() {
-                    Some(Selection::Elevation(Elevation::Rollback))
-                } else {
-                    decision.notice = Some(Notice::NotAvailable);
-                    None
-                }
-            }
+            // A rollback: root's `1d`.
+            KEY_B => Some(Selection::Elevation(Elevation::Rollback)),
             // The lifetime's one selection: it ends attention into the
             // lock, or says why there is none and sends nothing.
             KEY_L => {
@@ -751,18 +737,6 @@ impl KeyBindings {
             }
             _ => None,
         };
-    }
-
-    /// Whether `B` asks root for a rollback: in no production build until
-    /// L3 wires root's `1d`.
-    #[cfg(not(test))]
-    fn rollback_wired(&self) -> bool {
-        false
-    }
-
-    #[cfg(test)]
-    fn rollback_wired(&self) -> bool {
-        self.rollback
     }
 
     /// An approval-key digit for a fresh press from a device secure
@@ -10233,11 +10207,10 @@ mod tests {
 
     // Elevation consent: `B` and the approval key.
 
-    /// Bindings whose `B` asks root for a rollback, as L3's will.
+    /// Bindings on the open session, where `B` asks root for a rollback.
     fn rollback_bindings() -> Mutex<KeyBindings> {
         Mutex::new(KeyBindings {
             attention_enabled: true,
-            rollback: true,
             ..KeyBindings::default()
         })
     }
@@ -10253,13 +10226,12 @@ mod tests {
         deliver_key_decision(target, bindings, decision).unwrap();
     }
 
-    /// This build refuses `B`: the menu shows NOT AVAILABLE IN THIS BUILD,
-    /// asks root nothing, and the refusal is the lifetime's one selection.
-    /// `H` is L4's and selects nothing yet. Outside attention both are
-    /// ordinary keys.
+    /// `B` asks root for a rollback, and that is the lifetime's one
+    /// selection: no later letter selects anything. `H` is L4's and
+    /// selects nothing yet. Outside attention both are ordinary keys.
     #[test]
-    fn b_is_refused_in_this_build_and_ends_the_lifetimes_choice() {
-        use crate::attention::Notice;
+    fn b_selects_a_rollback_and_ends_the_lifetimes_choice() {
+        use crate::secret_client::{Elevation, Selection};
         let target = Mutex::new(RecordingTarget::default());
         let bindings = attention_bindings(None);
         read_reports(&target, &bindings, 0, &presses(&[KEY_B, KEY_H], 1));
@@ -10280,18 +10252,20 @@ mod tests {
         );
         let target = target.lock().unwrap();
         assert_eq!(target.attention_events, [true]);
-        assert_eq!(target.notices, [Notice::NotAvailable]);
-        assert!(target.secret_roles.is_empty());
+        assert!(target.notices.is_empty());
+        assert_eq!(
+            target.secret_roles,
+            [Selection::Elevation(Elevation::Rollback)]
+        );
         assert_eq!(target.lock_screens, 0);
         assert_eq!(target.keys.len(), typed);
     }
 
-    /// Where root's `1d` is wired, `B` is the lifetime's one selection, a
-    /// rollback: never from a repeat, a key held from before the screen
-    /// opened, or another device's press of a held key. `H` still selects
-    /// nothing.
+    /// `B`'s rollback is never selected by a repeat, a key held from
+    /// before the screen opened, or another device's press of a held key.
+    /// `H` still selects nothing.
     #[test]
-    fn b_selects_one_rollback_where_root_is_wired() {
+    fn b_selects_one_rollback_only_from_a_fresh_press() {
         use crate::secret_client::{Elevation, Selection};
         let mut bindings = rollback_bindings().into_inner().unwrap();
         let mut target = RecordingTarget::default();
@@ -10518,75 +10492,62 @@ mod tests {
         assert_eq!(target.approvals.len(), 2);
     }
 
-    /// A security key's own keyboard neither selects `B`, wired or not, nor
-    /// types an approval-key digit; the keyboard's do, and the key's
-    /// Escape still cancels.
+    /// A security key's own keyboard neither selects `B` nor types an
+    /// approval-key digit; the keyboard's do, and the key's Escape still
+    /// cancels.
     #[test]
     fn a_security_keys_keyboard_cannot_select_b_or_type_the_key() {
-        use crate::attention::Notice;
         use crate::secret_client::{Elevation, Selection};
         const KEY: usize = 1;
-        for wired in [false, true] {
-            let target = Mutex::new(RecordingTarget::default());
-            let bindings = Mutex::new(KeyBindings {
-                attention_enabled: true,
-                attention_excluded: BTreeSet::from([KEY]),
-                rollback: wired,
-                ..KeyBindings::default()
-            });
-            read_reports(&target, &bindings, 0, &chord_reports(10));
-            read_reports(
-                &target,
-                &bindings,
-                KEY,
-                &presses(&[KEY_B, KEY_H, KEY_4, KEY_7], 20),
-            );
-            {
-                let target = target.lock().unwrap();
-                assert!(target.notices.is_empty() && target.secret_roles.is_empty());
-                assert!(target.approvals.is_empty());
-            }
-            read_reports(&target, &bindings, 0, &presses(&[KEY_B], 30));
-            read_reports(&target, &bindings, KEY, &presses(&[KEY_4, KEY_7], 40));
-            assert!(target.lock().unwrap().approvals.is_empty());
-            read_reports(&target, &bindings, 0, &presses(&[KEY_4], 50));
-            read_reports(&target, &bindings, KEY, &presses(&[KEY_ESC], 60));
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings {
+            attention_enabled: true,
+            attention_excluded: BTreeSet::from([KEY]),
+            ..KeyBindings::default()
+        });
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        read_reports(
+            &target,
+            &bindings,
+            KEY,
+            &presses(&[KEY_B, KEY_H, KEY_4, KEY_7], 20),
+        );
+        {
             let target = target.lock().unwrap();
-            if wired {
-                assert_eq!(
-                    target.secret_roles,
-                    [Selection::Elevation(Elevation::Rollback)]
-                );
-                assert!(target.notices.is_empty());
-            } else {
-                assert!(target.secret_roles.is_empty());
-                assert_eq!(target.notices, [Notice::NotAvailable]);
-            }
-            assert_eq!(target.approvals, [(b'4', 50_000_000)]);
-            assert_eq!(target.draining_events, 1);
-            assert_eq!(target.attention_events, [true, false]);
+            assert!(target.notices.is_empty() && target.secret_roles.is_empty());
+            assert!(target.approvals.is_empty());
         }
+        read_reports(&target, &bindings, 0, &presses(&[KEY_B], 30));
+        read_reports(&target, &bindings, KEY, &presses(&[KEY_4, KEY_7], 40));
+        assert!(target.lock().unwrap().approvals.is_empty());
+        read_reports(&target, &bindings, 0, &presses(&[KEY_4], 50));
+        read_reports(&target, &bindings, KEY, &presses(&[KEY_ESC], 60));
+        let target = target.lock().unwrap();
+        assert_eq!(
+            target.secret_roles,
+            [Selection::Elevation(Elevation::Rollback)]
+        );
+        assert!(target.notices.is_empty());
+        assert_eq!(target.approvals, [(b'4', 50_000_000)]);
+        assert_eq!(target.draining_events, 1);
+        assert_eq!(target.attention_events, [true, false]);
     }
 
     /// On the lock surface the menu's letters select nothing, `B` among
-    /// them, wired or not: the chord's unlock is the lifetime's one
-    /// selection.
+    /// them: the chord's unlock is the lifetime's one selection.
     #[test]
     fn b_selects_nothing_on_the_lock_surface() {
         use crate::secret_client::{LoginSelection, Selection};
-        for wired in [false, true] {
-            let target = locked_target();
-            let bindings = attention_bindings(Some(ENROLLED.to_vec()));
-            bindings.lock().unwrap().rollback = wired;
-            read_reports(&target, &bindings, 0, &chord_reports(10));
-            read_reports(&target, &bindings, 0, &presses(&[KEY_B, KEY_H], 20));
-            let target = target.lock().unwrap();
-            assert_eq!(
-                target.secret_roles,
-                [Selection::Login(LoginSelection::Unlock)]
-            );
-            assert!(target.notices.is_empty());
-        }
+        let target = locked_target();
+        let bindings = attention_bindings(Some(ENROLLED.to_vec()));
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        read_reports(&target, &bindings, 0, &presses(&[KEY_B, KEY_H], 20));
+        let target = target.lock().unwrap();
+        assert_eq!(
+            target.secret_roles,
+            [Selection::Login(LoginSelection::Unlock)]
+        );
+        assert!(target.notices.is_empty());
     }
 
     #[test]

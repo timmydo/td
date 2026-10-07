@@ -3412,6 +3412,9 @@ enum VolumeLayout {
     Basic,
     Transactional,
     CorruptCurrent,
+    /// `current` a second successful deployment, `previous` the recipe's:
+    /// a pair for `deploy-rollback` to choose between.
+    Rollback,
 }
 
 struct VolumeFixture {
@@ -3471,7 +3474,7 @@ fn create_persistent_volume_layout(
     let copies: u64 = match layout {
         VolumeLayout::Basic => 1,
         VolumeLayout::Transactional => 3,
-        VolumeLayout::CorruptCurrent => 2,
+        VolumeLayout::CorruptCurrent | VolumeLayout::Rollback => 2,
     };
     let mut fixture_payload_bytes =
         persistent_fixture_payload_bytes(deployment, copies, seccomp_probe)?;
@@ -3546,6 +3549,22 @@ fn create_persistent_volume_layout(
                 .map_err(|e| format!("open corrupt-current payload {}: {e}", root.display()))?;
             file.write_all(b"td-corrupt-current")
                 .map_err(|e| format!("corrupt current payload {}: {e}", root.display()))?;
+            replace_seed_selector(&seed, "current", &id)?;
+            id
+        }
+        VolumeLayout::Rollback => {
+            let candidate = seed
+                .join(td_boot_protocol::VOLUME_CHANNEL_DIR)
+                .join("rollback-current");
+            let id = create_bootable_candidate(deployment, &candidate, trust)?;
+            let installed = seed.join(td_boot_protocol::DEPLOYMENTS_DIR).join(&id);
+            fs::rename(&candidate, &installed).map_err(|e| {
+                format!(
+                    "stage rollback current deployment {} -> {}: {e}",
+                    candidate.display(),
+                    installed.display()
+                )
+            })?;
             replace_seed_selector(&seed, "current", &id)?;
             id
         }
@@ -8412,6 +8431,16 @@ impl Qmp {
                         | "v"
                         | "w"
                         | "x"
+                        // `qemu-deploy-rollback`'s `B` and approval-key digits.
+                        | "b"
+                        | "2"
+                        | "3"
+                        | "4"
+                        | "5"
+                        | "6"
+                        | "7"
+                        | "8"
+                        | "9"
                 )
             })
         {

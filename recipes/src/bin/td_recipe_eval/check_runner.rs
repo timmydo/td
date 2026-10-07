@@ -883,6 +883,10 @@ const ORACLES: &[(&str, &[&str])] = &[
     ),
     ("qemu-boot-live", &["system-x86-64"]),
     (
+        "qemu-deploy-rollback",
+        &["system-x86-64", "btrfs-progs-x86-64"],
+    ),
+    (
         "qemu-install-system",
         &["system-x86-64", "td-install-qemu-test"],
     ),
@@ -1005,6 +1009,27 @@ pub fn qemu_boot_live_cli(args: &[String]) -> Result<(), String> {
     }
     let _lock = lock_ladder_for_run(&runner)?;
     crate::checks::qemu_boot::live::run(&runner)
+}
+
+/// `deploy-rollback` through the approval key (td-authd/DESIGN.md,
+/// "Elevation operations"): the system image on a two-deployment fixture
+/// volume, its prompt read off the screen, and the reboot it selects.
+pub fn qemu_deploy_rollback_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "system-x86-64";
+    if args.len() > 1 || args.first().is_some_and(|value| value != STEM) {
+        return Err("usage: qemu-deploy-rollback [system-x86-64]".into());
+    }
+    oracle_host(false)?;
+    let targets = oracle_targets("qemu-deploy-rollback")?;
+    ensure_targets_provenance(targets)?;
+    let root = env::current_dir().map_err(|error| format!("current dir: {error}"))?;
+    let name = scratch_name("qemu-deploy-rollback", &[STEM]);
+    let runner = RecipeCheckRunner::new(root, &name)?
+        .with_streamed_progress()
+        .with_allowed_builds(oracle_reach(targets)?);
+    warm_operator_inputs(&runner, targets);
+    let _lock = lock_ladder_for_run(&runner)?;
+    crate::checks::qemu_boot::update::run_deploy_rollback(&runner)
 }
 
 /// Install the production system from an ISO inside a disposable QEMU machine.
@@ -12479,6 +12504,7 @@ chmod 755 '{}'
             "qemu_boot_session_cli",
             "qemu_boot_system_cli",
             "qemu_boot_uefi_cli",
+            "qemu_deploy_rollback_cli",
             "qemu_install_cli",
             "qemu_install_encrypted_cli",
             "qemu_install_system_cli",

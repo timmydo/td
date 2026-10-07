@@ -1811,7 +1811,7 @@ workers reject it, and physical Enter for installation cannot substitute for
 a token-bound secret operation.
 
 Consent tags 11 and 12 describe the elevation operations `deploy-rollback`
-and `set-hostname` (td-authd/DESIGN.md, "Elevation operations (target)").
+and `set-hostname` (td-authd/DESIGN.md, "Elevation operations").
 td-secret's copy of the shared codec decodes them, so their refusal rests on
 each worker's operation match: the unlock, enrollment, credential write and
 login-key workers each reject both, which a test feeds every worker.
@@ -1865,12 +1865,19 @@ verifiers, fingerprints and every phase's client-data hash with Python's
 `login_tier.rs` is TOKEN-LOGIN.md's "Deployments" reader, std-only and
 `forbid(unsafe_code)`: the marker's grammar, and the bounded newc reader
 that finds it. The worker's module, it is compiled by td-authd through a
-reviewed `#[path]` for request 19, and hashes with the `engine/src/sha256.rs`
+reviewed `#[path]` for request 19 and for request `1d`'s selectors
+(`td-authd/DESIGN.md`, "Elevation operations"), and hashes with the
+`engine/src/sha256.rs`
 copy each crate already compiles (td-secret names `crypto`'s as
 `crate::sha256`). `read` takes a held deployment directory, the ID it is
 read against and the owner its files must have; `retained` takes the
 volume and a selector name, `current` or `previous`, and reads the
-deployment it names by that name. Any failure reads no version. The
+deployment it names by that name. Any failure reads no version.
+`open_volume` and `selected` are `retained`'s first steps on their own:
+the volume held as a directory, and the ID one selector names through
+it, exactly `../deployments/` and 64 lowercase hex digits; td-authd's
+`deploy-rollback` reads both selectors with them, and reads them again
+through the same descriptor before it acts. The
 system recipe writes the marker into every deployment from
 TOKEN-LOGIN.md increment 4's C10b, which follows the enforcement the
 marker claims, so these readers find it in a td-built deployment from
@@ -2269,7 +2276,8 @@ PIN step's acknowledgement. `17` stays store inspection's.
    regular files opened without following a link or waiting on a FIFO,
    the manifest hashing to the ID and the archive to the manifest, and
    the marker taken by the shared bounded newc reader,
-   `login_tier.rs`, which td-authd compiles for request 19. A
+   `login_tier.rs`, which td-authd compiles for request 19 and request
+   `1d`'s selectors. A
    deployment whose marker does not verify, or a machine with no volume,
    reads no version. Every deployment built from TOKEN-LOGIN.md
    increment 4's C10b onward carries the marker, C10b following the

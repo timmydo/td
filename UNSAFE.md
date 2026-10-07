@@ -2845,6 +2845,24 @@ compiled from td-install, with no descriptors. The controller source, its
 fixed child argv and the codec's freedom from unsafe and I/O are pinned by
 confinement tests. No instruction, syscall, option or allowance is added.
 
+### Elevation: `deploy-rollback`
+
+`td-authd/src/rollback.rs` and `td-authd/src/elevation.rs` are safe std
+consumers on the private channel's request `1d`; neither touches the raw
+modules or receives a descriptor. `elevation.rs` opens `/etc` and the
+principal table read-only through std with fixed `O_NOFOLLOW`,
+`O_NONBLOCK` and `O_DIRECTORY` flags, and creates, writes and spawns
+nothing. `rollback.rs` holds `/run/td-volume/td` open as a directory
+through the shared `login_tier.rs` reader, reads two selector links
+through it with safe std, and joins the confinement-pinned fixed child
+argv roster with one spawn: `/bin/td-boot on-volume rollback
+/run/td-update CURRENT PREVIOUS`, an empty environment, cwd `/`, null
+stdin and stdout and inherited stderr, the operands the two IDs root
+read and the person approved. Confinement tests pin both sources, the
+argv, the second selector read and the absence of any other process,
+descriptor or write API. No instruction, syscall, option or allowance is
+added.
+
 ### Claude shell terminal boundary
 
 The Claude shell launcher is another unprivileged consumer of the unchanged

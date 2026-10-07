@@ -165,9 +165,14 @@ enum Mode {
         /// there is no configuration in which it should.
         trusted_key: PathBuf,
     },
+    /// Moves `current` back to `previous`, but only while the two
+    /// selectors still name the pair the caller approved (td-install
+    /// DESIGN, "Full-system volume consumers").
     Rollback {
         device: PathBuf,
         mountpoint: PathBuf,
+        current: String,
+        previous: String,
     },
     Success {
         device: PathBuf,
@@ -290,7 +295,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>\n       td-boot live-seed <mountpoint> <deployment-id> <seed-directory>",
+        "usage: td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint> <current-id> <previous-id>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>\n       td-boot live-seed <mountpoint> <deployment-id> <seed-directory>",
     )
 }
 
@@ -516,12 +521,22 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
         Some(mode) if mode == OsStr::new("rollback") => {
             let device = args.next().ok_or_else(usage_error)?;
             let mountpoint = args.next().ok_or_else(usage_error)?;
+            let current = parse_deployment_id(args.next().ok_or_else(usage_error)?)?;
+            let previous = parse_deployment_id(args.next().ok_or_else(usage_error)?)?;
             if args.next().is_some() {
                 return Err(usage_error());
+            }
+            if current == previous {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a rollback names two different deployments",
+                ));
             }
             Ok(Mode::Rollback {
                 device: PathBuf::from(device),
                 mountpoint: PathBuf::from(mountpoint),
+                current,
+                previous,
             })
         }
         Some(mode) if mode == OsStr::new("success") => {
@@ -1823,10 +1838,22 @@ fn install_deployment(root: &Path, source: &Path, trust: Option<&TrustRoot>) -> 
     Ok(installed)
 }
 
-fn rollback_deployment(root: &Path) -> io::Result<String> {
+/// Moves `current` to `previous` only while the selectors name exactly
+/// the approved pair: the caller holds the transaction lock, and the check
+/// comes before any change, so an update or rollback published since the
+/// pair was read is refused rather than undone.
+fn rollback_deployment(root: &Path, current: &str, previous: &str) -> io::Result<String> {
     require_absolute(root, "volume root")?;
     require_real_directory(root, "volume root")?;
     require_real_directory(&root.join(protocol::BOOT_DIR), "boot selector directory")?;
+    for (slot, expected) in [("current", current), ("previous", previous)] {
+        let named = read_selector(root, slot)?;
+        if named != expected {
+            return Err(invalid(format!(
+                "refusing rollback: {slot} names {named}, not the approved {expected}"
+            )));
+        }
+    }
     reap_selector_temporaries(&root.join(protocol::BOOT_DIR))?;
     let previous = verify_slot(root, "previous")?;
     let previous_id = previous.id;
@@ -3371,8 +3398,10 @@ fn run_publish(root: &Path, source: &Path, trusted_key: Option<&Path>) -> io::Re
     writeln!(io::stdout(), "{id}")
 }
 
-fn run_rollback(device: &Path, mountpoint: &Path) -> io::Result<()> {
-    let id = run_on_writable_volume(device, mountpoint, rollback_deployment)?;
+fn run_rollback(device: &Path, mountpoint: &Path, current: &str, previous: &str) -> io::Result<()> {
+    let id = run_on_writable_volume(device, mountpoint, |root| {
+        rollback_deployment(root, current, previous)
+    })?;
     writeln!(io::stdout(), "{id}")
 }
 
@@ -4142,7 +4171,12 @@ fn dispatch(mode: Mode) -> io::Result<()> {
             channel,
             trusted_key,
         } => run_update(&device, &mountpoint, &volume, &channel, &trusted_key),
-        Mode::Rollback { device, mountpoint } => run_rollback(&device, &mountpoint),
+        Mode::Rollback {
+            device,
+            mountpoint,
+            current,
+            previous,
+        } => run_rollback(&device, &mountpoint, &current, &previous),
         Mode::Success {
             device,
             mountpoint,
@@ -4224,7 +4258,16 @@ mod tests {
             (vec!["live-root", "/media", &id, "/dev/loop0"], true),
             (vec!["live-seed", "/media", &id, "/live-seed"], true),
             (vec!["on-volume", "success", "/run/td-update", &id], false),
-            (vec!["on-volume", "rollback", "/run/td-update"], false),
+            (
+                vec![
+                    "on-volume",
+                    "rollback",
+                    "/run/td-update",
+                    &id,
+                    &"b".repeat(64),
+                ],
+                false,
+            ),
             (vec!["boot", "/dev/vda", "/volume", "quiet"], false),
             (vec!["mount-root", "/dev/vda", "/volume"], false),
             (vec!["verify", "/volume"], false),
@@ -4615,10 +4658,21 @@ mod tests {
                 ..
             })
         ));
-        assert!(matches!(
-            parse_args(args(&["rollback", "/dev/vda", "/run/td-update"])),
-            Ok(Mode::Rollback { .. })
-        ));
+        let (current, previous) = ("a".repeat(64), "b".repeat(64));
+        match parse_args(args(&[
+            "rollback",
+            "/dev/vda",
+            "/run/td-update",
+            &current,
+            &previous,
+        ])) {
+            Ok(Mode::Rollback {
+                current: named,
+                previous: kept,
+                ..
+            }) => assert_eq!((named, kept), (current.clone(), previous.clone())),
+            _ => panic!("rollback must parse and carry the approved pair"),
+        }
         assert!(matches!(
             parse_args(args(&[
                 "success",
@@ -4693,7 +4747,20 @@ mod tests {
             _ => panic!("update must parse and carry its volume, channel and key"),
         }
         assert!(parse_args(args(&["rollback", "/volume"])).is_err());
-        assert!(parse_args(args(&["rollback", "/dev/vda", "/volume", "extra"])).is_err());
+        // The pair is required, each a canonical ID, and the two differ.
+        let upper = current.to_uppercase();
+        for bad in [
+            vec!["rollback", "/dev/vda", "/volume"],
+            vec!["rollback", "/dev/vda", "/volume", &current],
+            vec!["rollback", "/dev/vda", "/volume", &current, &current],
+            vec!["rollback", "/dev/vda", "/volume", &upper, &previous],
+            vec!["rollback", "/dev/vda", "/volume", &current, "extra"],
+            vec![
+                "rollback", "/dev/vda", "/volume", &current, &previous, "extra",
+            ],
+        ] {
+            assert!(parse_args(args(&bad)).is_err(), "{bad:?}");
+        }
         assert!(parse_args(args(&["success", "/dev/vda", "/volume", "not-a-digest"])).is_err());
         assert!(parse_args(args(&["unknown", "/volume"])).is_err());
 
@@ -6121,14 +6188,19 @@ mod tests {
         let (source, candidate) = fixture.source_bundle("candidate", "next");
         install_deployment(&fixture.root, &source, None).unwrap();
 
-        assert_eq!(rollback_deployment(&fixture.root).unwrap(), initial);
+        assert_eq!(
+            rollback_deployment(&fixture.root, &candidate, &initial).unwrap(),
+            initial
+        );
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), initial);
         assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
         assert!(fixture.root.join("td/deployments").join(candidate).is_dir());
     }
 
+    /// The approved pair is used up by the rollback that moves it: the same
+    /// pair a second time no longer matches `current`, and nothing moves.
     #[test]
-    fn repeated_rollback_remains_on_verified_previous() {
+    fn a_second_rollback_of_the_same_pair_is_refused() {
         let fixture = Fixture::new();
         let initial = fixture.valid_deployment();
         fixture.selector("current", &initial);
@@ -6136,12 +6208,82 @@ mod tests {
         let (source, candidate) = fixture.source_bundle("candidate", "next");
         install_deployment(&fixture.root, &source, None).unwrap();
 
-        rollback_deployment(&fixture.root).unwrap();
-        rollback_deployment(&fixture.root).unwrap();
+        rollback_deployment(&fixture.root, &candidate, &initial).unwrap();
+        let error = rollback_deployment(&fixture.root, &candidate, &initial).unwrap_err();
 
+        assert!(error.to_string().contains(&format!(
+            "refusing rollback: current names {initial}, not the approved {candidate}"
+        )));
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), initial);
         assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
         assert!(fixture.root.join("td/deployments").join(candidate).is_dir());
+    }
+
+    /// The race td-authd's consent leaves open (td-authd/DESIGN.md,
+    /// "Elevation operations"): the person approves rolling pending `B`
+    /// back to `A`, and before the helper runs an update publishes `C`.
+    /// While `B` was pending, `install_deployment` kept `A` as `previous`,
+    /// so only the check of `current` sees it. The rollback is refused
+    /// before any change, even a temporary's reaping, and `C` stays current
+    /// with its boot budget.
+    #[test]
+    fn an_update_published_after_consent_is_refused_before_any_change() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, approved) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source, None).unwrap();
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), approved);
+        assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
+
+        let (later, published) = fixture.source_bundle("later", "first");
+        install_deployment(&fixture.root, &later, None).unwrap();
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), published);
+        assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
+        let budget = read_attempt_state(&fixture.root, &published).unwrap();
+        assert!(budget.is_some());
+        let temporary = fixture
+            .root
+            .join(format!("td/boot/.current-{}-0", std::process::id()));
+        fs::write(&temporary, b"").unwrap();
+
+        let error = rollback_deployment(&fixture.root, &approved, &initial).unwrap_err();
+
+        assert!(error.to_string().contains(&format!(
+            "refusing rollback: current names {published}, not the approved {approved}"
+        )));
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), published);
+        assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
+        assert_eq!(
+            read_attempt_state(&fixture.root, &published).unwrap(),
+            budget
+        );
+        assert!(temporary.exists());
+    }
+
+    /// A `previous` moved since consent refuses as well, before any change:
+    /// the rollback never lands on a deployment nobody approved.
+    #[test]
+    fn a_previous_moved_after_consent_is_refused_before_any_change() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source, None).unwrap();
+        let (other, moved) = fixture.source_bundle("other", "recovery");
+        let bundle = open_bundle(&other, None, Names::Source).unwrap();
+        publish_bundle(&fixture.root, bundle, false).unwrap();
+        replace_selector(&fixture.root, "previous", &moved).unwrap();
+
+        let error = rollback_deployment(&fixture.root, &candidate, &initial).unwrap_err();
+
+        assert!(error.to_string().contains(&format!(
+            "refusing rollback: previous names {moved}, not the approved {initial}"
+        )));
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
+        assert_eq!(read_selector(&fixture.root, "previous").unwrap(), moved);
     }
 
     #[test]
@@ -6172,7 +6314,10 @@ mod tests {
         fixture.selector("current", &current);
         fs::write(installed.join("root.erofs"), b"tampered\n").unwrap();
 
-        assert_eq!(rollback_deployment(&fixture.root).unwrap(), previous);
+        assert_eq!(
+            rollback_deployment(&fixture.root, &current, &previous).unwrap(),
+            previous
+        );
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), previous);
         assert_eq!(read_selector(&fixture.root, "previous").unwrap(), previous);
     }
@@ -6188,7 +6333,7 @@ mod tests {
         fixture.selector("previous", &previous);
         fs::write(installed.join("root.erofs"), b"tampered\n").unwrap();
 
-        let error = rollback_deployment(&fixture.root).unwrap_err();
+        let error = rollback_deployment(&fixture.root, &current, &previous).unwrap_err();
 
         assert!(error.to_string().contains("root.erofs hash mismatch"));
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), current);
@@ -6206,7 +6351,7 @@ mod tests {
         fs::remove_file(fixture.root.join("td/boot/previous")).unwrap();
         fixture.selector("previous", &candidate);
 
-        let error = rollback_deployment(&fixture.root).unwrap_err();
+        let error = rollback_deployment(&fixture.root, &candidate, &candidate).unwrap_err();
 
         assert!(error.to_string().contains("is not marked successful"));
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);

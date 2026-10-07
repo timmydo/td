@@ -3,8 +3,9 @@
 //! `initramfs.cpio` once the manifest hashes to the deployment ID and the
 //! archive to the manifest's entry. td-secret's login worker reads the
 //! retained deployments through it, and td-authd compiles this one file
-//! for request 19's queued update. It uses std alone and hashes with the
-//! `engine/src/sha256.rs` copy each crate compiles as `crate::sha256`.
+//! for request 19's queued update and request 1d's selectors. It uses std
+//! alone and hashes with the `engine/src/sha256.rs` copy each crate
+//! compiles as `crate::sha256`.
 #![forbid(unsafe_code)]
 
 use crate::sha256::{self, Sha256};
@@ -93,23 +94,36 @@ pub fn read(directory: &File, id: &str, owner: u32, give_up: Duration) -> Result
 /// within `give_up` as for `read`.
 pub fn retained(volume: &Path, slot: &str, owner: u32, give_up: Duration) -> Result<Vec<u8>> {
     let deadline = deadline(give_up)?;
+    let volume = open_volume(volume)?;
+    let id = selected(&volume, slot)?;
+    let deployments = open_directory(&at(&volume, "deployments"))?;
+    let deployment = open_directory(&at(&deployments, &id))?;
+    read_until(&deployment, &id, owner, deadline)
+}
+
+/// The volume, held open as a directory without following a link, for
+/// `selected` to read through.
+pub fn open_volume(volume: &Path) -> Result<File> {
+    open_directory(volume)
+}
+
+/// The deployment ID the held volume's `slot` selector names, read once:
+/// it must be exactly `../deployments/` and 64 lowercase hex digits.
+pub fn selected(volume: &File, slot: &str) -> Result<String> {
     if slot != CURRENT && slot != PREVIOUS {
         return Err(format!("{slot:?} is not a deployment selector"));
     }
-    let volume = open_directory(volume)?;
-    let boot = open_directory(&at(&volume, "boot"))?;
+    let boot = open_directory(&at(volume, "boot"))?;
     let target =
         fs::read_link(at(&boot, slot)).map_err(|e| format!("read the {slot} selector: {e}"))?;
-    let id = target
+    target
         .as_os_str()
         .as_bytes()
         .strip_prefix(SELECTOR)
         .filter(|id| is_id(id))
         .and_then(|id| std::str::from_utf8(id).ok())
-        .ok_or_else(|| format!("the {slot} selector does not name ../deployments/<id>"))?;
-    let deployments = open_directory(&at(&volume, "deployments"))?;
-    let deployment = open_directory(&at(&deployments, id))?;
-    read_until(&deployment, id, owner, deadline)
+        .map(str::to_string)
+        .ok_or_else(|| format!("the {slot} selector does not name ../deployments/<id>"))
 }
 
 fn deadline(give_up: Duration) -> Result<Instant> {
@@ -1114,6 +1128,40 @@ pub(crate) mod tests {
             let previous = self.deploy(previous);
             self.select(PREVIOUS, &format!("../deployments/{previous}"));
         }
+    }
+
+    /// Both selectors are read through the one held volume, whatever its
+    /// path names afterwards; only the two selectors, each only as
+    /// `../deployments/<64 hex>`.
+    #[test]
+    fn selectors_are_read_through_the_held_volume() {
+        let volume = Volume::new();
+        let one = volume.deploy(None);
+        let two = volume.deploy(Some(&marker(&[1])));
+        volume.select(CURRENT, &format!("../deployments/{two}"));
+        volume.select(PREVIOUS, &format!("../deployments/{one}"));
+        let held = open_volume(volume.path()).unwrap();
+        let moved = volume.path().with_extension("moved");
+        fs::rename(volume.path(), &moved).unwrap();
+        assert_eq!(selected(&held, CURRENT), Ok(two.clone()));
+        assert_eq!(selected(&held, PREVIOUS), Ok(one.clone()));
+        assert_eq!(
+            selected(&held, "attempts"),
+            Err("\"attempts\" is not a deployment selector".into())
+        );
+        let link = moved.join("boot").join(CURRENT);
+        fs::remove_file(&link).unwrap();
+        symlink(format!("../deployments/{two}/"), &link).unwrap();
+        assert_eq!(
+            selected(&held, CURRENT),
+            Err("the current selector does not name ../deployments/<id>".into())
+        );
+        fs::remove_file(&link).unwrap();
+        assert!(
+            selected(&held, CURRENT).is_err_and(|e| e.starts_with("read the current selector: "))
+        );
+        fs::rename(&moved, volume.path()).unwrap();
+        assert!(open_volume(&volume.path().join("absent")).is_err());
     }
 
     #[test]

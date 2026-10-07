@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
-pub(crate) use super::login_tier::tests::marker;
 use super::*;
+pub(crate) use crate::login_tier::tests::marker;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) struct Fixture {
@@ -30,7 +30,7 @@ impl Fixture {
     }
     /// A built deployment whose initramfs carries `tier` as its marker.
     pub(crate) fn marked(tier: Option<&[u8]>) -> Self {
-        use super::login_tier::tests::{bundle, initramfs};
+        use crate::login_tier::tests::{bundle, initramfs};
         let path = Self::directory();
         let id = bundle(&path, &initramfs(tier));
         Self {
@@ -102,7 +102,7 @@ pub(crate) fn hurry(intake: &mut Intake, give_up: Duration) {
 
 #[test]
 fn a_queued_update_reads_its_marker_through_the_held_directory() {
-    use super::login_tier::tests::{bundle, fifo, initramfs, marker};
+    use crate::login_tier::tests::{bundle, fifo, initramfs, marker};
     let fixture = Fixture::marked(Some(&marker(&[1, 2])));
     let ready = fixture.ready();
     assert_eq!(ready.reads(), [1, 2]);
@@ -132,7 +132,7 @@ fn a_queued_update_reads_its_marker_through_the_held_directory() {
     }
     File::create(&archive)
         .unwrap()
-        .set_len(super::login_tier::ARCHIVE_LIMIT + 1)
+        .set_len(crate::login_tier::ARCHIVE_LIMIT + 1)
         .unwrap();
     assert_eq!(ready.reads(), [] as [u8; 0]);
     fs::remove_file(&archive).unwrap();

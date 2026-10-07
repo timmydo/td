@@ -1182,7 +1182,13 @@ mod tests {
             vec!["on-volume", "mount-root", "/volume"],
             vec!["on-volume", "mount-var", "/sysroot/var"],
             vec!["on-volume", "install", "/update", "/source", "/key"],
-            vec!["on-volume", "rollback", "/update"],
+            vec![
+                "on-volume",
+                "rollback",
+                "/update",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ],
         ] {
             assert!(matches!(
                 parse(&good).unwrap(),
@@ -1195,6 +1201,7 @@ mod tests {
             vec!["on-volume", "boot", "/dev/vda", "/volume", "quiet"],
             vec!["on-volume", "mount-var", "/var", "extra"],
             vec!["on-volume", "success", "/update", "invalid-id"],
+            vec!["on-volume", "rollback", "/update"],
         ] {
             assert!(parse(&bad).is_err());
         }
@@ -2246,7 +2253,12 @@ mod tests {
     const RUNNING: &[&[&str]] = &[
         &["install", "/update", "/source", "/key"],
         &["update", "/update", "/volume", "/volume/channel", "/key"],
-        &["rollback", "/update"],
+        &[
+            "rollback",
+            "/update",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ],
         &[
             "success",
             "/update",

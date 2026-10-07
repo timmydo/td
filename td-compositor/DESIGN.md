@@ -5935,14 +5935,15 @@ transaction until completion. This confirmation does not authorize any
 secret-store operation or enroll or rotate a signing key. The installation
 protocol is in td-authd/DESIGN.md.
 
-### Elevation consent (target)
+### Elevation consent
 
-Implemented, inert (L2): the confirmation below and `B`'s refusal;
-nothing in production yet produces a prompt that takes the key.
-APPLICATIONS.md §L.1, "The v1 operations (target)", says what the
-operations are and why, and "Elevation increments" when each part
-lands; td-authd/DESIGN.md, "Elevation operations (target)", gives the
-protocol. This section alone says which input confirms.
+Implemented and live for `deploy-rollback` (L3): `B` and its menu row,
+the confirmation below, root's refusals and the success screen. `H` and
+a hostname change's screens are L4's. APPLICATIONS.md §L.1, "The v1
+operations (target)", says what the operations are and why, and
+"Elevation increments" when each part lands; td-authd/DESIGN.md,
+"Elevation operations", gives the protocol. This section alone says
+which input confirms.
 
 A fresh physical `B` on the attention menu asks root for a rollback
 (`1d`), and from L4 a fresh physical `H` selects the queued hostname
@@ -5950,12 +5951,22 @@ request (`1e`), each under the menu's rules for a selection: one per
 attention lifetime, never from a held key or a repeat. Both letters are
 modhex, so the exclusion of a security key's own keyboard above extends
 to them. On the lock surface neither selects, as no menu letter does.
-L2 adds `B` and a production build refuses it, showing `NOT AVAILABLE
-IN THIS BUILD`, until L3: the refusal asks root nothing and is the
-lifetime's one selection, as `L`'s is without keys. `H` is unbound
-until L4. Root's description must be the selected operation for owner
-1000; another elevation, another operation or another owner ends the
-paired generation, as a changed secret request does.
+The menu shows `B: ROLL BACK TO THE PREVIOUS SYSTEM` below `L`'s row,
+so every row above keeps its place and only `ESC TO RETURN` moves down
+(item 5 of "Session lock and login-key entry" gives the places). `H` is
+unbound until L4. Root's description must be the selected operation
+for owner 1000; another elevation, another operation or another owner
+ends the paired generation, as a changed secret request does.
+
+Root's refusal of `1d`, `9d` and one byte before any description, shows
+its notice and presents nothing: `00` `PREVIOUS REQUEST IS STILL
+FINISHING`, `01` `REFUSED BY THE ELEVATION TABLE` and `02` `NO PREVIOUS
+SYSTEM TO ROLL BACK TO`. `9d` with another byte, or answering another
+selection, ends the paired generation. After a rollback's commit,
+root's success (`06`) shows `ROLLED BACK - RESTART TO BOOT IT` until
+Escape, and its failure (`07`) `REQUEST FAILED`; nothing restarts the
+machine. A hostname change's success stays out of order, ending the
+paired generation, until L4 gives it a screen.
 
 The prompt shows the description's rows and then the approval key it
 carries, two digits from 2 to 9, as the keys to press in order, with
@@ -5990,17 +6001,17 @@ automation, control, Wayland and bridge input. A security key's own
 keyboard neither advances nor ends the key, though its Escape still
 cancels. A replaced or hidden prompt confirms nothing.
 
-L2 leaves to L3 and L4 what only a live operation needs: the menu's
-rows, root's refusals (`9d`, `9e`), which the client does not yet
-accept, and the success screens, so root's success (`06`) for an
-elevation is out of order and ends the paired generation. Host tests
-drive a rollback's and a hostname change's prompt against a scripted
-authority to its one commit, and through each refusal above;
-device-dispatcher tests cover `B`'s production refusal, its selection
-where wired, the digits offered, the drain after a wrong one, a
-security key's own keyboard and the lock surface. Source pins hold what
-they cannot: production's refusal of `B`, and that only the evdev
-target offers the attempt a digit.
+Host tests drive a rollback's and a hostname change's prompt against a
+scripted authority to its one commit and through each refusal above,
+and a rollback through each `9d` answer and its success screen;
+device-dispatcher tests cover `B`'s selection, the digits offered, the
+drain after a wrong one, a security key's own keyboard and the lock
+surface. Source pins hold what they cannot: that no test-only switch
+decides `B`, and that only the evdev target offers the attempt a digit.
+`qemu-deploy-rollback` reads a booted system's prompt and its key off
+the screen and shows that Enter and a wrong digit commit nothing and
+that production's control socket refuses key requests outright
+(td-authd/DESIGN.md, "Elevation operations").
 
 The approval key appears only on the private prompt, so ordinary
 rendering never carries it. In L5 an update's confirmation moves from
@@ -6468,7 +6479,7 @@ excluded from every selection, confirmation and field below.
 1. **One operation per lifetime (3).** Implemented for the key-management
    screen and the lock surface, whose chord opens a login unlock with no
    selection at all. Still to come: a disclosure's approval key
-   ("Elevation consent (target)") confirms its operation (TOKEN-LOGIN.md
+   ("Elevation consent") confirms its operation (TOKEN-LOGIN.md
    increment 5).
 2. **The PIN field (3).** Implemented, inert: "The PIN field" above.
    "The screen accepts no credential bytes" gains
@@ -6550,10 +6561,11 @@ excluded from every selection, confirmation and field below.
      client's, and its sheet does not list it.
    - **`L`.** Implemented (C9). Only the attention menu grows: `L: LOCK
      SCREEN` sits below `K`, and the menu's last row, `ESC TO RETURN`,
-     moves down one (on 1280x800 `L` at 528 and `ESC TO RETURN` at
-     564). Every other attention screen keeps its rows, its last at 528,
-     and the rows the boot oracles read (276, 312, 456) do not move. The
-     nine-row menu is 302 pixels tall at double scale and keeps the
+     moves down one (on 1280x800 `L` at 528; `B`'s row, below it since
+     L3, is at 564 and `ESC TO RETURN` at 600, "Elevation consent").
+     Every other attention screen keeps its rows, its last at 528, and
+     the rows the boot oracles read (276, 312, 456) do not move. The
+     ten-row menu is 338 pixels tall at double scale and keeps the
      menu's long-standing top, 276 on 1280x800 and 176 on 800x600;
      `rows_top`'s fit rule moves it up only on an output too short for
      that, as 320x200, where it starts at 0. Read under the menu's

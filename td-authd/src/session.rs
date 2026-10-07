@@ -3,7 +3,9 @@
 use crate::consent::{Recovery, Request as Description, Role};
 use crate::inspection::{Event as InspectionEvent, Inspection};
 use crate::login::{Login, Pin, Selection};
+use crate::rollback::{Refusal, Rollback};
 use crate::unlock::{Event, Unlock};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -27,6 +29,8 @@ pub(crate) enum Request {
     Login(Selection),
     /// `1c`: the presented PIN step's description and its PIN.
     Pin(Box<Description>, Pin),
+    /// `1d`: roll back to the previous deployment.
+    Rollback,
 }
 
 impl Request {
@@ -38,6 +42,7 @@ impl Request {
             [0x18] => Ok(Self::Write),
             [0x19] => Ok(Self::Install),
             [0x1a] => Ok(Self::LoginState),
+            [0x1d] => Ok(Self::Rollback),
             [0x12, 1] => Ok(Self::Begin(Role::Primary)),
             [0x12, 2] => Ok(Self::Begin(Role::Recovery)),
             [0x16, 0] => Ok(Self::Enroll(Recovery::Unrecoverable)),
@@ -87,6 +92,7 @@ enum Active {
     DiskInstall(Box<crate::disk_install::Installation>),
     /// A login-key worker shares the one operation slot.
     Login(Box<Login>),
+    Rollback(Box<Rollback>),
 }
 impl Active {
     /// None only for a login operation awaiting its worker's baseline.
@@ -96,6 +102,7 @@ impl Active {
             Self::Install(op) => Some(op.request()),
             Self::DiskInstall(op) => Some(op.request()),
             Self::Login(op) => op.request(),
+            Self::Rollback(op) => Some(op.request()),
         }
     }
     fn nonce(&self) -> &[u8; 32] {
@@ -104,6 +111,7 @@ impl Active {
             Self::Install(op) => op.request().nonce(),
             Self::DiskInstall(op) => op.request().nonce(),
             Self::Login(op) => op.nonce(),
+            Self::Rollback(op) => op.request().nonce(),
         }
     }
     fn presented(&mut self, request: &Description) -> Result<(), String> {
@@ -112,6 +120,7 @@ impl Active {
             Self::Install(op) => op.presented(request),
             Self::DiskInstall(op) => op.presented(request),
             Self::Login(op) => op.presented(request),
+            Self::Rollback(op) => op.presented(request),
         }
     }
     fn commit(&mut self, request: &Description) -> Result<(), String> {
@@ -120,6 +129,7 @@ impl Active {
             Self::Install(op) => op.commit(request),
             Self::DiskInstall(op) => op.commit(request),
             Self::Login(op) => op.commit(request),
+            Self::Rollback(op) => op.commit(request),
         }
     }
     fn cancel(&mut self, reason: &str) -> Result<(), String> {
@@ -129,6 +139,7 @@ impl Active {
             Self::DiskInstall(op) => op.cancel(reason),
             // Every login cancellation is the person's: kill, reap, no relock.
             Self::Login(op) => op.cancel(),
+            Self::Rollback(op) => op.cancel(),
         }
     }
     fn poll(&mut self) -> Result<Event, String> {
@@ -137,6 +148,7 @@ impl Active {
             Self::Install(op) => op.poll(),
             Self::DiskInstall(op) => op.poll(),
             Self::Login(op) => op.poll(),
+            Self::Rollback(op) => op.poll(),
         }
     }
     fn reap_for_teardown(self) -> Result<(), String> {
@@ -146,6 +158,7 @@ impl Active {
             // The setup intake owns the service and stops it at teardown.
             Self::DiskInstall(_) => Ok(()),
             Self::Login(op) => op.reap_for_teardown(),
+            Self::Rollback(op) => op.reap_for_teardown(),
         }
     }
 }
@@ -319,6 +332,10 @@ impl Session {
             Request::Inspect => self.inspect_with(Inspection::start),
             Request::Write => self.begin_write(),
             Request::Install => self.begin_install(),
+            Request::Rollback => self.begin_rollback(
+                crate::elevation::Table::load,
+                Path::new(crate::login_tier::VOLUME),
+            ),
             // Beside any operation, which it neither needs nor takes. Only
             // a live boot binds the setup intake.
             Request::LoginState if self.prepared => self.login_state.answer(self.setup.is_some()),
@@ -483,6 +500,32 @@ impl Session {
         answer.extend_from_slice(&operation.request().encode());
         self.operation = Some(Active::Install(Box::new(operation)));
         self.installing = true;
+        self.event = Some(Event::Waiting);
+        Ok(answer)
+    }
+
+    /// Request `1d`: the principal table, then both selectors through the
+    /// held volume, before any description exists.
+    fn begin_rollback(
+        &mut self,
+        table: impl FnOnce() -> Result<crate::elevation::Table, String>,
+        volume: &Path,
+    ) -> Result<Vec<u8>, String> {
+        if !self.prepared
+            || self.cleanup.is_some()
+            || self.operation.is_some()
+            || self.inspection.is_some()
+        {
+            return Ok(Refusal::Busy.answer());
+        }
+        let selectors = match crate::rollback::admit(self.owner, table(), volume) {
+            Ok(selectors) => selectors,
+            Err(refusal) => return Ok(refusal.answer()),
+        };
+        let operation = Rollback::start(self.owner, selectors)?;
+        let mut answer = vec![0x92];
+        answer.extend_from_slice(&operation.request().encode());
+        self.operation = Some(Active::Rollback(Box::new(operation)));
         self.event = Some(Event::Waiting);
         Ok(answer)
     }

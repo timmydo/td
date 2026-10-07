@@ -14,6 +14,14 @@ pub(crate) enum Notice {
     /// (td-authd/DESIGN.md, amendment 8).
     UpdateRefused,
     Installed,
+    /// Root's success for `deploy-rollback`.
+    RolledBack,
+    /// Root's `9d 01`: the principal table refuses the elevation or cannot
+    /// be read (td-authd/DESIGN.md, "Elevation operations").
+    ElevationRefused,
+    /// Root's `9d 02`: the boot selectors cannot be read or name one
+    /// deployment, so there is no previous system to roll back to.
+    NoPrevious,
     /// A committed device-bound disk installation, before its recovery key:
     /// the screen then closes by itself (secret_client).
     Returning,
@@ -462,9 +470,10 @@ fn draw_rows(
 }
 
 /// Every screen's rows are padded to the title and six more, and its last
-/// row is drawn below them: where the menu's was before `L`. The menu, a
-/// row longer, draws its last row one lower (td-compositor/DESIGN.md,
-/// "Session lock and login-key entry", item 5).
+/// row is drawn below them: where the menu's was before `L`. The menu, two
+/// rows longer since `B`, draws its last row two lower
+/// (td-compositor/DESIGN.md, "Session lock and login-key entry", item 5,
+/// and "Elevation consent").
 const MENU_ROWS: usize = 7;
 
 /// The first row's top for rows `block` pixels tall, the last row's foot
@@ -511,7 +520,8 @@ fn wrap(text: &str, columns: usize) -> Vec<String> {
 }
 
 /// A notice's rows below the title. The menu's rows are fixed in place, `K`
-/// comes below `I` and `L` below `K`, so the boot oracles' rows do not move.
+/// comes below `I`, `L` below `K` and `B` below `L`, so the boot oracles'
+/// rows do not move.
 fn notice_rows(notice: Notice) -> Vec<String> {
     let first = match notice {
         Notice::Menu => "U: UNLOCK  R: RECOVERY TOKEN",
@@ -519,6 +529,9 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::NoInstall => "NO INSTALLATION IS READY TO REVIEW",
         Notice::UpdateRefused => "UPDATE CANNOT READ LOGIN KEYS",
         Notice::Installed => "SYSTEM INSTALLED - RESTART TO BOOT IT",
+        Notice::RolledBack => "ROLLED BACK - RESTART TO BOOT IT",
+        Notice::ElevationRefused => "REFUSED BY THE ELEVATION TABLE",
+        Notice::NoPrevious => "NO PREVIOUS SYSTEM TO ROLL BACK TO",
         Notice::Returning => RETURNING_NOTICE,
         Notice::Stored => "CREDENTIAL STORED",
         Notice::NoWrite => "NO READY CREDENTIAL WRITE - RUN TD-SECRET SET FIRST",
@@ -558,6 +571,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
             "I: REVIEW PENDING SYSTEM INSTALLATION",
             "K: LOGIN KEYS",
             "L: LOCK SCREEN",
+            "B: ROLL BACK TO THE PREVIOUS SYSTEM",
         ],
         Notice::LoginKeys => &[
             "1: ENROLL ONE KEY",
@@ -824,11 +838,12 @@ mod tests {
     /// The menu's rows where the update and setup oracles read them on a
     /// 1280x800 output, as before `L`: the title at 276, the selections
     /// from 312 and `I` at 456, 36 apart; `K` below `I`, `L` below `K` at
-    /// 528, and the last row, which every other screen keeps at 528, one
-    /// lower at 564. On 800x600 the nine rows start at 176, and on 320x200,
-    /// at single scale, the fit rule moves them up to 0.
+    /// 528, `B` below `L` at 564, and the last row, which every other
+    /// screen keeps at 528, two lower at 600. On 800x600 the ten rows start
+    /// at 176, and on 320x200, at single scale, the fit rule moves them up
+    /// to 0.
     #[test]
-    fn the_menu_keeps_its_rows_and_adds_k_and_l_below_i() {
+    fn the_menu_keeps_its_rows_and_adds_k_l_and_b_below_i() {
         const MENU: &[&str] = &[
             "TD SECURE ATTENTION",
             "U: UNLOCK  R: RECOVERY TOKEN",
@@ -838,6 +853,7 @@ mod tests {
             "I: REVIEW PENDING SYSTEM INSTALLATION",
             "K: LOGIN KEYS",
             "L: LOCK SCREEN",
+            "B: ROLL BACK TO THE PREVIOUS SYSTEM",
             "ESC TO RETURN",
         ];
         for (width, height, top, scale) in
@@ -880,18 +896,18 @@ mod tests {
             }
             assert!(painted == expected, "{width}x{height}");
         }
-        // Nine doubled rows, the last row's foot included, are 302 tall
+        // Ten doubled rows, the last row's foot included, are 338 tall
         // and keep their top on 800 and 600 lines; on 200 single rows fit
         // only from the top.
-        assert_eq!(rows_top(800, 8 * 36 + 14), 276);
-        assert_eq!(rows_top(600, 8 * 36 + 14), 176);
-        assert_eq!(rows_top(200, 8 * 18 + 7), 0);
+        assert_eq!(rows_top(800, 9 * 36 + 14), 276);
+        assert_eq!(rows_top(600, 9 * 36 + 14), 176);
+        assert_eq!(rows_top(200, 9 * 18 + 7), 0);
     }
 
     /// HEAD's painter, before narrow outputs: every row doubled, 36 apart
     /// from `(height - 248) / 2`, padded to seven rows and then the last.
-    /// The menu, eight rows since `L`, has no padding, so only its last row
-    /// moves.
+    /// The menu, eight rows since `L` and nine since `B`, has no padding,
+    /// so only its last row moves.
     fn unchanged(width: usize, height: usize, draining: bool, notice: Notice) -> Vec<u8> {
         let stride = width * 4;
         let mut frame = vec![0; stride * height];
@@ -993,6 +1009,9 @@ mod tests {
         Notice::NoInstall,
         Notice::UpdateRefused,
         Notice::Installed,
+        Notice::RolledBack,
+        Notice::ElevationRefused,
+        Notice::NoPrevious,
         Notice::Returning,
         Notice::Enrolled,
         Notice::Unenrolled,

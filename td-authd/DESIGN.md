@@ -11,8 +11,8 @@ consent bound to that request, no remembered approval. Protector changes
 add fresh hardware-backed authentication under
 [`td-install/ENCRYPTION.md`](../td-install/ENCRYPTION.md). Separate
 compositor/application identities and exclusive device ownership precede
-enabling that path. Its first operations are specified, as a target, in
-"Elevation operations (target)".
+enabling that path. Its first operations are specified in "Elevation
+operations", where `deploy-rollback` is live and the rest a target.
 
 ## Portal file preparation
 
@@ -1753,18 +1753,19 @@ correlated captures check live repaint, default Cancel, and confirmed
 suspend/resume of a child owned by the driver. Host fixture source is not
 staged into the target authority recipe.
 
-## Elevation operations (target)
+## Elevation operations
 
-Nothing in this section is implemented but its consent tags, which
-`consent.rs` encodes, decodes and renders and nothing yet produces, and
-the compositor's side of the approval key (td-compositor/DESIGN.md
-"Elevation consent (target)"), which no request yet reaches.
+Implemented and live (L3): `deploy-rollback`, from the principal table
+and request `1d` through its commit and td-boot's checked pair. The rest
+of this section is a target: tag 12, which `consent.rs` encodes, decodes
+and renders and nothing yet produces, `set-hostname`'s request `1e` and
+intake, `deploy-publish`'s row for request 19, and the backoff.
 APPLICATIONS.md §L.1, "The v1 operations (target)", says what
 `deploy-rollback`, `set-hostname` and `deploy-publish` are and why, and
 its "Elevation increments" which commit lands each part;
-`td-compositor/DESIGN.md`, "Elevation consent (target)", says which
-presses confirm. Today the private channel routes requests `10` to `1c`
-to the secret session and refuses `1d` and above.
+`td-compositor/DESIGN.md`, "Elevation consent", says which presses
+confirm. The private channel routes requests `10` to `1d` to the secret
+session and refuses `1e` and above.
 
 **Consent tags.** Tags 11 (`deploy-rollback`) and 12 (`set-hostname`)
 follow the login tags. Each carries, right after its tag byte, the
@@ -1805,7 +1806,9 @@ operations, inspection and request 19 share, or `9d` (for `1d`) or `9e`
 or the slot is busy, `01` when the principal table refuses or cannot be
 read, and for `1d` `02` when the selectors cannot be read or name one
 deployment. Root reads `/etc/td-elevation.tsv` here, before any
-description exists; from L5 request 19 consults its `deploy-publish` row
+description exists, and for `1d` the table before the selectors, so a
+refused owner reads no volume; from L5 request 19 consults its
+`deploy-publish` row
 the same way and answers a miss with a new `99 02`, beside today's
 `99 00` (nothing ready or busy) and `99 01` (cannot read the login
 record). Presentation (`13`), then one commit (`14`), each with the
@@ -1819,24 +1822,67 @@ first, so a consumed nonce is never reused, even when the operation then
 fails. Escape, expiry or, for a hostname, requester loss before commit
 cancels without acting.
 
+**Principal table.** `elevation.rs` reads it at each `1d`. `/etc` is
+opened as a directory without following a link and must be root's and
+writable by neither group nor other; the table is opened through that
+descriptor's `/proc/self/fd` path with `O_NOFOLLOW | O_NONBLOCK` and
+admitted only as a regular root-owned file of mode exactly 0444, with
+one link and at most 4096 bytes, before a byte is read. Its text is the
+line `td-elevation-v1`, then at most 64 rows in strictly increasing UID
+order, each a canonical decimal UID from 1000 to 65533 and one or more
+operations, each after a tab, from `deploy-rollback`, `set-hostname`
+and `deploy-publish` in that order without a repeat; every line ends in
+a newline, and nothing else is admitted. The system recipe ships the v1
+row, `1000`, then all three operations (`build_elevation_table`), as
+regular immutable `/etc` content its shape check holds at 0444. Any
+departure refuses as the table's `01`; the table grants and never
+denies.
+
+**`deploy-rollback`.** At `1d`, after the table, `rollback.rs` opens
+`/run/td-volume/td` and reads `boot/current` and `boot/previous` through
+that held descriptor with `login_tier.rs`'s selector reader, each exactly
+`../deployments/` and 64 lowercase hexadecimal digits; a missing,
+malformed or equal pair is `02`. It then draws the 32-byte nonce and the
+two key bytes from `/dev/urandom` (a failed draw ends the generation)
+and describes the pair under tag 11. Its commit first consumes the
+confirmation, then reads both selectors again through the same
+descriptor: a pair moved since selection fails the request without
+starting anything.
+
 **`deploy-rollback` after commit.** Root spawns only `/bin/td-boot
 on-volume rollback /run/td-update CURRENT PREVIOUS`, the two IDs the
-person approved. Under its transaction lock and before any mutation,
-td-boot requires `current` to name CURRENT and `previous` to name
-PREVIOUS, and refuses otherwise. Both are needed: when `current` is
-still pending, an update replaces `current` and keeps `previous`
-(td-boot's `install_deployment` and `activate_install`), so after
-approving `current` B over `previous` A, publishing C leaves `previous`
-A, and a check of `previous` alone would let the rollback silently undo
-C. Today `rollback` takes neither operand and moves `current` to
-whatever `previous` names; L3 adds them. The spawn reuses request 19's
-rules: an empty environment, cwd `/`, null stdin and stdout and
-authority stderr; the confirmation consumed even if spawn fails; the
-slot held until the helper exits, with no automatic retry; and on
+person approved. Under its transaction lock and before any mutation, a
+selector temporary's reaping included, td-boot requires `current` to
+name CURRENT and `previous` to name PREVIOUS, and refuses otherwise
+(td-install/DESIGN.md, "Full-system volume consumers"). Both are needed:
+when `current` is still pending, an update replaces `current` and keeps
+`previous` (td-boot's `install_deployment` and `activate_install`), so
+after approving `current` B over `previous` A, publishing C leaves
+`previous` A, and a check of `previous` alone would let the rollback
+silently undo C. Root's own second read narrows the window; td-boot's
+check under the lock closes it. The rollback makes `previous` current
+and leaves `previous` naming it. The spawn reuses request 19's rules:
+an empty environment, cwd `/`, null stdin and stdout and authority
+stderr; the confirmation consumed even if spawn fails; the slot held
+until the helper exits, with no automatic retry; and on
 failed-generation teardown the direct helper killed and reaped before
 secret-session cleanup, inside td-svc's authority cgroup. Only a
 successful exit permits the success screen, which asks for a restart;
 td-authd never reboots.
+
+Host tests drive the table's grammar and file checks, the table's
+refusal before the selectors, both before a description, each `9d`
+answer, the key's digits, exact presentation before one commit, a pair
+moved after selection starting no helper, the helper's argv and its
+reaping; confinement pins hold the fixed argv, the empty environment,
+the second read and the selector reader's one use. `qemu-deploy-rollback`
+(an integration-tier oracle) boots the system image on a volume whose
+`current` and `previous` differ, reads the prompt and its key off the
+screen, shows that Enter and a wrong digit commit nothing and leave
+both selectors, and that the control socket refuses key requests
+outright (input automation is off in production; the compositor's
+source pins hold that no injected digit reaches the prompt when it is
+on), types the key, and boots `previous` next.
 
 **`set-hostname` intake.** On an installed system Prepare binds
 `/run/td-authd/1000/hostname` beside the update intake, with the same
@@ -2143,8 +2189,9 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    unchanged. TOKEN-LOGIN.md cites this as the update-consent rule. No
    key is required; consent is otherwise unchanged.
 
-   Implemented in increment 4's C4. `deployment.rs` compiles td-secret's
-   `login_tier.rs` through one reviewed `#[path]`, and `Ready::reads`
+   Implemented in increment 4's C4. td-authd compiles td-secret's
+   `login_tier.rs` through one reviewed `#[path]` in `main.rs`, which
+   request `1d`'s selector reader shares, and `Ready::reads`
    reads the marker afresh at selection, through the held directory, as
    the requester's files, against the admitted ID; the selection is
    already taken, so a refusal is `Intake::finish(false)`. The status's

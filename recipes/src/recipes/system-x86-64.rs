@@ -206,6 +206,9 @@ const PROFILER_OBJECT_INDEX: &str = "/etc/td-profiler-objects.tsv";
 const PROFILER_APPLICATION_ROOTS: &str = "/etc/td-profiler-application-roots.tsv";
 const PROFILER_CAPTURE_ROOT: &str = "/var/lib/td-profiler/captures";
 const PRINCIPALS_PATH: &str = "/etc/td-principals.tsv";
+/// td-authd's elevation principal table (APPLICATIONS.md §L.1, "Principal
+/// table"), root's and mode 0444 like the principal registry.
+const ELEVATION_TABLE: &str = "/etc/td-elevation.tsv";
 const COMPOSITOR_RESERVED_UID: u32 = td_engine::permissions::TD_COMPOSITOR_UID;
 const COMPOSITOR_USER: &str = "tdc1000";
 const COMPOSITOR_RUNTIME: &str = td_engine::permissions::TD_COMPOSITOR_RUNTIME_PATH;
@@ -3454,7 +3457,8 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          echo 'td-boot update installed nothing from the channel holding a bundle'; \
          healthy=0; \
          else echo {SYSTEM_DEPLOY_INSTALL_MARKER}; \
-         if ! /bin/td-boot on-volume rollback /run/td-update >/run/td-rolled-id; then \
+         if ! /bin/td-boot on-volume rollback /run/td-update \
+         \"$(/bin/cat /run/td-installed-id)\" \"$deployment\" >/run/td-rolled-id; then \
          echo 'td-boot rollback failed after the update installed a deployment'; \
          healthy=0; \
          elif ! /bin/grep -q -x -F \"$deployment\" /run/td-rolled-id; then \
@@ -4102,6 +4106,12 @@ fn build_firefox_tls_ready() -> String {
     )
 }
 
+/// The v1 row: the session owner may perform every v1 operation. td-authd
+/// consults it before any prompt, for `deploy-rollback` from L3.
+fn build_elevation_table() -> String {
+    format!("td-elevation-v1\n{UI_UID}\tdeploy-rollback\tset-hostname\tdeploy-publish\n")
+}
+
 fn build_principals(sys: &SystemDef) -> String {
     let mut text = format!(
         "td-principals-v1\nsession\t{UI_UID}\t{COMPOSITOR_RESERVED_UID}\t{BROKER_RESERVED_UID}\t{PORTAL_RESERVED_UID}\n"
@@ -4152,6 +4162,11 @@ fn etc_files(sys: &SystemDef) -> Result<Vec<(&'static str, String, bool)>, Strin
         (
             application_etc_name(PRINCIPALS_PATH),
             build_principals(sys),
+            false,
+        ),
+        (
+            application_etc_name(ELEVATION_TABLE),
+            build_elevation_table(),
             false,
         ),
         ("group", build_group(sys), false),
@@ -5119,6 +5134,7 @@ fn shape_check() -> String {
      done; \
      [ \"$(ls -ld \"$root/etc/passwd\" | cut -c1-10)\" = -rw-r--r-- ] || { echo 'root tree: passwd must have mode 0644 for shared account admission' >&2; exit 1; }; \
      [ \"$(ls -ld \"$root/etc/@BUS_APPLICATION_POLICY_NAME@\" | cut -c1-10)\" = -r--r--r-- ] || { echo 'root tree: bus application policy must have mode 0444' >&2; exit 1; }; \
+     [ -f \"$root/etc/@ELEVATION_TABLE_NAME@\" ] && [ ! -L \"$root/etc/@ELEVATION_TABLE_NAME@\" ] && [ \"$(ls -ld \"$root/etc/@ELEVATION_TABLE_NAME@\" | cut -c1-10)\" = -r--r--r-- ] || { echo 'root tree: the elevation principal table must be a regular file of mode 0444' >&2; exit 1; }; \
      for f in @APPLICATION_REGISTRY_NAME@ @APPLICATION_LAUNCHER_NAME@; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing - compileApplicationTables did not materialize the application image contract\" >&2; exit 1; }; \
          if [ -L \"$root/etc/$f\" ]; then echo \"root tree: /etc/$f is a symlink - application selection must be immutable image content\" >&2; exit 1; fi; \
@@ -5366,6 +5382,7 @@ fn shape_check() -> String {
         )
         .replace("@APPLICATION_COUNT@", &SYSTEM.applications.len().to_string())
         .replace("@BUS_APPLICATION_POLICY_NAME@", application_etc_name(BUS_APPLICATION_POLICY))
+        .replace("@ELEVATION_TABLE_NAME@", application_etc_name(ELEVATION_TABLE))
 
         // `<etc path>=<target>` pairs, and the etc paths alone. Both lists are
         // space-joined and unquoted in the script, which
@@ -5484,7 +5501,7 @@ pub fn recipe() -> Recipe {
                 POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
-                    "chmod 0755 '{{root}}/real-root' && chmod 0600 '{{root}}/real-root/etc/shadow' && chmod 0444 '{TERMINFO_ENTRY}' '{{root}}/real-root{PRINCIPALS_PATH}' '{{root}}/real-root{BUS_APPLICATION_POLICY}'"
+                    "chmod 0755 '{{root}}/real-root' && chmod 0600 '{{root}}/real-root/etc/shadow' && chmod 0444 '{TERMINFO_ENTRY}' '{{root}}/real-root{PRINCIPALS_PATH}' '{{root}}/real-root{ELEVATION_TABLE}' '{{root}}/real-root{BUS_APPLICATION_POLICY}'"
                 ),
             ],
         )
@@ -8849,6 +8866,39 @@ mod tests {
         assert!(staged.iter().any(
             |step| matches!(step, Step::WriteFile { path, content, exec: false }
             if path == &format!("{{root}}/real-root{BUS_APPLICATION_POLICY}") && content == &text)
+        ));
+    }
+
+    /// The elevation principal table ships as regular immutable `/etc`
+    /// content, mode 0444, with exactly the v1 row td-authd's own tests
+    /// parse (`elevation::tests::V1`).
+    #[test]
+    fn the_elevation_table_grants_the_session_owner_the_v1_operations() {
+        assert_eq!(ELEVATION_TABLE, "/etc/td-elevation.tsv");
+        assert_eq!(
+            build_elevation_table(),
+            "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\n"
+        );
+        assert!(etc_files(&SYSTEM)
+            .unwrap()
+            .iter()
+            .any(|(name, contents, exec)| *name == "td-elevation.tsv"
+                && *contents == build_elevation_table()
+                && !exec));
+        assert!(shape_check().contains(
+            "[ \"$(ls -ld \"$root/etc/td-elevation.tsv\" | cut -c1-10)\" = -r--r--r-- ]"
+        ));
+        let mode_step = format!("'{{root}}/real-root{ELEVATION_TABLE}'");
+        assert!(recipe().steps.unwrap().iter().any(|step| match step {
+            Step::Run { argv, .. } => argv
+                .iter()
+                .any(|argument| argument.contains("chmod 0444") && argument.contains(&mode_step)),
+            _ => false,
+        }));
+        assert!(real_root_steps(&SYSTEM).unwrap().iter().any(
+            |step| matches!(step, Step::WriteFile { path, content, exec: false }
+            if path == &format!("{{root}}/real-root{ELEVATION_TABLE}")
+                && content == &build_elevation_table())
         ));
     }
 
@@ -12373,8 +12423,8 @@ from the channel holding a bundle'; healthy=0; else echo {marker};",
         // deployment already marked successful it returns before doing anything
         // else, so it is only that.
         let rollback_branch = format!(
-            "else echo {install}; if ! /bin/td-boot on-volume rollback /run/td-update >{rolled}; \
-then echo 'td-boot rollback failed after the update installed a deployment'; healthy=0; \
+            "else echo {install}; if ! /bin/td-boot on-volume rollback /run/td-update \
+\"$(/bin/cat {installed})\" \"$deployment\" >{rolled}; then echo 'td-boot rollback failed after the update installed a deployment'; healthy=0; \
 elif ! /bin/grep -q -x -F \"$deployment\" {rolled}; then echo 'td-boot rollback did not \
 return to the deployment that booted'; healthy=0; elif ! /bin/td-boot on-volume success \
 /run/td-update \"$deployment\" >{current}; then echo 'td-boot rollback printed an id \
