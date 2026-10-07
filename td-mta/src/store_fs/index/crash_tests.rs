@@ -377,17 +377,28 @@ fn stopped_checkpoint_backup_restores_bodies_metadata_and_queue_retention() {
                 &mut [],
             )
             .unwrap();
-        store.checkpoint(deadline()).unwrap();
-        // All connections and the process lock end before the snapshot copy.
+        let mut destination_root = destination.locked();
+        let receipt = store
+            .backup(&mut destination_root, deadline(), &mut [0; 65536])
+            .unwrap();
+        assert_eq!(receipt.epoch, StoreEpoch::from_bytes([0x85; 16]));
+        assert_eq!(
+            receipt.bytes,
+            fs::metadata(destination.path.join("metadata.sqlite3"))
+                .unwrap()
+                .len()
+        );
+        assert!(!destination
+            .path
+            .join("metadata.sqlite3.backup-partial")
+            .exists());
+        // Both cooperative locks still belong to these callers after backup.
+        assert!(matches!(source.lock(), Err(super::super::LockError::Busy)));
+        assert!(matches!(
+            destination.lock(),
+            Err(super::super::LockError::Busy)
+        ));
     }
-    let database = Name::root(RootEntry::Database).unwrap();
-    let copied = destination.path.join(database.as_path().unwrap());
-    fs::copy(source.path.join(database.as_path().unwrap()), &copied).unwrap();
-    fs::File::open(&copied).unwrap().sync_all().unwrap();
-    fs::File::open(&destination.path)
-        .unwrap()
-        .sync_all()
-        .unwrap();
     assert!(!destination.path.join("metadata.sqlite3-wal").exists());
     assert!(!destination.path.join("metadata.sqlite3-shm").exists());
     let mut root = destination.locked();

@@ -39,9 +39,12 @@ const NEXT_CHANGE: &str = "SELECT sequence,operation,action,object FROM changes 
 #[path = "index/relational.rs"]
 mod relational;
 use relational::SCHEMA;
+#[path = "index/backup.rs"]
+mod backup;
 #[cfg(test)]
 #[path = "index/crash_tests.rs"]
 mod crash_tests;
+pub use backup::{BackupError, BackupReceipt};
 
 /// Borrowed stream for one new body. Its claimed length and digest come from
 /// the transaction's BlobRow and are independently checked before commit.
@@ -210,6 +213,15 @@ impl Native {
             budget,
             clock,
         })
+    }
+    fn close(self) -> Result<(), ports::Error> {
+        let connection = self
+            .connection
+            .into_inner()
+            .map_err(|_| ports::Error::WriterStopped)?;
+        connection
+            .close()
+            .map_err(|(_connection, error)| sql(error))
     }
     fn begin_work(&self, deadline: Deadline) -> Result<(), ports::Error> {
         let now = self.clock.sample()?.monotonic;
@@ -497,13 +509,21 @@ impl<'r> IndexStore<'r> {
         })
     }
     fn writer(&self, deadline: Deadline) -> Result<MutexGuard<'_, Writer>, ports::Error> {
-        if deadline.expired(self.clock.sample()?.monotonic) {
+        self.writer_observed(deadline).map(|(writer, _)| writer)
+    }
+    fn writer_observed(
+        &self,
+        deadline: Deadline,
+    ) -> Result<(MutexGuard<'_, Writer>, ports::Tick), ports::Error> {
+        let observed = self.clock.sample()?.monotonic;
+        if deadline.expired(observed) {
             return Err(ports::Error::Deadline);
         }
-        self.writer.try_lock().map_err(|error| match error {
+        let writer = self.writer.try_lock().map_err(|error| match error {
             TryLockError::WouldBlock => ports::Error::Busy,
             TryLockError::Poisoned(_) => ports::Error::WriterStopped,
-        })
+        })?;
+        Ok((writer, observed))
     }
     pub fn root(&self) -> &LockedRoot {
         self.root
@@ -857,7 +877,17 @@ impl<'r> IndexStore<'r> {
     }
     /// Reclaim WAL only when no view owns a SQLite read transaction.
     pub fn checkpoint(&self, deadline: Deadline) -> Result<(), ports::Error> {
-        let writer = self.writer(deadline)?;
+        self.checkpoint_after(deadline, None).map(|_| ())
+    }
+    fn checkpoint_after(
+        &self,
+        deadline: Deadline,
+        previous: Option<ports::Tick>,
+    ) -> Result<ports::Tick, ports::Error> {
+        let (writer, acquired) = self.writer_observed(deadline)?;
+        if previous.is_some_and(|previous| acquired < previous) {
+            return Err(ports::Error::Invalid);
+        }
         if writer.stopped {
             return Err(ports::Error::WriterStopped);
         }
@@ -868,6 +898,10 @@ impl<'r> IndexStore<'r> {
             return Err(ports::Error::Busy);
         }
         writer.native.begin_work(deadline)?;
+        let started = lock(&writer.native.budget)?.last;
+        if started < acquired {
+            return Err(ports::Error::Invalid);
+        }
         writer.native.run(|db| {
             let (busy, _, _): (i64, i64, i64) = db
                 .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
@@ -880,7 +914,8 @@ impl<'r> IndexStore<'r> {
             Ok(())
         })?;
         self.root.root.directory.file.sync_all()?;
-        Ok(())
+        let observed = lock(&writer.native.budget)?.last;
+        Ok(observed)
     }
 }
 fn body_rowid(db: &Connection, account: AccountId, id: BlobId) -> Result<i64, ports::Error> {

@@ -173,8 +173,50 @@ writes until an explicit maintenance policy is implemented.
 Backup must capture one consistent SQLite state. Stop service activity,
 checkpoint successfully, close every connection, then copy the main database;
 that snapshot contains bodies and metadata together. Copying only the live
-main file can lose committed WAL contents. Online backup, operational restore,
-verification/repair and history maintenance tools remain unimplemented.
+main file can lose committed WAL contents. The offline IndexStore::backup
+primitive implements this sequence with a consuming engine owner and
+caller-owned 64 KiB scratch. It retains the source
+LOCK and an exclusively borrowed destination LockedRoot until completion.
+A live borrowed view or body prevents consumption; a forgotten-view marker,
+stopped writer or poisoned mutex refuses. Every remaining available connection closes
+explicitly and must report success before a normal File opens the source.
+Retired slots retain no native owner and rely on their earlier retirement
+cleanup and the successful checkpoint. An implicit Drop of an available
+connection is not accepted as evidence of successful close.
+
+The destination must have no database, WAL, SHM, backup-partial or legacy
+FORMAT entry. Its filesystem must support hard links and directory sync.
+Create metadata.sqlite3.backup-partial exclusively as mode 0600, restoring
+owner permissions after umask filtering. Copy exactly the checkpointed length,
+at most 8 GiB, require source EOF, and sync the completed file. One original
+clock/deadline spans checkpoint and copy; native scope observations hand off
+to the copy scope. Each copy iteration checks before reading and writing.
+Synchronous filesystem and native operations cannot promise interruption at
+the deadline. This primitive reserves no quota or filesystem space.
+
+Publish with an atomic no-replace hard link to metadata.sqlite3, unlink the
+partial name, then sync the destination directory. Success returns the store
+epoch and copied byte count only after that final sync. Once the final link
+exists, cleanup and directory sync finish without another deadline refusal
+that could obscure completed publication. An error before attempting the
+link is Unpublished. Any error once linking is attempted is
+IncompletePublication: the final name may exist, but cleanup and publication
+durability are unproven. Even a failed link can have uncertain filesystem
+effects. Neither error grants a completed backup; either can leave partial
+artifacts. A crash between link and unlink
+can leave two links to the same completed inode; ordinary open safely refuses
+its link count. Under both locks, offline inspection must establish identity
+before removing the partial link. Never auto-delete or overwrite a destination
+on an error. The engine is consumed even on refusal; callers may reopen its
+source while retaining the original lock.
+
+The snapshot contains authoritative bodies and metadata, but receipt success
+does not verify every body digest or domain invariant. The snapshot may be opened for
+offline inspection with ordinary IndexStore::open and its normal checks.
+Serving a restored snapshot requires a fresh epoch so old client state tokens
+cannot identify a different history; that restore operation is not implemented.
+Online backup, operational restore commands, verification/repair and history
+maintenance tools remain unimplemented.
 SQLite integrity checks do not replace digest and domain validation.
 
 ## 3. Metadata records

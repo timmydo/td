@@ -1380,7 +1380,13 @@ expired lease retains its upload until explicit transactional removal.
 An uncertain COMMIT retires writes until reopen/recovery. Never acknowledge
 before COMMIT succeeds. Preserve transmission bytes independently of visible
 email lifetime. A stopped checkpointed database backup captures both bytes
-and metadata. Old schemas are refused; no data migration is required.
+and metadata. The consuming IndexStore::backup primitive closes all native
+connections, copies through caller-owned 64 KiB scratch under retained source
+and destination locks, and publishes without replacement only after file sync.
+Its receipt follows destination directory sync; explicit failure phases keep
+partial artifacts distinguishable from successful backups. STORAGE.md owns
+the bounded copy and offline recovery contract; no backup CLI is enabled.
+Old schemas are refused; no data migration is required.
 Startup validates the closed schema and store identity without a full integrity
 scan. Explicit validate_integrity maintenance runs SQLite's database and
 foreign-key checks; body pins still require exact length/digest verification.

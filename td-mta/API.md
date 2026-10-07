@@ -6759,3 +6759,23 @@ Physical chunk-read amplification and the exclusive validate_integrity
 maintenance fence are specified in STORAGE.md section 2. Logical MIME byte
 meters do not measure SQLite copying. Full integrity maintenance refuses a
 stopped writer; new view capture and commits return Busy during its scan.
+
+### Offline SQLite snapshot primitive
+
+IndexStore::backup consumes the engine and accepts a fresh destination
+LockedRoot, one original Deadline and caller-owned [u8; 65536] scratch.
+It checkpoints, explicitly closes all native connections, and copies one
+exact database snapshot under both retained root locks. It returns
+BackupReceipt { epoch, bytes } only after file sync, no-replace publication,
+partial-name removal and destination directory sync. BackupError::Unpublished
+means this invocation did not attempt final-name publication;
+IncompletePublication means publication was attempted, the final name may
+exist, and cleanup or durability is unproven. This includes failed hard-link
+calls whose filesystem effects may be uncertain. Neither failure grants successful
+backup acknowledgement. Both can leave artifacts for explicit offline
+inspection, and both consume the engine. STORAGE.md owns recovery of the
+brief two-link publication state, original clock handoff and filesystem
+limits. This is an offline storage primitive; it grants no CLI, online backup,
+quota reservation, body-integrity or service-activation claim. Opening a
+snapshot permits offline inspection; restoring it for service requires a fresh
+epoch, which remains unimplemented.

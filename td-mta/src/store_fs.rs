@@ -9,7 +9,9 @@ use std::{
 
 #[path = "store_fs/index.rs"]
 mod index;
-pub use index::{BlobSource, CommitError, CommitRequest, IndexReadView, IndexStore};
+pub use index::{
+    BackupError, BackupReceipt, BlobSource, CommitError, CommitRequest, IndexReadView, IndexStore,
+};
 #[path = "store_fs/pinned.rs"]
 mod pinned;
 #[cfg(test)]
@@ -341,7 +343,7 @@ mod tests {
                 owner,
             }
         }
-        fn lock(&self) -> Result<File, LockError> {
+        pub(super) fn lock(&self) -> Result<File, LockError> {
             acquire_lock(&self.directory, self.owner)
         }
         pub(super) fn locked(&self) -> LockedRoot {

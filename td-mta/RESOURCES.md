@@ -3264,3 +3264,14 @@ per small or unaligned body read, separately from logical MIME byte meters.
 Those buffers use the existing SQLite heap allowance; there is no per-pin
 chunk cache. Full integrity maintenance holds the writer fence and reports
 Busy to new view capture and commits until it finishes.
+
+The offline SQLite backup primitive borrows exactly one caller-owned 64 KiB
+copy buffer and copies at most the fixed 8 GiB database ceiling. SQLite
+connections close explicitly before copying starts; no complete database or
+body is retained in memory. The same admitted deadline and monotonic observed
+clock chain cross checkpoint and each copy turn. Final no-replace publication,
+partial-name removal and directory sync complete without deadline interruption
+to preserve the actual durability outcome. Native checkpoint, filesystem read,
+write and sync calls remain synchronous; these checks are not hard scheduling
+interrupts. Backup requires separate caller quota and work admission and does
+not activate an online background slot or alter the startup memory ledger.
