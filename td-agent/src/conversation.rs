@@ -2700,6 +2700,158 @@ impl Session {
         }
     }
 
+    /// `git_push`, the `ToolCall` record `started` (DESIGN.md §9,
+    /// Pushing): the worktree's branch exported from its base, as the
+    /// store has it, in a maintenance instance; staged by the window's
+    /// git worker, which says the remote branch's tip and the evidence;
+    /// put to the person on a card; and pushed, exactly that commit, by
+    /// the worker. The outer error is the log's; the inner, the model's.
+    fn git_push(
+        &mut self,
+        started: u64,
+        worktree: &str,
+        remote_branch: Option<String>,
+        force: bool,
+    ) -> Result<Result<String, String>, String> {
+        let meta = self.conversation.meta().clone();
+        let entry = match prepared_entry(&meta, "git_push", worktree) {
+            Ok((_, entry)) => entry.clone(),
+            Err(why) => return Ok(Err(why)),
+        };
+        let branch = remote_branch.unwrap_or_else(|| entry.branch.clone());
+        if let Err(why) = crate::git::push_branch(&branch) {
+            return Ok(Err(why));
+        }
+        let remote = entry.remote.clone();
+        if tools::visible(&remote).len() > MAX_SHOWN_REMOTE {
+            return Ok(Err(format!(
+                "the remote's URL is past {MAX_SHOWN_REMOTE} bytes, more than a card shows whole"
+            )));
+        }
+        let Some(base) = meta
+            .tracked
+            .iter()
+            .find(|tracked| tracked.remote == remote && tracked.base == entry.base)
+            .map(|tracked| tracked.id.clone())
+        else {
+            return Ok(Err(format!(
+                "where {}'s {} is upstream is not known yet",
+                remote, entry.base
+            )));
+        };
+        // The pack goes in the conversation's own directory, which no
+        // jail can write; one an earlier push left is no longer wanted.
+        let pack = StateDir::at(self.state.clone()).push_pack(&meta.id);
+        let _ = std::fs::remove_file(&pack);
+        let commit = match export(&self.state, &meta.id, &entry, &base, &pack) {
+            Ok(commit) => commit,
+            Err(why) => {
+                return Ok(Err(format!(
+                    "the branch {} of {worktree} could not be exported: {why}",
+                    entry.branch
+                )))
+            }
+        };
+        // An interrupt said while it exported: nothing is staged.
+        self.hear();
+        if self.interrupt {
+            let _ = std::fs::remove_file(&pack);
+            return Ok(Err(CALL_SKIPPED.into()));
+        }
+        let call = self.ask_id();
+        self.send(&Up::Stage {
+            call,
+            worktree: entry.id.clone(),
+            commit: commit.clone(),
+            base,
+            branch: branch.clone(),
+        });
+        let answer = self.wait_for(
+            |down| matches!(down, Down::Staged { call: c, .. } if *c == call),
+            None,
+        );
+        let _ = std::fs::remove_file(&pack);
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(why) => {
+                return Ok(Err(format!(
+                    "{why} while the push was checked; nothing was pushed"
+                )))
+            }
+        };
+        let Down::Staged { result, .. } = answer else {
+            return Ok(Err("the window answered something else".into()));
+        };
+        let staged = match result {
+            Ok(staged) => staged,
+            Err(why) => return Ok(Err(format!("the push could not be checked: {why}"))),
+        };
+        // A forced push expects the tip it was checked against; to a
+        // branch the remote does not have, it is a plain one.
+        let lease = if force { staged.tip.clone() } else { None };
+        let evidence = &staged.evidence;
+        let mut reasons = Vec::new();
+        if crate::git::PROTECTED.contains(&branch.as_str()) {
+            reasons.push(format!("it pushes to {branch}, a protected branch"));
+        }
+        if lease.is_some() {
+            reasons.push("it is forced".to_string());
+        }
+        if !evidence.found.is_empty()
+            || evidence.more_found > 0
+            || !evidence.binaries.is_empty()
+            || evidence.more_binaries > 0
+        {
+            reasons.push("the scan matched".to_string());
+        }
+        let asked = (!reasons.is_empty()).then(|| reasons.join(", and "));
+        let (title, mut details) = tools::push_card(&remote, &branch, &commit, force, &staged);
+        if let Some(why) = &asked {
+            details.insert(0, format!("Asked because {why}."));
+        }
+        match self.decide(started, title, details, asked.as_deref(), None, None)? {
+            Decided::Allowed | Decided::Released => {}
+            Decided::Refused => return Ok(Err(CALL_REFUSED.into())),
+            Decided::Undecided => return Ok(Err(CALL_UNDECIDED.into())),
+            Decided::Ruled(why) => return Ok(Err(ruled(&why))),
+        }
+        self.hear();
+        if self.interrupt {
+            return Ok(Err(CALL_SKIPPED.into()));
+        }
+        if self.gone {
+            return Ok(Err("the window has closed; nothing was pushed".into()));
+        }
+        let call = self.ask_id();
+        self.send(&Up::Push {
+            call,
+            worktree: entry.id.clone(),
+            commit: commit.clone(),
+            branch: branch.clone(),
+            lease,
+        });
+        let answer = match self.wait_for(
+            |down| matches!(down, Down::Pushed { call: c, .. } if *c == call),
+            None,
+        ) {
+            Ok(answer) => answer,
+            Err(why) => {
+                return Ok(Err(format!(
+                    "{why} while the push was sent; it may still reach {remote}"
+                )))
+            }
+        };
+        let Down::Pushed { result, .. } = answer else {
+            return Ok(Err("the window answered something else".into()));
+        };
+        Ok(match result {
+            Ok(said) => Ok(format!(
+                "pushed {commit} to refs/heads/{branch} of {remote}\n{said}"
+            )),
+            Err(why) => Err(format!("the push to {remote} failed: {why}")),
+        })
+    }
+
     /// The window's word of where `remote`'s `bases` were when it last
     /// fetched the store, `ids` in their order (DESIGN.md §7, Keeping
     /// current): each base this workspace names whose remote-tracking ref
@@ -2718,35 +2870,10 @@ impl Session {
     /// log's; the inner, the model's.
     fn git_fetch(&mut self, worktree: &str) -> Result<Result<String, String>, String> {
         let meta = self.conversation.meta().clone();
-        let Some(Workspace::Repositories(repositories)) = &meta.workspace else {
-            return Ok(Err("git_fetch is a repository workspace's tool".into()));
+        let (repositories, entry) = match prepared_entry(&meta, "git_fetch", worktree) {
+            Ok(found) => found,
+            Err(why) => return Ok(Err(why)),
         };
-        if meta.removed {
-            return Ok(Err(
-                "this conversation's workspace went with its archive".into()
-            ));
-        }
-        let path = Path::new(worktree);
-        let Some(entry) = repositories
-            .entries
-            .iter()
-            .find(|entry| entry.checkout == path)
-        else {
-            let named: Vec<String> = repositories
-                .entries
-                .iter()
-                .map(|entry| entry.checkout.display().to_string())
-                .collect();
-            return Ok(Err(format!(
-                "{worktree} is not one of this workspace's worktrees, which are {}",
-                named.join(", ")
-            )));
-        };
-        if !meta.prepared.contains(&entry.repository) {
-            return Ok(Err(format!(
-                "{worktree} is not prepared yet; its preparation fetches its remote and sets its remote-tracking refs"
-            )));
-        }
         let remote = entry.remote.clone();
         let mut bases: Vec<String> = Vec::new();
         for entry in &repositories.entries {
@@ -4059,6 +4186,11 @@ impl Session {
     ) -> Result<Result<String, String>, String> {
         Ok(match args {
             Args::GitFetch { worktree } => self.git_fetch(&worktree)?,
+            Args::GitPush {
+                worktree,
+                remote_branch,
+                force,
+            } => self.git_push(started, &worktree, remote_branch, force)?,
             Args::Todo(items) => {
                 let text = tools::todo_text(&items);
                 self.log(Kind::Todo {
@@ -5583,6 +5715,75 @@ fn check_out(state: &Path, id: &Id, entries: &[&Entry], fetched: &Stored) -> Res
         })?;
     }
     Ok(())
+}
+
+/// The longest remote a push names, made visible, so the card that asks
+/// for it shows it whole.
+const MAX_SHOWN_REMOTE: usize = 1024;
+
+/// The worktree of `meta`'s repository workspace at `worktree`, which
+/// tool `tool` names, once it is prepared, with the workspace; or why a
+/// call to it is refused, asking nothing.
+fn prepared_entry<'a>(
+    meta: &'a store::Meta,
+    tool: &str,
+    worktree: &str,
+) -> Result<(&'a crate::workspace::Repositories, &'a Entry), String> {
+    let Some(Workspace::Repositories(repositories)) = &meta.workspace else {
+        return Err(format!("{tool} is a repository workspace's tool"));
+    };
+    if meta.removed {
+        return Err("this conversation's workspace went with its archive".into());
+    }
+    let path = Path::new(worktree);
+    let Some(entry) = repositories
+        .entries
+        .iter()
+        .find(|entry| entry.checkout == path)
+    else {
+        let named: Vec<String> = repositories
+            .entries
+            .iter()
+            .map(|entry| entry.checkout.display().to_string())
+            .collect();
+        return Err(format!(
+            "{worktree} is not one of this workspace's worktrees, which are {}",
+            named.join(", ")
+        ));
+    };
+    if !meta.prepared.contains(&entry.repository) {
+        return Err(format!(
+            "{worktree} is not prepared yet; its preparation fetches its remote and sets its remote-tracking refs"
+        ));
+    }
+    Ok((repositories, entry))
+}
+
+/// Exports `entry`'s branch from `base`, the store's commit of its base,
+/// as a pack to the new file `pack`, in a maintenance instance
+/// (DESIGN.md §9, Pushing): the commit exported.
+fn export(state: &Path, id: &Id, entry: &Entry, base: &str, pack: &Path) -> Result<String, String> {
+    let programs = crate::jail::Programs::from_env()?;
+    let git = crate::repo::host_git()?;
+    let dir = crate::workspace::jail_dir(&StateDir::at(state.to_path_buf()), id);
+    let policy =
+        crate::workspace::maintenance(&dir, &[entry]).ok_or("no worktree to export from")?;
+    let task = crate::repo::Task::Export {
+        git,
+        repository: entry.repository.clone(),
+        id: entry.id.clone(),
+        checkout: entry.checkout.clone(),
+        branch: entry.branch.clone(),
+        base: base.to_string(),
+    };
+    crate::jail::export(
+        &programs,
+        &policy,
+        &dir.join("specs"),
+        &task,
+        crate::repo::EXPORT_TASK_TIME,
+        pack,
+    )
 }
 
 /// Sets `heads`' remote-tracking refs in the repository of `entries`,

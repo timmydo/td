@@ -269,6 +269,23 @@ impl Harness {
         }
     }
 
+    /// What the process said until `pick` took a message, reservations
+    /// answered on the way, the events kept for `turn`.
+    fn until<T>(&mut self, pick: impl Fn(&Up) -> Option<T>) -> T {
+        loop {
+            let up = self.next();
+            if self.hear(&up) {
+                continue;
+            }
+            if let Some(picked) = pick(&up) {
+                return picked;
+            }
+            if let Up::Event(event) = up {
+                self.heard.push(event);
+            }
+        }
+    }
+
     /// What the process said until it asked for a `git_fetch`: its call,
     /// remote and bases.
     fn until_refetch(&mut self) -> (u64, String, Vec<String>) {
@@ -437,6 +454,10 @@ fn spawn(
                 var,
                 std::env::var_os(var).unwrap_or_else(|| panic!("{var}")),
             );
+        }
+        // Where a maintenance instance finds the host's git.
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
         }
     }
     let child = command
@@ -6347,6 +6368,403 @@ fn a_cold_compaction_that_cannot_be_or_fails_is_said() {
     let (_, outcome, retry) = h.turn();
     assert!(outcome.contains("could not be compacted"), "{outcome}");
     assert!(retry);
+}
+
+/// `git_push` is refused, asking nothing, for a worktree not prepared,
+/// a base not yet known, and a branch that names a ref; with no jail to
+/// export in, it says so, and nothing is staged.
+#[test]
+fn git_push_is_refused_until_it_can_export() {
+    let base = std::env::temp_dir().join(format!(
+        "td-agent-model-push-{}-{}",
+        std::process::id(),
+        td_agent::store::random_hex(4).unwrap()
+    ));
+    let remote = "https://example.org/a/td";
+    let template = td_agent::config::Template {
+        name: "td".into(),
+        repos: vec![td_agent::config::Repo {
+            remote: remote.into(),
+            base: "main".into(),
+            branch: "agent".into(),
+            sparse: None,
+        }],
+        shared: None,
+    };
+    let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
+    let made = td_agent::workspace::repositories(
+        &template,
+        &Id::random().unwrap(),
+        &base.join("data"),
+        &base.join("trees"),
+        &admitted,
+        0,
+    )
+    .unwrap();
+    let checkout = made.entries[0].checkout.display().to_string();
+    let repository = made.entries[0].repository.clone();
+    let argument = td_agent::workspace::Workspace::Repositories(made).argument();
+    let push = |fixture: &str| Reply::sse_with(fixture, "WORKTREE", &checkout);
+    let mut h = Harness::new_in(
+        "push",
+        Role::Conversation,
+        Some(argument.to_str().unwrap()),
+        false,
+        vec![
+            push("stream-tool-git-push.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            push("stream-tool-git-push.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            push("stream-tool-git-push-ref.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            push("stream-tool-git-push.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    while !matches!(h.next(), Up::Fetch { .. }) {}
+    h.setup(Client::default());
+    h.down(&Down::Fetched {
+        remote: remote.into(),
+        result: Err("the remote is not admitted".into()),
+    });
+    // Each asked anew, so the log a reopened process replays first is
+    // not taken for the turn.
+    let said = |h: &mut Harness, text: &str| {
+        h.say(text);
+        h.until(|up| match up {
+            Up::Event(Event {
+                kind: Kind::User { text: said, .. },
+                ..
+            }) if said == text => Some(()),
+            _ => None,
+        });
+        let (events, outcome, _) = h.turn();
+        assert_eq!(outcome, "replied", "{}", h.said());
+        // Nothing was staged, nor asked.
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e.kind, Kind::Approval { .. })));
+        results(&events).last().unwrap().1.clone()
+    };
+    assert_eq!(
+        said(&mut h, "Push one."),
+        format!("error: {checkout} is not prepared yet; its preparation fetches its remote and sets its remote-tracking refs")
+    );
+    let (mut conversation, mut h) = h.close();
+    conversation.set_prepared(&repository).unwrap();
+    drop(conversation);
+    h.reopen();
+    h.setup(Client::default());
+    assert_eq!(
+        said(&mut h, "Push two."),
+        format!("error: where {remote}'s main is upstream is not known yet")
+    );
+    let (mut conversation, mut h) = h.close();
+    conversation
+        .set_tracked(remote, &[("main".into(), "a".repeat(40))])
+        .unwrap();
+    drop(conversation);
+    h.reopen();
+    h.setup(Client::default());
+    assert_eq!(
+        said(&mut h, "Push three."),
+        "error: \"refs/heads/main\" names a ref, not a branch"
+    );
+    let unexported = said(&mut h, "Push four.");
+    assert!(
+        unexported.starts_with(&format!(
+            "error: the branch agent of {checkout} could not be exported: "
+        )),
+        "{unexported}"
+    );
+    assert!(!h.state.push_pack(&h.id).exists());
+    let requests = h.mock.requests();
+    assert!(requests
+        .iter()
+        .filter(|r| !r.text().contains("Write a title"))
+        .all(|r| r.text().contains(r#""name":"git_push""#)));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A push, in a prepared repository workspace: the branch exported as a
+/// pack the window's worker reads, staged, put to the person with what
+/// the stage found, and sent as staged, the pack gone; a forced push to
+/// a protected branch is asked why, and a refusal sends nothing.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL, TD_AGENT_TXT and a host git"]
+fn a_push_is_exported_staged_asked_and_sent() {
+    use td_agent::git::{Evidence, Found, Staged};
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "td-agent-model-pushed-{}-{}",
+        std::process::id(),
+        td_agent::store::random_hex(4).unwrap()
+    ));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let scratch = std::fs::canonicalize(&scratch).unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "init.defaultBranch=main"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let up = scratch.join("up");
+    std::fs::create_dir_all(&up).unwrap();
+    std::fs::write(up.join("a.txt"), "a\n").unwrap();
+    git(&up, &["init", "--quiet"]);
+    git(&up, &["add", "."]);
+    git(&up, &["commit", "--quiet", "-m", "one"]);
+    let remote = "https://example.org/a/td";
+    let template = td_agent::config::Template {
+        name: "td".into(),
+        repos: vec![td_agent::config::Repo {
+            remote: remote.into(),
+            base: "main".into(),
+            branch: "agent".into(),
+            sparse: None,
+        }],
+        shared: None,
+    };
+    let made = td_agent::workspace::repositories(
+        &template,
+        &Id::random().unwrap(),
+        &scratch.join("data"),
+        &scratch.join("trees"),
+        &[td_agent::git::Admission::parse("example.org").unwrap()],
+        0,
+    )
+    .unwrap();
+    let entry = made.entries[0].clone();
+    // The store as the window's worker leaves it.
+    std::fs::create_dir_all(&entry.store).unwrap();
+    git(&entry.store, &["init", "--quiet", "--bare"]);
+    let from = up.display().to_string();
+    git(
+        &entry.store,
+        &["fetch", "--quiet", &from, "+refs/heads/*:refs/heads/*"],
+    );
+    let base = git(&entry.store, &["rev-parse", "main"]);
+    let checkout = entry.checkout.display().to_string();
+    let argument = td_agent::workspace::Workspace::Repositories(made).argument();
+    let push = |fixture: &str| Reply::sse_with(fixture, "WORKTREE", &checkout);
+    let mut h = Harness::new_in(
+        "pushed",
+        Role::Conversation,
+        Some(argument.to_str().unwrap()),
+        true,
+        vec![
+            push("stream-tool-git-push.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            push("stream-tool-git-push-forced.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            push("stream-tool-git-push-forced.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client::default());
+    // Prepared: the worktree checked out at the base.
+    let (remote_asked, bases) = h.until(|up| match up {
+        Up::Fetch { remote, bases } => Some((remote.clone(), bases.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        (remote_asked.as_str(), bases),
+        (remote, vec!["main".to_string()])
+    );
+    h.down(&Down::Fetched {
+        remote: remote.into(),
+        result: Ok(td_agent::protocol::Fetched {
+            rules: vec![td_agent::rules::Read::Absent],
+            identity: td_agent::repo::Identity {
+                name: Some("Human".into()),
+                email: Some("h@example.org".into()),
+            },
+            ids: vec![base.clone()],
+            instructions: vec![td_agent::repo::Instructions::Absent],
+        }),
+    });
+    h.until(|up| matches!(up, Up::Prepared { .. }).then_some(()));
+    // The agent's work, committed on its branch.
+    std::fs::write(entry.checkout.join("b.txt"), "b\n").unwrap();
+    git(&entry.checkout, &["add", "b.txt"]);
+    git(&entry.checkout, &["commit", "--quiet", "-m", "Add b"]);
+    let tip = git(&entry.checkout, &["rev-parse", "HEAD"]);
+    let pack = h.state.push_pack(&h.id);
+    // A pack an earlier push left is not in the way.
+    std::fs::write(&pack, b"stale").unwrap();
+    h.say("Push it.");
+    let (call, worktree, commit, base_sent, branch) = h.until(|up| match up {
+        Up::Stage {
+            call,
+            worktree,
+            commit,
+            base,
+            branch,
+        } => Some((
+            *call,
+            worktree.clone(),
+            commit.clone(),
+            base.clone(),
+            branch.clone(),
+        )),
+        _ => None,
+    });
+    assert_eq!(
+        (
+            worktree.as_str(),
+            commit.as_str(),
+            base_sent.as_str(),
+            branch.as_str()
+        ),
+        (entry.id.as_str(), tip.as_str(), base.as_str(), "agent")
+    );
+    // The pack the window's worker imports: the branch's new objects.
+    let bytes = std::fs::read(&pack).unwrap();
+    assert!(
+        bytes.starts_with(b"PACK"),
+        "{:?}",
+        &bytes[..bytes.len().min(8)]
+    );
+    let found = Found {
+        kind: "a GitHub token".into(),
+        commit: Some(tip.clone()),
+        path: Some("b.txt".into()),
+    };
+    h.down(&Down::Staged {
+        call,
+        result: Ok(Staged {
+            tip: None,
+            evidence: Evidence {
+                commits: vec![(tip.clone(), "Add b".into())],
+                paths: vec![("b.txt".into(), Some((1, 0)))],
+                found: vec![found],
+                ..Evidence::default()
+            },
+        }),
+    });
+    let (card, title, details) = h.until_ask();
+    assert_eq!(title, "Push to a remote");
+    assert_eq!(details[0], "Asked because the scan matched.");
+    assert_eq!(
+        details[1..4],
+        [
+            format!("Commit {tip}"),
+            "to refs/heads/agent".to_string(),
+            format!("of {remote}")
+        ]
+    );
+    assert!(details.contains(&format!("  a GitHub token in commit {tip} at b.txt")));
+    assert!(!pack.exists(), "the pack outlived its stage");
+    h.down(&Down::Decision {
+        call: card,
+        allow: true,
+        always: None,
+    });
+    let (call, sent) = h.until(|up| match up {
+        Up::Push {
+            call,
+            worktree,
+            commit,
+            branch,
+            lease,
+        } => Some((
+            *call,
+            (
+                worktree.clone(),
+                commit.clone(),
+                branch.clone(),
+                lease.clone(),
+            ),
+        )),
+        _ => None,
+    });
+    assert_eq!(sent, (entry.id.clone(), tip.clone(), "agent".into(), None));
+    h.down(&Down::Pushed {
+        call,
+        result: Ok("*\trefs/heads/agent\t[new branch]".into()),
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(
+        results(&events)[0].1,
+        format!("pushed {tip} to refs/heads/agent of {remote}\n*\trefs/heads/agent\t[new branch]")
+    );
+    // Forced, to main: asked why; refused, nothing is sent.
+    h.say("Force it onto main.");
+    let call = h.until(|up| match up {
+        Up::Stage { call, branch, .. } if branch == "main" => Some(*call),
+        _ => None,
+    });
+    h.down(&Down::Staged {
+        call,
+        result: Ok(Staged {
+            tip: Some(base.clone()),
+            evidence: Evidence::default(),
+        }),
+    });
+    let (card, _, details) = h.until_ask();
+    assert_eq!(
+        details[0],
+        "Asked because it pushes to main, a protected branch, and it is forced."
+    );
+    assert!(details[4].starts_with(&format!("Forced: it replaces the remote's {base}")));
+    h.down(&Down::Decision {
+        call: card,
+        allow: false,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(results(&events)[0]
+        .1
+        .starts_with("error: not run: the person refused this call"));
+    // Allowed, it goes forced against the tip it was staged against.
+    h.say("Force it onto main after all.");
+    let call = h.until(|up| match up {
+        Up::Stage { call, .. } => Some(*call),
+        _ => None,
+    });
+    h.down(&Down::Staged {
+        call,
+        result: Ok(Staged {
+            tip: Some(base.clone()),
+            evidence: Evidence::default(),
+        }),
+    });
+    let (card, _, _) = h.until_ask();
+    h.down(&Down::Decision {
+        call: card,
+        allow: true,
+        always: None,
+    });
+    let (call, sent) = h.until(|up| match up {
+        Up::Push {
+            call,
+            branch,
+            lease,
+            ..
+        } => Some((*call, (branch.clone(), lease.clone()))),
+        _ => None,
+    });
+    assert_eq!(sent, ("main".to_string(), Some(base.clone())));
+    h.down(&Down::Pushed {
+        call,
+        result: Err("the push was refused: stale info".into()),
+    });
+    let (events, _, _) = h.turn();
+    assert_eq!(
+        results(&events)[0].1,
+        format!("error: the push to {remote} failed: the push was refused: stale info")
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 /// `git_fetch` (DESIGN.md §9): a repository workspace's tool, of one of

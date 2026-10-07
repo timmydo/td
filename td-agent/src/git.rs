@@ -2093,8 +2093,13 @@ pub struct Push {
     pub lease: Option<String>,
 }
 
+/// The branches a push to which is always the person's (DESIGN.md §9,
+/// Pushing).
+pub const PROTECTED: &[&str] = &["main", "master"];
+
 /// `name` as a push's branch admits it: one `branch_name` admits, which
-/// starts with none of `+`, `:` and `-`, and not one beginning `refs/`,
+/// starts with none of `+`, `:` and `-`, within `PUSH_BRANCH` bytes,
+/// and not one beginning `refs/`,
 /// which git would make `refs/heads/refs/...`, not the branch a reader
 /// of it would think.
 pub fn push_branch(name: &str) -> Result<&str, String> {
@@ -2102,8 +2107,15 @@ pub fn push_branch(name: &str) -> Result<&str, String> {
     if branch.starts_with("refs/") {
         return Err(format!("{branch:?} names a ref, not a branch"));
     }
+    // So the card that asks for it shows it whole.
+    if branch.len() > PUSH_BRANCH {
+        return Err(format!("the branch is past {PUSH_BRANCH} bytes"));
+    }
     Ok(branch)
 }
+
+/// The longest branch a push names.
+pub const PUSH_BRANCH: usize = 255;
 
 impl Push {
     /// The one refspec pushed, `<id>:refs/heads/<branch>`, checked: the
@@ -2786,6 +2798,8 @@ pub(crate) mod tests {
         // null id would delete the branch.
         let zero = "0".repeat(three.len());
         let tree = said(&work, &["rev-parse", "HEAD^{tree}"]);
+        let long = "b".repeat(PUSH_BRANCH + 1);
+        assert!(push_branch(&long[1..]).is_ok());
         for (id, branch, lease, why) in [
             ("HEAD", "feature", None, "not a full commit id"),
             (&zero, "feature", None, "not a full commit id"),
@@ -2799,6 +2813,7 @@ pub(crate) mod tests {
             (three.as_str(), "+feature", None, "not a branch name"),
             (three.as_str(), ":feature", None, "not a branch name"),
             (three.as_str(), "refs/heads/x", None, "names a ref"),
+            (three.as_str(), &long, None, "past 255 bytes"),
             (&tree, "feature", None, "not a commit to push"),
             (
                 three.as_str(),

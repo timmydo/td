@@ -66,6 +66,7 @@ pub enum Tool {
     ProcessWait,
     ProcessKill,
     GitFetch,
+    GitPush,
 }
 
 /// Which tools a conversation has: the conversation's own, a
@@ -114,7 +115,7 @@ const WORKSPACE: &[Tool] = &[
 
 /// The tools a repository workspace adds (DESIGN.md §9), run by the git
 /// worker, outside the jail.
-const REPOSITORIES: &[Tool] = &[Tool::GitFetch];
+const REPOSITORIES: &[Tool] = &[Tool::GitFetch, Tool::GitPush];
 
 impl Tool {
     pub fn name(self) -> &'static str {
@@ -136,6 +137,7 @@ impl Tool {
             Self::ProcessWait => "process_wait",
             Self::ProcessKill => "process_kill",
             Self::GitFetch => "git_fetch",
+            Self::GitPush => "git_push",
         }
     }
 
@@ -433,6 +435,17 @@ fn definition(tool: Tool) -> Json {
                 &["worktree"],
             ),
         ),
+        Tool::GitPush => (
+            "Push a worktree's branch to its remote, outside the jail. td-agent sends the commits from the base to the branch's tip, scans them for credential shapes and binary files, and asks for approval: a push to main or master, a forced push, and one whose scan matched always go to the person, as may any other. Commit first: only committed work is pushed, and only to refs/heads/ on the worktree's own remote. The result is what git and the remote said.".to_string(),
+            schema(
+                vec![
+                    ("worktree", property("string", "The worktree's absolute path, as the environment names it.")),
+                    ("remote_branch", property("string", "The branch on the remote to push to; the worktree's own branch when left out.")),
+                    ("force", property("boolean", "Replace the remote's branch though the push does not fast-forward it, and only if it is still where it was when the push was checked; false when left out.")),
+                ],
+                &["worktree"],
+            ),
+        ),
     };
     Json::Obj(vec![
         ("type".into(), Json::Str("function".into())),
@@ -524,6 +537,13 @@ pub enum Args {
     /// `git_fetch`, of the worktree at this path.
     GitFetch {
         worktree: String,
+    },
+    /// `git_push`, of the worktree at this path, to the remote's
+    /// `remote_branch`, or the worktree's own, forced or not.
+    GitPush {
+        worktree: String,
+        remote_branch: Option<String>,
+        force: bool,
     },
     /// A workspace tool's, for the tool host; `acts` when the human
     /// decides it first. A write's or an edit's expected digest is the
@@ -931,6 +951,14 @@ pub fn parse_in(kit: Kit, name: &str, arguments: &str) -> Result<Args, String> {
             let m = members(tool_name, &value, &["worktree"])?;
             Args::GitFetch {
                 worktree: required(m, "worktree")?.to_string(),
+            }
+        }
+        Tool::GitPush => {
+            let m = members(tool_name, &value, &["worktree", "remote_branch", "force"])?;
+            Args::GitPush {
+                worktree: required(m, "worktree")?.to_string(),
+                remote_branch: text(m, "remote_branch")?.map(str::to_string),
+                force: flag(m, "force")?,
             }
         }
         Tool::ProcessOutput => {
@@ -1365,6 +1393,105 @@ pub fn crossing_card(target: &Id, title: &str, reach: Reach) -> (String, Vec<Str
     (heading.to_string(), card.done())
 }
 
+/// The most lines each list of a push's card shows, so every part of
+/// it shows.
+const PUSH_PART: usize = 40;
+
+/// The card that asks the person whether a push may go (DESIGN.md §9,
+/// Pushing; §11): the commit and where it goes, what the scan found,
+/// whole, then the binary files, the commits and the files changed, each
+/// part bounded and what it leaves out counted.
+pub fn push_card(
+    remote: &str,
+    branch: &str,
+    commit: &str,
+    force: bool,
+    staged: &crate::git::Staged,
+) -> (String, Vec<String>) {
+    let evidence = &staged.evidence;
+    let mut card = Lines::default();
+    // One part a line, so a long one cannot push another off the card.
+    card.line(format!("Commit {commit}"));
+    card.line(format!("to refs/heads/{}", visible(branch)));
+    card.line(format!("of {}", visible(remote)));
+    card.line(match (&staged.tip, force) {
+        (None, _) => "The branch is new on the remote.".to_string(),
+        (Some(tip), true) => format!(
+            "Forced: it replaces the remote's {tip}, and only if the branch is still there."
+        ),
+        (Some(tip), false) => {
+            format!("The remote's branch is at {tip}; the push must fast-forward it.")
+        }
+    });
+    if let Some(base) = &evidence.merge_base {
+        card.line(format!("Merge base with the remote's branch: {base}."));
+    }
+    let count = |shown: usize, more: u64| (shown as u64).saturating_add(more);
+    let more = |card: &mut Lines, shown: usize, more: u64| {
+        if more > 0 {
+            card.line(format!("  \u{2026} and {more} more, not shown"));
+        } else if shown == 0 {
+            card.line("  none".into());
+        }
+    };
+    let found = count(evidence.found.len(), evidence.more_found);
+    if found == 0 {
+        card.line("The scan for credential shapes found nothing, and read it all.".into());
+    } else {
+        card.line(format!(
+            "The scan matched {found}, credential shapes or what was too much to read:"
+        ));
+        for one in &evidence.found {
+            let commit = one
+                .commit
+                .as_ref()
+                .map_or_else(String::new, |c| format!(" in commit {c}"));
+            let path = one
+                .path
+                .as_ref()
+                .map_or_else(String::new, |p| format!(" at {}", visible(p)));
+            card.line(format!("  {}{commit}{path}", visible(&one.kind)));
+        }
+        more(&mut card, evidence.found.len(), evidence.more_found);
+    }
+    let binaries = count(evidence.binaries.len(), evidence.more_binaries);
+    if binaries > 0 {
+        card.line(format!(
+            "Binary files it carries, a scan match: {binaries}:"
+        ));
+        let shown = evidence.binaries.len().min(PUSH_PART);
+        for path in evidence.binaries.iter().take(shown) {
+            card.line(format!("  {}", visible(path)));
+        }
+        let left = (evidence.binaries.len() - shown) as u64;
+        more(
+            &mut card,
+            shown,
+            left.saturating_add(evidence.more_binaries),
+        );
+    }
+    let commits = count(evidence.commits.len(), evidence.more_commits);
+    card.line(format!("Commits: {commits}"));
+    let shown = evidence.commits.len().min(PUSH_PART);
+    for (id, subject) in evidence.commits.iter().take(shown) {
+        card.line(format!("  {id} {}", visible(subject)));
+    }
+    let left = (evidence.commits.len() - shown) as u64;
+    more(&mut card, shown, left.saturating_add(evidence.more_commits));
+    let paths = count(evidence.paths.len(), evidence.more_paths);
+    card.line(format!("Files changed: {paths}"));
+    let shown = evidence.paths.len().min(PUSH_PART);
+    for (path, lines) in evidence.paths.iter().take(shown) {
+        card.line(match lines {
+            Some((added, removed)) => format!("  +{added} -{removed} {}", visible(path)),
+            None => format!("  binary {}", visible(path)),
+        });
+    }
+    let left = (evidence.paths.len() - shown) as u64;
+    more(&mut card, shown, left.saturating_add(evidence.more_paths));
+    ("Push to a remote".to_string(), card.done())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
@@ -1431,7 +1558,10 @@ mod tests {
         let names = |kit| -> Vec<&str> { Tool::all(kit).iter().map(|t| t.name()).collect() };
         assert!(!names(Kit::Workspace).contains(&"git_fetch"));
         assert!(!names(Kit::Conversation).contains(&"git_fetch"));
-        assert_eq!(names(Kit::Repositories).last(), Some(&"git_fetch"));
+        assert_eq!(
+            names(Kit::Repositories)[names(Kit::Workspace).len()..],
+            ["git_fetch", "git_push"]
+        );
         assert_eq!(
             names(Kit::Repositories)[..names(Kit::Workspace).len()],
             names(Kit::Workspace)[..]
@@ -1457,6 +1587,123 @@ mod tests {
         let prefix = prefix(Kit::Repositories, "s");
         assert!(prefix.contains("\"git_fetch\""));
         assert!(!super::prefix(Kit::Workspace, "s").contains("\"git_fetch\""));
+    }
+
+    /// `git_push` is a repository workspace's alone and takes its
+    /// worktree, and a remote branch and force only as it says.
+    #[test]
+    fn a_repository_workspace_adds_git_push() {
+        let args = r#"{"worktree":"/w/td"}"#;
+        assert!(parse_in(Kit::Workspace, "git_push", args).is_err());
+        assert_eq!(
+            parse_in(Kit::Repositories, "git_push", args).unwrap(),
+            Args::GitPush {
+                worktree: "/w/td".into(),
+                remote_branch: None,
+                force: false,
+            }
+        );
+        assert_eq!(
+            parse_in(
+                Kit::Repositories,
+                "git_push",
+                r#"{"worktree":"/w/td","remote_branch":"feature","force":true}"#
+            )
+            .unwrap(),
+            Args::GitPush {
+                worktree: "/w/td".into(),
+                remote_branch: Some("feature".into()),
+                force: true,
+            }
+        );
+        for wrong in [
+            "{}",
+            r#"{"worktree":"/w/td","force":"yes"}"#,
+            r#"{"worktree":"/w/td","remote_branch":1}"#,
+            r#"{"worktree":"/w/td","remote":"origin"}"#,
+        ] {
+            assert!(
+                parse_in(Kit::Repositories, "git_push", wrong).is_err(),
+                "{wrong}"
+            );
+        }
+        assert!(!Tool::acting("git_push"));
+        assert!(known("git_push"));
+        assert!(prefix(Kit::Repositories, "s").contains("\"git_push\""));
+    }
+
+    /// A push's card says where the commit goes and what the scan found
+    /// first and whole; each list after it is bounded, what it leaves out
+    /// counted, so every part shows.
+    #[test]
+    fn a_pushs_card_shows_every_part() {
+        use crate::git::{Evidence, Found, Staged};
+        let id = |c: char| c.to_string().repeat(40);
+        let found = Found {
+            kind: "a GitHub token".into(),
+            commit: Some(id('c')),
+            path: Some("a\tb".into()),
+        };
+        let staged = Staged {
+            tip: Some(id('t')),
+            evidence: Evidence {
+                merge_base: Some(id('m')),
+                commits: vec![(id('c'), "Add it".into()); 200],
+                more_commits: 3,
+                paths: vec![("a.txt".into(), Some((2, 1))), ("b.bin".into(), None)],
+                more_paths: 0,
+                binaries: vec!["b.bin".into(); 100],
+                more_binaries: 0,
+                found: vec![found; 50],
+                more_found: 2,
+            },
+        };
+        let (title, lines) = push_card("ssh://h/r", "agent", &id('a'), false, &staged);
+        assert_eq!(title, "Push to a remote");
+        assert_eq!(
+            lines[..3],
+            [
+                format!("Commit {}", id('a')),
+                "to refs/heads/agent".to_string(),
+                "of ssh://h/r".to_string()
+            ]
+        );
+        assert!(lines[3].contains("must fast-forward"), "{}", lines[3]);
+        assert!(lines.contains(
+            &"The scan matched 52, credential shapes or what was too much to read:".to_string()
+        ));
+        let shown = |prefix: &str| lines.iter().filter(|l| l.starts_with(prefix)).count();
+        assert_eq!(shown("  a GitHub token in commit"), 50);
+        assert!(lines.contains(&format!(
+            "  a GitHub token in commit {} at a<U+0009>b",
+            id('c')
+        )));
+        assert_eq!(shown("  b.bin"), PUSH_PART);
+        assert!(lines.contains(&"  \u{2026} and 60 more, not shown".to_string()));
+        assert!(lines.contains(&"Commits: 203".to_string()));
+        assert_eq!(shown(&format!("  {} Add it", id('c'))), PUSH_PART);
+        assert!(lines.contains(&"  \u{2026} and 163 more, not shown".to_string()));
+        assert!(lines.contains(&"  +2 -1 a.txt".to_string()));
+        assert!(lines.contains(&"  binary b.bin".to_string()));
+        assert!(!lines.iter().any(|l| l.contains("not shown.")), "{lines:?}");
+        // Forced, new, clean.
+        let forced = push_card("r", "agent", &id('a'), true, &staged).1;
+        assert!(forced[3].starts_with(&format!("Forced: it replaces the remote's {}", id('t'))));
+        let clean = Staged {
+            tip: None,
+            evidence: Evidence::default(),
+        };
+        let lines = push_card("r", "agent", &id('a'), true, &clean).1;
+        assert_eq!(lines[3], "The branch is new on the remote.");
+        assert!(lines.contains(
+            &"The scan for credential shapes found nothing, and read it all.".to_string()
+        ));
+        assert!(!lines.iter().any(|l| l.starts_with("Binary")));
+        assert_eq!(shown_in(&lines, "  none"), 2);
+    }
+
+    fn shown_in(lines: &[String], line: &str) -> usize {
+        lines.iter().filter(|l| *l == line).count()
     }
 
     #[test]

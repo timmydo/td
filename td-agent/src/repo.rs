@@ -48,6 +48,9 @@ pub const MAINTAIN: &str = "maintain";
 const EXPORT_GIT_TIME: Duration = Duration::from_secs(60);
 /// How long packing an export may take.
 pub const EXPORT_TIME: Duration = Duration::from_secs(600);
+/// How long the instance running one export may take.
+pub(crate) const EXPORT_TASK_TIME: Duration =
+    EXPORT_GIT_TIME.saturating_add(EXPORT_TIME.saturating_add(Duration::from_secs(60)));
 
 /// The human's identity, which commits made in the jail carry.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

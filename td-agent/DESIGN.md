@@ -3253,8 +3253,38 @@ the objects' pass to the diffs', so none is counted twice: escaped, the
 largest evidence is under 1 MiB, and a frame whose lists pass the
 evidence's bounds is refused. `publish()` makes `objects/info` itself
 before writing the alternates, so a stage that loses a race to make the
-repository does not fail on it. Nothing sends `Up::Stage` yet:
-`git_push` will.
+repository does not fail on it.
+
+**As built (increment 14, `git_push`).** A repository workspace's kit
+holds `git_push {worktree, remote_branch?, force?}` beside `git_fetch`,
+refused, asking nothing, as `git_fetch` is, and also for a branch
+`push_branch` refuses, the worktree's own when none is named, and for a
+base whose commit upstream the conversation has not recorded yet. The
+conversation exports the worktree's branch from that recorded commit,
+the store's, in a maintenance instance, to `push.pack` in its own
+directory, a pack an earlier push left removed first; sends the window
+`Up::Stage`, and removes the pack once it is answered, as the worker has
+imported it or failed to. The card names the commit,
+`refs/heads/<branch>` and the remote, a line each, a branch past 255
+bytes and a remote whose visible URL is past 1024 refused so that each
+shows whole; whether the branch is new, must fast-forward, or is forced,
+replacing the tip it was staged against; the merge base; every match the
+scan kept and the count of the rest; and then the binary files, the
+commits and the files changed, at most 40 lines each and the rest
+counted, so every part shows. Its first line says why it is asked when
+the push is to a protected branch (`main` or `master` until
+`protected_branches` lands), forced against a tip the remote has, or the
+scan matched, a binary file counting. Until the classifier judges pushes
+and rules can name `git_push`, every push is the person's, in either
+mode, and the card offers no "always". Allowed and not interrupted, the
+conversation sends `Up::Push` with the commit, the branch and, when
+forced against a tip, that tip as the lease; to a branch the remote does
+not have, a forced push is a plain one. The model is told what git and
+the remote said, or why the push failed; an interrupt or a closed window
+while it waits says the push may still reach the remote. The export runs
+in the conversation process, as a preparation's checkout does, for at
+most twelve minutes in all, and an interrupt said meanwhile is heard
+when it ends, before anything is staged.
 
 ## 10. Network policy
 
