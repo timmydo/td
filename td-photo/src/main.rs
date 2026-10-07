@@ -23,6 +23,7 @@ use std::time::Instant;
 use td_ui::driven::{self, Binding, Input, Outcome};
 use td_ui::finder;
 use td_ui::raster::{Composition, Scale, Surface};
+use td_ui::xdg::{self, Base};
 
 use td_photo::auto::{self, Auto};
 use td_photo::color::{camera_color, CameraColor, Transfer};
@@ -1825,16 +1826,10 @@ fn make_thumbnail(
 
 /// `$XDG_CACHE_HOME/td-photo`, or `$HOME/.cache/td-photo`.
 fn cache_dir() -> Result<PathBuf, String> {
-    let base = match std::env::var_os("XDG_CACHE_HOME").filter(|v| Path::new(v).is_absolute()) {
-        Some(v) => PathBuf::from(v),
-        None => {
-            let home = std::env::var_os("HOME")
-                .filter(|v| Path::new(v).is_absolute())
-                .ok_or("neither XDG_CACHE_HOME nor HOME names an absolute directory")?;
-            PathBuf::from(home).join(".cache")
-        }
-    };
-    Ok(base.join("td-photo"))
+    let base = Base::Cache;
+    Ok(xdg::from_env(base)
+        .ok_or_else(|| base.missing())?
+        .join("td-photo"))
 }
 
 /// Whether `path`, one of the cache's own directories, is present as a
@@ -2032,16 +2027,10 @@ fn cache_clear() -> Result<(), String> {
 /// `$XDG_CONFIG_HOME/td-photo`, or `$HOME/.config/td-photo`: the user's
 /// looks and export settings.
 fn config_dir() -> Result<PathBuf, String> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| Path::new(v).is_absolute()) {
-        Some(v) => PathBuf::from(v),
-        None => {
-            let home = std::env::var_os("HOME")
-                .filter(|v| Path::new(v).is_absolute())
-                .ok_or("neither XDG_CONFIG_HOME nor HOME names an absolute directory")?;
-            PathBuf::from(home).join(".config")
-        }
-    };
-    Ok(base.join("td-photo"))
+    let base = Base::Config;
+    Ok(xdg::from_env(base)
+        .ok_or_else(|| base.missing())?
+        .join("td-photo"))
 }
 
 /// `$XDG_CONFIG_HOME/td-photo/looks`, or `$HOME/.config/td-photo/looks`.

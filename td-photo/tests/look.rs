@@ -963,7 +963,9 @@ fn the_looks_verb_lists_user_and_built_in_looks_and_prints_one() {
     let (ok, stdout, stderr) = td_photo(&["looks"], Some("relative"), None);
     assert!(ok, "{stderr}");
     assert!(
-        stderr.contains("user looks not listed: neither XDG_CONFIG_HOME nor HOME"),
+        stderr.contains(
+            "user looks not listed: no configuration directory: neither XDG_CONFIG_HOME nor HOME"
+        ),
         "{stderr}"
     );
     assert_eq!(stdout.lines().count(), BUILTIN.len());

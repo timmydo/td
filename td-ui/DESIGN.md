@@ -423,9 +423,11 @@ of its own files may name each module.
   (the variable when its value is absolute, else the fallback under an
   absolute `HOME`, else none: never a relative or shared directory),
   pure; and `from_env`, that rule over the process's environment.
-  `theme::path` and td-mail's draft directory are built on `dir`;
-  td-mail finds its configuration, cache, state and data, and td-news
-  its configuration and cache, through `from_env`. `face_file::places`
+  `theme::path`, td-mail's draft directory and td-agent's configuration
+  file and state directory are built on `dir`; td-mail finds its
+  configuration, cache, state and data, td-news its configuration and
+  cache, td-photo its configuration and cache, td-review its
+  configuration and td-agent its data through `from_env`. `face_file::places`
   keeps its own copy of the rule: td-compositor and td-recipe-eval
   compile that file by `#[path]` without this module.
 - `theme_file`: `host_path`, `theme::path` from the process's

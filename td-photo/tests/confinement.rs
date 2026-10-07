@@ -271,7 +271,8 @@ fn pure_modules_reach_no_file_environment_clock_network_or_process() {
 /// Which files may name which toolkit modules (td-ui/DESIGN.md, Public
 /// surface): the controller the pure seam, raster, chrome, control and
 /// the key list's sections; `main` the seam, the replay runner, the
-/// raster's surface and control; `window` the client, the wire, the
+/// raster's surface, control and the XDG base directories; `window` the
+/// client, the wire, the
 /// display, the font, the pointer, the socket and its worker, the seam,
 /// the raster, control, the key list, and the theme with the file it is
 /// kept in. A braced group
@@ -315,7 +316,7 @@ fn the_toolkit_is_named_only_where_the_design_says() {
     }
     assert_eq!(
         modules(&read("src/main.rs")),
-        set(&["control", "driven", "finder", "raster", "replay"])
+        set(&["control", "driven", "finder", "raster", "replay", "xdg"])
     );
     assert_eq!(
         modules(&read("src/window.rs")),
@@ -382,7 +383,9 @@ fn budgets_are_the_documented_values() {
         .map_or(main.as_str(), |(production, _)| production);
     assert!(!production.contains("remove_dir"), "a directory removal");
     assert!(main.contains("fn own_dir("));
-    assert!(main.contains("XDG_CACHE_HOME"));
+    assert!(main.contains(
+        "fn cache_dir() -> Result<PathBuf, String> {\n    let base = Base::Cache;\n    Ok(xdg::from_env(base)"
+    ));
     assert!(main.contains(".take(MAX_THUMB_FILE_BYTES + 1)"));
     assert!(main.contains("fn write_via("));
     assert!(main.contains(".ppm.{}.tmp\", std::process::id()"));

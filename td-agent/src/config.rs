@@ -938,12 +938,12 @@ pub fn path(
     // A relative XDG_CONFIG_HOME is invalid and ignored, as the XDG base
     // directory rules say, rather than read relative to the directory the
     // program happens to start in.
-    let base = match config_home.map(PathBuf::from).filter(|v| v.is_absolute()) {
-        Some(dir) => dir,
-        None => PathBuf::from(home.filter(|v| !v.is_empty())?).join(".config"),
-    };
-    base.is_absolute()
-        .then(|| base.join("td-agent").join("config"))
+    let base = td_ui::xdg::dir(
+        td_ui::xdg::Base::Config,
+        config_home.as_deref(),
+        home.as_deref(),
+    )?;
+    Some(base.join("td-agent").join("config"))
 }
 
 /// The configuration at `path`, every default when there is no file.

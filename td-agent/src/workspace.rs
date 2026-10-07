@@ -213,16 +213,8 @@ impl Repositories {
 /// refused to grants name it so, made the caller's alone and named as it
 /// resolves, since td-jail binds real paths.
 pub fn data_dir() -> Result<PathBuf, String> {
-    let absolute = |var: &str| {
-        std::env::var_os(var)
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-    };
-    let base = absolute("XDG_DATA_HOME")
-        .or_else(|| absolute("HOME").map(|home| home.join(".local/share")))
-        .ok_or(
-            "neither XDG_DATA_HOME nor HOME is an absolute path, so there is no data directory",
-        )?;
+    let data = td_ui::xdg::Base::Data;
+    let base = td_ui::xdg::from_env(data).ok_or_else(|| data.missing())?;
     data_in(&base)
 }
 

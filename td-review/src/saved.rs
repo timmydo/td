@@ -7,7 +7,6 @@
 //! an application view may write (td-authd/DESIGN.md, "Application
 //! filesystem grants").
 
-use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,15 +23,8 @@ const HEADER: &str = "# Repositories td-review opened, most recent first; one pa
 /// Where the list lives, from the environment; none without an absolute
 /// `XDG_CONFIG_HOME` or `HOME`.
 pub fn file() -> Option<PathBuf> {
-    let absolute = |name: &str| {
-        env::var_os(name)
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-    };
-    match absolute("XDG_CONFIG_HOME") {
-        Some(config) => Some(config.join("td-review").join("repositories")),
-        None => absolute("HOME").map(|home| home.join(".config/td-review/repositories")),
-    }
+    td_ui::xdg::from_env(td_ui::xdg::Base::Config)
+        .map(|config| config.join("td-review").join("repositories"))
 }
 
 /// Whether `path` can be kept: absolute, UTF-8, control-free and short
@@ -165,7 +157,8 @@ mod tests {
     use super::*;
 
     fn scratch(tag: &str) -> PathBuf {
-        let root = env::temp_dir().join(format!("td-review-saved-{tag}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("td-review-saved-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         root
     }

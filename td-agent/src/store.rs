@@ -161,19 +161,9 @@ impl StateDir {
     ) -> Result<Self, String> {
         // A relative XDG_STATE_HOME is invalid and ignored, as the XDG
         // base directory rules say; a relative HOME is still refused.
-        let base = match state_home.map(PathBuf::from).filter(|v| v.is_absolute()) {
-            Some(dir) => dir,
-            None => PathBuf::from(home.filter(|v| !v.is_empty()).ok_or(
-                "neither XDG_STATE_HOME nor HOME is set: the conversation store has no place",
-            )?)
-            .join(".local/state"),
-        };
-        if !base.is_absolute() {
-            return Err(format!(
-                "{} is not an absolute path: the conversation store needs one",
-                base.display()
-            ));
-        }
+        let state = td_ui::xdg::Base::State;
+        let base = td_ui::xdg::dir(state, state_home.as_deref(), home.as_deref())
+            .ok_or_else(|| format!("{}: the conversation store has no place", state.missing()))?;
         Ok(Self::at(base.join("td-agent")))
     }
 
