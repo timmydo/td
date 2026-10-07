@@ -55,6 +55,18 @@ pub struct Repositories {
     pub entries: Vec<Entry>,
 }
 
+/// The publish repository of `entry`, of the repository workspace named
+/// `name`, in the data directory `data` (DESIGN.md §7, Layout):
+/// `publish/<name>/<repo>.git`, as its workspace repository is under
+/// `ws/`.
+pub fn publish_repository(data: &Path, name: &str, entry: &Entry) -> Result<PathBuf, String> {
+    let repo = entry
+        .repository
+        .file_name()
+        .ok_or_else(|| format!("{} names no repository", entry.repository.display()))?;
+    Ok(data.join("publish").join(name).join(repo))
+}
+
 /// One of a repository workspace's worktrees.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Entry {

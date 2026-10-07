@@ -1809,7 +1809,7 @@ pub(crate) mod tests {
         let found: Vec<(&str, Option<&str>, Option<&str>)> = evidence
             .found
             .iter()
-            .map(|f| (f.kind, f.commit.as_deref(), f.path.as_deref()))
+            .map(|f| (f.kind.as_str(), f.commit.as_deref(), f.path.as_deref()))
             .collect();
         let at = |commit: &str| Some(commit.to_string());
         let wanted = [
@@ -1853,7 +1853,7 @@ pub(crate) mod tests {
         assert_eq!(
             evidence.found,
             [git::Found {
-                kind: "a private key",
+                kind: "a private key".into(),
                 commit: None,
                 path: Some("key.pem".into()),
             }]

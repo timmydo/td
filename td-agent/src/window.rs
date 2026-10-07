@@ -55,6 +55,77 @@ fn names(workspace: Option<&Workspace>, remote: &str, bases: &[String]) -> bool 
     !named.is_empty() && bases.iter().all(|base| named.contains(&base))
 }
 
+/// The entry of a repository workspace whose worktree's id is `worktree`,
+/// with the workspace's name, as the conversation's own record names it:
+/// no process asks to push from a worktree that is not its own.
+fn pushing_entry<'a>(
+    workspace: Option<&'a Workspace>,
+    worktree: &str,
+) -> Option<(&'a str, &'a crate::workspace::Entry)> {
+    let Some(Workspace::Repositories(repositories)) = workspace else {
+        return None;
+    };
+    let entry = repositories
+        .entries
+        .iter()
+        .find(|entry| entry.id == worktree)?;
+    Some((repositories.name.as_str(), entry))
+}
+
+/// A conversation's push, as the window staged it (DESIGN.md §9,
+/// Pushing): a push it sends must be the one staged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Pushing {
+    worktree: String,
+    commit: String,
+    branch: String,
+    /// None while it is staged; then the remote branch's tip, if it was
+    /// there.
+    staged: Option<Option<String>>,
+    /// False once the process that asked is gone: no push matches it,
+    /// and while it is staged no other stage starts, so its answer is
+    /// not taken for a later process's.
+    live: bool,
+}
+
+/// Ends conversation `id`'s push with the process that staged it: one
+/// staged goes, one being staged stays, dead, until its answer comes.
+fn ended_pushes(pushes: &mut Vec<(Id, Pushing)>, id: &Id) {
+    pushes.retain(|(of, pushing)| of != id || pushing.staged.is_none());
+    for (of, pushing) in pushes.iter_mut() {
+        if of == id {
+            pushing.live = false;
+        }
+    }
+}
+
+/// The longest field of a push's frames the window takes, so no error
+/// that names one runs past a frame.
+const PUSH_FIELD: usize = 4096;
+
+/// Whether conversation's push `push` may go as staged `pushing`: the
+/// same worktree, commit and branch, staged already, and a lease, if
+/// any, the tip it was staged against.
+fn as_staged(
+    pushing: Option<&Pushing>,
+    push: &crate::git::Push,
+    worktree: &str,
+) -> Result<(), String> {
+    let Some(pushing) = pushing.filter(|pushing| pushing.live) else {
+        return Err("no push was staged".into());
+    };
+    let Some(tip) = &pushing.staged else {
+        return Err("the push is still being staged".into());
+    };
+    if pushing.worktree != worktree || pushing.commit != push.id || pushing.branch != push.branch {
+        return Err("the push is not the one staged".into());
+    }
+    if push.lease.is_some() && push.lease != *tip {
+        return Err("a forced push expects the tip it was staged against".into());
+    }
+    Ok(())
+}
+
 /// The answer to `git_fetch` call `call`, of `remote`'s `bases`, from
 /// the store thread's `result`: each base beside its commit or why none.
 fn refetched(
@@ -263,6 +334,8 @@ pub struct Session {
     fetch_interval: Duration,
     next_refresh: Instant,
     refreshing: Vec<String>,
+    /// Each conversation's push being staged or staged last.
+    pushes: Vec<(Id, Pushing)>,
     heads: crate::upstream::Heads,
     /// What each failing background fetch, or base, last said, so it is
     /// said once until it changes or mends.
@@ -801,7 +874,10 @@ impl Session {
                     }
                 }
                 // A process started again asks nothing yet.
-                Update::Up(Up::Hello { .. }) => self.app.withdraw(&id, None),
+                Update::Up(Up::Hello { .. }) => {
+                    self.app.withdraw(&id, None);
+                    ended_pushes(&mut self.pushes, &id);
+                }
                 Update::Up(Up::Reserve {
                     id: request,
                     amount,
@@ -844,6 +920,45 @@ impl Session {
                         );
                     }
                 }
+                Update::Up(Up::Stage {
+                    call,
+                    worktree,
+                    commit,
+                    base,
+                    branch,
+                }) => {
+                    if let Err(why) = self.stage(&id, *call, worktree, commit, base, branch) {
+                        self.supervisor.answer(
+                            &id,
+                            &Down::Staged {
+                                call: *call,
+                                result: Err(why),
+                            },
+                        );
+                    }
+                }
+                Update::Up(Up::Push {
+                    call,
+                    worktree,
+                    commit,
+                    branch,
+                    lease,
+                }) => {
+                    let push = crate::git::Push {
+                        id: commit.clone(),
+                        branch: branch.clone(),
+                        lease: lease.clone(),
+                    };
+                    if let Err(why) = self.push(&id, *call, worktree, push) {
+                        self.supervisor.answer(
+                            &id,
+                            &Down::Pushed {
+                                call: *call,
+                                result: Err(why),
+                            },
+                        );
+                    }
+                }
                 Update::Up(Up::Fetch { remote, bases }) => {
                     if let Err(why) = self.fetch(&id, remote, bases) {
                         self.supervisor.answer(
@@ -866,6 +981,7 @@ impl Session {
                 Update::Restarting { .. } | Update::Failed { .. } => {
                     self.ledger.forget(&id);
                     self.app.withdraw(&id, None);
+                    ended_pushes(&mut self.pushes, &id);
                 }
                 Update::Up(Up::Event(Event {
                     kind: Kind::Finished { .. },
@@ -967,6 +1083,101 @@ impl Session {
         stores.fetch_now(id.clone(), call, parsed, bases.to_vec())
     }
 
+    /// The remote and publish repository of conversation `id`'s worktree
+    /// `worktree`, as its own record names them and the configuration
+    /// admits the remote.
+    fn publishing(
+        &self,
+        id: &Id,
+        worktree: &str,
+    ) -> Result<(crate::git::Remote, std::path::PathBuf), String> {
+        let workspace = self.state.workspace(id)?;
+        let (name, entry) = pushing_entry(workspace.as_ref(), worktree).ok_or_else(|| {
+            format!("the worktree {worktree:?} is not one of this conversation's workspace")
+        })?;
+        let remote = self.admitted(id, &entry.remote, std::slice::from_ref(&entry.base))?;
+        let data = self.data.as_ref().map_err(Clone::clone)?;
+        let publish = crate::workspace::publish_repository(data, name, entry)?;
+        Ok((remote, publish))
+    }
+
+    /// A conversation's `git_push`, call `call` (DESIGN.md §9, Pushing):
+    /// its export, in its push pack, staged against the remote's tip;
+    /// answered with `Staged`.
+    fn stage(
+        &mut self,
+        id: &Id,
+        call: u64,
+        worktree: &str,
+        commit: &str,
+        base: &str,
+        branch: &str,
+    ) -> Result<(), String> {
+        if [worktree, commit, base, branch]
+            .iter()
+            .any(|field| field.len() > PUSH_FIELD)
+        {
+            return Err(format!("a field of the push is past {PUSH_FIELD} bytes"));
+        }
+        // One at a time: a stage is a fetch, an import and a scan, and
+        // runs before other conversations' background fetches.
+        let staging = |(of, pushing): &(Id, Pushing)| of == id && pushing.staged.is_none();
+        if self.pushes.iter().any(staging) {
+            return Err("this conversation's last push is still being staged".into());
+        }
+        let (remote, publish) = self.publishing(id, worktree)?;
+        let staging = crate::git::Staging {
+            publish,
+            pack: self.state.push_pack(id),
+            id: commit.to_string(),
+            base: base.to_string(),
+            branch: branch.to_string(),
+        };
+        self.stores()?.stage(id.clone(), call, remote, staging)?;
+        self.pushes.retain(|(of, _)| of != id);
+        self.pushes.push((
+            id.clone(),
+            Pushing {
+                worktree: worktree.to_string(),
+                commit: commit.to_string(),
+                branch: branch.to_string(),
+                staged: None,
+                live: true,
+            },
+        ));
+        Ok(())
+    }
+
+    /// Call `call`'s push, decided, sent from the publish repository;
+    /// answered with `Pushed`.
+    fn push(
+        &mut self,
+        id: &Id,
+        call: u64,
+        worktree: &str,
+        push: crate::git::Push,
+    ) -> Result<(), String> {
+        if [worktree, &push.id, &push.branch]
+            .into_iter()
+            .chain(push.lease.as_deref())
+            .any(|field| field.len() > PUSH_FIELD)
+        {
+            return Err(format!("a field of the push is past {PUSH_FIELD} bytes"));
+        }
+        let pushing = self
+            .pushes
+            .iter()
+            .find(|(of, _)| of == id)
+            .map(|(_, pushing)| pushing);
+        as_staged(pushing, &push, worktree)?;
+        let (remote, publish) = self.publishing(id, worktree)?;
+        self.stores()?
+            .push(id.clone(), call, remote, publish, push)?;
+        // Each staged push is sent once.
+        self.pushes.retain(|(of, _)| of != id);
+        Ok(())
+    }
+
     /// The store thread, or why there is none.
     fn stores(&self) -> Result<&crate::git::Service, String> {
         self.stores.as_ref().ok_or_else(|| match &self.data {
@@ -1031,6 +1242,32 @@ impl Session {
                     }
                     self.supervisor
                         .answer(&conversation, &Down::Fetched { remote, result });
+                }
+                crate::git::Done::Staged {
+                    asker: (conversation, call),
+                    result,
+                } => {
+                    match &result {
+                        Ok(staged) => {
+                            self.pushes
+                                .retain(|(of, pushing)| *of != conversation || pushing.live);
+                            for (of, pushing) in &mut self.pushes {
+                                if *of == conversation && pushing.staged.is_none() {
+                                    pushing.staged = Some(staged.tip.clone());
+                                }
+                            }
+                        }
+                        Err(_) => self.pushes.retain(|(of, _)| *of != conversation),
+                    }
+                    self.supervisor
+                        .answer(&conversation, &Down::Staged { call, result });
+                }
+                crate::git::Done::Pushed {
+                    asker: (conversation, call),
+                    result,
+                } => {
+                    self.supervisor
+                        .answer(&conversation, &Down::Pushed { call, result });
                 }
                 crate::git::Done::Refreshed {
                     remote,
@@ -2018,6 +2255,7 @@ pub fn run(
         fetch_interval: config.fetch_interval(),
         next_refresh: Instant::now(),
         refreshing: Vec::new(),
+        pushes: Vec::new(),
         heads: crate::upstream::Heads::default(),
         troubles: std::collections::BTreeMap::new(),
         mode: config.mode,
@@ -2168,7 +2406,8 @@ fn remember_crossing(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
-        default_model, forget_rules, held, names, refetched, remember, remember_crossing, set_mode,
+        as_staged, default_model, ended_pushes, forget_rules, held, names, pushing_entry,
+        refetched, remember, remember_crossing, set_mode,
     };
     use crate::protocol::Down;
     use crate::workspace::Workspace;
@@ -2295,7 +2534,7 @@ mod tests {
         };
         let id = crate::store::Id::random().unwrap();
         let made = crate::workspace::plan(&template, &id, "/d".as_ref(), "/h".as_ref(), 0).unwrap();
-        let workspace = Workspace::Repositories(made);
+        let workspace = Workspace::Repositories(made.clone());
         let remote = "https://example.org/a/td";
         let bases = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
         assert!(names(Some(&workspace), remote, &bases(&["main", "next"])));
@@ -2328,6 +2567,104 @@ mod tests {
                 remote: remote.into(),
                 result: Err("unreachable".into()),
             }
+        );
+        // A push is from one of its own worktrees, whose publish
+        // repository sits beside its workspace repository.
+        let first = made.entries.first().unwrap();
+        let (name, entry) = pushing_entry(Some(&workspace), &first.id).unwrap();
+        assert_eq!((name, entry), (made.name.as_str(), first));
+        assert!(pushing_entry(Some(&workspace), "elsewhere").is_none());
+        assert!(pushing_entry(Some(&Workspace::Scratch), &first.id).is_none());
+        assert!(pushing_entry(None, &first.id).is_none());
+        let publish = crate::workspace::publish_repository("/d".as_ref(), name, entry).unwrap();
+        assert_eq!(
+            publish,
+            std::path::Path::new("/d/publish")
+                .join(name)
+                .join(entry.repository.file_name().unwrap())
+        );
+        assert!(entry
+            .repository
+            .starts_with(std::path::Path::new("/d/ws").join(name)));
+    }
+
+    /// A push goes only as staged: the same worktree, commit and branch,
+    /// staged already, and forced only against the tip it was staged at.
+    #[test]
+    fn a_push_goes_only_as_it_was_staged() {
+        let tip = "c".repeat(40);
+        let pushing = |staged: Option<Option<String>>| super::Pushing {
+            worktree: "td".into(),
+            commit: "a".repeat(40),
+            branch: "agent".into(),
+            staged,
+            live: true,
+        };
+        let push = |commit: &str, branch: &str, lease: Option<&str>| crate::git::Push {
+            id: commit.to_string(),
+            branch: branch.to_string(),
+            lease: lease.map(str::to_string),
+        };
+        let a = "a".repeat(40);
+        let staged = pushing(Some(Some(tip.clone())));
+        assert!(as_staged(Some(&staged), &push(&a, "agent", None), "td").is_ok());
+        assert!(as_staged(Some(&staged), &push(&a, "agent", Some(&tip)), "td").is_ok());
+        for (pushing, push, worktree) in [
+            (None, push(&a, "agent", None), "td"),
+            (Some(pushing(None)), push(&a, "agent", None), "td"),
+            (Some(staged.clone()), push(&a, "agent", None), "other"),
+            (
+                Some(staged.clone()),
+                push(&"b".repeat(40), "agent", None),
+                "td",
+            ),
+            (Some(staged.clone()), push(&a, "main", None), "td"),
+            (Some(staged.clone()), push(&a, "agent", Some(&a)), "td"),
+            (
+                Some(pushing(Some(None))),
+                push(&a, "agent", Some(&tip)),
+                "td",
+            ),
+            (
+                Some(super::Pushing {
+                    live: false,
+                    ..staged.clone()
+                }),
+                push(&a, "agent", None),
+                "td",
+            ),
+        ] {
+            assert!(
+                as_staged(pushing.as_ref(), &push, worktree).is_err(),
+                "{push:?}"
+            );
+        }
+        // A process gone ends its push: one staged goes, one being
+        // staged stays, dead; another conversation's stays as it was.
+        let (one, other) = (
+            crate::store::Id::random().unwrap(),
+            crate::store::Id::random().unwrap(),
+        );
+        let mut pushes = vec![
+            (one.clone(), staged.clone()),
+            (other.clone(), staged.clone()),
+        ];
+        ended_pushes(&mut pushes, &one);
+        assert_eq!(pushes, vec![(other.clone(), staged.clone())]);
+        let mut pushes = vec![(one.clone(), pushing(None)), (other.clone(), pushing(None))];
+        ended_pushes(&mut pushes, &one);
+        assert_eq!(
+            pushes,
+            vec![
+                (
+                    one,
+                    super::Pushing {
+                        live: false,
+                        ..pushing(None)
+                    }
+                ),
+                (other, pushing(None)),
+            ]
         );
     }
 

@@ -183,6 +183,13 @@ impl StateDir {
         self.conversations().join(id.as_str())
     }
 
+    /// Where conversation `id`'s `git_push` writes its export's pack and
+    /// the git worker imports it from (DESIGN.md §9, Pushing): in the
+    /// conversation's own directory, which no jail can write.
+    pub fn push_pack(&self, id: &Id) -> PathBuf {
+        self.conversation(id).join("push.pack")
+    }
+
     /// Makes the state directory and its conversations directory, each
     /// private to the caller, when they are missing.
     pub fn ensure(&self) -> Result<(), String> {

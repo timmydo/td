@@ -3219,6 +3219,43 @@ remote said on standard error, a credential helper's or ssh's words
 included, made visible; an exit of 1 is the remote's refusal, any other
 a failure to push.
 
+**As built (increment 14, the push's wiring).** A conversation process
+asks the window to stage a push with `Up::Stage` (its call, the
+worktree's id, the exported commit, the base it was exported from, and
+the branch) and to send one with `Up::Push` (its call, the worktree's
+id, the commit, the branch, and the id a forced push expects), answered
+with `Down::Staged` (the remote branch's tip and the evidence, or why
+not) and `Down::Pushed` (what git and the remote said, or why not). The
+window answers only for a worktree its own record of that conversation's
+workspace names, admits that worktree's remote as a fetch is admitted,
+and derives the rest itself: the publish repository,
+`publish/<name>/<repo>.git` beside the workspace repository under `ws/`,
+and the export's pack, `push.pack` in the conversation's own directory,
+which no jail can write; the conversation process names neither. It
+stages one push per conversation at a time, since a stage is a fetch, an
+import and a scan run ahead of queued background fetches, and keeps what
+it staged: a push it sends must be that one, the same worktree, commit
+and branch, sent once, and forced only against the tip it was staged at.
+The record ends with the process that asked: a new process, or one
+restarted or failed, finds none, and a stage still running when it ended
+is kept, matching no push and holding off another stage, until its
+answer comes. The worker refuses a base the remote's store does not
+hold, so a commit the pack brought cannot hide those before it from the
+evidence, and a branch that names a ref. Both go to the store thread,
+which runs them ahead of queued background fetches, as it runs a
+preparation and a `git_fetch`, and answers the conversation and call
+that asked. So that the evidence crosses in one frame, every subject and
+path it names is made visible and cut to 256 bytes where a character
+ends, an ellipsis saying so (a kind is one of the scanner's own short
+names), though matches and binary files are told apart by their whole
+paths, a match by a hash of it keyed afresh each scan and carried from
+the objects' pass to the diffs', so none is counted twice: escaped, the
+largest evidence is under 1 MiB, and a frame whose lists pass the
+evidence's bounds is refused. `publish()` makes `objects/info` itself
+before writing the alternates, so a stage that loses a race to make the
+repository does not fail on it. Nothing sends `Up::Stage` yet:
+`git_push` will.
+
 ## 10. Network policy
 
 A workspace has one of three network policies, shown in the status row:

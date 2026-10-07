@@ -140,6 +140,18 @@ pub enum Down {
         remote: String,
         result: Result<Resolved, String>,
     },
+    /// The answer to a `Stage`, call `call`'s: the remote branch's tip
+    /// and the evidence against it, or why the push was not staged.
+    Staged {
+        call: u64,
+        result: Result<crate::git::Staged, String>,
+    },
+    /// The answer to a `Push`, call `call`'s: what git and the remote
+    /// said, or why it was not pushed.
+    Pushed {
+        call: u64,
+        result: Result<String, String>,
+    },
 }
 
 /// Bases fetched, each with its commit or why it has none.
@@ -280,6 +292,27 @@ pub enum Up {
         call: u64,
         remote: String,
         bases: Vec<String>,
+    },
+    /// `git_push`, call `call`'s (DESIGN.md §9, Pushing): commit
+    /// `commit` of worktree `worktree`, exported from `base` into the
+    /// conversation's push pack, staged to go to branch `branch` of the
+    /// worktree's remote; answered with `Staged`.
+    Stage {
+        call: u64,
+        worktree: String,
+        commit: String,
+        base: String,
+        branch: String,
+    },
+    /// Call `call`'s push, staged and decided: `commit` to branch
+    /// `branch` of worktree `worktree`'s remote, `lease` the id expected
+    /// there when forced; answered with `Pushed`.
+    Push {
+        call: u64,
+        worktree: String,
+        commit: String,
+        branch: String,
+        lease: Option<String>,
     },
 }
 
@@ -466,6 +499,147 @@ fn instructions(value: &Json, ids: &[String]) -> Result<Vec<crate::repo::Instruc
 /// many as a repository workspace has worktrees.
 const MAX_STRINGS: usize = crate::workspace::MAX_ENTRIES;
 
+/// A staged push's tip and evidence as they cross.
+fn staged_pairs(staged: &crate::git::Staged) -> Vec<(String, Json)> {
+    let evidence = &staged.evidence;
+    let text = |text: &str| Json::Str(text.to_string());
+    let or_null = |value: &Option<String>| value.as_deref().map_or(Json::Null, text);
+    vec![
+        ("tip".into(), or_null(&staged.tip)),
+        ("merge_base".into(), or_null(&evidence.merge_base)),
+        (
+            "commits".into(),
+            Json::Arr(
+                evidence
+                    .commits
+                    .iter()
+                    .map(|(id, subject)| Json::Arr(vec![text(id), text(subject)]))
+                    .collect(),
+            ),
+        ),
+        ("more_commits".into(), Json::from(evidence.more_commits)),
+        (
+            "paths".into(),
+            Json::Arr(
+                evidence
+                    .paths
+                    .iter()
+                    .map(|(path, lines)| {
+                        let (added, removed) = lines.map_or((Json::Null, Json::Null), |(a, r)| {
+                            (Json::from(a), Json::from(r))
+                        });
+                        Json::Arr(vec![text(path), added, removed])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("more_paths".into(), Json::from(evidence.more_paths)),
+        (
+            "binaries".into(),
+            Json::Arr(evidence.binaries.iter().map(|path| text(path)).collect()),
+        ),
+        ("more_binaries".into(), Json::from(evidence.more_binaries)),
+        (
+            "found".into(),
+            Json::Arr(
+                evidence
+                    .found
+                    .iter()
+                    .map(|found| {
+                        Json::Arr(vec![
+                            text(&found.kind),
+                            or_null(&found.commit),
+                            or_null(&found.path),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("more_found".into(), Json::from(evidence.more_found)),
+    ]
+}
+
+/// A member that is a list of at most `most` rows, each a list.
+fn rows<'a>(value: &'a Json, name: &str, most: usize) -> Result<Vec<&'a [Json]>, String> {
+    let rows = value
+        .get(name)
+        .and_then(Json::as_arr)
+        .ok_or_else(|| format!("no {name}"))?;
+    if rows.len() > most {
+        return Err(format!("{name} holds more than {most} items"));
+    }
+    rows.iter()
+        .map(|row| {
+            row.as_arr()
+                .ok_or_else(|| format!("{name} holds something other than a list"))
+        })
+        .collect()
+}
+
+/// A row's text at `at`, none for null when `null` allows it.
+fn cell(row: &[Json], at: usize, null: bool) -> Result<Option<String>, String> {
+    match row.get(at) {
+        Some(Json::Str(text)) => Ok(Some(text.clone())),
+        Some(Json::Null) if null => Ok(None),
+        _ => Err("a row holds the wrong thing".into()),
+    }
+}
+
+/// A staged push's tip and evidence, from the members `staged_pairs`
+/// makes: each list held to the evidence's own bounds.
+fn staged(value: &Json) -> Result<crate::git::Staged, String> {
+    use crate::git::{MAX_COMMITS, MAX_FOUND, MAX_PATHS};
+    let text =
+        |row: &[Json], at| cell(row, at, false)?.ok_or_else(|| "a row lacks its text".to_string());
+    let mut evidence = crate::git::Evidence {
+        merge_base: maybe(value, "merge_base")?,
+        more_commits: number(value, "more_commits")?,
+        more_paths: number(value, "more_paths")?,
+        more_binaries: number(value, "more_binaries")?,
+        more_found: number(value, "more_found")?,
+        ..crate::git::Evidence::default()
+    };
+    for row in rows(value, "commits", MAX_COMMITS)? {
+        evidence.commits.push((text(row, 0)?, text(row, 1)?));
+    }
+    for row in rows(value, "paths", MAX_PATHS)? {
+        let lines = match (row.get(1), row.get(2)) {
+            (Some(Json::Null), Some(Json::Null)) => None,
+            (Some(added), Some(removed)) => Some((
+                added.as_u64().ok_or("a path's lines are not numbers")?,
+                removed.as_u64().ok_or("a path's lines are not numbers")?,
+            )),
+            _ => return Err("a path lacks its lines".into()),
+        };
+        evidence.paths.push((text(row, 0)?, lines));
+    }
+    evidence.binaries = value
+        .get("binaries")
+        .and_then(Json::as_arr)
+        .ok_or("no binaries")?
+        .iter()
+        .map(|path| {
+            path.as_str()
+                .map(str::to_string)
+                .ok_or("binaries holds something other than text")
+        })
+        .collect::<Result<_, _>>()?;
+    if evidence.binaries.len() > MAX_PATHS {
+        return Err(format!("binaries holds more than {MAX_PATHS} items"));
+    }
+    for row in rows(value, "found", MAX_FOUND)? {
+        evidence.found.push(crate::git::Found {
+            kind: text(row, 0)?,
+            commit: cell(row, 1, true)?,
+            path: cell(row, 2, true)?,
+        });
+    }
+    Ok(crate::git::Staged {
+        tip: maybe(value, "tip")?,
+        evidence,
+    })
+}
+
 fn number(value: &Json, name: &str) -> Result<u64, String> {
     value
         .get(name)
@@ -635,6 +809,31 @@ impl Down {
                     ),
                 ],
             ),
+            Self::Staged { call, result } => {
+                let mut pairs = vec![("call".into(), Json::from(*call))];
+                match result {
+                    Ok(staged) => {
+                        pairs.push(("error".into(), Json::Null));
+                        pairs.extend(staged_pairs(staged));
+                    }
+                    Err(why) => pairs.push(("error".into(), Json::Str(why.clone()))),
+                }
+                typed("staged", pairs)
+            }
+            Self::Pushed { call, result } => {
+                let (said, error) = match result {
+                    Ok(said) => (Json::Str(said.clone()), Json::Null),
+                    Err(why) => (Json::Null, Json::Str(why.clone())),
+                };
+                typed(
+                    "pushed",
+                    vec![
+                        ("call".into(), Json::from(*call)),
+                        ("said".into(), said),
+                        ("error".into(), error),
+                    ],
+                )
+            }
             Self::Refetched {
                 call,
                 remote,
@@ -858,6 +1057,21 @@ impl Down {
                     ids,
                 })
             }
+            Some("staged") => Ok(Self::Staged {
+                call: number(&value, "call")?,
+                result: match maybe(&value, "error")? {
+                    Some(why) => Err(why),
+                    None => Ok(staged(&value)?),
+                },
+            }),
+            Some("pushed") => Ok(Self::Pushed {
+                call: number(&value, "call")?,
+                result: match (maybe(&value, "said")?, maybe(&value, "error")?) {
+                    (Some(said), None) => Ok(said),
+                    (None, Some(why)) => Err(why),
+                    _ => return Err("pushed holds neither or both of what was said and why".into()),
+                },
+            }),
             Some("refetched") => Ok(Self::Refetched {
                 call: number(&value, "call")?,
                 remote: string(&value, "remote")?,
@@ -983,6 +1197,38 @@ impl Up {
                         "bases".into(),
                         Json::Arr(bases.iter().cloned().map(Json::Str).collect()),
                     ),
+                ],
+            ),
+            Self::Stage {
+                call,
+                worktree,
+                commit,
+                base,
+                branch,
+            } => typed(
+                "stage",
+                vec![
+                    ("call".into(), Json::from(*call)),
+                    ("worktree".into(), Json::Str(worktree.clone())),
+                    ("commit".into(), Json::Str(commit.clone())),
+                    ("base".into(), Json::Str(base.clone())),
+                    ("branch".into(), Json::Str(branch.clone())),
+                ],
+            ),
+            Self::Push {
+                call,
+                worktree,
+                commit,
+                branch,
+                lease,
+            } => typed(
+                "push",
+                vec![
+                    ("call".into(), Json::from(*call)),
+                    ("worktree".into(), Json::Str(worktree.clone())),
+                    ("commit".into(), Json::Str(commit.clone())),
+                    ("branch".into(), Json::Str(branch.clone())),
+                    ("lease".into(), optional(lease)),
                 ],
             ),
             Self::Refetch {
@@ -1185,6 +1431,20 @@ impl Up {
                 remote: string(&value, "remote")?,
                 bases: strings(&value, "bases")?,
             },
+            Some("stage") => Self::Stage {
+                call: number(&value, "call")?,
+                worktree: string(&value, "worktree")?,
+                commit: string(&value, "commit")?,
+                base: string(&value, "base")?,
+                branch: string(&value, "branch")?,
+            },
+            Some("push") => Self::Push {
+                call: number(&value, "call")?,
+                worktree: string(&value, "worktree")?,
+                commit: string(&value, "commit")?,
+                branch: string(&value, "branch")?,
+                lease: maybe(&value, "lease")?,
+            },
             Some("refetch") => Self::Refetch {
                 call: number(&value, "call")?,
                 remote: string(&value, "remote")?,
@@ -1332,6 +1592,150 @@ mod tests {
         assert_eq!(Up::decode(&most.encode()).unwrap(), most);
         let e = Up::decode(&fetch(MAX_STRINGS + 1).encode()).unwrap_err();
         assert!(e.contains("more than 32"), "{e}");
+    }
+
+    /// A push's stage and send cross whole; the largest evidence the
+    /// scan can name, every name its longest and of the text JSON
+    /// escapes most, fits one frame; a list past the evidence's bounds,
+    /// or a row without its parts, is refused.
+    #[test]
+    fn a_pushs_frames_round_trip_and_the_largest_evidence_fits_one() {
+        use crate::git::{Evidence, Found, Staged, MAX_COMMITS, MAX_FOUND, MAX_PATHS, NAME};
+        for up in [
+            Up::Stage {
+                call: 7,
+                worktree: "td".into(),
+                commit: "a".repeat(40),
+                base: "b".repeat(40),
+                branch: "agent".into(),
+            },
+            Up::Push {
+                call: 8,
+                worktree: "td".into(),
+                commit: "a".repeat(40),
+                branch: "agent".into(),
+                lease: Some("c".repeat(40)),
+            },
+            Up::Push {
+                call: 9,
+                worktree: "td".into(),
+                commit: "a".repeat(40),
+                branch: "agent".into(),
+                lease: None,
+            },
+        ] {
+            assert_eq!(Up::decode(&up.encode()).unwrap(), up);
+        }
+        let worst = "\"".repeat(NAME);
+        let id = "a".repeat(64);
+        let staged = Staged {
+            tip: Some(id.clone()),
+            evidence: Evidence {
+                merge_base: Some(id.clone()),
+                commits: vec![(id.clone(), worst.clone()); MAX_COMMITS],
+                more_commits: u64::MAX,
+                paths: vec![(worst.clone(), Some((u64::MAX, u64::MAX))); MAX_PATHS],
+                more_paths: u64::MAX,
+                binaries: vec![worst.clone(); MAX_PATHS],
+                more_binaries: u64::MAX,
+                found: vec![
+                    Found {
+                        kind: worst.clone(),
+                        commit: Some(id.clone()),
+                        path: Some(worst.clone()),
+                    };
+                    MAX_FOUND
+                ],
+                more_found: u64::MAX,
+            },
+        };
+        let down = Down::Staged {
+            call: 7,
+            result: Ok(staged.clone()),
+        };
+        let bytes = down.encode();
+        assert!(bytes.len() <= crate::frame::MAX_FRAME, "{}", bytes.len());
+        assert_eq!(Down::decode(&bytes).unwrap(), down);
+        let mut small = Staged {
+            tip: None,
+            evidence: Evidence::default(),
+        };
+        small.evidence.paths = vec![("blob.bin".into(), None), ("a.txt".into(), Some((1, 2)))];
+        small.evidence.found = vec![Found {
+            kind: "a GitHub token".into(),
+            commit: None,
+            path: None,
+        }];
+        for down in [
+            Down::Staged {
+                call: 1,
+                result: Ok(small),
+            },
+            Down::Staged {
+                call: 2,
+                result: Err("the remote is not admitted".into()),
+            },
+            Down::Pushed {
+                call: 3,
+                result: Ok("=\trefs/heads/agent".into()),
+            },
+            Down::Pushed {
+                call: 4,
+                result: Err("the push was refused".into()),
+            },
+        ] {
+            assert_eq!(Down::decode(&down.encode()).unwrap(), down);
+        }
+        // Past a bound, or a row short of its parts, is no answer.
+        let over = |evidence: Evidence| {
+            Down::Staged {
+                call: 1,
+                result: Ok(Staged {
+                    tip: None,
+                    evidence,
+                }),
+            }
+            .encode()
+        };
+        for evidence in [
+            Evidence {
+                commits: vec![(id.clone(), String::new()); MAX_COMMITS + 1],
+                ..Evidence::default()
+            },
+            Evidence {
+                paths: vec![(String::new(), None); MAX_PATHS + 1],
+                ..Evidence::default()
+            },
+            Evidence {
+                binaries: vec![String::new(); MAX_PATHS + 1],
+                ..Evidence::default()
+            },
+            Evidence {
+                found: vec![
+                    Found {
+                        kind: String::new(),
+                        commit: None,
+                        path: None,
+                    };
+                    MAX_FOUND + 1
+                ],
+                ..Evidence::default()
+            },
+        ] {
+            assert!(Down::decode(&over(evidence)).is_err());
+        }
+        for paths in [r#"[["a",1]]"#, r#"[["a",null,1]]"#, r#"[["a",1,null]]"#] {
+            let short = format!(
+                r#"{{"type":"staged","call":1,"error":null,"tip":null,"merge_base":null,"commits":[],"more_commits":0,"paths":{paths},"more_paths":0,"binaries":[],"more_binaries":0,"found":[],"more_found":0}}"#
+            );
+            assert!(Down::decode(short.as_bytes()).is_err(), "{paths}");
+        }
+        for pushed in [
+            br#"{"type":"pushed","call":1,"said":null,"error":null}"#.as_slice(),
+            br#"{"type":"pushed","call":1,"said":"a","error":"b"}"#,
+        ] {
+            assert!(Down::decode(pushed).is_err());
+        }
     }
 
     #[test]

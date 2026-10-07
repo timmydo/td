@@ -940,6 +940,32 @@ enum Job {
         bases: Vec<String>,
         asker: Option<(crate::store::Id, u64)>,
     },
+    /// A conversation's `git_push`, `asker` naming it and its call:
+    /// stage the push (`Worker::stage`).
+    Stage {
+        asker: (crate::store::Id, u64),
+        remote: Remote,
+        staging: Staging,
+    },
+    /// Send it (`Worker::push`), once decided.
+    Push {
+        asker: (crate::store::Id, u64),
+        remote: Remote,
+        publish: PathBuf,
+        push: Push,
+    },
+}
+
+/// What staging a push takes, beside its remote: the publish repository,
+/// the export's pack, the commit, the base it was exported from, and the
+/// branch it goes to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Staging {
+    pub publish: PathBuf,
+    pub pack: PathBuf,
+    pub id: String,
+    pub base: String,
+    pub branch: String,
 }
 
 /// An answer, for the conversation that asked or for the window, with
@@ -958,6 +984,17 @@ pub enum Done {
         bases: Vec<String>,
         result: Result<Vec<Result<String, String>>, String>,
         asker: Option<(crate::store::Id, u64)>,
+    },
+    /// A push staged, or why not, for the conversation and call that
+    /// asked.
+    Staged {
+        asker: (crate::store::Id, u64),
+        result: Result<Staged, String>,
+    },
+    /// A push sent: what git and the remote said, or why it was not.
+    Pushed {
+        asker: (crate::store::Id, u64),
+        result: Result<String, String>,
     },
 }
 
@@ -1010,6 +1047,37 @@ impl Service {
                             },
                             remote: remote.url(),
                             bases,
+                            asker,
+                        },
+                        Job::Stage {
+                            asker,
+                            remote,
+                            staging,
+                        } => Done::Staged {
+                            result: match &made {
+                                Ok(made) => made.stage(
+                                    &stores,
+                                    &staging.publish,
+                                    &remote,
+                                    &staging.pack,
+                                    &staging.id,
+                                    &staging.base,
+                                    &staging.branch,
+                                ),
+                                Err(why) => Err(unmade(why)),
+                            },
+                            asker,
+                        },
+                        Job::Push {
+                            asker,
+                            remote,
+                            publish,
+                            push,
+                        } => Done::Pushed {
+                            result: match &made {
+                                Ok(made) => made.push(&publish, &remote, &push),
+                                Err(why) => Err(unmade(why)),
+                            },
                             asker,
                         },
                     };
@@ -1071,6 +1139,44 @@ impl Service {
             .map_err(|_| "the store thread has ended".to_string())
     }
 
+    /// Asks for a push staged, for `conversation`'s `git_push`, call
+    /// `call`, which waits on it.
+    pub fn stage(
+        &self,
+        conversation: crate::store::Id,
+        call: u64,
+        remote: Remote,
+        staging: Staging,
+    ) -> Result<(), String> {
+        self.jobs
+            .send(Job::Stage {
+                asker: (conversation, call),
+                remote,
+                staging,
+            })
+            .map_err(|_| "the store thread has ended".to_string())
+    }
+
+    /// Asks for a push sent, for `conversation`'s `git_push`, call
+    /// `call`, once decided.
+    pub fn push(
+        &self,
+        conversation: crate::store::Id,
+        call: u64,
+        remote: Remote,
+        publish: PathBuf,
+        push: Push,
+    ) -> Result<(), String> {
+        self.jobs
+            .send(Job::Push {
+                asker: (conversation, call),
+                remote,
+                publish,
+                push,
+            })
+            .map_err(|_| "the store thread has ended".to_string())
+    }
+
     /// The answers that have come.
     pub fn answers(&self) -> Vec<Done> {
         self.done.try_iter().collect()
@@ -1078,16 +1184,19 @@ impl Service {
 }
 
 /// The job the store thread runs next: the first conversation's ask
-/// waiting, a preparation or a `git_fetch`, so neither waits behind a
-/// queued background fetch, only one already running; else the oldest
-/// refresh.
+/// waiting, a preparation, a `git_fetch` or a push's stage or send, so
+/// none waits behind a queued background fetch, only one already
+/// running; else the oldest refresh.
 fn next(queue: &mut std::collections::VecDeque<Job>) -> Option<Job> {
     let at = queue
         .iter()
         .position(|job| {
             matches!(
                 job,
-                Job::Prepare { .. } | Job::Refresh { asker: Some(_), .. }
+                Job::Prepare { .. }
+                    | Job::Refresh { asker: Some(_), .. }
+                    | Job::Stage { .. }
+                    | Job::Push { .. }
             )
         })
         .unwrap_or(0);
@@ -1130,12 +1239,19 @@ impl Worker {
         }
         let objects = std::fs::canonicalize(store.join("objects"))
             .map_err(|e| format!("{}: {e}", store.display()))?;
-        let alternates = publish.join("objects/info/alternates");
+        // A second stage's `init` may not have made it yet.
+        let info = publish.join("objects/info");
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&info)
+            .map_err(|e| format!("{}: {e}", info.display()))?;
+        let alternates = info.join("alternates");
         // Written whole under a name of this call's own, so a second
         // stage's write never mixes with it.
         static CALLS: AtomicU64 = AtomicU64::new(0);
-        let new = publish.join(format!(
-            "objects/info/alternates.{}.{}",
+        let new = info.join(format!(
+            "alternates.{}.{}",
             std::process::id(),
             CALLS.fetch_add(1, Ordering::Relaxed)
         ));
@@ -1245,9 +1361,9 @@ impl Worker {
 
 /// The most commits, paths, binary files and matches the evidence names;
 /// the rest are counted.
-const MAX_COMMITS: usize = 200;
-const MAX_PATHS: usize = 500;
-const MAX_FOUND: usize = 50;
+pub const MAX_COMMITS: usize = 200;
+pub const MAX_PATHS: usize = 500;
+pub const MAX_FOUND: usize = 50;
 /// The most bytes the scan reads in each of its passes; what is past it
 /// is a match of its own, unscanned.
 pub const MAX_SCANNED: u64 = 512 << 20;
@@ -1259,8 +1375,9 @@ const EVIDENCE_TIME: Duration = Duration::from_secs(600);
 /// pieces that overlap by `OVERLAP`, so no shape is cut in two.
 const SCAN_LINE: usize = 64 * 1024;
 pub(crate) const OVERLAP: usize = 512;
-/// The longest subject named, in characters.
-const SUBJECT: usize = 200;
+/// The longest subject, path or kind the evidence names, in bytes, so
+/// the whole of it, escaped, fits a frame (`protocol::Down::Staged`).
+pub const NAME: usize = 256;
 /// How much of a commit object is kept for its subject.
 const COMMIT_HEAD: usize = 64 * 1024;
 /// How much of a blob git reads to call it binary: a NUL among them.
@@ -1297,7 +1414,7 @@ pub struct Evidence {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Found {
-    pub kind: &'static str,
+    pub kind: String,
     /// The commit whose object or own diff holds it; none for a file's
     /// whole text or a directory's names, which commits share.
     pub commit: Option<String>,
@@ -1348,9 +1465,31 @@ struct Scanner {
     left: (u64, u64),
     found: Vec<Found>,
     more: u64,
+    seen: Seen,
 }
 
+/// The matches a scan noted, by kind, commit and a hash of the whole
+/// path, keyed afresh each scan so no path is made to collide with
+/// another; carried from one pass to the next.
+#[derive(Default)]
+struct Seen {
+    keys: std::collections::HashSet<(String, Option<String>, Option<u64>)>,
+    hasher: std::collections::hash_map::RandomState,
+}
+
+/// The most matches the scan tells apart.
+const SEEN: usize = 4096;
+
 impl Scanner {
+    /// The next pass, in `mode`, of the same scan: what this one found
+    /// and told apart carried, so no match is counted twice.
+    fn then(self, mode: Mode) -> Self {
+        Self {
+            seen: self.seen,
+            ..Self::new(mode, self.found, self.more)
+        }
+    }
+
     fn new(mode: Mode, found: Vec<Found>, more: u64) -> Self {
         Self {
             mode,
@@ -1361,6 +1500,7 @@ impl Scanner {
             left: (0, 0),
             found,
             more,
+            seen: Seen::default(),
         }
     }
 
@@ -1485,17 +1625,29 @@ impl Scanner {
     }
 
     /// Notes a match of `kind` where the scan is, once.
-    fn note(&mut self, kind: &'static str) {
-        let found = Found {
-            kind,
-            commit: self.commit.clone(),
-            path: self.path.clone(),
-        };
-        if self.found.contains(&found) {
+    /// Notes a match of `kind` where the scan is, once: told apart by
+    /// its whole path, though the name kept is cut. Past `SEEN` matches
+    /// told apart, each is counted, so the count may run over, never
+    /// under.
+    fn note(&mut self, kind: &str) {
+        use std::hash::BuildHasher;
+        let path = self
+            .path
+            .as_deref()
+            .map(|path| self.seen.hasher.hash_one(path));
+        let key = (kind.to_string(), self.commit.clone(), path);
+        if self.seen.keys.contains(&key) {
             return;
         }
+        if self.seen.keys.len() < SEEN {
+            self.seen.keys.insert(key);
+        }
         if self.found.len() < MAX_FOUND {
-            self.found.push(found);
+            self.found.push(Found {
+                kind: kind.to_string(),
+                commit: self.commit.clone(),
+                path: self.path.as_deref().map(named),
+            });
         } else {
             self.more = self.more.saturating_add(1);
         }
@@ -1690,7 +1842,7 @@ impl<'a> Objects<'a> {
                     .map_or_else(|| self.id.clone(), |name| crate::tools::visible(name));
                 if self.named.insert(path.clone()) {
                     if self.binaries.len() < MAX_PATHS {
-                        self.binaries.push(path);
+                        self.binaries.push(named(&path));
                     } else {
                         self.more_binaries = self.more_binaries.saturating_add(1);
                     }
@@ -1706,10 +1858,22 @@ fn subject(head: &[u8]) -> String {
     let text = String::from_utf8_lossy(head);
     let message = text.split_once("\n\n").map_or("", |(_, message)| message);
     let line = message.lines().next().unwrap_or_default();
-    crate::tools::visible(line.trim())
-        .chars()
-        .take(SUBJECT)
-        .collect()
+    named(line.trim())
+}
+
+/// `text` as the evidence names it: made visible, and cut to `NAME`
+/// bytes where a character ends, an ellipsis saying so.
+pub fn named(text: &str) -> String {
+    let mut visible = crate::tools::visible(text);
+    if visible.len() > NAME {
+        let mut end = NAME - '…'.len_utf8();
+        while !visible.is_char_boundary(end) {
+            end -= 1;
+        }
+        visible.truncate(end);
+        visible.push('…');
+    }
+    visible
 }
 
 impl Worker {
@@ -1788,7 +1952,7 @@ impl Worker {
         );
         let mut names = std::collections::HashMap::new();
         let mut wanted = Vec::new();
-        let (found, more) = match listed {
+        let first = match listed {
             Ok(out) => {
                 for line in out.split(|b| *b == b'\n') {
                     let (object, name) = match line.iter().position(|b| *b == b' ') {
@@ -1826,12 +1990,12 @@ impl Worker {
                 evidence.commits = objects.commits;
                 evidence.binaries = objects.binaries;
                 evidence.more_binaries = objects.more_binaries;
-                (objects.scanner.found, objects.scanner.more)
+                objects.scanner
             }
             Err(Failure::TooLong) => {
                 let mut scanner = Scanner::new(Mode::Raw, Vec::new(), 0);
                 scanner.note(UNSCANNED);
-                (scanner.found, scanner.more)
+                scanner
             }
             Err(e) => return Err(format!("listing the objects: {e}")),
         };
@@ -1839,7 +2003,7 @@ impl Worker {
         // Every commit's own diff, a merge's against its first parent, so
         // what one commit adds and a later one removes is still found;
         // only what is added, so what was there already is not.
-        let mut scanner = Scanner::new(Mode::Diff, found, more);
+        let mut scanner = first.then(Mode::Diff);
         let mut log = self.command(publish);
         log.arg(&attributes).args([
             "log",
@@ -1929,6 +2093,18 @@ pub struct Push {
     pub lease: Option<String>,
 }
 
+/// `name` as a push's branch admits it: one `branch_name` admits, which
+/// starts with none of `+`, `:` and `-`, and not one beginning `refs/`,
+/// which git would make `refs/heads/refs/...`, not the branch a reader
+/// of it would think.
+pub fn push_branch(name: &str) -> Result<&str, String> {
+    let branch = branch_name(name)?;
+    if branch.starts_with("refs/") {
+        return Err(format!("{branch:?} names a ref, not a branch"));
+    }
+    Ok(branch)
+}
+
 impl Push {
     /// The one refspec pushed, `<id>:refs/heads/<branch>`, checked: the
     /// id a full object id, the branch one `branch_name` admits, which
@@ -1940,12 +2116,7 @@ impl Push {
         if !commit(&self.id) {
             return Err(format!("{:?} is not a full commit id", self.id));
         }
-        let branch = branch_name(&self.branch)?;
-        // `refs/heads/refs/heads/x` is a branch git makes, but not the
-        // one a reader of `refs/heads/x` would think.
-        if branch.starts_with("refs/") {
-            return Err(format!("{branch:?} names a ref, not a branch"));
-        }
+        let branch = push_branch(&self.branch)?;
         if let Some(lease) = self.lease.as_deref().filter(|lease| !commit(lease)) {
             return Err(format!("{lease:?} is not a full commit id"));
         }
@@ -1970,9 +2141,21 @@ impl Worker {
         base: &str,
         branch: &str,
     ) -> Result<Staged, String> {
-        let branch = branch_name(branch)?;
+        let branch = push_branch(branch)?;
         let store = self.store(stores, remote)?;
         self.fetch(&store, remote)?;
+        // The base must be the store's, what came from the remote, not
+        // a commit the export brought, which would hide those before it
+        // from the evidence.
+        let mut known = self.command(&store);
+        known
+            .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+            .arg(format!("{base}^{{commit}}"));
+        let peeled = run(&mut known, 256, LOCAL_TIME)
+            .map(|out| String::from_utf8_lossy(&out).trim().to_string());
+        if !object_id(base) || peeled.ok().as_deref() != Some(base) {
+            return Err(format!("{base} is not a commit the remote's store holds"));
+        }
         let tip = self.branch_tip(&store, branch)?;
         self.publish(publish, &store)?;
         self.import(publish, pack, id)?;
@@ -2056,7 +2239,7 @@ fn numstat(record: &[u8]) -> Option<(String, Option<(u64, u64)>)> {
         (Ok(a), Ok(r)) => Some((a, r)),
         _ => None,
     };
-    Some((crate::tools::visible(path), lines))
+    Some((named(path), lines))
 }
 
 impl std::fmt::Display for Failure {
@@ -2539,6 +2722,25 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(staged.tip.as_deref(), Some(two.as_str()));
         assert_eq!(staged.evidence.merge_base.as_deref(), Some(base.as_str()));
+        // A base the store never had, a commit the pack brought, is
+        // refused: it would hide what comes before it from the scan.
+        let four = commit("four");
+        let five = commit("five");
+        let hidden = worker
+            .stage(
+                &stores,
+                &publish,
+                &remote,
+                &packed(&five, "five.pack"),
+                &five,
+                &four,
+                "feature",
+            )
+            .unwrap_err();
+        assert!(
+            hidden.contains("not a commit the remote's store holds"),
+            "{hidden}"
+        );
         // Not a fast-forward: refused unless forced.
         let refused = worker
             .push(&publish, &remote, &push(&three, "feature", None))
@@ -2949,15 +3151,57 @@ pub(crate) mod tests {
                 let Done::Refreshed { asker, .. } = done else {
                     panic!("not a refresh's answer");
                 };
-                assert_eq!(asker, Some((id, 7)));
+                assert_eq!(asker, Some((id.clone(), 7)));
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        // A push's stage and send name theirs.
+        let remote = Remote::parse("https://example.org/a/td").unwrap();
+        let staging = Staging {
+            publish: "/p".into(),
+            pack: "/k".into(),
+            id: "a".repeat(40),
+            base: "b".repeat(40),
+            branch: "x".into(),
+        };
+        service
+            .stage(id.clone(), 8, remote.clone(), staging)
+            .unwrap();
+        let push = Push {
+            id: "a".repeat(40),
+            branch: "x".into(),
+            lease: None,
+        };
+        service
+            .push(id.clone(), 9, remote, "/p".into(), push)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut answers = Vec::new();
+        while answers.len() < 2 {
+            assert!(Instant::now() < deadline, "no answer came");
+            answers.extend(service.answers());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        match answers.as_slice() {
+            [Done::Staged {
+                asker: staged,
+                result: Err(why),
+            }, Done::Pushed {
+                asker: pushed,
+                result: Err(sent),
+            }] => {
+                assert_eq!((staged, pushed), (&(id.clone(), 8), &(id, 9)));
+                assert!(why.starts_with("the git worker"), "{why}");
+                assert!(sent.starts_with("the git worker"), "{sent}");
+            }
+            _ => panic!("not a stage's and a push's answers"),
+        }
     }
 
-    /// A conversation's ask, a preparation or a `git_fetch`, goes before
-    /// any background fetch queued ahead of it; each kind keeps its order.
+    /// A conversation's ask, a preparation, a `git_fetch` or a push's
+    /// stage or send, goes before any background fetch queued ahead of
+    /// it; each kind keeps its order.
     #[test]
     fn a_preparation_goes_before_queued_background_fetches() {
         let remote = |path: &str| Remote::parse(&format!("https://example.org/{path}")).unwrap();
@@ -2981,6 +3225,28 @@ pub(crate) mod tests {
                 remote: remote("e"),
                 bases: vec!["main".into()],
             },
+            refresh("f", false),
+            Job::Stage {
+                asker: (id.clone(), 2),
+                remote: remote("g"),
+                staging: Staging {
+                    publish: "/p".into(),
+                    pack: "/k".into(),
+                    id: "a".repeat(40),
+                    base: "b".repeat(40),
+                    branch: "x".into(),
+                },
+            },
+            Job::Push {
+                asker: (id.clone(), 3),
+                remote: remote("h"),
+                publish: "/p".into(),
+                push: Push {
+                    id: "a".repeat(40),
+                    branch: "x".into(),
+                    lease: None,
+                },
+            },
         ]
         .into();
         let order: Vec<String> = std::iter::from_fn(|| next(&mut queue))
@@ -2992,6 +3258,8 @@ pub(crate) mod tests {
                     ..
                 } => format!("fetch {}", remote.url()),
                 Job::Refresh { remote, .. } => format!("refresh {}", remote.url()),
+                Job::Stage { remote, .. } => format!("stage {}", remote.url()),
+                Job::Push { remote, .. } => format!("push {}", remote.url()),
             })
             .collect();
         assert_eq!(
@@ -3000,8 +3268,11 @@ pub(crate) mod tests {
                 "prepare https://example.org/c",
                 "fetch https://example.org/d",
                 "prepare https://example.org/e",
+                "stage https://example.org/g",
+                "push https://example.org/h",
                 "refresh https://example.org/a",
-                "refresh https://example.org/b"
+                "refresh https://example.org/b",
+                "refresh https://example.org/f"
             ]
         );
     }
@@ -3053,6 +3324,71 @@ pub(crate) mod tests {
                 assert_eq!(scanner.found[0].path.as_deref(), Some("f"));
             }
         }
+    }
+
+    /// A name is made visible and cut where a character ends, within
+    /// `NAME` bytes, an ellipsis saying so.
+    #[test]
+    fn a_name_is_cut_where_a_character_ends() {
+        assert_eq!(named("a.txt"), "a.txt");
+        assert_eq!(named("a\tb"), crate::tools::visible("a\tb"));
+        for long in ["x".repeat(NAME + 1), "é".repeat(NAME), "\n".repeat(NAME)] {
+            let cut = named(&long);
+            assert!(cut.len() <= NAME, "{}", cut.len());
+            assert!(cut.ends_with('…'), "{cut}");
+        }
+        assert_eq!(named(&"x".repeat(NAME)), "x".repeat(NAME));
+    }
+
+    /// A match the first pass found is not counted again by the next,
+    /// even past the matches kept.
+    #[test]
+    fn a_match_is_counted_once_across_passes() {
+        let mut first = Scanner::new(Mode::Raw, Vec::new(), 0);
+        for at in 0..=MAX_FOUND {
+            first.commit = Some(at.to_string());
+            first.note(UNSCANNED);
+        }
+        let (found, more) = (first.found.len(), first.more);
+        let mut next = first.then(Mode::Diff);
+        next.commit = Some("0".into());
+        next.note(UNSCANNED);
+        next.commit = Some(format!("{MAX_FOUND}"));
+        next.note(UNSCANNED);
+        assert_eq!((next.found.len(), next.more), (found, more));
+        assert_eq!((found as u64, more), (MAX_FOUND as u64, 1));
+    }
+
+    /// Two matches, or two binary files, whose long paths share the start
+    /// a name is cut to are two, not one.
+    #[test]
+    fn long_paths_cut_alike_are_told_apart() {
+        let long = "d/".repeat(150);
+        let token = format!("ghp_{}", "a".repeat(36));
+        let mut scanner = Scanner::new(Mode::Diff, Vec::new(), 0);
+        let mut text = b"\0commit c\n".to_vec();
+        for end in ["a", "b"] {
+            text.extend_from_slice(
+                format!("+++ b/{long}{end}\n@@ -0,0 +1 @@\n+{token}\n").as_bytes(),
+            );
+        }
+        scanner.take(&text);
+        scanner.finish();
+        assert_eq!(scanner.found.len(), 2, "{:?}", scanner.found);
+        assert!(scanner
+            .found
+            .iter()
+            .all(|f| f.path.as_deref().is_some_and(|p| p.len() <= NAME)));
+        let (one, two) = ("1".repeat(40), "2".repeat(40));
+        let names = std::collections::HashMap::from([
+            (one.clone(), format!("{long}a")),
+            (two.clone(), format!("{long}b")),
+        ]);
+        let mut objects = Objects::new(&names);
+        objects
+            .take(format!("{one} blob 2\n\0\0\n{two} blob 2\n\0\0\n").as_bytes())
+            .unwrap();
+        assert_eq!(objects.binaries.len(), 2, "{:?}", objects.binaries);
     }
 
     /// A hunk's header says how many of the file's lines follow it.

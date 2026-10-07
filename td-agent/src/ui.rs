@@ -1759,6 +1759,8 @@ impl App {
                 | Up::Query { .. }
                 | Up::Fetch { .. }
                 | Up::Refetch { .. }
+                | Up::Stage { .. }
+                | Up::Push { .. }
                 | Up::Heads { .. }
                 | Up::Prepared { .. }
                 | Up::Restored

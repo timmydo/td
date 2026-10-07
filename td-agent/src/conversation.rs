@@ -984,6 +984,8 @@ impl Session {
                 // waiting is not waited for either.
                 Down::Reservation { .. }
                 | Down::Refetched { .. }
+                | Down::Staged { .. }
+                | Down::Pushed { .. }
                 | Down::Resumed { .. }
                 | Down::Interrupt
                 | Down::Sent { .. }
