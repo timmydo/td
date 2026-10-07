@@ -174,7 +174,7 @@ pub fn recipe() -> Recipe {
                      e=$('{bin}' mknod {{root}}/mknod-probe b 4096 0 2>&1); \
                      [ $? -eq 1 ] || {{ echo 'mknod must refuse an unencodable major with exit 1 — truncating it silently would create a node for driver 0' >&2; exit 1; }}; \
                      printf '%s\\n' \"$e\" | grep -q 'does not fit' || {{ echo \"mknod refused the major without saying so: '$e'\" >&2; exit 1; }}; \
-                     [ ! -e {{root}}/mknod-probe ] || {{ echo 'a refused mknod must not have created anything' >&2; exit 1; }}; \
+                     [ ! -e {{root}}/mknod-probe ] && [ ! -L {{root}}/mknod-probe ] || {{ echo 'a refused mknod must not have created anything' >&2; exit 1; }}; \
                      e=$('{bin}' mknod {{root}}/mknod-probe b 7 2>&1); \
                      [ $? -eq 1 ] || {{ echo 'mknod must refuse a short operand list with exit 1' >&2; exit 1; }}; \
                      e=$('{bin}' losetup -r dev/loop0 /img 2>&1); \

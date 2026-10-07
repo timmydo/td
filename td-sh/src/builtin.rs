@@ -4049,10 +4049,34 @@ fn int_arg(s: &str) -> Result<i64, String> {
 pub fn unary_op(sh: &Shell, op: &str, arg: &str) -> Result<bool, String> {
     use std::os::unix::fs::FileTypeExt;
     let path = || sh.resolve(arg);
+    // An empty operand names no file; resolving it would test the cwd.
+    let file_test = matches!(
+        op,
+        "e" | "f"
+            | "d"
+            | "r"
+            | "w"
+            | "x"
+            | "s"
+            | "h"
+            | "L"
+            | "b"
+            | "c"
+            | "p"
+            | "S"
+            | "u"
+            | "g"
+            | "k"
+    );
+    if arg.is_empty() && file_test {
+        return Ok(false);
+    }
     Ok(match op {
         "z" => arg.is_empty(),
         "n" => !arg.is_empty(),
-        "e" => path().symlink_metadata().is_ok(),
+        // POSIX -e resolves the name: a dangling symlink does not exist (-h
+        // and -L ask about the link itself).
+        "e" => path().metadata().is_ok(),
         "f" => path().is_file(),
         "d" => path().is_dir(),
         "r" => path().exists(),
@@ -4093,6 +4117,10 @@ fn mode_bit(p: &std::path::Path, bit: u32) -> bool {
 // inode). An operand that cannot be stat'd makes the test false, as in dash.
 fn file_cmp(sh: &Shell, a: &str, op: &str, b: &str) -> bool {
     use std::os::unix::fs::MetadataExt;
+    // An empty operand names no file (stat("") is ENOENT), not the cwd.
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
     let (Ok(x), Ok(y)) = (sh.resolve(a).metadata(), sh.resolve(b).metadata()) else {
         return false;
     };
@@ -4323,6 +4351,48 @@ mod tests {
             "a stage burned ~30 ticks and `times` saw {}: {out:?}",
             after - before
         );
+    }
+
+    /// POSIX `-e` resolves the name, as BusyBox's and dash's do: a dangling
+    /// symlink does not exist, though `-h` still sees the link. A test that
+    /// guards on `[ ! -e /dev/console ]` must not take a dead link for a
+    /// console. An empty operand names no file, where resolving it against
+    /// the cwd made `[ -d "" ]` true. (The corpus cannot pin the links: its
+    /// staged externals have no ln.)
+    #[test]
+    fn exists_follows_a_symlink_and_h_sees_the_link() {
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("td-sh-test-e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = Fixture(dir.clone());
+        std::fs::write(dir.join("file"), b"").unwrap();
+        std::os::unix::fs::symlink(dir.join("file"), dir.join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.join("absent"), dir.join("dangling")).unwrap();
+        let sh = crate::exec::Shell::new_for_test();
+        let at = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let e = |name: &str| super::unary_op(&sh, "e", &at(name)).unwrap();
+        let h = |name: &str| super::unary_op(&sh, "h", &at(name)).unwrap();
+        assert!(e("file") && e("link"));
+        assert!(!e("dangling") && !e("absent"));
+        assert!(h("link") && h("dangling") && !h("file"));
+        for op in ["e", "f", "d", "r", "w", "x", "s", "h", "L"] {
+            assert!(!super::unary_op(&sh, op, "").unwrap(), "-{op} \"\"");
+        }
+        assert!(super::unary_op(&sh, "z", "").unwrap());
+        assert!(!super::unary_op(&sh, "n", "").unwrap());
+        assert!(super::unary_op(&sh, "t", "").is_err());
+        assert!(super::unary_op(&sh, "Q", "").is_err());
+        for op in ["-ef", "-nt", "-ot"] {
+            assert!(!super::file_cmp(&sh, "", op, "."), "\"\" {op} .");
+            assert!(!super::file_cmp(&sh, ".", op, ""), ". {op} \"\"");
+        }
+        drop(fixture);
     }
 
     /// `times` is a special builtin, but a missing `/proc` is not a usage error

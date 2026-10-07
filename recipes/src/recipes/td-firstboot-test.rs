@@ -255,7 +255,7 @@ pub fn recipe() -> Recipe {
                        {{ echo 'a later provision over edited application state failed; its own diagnostic:' >&2; cat \"$err\" >&2; exit 1; }}; \
                      [ \"$(cat \"$home/.td/app/mail/config/td-mail/config.toml\")\" = edited ] || \
                        {{ echo 'a later provision rewrote an operator-edited application configuration' >&2; exit 1; }}; \
-                     [ ! -e \"$home/.td/app/mail/config/td-mail/password\" ] || \
+                     [ ! -e \"$home/.td/app/mail/config/td-mail/password\" ] && [ ! -L \"$home/.td/app/mail/config/td-mail/password\" ] || \
                        {{ echo 'a later provision recreated a plaintext password file' >&2; exit 1; }}; \
                      '{bin}' provision --state-dir \"$state\" --keygen \"$stub\" --application-home \"$home\" >/dev/null 2>&1; \
                      [ $? -eq 2 ] || {{ echo 'td-firstboot must exit 2 (usage) when --application-home comes without --application-owner' >&2; exit 1; }}; \
@@ -264,7 +264,7 @@ pub fn recipe() -> Recipe {
                      out=$('{bin}' provision --state-dir \"$state\" --keygen \"$stub\" --application-home \"{{root}}/nobody\" --application-owner \"$owner\" 2>\"$err\") || \
                        {{ echo 'an absent application home must be skipped with a diagnostic, not failed: the identity does not depend on a mail client' >&2; exit 1; }}; \
                      grep -q 'is absent' \"$err\" || {{ echo 'the skipped application home was not reported' >&2; exit 1; }}; \
-                     [ ! -e '{{root}}/nobody' ] || {{ echo 'td-firstboot created an application home it was not given' >&2; exit 1; }}"
+                     [ ! -e '{{root}}/nobody' ] && [ ! -L '{{root}}/nobody' ] || {{ echo 'td-firstboot created an application home it was not given' >&2; exit 1; }}"
                 ),
             ],
         )
