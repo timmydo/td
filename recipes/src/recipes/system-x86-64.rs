@@ -10988,37 +10988,60 @@ mod tests {
             exec, "/bin/sshd -D -e -f /run/td-sshd.conf",
             "the service must run the foreground OpenSSH daemon against the reviewed config"
         );
-        let config = ssh_policy::config("alice");
-        for required in [
-            format!("HostKey {SSHD_HOST_KEY}"),
-            format!("AuthorizedKeysFile {SSHD_AUTHORIZED_KEYS}"),
-            "AuthenticationMethods publickey".into(),
-            "PasswordAuthentication no".into(),
-            "KbdInteractiveAuthentication no".into(),
-            "HostbasedAuthentication no".into(),
-            format!("KexAlgorithms {OPENSSH_KEX_ALGORITHMS}"),
-            format!("HostKeyAlgorithms {OPENSSH_KEY_ALGORITHMS}"),
-            format!("PubkeyAcceptedAlgorithms {OPENSSH_KEY_ALGORITHMS}"),
-            format!("Ciphers {OPENSSH_CIPHERS}"),
-            "Compression no".into(),
-            "DisableForwarding yes".into(),
+        // TOKEN-LOGIN.md, "SSH": the login state selects the form; both keep
+        // every reviewed line, and the enforced one refuses root and admits
+        // only the primary.
+        for (form, admission) in [
+            (
+                ssh_policy::Form::Ordinary,
+                &["PermitRootLogin prohibit-password", "Match User alice"][..],
+            ),
+            (
+                ssh_policy::Form::Enforced,
+                &["PermitRootLogin no", "AllowUsers alice", "Match User alice"][..],
+            ),
         ] {
+            let config = ssh_policy::config("alice", form);
+            for required in [
+                format!("HostKey {SSHD_HOST_KEY}"),
+                format!("AuthorizedKeysFile {SSHD_AUTHORIZED_KEYS}"),
+                "AuthenticationMethods publickey".into(),
+                "PasswordAuthentication no".into(),
+                "KbdInteractiveAuthentication no".into(),
+                "HostbasedAuthentication no".into(),
+                format!("KexAlgorithms {OPENSSH_KEX_ALGORITHMS}"),
+                format!("HostKeyAlgorithms {OPENSSH_KEY_ALGORITHMS}"),
+                format!("PubkeyAcceptedAlgorithms {OPENSSH_KEY_ALGORITHMS}"),
+                format!("Ciphers {OPENSSH_CIPHERS}"),
+                "Compression no".into(),
+                "DisableForwarding yes".into(),
+            ] {
+                assert!(
+                    config.lines().any(|line| line == required),
+                    "the reviewed OpenSSH server policy lost {required:?}"
+                );
+            }
+            let admitted: Vec<&str> = config
+                .lines()
+                .filter(|line| {
+                    ["PermitRootLogin ", "Allow", "Deny", "Match"]
+                        .iter()
+                        .any(|prefix| line.starts_with(prefix))
+                })
+                .collect();
+            assert_eq!(admitted, admission, "{form:?}");
             assert!(
-                config.lines().any(|line| line == required),
-                "the reviewed OpenSSH server policy lost {required:?}"
+                !config.lines().any(|line| line.starts_with("Subsystem ")),
+                "the minimal server profile must not expose the unneeded SFTP subsystem"
+            );
+            assert!(
+                config.ends_with(&format!(
+                    "\nMatch User alice\n\
+                     \tAuthorizedKeysFile {SSHD_SELFTEST_AUTHORIZED_KEYS}\n"
+                )),
+                "the volatile boot key must authorize only the admitted primary account"
             );
         }
-        assert!(
-            !config.lines().any(|line| line.starts_with("Subsystem ")),
-            "the minimal server profile must not expose the unneeded SFTP subsystem"
-        );
-        assert!(
-            config.contains(&format!(
-                "Match User alice\n\
-                 \tAuthorizedKeysFile {SSHD_SELFTEST_AUTHORIZED_KEYS}\n"
-            )),
-            "the volatile boot key must authorize only the admitted primary account"
-        );
     }
 
     #[test]
@@ -11685,6 +11708,9 @@ mod tests {
         );
         assert!(init.starts_with("#!/bin/sh\nset -e\n"));
         assert_eq!(init.matches("ensure-login-directory").count(), 1);
+        // The render's form follows the state the step leaves (TOKEN-LOGIN.md,
+        // "SSH"), so there is exactly one render and it comes next.
+        assert_eq!(init.matches("render-primary-sshd").count(), 1);
         let lines: Vec<&str> = init.lines().map(str::trim).collect();
         let at = lines
             .iter()

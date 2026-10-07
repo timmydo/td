@@ -64,21 +64,31 @@ chroot, split helpers, seccomp sandbox, and a real unprivileged loopback login.
 Before entering the authenticated deployment, firstboot validates its complete
 root-owned account tables and renders the server policy into root-owned
 mode-0600 `/run/td-sshd.conf`. Only the admitted UID/GID-1000 account name
-selects its self-test Match block. The policy's remaining bytes are compiled
-from the shared source used by the realized OpenSSH recipe test. The daemon
+selects its self-test Match block and, in the enforced form below, the one
+`AllowUsers` entry. The policy's remaining bytes are compiled from the
+shared source used by the realized OpenSSH recipe test. The daemon
 requires this configuration file explicitly; there is no optional include or
 fallback configuration. Generation failure stops boot before user processes,
 and the caller serializes publication against all account readers. This
-changes no credential transition or authentication method. The planned
-login-key tier adds an enforced form of this policy that refuses root and
-every account but the primary (`TOKEN-LOGIN.md`, "SSH").
+changes no credential transition or authentication method. Since
+`TOKEN-LOGIN.md`'s increment 4 (C6) the render reads the login state
+through the shared predicate (§3) under the root it renders, and renders
+this policy byte for byte only where that state is unenrolled. Enrolled,
+and every unavailable cause including a failed read, renders the
+enforced form, which replaces `PermitRootLogin prohibit-password` with
+`PermitRootLogin no` and `AllowUsers` naming only that admitted account
+(`TOKEN-LOGIN.md`, "SSH", pins the bytes). The stock image never contains
+a record and firstboot ensures the directory at every boot, so it renders
+the ordinary policy; the enforced form acts only where a record or an
+invalid directory exists.
 The boot-health login uses a fresh volatile key for the unprivileged UI account,
 but its root-owned authorization line is constrained by OpenSSH `restrict` and
 `from="127.0.0.1"`; possession of that key cannot create a network-reachable
 login. The persistent administrator path is exercised separately only in the
-disposable QEMU volume: it is preseeded with a loopback-restricted public key
-and a root-only matching private fixture before boot. Boot health reads those
-fixtures but never rewrites live administrator authorization state.
+disposable, unenrolled QEMU volume: it is preseeded with a
+loopback-restricted public key and a root-only matching private fixture
+before boot. Boot health reads those fixtures but never rewrites live
+administrator authorization state.
 
 The resource boundary is also an asset. The application identity must enter
 its delegated session cgroup before it loses root, otherwise a

@@ -285,7 +285,7 @@ fn usage() -> String {
          td-firstboot stage-primary-name ROOT NAME OUT prepares new account tables without activating them\n  \
          td-firstboot ensure-login-directory ROOT creates an absent ROOT/var/lib/td/login, refuses an invalid one, and removes its tmp- entries\n  \
          td-firstboot check-login-directory ROOT checks ROOT/var/lib/td/login without writing\n  \
-         td-firstboot render-primary-sshd ROOT prints the validated primary-account server policy\n  \
+         td-firstboot render-primary-sshd ROOT prints the validated primary-account server policy in the form ROOT's login state selects\n  \
          td-firstboot prepare-primary-profile ROOT publishes the selected primary account and prepares its home before users start\n  \
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
          td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n"
@@ -311,7 +311,8 @@ fn run_with_primary(
         }
         Invocation::RenderPrimarySshd(root) => {
             let primary = principals::primary_in_root(&root).map_err(Failure::Failed)?;
-            return emit(&ssh_policy::config(primary.name())).map_err(Failure::Failed);
+            let policy = sshd_policy(primary.name(), &root, login_state::Owner::ROOT);
+            return emit(&policy).map_err(Failure::Failed);
         }
         Invocation::PreparePrimaryProfile(root) => {
             let home = primary_profile::prepare(&root).map_err(Failure::Failed)?;
@@ -1577,6 +1578,24 @@ fn write_durably_owned(
     })
 }
 
+/// The server policy for the admitted `primary` account, in the form the
+/// login state under the same `root` selects (td-login/TOKEN-LOGIN.md, "SSH").
+fn sshd_policy(primary: &str, root: &Path, owner: login_state::Owner) -> String {
+    let state = login_state::state_as(root, owner, principals::primary_account::UID);
+    ssh_policy::config(primary, ssh_form(state))
+}
+
+/// Only a verifiably unenrolled machine gets the ordinary form; the
+/// predicate reports every failure to read as unavailable, never unenrolled.
+fn ssh_form(state: login_state::State) -> ssh_policy::Form {
+    match state {
+        login_state::State::Unenrolled => ssh_policy::Form::Ordinary,
+        login_state::State::Enrolled | login_state::State::Unavailable(_) => {
+            ssh_policy::Form::Enforced
+        }
+    }
+}
+
 /// Markers to stdout. A closed reader is a clean exit, not a panic: `println!`
 /// panics on a failed write and Rust leaves SIGPIPE ignored, so `td-firstboot |
 /// head` would abort — which the no-panic rule forbids.
@@ -2288,6 +2307,318 @@ mod tests {
         assert!(!NEW_MARKER.contains(HOST_KEY_PREFIX));
         assert!(!STABLE_MARKER.contains(HOST_KEY_PREFIX));
         assert!(HOST_KEY_PREFIX.ends_with(' '), "the fingerprint follows it");
+    }
+}
+
+#[cfg(test)]
+mod ssh_forms {
+    #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+    use super::*;
+
+    /// The policy as rendered before the login-key tier, for `alice`,
+    /// written out independently of the formatter.
+    const BEFORE: &str = "Port 22\n\
+        ListenAddress 0.0.0.0\n\
+        HostKey /etc/ssh/ssh_host_ed25519_key\n\
+        AuthorizedKeysFile /etc/ssh/authorized_keys\n\
+        AuthenticationMethods publickey\n\
+        PubkeyAuthentication yes\n\
+        PasswordAuthentication no\n\
+        KbdInteractiveAuthentication no\n\
+        ChallengeResponseAuthentication no\n\
+        HostbasedAuthentication no\n\
+        PermitEmptyPasswords no\n\
+        PermitRootLogin prohibit-password\n\
+        StrictModes yes\n\
+        KexAlgorithms mlkem768x25519-sha256,sntrup761x25519-sha512,curve25519-sha256\n\
+        HostKeyAlgorithms ssh-ed25519\n\
+        PubkeyAcceptedAlgorithms ssh-ed25519\n\
+        Ciphers chacha20-poly1305@openssh.com\n\
+        Compression no\n\
+        DisableForwarding yes\n\
+        PermitTTY yes\n\
+        PermitUserEnvironment no\n\
+        PermitUserRC no\n\
+        UseDNS no\n\
+        PrintMotd no\n\
+        LoginGraceTime 30\n\
+        MaxAuthTries 3\n\
+        MaxSessions 4\n\
+        PidFile /run/sshd.pid\n\
+        Match User alice\n\
+        \tAuthorizedKeysFile /run/td-ssh-selftest-authorized_keys\n";
+
+    const NAMES: &[&str] = &[
+        "alice",
+        "tester",
+        "a",
+        "z0_-",
+        "abcdefghijklmnopqrstuvwxyz012345",
+    ];
+
+    /// td-login/TOKEN-LOGIN.md, "SSH": the enforced form's only difference.
+    const ORDINARY_ADMISSION: &str = "PermitRootLogin prohibit-password\n";
+
+    fn before(name: &str) -> String {
+        BEFORE.replace("Match User alice\n", &format!("Match User {name}\n"))
+    }
+
+    fn enforced(name: &str) -> String {
+        before(name).replace(
+            ORDINARY_ADMISSION,
+            &format!("PermitRootLogin no\nAllowUsers {name}\n"),
+        )
+    }
+
+    /// A root holding a valid `var/lib/td/login`, owned by the test's IDs.
+    struct Root {
+        root: PathBuf,
+        owner: login_state::Owner,
+    }
+
+    impl Root {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "td-firstboot-ssh-form-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::DirBuilder::new()
+                .mode(0o755)
+                .recursive(true)
+                .create(root.join("var/lib/td"))
+                .unwrap();
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(login_state::directory(&root))
+                .unwrap();
+            let meta = std::fs::metadata(&root).unwrap();
+            Self {
+                root,
+                owner: login_state::Owner {
+                    uid: meta.uid(),
+                    gid: meta.gid(),
+                },
+            }
+        }
+
+        fn login(&self) -> PathBuf {
+            login_state::directory(&self.root)
+        }
+
+        fn policy(&self, name: &str) -> String {
+            sshd_policy(name, &self.root, self.owner)
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            for path in [self.root.join("var/lib/td"), self.login()] {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn the_ordinary_form_is_the_policy_from_before_the_tier_byte_for_byte() {
+        for name in NAMES {
+            assert_eq!(
+                ssh_policy::config(name, ssh_policy::Form::Ordinary),
+                before(name)
+            );
+        }
+        let root = Root::new();
+        for name in NAMES {
+            assert_eq!(root.policy(name), before(name));
+        }
+        // Temporaries, other names and another account's record are not the record.
+        for entry in ["tmp-0123", "cutover-reboot", "1001", "100", "10000"] {
+            std::fs::write(root.login().join(entry), b"").unwrap();
+        }
+        assert_eq!(root.policy("alice"), BEFORE);
+    }
+
+    /// The exact enforced bytes TOKEN-LOGIN.md pins: the one admission line
+    /// becomes `PermitRootLogin no` then `AllowUsers PRIMARY`, still in the
+    /// global section before the primary's `Match` block; nothing else moves.
+    #[test]
+    fn the_enforced_form_refuses_root_and_admits_only_the_primary() {
+        assert_eq!(BEFORE.matches(ORDINARY_ADMISSION).count(), 1);
+        for name in NAMES {
+            let policy = ssh_policy::config(name, ssh_policy::Form::Enforced);
+            assert_eq!(policy, enforced(name));
+            let lines: Vec<&str> = policy.lines().collect();
+            let rule = |prefix: &str| {
+                let found: Vec<usize> = lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| line.starts_with(prefix))
+                    .map(|(at, _)| at)
+                    .collect();
+                assert_eq!(found.len(), 1, "{prefix} in {policy}");
+                found[0]
+            };
+            let root_rule = rule("PermitRootLogin ");
+            let allow = rule("AllowUsers ");
+            let matched = rule("Match ");
+            assert_eq!(lines[root_rule], "PermitRootLogin no");
+            assert_eq!(lines[allow], format!("AllowUsers {name}"));
+            assert_eq!(lines[matched], format!("Match User {name}"));
+            assert_eq!(allow, root_rule + 1);
+            assert!(allow < matched, "AllowUsers must be global");
+            assert!(!policy.contains("prohibit-password"));
+            assert!(!policy.contains("DenyUsers") && !policy.contains("AllowGroups"));
+        }
+        assert_eq!(
+            ssh_policy::config("alice", ssh_policy::Form::Enforced),
+            BEFORE.replace(
+                "PermitRootLogin prohibit-password\n",
+                "PermitRootLogin no\nAllowUsers alice\n"
+            )
+        );
+    }
+
+    #[test]
+    fn only_unenrolled_selects_the_ordinary_form() {
+        use login_state::{Cause, State};
+        assert_eq!(ssh_form(State::Unenrolled), ssh_policy::Form::Ordinary);
+        for state in [
+            State::Enrolled,
+            State::Unavailable(Cause::DirectoryDamaged),
+            State::Unavailable(Cause::RecordDamaged),
+            State::Unavailable(Cause::Unreadable),
+        ] {
+            assert_eq!(ssh_form(state), ssh_policy::Form::Enforced, "{state:?}");
+        }
+    }
+
+    /// The record's name in any shape is enrolled; its bytes are never read.
+    #[test]
+    fn an_enrolled_root_renders_the_enforced_form() {
+        let root = Root::new();
+        let record = root.login().join("1000");
+        std::fs::write(&record, b"not a record").unwrap();
+        assert_eq!(root.policy("alice"), enforced("alice"));
+        std::fs::remove_file(&record).unwrap();
+        std::os::unix::fs::symlink("missing", &record).unwrap();
+        assert_eq!(root.policy("alice"), enforced("alice"));
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir(&record).unwrap();
+        assert_eq!(root.policy("tester"), enforced("tester"));
+        std::fs::remove_dir(&record).unwrap();
+        assert_eq!(root.policy("alice"), BEFORE);
+    }
+
+    /// Each way the directory is damaged, including one that only the
+    /// production owner sees, renders the enforced form.
+    #[test]
+    fn a_damaged_directory_renders_the_enforced_form() {
+        let root = Root::new();
+        let login = root.login();
+        let damaged = Some(login_state::State::Unavailable(
+            login_state::Cause::DirectoryDamaged,
+        ));
+        let check = |root: &Root| {
+            assert_eq!(
+                Some(login_state::state_as(&root.root, root.owner, 1000)),
+                damaged
+            );
+            assert_eq!(root.policy("alice"), enforced("alice"));
+        };
+        for mode in [0o750, 0o755, 0o701, 0o500, 0o1700] {
+            std::fs::set_permissions(&login, std::fs::Permissions::from_mode(mode)).unwrap();
+            check(&root);
+        }
+        std::fs::set_permissions(&login, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let held = root.root.join("held");
+        std::fs::rename(&login, &held).unwrap();
+        check(&root);
+        std::fs::write(&login, b"").unwrap();
+        check(&root);
+        std::fs::remove_file(&login).unwrap();
+        std::os::unix::fs::symlink(&held, &login).unwrap();
+        check(&root);
+        std::fs::remove_file(&login).unwrap();
+        std::fs::rename(&held, &login).unwrap();
+        assert_eq!(root.policy("alice"), BEFORE);
+        let td = root.root.join("var/lib/td");
+        let real = root.root.join("var/lib/real");
+        std::fs::rename(&td, &real).unwrap();
+        std::os::unix::fs::symlink("real", &td).unwrap();
+        check(&root);
+        std::fs::remove_file(&td).unwrap();
+        std::fs::rename(&real, &td).unwrap();
+        let foreign = login_state::Owner {
+            uid: root.owner.uid ^ 1,
+            ..root.owner
+        };
+        assert_eq!(sshd_policy("alice", &root.root, foreign), enforced("alice"));
+        // Production reads root's directory; the test's is root's only as root.
+        if root.owner != login_state::Owner::ROOT {
+            assert_eq!(
+                sshd_policy("alice", &root.root, login_state::Owner::ROOT),
+                enforced("alice")
+            );
+        }
+        for odd in [Path::new("relative"), &root.root.join("var/..")] {
+            assert_eq!(sshd_policy("alice", odd, root.owner), enforced("alice"));
+        }
+        assert_eq!(
+            sshd_policy("alice", &root.root.join("absent"), root.owner),
+            enforced("alice")
+        );
+        assert_eq!(root.policy("alice"), BEFORE);
+    }
+
+    /// A read that fails other than by damage is the predicate's error:
+    /// unavailable, never unenrolled, so the enforced form.
+    #[test]
+    fn a_state_that_cannot_be_read_renders_the_enforced_form() {
+        let root = Root::new();
+        let td = root.root.join("var/lib/td");
+        std::fs::set_permissions(&td, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let state = login_state::state_as(&root.root, root.owner, 1000);
+        // Only root overrides the search permission.
+        if root.owner.uid != 0 {
+            assert_eq!(
+                state,
+                login_state::State::Unavailable(login_state::Cause::Unreadable)
+            );
+            assert_eq!(root.policy("alice"), enforced("alice"));
+        }
+        std::fs::set_permissions(&td, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(root.policy("alice"), BEFORE);
+    }
+
+    /// The name both forms admit is the one the shared account validation
+    /// admits, which carries none of OpenSSH's pattern characters, so
+    /// `AllowUsers` and `Match User` name exactly that account.
+    #[test]
+    fn the_admitted_primary_is_the_validated_account() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\n\
+                      bob:x:1001:1001::/home/bob:/bin/sh\n\
+                      alice:x:1000:1000::/home/alice:/bin/sh\n";
+        let primary = principals::primary_account::parse(passwd).unwrap();
+        assert_eq!(primary.name(), "alice");
+        let root = Root::new();
+        std::fs::write(root.login().join("1000"), b"").unwrap();
+        let policy = root.policy(primary.name());
+        assert!(policy.contains("\nAllowUsers alice\n"));
+        assert!(policy.contains("\nMatch User alice\n"));
+        for name in NAMES {
+            assert!(principals::primary_account::validate_name(name).is_ok());
+        }
+        for name in [
+            "*", "a*", "a?", "!a", "a,b", "a@b", "a b", "a\tb", "A", "1a", "", "a.b",
+        ] {
+            assert!(
+                principals::primary_account::validate_name(name).is_err(),
+                "{name:?}"
+            );
+        }
     }
 }
 

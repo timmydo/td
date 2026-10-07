@@ -44,7 +44,7 @@ surface with its login unlock ("Session lock"), inert: its one entry is
 test-only and nothing in production locks. Increment 3 is complete; its
 desktop guest moved to increment 4 as `login-desktop`. Increment 4 is
 specified as twelve commits, C1 to C11 and C10b ("Increments"), of which
-C1 to C5 have landed: firstboot ensures the login directory at every
+C1 to C6 have landed: firstboot ensures the login directory at every
 boot, the live medium's included, through the shared login-state
 predicate, and rootcheck reports it on a marker of its own; td-authd
 answers request `1a` with the login state, through that predicate and
@@ -61,9 +61,10 @@ enrolled or unavailable machine therefore refuses every update; that is
 moot, since nothing enrolls before increment 5. td-login's interactive
 `login` and `login-primary` refuse the console there, returning the line
 to root and parking with one fixed line (`THREAT-MODEL.md` §3), while
-the image logs in only through `login-primary`. Nothing in production
-locks on the state yet, and only those two refusals act on it, where a
-record or an invalid directory exists. Nothing else below is
+the image logs in only through `login-primary`; and firstboot's
+boot-time SSH render takes the enforced form there ("SSH"). Nothing in
+production locks on the state yet, and only those three refusals act on
+it, where a record or an invalid directory exists. Nothing else below is
 implemented. Until the increments at the end land, `THREAT-MODEL.md` §3
 is the complete current behaviour: the installed account logs in
 automatically and the session never locks. No document, UI or release
@@ -736,6 +737,21 @@ one rendered before this tier, and anything else the enforced form. The
 cutover renders it within a boot. The QEMU persistent-administrator
 fixture therefore runs only on unenrolled images.
 
+The two forms differ in one place. The ordinary policy's global line
+`PermitRootLogin prohibit-password` becomes, in the enforced form, the
+two lines `PermitRootLogin no` and `AllowUsers NAME`, in that order and
+still in the global section before the primary's `Match User NAME`
+block, NAME being the admitted primary account; every other byte is
+the same. The shared account validation admits only a lowercase letter
+followed by lowercase letters, digits, `_` and `-`, so NAME carries none
+of OpenSSH's pattern characters and `AllowUsers` names that one account.
+Firstboot reads the accounts first, whose failure still stops boot, then
+the state under the same root it renders under, for UID 1000's record
+with root:root as the owner. The predicate answers every failure to read
+as unavailable, never as unenrolled, so a read that fails renders the
+enforced form and nothing falls back to the ordinary one. The realized
+OpenSSH recipe test checks both forms with the built `sshd -T`.
+
 ## Cutover
 
 Whenever the login state moves between unenrolled and enforced (enrolled
@@ -1341,8 +1357,22 @@ and the oracle that shows it.
      writes and the recipe's staging; the refusal on a full system is
      `qemu-login-system`'s (C11). It changes every boot's greeter path,
      so its landing runs `check integration` by hand.
-   - C6: `render-primary-sshd`'s enforced form ("SSH"), its unenrolled
-     output byte-identical to the one before it.
+   - C6, landed: `render-primary-sshd`'s enforced form ("SSH"), its
+     unenrolled output byte-identical to the one before it. The
+     predicate was already td-firstboot's reviewed `#[path]` since C1, and
+     its recipe already staged it. Host tests hold the ordinary form to a
+     literal copy of the policy before it for several names, the enforced
+     form's exact bytes, the ordinary form chosen only by an unenrolled
+     state, and the enforced form over temporary roots that are enrolled
+     (the record name in any shape), damaged in each way the predicate
+     names (a wrong mode or owner, missing, a file, a link at or above
+     it, a relative root) and unreadable (an unsearchable parent); the
+     admitted name is the one the shared account validation admits; and
+     the recipe tests keep the single render right after the directory
+     step and check both forms with the built `sshd -T`. The enforced
+     form on a full system is `qemu-login-system`'s (C11). It changes
+     the boot path's td-firstboot, so its landing runs `check
+     integration` by hand.
    - C7, the activating commit: the compositor's locked start. The `1a`
      state at connect locks an enrolled or unavailable session before
      the first repaint, the lock surface gains the hostname and username

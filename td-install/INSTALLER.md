@@ -1401,13 +1401,20 @@ destructive authorization.
 `td-firstboot render-primary-sshd ROOT` is a read-only early boot operation
 using the same complete root-owned account admission as home preparation.
 It prints the full fixed SSH server policy with one Match block for that
-primary account. The caller owns deployment verification and serializes
+primary account, in the form the login state under the same ROOT selects
+(td-login/TOKEN-LOGIN.md, "SSH"): the ordinary policy, unchanged byte for
+byte, only where that state is unenrolled, and otherwise the enforced form,
+which refuses root and admits only that account. A state it cannot read is
+unavailable, so it renders the enforced form; an account failure still
+fails the render. The caller owns deployment verification and serializes
 account publication before rendering. No name or policy fragment comes
-from argv, the environment or mutable home content. It preserves the
-per-machine administrator authorization and the distinct volatile,
-loopback-restricted human self-test key. It runs after profile publication,
-right after `td-firstboot ensure-login-directory /sysroot`, whose refusal
-never stops boot (td-login/TOKEN-LOGIN.md, "The login record").
+from argv, the environment or mutable home content. Both forms keep the
+per-machine administrator authorization file and the distinct volatile,
+loopback-restricted human self-test key; only the ordinary form admits an
+account that the administrator file serves. It runs after profile
+publication, right after `td-firstboot ensure-login-directory /sysroot`,
+whose refusal never stops boot (td-login/TOKEN-LOGIN.md, "The login
+record").
 
 The deployment initramfs writes that output to fresh volatile
 `/run/td-sshd.conf` with a private creation mask and final mode 0600,
@@ -1417,8 +1424,12 @@ The supervised server explicitly requires that path. There is no optional
 include and no immutable config with a stale human name. Only root can
 modify its file or parent. The complete policy formatter is shared with
 the source-built OpenSSH test, which checks effective authorization for
-a renamed human, the stock name and root. The generated policy contains
-no secrets and is recreated on every boot, including deployment updates.
+a renamed human, the stock name and root, and that each form's effective
+configuration for each of them carries exactly that form's
+`PermitRootLogin` and `AllowUsers` lines. It reads `sshd -T`'s report and
+attempts no login, so the refusal itself is `qemu-login-system`'s
+(td-login/TOKEN-LOGIN.md, C11). The generated policy contains no secrets
+and is recreated on every boot, including deployment updates.
 
 Keyboard and timezone choices must actually affect the installed session;
 only supported choices with available data may be offered.
