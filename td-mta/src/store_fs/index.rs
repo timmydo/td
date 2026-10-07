@@ -2158,6 +2158,191 @@ mod tests {
     }
 
     #[test]
+    fn native_database_full_rolls_back_body_metadata_and_id_registration() {
+        use crate::{limits::SQLITE_BODY_CHUNK_BYTES, ports::BlobReader};
+        const BODY_BYTES: usize = 2 * 1024 * 1024;
+        fn verify(view: &mut IndexReadView<'_, '_>, id: BlobId, expected: &[u8]) {
+            let mut input = view
+                .open_blob_input(&td_crypto::Provider, id, expected.len() as u64)
+                .unwrap();
+            let mut scratch = [0; 4096];
+            let mut position = 0;
+            while position < expected.len() {
+                let count = input.read(&mut scratch).unwrap();
+                assert!(count > 0);
+                assert_eq!(&scratch[..count], &expected[position..position + count]);
+                position += count;
+            }
+            assert_eq!(input.finish().unwrap().len(), expected.len() as u64);
+        }
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let clock = Arc::new(Timer(AtomicU64::new(1)));
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            clock.clone(),
+            2,
+            deadline(),
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        let original = BlobId::from_bytes([0x91; 16]);
+        let candidate = BlobId::from_bytes([0x92; 16]);
+        let original_body = b"previous committed body";
+        let original_row = encode(Row::Blob(body_row(original_body, BlobKind::Message)));
+        let original_mailbox = mailbox("original", None);
+        store
+            .commit(
+                &td_crypto::Provider,
+                request(0),
+                &[
+                    Operation::put(Table::Blobs, original.as_bytes(), &original_row).unwrap(),
+                    Operation::put(Table::Mailboxes, ID.as_bytes(), &original_mailbox).unwrap(),
+                ],
+                &mut [BlobSource {
+                    id: original,
+                    source: &mut original_body.as_slice(),
+                }],
+            )
+            .unwrap();
+        store.checkpoint(deadline()).unwrap();
+        let mut snapshot = store.view(ACCOUNT, deadline()).unwrap();
+        {
+            let writer = lock(&store.writer).unwrap();
+            let db = lock(&writer.native.connection).unwrap();
+            let pages: i64 = db
+                .pragma_query_value(None, "page_count", |r| r.get(0))
+                .unwrap();
+            let cap = pages + (BODY_BYTES as u64 / 2 / PAGE_BYTES) as i64;
+            let actual: i64 = db
+                .pragma_query_value(None, "max_page_count", |r| r.get(0))
+                .unwrap();
+            assert_eq!(actual, MAX_PAGES as i64);
+            db.pragma_update(None, "max_page_count", cap).unwrap();
+            let actual: i64 = db
+                .pragma_query_value(None, "max_page_count", |r| r.get(0))
+                .unwrap();
+            assert_eq!(actual, cap);
+            // Establish the native failure, not just the Capacity translation.
+            db.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let chunk = [0x5a_u8; SQLITE_BODY_CHUNK_BYTES];
+            let error = (1..=32)
+                .find_map(|ordinal| {
+                    db.execute(
+                        "INSERT INTO blob_chunks(account,blob,ordinal,body) VALUES(?1,?2,?3,?4)",
+                        params![
+                            ACCOUNT.as_bytes().as_slice(),
+                            original.as_bytes().as_slice(),
+                            ordinal,
+                            chunk.as_slice()
+                        ],
+                    )
+                    .err()
+                })
+                .unwrap();
+            assert!(matches!(error, rusqlite::Error::SqliteFailure(error, _)
+                if error.code == rusqlite::ErrorCode::DiskFull));
+            // This single-row insert exercises automatic transaction rollback.
+            assert!(db.is_autocommit());
+        }
+        let body = vec![0x5a; BODY_BYTES];
+        let row = encode(Row::Blob(body_row(&body, BlobKind::Message)));
+        let changed_mailbox = mailbox("replacement", None);
+        let operations = [
+            Operation::put(Table::Mailboxes, ID.as_bytes(), &changed_mailbox).unwrap(),
+            Operation::delete(Table::Blobs, original.as_bytes()).unwrap(),
+            Operation::put(Table::Blobs, candidate.as_bytes(), &row).unwrap(),
+        ];
+        let mut source = std::io::Cursor::new(body.as_slice());
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                request(1),
+                &operations,
+                &mut [BlobSource {
+                    id: candidate,
+                    source: &mut source
+                }],
+            ),
+            Err(CommitError::Rejected(ports::Error::Capacity))
+        );
+        assert!(source.position() > SQLITE_BODY_CHUNK_BYTES as u64);
+        assert!(source.position() < body.len() as u64);
+        {
+            let writer = lock(&store.writer).unwrap();
+            assert!(!writer.stopped);
+            assert!(lock(&writer.native.connection).unwrap().is_autocommit());
+            assert!(lock(&writer.native.budget).unwrap().failure.is_none());
+        }
+        verify(&mut snapshot, original, original_body);
+        {
+            let mut fresh = store.view(ACCOUNT, deadline()).unwrap();
+            assert_eq!(fresh.identity().committed_sequence, Sequence::from_u64(1));
+            let mut bytes = [0; 128];
+            assert!(fresh
+                .get(Key::Blob(candidate), &mut bytes)
+                .unwrap()
+                .is_none());
+            assert!(matches!(
+                fresh.get(Key::Mailbox(ID), &mut bytes).unwrap(),
+                Some((
+                    Row::Mailbox(MailboxRow {
+                        name: "original",
+                        ..
+                    }),
+                    _
+                ))
+            ));
+            verify(&mut fresh, original, original_body);
+        }
+        {
+            let writer = lock(&store.writer).unwrap();
+            lock(&writer.native.connection)
+                .unwrap()
+                .pragma_update(None, "max_page_count", MAX_PAGES as i64)
+                .unwrap();
+        }
+        source.set_position(0);
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                request(1),
+                &operations,
+                &mut [BlobSource {
+                    id: candidate,
+                    source: &mut source
+                }],
+            ),
+            Ok(Sequence::from_u64(2))
+        );
+        assert_eq!(
+            snapshot.identity().committed_sequence,
+            Sequence::from_u64(1)
+        );
+        verify(&mut snapshot, original, original_body);
+        drop(snapshot);
+        drop(store);
+        let reopened = IndexStore::open(&mut root, clock, 1, deadline()).unwrap();
+        reopened.validate_integrity(deadline()).unwrap();
+        let mut view = reopened.view(ACCOUNT, deadline()).unwrap();
+        assert_eq!(view.identity().committed_sequence, Sequence::from_u64(2));
+        let mut bytes = [0; 128];
+        assert!(view.get(Key::Blob(original), &mut bytes).unwrap().is_none());
+        assert!(matches!(
+            view.get(Key::Mailbox(ID), &mut bytes).unwrap(),
+            Some((
+                Row::Mailbox(MailboxRow {
+                    name: "replacement",
+                    ..
+                }),
+                _
+            ))
+        ));
+        verify(&mut view, candidate, &body);
+    }
+
+    #[test]
     fn maximum_body_streams_with_fixed_scratch_and_reopens() {
         use std::io::Read;
         let fixture = Fixture::new();
