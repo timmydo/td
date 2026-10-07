@@ -1,4 +1,4 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // Build a populated Btrfs volume in a regular file, verify it offline, and
@@ -6,15 +6,10 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 pub fn recipe() -> Recipe {
     let mkfs = "{in:btrfs-progs-x86-64}/bin/mkfs.btrfs";
     let btrfs = "{in:btrfs-progs-x86-64}/bin/btrfs";
-    let path = format!("{{tools}}:{}", post_bootstrap_path());
+    let path = "{tools}";
     // Deployment directory names are the SHA-256 of their manifest bytes.
     let mut steps = vec![
-        Step::ToolFarm {
-            links: ["awk", "cmp", "grep", "readlink"]
-                .iter()
-                .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))
-                .collect(),
-        },
+        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
         Step::MkDir {
             path: "{root}/seed/td/deployments/9b749e4f4dd9ef26ce57d6c2e5e7120ea3a5e64de4394c80e56369c35791ea9d".into(),
         },
@@ -68,7 +63,7 @@ pub fn recipe() -> Recipe {
                 "{root}/volume.btrfs",
             ],
         )
-        .env("PATH", &path),
+        .env("PATH", path),
     );
     steps.push(
         Step::run(
@@ -81,13 +76,13 @@ pub fn recipe() -> Recipe {
                 "{root}/volume.btrfs",
             ],
         )
-        .env("PATH", &path),
+        .env("PATH", path),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 "'{in:btrfs-progs-x86-64}/bin/btrfs' inspect-internal dump-tree -t root '{root}/volume.btrfs' > '{root}/root-tree'; \
                  grep -q 'name @var' '{root}/root-tree' || { echo 'root tree has no @var subvolume reference' >&2; exit 1; }; \
@@ -104,7 +99,7 @@ pub fn recipe() -> Recipe {
                  [ \"$(readlink '{root}/restored/td/boot/current')\" = ../deployments/9b749e4f4dd9ef26ce57d6c2e5e7120ea3a5e64de4394c80e56369c35791ea9d ] || { echo 'boot selector symlink did not round-trip' >&2; exit 1; }",
             ],
         )
-        .env("PATH", &path),
+        .env("PATH", path),
     );
     steps.push(Step::MkDir {
         path: "{out}".into(),
@@ -120,7 +115,7 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("btrfs-progs-x86-64-test", "1.0")
-        .native_inputs(&["btrfs-progs-x86-64", "busybox-x86-64"])
+        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["btrfs-progs-x86-64"]))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"

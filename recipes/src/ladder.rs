@@ -638,12 +638,13 @@ pub fn post_bootstrap_path() -> String {
 /// stage2 toolchain, so no recipe that uses it can be on its own input path.
 pub const POST_RUST_SH: &str = "{in:td-sh}/bin/td-sh";
 
-/// The post-Rust build userland: the tool names gawk's build and the
-/// zlib/make/libressl-class farms call, each with exactly one td provider.
-/// td-txt, td-util and uutils dispatch on argv[0]. Not yet here, for the
-/// farms that still link them from BusyBox: egrep, fgrep and od. `awk`
-/// is per recipe (`post_rust_tool_farm`): the awk that builds gawk cannot be
-/// gawk.
+/// The post-Rust build userland: the tool names gawk's build and every
+/// post-Rust farm call, each with exactly one td provider. td-txt, td-util
+/// and uutils dispatch on argv[0]. Not served: egrep and fgrep, which
+/// autoconf's probes replace with `grep -E` and `grep -F`, and od and tar,
+/// which no farm build needs (configure's tar probe falls back to none,
+/// which only `make dist` reads). `awk` is per recipe
+/// (`post_rust_tool_farm`): the awk that builds gawk cannot be gawk.
 const POST_RUST_TOOLS: &[(&str, &str, &[&str])] = &[
     ("td-sh", "{in:td-sh}/bin/td-sh", &["sh"]),
     ("td-txt", "{in:td-txt}/bin/td-txt", &["grep", "sed"]),

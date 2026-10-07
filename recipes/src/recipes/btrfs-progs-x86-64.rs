@@ -1,5 +1,6 @@
 use crate::ladder::{
-    post_bootstrap_path, split_target_debug, unpack_into, unpack_keep_top, POST_BOOTSTRAP_SH,
+    post_rust_inputs, post_rust_tool_farm, split_target_debug, unpack_into, unpack_keep_top,
+    POST_RUST_SH,
 };
 use crate::types::{Recipe, Step};
 
@@ -14,42 +15,26 @@ use crate::types::{Recipe, Step};
 // assembly it links, crypto/crc32c-pcl-intel-asm_64.S, is a leaf that never
 // touches rsp or rbp, so it keeps every caller's frame chain and needs no
 // ASSEMBLY_EXCEPTIONS entry.
-/// Busybox applets configure and the Makefile call by name.
-const TOOLS: &[&str] = &[
-    "awk", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "diff", "dirname", "echo",
-    "egrep", "env", "expr", "false", "fgrep", "find", "grep", "head", "install", "ln", "ls",
-    "mkdir", "mktemp", "mv", "od", "printf", "pwd", "readlink", "rm", "rmdir", "sed", "sleep",
-    "sort", "tail", "tee", "test", "touch", "tr", "true", "uname", "uniq", "wc", "which", "xargs",
-];
-
 pub fn recipe() -> Recipe {
     let sgcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let sbin = "{in:binutils-x86-64-self}/bin";
     let ul = "{in:util-linux-libs-x86-64}";
     let zlib = "{in:zlib-x86-64-self}";
-    let path = format!(
-        "{{root}}/wb:{{tools}}:{{in:make-x86-64-self}}/bin:{sbin}:{}",
-        post_bootstrap_path()
-    );
+    let path = format!("{{root}}/wb:{{tools}}:{{in:make-x86-64-self}}/bin:{sbin}");
     let cip = format!("{ul}/include:{zlib}/include:{xglibc}/include:{{root}}/kh");
 
     let mut steps = unpack_into("btrfs-progs-x86-64-source", "{src}");
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
-    steps.push(Step::ToolFarm {
-        links: TOOLS
-            .iter()
-            .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))
-            .collect(),
-    });
+    steps.push(post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"));
     steps.push(Step::PatchShebangs {
         dir: "{src}".into(),
-        shell: POST_BOOTSTRAP_SH.into(),
+        shell: POST_RUST_SH.into(),
     });
     steps.push(Step::WriteFile {
         path: "{root}/wb/cc".into(),
         content: format!(
-            "#!{POST_BOOTSTRAP_SH}\nexec \"{sgcc}\" -static -B\"{sbin}/\" -B{xglibc}/lib -L{xglibc}/lib \
+            "#!{POST_RUST_SH}\nexec \"{sgcc}\" -static -B\"{sbin}/\" -B{xglibc}/lib -L{xglibc}/lib \
              -L{ul}/lib -L{zlib}/lib \"$@\" \
              -fno-omit-frame-pointer -g1 \
              -ffile-prefix-map={{root}}=/td-build-root \
@@ -63,7 +48,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/wb/pkg-config".into(),
         content: format!(
-            "#!{POST_BOOTSTRAP_SH}\n\
+            "#!{POST_RUST_SH}\n\
              mod=''; cflags=0; libs=0; version=0\n\
              for a in \"$@\"; do\n\
              \tcase \"$a\" in\n\
@@ -94,7 +79,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{src}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "./configure",
                 "--build=x86_64-pc-linux-gnu",
                 "--host=x86_64-pc-linux-gnu",
@@ -111,8 +96,8 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("PATH", &path)
-        .env("CONFIG_SHELL", POST_BOOTSTRAP_SH)
-        .env("SHELL", POST_BOOTSTRAP_SH)
+        .env("CONFIG_SHELL", POST_RUST_SH)
+        .env("SHELL", POST_RUST_SH)
         .env("CC", "{root}/wb/cc")
         .env("CC_FOR_BUILD", "{root}/wb/cc")
         .env("AR", "{in:binutils-x86-64-self}/bin/ar")
@@ -129,8 +114,8 @@ pub fn recipe() -> Recipe {
                 "-j{jobs}",
                 "mkfs.btrfs.static",
                 "btrfs.static",
-                &format!("SHELL={POST_BOOTSTRAP_SH}"),
-                &format!("CONFIG_SHELL={POST_BOOTSTRAP_SH}"),
+                &format!("SHELL={POST_RUST_SH}"),
+                &format!("CONFIG_SHELL={POST_RUST_SH}"),
             ],
         )
         .env("PATH", &path)
@@ -171,7 +156,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{out}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 "for p in bin/mkfs.btrfs bin/btrfs; do \
                    h=$('{in:binutils-x86-64-self}/bin/readelf' -h \"$p\"); \
@@ -187,15 +172,17 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("btrfs-progs-x86-64", "7.0")
         .source_input("btrfs-progs-x86-64-source")
-        .native_inputs(&[
-            "util-linux-libs-x86-64",
-            "zlib-x86-64-self",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-            "make-x86-64-self",
-            "busybox-x86-64",
-        ])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &[
+                "util-linux-libs-x86-64",
+                "zlib-x86-64-self",
+                "gcc-x86-64-self",
+                "binutils-x86-64-self",
+                "glibc-x86-64",
+                "make-x86-64-self",
+            ],
+        ))
         .inputs(&["linux-headers-x86-64"])
         .steps(steps)
 }

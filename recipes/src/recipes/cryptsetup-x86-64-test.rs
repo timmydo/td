@@ -1,5 +1,5 @@
 use super::cryptsetup_x86_64::VERSION_LINE;
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // Check the realized cryptsetup's compiled-in surface: the exact feature line,
@@ -9,18 +9,13 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // the QEMU oracle (td-install/ENCRYPTION.md, acceptance evidence).
 pub fn recipe() -> Recipe {
     let cs = "{in:cryptsetup-x86-64}";
-    let path = format!("{{tools}}:{}", post_bootstrap_path());
+    let path = "{tools}";
     let steps = vec![
-        Step::ToolFarm {
-            links: ["grep"]
-                .iter()
-                .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))
-                .collect(),
-        },
+        post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"),
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "v=$('{cs}/bin/cryptsetup' --version) || exit 1; \
@@ -32,7 +27,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &path),
+        .env("PATH", path),
         Step::MkDir {
             path: "{out}".into(),
         },
@@ -48,7 +43,7 @@ pub fn recipe() -> Recipe {
     ];
 
     Recipe::mesboot("cryptsetup-x86-64-test", "1.0")
-        .native_inputs(&["cryptsetup-x86-64", "busybox-x86-64"])
+        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["cryptsetup-x86-64"]))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"

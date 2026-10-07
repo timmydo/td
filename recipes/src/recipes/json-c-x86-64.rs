@@ -1,4 +1,6 @@
-use crate::ladder::{post_bootstrap_path, unpack_into, unpack_keep_top, POST_BOOTSTRAP_SH};
+use crate::ladder::{
+    post_rust_inputs, post_rust_tool_farm, unpack_into, unpack_keep_top, POST_RUST_SH,
+};
 use crate::types::{Recipe, Step};
 
 // json-c's static library for cryptsetup's LUKS2 metadata (td-install/
@@ -13,23 +15,15 @@ pub fn recipe() -> Recipe {
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let sbin = "{in:binutils-x86-64-self}/bin";
     let cmake = "{in:cmake-x86-64}/bin/cmake";
-    let path = format!("{{root}}/wb:{{tools}}:{sbin}:{}", post_bootstrap_path());
+    let path = format!("{{root}}/wb:{{tools}}:{sbin}");
 
     let mut steps = unpack_into("json-c-x86-64-source", "{src}");
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
-    steps.push(Step::ToolFarm {
-        links: [
-            "awk", "cat", "cmp", "cp", "dirname", "echo", "env", "false", "grep", "ln", "ls",
-            "mkdir", "mv", "printf", "rm", "sed", "sh", "test", "touch", "tr", "true", "uname",
-        ]
-        .iter()
-        .map(|name| ((*name).into(), "{in:busybox-x86-64}/bin/busybox".into()))
-        .collect(),
-    });
+    steps.push(post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk"));
     steps.push(Step::WriteFile {
         path: "{root}/wb/cc".into(),
         content: format!(
-            "#!{POST_BOOTSTRAP_SH}\nexec \"{sgcc}\" -static -idirafter \"{xglibc}/include\" \
+            "#!{POST_RUST_SH}\nexec \"{sgcc}\" -static -idirafter \"{xglibc}/include\" \
              -idirafter \"{{root}}/kh\" -B\"{sbin}/\" -B{xglibc}/lib -L{xglibc}/lib \"$@\" \
              -fno-omit-frame-pointer -g1 \
              -ffile-prefix-map={{root}}=/td-build-root \
@@ -40,8 +34,8 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/wb/make".into(),
         content: format!(
-            "#!{POST_BOOTSTRAP_SH}\nexec \"{{in:make-x86-64-self}}/bin/make\" \
-             SHELL=\"{POST_BOOTSTRAP_SH}\" \"$@\"\n"
+            "#!{POST_RUST_SH}\nexec \"{{in:make-x86-64-self}}/bin/make\" \
+             SHELL=\"{POST_RUST_SH}\" \"$@\"\n"
         ),
         exec: true,
     });
@@ -73,7 +67,7 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("PATH", &path)
-        .env("SHELL", POST_BOOTSTRAP_SH)
+        .env("SHELL", POST_RUST_SH)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(
@@ -90,7 +84,7 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("PATH", &path)
-        .env("SHELL", POST_BOOTSTRAP_SH)
+        .env("SHELL", POST_RUST_SH)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(Step::MkDir {
@@ -142,14 +136,16 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("json-c-x86-64", "0.18")
         .source_input("json-c-x86-64-source")
-        .native_inputs(&[
-            "cmake-x86-64",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "glibc-x86-64",
-            "make-x86-64-self",
-            "busybox-x86-64",
-        ])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &[
+                "cmake-x86-64",
+                "gcc-x86-64-self",
+                "binutils-x86-64-self",
+                "glibc-x86-64",
+                "make-x86-64-self",
+            ],
+        ))
         .inputs(&["linux-headers-x86-64"])
         .steps(steps)
 }
