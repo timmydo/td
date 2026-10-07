@@ -80,7 +80,7 @@ mod set_client;
 mod store;
 #[allow(
     dead_code,
-    reason = "shared descriptor transport also sends Wayland files"
+    reason = "the shared descriptor transport also serves td-portal and td-open"
 )]
 mod sys;
 mod token_check;
@@ -471,6 +471,7 @@ mod confinement {
             ("pin_terminal.rs", include_str!("pin_terminal.rs")),
             ("token_check.rs", include_str!("token_check.rs")),
             ("store.rs", include_str!("store.rs")),
+            ("scm.rs", include_str!("scm.rs")),
             ("sys.rs", include_str!("sys.rs")),
             ("system_vm.rs", include_str!("system_vm.rs")),
             ("tpm.rs", include_str!("tpm.rs")),
@@ -490,8 +491,9 @@ mod confinement {
                     );
                 }
             }
-            // UNSAFE.md §15: the two descriptor receivers.
-            if name != "sys.rs"
+            // UNSAFE.md §15: the two descriptor receivers, beside the
+            // transport itself (sys.rs's safe child scm.rs).
+            if !matches!(name, "sys.rs" | "scm.rs")
                 && (production.contains("recv_with_fds") || production.contains("take_received"))
             {
                 assert!(
@@ -546,6 +548,33 @@ mod confinement {
             "credential client changed"
         );
         let sys = include_str!("sys.rs");
+        // scm.rs reaches its parent only through these five names: a child
+        // module sees every private item above it, so the import line is the
+        // boundary, and a raw name, a syscall or an adoption is refused.
+        let scm_production = include_str!("scm.rs").split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            scm_production
+                .matches("use super::{close_raw, raw_errno, recvmsg, sendmsg, CONTROL_CAPACITY};")
+                .count(),
+            1
+        );
+        assert_eq!(scm_production.matches("super::").count(), 1);
+        assert!(!scm_production.contains("crate::"));
+        assert_eq!(scm_production.matches("recvmsg(").count(), 1);
+        assert_eq!(scm_production.matches("sendmsg(").count(), 1);
+        for raw in [
+            "asm!",
+            "syscall",
+            "SYS_",
+            "from_raw_fd",
+            "take_received",
+            "ReceivedFd",
+            "adopt(",
+            "MSG_CMSG_CLOEXEC",
+            "MSG_NOSIGNAL",
+        ] {
+            assert!(!scm_production.contains(raw), "scm.rs names {raw}");
+        }
         assert_eq!(sys.matches("core::arch::asm!").count(), 1);
         assert_eq!(sys.matches("const SYS_").count(), 3);
         let production = sys.split("#[cfg(test)]").next().unwrap();
@@ -614,6 +643,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "portable_notebook.rs",
                 "portable_pass.rs",
                 "portable_store.rs",
+                "scm.rs",
                 "set_client.rs",
                 "store.rs",
                 "sys.rs",

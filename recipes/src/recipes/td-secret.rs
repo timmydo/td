@@ -181,6 +181,11 @@ pub fn recipe() -> Recipe {
         });
     }
     for (path, source) in [
+        // sys.rs's own child, which lib.rs does not declare.
+        (
+            "{src}/td-secret/src/scm.rs",
+            include_str!("../../../td-secret/src/scm.rs"),
+        ),
         (
             "{src}/td-secret/src/portable_events.rs",
             include_str!("../../../td-secret/src/portable_events.rs"),

@@ -645,7 +645,14 @@ or negative descriptor, but continues over valid framing. Any recognizable
 SCM_RIGHTS descriptors that the kernel already installed are collected and
 closed before the receive is refused. A structural framing error instead
 closes everything collected through the last trusted boundary and returns
-immediately because later records cannot be identified. The `syscall5` body
+immediately because later records cannot be identified. That parser, the
+message headers and the receive and send loops are `td-secret/src/scm.rs`,
+one safe file with §12's module, mounted beneath this `sys.rs` (staged at
+`secret/scm.rs` for the target build). It names no syscall, number, flag or
+adoption: it reaches the kernel only through this module's two pinned
+wrappers, `recvmsg` with `MSG_CMSG_CLOEXEC` into a 1024-byte control buffer
+and `sendmsg` with no flags (Rust ignores SIGPIPE, so a departed client is
+the EPIPE `write_peer_disconnected` names). The `syscall5` body
 also carries `getsockopt(2)` once per
 accepted private-portal connection, with level fixed to `SOL_SOCKET=1`, option
 fixed to x86-64 `SO_PEERCRED=17`, and an exact 12-byte `[u32; 3]` result. The
@@ -896,7 +903,9 @@ to `runtime.rs`. The runtime has two total `sys::` references to the same monoto
 wrapper: one after ordinary-screen restoration and one after complete
 trusted-prompt presentation. Session policy has one pinned peer-UID
 reference. No other module may
-reach a syscall wrapper.
+reach a syscall wrapper, but for sys.rs's own child `scm.rs`, whose one
+pinned import reaches only `recvmsg`, `sendmsg`, `close_raw`, `raw_errno`
+and `CONTROL_CAPACITY`.
 `conn.rs` is the demo client's transport, extracted from `client.rs`; the
 descriptor queue is intrinsic to that connection. A `Connection` is
 crate-visible, though, so a module could reach `sendmsg`/`recvmsg` through
@@ -2263,7 +2272,13 @@ function-scoped `File::from_raw_fd` adoption. Safe `UnixStream` carries every
 descriptor-free message; the raw layer carries only descriptors. §12 is this
 module's canonical record: td-portal, td-secret (§15) and td-open (§23) all
 compile the same physical source with `#[path = "../../td-secret/src/sys.rs"]`
-and none has an independent copy. It borrows the stream and the descriptor it sends; no
+and none has an independent copy. The message headers, the bounded ancillary
+parser and the receive and send loops are its safe child `scm.rs`, which names
+no syscall, number, flag or adoption and reaches the kernel only through this
+module's `recvmsg` and `sendmsg` wrappers. td-compositor's raw module (§6)
+mounts the same child under its own wrappers, flags, capacity and adoption;
+that shares the parser, not this module, so td-compositor is no caller of it.
+It borrows the stream and the descriptor it sends; no
 socket creation, connection, path lookup, or caller-selected ancillary type
 enters the surface.
 
@@ -2309,7 +2324,9 @@ There is no general descriptor-forwarding API, raw descriptor owner, mmap,
 fcntl, ioctl, credential call, or network socket in td-portal beyond this. A
 fourth syscall, a second ancillary kind, a third scoped allowance, another
 production caller, or another raw descriptor adoption is an amendment here and
-in `APPLICATIONS.md` in the same landing.
+in `APPLICATIONS.md` in the same landing. A raw module other than this one and
+td-compositor's mounting `scm.rs`, or a name added to `scm.rs`'s one pinned
+`use super::` import, is an amendment here.
 
 ## 13. `td-audio` — the ALSA playback back end
 

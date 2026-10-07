@@ -3704,6 +3704,7 @@ mod confinement {
         ("handoff.rs", include_str!("handoff.rs")),
         ("open_uri.rs", include_str!("open_uri.rs")),
         ("sys.rs", include_str!("../../td-secret/src/sys.rs")),
+        ("scm.rs", include_str!("../../td-secret/src/scm.rs")),
         (
             "app_policy.rs",
             include_str!("../../td-busd/src/app_policy.rs"),
@@ -3714,6 +3715,7 @@ mod confinement {
         ),
     ];
     const SYS: &str = include_str!("../../td-secret/src/sys.rs");
+    const SCM: &str = include_str!("../../td-secret/src/scm.rs");
 
     fn production(source: &str) -> &str {
         // A source with no test section (lib.rs) is all production.
@@ -3757,13 +3759,41 @@ mod confinement {
             "const SYS_CLOSE: usize = 3;",
             "const SYS_SENDMSG: usize = 46;",
             "const SYS_RECVMSG: usize = 47;",
-            "const SCM_RIGHTS: i32 = 1;",
             "const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;",
             "const MSG_NOSIGNAL: i32 = 0x4000;",
         ] {
             assert!(SYS.contains(pin), "missing syscall pin {pin}");
         }
         assert_eq!(SYS.matches("const SYS_").count(), 3);
+        // The one ancillary kind lives in the safe child.
+        assert!(SCM.contains("const SCM_RIGHTS: i32 = 1;"));
+        // scm.rs reaches its parent only through these five names: a child
+        // module sees every private item above it, so the import line is the
+        // boundary, and a raw name, a syscall or an adoption is refused.
+        let scm_production = production(SCM);
+        assert_eq!(
+            scm_production
+                .matches("use super::{close_raw, raw_errno, recvmsg, sendmsg, CONTROL_CAPACITY};")
+                .count(),
+            1
+        );
+        assert_eq!(scm_production.matches("super::").count(), 1);
+        assert!(!scm_production.contains("crate::"));
+        assert_eq!(scm_production.matches("recvmsg(").count(), 1);
+        assert_eq!(scm_production.matches("sendmsg(").count(), 1);
+        for raw in [
+            "asm!",
+            "syscall",
+            "SYS_",
+            "from_raw_fd",
+            "take_received",
+            "ReceivedFd",
+            "adopt(",
+            "MSG_CMSG_CLOEXEC",
+            "MSG_NOSIGNAL",
+        ] {
+            assert!(!scm_production.contains(raw), "scm.rs names {raw}");
+        }
         assert_eq!(production(SYS).matches("syscall5(SYS_CLOSE,").count(), 1);
         assert_eq!(production(SYS).matches("SYS_SENDMSG,").count(), 1);
         assert_eq!(production(SYS).matches("SYS_RECVMSG,").count(), 1);
@@ -3826,7 +3856,9 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
         actual.sort();
         let mut expected = SOURCES
             .iter()
-            .filter(|(name, _)| !["sys.rs", "app_policy.rs", "bus_client.rs"].contains(name))
+            .filter(|(name, _)| {
+                !["sys.rs", "scm.rs", "app_policy.rs", "bus_client.rs"].contains(name)
+            })
             .map(|(name, _)| (*name).to_string())
             .collect::<Vec<_>>();
         expected.sort();

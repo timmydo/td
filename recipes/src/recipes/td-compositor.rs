@@ -150,6 +150,11 @@ const STAGED_FILES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/src/channel.rs"),
     ),
     ("auth/sys.rs", include_str!("../../../td-authd/src/sys.rs")),
+    // sys.rs's safe SCM_RIGHTS child, one file with td-secret's (UNSAFE.md §6).
+    (
+        "secret/scm.rs",
+        include_str!("../../../td-secret/src/scm.rs"),
+    ),
     // `9a`'s admission: the primary name rule and the hostname rules.
     (
         "auth/primary_account.rs",

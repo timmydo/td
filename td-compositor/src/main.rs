@@ -1100,6 +1100,7 @@ mod confinement {
     const MAIN: &str = include_str!("main.rs");
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
+    const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
     const AUTHORITY_FINGERPRINT: u64 = 0xf34df6decf17f3db;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
@@ -1115,6 +1116,7 @@ mod confinement {
         "coverage.rs",
         "face.rs",
         "face_file.rs",
+        "scm.rs",
         "sfnt.rs",
         "timezone.rs",
     ];
@@ -1159,6 +1161,7 @@ mod confinement {
         ("secret_client.rs", include_str!("secret_client.rs")),
         ("server.rs", include_str!("server.rs")),
         ("session.rs", include_str!("session.rs")),
+        ("scm.rs", SCM),
         ("sfnt.rs", include_str!("../../td-ui/src/sfnt.rs")),
         ("socket.rs", include_str!("socket.rs")),
         ("text.rs", include_str!("text.rs")),
@@ -1341,6 +1344,8 @@ mod confinement {
         let mut inventoried: Vec<&str> = OTHER
             .iter()
             .filter_map(|(name, _)| name.strip_suffix(".rs"))
+            // sys.rs declares scm itself; main.rs declares sys.
+            .filter(|name| *name != "scm")
             .chain(std::iter::once("sys"))
             .collect();
         declared.sort_unstable();
@@ -1949,22 +1954,30 @@ unsafe impl Send for MappedRegion {}"#;
     #[test]
     fn syscall_wrapper_is_called_only_by_the_eight_reviewed_operations() {
         let close = r#"errno_result(syscall5(SYS_CLOSE, fd as usize, 0, 0, 0, 0), "close")?"#;
-        let receive = r#"syscall5(
-            SYS_RECVMSG,
-            stream.as_raw_fd() as usize,
-            (&mut message as *mut MsgHdr) as usize,
-            MSG_CMSG_CLOEXEC as usize,
-            0,
-            0,
-        )"#;
-        let send = r#"syscall5(
-            SYS_SENDMSG,
-            stream.as_raw_fd() as usize,
-            (&message as *const MsgHdr) as usize,
-            0,
-            0,
-            0,
-        )"#;
+        // The two descriptor syscalls are one-line wrappers carrying this
+        // crate's flags; td-secret's scm.rs, mounted beneath, owns the headers,
+        // the ancillary parser and the loops, and reaches the kernel only
+        // through them.
+        let receive = r#"fn recvmsg(stream: &UnixStream, message: &mut scm::MsgHdr) -> isize {
+    syscall5(
+        SYS_RECVMSG,
+        stream.as_raw_fd() as usize,
+        (message as *mut scm::MsgHdr) as usize,
+        MSG_CMSG_CLOEXEC as usize,
+        0,
+        0,
+    )
+}"#;
+        let send = r#"fn sendmsg(stream: &UnixStream, message: &scm::MsgHdr) -> isize {
+    syscall5(
+        SYS_SENDMSG,
+        stream.as_raw_fd() as usize,
+        (message as *const scm::MsgHdr) as usize,
+        0,
+        0,
+        0,
+    )
+}"#;
         let peer = r#"syscall5(
             SYS_GETSOCKOPT,
             stream.as_raw_fd() as usize,
@@ -2034,15 +2047,42 @@ pub struct MappedRegion {
         assert_eq!(occurrences(SYS, receive), 1);
         assert_eq!(occurrences(SYS, send), 1);
         assert_eq!(occurrences(SYS, peer), 1);
+        for operation in ["fn close_raw(", "fn fcntl(", "pub fn peer_uid("] {
+            assert!(SYS.contains(operation), "{operation}");
+        }
         for operation in [
-            "fn close_raw(",
-            "fn fcntl(",
-            "pub fn peer_uid(",
             "pub fn recv_with_fds(",
             "pub fn send_with_fd(",
             "pub fn send_prefix_with_fd(",
         ] {
-            assert!(SYS.contains(operation), "{operation}");
+            assert!(SCM.contains(operation), "{operation}");
+        }
+        // scm.rs reaches its parent only through these five names: a child
+        // module sees every private item above it, so the import line is the
+        // boundary, and a raw name, a syscall or an adoption is refused.
+        let scm_production = production(SCM);
+        assert_eq!(
+            scm_production
+                .matches("use super::{close_raw, raw_errno, recvmsg, sendmsg, CONTROL_CAPACITY};")
+                .count(),
+            1
+        );
+        assert_eq!(scm_production.matches("super::").count(), 1);
+        assert!(!scm_production.contains("crate::"));
+        assert_eq!(scm_production.matches("recvmsg(").count(), 1);
+        assert_eq!(scm_production.matches("sendmsg(").count(), 1);
+        for raw in [
+            "asm!",
+            "syscall",
+            "SYS_",
+            "from_raw_fd",
+            "take_received",
+            "ReceivedFd",
+            "adopt(",
+            "MSG_CMSG_CLOEXEC",
+            "MSG_NOSIGNAL",
+        ] {
+            assert!(!scm_production.contains(raw), "scm.rs names {raw}");
         }
     }
 
