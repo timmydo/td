@@ -44,6 +44,10 @@ const TRACK_GIT_TIME: Duration = Duration::from_secs(60);
 pub(crate) const TRACK_TIME: Duration = TRACK_GIT_TIME.saturating_add(Duration::from_secs(60));
 /// The word a maintenance instance's entry is started with.
 pub const MAINTAIN: &str = "maintain";
+/// How long resolving an export's branch may take.
+const EXPORT_GIT_TIME: Duration = Duration::from_secs(60);
+/// How long packing an export may take.
+pub const EXPORT_TIME: Duration = Duration::from_secs(600);
 
 /// The human's identity, which commits made in the jail carry.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -452,6 +456,19 @@ pub enum Task {
         heads: Vec<(String, String)>,
         preparing: bool,
     },
+    /// Resolves `branch`, td-agent's record of the worktree's branch, to
+    /// its commit and sends the objects reachable from it and not from
+    /// `base`, a commit of the store, as a pack (DESIGN.md §9, Pushing):
+    /// frames of pack (`p`) and then the answer (`a`), the commit, so
+    /// nothing but objects leaves for the import. It writes nothing.
+    Export {
+        git: PathBuf,
+        repository: PathBuf,
+        id: String,
+        checkout: PathBuf,
+        branch: String,
+        base: String,
+    },
 }
 
 /// A survey's answer, read back outside the instance: what the
@@ -552,6 +569,22 @@ impl Task {
                     .flat_map(|(base, commit)| [OsString::from(base), OsString::from(commit)]),
             )
             .collect(),
+            Self::Export {
+                git,
+                repository,
+                id,
+                checkout,
+                branch,
+                base,
+            } => vec![
+                "export".into(),
+                git.into(),
+                repository.into(),
+                id.into(),
+                checkout.into(),
+                branch.into(),
+                base.into(),
+            ],
         }
     }
 
@@ -562,17 +595,38 @@ impl Task {
             Ok::<_, String>(path)
         };
         match args {
-            [word, git, repository, id, checkout, branch, base] if word == "checkout" => {
+            [word, git, repository, id, checkout, branch, base]
+                if word == "checkout" || word == "export" =>
+            {
                 if !git::object_id(base) {
                     return Err(format!("{base:?} is not a full commit id"));
                 }
-                Ok(Self::Checkout {
-                    git: absolute(git)?,
-                    repository: absolute(repository)?,
-                    id: worktree_id(id)?.into(),
-                    checkout: absolute(checkout)?,
-                    branch: git::branch_name(branch)?.into(),
-                    base: base.clone(),
+                let (git, repository, id, checkout, branch, base) = (
+                    absolute(git)?,
+                    absolute(repository)?,
+                    worktree_id(id)?.to_string(),
+                    absolute(checkout)?,
+                    git::branch_name(branch)?.to_string(),
+                    base.clone(),
+                );
+                Ok(if word == "export" {
+                    Self::Export {
+                        git,
+                        repository,
+                        id,
+                        checkout,
+                        branch,
+                        base,
+                    }
+                } else {
+                    Self::Checkout {
+                        git,
+                        repository,
+                        id,
+                        checkout,
+                        branch,
+                        base,
+                    }
                 })
             }
             [word, git, repository, id, checkout, bases @ ..]
@@ -616,7 +670,7 @@ impl Task {
                 })
             }
             _ => Err(
-                "usage: td-agent maintain checkout GIT REPOSITORY ID CHECKOUT BRANCH BASE, survey GIT REPOSITORY ID CHECKOUT BASE..., or track (or track-new) GIT REPOSITORY ID CHECKOUT BASE COMMIT...".into(),
+                "usage: td-agent maintain checkout (or export) GIT REPOSITORY ID CHECKOUT BRANCH BASE, survey GIT REPOSITORY ID CHECKOUT BASE..., or track (or track-new) GIT REPOSITORY ID CHECKOUT BASE COMMIT...".into(),
             ),
         }
     }
@@ -803,8 +857,75 @@ impl Task {
                 .map_err(|e| said("setting the remote-tracking refs", &e))?;
                 Ok(format!("{} remote-tracking refs set", heads.len()))
             }
+            Self::Export { .. } => Err("an export is run with its frames' writer".into()),
         }
     }
+
+    /// Runs an export, its pack in frames to `out`, and says the commit
+    /// it exported; any other task as `run`.
+    pub fn export(&self, out: &mut dyn Write) -> Result<String, String> {
+        let Self::Export {
+            git,
+            repository,
+            id,
+            checkout,
+            branch,
+            base,
+        } = self
+        else {
+            return self.run();
+        };
+        let jailed = || jailed(git, repository, id, checkout);
+        let resolved = git::run(
+            jailed().args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &format!("refs/heads/{branch}^{{commit}}"),
+            ]),
+            MAX_SAID,
+            EXPORT_GIT_TIME,
+        )
+        .map_err(|e| said(&format!("resolving the branch {branch}"), &e))?;
+        let commit = String::from_utf8_lossy(&resolved).trim().to_string();
+        if !git::object_id(&commit) {
+            return Err(format!("the branch {branch} resolved to {commit:?}"));
+        }
+        // Every object from the branch's commit back to the base, the
+        // store's, which the publish repository borrows too.
+        git::run_into(
+            jailed().args(["pack-objects", "--stdout", "--revs", "--quiet"]),
+            Some(format!("{commit}\n^{base}\n").into_bytes()),
+            git::MAX_PACK,
+            EXPORT_TIME,
+            &mut |chunk| {
+                let mut payload = Vec::with_capacity(chunk.len().saturating_add(1));
+                payload.push(b'p');
+                payload.extend_from_slice(chunk);
+                crate::frame::write(out, &payload).map_err(|e| e.to_string())
+            },
+        )
+        .map_err(|e| said("packing the commits", &e))?;
+        Ok(commit)
+    }
+}
+
+/// A maintenance instance's entry, `td-agent maintain ARGS`: the task
+/// run and its answer written to `out`, one line, or for an export its
+/// pack's frames and then the line as a frame of its own.
+pub fn maintain(args: &[String], out: &mut dyn Write) -> Result<(), String> {
+    let framed = args.first().is_some_and(|word| word == "export");
+    let result = Task::parse(args).and_then(|task| task.export(out));
+    let line = answer(&result);
+    let _ = if framed {
+        let mut payload = vec![b'a'];
+        payload.extend_from_slice(line.as_bytes());
+        crate::frame::write(out, &payload)
+    } else {
+        out.write_all(line.as_bytes()).and_then(|()| out.flush())
+    };
+    result.map(drop)
 }
 
 fn said(what: &str, failure: &Failure) -> String {
@@ -1396,11 +1517,156 @@ pub(crate) mod tests {
             .any(|_| true));
     }
 
+    /// An export's frames read back: its pack, and its answer line.
+    fn unframe(mut bytes: &[u8]) -> (Vec<u8>, String) {
+        let (mut pack, mut answer) = (Vec::new(), None);
+        while let Some(payload) = crate::frame::read(&mut bytes).unwrap() {
+            assert!(answer.is_none(), "a frame after the answer");
+            match payload.split_first().unwrap() {
+                (b'p', chunk) => pack.extend_from_slice(chunk),
+                (b'a', line) => answer = Some(String::from_utf8(line.to_vec()).unwrap()),
+                (tag, _) => panic!("a frame tagged {tag}"),
+            }
+        }
+        (pack, answer.unwrap())
+    }
+
+    /// An export sends the commits of td-agent's branch from the base as
+    /// a pack, framed, which the publish repository imports strictly; an
+    /// import refuses a pack missing what its objects name, one cut
+    /// short, and one without the commit (DESIGN.md §9, Pushing).
+    #[test]
+    fn an_export_is_imported_strictly_into_the_publish_repository() {
+        if !git::tests::have_git() {
+            return;
+        }
+        let scratch = Scratch::new("repo-export");
+        let (store, base) = store_fixture(&scratch.0);
+        let repository = scratch.0.join("ws/w/r.git");
+        let checkout = scratch.0.join("tree/w/r");
+        create(&repository, &store, &Identity::default()).unwrap();
+        add_worktree(&repository, &worktree(&checkout, None)).unwrap();
+        let found = String::from_utf8(
+            Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let git = fs::canonicalize(found.trim()).unwrap();
+        Task::Checkout {
+            git: git.clone(),
+            repository: repository.clone(),
+            id: "r".into(),
+            checkout: checkout.clone(),
+            branch: "agent/one".into(),
+            base: base.clone(),
+        }
+        .run()
+        .unwrap();
+        // Two commits, as the model's own git in the jail makes them.
+        let mut commits = Vec::new();
+        for (file, text) in [("one", "first\n"), ("two", "second\n")] {
+            fs::write(checkout.join(file), text).unwrap();
+            plain(&checkout, &["add", file]);
+            plain(&checkout, &["commit", "--quiet", "-m", file]);
+            commits.push(plain(&checkout, &["rev-parse", "HEAD"]).trim().to_string());
+        }
+        let export = |from: &str| Task::Export {
+            git: git.clone(),
+            repository: repository.clone(),
+            id: "r".into(),
+            checkout: checkout.clone(),
+            branch: "agent/one".into(),
+            base: from.to_string(),
+        };
+        // Its words cross, and the entry frames its answer after the pack.
+        let task = export(&base);
+        let words: Vec<String> = task
+            .args()
+            .iter()
+            .map(|w| w.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(Task::parse(&words).unwrap(), task);
+        let mut out = Vec::new();
+        maintain(&words, &mut out).unwrap();
+        let (pack, line) = unframe(&out);
+        assert_eq!(line, format!("ok {}\n", commits[1]));
+        assert!(pack.starts_with(b"PACK"), "{:?}", pack.get(..8));
+        // The publish repository takes it whole.
+        let worker = git::Worker::new(&scratch.0.join("git"), &git::kept_env()).unwrap();
+        let publish = scratch.0.join("publish/w/r.git");
+        worker.publish(&publish, &store).unwrap();
+        worker.publish(&publish, &store).unwrap();
+        let file = scratch.0.join("export.pack");
+        fs::write(&file, &pack).unwrap();
+        worker.import(&publish, &file, &commits[1]).unwrap();
+        let head = |c: &str| plain(&publish, &["rev-parse", &format!("{c}^{{tree}}")]);
+        assert_eq!(
+            head(&commits[1]),
+            plain(&checkout, &["rev-parse", "HEAD^{tree}"])
+        );
+        // It holds no ref the jail wrote, only objects.
+        assert_eq!(plain(&publish, &["for-each-ref"]), "");
+        // A pack from the first commit on names a parent the publish
+        // repository lacks, and is refused.
+        let missing = scratch.0.join("publish/w/s.git");
+        worker.publish(&missing, &store).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(export(&commits[0]).export(&mut out).unwrap(), commits[1]);
+        fs::write(&file, unframe_pack(&out)).unwrap();
+        let e = worker.import(&missing, &file, &commits[1]).unwrap_err();
+        assert!(e.starts_with("importing the export"), "{e}");
+        // Cut short, refused.
+        let other = scratch.0.join("publish/w/t.git");
+        worker.publish(&other, &store).unwrap();
+        fs::write(&file, pack.get(..pack.len() / 2).unwrap()).unwrap();
+        let e = worker.import(&other, &file, &commits[1]).unwrap_err();
+        assert!(e.starts_with("importing the export"), "{e}");
+        // Whole, but without the commit named, refused.
+        fs::write(&file, &pack).unwrap();
+        let e = worker.import(&other, &file, &"f".repeat(40)).unwrap_err();
+        assert!(e.contains("no commit"), "{e}");
+        // Nor is an object that only peels to it, such as a tag.
+        plain(&publish, &["tag", "-a", "-m", "t", "t", &commits[1]]);
+        let tag = plain(&publish, &["rev-parse", "t"]).trim().to_string();
+        assert_ne!(tag, commits[1]);
+        let e = worker.import(&publish, &file, &tag).unwrap_err();
+        assert!(e.contains("no commit"), "{e}");
+        // A branch that is not there is said.
+        let mut out = Vec::new();
+        let gone = Task::Export {
+            git: git.clone(),
+            repository: repository.clone(),
+            id: "r".into(),
+            checkout: checkout.clone(),
+            branch: "nowhere".into(),
+            base: base.clone(),
+        };
+        let e = gone.export(&mut out).unwrap_err();
+        assert!(e.starts_with("resolving the branch nowhere"), "{e}");
+        assert!(out.is_empty());
+    }
+
+    /// An export's frames, the pack alone.
+    fn unframe_pack(bytes: &[u8]) -> Vec<u8> {
+        let mut pack = Vec::new();
+        let mut rest = bytes;
+        while let Some(payload) = crate::frame::read(&mut rest).unwrap() {
+            if let (b'p', chunk) = payload.split_first().unwrap() {
+                pack.extend_from_slice(chunk);
+            }
+        }
+        pack
+    }
+
     fn task_git(task: &Task) -> PathBuf {
         match task {
-            Task::Checkout { git, .. } | Task::Survey { git, .. } | Task::Track { git, .. } => {
-                git.clone()
-            }
+            Task::Checkout { git, .. }
+            | Task::Survey { git, .. }
+            | Task::Track { git, .. }
+            | Task::Export { git, .. } => git.clone(),
         }
     }
 

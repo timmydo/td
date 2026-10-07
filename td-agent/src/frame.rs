@@ -35,7 +35,7 @@ impl std::fmt::Display for Error {
 /// Writes one frame whole: its header and payload in a single write, so
 /// a reader never sees a header without the bytes it promises unless the
 /// stream breaks.
-pub fn write(stream: &mut impl Write, payload: &[u8]) -> io::Result<()> {
+pub fn write<W: Write + ?Sized>(stream: &mut W, payload: &[u8]) -> io::Result<()> {
     if payload.len() > MAX_FRAME {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

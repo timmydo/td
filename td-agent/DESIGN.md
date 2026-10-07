@@ -3122,6 +3122,32 @@ outside `refs/remotes/`, so it is not snapshotted and needs no approval
 goes before queued background fetches, so many conversations asking at
 once can hold those back.
 
+**As built (increment 14, export and import).** The second step lays the
+push's first two stages, which nothing calls yet. A maintenance
+instance's `export` task resolves td-agent's record of the worktree's
+branch, never the jail's `HEAD`, to its commit with `rev-parse
+--verify`, and runs `pack-objects --stdout --revs` over that commit and
+not the base, a commit of the store, so every object the branch added
+since goes, and one the store already has may too. Its output is
+streamed as it comes, never held whole: a few pieces read ahead of the
+channel at most, so a slow reader holds git back, and once git exits its
+pipes are read for as long as its standard output still comes, a second
+without it ending them. It goes in frames on the instance's channel:
+pack frames, then the answer frame, its one line as every task's and no
+longer, with nothing allowed after it, each read of the channel given
+only what is left of the deadline. The conversation process writes the
+pack frames to a file it makes new, after the instance's spec is checked
+and in a directory no jail can write, refusing one already there, at
+most `MAX_PACK`, 128 MiB, and removes the file when the export fails.
+The git worker makes a workspace repository's publish repository,
+`publish/<name>/<repo>.git` beside its `ws/` one, with `init --bare` in
+the fixed shape, its objects borrowing the store's by an `alternates`
+file written whole; it is never mounted into any jail and holds no ref.
+It imports the file with `index-pack --strict --max-input-size`, which
+refuses a malformed object and an object naming one neither the pack nor
+the store has, and then requires the exported commit to be a commit
+there.
+
 ## 10. Network policy
 
 A workspace has one of three network policies, shown in the status row:

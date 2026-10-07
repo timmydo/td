@@ -137,12 +137,7 @@ fn main() -> ExitCode {
             }),
         // A maintenance instance's entry: its answer is its one line out.
         Some((first, rest)) if first == td_agent::repo::MAINTAIN => {
-            let result = td_agent::repo::Task::parse(rest).and_then(|task| task.run());
-            let mut out = std::io::stdout().lock();
-            let _ = out
-                .write_all(td_agent::repo::answer(&result).as_bytes())
-                .and_then(|()| out.flush());
-            result.map(drop)
+            td_agent::repo::maintain(rest, &mut std::io::stdout().lock())
         }
         Some((first, [])) if first == "--help" || first == "-h" => {
             let _ = std::io::stdout().lock().write_all(USAGE.as_bytes());

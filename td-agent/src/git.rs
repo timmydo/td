@@ -810,7 +810,16 @@ pub(crate) enum Failure {
     Exit(i32, String),
     TooLong,
     TimedOut(Duration),
+    /// What its output was handed to refused it.
+    Sink(String),
 }
+
+/// The most bytes of pack a push's export carries (DESIGN.md §9): the
+/// frames read from the maintenance instance, the file they are written
+/// to, and the import's `--max-input-size`.
+pub const MAX_PACK: u64 = 128 << 20;
+/// How long an import may take.
+const IMPORT_TIME: Duration = Duration::from_secs(600);
 
 /// The most bytes of project instructions one store's answer carries, in
 /// all: escaped as JSON escapes the worst text, within a frame.
@@ -1079,6 +1088,97 @@ fn next(queue: &mut std::collections::VecDeque<Job>) -> Option<Job> {
 }
 
 impl Worker {
+    /// The publish repository at `publish` (DESIGN.md §7, §9), made if
+    /// need be: bare, its objects borrowing `store`'s, never mounted into
+    /// a jail, and holding only what was imported for a push.
+    pub fn publish(&self, publish: &Path, store: &Path) -> Result<(), String> {
+        if !publish.is_absolute() {
+            return Err(format!("{} is not absolute", publish.display()));
+        }
+        if !publish.join("HEAD").is_file() {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(publish)
+                .map_err(|e| format!("{}: {e}", publish.display()))?;
+            let mut init = self.bare();
+            init.env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", &self.config)
+                .args([
+                    "-c",
+                    "init.defaultBranch=main",
+                    "init",
+                    "--quiet",
+                    "--bare",
+                    "--",
+                ])
+                .arg(publish);
+            run(&mut init, MAX_TEXT as u64, LOCAL_TIME)
+                .map_err(|e| format!("making {}: {e}", publish.display()))?;
+        }
+        let objects = std::fs::canonicalize(store.join("objects"))
+            .map_err(|e| format!("{}: {e}", store.display()))?;
+        let alternates = publish.join("objects/info/alternates");
+        let new = publish.join("objects/info/alternates.new");
+        std::fs::write(&new, format!("{}\n", objects.display()))
+            .and_then(|()| std::fs::rename(&new, &alternates))
+            .map_err(|e| format!("{}: {e}", alternates.display()))
+    }
+
+    /// The pack in file `pack`, a push's export, imported into publish
+    /// repository `publish` (DESIGN.md §9): checked by `index-pack
+    /// --strict`, which refuses a broken object and a link to one missing,
+    /// so only objects cross and every one is whole; then `id` must be a
+    /// commit there.
+    pub fn import(&self, publish: &Path, pack: &Path, id: &str) -> Result<(), String> {
+        if !object_id(id) {
+            return Err(format!("{id:?} is not a full commit id"));
+        }
+        let file = std::fs::File::open(pack).map_err(|e| format!("{}: {e}", pack.display()))?;
+        let size = file
+            .metadata()
+            .map_err(|e| format!("{}: {e}", pack.display()))?
+            .len();
+        if size > MAX_PACK {
+            return Err(format!(
+                "the export is {size} bytes, past the {MAX_PACK}-byte bound"
+            ));
+        }
+        run(
+            self.command(publish)
+                .args([
+                    "index-pack",
+                    "--strict",
+                    &format!("--max-input-size={MAX_PACK}"),
+                    "--stdin",
+                ])
+                .stdin(file),
+            MAX_TEXT as u64,
+            IMPORT_TIME,
+        )
+        .map_err(|e| format!("importing the export: {e}"))?;
+        let found = run(
+            self.command(publish).args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &format!("{id}^{{commit}}"),
+            ]),
+            MAX_TEXT as u64,
+            LOCAL_TIME,
+        )
+        .map_err(|e| match e {
+            // `--quiet`: it is not there, or no commit.
+            Failure::Exit(1, _) => format!("the import holds no commit {id}"),
+            e => format!("finding {id} in the import: {e}"),
+        })?;
+        if String::from_utf8_lossy(&found).trim() != id {
+            return Err(format!("the import holds no commit {id}"));
+        }
+        Ok(())
+    }
+
     /// The store for `remote` under `stores`, made if need be and
     /// fetched, with `bases` resolved there and the human's identity.
     fn prepare(
@@ -1129,6 +1229,7 @@ impl std::fmt::Display for Failure {
             Self::Exit(code, said) => write!(f, "git exited {code}: {said}"),
             Self::TooLong => write!(f, "git said more than was asked for"),
             Self::TimedOut(time) => write!(f, "git took more than {} seconds", time.as_secs()),
+            Self::Sink(why) => write!(f, "its output: {why}"),
         }
     }
 }
@@ -1145,7 +1246,12 @@ enum Piece {
 /// Standard output is read to one byte past `cap`, which is enough to
 /// refuse it; standard error is read to its end and only its first `cap`
 /// bytes told.
-fn reader(mut from: impl Read + Send + 'static, tell: mpsc::Sender<Piece>, out: bool, cap: u64) {
+fn reader(
+    mut from: impl Read + Send + 'static,
+    tell: mpsc::SyncSender<Piece>,
+    out: bool,
+    cap: u64,
+) {
     std::thread::spawn(move || {
         let mut buffer = vec![0u8; 8192];
         let mut told = 0u64;
@@ -1176,9 +1282,11 @@ fn reader(mut from: impl Read + Send + 'static, tell: mpsc::Sender<Piece>, out: 
     });
 }
 
-/// How long the pipes may stay open once git has exited: a helper it
+/// How long the pipes may stay quiet once git has exited: a helper it
 /// left behind can hold them.
 const GRACE: Duration = Duration::from_secs(1);
+/// The most pieces of git's output read ahead of the sink.
+const PIECES: usize = 16;
 
 /// Runs `command` for at most `time`, returning at most `limit` bytes of
 /// its standard output. Its standard error is read to its end, so a git
@@ -1198,6 +1306,24 @@ pub(crate) fn run_fed(
     limit: u64,
     time: Duration,
 ) -> Result<Vec<u8>, Failure> {
+    let mut out = Vec::new();
+    run_into(command, input, limit, time, &mut |bytes| {
+        out.extend_from_slice(bytes);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// `run_fed`, its standard output handed to `sink` as it comes rather
+/// than kept, so what it says may be larger than memory should hold; a
+/// sink's refusal kills git.
+pub(crate) fn run_into(
+    command: &mut Command,
+    input: Option<Vec<u8>>,
+    limit: u64,
+    time: Duration,
+    sink: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), Failure> {
     let now = Instant::now();
     let deadline = now.checked_add(time).unwrap_or(now);
     if input.is_some() {
@@ -1213,7 +1339,9 @@ pub(crate) fn run_fed(
             let _ = std::io::Write::write_all(&mut stdin, &input);
         });
     }
-    let (tell, heard) = mpsc::channel();
+    // Bounded, so a slow sink holds git back rather than its output
+    // piling up here.
+    let (tell, heard) = mpsc::sync_channel(PIECES);
     let mut open = 0;
     if let Some(stdout) = child.stdout.take() {
         reader(stdout, tell.clone(), true, limit);
@@ -1229,7 +1357,7 @@ pub(crate) fn run_fed(
         let _ = child.wait();
         Err(why)
     };
-    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let (mut told, mut err) = (0u64, Vec::new());
     let mut exited: Option<(std::process::ExitStatus, Instant)> = None;
     while open > 0 {
         let now = Instant::now();
@@ -1241,6 +1369,9 @@ pub(crate) fn run_fed(
                 Err(e) => return stop(&mut child, Failure::Start(e)),
             }
         }
+        // Once git has exited, its pipes have `GRACE` from the last of
+        // them heard: what it said is all taken, however slow the sink,
+        // and only a pipe a helper holds quiet is left.
         let until = exited.map_or(deadline, |(_, grace)| grace.min(deadline));
         if exited.is_some() && now >= until {
             break;
@@ -1248,11 +1379,21 @@ pub(crate) fn run_fed(
         let wait = until
             .saturating_duration_since(now)
             .min(Duration::from_millis(20));
-        match heard.recv_timeout(wait) {
+        let piece = heard.recv_timeout(wait);
+        // Standard output alone carries the answer: a helper's chatter
+        // on standard error renews nothing.
+        if let (Ok(Piece::Out(_)), Some((_, grace))) = (&piece, &mut exited) {
+            let now = Instant::now();
+            *grace = now.checked_add(GRACE).unwrap_or(now);
+        }
+        match piece {
             Ok(Piece::Out(bytes)) => {
-                out.extend_from_slice(&bytes);
-                if out.len() as u64 > limit {
+                told = told.saturating_add(bytes.len() as u64);
+                if told > limit {
                     return stop(&mut child, Failure::TooLong);
+                }
+                if let Err(why) = sink(&bytes) {
+                    return stop(&mut child, Failure::Sink(why));
                 }
             }
             // The start is kept for the reason; the rest is drained.
@@ -1279,7 +1420,7 @@ pub(crate) fn run_fed(
         },
     };
     if status.success() {
-        return Ok(out);
+        return Ok(());
     }
     let said = String::from_utf8_lossy(&err);
     let said: String = crate::tools::visible(said.trim())
@@ -1815,6 +1956,101 @@ pub(crate) mod tests {
                 "refresh https://example.org/b"
             ]
         );
+    }
+
+    /// A sink slower than git's grace still takes all git said, though
+    /// git exits long before it does.
+    #[test]
+    fn a_slow_sink_takes_all_git_said() {
+        if Command::new("sh").arg("-c").arg("true").status().is_err() {
+            eprintln!("skipped: no sh on PATH");
+            return;
+        }
+        let mut taken = 0usize;
+        run_into(
+            Command::new("sh").args(["-c", "head -c 300000 /dev/zero"]),
+            None,
+            1 << 20,
+            LOCAL_TIME,
+            &mut |bytes| {
+                taken += bytes.len();
+                std::thread::sleep(Duration::from_millis(50));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(taken, 300_000);
+    }
+
+    /// A helper left behind that keeps talking on standard error holds a
+    /// run no longer than the grace, as one that keeps quiet does.
+    #[test]
+    fn a_helper_chattering_on_its_error_holds_no_run() {
+        if Command::new("sh").arg("-c").arg("true").status().is_err() {
+            eprintln!("skipped: no sh on PATH");
+            return;
+        }
+        let started = Instant::now();
+        let said = run(
+            Command::new("sh").args([
+                "-c",
+                "(for i in 1 2 3 4 5 6 7 8 9 10; do echo x >&2; sleep 0.3; done &); echo hi",
+            ]),
+            64,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(said, b"hi\n");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A sink that refuses what git says ends it, said as the sink's.
+    #[test]
+    fn a_runs_sink_takes_its_output_as_it_comes_or_ends_it() {
+        if Command::new("sh").arg("-c").arg("true").status().is_err() {
+            eprintln!("skipped: no sh on PATH");
+            return;
+        }
+        let mut taken = Vec::new();
+        run_into(
+            Command::new("sh").args(["-c", "echo one; echo two"]),
+            None,
+            64,
+            LOCAL_TIME,
+            &mut |bytes| {
+                taken.extend_from_slice(bytes);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(taken, b"one\ntwo\n");
+        let refused = run_into(
+            Command::new("sh").args(["-c", "echo one"]),
+            None,
+            64,
+            LOCAL_TIME,
+            &mut |_| Err("full".into()),
+        )
+        .unwrap_err();
+        assert_eq!(refused.to_string(), "its output: full");
+        // Past its limit, the sink is not handed the rest.
+        let mut taken = Vec::new();
+        let long = run_into(
+            Command::new("sh").args(["-c", "head -c 100000 /dev/zero"]),
+            None,
+            10,
+            LOCAL_TIME,
+            &mut |bytes| {
+                taken.extend_from_slice(bytes);
+                Ok(())
+            },
+        );
+        assert!(matches!(long, Err(Failure::TooLong)));
+        assert!(taken.len() <= 10, "{}", taken.len());
     }
 
     #[test]

@@ -360,6 +360,7 @@ fn a_maintenance_instance_checks_out_and_a_jailed_git_commits() {
 
     // The model's own git, in a shell instance: it commits as the human
     // the repository names, and cannot touch what the chain protects.
+    let git_path = git.clone();
     let mut client = jail::launch(&programs(), &policy("jail/home"), &specs).unwrap();
     let git = git.display();
     let said = shell(
@@ -401,6 +402,62 @@ fn a_maintenance_instance_checks_out_and_a_jailed_git_commits() {
         std::fs::read_to_string(repository.join("config")).unwrap(),
         repo::config_text(&repository, &identity).unwrap()
     );
+    // A maintenance instance exports the branch's commits from the base
+    // as a pack, which the publish repository imports strictly (§9).
+    let export = Task::Export {
+        git: git_path,
+        repository: repository.clone(),
+        id: "r".into(),
+        checkout: checkout.clone(),
+        branch: "agent/one".into(),
+        base: base.clone(),
+    };
+    let pack = scratch.0.join("export.pack");
+    let exported = |pack: &std::path::Path| {
+        jail::export(
+            &programs(),
+            &policy("jail/maintenance"),
+            &specs,
+            &export,
+            time,
+            pack,
+        )
+    };
+    let commit = exported(&pack).unwrap();
+    assert_eq!(commit, tip.trim());
+    let worker =
+        td_agent::git::Worker::new(&scratch.0.join("git"), &td_agent::git::kept_env()).unwrap();
+    let publish = scratch.0.join("publish/w/r.git");
+    worker.publish(&publish, &store).unwrap();
+    worker.import(&publish, &pack, &commit).unwrap();
+    assert_eq!(
+        plain(&publish, &["log", "--format=%s", "-1", &commit]).trim(),
+        "two"
+    );
+    // A pack file already there is neither written over nor removed.
+    let kept = std::fs::read(&pack).unwrap();
+    assert!(exported(&pack).is_err());
+    assert_eq!(std::fs::read(&pack).unwrap(), kept);
+    // One that fails leaves no file of its own: here, a branch not there.
+    let mut words: Vec<String> = export
+        .args()
+        .iter()
+        .map(|word| word.to_str().unwrap().to_string())
+        .collect();
+    *words.get_mut(5).unwrap() = "nowhere".into();
+    let gone = Task::parse(&words).unwrap();
+    let unmade = scratch.0.join("unmade.pack");
+    let e = jail::export(
+        &programs(),
+        &policy("jail/maintenance"),
+        &specs,
+        &gone,
+        time,
+        &unmade,
+    )
+    .unwrap_err();
+    assert!(e.contains("resolving the branch nowhere"), "{e}");
+    assert!(!unmade.exists());
 }
 
 /// A repository conversation prepares its workspace as the window

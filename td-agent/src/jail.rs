@@ -336,16 +336,260 @@ pub fn maintain(
         ..policy.clone()
     };
     let spec = write_spec(spec_dir, &spec_text(programs, &policy, &host_path())?)?;
-    let answered = run_maintenance(programs, &spec, task, time);
+    let answered = run_maintenance(programs, &spec, task, time, &mut |ours, deadline| {
+        raw_answer(ours, deadline, time)
+    });
     let _ = fs::remove_file(&spec);
     answered
 }
 
+/// Runs `task`, an export, in a maintenance instance of `policy`, as
+/// `maintain` does, writing the pack it sends to a new file at `pack`
+/// (DESIGN.md §9), which is removed when the export fails; its answer
+/// is the commit exported. `pack`'s directory must be one no jail can
+/// write, so the file removed is the one made.
+pub fn export(
+    programs: &Programs,
+    policy: &Policy,
+    spec_dir: &Path,
+    task: &Task,
+    time: Duration,
+    pack: &Path,
+) -> Result<String, String> {
+    let policy = Policy {
+        home: private_dir(&policy.home)?,
+        ..policy.clone()
+    };
+    // Checked before the file is made, so no failure leaves it.
+    let text = spec_text(programs, &policy, &host_path())?;
+    // Made here, new, so a file that was there is neither written over
+    // nor removed.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(pack)
+        .map_err(|e| format!("{}: {e}", pack.display()))?;
+    let answered = write_spec(spec_dir, &text).and_then(|spec| {
+        let answered = run_maintenance(programs, &spec, task, time, &mut |ours, deadline| {
+            framed_answer(ours, deadline, time, &mut file, pack)
+        });
+        let _ = fs::remove_file(&spec);
+        answered
+    });
+    if answered.is_err() {
+        let _ = fs::remove_file(pack);
+    }
+    answered
+}
+
+/// The answer the channel gives until every end of it closes, as the
+/// instance's last process exits.
+fn raw_answer(ours: &mut UnixStream, deadline: Instant, time: Duration) -> Result<Vec<u8>, String> {
+    let mut answer = Vec::new();
+    let mut buffer = [0u8; 4096];
+    let read = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break Err(format!("maintenance took more than {time:?}"));
+        }
+        if let Err(e) = ours.set_read_timeout(Some(left)) {
+            break Err(format!("the jail's channel: {e}"));
+        }
+        match ours.read(&mut buffer) {
+            Ok(0) => break Ok(()),
+            Ok(n) => {
+                answer.extend_from_slice(buffer.get(..n).unwrap_or_default());
+                if answer.len() > MAX_ANSWER {
+                    break Err("the maintenance instance said too much".into());
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => break Err(format!("the jail's channel: {e}")),
+        }
+    };
+    read.map(|()| answer)
+}
+
+#[cfg(test)]
+mod export_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// What an instance sends, read as an export's answer: the pack
+    /// written to its file, then the answer line; anything out of place,
+    /// or no answer, refused.
+    #[test]
+    fn an_exports_frames_become_its_pack_and_answer() {
+        let dir = crate::store::tests::Scratch::new("jail-export");
+        let read = |frames: &[&[u8]], name: &str| {
+            let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+            for frame in frames {
+                crate::frame::write(&mut theirs, frame).unwrap();
+            }
+            drop(theirs);
+            let pack = dir.0.join(name);
+            let mut file = fs::File::create(&pack).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let time = Duration::from_secs(5);
+            let answer = framed_answer(&mut ours, deadline, time, &mut file, &pack);
+            (answer, fs::read(&pack).ok())
+        };
+        let (answer, pack) = read(&[b"pPACK", b"p-more", b"aok abc\n"], "whole");
+        // Bytes that trickle in, or none after a frame's length, hold a
+        // frame no longer than the deadline.
+        for (name, pause) in [("trickle", 0), ("silent", 1500)] {
+            let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+            let writer = std::thread::spawn(move || {
+                let _ = theirs.write_all(&64u32.to_be_bytes());
+                std::thread::sleep(Duration::from_millis(pause));
+                for _ in 0..40 {
+                    std::thread::sleep(Duration::from_millis(50));
+                    if theirs.write_all(b"p").is_err() {
+                        break;
+                    }
+                }
+            });
+            let trickled = dir.0.join(name);
+            let mut file = fs::File::create(&trickled).unwrap();
+            let started = Instant::now();
+            let time = Duration::from_millis(300);
+            let late = framed_answer(&mut ours, started + time, time, &mut file, &trickled);
+            assert!(
+                late.unwrap_err().starts_with("maintenance took more than"),
+                "{name}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(1), "{name}");
+            drop(ours);
+            writer.join().unwrap();
+        }
+        // A spec that cannot be written fails before any file is made.
+        let programs = Programs {
+            jail: "/bin/td-jail".into(),
+            agent: "/bin/td-agent".into(),
+            txt: "/bin/td-txt".into(),
+        };
+        let policy = Policy {
+            home: dir.0.join("home\nhidden"),
+            ..Policy::default()
+        };
+        let task = Task::Survey {
+            git: "/usr/bin/git".into(),
+            repository: "/r".into(),
+            id: "r".into(),
+            checkout: "/c".into(),
+            bases: vec!["a".repeat(40)],
+        };
+        let unmade = dir.0.join("unmade.pack");
+        let time = Duration::from_secs(1);
+        assert!(export(&programs, &policy, &dir.0, &task, time, &unmade).is_err());
+        assert!(!unmade.exists());
+        assert_eq!(answer.unwrap(), b"ok abc\n");
+        assert_eq!(pack.unwrap(), b"PACK-more");
+        let mut long = vec![b'a'];
+        long.extend(std::iter::repeat_n(b'x', MAX_ANSWER + 1));
+        for (frames, name) in [
+            (&[long.as_slice()][..], "long"),
+            (&[b"pPACK".as_slice()][..], "unanswered"),
+            (&[b"aok abc\n".as_slice(), b"pPACK"][..], "after"),
+            (&[b"xwhat".as_slice(), b"aok abc\n"][..], "untagged"),
+        ] {
+            assert!(read(frames, name).0.is_err(), "{name}");
+        }
+    }
+}
+
+/// A stream read only until `deadline`: each read is given what is left
+/// of it, so bytes that trickle in cannot hold a frame past it.
+struct Until<'a> {
+    stream: &'a mut UnixStream,
+    deadline: Instant,
+}
+
+impl Read for Until<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buffer)
+    }
+}
+
+/// An export's answer: its pack frames (`p`) written to `file`, the
+/// one at `pack`, at most `git::MAX_PACK` bytes of them, then its answer
+/// line (`a`), and then nothing until the channel closes.
+fn framed_answer(
+    ours: &mut UnixStream,
+    deadline: Instant,
+    time: Duration,
+    file: &mut fs::File,
+    pack: &Path,
+) -> Result<Vec<u8>, String> {
+    let mut size = 0u64;
+    let mut answer = None;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!("maintenance took more than {time:?}"));
+        }
+        let payload = match crate::frame::read(&mut Until {
+            stream: ours,
+            deadline,
+        }) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => break,
+            Err(crate::frame::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(format!("maintenance took more than {time:?}"));
+            }
+            Err(e) => return Err(format!("the jail's channel: {e}")),
+        };
+        match (payload.split_first(), &answer) {
+            (Some((b'p', chunk)), None) => {
+                size = size.saturating_add(chunk.len() as u64);
+                if size > crate::git::MAX_PACK {
+                    return Err(format!(
+                        "the export is past the {}-byte bound",
+                        crate::git::MAX_PACK
+                    ));
+                }
+                file.write_all(chunk)
+                    .map_err(|e| format!("{}: {e}", pack.display()))?;
+            }
+            (Some((b'a', line)), None) if line.len() <= MAX_ANSWER => {
+                answer = Some(line.to_vec());
+            }
+            _ => return Err("the maintenance instance said something out of place".into()),
+        }
+    }
+    file.sync_all()
+        .map_err(|e| format!("{}: {e}", pack.display()))?;
+    answer.ok_or_else(|| "the maintenance instance gave no answer".to_string())
+}
+
+/// What makes a maintenance instance's answer of its channel, by a
+/// deadline.
+type Reader<'a> = dyn FnMut(&mut UnixStream, Instant) -> Result<Vec<u8>, String> + 'a;
+
+/// Runs `task` in a maintenance instance from `spec`, its answer what
+/// `read` makes of the channel by the deadline.
 fn run_maintenance(
     programs: &Programs,
     spec: &Path,
     task: &Task,
     time: Duration,
+    read: &mut Reader,
 ) -> Result<String, String> {
     let now = Instant::now();
     let deadline = now.checked_add(time).unwrap_or(now);
@@ -380,35 +624,7 @@ fn run_maintenance(
         Some(text) if !text.trim().is_empty() => format!("{what}; td-jail said: {}", text.trim()),
         _ => what,
     };
-    // The answer is what the channel gives until every end of it closes,
-    // as the instance's last process exits.
-    let mut answer = Vec::new();
-    let mut buffer = [0u8; 4096];
-    let read = loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break Err(format!("maintenance took more than {time:?}"));
-        }
-        if let Err(e) = ours.set_read_timeout(Some(left)) {
-            break Err(format!("the jail's channel: {e}"));
-        }
-        match ours.read(&mut buffer) {
-            Ok(0) => break Ok(()),
-            Ok(n) => {
-                answer.extend_from_slice(buffer.get(..n).unwrap_or_default());
-                if answer.len() > MAX_ANSWER {
-                    break Err("the maintenance instance said too much".into());
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) => {}
-            Err(e) => break Err(format!("the jail's channel: {e}")),
-        }
-    };
+    let read = read(&mut ours, deadline);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -422,7 +638,7 @@ fn run_maintenance(
             }
         }
     };
-    read.map_err(said)?;
+    let answer = read.map_err(said)?;
     let answered = repo::read_answer(&answer);
     match status {
         Some(status) if status.success() => answered,
