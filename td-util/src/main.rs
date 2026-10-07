@@ -975,22 +975,26 @@ mod confinement {
         let start = at(&term, concat!("fnraw(tty:Borrowed", "Fd<'_>)"));
         assert!(start.is_some(), "term::raw must exist");
         let body = term.get(start.unwrap_or_default()..).unwrap_or_default();
-        // Bounded to raw() ITSELF. Left running to end-of-file, every scan below
-        // would be answered by some other function — or by this module's own
-        // tests, which legitimately spell all of these.
+        // Bounded to raw() and the readback_refusal() helper that follows it,
+        // whose refusals are counted below. Left running to end-of-file, every
+        // scan below would be answered by some other function — or by this
+        // module's own tests, which legitimately spell all of these.
         let ends = at(body, "pubfnsize(");
         assert!(
             ends.is_some(),
             "term::size must follow raw(); the scan needs a bound"
         );
         let rest = body.get(..ends.unwrap_or(body.len())).unwrap_or_default();
-        // Including the `?;`: that one IS allowed, because if the patch itself
-        // fails the terminal was never changed and there is nothing to put back.
-        // It is also where "after the terminal was patched" begins.
-        let patch = concat!("sys", "::termios_set(fd,&want)?;");
+        // Without a `?`: a `TCSETS` that applied part of the patch and still
+        // reported failure would otherwise leave that half-raw terminal behind,
+        // so the patch's own failure restores too. Where it begins is where
+        // "after the terminal was patched" begins.
+        let patch = concat!("sys", "::termios_set(fd,&want)");
         let set = at(rest, patch);
         let readback = at(rest, concat!("sys", "::termios_get(fd,&mutgot)"));
-        let refuse = at(rest, "returnErr(");
+        // The refusal is the readback's verdict, asked of the word `raw` WROTE:
+        // handed the word it read instead, the whole-word compare is a tautology.
+        let refuse = at(rest, "readback_refusal(&got,&saved,lflag)");
         assert!(set.is_some(), "raw() must set the patched termios");
         assert!(
             readback.is_some(),
@@ -998,7 +1002,8 @@ mod confinement {
         );
         assert!(
             refuse.is_some(),
-            "raw() must refuse a terminal that did not switch"
+            "raw() must refuse, through readback_refusal over the word it wrote, \
+             a terminal that did not switch"
         );
         assert!(
             set < readback && readback < refuse,
@@ -1025,10 +1030,24 @@ mod confinement {
             exits += 1;
         }
         assert_eq!(
-            exits, 4,
-            "raw() must refuse four ways — a failed readback, the flags not \
-             clearing, the control bytes not taking, and any OTHER byte moving — \
-             each restoring the terminal first"
+            exits, 3,
+            "raw() must refuse three ways — a failed patch, a failed readback, \
+             and a readback `readback_refusal` refuses — each restoring the \
+             terminal first"
+        );
+        // ...and `readback_refusal` refuses three ways: the flag word not being
+        // EXACTLY the one written (not merely ICANON and ECHO clear, which a
+        // zeroed word also has), the control bytes not taking, and any OTHER
+        // byte moving.
+        assert!(
+            after_set.contains("read_u32(got,LFLAG_AT)!=lflag"),
+            "the readback must compare the whole local-flag word"
+        );
+        assert_eq!(
+            after_set.matches("returnSome(").count(),
+            3,
+            "readback_refusal must refuse the flag word, the control bytes and \
+             any other byte"
         );
         // A `?` after the patch is an exit that skips all of the above.
         assert!(

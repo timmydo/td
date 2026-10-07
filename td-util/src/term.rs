@@ -9,7 +9,8 @@
 //! kernel's own bytes are read, two known offsets are patched, and the untouched
 //! original is what gets written back on restore, so a mistake cannot invent a
 //! line discipline out of nothing. Second, raw mode is read back and REFUSED
-//! unless the kernel agrees the two bits actually cleared; nothing else would
+//! unless the kernel agrees the local-flag word is exactly the one written,
+//! with the two bits cleared and nothing else moved; nothing else would
 //! notice, because a terminal still in canonical mode looks exactly like one that
 //! is simply waiting for a slow typist.
 
@@ -73,7 +74,13 @@ pub fn raw(tty: BorrowedFd<'_>) -> io::Result<Raw<'_>> {
     // the reader presses something, which is exactly the wait it wants.
     set_cc(&mut want, VMIN, 1);
     set_cc(&mut want, VTIME, 0);
-    sys::termios_set(fd, &want)?;
+    // Restoring on THIS failure too, not just the ones below: a `TCSETS` can
+    // apply part of what was asked and still report failure, and a bare `?`
+    // here would leave that half-raw terminal behind.
+    if let Err(e) = sys::termios_set(fd, &want) {
+        let _ = sys::termios_set(fd, &saved);
+        return Err(e);
+    }
     // ...and REFUSE unless the kernel agrees. A `TCSETS` can succeed having
     // applied only part of what was asked, and a terminal still in canonical mode
     // is indistinguishable from one whose reader has not typed yet.
@@ -87,32 +94,49 @@ pub fn raw(tty: BorrowedFd<'_>) -> io::Result<Raw<'_>> {
         let _ = sys::termios_set(fd, &saved);
         return Err(e);
     }
-    if read_u32(&got, LFLAG_AT) & (ICANON | ECHO) != 0 {
+    if let Some(why) = readback_refusal(&got, &saved, lflag) {
         let _ = sys::termios_set(fd, &saved);
-        return Err(io::Error::other("terminal did not enter raw mode"));
-    }
-    // The control bytes too, not just the flags. `TCSETS` applying ICANON/ECHO but
-    // not these leaves a terminal that passes the check above while a command read
-    // waits for several keystrokes, or times out and reads EOF — which this pager
-    // treats as `q`, so the failure looks like a pager that quits by itself.
-    if got.get(CC_AT + VMIN) != Some(&1) || got.get(CC_AT + VTIME) != Some(&0) {
-        let _ = sys::termios_set(fd, &saved);
-        return Err(io::Error::other("terminal kept its own VMIN/VTIME"));
-    }
-    // ...and NOTHING else moved. This is what makes "a termios is never
-    // constructed here" a property rather than a claim: hand the kernel a
-    // zeroed buffer instead of the patched original and every check above still
-    // passes — a zeroed c_lflag has ICANON and ECHO clear — while c_cflag = 0 is
-    // B0, which on a serial console is a hang-up, and c_oflag = 0 drops ONLCR so
-    // every line staircases. Comparing the untouched bytes catches it, and can
-    // only ever fire on bytes this function handed back verbatim.
-    if !only_the_patch_changed(&got, &saved) {
-        let _ = sys::termios_set(fd, &saved);
-        return Err(io::Error::other(
-            "terminal changed more than raw mode asked for",
-        ));
+        return Err(io::Error::other(why));
     }
     Ok(Raw { fd: tty, saved })
+}
+
+/// Why the termios read back after `TCSETS` is not the raw mode `raw` asked
+/// for, or `None` when it is. `lflag` is the local-flag word `raw` wrote.
+///
+/// The WHOLE `c_lflag` word, not just the two bits: `only_the_patch_changed`
+/// exempts those four bytes, so checking only that ICANON and ECHO cleared
+/// would let every OTHER local flag move unnoticed -- and a ZEROED c_lflag has
+/// both clear, so it would pass while ISIG went with it and Ctrl-C stopped
+/// reaching the pager.
+///
+/// The control bytes too, not just the flags. `TCSETS` applying ICANON/ECHO but
+/// not these leaves a terminal that passes the flag check while a command read
+/// waits for several keystrokes, or times out and reads EOF — which this pager
+/// treats as `q`, so the failure looks like a pager that quits by itself.
+///
+/// ...and NOTHING else moved. This is what makes "a termios is never
+/// constructed here" a property rather than a claim: hand the kernel a zeroed
+/// buffer instead of the patched original and the VMIN/VTIME check still
+/// passes, while c_cflag = 0 is B0, which on a serial console is a hang-up,
+/// and c_oflag = 0 drops ONLCR so every line staircases. Comparing the
+/// untouched bytes catches it, and can only ever fire on bytes `raw` handed
+/// back verbatim.
+fn readback_refusal(
+    got: &[u8; sys::TERMIOS_LEN],
+    saved: &[u8; sys::TERMIOS_LEN],
+    lflag: u32,
+) -> Option<&'static str> {
+    if read_u32(got, LFLAG_AT) != lflag {
+        return Some("terminal did not enter raw mode");
+    }
+    if got.get(CC_AT + VMIN) != Some(&1) || got.get(CC_AT + VTIME) != Some(&0) {
+        return Some("terminal kept its own VMIN/VTIME");
+    }
+    if !only_the_patch_changed(got, saved) {
+        return Some("terminal changed more than raw mode asked for");
+    }
+    None
 }
 
 /// The terminal's `(rows, columns)`, or `None` when it will not say.
@@ -315,6 +339,50 @@ mod tests {
             *slot = slot.wrapping_add(1);
         }
         assert!(!only_the_patch_changed(&nudged, &saved), "c_iflag moved");
+    }
+
+    /// The read-back compares the whole local-flag word. A c_lflag that came
+    /// back ZEROED has ICANON and ECHO clear and leaves every byte
+    /// `only_the_patch_changed` checks untouched, but ISIG went with it.
+    #[test]
+    fn a_zeroed_local_flag_word_is_refused() {
+        const ISIG: u32 = 0x0000_0001;
+        let mut saved = [0u8; sys::TERMIOS_LEN];
+        for (i, slot) in saved.iter_mut().enumerate() {
+            *slot = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        write_u32(&mut saved, LFLAG_AT, ISIG | ICANON | ECHO);
+        let lflag = read_u32(&saved, LFLAG_AT) & !(ICANON | ECHO);
+        let mut want = saved;
+        write_u32(&mut want, LFLAG_AT, lflag);
+        set_cc(&mut want, VMIN, 1);
+        set_cc(&mut want, VTIME, 0);
+        assert_eq!(readback_refusal(&want, &saved, lflag), None);
+
+        let mut zeroed = want;
+        write_u32(&mut zeroed, LFLAG_AT, 0);
+        assert!(only_the_patch_changed(&zeroed, &saved));
+        assert_eq!(
+            readback_refusal(&zeroed, &saved, lflag),
+            Some("terminal did not enter raw mode"),
+            "ISIG was dropped with ICANON and ECHO"
+        );
+
+        // The other two refusals, through the helper `raw` calls.
+        let mut slow = want;
+        set_cc(&mut slow, VMIN, 4);
+        assert_eq!(
+            readback_refusal(&slow, &saved, lflag),
+            Some("terminal kept its own VMIN/VTIME")
+        );
+        let mut moved = want;
+        if let Some(slot) = moved.get_mut(0) {
+            *slot = slot.wrapping_add(1);
+        }
+        assert_eq!(
+            readback_refusal(&moved, &saved, lflag),
+            Some("terminal changed more than raw mode asked for")
+        );
     }
 
     /// A terminal reporting zero rows or columns is "unknown", not a size.
