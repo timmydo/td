@@ -660,9 +660,9 @@ const POST_RUST_TOOLS: &[(&str, &str, &[&str])] = &[
         "{in:uutils}/bin/coreutils",
         &[
             "basename", "cat", "chmod", "cp", "cut", "date", "dirname", "echo", "env", "expr",
-            "false", "head", "install", "ln", "ls", "mkdir", "mktemp", "mv", "printf", "pwd",
-            "readlink", "rm", "rmdir", "sleep", "sort", "tail", "tee", "touch", "tr", "true",
-            "uname", "uniq", "wc",
+            "false", "head", "install", "kill", "ln", "ls", "mkdir", "mkfifo", "mktemp", "mv",
+            "printf", "pwd", "readlink", "rm", "rmdir", "sleep", "sort", "tail", "tee", "touch",
+            "tr", "true", "uname", "uniq", "wc",
         ],
     ),
 ];

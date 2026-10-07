@@ -1,5 +1,20 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
+
+/// td-sh runs `&` on a thread, so its `$!` names that JOB, not a process
+/// (td-sh/src/jobs.rs): `kill $!` finds no such process, and a shell joins
+/// its jobs before it exits. A leg that signals what it started has the
+/// process publish its own pid instead. `bg FILE CMD...` starts CMD as a job
+/// whose process writes `$$` to FILE and then execs CMD, so the pid is CMD's;
+/// `pid_of FILE` waits up to 30s for it. Signal the pid, `wait` the job.
+fn job_pids() -> String {
+    format!(
+        "publish='echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\" && shift && exec \"$@\"'; \
+         bg() {{ rm -f \"$1\"; '{POST_RUST_SH}' -c \"$publish\" bg \"$@\" & }}; \
+         pid_of() {{ i=0; while [ ! -s \"$1\" ]; do [ $i -lt 300 ] || return 1; \
+         i=$((i+1)); sleep 0.1; done; cat \"$1\"; }}; "
+    )
+}
 
 // td-svc-test: build-shape AND behavioural validation of the service supervisor.
 //
@@ -20,14 +35,15 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // for the wrong reason later.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-svc}/bin/td-svc";
+    let bg = job_pids();
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let mut steps = Vec::new();
+    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-svc' >&2; exit 1; }}; \
@@ -37,13 +53,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-svc (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -51,13 +67,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "dout=$('{readelf}' -d '{bin}' 2>/dev/null) || {{ echo 'readelf -d failed on td-svc (cannot verify absence of dynamic NEEDED)' >&2; exit 1; }}; \
@@ -65,7 +81,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // Fixture tables, written as files rather than heredocs so the shell layer
@@ -138,7 +154,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "o=$('{bin}' check -f '{{root}}/good.conf') || {{ echo 'check rejected a valid table' >&2; exit 1; }}; \
@@ -155,13 +171,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "e=$('{bin}' check -f '{{root}}/cycle.conf' 2>&1); \
@@ -193,7 +209,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // `run`, not just `check`. Everything above exercises the VALIDATOR; the
@@ -207,8 +223,8 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/run.conf".into(),
         content: format!(
-            "[first]\ntype=oneshot\nexec={POST_BOOTSTRAP_SH} -c 'echo 1 > {{root}}/ran-first'\n\n\
-             [second]\ntype=oneshot\nexec={POST_BOOTSTRAP_SH} -c 'echo 2 > {{root}}/ran-second'\nafter=first\n"
+            "[first]\ntype=oneshot\nexec={POST_RUST_SH} -c 'echo 1 > {{root}}/ran-first'\n\n\
+             [second]\ntype=oneshot\nexec={POST_RUST_SH} -c 'echo 2 > {{root}}/ran-second'\nafter=first\n"
         ),
         exec: false,
     });
@@ -216,11 +232,13 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
-                    "'{bin}' run -f '{{root}}/run.conf' >/dev/null 2>&1 & \
-                     p=$!; \
+                    "{bg}bg '{{root}}/run.pid' '{bin}' run -f '{{root}}/run.conf' >/dev/null 2>&1; \
+                     jp=$!; \
+                     p=$(pid_of '{{root}}/run.pid') || \
+                         {{ echo 'td-svc run never published its pid' >&2; exit 1; }}; \
                      i=0; \
                      while [ $i -lt 30 ]; do \
                          [ -f '{{root}}/ran-second' ] && break; \
@@ -232,13 +250,13 @@ pub fn recipe() -> Recipe {
                      : 'control socket path, so a leg that starts the next one'; \
                      : 'while this is still dying can see a live socket, decline'; \
                      : 'to bind, and then lose it when this process exits.'; \
-                     wait $p 2>/dev/null || :; \
+                     wait $jp 2>/dev/null || :; \
                      [ -f '{{root}}/ran-first' ] || {{ echo 'td-svc run started no service at all — the event loop is dead in the shipped static binary' >&2; exit 1; }}; \
                      [ -f '{{root}}/ran-second' ] || {{ echo 'td-svc run started the first unit but never released the one ordered after it' >&2; exit 1; }}"
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // The control socket, driven by the shipped binary on BOTH ends.
@@ -252,7 +270,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/ctl.conf".into(),
         content: format!(
-            "[held-open]\ntype=daemon\nexec={POST_BOOTSTRAP_SH} -c 'while : ; do sleep 1; done'\n\
+            "[held-open]\ntype=daemon\nexec={POST_RUST_SH} -c 'while : ; do sleep 1; done'\n\
              restart=always\n"
         ),
         exec: false,
@@ -261,12 +279,14 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
-                    "if mkdir -p /run/td-svc 2>/dev/null; then \
-                         '{bin}' run -f '{{root}}/ctl.conf' >/dev/null 2>&1 & \
-                         p=$!; \
+                    "{bg}if mkdir -p /run/td-svc 2>/dev/null; then \
+                         bg '{{root}}/ctl.pid' '{bin}' run -f '{{root}}/ctl.conf' >/dev/null 2>&1; \
+                         jp=$!; \
+                         p=$(pid_of '{{root}}/ctl.pid') || \
+                             {{ echo 'td-svc run never published its pid' >&2; exit 1; }}; \
                          i=0; \
                          while [ $i -lt 30 ]; do \
                              o=$('{bin}' status 2>/dev/null) && \
@@ -321,14 +341,14 @@ pub fn recipe() -> Recipe {
                          : 'Reap it before the next leg binds the same socket path:'; \
                          : 'a supervisor still dying answers clear_stale, so bind gets'; \
                          : 'AddrInUse and the next one runs with no socket at all.'; \
-                         wait $p 2>/dev/null || :; \
+                         wait $jp 2>/dev/null || :; \
                      else \
                          echo 'note: /run is not writable in this sandbox; the control socket is re-proved by the boot oracle'; \
                      fi"
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // The shutdown path, end to end in the shipped binary. Two legs, because the
@@ -346,7 +366,7 @@ pub fn recipe() -> Recipe {
         path: "{root}/down.conf".into(),
         content: format!(
             "[held-open]\ntype=daemon\n\
-             exec={POST_BOOTSTRAP_SH} -c 'echo $$ > /run/td-svc/held.pid; while : ; do sleep 1; done'\n\
+             exec={POST_RUST_SH} -c 'echo $$ > /run/td-svc/held.pid; while : ; do sleep 1; done'\n\
              restart=always\n"
         ),
         exec: false,
@@ -355,7 +375,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/resume.conf".into(),
         content: format!(
-            "[tracer]\ntype=oneshot\nexec={POST_BOOTSTRAP_SH} -c 'echo ran > /run/td-svc/tracer-ran'\n"
+            "[tracer]\ntype=oneshot\nexec={POST_RUST_SH} -c 'echo ran > /run/td-svc/tracer-ran'\n"
         ),
         exec: false,
     });
@@ -363,13 +383,15 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
-                    "if mkdir -p /run/td-svc 2>/dev/null; then \
+                    "{bg}if mkdir -p /run/td-svc 2>/dev/null; then \
                          rm -f /run/td-svc/shutdown /run/td-svc/tracer-ran /run/td-svc/held.pid; \
-                         '{bin}' run -f '{{root}}/down.conf' >/dev/null 2>&1 & \
-                         p=$!; \
+                         bg '{{root}}/down.pid' '{bin}' run -f '{{root}}/down.conf' >/dev/null 2>&1; \
+                         jp=$!; \
+                         p=$(pid_of '{{root}}/down.pid') || \
+                             {{ echo 'td-svc run never published its pid' >&2; exit 1; }}; \
                          i=0; \
                          while [ $i -lt 30 ]; do \
                              o=$('{bin}' status 2>/dev/null) && \
@@ -381,6 +403,12 @@ pub fn recipe() -> Recipe {
                          case \"$o\" in \
                              *'held-open ready'*) : ;; \
                              *) kill $p 2>/dev/null; echo \"td-svc never brought the daemon up before the shutdown leg, got: $o\" >&2; exit 1;; \
+                         esac; \
+                         : 'Ready means spawned, not that the daemon has run its'; \
+                         : 'first line: take its pid before the teardown can stop it.'; \
+                         d=$(pid_of /run/td-svc/held.pid); \
+                         case \"$d\" in \
+                             ''|*[!0-9]*) kill $p 2>/dev/null; echo \"the daemon never published its pid, got: '$d'\" >&2; exit 1;; \
                          esac; \
                          r=$('{bin}' reboot 2>&1); \
                          case \"$r\" in \
@@ -399,15 +427,11 @@ pub fn recipe() -> Recipe {
                          : 'execs the applet - absent here - and parks, so it stops'; \
                          : 'answering status. Polling for the final phase would time'; \
                          : 'out over and over and then report a failure that did not'; \
-                         : 'happen. The pid the daemon published stays readable after'; \
-                         : 'the process it names is gone, so there is nothing to poll'; \
-                         : 'the supervisor for. (kill -0 is pid-reuse sensitive in'; \
+                         : 'happen. The pid the daemon published before the reboot'; \
+                         : 'names it, so there is nothing to poll the supervisor'; \
+                         : 'for. (kill -0 is pid-reuse sensitive in'; \
                          : 'principle; over this 30s window in a fresh pid namespace'; \
                          : 'with one spawner it is not a real hazard.)'; \
-                         d=$(cat /run/td-svc/held.pid 2>/dev/null); \
-                         case \"$d\" in \
-                             ''|*[!0-9]*) kill $p 2>/dev/null; echo \"the daemon never published its pid, got: '$d'\" >&2; exit 1;; \
-                         esac; \
                          i=0; \
                          while [ $i -lt 30 ]; do \
                              kill -0 \"$d\" 2>/dev/null || break; \
@@ -415,7 +439,7 @@ pub fn recipe() -> Recipe {
                              sleep 1; \
                          done; \
                          kill $p 2>/dev/null; \
-                         wait $p 2>/dev/null || :; \
+                         wait $jp 2>/dev/null || :; \
                          if kill -0 \"$d\" 2>/dev/null; then \
                              echo 'the teardown did not stop a restart=always daemon' >&2; \
                              exit 1; \
@@ -427,11 +451,13 @@ pub fn recipe() -> Recipe {
                          : 'services up against filesystems /etc/shutdown has released.'; \
                          printf reboot > /run/td-svc/shutdown; \
                          rm -f /run/td-svc/tracer-ran; \
-                         '{bin}' run -f '{{root}}/resume.conf' >/dev/null 2>&1 & \
-                         q=$!; \
+                         bg '{{root}}/resume.pid' '{bin}' run -f '{{root}}/resume.conf' >/dev/null 2>&1; \
+                         jq=$!; \
+                         q=$(pid_of '{{root}}/resume.pid') || \
+                             {{ echo 'td-svc run never published its pid' >&2; exit 1; }}; \
                          sleep 5; \
                          kill $q 2>/dev/null; \
-                         wait $q 2>/dev/null || :; \
+                         wait $jq 2>/dev/null || :; \
                          if [ -e /run/td-svc/tracer-ran ]; then \
                              echo 'td-svc started a service while a shutdown was recorded (I6) - a crash mid-teardown would bring services back up against released filesystems' >&2; \
                              exit 1; \
@@ -443,7 +469,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // Log capture, in the SHIPPED binary: a unit with log= has BOTH its
@@ -454,7 +480,7 @@ pub fn recipe() -> Recipe {
         path: "{root}/capture.conf".into(),
         content: format!(
             "[talker]\ntype=oneshot\n\
-             exec={POST_BOOTSTRAP_SH} -c 'echo out-line; echo err-line >&2'\n\
+             exec={POST_RUST_SH} -c 'echo out-line; echo err-line >&2'\n\
              log={{root}}/captured/talker.log\n"
         ),
         exec: false,
@@ -463,21 +489,23 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
-                    "if mkdir -p /run/td-svc 2>/dev/null; then \
+                    "{bg}if mkdir -p /run/td-svc 2>/dev/null; then \
                          rm -f /run/td-svc/started /run/td-svc/shutdown; \
                          rm -rf '{{root}}/captured'; \
-                         '{bin}' run -f '{{root}}/capture.conf' >/dev/null 2>&1 & \
-                         p=$!; \
+                         bg '{{root}}/capture.pid' '{bin}' run -f '{{root}}/capture.conf' >/dev/null 2>&1; \
+                         jp=$!; \
+                         p=$(pid_of '{{root}}/capture.pid') || \
+                             {{ echo 'td-svc run never published its pid' >&2; exit 1; }}; \
                          log='{{root}}/captured/talker.log'; \
                          i=0; \
                          while [ $i -lt 60 ]; do \
                              if [ -f \"$log\" ] && grep -q out-line \"$log\" && grep -q err-line \"$log\"; then break; fi; \
                              i=$((i+1)); sleep 1; \
                          done; \
-                         kill $p 2>/dev/null; wait $p 2>/dev/null || :; \
+                         kill $p 2>/dev/null; wait $jp 2>/dev/null || :; \
                          [ -f \"$log\" ] || {{ echo 'no log file was created' >&2; exit 1; }}; \
                          grep -q out-line \"$log\" || {{ echo \"stdout was not captured, log holds: $(cat \"$log\")\" >&2; exit 1; }}; \
                          : 'stderr is the stream a services failures arrive on, and'; \
@@ -500,7 +528,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // Eviction, in the SHIPPED binary: a supervisor that starts with a record
@@ -517,7 +545,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/evict.conf".into(),
         content: format!(
-            "[tracer]\ntype=oneshot\nexec={POST_BOOTSTRAP_SH} -c 'echo ran > /run/td-svc/evict-ran'\n"
+            "[tracer]\ntype=oneshot\nexec={POST_RUST_SH} -c 'echo ran > /run/td-svc/evict-ran'\n"
         ),
         exec: false,
     });
@@ -525,26 +553,31 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
-                    "if mkdir -p /run/td-svc 2>/dev/null && [ -r /proc/self/stat ]; then \
+                    "{bg}if mkdir -p /run/td-svc 2>/dev/null && [ -r /proc/self/stat ]; then \
                          rm -f /run/td-svc/started /run/td-svc/shutdown /run/td-svc/evict-ran; \
-                         '{POST_BOOTSTRAP_SH}' -c 'while : ; do sleep 1; done' & \
-                         op=$!; \
-                         sleep 1; \
+                         bg '{{root}}/orphan.pid' '{POST_RUST_SH}' -c 'while : ; do sleep 1; done'; \
+                         jo=$!; \
+                         op=$(pid_of '{{root}}/orphan.pid') || \
+                             {{ echo 'the stand-in orphan never started' >&2; exit 1; }}; \
                          s=$(cat /proc/$op/stat 2>/dev/null); \
                          case \"$s\" in '') echo 'the stand-in orphan never started' >&2; exit 1;; esac; \
                          r=${{s#*') '}}; \
                          st=$(echo \"$r\" | cut -d' ' -f20); \
-                         case \"$st\" in ''|*[!0-9]*) echo \"no starttime for the orphan, got: '$st'\" >&2; exit 1;; esac; \
+                         case \"$st\" in ''|*[!0-9]*) kill $op 2>/dev/null; echo \"no starttime for the orphan, got: '$st'\" >&2; exit 1;; esac; \
                          echo \"$op $st 0 tracer\" > /run/td-svc/started; \
-                         '{bin}' run -f '{{root}}/evict.conf' >/dev/null 2>&1 & \
-                         p=$!; \
-                         : 'A background job of a non-interactive shell leads no group,'; \
-                         : 'so td-svc classifies it Process(pid) and signals it alone.'; \
-                         : 'It is this shells child, so the kill leaves a zombie until'; \
-                         : 'the wait below - hence state Z counts as evicted, not alive.'; \
+                         bg '{{root}}/evict.pid' '{bin}' run -f '{{root}}/evict.conf' >/dev/null 2>&1; \
+                         jp=$!; \
+                         : 'A shell joins its jobs before it exits, so a failure'; \
+                         : 'exit stops the looping orphan first.'; \
+                         p=$(pid_of '{{root}}/evict.pid') || \
+                             {{ kill $op 2>/dev/null; echo 'td-svc run never published its pid' >&2; exit 1; }}; \
+                         : 'td-sh puts no job in a process group of its own, so the'; \
+                         : 'orphan leads no group: td-svc classifies it Process(pid)'; \
+                         : 'and signals it alone. Its job reaps it at once, so it'; \
+                         : 'leaves /proc; a Z state still counts as evicted.'; \
                          i=0; alive=yes; \
                          while [ $i -lt 60 ]; do \
                              s=$(cat /proc/$op/stat 2>/dev/null); \
@@ -560,8 +593,8 @@ pub fn recipe() -> Recipe {
                              if [ -f /run/td-svc/evict-ran ]; then ran=yes; break; fi; \
                              j=$((j+1)); sleep 1; \
                          done; \
-                         kill $p 2>/dev/null; wait $p 2>/dev/null || :; \
-                         kill $op 2>/dev/null; wait $op 2>/dev/null || :; \
+                         kill $p 2>/dev/null; wait $jp 2>/dev/null || :; \
+                         kill $op 2>/dev/null; wait $jo 2>/dev/null || :; \
                          if [ \"$alive\" = yes ]; then \
                              echo 'the recorded orphan survived; a duplicate would have followed' >&2; exit 1; \
                          fi; \
@@ -576,7 +609,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // The Ctrl-Alt-Del sentinel, in the SHIPPED binary. Arming turns entirely
@@ -595,14 +628,19 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
-                    "d=/tmp/td-svc-cad-$$; \
-                     if mkdir -p \"$d\" 2>/dev/null && mkfifo \"$d/pipe\" 2>/dev/null; then \
-                         '{bin}' cad-sentinel < \"$d/pipe\" & \
-                         p=$!; \
+                    "{bg}d=/tmp/td-svc-cad-$$; \
+                     if mkdir -p \"$d\" 2>/dev/null; then \
+                         mkfifo \"$d/pipe\" || {{ echo 'mkfifo could not make the sentinel pipe' >&2; exit 1; }}; \
+                         '{POST_RUST_SH}' -c \"$publish\" bg \"$d/pid\" '{bin}' cad-sentinel < \"$d/pipe\" & \
+                         j=$!; \
                          exec 9> \"$d/pipe\"; \
+                         : 'The pid is written once the FIFO opens, which the line'; \
+                         : 'above is what lets happen.'; \
+                         p=$(pid_of \"$d/pid\") || \
+                             {{ exec 9>&-; echo 'FAIL: the sentinel never published its pid' >&2; exit 1; }}; \
                          sleep 2; \
                          : 'Still held: it must be alive, and not a zombie.'; \
                          st=`cut -d' ' -f3 /proc/$p/stat 2>/dev/null || echo '?'`; \
@@ -612,7 +650,7 @@ pub fn recipe() -> Recipe {
                          fi; \
                          : 'Let go: it must exit promptly, and cleanly.'; \
                          exec 9>&-; \
-                         wait $p; rc=$?; \
+                         wait $j; rc=$?; \
                          if [ \"$rc\" -ne 0 ]; then \
                              echo \"FAIL: the sentinel exited $rc when its pipe closed\" >&2; \
                              exit 1; \
@@ -620,12 +658,12 @@ pub fn recipe() -> Recipe {
                          echo 'the cad sentinel blocked while the pipe was held and exited 0 when it closed'; \
                          rm -rf \"$d\"; \
                      else \
-                         echo 'note: no writable /tmp or no mkfifo in this sandbox; the cad sentinel is re-proved by the boot oracle'; \
+                         echo 'note: no writable /tmp in this sandbox; the cad sentinel is re-proved by the boot oracle'; \
                      fi"
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     steps.push(Step::MkDir {
@@ -642,7 +680,7 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-svc-test", "1.0")
-        .native_inputs(&["td-svc", "binutils-x86-64-self", "busybox-x86-64"])
+        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["td-svc", "binutils-x86-64-self"]))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"

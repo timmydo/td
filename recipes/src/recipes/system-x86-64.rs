@@ -982,7 +982,7 @@ const UUTILS_APPLETS: &[&str] = &[
     "env", "df", "du", "chmod", "chown", "sleep", "sync", "wc", "head", "tail", "sort", "date",
     "whoami", "tty", "dd", "mktemp", "seq", "touch", "mknod", "kill", "readlink", "basename",
     "dirname", "true", "false", "printenv", "link", "unlink", "cut", "tr", "expr", "tee", "uniq",
-    "install",
+    "install", "mkfifo",
 ];
 
 enum UutilsProbe {
@@ -1002,6 +1002,7 @@ enum UutilsProbe {
     Tee,
     Uniq,
     Install,
+    Mkfifo,
 }
 
 const UUTILS_BEHAVIOR_PROBES: &[UutilsProbe] = &[
@@ -1026,6 +1027,7 @@ const UUTILS_BEHAVIOR_PROBES: &[UutilsProbe] = &[
     UutilsProbe::Tee,
     UutilsProbe::Uniq,
     UutilsProbe::Install,
+    UutilsProbe::Mkfifo,
 ];
 
 impl UutilsProbe {
@@ -1041,6 +1043,7 @@ impl UutilsProbe {
             Self::Tee => "tee",
             Self::Uniq => "uniq",
             Self::Install => "install",
+            Self::Mkfifo => "mkfifo",
         }
     }
 }
@@ -1140,6 +1143,15 @@ fn uutils_behavior_probe(probe: &UutilsProbe) -> String {
              m=$(/bin/ls -l /tmp/td-uutils-probe/install-dst | /bin/cut -c1-10); \
              [ \"$m\" = -rw-r----- ] || \
              {{ echo \"uutils: /bin/{applet} -m 640 left mode $m\"; u=0; }}; \
+             else echo \"uutils: /bin/{applet} failed\"; u=0; fi; "
+        ),
+        UutilsProbe::Mkfifo => format!(
+            "if /bin/{applet} -m 600 /tmp/td-uutils-probe/fifo; then \
+             [ -p /tmp/td-uutils-probe/fifo ] || \
+             {{ echo \"uutils: /bin/{applet} did not make a fifo\"; u=0; }}; \
+             m=$(/bin/ls -l /tmp/td-uutils-probe/fifo | /bin/cut -c1-10); \
+             [ \"$m\" = prw------- ] || \
+             {{ echo \"uutils: /bin/{applet} -m 600 left mode $m\"; u=0; }}; \
              else echo \"uutils: /bin/{applet} failed\"; u=0; fi; "
         ),
     }
