@@ -323,6 +323,9 @@ pub enum Request {
     /// Write one conversation's diagnostics archive, from its row's
     /// menu's Diagnostics.
     ExportConversation(Id),
+    /// Show what request `request` of conversation `id` and its reply
+    /// carried (DESIGN.md §4, the Debug button).
+    Debug { id: Id, request: u64 },
     /// Delete this conversation for good, as the human confirmed.
     Delete(Id),
     /// Archive this conversation, or bring it back, from its row's menu.
@@ -580,7 +583,12 @@ const TRANSCRIPT_KEYS: &[(&str, &str)] = &[
     ("C-a", "Select the whole transcript."),
     ("C-c", "Copy the selection."),
     ("C-S-c", "Copy the focused message whole."),
+    (DEBUG_CHORD, "Show the focused reply's request and reply."),
 ];
+/// The caption of a reply's button that shows its request and reply.
+pub const DEBUG: &str = "Debug";
+/// The chord that does, on the focused message.
+pub const DEBUG_CHORD: &str = "C-S-d";
 const COMPOSER_KEYS: &[(&str, &str)] = &[
     (
         "Return/C-Return",
@@ -633,6 +641,9 @@ pub struct App {
     /// transcript, and each started turn's and its user message's.
     messages: Vec<(u64, usize)>,
     turns: Vec<(u64, u64)>,
+    /// Each message that came of a request, and so has a Debug button:
+    /// the request's sequence number and the message's index.
+    exchanges: Vec<(u64, usize)>,
     /// The turn each conversation in the background is running.
     background_turns: Vec<(Id, u64)>,
     /// The last event shown, so one heard twice (read from the log when a
@@ -811,6 +822,7 @@ impl App {
             todo_open: false,
             steps: crate::store::Steps::default(),
             messages: Vec::new(),
+            exchanges: Vec::new(),
             turns: Vec::new(),
             last_seq: 0,
             background_turns: Vec::new(),
@@ -1652,6 +1664,7 @@ impl App {
     fn clear_transcript(&mut self) {
         self.transcript.remove_first(self.transcript.len());
         self.messages.clear();
+        self.exchanges.clear();
         self.turns.clear();
         self.last_seq = 0;
         self.meter = Meter::default();
@@ -2072,6 +2085,9 @@ impl App {
                     .and_then(|m| m.section("summary", content.as_deref().unwrap_or_default(), true))
                     .map_err(|e| e.to_string())
                     .and_then(|m| self.push_message(m));
+                if let Ok(index) = pushed {
+                    self.exchange(request, index);
+                }
                 if let Err(e) = pushed {
                     self.note(format!("the transcript refused a summary: {e}"));
                 }
@@ -2140,7 +2156,10 @@ impl App {
                     },
                 };
                 match shown {
-                    Ok(index) => self.meter.replies.push((request, index)),
+                    Ok(index) => {
+                        self.meter.replies.push((request, index));
+                        self.exchange(request, index);
+                    }
                     Err(e) => self.note(format!("the transcript refused a reply: {e}")),
                 }
             }
@@ -2430,7 +2449,11 @@ impl App {
     fn evict(&mut self) {
         let count = (self.transcript.len() / 8).max(1);
         self.transcript.remove_first(count);
-        for list in [&mut self.messages, &mut self.meter.replies] {
+        for list in [
+            &mut self.messages,
+            &mut self.meter.replies,
+            &mut self.exchanges,
+        ] {
             list.retain(|(_, index)| *index >= count);
             for (_, index) in list.iter_mut() {
                 *index = index.saturating_sub(count);
@@ -3523,6 +3546,63 @@ impl App {
         if let Some(id) = self.menu_row.take() {
             self.requests.push(Request::Archive { id, archived });
             self.touch();
+        }
+    }
+
+    /// Message `index`, which came of a request, gets its Debug button.
+    fn exchange(&mut self, request: u64, index: usize) {
+        if let Err(e) = self.transcript.set_action(index, Some(DEBUG)) {
+            return self.note(format!("the transcript refused a Debug button: {e}"));
+        }
+        self.exchanges.push((request, index));
+    }
+
+    /// Asks the window for what the request message `index` came of
+    /// carried; a message that came of none says so.
+    fn debug(&mut self, index: usize) {
+        let request = self
+            .exchanges
+            .iter()
+            .rev()
+            .find(|(_, at)| *at == index)
+            .map(|(request, _)| *request);
+        match (request, self.active.clone()) {
+            (Some(request), Some(id)) => {
+                self.requests.push(Request::Debug { id, request });
+                self.touch();
+            }
+            _ => self.note("that message came of no request to show"),
+        }
+    }
+
+    /// What request `request` of conversation `id` carried, from the
+    /// window, in the read-only panel output shows in; why not, said.
+    pub fn show_debug(
+        &mut self,
+        id: &Id,
+        request: u64,
+        view: Result<Vec<(String, String)>, String>,
+    ) {
+        if self.modal() {
+            return;
+        }
+        let entries = match view {
+            Ok(entries) => entries,
+            Err(why) => return self.note(format!("request {request}: {why}")),
+        };
+        match crate::notes::Panel::debug(
+            self.surface,
+            body(self.surface),
+            id.clone(),
+            format!("request {request}: what it and its reply carried, the key never shown"),
+            &entries,
+        ) {
+            Ok(panel) => {
+                self.notes = Some(panel);
+                self.apply_focus();
+                self.touch();
+            }
+            Err(why) => self.note(why),
         }
     }
 
@@ -4751,6 +4831,13 @@ impl App {
                 }
             }
             Focus::Transcript => {
+                // Once a press: each reads the conversation's whole log.
+                if chord == DEBUG_CHORD {
+                    if let Some(index) = self.transcript.focused_message().filter(|_| !repeat) {
+                        self.debug(index);
+                    }
+                    return;
+                }
                 if let Some(key) = messages::Key::from_chord(chord) {
                     match self
                         .transcript
@@ -4906,6 +4993,7 @@ impl App {
                 match self.transcript.event(event, clipboard) {
                     messages::Outcome::Ignored | messages::Outcome::Consumed => {}
                     messages::Outcome::Refused(why) => self.note(format!("copy: {why}")),
+                    messages::Outcome::Action(index) => self.debug(index),
                     _ => self.touch(),
                 }
             }
@@ -5729,6 +5817,73 @@ pub mod tests {
             bytes: 0,
             reserved,
         }
+    }
+
+    /// A reply gets a Debug button, a user's message none; its press, or
+    /// the chord on the focused message, asks the window for what that
+    /// request carried, shown read-only, or says why not.
+    #[test]
+    fn a_replys_debug_button_asks_for_its_request() {
+        let mut app = app();
+        turn(&mut app, 1, "hello");
+        app.update(at(3, request(2, 900)), 0);
+        app.update(
+            at(
+                4,
+                Kind::Assistant {
+                    request: 3,
+                    content: Some("hi there".into()),
+                    reasoning: None,
+                    details: None,
+                    finish: "stop".into(),
+                    incomplete: false,
+                    calls: Vec::new(),
+                },
+            ),
+            0,
+        );
+        let (_, user) = app.messages[0];
+        assert!(app.transcript.action_button(user).is_none());
+        let (request, reply) = *app.exchanges.last().unwrap();
+        assert_eq!(request, 3);
+        let button = app.transcript.action_button(reply).unwrap();
+        let _ = app.take_requests();
+        press(&mut app, button.x + 2, button.y + 2);
+        let id = app.active().unwrap().clone();
+        assert_eq!(
+            app.take_requests(),
+            [Request::Debug {
+                id: id.clone(),
+                request: 3
+            }]
+        );
+        // The chord, on the focused message, which the press focused.
+        app.set_focus(Focus::Transcript);
+        key(&mut app, DEBUG_CHORD);
+        assert_eq!(
+            app.take_requests(),
+            [Request::Debug {
+                id: id.clone(),
+                request: 3
+            }]
+        );
+        // Held, it asks once.
+        app.key(DEBUG_CHORD, true, &mut NoClipboard);
+        assert!(app.take_requests().is_empty());
+        // On a user's message it says there is nothing to show.
+        app.debug(user);
+        assert!(app.take_requests().is_empty());
+        assert!(app.notice().unwrap().contains("came of no request"));
+        // The window's answer opens the read-only panel, or says why not.
+        app.show_debug(&id, 3, Err("request 3 is not in the log".into()));
+        assert!(app.notes.is_none());
+        assert!(app.notice().unwrap().contains("not in the log"));
+        app.show_debug(
+            &id,
+            3,
+            Ok(vec![("request".into(), "POST https://h/v1".into())]),
+        );
+        assert!(app.notes.is_some());
     }
 
     #[test]

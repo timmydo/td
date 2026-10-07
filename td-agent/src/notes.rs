@@ -245,6 +245,18 @@ impl Panel {
         Self::carded(surface, body, id, title, entries, "process output")
     }
 
+    /// What a request and its reply carried (the Debug button), read-only
+    /// as process output is.
+    pub fn debug(
+        surface: Surface,
+        body: Rect,
+        id: crate::store::Id,
+        title: String,
+        entries: &[(String, String)],
+    ) -> Result<Self, String> {
+        Self::carded(surface, body, id, title, entries, "request view")
+    }
+
     /// Adds an entry, the oldest shown going while the list refuses it;
     /// one it refuses alone is left out.
     /// A card's entry is never evicted, its recommendation first of all:

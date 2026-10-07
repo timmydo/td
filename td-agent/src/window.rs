@@ -459,6 +459,24 @@ impl Session {
                     );
                     self.app.show_output(&id, number, read);
                 }
+                // Read here, the whole log and one record, once a press:
+                // they are the conversation's, only read meanwhile
+                // (DESIGN.md §6). Every key held is looked for.
+                Request::Debug { id, request } => {
+                    let view = match self.known_keys() {
+                        Ok((keys, _)) => {
+                            let forms: Vec<String> = keys
+                                .iter()
+                                .flat_map(|key| crate::wire::key_forms(key.expose()))
+                                .collect();
+                            crate::wire::view(&self.state, &id, request, &forms)
+                        }
+                        Err(problem) => Err(format!(
+                            "the stored key cannot be read to keep it out of the view: {problem}"
+                        )),
+                    };
+                    self.app.show_debug(&id, request, view);
+                }
                 Request::Admit { template, remotes } => self.admit(&template, &remotes),
                 // To whichever conversation asked, open or not; one whose
                 // process has gone asks again from nothing.
@@ -1883,6 +1901,23 @@ impl Session {
         true
     }
 
+    /// Every key this window has held, and the stored one, only to look
+    /// for, with why the stored one could not be read; refused when it
+    /// cannot be and no other is held.
+    fn known_keys(&self) -> Result<(Vec<Secret>, Option<String>), String> {
+        let mut keys = self.keys.clone();
+        let mut key_problem = None;
+        if let Some(path) = self.key_path.as_deref() {
+            match key::read(path) {
+                Ok(stored) if !keys.contains(&stored) => keys.push(stored),
+                Ok(_) | Err(key::Problem::Missing(_)) => {}
+                Err(problem) if keys.is_empty() => return Err(problem.to_string()),
+                Err(problem) => key_problem = Some(problem.to_string()),
+            }
+        }
+        Ok((keys, key_problem))
+    }
+
     /// Starts the diagnostics export (DESIGN.md §4), of every
     /// conversation or of `conversation` alone, on a thread, into
     /// `~/Downloads`, else the home directory: never where a workspace
@@ -1913,22 +1948,15 @@ impl Session {
             home
         };
         let config = self.config_file();
-        // Every key this window has held, and the stored one, only to
-        // look for: no file holding one is taken.
-        let mut keys = self.keys.clone();
-        let mut key_problem = None;
-        if let Some(path) = self.key_path.as_deref() {
-            match key::read(path) {
-                Ok(stored) if !keys.contains(&stored) => keys.push(stored),
-                Ok(_) | Err(key::Problem::Missing(_)) => {}
-                Err(problem) if keys.is_empty() => {
-                    return self.app.note(format!(
-                        "no diagnostics: the stored key cannot be read to keep it out of them: {problem}"
-                    ));
-                }
-                Err(problem) => key_problem = Some(problem.to_string()),
+        // No file holding a key is taken.
+        let (keys, key_problem) = match self.known_keys() {
+            Ok(known) => known,
+            Err(problem) => {
+                return self.app.note(format!(
+                "no diagnostics: the stored key cannot be read to keep it out of them: {problem}"
+            ))
             }
-        }
+        };
         let sources = diagnostics::Sources {
             state: self.state.root().to_path_buf(),
             config,

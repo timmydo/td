@@ -586,6 +586,31 @@ fn replies(events: &[Event]) -> Vec<(u64, Option<String>, Option<String>, bool)>
         .collect()
 }
 
+/// A key the person pasted is sent as they wrote it, but the Debug
+/// view never shows it.
+#[test]
+fn the_debug_view_never_shows_a_pasted_key() {
+    let mut h = Harness::new(
+        "debugkey",
+        Role::Conversation,
+        vec![Reply::sse("stream-sonnet.sse"), Reply::ok("title.json")],
+    );
+    h.setup(Client::default());
+    h.say(&format!("is this my key? {KEY}"));
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    assert!(h.mock.requests()[0].text().contains(KEY));
+    let request = replies(&events)[0].0;
+    let view =
+        td_agent::wire::view(&h.state, &h.id, request, &td_agent::wire::key_forms(KEY)).unwrap();
+    assert!(view.iter().all(|(_, text)| !text.contains(KEY)), "{view:?}");
+    assert!(
+        view[1].1.contains("is this my key? [redacted]"),
+        "{}",
+        view[1].1
+    );
+}
+
 #[test]
 fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
     let mut h = Harness::new(
@@ -674,6 +699,26 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
         "{record}"
     );
     assert!(record.contains("data: "), "{record}");
+    // The Debug view: the request as recorded, its body rebuilt from the
+    // log byte for byte as it was sent, and the reply.
+    let view =
+        td_agent::wire::view(&h.state, &h.id, reply[0].0, &td_agent::wire::key_forms(KEY)).unwrap();
+    let headers: Vec<&str> = view.iter().map(|(header, _)| header.as_str()).collect();
+    assert_eq!(headers[0], "request");
+    assert!(view[0]
+        .1
+        .starts_with("POST https://openrouter.ai/api/v1/chat/completions\n"));
+    assert_eq!(
+        headers[1],
+        format!(
+            "request body: {} bytes, rebuilt from the log",
+            turn.text().len()
+        )
+    );
+    assert_eq!(view[1].1, turn.text());
+    assert_eq!(headers[2], "reply");
+    assert!(view[2].1.starts_with("status 200\n"), "{}", view[2].1);
+    assert!(view.iter().all(|(_, text)| !text.contains(KEY)));
     // Read whole at `[DONE]`, before the service says the body ended.
     assert!(
         record.ends_with("data: [DONE]\n\n[td-agent read a whole reply]\n"),

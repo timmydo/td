@@ -686,6 +686,26 @@ copyable:
   the focused message, that copies the whole message as its source text,
   and a tool block's copy action copies its full result as retained in the
   log, not the drawn excerpt;
+- a message that came of a model request, a reply or a compaction's
+  summary, also has a `Debug` button before Copy (td-ui's action button)
+  and `C-S-d` on the focused message, once a press, not repeated while
+  held: the window reads the conversation's whole log and that
+  request's wire record (§6) and shows them read-only in the panel that
+  shows a process's output, as entries of their own: `request` (the
+  method, the URL and headers, credentials `[redacted]`), the request's
+  body as the log rebuilds it, as it was sent, with its length, and
+  `reply` (the status, headers and body as they came, and how the
+  exchange ended). Every form of every key the window holds or has
+  stored is replaced by `[redacted]` in each, one the person pasted
+  included, and the window refuses to show them when the stored key
+  cannot be read and it holds none; each line's control and
+  bidirectional characters are shown escaped, as output's are; an
+  entry past the panel's bound is cut at a character and says so, a
+  reply keeping its ending lines past the cut. With no record kept (a
+  fork's replies have none), the body and why there is no reply. A
+  user's message, a tool block or a notice has none, and the chord on
+  one says it came of no request. Through the control seam it is the
+  chord;
 - copying never includes the chrome: headers, buttons and verdict marks are
   not part of any selection.
 

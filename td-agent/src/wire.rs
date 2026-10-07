@@ -343,6 +343,92 @@ pub fn read(dir: &Path, request: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// The most bytes of a request's body or a reply the Debug view shows,
+/// a list entry's bound less room for saying so.
+const MAX_SHOWN: usize = td_ui::messages::MAX_TEXT_BYTES - 1024;
+
+/// The most bytes of a record's ending lines kept past a cut.
+const MAX_ENDING: usize = 2 * MAX_END + 1024;
+
+/// `text` as the Debug view shows it: every form of `keys` replaced,
+/// each line's control and bidirectional characters shown escaped as a
+/// process's output's are, then held to `MAX_SHOWN`, cut at a character
+/// and said so. Its last lines that begin `[`, up to `ending` of them,
+/// say how a record ended, and are kept past the cut.
+fn entry(text: &str, keys: &[String], ending: usize) -> String {
+    let text = scrubbed(text.to_string(), keys);
+    let text: Vec<String> = text.split('\n').map(crate::tools::visible).collect();
+    let text = text.join("\n");
+    if text.len() <= MAX_SHOWN {
+        return text;
+    }
+    let mut tail = text.len();
+    for _ in 0..ending {
+        let before = text.get(..tail.saturating_sub(1)).unwrap_or_default();
+        match before.rfind('\n') {
+            Some(at)
+                if text.get(at + 1..).is_some_and(|line| line.starts_with('['))
+                    && text.len() - (at + 1) <= MAX_ENDING =>
+            {
+                tail = at + 1
+            }
+            _ => break,
+        }
+    }
+    let (head, tail) = text.split_at_checked(tail).unwrap_or((&text, ""));
+    let mut end = MAX_SHOWN.saturating_sub(tail.len()).min(head.len());
+    while !head.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[the first {end} of its {} bytes as shown here are shown; the conversation's diagnostics export holds the record whole]\n{tail}",
+        head.get(..end).unwrap_or_default(),
+        head.len()
+    )
+}
+
+/// What the window's Debug view shows of request `request` of
+/// conversation `id`: the request's line and headers, its body as the log
+/// rebuilds it, and the reply as its record kept it, or why there is no
+/// record.
+pub fn view(
+    state: &crate::store::StateDir,
+    id: &crate::store::Id,
+    request: u64,
+    keys: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    let events = crate::store::read_log(state, id)?;
+    let index = events
+        .iter()
+        .position(|event| event.seq == request)
+        .ok_or_else(|| format!("request {request} is not in the log"))?;
+    let prefix = crate::store::read_prefix(state, id)?;
+    let body = crate::client::body(&events, index, &prefix)?;
+    let body = (
+        format!("request body: {} bytes, rebuilt from the log", body.len()),
+        entry(&body, keys, 0),
+    );
+    let split = format!("\n{REPLY}\n");
+    let record = read(&state.conversation(id), request);
+    Ok(match record.as_deref().and_then(|text| text.split_once(&split)) {
+        Some((sent, reply)) => vec![
+            ("request".into(), entry(sent, keys, 0)),
+            body,
+            ("reply".into(), entry(reply, keys, 2)),
+        ],
+        None => vec![
+            body,
+            (
+                "reply".into(),
+                format!(
+                    "no record of it is kept: a reply is recorded once it ends, a conversation's records keep its most recent {} MiB, and a fork takes its source's log but none of its records",
+                    MAX_TOTAL / (1024 * 1024)
+                ),
+            ),
+        ],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
@@ -429,6 +515,29 @@ mod tests {
                 MAX_BODY - before + KEY.len() + 10_000
             )));
         }
+    }
+
+    /// What the Debug view shows holds no key, escapes what a terminal
+    /// or a bidirectional run would act on, and keeps how a record ended
+    /// past its cut.
+    #[test]
+    fn an_entry_hides_the_key_escapes_and_keeps_its_ending() {
+        let forms = key_forms(KEY);
+        let shown = entry(&format!("a {KEY}\u{202e}b\u{1b}[2J"), &forms, 0);
+        assert!(!shown.contains(KEY) && shown.contains(REDACTED), "{shown}");
+        assert!(
+            !shown.contains('\u{202e}') && !shown.contains('\u{1b}'),
+            "{shown}"
+        );
+        let ending = "[1048576 bytes of the body's text are kept; it had 2000000 bytes]\n[td-agent read a whole reply]\n";
+        let long = format!("status 200\n{}\n{ending}", "x".repeat(MAX_SHOWN));
+        let shown = entry(&long, &forms, 2);
+        assert!(shown.len() <= MAX_SHOWN + 512, "{}", shown.len());
+        assert!(shown.ends_with(ending), "{}", &shown[shown.len() - 300..]);
+        assert!(shown.contains("bytes as shown here are shown;"));
+        // Without ending lines, a long last line is cut as the rest is.
+        let shown = entry(&"y".repeat(2 * MAX_SHOWN), &forms, 2);
+        assert!(shown.len() <= MAX_SHOWN + 512, "{}", shown.len());
     }
 
     /// A key cut short at the held bound leaves nothing either, however
