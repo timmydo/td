@@ -1,4 +1,4 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-txt-test: build-shape validation of the target-built text userland.
@@ -25,16 +25,22 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // green in the shared per-change cargo-test gate. The shape build + smoke-exec
 // here proves the SEPARATE property that harness cannot: that the target
 // toolchain links td-txt into a self-contained static ELF.
+//
+// The checks read readelf's output with the bootstrap root's GNU grep, ahead of
+// the farm on PATH: the farm's grep IS td-txt, and a grep that mis-matched could
+// pass its own check. The smoke step reaches td-txt only by its own path.
+const ORACLE_PATH: &str = "{in:grep-mesboot0}/bin:{tools}";
+
 pub fn recipe() -> Recipe {
     let bin = "{in:td-txt}/bin/td-txt";
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let mut steps = Vec::new();
+    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-txt' >&2; exit 1; }}; \
@@ -44,13 +50,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", ORACLE_PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-txt (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -58,13 +64,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", ORACLE_PATH),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "dout=$('{readelf}' -d '{bin}' 2>/dev/null) || {{ echo 'readelf -d failed on td-txt (cannot verify absence of dynamic NEEDED)' >&2; exit 1; }}; \
@@ -72,7 +78,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", ORACLE_PATH),
     );
     // Beyond the shape: RUN it. `--list` names the applets, a `grep` symlink
     // proves argv[0] dispatch (how the image's /bin farm reaches it), and the
@@ -82,7 +88,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "list=$('{bin}' --list) || {{ echo 'td-txt --list failed' >&2; exit 1; }}; \
@@ -98,7 +104,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", ORACLE_PATH),
     );
 
     steps.push(Step::MkDir {
@@ -115,7 +121,10 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-txt-test", "1.0")
-        .native_inputs(&["td-txt", "binutils-x86-64-self", "busybox-x86-64"])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &["binutils-x86-64-self", "grep-mesboot0"],
+        ))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"

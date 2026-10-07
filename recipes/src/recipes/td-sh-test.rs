@@ -1,11 +1,11 @@
-use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
+use crate::ladder::{post_rust_inputs, post_rust_tool_farm, SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-sh-test: build-shape validation of the target-built shell.
 //
 // This asserts — per repo policy that recipes test their output — that the
 // shipped td-sh binary is the self-contained STATIC ELF the boot-critical
-// `/bin/sh` slot requires (busybox `sh` runs in stage-1 init before the dynamic
+// `/bin/sh` slot requires (`/bin/sh` runs in stage-1 init before the dynamic
 // uutils glibc closure is reachable). It re-proves, with an independent readelf
 // walk, what the producer's `assert_static` fail-closes on:
 //   1. td-sh is an ELF64 x86-64 *executable* (readelf: class ELF64, machine
@@ -24,16 +24,20 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // per-change cargo-test gate. The shape build + smoke-exec here proves the SEPARATE
 // property that harness cannot: that the target toolchain links td-sh into the
 // self-contained static ELF the boot-critical `/bin/sh` slot requires.
+//
+// The walk runs under the bootstrap root's bash, not the farm's `sh`: that is
+// td-sh, and a shell that mis-read a pipeline's status could pass its own check.
+// Its grep is the farm's, td-txt, which is not the subject.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-sh}/bin/td-sh";
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let mut steps = Vec::new();
+    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-sh' >&2; exit 1; }}; \
@@ -43,13 +47,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-sh (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -57,13 +61,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                SH,
                 "-c",
                 &format!(
                     "dout=$('{readelf}' -d '{bin}' 2>/dev/null) || {{ echo 'readelf -d failed on td-sh (cannot verify absence of dynamic NEEDED)' >&2; exit 1; }}; \
@@ -71,7 +75,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     // Beyond the shape: actually RUN the static binary so a mis-built ELF with
     // correct headers but a broken entry point / bad static link fails here (the
@@ -93,7 +97,10 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-sh-test", "1.0")
-        .native_inputs(&["td-sh", "binutils-x86-64-self", "busybox-x86-64"])
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &["binutils-x86-64-self", "bash-mesboot"],
+        ))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"

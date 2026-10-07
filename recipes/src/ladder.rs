@@ -1878,6 +1878,10 @@ mod tests {
         // gawk and the bootstrap Make, once, as make-x86-64-self does.
         ("gawk-x86-64-self", "gawk-mesboot"),
         ("gawk-x86-64-self", "make-x86-64"),
+        // An oracle that is not its own subject: the farm's shell is td-sh and
+        // its grep td-txt, so the tests of those two take the root's.
+        ("td-sh-test", "bash-mesboot"),
+        ("td-txt-test", "grep-mesboot0"),
     ];
     const RECIPE_SHEBANG_INTERPRETERS: &[&str] =
         &[super::SH, super::POST_BOOTSTRAP_SH, super::POST_RUST_SH];
