@@ -65,6 +65,16 @@ pub enum Tool {
     ProcessOutput,
     ProcessWait,
     ProcessKill,
+    GitFetch,
+}
+
+/// Which tools a conversation has: the conversation's own, a
+/// workspace's beside them, and a repository workspace's beside both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Kit {
+    Conversation,
+    Workspace,
+    Repositories,
 }
 
 /// The tools every conversation has, in the order the prefix defines
@@ -82,6 +92,7 @@ pub fn known(name: &str) -> bool {
     CONVERSATION
         .iter()
         .chain(WORKSPACE)
+        .chain(REPOSITORIES)
         .any(|tool| tool.name() == name)
 }
 
@@ -100,6 +111,10 @@ const WORKSPACE: &[Tool] = &[
     Tool::ProcessWait,
     Tool::ProcessKill,
 ];
+
+/// The tools a repository workspace adds (DESIGN.md §9), run by the git
+/// worker, outside the jail.
+const REPOSITORIES: &[Tool] = &[Tool::GitFetch];
 
 impl Tool {
     pub fn name(self) -> &'static str {
@@ -120,15 +135,18 @@ impl Tool {
             Self::ProcessOutput => "process_output",
             Self::ProcessWait => "process_wait",
             Self::ProcessKill => "process_kill",
+            Self::GitFetch => "git_fetch",
         }
     }
 
-    /// The tools a conversation has, with a workspace's when it works in
-    /// one.
-    pub fn all(workspace: bool) -> Vec<Self> {
+    /// The tools a conversation with `kit` has.
+    pub fn all(kit: Kit) -> Vec<Self> {
         let mut tools = CONVERSATION.to_vec();
-        if workspace {
+        if kit != Kit::Conversation {
             tools.extend_from_slice(WORKSPACE);
+        }
+        if kit == Kit::Repositories {
+            tools.extend_from_slice(REPOSITORIES);
         }
         tools
     }
@@ -144,11 +162,11 @@ impl Tool {
 
     /// Whether the workspace tool named `name` acts (`acts`).
     pub fn acting(name: &str) -> bool {
-        Self::find(true, name).is_some_and(Self::acts)
+        Self::find(Kit::Repositories, name).is_some_and(Self::acts)
     }
 
-    fn find(workspace: bool, name: &str) -> Option<Self> {
-        Self::all(workspace).into_iter().find(|t| t.name() == name)
+    fn find(kit: Kit, name: &str) -> Option<Self> {
+        Self::all(kit).into_iter().find(|t| t.name() == name)
     }
 }
 
@@ -408,6 +426,13 @@ fn definition(tool: Tool) -> Json {
                 &["id"],
             ),
         ),
+        Tool::GitFetch => (
+            "Fetch a worktree's remote now, outside the jail, and set refs/remotes/origin/<base> in each of this workspace's worktrees of that remote to where its base is upstream. It changes no branch and no file: merge or rebase in the worktree with shell afterwards if you want what came. td-agent also fetches in the background and tells you when a base moves, so call this only when you need the newest upstream at once.".to_string(),
+            schema(
+                vec![("worktree", property("string", "The worktree's absolute path, as the environment names it."))],
+                &["worktree"],
+            ),
+        ),
     };
     Json::Obj(vec![
         ("type".into(), Json::Str("function".into())),
@@ -426,8 +451,8 @@ fn definition(tool: Tool) -> Json {
 /// workspace's with them when it works in one, and their settings, then
 /// the messages every request begins with, `messages` last so a request
 /// appends to it.
-pub fn prefix(workspace: bool, system: &str) -> String {
-    let tools = Tool::all(workspace).into_iter().map(definition).collect();
+pub fn prefix(kit: Kit, system: &str) -> String {
+    let tools = Tool::all(kit).into_iter().map(definition).collect();
     Json::Obj(vec![
         ("tools".into(), Json::Arr(tools)),
         (
@@ -495,6 +520,10 @@ pub enum Args {
     Wait {
         number: u64,
         timeout_ms: u64,
+    },
+    /// `git_fetch`, of the worktree at this path.
+    GitFetch {
+        worktree: String,
     },
     /// A workspace tool's, for the tool host; `acts` when the human
     /// decides it first. A write's or an edit's expected digest is the
@@ -799,13 +828,13 @@ fn todo(given: &[(String, Json)]) -> Result<Vec<TodoItem>, String> {
 /// parsed, or why they cannot be, which the call is answered with and
 /// nothing is done.
 pub fn parse(name: &str, arguments: &str) -> Result<Args, String> {
-    parse_in(false, name, arguments)
+    parse_in(Kit::Conversation, name, arguments)
 }
 
-/// `parse`, for a conversation that works in a workspace when `workspace`.
-pub fn parse_in(workspace: bool, name: &str, arguments: &str) -> Result<Args, String> {
-    let tool = Tool::find(workspace, name).ok_or_else(|| {
-        let names: Vec<&str> = Tool::all(workspace).iter().map(|t| t.name()).collect();
+/// `parse`, for a conversation with `kit`.
+pub fn parse_in(kit: Kit, name: &str, arguments: &str) -> Result<Args, String> {
+    let tool = Tool::find(kit, name).ok_or_else(|| {
+        let names: Vec<&str> = Tool::all(kit).iter().map(|t| t.name()).collect();
         format!(
             "there is no tool named {name:?}; the tools are {}",
             names.join(", ")
@@ -897,6 +926,12 @@ pub fn parse_in(workspace: bool, name: &str, arguments: &str) -> Result<Args, St
         Tool::ProcessKill => {
             let m = members(tool_name, &value, &["id"])?;
             Args::Kill(process_id(required(m, "id")?)?)
+        }
+        Tool::GitFetch => {
+            let m = members(tool_name, &value, &["worktree"])?;
+            Args::GitFetch {
+                worktree: required(m, "worktree")?.to_string(),
+            }
         }
         Tool::ProcessOutput => {
             let m = members(tool_name, &value, &["id", "from", "max_bytes"])?;
@@ -1354,7 +1389,7 @@ mod tests {
     #[test]
     fn the_prefix_defines_the_tools_before_its_messages() {
         {
-            let text = prefix(false, "system text");
+            let text = prefix(Kit::Conversation, "system text");
             assert!(text.ends_with("]}"), "{text}");
             let value = td_json::parse(&text).unwrap();
             let names: Vec<&str> = value
@@ -1385,13 +1420,48 @@ mod tests {
             };
             assert_eq!(members.last().unwrap().0, "messages");
             // The same text every time: the prefix is fixed.
-            assert_eq!(text, prefix(false, "system text"));
+            assert_eq!(text, prefix(Kit::Conversation, "system text"));
         }
+    }
+
+    /// `git_fetch` is a repository workspace's alone, takes only its
+    /// worktree, and acts on nothing the human decides first.
+    #[test]
+    fn a_repository_workspace_adds_git_fetch() {
+        let names = |kit| -> Vec<&str> { Tool::all(kit).iter().map(|t| t.name()).collect() };
+        assert!(!names(Kit::Workspace).contains(&"git_fetch"));
+        assert!(!names(Kit::Conversation).contains(&"git_fetch"));
+        assert_eq!(names(Kit::Repositories).last(), Some(&"git_fetch"));
+        assert_eq!(
+            names(Kit::Repositories)[..names(Kit::Workspace).len()],
+            names(Kit::Workspace)[..]
+        );
+        let args = r#"{"worktree":"/home/me/td-agent/w/td"}"#;
+        assert!(parse_in(Kit::Workspace, "git_fetch", args)
+            .unwrap_err()
+            .starts_with("there is no tool named \"git_fetch\""));
+        assert_eq!(
+            parse_in(Kit::Repositories, "git_fetch", args).unwrap(),
+            Args::GitFetch {
+                worktree: "/home/me/td-agent/w/td".into()
+            }
+        );
+        for wrong in ["{}", r#"{"worktree":"/a","force":true}"#] {
+            assert!(
+                parse_in(Kit::Repositories, "git_fetch", wrong).is_err(),
+                "{wrong}"
+            );
+        }
+        assert!(!Tool::acting("git_fetch"));
+        assert!(known("git_fetch"));
+        let prefix = prefix(Kit::Repositories, "s");
+        assert!(prefix.contains("\"git_fetch\""));
+        assert!(!super::prefix(Kit::Workspace, "s").contains("\"git_fetch\""));
     }
 
     #[test]
     fn a_workspace_adds_its_tools_and_their_calls_go_to_the_host() {
-        let names: Vec<&str> = Tool::all(true).iter().map(|t| t.name()).collect();
+        let names: Vec<&str> = Tool::all(Kit::Workspace).iter().map(|t| t.name()).collect();
         assert_eq!(
             names[names.len() - 11..],
             [
@@ -1414,7 +1484,7 @@ mod tests {
             outside.starts_with("there is no tool named \"shell\""),
             "{outside}"
         );
-        let call = |name: &str, args: &str| parse_in(true, name, args);
+        let call = |name: &str, args: &str| parse_in(Kit::Workspace, name, args);
         assert_eq!(
             call("shell", r#"{"command":"ls -l","timeout_ms":null}"#).unwrap(),
             Args::Host {

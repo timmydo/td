@@ -1758,6 +1758,7 @@ impl App {
                 | Up::Send { .. }
                 | Up::Query { .. }
                 | Up::Fetch { .. }
+                | Up::Refetch { .. }
                 | Up::Heads { .. }
                 | Up::Prepared { .. }
                 | Up::Restored

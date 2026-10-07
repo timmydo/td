@@ -55,6 +55,24 @@ fn names(workspace: Option<&Workspace>, remote: &str, bases: &[String]) -> bool 
     !named.is_empty() && bases.iter().all(|base| named.contains(&base))
 }
 
+/// The answer to `git_fetch` call `call`, of `remote`'s `bases`, from
+/// the store thread's `result`: each base beside its commit or why none.
+fn refetched(
+    call: u64,
+    remote: &str,
+    bases: &[String],
+    result: &Result<Vec<Result<String, String>>, String>,
+) -> Down {
+    Down::Refetched {
+        call,
+        remote: remote.to_string(),
+        result: result
+            .as_ref()
+            .map_err(String::clone)
+            .map(|ids| bases.iter().cloned().zip(ids.iter().cloned()).collect()),
+    }
+}
+
 /// The ids a repository workspace is named from before its making gives
 /// up: another holds a name rarely.
 const NAME_TRIES: usize = 8;
@@ -810,6 +828,22 @@ impl Session {
                         );
                     }
                 }
+                Update::Up(Up::Refetch {
+                    call,
+                    remote,
+                    bases,
+                }) => {
+                    if let Err(why) = self.refetch(&id, *call, remote, bases) {
+                        self.supervisor.answer(
+                            &id,
+                            &Down::Refetched {
+                                call: *call,
+                                remote: remote.clone(),
+                                result: Err(why),
+                            },
+                        );
+                    }
+                }
                 Update::Up(Up::Fetch { remote, bases }) => {
                     if let Err(why) = self.fetch(&id, remote, bases) {
                         self.supervisor.answer(
@@ -914,6 +948,41 @@ impl Session {
     /// handed to the store thread when the configuration admits the
     /// remote; why not, otherwise, which it is answered with.
     fn fetch(&mut self, id: &Id, remote: &str, bases: &[String]) -> Result<(), String> {
+        let parsed = self.admitted(id, remote, bases)?;
+        let stores = self.stores()?;
+        stores.ask(id.clone(), parsed, bases.to_vec())
+    }
+
+    /// A conversation's `git_fetch`, call `call` (DESIGN.md §9): `remote`
+    /// fetched now, as `fetch` admits it; answered with `Refetched`.
+    fn refetch(
+        &mut self,
+        id: &Id,
+        call: u64,
+        remote: &str,
+        bases: &[String],
+    ) -> Result<(), String> {
+        let parsed = self.admitted(id, remote, bases)?;
+        let stores = self.stores()?;
+        stores.fetch_now(id.clone(), call, parsed, bases.to_vec())
+    }
+
+    /// The store thread, or why there is none.
+    fn stores(&self) -> Result<&crate::git::Service, String> {
+        self.stores.as_ref().ok_or_else(|| match &self.data {
+            Err(why) => why.clone(),
+            Ok(_) => "no store thread".to_string(),
+        })
+    }
+
+    /// `remote` parsed, when conversation `id`'s own record names it and
+    /// `bases` and the configuration admits it; why not, otherwise.
+    fn admitted(
+        &self,
+        id: &Id,
+        remote: &str,
+        bases: &[String],
+    ) -> Result<crate::git::Remote, String> {
         // Only what the conversation's own record names, as the window
         // made it: no process asks for another remote or base.
         if !names(self.state.workspace(id)?.as_ref(), remote, bases) {
@@ -927,11 +996,7 @@ impl Session {
                 "the remote {remote} is not admitted: admit it on a template's card, or list it in `remotes` in the configuration"
             ));
         }
-        let stores = self.stores.as_ref().ok_or_else(|| match &self.data {
-            Err(why) => why.clone(),
-            Ok(_) => "no store thread".to_string(),
-        })?;
-        stores.ask(id.clone(), parsed, bases.to_vec())
+        Ok(parsed)
     }
 
     /// The store thread's answers: a preparation's to the conversation
@@ -971,28 +1036,38 @@ impl Session {
                     remote,
                     bases,
                     result,
+                    asker,
                 } => {
-                    self.refreshing.retain(|asked| *asked != remote);
-                    // Said where diagnostics go, not in the window, and
-                    // once until it changes or mends.
-                    let fetched = result.as_ref().err().cloned();
-                    self.trouble(
-                        remote.clone(),
-                        fetched.map(|e| format!("fetching {remote} in the background: {e}")),
-                    );
+                    // A `git_fetch`'s is its caller's to hear, and a
+                    // background fetch still running stays marked.
+                    if let Some((conversation, call)) = &asker {
+                        self.supervisor
+                            .answer(conversation, &refetched(*call, &remote, &bases, &result));
+                    } else {
+                        self.refreshing.retain(|asked| *asked != remote);
+                        // Said where diagnostics go, not in the window,
+                        // and once until it changes or mends.
+                        let fetched = result.as_ref().err().cloned();
+                        self.trouble(
+                            remote.clone(),
+                            fetched.map(|e| format!("fetching {remote} in the background: {e}")),
+                        );
+                    }
                     let Ok(ids) = result else {
                         continue;
                     };
                     if !learnt.contains(&remote) {
                         learnt.push(remote.clone());
                     }
-                    for (base, id) in bases.iter().zip(&ids) {
-                        self.trouble(
-                            format!("{remote} {base}"),
-                            id.as_ref()
-                                .err()
-                                .map(|e| format!("{remote}'s {base:?} after fetching it: {e}")),
-                        );
+                    if asker.is_none() {
+                        for (base, id) in bases.iter().zip(&ids) {
+                            self.trouble(
+                                format!("{remote} {base}"),
+                                id.as_ref()
+                                    .err()
+                                    .map(|e| format!("{remote}'s {base:?} after fetching it: {e}")),
+                            );
+                        }
                     }
                     let ids = ids.iter().map(|id| id.as_deref().ok());
                     moved.extend(
@@ -2092,7 +2167,10 @@ fn remember_crossing(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::{default_model, forget_rules, held, names, remember, remember_crossing, set_mode};
+    use super::{
+        default_model, forget_rules, held, names, refetched, remember, remember_crossing, set_mode,
+    };
+    use crate::protocol::Down;
     use crate::workspace::Workspace;
 
     /// A card's "always" answer adds its rules under the conversation's
@@ -2230,6 +2308,27 @@ mod tests {
         ));
         assert!(!names(Some(&Workspace::Scratch), remote, &bases(&["main"])));
         assert!(!names(None, remote, &bases(&["main"])));
+        // A `git_fetch`'s answer pairs each base with what it found.
+        let found = Ok(vec![Ok("a".repeat(40)), Err("gone".to_string())]);
+        assert_eq!(
+            refetched(3, remote, &bases(&["main", "next"]), &found),
+            Down::Refetched {
+                call: 3,
+                remote: remote.into(),
+                result: Ok(vec![
+                    ("main".into(), Ok("a".repeat(40))),
+                    ("next".into(), Err("gone".into()))
+                ]),
+            }
+        );
+        assert_eq!(
+            refetched(4, remote, &bases(&["main"]), &Err("unreachable".into())),
+            Down::Refetched {
+                call: 4,
+                remote: remote.into(),
+                result: Err("unreachable".into()),
+            }
+        );
     }
 
     #[test]

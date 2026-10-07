@@ -171,7 +171,7 @@ impl Bench {
                     _ => None,
                 });
             if let Some(Ok(Args::Host { call, .. })) =
-                call.map(|c| tools::parse_in(true, &c.name, &c.arguments))
+                call.map(|c| tools::parse_in(tools::Kit::Workspace, &c.name, &c.arguments))
             {
                 self.record(&call, Some(digest));
             }

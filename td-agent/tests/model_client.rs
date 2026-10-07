@@ -269,6 +269,26 @@ impl Harness {
         }
     }
 
+    /// What the process said until it asked for a `git_fetch`: its call,
+    /// remote and bases.
+    fn until_refetch(&mut self) -> (u64, String, Vec<String>) {
+        loop {
+            let up = self.next();
+            if self.hear(&up) {
+                continue;
+            }
+            match up {
+                Up::Refetch {
+                    call,
+                    remote,
+                    bases,
+                } => return (call, remote, bases),
+                Up::Event(event) => self.heard.push(event),
+                _ => {}
+            }
+        }
+    }
+
     /// What the process said until it asked how to resume cold: the
     /// card's turn, title and details.
     fn until_resume(&mut self) -> (u64, String, Vec<String>) {
@@ -6327,4 +6347,191 @@ fn a_cold_compaction_that_cannot_be_or_fails_is_said() {
     let (_, outcome, retry) = h.turn();
     assert!(outcome.contains("could not be compacted"), "{outcome}");
     assert!(retry);
+}
+
+/// `git_fetch` (DESIGN.md §9): a repository workspace's tool, of one of
+/// its worktrees once prepared, asking the window for the fetch and
+/// waiting for its answer, which it says: a base unchanged, the window's
+/// refusal, a base that moved but whose refs could not be set (here,
+/// with no jail), and an interrupt while it waits.
+#[test]
+fn git_fetch_asks_the_window_and_says_what_came() {
+    let base = std::env::temp_dir().join(format!(
+        "td-agent-model-fetch-{}-{}",
+        std::process::id(),
+        td_agent::store::random_hex(4).unwrap()
+    ));
+    let remote = "https://example.org/a/td";
+    let template = td_agent::config::Template {
+        name: "td".into(),
+        repos: vec![td_agent::config::Repo {
+            remote: remote.into(),
+            base: "main".into(),
+            branch: "agent".into(),
+            sparse: None,
+        }],
+        shared: None,
+    };
+    let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
+    let made = td_agent::workspace::repositories(
+        &template,
+        &Id::random().unwrap(),
+        &base.join("data"),
+        &base.join("trees"),
+        &admitted,
+        0,
+    )
+    .unwrap();
+    let checkout = made.entries[0].checkout.display().to_string();
+    let repository = made.entries[0].repository.clone();
+    let argument = td_agent::workspace::Workspace::Repositories(made).argument();
+    let fetch = || Reply::sse_with("stream-tool-git-fetch.sse", "WORKTREE", &checkout);
+    let mut h = Harness::new_in(
+        "fetch",
+        Role::Conversation,
+        Some(argument.to_str().unwrap()),
+        false,
+        vec![
+            fetch(),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            fetch(),
+            Reply::sse("stream-sonnet.sse"),
+            fetch(),
+            Reply::sse("stream-sonnet.sse"),
+            fetch(),
+            Reply::sse("stream-sonnet.sse"),
+            fetch(),
+            fetch(),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    while !matches!(h.next(), Up::Fetch { .. }) {}
+    h.setup(Client::default());
+    h.down(&Down::Fetched {
+        remote: remote.into(),
+        result: Err("the remote is not admitted".into()),
+    });
+    // Not prepared, nothing is asked.
+    h.say("Fetch.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let said = results(&events);
+    assert_eq!(
+        said[0].1,
+        format!("error: {checkout} is not prepared yet; its preparation fetches its remote and sets its remote-tracking refs")
+    );
+    // Prepared, with main tracked where upstream still is.
+    let (mut conversation, mut h) = h.close();
+    let at = "a".repeat(40);
+    conversation.set_prepared(&repository).unwrap();
+    conversation
+        .set_tracked(remote, &[("main".into(), at.clone())])
+        .unwrap();
+    drop(conversation);
+    h.reopen();
+    h.setup(Client::default());
+    let answered =
+        |h: &mut Harness, stale: bool, result: Result<td_agent::protocol::Resolved, String>| {
+            h.say("Fetch.");
+            let (call, asked, bases) = h.until_refetch();
+            assert_eq!((asked.as_str(), bases), (remote, vec!["main".to_string()]));
+            // Where a background fetch found main earlier, told meanwhile.
+            if stale {
+                h.down(&Down::Heads {
+                    remote: remote.into(),
+                    bases: vec!["main".into()],
+                    ids: vec!["c".repeat(40)],
+                });
+            }
+            h.down(&Down::Refetched {
+                call,
+                remote: remote.into(),
+                result,
+            });
+            let (events, outcome, _) = h.turn();
+            assert_eq!(outcome, "replied", "{}", h.said());
+            // The log replayed on reopening is heard first.
+            results(&events).last().unwrap().1.clone()
+        };
+    // Every base found is set again, unchanged or not: here, with no
+    // jail, it cannot be.
+    let unset = |said: String| {
+        assert!(
+            said.starts_with(&format!(
+                "error: {remote} was fetched, but its remote-tracking refs could not be set: "
+            )),
+            "{said}"
+        );
+    };
+    unset(answered(
+        &mut h,
+        false,
+        Ok(vec![("main".into(), Ok(at.clone()))]),
+    ));
+    assert_eq!(
+        answered(&mut h, false, Err("the remote is not admitted".into())),
+        format!("error: {remote} was not fetched: the remote is not admitted")
+    );
+    unset(answered(
+        &mut h,
+        true,
+        Ok(vec![("main".into(), Ok("b".repeat(40)))]),
+    ));
+    // Interrupted while it waits, it says the fetch may yet finish.
+    h.say("Fetch.");
+    let (late, _, _) = h.until_refetch();
+    h.down(&Down::Interrupt);
+    let (events, _, _) = h.turn();
+    let said = results(&events);
+    assert!(
+        said.last()
+            .unwrap()
+            .1
+            .starts_with(&format!("error: interrupted while {remote} was fetched")),
+        "{said:?}"
+    );
+    // Its answer, come late while the next call waits, is not that
+    // call's.
+    h.say("Fetch.");
+    let (call, _, _) = h.until_refetch();
+    assert_ne!(call, late);
+    for (call, result) in [
+        (late, Ok(vec![("main".into(), Ok("d".repeat(40)))])),
+        (call, Err("unreachable".into())),
+    ] {
+        h.down(&Down::Refetched {
+            call,
+            remote: remote.into(),
+            result,
+        });
+    }
+    let (events, _, _) = h.turn();
+    assert_eq!(
+        results(&events).last().unwrap().1,
+        format!("error: {remote} was not fetched: unreachable")
+    );
+    // Each request offered it, a repository workspace's tool.
+    let requests = h.mock.requests();
+    assert!(requests
+        .iter()
+        .filter(|r| !r.text().contains("Write a title"))
+        .all(|r| r.text().contains(r#""name":"git_fetch""#)));
+    let (conversation, _) = h.close();
+    // The earlier heads told during the fetch were dropped, not tried.
+    assert!(
+        !conversation.events().iter().any(|e| matches!(
+            &e.kind,
+            Kind::Notice { text } if text.contains("could not be set")
+        )),
+        "{:?}",
+        conversation.events()
+    );
+    let tracked = &conversation.meta().tracked;
+    assert_eq!(tracked.len(), 1);
+    assert_eq!(
+        tracked[0].id, at,
+        "not moved by a fetch whose refs were not set"
+    );
+    let _ = std::fs::remove_dir_all(&base);
 }

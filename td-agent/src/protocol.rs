@@ -133,7 +133,17 @@ pub enum Down {
         bases: Vec<String>,
         ids: Vec<String>,
     },
+    /// The answer to a `Refetch`, call `call`'s: each base asked about
+    /// with its commit or why it has none, or why nothing was fetched.
+    Refetched {
+        call: u64,
+        remote: String,
+        result: Result<Resolved, String>,
+    },
 }
+
+/// Bases fetched, each with its commit or why it has none.
+pub type Resolved = Vec<(String, Result<String, String>)>;
 
 /// A fetched store, for a repository workspace's preparation (DESIGN.md
 /// §7): the human's identity its commits carry, and each base asked for
@@ -261,6 +271,13 @@ pub enum Up {
     /// Where the window last found each of `remote`'s `bases`, answered
     /// with `Heads` of those it knows.
     Heads {
+        remote: String,
+        bases: Vec<String>,
+    },
+    /// `git_fetch`, call `call`'s (DESIGN.md §9): `remote`'s store
+    /// fetched now and `bases` resolved there, answered with `Refetched`.
+    Refetch {
+        call: u64,
         remote: String,
         bases: Vec<String>,
     },
@@ -618,6 +635,40 @@ impl Down {
                     ),
                 ],
             ),
+            Self::Refetched {
+                call,
+                remote,
+                result,
+            } => {
+                let mut pairs = vec![
+                    ("call".into(), Json::from(*call)),
+                    ("remote".into(), Json::Str(remote.clone())),
+                ];
+                match result {
+                    // A base's commit, or empty and why not beside it.
+                    Ok(resolved) => {
+                        let texts = |pick: fn(&Result<String, String>) -> String| {
+                            Json::Arr(resolved.iter().map(|(_, r)| Json::Str(pick(r))).collect())
+                        };
+                        pairs.extend([
+                            ("error".into(), Json::Null),
+                            (
+                                "bases".into(),
+                                Json::Arr(
+                                    resolved.iter().map(|(b, _)| Json::Str(b.clone())).collect(),
+                                ),
+                            ),
+                            ("ids".into(), texts(|r| r.clone().unwrap_or_default())),
+                            (
+                                "whys".into(),
+                                texts(|r| r.clone().err().unwrap_or_default()),
+                            ),
+                        ]);
+                    }
+                    Err(why) => pairs.push(("error".into(), Json::Str(why.clone()))),
+                }
+                typed("refetched", pairs)
+            }
         }
     }
 
@@ -807,6 +858,34 @@ impl Down {
                     ids,
                 })
             }
+            Some("refetched") => Ok(Self::Refetched {
+                call: number(&value, "call")?,
+                remote: string(&value, "remote")?,
+                result: match maybe(&value, "error")? {
+                    Some(why) => Err(why),
+                    None => {
+                        let bases = strings(&value, "bases")?;
+                        let ids = strings(&value, "ids")?;
+                        let whys = strings(&value, "whys")?;
+                        if bases.len() != ids.len() || bases.len() != whys.len() {
+                            return Err("refetched holds a base without its commit".into());
+                        }
+                        let mut resolved = Vec::with_capacity(bases.len());
+                        for ((base, id), why) in bases.into_iter().zip(ids).zip(whys) {
+                            resolved.push(match (id.is_empty(), why.is_empty()) {
+                                (false, true) => (base, Ok(id)),
+                                (true, false) => (base, Err(why)),
+                                _ => {
+                                    return Err(
+                                        "refetched holds a base neither found nor not".into()
+                                    )
+                                }
+                            });
+                        }
+                        Ok(resolved)
+                    }
+                },
+            }),
             other => Err(format!("unknown message {other:?}")),
         }
     }
@@ -899,6 +978,21 @@ impl Up {
             Self::Heads { remote, bases } => typed(
                 "heads",
                 vec![
+                    ("remote".into(), Json::Str(remote.clone())),
+                    (
+                        "bases".into(),
+                        Json::Arr(bases.iter().cloned().map(Json::Str).collect()),
+                    ),
+                ],
+            ),
+            Self::Refetch {
+                call,
+                remote,
+                bases,
+            } => typed(
+                "refetch",
+                vec![
+                    ("call".into(), Json::from(*call)),
                     ("remote".into(), Json::Str(remote.clone())),
                     (
                         "bases".into(),
@@ -1088,6 +1182,11 @@ impl Up {
                 call: number(&value, "call")?,
             },
             Some("fetch") => Self::Fetch {
+                remote: string(&value, "remote")?,
+                bases: strings(&value, "bases")?,
+            },
+            Some("refetch") => Self::Refetch {
+                call: number(&value, "call")?,
                 remote: string(&value, "remote")?,
                 bases: strings(&value, "bases")?,
             },
@@ -1291,6 +1390,11 @@ mod tests {
                 remote: "https://github.com/timmydo/td".into(),
                 bases: vec!["main".into()],
             },
+            Up::Refetch {
+                call: 4,
+                remote: "https://github.com/timmydo/td".into(),
+                bases: vec!["main".into(), "next".into()],
+            },
             Up::Ask {
                 call: 9,
                 title: "Run a command?".into(),
@@ -1460,6 +1564,19 @@ mod tests {
                 bases: vec!["main".into(), "next".into()],
                 ids: vec!["a".repeat(40), "b".repeat(40)],
             },
+            Down::Refetched {
+                call: 4,
+                remote: "https://github.com/timmydo/td".into(),
+                result: Ok(vec![
+                    ("main".into(), Ok("a".repeat(40))),
+                    ("next".into(), Err("no such branch".into())),
+                ]),
+            },
+            Down::Refetched {
+                call: 5,
+                remote: "https://github.com/timmydo/td".into(),
+                result: Err("the remote is not admitted".into()),
+            },
         ] {
             assert!(down.encode().len() <= crate::frame::MAX_FRAME);
             assert_eq!(Down::decode(&down.encode()).unwrap(), down);
@@ -1467,6 +1584,14 @@ mod tests {
         // A base without its commit is no answer.
         let lopsided = br#"{"type":"heads","remote":"https://github.com/timmydo/td","bases":["main","next"],"ids":["aaaa"]}"#;
         assert!(Down::decode(lopsided).is_err());
+        // Nor is a fetch's base without one, or found and not at once.
+        for refetched in [
+            br#"{"type":"refetched","call":1,"remote":"r","error":null,"bases":["main"],"ids":[],"whys":[]}"#.as_slice(),
+            br#"{"type":"refetched","call":1,"remote":"r","error":null,"bases":["main"],"ids":["a"],"whys":["b"]}"#,
+            br#"{"type":"refetched","call":1,"remote":"r","error":null,"bases":["main"],"ids":[""],"whys":[""]}"#,
+        ] {
+            assert!(Down::decode(refetched).is_err());
+        }
         let client = Client::default();
         for down in [
             Down::Setup {

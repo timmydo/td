@@ -80,6 +80,12 @@ impl Reply {
         }
     }
 
+    /// The same, each `from` in it made `to`.
+    pub fn sse_with(name: &str, from: &str, to: &str) -> Self {
+        let text = String::from_utf8(fixture(name)).expect("a UTF-8 fixture");
+        Self::sse(name).body(text.replace(from, to).into_bytes())
+    }
+
     /// The same, its lines ending in CRLF.
     pub fn sse_crlf(name: &str) -> Self {
         let text = String::from_utf8(fixture(name)).expect("a UTF-8 fixture");

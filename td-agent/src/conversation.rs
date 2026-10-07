@@ -135,6 +135,36 @@ fn short(id: &str) -> &str {
     id.get(..12).unwrap_or(id)
 }
 
+/// What `git_fetch` says of `remote` once its refs are set: each base of
+/// `resolved` where it is, against where it was recorded (`was`), or
+/// why it was not found upstream.
+fn fetched(
+    remote: &str,
+    resolved: &[(String, Result<String, String>)],
+    was: &[Option<String>],
+) -> String {
+    let lines: Vec<String> = resolved
+        .iter()
+        .zip(was)
+        .map(|((base, id), was)| match (id, was) {
+            (Err(why), _) => format!("- {base}: not found upstream: {why}"),
+            (Ok(id), Some(was)) if was == id => {
+                format!("- origin/{base} at {}, unchanged", short(id))
+            }
+            (Ok(id), Some(was)) => format!(
+                "- origin/{base} at {}, moved from {}",
+                short(id),
+                short(was)
+            ),
+            (Ok(id), None) => format!("- origin/{base} at {}", short(id)),
+        })
+        .collect();
+    format!(
+        "fetched {remote}; in each of this workspace's worktrees of it:\n{}\nNo branch or file changed.",
+        lines.join("\n")
+    )
+}
+
 /// What a workspace tool says once its repository workspace went with
 /// the conversation's archive (DESIGN.md §7).
 const WORKSPACE_GONE: &str = "the workspace went with this conversation's archive: its worktrees are removed, so the file, shell and search tools are refused";
@@ -953,6 +983,7 @@ impl Session {
                 // A cold-resume answer that comes after its turn gave up
                 // waiting is not waited for either.
                 Down::Reservation { .. }
+                | Down::Refetched { .. }
                 | Down::Resumed { .. }
                 | Down::Interrupt
                 | Down::Sent { .. }
@@ -1197,21 +1228,48 @@ impl Session {
     /// came after it gave up is released, and anything else waits its
     /// turn. Why not, when the window closes or does not answer.
     fn wait(&mut self, wanted: impl Fn(&Down) -> bool) -> Result<Down, String> {
+        self.wait_for(wanted, Some(ANSWER_WAIT))
+    }
+
+    /// `wait`, for at most `time`, or with none for as long as the answer
+    /// takes, when an interrupt ends the wait as well as the turn.
+    fn wait_for(
+        &mut self,
+        wanted: impl Fn(&Down) -> bool,
+        time: Option<Duration>,
+    ) -> Result<Down, String> {
         if self.gone {
             return Err("the window has closed".into());
         }
-        let deadline = Instant::now() + ANSWER_WAIT;
+        if time.is_none() && self.interrupt {
+            return Err("interrupted".into());
+        }
+        let deadline = time.map(|time| Instant::now() + time);
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match self.inbox.recv_timeout(left) {
+            let got = match deadline {
+                Some(deadline) => self
+                    .inbox
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                None => self
+                    .inbox
+                    .recv()
+                    .map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            match got {
                 Ok(Inbound::Down(down)) if wanted(&down) => return Ok(down),
                 // An earlier request's grant, come after it gave up.
                 Ok(Inbound::Down(Down::Reservation {
                     id: late,
                     refusal: None,
                 })) => self.spent(late, 0),
-                // Said while waiting: the turn ends at its next step.
-                Ok(Inbound::Down(Down::Interrupt)) => self.interrupt = true,
+                // Said while waiting: the turn ends at its next step, and
+                // a wait with no bound ends now.
+                Ok(Inbound::Down(Down::Interrupt)) => {
+                    self.interrupt = true;
+                    if deadline.is_none() {
+                        return Err("interrupted".into());
+                    }
+                }
                 Ok(Inbound::Down(down)) => self.later(down),
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
@@ -1223,7 +1281,7 @@ impl Session {
                 Err(RecvTimeoutError::Timeout) => {
                     return Err(format!(
                         "the window did not answer in {} s",
-                        ANSWER_WAIT.as_secs()
+                        time.unwrap_or(ANSWER_WAIT).as_secs()
                     ))
                 }
             }
@@ -2231,7 +2289,12 @@ impl Session {
                 _ => None,
             })
             .unwrap_or_default();
-        let workspace = self.conversation.meta().workspace.is_some();
+        let kit = match &self.conversation.meta().workspace {
+            None => tools::Kit::Conversation,
+            Some(Workspace::Repositories(_)) => tools::Kit::Repositories,
+            Some(_) => tools::Kit::Workspace,
+        };
+        let workspace = kit != tools::Kit::Conversation;
         // A step that may change files is snapshotted before and after
         // (DESIGN.md §12).
         let writes = workspace && calls.iter().any(|call| tools::Tool::acting(&call.name));
@@ -2262,7 +2325,7 @@ impl Session {
                 .seq;
             // Durable before it runs: a restart never runs it again.
             self.sync()?;
-            let (answer, beside) = match tools::parse_in(workspace, &call.name, &call.arguments) {
+            let (answer, beside) = match tools::parse_in(kit, &call.name, &call.arguments) {
                 Ok(Args::Host { call: hosted, acts }) => {
                     let repeated = repeats(self.conversation.events(), reply, at) + 1 >= REPEATS;
                     self.host(started, &call.name, hosted, acts, repeated)?
@@ -2643,12 +2706,118 @@ impl Session {
     /// log. A repository not yet prepared waits for its preparation,
     /// which sets them.
     fn heads(&mut self, remote: &str, bases: &[String], ids: &[String]) -> Result<(), String> {
+        self.heads_told(remote, bases, ids, true).map(drop)
+    }
+
+    /// `git_fetch` (DESIGN.md §9): the worktree's remote fetched now by
+    /// the window's git worker, outside any jail, and each base of it
+    /// this workspace names set as its remote-tracking ref in every
+    /// worktree of that remote; what came said. The outer error is the
+    /// log's; the inner, the model's.
+    fn git_fetch(&mut self, worktree: &str) -> Result<Result<String, String>, String> {
         let meta = self.conversation.meta().clone();
         let Some(Workspace::Repositories(repositories)) = &meta.workspace else {
-            return Ok(());
+            return Ok(Err("git_fetch is a repository workspace's tool".into()));
         };
         if meta.removed {
-            return Ok(());
+            return Ok(Err(
+                "this conversation's workspace went with its archive".into()
+            ));
+        }
+        let path = Path::new(worktree);
+        let Some(entry) = repositories
+            .entries
+            .iter()
+            .find(|entry| entry.checkout == path)
+        else {
+            let named: Vec<String> = repositories
+                .entries
+                .iter()
+                .map(|entry| entry.checkout.display().to_string())
+                .collect();
+            return Ok(Err(format!(
+                "{worktree} is not one of this workspace's worktrees, which are {}",
+                named.join(", ")
+            )));
+        };
+        if !meta.prepared.contains(&entry.repository) {
+            return Ok(Err(format!(
+                "{worktree} is not prepared yet; its preparation fetches its remote and sets its remote-tracking refs"
+            )));
+        }
+        let remote = entry.remote.clone();
+        let mut bases: Vec<String> = Vec::new();
+        for entry in &repositories.entries {
+            if entry.remote == remote && !bases.contains(&entry.base) {
+                bases.push(entry.base.clone());
+            }
+        }
+        let call = self.ask_id();
+        self.send(&Up::Refetch {
+            call,
+            remote: remote.clone(),
+            bases: bases.clone(),
+        });
+        let answer = match self.wait_for(
+            |down| matches!(down, Down::Refetched { call: c, .. } if *c == call),
+            None,
+        ) {
+            Ok(answer) => answer,
+            Err(why) => {
+                return Ok(Err(format!(
+                    "{why} while {remote} was fetched; the window may still finish the fetch, and a base that moved is told as news"
+                )))
+            }
+        };
+        let Down::Refetched { result, .. } = answer else {
+            return Ok(Err("the window answered something else".into()));
+        };
+        let resolved = match result {
+            Ok(resolved) => resolved,
+            Err(why) => return Ok(Err(format!("{remote} was not fetched: {why}"))),
+        };
+        // Where the window found the bases before this fetch, queued
+        // meanwhile, would move them back; it tells this one's after
+        // its answer.
+        self.queue
+            .retain(|down| !matches!(down, Down::Heads { remote: r, .. } if *r == remote));
+        let was: Vec<Option<String>> = resolved
+            .iter()
+            .map(|(base, _)| {
+                meta.tracked
+                    .iter()
+                    .find(|tracked| tracked.remote == remote && tracked.base == *base)
+                    .map(|tracked| tracked.id.clone())
+            })
+            .collect();
+        let (found, ids): (Vec<String>, Vec<String>) = resolved
+            .iter()
+            .filter_map(|(base, id)| Some((base.clone(), id.as_ref().ok()?.clone())))
+            .unzip();
+        if let Err(why) = self.heads_told(&remote, &found, &ids, false)? {
+            return Ok(Err(format!(
+                "{remote} was fetched, but its remote-tracking refs could not be set: {why}"
+            )));
+        }
+        Ok(Ok(fetched(&remote, &resolved, &was)))
+    }
+
+    /// `heads`, a base that moved logged as the model's news when `tell`;
+    /// a failure to set them is said where `tell`, and returned whether
+    /// or not.
+    fn heads_told(
+        &mut self,
+        remote: &str,
+        bases: &[String],
+        ids: &[String],
+        tell: bool,
+    ) -> Result<Result<(), String>, String> {
+        let meta = self.conversation.meta().clone();
+        let Some(Workspace::Repositories(repositories)) = &meta.workspace else {
+            return Ok(Ok(()));
+        };
+        if meta.removed {
+            return Ok(Ok(()));
         }
         let entries: Vec<&Entry> = repositories
             .entries
@@ -2656,10 +2825,10 @@ impl Session {
             .filter(|entry| entry.remote == remote)
             .collect();
         let Some(first) = entries.first() else {
-            return Ok(());
+            return Ok(Ok(()));
         };
         if !meta.prepared.contains(&first.repository) {
-            return Ok(());
+            return Ok(Ok(()));
         }
         let mut moved: Vec<(String, String, Option<String>)> = Vec::new();
         for (base, id) in bases.iter().zip(ids) {
@@ -2672,23 +2841,27 @@ impl Session {
                 .iter()
                 .find(|tracked| tracked.remote == remote && tracked.base == *base)
                 .map(|tracked| tracked.id.clone());
-            if was.as_deref() != Some(id.as_str()) {
+            // The model's own fetch sets every ref again, whatever the
+            // jail did to one the record says is current.
+            if !tell || was.as_deref() != Some(id.as_str()) {
                 moved.push((base.clone(), id.clone(), was));
             }
         }
         if moved.is_empty() {
-            return Ok(());
+            return Ok(Ok(()));
         }
         let heads: Vec<(String, String)> = moved
             .iter()
             .map(|(base, id, _)| (base.clone(), id.clone()))
             .collect();
-        if self
-            .untracked
-            .iter()
-            .any(|failed| failed.remote == remote && failed.tried == heads)
+        // Told as a background fetch's, a failure is tried once.
+        if tell
+            && self
+                .untracked
+                .iter()
+                .any(|failed| failed.remote == remote && failed.tried == heads)
         {
-            return Ok(());
+            return Ok(Ok(()));
         }
         let said = match track(&self.state, &meta.id, &entries, &heads, false) {
             Ok(()) => {
@@ -2702,13 +2875,14 @@ impl Session {
                     })
                     .collect();
                 // The model's news; it reads it at its next turn.
-                (!told.is_empty()).then(|| Kind::Notification {
+                (tell && !told.is_empty()).then(|| Kind::Notification {
                     text: format!(
                         "upstream's {} in {remote}: each worktree's refs/remotes/origin/<base> names it now",
                         told.join(", ")
                     ),
                 })
             }
+            Err(why) if !tell => return Ok(Err(why)),
             Err(why) => {
                 let text = format!("the remote-tracking refs of {remote} could not be set: {why}");
                 let new = !self
@@ -2729,7 +2903,7 @@ impl Session {
             self.log(kind)?;
             self.sync()?;
         }
-        Ok(())
+        Ok(Ok(()))
     }
 
     /// The window's answer for `remote`'s store (`prepare`), then the
@@ -3882,6 +4056,7 @@ impl Session {
         repeated: bool,
     ) -> Result<Result<String, String>, String> {
         Ok(match args {
+            Args::GitFetch { worktree } => self.git_fetch(&worktree)?,
             Args::Todo(items) => {
                 let text = tools::todo_text(&items);
                 self.log(Kind::Todo {
@@ -5524,6 +5699,26 @@ fn canonical(value: td_json::Json) -> td_json::Json {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
+
+    /// `git_fetch`'s result: each base where it is, unchanged, moved or
+    /// newly recorded, or not found upstream.
+    #[test]
+    fn a_fetch_says_where_each_base_is() {
+        let said = fetched(
+            "https://example.org/a/td",
+            &[
+                ("main".into(), Ok("a".repeat(40))),
+                ("next".into(), Ok("b".repeat(40))),
+                ("new".into(), Ok("c".repeat(40))),
+                ("gone".into(), Err("no such ref".into())),
+            ],
+            &[Some("a".repeat(40)), Some("d".repeat(40)), None, None],
+        );
+        assert_eq!(
+            said,
+            "fetched https://example.org/a/td; in each of this workspace's worktrees of it:\n- origin/main at aaaaaaaaaaaa, unchanged\n- origin/next at bbbbbbbbbbbb, moved from dddddddddddd\n- origin/new at cccccccccccc\n- gone: not found upstream: no such ref\nNo branch or file changed."
+        );
+    }
     use crate::store::tests::Scratch;
 
     /// A call into a worktree not ready is refused with its state; one

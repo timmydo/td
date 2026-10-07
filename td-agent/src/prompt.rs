@@ -76,7 +76,12 @@ pub fn prefix_in(created: u64, place: Option<&Place>) -> String {
         system.push_str("\n\n");
         system.push_str(&project);
     }
-    crate::tools::prefix(place.is_some(), &system)
+    let kit = match place {
+        None => crate::tools::Kit::Conversation,
+        Some(place) if place.repositories.is_some() => crate::tools::Kit::Repositories,
+        Some(_) => crate::tools::Kit::Workspace,
+    };
+    crate::tools::prefix(kit, &system)
 }
 
 /// A repository workspace's project instructions (DESIGN.md §13), none

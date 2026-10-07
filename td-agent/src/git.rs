@@ -916,9 +916,14 @@ enum Job {
         remote: Remote,
         bases: Vec<String>,
     },
-    /// The window's own, every `fetch_interval`: fetch `remote`'s store
+    /// The window's own, every `fetch_interval`, or a conversation's
+    /// `git_fetch`, `asker` naming it and its call: fetch `remote`'s store
     /// and resolve `bases`, the ones workspaces name.
-    Refresh { remote: Remote, bases: Vec<String> },
+    Refresh {
+        remote: Remote,
+        bases: Vec<String>,
+        asker: Option<(crate::store::Id, u64)>,
+    },
 }
 
 /// An answer, for the conversation that asked or for the window, with
@@ -930,11 +935,13 @@ pub enum Done {
         bases: Vec<String>,
         result: Result<crate::protocol::Fetched, String>,
     },
-    /// Each base's commit, or why there is none, when the fetch was made.
+    /// Each base's commit, or why there is none, when the fetch was made;
+    /// for the conversation and call that asked, if one did.
     Refreshed {
         remote: String,
         bases: Vec<String>,
         result: Result<Vec<Result<String, String>>, String>,
+        asker: Option<(crate::store::Id, u64)>,
     },
 }
 
@@ -976,13 +983,18 @@ impl Service {
                             remote: remote.url(),
                             bases,
                         },
-                        Job::Refresh { remote, bases } => Done::Refreshed {
+                        Job::Refresh {
+                            remote,
+                            bases,
+                            asker,
+                        } => Done::Refreshed {
                             result: match &made {
                                 Ok(made) => made.refresh(&stores, &remote, &bases),
                                 Err(why) => Err(unmade(why)),
                             },
                             remote: remote.url(),
                             bases,
+                            asker,
                         },
                     };
                     if tell.send(answer).is_err() {
@@ -1017,7 +1029,29 @@ impl Service {
     /// resolved there, for the window; the answer comes from `answers`.
     pub fn refresh(&self, remote: Remote, bases: Vec<String>) -> Result<(), String> {
         self.jobs
-            .send(Job::Refresh { remote, bases })
+            .send(Job::Refresh {
+                remote,
+                bases,
+                asker: None,
+            })
+            .map_err(|_| "the store thread has ended".to_string())
+    }
+
+    /// `refresh`, for `conversation`'s `git_fetch`, call `call`, which
+    /// waits on it, so it waits behind no queued background fetch.
+    pub fn fetch_now(
+        &self,
+        conversation: crate::store::Id,
+        call: u64,
+        remote: Remote,
+        bases: Vec<String>,
+    ) -> Result<(), String> {
+        self.jobs
+            .send(Job::Refresh {
+                remote,
+                bases,
+                asker: Some((conversation, call)),
+            })
             .map_err(|_| "the store thread has ended".to_string())
     }
 
@@ -1028,12 +1062,18 @@ impl Service {
 }
 
 /// The job the store thread runs next: the first conversation's ask
-/// waiting, so a preparation waits behind no queued background fetch,
-/// only one already running; else the oldest refresh.
+/// waiting, a preparation or a `git_fetch`, so neither waits behind a
+/// queued background fetch, only one already running; else the oldest
+/// refresh.
 fn next(queue: &mut std::collections::VecDeque<Job>) -> Option<Job> {
     let at = queue
         .iter()
-        .position(|job| matches!(job, Job::Prepare { .. }))
+        .position(|job| {
+            matches!(
+                job,
+                Job::Prepare { .. } | Job::Refresh { asker: Some(_), .. }
+            )
+        })
         .unwrap_or(0);
     queue.remove(at)
 }
@@ -1688,6 +1728,7 @@ pub(crate) mod tests {
                     remote,
                     bases,
                     result,
+                    asker,
                 } = done
                 else {
                     panic!("not a refresh's answer");
@@ -1697,28 +1738,58 @@ pub(crate) mod tests {
                     ("https://example.org/a/td", vec!["main".to_string()])
                 );
                 assert!(result.unwrap_err().starts_with("the git worker"));
+                assert_eq!(asker, None);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A `git_fetch`'s names its conversation and call.
+        let id = crate::store::Id::random().unwrap();
+        service
+            .fetch_now(
+                id.clone(),
+                7,
+                Remote::parse("https://example.org/a/td").unwrap(),
+                vec!["main".into()],
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "no answer came");
+            if let Some(done) = service.answers().pop() {
+                let Done::Refreshed { asker, .. } = done else {
+                    panic!("not a refresh's answer");
+                };
+                assert_eq!(asker, Some((id, 7)));
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
 
-    /// A conversation's ask goes before any background fetch queued
-    /// ahead of it; the refreshes keep their order.
+    /// A conversation's ask, a preparation or a `git_fetch`, goes before
+    /// any background fetch queued ahead of it; each kind keeps its order.
     #[test]
     fn a_preparation_goes_before_queued_background_fetches() {
         let remote = |path: &str| Remote::parse(&format!("https://example.org/{path}")).unwrap();
-        let refresh = |path: &str| Job::Refresh {
+        let id = crate::store::Id::random().unwrap();
+        let refresh = |path: &str, asked: bool| Job::Refresh {
             remote: remote(path),
             bases: vec!["main".into()],
+            asker: asked.then(|| (id.clone(), 1)),
         };
-        let id = crate::store::Id::random().unwrap();
         let mut queue: std::collections::VecDeque<Job> = [
-            refresh("a"),
-            refresh("b"),
+            refresh("a", false),
+            refresh("b", false),
             Job::Prepare {
-                conversation: id,
+                conversation: id.clone(),
                 remote: remote("c"),
+                bases: vec!["main".into()],
+            },
+            refresh("d", true),
+            Job::Prepare {
+                conversation: id.clone(),
+                remote: remote("e"),
                 bases: vec!["main".into()],
             },
         ]
@@ -1726,6 +1797,11 @@ pub(crate) mod tests {
         let order: Vec<String> = std::iter::from_fn(|| next(&mut queue))
             .map(|job| match job {
                 Job::Prepare { remote, .. } => format!("prepare {}", remote.url()),
+                Job::Refresh {
+                    remote,
+                    asker: Some(_),
+                    ..
+                } => format!("fetch {}", remote.url()),
                 Job::Refresh { remote, .. } => format!("refresh {}", remote.url()),
             })
             .collect();
@@ -1733,6 +1809,8 @@ pub(crate) mod tests {
             order,
             [
                 "prepare https://example.org/c",
+                "fetch https://example.org/d",
+                "prepare https://example.org/e",
                 "refresh https://example.org/a",
                 "refresh https://example.org/b"
             ]

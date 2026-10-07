@@ -115,7 +115,7 @@ mod tests {
                 .unwrap();
             assert_eq!(message.section_text(0), Some(content));
             let tools = message.section_text(1).unwrap();
-            for tool in crate::tools::Tool::all(false) {
+            for tool in crate::tools::Tool::all(crate::tools::Kit::Conversation) {
                 assert!(tools.contains(&format!("{}: ", tool.name())), "{tools}");
             }
         }

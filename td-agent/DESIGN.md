@@ -3087,6 +3087,41 @@ submodule or a missing path is none, and one past 64 KiB refused. The
 project instructions are `AGENTS.md`, else `CLAUDE.md`, at the commit's
 top.
 
+**As built (increment 14, fetching).** A conversation's tools come in
+three kits: its own, a workspace's beside them, and a repository
+workspace's beside both, which holds `git_fetch {worktree}`, the
+worktree's absolute path as the environment names it. The call is
+refused, asking nothing, for a path that is not one of the workspace's
+worktrees, one not yet prepared, and a workspace gone with its archive.
+Otherwise the conversation sends the window `refetch`, naming the call,
+the worktree's remote and every base of that remote the workspace names,
+and waits for as long as the fetch takes, as a preparation does, so a
+conversation no one interrupts waits on a hung fetch until the git
+worker's own bound; an interrupt ends the wait and the turn, and the
+result says the window may still finish the fetch. The window admits it
+as it admits a preparation's fetch (the conversation's own record names
+the remote and bases, and the configuration admits the remote) and
+queues it on the store thread, where it goes before any queued
+background fetch, as a preparation does. The answer, `refetched`,
+carries each base's commit or why it has none, or why nothing was
+fetched; the window also learns the bases' new commits and tells every
+conversation of the remote, as after a background fetch, so a background
+fetch's diagnostics are not this one's. The conversation drops what the
+window told it of the remote's bases meanwhile, which is older and would
+move them back (the window tells this fetch's after its answer), then
+sets every base found as its remote-tracking ref in every worktree of
+the remote, whether or not the record says it moved, since the jail may
+have moved or deleted one, in a maintenance instance as a background
+fetch's news does, and records it; its result says, for each base, where
+`origin/<base>` is and whether it moved, or that it was not found
+upstream, or that the refs could not be set, and logs no news of its
+own; refs it could not set are tried again, and said to the human, when
+the window next tells the bases. It changes no branch, file or ref
+outside `refs/remotes/`, so it is not snapshotted and needs no approval
+(§11), and nothing bounds how often a model asks for it; an asked fetch
+goes before queued background fetches, so many conversations asking at
+once can hold those back.
+
 ## 10. Network policy
 
 A workspace has one of three network policies, shown in the status row:
