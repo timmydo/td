@@ -15,23 +15,31 @@ starting point for successive agents; the root `AGENTS.md` and
 
 ## Status
 
-Increments 3 to 8 of §18 are built: td-ui's message list; the
-crate with its gate, the window and conversation processes, the store
-and the host launch; the model client over `td-fetch 1`, with the key file,
-the models list, cost limits, credit and titles; td-net's streamed
-fetch; streamed replies over it, drawn as they arrive and interrupted
-by `Escape`; and the conversation tools, the first a model is given:
-the todo list, `history_search` and `history_read`, `conversations`
-and `send_message`, with the wake budget and pausing. After them came
-the window's File menu and the dialog that stores the OpenRouter key
-from it (§4, §6), then the Conversation menu, which chooses each
-conversation's model, from a picker over the models list, and its
-reasoning effort (§4), the system context, shown folded at the head of
-the transcript, and the diagnostics export (§4); then increments 9 and
-10, the tool host and the `workspace` jail, with directory and scratch
-workspaces whose file and shell tools run in `ask` mode, and then the
-peers step of §18, which made every conversation a peer (§3). Where
-building them settled a point the design left open, the section says so
+Increments 3 to 13 and 16 of §18 are built, with the small steps between
+10 and 11. First came td-ui's message list; the crate with its gate, the
+window and conversation processes, the store and the host launch; the
+model client over `td-fetch 1`, with the key file, the models list, cost
+limits, credit and titles; td-net's streamed fetch; streamed replies
+over it, drawn as they arrive and interrupted by `Escape`; and the
+conversation tools, the first a model is given: the todo list,
+`history_search` and `history_read`, `conversations` and `send_message`,
+with the wake budget and pausing. After them came the window's File and
+Conversation menus, the key dialog, the model picker and reasoning
+effort, the system context and the diagnostics export (§4, §6);
+increments 9 and 10, the tool host and the `workspace` jail, with
+directory and scratch workspaces; the peers step, which made every
+conversation a peer (§3), templates, the Messages window, and the row's
+menu that archives and deletes (§4, §7); increment 11, the repository
+store, admitted remotes, background fetch, sparse worktrees prepared
+asynchronously, step snapshots with undo, and notifications (§7, §9,
+§12); increment 12, background processes (§12); increment 13, rules,
+cards, modes, the two-stage classifier with its calibrated threshold,
+the circuit breaker and the trust mark (§11); and increment 16,
+compaction, by hand and past `compact_at`, and the card that asks how to
+resume a conversation whose cache has gone cold (§14). Increments 14 and
+15, the push and fetch tools and the network, are not yet built, so a
+model cannot push and nothing leaves a workspace's jail. Where building
+an increment settled a point the design left open, the section says so
 under "As built". No recipe names td-agent yet. The decisions below that
 were the user's to make were made on 2026-10-01, 2026-10-02 and
 2026-10-04:
