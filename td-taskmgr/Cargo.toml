@@ -23,3 +23,6 @@ indexing_slicing = "deny"
 
 [dependencies]
 td-ui = { path = "../td-ui" }
+
+[dev-dependencies]
+td-test-compositor = { path = "../td-test-compositor" }

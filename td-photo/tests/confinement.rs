@@ -121,9 +121,16 @@ fn the_manifest_declares_the_calendar_and_the_toolkit_and_joins_the_gate() {
         ),
         "the civil calendar and the toolkit by path"
     );
-    assert_eq!(manifest.matches("path =").count(), 2, "two dependencies");
+    // And the native harness, for the tests alone.
+    assert!(
+        manifest.ends_with(
+            "\n[dev-dependencies]\ntd-test-compositor = { path = \"../td-test-compositor\" }\n"
+        ),
+        "the native harness by path, for the tests"
+    );
+    assert_eq!(manifest.matches("path =").count(), 3, "three dependencies");
     assert_eq!(manifest.matches("[dependencies]").count(), 1);
-    assert!(!manifest.contains("[dev-dependencies]"));
+    assert_eq!(manifest.matches("[dev-dependencies]").count(), 1);
     assert!(!manifest.contains("[build-dependencies]"));
     assert!(!manifest.contains("[target"));
     assert!(!manifest.contains("[patch"));
@@ -146,9 +153,10 @@ fn the_manifest_declares_the_calendar_and_the_toolkit_and_joins_the_gate() {
         assert!(manifest.contains(&format!("{lint} = \"deny\"")), "{lint}");
     }
     let lock = read("Cargo.lock");
-    assert_eq!(lock.matches("[[package]]").count(), 3);
+    assert_eq!(lock.matches("[[package]]").count(), 4);
     assert!(lock.contains("name = \"td-civil\""));
     assert!(lock.contains("name = \"td-photo\""));
+    assert!(lock.contains("name = \"td-test-compositor\""));
     assert!(lock.contains("name = \"td-ui\""));
     assert!(!lock.contains("source ="), "no registry or git source");
     assert!(

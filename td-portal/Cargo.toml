@@ -41,3 +41,6 @@ indexing_slicing = "deny"
 opt-level = "s"
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+td-test-compositor = { path = "../td-test-compositor" }

@@ -38,6 +38,7 @@ pub fn recipe() -> Recipe {
             "engine",
             "td-ui",
             "td-tpm",
+            "td-test-compositor",
         ])
         .native_inputs(&[
             "rust-toolchain",
@@ -74,6 +75,7 @@ mod tests {
                 "engine".to_string(),
                 "td-ui".to_string(),
                 "td-tpm".to_string(),
+                "td-test-compositor".to_string(),
             ])
         );
         assert_eq!(recipe.cargo_subdir.as_deref(), Some("td-portal"));

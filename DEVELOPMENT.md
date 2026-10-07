@@ -821,6 +821,12 @@ checks that declaration, builds the repository's compositor offline into a
 fresh owned directory under `target/`, then runs the consumer's ignored
 `control_process` cases filtered by `native_compositor::`, with two test
 threads. Ordinary tests and optional Weston cases keep their own commands.
+The cases drive the compositor through one shared harness, the
+`td-test-compositor` crate, which a consumer names under
+`[dev-dependencies]`: it launches the tool, reads its readiness line and
+speaks its control socket (layout, input with receipts, observation,
+capture, clipboard). Cargo resolves a dev-dependency into the consumer's
+lock, so a consumer's recipe stages that tree beside its others.
 The tool's absolute UTF-8 path is forced through Cargo configuration as
 `TD_TEST_COMPOSITOR`; ambient values cannot substitute another executable.
 `trusted-test-root` is retained for this test command. The tool build's

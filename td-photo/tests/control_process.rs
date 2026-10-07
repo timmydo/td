@@ -11,81 +11,23 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use td_test_compositor::{remaining, write_until, Directory};
 use td_ui::control::{frame, Decoder};
 use td_ui::raster::{Scale, Surface};
 
-type Result<T> = std::result::Result<T, String>;
 const TIMEOUT: Duration = Duration::from_secs(10);
-static NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[path = "support/native_compositor.rs"]
 mod native_compositor;
 
 #[path = "support/synth_nef.rs"]
 mod synth_nef;
-
-/// A short-lived private directory for a compositor session or a client's
-/// runtime, at a Linux-socket-length path independent of TMPDIR.
-struct Directory(PathBuf);
-impl Directory {
-    fn new() -> Self {
-        // Concurrent hosted checks run in their own PID namespaces, so the
-        // pid alone can repeat: only a directory this call created is ours.
-        let mut taken = 0;
-        loop {
-            let path = Path::new("/tmp").join(format!(
-                "td-photo-process-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && taken < 1024 => {
-                    taken += 1;
-                }
-                created => {
-                    created.unwrap();
-                    // The create's mode is filtered by the umask.
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-                        .unwrap();
-                    return Self(path);
-                }
-            }
-        }
-    }
-}
-impl Drop for Directory {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn remaining(deadline: Instant) -> io::Result<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|duration| !duration.is_zero())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "native I/O deadline"))
-}
-
-fn write_until(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
-    while !bytes.is_empty() {
-        stream.set_write_timeout(Some(remaining(deadline)?))?;
-        match stream.write(bytes) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => bytes = &bytes[n..],
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
 
 // ------------------------------------------------- headless develop preview
 
@@ -182,7 +124,7 @@ fn preview_develop_reflects_the_sidecar() {
     // the develop box carries pixels, and an exposure written to the sidecar
     // changes them, so the developed preview reflects the sidecar the window,
     // the verb and the preview share.
-    let dir = Directory::new();
+    let dir = Directory::new("td-photo-process");
     let roll = dir.0.join("roll");
     std::fs::create_dir(&roll).unwrap();
     let (w, h) = (64usize, 48usize);
@@ -235,7 +177,7 @@ fn preview_develop_reflects_the_crop() {
     // A crop written to the sidecar changes the develop box the same way an
     // exposure does: `--preview --develop` develops the cropped region, so the
     // shared crop the window, the verb and the preview read reaches the pixels.
-    let dir = Directory::new();
+    let dir = Directory::new("td-photo-process");
     let roll = dir.0.join("roll");
     std::fs::create_dir(&roll).unwrap();
     let (w, h) = (64usize, 48usize);
@@ -274,7 +216,7 @@ fn preview_single_shows_the_developed_photo_in_the_single_view() {
     // a decodable NEF carries an image in the single view's box (the
     // larger one over the whole area), and an exposure written to the
     // sidecar changes it.
-    let dir = Directory::new();
+    let dir = Directory::new("td-photo-process");
     let roll = dir.0.join("roll");
     std::fs::create_dir(&roll).unwrap();
     let (w, h) = (64usize, 48usize);
@@ -381,7 +323,7 @@ fn preview_develop_zooms_the_box_to_the_centre_at_100() {
     // enlarges tells the two apart. The square renders near white with a
     // magenta cast, which the box's placeholder and the chrome, warmer
     // and darker in blue, do not reach.
-    let dir = Directory::new();
+    let dir = Directory::new("td-photo-process");
     let roll = dir.0.join("roll");
     std::fs::create_dir(&roll).unwrap();
     let (w, h) = (1600usize, 1200usize);
@@ -455,7 +397,7 @@ fn preview_develop_blits_the_filmstrip_thumbnails() {
     // Three decodable NEFs whose embedded previews are flat colours: in
     // develop the strip under the box carries each photo's thumbnail, in
     // roll order around the cursor, and the cursor's box is outlined.
-    let dir = Directory::new();
+    let dir = Directory::new("td-photo-process");
     let roll = dir.0.join("roll");
     std::fs::create_dir_all(&roll).unwrap();
     let (w, h) = (16usize, 12usize);

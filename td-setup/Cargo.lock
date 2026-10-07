@@ -28,8 +28,13 @@ version = "0.1.0"
 dependencies = [
  "td-install",
  "td-protector",
+ "td-test-compositor",
  "td-ui",
 ]
+
+[[package]]
+name = "td-test-compositor"
+version = "0.1.0"
 
 [[package]]
 name = "td-tpm"

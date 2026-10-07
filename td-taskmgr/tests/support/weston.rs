@@ -14,7 +14,7 @@ fn real_weston_configures_releases_buffers_and_keeps_collection_live() {
     let binary =
         PathBuf::from(std::env::var_os("TD_TEST_WESTON").expect("TD_TEST_WESTON required"));
     assert!(binary.is_absolute());
-    let directory = Directory::new();
+    let directory = Directory::new("td-taskmgr-process");
     let log = directory.0.join("weston.log");
     let mut server = Server(
         Command::new(binary)
@@ -44,7 +44,7 @@ fn real_weston_configures_releases_buffers_and_keeps_collection_live() {
         assert!(Instant::now() < deadline, "Weston readiness deadline");
         std::thread::sleep(Duration::from_millis(20));
     }
-    let client_directory = Directory::new();
+    let client_directory = Directory::new("td-taskmgr-process");
     let client = TaskProcess::start(&client_directory, &directory.0.join("wayland-test"));
     while !client_directory.0.join("control").exists() {
         assert!(Instant::now() < deadline, "client startup deadline");

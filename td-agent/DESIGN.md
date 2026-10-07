@@ -5061,10 +5061,12 @@ follows:
   change to a crate it reads selects td-agent as well, as it should;
 - no recipe, recipe test or seed roster names it until packaging;
 - its outgoing edges are pinned: exactly `td-civil`, `td-compositor`,
-  `td-fetch-client`, `td-fs`, `td-json`, `td-toml` and `td-ui` (its
-  dependencies). `td-civil` joined when the history's UTC stamps left a
-  copied calendar; `td-fs` when the store's atomic replace became
-  td-fs's; `td-compositor` joined with the window increment, which
+  `td-fetch-client`, `td-fs`, `td-json`, `td-test-compositor`, `td-toml`
+  and `td-ui` (its dependencies). `td-test-compositor` joined when the
+  native harness left the copy in `tests/support` for the shared crate;
+  `td-civil` joined when the history's UTC stamps left a copied
+  calendar; `td-fs` when the store's atomic replace became td-fs's;
+  `td-compositor` joined with the window increment, which
   declared `native-compositor-tests`, since that opt-in adds the edge;
   `td-json` and `td-toml` joined when JSON and TOML left the copied
   modules for crates of their own, and `td-fetch-client` replaced

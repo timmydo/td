@@ -3,17 +3,5 @@
 version = 4
 
 [[package]]
-name = "td-pinentry"
-version = "0.1.0"
-dependencies = [
- "td-test-compositor",
- "td-ui",
-]
-
-[[package]]
 name = "td-test-compositor"
-version = "0.1.0"
-
-[[package]]
-name = "td-ui"
 version = "0.1.0"

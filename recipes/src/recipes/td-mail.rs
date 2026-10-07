@@ -23,6 +23,7 @@ pub fn recipe() -> Recipe {
             "td-toml",
             "td-ui",
             "td-compositor",
+            "td-test-compositor",
         ])
         .native_inputs(&[
             "rust-toolchain",
@@ -61,6 +62,7 @@ mod tests {
                 "td-toml".into(),
                 "td-ui".into(),
                 "td-compositor".into(),
+                "td-test-compositor".into(),
             ])
         );
         assert_eq!(recipe.cargo_subdir.as_deref(), Some("td-mail"));
@@ -95,6 +97,7 @@ mod tests {
                 "td-kv",
                 "td-mail",
                 "td-regex",
+                "td-test-compositor",
                 "td-toml",
                 "td-ui",
             ]
@@ -110,6 +113,7 @@ mod tests {
             "td-json",
             "td-kv",
             "td-regex",
+            "td-test-compositor",
             "td-toml",
             "td-ui",
         ] {

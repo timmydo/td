@@ -34,3 +34,6 @@ unreachable = "deny"
 todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"
+
+[dev-dependencies]
+td-test-compositor = { path = "../td-test-compositor" }

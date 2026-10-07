@@ -529,6 +529,7 @@ mod tests {
                 "td-setup",
                 "td-taskmgr",
                 "td-term",
+                "td-test-compositor",
                 "td-toml",
                 "td-tpm",
                 "td-ui"

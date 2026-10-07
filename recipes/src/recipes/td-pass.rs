@@ -28,6 +28,7 @@ pub fn recipe() -> Recipe {
             "td-firstboot",
             "engine",
             "td-tpm",
+            "td-test-compositor",
         ])
         .native_inputs(&[
             "rust-toolchain",
@@ -62,7 +63,8 @@ mod tests {
                     "td-busd",
                     "td-firstboot",
                     "engine",
-                    "td-tpm"
+                    "td-tpm",
+                    "td-test-compositor"
                 ]
                 .map(String::from)
                 .to_vec()
@@ -168,6 +170,9 @@ mod tests {
         trees.insert("td-secret".to_owned());
         trees.insert("td-tpm".to_owned());
         trees.insert("td-ui".to_owned());
+        // The native harness: a dev-dependency, which cargo reads to
+        // resolve the lock though no shipped file names it.
+        trees.insert("td-test-compositor".to_owned());
         let staged: std::collections::BTreeSet<String> = recipe()
             .local_source_trees
             .unwrap_or_default()
@@ -176,7 +181,8 @@ mod tests {
         assert_eq!(trees, staged);
     }
 
-    /// The manifest names exactly the two path dependencies staged here.
+    /// The manifest names exactly the two path dependencies staged here,
+    /// and the native harness its tests alone use.
     #[test]
     fn the_manifest_depends_on_the_staged_library_and_toolkit() {
         let manifest = include_str!("../../../td-pass/Cargo.toml");
@@ -188,7 +194,8 @@ mod tests {
             paths,
             [
                 "td-ui = { path = \"../td-ui\" }",
-                "td-secret = { path = \"../td-secret\" }"
+                "td-secret = { path = \"../td-secret\" }",
+                "td-test-compositor = { path = \"../td-test-compositor\" }"
             ]
         );
         let lock = include_str!("../../../td-pass/Cargo.lock");

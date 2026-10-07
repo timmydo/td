@@ -42,12 +42,17 @@ dependencies = [
  "td-json",
  "td-kv",
  "td-regex",
+ "td-test-compositor",
  "td-toml",
  "td-ui",
 ]
 
 [[package]]
 name = "td-regex"
+version = "0.1.0"
+
+[[package]]
+name = "td-test-compositor"
 version = "0.1.0"
 
 [[package]]

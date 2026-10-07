@@ -1,5 +1,5 @@
-//! The real headless compositor driving the td-agent window. A copy of
-//! td-mail's native harness: `Compositor` launches the compositor from
+//! The real headless compositor driving the td-agent window. td's shared
+//! native harness (`td-test-compositor`) launches the compositor from
 //! the `TD_TEST_COMPOSITOR` binary and injects keys through its seat, and
 //! `AgentProcess` launches td-agent against its Wayland socket with its
 //! state and configuration inside the test's own directory. The cases
@@ -15,11 +15,8 @@
 
 use super::*;
 
-use std::io::{BufRead, BufReader};
-use std::sync::mpsc;
-use std::thread::JoinHandle;
-
 use td_agent::store::{parse_log, Kind};
+use td_test_compositor::{remaining, write_until, Compositor, Controls};
 use td_ui::control::{frame, Decoder};
 
 const KEY_ESC: u32 = 1;
@@ -52,187 +49,6 @@ const SECRET: &str = "sk-or-v1-abc";
 const SECRET_KEYS: [u32; 12] = [
     KEY_S, KEY_K, KEY_MINUS, KEY_O, KEY_R, KEY_MINUS, KEY_V, KEY_1, KEY_MINUS, KEY_A, KEY_B, KEY_C,
 ];
-
-struct Compositor {
-    child: Child,
-    directory: PathBuf,
-    session: String,
-    action: u64,
-    output: Option<JoinHandle<()>>,
-}
-
-fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    line.split_whitespace()
-        .find_map(|token| token.strip_prefix(key))
-}
-
-fn identity(value: &str) -> bool {
-    value.len() == 32
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-impl Compositor {
-    fn start(directory: &Directory) -> Self {
-        let binary = PathBuf::from(
-            std::env::var_os("TD_TEST_COMPOSITOR")
-                .expect("set TD_TEST_COMPOSITOR to an explicitly built compositor"),
-        );
-        assert!(
-            binary.is_absolute(),
-            "compositor test tool must be an absolute path"
-        );
-        let session_dir = directory.0.join("session");
-        let child = Command::new(binary)
-            .arg("headless")
-            .arg("--session-dir")
-            .arg(&session_dir)
-            .args([
-                "--width",
-                "800",
-                "--height",
-                "600",
-                "--input-control",
-                "enabled",
-            ])
-            .env_clear()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(std::fs::File::create(directory.0.join("compositor.log")).unwrap())
-            .spawn()
-            .unwrap();
-        // Establish cleanup before any later setup or readiness can unwind.
-        let mut compositor = Self {
-            child,
-            directory: session_dir,
-            session: String::new(),
-            action: 0,
-            output: None,
-        };
-        let stdout = compositor.child.stdout.take().unwrap();
-        let (send, receive) = mpsc::sync_channel(1);
-        compositor.output = Some(
-            std::thread::Builder::new()
-                .spawn(move || {
-                    let mut reader = BufReader::new(stdout);
-                    let mut line = String::new();
-                    if reader.by_ref().take(4097).read_line(&mut line).is_ok() && line.len() <= 4096
-                    {
-                        let _ = send.send(line);
-                    }
-                    let _ = std::io::copy(&mut reader, &mut std::io::sink());
-                })
-                .unwrap(),
-        );
-        let ready = receive
-            .recv_timeout(TIMEOUT)
-            .expect("compositor readiness deadline");
-        let session = ready
-            .strip_prefix("TD-COMPOSITOR-HEADLESS-READY version=2 session=")
-            .and_then(|line| line.strip_suffix(" width=800 height=600 scale=1\n"))
-            .expect("compositor readiness grammar");
-        assert!(identity(session));
-        compositor.session = session.to_string();
-        compositor
-    }
-
-    fn request(&self, line: &str, limit: usize) -> Vec<u8> {
-        let deadline = Instant::now() + TIMEOUT;
-        let mut stream = UnixStream::connect(self.directory.join("td-control")).unwrap();
-        write_until(&mut stream, format!("{line}\n").as_bytes(), deadline).unwrap();
-        let mut reply = Vec::new();
-        let mut chunk = [0; 16384];
-        loop {
-            stream
-                .set_read_timeout(Some(remaining(deadline).unwrap()))
-                .unwrap();
-            let count = match stream.read(&mut chunk) {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                result => result.expect("compositor reply"),
-            };
-            if count == 0 {
-                break;
-            }
-            assert!(reply.len() + count <= limit, "compositor reply byte bound");
-            reply.extend_from_slice(&chunk[..count]);
-        }
-        reply
-    }
-
-    /// Whether a toplevel carrying `app_id` is mapped and has the
-    /// keyboard, which the seat's keys then reach.
-    fn focused(&self, app_id: &str) -> bool {
-        let layout = self.request("layout", 65536);
-        let text = std::str::from_utf8(&layout).unwrap();
-        text.lines()
-            .filter_map(|line| line.strip_prefix("window "))
-            .any(|line| {
-                field(line, "app_id=") == Some(app_id) && field(line, "focused=") == Some("true")
-            })
-    }
-
-    fn key(&mut self, key: u32, down: bool) {
-        // Timestamps follow the receipt counter; callers do not send action IDs.
-        let time = self.action + 1;
-        let line = format!(
-            "key {} {time} {key} {}",
-            self.session,
-            if down { "down" } else { "up" }
-        );
-        self.receipt(&line);
-    }
-
-    fn receipt(&mut self, line: &str) {
-        let action = self.action + 1;
-        let expected = format!(
-            "ok\ntd-action-v1 session={} action={action}\n",
-            self.session
-        );
-        assert_eq!(self.request(line, 1024), expected.as_bytes());
-        self.action = action;
-    }
-
-    /// `key` tapped with every one of `modifiers` held, pressed in order
-    /// and released in reverse.
-    fn chord(&mut self, modifiers: &[u32], key: u32) {
-        for modifier in modifiers {
-            self.key(*modifier, true);
-        }
-        self.key(key, true);
-        self.key(key, false);
-        for modifier in modifiers.iter().rev() {
-            self.key(*modifier, false);
-        }
-    }
-
-    fn stop(&mut self) {
-        self.child.stdin.take();
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                assert!(status.success());
-                break;
-            }
-            assert!(Instant::now() < deadline, "compositor owner-EOF deadline");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert!(!self.directory.exists());
-    }
-}
-
-impl Drop for Compositor {
-    fn drop(&mut self) {
-        self.child.stdin.take();
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
-        if let Some(output) = self.output.take() {
-            let _ = output.join();
-        }
-    }
-}
 
 /// td-agent launched as an ordinary Wayland client, its home, state and
 /// configuration inside `directory`, with a control socket there when
@@ -425,15 +241,10 @@ fn wait<T>(agent: &AgentProcess, what: &str, mut ready: impl FnMut() -> Option<T
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
 fn messages_typed_into_the_window_land_in_each_conversations_log() {
-    let compositor_directory = Directory::new();
-    let mut compositor = Compositor::start(&compositor_directory);
-    let client_directory = Directory::new();
-    let agent = AgentProcess::launch(
-        &client_directory,
-        &compositor.directory.join("wayland-0"),
-        true,
-        &[],
-    );
+    let compositor_directory = Directory::new("td-agent-process");
+    let mut compositor = Compositor::start(&compositor_directory.0, Controls::default());
+    let client_directory = Directory::new("td-agent-process");
+    let agent = AgentProcess::launch(&client_directory, &compositor.display(), true, &[]);
     wait(&agent, "the td-agent window maps with the keyboard", || {
         compositor.focused("td-agent").then_some(())
     });
@@ -502,15 +313,10 @@ fn messages_typed_into_the_window_land_in_each_conversations_log() {
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
 fn the_file_menu_opens_a_masked_key_dialog() {
-    let compositor_directory = Directory::new();
-    let mut compositor = Compositor::start(&compositor_directory);
-    let client_directory = Directory::new();
-    let agent = AgentProcess::launch(
-        &client_directory,
-        &compositor.directory.join("wayland-0"),
-        true,
-        &[],
-    );
+    let compositor_directory = Directory::new("td-agent-process");
+    let mut compositor = Compositor::start(&compositor_directory.0, Controls::default());
+    let client_directory = Directory::new("td-agent-process");
+    let agent = AgentProcess::launch(&client_directory, &compositor.display(), true, &[]);
     wait(&agent, "the td-agent window maps with the keyboard", || {
         compositor.focused("td-agent").then_some(())
     });
@@ -562,9 +368,9 @@ fn the_file_menu_opens_a_masked_key_dialog() {
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
 fn the_conversation_menu_chooses_a_model_the_conversation_logs() {
-    let compositor_directory = Directory::new();
-    let mut compositor = Compositor::start(&compositor_directory);
-    let client_directory = Directory::new();
+    let compositor_directory = Directory::new("td-agent-process");
+    let mut compositor = Compositor::start(&compositor_directory.0, Controls::default());
+    let client_directory = Directory::new("td-agent-process");
     // The models list as the window would have cached it.
     let state = td_agent::store::StateDir::at(client_directory.0.join("home/state/td-agent"));
     state.ensure().unwrap();
@@ -572,12 +378,7 @@ fn the_conversation_menu_chooses_a_model_the_conversation_logs() {
         .unwrap()
         .save(state.root())
         .unwrap();
-    let agent = AgentProcess::launch(
-        &client_directory,
-        &compositor.directory.join("wayland-0"),
-        true,
-        &[],
-    );
+    let agent = AgentProcess::launch(&client_directory, &compositor.display(), true, &[]);
     wait(&agent, "the td-agent window maps with the keyboard", || {
         compositor.focused("td-agent").then_some(())
     });
@@ -643,7 +444,7 @@ fn the_conversation_menu_chooses_a_model_the_conversation_logs() {
 #[cfg(feature = "test-key-root")]
 mod fixture {
     use super::*;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
     /// The outcome of each turn the conversations' logs have finished.
     fn outcomes(agent: &AgentProcess) -> Vec<String> {
@@ -671,9 +472,9 @@ mod fixture {
     #[test]
     #[ignore = "ready supplies the disposable native compositor"]
     fn a_key_saved_from_the_dialog_is_stored_0600_and_used() {
-        let compositor_directory = Directory::new();
-        let mut compositor = Compositor::start(&compositor_directory);
-        let client_directory = Directory::new();
+        let compositor_directory = Directory::new("td-agent-process");
+        let mut compositor = Compositor::start(&compositor_directory.0, Controls::default());
+        let client_directory = Directory::new("td-agent-process");
         // The configuration home, which the dialog does not make.
         let config = client_directory.0.join("home/config");
         // Canonical, so a linked `/tmp` cannot leave the walk checking
@@ -681,7 +482,7 @@ mod fixture {
         let root = std::fs::canonicalize(&client_directory.0).unwrap();
         let agent = AgentProcess::launch(
             &client_directory,
-            &compositor.directory.join("wayland-0"),
+            &compositor.display(),
             true,
             &[("TD_AGENT_TEST_KEY_ROOT", &root)],
         );

@@ -1,0 +1,33 @@
+[package]
+name = "td-test-compositor"
+version = "0.1.0"
+edition = "2021"
+description = "td's native test harness: the real headless compositor driven over its control socket"
+license = "MIT"
+
+# Own workspace root, so cargo behaves the same from the main checkout as from
+# a worktree nested under it (see the root Cargo.toml). A graphical client
+# names this crate under a bare [dev-dependencies] as
+# `td-test-compositor = { path = "../td-test-compositor" }`, the one sibling
+# spelling the lock guard admits (AGENTS.md 'Rust code'). Cargo resolves a
+# dev-dependency into the client's lock, so a recipe that builds the client
+# stages this tree beside its others; no shipped binary links it. It depends
+# on nothing but `std`. A broken expectation is a failed test, so it asserts
+# and panics where a production crate returns an error.
+[workspace]
+
+[lib]
+# Doctests link with the host `cc`, which the gate sandbox does not have.
+doctest = false
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

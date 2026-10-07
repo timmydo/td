@@ -1,18 +1,15 @@
-//! The real headless `td-compositor` driving the td-mail window. A minimal
-//! copy of td-setup's native harness, with td-editor's key injection:
-//! `Compositor` launches the compositor from the `TD_TEST_COMPOSITOR`
-//! binary and injects keys through its seat, and `MailProcess` launches
-//! td-mail offline against its Wayland socket with every directory it
-//! reads or writes inside the test's own. The one case proves what the
-//! in-process session tests cannot: the chords reach td-mail through a
-//! real keyboard, the finder opens over the draft, and the file chosen
-//! lands in the draft's sidecar with its tag in the draft.
+//! The real headless `td-compositor` driving the td-mail window. td's
+//! shared native harness (`td-test-compositor`) launches the compositor
+//! from the `TD_TEST_COMPOSITOR` binary and injects keys through its seat,
+//! and `MailProcess` launches td-mail offline against its Wayland socket
+//! with every directory it reads or writes inside the test's own. The one
+//! case proves what the in-process session tests cannot: the chords reach
+//! td-mail through a real keyboard, the finder opens over the draft, and
+//! the file chosen lands in the draft's sidecar with its tag in the draft.
 
 use super::*;
 
-use std::io::{BufRead, BufReader};
-use std::sync::mpsc;
-use std::thread::JoinHandle;
+use td_test_compositor::{Compositor, Controls};
 
 const KEY_E: u32 = 18;
 const KEY_R: u32 = 19;
@@ -23,188 +20,6 @@ const KEY_A: u32 = 30;
 const KEY_S: u32 = 31;
 const KEY_LEFTSHIFT: u32 = 42;
 const KEY_C: u32 = 46;
-
-struct Compositor {
-    child: Child,
-    directory: PathBuf,
-    session: String,
-    action: u64,
-    output: Option<JoinHandle<()>>,
-}
-
-fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    line.split_whitespace()
-        .find_map(|token| token.strip_prefix(key))
-}
-
-fn identity(value: &str) -> bool {
-    value.len() == 32
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-impl Compositor {
-    fn start(directory: &Directory) -> Self {
-        let binary = PathBuf::from(
-            std::env::var_os("TD_TEST_COMPOSITOR")
-                .expect("set TD_TEST_COMPOSITOR to an explicitly built td-compositor"),
-        );
-        assert!(
-            binary.is_absolute(),
-            "compositor test tool must be an absolute path"
-        );
-        let session_dir = directory.0.join("session");
-        let child = Command::new(binary)
-            .arg("headless")
-            .arg("--session-dir")
-            .arg(&session_dir)
-            .args([
-                "--width",
-                "800",
-                "--height",
-                "600",
-                "--input-control",
-                "enabled",
-            ])
-            .env_clear()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(std::fs::File::create(directory.0.join("compositor.log")).unwrap())
-            .spawn()
-            .unwrap();
-        // Establish cleanup before any later setup or readiness can unwind.
-        let mut compositor = Self {
-            child,
-            directory: session_dir,
-            session: String::new(),
-            action: 0,
-            output: None,
-        };
-        let stdout = compositor.child.stdout.take().unwrap();
-        let (send, receive) = mpsc::sync_channel(1);
-        compositor.output = Some(
-            std::thread::Builder::new()
-                .spawn(move || {
-                    let mut reader = BufReader::new(stdout);
-                    let mut line = String::new();
-                    if reader.by_ref().take(4097).read_line(&mut line).is_ok() && line.len() <= 4096
-                    {
-                        let _ = send.send(line);
-                    }
-                    let _ = std::io::copy(&mut reader, &mut std::io::sink());
-                })
-                .unwrap(),
-        );
-        let ready = receive
-            .recv_timeout(TIMEOUT)
-            .expect("compositor readiness deadline");
-        let session = ready
-            .strip_prefix("TD-COMPOSITOR-HEADLESS-READY version=2 session=")
-            .and_then(|line| line.strip_suffix(" width=800 height=600 scale=1\n"))
-            .expect("compositor readiness grammar");
-        assert!(identity(session));
-        compositor.session = session.to_string();
-        compositor
-    }
-
-    fn request(&self, line: &str, limit: usize) -> Vec<u8> {
-        let deadline = Instant::now() + TIMEOUT;
-        let mut stream = UnixStream::connect(self.directory.join("td-control")).unwrap();
-        write_until(&mut stream, format!("{line}\n").as_bytes(), deadline).unwrap();
-        let mut reply = Vec::new();
-        let mut chunk = [0; 16384];
-        loop {
-            stream
-                .set_read_timeout(Some(remaining(deadline).unwrap()))
-                .unwrap();
-            let count = match stream.read(&mut chunk) {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                result => result.expect("compositor reply"),
-            };
-            if count == 0 {
-                break;
-            }
-            assert!(reply.len() + count <= limit, "compositor reply byte bound");
-            reply.extend_from_slice(&chunk[..count]);
-        }
-        reply
-    }
-
-    /// Whether a toplevel carrying `app_id` is mapped and has the
-    /// keyboard: the client bound, set its app id and mapped a surface,
-    /// the one activated toplevel, which the seat's keys then reach.
-    fn focused(&self, app_id: &str) -> bool {
-        let layout = self.request("layout", 65536);
-        let text = std::str::from_utf8(&layout).unwrap();
-        text.lines()
-            .filter_map(|line| line.strip_prefix("window "))
-            .any(|line| {
-                field(line, "app_id=") == Some(app_id) && field(line, "focused=") == Some("true")
-            })
-    }
-
-    fn key(&mut self, key: u32, down: bool) {
-        // Timestamps follow the receipt counter; callers do not send action IDs.
-        let time = self.action + 1;
-        let line = format!(
-            "key {} {time} {key} {}",
-            self.session,
-            if down { "down" } else { "up" }
-        );
-        self.receipt(&line);
-    }
-
-    fn receipt(&mut self, line: &str) {
-        let action = self.action + 1;
-        let expected = format!(
-            "ok\ntd-action-v1 session={} action={action}\n",
-            self.session
-        );
-        assert_eq!(self.request(line, 1024), expected.as_bytes());
-        self.action = action;
-    }
-
-    /// `key` tapped with every one of `modifiers` held, pressed in order
-    /// and released in reverse.
-    fn chord(&mut self, modifiers: &[u32], key: u32) {
-        for modifier in modifiers {
-            self.key(*modifier, true);
-        }
-        self.key(key, true);
-        self.key(key, false);
-        for modifier in modifiers.iter().rev() {
-            self.key(*modifier, false);
-        }
-    }
-
-    fn stop(&mut self) {
-        self.child.stdin.take();
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                assert!(status.success());
-                break;
-            }
-            assert!(Instant::now() < deadline, "compositor owner-EOF deadline");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert!(!self.directory.exists());
-    }
-}
-
-impl Drop for Compositor {
-    fn drop(&mut self) {
-        self.child.stdin.take();
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
-        if let Some(output) = self.output.take() {
-            let _ = output.join();
-        }
-    }
-}
 
 /// td-mail launched offline as an ordinary Wayland client, its home,
 /// configuration, state and cache inside `directory`: one placeholder
@@ -313,10 +128,10 @@ fn wait<T>(mail: &MailProcess, what: &str, mut ready: impl FnMut() -> Option<T>)
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
 fn a_file_chosen_in_the_finder_is_attached_to_the_draft() {
-    let compositor_directory = Directory::new();
-    let mut compositor = Compositor::start(&compositor_directory);
-    let client_directory = Directory::new();
-    let mail = MailProcess::start(&client_directory, &compositor.directory.join("wayland-0"));
+    let compositor_directory = Directory::new("td-mail-process");
+    let mut compositor = Compositor::start(&compositor_directory.0, Controls::default());
+    let client_directory = Directory::new("td-mail-process");
+    let mail = MailProcess::start(&client_directory, &compositor.display());
     std::fs::write(mail.home.join("report.pdf"), b"%PDF-1.4 native").unwrap();
     std::fs::write(mail.home.join("notes.txt"), b"not this one").unwrap();
     wait(&mail, "the td-mail window maps with the keyboard", || {

@@ -1643,6 +1643,8 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 
     // The library crates the applications share are staged into their
     // recipes beside the toolkit, so an edit reaches the same consumers.
+    // td-test-compositor, the native harness, is a dev-dependency only, but
+    // cargo reads it to resolve the lock, so the same recipes stage it.
     const SHARED_LIBRARIES: &[&str] = &[
         "td-civil/",
         "td-encoding/",
@@ -1651,6 +1653,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         "td-json/",
         "td-kv/",
         "td-regex/",
+        "td-test-compositor/",
         "td-toml/",
     ];
     if SHARED_LIBRARIES.iter().any(|dir| p.starts_with(dir)) && !p.contains("..") {
@@ -2842,6 +2845,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "td-json/src/lib.rs",
         "td-kv/src/lib.rs",
         "td-regex/src/lib.rs",
+        "td-test-compositor/src/lib.rs",
         "td-toml/src/lib.rs",
         "td-json/Cargo.toml",
         "td-toml/Cargo.toml",
@@ -4576,6 +4580,11 @@ fn resembles_gate_section(header: &str) -> bool {
     }
 }
 
+/// Roster crates that exist only to test others: they assert and panic as a
+/// test does, so a crate may name one under `[dev-dependencies]` and never
+/// under `[dependencies]`, where it would link into a shipped binary.
+const TEST_SUPPORT_CRATES: &[&str] = &["td-test-compositor"];
+
 /// The optional `[package.metadata.td-gate]` block, over the manifest TEXT so
 /// its cases are literals in the test rather than a fixture tree.
 ///
@@ -4587,6 +4596,14 @@ fn resembles_gate_section(header: &str) -> bool {
 /// drop lint coverage, which is the failure this whole roster exists to stop.
 fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
     let (path_dependencies, path_dev_dependencies) = manifest_path_dependencies(name, manifest)?;
+    if let Some(support) = path_dependencies
+        .iter()
+        .find(|dependency| TEST_SUPPORT_CRATES.contains(&dependency.as_str()))
+    {
+        return Err(format!(
+            "{name}: {support} is test support; name it under [dev-dependencies] only"
+        ));
+    }
     let mut out = GateCrate {
         trusted_test_root: false,
         native_compositor_tests: false,
@@ -5171,7 +5188,8 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// gains a reader is no longer alone after reader closure, so it takes the
 /// whole list without the list changing. td-mta reads td-crypto, td-header,
 /// td-json, td-mime and td-nfc, its direct dependencies. td-agent reads td-civil,
-/// td-fetch-client, td-fs, td-json, td-toml and td-ui, its dependencies, and
+/// td-fetch-client, td-fs, td-json, td-toml and td-ui, its dependencies,
+/// td-test-compositor, the native harness its tests depend on, and
 /// td-compositor, the test tool its `native-compositor-tests` opt-in builds
 /// (td-agent/DESIGN.md §17).
 const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[
@@ -5183,6 +5201,7 @@ const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[
             "td-fetch-client",
             "td-fs",
             "td-json",
+            "td-test-compositor",
             "td-toml",
             "td-ui",
         ],
@@ -10294,8 +10313,13 @@ mod tests {
                  [package.metadata.td-gate]\nnative-compositor-tests = true\n\n\
                  [dependencies]\n",
             );
-            for name in names {
-                manifest.push_str(&format!("{name} = {{ path = \"../{name}\" }}\n"));
+            let line = |name: &str| format!("{name} = {{ path = \"../{name}\" }}\n");
+            for name in names.iter().filter(|name| **name != "td-test-compositor") {
+                manifest.push_str(&line(name));
+            }
+            if names.contains(&"td-test-compositor") {
+                manifest.push_str("\n[dev-dependencies]\n");
+                manifest.push_str(&line("td-test-compositor"));
             }
             manifest
         };
@@ -10304,6 +10328,7 @@ mod tests {
             "td-fetch-client",
             "td-fs",
             "td-json",
+            "td-test-compositor",
             "td-toml",
             "td-ui",
         ];
@@ -10315,6 +10340,7 @@ mod tests {
             "td-fs",
             "td-json",
             "td-news",
+            "td-test-compositor",
             "td-toml",
             "td-ui",
         ] {
@@ -11583,6 +11609,14 @@ mod tests {
         let parsed = parse_gate_crate("td-aa", "[dependencies]\ntd-bb = { path = \"../td-bb\" }\n\n[dev-dependencies]\ntd-cc = { path = \"../td-cc\" }\n\n[workspace]\n").unwrap();
         assert_eq!(parsed.path_dependencies, ["td-bb"]);
         assert_eq!(parsed.path_dev_dependencies, ["td-cc"]);
+        // Test support is admitted as a dev-dependency and refused as a
+        // dependency, where it would link into a shipped binary.
+        let harness = "td-test-compositor = { path = \"../td-test-compositor\" }\n";
+        assert!(parse_gate_crate("td-aa", &format!("[dev-dependencies]\n{harness}")).is_ok());
+        assert!(
+            parse_gate_crate("td-aa", &format!("[dependencies]\n{harness}"))
+                .is_err_and(|e| e.contains("[dev-dependencies] only"))
+        );
         for (bad, why) in [
             ("[dependencies]\ntd-bb = { path = \"../vendor/td-bb\" }\n", "an outside copy under a roster name"),
             ("[dependencies]\ntd-bb = { path = \"../td-bb\", features = [\"x\"] }\n", "a feature list"),

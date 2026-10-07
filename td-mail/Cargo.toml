@@ -71,3 +71,6 @@ td-kv = { path = "../td-kv" }
 td-regex = { path = "../td-regex" }
 td-toml = { path = "../td-toml" }
 td-ui = { path = "../td-ui" }
+
+[dev-dependencies]
+td-test-compositor = { path = "../td-test-compositor" }

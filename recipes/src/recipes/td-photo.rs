@@ -15,7 +15,7 @@ use crate::types::Recipe;
 pub fn recipe() -> Recipe {
     Recipe::rust("td-photo", "0.1.0")
         .local_source("td-photo")
-        .local_source_trees(&["td-civil", "td-ui", "td-compositor"])
+        .local_source_trees(&["td-civil", "td-ui", "td-compositor", "td-test-compositor"])
         .native_inputs(&[
             "rust-toolchain",
             "gcc-x86-64-self",
@@ -43,7 +43,8 @@ mod tests {
             Some(vec![
                 "td-civil".into(),
                 "td-ui".into(),
-                "td-compositor".into()
+                "td-compositor".into(),
+                "td-test-compositor".into()
             ])
         );
         assert_eq!(r.cargo_subdir.as_deref(), Some("td-photo"));

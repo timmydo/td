@@ -20,6 +20,7 @@ pub fn recipe() -> Recipe {
             "td-tpm",
             "td-json",
             "engine",
+            "td-test-compositor",
         ])
         .native_inputs(&[
             "rust-toolchain",
@@ -52,7 +53,8 @@ mod tests {
                 "td-protector".into(),
                 "td-tpm".into(),
                 "td-json".into(),
-                "engine".into()
+                "engine".into(),
+                "td-test-compositor".into(),
             ])
         );
         assert_eq!(recipe.cargo_subdir.as_deref(), Some("td-setup"));
@@ -72,6 +74,7 @@ mod tests {
                 "td-install = { path = \"../td-install\" }",
                 "td-protector = { path = \"../td-protector\" }",
                 "td-ui = { path = \"../td-ui\" }",
+                "td-test-compositor = { path = \"../td-test-compositor\" }",
             ]
         );
         let toolkit = include_str!("../../../td-ui/src/lib.rs");

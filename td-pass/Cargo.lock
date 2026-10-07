@@ -7,6 +7,7 @@ name = "td-pass"
 version = "0.1.0"
 dependencies = [
  "td-secret",
+ "td-test-compositor",
  "td-ui",
 ]
 
@@ -16,6 +17,10 @@ version = "0.1.0"
 dependencies = [
  "td-tpm",
 ]
+
+[[package]]
+name = "td-test-compositor"
+version = "0.1.0"
 
 [[package]]
 name = "td-tpm"

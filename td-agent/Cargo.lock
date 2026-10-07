@@ -10,6 +10,7 @@ dependencies = [
  "td-fetch-client",
  "td-fs",
  "td-json",
+ "td-test-compositor",
  "td-toml",
  "td-ui",
 ]
@@ -28,6 +29,10 @@ version = "0.1.0"
 
 [[package]]
 name = "td-json"
+version = "0.1.0"
+
+[[package]]
+name = "td-test-compositor"
 version = "0.1.0"
 
 [[package]]

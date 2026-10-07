@@ -6,9 +6,14 @@ version = 4
 name = "td-portal"
 version = "0.1.0"
 dependencies = [
+ "td-test-compositor",
  "td-tpm",
  "td-ui",
 ]
+
+[[package]]
+name = "td-test-compositor"
+version = "0.1.0"
 
 [[package]]
 name = "td-tpm"
