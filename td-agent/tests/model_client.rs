@@ -6497,6 +6497,8 @@ struct Prepared {
     tip: String,
     scratch: PathBuf,
     remote: String,
+    /// The workspace's name, which the person's rules for it are under.
+    workspace: String,
 }
 
 /// git on the host, in `dir`, with no configuration but the test's.
@@ -6555,6 +6557,7 @@ fn prepared(
     )
     .unwrap();
     let entry = made.entries[0].clone();
+    let workspace = made.name.clone();
     // The store as the window's worker leaves it.
     std::fs::create_dir_all(&entry.store).unwrap();
     git_in(&entry.store, &["init", "--quiet", "--bare"]);
@@ -6609,7 +6612,199 @@ fn prepared(
         tip,
         scratch,
         remote,
+        workspace,
     }
+}
+
+/// A push's rules and protected branches (DESIGN.md §9, §11): a
+/// configured protected branch is the person's whatever an allow rule
+/// says, its card offering to remember only a deny; a push an allow
+/// rule names goes with no card, the approval the rule's; and one a
+/// deny rule names is refused before anything is staged.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL, TD_AGENT_TXT and a host git"]
+fn git_push_rules_and_protected_branches() {
+    use td_agent::git::{Evidence, Staged};
+    let Prepared {
+        mut h,
+        scratch,
+        remote,
+        workspace,
+        ..
+    } = prepared(
+        "push-rules",
+        Client {
+            protected_branches: vec!["agent".into()],
+            ..Client::default()
+        },
+        |push| {
+            vec![
+                push("stream-tool-git-push.sse"),
+                Reply::sse("stream-sonnet.sse"),
+                Reply::ok("title.json"),
+                push("stream-tool-git-push-feature.sse"),
+                Reply::sse("stream-sonnet.sse"),
+                push("stream-tool-git-push-feature.sse"),
+                Reply::sse("stream-sonnet.sse"),
+                push("stream-tool-git-push-feature.sse"),
+                Reply::sse("stream-sonnet.sse"),
+                push("stream-tool-git-push-feature.sse"),
+                Reply::sse("stream-sonnet.sse"),
+            ]
+        },
+    );
+    let moded = |h: &mut Harness, version: u64, rules: &str, mode| {
+        h.down(&Down::Policy {
+            version,
+            rules: Ok(format!("[workspace {workspace}]\n{rules}\n")),
+            mode,
+        });
+    };
+    let policy = |h: &mut Harness, version: u64, rules: &str| {
+        moded(h, version, rules, td_agent::config::Mode::Ask)
+    };
+    let clean = |h: &mut Harness| {
+        let call = h.until(|up| match up {
+            Up::Stage { call, .. } => Some(*call),
+            _ => None,
+        });
+        h.down(&Down::Staged {
+            call,
+            result: Ok(Staged {
+                tip: None,
+                evidence: Evidence::default(),
+            }),
+        });
+    };
+    policy(&mut h, 1, &format!("allow git_push {remote}"));
+    h.say("Push it.");
+    clean(&mut h);
+    let (card, _, details) = h.until_ask();
+    assert_eq!(
+        details[0],
+        "Asked because it pushes to agent, a protected branch."
+    );
+    assert_eq!(
+        h.always,
+        Some(td_agent::rules::Offer::Rules(td_agent::rules::Always {
+            allow: false,
+            bodies: vec![format!("git_push {remote} agent")],
+        }))
+    );
+    h.down(&Down::Decision {
+        call: card,
+        allow: false,
+        always: None,
+    });
+    h.turn();
+    // An unprotected branch the allow names: no card.
+    h.say("Push it to feature.");
+    clean(&mut h);
+    let (call, branch) = h.until(|up| match up {
+        Up::Push { call, branch, .. } => Some((*call, branch.clone())),
+        Up::Ask { .. } => panic!("an allowed push was put to the person"),
+        _ => None,
+    });
+    assert_eq!(branch, "feature");
+    h.down(&Down::Pushed {
+        call,
+        result: Ok("pushed".into()),
+    });
+    let (events, _, _) = h.turn();
+    let approvals: Vec<(String, String, Option<String>)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::Approval {
+                outcome,
+                by,
+                reason,
+                ..
+            } => Some((outcome.clone(), by.clone(), reason.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        approvals,
+        [(
+            "allow".to_string(),
+            "rule".to_string(),
+            Some(format!(
+                "the rule `allow git_push {remote}` of your rules for this workspace allows it"
+            ))
+        )]
+    );
+    // A deny refuses it before anything is staged.
+    policy(
+        &mut h,
+        2,
+        &format!("allow git_push {remote}\ndeny git_push {remote} feature"),
+    );
+    h.say("Push feature again.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(
+        results(&events)[0].1,
+        format!("error: not run: the rule `deny git_push {remote} feature` of your rules for this workspace denies it. That is the workspace's answer: do not try to reach the same result another way. Say what you needed it for and ask the person how they would like to go on")
+    );
+    assert!(!h.state.push_pack(&h.id).exists());
+    // An ask outranks the allow: a card, offering no allow.
+    policy(
+        &mut h,
+        3,
+        &format!("allow git_push {remote}\nask git_push {remote} feature"),
+    );
+    h.say("Push feature once more.");
+    clean(&mut h);
+    let (card, _, details) = h.until_ask();
+    assert_eq!(
+        details[0],
+        format!("Asked because the rule `ask git_push {remote} feature` of your rules for this workspace asks.")
+    );
+    assert_eq!(
+        h.always,
+        Some(td_agent::rules::Offer::Rules(td_agent::rules::Always {
+            allow: false,
+            bodies: vec![format!("git_push {remote} feature")],
+        }))
+    );
+    h.down(&Down::Decision {
+        call: card,
+        allow: false,
+        always: None,
+    });
+    h.turn();
+    // In `auto` mode an allow still goes first: the classifier is not
+    // asked.
+    moded(
+        &mut h,
+        4,
+        &format!("allow git_push {remote} feature"),
+        td_agent::config::Mode::Auto,
+    );
+    h.say("And push feature in auto mode.");
+    clean(&mut h);
+    let call = h.until(|up| match up {
+        Up::Push { call, .. } => Some(*call),
+        Up::Ask { .. } => panic!("an allowed push was put to the person"),
+        _ => None,
+    });
+    h.down(&Down::Pushed {
+        call,
+        result: Ok("pushed".into()),
+    });
+    let (events, _, _) = h.turn();
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        Kind::Approval { by, .. } if by == "rule"
+    )));
+    let asked_classifier = h
+        .mock
+        .requests()
+        .iter()
+        .filter(|r| r.text().contains("gpt-oss-safeguard"))
+        .count();
+    assert_eq!(asked_classifier, 0);
+    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 /// In `auto` mode a clean push to an unprotected branch, not forced, is
@@ -6836,6 +7031,7 @@ fn a_push_is_exported_staged_asked_and_sent() {
         tip,
         scratch,
         remote,
+        ..
     } = prepared("pushed", Client::default(), |push| {
         vec![
             push("stream-tool-git-push.sse"),

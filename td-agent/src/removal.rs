@@ -8,7 +8,8 @@
 //! human's confirmation listing it. Removal runs no git over the tree:
 //! the workspace tree and its repositories' directory are renamed out of
 //! the way and removed by `workspace::remove_tree`, which follows no
-//! link, and what a crash leaves the next start sweeps. The store stays.
+//! link, and what a crash leaves the next start sweeps. Its publish
+//! repositories go with it. The store stays.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -194,21 +195,27 @@ pub struct Doomed {
     problems: Vec<String>,
 }
 
-/// Renames `repositories`' workspace tree and its repositories'
-/// directory, each beside itself, so they are gone at once and, should
-/// td-agent stop before `Doomed::finish`, swept at its next start. A
-/// directory not named for the workspace is left, and said.
+/// Renames `repositories`' workspace tree, its repositories' directory
+/// and its publish repositories' (`publish/<name>` beside `ws/<name>`),
+/// each beside itself, so they are gone at once and, should td-agent
+/// stop before `Doomed::finish`, swept at its next start. A directory
+/// not named for the workspace is left, and said.
 pub fn doom(repositories: &Repositories) -> Doomed {
     let name = OsString::from(&repositories.name);
+    let own = repositories
+        .entries
+        .first()
+        .and_then(|entry| entry.repository.parent());
+    let publish = own
+        .and_then(Path::parent)
+        .filter(|ws| ws.file_name() == Some("ws".as_ref()))
+        .and_then(Path::parent)
+        .map(|data| data.join("publish").join(&repositories.name));
     let dirs: Vec<&Path> = repositories
         .tree()
         .into_iter()
-        .chain(
-            repositories
-                .entries
-                .first()
-                .and_then(|entry| entry.repository.parent()),
-        )
+        .chain(own)
+        .chain(publish.as_deref())
         .collect();
     let mut doomed = Doomed {
         moved: Vec::new(),
@@ -323,8 +330,8 @@ fn doomed_name(name: &str) -> bool {
 }
 
 /// Removes, on a thread, what removals a crash cut short left in `dirs`:
-/// the workspace root and the data directory's `ws/`, each name one
-/// `doom` gives.
+/// the workspace root and the data directory's `ws/` and `publish/`,
+/// each name one `doom` gives.
 pub fn sweep(dirs: &[PathBuf]) {
     let doomed: Vec<PathBuf> = dirs
         .iter()
@@ -478,16 +485,22 @@ mod tests {
         std::fs::write(outside.join("keep"), "kept").unwrap();
         let tree = root.join(NAME);
         let repos = data.join("ws").join(NAME);
-        for dir in [tree.join("td"), repos.join("td.git")] {
+        let publish = data.join("publish").join(NAME);
+        for dir in [
+            tree.join("td"),
+            repos.join("td.git"),
+            publish.join("td.git"),
+        ] {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("f"), "x").unwrap();
             std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
         }
         // Renamed away, then put back: the conversation was kept.
         let doomed = doom(&repositories);
-        assert!(!tree.exists() && !repos.exists());
+        assert!(!tree.exists() && !repos.exists() && !publish.exists());
         doomed.restore().unwrap();
         assert!(tree.join("td/f").exists() && repos.join("td.git/f").exists());
+        assert!(publish.join("td.git/f").exists());
         // An earlier removal's leftover holds the plain name, and the
         // human's own `.deleting-` files are no removal's, a directory's
         // name or not.
@@ -496,7 +509,7 @@ mod tests {
         std::fs::write(root.join(".deleting-notes"), "mine").unwrap();
         std::fs::write(root.join(".deleting-backup-20240101"), "mine").unwrap();
         doom(&repositories).finish().unwrap();
-        assert!(!tree.exists() && !repos.exists());
+        assert!(!tree.exists() && !repos.exists() && !publish.exists());
         until(|| {
             names(&root)
                 == [
@@ -505,6 +518,7 @@ mod tests {
                     OsString::from(&leftover),
                 ]
                 && names(&data.join("ws")).is_empty()
+                && names(&data.join("publish")).is_empty()
         });
         assert!(outside.join("keep").exists(), "a link was followed");
         sweep(&[root.clone(), data.join("ws")]);

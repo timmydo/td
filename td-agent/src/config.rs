@@ -79,6 +79,9 @@ pub struct Client {
     pub cold_resume_tokens: Option<u64>,
     /// The bytes of each background process's output kept.
     pub background_output_bytes: u64,
+    /// The branches a push to which is always the person's (DESIGN.md
+    /// §9, Pushing), beside each workspace's bases.
+    pub protected_branches: Vec<String>,
 }
 
 /// A configured template and its own shared directories, admitted; none
@@ -112,8 +115,33 @@ impl Default for Client {
             cache_ttl: DEFAULT_CACHE_TTL,
             cold_resume_tokens: Some(DEFAULT_COLD_RESUME_TOKENS),
             background_output_bytes: DEFAULT_BACKGROUND_OUTPUT_BYTES,
+            protected_branches: crate::git::PROTECTED
+                .iter()
+                .map(|branch| (*branch).to_string())
+                .collect(),
         }
     }
+}
+
+/// The most protected branches configured.
+const MAX_PROTECTED: usize = 64;
+
+/// `protected_branches`' list, each a branch a push could name, at most
+/// `MAX_PROTECTED`.
+fn protected_branches(items: Option<&[String]>) -> Result<Vec<String>, String> {
+    let wrong = format!("`protected_branches` is a list of at most {MAX_PROTECTED} branch names");
+    let items = items.ok_or(wrong.as_str())?;
+    if items.len() > MAX_PROTECTED {
+        return Err(wrong);
+    }
+    let mut branches: Vec<String> = Vec::new();
+    for item in items {
+        crate::git::push_branch(item).map_err(|e| format!("`protected_branches`: {e}"))?;
+        if !branches.contains(item) {
+            branches.push(item.clone());
+        }
+    }
+    Ok(branches)
 }
 
 /// Shared directories as `to_json` writes them.
@@ -264,6 +292,15 @@ impl Client {
             ),
             ("shared".into(), shared_json(&self.shared)),
             (
+                "protected_branches".into(),
+                Json::Arr(
+                    self.protected_branches
+                        .iter()
+                        .map(|branch| Json::Str(branch.clone()))
+                        .collect(),
+                ),
+            ),
+            (
                 "template_shared".into(),
                 Json::Arr(
                     self.template_shared
@@ -384,6 +421,19 @@ impl Client {
             shared: match value.get("shared") {
                 None => Vec::new(),
                 Some(shared) => shared_from_json(shared)?,
+            },
+            // A setup from a window before it: the defaults.
+            protected_branches: match value.get("protected_branches") {
+                None => Self::default().protected_branches,
+                Some(list) => {
+                    let items: Option<Vec<String>> = list.as_arr().and_then(|items| {
+                        items
+                            .iter()
+                            .map(|item| item.as_str().map(str::to_string))
+                            .collect()
+                    });
+                    protected_branches(items.as_deref())?
+                }
             },
             template_shared: match value.get("template_shared") {
                 None => Vec::new(),
@@ -615,7 +665,7 @@ const KEYS: &[(&str, Use)] = &[
     ("remotes", Use::Read),
     ("network", Use::Later(15)),
     ("network_allowlist", Use::Later(15)),
-    ("protected_branches", Use::Later(14)),
+    ("protected_branches", Use::Read),
     ("fetch_interval", Use::Read),
     ("fetch_concurrency", Use::Later(11)),
     ("max_background", Use::Read),
@@ -1026,6 +1076,15 @@ pub fn parse(text: &str) -> Result<Config, String> {
     }
     if let Some(value) = table.get("template") {
         config.templates = templates(value, &mut config.notes)?;
+    }
+    if let Some(value) = table.get("protected_branches") {
+        let items: Option<Vec<String>> = value.as_arr().and_then(|items| {
+            items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string))
+                .collect()
+        });
+        config.client.protected_branches = protected_branches(items.as_deref())?;
     }
     if let Some(value) = table.get("remotes") {
         let wrong = "`remotes` is a list of remotes, each a URL or a host with a path prefix";
@@ -1556,6 +1615,47 @@ mod tests {
             let refused = parse(&format!("background_output_bytes = {text}")).unwrap_err();
             assert!(refused.contains("`background_output_bytes`"), "{refused}");
         }
+    }
+
+    /// `protected_branches` names branches a push could, each once, and
+    /// crosses whole; `main` and `master` when left out.
+    #[test]
+    fn protected_branches_are_branches_and_cross_whole() {
+        assert_eq!(
+            Config::default().client.protected_branches,
+            ["main", "master"]
+        );
+        let config = parse("protected_branches = [\"release\", \"main\", \"release\"]").unwrap();
+        assert_eq!(config.client.protected_branches, ["release", "main"]);
+        assert!(config.notes.is_empty(), "{:?}", config.notes);
+        let client = &config.client;
+        assert_eq!(&Client::from_json(&client.to_json()).unwrap(), client);
+        assert!(parse("protected_branches = []")
+            .unwrap()
+            .client
+            .protected_branches
+            .is_empty());
+        for text in ["\"main\"", "[1]", "[\"-x\"]", "[\"refs/heads/main\"]"] {
+            let refused = parse(&format!("protected_branches = {text}")).unwrap_err();
+            assert!(refused.contains("`protected_branches`"), "{refused}");
+        }
+        let many: Vec<String> = (0..=MAX_PROTECTED).map(|n| format!("\"b{n}\"")).collect();
+        assert!(parse(&format!("protected_branches = [{}]", many.join(", "))).is_err());
+        let mut value = Client::default().to_json();
+        if let Json::Obj(pairs) = &mut value {
+            for (name, branches) in pairs.iter_mut() {
+                if name == "protected_branches" {
+                    *branches = Json::Arr(vec![Json::Str("-x".into())]);
+                }
+            }
+        }
+        assert!(Client::from_json(&value).is_err());
+        let mut older = config.client.to_json();
+        older.remove("protected_branches");
+        assert_eq!(
+            Client::from_json(&older).unwrap().protected_branches,
+            ["main", "master"]
+        );
     }
 
     #[test]

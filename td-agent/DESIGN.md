@@ -3012,11 +3012,12 @@ an approval of it is bound to immutable values:
    `--force-with-lease` carrying that expected id when forced, and returns
    the result, including the remote's message, to the model.
 
-A push to a protected branch (`main`, `master`, and any configured in
-`protected_branches`), a force push, and any push whose scan matched
-always go to the human. Another push is the classifier's in `auto` mode
-and the human's in `ask` mode. The tool pushes only `refs/heads/`, so
-branch deletion and tags are not expressible through it.
+A push to a protected branch (those configured in `protected_branches`,
+`main` and `master` by default, and every base the workspace tracks on
+that remote), a force push, and any push whose scan matched always go to
+the human. Another push is the classifier's in `auto` mode and the
+human's in `ask` mode. The tool pushes only `refs/heads/`, so branch
+deletion and tags are not expressible through it.
 
 **Fetching** is `git_fetch {worktree}`, a repository workspace's tool:
 an immediate store fetch and remote-tracking update for that workspace,
@@ -3273,12 +3274,11 @@ scan kept and the count of the rest; and then the binary files, the
 commits and the files changed with the lines added and removed over all
 of them, at most 40 lines each and the rest counted, so every part
 shows. Its first line says why it is asked when the push is to a
-protected branch (`main`, `master` and every base the workspace tracks
-on that remote, until `protected_branches` lands), forced against a tip
-the remote has, or the scan matched, a binary file counting. Every other
-push is the person's in `ask` mode and the classifier's in `auto` mode
-(As built (increment 14, the classifier for pushes)); until rules can
-name `git_push`, the card offers no "always". Allowed and not
+protected branch (§9, Pushing), forced against a tip the remote has, or
+the scan matched, a binary file counting. Every other push is the
+person's in `ask` mode and the classifier's in `auto` mode (As built
+(increment 14, the classifier for pushes)), and the person's rules come
+first (As built (increment 14, rules for pushes)). Allowed and not
 interrupted, the conversation sends `Up::Push` with the commit, the
 branch and, when forced against a tip, that tip as the lease; to a
 branch the remote does not have, a forced push is a plain one. The model
@@ -3295,32 +3295,62 @@ ask, to a branch not protected, not forced against a tip, its scan
 clean, goes to both stages, unless it is the third same call in a row or
 the person's rules could not be read, which go to the person as a
 crossing's do. The state is a crossing's but for three things: `policy`
-also names the protected branches, `main`, `master` and the workspace's
-bases on that remote; an `evidence` field, after `project` and before
-`action`, holds what td-agent computed outside the jail, every value a
-string: the commits and files changed, counted with those past the
-evidence's lists, the lines added and removed over every file changed,
-listed or not (`Evidence::lines`), the binary files, and the scan,
-`nothing found, all of it read`; and the action, kind `push`, names the
-source and its `remote`, one of the source's own, and no receiver, its
-detail td-agent's (`classifier::pushed`): the commit, the remote, and
-whether the branch is new there or fast-forwards from its tip. The
-branch's name, the commits' subjects and the paths changed are the
-model's and go to `untrusted`, each cut as its other fields are. Jev's
-`discloses` question and the reasoning stage's policy text say that a
-push to one of the source's own remotes is not by itself a disclosure,
-and the policy text says when a push matches the person's request. Both
-allowing, the push goes with no card, its approval logged `by`
-`classifier`; otherwise the verdict is logged `ask`, counted by the
-breaker, and the card says why with Jev's probabilities. A policy that
-came while the classifier was asked is heard before its verdict is
-taken: out of `auto` mode then, the verdict is neither logged nor
-counted and the push goes to a card; and one heard after the verdict,
-just before the push, sends a push the classifier allowed to a card too.
-`td-agent/calibration/pushes.json` is the shipped set of pushes, held to
-the push's state in shape, its detail to `classifier::pushed`, and its
-calls to end with `git_push`; `td-agent calibrate` takes it as it takes
-the crossings.
+also names the protected branches (§9, Pushing); an `evidence` field,
+after `project` and before `action`, holds what td-agent computed
+outside the jail, every value a string: the commits and files changed,
+counted with those past the evidence's lists, the lines added and
+removed over every file changed, listed or not (`Evidence::lines`), the
+binary files, and the scan, `nothing found, all of it read`; and the
+action, kind `push`, names the source and its `remote`, one of the
+source's own, and no receiver, its detail td-agent's
+(`classifier::pushed`): the commit, the remote, and whether the branch
+is new there or fast-forwards from its tip. The branch's name, the
+commits' subjects and the paths changed are the model's and go to
+`untrusted`, each cut as its other fields are. Jev's `discloses`
+question and the reasoning stage's policy text say that a push to one of
+the source's own remotes is not by itself a disclosure, and the policy
+text says when a push matches the person's request. Both allowing, the
+push goes with no card, its approval logged `by` `classifier`; otherwise
+the verdict is logged `ask`, counted by the breaker, and the card says
+why with Jev's probabilities. A policy that came while the classifier
+was asked is heard before its verdict is taken: out of `auto` mode then,
+the verdict is neither logged nor counted and the push goes to a card;
+and one heard after the verdict, just before the push, sends a push the
+classifier allowed to a card too. `td-agent/calibration/pushes.json` is
+the shipped set of pushes, held to the push's state in shape, its detail
+to `classifier::pushed`, and its calls to end with `git_push`; `td-agent
+calibrate` takes it as it takes the crossings.
+
+**As built (increment 14, rules for pushes).** A rule may name
+`git_push` with no words, a remote, or a remote and a branch: `allow
+git_push git@example.org:a/td.git agent`. The remote is checked as a
+template's is and kept as td-agent records it (`git::Remote::url`), so
+`git@Example.org:/a/td.git` reads back as
+`ssh://git@example.org/a/td.git`, and it names a push's remote as an
+exact admission does, with or without a final `.git` (§7); the branch is
+one `git_push` could name. A repository's `.td-agent/rules` may deny or
+ask a push too. A push is judged in §11's order (`rules::judge_push`): a
+deny that names it refuses it, before anything is exported or staged,
+and again at the card should one have come since; then an ask that names
+it, or a rules file not read, puts it on a card; then a protected
+branch, a force against a tip, a scan match or a third same call in a
+row keep it the person's whatever an allow says; then one of the
+person's allows lets it go with no card, its approval logged `by`
+`rule`; else the table, the classifier's in `auto` mode. A shell rule is
+never a push's, nor a push's a shell call's. A push card offers "always"
+for `git_push <remote> <branch>`, an allow only when nothing keeps the
+push the person's and no rule or unread file asked for the card, a deny
+always; the person's rules file not read offers none. A policy taken
+after a push was allowed, before it is sent, judges it again: a deny
+refuses it whoever allowed it, and a rule's or the classifier's allow
+may go to a card, the person's own holding. `protected_branches` is
+read: a list of at most 64 branch names, each once, which replaces
+`main` and `master`, so an empty list leaves only the bases protected,
+crossing to the conversation in its configuration (`config::Client`); a
+workspace's bases on the remote are protected whatever it says. A
+removed repository workspace's publish repositories go with it, renamed
+out of the way as its repositories are (`removal::doom`), and a start
+sweeps what a crash left in `publish/` as in `ws/`.
 
 ## 10. Network policy
 
@@ -3459,51 +3489,52 @@ stated only in chat can be lost to compaction, and a rule cannot.
 **As built (increment 13, a repository's rules).** `.td-agent/rules`
 holds one rule a line: `deny` or `ask`, then a tool the tool host runs
 (`read_file`, `write_file`, `edit_file`, `glob`, `grep`, `sed` or
-`shell`), then, for `shell` alone, the words of an argv prefix, parted
-by spaces or tabs. Blank lines and lines starting with `#` are skipped.
-A word may not hold what the shell would read rather than pass, or what
-the matcher could never match: a quote, `\`, `$`, a backtick, `;`, `&`,
-`|`, `<`, `>`, a parenthesis, `#`, a glob or brace character, a leading
-`~`, or a control. The git worker reads the file at each base beside the
-project instructions, at most 16 KiB and 256 rules, each commit's
-crossing once and all at most 32 KiB in one answer; the conversation
-records them with the instructions, each commit's counted and written
-once against the same bound, and the workspace card lists them. A file
-not read whole (past its bound, not UTF-8, not a regular file, or with a
-line refused, an `allow` among them) is refused whole and its reason
-named on the card in td-agent's own words, as is a record made before
-td-agent read rules; every call that changes the workspace or runs a
-command then asks the human, saying why, so a broken file narrows and
-never widens. A deny refuses the call before any card, whether or not it
-could run yet, its answer to the model naming the rule and its
-repository, and logs the approval `by` `rule` with that reason; an ask
-puts the call on the human's card once it could run, the card saying
-first which rule asks and the approval logged with that reason. A deny
-or ask matches a command word by its name after any `/`, so `/bin/rm` is
-`rm`, and one on `git` reads past git's options before the subcommand,
-so `git --no-pager push` is `git push`; an allow matches the command
-word as written, so `./git` is not `git`, and a command runs on the
-human's allows only when each of its segments starts with one of them,
-so `allow shell cargo test` and `allow shell cargo fmt` together cover
-`cargo test && cargo fmt`. Composed so, one allowed program can feed
-another through a pipe, `curl ... | git apply` running on an allow for
-each: an allow for a program that does what its input says means more
-for it. The words after it match word
-for word, and a word an expansion or a glob decides (`$X`, `*.o`, a
-leading `~`) matches none. Besides the set above, the matcher treats as
-opaque what it reads as compound (a reserved word such as `if`, `{` or
-`!`, a subshell, a here-document), a command word an expansion decides,
-an append assignment `NAME+=value`, `$'…'` quoting, a `${…}` holding
-more than a name, `&>` (which dash, as `sh`, reads as `&` and `>`),
-`hash`, fish's `--command`, a shell given `-s` or no script, so reading
-commands from its input, and a shell's or `find`'s option an expansion
-decides, and an option before git's subcommand that may take the next
-word as its argument: one written without `=` that the matcher does not
-know to take none. The shell's joining of `\` and a newline is undone
-first, and a newline after `&&`, `||` or `|` continues the command. A
-command the matcher cannot see into asks while any shell deny or ask
-rule exists, not only a deny. A segment of redirections alone, such
-as `> notes.txt`, is kept as a segment with no words, which no rule
+`shell`) or `git_push`, then, for `shell`, the words of an argv prefix,
+parted by spaces or tabs, and for `git_push` a remote and a branch, or
+the remote alone (As built (increment 14, rules for pushes)). Blank
+lines and lines starting with `#` are skipped. A word may not hold what
+the shell would read rather than pass, or what the matcher could never
+match: a quote, `\`, `$`, a backtick, `;`, `&`, `|`, `<`, `>`, a
+parenthesis, `#`, a glob or brace character, a leading `~`, or a
+control. The git worker reads the file at each base beside the project
+instructions, at most 16 KiB and 256 rules, each commit's crossing once
+and all at most 32 KiB in one answer; the conversation records them with
+the instructions, each commit's counted and written once against the
+same bound, and the workspace card lists them. A file not read whole
+(past its bound, not UTF-8, not a regular file, or with a line refused,
+an `allow` among them) is refused whole and its reason named on the card
+in td-agent's own words, as is a record made before td-agent read rules;
+every call that changes the workspace or runs a command then asks the
+human, saying why, so a broken file narrows and never widens. A deny
+refuses the call before any card, whether or not it could run yet, its
+answer to the model naming the rule and its repository, and logs the
+approval `by` `rule` with that reason; an ask puts the call on the
+human's card once it could run, the card saying first which rule asks
+and the approval logged with that reason. A deny or ask matches a
+command word by its name after any `/`, so `/bin/rm` is `rm`, and one on
+`git` reads past git's options before the subcommand, so `git --no-pager
+push` is `git push`; an allow matches the command word as written, so
+`./git` is not `git`, and a command runs on the human's allows only when
+each of its segments starts with one of them, so `allow shell cargo
+test` and `allow shell cargo fmt` together cover `cargo test && cargo
+fmt`. Composed so, one allowed program can feed another through a pipe,
+`curl ... | git apply` running on an allow for each: an allow for a
+program that does what its input says means more for it. The words after
+it match word for word, and a word an expansion or a glob decides (`$X`,
+`*.o`, a leading `~`) matches none. Besides the set above, the matcher
+treats as opaque what it reads as compound (a reserved word such as
+`if`, `{` or `!`, a subshell, a here-document), a command word an
+expansion decides, an append assignment `NAME+=value`, `$'…'` quoting, a
+`${…}` holding more than a name, `&>` (which dash, as `sh`, reads as `&`
+and `>`), `hash`, fish's `--command`, a shell given `-s` or no script,
+so reading commands from its input, and a shell's or `find`'s option an
+expansion decides, and an option before git's subcommand that may take
+the next word as its argument: one written without `=` that the matcher
+does not know to take none. The shell's joining of `\` and a newline is
+undone first, and a newline after `&&`, `||` or `|` continues the
+command. A command the matcher cannot see into asks while any shell deny
+or ask rule exists, not only a deny. A segment of redirections alone,
+such as `> notes.txt`, is kept as a segment with no words, which no rule
 with words matches. A call that acts and that no allow of the human's
 matches takes its workspace's mode's column (As built (increment 13,
 modes)).
@@ -4940,7 +4971,10 @@ default; `jev_threshold`'s is calibrated (§11):
   directory's `remotes` (§7)
 - `network`: the default policy, `off` or `allowlist`; default `allowlist`
 - `network_allowlist`: the default allowlist of §10, hosts with ports
-- `protected_branches`; default `["main", "master"]`
+- `protected_branches`: at most 64 branch names, a push to which is
+  always the human's (§9); default `["main", "master"]`. The list
+  replaces the default, and each workspace's bases on a remote are
+  protected beside it whatever it says
 - `fetch_interval`, a whole number of seconds from 60 to 86,400, and
   `fetch_concurrency`; defaults 600 (ten minutes) and 4
 - `max_background`, a whole number from 1 to 16, and

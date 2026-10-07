@@ -2265,7 +2265,7 @@ pub fn run(
     session.repolicy();
     // What removals a crash cut short left (`removal::sweep`).
     if let Ok(data) = &session.data {
-        let mut doomed = vec![data.join("ws")];
+        let mut doomed = vec![data.join("ws"), data.join("publish")];
         if let Some(home) = std::env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|home| home.is_absolute())

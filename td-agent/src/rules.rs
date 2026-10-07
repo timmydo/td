@@ -23,7 +23,7 @@ pub const MAX_CARRIED: usize = 32 * 1024;
 /// and git's cut to it, so none carries the file's.
 pub const MAX_WHY: usize = 256;
 
-/// The tools a rule may name: those the tool host runs.
+/// The tools a rule may name: those the tool host runs, and `git_push`.
 pub const TOOLS: &[&str] = &[
     "read_file",
     "write_file",
@@ -32,6 +32,7 @@ pub const TOOLS: &[&str] = &[
     "grep",
     "sed",
     "shell",
+    "git_push",
 ];
 
 /// What a rule does with the calls it matches.
@@ -79,9 +80,28 @@ impl Rule {
         let Some(tool) = TOOLS.iter().copied().find(|one| *one == tool) else {
             return Err("names a tool no rule applies to".into());
         };
-        let prefix: Vec<String> = words.map(str::to_string).collect();
+        let mut prefix: Vec<String> = words.map(str::to_string).collect();
+        // A push's remote, as td-agent records it, and its branch.
+        if tool == "git_push" {
+            if prefix.len() > 2 {
+                return Err("gives git_push more than a remote and a branch".into());
+            }
+            if let Some(remote) = prefix.first_mut() {
+                *remote = crate::git::Remote::parse(remote)?.url();
+            }
+            if let Some(branch) = prefix.get(1) {
+                crate::git::push_branch(branch)?;
+            }
+            return Ok(Self {
+                effect,
+                tool: tool.to_string(),
+                prefix,
+            });
+        }
         if !prefix.is_empty() && tool != "shell" {
-            return Err(format!("gives {tool} words, which only shell takes"));
+            return Err(format!(
+                "gives {tool} words, which only shell and git_push take"
+            ));
         }
         if let Some(at) = prefix.iter().position(|w| !plain(w)) {
             return Err(format!(
@@ -1557,6 +1577,62 @@ pub fn judge(
 /// The most allow rules an allow's reason names.
 const NAMED: usize = 3;
 
+/// Whether `rule` is for a push of `branch` to `remote`: a `git_push`
+/// rule naming neither, the remote, or both, its remote compared as an
+/// exact admission compares one, with or without a final `.git`.
+fn pushes(rule: &Rule, remote: Option<&crate::git::Remote>, branch: &str) -> bool {
+    let same = |named: &String| match (crate::git::Remote::parse(named), remote) {
+        (Ok(named), Some(remote)) => crate::git::Admission::Exact(named).admits(remote),
+        _ => false,
+    };
+    rule.tool == "git_push"
+        && rule.prefix.first().is_none_or(same)
+        && rule.prefix.get(1).is_none_or(|b| b == branch)
+}
+
+/// What the rules say of a push of `branch` to `remote` (DESIGN.md
+/// §11): a deny refuses it, an ask or a rules file not read puts it on
+/// a card, and one of the person's allows lets it go; else the table.
+pub fn judge_push(
+    rules: &[Sourced],
+    unread: &[(String, String)],
+    remote: &str,
+    branch: &str,
+) -> Verdict {
+    // A remote that does not parse is named by no rule's.
+    let remote = crate::git::Remote::parse(remote).ok();
+    let said = |effect: Effect| {
+        rules
+            .iter()
+            .find(|one| one.rule.effect == effect && pushes(&one.rule, remote.as_ref(), branch))
+    };
+    if let Some(one) = said(Effect::Deny) {
+        return Verdict::Deny(format!(
+            "the rule `{}` of {} denies it",
+            one.rule.text(),
+            one.from
+        ));
+    }
+    if let Some(one) = said(Effect::Ask) {
+        return Verdict::Ask(format!(
+            "the rule `{}` of {} asks",
+            one.rule.text(),
+            one.from
+        ));
+    }
+    if let Some((from, why)) = unread.first() {
+        return Verdict::Ask(format!("{from} could not be read: {why}"));
+    }
+    match said(Effect::Allow) {
+        Some(one) => Verdict::Allow(format!(
+            "the rule `{}` of {} allows it",
+            one.rule.text(),
+            one.from
+        )),
+        None => Verdict::Table,
+    }
+}
+
 /// The allow rules that let a call to `tool` run, `command` its shell
 /// command as `split` read it: one for the whole tool, or for a command
 /// the matcher can see into, one for each segment, every segment
@@ -1896,6 +1972,80 @@ mod tests {
         assert!(matches(&rule("ask write_file"), "write_file", None));
     }
 
+    /// A push's rule names its remote, kept as td-agent records it, and
+    /// its branch, or neither; a deny wins, then an ask or a file not
+    /// read, then an allow, else the table.
+    #[test]
+    fn a_push_is_judged_by_its_remote_and_branch() {
+        let remote = "ssh://git@example.org/a/td.git";
+        assert_eq!(
+            rule("allow git_push git@Example.org:/a/td.git agent").text(),
+            format!("allow git_push {remote} agent")
+        );
+        let from = |lines: &[&str]| -> Vec<Sourced> {
+            lines
+                .iter()
+                .map(|line| Sourced {
+                    rule: rule(line),
+                    from: "here".into(),
+                })
+                .collect()
+        };
+        let judged = |lines: &[&str], branch: &str| judge_push(&from(lines), &[], remote, branch);
+        assert_eq!(judged(&[], "agent"), Verdict::Table);
+        assert!(matches!(
+            judged(&[&format!("allow git_push {remote} agent")], "agent"),
+            Verdict::Allow(_)
+        ));
+        assert_eq!(
+            judged(&[&format!("allow git_push {remote} agent")], "other"),
+            Verdict::Table
+        );
+        assert_eq!(
+            judged(&["allow git_push https://example.org/a/td agent"], "agent"),
+            Verdict::Table
+        );
+        // A remote with or without its final `.git` is one remote; another
+        // user is another.
+        assert!(matches!(
+            judged(&["deny git_push ssh://git@example.org/a/td agent"], "agent"),
+            Verdict::Deny(_)
+        ));
+        assert_eq!(
+            judged(
+                &["deny git_push ssh://other@example.org/a/td.git agent"],
+                "agent"
+            ),
+            Verdict::Table
+        );
+        assert!(matches!(
+            judged(&[&format!("allow git_push {remote}")], "other"),
+            Verdict::Allow(_)
+        ));
+        assert_eq!(
+            judged(&["allow git_push", "deny git_push"], "agent"),
+            Verdict::Deny("the rule `deny git_push` of here denies it".into())
+        );
+        assert!(matches!(
+            judged(
+                &["allow git_push", &format!("ask git_push {remote} agent")],
+                "agent"
+            ),
+            Verdict::Ask(_)
+        ));
+        // A shell rule is not a push's.
+        assert_eq!(judged(&["deny shell git push"], "agent"), Verdict::Table);
+        let unread = [("your rules".to_string(), "unreadable".to_string())];
+        assert_eq!(
+            judge_push(&from(&["allow git_push"]), &unread, remote, "agent"),
+            Verdict::Ask("your rules could not be read: unreadable".into())
+        );
+        assert!(matches!(
+            judge_push(&from(&["deny git_push"]), &unread, remote, "agent"),
+            Verdict::Deny(_)
+        ));
+    }
+
     #[test]
     fn a_rules_file_is_read_whole_or_refused() {
         let text = "# keep pushes for people\n\n  ask shell git push\t\ndeny write_file\n";
@@ -1919,7 +2069,19 @@ mod tests {
             ),
             (
                 "deny read_file x",
-                "line 1: gives read_file words, which only shell takes",
+                "line 1: gives read_file words, which only shell and git_push take",
+            ),
+            (
+                "deny git_push https://h/r main x",
+                "line 1: gives git_push more than a remote and a branch",
+            ),
+            (
+                "deny git_push file:///r",
+                "line 1: the remote \"file:///r\" is not https or ssh: td-agent admits no other transport",
+            ),
+            (
+                "deny git_push https://h/r refs/heads/main",
+                "line 1: \"refs/heads/main\" names a ref, not a branch",
             ),
             (
                 "deny shell rm 'x'",

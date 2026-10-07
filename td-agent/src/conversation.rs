@@ -292,6 +292,13 @@ enum Judged<'a> {
         op: crate::rules::Crossed,
         to: &'a str,
     },
+    /// A push of `branch` to `remote`, and why it is the person's
+    /// whatever the rules allow, if it is.
+    Push {
+        remote: &'a str,
+        branch: &'a str,
+        theirs: Option<&'a str>,
+    },
 }
 
 /// What the rules make of a host call.
@@ -2729,6 +2736,23 @@ impl Session {
                 "the remote's URL is past {MAX_SHOWN_REMOTE} bytes, more than a card shows whole"
             )));
         }
+        // A rule that denies the push refuses it before anything is
+        // exported.
+        let judged = Judged::Push {
+            remote: &remote,
+            branch: &branch,
+            theirs: None,
+        };
+        if let Ruling::Deny(why) = self.ruling(&judged) {
+            self.log(Kind::Approval {
+                call: started,
+                outcome: "deny".into(),
+                by: "rule".into(),
+                probabilities: None,
+                reason: Some(why.clone()),
+            })?;
+            return Ok(Err(ruled(&why)));
+        }
         let Some(base) = meta
             .tracked
             .iter()
@@ -2792,7 +2816,7 @@ impl Session {
         let lease = if force { staged.tip.clone() } else { None };
         let evidence = &staged.evidence;
         let mut reasons = Vec::new();
-        if protected_branches(meta.workspace.as_ref(), &remote).contains(&branch) {
+        if self.protected(&remote).contains(&branch) {
             reasons.push(format!("it pushes to {branch}, a protected branch"));
         }
         if lease.is_some() {
@@ -2805,65 +2829,121 @@ impl Session {
         {
             reasons.push("the scan matched".to_string());
         }
-        let mut asked = (!reasons.is_empty()).then(|| reasons.join(", and "));
-        // The table (DESIGN.md §11): any other push is the classifier's
-        // in `auto` mode, unless it is a repeated call or the person's
-        // rules could not be read.
-        if asked.is_none() && repeated {
-            asked = Some(REPEATED_WHY.into());
-        }
-        if let (None, Err(why)) = (&asked, &self.human.1) {
-            asked = Some(tools::visible(&format!(
-                "your rules could not be read: {why}"
-            )));
-        }
+        // Why it is the person's whatever the rules allow: a protected
+        // branch, a force, a match, or a repeated call.
+        let theirs = if !reasons.is_empty() {
+            Some(reasons.join(", and "))
+        } else if repeated {
+            Some(REPEATED_WHY.to_string())
+        } else {
+            None
+        };
+        let judged = Judged::Push {
+            remote: &remote,
+            branch: &branch,
+            theirs: theirs.as_deref(),
+        };
+        // What "always" would remember: the push's remote and branch, an
+        // allow only for a push no reason keeps the person's and, at its
+        // card, no rule or unread file asks.
+        let always = self
+            .human
+            .1
+            .is_ok()
+            .then(|| {
+                crate::rules::Always::checked(
+                    theirs.is_none(),
+                    vec![format!("git_push {remote} {branch}")],
+                )
+                .ok()
+                .map(crate::rules::Offer::Rules)
+            })
+            .flatten();
+        let mut ruled_at = self.human.0;
+        let mut ruling = self.ruling(&judged);
+        // The classifier's verdict: asked once, and again only should a
+        // policy taken while it was asked leave `auto` mode and a later
+        // one return to it.
+        let mut verdict: Option<classifier::Outcome> = None;
         let mut jev = None;
-        // Allowed by the classifier, not the person; asked at most once.
-        let mut allowed = false;
-        let mut classified = false;
+        // Until a decision holds: one a rule or the classifier made,
+        // which a policy taken since leaves to the person, goes round
+        // again.
         loop {
-            let auto = self.workspace_mode() == crate::config::Mode::Auto;
-            if asked.is_none() && auto && !classified {
-                classified = true;
-                let outcome = self.classify(|me, client| {
-                    me.push_pending(&entry, &branch, &commit, &staged, client)
-                })?;
-                // A policy the person set while it was asked comes first:
-                // out of `auto` mode now, the verdict is not theirs.
-                self.hear();
-                if self.workspace_mode() != crate::config::Mode::Auto {
-                    continue;
-                }
-                if outcome.allow {
+            let mut human = false;
+            let mut allowed: Option<(&str, Option<String>, String)> = None;
+            let rule_asked = matches!(ruling, Ruling::Card(Some(_)));
+            let card = match &ruling {
+                Ruling::Deny(why) => {
                     self.log(Kind::Approval {
                         call: started,
-                        outcome: "allow".into(),
-                        by: "classifier".into(),
-                        probabilities: outcome.probabilities,
-                        reason: Some(outcome.reason),
+                        outcome: "deny".into(),
+                        by: "rule".into(),
+                        probabilities: None,
+                        reason: Some(why.clone()),
                     })?;
-                    allowed = true;
-                } else {
-                    // A verdict is logged, and counted by the breaker; a
-                    // classifier not asked gave none.
-                    if outcome.asked {
-                        self.log(Kind::Approval {
-                            call: started,
-                            outcome: "ask".into(),
-                            by: "classifier".into(),
-                            probabilities: outcome.probabilities.clone(),
-                            reason: Some(outcome.reason.clone()),
-                        })?;
-                        self.brake()?;
-                    }
-                    jev = outcome.probabilities;
-                    asked = Some(format!(
-                        "the classifier did not allow it: {}",
-                        outcome.reason
-                    ));
+                    return Ok(Err(ruled(why)));
                 }
-            }
-            if !allowed {
+                Ruling::Run(why) => {
+                    allowed = Some((
+                        "rule",
+                        None,
+                        why.clone().unwrap_or_else(|| RULES_CHANGED.into()),
+                    ));
+                    None
+                }
+                Ruling::Auto => {
+                    if verdict.is_none() {
+                        let outcome = self.classify(|me, client| {
+                            me.push_pending(&entry, &branch, &commit, &staged, client)
+                        })?;
+                        // A policy the person set while it was asked comes
+                        // first: out of `auto` now, the verdict is not
+                        // theirs, neither logged nor counted.
+                        self.hear();
+                        if self.human.0 != ruled_at {
+                            ruled_at = self.human.0;
+                            ruling = self.ruling(&judged);
+                            if !matches!(ruling, Ruling::Auto) {
+                                continue;
+                            }
+                        }
+                        // A verdict is logged, and counted by the breaker;
+                        // a classifier not asked gave none.
+                        if !outcome.allow && outcome.asked {
+                            self.log(Kind::Approval {
+                                call: started,
+                                outcome: "ask".into(),
+                                by: "classifier".into(),
+                                probabilities: outcome.probabilities.clone(),
+                                reason: Some(outcome.reason.clone()),
+                            })?;
+                            self.brake()?;
+                        }
+                        verdict = Some(outcome);
+                    }
+                    match &verdict {
+                        Some(outcome) if outcome.allow => {
+                            allowed = Some((
+                                "classifier",
+                                outcome.probabilities.clone(),
+                                outcome.reason.clone(),
+                            ));
+                            None
+                        }
+                        Some(outcome) => {
+                            jev = outcome.probabilities.clone();
+                            Some(Some(format!(
+                                "the classifier did not allow it: {}",
+                                outcome.reason
+                            )))
+                        }
+                        None => Some(None),
+                    }
+                }
+                Ruling::Card(why) => Some(why.clone()),
+            };
+            if let Some(asked) = card {
                 let (title, mut details) =
                     tools::push_card(&remote, &branch, &commit, force, &staged);
                 if let Some(jev) = &jev {
@@ -2872,8 +2952,27 @@ impl Session {
                 if let Some(why) = &asked {
                     details.insert(0, format!("Asked because {why}."));
                 }
-                match self.decide(started, title, details, asked.as_deref(), None, None)? {
-                    Decided::Allowed | Decided::Released => {}
+                let decided = self.decide(
+                    started,
+                    title,
+                    details,
+                    asked.as_deref(),
+                    always.clone().map(|offer| match offer {
+                        crate::rules::Offer::Rules(always) => {
+                            crate::rules::Offer::Rules(crate::rules::Always {
+                                allow: always.allow && !rule_asked,
+                                ..always
+                            })
+                        }
+                        other => other,
+                    }),
+                    Some(&judged),
+                )?;
+                // The card was judged again at every policy it saw.
+                ruled_at = self.human.0;
+                match decided {
+                    Decided::Allowed => human = true,
+                    Decided::Released => {}
                     Decided::Refused => return Ok(Err(CALL_REFUSED.into())),
                     Decided::Undecided => return Ok(Err(CALL_UNDECIDED.into())),
                     Decided::Ruled(why) => return Ok(Err(ruled(&why))),
@@ -2886,13 +2985,37 @@ impl Session {
             if self.gone {
                 return Ok(Err("the window has closed; nothing was pushed".into()));
             }
-            // Out of `auto` mode since the classifier allowed it: the
-            // person's.
-            if allowed && self.workspace_mode() != crate::config::Mode::Auto {
-                allowed = false;
-                asked =
-                    Some("this workspace left auto mode after the classifier allowed it".into());
-                continue;
+            // A policy taken since: a deny refuses the push, whoever
+            // allowed it; a rule's or the classifier's allow is judged
+            // again, the person's own holding.
+            if self.human.0 != ruled_at {
+                ruled_at = self.human.0;
+                match self.ruling(&judged) {
+                    Ruling::Deny(why) => {
+                        self.log(Kind::Approval {
+                            call: started,
+                            outcome: "deny".into(),
+                            by: "rule".into(),
+                            probabilities: None,
+                            reason: Some(why.clone()),
+                        })?;
+                        return Ok(Err(ruled(&why)));
+                    }
+                    again if !human => {
+                        ruling = again;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some((by, probabilities, why)) = allowed {
+                self.log(Kind::Approval {
+                    call: started,
+                    outcome: "allow".into(),
+                    by: by.into(),
+                    probabilities,
+                    reason: Some(why),
+                })?;
             }
             break;
         }
@@ -4193,9 +4316,10 @@ impl Session {
         Ok(decided)
     }
 
-    /// What the rules make of a call to `judged.name` (DESIGN.md §11): a
-    /// deny refuses it; an ask, an unread file, a call that acts with no
-    /// allow for it, or a repeated one puts it on a card; else it runs.
+    /// What the rules make of `judged` (DESIGN.md §11): for a host call,
+    /// a deny refuses it; an ask, an unread file, a call that acts with
+    /// no allow for it, or a repeated one puts it on a card; else it
+    /// runs.
     fn ruling(&self, judged: &Judged<'_>) -> Ruling {
         let (name, command, acts, repeated) = match *judged {
             Judged::Host {
@@ -4204,6 +4328,23 @@ impl Session {
                 acts,
                 repeated,
             } => (name, command, acts, repeated),
+            // The rules for a push, then the reasons it is the person's,
+            // then the table (DESIGN.md §11).
+            Judged::Push {
+                remote,
+                branch,
+                theirs,
+            } => {
+                let (rules, unread) = self.rules();
+                return match crate::rules::judge_push(&rules, &unread, remote, branch) {
+                    crate::rules::Verdict::Deny(why) => Ruling::Deny(tools::visible(&why)),
+                    crate::rules::Verdict::Ask(why) => Ruling::Card(Some(tools::visible(&why))),
+                    _ if theirs.is_some() => Ruling::Card(theirs.map(str::to_string)),
+                    crate::rules::Verdict::Allow(why) => Ruling::Run(Some(tools::visible(&why))),
+                    _ if self.workspace_mode() == crate::config::Mode::Auto => Ruling::Auto,
+                    _ => Ruling::Card(None),
+                };
+            }
             // A crossing is the human's unless they answered it for
             // good; with their rules unread, it is theirs.
             Judged::Cross { op, to } => {
@@ -5406,12 +5547,7 @@ impl Session {
         if let Some(remote) = &pending.remote {
             policy.push((
                 "protected_branches".into(),
-                Json::Arr(
-                    protected_branches(self.conversation.meta().workspace.as_ref(), remote)
-                        .into_iter()
-                        .map(Json::Str)
-                        .collect(),
-                ),
+                Json::Arr(self.protected(remote).into_iter().map(Json::Str).collect()),
             ));
         }
         classifier::state(
@@ -5449,6 +5585,20 @@ impl Session {
             payload,
             untrusted,
         }
+    }
+
+    /// The branches of `remote` a push to which is the person's: the
+    /// configured `protected_branches`, and this workspace's bases there.
+    fn protected(&self, remote: &str) -> Vec<String> {
+        let configured = self.setup.as_ref().map_or_else(
+            || Client::default().protected_branches,
+            |(_, client)| client.protected_branches.clone(),
+        );
+        protected_branches(
+            &configured,
+            self.conversation.meta().workspace.as_ref(),
+            remote,
+        )
     }
 
     /// What other conversations sent this one, the latest few, for the
@@ -5521,13 +5671,14 @@ impl Session {
 }
 
 /// The branches of `remote` a push to which is always the person's
-/// (DESIGN.md §9, Pushing): `git::PROTECTED`, and every base
+/// (DESIGN.md §9, Pushing): those `configured`, and every base
 /// `workspace` tracks there.
-fn protected_branches(workspace: Option<&Workspace>, remote: &str) -> Vec<String> {
-    let mut branches: Vec<String> = crate::git::PROTECTED
-        .iter()
-        .map(|branch| (*branch).to_string())
-        .collect();
+fn protected_branches(
+    configured: &[String],
+    workspace: Option<&Workspace>,
+    remote: &str,
+) -> Vec<String> {
+    let mut branches = configured.to_vec();
     if let Some(Workspace::Repositories(repositories)) = workspace {
         for entry in &repositories.entries {
             if entry.remote == remote && !branches.contains(&entry.base) {
@@ -6094,15 +6245,32 @@ mod tests {
         let id = Id::random().unwrap();
         let made = crate::workspace::plan(&template, &id, "/d".as_ref(), "/h".as_ref(), 0).unwrap();
         let workspace = Workspace::Repositories(made);
+        let configured = Client::default().protected_branches;
         assert_eq!(
-            protected_branches(Some(&workspace), "https://example.org/a/td"),
+            protected_branches(&configured, Some(&workspace), "https://example.org/a/td"),
             ["main", "master", "develop"]
         );
         assert_eq!(
-            protected_branches(Some(&Workspace::Scratch), "https://example.org/a/td"),
+            protected_branches(
+                &configured,
+                Some(&Workspace::Scratch),
+                "https://example.org/a/td"
+            ),
             ["main", "master"]
         );
-        assert_eq!(protected_branches(None, "r"), ["main", "master"]);
+        assert_eq!(
+            protected_branches(&configured, None, "r"),
+            ["main", "master"]
+        );
+        // Those configured, in place of the defaults.
+        assert_eq!(
+            protected_branches(
+                &["release".to_string()],
+                Some(&workspace),
+                "https://example.org/a/td"
+            ),
+            ["release", "develop", "main"]
+        );
     }
 
     /// `git_fetch`'s result: each base where it is, unchanged, moved or
