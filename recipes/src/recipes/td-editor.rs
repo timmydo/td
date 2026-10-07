@@ -7,16 +7,17 @@ use crate::types::Recipe;
 /// `#[path]`, and embeds the licence notices under `td-compositor/assets` by
 /// `include_str!`, so both sibling trees are staged beside td-editor and
 /// cargo compiles exactly what the crate names: the td-taskmgr shape. Its
-/// lock lists only itself, td-civil and td-ui (td-civil staged too), so the
-/// closure is std and the vendor set is empty; the binary is linked fully
-/// static, as every td-owned program in the system tree is; td-mail and
-/// td-news compile the crate as a library. The system image copies the
+/// lock lists only itself, td-civil, td-ui and td-test-compositor, the native
+/// harness its tests use (each staged too: cargo reads a dev-dependency to
+/// resolve the lock), so the closure is std and the vendor set is empty;
+/// the binary is linked fully static, as every td-owned program in the
+/// system tree is; td-mail and td-news compile the crate as a library. The system image copies the
 /// complete output, debug companion included, and links `/bin/td-editor` to
 /// it, as it does td-photo's; no application package carries it.
 pub fn recipe() -> Recipe {
     Recipe::rust("td-editor", "0.1.0")
         .local_source("td-editor")
-        .local_source_trees(&["td-civil", "td-ui", "td-compositor"])
+        .local_source_trees(&["td-civil", "td-ui", "td-compositor", "td-test-compositor"])
         .native_inputs(&[
             "rust-toolchain",
             "gcc-x86-64-self",
@@ -44,7 +45,8 @@ mod tests {
             Some(vec![
                 "td-civil".to_string(),
                 "td-ui".to_string(),
-                "td-compositor".to_string()
+                "td-compositor".to_string(),
+                "td-test-compositor".to_string()
             ])
         );
         assert_eq!(recipe.cargo_subdir.as_deref(), Some("td-editor"));
@@ -56,12 +58,13 @@ mod tests {
         assert!(crate::source_pins::by_key("td-editor-source").is_none());
     }
 
-    /// The staged siblings are exactly the trees the crate reaches: td-civil
-    /// and td-ui by the manifest's path dependencies, and td-compositor
-    /// through td-ui's `#[path]` mounts and embedded notices. A crate that
-    /// grew a third reach, or td-ui a mount elsewhere, would build on the
-    /// host from the whole checkout and fail only in the sandbox, so the
-    /// reaches are pinned here against the sources themselves.
+    /// The staged siblings are exactly the trees the crate reaches: td-civil,
+    /// td-ui and td-test-compositor by the manifest's path dependencies, and
+    /// td-compositor through td-ui's `#[path]` mounts and embedded notices.
+    /// A crate that grew another reach, or td-ui a mount elsewhere, would
+    /// build on the host from the whole checkout and fail only in the
+    /// sandbox, so the reaches are pinned here against the sources
+    /// themselves.
     #[test]
     fn the_staged_trees_are_the_ones_the_sources_reach() {
         // Every `path =` line in the manifest, whichever table it sits in:
@@ -76,7 +79,8 @@ mod tests {
             declared,
             [
                 "td-civil = { path = \"../td-civil\" }",
-                "td-ui = { path = \"../td-ui\" }"
+                "td-ui = { path = \"../td-ui\" }",
+                "td-test-compositor = { path = \"../td-test-compositor\" }"
             ]
         );
         let toolkit = include_str!("../../../td-ui/src/lib.rs");

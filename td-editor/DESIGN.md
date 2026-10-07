@@ -3171,9 +3171,10 @@ profiles in disposable td-compositor processes. Its manifest declares
 `native-compositor-tests = true`: ready's host preflight and gate 325 build
 the explicit compositor tool and run the ignored native cases. Bare Cargo
 tests still require an absolute `TD_TEST_COMPOSITOR` path and explicit
-ignored-test selection; bounded observation/capture decoders run in the
-ordinary suite. DEVELOPMENT.md defines tool preparation, narrowing,
-non-vacuous result checks, ownership and cancellation boundaries.
+ignored-test selection. The fixture drives the compositor through the shared
+`td-test-compositor` harness, whose ordinary suite runs the bounded
+observation/capture decoders. DEVELOPMENT.md defines tool preparation,
+narrowing, non-vacuous result checks, ownership and cancellation boundaries.
 The owned compositor starts with an empty inherited environment, an owner
 stdin lifetime and separate input/capture grants. Session readiness, numbered
 input receipts, applied client-publication snapshots and completed PPM output

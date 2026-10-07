@@ -1,5 +1,8 @@
 use super::*;
+
+use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Mutex;
 
 struct BarrierPeer(Arc<Mutex<Option<UnixStream>>>);
@@ -176,7 +179,7 @@ impl Drop for Barrier {
 #[test]
 #[ignore = "ready builds the isolated test-file-barrier editor"]
 fn barrier_idle_intervals_preserve_sequence_and_armed_request() {
-    let directory = Directory::new();
+    let directory = Directory::new("td-editor-process");
     let mut barrier = Barrier::start_with_timeout(&directory, Duration::from_millis(50));
     let stream = UnixStream::connect(&barrier.path).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
@@ -201,7 +204,7 @@ fn barrier_idle_intervals_preserve_sequence_and_armed_request() {
 #[test]
 #[ignore = "ready builds the isolated test-file-barrier editor"]
 fn barrier_partial_request_timeout_still_fails_closed() {
-    let directory = Directory::new();
+    let directory = Directory::new("td-editor-process");
     let mut barrier = Barrier::start_with_timeout(&directory, Duration::from_millis(50));
     let mut peer = UnixStream::connect(&barrier.path).unwrap();
     peer.set_read_timeout(Some(TIMEOUT)).unwrap();
@@ -215,7 +218,7 @@ fn barrier_partial_request_timeout_still_fails_closed() {
 #[test]
 #[ignore = "ready builds the isolated test-file-barrier editor"]
 fn barrier_finish_stops_a_live_idle_peer_and_drop_stops_accept() {
-    let directory = Directory::new();
+    let directory = Directory::new("td-editor-process");
     let mut barrier = Barrier::start(&directory);
     let stream = UnixStream::connect(&barrier.path).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
@@ -230,7 +233,7 @@ fn barrier_finish_stops_a_live_idle_peer_and_drop_stops_accept() {
     assert!(started.elapsed() < Duration::from_secs(2));
     response.clear();
     assert_eq!(peer.read_line(&mut response).unwrap(), 0);
-    let directory = Directory::new();
+    let directory = Directory::new("td-editor-process");
     drop(Barrier::start(&directory));
 }
 
@@ -243,9 +246,9 @@ fn admitted_file_copy_preserves_dirty_source_and_incidental_directory_views() {
 }
 
 fn admitted_file_copy(cross: bool) {
-    let compositor_directory = Directory::new();
-    let directory = Directory::new();
-    let mut compositor = Compositor::start(&compositor_directory);
+    let compositor_directory = Directory::new("td-editor-process");
+    let directory = Directory::new("td-editor-process");
+    let mut compositor = start_compositor(&compositor_directory, false);
     let mut barrier = Barrier::start(&directory);
     let root = directory.0.join("browse");
     std::fs::create_dir(&root).unwrap();
@@ -258,7 +261,7 @@ fn admitted_file_copy(cross: bool) {
     std::fs::write(&dictionary, b"disk\n").unwrap();
     let mut editor = EditorProcess::start_with_barrier(
         &directory,
-        &compositor.directory.join("wayland-0"),
+        &compositor.display(),
         &file,
         &dictionary,
         "emacs",
@@ -276,7 +279,7 @@ fn admitted_file_copy(cross: bool) {
         ));
     }
     editor.ok("select-tab\t2\t0");
-    compositor.chord(Some(KEY_LEFT_SHIFT), KEY_C); // C
+    compositor.chord(&[KEY_LEFT_SHIFT], KEY_C); // C
     editor.wait_field("prompt-state", "prompt", "path-copy");
     let state = editor.ok("state");
     let dialog = field(&state, "dialog").unwrap().split(',').next().unwrap();
@@ -295,8 +298,8 @@ fn admitted_file_copy(cross: bool) {
         .contains(&format!("job={job},copy,2,0,0,pending,-")));
     editor.ok("select-tab\t1\t1");
     editor.ok("insert\t1\t1\t1\t1\t62");
-    compositor.chord(Some(KEY_LEFT_CTRL), KEY_SPACE);
-    compositor.chord(Some(KEY_LEFT_CTRL), 45);
+    compositor.chord(&[KEY_LEFT_CTRL], KEY_SPACE);
+    compositor.chord(&[KEY_LEFT_CTRL], 45);
     editor.wait_field("state", "prefix", "1");
     let state = editor.ok("state");
     let view = field(&state, "view").unwrap().to_owned();
@@ -327,7 +330,7 @@ fn admitted_file_copy(cross: bool) {
     assert!(created.is_file());
     assert_eq!(std::fs::read(&created).unwrap(), b"disk");
     assert_eq!(std::fs::read(&file).unwrap(), b"disk");
-    compositor.chord(Some(KEY_LEFT_CTRL), KEY_G);
+    compositor.chord(&[KEY_LEFT_CTRL], KEY_G);
     editor.job("save\t1\t2");
     assert_eq!(std::fs::read(&file).unwrap(), b"abdisk");
     assert_eq!(std::fs::read(&created).unwrap(), b"disk");
@@ -353,9 +356,9 @@ fn admitted_file_copy(cross: bool) {
 #[test]
 #[ignore = "ready builds the isolated test-file-barrier editor"]
 fn admitted_mkdir_preserves_edits_and_incidental_directory_views() {
-    let compositor_directory = Directory::new();
-    let directory = Directory::new();
-    let mut compositor = Compositor::start(&compositor_directory);
+    let compositor_directory = Directory::new("td-editor-process");
+    let directory = Directory::new("td-editor-process");
+    let mut compositor = start_compositor(&compositor_directory, false);
     let mut barrier = Barrier::start(&directory);
     let root = directory.0.join("browse");
     std::fs::create_dir(&root).unwrap();
@@ -366,7 +369,7 @@ fn admitted_mkdir_preserves_edits_and_incidental_directory_views() {
     std::fs::write(&dictionary, b"disk\n").unwrap();
     let mut editor = EditorProcess::start_with_barrier(
         &directory,
-        &compositor.directory.join("wayland-0"),
+        &compositor.display(),
         &file,
         &dictionary,
         "emacs",
@@ -384,7 +387,7 @@ fn admitted_mkdir_preserves_edits_and_incidental_directory_views() {
         ));
     }
     editor.ok("select-tab\t2\t0");
-    compositor.chord(Some(KEY_LEFT_SHIFT), 13); // +
+    compositor.chord(&[KEY_LEFT_SHIFT], 13); // +
     editor.wait_field("prompt-state", "prompt", "path-mkdir");
     let state = editor.ok("state");
     let dialog = field(&state, "dialog").unwrap().split(',').next().unwrap();
@@ -400,8 +403,8 @@ fn admitted_mkdir_preserves_edits_and_incidental_directory_views() {
         .contains(&format!("job={job},mkdir,2,0,0,pending,-")));
     editor.ok("select-tab\t1\t1");
     editor.ok("insert\t1\t1\t1\t1\t62");
-    compositor.chord(Some(KEY_LEFT_CTRL), KEY_SPACE);
-    compositor.chord(Some(KEY_LEFT_CTRL), 45);
+    compositor.chord(&[KEY_LEFT_CTRL], KEY_SPACE);
+    compositor.chord(&[KEY_LEFT_CTRL], 45);
     editor.wait_field("state", "prefix", "1");
     let state = editor.ok("state");
     let view = field(&state, "view").unwrap().to_owned();
@@ -421,7 +424,7 @@ fn admitted_mkdir_preserves_edits_and_incidental_directory_views() {
     compositor.rendered_tab_text_at(&mut editor, &window, (1, 2, 32), before, "abdisk", 2);
     assert!(created.is_dir());
     assert_eq!(std::fs::read(&file).unwrap(), b"disk");
-    compositor.chord(Some(KEY_LEFT_CTRL), KEY_G);
+    compositor.chord(&[KEY_LEFT_CTRL], KEY_G);
     editor.job("save\t1\t2");
     assert_eq!(std::fs::read(&file).unwrap(), b"abdisk");
     for (tab, path) in [(2, &created), (3, &file)] {
@@ -443,9 +446,9 @@ fn admitted_mkdir_preserves_edits_and_incidental_directory_views() {
 #[test]
 #[ignore = "ready builds the isolated test-file-barrier editor"]
 fn admitted_deletion_preserves_edits_and_incidental_directory_views() {
-    let compositor_directory = Directory::new();
-    let directory = Directory::new();
-    let mut compositor = Compositor::start(&compositor_directory);
+    let compositor_directory = Directory::new("td-editor-process");
+    let directory = Directory::new("td-editor-process");
+    let mut compositor = start_compositor(&compositor_directory, false);
     let mut barrier = Barrier::start(&directory);
     let root = directory.0.join("browse");
     std::fs::create_dir(&root).unwrap();
@@ -457,7 +460,7 @@ fn admitted_deletion_preserves_edits_and_incidental_directory_views() {
     std::fs::write(&dictionary, b"disk\n").unwrap();
     let mut editor = EditorProcess::start_with_barrier(
         &directory,
-        &compositor.directory.join("wayland-0"),
+        &compositor.display(),
         &file,
         &dictionary,
         "emacs",
@@ -475,9 +478,9 @@ fn admitted_deletion_preserves_edits_and_incidental_directory_views() {
         ));
     }
     editor.ok("select-tab\t2\t0");
-    compositor.chord(None, 32); // d marks the first row and advances.
+    compositor.chord(&[], 32); // d marks the first row and advances.
     editor.wait_field("state", "directory-marks", "2,1");
-    compositor.chord(None, 45); // x reviews, but does not delete.
+    compositor.chord(&[], 45); // x reviews, but does not delete.
     editor.wait_field("prompt-state", "prompt", "path-delete");
     let state = editor.ok("state");
     let dialog = field(&state, "dialog").unwrap().split(',').next().unwrap();
@@ -501,8 +504,8 @@ fn admitted_deletion_preserves_edits_and_incidental_directory_views() {
         .contains(&format!("job={job},delete,2,1,0,pending,-")));
     editor.ok("select-tab\t1\t1");
     editor.ok("insert\t1\t1\t1\t1\t62");
-    compositor.chord(Some(KEY_LEFT_CTRL), KEY_SPACE);
-    compositor.chord(Some(KEY_LEFT_CTRL), 45);
+    compositor.chord(&[KEY_LEFT_CTRL], KEY_SPACE);
+    compositor.chord(&[KEY_LEFT_CTRL], 45);
     editor.wait_field("state", "prefix", "1");
     let state = editor.ok("state");
     let view = field(&state, "view").unwrap().to_owned();
@@ -522,7 +525,7 @@ fn admitted_deletion_preserves_edits_and_incidental_directory_views() {
     compositor.rendered_tab_text_at(&mut editor, &window, (1, 2, 32), before, "abdisk", 2);
     assert!(!victim.exists());
     assert_eq!(std::fs::read(&file).unwrap(), b"disk");
-    compositor.chord(Some(KEY_LEFT_CTRL), KEY_G);
+    compositor.chord(&[KEY_LEFT_CTRL], KEY_G);
     editor.job("save\t1\t2");
     assert_eq!(std::fs::read(&file).unwrap(), b"abdisk");
     editor.quit();
@@ -539,9 +542,9 @@ fn admitted_rename_preserves_edits_focus_and_duplicate_directory_views() {
 }
 
 fn admitted_rename(cross: bool) {
-    let compositor_directory = Directory::new();
-    let directory = Directory::new();
-    let mut compositor = Compositor::start(&compositor_directory);
+    let compositor_directory = Directory::new("td-editor-process");
+    let directory = Directory::new("td-editor-process");
+    let mut compositor = start_compositor(&compositor_directory, false);
     let mut barrier = Barrier::start(&directory);
     let root = directory.0.join("browse");
     std::fs::create_dir(&root).unwrap();
@@ -554,7 +557,7 @@ fn admitted_rename(cross: bool) {
     std::fs::write(&dictionary, b"disk\n").unwrap();
     let mut editor = EditorProcess::start_with_barrier(
         &directory,
-        &compositor.directory.join("wayland-0"),
+        &compositor.display(),
         &file,
         &dictionary,
         "emacs",
@@ -572,7 +575,7 @@ fn admitted_rename(cross: bool) {
         ));
     }
     editor.ok("select-tab\t2\t0");
-    compositor.chord(Some(KEY_LEFT_SHIFT), 19);
+    compositor.chord(&[KEY_LEFT_SHIFT], 19);
     editor.wait_field("prompt-state", "prompt", "path-rename");
     let state = editor.ok("state");
     let dialog = field(&state, "dialog").unwrap().split(',').next().unwrap();
@@ -593,8 +596,8 @@ fn admitted_rename(cross: bool) {
     editor.ok("select-tab\t1\t1");
     editor.ok("insert\t1\t1\t1\t1\t62");
     editor.wait_tab(2, "abdisk");
-    compositor.chord(Some(KEY_LEFT_CTRL), KEY_SPACE);
-    compositor.chord(Some(KEY_LEFT_CTRL), 45); // C-x prefix, with an active mark.
+    compositor.chord(&[KEY_LEFT_CTRL], KEY_SPACE);
+    compositor.chord(&[KEY_LEFT_CTRL], 45); // C-x prefix, with an active mark.
     editor.wait_field("state", "prefix", "1");
     let state = editor.ok("state");
     assert_eq!(field(&state, "line-numbers"), Some("1"));
@@ -616,7 +619,7 @@ fn admitted_rename(cross: bool) {
     wait_directory_rows(&mut editor, 3, 1, &["renamed"]);
     // The default two-digit gutter plus gap moves text 24px right.
     compositor.rendered_tab_text_at(&mut editor, &window, (1, 2, 32), before, "abdisk", 2);
-    compositor.chord(Some(KEY_LEFT_CTRL), KEY_G);
+    compositor.chord(&[KEY_LEFT_CTRL], KEY_G);
     assert!(!file.exists());
     assert_eq!(std::fs::read(&destination).unwrap(), b"disk");
     editor.job("save\t1\t2");
@@ -664,16 +667,16 @@ fn queued_save_as_rejects_edit_undo_before_snapshot_handoff() {
 }
 
 fn queued_save(save_as: bool) {
-    let compositor_directory = Directory::new();
-    let directory = Directory::new();
-    let mut compositor = Compositor::start(&compositor_directory);
+    let compositor_directory = Directory::new("td-editor-process");
+    let directory = Directory::new("td-editor-process");
+    let mut compositor = start_compositor(&compositor_directory, false);
     let mut barrier = Barrier::start(&directory);
     let file = directory.0.join("draft");
     let destination = directory.0.join("saved copy");
     let dictionary = directory.0.join("dictionary");
     std::fs::write(&file, b"disk").unwrap();
     std::fs::write(&dictionary, b"disk\n").unwrap();
-    let display = compositor.directory.join("wayland-0");
+    let display = compositor.display();
     let mut editor = EditorProcess::start_with_barriers(
         &directory,
         &display,
@@ -743,16 +746,16 @@ fn queued_save(save_as: bool) {
 #[test]
 #[ignore = "ready builds the isolated test-file-barrier editor"]
 fn save_as_destination_created_after_handoff_is_not_overwritten() {
-    let compositor_directory = Directory::new();
-    let directory = Directory::new();
-    let mut compositor = Compositor::start(&compositor_directory);
+    let compositor_directory = Directory::new("td-editor-process");
+    let directory = Directory::new("td-editor-process");
+    let mut compositor = start_compositor(&compositor_directory, false);
     let mut barrier = Barrier::start(&directory);
     let file = directory.0.join("draft");
     let destination = directory.0.join("contested copy");
     let dictionary = directory.0.join("dictionary");
     std::fs::write(&file, b"disk").unwrap();
     std::fs::write(&dictionary, b"disk\n").unwrap();
-    let display = compositor.directory.join("wayland-0");
+    let display = compositor.display();
     let mut editor = EditorProcess::start_with_barrier(
         &directory,
         &display,
@@ -821,15 +824,15 @@ fn save_as_destination_created_after_handoff_is_not_overwritten() {
 #[test]
 #[ignore = "ready builds the isolated test-file-barrier editor"]
 fn barrier_disconnect_fails_before_write_and_leaves_document_editable() {
-    let compositor_directory = Directory::new();
-    let directory = Directory::new();
-    let mut compositor = Compositor::start(&compositor_directory);
+    let compositor_directory = Directory::new("td-editor-process");
+    let directory = Directory::new("td-editor-process");
+    let mut compositor = start_compositor(&compositor_directory, false);
     let mut barrier = Barrier::start(&directory);
     let file = directory.0.join("draft");
     let dictionary = directory.0.join("dictionary");
     std::fs::write(&file, b"disk").unwrap();
     std::fs::write(&dictionary, b"disk\n").unwrap();
-    let display = compositor.directory.join("wayland-0");
+    let display = compositor.display();
     let mut editor = EditorProcess::start_with_barrier(
         &directory,
         &display,
@@ -908,9 +911,9 @@ fn barrier_disconnect_fails_before_write_and_leaves_document_editable() {
 }
 
 fn admitted_save(save_as: bool) {
-    let compositor_directory = Directory::new();
-    let directory = Directory::new();
-    let mut compositor = Compositor::start(&compositor_directory);
+    let compositor_directory = Directory::new("td-editor-process");
+    let directory = Directory::new("td-editor-process");
+    let mut compositor = start_compositor(&compositor_directory, false);
     let mut barrier = Barrier::start(&directory);
     let file = directory.0.join("draft");
     let destination = directory.0.join("saved copy");
@@ -918,7 +921,7 @@ fn admitted_save(save_as: bool) {
     let dictionary = directory.0.join("dictionary");
     std::fs::write(&file, b"disk").unwrap();
     std::fs::write(&dictionary, b"disk\n").unwrap();
-    let display = compositor.directory.join("wayland-0");
+    let display = compositor.display();
     let mut editor = EditorProcess::start_with_barrier(
         &directory,
         &display,
@@ -1040,15 +1043,15 @@ fn admitted_save(save_as: bool) {
 }
 
 fn scenario(reload: bool) {
-    let compositor_directory = Directory::new();
-    let directory = Directory::new();
-    let mut compositor = Compositor::start(&compositor_directory);
+    let compositor_directory = Directory::new("td-editor-process");
+    let directory = Directory::new("td-editor-process");
+    let mut compositor = start_compositor(&compositor_directory, false);
     let mut barrier = Barrier::start(&directory);
     let file = directory.0.join("draft");
     let dictionary = directory.0.join("dictionary");
     std::fs::write(&file, b"disk").unwrap();
     std::fs::write(&dictionary, b"disk\n").unwrap();
-    let display = compositor.directory.join("wayland-0");
+    let display = compositor.display();
     let mut editor = EditorProcess::start_with_barrier(
         &directory,
         &display,

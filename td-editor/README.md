@@ -550,10 +550,10 @@ The capture must contain the expected Unifont text at the document origin
 after every edit, excluding the one-pixel blinking caret column when it
 falls within the sampled prefix. Caret visibility and open menu/prompt
 pixels are not asserted by this case; menu transitions use semantic state.
-Bare Cargo leaves these process cases ignored; their decoder tests run by
-default. A native control-worker case also runs the shared edit, spelling,
-save and dirty-close scenario against td-compositor: stale requests refuse,
-Undo/Redo and spelling pages agree, saved BOM/CRLF bytes are exact, old close
+Bare Cargo leaves these process cases ignored; the shared harness's decoder
+tests run in td-test-compositor's own suite. A native control-worker case
+also runs the shared edit, spelling, save and dirty-close scenario against
+td-compositor: stale requests refuse, Undo/Redo and spelling pages agree, saved BOM/CRLF bytes are exact, old close
 dialog IDs cannot discard a newer dialog, and the final single saved tab
 has correlated `warm` pixels. The default strict protocol-peer case remains
 independent and runs without keyboard focus.

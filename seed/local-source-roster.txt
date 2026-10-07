@@ -11,7 +11,7 @@
 # removes, or renames a `local_source'/`local_source_trees' declaration —
 # an ordinary edit inside a staged tree does not move a row.
 td-dua-source td-dua td-civil,td-json,td-ui,td-compositor
-td-editor-source td-editor td-civil,td-ui,td-compositor
+td-editor-source td-editor td-civil,td-ui,td-compositor,td-test-compositor
 td-install-qemu-test-source td-install-qemu-test
 td-mail-source td-mail td-civil,td-encoding,td-fetch-client,td-fs,td-html,td-json,td-kv,td-regex,td-toml,td-ui,td-compositor,td-test-compositor
 td-net-source net engine,td-boot,td-fs

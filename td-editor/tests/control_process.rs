@@ -5,18 +5,18 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use td_test_compositor::{remaining, write_until, Directory};
+
 type Result<T> = std::result::Result<T, String>;
 const TIMEOUT: Duration = Duration::from_secs(10);
-static NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[path = "support/native_compositor.rs"]
 mod native_compositor;
@@ -32,40 +32,6 @@ const KEY_V: u32 = 47;
 const KEY_B: u32 = 48;
 const KEY_SLASH: u32 = 53;
 
-struct Directory(PathBuf);
-impl Directory {
-    fn new() -> Self {
-        // Linux pathname sockets need a short path, independent of TMPDIR.
-        // Concurrent hosted checks run in their own PID namespaces, so the
-        // pid alone can repeat: only a directory this call created is ours.
-        let mut taken = 0;
-        loop {
-            let path = Path::new("/tmp").join(format!(
-                "td-editor-process-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && taken < 1024 => {
-                    taken += 1;
-                }
-                created => {
-                    created.unwrap();
-                    // The create's mode is filtered by the umask.
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-                        .unwrap();
-                    return Self(path);
-                }
-            }
-        }
-    }
-}
-impl Drop for Directory {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 fn words(values: &[u32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_ne_bytes()).collect()
 }
@@ -78,30 +44,12 @@ fn word(bytes: &[u8], at: usize) -> Result<u32> {
             .map_err(|_| "display word")?,
     ))
 }
-fn remaining(deadline: Instant) -> io::Result<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|duration| !duration.is_zero())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "fixture I/O deadline"))
-}
 fn read_until(stream: &mut UnixStream, mut bytes: &mut [u8], deadline: Instant) -> io::Result<()> {
     while !bytes.is_empty() {
         stream.set_read_timeout(Some(remaining(deadline)?))?;
         match stream.read(bytes) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => bytes = &mut bytes[n..],
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-fn write_until(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
-    while !bytes.is_empty() {
-        stream.set_write_timeout(Some(remaining(deadline)?))?;
-        match stream.write(bytes) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => bytes = &bytes[n..],
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
@@ -868,7 +816,7 @@ fn display_roundtrip(mut stream: UnixStream) {
 #[test]
 #[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
 fn disposable_weston_runs_the_production_editor_and_control_workers() {
-    let directory = Directory::new();
+    let directory = Directory::new("td-editor-process");
     let display = directory.0.join("wayland");
     let mut weston = WestonProcess::start(&directory);
     let file = directory.0.join("-draft with spaces.txt");
@@ -1133,7 +1081,7 @@ fn weston_test_global_decoder_checks_strings_versions_and_payload_bounds() {
 }
 
 fn weston_keyboard_profile(profile: &str) {
-    let directory = Directory::new();
+    let directory = Directory::new("td-editor-process");
     let display = directory.0.join("wayland");
     let mut weston = WestonProcess::start(&directory);
     let file = directory.0.join("draft");
@@ -1239,7 +1187,7 @@ fn weston_pointer_line_numbers(line_numbers: bool) {
     const PANEL_TOP: i32 = 24;
     const MENU_ROW_HEIGHT: i32 = 24;
     const FIND_ROW: i32 = 8;
-    let directory = Directory::new();
+    let directory = Directory::new("td-editor-process");
     let display = directory.0.join("wayland");
     let mut weston = WestonProcess::start(&directory);
     let file = directory.0.join("draft");
@@ -1306,10 +1254,10 @@ fn weston_pointer_line_numbers(line_numbers: bool) {
 #[test]
 #[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
 fn disposable_weston_transfers_clipboard_between_editor_processes() {
-    let compositor = Directory::new();
+    let compositor = Directory::new("td-editor-process");
     let display = compositor.0.join("wayland");
     let mut weston = WestonProcess::start(&compositor);
-    let source_dir = Directory::new();
+    let source_dir = Directory::new("td-editor-process");
     let source_path = source_dir.0.join("source");
     let dictionary = source_dir.0.join("dictionary");
     let text = "café e\u{301} 🦀\nsecond line\n";
@@ -1330,7 +1278,7 @@ fn disposable_weston_transfers_clipboard_between_editor_processes() {
     assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
     source.rendered_at(1024, 768);
 
-    let destination_dir = Directory::new();
+    let destination_dir = Directory::new("td-editor-process");
     let destination_path = destination_dir.0.join("destination");
     let destination_dictionary = destination_dir.0.join("dictionary");
     std::fs::write(&destination_path, b"").unwrap();
@@ -1360,7 +1308,7 @@ fn disposable_weston_transfers_clipboard_between_editor_processes() {
 
 #[test]
 fn production_process_roundtrips_remote_edit_jobs_frames_and_close_dialogs() {
-    let directory = Directory::new();
+    let directory = Directory::new("td-editor-process");
     let display_path = directory.0.join("wayland");
     let mut display = Display::start(&display_path, false);
     let file = directory.0.join("-draft");
@@ -1447,7 +1395,7 @@ fn control_edit_jobs_and_close_dialogs(editor: &mut EditorProcess, file: &Path) 
 
 #[test]
 fn production_pointer_menu_and_prompt_answers_work_without_keyboard_focus() {
-    let directory = Directory::new();
+    let directory = Directory::new("td-editor-process");
     let display_path = directory.0.join("wayland");
     let mut display = Display::start(&display_path, true);
     let file = directory.0.join("draft");
@@ -1509,7 +1457,7 @@ fn control_menu_prompts_and_fill(
 
 #[test]
 fn production_display_loss_exits_nonzero_without_saving_dirty_text() {
-    let directory = Directory::new();
+    let directory = Directory::new("td-editor-process");
     let display_path = directory.0.join("wayland");
     let mut display = Display::start(&display_path, false);
     let file = directory.0.join("draft");
