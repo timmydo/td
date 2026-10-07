@@ -36,14 +36,9 @@ impl Protocol {
         for (dst, src) in out.0.iter_mut().zip(&mac) {
             *dst = *src;
         }
-        clear(&mut mac);
+        td_tpm::zero(&mut mac);
         out
     }
-}
-
-fn clear(bytes: &mut [u8]) {
-    bytes.fill(0);
-    std::hint::black_box(bytes);
 }
 
 struct Secret(Box<[u8]>);
@@ -54,7 +49,7 @@ impl Secret {
 }
 impl Drop for Secret {
     fn drop(&mut self) {
-        clear(&mut self.0);
+        td_tpm::zero(&mut self.0);
     }
 }
 
@@ -375,8 +370,8 @@ pub(super) struct Intent {
 }
 impl Drop for Intent {
     fn drop(&mut self) {
-        clear(&mut self.challenge);
-        clear(&mut self.salt);
+        td_tpm::zero(&mut self.challenge);
+        td_tpm::zero(&mut self.salt);
     }
 }
 
@@ -458,7 +453,7 @@ impl<I: Operation> KeyRequest<I> {
         let mut hash = crypto::digest(&pin.0 .0);
         drop(pin);
         let encrypted = keys.encrypt(hash.get(..16).ok_or("PIN hash extent")?, entropy);
-        clear(&mut hash);
+        td_tpm::zero(&mut hash);
         let encrypted = encrypted?;
         let mut out = client_pin(
             self.profile.protocol,
@@ -638,8 +633,8 @@ pub(super) struct Creation {
 }
 impl Drop for Creation {
     fn drop(&mut self) {
-        clear(&mut self.challenge);
-        clear(&mut self.user);
+        td_tpm::zero(&mut self.challenge);
+        td_tpm::zero(&mut self.user);
     }
 }
 impl Operation for Creation {
@@ -1019,7 +1014,7 @@ struct Credential {
 }
 impl Drop for Credential {
     fn drop(&mut self) {
-        clear(&mut self.salt);
+        td_tpm::zero(&mut self.salt);
     }
 }
 /// Candidate identity stays attached to the exact proof request through every step.
@@ -1110,15 +1105,15 @@ impl Keys {
                 let mut hash = crypto::digest(shared);
                 keys.aes.0.copy_from_slice(&hash);
                 keys.hmac.0.copy_from_slice(&hash);
-                clear(&mut hash);
+                td_tpm::zero(&mut hash);
             }
             Protocol::Two => {
                 let mut aes = crypto::hkdf(shared, &[0; 32], b"CTAP2 AES key");
                 let mut hmac = crypto::hkdf(shared, &[0; 32], b"CTAP2 HMAC key");
                 keys.aes.0.copy_from_slice(&aes);
                 keys.hmac.0.copy_from_slice(&hmac);
-                clear(&mut aes);
-                clear(&mut hmac);
+                td_tpm::zero(&mut aes);
+                td_tpm::zero(&mut hmac);
             }
         }
         keys
@@ -1190,7 +1185,7 @@ fn fresh_scalar(
     for _ in 0..8 {
         let mut bytes = Box::new([0; 32]);
         if let Err(error) = entropy(bytes.as_mut()) {
-            clear(bytes.as_mut());
+            td_tpm::zero(bytes.as_mut());
             return Err(error);
         }
         if let Ok(private) = SecretScalar::from_bytes(bytes) {

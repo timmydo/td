@@ -109,14 +109,11 @@ fn roundtrip<C: Channel>(
 }
 
 fn verify_repeat(first: &[u8], second: &[u8], before: u32, after: u32) -> Result<(), String> {
-    if first.len() != 32 || second.len() != 32 {
+    let (Ok(first), Ok(second)) = (<&[u8; 32]>::try_from(first), <&[u8; 32]>::try_from(second))
+    else {
         return Err("invalid token secret length".into());
-    }
-    let difference = first
-        .iter()
-        .zip(second)
-        .fold(0u8, |difference, (a, b)| difference | (a ^ b));
-    if std::hint::black_box(difference) != 0 {
+    };
+    if !td_tpm::equal(first, second) {
         return Err("token secret was not repeatable".into());
     }
     if (before != 0 || after != 0) && after <= before {

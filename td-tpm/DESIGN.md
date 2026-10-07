@@ -31,7 +31,11 @@ The crate owns the protocol and nothing a consumer persists or decides:
   copy, and are zeroed on every return path with `zero`, which keeps the
   stores observable through `black_box` so they are not elided before
   the buffer is freed. This is best effort in safe Rust. The payload
-  `unseal_object` returns is the caller's to zero. A refused command is
+  `unseal_object` returns is the caller's to zero. `zero` is public, as
+  is `equal`, which compares two fixed-length secrets with no early exit
+  at the first difference (best effort, as `zero` is), so td-boot,
+  td-protector and td-secret share one copy of what they use. A refused
+  command is
   an error naming its code and response code; there is no retry or
   fallback.
 - **Handles.** Returned handles are owned by the client until `flush`,

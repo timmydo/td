@@ -760,6 +760,19 @@ pub fn zero(bytes: &mut [u8]) {
     std::hint::black_box(bytes);
 }
 
+/// Whether two secrets of one fixed length are equal. The bytes' XORs are
+/// folded into one value with no branch on any of them, and `black_box`
+/// hides that value from the comparison after it, so the source has no
+/// early exit at the first difference. This is best effort in safe Rust,
+/// as `zero` is: it is not a guarantee about what the optimizer emits.
+pub fn equal<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {
+    let difference = a
+        .iter()
+        .zip(b)
+        .fold(0u8, |difference, (x, y)| difference | (x ^ y));
+    std::hint::black_box(difference) == 0
+}
+
 /// The selection bit of one of PCRs 0 through 15.
 fn pcr_bit(index: u8) -> Result<u16, String> {
     1u16.checked_shl(u32::from(index))
@@ -865,6 +878,20 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn equal_compares_every_byte() {
+        let a = [7u8; 32];
+        assert!(equal(&a, &a));
+        for at in 0..a.len() {
+            for bit in [0x01, 0x80] {
+                let mut b = a;
+                b[at] ^= bit;
+                assert!(!equal(&a, &b), "a difference at {at}");
+            }
+        }
+        assert!(equal(&[0u8; 0], &[0u8; 0]));
     }
 
     fn response(tag: u16, rc: u32, body: &[u8]) -> Vec<u8> {

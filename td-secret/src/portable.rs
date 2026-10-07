@@ -643,11 +643,7 @@ impl OpenVault {
 }
 
 pub(super) fn equal32(a: &Secret32, b: &Secret32) -> bool {
-    let difference =
-        a.0.iter()
-            .zip(&b.0)
-            .fold(0u8, |difference, (x, y)| difference | (x ^ y));
-    std::hint::black_box(difference) == 0
+    td_tpm::equal(&a.0, &b.0)
 }
 
 fn validate_keys<'a>(keys: impl Iterator<Item = (Role, &'a [u8])>) -> Result<()> {

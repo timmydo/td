@@ -308,12 +308,7 @@ impl RecoveryKey {
 
     /// Whether `other` is the same key, comparing every digit.
     pub fn matches(&self, other: &Self) -> bool {
-        let difference = self
-            .0
-            .iter()
-            .zip(other.0.iter())
-            .fold(0u8, |difference, (a, b)| difference | (a ^ b));
-        std::hint::black_box(difference) == 0
+        td_tpm::equal(&self.0, &other.0)
     }
 }
 

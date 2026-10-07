@@ -307,11 +307,7 @@ fn verifier(uid: u32, id: &[u8; 32], credential: &[u8], output: &[u8; 32]) -> Re
 }
 
 fn check(stored: &[u8; 32], derived: &Verifier) -> bool {
-    let difference = stored
-        .iter()
-        .zip(&derived.0)
-        .fold(0u8, |difference, (a, b)| difference | (a ^ b));
-    std::hint::black_box(difference) == 0
+    td_tpm::equal(stored, &derived.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
