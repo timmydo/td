@@ -659,20 +659,27 @@ impl Worker {
 
     /// The commit the store's branch `base` names.
     pub fn resolve(&self, store: &Path, base: &str) -> Result<String, String> {
-        let base = branch_name(base)?;
+        self.branch_tip(store, base)?
+            .ok_or_else(|| format!("the remote has no branch {base:?}"))
+    }
+
+    /// The commit the store's branch `branch` names, none when the
+    /// remote has no such branch.
+    fn branch_tip(&self, store: &Path, branch: &str) -> Result<Option<String>, String> {
+        let branch = branch_name(branch)?;
         let mut parse = self.command(store);
         parse
             .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
-            .arg(format!("refs/heads/{base}^{{commit}}"));
+            .arg(format!("refs/heads/{branch}^{{commit}}"));
         let out = match run(&mut parse, 256, LOCAL_TIME) {
             Ok(out) => out,
-            Err(Failure::Exit(1, _)) => return Err(format!("the remote has no branch {base:?}")),
-            Err(e) => return Err(format!("resolving {base:?}: {e}")),
+            Err(Failure::Exit(1, _)) => return Ok(None),
+            Err(e) => return Err(format!("resolving {branch:?}: {e}")),
         };
         let id = String::from_utf8_lossy(&out).trim().to_string();
         object_id(&id)
-            .then_some(id)
-            .ok_or_else(|| format!("git named {base:?} oddly"))
+            .then_some(Some(id))
+            .ok_or_else(|| format!("git named {branch:?} oddly"))
     }
 
     /// The file at `path` in commit `id` of the store, none when the
@@ -1113,16 +1120,31 @@ impl Worker {
                     "--",
                 ])
                 .arg(publish);
-            run(&mut init, MAX_TEXT as u64, LOCAL_TIME)
-                .map_err(|e| format!("making {}: {e}", publish.display()))?;
+            // A second stage's `init` may hold git's lock; its
+            // repository is ours.
+            if let Err(e) = run(&mut init, MAX_TEXT as u64, LOCAL_TIME) {
+                if !publish.join("HEAD").is_file() {
+                    return Err(format!("making {}: {e}", publish.display()));
+                }
+            }
         }
         let objects = std::fs::canonicalize(store.join("objects"))
             .map_err(|e| format!("{}: {e}", store.display()))?;
         let alternates = publish.join("objects/info/alternates");
-        let new = publish.join("objects/info/alternates.new");
-        std::fs::write(&new, format!("{}\n", objects.display()))
-            .and_then(|()| std::fs::rename(&new, &alternates))
-            .map_err(|e| format!("{}: {e}", alternates.display()))
+        // Written whole under a name of this call's own, so a second
+        // stage's write never mixes with it.
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        let new = publish.join(format!(
+            "objects/info/alternates.{}.{}",
+            std::process::id(),
+            CALLS.fetch_add(1, Ordering::Relaxed)
+        ));
+        let written = std::fs::write(&new, format!("{}\n", objects.display()))
+            .and_then(|()| std::fs::rename(&new, &alternates));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&new);
+        }
+        written.map_err(|e| format!("{}: {e}", alternates.display()))
     }
 
     /// The pack in file `pack`, a push's export, imported into publish
@@ -1884,6 +1906,141 @@ impl Worker {
     }
 }
 
+/// How long a push may take.
+const PUSH_TIME: Duration = Duration::from_secs(600);
+
+/// A push staged (DESIGN.md §9, Pushing, steps 2 and 3): the remote
+/// branch's tip when it is there, as the store last fetched it, and the
+/// evidence against it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Staged {
+    pub tip: Option<String>,
+    pub evidence: Evidence,
+}
+
+/// What a push sends (DESIGN.md §9, Pushing, step 5): one commit to one
+/// branch, the remote's id expected there when forced.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Push {
+    pub id: String,
+    pub branch: String,
+    /// For a force push, the id the remote's branch must still name,
+    /// carried by `--force-with-lease`.
+    pub lease: Option<String>,
+}
+
+impl Push {
+    /// The one refspec pushed, `<id>:refs/heads/<branch>`, checked: the
+    /// id a full object id, the branch one `branch_name` admits, which
+    /// starts with none of `+`, `:` and `-`, and the lease an id too.
+    /// Neither is the null id, which git reads as no commit: pushed, a
+    /// deletion; as a lease, a branch that must not be there.
+    pub fn refspec(&self) -> Result<String, String> {
+        let commit = |id: &str| object_id(id) && id.bytes().any(|b| b != b'0');
+        if !commit(&self.id) {
+            return Err(format!("{:?} is not a full commit id", self.id));
+        }
+        let branch = branch_name(&self.branch)?;
+        // `refs/heads/refs/heads/x` is a branch git makes, but not the
+        // one a reader of `refs/heads/x` would think.
+        if branch.starts_with("refs/") {
+            return Err(format!("{branch:?} names a ref, not a branch"));
+        }
+        if let Some(lease) = self.lease.as_deref().filter(|lease| !commit(lease)) {
+            return Err(format!("{lease:?} is not a full commit id"));
+        }
+        Ok(format!("{}:refs/heads/{branch}", self.id))
+    }
+}
+
+impl Worker {
+    /// Stages pushing commit `id`, from `base`, to `remote`'s branch
+    /// `branch`: fetches the store under `stores`, so the branch's tip is
+    /// the remote's now; makes the publish repository `publish` over it
+    /// if need be; imports `pack`, which must hold `id`; and computes the
+    /// evidence against that tip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage(
+        &self,
+        stores: &Path,
+        publish: &Path,
+        remote: &Remote,
+        pack: &Path,
+        id: &str,
+        base: &str,
+        branch: &str,
+    ) -> Result<Staged, String> {
+        let branch = branch_name(branch)?;
+        let store = self.store(stores, remote)?;
+        self.fetch(&store, remote)?;
+        let tip = self.branch_tip(&store, branch)?;
+        self.publish(publish, &store)?;
+        self.import(publish, pack, id)?;
+        let evidence = self.evidence(publish, id, base, tip.as_deref())?;
+        Ok(Staged { tip, evidence })
+    }
+
+    /// Pushes `push` from the publish repository to `remote` with the
+    /// human's credentials, its hooks off, and answers with what git and
+    /// the remote said: the ref's status and the remote's message.
+    pub fn push(&self, publish: &Path, remote: &Remote, push: &Push) -> Result<String, String> {
+        let refspec = push.refspec()?;
+        // Through the alternates every object of the store is there: the
+        // id must be a commit's, not a tag's or a tree's.
+        let mut peel = self.command(publish);
+        peel.args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+            .arg(format!("{}^{{commit}}", push.id));
+        let peeled = run(&mut peel, 256, LOCAL_TIME)
+            .map(|out| String::from_utf8_lossy(&out).trim().to_string());
+        if peeled.ok().as_deref() != Some(push.id.as_str()) {
+            return Err(format!("{} is not a commit to push", push.id));
+        }
+        let mut command = self.command(publish);
+        command.args([
+            "push",
+            "--porcelain",
+            "--no-verify",
+            "--no-signed",
+            "--no-follow-tags",
+            "--no-recurse-submodules",
+            "--no-atomic",
+        ]);
+        if let Some(lease) = &push.lease {
+            command.arg(format!(
+                "--force-with-lease=refs/heads/{}:{lease}",
+                push.branch
+            ));
+        }
+        command
+            .arg("--end-of-options")
+            .arg(remote.url())
+            .arg(&refspec);
+        let mut out = Vec::new();
+        let pushed = run_heard(&mut command, None, 64 * 1024, PUSH_TIME, &mut |bytes| {
+            out.extend_from_slice(bytes);
+            Ok(())
+        });
+        let out = crate::tools::visible(String::from_utf8_lossy(&out).trim());
+        let both = |said: &str| match (out.is_empty(), said.is_empty()) {
+            (_, true) => out.clone(),
+            (true, false) => said.to_string(),
+            (false, false) => format!("{out}\n{said}"),
+        };
+        match pushed {
+            Ok(said) => Ok(both(&said)),
+            // git says 1 when the remote refused a ref, more when it
+            // could not push at all.
+            Err(Failure::Exit(1, said)) => Err(format!("the push was refused: {}", both(&said))),
+            Err(Failure::Exit(_, said)) => Err(format!(
+                "pushing to {} failed: {}",
+                remote.url(),
+                both(&said)
+            )),
+            Err(e) => Err(format!("pushing to {}: {e}", remote.url())),
+        }
+    }
+}
+
 /// What a match past the scan's bound is called.
 const UNSCANNED: &str = "more than the scan reads, unscanned";
 
@@ -2005,6 +2162,24 @@ pub(crate) fn run_into(
     time: Duration,
     sink: &mut dyn FnMut(&[u8]) -> Result<(), String>,
 ) -> Result<(), Failure> {
+    run_heard(command, input, limit, time, sink)
+        .map(drop)
+        .map_err(|failure| match failure {
+            Failure::Exit(code, said) => Failure::Exit(code, said.chars().take(300).collect()),
+            other => other,
+        })
+}
+
+/// `run_into`, answering with the start of what git said on standard
+/// error when it succeeds too, and all of that start when it fails, not
+/// cut as a reason: a remote's message, made visible.
+fn run_heard(
+    command: &mut Command,
+    input: Option<Vec<u8>>,
+    limit: u64,
+    time: Duration,
+    sink: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Result<String, Failure> {
     let now = Instant::now();
     let deadline = now.checked_add(time).unwrap_or(now);
     if input.is_some() {
@@ -2100,14 +2275,11 @@ pub(crate) fn run_into(
             }
         },
     };
-    if status.success() {
-        return Ok(());
-    }
     let said = String::from_utf8_lossy(&err);
-    let said: String = crate::tools::visible(said.trim())
-        .chars()
-        .take(300)
-        .collect();
+    let said = crate::tools::visible(said.trim());
+    if status.success() {
+        return Ok(said);
+    }
     Err(Failure::Exit(status.code().unwrap_or(-1), said))
 }
 
@@ -2244,6 +2416,201 @@ pub(crate) mod tests {
             local: Some(dir.to_path_buf()),
             ..Remote::parse("https://local/up").unwrap()
         }
+    }
+
+    /// The output of git run in `dir`.
+    fn said(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A push is staged against the remote branch's tip as it is now,
+    /// and sends one commit to one branch from the publish repository,
+    /// its hooks off: a fast-forward plain, anything else refused unless
+    /// forced, and forced only while the remote still names the id the
+    /// lease expects; the remote's refusal is said.
+    #[test]
+    fn a_push_sends_one_commit_to_one_branch_with_its_lease() {
+        if !have_git() {
+            return;
+        }
+        let scratch = Scratch::new("git-push");
+        let root = scratch.state().root().to_path_buf();
+        let up = root.join("up");
+        std::fs::create_dir_all(&up).unwrap();
+        upstream(&up, &["init", "--quiet"]);
+        std::fs::write(up.join("README"), "one\n").unwrap();
+        upstream(&up, &["add", "."]);
+        upstream(&up, &["commit", "--quiet", "-m", "one"]);
+        // The remote's own hooks run, and what they say is told.
+        let told = up.join(".git/hooks/post-receive");
+        std::fs::write(&told, "#!/bin/sh\necho the remote took it >&2\n").unwrap();
+        std::fs::set_permissions(&told, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let mut worker = Worker::new(&root.join("worker"), &kept_env()).unwrap();
+        worker.file = true;
+        let remote = local(&up);
+        let stores = root.join("store");
+        let store = worker.store(&stores, &remote).unwrap();
+        worker.fetch(&store, &remote).unwrap();
+        let base = worker.resolve(&store, "main").unwrap();
+        let work = root.join("work");
+        upstream(&root, &["clone", "--quiet", up.to_str().unwrap(), "work"]);
+        let packed = |id: &str, name: &str| {
+            let mut child = Command::new("git")
+                .current_dir(&work)
+                .args(["pack-objects", "--stdout", "--revs", "--quiet"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::io::Write::write_all(
+                child.stdin.as_mut().unwrap(),
+                format!("{id}\n^{base}\n").as_bytes(),
+            )
+            .unwrap();
+            drop(child.stdin.take());
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            let pack = root.join(name);
+            std::fs::write(&pack, out.stdout).unwrap();
+            pack
+        };
+        let commit = |message: &str| {
+            std::fs::write(work.join(message), message).unwrap();
+            upstream(&work, &["add", message]);
+            upstream(&work, &["commit", "--quiet", "-m", message]);
+            said(&work, &["rev-parse", "HEAD"])
+        };
+        let two = commit("two");
+        let publish = root.join("publish/w/r.git");
+        let staged = worker
+            .stage(
+                &stores,
+                &publish,
+                &remote,
+                &packed(&two, "two.pack"),
+                &two,
+                &base,
+                "feature",
+            )
+            .unwrap();
+        assert_eq!(staged.tip, None);
+        assert_eq!(staged.evidence.commits, [(two.clone(), "two".to_string())]);
+        // The publish repository's own hooks never run.
+        let hook = publish.join("hooks/pre-push");
+        let ran = root.join("hook-ran");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", ran.display())).unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let push = |id: &str, branch: &str, lease: Option<&str>| Push {
+            id: id.to_string(),
+            branch: branch.to_string(),
+            lease: lease.map(str::to_string),
+        };
+        let answer = worker
+            .push(&publish, &remote, &push(&two, "feature", None))
+            .unwrap();
+        assert!(answer.contains("refs/heads/feature"), "{answer}");
+        assert!(answer.contains("the remote took it"), "{answer}");
+        assert!(!ran.exists(), "a publish hook ran");
+        assert_eq!(said(&up, &["rev-parse", "refs/heads/feature"]), two);
+        // A commit off the base, staged against the tip now there.
+        upstream(&work, &["checkout", "--quiet", "-b", "other", &base]);
+        let three = commit("three");
+        let staged = worker
+            .stage(
+                &stores,
+                &publish,
+                &remote,
+                &packed(&three, "three.pack"),
+                &three,
+                &base,
+                "feature",
+            )
+            .unwrap();
+        assert_eq!(staged.tip.as_deref(), Some(two.as_str()));
+        assert_eq!(staged.evidence.merge_base.as_deref(), Some(base.as_str()));
+        // Not a fast-forward: refused unless forced.
+        let refused = worker
+            .push(&publish, &remote, &push(&three, "feature", None))
+            .unwrap_err();
+        assert!(refused.starts_with("the push was refused"), "{refused}");
+        assert!(refused.contains("rejected"), "{refused}");
+        // Forced, while the remote names what the lease expects.
+        let stale = worker
+            .push(&publish, &remote, &push(&three, "feature", Some(&base)))
+            .unwrap_err();
+        assert!(stale.contains("stale"), "{stale}");
+        assert_eq!(said(&up, &["rev-parse", "refs/heads/feature"]), two);
+        worker
+            .push(&publish, &remote, &push(&three, "feature", Some(&two)))
+            .unwrap();
+        assert_eq!(said(&up, &["rev-parse", "refs/heads/feature"]), three);
+        // A refusal's whole message is said, not a reason's start.
+        let refusing = up.join(".git/hooks/pre-receive");
+        let long: String = (0..20)
+            .map(|n| format!("echo line {n} of the refusal >&2\n"))
+            .collect();
+        std::fs::write(
+            &refusing,
+            format!("#!/bin/sh\n{long}echo the end >&2\nexit 1\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &refusing,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let refused = worker
+            .push(&publish, &remote, &push(&three, "elsewhere", None))
+            .unwrap_err();
+        assert!(refused.contains("the end"), "{refused}");
+        std::fs::remove_file(&refusing).unwrap();
+        // The remote's own refusal is said: its checked-out branch.
+        let checked_out = worker
+            .push(&publish, &remote, &push(&three, "main", None))
+            .unwrap_err();
+        assert!(checked_out.contains("refusing to update"), "{checked_out}");
+        // Only a commit's id to a branch, and a lease that is one: the
+        // null id would delete the branch.
+        let zero = "0".repeat(three.len());
+        let tree = said(&work, &["rev-parse", "HEAD^{tree}"]);
+        for (id, branch, lease, why) in [
+            ("HEAD", "feature", None, "not a full commit id"),
+            (&zero, "feature", None, "not a full commit id"),
+            (
+                three.as_str(),
+                "feature",
+                Some(zero.as_str()),
+                "not a full commit id",
+            ),
+            (three.as_str(), "-f", None, "not a branch name"),
+            (three.as_str(), "+feature", None, "not a branch name"),
+            (three.as_str(), ":feature", None, "not a branch name"),
+            (three.as_str(), "refs/heads/x", None, "names a ref"),
+            (&tree, "feature", None, "not a commit to push"),
+            (
+                three.as_str(),
+                "feature",
+                Some("main"),
+                "not a full commit id",
+            ),
+        ] {
+            let refused = worker
+                .push(&publish, &remote, &push(id, branch, lease))
+                .unwrap_err();
+            assert!(refused.contains(why), "{id} {branch} {lease:?}: {refused}");
+        }
+        assert_eq!(said(&up, &["rev-parse", "refs/heads/feature"]), three);
     }
 
     /// Whether a `git` is on PATH: the in-sandbox gate's toolchain has

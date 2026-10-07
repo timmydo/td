@@ -3193,6 +3193,32 @@ alone, at most 50 and the rest counted; output past a pass's bound is a
 match of its own. The evidence is clean when nothing matched and the
 push carries no binary file.
 
+**As built (increment 14, staging and the push).** The git worker's two
+halves of a push are built, which nothing calls yet: `git_push` will.
+`Worker::stage` fetches the remote's store, so the branch's tip is the
+remote's as of that fetch, absent when the remote has no such branch;
+makes the publish repository over the store if need be; imports the
+pack, which must hold the exported commit; and computes the evidence
+against that tip. `Worker::push` pushes exactly
+`<id>:refs/heads/<branch>` from the publish repository with the human's
+credentials in the fixed shape, its hooks path empty, with `--porcelain
+--no-verify --no-signed --no-follow-tags --no-recurse-submodules
+--no-atomic`, then `--end-of-options` before the remote's URL and the
+refspec. Before git runs, the id and a forced push's expected id must be
+full object ids other than the null id, which git reads as a deletion,
+the id must name a commit, not a tag or a tree the store's objects hold,
+and the branch must be one `branch_name` admits, which refuses `+`, `:`
+and `-` at its start, and not begin `refs/`. A forced push carries
+`--force-with-lease=refs/heads/<branch>:<expected>`, so it lands only
+while the remote still names the id the human saw; an unforced one is a
+fast-forward or the remote refuses it. A branch absent when the push was
+staged has no id to expect, so a forced push to it is sent unforced: one
+made meanwhile can then only be fast-forwarded. The answer, on success
+or refusal, is git's status line and the first 4 KiB of what git and the
+remote said on standard error, a credential helper's or ssh's words
+included, made visible; an exit of 1 is the remote's refusal, any other
+a failure to push.
+
 ## 10. Network policy
 
 A workspace has one of three network policies, shown in the status row:
