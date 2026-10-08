@@ -340,6 +340,9 @@ pub struct Session {
     /// run is handled first.
     schedules: crate::schedule::Schedules,
     next_fire: Option<u64>,
+    /// The person's commands' directory, beside the configuration
+    /// (DESIGN.md §15).
+    commands: Option<PathBuf>,
     /// The background store fetches (DESIGN.md §7, Keeping current):
     /// how often, when the next is due, the remotes whose fetch has not
     /// answered yet, and each base's commit as last fetched.
@@ -396,12 +399,24 @@ impl Session {
                     Ok(said) => self.app.template_saved(said),
                     Err(why) => self.app.template_refused(why),
                 },
-                Request::Send(text) => {
-                    if let Err(e) = self.supervisor.send(text.clone()) {
-                        self.app.restore(&text, e);
+                Request::Send(text) => self.send_message(text),
+                Request::Command { name, args, typed } => {
+                    let expanded = match &self.commands {
+                        Some(dir) => crate::commands::expand(dir, &name, &args, crate::protocol::MAX_TEXT),
+                        None => Ok(None),
+                    };
+                    match expanded {
+                        Ok(text) => self.send_message(text.unwrap_or(typed)),
+                        Err(why) => self.app.restore(&typed, why),
                     }
-                    self.app.set_queued(self.supervisor.queued());
                 }
+                Request::Commands => match self.commands.as_deref().map(crate::commands::list) {
+                    Some(Ok((listed, more))) => self.app.show_commands(&listed, more),
+                    Some(Err(why)) => self.app.note(why),
+                    None => self.app.note(
+                        "neither XDG_CONFIG_HOME nor HOME is an absolute path, so there are no commands",
+                    ),
+                },
                 Request::Retry => {
                     if let Err(e) = self.supervisor.retry() {
                         self.app.note(e);
@@ -1640,6 +1655,15 @@ impl Session {
             .answer(from, &Down::Scheduled { id: ask, answer });
     }
 
+    /// The person's message, to the open conversation, put back in the
+    /// composer when it cannot go.
+    fn send_message(&mut self, text: String) {
+        if let Err(e) = self.supervisor.send(text.clone()) {
+            self.app.restore(&text, e);
+        }
+        self.app.set_queued(self.supervisor.queued());
+    }
+
     /// The composer's schedule commands (DESIGN.md §3).
     fn schedule(&mut self, command: crate::schedule::Command) {
         use crate::schedule::Command;
@@ -2646,6 +2670,11 @@ pub fn run(
         removals: Vec::new(),
         schedules,
         next_fire: Some(0),
+        commands: crate::config::path(
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("HOME"),
+        )
+        .and_then(|file| file.parent().map(|dir| dir.join(crate::commands::DIR))),
         fetch_interval: config.fetch_interval(),
         next_refresh: Instant::now(),
         refreshing: Vec::new(),

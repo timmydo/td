@@ -674,11 +674,12 @@ that would never fire, before the person is asked. Allowed, the
 conversation asks the window, which keeps the schedules, to make it,
 made by the asking conversation; the window refuses an unknown or
 archived receiver and, whatever the conversation checked, a text the
-card could not show whole, says the schedule to the person with how to remove
-it, and answers with its id and next times. An answer lost is said as
-unknown, with `schedules` named to find out for the caller's own and,
-as `schedules` lists only those, the person's `/schedules` for another. `schedules` lists, and
-`cancel_schedule` cancels by its exact id, only the schedules
+card could not show whole, says the schedule to the person with how to
+remove it, and answers with its id and next times. An answer lost is
+said as unknown, with `schedules` named to find out for the caller's
+own and, as `schedules` lists only those, the person's `/schedules`
+for another. `schedules` lists, and `cancel_schedule` cancels by its
+exact id, only the schedules
 delivering to the caller, whoever made them, with no card: neither
 reaches outside the caller, and a cancellation is said to the person.
 The approval stored with a schedule is its record itself: only the
@@ -5699,7 +5700,8 @@ nothing is asked.
 composer, `/compact` followed by an optional focus ("keep the failing test
 names") that is added to the summary request, or from a button. Neither
 the model nor another conversation can compact a conversation. The
-composer's other commands are the schedules' (§3).
+composer's other commands are the schedules' (§3) and the person's own
+(§15).
 
 **Failure is visible.** If the summary request fails, or the compacted
 view still exceeds the threshold, the turn stops and says why; nothing is
@@ -5838,6 +5840,29 @@ no `..` and no control character; increment 11 prepares them.
 `template.shared`. `network` is `off`, `allowlist` or `open`, and any
 other key is refused by name.
 
+**As built (commands).** The person's commands are files `NAME.md` in
+the `commands` directory beside the configuration file, a place no jail
+binds (§8), so their text is the person's. A name is 1 to 32 lowercase
+ASCII letters, digits and `-`, starting with a letter; the composer's
+own commands (`/commands`, `/compact`, `/schedule`, `/schedules`,
+`/unschedule`) are never looked up. `/NAME ARGS` in the composer asks
+the window, which reads the file when it is sent: a regular file of its
+own in a directory of its own, never through a link, whose target could
+be a place a workspace writes, opened without blocking, so a FIFO
+cannot hang the window, and at most a message's 128 KiB of UTF-8. Its
+text, trailing space trimmed, with every `$ARGUMENTS` replaced by the
+arguments, or, with none in it, the arguments after a blank line, its
+length reckoned before it is built and not blank, goes to the open
+conversation as the person's message, exactly as one typed, and is shown and logged as
+that text. One that cannot be read, is too long with its arguments or
+comes to nothing is said, and what was typed put back in the composer. With no such file the text goes as
+typed, so a message that merely starts with a slash and a word, `/tmp
+is full`, still reaches the model. `/commands` lists them over the open
+conversation, the first 128 by name, each with its first line that is
+not blank in its first 4 KiB, cut to 120 characters, and how many more
+there are; a file named as one of the composer's own commands is listed
+as never used.
+
 ## 16. Prior art: opencode
 
 opencode is the open agent closest to td-agent's shape, with
@@ -5864,7 +5889,8 @@ kind. td-agent's position on its features:
 | GitHub Actions app, server mode, ACP | not adopted: hosted runners, a listening socket, a second frontend |
 | JS plugins and code-mode `execute` | not adopted: no embedded runtime |
 | LSP diagnostics and formatters after edits | not adopted for now; opencode itself turned both off by default |
-| Skills and custom commands | later, as plain files read through the tool host |
+| Custom commands | adopted, as the person's files beside the configuration (§15) |
+| Skills | later, as plain files |
 | MCP | later (§12) |
 
 ## 17. Testing
@@ -6644,9 +6670,10 @@ in parallel with it.
 
 After these: resource limits (§8), a loopback shared by
 a conversation's instances (§19), child conversations within a
-workspace, skills and custom commands, the MCP client, moving a
+workspace, skills, the MCP client, moving a
 conversation between workspaces, and a native Anthropic Messages
-dialect. `web_fetch`, `question` and schedules are built (§3, §12).
+dialect. `web_fetch`, `question`, schedules and the person's commands
+are built (§3, §12, §15).
 
 ## 19. Open questions
 

@@ -39,6 +39,7 @@ pub mod card;
 pub mod chooser;
 pub mod classifier;
 pub mod client;
+pub mod commands;
 pub mod compact;
 pub mod config;
 pub mod confirm;

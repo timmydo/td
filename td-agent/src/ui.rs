@@ -357,6 +357,16 @@ pub enum Request {
     Compact(Option<String>),
     /// A schedule command from the composer (DESIGN.md §3).
     Schedule(crate::schedule::Command),
+    /// The person's command `name` with its arguments, sent as their
+    /// message, or `typed` as it is when there is no such command
+    /// (DESIGN.md §15).
+    Command {
+        name: String,
+        args: String,
+        typed: String,
+    },
+    /// List the person's commands.
+    Commands,
     /// The human's answer to `conversation`'s cold-resume card for turn
     /// `turn` (DESIGN.md §14).
     Resume {
@@ -3310,6 +3320,23 @@ impl App {
             }
             return;
         }
+        // The person's commands (DESIGN.md §15): the window reads the
+        // file, and sends the text as typed when there is none.
+        let command = crate::commands::typed(&text);
+        match &command {
+            Some(Err(why)) => {
+                self.note(why.clone());
+                return;
+            }
+            Some(Ok(crate::commands::Typed::List)) => {
+                self.composer.fresh();
+                self.apply_focus();
+                self.requests.push(Request::Commands);
+                self.touch();
+                return;
+            }
+            _ => {}
+        }
         if self.active_failed() {
             self.note(
                 "the conversation's process failed; open it again (Return on its row) to retry",
@@ -3339,7 +3366,14 @@ impl App {
         }
         self.composer.fresh();
         self.apply_focus();
-        self.requests.push(Request::Send(text));
+        self.requests.push(match command {
+            Some(Ok(crate::commands::Typed::Run { name, args })) => Request::Command {
+                name,
+                args,
+                typed: text,
+            },
+            _ => Request::Send(text),
+        });
         self.touch();
     }
 
@@ -3810,8 +3844,41 @@ impl App {
     /// The schedules, listed read-only over the open conversation as its
     /// process output is; with none open, said as notes.
     pub fn show_schedules(&mut self, entries: &[(String, String)]) {
+        self.show_listing(
+            entries,
+            "there are no schedules",
+            format!("{} schedules; /unschedule ID removes one", entries.len()),
+        );
+    }
+
+    /// The person's commands, by name with their first lines (DESIGN.md
+    /// §15).
+    pub fn show_commands(&mut self, commands: &[(String, String)], more: usize) {
+        let mut entries: Vec<(String, String)> = commands
+            .iter()
+            .map(|(name, first)| (format!("/{name}"), first.clone()))
+            .collect();
+        if more > 0 {
+            entries.push((
+                format!("{more} more"),
+                "not listed; the first by name are".into(),
+            ));
+        }
+        self.show_listing(
+            &entries,
+            "there are no commands: each is a file NAME.md in the commands directory beside td-agent's configuration",
+            format!(
+                "{} commands; /NAME ARGS sends one's text, ARGS in place of $ARGUMENTS",
+                entries.len()
+            ),
+        );
+    }
+
+    /// A listing over the open conversation, read-only, or as notes
+    /// when none is open.
+    fn show_listing(&mut self, entries: &[(String, String)], none: &str, title: String) {
         if entries.is_empty() {
-            self.note("there are no schedules");
+            self.note(none);
             return;
         }
         let Some(id) = self.active.clone() else {
@@ -3820,13 +3887,7 @@ impl App {
             }
             return;
         };
-        match crate::notes::Panel::output(
-            self.surface,
-            body(self.surface),
-            id,
-            format!("{} schedules; /unschedule ID removes one", entries.len()),
-            entries,
-        ) {
+        match crate::notes::Panel::output(self.surface, body(self.surface), id, title, entries) {
             Ok(panel) => {
                 self.notes = Some(panel);
                 self.apply_focus();
@@ -5721,7 +5782,15 @@ pub mod tests {
         assert_eq!(app.take_requests(), [Request::Compact(None)]);
         assert!(app.composer.insert("/compacting").unwrap());
         key(&mut app, "Return");
-        assert_eq!(app.take_requests(), [Request::Send("/compacting".into())]);
+        // Not `/compact`: a command of the person's, or sent as typed.
+        assert_eq!(
+            app.take_requests(),
+            [Request::Command {
+                name: "compacting".into(),
+                args: String::new(),
+                typed: "/compacting".into(),
+            }]
+        );
         let long = format!("/compact {}", "f".repeat(crate::compact::FOCUS_BYTES + 1));
         assert!(app.composer.insert(&long).unwrap());
         key(&mut app, "Return");
@@ -5766,6 +5835,47 @@ pub mod tests {
         assert!(app.log.last().is_some_and(|n| n.contains("outside 0 to 7")));
         // Listed over the open conversation, read-only.
         app.show_schedules(&[("schedule 0a1b2c3d".into(), "0 9 * * *\nto x".into())]);
+        assert!(app.notes.is_some());
+    }
+
+    /// `/NAME ARGS` asks the window for the person's command, which sends
+    /// the text as typed when there is none; `/commands` lists them.
+    #[test]
+    fn the_persons_commands_are_asked_of_the_window() {
+        let mut app = app();
+        app.add_row(row(9, 1));
+        app.set_active(id(9));
+        assert!(app.composer.insert("/review PR 12").unwrap());
+        key(&mut app, "Return");
+        assert_eq!(
+            app.take_requests(),
+            [Request::Command {
+                name: "review".into(),
+                args: "PR 12".into(),
+                typed: "/review PR 12".into(),
+            }]
+        );
+        assert_eq!(app.composed(), "");
+        assert!(app.composer.insert("/usr/bin is gone").unwrap());
+        key(&mut app, "Return");
+        assert_eq!(
+            app.take_requests(),
+            [Request::Send("/usr/bin is gone".into())]
+        );
+        assert!(app.composer.insert("/commands").unwrap());
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [Request::Commands]);
+        assert!(app.composer.insert("/commands all").unwrap());
+        key(&mut app, "Return");
+        assert!(app.take_requests().is_empty());
+        assert_eq!(app.composed(), "/commands all");
+        app.composer.fresh();
+        app.show_commands(&[], 0);
+        assert!(app
+            .log
+            .last()
+            .is_some_and(|n| n.contains("there are no commands")));
+        app.show_commands(&[("review".into(), "Review the PR.".into())], 1);
         assert!(app.notes.is_some());
     }
 
