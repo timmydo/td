@@ -1,7 +1,7 @@
 //! Preserve retained queue history against the pre-transaction rows.
 use super::*;
 use crate::format::row::{
-    FailureReason, NotificationState, RecipientRow, RecipientState, SubmissionRow,
+    AttemptPhase, FailureReason, NotificationState, RecipientRow, RecipientState, SubmissionRow,
 };
 
 pub(super) fn validate(
@@ -70,9 +70,19 @@ fn recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
         && terminal_recipient(old, next)
         && (!old.uncertain || next.uncertain)
         && if next.attempt_count == old.attempt_count {
-            next.attempt == old.attempt && next.last_attempt_at == old.last_attempt_at
+            (next.state != RecipientState::InFlight || old.state == RecipientState::InFlight)
+                && next.attempt == old.attempt
+                && next.last_attempt_at == old.last_attempt_at
         } else {
-            old.attempt_count.checked_add(1) == Some(next.attempt_count)
+            let eligible = matches!(
+                old.state,
+                RecipientState::Queued | RecipientState::RetryWait
+            ) || (old.state == RecipientState::OutcomeUnknown
+                && old.next_attempt_at.is_some());
+            eligible
+                && next.state == RecipientState::InFlight
+                && next.phase == AttemptPhase::Prepared
+                && old.attempt_count.checked_add(1) == Some(next.attempt_count)
                 && next.attempt != old.attempt
         }
 }

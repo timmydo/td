@@ -639,15 +639,21 @@ fn seed_terminal(store: &IndexStore<'_>, state: RecipientState, encoded: bool) {
     seed_terminal_row(store, terminal(state), encoded);
 }
 fn seed_terminal_row(store: &IndexStore<'_>, row: RecipientRow<'_>, encoded: bool) {
-    create_with(store, 2, &[0, 1], encoded).unwrap();
     let state = row.state;
-    let row = encode(Row::Recipient(row));
     let first = recipient_key(0);
     let second = recipient_key(1);
     let mut sub = submission(2);
     if state == RecipientState::Canceled {
         sub.completed_at = Some(1);
     }
+    let other = if state == RecipientState::Canceled {
+        row
+    } else {
+        queued()
+    };
+    create_group(store, sub, &[(0, row), (1, other)], encoded).unwrap();
+    // Keep the existing snapshot sequence with an identical group PUT.
+    let row = encode(Row::Recipient(row));
     let sub_bytes = encode(Row::Submission(sub));
     let mut operations = vec![
         Operation::put(Table::Recipients, &first, &row).unwrap(),
@@ -1113,11 +1119,34 @@ fn final_attempt_put_controls_repeated_keys_against_the_original_row() {
         chained.last_attempt_at = Some(3);
         let chained_bytes = encode(Row::Recipient(chained));
         let chained_put = Operation::put(Table::Recipients, &key, &chained_bytes).unwrap();
-        rejected(apply(&store, 1, &[good, chained_put], encoded));
+        let mut retry = valid;
+        retry.state = RecipientState::RetryWait;
+        retry.phase = AttemptPhase::Final;
+        retry.reason = FailureReason::Network;
+        retry.next_attempt_at = Some(3);
+        let retry_bytes = encode(Row::Recipient(retry));
+        let retry_put = Operation::put(Table::Recipients, &key, &retry_bytes).unwrap();
+        rejected(apply(&store, 1, &[good, retry_put, chained_put], encoded));
         rejected(apply(&store, 1, &[delete, bad], encoded));
         assert_eq!(
             apply(&store, 1, &[bad, delete, good], encoded),
             Ok(Sequence::from_u64(2))
+        );
+        let separate_fixture = Fixture::new();
+        let mut separate_root = separate_fixture.locked();
+        let separate = open(&mut separate_root);
+        create_with_recipient(&separate, 1, &[0], original, encoded).unwrap();
+        assert_eq!(
+            apply(&separate, 1, &[good], encoded),
+            Ok(Sequence::from_u64(2))
+        );
+        assert_eq!(
+            apply(&separate, 2, &[retry_put], encoded),
+            Ok(Sequence::from_u64(3))
+        );
+        assert_eq!(
+            apply(&separate, 3, &[chained_put], encoded),
+            Ok(Sequence::from_u64(4))
         );
     }
 }
@@ -1171,4 +1200,263 @@ fn the_last_attempt_count_is_usable_without_wrapping_or_replacing_its_id() {
             Ok(Sequence::from_u64(3))
         );
     }
+}
+
+fn assert_fresh_group(
+    sub: SubmissionRow<'_>,
+    recipients: &[(u32, RecipientRow<'_>)],
+    encoded: bool,
+) {
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let store = open(&mut root);
+    assert_eq!(
+        create_group(&store, sub, recipients, encoded),
+        Ok(Sequence::from_u64(1))
+    );
+}
+#[test]
+fn a_new_attempt_must_first_commit_the_prepared_phase() {
+    let mut accepted = Vec::new();
+    for encoded in [false, true] {
+        for state in [
+            RecipientState::Queued,
+            RecipientState::RetryWait,
+            RecipientState::OutcomeUnknown,
+        ] {
+            for variant in 0..7 {
+                if state == RecipientState::OutcomeUnknown && matches!(variant, 2 | 4 | 6) {
+                    continue;
+                }
+                let fixture = Fixture::new();
+                let mut root = fixture.locked();
+                let store = open(&mut root);
+                let original = pending_attempt(state);
+                create_with_recipient(&store, 2, &[0, 1], original, encoded).unwrap();
+                let mut next = next_attempt(original);
+                match variant {
+                    0 => {
+                        next.phase = AttemptPhase::Body;
+                        next.rcpt_reply = Some("250 recipient accepted");
+                    }
+                    1 => {
+                        next.phase = AttemptPhase::AcceptancePossible;
+                        next.rcpt_reply = Some("250 recipient accepted");
+                    }
+                    2 => {
+                        next.state = RecipientState::RetryWait;
+                        next.phase = AttemptPhase::Final;
+                        next.reason = FailureReason::Network;
+                        next.next_attempt_at = Some(3);
+                    }
+                    3 => {
+                        next.state = RecipientState::Accepted;
+                        next.phase = AttemptPhase::Final;
+                        next.rcpt_reply = Some("250 recipient accepted");
+                        next.data_reply = Some("250 delivered");
+                    }
+                    4 => {
+                        next.state = RecipientState::Failed;
+                        next.phase = AttemptPhase::Final;
+                        next.reason = FailureReason::Expired;
+                    }
+                    5 => {
+                        next.state = RecipientState::OutcomeUnknown;
+                        next.phase = AttemptPhase::Final;
+                        next.uncertain = true;
+                        next.reason = FailureReason::Network;
+                        next.next_attempt_at = Some(3);
+                    }
+                    _ => {
+                        next.state = RecipientState::Canceled;
+                        next.phase = AttemptPhase::Final;
+                        next.reason = FailureReason::Canceled;
+                    }
+                }
+                let bytes = encode(Row::Recipient(next));
+                let first = recipient_key(0);
+                let second = recipient_key(1);
+                let mut operations =
+                    vec![Operation::put(Table::Recipients, &first, &bytes).unwrap()];
+                let mut sub = submission(2);
+                let other = if variant == 6 {
+                    sub.completed_at = Some(3);
+                    next
+                } else {
+                    original
+                };
+                assert_fresh_group(sub, &[(0, next), (1, other)], encoded);
+                let sub_bytes = encode(Row::Submission(sub));
+                if variant == 6 {
+                    operations.push(Operation::put(Table::Recipients, &second, &bytes).unwrap());
+                    operations.push(
+                        Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes)
+                            .unwrap(),
+                    );
+                }
+                let result = apply(&store, 1, &operations, encoded);
+                if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                    accepted.push((encoded, state, variant, result));
+                    continue;
+                }
+                let valid = next_attempt(original);
+                let valid_bytes = encode(Row::Recipient(valid));
+                assert_eq!(
+                    apply(
+                        &store,
+                        1,
+                        &[Operation::put(Table::Recipients, &first, &valid_bytes).unwrap()],
+                        encoded
+                    ),
+                    Ok(Sequence::from_u64(2))
+                );
+                let mut view = store.view(ACCOUNT, deadline()).unwrap();
+                let mut scratch = [0; 65536];
+                assert_eq!(
+                    view.get(Key::Recipient(SUBMISSION, 0), &mut scratch)
+                        .unwrap()
+                        .unwrap()
+                        .0,
+                    Row::Recipient(valid)
+                );
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "attempt skipped Prepared: {accepted:?}"
+    );
+}
+#[test]
+fn an_in_flight_attempt_cannot_be_replaced_by_a_fresh_attempt() {
+    let mut accepted = Vec::new();
+    for encoded in [false, true] {
+        for phase in [
+            AttemptPhase::Prepared,
+            AttemptPhase::Body,
+            AttemptPhase::AcceptancePossible,
+        ] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = open(&mut root);
+            let mut original = pending_attempt(RecipientState::RetryWait);
+            original.state = RecipientState::InFlight;
+            original.phase = phase;
+            original.reason = FailureReason::None;
+            original.next_attempt_at = None;
+            original.rcpt_reply = Some("250 recipient accepted");
+            create_with_recipient(&store, 1, &[0], original, encoded).unwrap();
+            let next = next_attempt(original);
+            let bytes = encode(Row::Recipient(next));
+            let key = recipient_key(0);
+            assert_fresh_group(submission(1), &[(0, next)], encoded);
+            let result = apply(
+                &store,
+                1,
+                &[Operation::put(Table::Recipients, &key, &bytes).unwrap()],
+                encoded,
+            );
+            if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                accepted.push((encoded, phase, result));
+                continue;
+            }
+            let mut retained = original;
+            retained.diagnostic = "current attempt still owns responsibility";
+            let retained_bytes = encode(Row::Recipient(retained));
+            assert_eq!(
+                apply(
+                    &store,
+                    1,
+                    &[Operation::put(Table::Recipients, &key, &retained_bytes).unwrap()],
+                    encoded
+                ),
+                Ok(Sequence::from_u64(2))
+            );
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "active attempt was replaced: {accepted:?}"
+    );
+}
+#[test]
+fn a_new_attempt_cannot_combine_prepared_and_body_in_one_commit() {
+    for encoded in [false, true] {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = open(&mut root);
+        create_with(&store, 1, &[0], encoded).unwrap();
+        let key = recipient_key(0);
+        let prepared = next_attempt(queued());
+        let prepared_bytes = encode(Row::Recipient(prepared));
+        let good = Operation::put(Table::Recipients, &key, &prepared_bytes).unwrap();
+        let mut body = prepared;
+        body.phase = AttemptPhase::Body;
+        body.rcpt_reply = Some("250 recipient accepted");
+        assert_fresh_group(submission(1), &[(0, body)], encoded);
+        let body_bytes = encode(Row::Recipient(body));
+        let bad = Operation::put(Table::Recipients, &key, &body_bytes).unwrap();
+        let delete = Operation::delete(Table::Recipients, &key).unwrap();
+        rejected(apply(&store, 1, &[good, bad], encoded));
+        rejected(apply(&store, 1, &[delete, bad], encoded));
+        assert_eq!(
+            apply(&store, 1, &[bad, delete, good], encoded),
+            Ok(Sequence::from_u64(2))
+        );
+        assert_eq!(apply(&store, 2, &[bad], encoded), Ok(Sequence::from_u64(3)));
+    }
+}
+
+#[test]
+fn pending_recipients_cannot_reenter_in_flight_with_the_previous_attempt() {
+    let mut accepted = Vec::new();
+    for encoded in [false, true] {
+        for state in [RecipientState::RetryWait, RecipientState::OutcomeUnknown] {
+            for phase in [
+                AttemptPhase::Prepared,
+                AttemptPhase::Body,
+                AttemptPhase::AcceptancePossible,
+            ] {
+                let fixture = Fixture::new();
+                let mut root = fixture.locked();
+                let store = open(&mut root);
+                let original = pending_attempt(state);
+                create_with_recipient(&store, 1, &[0], original, encoded).unwrap();
+                let mut next = next_attempt(original);
+                next.attempt_count = original.attempt_count;
+                next.attempt = original.attempt;
+                next.last_attempt_at = original.last_attempt_at;
+                next.phase = phase;
+                next.rcpt_reply = Some("250 recipient accepted");
+                let key = recipient_key(0);
+                let bytes = encode(Row::Recipient(next));
+                assert_fresh_group(submission(1), &[(0, next)], encoded);
+                let result = apply(
+                    &store,
+                    1,
+                    &[Operation::put(Table::Recipients, &key, &bytes).unwrap()],
+                    encoded,
+                );
+                if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                    accepted.push((encoded, state, phase, result));
+                    continue;
+                }
+                let valid = next_attempt(original);
+                let valid_bytes = encode(Row::Recipient(valid));
+                assert_eq!(
+                    apply(
+                        &store,
+                        1,
+                        &[Operation::put(Table::Recipients, &key, &valid_bytes).unwrap()],
+                        encoded
+                    ),
+                    Ok(Sequence::from_u64(2))
+                );
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "previous attempt was revived: {accepted:?}"
+    );
 }

@@ -151,9 +151,20 @@ historical notificationEmail, even after the visible Email is deleted.
 Cancellation preserves either retained notice state. Recipient address is
 immutable and uncertainty cannot clear. A changed attemptCount must be exactly
 one checked increment, with an attempt ID different from the immediately
-previous row. When attemptCount is unchanged, attempt ID and lastAttemptAt
-must also stay unchanged. Accepted and Canceled recipients remain in their
-respective states.
+previous row. Its original state must be Queued, RetryWait or OutcomeUnknown
+with a next attempt, and its final state must be InFlight/Prepared. An active
+InFlight attempt cannot be replaced by incrementing the count. Prepared and
+a later phase cannot be combined into one count-advancing transaction: the
+final PUT is compared with the original row. This constrains stored history;
+it does not prove when the caller performs transport I/O.
+When attemptCount is unchanged, attempt ID and lastAttemptAt stay unchanged.
+An InFlight final row then also requires an original InFlight row: re-entry
+into InFlight cannot reuse a pending recipient's previous count/ID/time.
+Same-count pending-to-outcome changes, such as RetryWait becoming Accepted
+or replacing retained replies without an active attempt, are still accepted
+by this core when the final group is otherwise valid. They remain explicit
+coordinator-validation gaps, not proof of a fenced SMTP result.
+Accepted and Canceled recipients remain in their respective states.
 Failed recipients remain Failed or become Canceled as part of a valid
 whole-submission cancellation. OutcomeUnknown without a next attempt remains
 OutcomeUnknown without a next attempt. All these terminal rows retain their
@@ -178,7 +189,9 @@ that every store/host can finish within its deadline.
 This preserves named history fields, not the full transition graph. The
 counter/ID comparison does not authorize dispatch or prove random/global ID
 freshness: the service must obtain a fresh ID from Entropy, reject collisions,
-authorize the source state and time, and persist Prepared before dispatch.
+authorize dispatch timing and the worker, and wait for the Prepared commit
+before transport I/O. The stored source/destination shape alone does not
+establish any of those permissions or transport ordering.
 The core compares only the immediately prior ID; it retains no AttemptId
 registry and does not establish worker fences. Counter exhaustion still
 requires service pause and operator intervention. Actual notice creation,

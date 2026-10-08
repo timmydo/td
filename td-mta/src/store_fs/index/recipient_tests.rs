@@ -109,6 +109,18 @@ fn create_with_recipient(
     recipient: RecipientRow<'_>,
     encoded: bool,
 ) -> Result<Sequence, CommitError> {
+    let recipients: Vec<_> = ordinals
+        .iter()
+        .map(|&ordinal| (ordinal, recipient))
+        .collect();
+    create_group(store, submission(count), &recipients, encoded)
+}
+fn create_group(
+    store: &IndexStore<'_>,
+    submission: SubmissionRow<'_>,
+    recipients: &[(u32, RecipientRow<'_>)],
+    encoded: bool,
+) -> Result<Sequence, CommitError> {
     let body = b"a prepared message";
     let mut digest = td_crypto::Provider.sha256().unwrap();
     digest.update(body).unwrap();
@@ -118,9 +130,15 @@ fn create_with_recipient(
         digest: digest.finish().unwrap(),
         created_at: 0,
     }));
-    let sub = encode(Row::Submission(submission(count)));
-    let recipient = encode(Row::Recipient(recipient));
-    let keys: Vec<_> = ordinals.iter().copied().map(recipient_key).collect();
+    let sub = encode(Row::Submission(submission));
+    let rows: Vec<_> = recipients
+        .iter()
+        .map(|(_, row)| encode(Row::Recipient(*row)))
+        .collect();
+    let keys: Vec<_> = recipients
+        .iter()
+        .map(|(ordinal, _)| recipient_key(*ordinal))
+        .collect();
     let mut operations = vec![
         Operation::put(Table::Blobs, BLOB.as_bytes(), &blob).unwrap(),
         Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub).unwrap(),
@@ -132,7 +150,8 @@ fn create_with_recipient(
     ];
     operations.extend(
         keys.iter()
-            .map(|key| Operation::put(Table::Recipients, key, &recipient).unwrap()),
+            .zip(&rows)
+            .map(|(key, row)| Operation::put(Table::Recipients, key, row).unwrap()),
     );
     let mut body = body.as_slice();
     let mut sources = [BlobSource {
@@ -306,7 +325,6 @@ fn accepted_reply_and_failure_notice_rules_reuse_the_queue_validator() {
     let fixture = Fixture::new();
     let mut root = fixture.locked();
     let store = open(&mut root);
-    create(&store, 1, &[0]).unwrap();
     let key = recipient_key(0);
     let mut accepted = queued();
     accepted.state = RecipientState::Accepted;
@@ -317,6 +335,11 @@ fn accepted_reply_and_failure_notice_rules_reuse_the_queue_validator() {
     accepted.next_attempt_at = None;
     accepted.rcpt_reply = Some("250 recipient accepted");
     accepted.data_reply = Some("354 send body");
+    let mut in_flight = accepted;
+    in_flight.state = RecipientState::InFlight;
+    in_flight.phase = AttemptPhase::AcceptancePossible;
+    in_flight.data_reply = None;
+    create_with_recipient(&store, 1, &[0], in_flight, false).unwrap();
     let mut sub = submission(1);
     sub.completed_at = Some(2);
     let completed = encode(Row::Submission(sub));
