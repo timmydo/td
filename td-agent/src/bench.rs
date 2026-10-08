@@ -107,6 +107,24 @@ impl Bench {
                 new,
                 all,
             },
+            // Each file the patch changes that this conversation read or
+            // wrote, by the path as the patch spells it.
+            Call::Patch { patch, expected } if expected.is_empty() => {
+                let expected = crate::patch::parse(&patch)
+                    .map(|parsed| {
+                        parsed
+                            .existing()
+                            .into_iter()
+                            .filter_map(|path| {
+                                self.digests
+                                    .get(&key(path))
+                                    .map(|digest| (path.to_string(), digest.clone()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Call::Patch { patch, expected }
+            }
             other => other,
         }
     }
@@ -214,6 +232,17 @@ impl Bench {
         }
     }
 
+    /// Notes a patch's digests: each file it wrote with its digest now,
+    /// and each it deleted or moved away forgotten.
+    pub fn record_each(&mut self, digests: &[(String, Option<String>)]) {
+        for (path, digest) in digests {
+            match digest {
+                Some(digest) => self.digests.insert(key(path), digest.clone()),
+                None => self.digests.remove(&key(path)),
+            };
+        }
+    }
+
     /// The digests a conversation's log holds, as a process starting
     /// again takes them up: each result that kept one, of the call its
     /// assistant message made.
@@ -222,11 +251,16 @@ impl Bench {
             let Kind::ToolResult {
                 reply,
                 id,
-                digest: Some(digest),
+                digest,
+                digests,
                 error: false,
                 ..
             } = &event.kind
             else {
+                continue;
+            };
+            self.record_each(digests);
+            let Some(digest) = digest else {
                 continue;
             };
             // The log is in sequence order.
@@ -356,6 +390,7 @@ mod tests {
             error,
             kept: None,
             digest: digest.map(str::to_string),
+            digests: Vec::new(),
         };
         let events = [
             event(
@@ -402,5 +437,47 @@ mod tests {
         );
         // A failed call's is not taken up.
         assert_eq!(expected(bench.with_digest(edit("/w/b"))), None);
+
+        // A patch: it carries the digest of each file it changes that was
+        // read, and what it wrote and deleted is noted, here and from the
+        // log alike.
+        let patch = |text: &str| Call::Patch {
+            patch: text.into(),
+            expected: Vec::new(),
+        };
+        let changes = "*** Begin Patch\n*** Update File: /w/./a\n-y\n+z\n*** Delete File: /w/b\n*** Add File: /w/n\n+x\n*** End Patch\n";
+        assert_eq!(
+            bench.with_digest(patch(changes)),
+            Call::Patch {
+                patch: changes.into(),
+                expected: vec![("/w/./a".into(), "d2".into())],
+            }
+        );
+        let mut patched = Bench::default();
+        patched.record(&edit("/w/b"), Some("d0"));
+        let mut events = events.to_vec();
+        events.push(event(
+            9,
+            Kind::Assistant {
+                content: None,
+                reasoning: None,
+                details: None,
+                calls: vec![asked("p", "apply_patch", r#"{"input":"x"}"#)],
+                request: 8,
+                finish: "tool_calls".into(),
+                incomplete: false,
+            },
+        ));
+        let mut done = result(9, "p", None, false);
+        if let Kind::ToolResult { digests, .. } = &mut done {
+            *digests = vec![("/w/a".into(), Some("d3".into())), ("/w/b".into(), None)];
+        }
+        events.push(event(10, done));
+        patched.restore(&events);
+        assert_eq!(
+            expected(patched.with_digest(edit("/w/a"))).as_deref(),
+            Some("d3")
+        );
+        assert_eq!(expected(patched.with_digest(edit("/w/b"))), None);
     }
 }

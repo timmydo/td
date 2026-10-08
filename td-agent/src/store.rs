@@ -1497,6 +1497,9 @@ pub enum Kind {
         error: bool,
         kept: Option<String>,
         digest: Option<String>,
+        /// A patch's files, each with its digest now or none when it was
+        /// deleted or moved away; empty for every other call.
+        digests: Vec<(String, Option<String>)>,
     },
     /// A compaction (DESIGN.md §14): the tool results it pruned, sent as
     /// stubs from here on, and the summary it asks for, if any, of the
@@ -1713,6 +1716,7 @@ impl Event {
                 error,
                 kept,
                 digest,
+                digests,
             } => {
                 put("kind", Json::Str("tool_result".into()));
                 put("reply", Json::from(*reply));
@@ -1728,6 +1732,22 @@ impl Event {
                 }
                 if let Some(digest) = digest {
                     put("digest", Json::Str(digest.clone()));
+                }
+                if !digests.is_empty() {
+                    put(
+                        "digests",
+                        Json::Arr(
+                            digests
+                                .iter()
+                                .map(|(path, digest)| {
+                                    Json::Arr(vec![
+                                        Json::Str(path.clone()),
+                                        digest.clone().map_or(Json::Null, Json::Str),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    );
                 }
             }
             Kind::Todo { items, cleared } => {
@@ -1993,6 +2013,23 @@ impl Event {
                 error: flag("error")?,
                 kept: optional("kept")?,
                 digest: optional("digest")?,
+                // A log from before patches holds none.
+                digests: match value.get("digests") {
+                    None => Vec::new(),
+                    Some(list) => list
+                        .as_arr()
+                        .filter(|items| items.len() <= crate::patch::MAX_FILES.saturating_mul(2))
+                        .ok_or("a tool result's `digests` is not a bounded list")?
+                        .iter()
+                        .map(|item| match item.as_arr() {
+                            Some([Json::Str(path), Json::Str(digest)]) => {
+                                Ok((path.clone(), Some(digest.clone())))
+                            }
+                            Some([Json::Str(path), Json::Null]) => Ok((path.clone(), None)),
+                            _ => Err("a tool result's `digests` holds something not a [path, digest] pair"),
+                        })
+                        .collect::<Result<_, _>>()?,
+                },
             },
             Some("todo") => Kind::Todo {
                 items: value
@@ -2320,6 +2357,7 @@ impl Conversation {
                 error: true,
                 kept: None,
                 digest: None,
+                digests: Vec::new(),
             })?;
             if call != 0 {
                 load.interrupted.push(call);
@@ -3394,6 +3432,8 @@ pub mod tests {
                 error: false,
                 kept: None,
                 digest: None,
+                // A patch's, one file written and one gone.
+                digests: vec![("/w/a".into(), Some("d1".into())), ("/w/b".into(), None)],
             },
             Kind::ToolResult {
                 reply: 3,
@@ -3404,6 +3444,7 @@ pub mod tests {
                 error: true,
                 kept: None,
                 digest: None,
+                digests: Vec::new(),
             },
             Kind::Todo {
                 items: vec![TodoItem {
@@ -4040,6 +4081,7 @@ pub mod tests {
                     error: false,
                     kept: None,
                     digest: None,
+                    digests: Vec::new(),
                 })
                 .unwrap();
             conversation

@@ -116,7 +116,7 @@ fn the_jailed_tool_host_works_inside_its_policy() {
     }
 
     let file = tree.join("a.rs").display().to_string();
-    done(
+    let written = done(
         &mut client,
         Call::Write {
             path: file.clone(),
@@ -166,6 +166,39 @@ fn the_jailed_tool_host_works_inside_its_policy() {
     )
     .unwrap();
     assert!(found.text.contains("a.rs:1:fn old() {}"), "{}", found.text);
+
+    // A patch, in the jail: one file updated and one added, with the
+    // digests they leave; into the read-only shared directory, refused.
+    let added = tree.join("b.rs").display().to_string();
+    let patched = done(
+        &mut client,
+        Call::Patch {
+            patch: format!(
+                "*** Begin Patch\n*** Update File: {file}\n-fn old() {{}}\n+fn new() {{}}\n*** Add File: {added}\n+fn b() {{}}\n*** End Patch\n"
+            ),
+            expected: vec![(file.clone(), written.digest.clone().unwrap())],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tree.join("a.rs")).unwrap(),
+        "fn new() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tree.join("b.rs")).unwrap(),
+        "fn b() {}\n"
+    );
+    assert_eq!(patched.digests.len(), 2, "{patched:?}");
+    let into_shared = scratch.0.join("shared/new.txt").display().to_string();
+    let refused = done(
+        &mut client,
+        Call::Patch {
+            patch: format!("*** Begin Patch\n*** Add File: {into_shared}\n+x\n*** End Patch\n"),
+            expected: Vec::new(),
+        },
+    );
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(!scratch.0.join("shared/new.txt").exists());
 
     let inside = shell(
         &mut client,

@@ -471,7 +471,7 @@ conversation counts as a workspace of its own, a fork included. So:
   is the call's answer, telling the model not to reach the same result
   another way;
 - the conversation process enforces the decision, as it does for
-  `write_file`, `edit_file`, `sed` and `shell`. The window's post
+  `write_file`, `edit_file`, `apply_patch`, `sed` and `shell`. The window's post
   office checks every message again, whatever the sender checked: the
   receiver exists, it is not the sender, the size bounds, and at most
   16 undelivered;
@@ -4026,8 +4026,8 @@ stated only in chat can be lost to compaction, and a rule cannot.
 
 **As built (increment 13, a repository's rules).** `.td-agent/rules`
 holds one rule a line: `deny` or `ask`, then a tool the tool host runs
-(`read_file`, `write_file`, `edit_file`, `glob`, `grep`, `sed` or
-`shell`), `git_push` or `network`, then, for `shell`, the words of an
+(`read_file`, `write_file`, `edit_file`, `apply_patch`, `glob`, `grep`,
+`sed` or `shell`), `git_push` or `network`, then, for `shell`, the words of an
 argv prefix, parted by spaces or tabs, for `git_push` a remote and a
 branch, or the remote alone (As built (increment 14, rules for
 pushes)), and for `network` a destination as an allowlist writes it,
@@ -4345,7 +4345,8 @@ arguments go to the human whatever the table says, as opencode's
 
 **As built (increment 13, repetition).** The run is counted over the
 tools the tool host runs (`read_file`, `write_file`, `edit_file`,
-`glob`, `grep`, `sed` and `shell`), back through earlier replies. The
+`apply_patch`, `glob`, `grep`, `sed` and `shell`), back through earlier
+replies. The
 human's message ends it; another conversation's message, a
 notification or a process's end does not, so a loop a peer drives
 stays visible. A reply cut off before it was whole is passed over,
@@ -4541,6 +4542,19 @@ and git tools, as far as the workspace has what they act on.
   unique match, the Claude Code and `str_replace` design. It has the same
   read-before-write rule. A missing match or several matches is an error
   that says which and asks for more context. No fuzzy application.
+- **`apply_patch {input}`**: Codex's patch grammar as one string, for
+  models trained on it: `*** Begin Patch`, then files to add (`*** Add
+  File:`, `+` lines), delete (`*** Delete File:`) or update (`*** Update
+  File:`, an optional `*** Move to:`, then `@@` hunks of ` `, `-` and
+  `+` lines, `@@` optionally naming a line just above the change, `@@`
+  lines in a row narrowing in turn, and `*** End of File` putting the
+  hunk at the end), then `*** End Patch`. Each path is absolute.
+  Matching is exact, as `edit_file`'s is: each hunk's kept and removed
+  lines must appear exactly once after the hunk before it (and after its
+  `@@` line), so a patch never lands where its author did not look. A
+  file it updates, moves or deletes has `edit_file`'s read-before-write
+  rule; one it adds, or moves a file to, must not exist. Every file is
+  checked before any is written.
 - **`shell {command, timeout_ms?, workdir?, background?}`**: one `sh -c`
   per call, in a jail instance of its own, as mini-swe-agent and Claude
   Code run one process per call. The working directory defaults to the
@@ -4922,8 +4936,7 @@ the provider returned it as text. The stubs and summaries compaction
 writes name the sequence numbers they replace, so a model can recover
 what a summary dropped.
 
-Planned later, each its own increment: `apply_patch`, taking Codex's patch
-grammar as one string argument for models trained on it; `web_fetch`,
+Planned later, each its own increment: `web_fetch`,
 made by the conversation process through the fetch service as a network
 crossing; a `task` tool for summarizing child conversations within a
 workspace; and an MCP stdio client.
@@ -4996,7 +5009,52 @@ past the end are said. A write creates missing parent directories and
 writes the file in place, so its mode and links stay; it is not atomic.
 `edit_file` takes UTF-8 files of at most 8 MiB, counted as read, naming
 `sed` for others, and refuses an empty `old_string` and one equal to
-`new_string`. `glob` matches its relative pattern, at most 1 KiB with at
+`new_string`.
+
+**As built (apply_patch).** The conversation process parses the patch
+before it asks anything, so a patch the grammar refuses, or one naming
+a relative path, is answered with what was wrong (and on which line,
+where a line is to blame), and never reaches a card. The card has a
+line for each file saying what happens to it, deletions and moves
+first, so a long patch cannot hide one below its hunks, and then the
+patch. A patch names at most 64 files, a move's target included, each
+once: two spellings of one path (`/w/a`, `/w/./a`) are refused, and in
+the tool host so are two names of one file (a link). As models write
+it, a heredoc around the patch (`<<'EOF'` … `EOF`) and blank lines
+about it are dropped; a patch whose every ended line that is not empty
+ends `\r\n` loses the `\r`, its last line needing no end; and a blank
+line ending a hunk that does not match is tried again as the separator
+it usually is. Matching stays exact otherwise: a refusal says when the
+lines are there but for their whitespace. The call carries `expected`
+for each existing file it changes that this conversation read or
+wrote, by the path as the patch spells it, and the tool host answers
+with each file's digest now, or none for one deleted or moved away;
+the log keeps them beside the result (`digests`), so a later edit or
+patch of the same file needs no read again, and a process started
+again takes them up. Hunks apply in order, each after the one before;
+a hunk with no kept or removed lines adds at the end of the file, or
+after its `@@` line. A file whose every line ends `\r\n` is matched
+without the `\r` and keeps it; in any other file, and any other patch,
+a `\r` is part of its line. A file keeps whether it ended with a
+newline; an added one ends each line with one. A file it updates has
+`edit_file`'s bounds (UTF-8, 8 MiB), and its hunks apply to the very
+bytes whose digest was checked; a delete reads no text. The tool host
+holds its one mutation lock while it reads, checks and computes every
+file, opening each it changes in place for writing, so a read-only
+file or mount is found before anything lands, and then writes them in
+the patch's order. Adds and moves make their file exclusively, with
+missing directories. A move makes its target with its source's mode,
+less set-id and sticky bits, as a write in place would clear them,
+removes the source once the target is written, and takes the target
+back when anything after making it fails. A symbolic link is not moved
+or deleted (an update writes through it, as `edit_file` does). Whether
+a directory can be written, for a new file or a removed one, is found
+only when it is written: a write that fails after others landed is
+answered with which landed, and nothing later is changed. `apply_patch`
+acts (§11), runs in the long-lived file instance, may be named by a
+rule, and counts toward repetition. It can delete and move files, so a
+repository whose rules ask before `write_file` and `edit_file` names it
+too. `glob` matches its relative pattern, at most 1 KiB with at
 most 16 `{` groups, under `path`, or the first worktree: `*` and `?`
 within a segment, `[...]` with `!` or `^` negating and ranges, `**` for
 any number of segments, hidden ones included, and `{a,b}`, at most 64
@@ -6437,7 +6495,7 @@ in parallel with it.
 
 After these: resource limits (§8), schedules (§3), the `question` tool
 (§12), a loopback shared by a
-conversation's instances (§19), `web_fetch`, `apply_patch`, child
+conversation's instances (§19), `web_fetch`, child
 conversations within a workspace, skills and custom commands, the MCP
 client, moving a conversation between workspaces, and a native Anthropic
 Messages dialect.

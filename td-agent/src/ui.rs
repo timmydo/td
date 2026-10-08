@@ -6764,6 +6764,7 @@ pub mod tests {
                     error: true,
                     kept: None,
                     digest: None,
+                    digests: Vec::new(),
                 },
             ),
             0,

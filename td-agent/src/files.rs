@@ -524,6 +524,272 @@ pub fn edit(
     })
 }
 
+/// What `apply_patch` did: a line for each file, and each file's digest
+/// now, none for one deleted or moved away.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Patched {
+    pub said: Vec<String>,
+    pub digests: Vec<(String, Option<String>)>,
+}
+
+/// One file's change, checked and ready to land.
+enum Landing {
+    Add {
+        at: PathBuf,
+        text: String,
+    },
+    Delete {
+        at: PathBuf,
+    },
+    Update {
+        at: PathBuf,
+        text: String,
+    },
+    Move {
+        at: PathBuf,
+        to: PathBuf,
+        text: String,
+        mode: u32,
+    },
+}
+
+/// `apply_patch`: every file `patch` names, each resolved by `resolve`,
+/// checked before any is written (§12). A file it changes must be one
+/// this conversation read, unchanged since (`expected`, by the path as
+/// the patch spells it), and open for writing; one it adds, or moves a
+/// file to, must not exist; two names of one file are refused. Hunks
+/// match exactly (`patch::apply`). A write that fails after others
+/// landed says which did.
+pub fn patch(
+    patch: &crate::patch::Patch,
+    expected: &[(String, String)],
+    resolve: &dyn Fn(&str) -> Result<PathBuf, String>,
+) -> Result<Patched, String> {
+    use crate::patch::{self as grammar, Op};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let _held = MUTATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let expected_of = |path: &str| {
+        expected
+            .iter()
+            .find(|(named, _)| named == path)
+            .map(|(_, digest)| digest.as_str())
+    };
+    let absent = |at: &Path, shown: &str, what: &str| {
+        match fs::symlink_metadata(at) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(format!(
+            "{shown} exists; {what} makes a new file, so update it with *** Update File, or delete it first"
+        )),
+        Err(e) => Err(format!("{shown}: {e}")),
+    }
+    };
+    let bounded = |shown: &str, text: &str| {
+        if text.len() as u64 > MAX_EDIT_BYTES {
+            Err(format!(
+                "{shown} would be {} bytes, past apply_patch's {MAX_EDIT_BYTES}",
+                text.len()
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    // An existing file the patch changes: not a link it would move or
+    // remove, nor a second name of a file already named, and, for one
+    // changed in place, open for writing, so a read-only file or mount
+    // is found before anything lands. Removing a file needs its
+    // directory written instead, which is found when it is done.
+    let mut identities = std::collections::BTreeSet::new();
+    let mut existing = |at: &Path, shown: &str, in_place: bool| {
+        let meta = fs::symlink_metadata(at).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => format!("{shown} does not exist"),
+            _ => format!("{shown}: {e}"),
+        })?;
+        if meta.file_type().is_symlink() && !in_place {
+            return Err(format!(
+                "{shown} is a symbolic link; a patch moves or deletes a file, so change the link with shell"
+            ));
+        }
+        let meta = regular(at, shown, "apply_patch")?;
+        if !identities.insert((meta.dev(), meta.ino())) {
+            return Err(format!(
+                "{shown} is a second name of a file the patch already changes; a patch changes each file once"
+            ));
+        }
+        if in_place {
+            OpenOptions::new()
+                .write(true)
+                .custom_flags(O_NONBLOCK)
+                .open(at)
+                .map_err(|e| format!("{shown} cannot be written: {e}"))?;
+        }
+        Ok(meta)
+    };
+    // The file's text, as `edit` reads it: bounded, unchanged since this
+    // conversation's last read by the digest of the very bytes it gives,
+    // and UTF-8.
+    let text_of = |at: &Path, shown: &str, path: &str| -> Result<String, String> {
+        let (file, meta) = open_regular(at, shown, "apply_patch")?;
+        if meta.len() > MAX_EDIT_BYTES {
+            return Err(format!(
+                "{shown} is {} bytes, past apply_patch's {MAX_EDIT_BYTES}; change it with sed",
+                meta.len()
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_EDIT_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("{shown}: {e}"))?;
+        if bytes.len() as u64 > MAX_EDIT_BYTES {
+            return Err(format!(
+                "{shown} is past apply_patch's {MAX_EDIT_BYTES} bytes; change it with sed"
+            ));
+        }
+        unchanged(shown, &digest(&bytes), expected_of(path))?;
+        String::from_utf8(bytes)
+            .map_err(|_| format!("{shown} is not UTF-8 text; change it with sed"))
+    };
+    let mut landings = Vec::new();
+    for op in &patch.ops {
+        let path = op.path();
+        let at = resolve(path)?;
+        let shown = at.display().to_string();
+        landings.push(match op {
+            Op::Add { lines, .. } => {
+                absent(&at, &shown, "*** Add File")?;
+                let text = grammar::added(lines);
+                bounded(&shown, &text)?;
+                Landing::Add { at, text }
+            }
+            Op::Delete { .. } => {
+                existing(&at, &shown, false)?;
+                unchanged(&shown, &digest_file(&at)?, expected_of(path))?;
+                Landing::Delete { at }
+            }
+            Op::Update { to, hunks, .. } => {
+                let meta = existing(&at, &shown, to.is_none())?;
+                let text = grammar::apply(&shown, &text_of(&at, &shown, path)?, hunks)?;
+                bounded(&shown, &text)?;
+                match to {
+                    None => Landing::Update { at, text },
+                    Some(to) => {
+                        let to = resolve(to)?;
+                        absent(&to, &to.display().to_string(), "*** Move to")?;
+                        Landing::Move {
+                            at,
+                            to,
+                            text,
+                            // Not set-id or sticky on new content, as
+                            // a write in place would clear them.
+                            mode: meta.permissions().mode() & 0o777,
+                        }
+                    }
+                }
+            }
+        });
+    }
+    let mut patched = Patched::default();
+    let parent = |at: &Path| match at.parent() {
+        Some(parent) => {
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))
+        }
+        None => Ok(()),
+    };
+    for (op, landing) in patch.ops.iter().zip(landings) {
+        let landed = match &landing {
+            Landing::Add { at, text } => {
+                let shown = at.display().to_string();
+                parent(at).and_then(|()| put(at, &shown, text.as_bytes(), true))
+            }
+            Landing::Delete { at } => {
+                fs::remove_file(at).map_err(|e| format!("{}: {e}", at.display()))
+            }
+            Landing::Update { at, text } => {
+                put(at, &at.display().to_string(), text.as_bytes(), false)
+            }
+            Landing::Move { at, to, text, mode } => {
+                let shown = to.display().to_string();
+                parent(to).and_then(|()| {
+                    // Made with the source's mode, then given it past the
+                    // umask, so it is never wider than it ends.
+                    let made = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(*mode)
+                        .custom_flags(O_NONBLOCK)
+                        .open(to)
+                        .map_err(|e| format!("{shown}: {e}"))?;
+                    let moved = (&made)
+                        .write_all(text.as_bytes())
+                        .and_then(|()| fs::set_permissions(to, fs::Permissions::from_mode(*mode)))
+                        .map_err(|e| format!("{shown}: {e}"))
+                        .and_then(|()| {
+                            fs::remove_file(at).map_err(|e| format!("{}: {e}", at.display()))
+                        });
+                    // Not moved unless the source is gone: what was made
+                    // of the target is taken back.
+                    moved.map_err(|e| match fs::remove_file(to) {
+                        Ok(()) => format!("{e}; {shown} was not kept"),
+                        Err(left) => format!("{e}; {shown} was left as written ({left})"),
+                    })
+                })
+            }
+        };
+        if let Err(e) = landed {
+            return Err(if patched.said.is_empty() {
+                e
+            } else {
+                format!(
+                    "{e}; before it the patch {}, and no later file was changed",
+                    patched.said.join(", ")
+                )
+            });
+        }
+        let path = op.path().to_string();
+        match (op, landing) {
+            (Op::Add { lines, .. }, Landing::Add { text, .. }) => {
+                patched
+                    .said
+                    .push(format!("added {path} ({} lines)", lines.len()));
+                patched.digests.push((path, Some(digest(text.as_bytes()))));
+            }
+            (Op::Delete { .. }, _) => {
+                patched.said.push(format!("deleted {path}"));
+                patched.digests.push((path, None));
+            }
+            (Op::Update { to, hunks, .. }, landing) => {
+                let text = match landing {
+                    Landing::Update { text, .. } | Landing::Move { text, .. } => text,
+                    _ => String::new(),
+                };
+                let hunks = match hunks.len() {
+                    0 => String::new(),
+                    1 => " (1 hunk)".to_string(),
+                    n => format!(" ({n} hunks)"),
+                };
+                match to {
+                    Some(to) => {
+                        patched
+                            .said
+                            .push(format!("updated {path}{hunks} and moved it to {to}"));
+                        patched.digests.push((path, None));
+                        patched
+                            .digests
+                            .push((to.clone(), Some(digest(text.as_bytes()))));
+                    }
+                    None => {
+                        patched.said.push(format!("updated {path}{hunks}"));
+                        patched.digests.push((path, Some(digest(text.as_bytes()))));
+                    }
+                }
+            }
+            (Op::Add { .. }, _) => {}
+        }
+    }
+    Ok(patched)
+}
+
 /// `glob`: the files under `base` whose path relative to it matches
 /// `pattern`, sorted, at most `MAX_GLOB`. `*` and `?` match within a
 /// path segment, `**` any number of segments, `[...]` a class, and
@@ -896,6 +1162,226 @@ mod tests {
         assert!(write(&dir.0, "x", None)
             .unwrap_err()
             .contains("is a directory"));
+    }
+
+    /// `apply_patch` over real files: every file checked before any is
+    /// written, each changed one read first, an added one new, and the
+    /// digests it leaves the files' own.
+    #[test]
+    fn a_patch_checks_every_file_before_writing_any() {
+        let dir = Dir::new("patch");
+        let a = dir.file("a.rs", b"fn a() {}\nfn b() {}\n");
+        let b = dir.file("b.rs", b"one\ntwo\n");
+        let gone = dir.file("gone.txt", b"bye\n");
+        let shown = |p: &Path| p.display().to_string();
+        let resolve = |path: &str| Ok(PathBuf::from(path));
+        let seen_a = read(&a, None, None).unwrap().digest;
+        let seen_b = read(&b, None, None).unwrap().digest;
+        let seen_gone = read(&gone, None, None).unwrap().digest;
+        let text = format!(
+            "*** Begin Patch\n*** Update File: {}\n-fn a() {{}}\n+fn z() {{}}\n*** Update File: {}\n*** Move to: {}/moved/b.rs\n one\n-two\n+2\n*** Add File: {}/new.txt\n+hello\n*** Delete File: {}\n*** End Patch\n",
+            shown(&a),
+            shown(&b),
+            shown(&dir.0),
+            shown(&dir.0),
+            shown(&gone)
+        );
+        let parsed = crate::patch::parse(&text).unwrap();
+        let all = vec![
+            (shown(&a), seen_a.clone()),
+            (shown(&b), seen_b.clone()),
+            (shown(&gone), seen_gone.clone()),
+        ];
+        // b unread: nothing is written, a included.
+        let e = patch(&parsed, &all[..1], &resolve).unwrap_err();
+        assert!(e.contains("has not read it") && e.contains("b.rs"), "{e}");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "fn a() {}\nfn b() {}\n");
+        // A hunk that does not match leaves every file as it was.
+        let wrong = text.replace("-two", "-three");
+        let e = patch(&crate::patch::parse(&wrong).unwrap(), &all, &resolve).unwrap_err();
+        assert!(e.contains("were not found"), "{e}");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "fn a() {}\nfn b() {}\n");
+        assert!(gone.exists() && !dir.0.join("new.txt").exists());
+        let done = patch(&parsed, &all, &resolve).unwrap();
+        assert_eq!(fs::read_to_string(&a).unwrap(), "fn z() {}\nfn b() {}\n");
+        let moved = dir.0.join("moved/b.rs");
+        assert_eq!(fs::read_to_string(&moved).unwrap(), "one\n2\n");
+        assert!(!b.exists() && !gone.exists());
+        assert_eq!(
+            fs::read_to_string(dir.0.join("new.txt")).unwrap(),
+            "hello\n"
+        );
+        assert_eq!(
+            done.digests,
+            vec![
+                (shown(&a), Some(digest_file(&a).unwrap())),
+                (shown(&b), None),
+                (shown(&moved), Some(digest_file(&moved).unwrap())),
+                (
+                    format!("{}/new.txt", shown(&dir.0)),
+                    Some(digest_file(&dir.0.join("new.txt")).unwrap())
+                ),
+                (shown(&gone), None),
+            ]
+        );
+        assert_eq!(done.said.len(), 4, "{:?}", done.said);
+        // Adding a file that exists, or moving onto one, is refused; so is
+        // a stale digest.
+        let again = patch(
+            &crate::patch::parse(&format!(
+                "*** Begin Patch\n*** Add File: {}\n+x\n*** End Patch\n",
+                shown(&a)
+            ))
+            .unwrap(),
+            &[],
+            &resolve,
+        )
+        .unwrap_err();
+        assert!(again.contains("exists"), "{again}");
+        let stale = patch(
+            &crate::patch::parse(&format!(
+                "*** Begin Patch\n*** Update File: {}\n-fn b() {{}}\n+fn c() {{}}\n*** End Patch\n",
+                shown(&a)
+            ))
+            .unwrap(),
+            &[(shown(&a), seen_a)],
+            &resolve,
+        )
+        .unwrap_err();
+        assert!(stale.contains("changed since"), "{stale}");
+    }
+
+    /// A move keeps the file's mode and is taken back when its source
+    /// stays; a link is not moved or deleted; two names of one file, and a
+    /// file that cannot be written, are found before anything lands; a
+    /// delete reads no text.
+    #[test]
+    fn a_patch_keeps_modes_and_refuses_what_it_cannot_finish() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Dir::new("patch-edges");
+        let shown = |p: &Path| p.display().to_string();
+        let resolve = |path: &str| Ok(PathBuf::from(path));
+        let seen = |p: &Path| (shown(p), read(p, None, None).unwrap().digest);
+        let run = |text: String, expected: &[(String, String)]| {
+            patch(&crate::patch::parse(&text).unwrap(), expected, &resolve)
+        };
+
+        // Set-id bits are not carried to the new content.
+        let script = dir.file("run.sh", b"echo a\n");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o4750)).unwrap();
+        let to = dir.0.join("bin/run.sh");
+        run(
+            format!(
+                "*** Begin Patch\n*** Update File: {}\n*** Move to: {}\n-echo a\n+echo b\n*** End Patch\n",
+                shown(&script),
+                shown(&to)
+            ),
+            &[seen(&script)],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&to).unwrap().permissions().mode() & 0o7777,
+            0o750
+        );
+        assert_eq!(fs::read_to_string(&to).unwrap(), "echo b\n");
+
+        // A link is neither deleted nor moved; it is updated through, as
+        // edit_file writes.
+        let target = dir.file("target.txt", b"t\n");
+        let link = dir.0.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let e = run(
+            format!(
+                "*** Begin Patch\n*** Delete File: {}\n*** End Patch\n",
+                shown(&link)
+            ),
+            &[seen(&link)],
+        )
+        .unwrap_err();
+        assert!(e.contains("symbolic link"), "{e}");
+        // Two names of one file, by a link.
+        let e = run(
+            format!(
+                "*** Begin Patch\n*** Update File: {}\n-t\n+u\n*** Update File: {}\n-t\n+v\n*** End Patch\n",
+                shown(&target),
+                shown(&link)
+            ),
+            &[seen(&target), seen(&link)],
+        )
+        .unwrap_err();
+        assert!(e.contains("second name"), "{e}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "t\n");
+
+        // A file that cannot be written is found before the first lands.
+        let first = dir.file("first.txt", b"1\n");
+        let locked = dir.file("locked.txt", b"2\n");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o444)).unwrap();
+        let writable = fs::OpenOptions::new().write(true).open(&locked).is_ok();
+        if !writable {
+            let e = run(
+                format!(
+                    "*** Begin Patch\n*** Update File: {}\n-1\n+one\n*** Update File: {}\n-2\n+two\n*** End Patch\n",
+                    shown(&first),
+                    shown(&locked)
+                ),
+                &[seen(&first), seen(&locked)],
+            )
+            .unwrap_err();
+            assert!(e.contains("cannot be written"), "{e}");
+            assert_eq!(fs::read_to_string(&first).unwrap(), "1\n");
+        }
+
+        // A move whose source cannot be removed keeps no copy.
+        let fixed = dir.0.join("fixed");
+        fs::create_dir(&fixed).unwrap();
+        let held = fixed.join("held.txt");
+        fs::write(&held, "h\n").unwrap();
+        let expected = [seen(&held)];
+        fs::set_permissions(&fixed, fs::Permissions::from_mode(0o555)).unwrap();
+        // Root writes the directory anyway, and then there is nothing to see.
+        let removable = fs::File::create(fixed.join("probe")).is_ok();
+        let away = dir.0.join("away.txt");
+        if !removable {
+            let e = run(
+                format!(
+                    "*** Begin Patch\n*** Update File: {}\n*** Move to: {}\n-h\n+H\n*** End Patch\n",
+                    shown(&held),
+                    shown(&away)
+                ),
+                &expected,
+            )
+            .unwrap_err();
+            assert!(e.contains("was not kept"), "{e}");
+            assert!(!away.exists() && held.exists());
+        }
+        fs::set_permissions(&fixed, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A file read-only to its owner is deleted as `rm` would, its
+        // directory being writable.
+        let kept = dir.file("kept.txt", b"k\n");
+        fs::set_permissions(&kept, fs::Permissions::from_mode(0o444)).unwrap();
+        run(
+            format!(
+                "*** Begin Patch\n*** Delete File: {}\n*** End Patch\n",
+                shown(&kept)
+            ),
+            &[seen(&kept)],
+        )
+        .unwrap();
+        assert!(!kept.exists());
+
+        // A delete reads no text: a large or binary file goes too.
+        let binary = dir.file("blob.bin", b"\xff\x00\xfe");
+        let digest = digest_file(&binary).unwrap();
+        run(
+            format!(
+                "*** Begin Patch\n*** Delete File: {}\n*** End Patch\n",
+                shown(&binary)
+            ),
+            &[(shown(&binary), digest)],
+        )
+        .unwrap();
+        assert!(!binary.exists());
     }
 
     #[test]

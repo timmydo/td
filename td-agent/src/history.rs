@@ -634,6 +634,7 @@ mod tests {
                 error: false,
                 kept: None,
                 digest: None,
+                digests: Vec::new(),
             },
         )
     }

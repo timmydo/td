@@ -57,6 +57,7 @@ pub enum Tool {
     ReadFile,
     WriteFile,
     EditFile,
+    ApplyPatch,
     Glob,
     Grep,
     Sed,
@@ -103,6 +104,7 @@ const WORKSPACE: &[Tool] = &[
     Tool::ReadFile,
     Tool::WriteFile,
     Tool::EditFile,
+    Tool::ApplyPatch,
     Tool::Glob,
     Tool::Grep,
     Tool::Sed,
@@ -128,6 +130,7 @@ impl Tool {
             Self::ReadFile => "read_file",
             Self::WriteFile => "write_file",
             Self::EditFile => "edit_file",
+            Self::ApplyPatch => "apply_patch",
             Self::Glob => "glob",
             Self::Grep => "grep",
             Self::Sed => "sed",
@@ -158,7 +161,7 @@ impl Tool {
     pub fn acts(self) -> bool {
         matches!(
             self,
-            Self::WriteFile | Self::EditFile | Self::Sed | Self::Shell
+            Self::WriteFile | Self::EditFile | Self::ApplyPatch | Self::Sed | Self::Shell
         )
     }
 
@@ -308,7 +311,7 @@ fn definition(tool: Tool) -> Json {
             ),
         ),
         Tool::ReadFile => (
-            format!("Read a text file in the workspace or a shared directory, by its absolute path, as numbered lines: at most {} lines or {} KiB from `offset` (the first line is 1). A view that stops short says so and names the offset to go on from. Every read returns the file's digest, which a later write_file or edit_file of it needs: read a file before changing it. Reading a directory is an error; list one with glob.", files::MAX_LINES, files::MAX_READ_BYTES / 1024),
+            format!("Read a text file in the workspace or a shared directory, by its absolute path, as numbered lines: at most {} lines or {} KiB from `offset` (the first line is 1). A view that stops short says so and names the offset to go on from. Every read returns the file's digest, which a later write_file, edit_file or apply_patch of it needs: read a file before changing it. Reading a directory is an error; list one with glob.", files::MAX_LINES, files::MAX_READ_BYTES / 1024),
             schema(
                 vec![
                     ("path", property("string", "The file's absolute path.")),
@@ -338,6 +341,13 @@ fn definition(tool: Tool) -> Json {
                     ("replace_all", property("boolean", "Replace every match rather than one unique match; false when left out.")),
                 ],
                 &["path", "old_string", "new_string"],
+            ),
+        ),
+        Tool::ApplyPatch => (
+            format!("Change several files at once with a patch, in this grammar:\n*** Begin Patch\n*** Add File: /abs/path\n+each line of the new file\n*** Delete File: /abs/path\n*** Update File: /abs/path\n*** Move to: /abs/new/path   (optional)\n@@ a line just above the change   (optional)\n kept line (a space first)\n-removed line\n+added line\n*** End of File   (optional: the hunk is at the file's end)\n*** End Patch\nPaths are absolute. Each hunk's kept and removed lines must appear exactly once after the hunk before it, character for character: no fuzzy matching. Give enough context, or an @@ line, to make them unique. A file it updates, moves or deletes must have been read by this conversation and be unchanged since; one it adds, or moves a file to, must not exist. Every file is checked before any is written. At most {} files. The person approves each patch before it is applied, and may refuse it.", crate::patch::MAX_FILES),
+            schema(
+                vec![("input", property("string", "The whole patch, from *** Begin Patch to *** End Patch."))],
+                &["input"],
             ),
         ),
         Tool::Glob => (
@@ -598,6 +608,22 @@ fn host_call(tool: Tool, value: &Json) -> Result<Call, String> {
                 new: required(m, "new_string")?.to_string(),
                 all: flag(m, "replace_all")?,
                 expected: None,
+            }
+        }
+        Tool::ApplyPatch => {
+            let m = members(name, value, &["input"])?;
+            let patch = required(m, "input")?.to_string();
+            // Refused here, before any card, when the grammar does not
+            // hold; the tool host parses it again.
+            let parsed = crate::patch::parse(&patch)?;
+            if let Some(relative) = parsed.paths().into_iter().find(|p| !p.starts_with('/')) {
+                return Err(format!(
+                    "{relative:?} is not an absolute path; a patch names each file by its absolute path"
+                ));
+            }
+            Call::Patch {
+                patch,
+                expected: Vec::new(),
             }
         }
         Tool::Glob => {
@@ -992,6 +1018,7 @@ pub fn parse_in(kit: Kit, name: &str, arguments: &str) -> Result<Args, String> {
         Tool::ReadFile
         | Tool::WriteFile
         | Tool::EditFile
+        | Tool::ApplyPatch
         | Tool::Glob
         | Tool::Grep
         | Tool::Sed
@@ -1296,6 +1323,55 @@ pub fn card(call: &Call) -> (String, Vec<String>) {
             card.line("replaced with:".into());
             card.text("+ ", new, PART_LINES);
             "Edit a file"
+        }
+        Call::Patch { patch, .. } => {
+            match crate::patch::parse(patch) {
+                // A line for each file, what removes or moves one first,
+                // so a long patch cannot hide it below its hunks.
+                Ok(parsed) => {
+                    use crate::patch::Op;
+                    let mut first = Vec::new();
+                    let mut then = Vec::new();
+                    for op in &parsed.ops {
+                        match op {
+                            Op::Delete { path } => first.push(format!("Delete {}", visible(path))),
+                            Op::Update {
+                                path,
+                                to: Some(to),
+                                hunks,
+                            } => {
+                                // Each path its own line, so a long one
+                                // cannot cut the other from view.
+                                first.push(format!("Move {}", visible(path)));
+                                first.push(format!(
+                                    "  to {}, {} hunk(s)",
+                                    visible(to),
+                                    hunks.len()
+                                ));
+                            }
+                            Op::Update {
+                                path,
+                                to: None,
+                                hunks,
+                            } => then.push(format!(
+                                "Update {}, {} hunk(s)",
+                                visible(path),
+                                hunks.len()
+                            )),
+                            Op::Add { path, lines } => {
+                                then.push(format!("Add {}, {} line(s)", visible(path), lines.len()))
+                            }
+                        }
+                    }
+                    for line in first.into_iter().chain(then) {
+                        card.line(line);
+                    }
+                    card.line("The patch:".into());
+                }
+                Err(e) => card.line(format!("A patch td-agent cannot read ({}):", visible(&e))),
+            }
+            card.text("", patch, PART_LINES * 2);
+            "Apply a patch"
         }
         Call::Sed {
             script,
@@ -1713,15 +1789,67 @@ mod tests {
         lines.iter().filter(|l| *l == line).count()
     }
 
+    /// `apply_patch` goes to the tool host as a call that acts, its
+    /// grammar refused before any card, and its card names its files and
+    /// shows the patch.
+    #[test]
+    fn a_patch_is_checked_before_its_card_and_shown_on_it() {
+        let text = "*** Begin Patch\n*** Update File: /w/a\n-x\n+y\n*** Add File: /w/b\n+z\n*** End Patch\n";
+        let arguments = Json::Obj(vec![("input".into(), Json::Str(text.into()))]).to_string();
+        match parse_in(Kit::Workspace, "apply_patch", &arguments).unwrap() {
+            Args::Host { call, acts } => {
+                assert!(acts);
+                assert_eq!(
+                    call,
+                    Call::Patch {
+                        patch: text.into(),
+                        expected: Vec::new()
+                    }
+                );
+                let (title, lines) = card(&call);
+                assert_eq!(title, "Apply a patch");
+                assert_eq!(
+                    lines[..3],
+                    [
+                        "Update /w/a, 1 hunk(s)",
+                        "Add /w/b, 1 line(s)",
+                        "The patch:"
+                    ]
+                );
+                assert!(lines.iter().any(|l| l == "+y"), "{lines:?}");
+            }
+            _ => panic!("not a host call"),
+        }
+        assert!(Tool::acting("apply_patch"));
+        let broken = Json::Obj(vec![(
+            "input".into(),
+            Json::Str("*** Begin Patch\n".into()),
+        )]);
+        let e = parse_in(Kit::Workspace, "apply_patch", &broken.to_string()).unwrap_err();
+        assert!(e.contains("End Patch"), "{e}");
+        let e = parse_in(Kit::Workspace, "apply_patch", r#"{"patch":"x"}"#).unwrap_err();
+        assert!(e.contains("input"), "{e}");
+        // A relative path is refused before any card.
+        let relative = Json::Obj(vec![(
+            "input".into(),
+            Json::Str("*** Begin Patch\n*** Delete File: src/a.rs\n*** End Patch\n".into()),
+        )]);
+        let e = parse_in(Kit::Workspace, "apply_patch", &relative.to_string()).unwrap_err();
+        assert!(e.contains("absolute"), "{e}");
+        // Not without a workspace.
+        assert!(parse_in(Kit::Conversation, "apply_patch", &arguments).is_err());
+    }
+
     #[test]
     fn a_workspace_adds_its_tools_and_their_calls_go_to_the_host() {
         let names: Vec<&str> = Tool::all(Kit::Workspace).iter().map(|t| t.name()).collect();
         assert_eq!(
-            names[names.len() - 11..],
+            names[names.len() - 12..],
             [
                 "read_file",
                 "write_file",
                 "edit_file",
+                "apply_patch",
                 "glob",
                 "grep",
                 "sed",

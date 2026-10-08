@@ -1648,6 +1648,7 @@ mod tests {
                     // What the log keeps beside a result is never sent.
                     kept: Some("the whole output".into()),
                     digest: Some("0123".into()),
+                    digests: Vec::new(),
                 },
             ),
         ];

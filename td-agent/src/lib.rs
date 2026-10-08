@@ -58,6 +58,7 @@ pub mod menu;
 pub mod models;
 pub mod notes;
 pub mod output;
+pub mod patch;
 pub mod picker;
 pub mod post;
 pub mod prompt;

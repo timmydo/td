@@ -67,6 +67,13 @@ pub enum Call {
         all: bool,
         expected: Option<String>,
     },
+    /// `apply_patch`: `patch` in Codex's grammar (`patch.rs`), with the
+    /// digest of this conversation's last read or write of each existing
+    /// file it changes, which that file must match.
+    Patch {
+        patch: String,
+        expected: Vec<(String, String)>,
+    },
     Glob {
         pattern: String,
         path: Option<String>,
@@ -331,6 +338,9 @@ pub struct Done {
     /// The file's digest after a read, write or edit, which the next
     /// replacement of it expects.
     pub digest: Option<String>,
+    /// A patch's files: each one written with its digest now, and each
+    /// one deleted or moved away with none, which is forgotten.
+    pub digests: Vec<(String, Option<String>)>,
 }
 
 /// From a tool host to its conversation.
@@ -355,6 +365,25 @@ fn opt_num(value: Option<u64>) -> Json {
     value.map_or(Json::Null, |v| Json::Num(v.to_string()))
 }
 
+/// A list of `[path, digest]` pairs, a digest null where none is, at
+/// most two for each file a patch may name: untrusted, so bounded.
+fn pairs(value: Option<&Json>, what: &str) -> Result<Vec<(String, Option<String>)>, String> {
+    let Some(items) = value.and_then(Json::as_arr) else {
+        return Err(format!("{what} is not a list"));
+    };
+    if items.len() > crate::patch::MAX_FILES.saturating_mul(2) {
+        return Err(format!("{what} names too many files"));
+    }
+    items
+        .iter()
+        .map(|item| match item.as_arr() {
+            Some([Json::Str(path), Json::Str(digest)]) => Ok((path.clone(), Some(digest.clone()))),
+            Some([Json::Str(path), Json::Null]) => Ok((path.clone(), None)),
+            _ => Err(format!("{what} holds something not a [path, digest] pair")),
+        })
+        .collect()
+}
+
 impl Call {
     /// The call's name on the wire: the tool's, as the model calls it,
     /// but for td-agent's own and a background `shell`.
@@ -363,6 +392,7 @@ impl Call {
             Self::Read { .. } => "read_file",
             Self::Write { .. } => "write_file",
             Self::Edit { .. } => "edit_file",
+            Self::Patch { .. } => "apply_patch",
             Self::Glob { .. } => "glob",
             Self::Shell { .. } => "shell",
             Self::Background { .. } => "background",
@@ -408,6 +438,20 @@ impl Call {
                 ("new_string", Json::Str(new.clone())),
                 ("replace_all", Json::Bool(*all)),
                 ("expected", opt_str(expected.as_deref())),
+            ]),
+            Self::Patch { patch, expected } => member(vec![
+                ("patch", Json::Str(patch.clone())),
+                (
+                    "expected",
+                    Json::Arr(
+                        expected
+                            .iter()
+                            .map(|(path, digest)| {
+                                Json::Arr(vec![Json::Str(path.clone()), Json::Str(digest.clone())])
+                            })
+                            .collect(),
+                    ),
+                ),
             ]),
             Self::Glob { pattern, path } => member(vec![
                 ("pattern", Json::Str(pattern.clone())),
@@ -547,6 +591,17 @@ impl Call {
                 all: flag("replace_all"),
                 expected: maybe("expected")?,
             },
+            "apply_patch" => Self::Patch {
+                patch: text("patch")?,
+                expected: pairs(args.get("expected"), "apply_patch: `expected`")?
+                    .into_iter()
+                    .map(|(path, digest)| {
+                        digest
+                            .map(|digest| (path, digest))
+                            .ok_or_else(|| "apply_patch: an `expected` digest is null".to_string())
+                    })
+                    .collect::<Result<_, _>>()?,
+            },
             "glob" => Self::Glob {
                 pattern: text("pattern")?,
                 path: maybe("path")?,
@@ -665,6 +720,22 @@ impl Up {
                         pairs.push(("text".into(), Json::Str(done.text.clone())));
                         pairs.push(("kept".into(), opt_str(done.kept.as_deref())));
                         pairs.push(("digest".into(), opt_str(done.digest.as_deref())));
+                        if !done.digests.is_empty() {
+                            pairs.push((
+                                "digests".into(),
+                                Json::Arr(
+                                    done.digests
+                                        .iter()
+                                        .map(|(path, digest)| {
+                                            Json::Arr(vec![
+                                                Json::Str(path.clone()),
+                                                opt_str(digest.as_deref()),
+                                            ])
+                                        })
+                                        .collect(),
+                                ),
+                            ));
+                        }
                     }
                     Err(why) => pairs.push(("error".into(), Json::Str(why.clone()))),
                 }
@@ -703,6 +774,10 @@ impl Up {
                 text: text("text").ok_or("a reply with no text")?,
                 kept: text("kept"),
                 digest: text("digest"),
+                digests: match value.get("digests") {
+                    None => Vec::new(),
+                    digests => pairs(digests, "a reply's `digests`")?,
+                },
             }),
         };
         Ok(Self::Done { id, outcome })
@@ -1049,6 +1124,32 @@ mod tests {
     }
 
     #[test]
+    fn a_patch_and_its_digests_round_trip() {
+        let call = Call::Patch {
+            patch: "*** Begin Patch\n*** Delete File: /w/a\n*** End Patch\n".into(),
+            expected: vec![("/w/a".into(), "d1".into())],
+        };
+        assert_eq!(Call::decode(call.tool(), &call.args()).unwrap(), call);
+        let up = Up::Done {
+            id: 7,
+            outcome: Ok(Done {
+                text: "applied".into(),
+                digests: vec![("/w/a".into(), None), ("/w/b".into(), Some("d2".into()))],
+                ..Done::default()
+            }),
+        };
+        assert_eq!(Up::decode(&up.encode()).unwrap(), up);
+        // A reply from before patches has none; a malformed list is refused.
+        let old = br#"{"done":7,"text":"x","kept":null,"digest":null}"#;
+        assert!(matches!(
+            Up::decode(old).unwrap(),
+            Up::Done { outcome: Ok(Done { digests, .. }), .. } if digests.is_empty()
+        ));
+        let bad = br#"{"done":7,"text":"x","digests":[["/w/a",3]]}"#;
+        assert!(Up::decode(bad).is_err());
+    }
+
+    #[test]
     fn calls_and_replies_round_trip() {
         let calls = [
             Call::Read {
@@ -1125,6 +1226,7 @@ mod tests {
                     text: "t".into(),
                     kept: Some("k".into()),
                     digest: None,
+                    digests: Vec::new(),
                 }),
             },
             Up::Done {

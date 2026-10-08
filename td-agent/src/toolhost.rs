@@ -337,6 +337,7 @@ fn act(
                 text: view.render(path),
                 kept: None,
                 digest: Some(view.digest),
+                digests: Vec::new(),
             })
         }
         Call::Write {
@@ -355,6 +356,7 @@ fn act(
                 text: format!("{verb} {path} ({} bytes)", written.bytes),
                 kept: None,
                 digest: Some(written.digest),
+                digests: Vec::new(),
             })
         }
         Call::Edit {
@@ -375,6 +377,19 @@ fn act(
                 text: format!("edited {path}: replaced {places}"),
                 kept: None,
                 digest: Some(edited.digest),
+                digests: Vec::new(),
+            })
+        }
+        Call::Patch { patch, expected } => {
+            let parsed = crate::patch::parse(patch)?;
+            let patched = files::patch(&parsed, expected, &|path| {
+                config.path(path, "a patch's path")
+            })?;
+            Ok(Done {
+                text: format!("applied the patch: {}", patched.said.join("; ")),
+                kept: None,
+                digest: None,
+                digests: patched.digests,
             })
         }
         Call::Glob { pattern, path } => {
@@ -399,6 +414,7 @@ fn act(
                 text,
                 kept: None,
                 digest: None,
+                digests: Vec::new(),
             })
         }
         Call::Shell {
@@ -424,6 +440,7 @@ fn act(
                 text: exit.render(),
                 kept: Some(exit.output.text()),
                 digest: None,
+                digests: Vec::new(),
             })
         }
         // Its output went up as it came; the answer is how it ended.
@@ -454,6 +471,7 @@ fn act(
                 text,
                 kept: None,
                 digest: None,
+                digests: Vec::new(),
             })
         }
         Call::Grep {
@@ -495,6 +513,7 @@ fn act(
                 text: Grep::render(&exit),
                 kept: None,
                 digest: None,
+                digests: Vec::new(),
             })
         }
         Call::Sed {
@@ -535,6 +554,7 @@ fn act(
                 text,
                 kept: None,
                 digest: None,
+                digests: Vec::new(),
             })
         }
         Call::Snapshot {
@@ -553,6 +573,7 @@ fn act(
             )?),
             kept: None,
             digest: None,
+            digests: Vec::new(),
         }),
         Call::Restore {
             git,
@@ -572,6 +593,7 @@ fn act(
             )?),
             kept: None,
             digest: None,
+            digests: Vec::new(),
         }),
     }
 }
@@ -899,6 +921,7 @@ mod tests {
                 text: "\u{1}".repeat(frame::MAX_FRAME),
                 kept: None,
                 digest: None,
+                digests: Vec::new(),
             }),
         };
         reply(&mut ours, &huge);

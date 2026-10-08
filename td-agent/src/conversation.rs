@@ -346,6 +346,7 @@ const CALL_UNANSWERED: &str = "the tool host did not end this call by its deadli
 struct Beside {
     kept: Option<String>,
     digest: Option<String>,
+    digests: Vec<(String, Option<String>)>,
 }
 /// What a call the log has no room to run is answered with.
 const CALL_NO_ROOM: &str =
@@ -2751,32 +2752,43 @@ impl Session {
         beside: Beside,
     ) -> Result<(), String> {
         let result =
-            |content: String, error: bool, kept: Option<String>, digest: Option<String>| {
-                Kind::ToolResult {
-                    reply,
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    call: started,
-                    content,
-                    error,
-                    kept,
-                    digest,
-                }
+            |content: String,
+             error: bool,
+             kept: Option<String>,
+             digest: Option<String>,
+             digests: Vec<(String, Option<String>)>| Kind::ToolResult {
+                reply,
+                id: call.id.clone(),
+                name: call.name.clone(),
+                call: started,
+                content,
+                error,
+                kept,
+                digest,
+                digests,
             };
         let digest = beside.digest.clone();
+        let digests = beside.digests.clone();
         if self
-            .log(result(content.clone(), error, beside.kept, beside.digest))
+            .log(result(
+                content.clone(),
+                error,
+                beside.kept,
+                beside.digest,
+                beside.digests,
+            ))
             .is_ok()
         {
             return Ok(());
         }
         // The kept output is what may not fit: the result without it.
-        if let Err(e) = self.log(result(content, error, None, digest)) {
+        if let Err(e) = self.log(result(content, error, None, digest, digests)) {
             self.log(result(
                 format!("error: the result could not be logged: {e}"),
                 true,
                 None,
                 None,
+                Vec::new(),
             ))?;
         }
         Ok(())
@@ -3991,9 +4003,11 @@ impl Session {
                     let answer = match outcome {
                         Ok(done) => {
                             self.bench.record(&call, done.digest.as_deref());
+                            self.bench.record_each(&done.digests);
                             let beside = Beside {
                                 kept: done.kept,
                                 digest: done.digest,
+                                digests: done.digests,
                             };
                             (Ok(done.text), beside)
                         }
@@ -6277,9 +6291,19 @@ impl Session {
                 _ => &[],
             })
             .map(|call| {
-                let path = td_json::parse_slice(call.arguments.as_bytes())
-                    .ok()
-                    .and_then(|a| a.get("path").and_then(Json::as_str).map(str::to_string));
+                let arguments = td_json::parse_slice(call.arguments.as_bytes()).ok();
+                // A patch's files, by the paths it names.
+                let patched = arguments
+                    .as_ref()
+                    .filter(|_| call.name == "apply_patch")
+                    .and_then(|a| a.get("input").and_then(Json::as_str))
+                    .and_then(|input| crate::patch::parse(input).ok())
+                    .map(|patch| patch.paths().join(" "));
+                let path = patched.or_else(|| {
+                    arguments
+                        .as_ref()
+                        .and_then(|a| a.get("path").and_then(Json::as_str).map(str::to_string))
+                });
                 let tool = if tools::known(&call.name) {
                     call.name.clone()
                 } else {
@@ -6667,6 +6691,22 @@ fn unready(
             vec![workdir.as_deref()]
         }
         host::Call::Sed { paths, .. } => paths.iter().map(|path| Some(path.as_str())).collect(),
+        // A patch the grammar refuses is the tool host's to say why.
+        host::Call::Patch { patch, .. } => {
+            return crate::patch::parse(patch).ok().and_then(|parsed| {
+                let named: Vec<host::Call> = parsed
+                    .paths()
+                    .into_iter()
+                    .map(|path| host::Call::Glob {
+                        pattern: String::new(),
+                        path: Some(path.to_string()),
+                    })
+                    .collect();
+                named
+                    .iter()
+                    .find_map(|call| unready(repositories, prepared, pending, call))
+            })
+        }
         // td-agent's own, over the ready worktrees alone.
         host::Call::Snapshot { .. } | host::Call::Restore { .. } => Vec::new(),
     };

@@ -5954,6 +5954,7 @@ fn read_two(conversation: &mut Conversation, old: usize, recent: usize) -> u64 {
                 error: false,
                 kept: None,
                 digest: None,
+                digests: Vec::new(),
             })
             .unwrap()
             .seq;
