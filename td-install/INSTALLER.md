@@ -1244,12 +1244,13 @@ The boot state-ownership and SSH host-key permission checks run as the
 validated primary account; home writes and cleanup use its runtime HOME
 with dropped credentials. Their root pre/post cleanup clears only the
 fixed system-state probe paths.
-Boot health resolves the primary name once through the checked launcher
-and passes it as a quoted argument to its existing `su` and `exec-as`
-probes. The network self-test does the same. SSH and Git clients use the
-credential-selected USER value, including when a probe substitutes a
-temporary HOME. The physical-input download oracle obtains HOME through
-that launcher and removes only its two fixture names after dropping to the
+Boot health runs each unprivileged probe through that launcher
+(`exec-primary -- /bin/sh -c`), as does the network self-test, and
+resolves the primary name once through it for the literal `exec-as`
+credential probe. SSH and Git clients use the credential-selected USER
+value, including when a probe substitutes a temporary HOME. The
+physical-input download oracle obtains HOME through that launcher and
+removes only its two fixture names after dropping to the
 primary account. A failed lookup or nonzero removal status prevents the
 input test; an absent directory is still diagnosed by the later grant
 and download probes. The immutable `/home` alias to `var/home` makes the

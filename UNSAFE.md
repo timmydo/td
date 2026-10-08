@@ -579,8 +579,9 @@ crate's own source, since the compiler alone cannot.
 
 ## 4. `td-login` — the credential multicall
 
-The `td-login` credential multicall (`login`/`su`), whose one `syscall2`
-body in `td-login/src/sys.rs` carries EXACTLY three syscalls —
+The `td-login` credential multicall (`login` and the `exec-*`
+subcommands; there is no `su`), whose one `syscall2` body in
+`td-login/src/sys.rs` carries EXACTLY three syscalls —
 `setgroups(2)`, `setgid(2)`, `setuid(2)` — issued once each, in that
 order, from the single `creds::apply`, which then re-reads
 `/proc/self/status` and refuses to `exec` unless the kernel agrees with

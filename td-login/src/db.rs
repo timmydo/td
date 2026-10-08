@@ -59,7 +59,7 @@ pub enum Denied {
 
 /// The whole authentication decision, in one place.
 ///
-/// `forced` is `login -f` / a root-invoked `su`: the CALLER has already
+/// `forced` is `login -f` / a root-invoked `exec-as`: the CALLER has already
 /// established the right to start this session, so no secret is consulted —
 /// except that a locked account stays locked (THREAT-MODEL.md §3).
 pub fn may_start_session(secret: Secret, forced: bool) -> Result<(), Denied> {
@@ -74,8 +74,8 @@ pub fn may_start_session(secret: Secret, forced: bool) -> Result<(), Denied> {
 
 /// Admit only the exact service-account class.
 ///
-/// This is intentionally not a `forced` branch above. `login -f`, `su`, and
-/// ordinary `exec-as` must keep refusing a service account, while a unit must
+/// This is intentionally not a `forced` branch above. `login -f` and ordinary
+/// `exec-as` must keep refusing a service account, while a unit must
 /// not use the service path to enter an interactive account.
 pub fn may_start_service(secret: Secret) -> Result<(), Denied> {
     match secret {
@@ -380,15 +380,15 @@ mod tests {
         }
         // A uid claimed ONCE still resolves: this refuses sharing, not the entry.
         assert!(account_in(PW, PASSWD, "tester").is_ok());
-        // And a shared GID is not a shared identity — `su` and `exec-as` switch
-        // to a uid, and two accounts in one group is ordinary.
+        // And a shared GID is not a shared identity — `login` and `exec-as`
+        // switch to a uid, and two accounts in one group is ordinary.
         let shared_gid = format!("{PW}other:x:1001:1000:Other:/home/other:/bin/sh\n");
         assert!(account_in(&shared_gid, PASSWD, "tester").is_ok());
     }
 
     /// The service class alone does not decide who may be the daemon's uid.
     ///
-    /// `!td-service` is refused by `login`, `login -f`, `su` and ordinary
+    /// `!td-service` is refused by `login`, `login -f` and ordinary
     /// `exec-as`, which is what makes `exec-service-as` the only door. But the
     /// class hangs on the NAME `audio`. An alias sharing 994 carries its own
     /// shadow field, and an empty one is `NoPassword`, which every forced

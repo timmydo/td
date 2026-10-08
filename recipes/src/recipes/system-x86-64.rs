@@ -63,15 +63,15 @@ const BOOT_SUCCESS_RETRY_SECS: u8 = 3;
 const BUS_MARKER_GRACE_SWEEPS: u8 = 2;
 const BOOT_SUCCESS_RETRY_MAX_SECS: u8 = 10;
 /// What ONE iteration of the boot-success loop may cost on a slow TCG guest: nine
-/// `su` probe blocks, four `td-boot update` passes and a `rollback`. Exactly ONE of
+/// `exec-primary` probe blocks, four `td-boot update` passes and a `rollback`. Exactly ONE of
 /// those copies an image; what the rest add is deployment-sized READS, and the
 /// distinction is worth the words because the QEMU volume budget turns on it
 /// — see BOOTSUCCESS below. Named rather than spelled twice because the td-svc
 /// backstop and the host's own ceiling are both derived from it, and a figure that
 /// drifted between them would leave one of the two killing a healthy boot.
 ///
-/// The eighth block is the session-bus probe, and it costs BOTH: the `su`, `sh` and
-/// `td-busd` it forks like every other block, and a bounded wait none of the others
+/// The eighth block is the session-bus probe, and it costs BOTH: the `td-login`, `sh`
+/// and `td-busd` it forks like every other block, and a bounded wait none of the others
 /// have. `td-busd probe` allows five seconds over the connect and the answer
 /// together — one deadline, not one each, which is why five and not ten — and a
 /// broker that is wedged rather than absent spends all five, where an absent one
@@ -126,7 +126,7 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 //
 // Userland strategy (v0): the static Rust td-init multicall provides the boot
 // glue — PID 1, the pivot, and every mount/umount on the machine — the static
-// Rust td-login serves the credential switch (/bin/{login,su}), td-util the
+// Rust td-login serves the credential switch (/bin/{login,td-login}), td-util the
 // diagnostics, td-sh the shell (/bin/{sh,ash}), td-txt the text tools uutils
 // lacks, and — since the getty applet landed — the tty setup that was busybox's
 // last job here; source-built Rust uutils provides the interactive core
@@ -161,8 +161,8 @@ struct User {
     groups: &'static [&'static str],
     passwordless: bool,
     /// Mark this account with td-login's exact service-only shadow class.
-    /// Such an account is refused by login, login -f, su, and ordinary
-    /// exec-as; only exec-service-as may enter it.
+    /// Such an account is refused by login, login -f and ordinary exec-as;
+    /// only exec-service-as may enter it.
     service_only: bool,
 }
 
@@ -699,22 +699,23 @@ const TD_TXT_APPLETS: &[&str] = &["grep", "sed"];
 /// step's command surface — the same lock that kept them off `/bin` in the first place.
 /// So their drop is asserted in Rust instead, by `find_and_xargs_left_the_image`.
 const DROPPED_APPLETS: &[&str] = &["vi", "more", "awk"];
-/// The credential switch, served by the static td-login multicall — the two busybox applets
-/// that change WHO A PROCESS IS. They are their own binary, and their own entry in
-/// UNSAFE.md, because a credential-ordering bug in them is privilege escalation rather than
-/// a malfunction: `setuid(2)` before `setgroups(2)` drops the uid and silently keeps the
+/// The credential switch, served by the static td-login multicall — the busybox applet
+/// that changes WHO A PROCESS IS. It is its own binary, and its own entry in UNSAFE.md,
+/// because a credential-ordering bug in it is privilege escalation rather than a
+/// malfunction: `setuid(2)` before `setgroups(2)` drops the uid and silently keeps the
 /// previous holder's supplementary groups. td-login/THREAT-MODEL.md is the specification.
 ///
 /// The stock console enters login's forced-session path through login-primary;
-/// health probes still use the su applet. The boot exercises their session and
-/// credential behavior, while login's basename dispatch is covered by unit tests
-/// and the image shape check pins its symlink. TD_LOGIN_RUNTIME_MARKER also
-/// verifies that a working session retained no unexpected credentials.
+/// health probes use `PRIMARY_PROBE_LAUNCHER`. There is no `su` (APPLICATIONS.md
+/// §L.1, L6), and the shape check refuses a `/bin/su`. The boot exercises the
+/// session and credential behavior, while login's basename dispatch is covered by
+/// unit tests and the image shape check pins its symlink. TD_LOGIN_RUNTIME_MARKER
+/// also verifies that a working session retained no unexpected credentials.
 ///
 /// td-login is an ET_EXEC with an EMPTY runtime closure: a `login` that dies with the
 /// dynamic closure locks an operator out of the console exactly when the closure is what
 /// broke.
-const TD_LOGIN_APPLETS: &[&str] = &["login", "su"];
+const TD_LOGIN_APPLETS: &[&str] = &["login"];
 
 /// The boot glue, served by the static td-init multicall — the busybox applets that need a
 /// RAW SYSCALL, which is why they are a separate binary from td-util's
@@ -933,8 +934,8 @@ fn td_init_applets() -> Vec<&'static str> {
 /// (`i=0`) on failure and names the applet, so the oracle's console tail says WHICH one
 /// broke instead of only that the marker was absent.
 /// Double quotes only, never single: these segments are pasted inside the health target's
-/// single-quoted `su -c '…'` argument, where one `'` would end it and hand the rest to the
-/// wrong shell.
+/// single-quoted `exec-primary -- /bin/sh -c '…'` argument, where one `'` would end it and
+/// hand the rest to the wrong shell.
 fn td_init_probe(applet: &str, probe: &Probe) -> String {
     match probe {
         // Captured, not discarded: the one Runs probe is `init --dry-run` over the shipped
@@ -1052,7 +1053,7 @@ impl UutilsProbe {
 }
 
 /// Render one unprivileged `/bin` behavior check. The result is embedded in a
-/// single-quoted `su -c` script, so it must contain no single quotes.
+/// single-quoted `/bin/sh -c` script, so it must contain no single quotes.
 fn uutils_behavior_probe(probe: &UutilsProbe) -> String {
     let applet = probe.applet();
     match probe {
@@ -1415,7 +1416,7 @@ mod svc_timeouts {
     pub const HOSTNAME: u32 = 30;
     /// Mints the per-machine identity: ed25519 keygen, writes to /var, then sync.
     pub const FIRSTBOOT: u32 = 300;
-    /// Dozens of greps over /proc/mounts, several `su` runs, and write probes.
+    /// Dozens of greps over /proc/mounts, two `exec-primary` runs, and write probes.
     pub const ROOTCHECK: u32 = 120;
     /// Validates and assigns the display card and framebuffer plus the
     /// built-in evdev nodes.
@@ -1432,7 +1433,7 @@ mod svc_timeouts {
     /// One control-channel request: a line in, and a line or a short report out.
     pub const APPLICATION_PLACE: u32 = 30;
     /// The script's own retry loop is clamped to BOOT_SUCCESS_RETRY_MAX_SECS iterations,
-    /// but each runs a large probe farm (nine `su` blocks) and can run four
+    /// but each runs a large probe farm (nine `exec-primary` blocks) and can run four
     /// transactional `td-boot update` passes plus a `rollback`, so an iteration is worth
     /// seconds on a slow disk, not one. Two of the four are cheap by construction — a
     /// refusal and an idle tick each read a bounded manifest and stop.
@@ -1450,7 +1451,7 @@ mod svc_timeouts {
     /// the fallback being the deployment that is running, since this fixture has two
     /// deployments and not three.
     ///
-    /// Raised again for the ninth, Git-heavy `su` block, and by the rule rather than
+    /// Raised again for the ninth, Git-heavy probe block, and by the rule rather than
     /// by a measurement: this backstop must clear
     /// the guest loop's own worst case TWICE. What the number bounds is a HANG — the
     /// loop exits as soon as it is healthy — so the cost of the increase is only how
@@ -1639,7 +1640,7 @@ fn build_td_svc_conf() -> String {
          # network client the applications have. A jail proves the socket\n\
          # accepting before it launches, so mail and news require this unit.\n\
          # The socket is authenticated by its mode alone (0600 under the 0700\n\
-         # runtime directory), which is why exec-as and not su.\n\
+         # runtime directory), which is why it runs as the account itself.\n\
          [fetchd]\n\
          type=daemon\n\
          cgroup=session\n\
@@ -2585,16 +2586,16 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     // The child clears and writes its own HOME with dropped credentials;
     // its positive redirection can abort that child directly on failure.
     s.push_str(&format!(
-        "/bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su || ok=0\n\
+        "/bin/td-util rm -f /var/.tdwr-probe /var/root/.tdwr-probe || ok=0\n\
          if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          '/bin/td-util test -d /var/root || exit 1; \
-         /bin/sh -c \": > /var/.tdwr-su\" 2>/dev/null && exit 1; \
-         /bin/sh -c \": > /var/root/.tdwr-su\" 2>/dev/null && exit 1; \
-         /bin/td-util rm -f \"$HOME/.tdwr-su\" || exit 1; \
-         : > \"$HOME/.tdwr-su\" || exit 1; \
-         /bin/td-util rm -f \"$HOME/.tdwr-su\"'; then \
+         /bin/sh -c \": > /var/.tdwr-probe\" 2>/dev/null && exit 1; \
+         /bin/sh -c \": > /var/root/.tdwr-probe\" 2>/dev/null && exit 1; \
+         /bin/td-util rm -f \"$HOME/.tdwr-probe\" || exit 1; \
+         : > \"$HOME/.tdwr-probe\" || exit 1; \
+         /bin/td-util rm -f \"$HOME/.tdwr-probe\"'; then \
          echo {SYSTEM_STATE_OWNER_MARKER}; else ok=0; fi\n\
-         /bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su || ok=0\n"
+         /bin/td-util rm -f /var/.tdwr-probe /var/root/.tdwr-probe || ok=0\n"
     ));
     // `/` is a read-only erofs mount (fields: <src> <mnt> <fstype> <opts> …; erofs is
     //     always mounted `ro`, so the options field begins `ro`).
@@ -2762,6 +2763,10 @@ fn build_mutable_etc_check() -> String {
 
 /// How root-run health probes become the human account: through the primary
 /// selector, since the autologin account is the primary one (`build_autologin`).
+/// Each probe is `{PRIMARY_PROBE_LAUNCHER} /bin/sh -c '…'`, whose shell starts in
+/// `/` with only `HOME`, `SHELL`, `USER`, `LOGNAME` and `PATH`, `SHELL` being the
+/// account's; `every_primary_probe_reads_only_what_it_assigns_or_its_identity`
+/// holds each body to that.
 const PRIMARY_PROBE_LAUNCHER: &str = "/bin/td-login exec-primary --";
 
 /// The supplementary gids the SHIPPED `/etc/group` grants `user`, derived by reading the
@@ -2792,8 +2797,9 @@ fn supplementary_gids(sys: &SystemDef, user: &str) -> Vec<u32> {
     gids
 }
 
-/// The td-login leg of the health target: run THROUGH `/bin/su` (which is td-login) and have
-/// the switched process read its own credentials back out of `/proc/self/status`.
+/// The td-login leg of the health target: run THROUGH `PRIMARY_PROBE_LAUNCHER` (td-login's
+/// `exec-primary`) and have the switched process read its own credentials back out of
+/// `/proc/self/status`.
 ///
 /// The other unprivileged health legs also use td-login's credential switch,
 /// so a td-login that fails to start a session reds them all — but
@@ -2802,11 +2808,11 @@ fn supplementary_gids(sys: &SystemDef, user: &str) -> Vec<u32> {
 /// the RESULT: all four uid columns, all four gid columns, and the exact supplementary set.
 ///
 /// Double quotes only, never single: this is pasted inside the health target's single-quoted
-/// `su -c '…'` argument, where one `'` would end it and hand the rest to the wrong shell.
+/// `/bin/sh -c '…'` argument, where one `'` would end it and hand the rest to the wrong shell.
 fn td_login_probe(sys: &SystemDef) -> String {
     let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) else {
         // Fail CLOSED. `system_def_is_self_consistent` makes this unreachable, but an
-        // EMPTY probe body is a `su -c ''` that exits 0, so the marker would print
+        // EMPTY probe body is a `/bin/sh -c ''` that exits 0, so the marker would print
         // unconditionally and the oracle would green a switch nothing checked. A
         // vacuous pass is worse than the build error it replaces.
         return "echo \"td-login: no autologin user to verify credentials for\"; false".into();
@@ -2819,7 +2825,7 @@ fn td_login_probe(sys: &SystemDef) -> String {
         "l=1; /bin/td-login --list >/dev/null 2>&1 || \
          {{ echo \"td-login: --list failed\"; l=0; }}; \
          /bin/td-login verify-credentials --uid {uid} --gid {gid} --groups \"{groups}\" || \
-         {{ echo \"td-login: the su credential switch did not produce uid {uid} gid {gid} \
+         {{ echo \"td-login: the exec-primary credential switch did not produce uid {uid} gid {gid} \
          groups [{groups}]\"; l=0; }}; [ \"$l\" = 1 ]",
         uid = user.uid,
         gid = user.gid,
@@ -2827,7 +2833,8 @@ fn td_login_probe(sys: &SystemDef) -> String {
     )
 }
 
-/// The `exec-as` half of the td-login farm, which runs as ROOT rather than through `su`.
+/// The `exec-as` half of the td-login leg, which runs as ROOT rather than through
+/// `exec-primary`.
 ///
 /// It has to: `exec-as` changes credentials, so a copy running as the unprivileged user
 /// would fail `setgroups(2)` with EPERM and prove nothing about the applet. That is also
@@ -2841,7 +2848,7 @@ fn td_login_probe(sys: &SystemDef) -> String {
 /// through the checked account launcher; this leg retains direct coverage of the
 /// literal exec-as CLI as well as the credential implementation used by selectors.
 ///
-/// Single quotes are fine here, unlike every probe inside the greeter's `su -c '…'`:
+/// Single quotes are fine here, unlike every probe inside a `/bin/sh -c '…'` body:
 /// this one is a root-level command in the generated script rather than an argument to
 /// one.
 fn td_login_exec_as_probe(sys: &SystemDef) -> String {
@@ -2890,7 +2897,7 @@ fn td_login_exec_as_probe(sys: &SystemDef) -> String {
 /// where the reversible/irreversible split forced probing by refusal.
 fn build_td_txt_probes() -> String {
     // NO SINGLE QUOTE may appear below: this whole string is interpolated INSIDE the
-    // greeter's `su -s /bin/sh USER -c '…'` argument, so one would close that argument
+    // health target's `exec-primary -- /bin/sh -c '…'` argument, so one would close that argument
     // and scatter the rest of the probe into the outer shell as stray words — which
     // still PARSES, so `sh -n` would not catch it. Double quotes are literal there, and
     // none of these patterns contains `$`, a backtick or a backslash.
@@ -3078,8 +3085,8 @@ const SANDBOX_KERNEL_UCOUNTS: &[(&str, &str)] = &[
 /// 80-line console tail the oracle's error message tells an operator to read would be
 /// filled with identical repeats — pushing out the other farms' diagnostics.
 fn build_sandbox_kernel_probes() -> String {
-    // NO SINGLE QUOTE may appear below: this string is interpolated INSIDE the greeter's
-    // `su -s /bin/sh USER -c '…'` argument, exactly as build_td_txt_probes is, and one
+    // NO SINGLE QUOTE may appear below: this string is interpolated INSIDE the health
+    // target's `exec-primary -- /bin/sh -c '…'` argument, exactly as build_td_txt_probes is, and one
     // would close that argument and scatter the rest into the outer shell.
     let mut p = String::from("k=1; ");
     for (path, symbol, cost) in SANDBOX_KERNEL_NODES {
@@ -3178,7 +3185,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     for probe in UUTILS_BEHAVIOR_PROBES {
         uutils_behavior_probes.push_str(&uutils_behavior_probe(probe));
     }
-    // These run under `su` as the unprivileged user, so the dmesg leg needs an unprivileged
+    // These run through `exec-primary` as the unprivileged user, so the dmesg leg needs an unprivileged
     // /dev/kmsg read — which linux-x86-64 guarantees by pinning CONFIG_SECURITY_DMESG_RESTRICT
     // off. Drop dmesg from the farm and that pin is orphaned.
     let mut td_util_probes = String::new();
@@ -3274,16 +3281,16 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          [ \"$bg\" -ge \"$wait\" ] && bg=$((wait-1))\n\
          mu=0; mrf=0; mg=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0; mtb=0; btb=0\n\
          msk=0; mtj=0; mtk=0; mts=1\n\
-         if /bin/su -s /bin/sh \"$health_user\" -c \
+         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          '{sandbox_kernel_probes}[ \"$k\" = 1 ]'; then \
          echo {TD_SANDBOX_KERNEL_MARKER}; msk=1; fi\n\
-         if /bin/su -s /bin/sh \"$health_user\" -c \
+         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          'j=$(TD_JAIL_TEST_LEAK_FD=1 /bin/td-jail --probe-transition 2>&1) || \
          {{ echo \"td-jail: target transition probe failed: $j\"; exit 1; }}; \
          [ \"$j\" = \"{TD_JAIL_TRANSITION_MARKER} pid=1\" ] || \
          {{ echo \"td-jail: target transition returned unexpected output: $j\"; \
          exit 1; }}'; then echo {TD_JAIL_TRANSITION_MARKER}; mtj=1; fi\n\
-         if /bin/su -s /bin/sh \"$health_user\" -c \
+         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          'k=$(/bin/td-jail --probe-kill-reaps 2>&1) || \
          {{ echo \"td-jail: kill-reaps probe failed: $k\"; exit 1; }}; \
          /bin/td-util printf \"%s\\n\" \"$k\" | \
@@ -3303,7 +3310,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          && /bin/chmod 0555 /run/td-jail-seccomp-probe \
          /run/td-jail-seccomp-probe/probe \
          && /bin/chmod 0444 /run/td-jail-seccomp-probe/filter.bpf; then \
-         if /bin/su -s /bin/sh \"$health_user\" -c \
+         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          '[ -x /run/td-jail-seccomp-probe/probe ] \
          && [ ! -w /run/td-jail-seccomp-probe/probe ] \
          && [ -r /run/td-jail-seccomp-probe/filter.bpf ] \
@@ -3319,8 +3326,8 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          else echo \"td-jail: could not prepare immutable target seccomp inputs\"; fi; fi\n\
          while [ \"$n\" -lt \"$wait\" ]; do \
          healthy=1; \
-         if /bin/su -s /bin/sh \"$health_user\" -c \
-         'u=1; h=0; /bin/cat /etc/os-release >/dev/null 2>&1 || \
+         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
+         'u=1; h=0; o=; m=; /bin/cat /etc/os-release >/dev/null 2>&1 || \
          {{ echo \"uutils: /bin/cat failed\"; u=0; }}; \
          /bin/rm -rf /tmp/td-uutils-probe; \
          /bin/mkdir /tmp/td-uutils-probe || \
@@ -3329,7 +3336,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          {{ echo \"uutils: /bin/rm could not remove probe directory\"; u=0; }}; \
          [ \"$u\" = 1 ]'; then \
          [ \"$mu\" = 1 ] || {{ echo {UUTILS_RUNTIME_MARKER}; mu=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh \"$health_user\" -c \
+         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          'n=$(/bin/hostname) && [ -n \"$n\" ] || exit 1; \
          r=$(/bin/rg --color never --no-filename --fixed-strings --line-regexp -- \
          \"$n\" /etc/hostname) || \
@@ -3340,7 +3347,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          {{ echo \"fd: /bin/fd failed\"; exit 1; }}; \
          [ \"$f\" = /etc/hostname ] || {{ echo \"fd: unexpected hostname path: $f\"; exit 1; }}'; then \
          [ \"$mrf\" = 1 ] || {{ echo {RIPGREP_FD_RUNTIME_MARKER}; mrf=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh \"$health_user\" -c \
+         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          'HOME=/tmp/td-git-probe/home; export HOME; \
          XDG_CONFIG_HOME=/tmp/td-git-probe/xdg; export XDG_CONFIG_HOME; \
          GIT_CONFIG_GLOBAL=/dev/null; export GIT_CONFIG_GLOBAL; \
@@ -3391,7 +3398,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          /etc/ssl/certs/ca-certificates.crt || \
          {{ echo \"git: the installed CA bundle has no PEM certificate\"; exit 1; }}'; then \
          [ \"$mg\" = 1 ] || {{ echo {GIT_RUNTIME_MARKER}; mg=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh \"$health_user\" -c \
+         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          'o=$(/bin/ssh -F /dev/null -i /run/td-ssh-selftest \
          -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
          -o UserKnownHostsFile=/run/td-ssh-known-hosts \
@@ -3405,23 +3412,23 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          [ \"$o\" = TD-OPENSSH-ROUNDTRIP ] || \
          {{ echo \"OpenSSH: unexpected loopback output: $o\"; exit 1; }}'; then \
          [ \"$ms\" = 1 ] || {{ echo {SSHD_MARKER}; ms=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh \"$health_user\" -c \
+         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          'u=1; /bin/td-util --list >/dev/null 2>&1 || \
          {{ echo \"td-util: --list failed\"; u=0; }}; \
          {td_util_probes}[ \"$u\" = 1 ]'; then \
          [ \"$mtu\" = 1 ] || {{ echo {TD_UTIL_RUNTIME_MARKER}; mtu=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh \"$health_user\" -c \
-         'i=1; /bin/td-init --list >/dev/null 2>&1 || \
+         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
+         'i=1; e=; /bin/td-init --list >/dev/null 2>&1 || \
          {{ echo \"td-init: --list failed\"; i=0; }}; \
          {td_init_probes}[ \"$i\" = 1 ]'; then \
          [ \"$mti\" = 1 ] || {{ echo {TD_INIT_RUNTIME_MARKER}; mti=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh \"$health_user\" -c \
+         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          '{td_login_probe}' && {td_login_exec_as_probe}; then \
          [ \"$mtl\" = 1 ] || {{ echo {TD_LOGIN_RUNTIME_MARKER}; mtl=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh \"$health_user\" -c \
+         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          '{td_txt_probes}[ \"$t\" = 1 ]'; then \
          [ \"$mtt\" = 1 ] || {{ echo {TD_TXT_RUNTIME_MARKER}; mtt=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh \"$health_user\" -c \
+         if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          'b=$(/bin/td-busd probe {SESSION_BUS_SOCKET} 2>&1) || \
          {{ echo \"td-busd: the session bus did not answer on {SESSION_BUS_SOCKET}: \
          $b\"; \
@@ -3540,7 +3547,7 @@ fn build_profile(sys: &SystemDef) -> String {
     // prints. That is exactly why it needs saying out loud somewhere.
     //
     // It lives HERE, in the login session, rather than in /etc/bootsuccess: the health
-    // target runs as root through `su`, whose terminal is not this one, and making it
+    // target runs as root and drops through `exec-primary`, whose terminal is not this one, and making it
     // wait for a greeter that may not have started yet would couple the deployment
     // transaction to a session with its own timing. A console diagnostic in the one
     // process that can see the answer is the honest trade; `greeter_checks_the_login_
@@ -3636,18 +3643,17 @@ fn build_netup() -> String {
          [ \"$up\" = 1 ] && echo {SYSTEM_NET_UP_MARKER}; \
          /bin/td-netd resolve {NETTEST_DEFAULT_HOST} && echo {SYSTEM_NET_RESOLVE_MARKER}; \
          /bin/td-netd reach {NETTEST_DEFAULT_HOST} {NETTEST_DEFAULT_PORT} && echo {SYSTEM_NET_REACH_MARKER}; \
-         health_user=$(/bin/td-login exec-primary -- /bin/printenv USER) || exit 1\n\
-         /bin/su -s /bin/sh \"$health_user\" -c \
+         {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          'HOME=/tmp/td-git-net-home; export HOME; \
          XDG_CONFIG_HOME=/tmp/td-git-net-xdg; export XDG_CONFIG_HOME; \
-         /bin/rm -rf \"$HOME\" \"$XDG_CONFIG_HOME\" && \
-         /bin/mkdir -p \"$HOME\" \"$XDG_CONFIG_HOME\" && \
          GIT_CONFIG_GLOBAL=/dev/null; export GIT_CONFIG_GLOBAL; \
          GIT_CONFIG_NOSYSTEM=1; export GIT_CONFIG_NOSYSTEM; \
          GIT_TERMINAL_PROMPT=0; export GIT_TERMINAL_PROMPT; \
          GIT_HTTP_LOW_SPEED_LIMIT=1; export GIT_HTTP_LOW_SPEED_LIMIT; \
          GIT_HTTP_LOW_SPEED_TIME=10; export GIT_HTTP_LOW_SPEED_TIME; \
          GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt; export GIT_SSL_CAINFO; \
+         /bin/rm -rf \"$HOME\" \"$XDG_CONFIG_HOME\" && \
+         /bin/mkdir -p \"$HOME\" \"$XDG_CONFIG_HOME\" || exit 1; \
          r=$(/bin/git ls-remote {GIT_HTTPS_TEST_URL} HEAD) && \
          set -- $r && [ \"$#\" = 2 ] && [ \"${{#1}}\" = 40 ] && [ \"$2\" = HEAD ]' && \
          echo {GIT_HTTPS_RUNTIME_MARKER}; \
@@ -4965,7 +4971,7 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     }
     // /bin/td-login is the multicall's own entry (`td-login <applet>`, `--list`, and the
     // `verify-credentials` readback the health target runs); the loop below is the argv[0]
-    // farm `login` and `su` resolve through. The probe deliberately gets NO symlink — it is
+    // farm `login` resolves through. The probe deliberately gets NO symlink — it is
     // not an applet, and a /bin name no farm list accounts for is a name nothing checks.
     steps.push(Step::Symlink {
         target: "{in:td-login}/bin/td-login".into(),
@@ -5220,12 +5226,13 @@ fn shape_check() -> String {
          printf '%s\\n' \"$tdllist\" | grep -q -x -F \"$a\" || { echo \"td-login does not serve applet '$a' - its packed /bin/$a symlink would dispatch to nothing (usage, exit 2)\" >&2; exit 1; }; \
      done; \
      [ -e \"$root/bin/verify-credentials\" ] && { echo 'root tree: verify-credentials is a readback PROBE, not an applet; a /bin symlink for it is a name no farm list accounts for' >&2; exit 1; }; \
-     [ -e \"$root/bin/exec-as\" ] && { echo 'root tree: exec-as is a SUBCOMMAND, not an applet; a /bin/exec-as symlink would be a name no farm list in system-x86-64.rs accounts for, and one a reader could mistake for a general-purpose run-as-anyone tool beside su. It is not a privilege boundary - creds::may_switch is - so this refuses an unaccounted NAME, not a reachable capability' >&2; exit 1; }; \
+     [ -e \"$root/bin/exec-as\" ] && { echo 'root tree: exec-as is a SUBCOMMAND, not an applet; a /bin/exec-as symlink would be a name no farm list in system-x86-64.rs accounts for, and one a reader could mistake for a general-purpose run-as-anyone tool. It is not a privilege boundary - creds::may_switch is - so this refuses an unaccounted NAME, not a reachable capability' >&2; exit 1; }; \
      [ -e \"$root/bin/exec-service-as\" ] && { echo 'root tree: exec-service-as is a SUBCOMMAND, not an applet' >&2; exit 1; }; \
+     { [ -e \"$root/bin/su\" ] || [ -L \"$root/bin/su\" ]; } && { echo 'root tree: /bin/su is packed, but td ships no su (APPLICATIONS.md section L.1, L6): root-run probes use td-login exec-primary' >&2; exit 1; }; \
      \"$tdl\" exec-as 2>/dev/null && { echo 'td-login exec-as ACCEPTED an argv with no user and no program - its parser is what keeps a supervisor unit from starting something nobody named' >&2; exit 1; }; \
      \"$tdl\" exec-service-as 2>/dev/null && { echo 'td-login exec-service-as ACCEPTED an argv with no service account and no program' >&2; exit 1; }; \
      \"$tdl\" verify-credentials --uid 4294967294 --gid 4294967294 >/dev/null 2>&1 && { echo 'td-login verify-credentials ACCEPTED credentials this build process cannot have - the readback the TD-LOGIN-RUN-OK marker gates on proves nothing' >&2; exit 1; }; \
-     set -- $(ls -l \"$tdl\"); case \"$1\" in *[sS]*) echo \"root tree: the packed td-login carries a setuid/setgid bit (mode $1). td-login is NEVER installed setuid-root (td-login/THREAT-MODEL.md section 4): with one, an unprivileged caller starts with euid 0 and 'su root' becomes root without authenticating\" >&2; exit 1;; esac; \
+     set -- $(ls -l \"$tdl\"); case \"$1\" in *[sS]*) echo \"root tree: the packed td-login carries a setuid/setgid bit (mode $1). td-login is NEVER installed setuid-root (td-login/THREAT-MODEL.md section 4): with one, an unprivileged caller starts with euid 0 and 'td-login exec-as root' becomes root without authenticating\" >&2; exit 1;; esac; \
      tditab=$(\"$tdi\" init --dry-run -f \"$root/etc/inittab\" 2>&1) || { echo 'td-init init --dry-run REJECTED the inittab this image ships - PID 1 would come up having understood only part of its table. Its per-line diagnostics:' >&2; printf '%s\\n' \"$tditab\" >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-svc\" 2>/dev/null)\" = \"{in:td-svc}/bin/td-svc\" ] || { echo 'root tree: /bin/td-svc is not a symlink to the staged service supervisor - PID 1s only respawn line would exec nothing and the machine would have no userland at all' >&2; exit 1; }; \
      tds=\"{root}/real-root{in:td-svc}/bin/td-svc\"; { [ -f \"$tds\" ] && [ -x \"$tds\" ]; } || { echo 'root tree: the td-svc binary is not packed/executable at real-root{in:td-svc}/bin/td-svc - no identity, no network, no sshd and no console' >&2; exit 1; }; \
@@ -5677,9 +5684,10 @@ pub fn recipe() -> Recipe {
         //   CopyTree'd). One /bin entry, run once per boot as a sysinit job; it is what
         //   fills the /var targets the MUTABLE_ETC symlinks point at.
         // td-login: the static credential multicall (empty runtime closure, CopyTree'd),
-        //   serving the /bin/{login,su} farm. Load-bearing like td-init rather than
-        //   probe-only like td-util: `login-primary` is how the greeter is reached and `su` is
-        //   how every unprivileged health leg runs. See td-login/THREAT-MODEL.md.
+        //   serving the /bin/login farm. Load-bearing like td-init rather than
+        //   probe-only like td-util: `login-primary` is how the greeter is reached and
+        //   `exec-primary` is how every unprivileged health leg runs. See
+        //   td-login/THREAT-MODEL.md.
         // td-svc: the static service supervisor that starts every real-root job.
         // td-jail: the static application boundary; its target-kernel transition probe
         //   and the Firefox launch both run on every boot.
@@ -7779,7 +7787,7 @@ mod tests {
             (
                 svc_timeouts::ROOTCHECK,
                 50,
-                "~50 process spawns incl. su, plus a sync",
+                "~50 process spawns incl. two exec-primary runs, plus a sync",
             ),
             (
                 svc_timeouts::SEAT,
@@ -7797,7 +7805,7 @@ mod tests {
                 // The loop is clamped to this many iterations; budget a slow one each.
                 (BOOT_SUCCESS_RETRY_MAX_SECS as u32)
                     .saturating_mul(BOOT_SUCCESS_ITERATION_BUDGET_SECS),
-                "clamped iterations of nine su probe blocks, four td-boot updates and \
+                "clamped iterations of nine exec-primary probe blocks, four td-boot updates and \
                  a rollback",
             ),
             (
@@ -9681,12 +9689,10 @@ mod tests {
                 "shell name '{a}' missing from the td-sh farm"
             );
         }
-        for a in ["login", "su"] {
-            assert!(
-                TD_LOGIN_APPLETS.contains(&a),
-                "credential applet '{a}' missing from the td-login farm"
-            );
-        }
+        assert!(
+            TD_LOGIN_APPLETS.contains(&"login"),
+            "credential applet 'login' missing from the td-login farm"
+        );
         for a in [
             "init",
             "reboot",
@@ -9859,7 +9865,6 @@ mod tests {
             "init",
             "switch_root",
             "login",
-            "su",
         ] {
             assert!(
                 TD_SH_APPLETS.contains(&a) || td_init.contains(&a) || TD_LOGIN_APPLETS.contains(&a),
@@ -11315,7 +11320,7 @@ mod tests {
             rendered_probes.push_str(&segment);
             assert!(
                 !segment.contains('\''),
-                "the /bin/{applet} probe would break the enclosing single-quoted su script"
+                "the /bin/{applet} probe would break the enclosing single-quoted /bin/sh -c script"
             );
             assert!(
                 bootsuccess.contains(&segment),
@@ -11392,8 +11397,8 @@ mod tests {
             "the link probe must create the hard link before unlink consumes it"
         );
         let gated_probes = format!(
-            "if /bin/su -s /bin/sh \"$health_user\" -c \
-             'u=1; h=0; /bin/cat /etc/os-release >/dev/null 2>&1 || \
+            "if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
+             'u=1; h=0; o=; m=; /bin/cat /etc/os-release >/dev/null 2>&1 || \
              {{ echo \"uutils: /bin/cat failed\"; u=0; }}; \
              /bin/rm -rf /tmp/td-uutils-probe; \
              /bin/mkdir /tmp/td-uutils-probe || \
@@ -11819,7 +11824,7 @@ mod tests {
         let renamed = renamed_primary_system();
         let stock = build_rootcheck(&SYSTEM);
         assert_eq!(stock, build_rootcheck(&renamed));
-        assert!(!stock.contains("/home/tester") && !stock.contains("/bin/su "));
+        assert!(!stock.contains("/home/tester") && !stock.contains("/bin/su"));
         assert_eq!(
             stock
                 .matches("/bin/td-login exec-primary -- /bin/sh -c")
@@ -11828,7 +11833,7 @@ mod tests {
         );
         assert_eq!(
             stock
-                .matches("/bin/td-util rm -f \"$HOME/.tdwr-su\"")
+                .matches("/bin/td-util rm -f \"$HOME/.tdwr-probe\"")
                 .count(),
             2
         );
@@ -11969,11 +11974,11 @@ mod tests {
         let script = build_bootsuccess(&SYSTEM);
         assert_eq!(script, build_bootsuccess(&renamed_primary_system()));
         let setup = "health_user=$(/bin/td-login exec-primary -- /bin/printenv USER) || fail";
-        let su = "/bin/su -s /bin/sh \"$health_user\" -c";
+        let probe = format!("{PRIMARY_PROBE_LAUNCHER} /bin/sh -c '");
         assert_eq!(script.matches(setup).count(), 1);
-        assert!(script.find(setup).unwrap() < script.find(su).unwrap());
-        assert_eq!(script.matches(su).count(), 13);
-        assert_eq!(script.matches("/bin/su ").count(), 13);
+        assert!(script.find(setup).unwrap() < script.find(&probe).unwrap());
+        assert_eq!(script.matches(&probe).count(), 13);
+        assert!(!script.contains("/bin/su") && !script.contains("su -s"));
         assert!(script.contains(
             "/bin/td-login exec-as \"$health_user\" -- /bin/td-login verify-credentials"
         ));
@@ -11988,8 +11993,654 @@ mod tests {
         };
         let script = build_bootsuccess(&invalid);
         let refusal = "echo \"td-boot: no autologin account for health probes\"; fail";
-        assert!(script.find(refusal).unwrap() < script.find("/bin/su ").unwrap());
+        let probe = format!("{PRIMARY_PROBE_LAUNCHER} /bin/sh -c '");
+        assert!(script.find(refusal).unwrap() < script.find(&probe).unwrap());
         assert!(!script.contains("health_user=$("));
+    }
+
+    /// The identity `exec-primary` gives a probe's shell, and nothing else of the
+    /// caller's survives (td-login/THREAT-MODEL.md §5). `SHELL` is the fifth, but it
+    /// names the account's shell rather than the `/bin/sh` the retired `su -s` set,
+    /// so a probe may not read it at all.
+    const PRIMARY_PROBE_IDENTITY: &[&str] = &["HOME", "USER", "LOGNAME", "PATH"];
+
+    /// One lexed piece of a probe body: a word as its byte range in the body
+    /// (quotes, escapes, `$(…)`, `$((…))` and `${…}` stay inside it, and
+    /// `subs` holds the byte range of each outermost command substitution's
+    /// script), or an operator.
+    #[derive(Debug)]
+    enum ProbeToken {
+        Word {
+            start: usize,
+            end: usize,
+            subs: Vec<(usize, usize)>,
+        },
+        Op(&'static str),
+    }
+
+    /// What encloses a command: an `if`, a `while`/`until`, a `case`, a
+    /// `{ … }` group or a `( … )` subshell.
+    #[derive(Debug, PartialEq)]
+    enum ProbeFrame {
+        If,
+        Loop,
+        Case,
+        Brace,
+        Paren,
+    }
+
+    /// The tokens of `body[from..to]`, which holds no single quote, backtick,
+    /// here-document or whitespace but a space (the caller refuses those).
+    fn probe_tokens(body: &str, from: usize, to: usize) -> Result<Vec<ProbeToken>, String> {
+        let chars: Vec<(usize, char)> = body
+            .char_indices()
+            .filter(|(o, _)| (from..to).contains(o))
+            .collect();
+        let at = |i: usize| chars.get(i).map(|(_, c)| *c);
+        let offset = |i: usize| chars.get(i).map_or(to, |(o, _)| *o);
+        let mut tokens = Vec::new();
+        let mut i = 0;
+        while let Some(c) = at(i) {
+            let pair = |second: char| at(i + 1) == Some(second);
+            let op = match c {
+                ' ' => {
+                    i += 1;
+                    continue;
+                }
+                ';' if pair(';') => ";;",
+                ';' => ";",
+                '&' if pair('&') => "&&",
+                '&' => "&",
+                '|' if pair('|') => "||",
+                '|' => "|",
+                '(' => "(",
+                ')' => ")",
+                '<' | '>' => {
+                    // A redirection; its target is the next word.
+                    i += 1;
+                    while matches!(at(i), Some('>' | '&')) {
+                        i += 1;
+                    }
+                    tokens.push(ProbeToken::Op("redirect"));
+                    continue;
+                }
+                _ => {
+                    // Contexts the word is inside: `"`, `{` for `${`, and `(`
+                    // with the char index a command substitution's script
+                    // starts at when it is the outermost one.
+                    let start = i;
+                    let mut stack: Vec<(char, Option<usize>)> = Vec::new();
+                    let mut subs = Vec::new();
+                    while let Some(d) = at(i) {
+                        if d == '\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if d == '$' && pair_at(&chars, i + 1, '(') {
+                            if pair_at(&chars, i + 2, '(') {
+                                stack.push(('(', None));
+                                stack.push(('(', None));
+                                i += 3;
+                                continue;
+                            }
+                            let outermost = !stack.iter().any(|(_, s)| s.is_some());
+                            stack.push(('(', outermost.then_some(i + 2)));
+                            i += 2;
+                            continue;
+                        }
+                        if d == '$' && pair_at(&chars, i + 1, '{') {
+                            stack.push(('{', None));
+                            i += 2;
+                            continue;
+                        }
+                        match (stack.last().map(|(c, _)| *c), d) {
+                            (Some('"'), '"') | (Some('{'), '}') => {
+                                stack.pop();
+                            }
+                            (Some('"'), _) => {}
+                            (Some('('), '(') => stack.push(('(', None)),
+                            (Some('('), ')') => {
+                                if let Some((_, Some(script))) = stack.pop() {
+                                    subs.push((offset(script), offset(i)));
+                                }
+                            }
+                            (_, '"') => stack.push(('"', None)),
+                            (None, ' ' | ';' | '&' | '|' | '(' | ')' | '<' | '>') => break,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    if !stack.is_empty() {
+                        return Err("an unterminated quote or substitution".into());
+                    }
+                    tokens.push(ProbeToken::Word {
+                        start: offset(start),
+                        end: offset(i),
+                        subs,
+                    });
+                    continue;
+                }
+            };
+            i += op.len();
+            tokens.push(ProbeToken::Op(op));
+        }
+        Ok(tokens)
+    }
+
+    fn pair_at(chars: &[(usize, char)], i: usize, want: char) -> bool {
+        chars.get(i).is_some_and(|(_, c)| *c == want)
+    }
+
+    /// Every parameter `body` expands, as `(offset of its $, name)`: `$NAME`,
+    /// `${NAME…}` and `${#NAME}`. Positional and special parameters are never
+    /// inherited, so they are not names here. Err names what the scan does not
+    /// model, which includes any name or `$` inside `$((…))`: td-sh evaluates a
+    /// name's value there as an expression in turn (td-sh/src/arith.rs), so
+    /// `n=TERM; echo $((n))` reads `TERM`.
+    fn probe_expansions(body: &str) -> Result<Vec<(usize, String)>, String> {
+        let chars: Vec<(usize, char)> = body.char_indices().collect();
+        let name_start = |c: char| c.is_ascii_alphabetic() || c == '_';
+        let name_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let at = |i: usize| chars.get(i).map(|(_, c)| *c);
+        let name_at = |i: usize| -> String {
+            chars
+                .iter()
+                .skip(i)
+                .map(|(_, c)| *c)
+                .take_while(|c| name_char(*c))
+                .collect()
+        };
+        let mut reads = Vec::new();
+        let mut i = 0;
+        while let Some(&(offset, c)) = chars.get(i) {
+            i += 1;
+            if c == '\\' {
+                i += 1;
+                continue;
+            }
+            if c != '$' {
+                continue;
+            }
+            match at(i) {
+                Some('{') if at(i + 1) == Some('!') => {
+                    return Err("an indirect `${!…}` expansion".into())
+                }
+                Some('{') => {
+                    let from = if at(i + 1) == Some('#') { i + 2 } else { i + 1 };
+                    let name = name_at(from);
+                    if name.starts_with(name_start) {
+                        reads.push((offset, name));
+                    }
+                }
+                Some('(') if at(i + 1) == Some('(') => {
+                    let (mut j, mut depth) = (i + 2, 0usize);
+                    loop {
+                        match at(j) {
+                            Some('(') => depth += 1,
+                            Some(')') if depth > 0 => depth -= 1,
+                            Some(')') if at(j + 1) == Some(')') => break,
+                            None | Some(')') => {
+                                return Err("arithmetic not closed by its `))`".into())
+                            }
+                            Some('$') => return Err("an expansion inside `$((…))`".into()),
+                            Some(d) if name_start(d) && !at(j - 1).is_some_and(name_char) => {
+                                return Err(
+                                    "a name inside `$((…))`, which td-sh evaluates recursively"
+                                        .into(),
+                                );
+                            }
+                            Some(_) => {}
+                        }
+                        j += 1;
+                    }
+                    i = j + 2;
+                }
+                Some(d) if name_start(d) => reads.push((offset, name_at(i))),
+                _ => {}
+            }
+        }
+        Ok(reads)
+    }
+
+    /// Command words whose effect on variables this scan does not model, so a
+    /// body running one is refused rather than guessed at. `command` and
+    /// `builtin` are here because they run a builtin named as their argument;
+    /// `exec` and `env` run a program, never `eval` or `.`. `[[` is td-sh's
+    /// conditional, whose `-v NAME` reads a name with no `$`.
+    const PROBE_UNMODELLED: &[&str] = &[
+        "eval", "source", ".", "function", "for", "select", "alias", "read", "getopts", "local",
+        "typeset", "declare", "readonly", "trap", "command", "builtin", "[[",
+    ];
+
+    /// The reserved words the scan tracks, which a quoted spelling would turn
+    /// into an ordinary command word.
+    const PROBE_RESERVED: &[&str] = &[
+        "if", "then", "elif", "else", "fi", "while", "until", "do", "done", "case", "esac", "{",
+        "}", "!",
+    ];
+
+    /// Shells a probe could hand a script to: td-sh's farm (`sh`, `ash`) and
+    /// its own name, and the common others should one ever ship.
+    const PROBE_SHELLS: &[&str] = &["sh", "td-sh", "ash", "dash", "bash", "ksh", "zsh"];
+
+    /// Programs that run a program named among their operands, so an operand
+    /// that expands could name a shell this scan never sees spelled.
+    const PROBE_RUNNERS: &[&str] = &[
+        "exec", "env", "nohup", "xargs", "timeout", "nice", "setsid", "chroot", "stdbuf", "time",
+        "chrt", "ionice", "taskset", "unshare", "nsenter", "flock", "setpriv", "runuser", "sudo",
+        "doas", "su", "td-jail", "td-login",
+    ];
+
+    /// The script a nested `sh -c` runs, from its one argv word: a double-quoted
+    /// word with the backslash escapes double quotes give, or a word with no
+    /// quoting at all. Anything else is not modelled.
+    fn probe_nested_script(raw: &str) -> Result<String, String> {
+        let not_modelled = || Err("a nested `sh -c` script quoted other than as one word".into());
+        let Some(inner) = raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else {
+            if raw.contains(['"', '\\']) {
+                return not_modelled();
+            }
+            return Ok(raw.to_string());
+        };
+        let mut script = String::new();
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.next() {
+                    Some(e @ ('$' | '\\' | '"')) => script.push(e),
+                    Some(e) => {
+                        script.push('\\');
+                        script.push(e);
+                    }
+                    None => return not_modelled(),
+                },
+                '"' => return not_modelled(),
+                c => script.push(c),
+            }
+        }
+        Ok(script)
+    }
+
+    /// Walks the commands of `body[from..to]`, recursing into each command
+    /// substitution as `nested`, where nothing is credited. Pushes a bare
+    /// top-level `NAME=value` statement's name to `credited` with the offset
+    /// its word ends at, and each `export NAME` to `reads`.
+    fn probe_commands(
+        body: &str,
+        from: usize,
+        to: usize,
+        nested: bool,
+        credited: &mut Vec<(usize, String)>,
+        reads: &mut Vec<(usize, String)>,
+    ) -> Result<(), String> {
+        let tokens = probe_tokens(body, from, to)?;
+        let text = |start: usize, end: usize| body.get(start..end).unwrap_or("");
+        // Without quotes and escapes: how the shell sees a literal word.
+        let plain =
+            |raw: &str| -> String { raw.chars().filter(|c| !matches!(c, '"' | '\\')).collect() };
+        let is_name = |s: &str| {
+            let mut chars = s.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        let assignment = |raw: &str| -> Option<String> {
+            let (name, _) = raw.split_once('=')?;
+            is_name(name).then(|| name.to_string())
+        };
+        let mut stack: Vec<ProbeFrame> = Vec::new();
+        // The next word is a command word, and it starts a statement.
+        let (mut command, mut statement, mut exporting) = (true, true, false);
+        for (index, token) in tokens.iter().enumerate() {
+            let pattern = stack.last() == Some(&ProbeFrame::Case) && !command;
+            let (start, end, subs) = match token {
+                ProbeToken::Op(op) => {
+                    exporting = false;
+                    match (*op, pattern) {
+                        ("|" | "(", true) | ("redirect", _) => {}
+                        (")", true) => command = true,
+                        (";", _) => (command, statement) = (true, true),
+                        ("&&" | "||" | "|" | "&", _) => (command, statement) = (true, false),
+                        (";;", _) if stack.last() == Some(&ProbeFrame::Case) => command = false,
+                        ("(", _) if command => {
+                            stack.push(ProbeFrame::Paren);
+                            statement = false;
+                        }
+                        (")", _) if stack.last() == Some(&ProbeFrame::Paren) => {
+                            stack.pop();
+                            command = false;
+                        }
+                        (op, _) => return Err(format!("`{op}` where it is not modelled")),
+                    }
+                    continue;
+                }
+                ProbeToken::Word { start, end, subs } => (*start, *end, subs),
+            };
+            for &(script, close) in subs {
+                probe_commands(body, script, close, true, credited, reads)?;
+            }
+            let raw = text(start, end);
+            let word = plain(raw);
+            let word_at = |n: usize| match tokens.get(n) {
+                Some(ProbeToken::Word { start, end, .. }) => Some(text(*start, *end)),
+                _ => None,
+            };
+            let basename = |w: &str| w.rsplit('/').next().unwrap_or("").to_string();
+            let named = basename(&word);
+            // Wherever it appears, a shell's name must be followed by exactly
+            // `-c` and a literal script that holds no `$` and is itself a body
+            // this scan passes; td-sh, like dash, would take further options
+            // after `-c`, and with no `-c` reads a script this scan cannot see.
+            // The one exception names no script: `which sh`.
+            let which_operand = index
+                .checked_sub(1)
+                .and_then(word_at)
+                .is_some_and(|before| basename(&plain(before)) == "which");
+            if !word.contains('=') && PROBE_SHELLS.contains(&named.as_str()) && !which_operand {
+                let script = match (word_at(index + 1).map(plain).as_deref(), word_at(index + 2)) {
+                    // td-sh would take a word led by `-` or `+` (`--` too) as
+                    // a further option, and the script as the one after it.
+                    (Some("-c"), Some(script)) if !plain(script).starts_with(['-', '+']) => {
+                        probe_nested_script(script)?
+                    }
+                    _ => {
+                        return Err(format!(
+                            "`{word}` not followed by `-c` and a literal script"
+                        ))
+                    }
+                };
+                if script.contains('$') {
+                    return Err("a nested `sh -c` script that expands a parameter".into());
+                }
+                let problems = primary_probe_inherited_reads(&script);
+                if !problems.is_empty() {
+                    return Err(format!("a nested `sh -c` script: {problems:?}"));
+                }
+            }
+            // A runner's operands could name a shell through an expansion.
+            if PROBE_RUNNERS.contains(&named.as_str()) {
+                for later in tokens.get(index + 1..).unwrap_or(&[]) {
+                    match later {
+                        ProbeToken::Word { start, end, .. } => {
+                            let operand = text(*start, *end);
+                            if operand.contains('$') && assignment(operand).is_none() {
+                                return Err(format!(
+                                    "`{word}` given an operand that expands: `{operand}`"
+                                ));
+                            }
+                        }
+                        ProbeToken::Op("redirect") => {}
+                        ProbeToken::Op(_) => break,
+                    }
+                }
+            }
+            if matches!(
+                tokens.get(index.wrapping_sub(1)),
+                Some(ProbeToken::Op("redirect"))
+            ) {
+                continue;
+            }
+            if pattern {
+                if word == "esac" {
+                    stack.pop();
+                }
+                continue;
+            }
+            if exporting {
+                if is_name(&word) {
+                    reads.push((start, word));
+                } else if assignment(raw).is_none() {
+                    return Err(format!("`export {word}`"));
+                }
+                continue;
+            }
+            if !command {
+                continue;
+            }
+            let top = |want: ProbeFrame| stack.last() == Some(&want);
+            if raw != word && PROBE_RESERVED.contains(&word.as_str()) {
+                // Quoted, it is a command named `fi`, not the keyword.
+                return Err(format!("a quoted reserved word `{raw}`"));
+            }
+            match word.as_str() {
+                w if PROBE_UNMODELLED.contains(&w) => return Err(format!("`{w}`")),
+                "if" => stack.push(ProbeFrame::If),
+                "while" | "until" => stack.push(ProbeFrame::Loop),
+                "case" => {
+                    stack.push(ProbeFrame::Case);
+                    command = false;
+                }
+                "{" => stack.push(ProbeFrame::Brace),
+                "then" | "elif" | "else" if top(ProbeFrame::If) => {}
+                "do" if top(ProbeFrame::Loop) => {}
+                "fi" | "done" | "esac" | "}" => {
+                    let want = match word.as_str() {
+                        "fi" => ProbeFrame::If,
+                        "done" => ProbeFrame::Loop,
+                        "esac" => ProbeFrame::Case,
+                        _ => ProbeFrame::Brace,
+                    };
+                    if !top(want) {
+                        return Err(format!("an unbalanced `{word}`"));
+                    }
+                    stack.pop();
+                    command = false;
+                }
+                "then" | "elif" | "else" | "do" => return Err(format!("an unbalanced `{word}`")),
+                "!" => {}
+                "export" => {
+                    exporting = true;
+                    command = false;
+                }
+                _ => match assignment(raw) {
+                    Some(name) => {
+                        let ends = matches!(
+                            tokens.get(index + 1),
+                            None | Some(ProbeToken::Op(";" | "&&" | "||"))
+                        );
+                        if !nested && stack.is_empty() && statement && ends {
+                            credited.push((end, name));
+                        }
+                    }
+                    None if raw.contains('$') => {
+                        return Err(format!("a command word that expands: `{raw}`"))
+                    }
+                    None => command = false,
+                },
+            }
+            statement = false;
+        }
+        if stack.is_empty() {
+            Ok(())
+        } else {
+            Err("an unclosed compound command".into())
+        }
+    }
+
+    /// Why `body`, a probe's `/bin/sh -c` script, could read a value it did not
+    /// set itself: a read of `SHELL`; a read of a name neither in
+    /// `PRIMARY_PROBE_IDENTITY` nor assigned earlier by a bare top-level
+    /// `NAME=value` statement; or a construct this scan does not model.
+    ///
+    /// Conservative rather than a shell. Only `NAME=value` that starts a
+    /// statement at the top level — outside `( … )`, `$( … )`, `{ … }` and every
+    /// `if`, `while`, `until` and `case` — and is followed by `;`, `&&`, `||` or
+    /// the end assigns, taking effect where its word ends. A prefix
+    /// (`NAME=value cmd`), an `env NAME=value` operand, `export NAME=value` and
+    /// anything after `&&`, `||`, `|` or `&` assign nothing; `export NAME`
+    /// reads `NAME`. Refused outright, inside command substitutions too:
+    /// whitespace other than a space, single quotes, backticks,
+    /// here-documents, `${!…}`, any name or `$` inside `$((…))` (td-sh
+    /// evaluates names there recursively), function definitions, a quoted
+    /// reserved word, a command word that expands, a `PROBE_UNMODELLED`
+    /// command word however quoted or escaped, a `PROBE_RUNNERS` word given an
+    /// operand that expands, and a `PROBE_SHELLS` name anywhere — but as
+    /// `which`'s operand — not followed by exactly `-c` and one literal script
+    /// that holds no `$` and passes this scan itself. Not modelled because
+    /// td-sh has no such reader: `[ -v NAME ]` (its `test` has no `-v`) and
+    /// `printf -v`. It sees the shell's own parameters only: a program reading
+    /// its environment is not a read here, and gets only the identity
+    /// `exec-primary` gave and what the body exported.
+    fn primary_probe_inherited_reads(body: &str) -> Vec<String> {
+        let unsupported = |why: &str| vec![format!("unsupported: {why}")];
+        if body.chars().any(|c| c.is_whitespace() && c != ' ') {
+            return unsupported("whitespace other than a space");
+        }
+        if body.contains(['\'', '`']) || body.contains("<<") {
+            return unsupported("single quotes, backticks or a here-document");
+        }
+        let mut reads = match probe_expansions(body) {
+            Ok(reads) => reads,
+            Err(why) => return unsupported(&why),
+        };
+        let mut credited = Vec::new();
+        if let Err(why) = probe_commands(body, 0, body.len(), false, &mut credited, &mut reads) {
+            return unsupported(&why);
+        }
+        let mut problems = Vec::new();
+        for (at, name) in reads {
+            if name == "SHELL" {
+                problems.push("reads $SHELL, which is the account's shell".into());
+            } else if !PRIMARY_PROBE_IDENTITY.contains(&name.as_str())
+                && !credited.iter().any(|(set, n)| *n == name && *set <= at)
+            {
+                problems.push(format!("reads ${name} before assigning it"));
+            }
+        }
+        problems
+    }
+
+    /// APPLICATIONS.md §L.1, L6: the probes `su` ran moved to `exec-primary`, whose
+    /// shell inherits only the five identity variables, starts in `/`, and gets the
+    /// account's `SHELL`. So every body handed to `PRIMARY_PROBE_LAUNCHER /bin/sh -c`,
+    /// in every generated script, reads only what a bare top-level statement of its
+    /// own assigned first, or the identity — a value `su` once carried across from
+    /// td-svc would now read empty.
+    #[test]
+    fn every_primary_probe_reads_only_what_it_assigns_or_its_identity() {
+        // The scanner itself, both ways, before it is trusted with the image.
+        for (body, problem) in [
+            ("echo \"$TERM\"", "reads $TERM before"),
+            ("echo $SHELL", "reads $SHELL"),
+            ("SHELL=/bin/sh; echo ${SHELL}", "reads $SHELL"),
+            ("echo $x; x=1", "reads $x before"),
+            ("TERM=$TERM /bin/env", "reads $TERM before"),
+            ("o=$(/bin/echo \"$o\")", "reads $o before"),
+            ("export LANG=$LANG", "reads $LANG before"),
+            ("n=$((count+1))", "unsupported"),
+            ("[ \"${#PWD}\" = 1 ]", "reads $PWD before"),
+            ("export LANG", "reads $LANG before"),
+            (
+                "/bin/ssh -o BatchMode=yes h; echo $BatchMode",
+                "reads $BatchMode",
+            ),
+            ("echo \"x=1\"; echo $x", "reads $x before"),
+            ("read x", "unsupported"),
+            // A subshell's or a command substitution's assignment does not
+            // persist.
+            ("(x=1); echo $x", "reads $x before"),
+            ("o=$(y=1; echo); echo $y", "reads $y before"),
+            ("{ x=1; }; echo $x", "reads $x before"),
+            // A conditional assignment is not one.
+            (
+                "if false; then TERM=x; fi; echo $TERM",
+                "reads $TERM before",
+            ),
+            ("if o=$(/bin/true); then echo \"$o\"; fi", "reads $o before"),
+            ("/bin/false && TERM=x; echo $TERM", "reads $TERM before"),
+            ("TERM=x | /bin/true; echo $TERM", "reads $TERM before"),
+            // Neither a prefix nor an env operand assigns the shell's own.
+            ("B=2 /bin/env; echo $B", "reads $B before"),
+            ("TD_X=1 /bin/td-jail; echo $TD_X", "reads $TD_X before"),
+            ("/bin/env C=3 /bin/true; echo $C", "reads $C before"),
+            ("A=1; export A; export C=3; echo $A $C", "reads $C before"),
+            // A for list expands before its variable is set.
+            ("for TERM in $TERM; do :; done", "unsupported"),
+            ("for d in a b; do echo $d; done", "unsupported"),
+            // td-sh evaluates an arithmetic name's value recursively.
+            ("n=$(( (a) + b ))", "unsupported"),
+            ("n=$(( (1) + 2 )", "unsupported"),
+            ("n=TERM; echo $((n))", "unsupported"),
+            ("n=TERM; echo $(($n))", "unsupported"),
+            ("[[ -v TERM ]]", "unsupported"),
+            // A shell takes options after `-c`, and with none reads stdin
+            // or a file.
+            ("/bin/sh -c -- \"echo \\$TERM\"", "unsupported"),
+            ("/bin/sh -c -e \"echo \\$TERM\"", "unsupported"),
+            ("/bin/td-sh -c -x \"echo \\$TERM\"", "unsupported"),
+            ("echo \"echo \\$TERM\" | /bin/env sh", "unsupported"),
+            ("echo \"echo \\$TERM\" | exec sh", "unsupported"),
+            ("echo \"echo \\$TERM\" | exec /bin/env sh", "unsupported"),
+            ("/bin/env sh -s \"$HOME\" </tmp/x", "unsupported"),
+            ("nohup sh </tmp/x", "unsupported"),
+            ("/bin/td-util xargs sh </tmp/x", "unsupported"),
+            ("c=/bin/sh; /bin/env \"$c\" </tmp/x", "unsupported"),
+            ("c=/bin/sh; /bin/timeout 5 \"$c\" -c :", "unsupported"),
+            ("/bin/sh -c \"/bin/printf x | sh\"", "unsupported"),
+            ("/bin/sh -c \"eval x\"", "unsupported"),
+            // Refused however it is spelled.
+            ("e\\val \"echo \\$TERM\"", "unsupported"),
+            ("\"eval\" x", "unsupported"),
+            ("command eval x", "unsupported"),
+            ("o=$(eval \"echo \\$TERM\"); echo \"$o\"", "unsupported"),
+            ("[ \"$(ev\"\"al x)\" = 1 ]", "unsupported"),
+            ("c=/bin/true; \"$c\" x", "unsupported"),
+            ("echo \"echo \\$TERM\" | /bin/sh", "unsupported"),
+            ("echo \"echo \\$TERM\" | /bin/env /bin/sh", "unsupported"),
+            ("if true; then \"fi\"; x=1; fi; echo $x", "unsupported"),
+            ("/bin/sh -ec \"echo \\$TERM\"", "unsupported"),
+            ("export\tTERM", "unsupported"),
+            ("/bin/sh -c \"echo \\$TERM\"", "unsupported"),
+            ("/bin/sh -c \"echo $TERM\"", "unsupported"),
+            (". /etc/profile", "unsupported"),
+            ("source /etc/profile", "unsupported"),
+            ("echo ${!SHELL}", "unsupported"),
+            ("f() { TERM=x; }; f; echo $TERM", "unsupported"),
+            ("/bin/cat <<EOF", "unsupported"),
+            ("x=1; echo '$x'", "unsupported"),
+            ("if x; then :", "unsupported"),
+        ] {
+            let found = primary_probe_inherited_reads(body);
+            assert!(
+                found.iter().any(|p| p.contains(problem)),
+                "{body}: {found:?}"
+            );
+        }
+        for body in [
+            "x=1; echo \"$x\" ${x} $HOME $USER $LOGNAME $PATH $# $1 ${#1} $?",
+            "o=$(/bin/true) || exit 1; echo \"$o\"",
+            "n=$((1+2)); echo \\$x",
+            "A=1; export A; if [ \"$A\" = 1 ]; then echo \"$A\"; fi",
+            "m=$(/bin/cat f) || { echo no; m=1; }; \
+             case \"$m\" in \"\"|*[!0-9]*) echo \"$m\";; 0) :;; esac",
+            "/bin/sh -c \": > /tmp/x\" 2>/dev/null && exit 1; : > \"$HOME/x\"",
+            "/bin/which sh >/dev/null 2>&1 || echo no",
+        ] {
+            assert_eq!(
+                primary_probe_inherited_reads(body),
+                Vec::<String>::new(),
+                "{body}"
+            );
+        }
+
+        let launch = format!("{PRIMARY_PROBE_LAUNCHER} /bin/sh -c '");
+        let mut bodies = 0;
+        for (name, script, _) in etc_files(&SYSTEM).unwrap() {
+            assert!(!script.contains("/bin/su"), "{name} still runs /bin/su");
+            for (at, _) in script.match_indices(&launch) {
+                let rest = script.get(at + launch.len()..).unwrap();
+                let body = rest.split_once('\'').map(|(body, _)| body).unwrap();
+                let problems = primary_probe_inherited_reads(body);
+                assert!(
+                    problems.is_empty(),
+                    "an exec-primary probe in /etc/{name} {problems:?}: {body}"
+                );
+                bodies += 1;
+            }
+        }
+        // Rootcheck's two, bootsuccess's thirteen and netup's one.
+        assert_eq!(bodies, 16);
     }
 
     /// The read-only-root self-check must emit both diagnostic markers the headless
@@ -12020,10 +12671,10 @@ mod tests {
         // reaching its explicit || exit 1 fallback.
         assert!(
             rootcheck.contains(SYSTEM_STATE_OWNER_MARKER)
-                && rootcheck.contains("/bin/sh -c \": > /var/.tdwr-su\" 2>/dev/null && exit 1")
+                && rootcheck.contains("/bin/sh -c \": > /var/.tdwr-probe\" 2>/dev/null && exit 1")
                 && rootcheck
-                    .contains("/bin/sh -c \": > /var/root/.tdwr-su\" 2>/dev/null && exit 1")
-                && rootcheck.contains(": > \"$HOME/.tdwr-su\" || exit 1"),
+                    .contains("/bin/sh -c \": > /var/root/.tdwr-probe\" 2>/dev/null && exit 1")
+                && rootcheck.contains(": > \"$HOME/.tdwr-probe\" || exit 1"),
             "rootcheck must prove the login user cannot own system state by WRITING"
         );
         // The pre-clear must come BEFORE the child, and its failure must count. A stale
@@ -12031,7 +12682,7 @@ mod tests {
         // where `/var` is world-writable, and that failure reads as a pass — so
         // moving both clears after the child, or letting one fail quietly, reopens the
         // hole while leaving the assertion above green.
-        let clear = "/bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su";
+        let clear = "/bin/td-util rm -f /var/.tdwr-probe /var/root/.tdwr-probe";
         let (Some(first_clear), Some(child), Some(last_clear)) = (
             rootcheck.find(clear),
             rootcheck.find("if /bin/td-login exec-primary -- /bin/sh -c"),
@@ -12075,7 +12726,7 @@ mod tests {
         assert!(
             rootcheck.contains("td-rootcheck-v1 > /run/td-rootcheck-ok")
                 && bootsuccess.contains("set -f")
-                && bootsuccess.contains("su -s /bin/sh \"$health_user\" -c")
+                && bootsuccess.contains(&format!("{PRIMARY_PROBE_LAUNCHER} /bin/sh -c '"))
                 && bootsuccess.contains("/bin/cat /etc/os-release")
                 && bootsuccess.contains(
                     "/bin/rg --color never --no-filename --fixed-strings --line-regexp -- \"$n\" /etc/hostname"
@@ -12591,11 +13242,13 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // markers. Each marker must be gated on its real operation so a failure drops
         // the marker and reds the qemu-boot-net oracle rather than false-passing.
         let netup = build_netup();
-        let user_lookup =
-            "health_user=$(/bin/td-login exec-primary -- /bin/printenv USER) || exit 1";
-        let user_probe = "/bin/su -s /bin/sh \"$health_user\" -c";
-        assert!(netup.find(user_lookup).unwrap() < netup.find(user_probe).unwrap());
-        assert!(!netup.contains("tester"));
+        assert_eq!(
+            netup
+                .matches(&format!("{PRIMARY_PROBE_LAUNCHER} /bin/sh -c '"))
+                .count(),
+            1
+        );
+        assert!(!netup.contains("tester") && !netup.contains("/bin/su"));
         assert!(
             netup.contains("/bin/td-netd up"),
             "netup must bring the link up via td-netd on every boot"
@@ -13407,7 +14060,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         );
     }
 
-    /// The greeter wraps the probes in `su -s /bin/sh USER -c '\u{2026}'`, so a single quote
+    /// The health target wraps the probes in `exec-primary -- /bin/sh -c '\u{2026}'`, so a single quote
     /// anywhere in them closes that argument and scatters the rest into the OUTER shell
     /// as stray words: `grep -Eq "^[^ ]+ / erofs ro[, ]"` becomes `grep -Eq ^[^` plus
     /// five loose arguments, `$t` is set in the wrong shell, and the marker can never be
@@ -13415,19 +14068,19 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// oracle — a whole-image check — would ever notice. Hence a unit test.
     ///
     /// Two halves, and both are needed: the probes carry no single quote, and they sit
-    /// immediately after the opening quote of the `su -c` argument. The second is what
+    /// immediately after the opening quote of the `/bin/sh -c` argument. The second is what
     /// makes the first a proof rather than a convention about a wrapper nothing pins.
     #[test]
     fn td_txt_probes_survive_the_greeters_quoting() {
         let probes = build_td_txt_probes();
         assert!(
             !probes.contains('\''),
-            "a single quote in the td-txt probes would close the greeter's `su -c` \
+            "a single quote in the td-txt probes would close the health target's `sh -c` \
              argument: {probes}"
         );
         assert!(
             build_bootsuccess(&SYSTEM).contains(&format!("-c '{probes}")),
-            "the greeter must run the td-txt probes verbatim inside its `su -c` argument"
+            "the health target must run the td-txt probes verbatim inside its `sh -c` argument"
         );
     }
 
@@ -13642,19 +14295,19 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     }
 
     /// Every probe leg can clear the flag, and the farm is quoted so the greeter's
-    /// `su -c '…'` survives it — `td_txt_probes_survive_the_greeters_quoting`'s argument,
+    /// `/bin/sh -c '…'` survives it — `td_txt_probes_survive_the_greeters_quoting`'s argument,
     /// which applies verbatim to any farm added beside it.
     #[test]
     fn sandbox_kernel_probes_can_fail_and_survive_the_greeters_quoting() {
         let probes = build_sandbox_kernel_probes();
         assert!(
             !probes.contains('\''),
-            "a single quote in the kernel probes would close the greeter's `su -c` \
+            "a single quote in the kernel probes would close the health target's `sh -c` \
              argument: {probes}"
         );
         assert!(
             build_bootsuccess(&SYSTEM).contains(&format!("-c '{probes}")),
-            "the greeter must run the kernel probes verbatim inside its `su -c` argument"
+            "the health target must run the kernel probes verbatim inside its `sh -c` argument"
         );
         // One `k=0` per table entry, and THREE per ucount limit — unreadable, not a
         // number, zero — since each is a distinct way for one file to fail to answer.
@@ -13955,7 +14608,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             "an empty farm would make every per-applet assertion below, and shape_check's \
              own farm loop, silently vacuous"
         );
-        // The segments are pasted inside the health target's single-quoted `su -c '…'`
+        // The segments are pasted inside the health target's single-quoted `sh -c '…'`
         // argument, so ONE `'` anywhere in them ends it and hands the rest to the wrong
         // shell. The rule is stated at `td_init_probe`; this is what holds it.
         for (applet, probe) in TD_INIT_FARM {
@@ -13963,7 +14616,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             assert!(
                 !segment.contains('\''),
                 "the probe segment for /bin/{applet} contains a single quote, which would \
-                 terminate the health target's `su -c '...'` argument: {segment}"
+                 terminate the health target's `sh -c '...'` argument: {segment}"
             );
         }
         // Match the WHOLE generated segment, failure branch included: matching the applet
@@ -14044,7 +14697,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         );
     }
 
-    /// td-login is packed, owns `/bin/{login,su}`, and the credential switch it performs is
+    /// td-login is packed, owns `/bin/login`, and the credential switch it performs is
     /// VERIFIED on the image rather than assumed.
     ///
     /// The stock console and health probes exercise the session machinery;
@@ -14122,9 +14775,19 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 "{subcommand} is a subcommand, not an applet; it must not be packed into /bin"
             );
         }
+        // No `su` at all (APPLICATIONS.md §L.1, L6): no farm serves it, nothing packs
+        // it, and the shape check refuses one in the packed tree.
+        assert!(!packed_bin_names().iter().any(|n| n == "su"));
+        assert!(steps.iter().all(|s| !matches!(
+            s,
+            Step::Symlink { link, .. } if link == "{root}/real-root/bin/su"
+        )));
+        assert!(shape.contains(
+            "{ [ -e \"$root/bin/su\" ] || [ -L \"$root/bin/su\" ]; } && { echo 'root tree: /bin/su is packed"
+        ));
 
-        // The health target must RUN the readback through /bin/su — the shipped symlink and
-        // the real credential switch — and clear the marker gate when it disagrees.
+        // The health target must RUN the readback through exec-primary — the shipped
+        // credential switch — and clear the marker gate when it disagrees.
         let bootsuccess = build_bootsuccess(&SYSTEM);
         let user = SYSTEM
             .users
@@ -14136,8 +14799,8 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             .map(|gid| gid.to_string())
             .collect();
         assert!(
-            bootsuccess.contains("/bin/su -s /bin/sh \"$health_user\" -c 'l=1;"),
-            "the td-login leg must run THROUGH /bin/su as the login user: that IS the \
+            bootsuccess.contains(&format!("{PRIMARY_PROBE_LAUNCHER} /bin/sh -c 'l=1;")),
+            "the td-login leg must run THROUGH exec-primary as the login user: that IS the \
              credential switch under test, and a leg run as root would verify nothing"
         );
         assert!(
@@ -14181,7 +14844,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             td_login_probe(&lone)
         );
         // A SystemDef whose autologin user does not resolve must produce a probe that
-        // FAILS, never an empty one: `su -c ''` exits 0 and would print the marker
+        // FAILS, never an empty one: `sh -c ''` exits 0 and would print the marker
         // unconditionally.
         assert!(
             td_login_probe(&SystemDef {
@@ -14197,7 +14860,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             bootsuccess.contains("l=0; }; [ \"$l\" = 1 ]"),
             "a failed readback must clear the marker gate"
         );
-        // Both halves gate the ONE marker: the unprivileged readback through `su`, and
+        // Both halves gate the ONE marker: the unprivileged readback through `exec-primary`, and
         // the root-side `exec-as` that starts a session of its own. They are `&&`ed
         // rather than given a marker each because they prove the same thing — that this
         // crate's credential switch produced the credentials it named — through the two

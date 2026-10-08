@@ -97,9 +97,9 @@ release note may describe this tier as available before its acceptance
 evidence exists.
 
 **Enrollment requires §L.1 elevation.** Enrolling a key refuses every
-interactive login, and on a fresh install `su` cannot elevate from a
-session and root has no SSH key, so an enrolled machine would otherwise
-have no administrative path. The activation increment therefore lands
+interactive login, and on a fresh install there is no `su` and root has
+no SSH key, so an enrolled machine would otherwise have no
+administrative path. The activation increment therefore lands
 only after the `APPLICATIONS.md` §L.1 consent-only elevation workstream,
 whose "Elevation increments" L1 to L7 make `deploy-rollback`,
 `set-hostname` and `deploy-publish` approval-key operations and then

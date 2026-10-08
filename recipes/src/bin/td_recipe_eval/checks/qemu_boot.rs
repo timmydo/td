@@ -117,7 +117,7 @@ const TD_TXT_RUNTIME_MARKER: &str = td_recipe::ladder::TD_TXT_RUNTIME_MARKER;
 /// serves has been exercised — the reversible ones by running, the irreversible ones
 /// (`reboot`/`poweroff`/`halt`/`switch_root`) by refusing a bad argument with a diagnostic.
 const TD_INIT_RUNTIME_MARKER: &str = td_recipe::ladder::TD_INIT_RUNTIME_MARKER;
-/// Printed by the root-owned health target after `/bin/su` — td-login — switched to the
+/// Printed by the root-owned health target after `td-login exec-primary` switched to the
 /// unprivileged login user AND the switched process read its own credentials back out of
 /// `/proc/self/status` and they matched exactly. This is the only marker that asserts the
 /// RESULT of a credential change rather than that something ran.
@@ -2114,13 +2114,13 @@ fn validate_system_boot(
     if !result.evidence.td_login_runtime {
         return Err(format!(
             "the root/userland/sshd/td-util/td-init health checks passed, but the td-login \
-             runtime marker ({TD_LOGIN_RUNTIME_MARKER:?}) was absent — `/bin/su` reached the \
-             unprivileged login user (every other health leg above runs through it, so it \
-             must have), but the switched process did not read its own credentials back as \
-             the ones the switch asked for. The console names the disagreement \
-             (`real/effective/saved/filesystem uid is …, expected …`, or `supplementary \
-             groups are …`). Read this one carefully: it is the ONLY check on this image \
-             that would notice a credential switch which started a perfectly working \
+             runtime marker ({TD_LOGIN_RUNTIME_MARKER:?}) was absent — `td-login exec-primary` \
+             reached the unprivileged login user (every other health leg above runs through \
+             it, so it must have), but the switched process, or the one root's `exec-as` \
+             started, did not read its own credentials back as the ones the switch asked \
+             for. The console names the disagreement (`real/effective/saved/filesystem \
+             uid is …, expected …`, or `supplementary groups are …`). Read this one \
+             carefully: it is the ONLY check on this image that would notice a credential switch which started a perfectly working \
              session while leaving a residual credential attached — a `setuid(2)` issued \
              before `setgroups(2)` drops the uid and silently keeps root's supplementary \
              groups, and every other marker here still prints. See \

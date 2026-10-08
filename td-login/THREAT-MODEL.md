@@ -1,10 +1,12 @@
 # td-login threat model
 
 td-login is the credential-switching half of td's login chain: the
-`login` and `su` applets, replacing busybox's, plus the `exec-as` and
+`login` applet, replacing busybox's, plus the `exec-as` and
 `exec-service-as` subcommands that run supervised daemons as another user.
 `login-primary` and `exec-primary` select the deployment's UID-1000 human
-and then call the existing `login -f` and ordinary `exec-as` front ends.
+and then call the existing `login -f` and ordinary `exec-as` front ends;
+root's boot-health probes drop to that human through `exec-primary`.
+td ships no `su`: `APPLICATIONS.md` §L.1's L6 deleted it.
 It is the only
 td-owned general-purpose program on a td image whose job is to *change* a
 process's Unix credentials, so a
@@ -40,10 +42,10 @@ Adversaries considered:
   specifies its complete admission and publication. A build-time tailoring
   mistake or damaged saved setting must refuse, and readers still validate
   the live files. Numeric identities and authentication fields are preserved.
-- **A3 — a hostile caller of td-login**: whatever execs `login`, `su`,
-  `exec-as`, or `exec-service-as` chooses argv, the environment, the
-  current directory, and the open file descriptors, including which file
-  is on fd 0.
+- **A3 — a hostile caller of td-login**: whatever execs `login`,
+  `login-primary`, `exec-as`, `exec-primary` or `exec-service-as` chooses
+  argv, the environment, the current directory, and the open file
+  descriptors, including which file is on fd 0.
 - **A4 — a person at a locked machine** without an enrolled login key and
   its PIN. This adversary exists only under the planned login-key tier in
   [`TOKEN-LOGIN.md`](TOKEN-LOGIN.md), which owns that tier's scope, and
@@ -91,7 +93,7 @@ disposable, unenrolled QEMU volume: it is preseeded with a
 loopback-restricted public key and a root-only matching private fixture
 before boot. Boot health reads those fixtures but never rewrites live
 administrator authorization state. Root SSH with a key is today's one
-interactive administrative path (§4: `su` is none);
+interactive administrative path (td-login is none, §4);
 [`APPLICATIONS.md`](../APPLICATIONS.md) §L.1's L7 refuses it in both
 forms, and the same seeded key then proves the refusal.
 
@@ -235,21 +237,24 @@ capability no shipped td image uses. The policy is therefore fail-closed
 by construction — the shadow field is classified, and only one class
 authenticates:
 
-The `login -f` and `su`/`exec-as` columns below are the *forced* paths,
+The `login -f` and `exec-as` columns below are the *forced* paths,
 which skip authentication because the caller has by then already
 established the right to start the session. **"Reachable
 only by root" is how that used to be stated here and it is not quite
 true**, which is worth correcting rather than repeating: what root is
 needed for is a switch that CHANGES something, and §4's
 `creds::may_switch` is what refuses one, over all four uid columns. A
-caller asking to become who they already are takes `creds::apply`'s early
-return instead — `su tester` as tester, or `exec-as tester` as tester —
-and starts a program with no privilege that caller lacked. The forced
-path skips a password; it does not hand one out.
+switch to the credentials the caller already holds takes `creds::apply`'s
+early return instead and starts a program with no privilege that caller
+lacked. Only root targeting root reaches that case today: the forced path
+reads the root-only `/etc/shadow` before any switch, so `exec-as tester`
+or `exec-primary` run as tester fails there. The forced path skips a
+password; it does not hand one out.
 
-Ordinary `exec-as` shares `su`'s column exactly, and by construction rather
-than by coincidence: all three human-session front ends reach ONE decision,
-`login::authorize`, which `the_session_policy_is_decided_in_one_place`
+Ordinary `exec-as` shares `login -f`'s forced policy, and by construction
+rather than by coincidence: both human-session front ends, `login` and
+`exec-as` (with the primary selectors that forward to them), reach ONE
+decision, `login::authorize`, which `the_session_policy_is_decided_in_one_place`
 holds them to by refusing any module but `db` and `login` to name
 `may_start_session` at all. So a locked or service-only account is refused on
 every one of them. `exec-service-as` reaches the same account lookup and the
@@ -272,7 +277,8 @@ retains the all-root caller requirement of `login -f`; `exec-primary` retains
 the ordinary forced policy and same-credentials no-op behavior. Locked and
 service-only accounts remain denied. A missing or malformed primary record
 refuses without a fallback name. Environment and terminal handling follow
-their existing front ends exactly. The applet/symlink roster stays `login,su`.
+their existing front ends exactly. The applet/symlink roster is `login`
+alone.
 
 The shared reader is compiled beneath `forbid(unsafe_code)` and is included
 in the source-level confinement scan alongside the local modules. Exactly
@@ -291,20 +297,20 @@ outside its tests. The predicate adds no credential syscall or policy
 decision; the console refusal below adds a hand-back to root that reuses
 §6's identification and mode write in its own order.
 
-| `/etc/shadow` field | class        | interactive `login` | `login -f` | `su`, `exec-as` (forced) | `exec-service-as` |
-| ------------------- | ------------ | ------------------- | ---------- | ------------------------ | ----------------- |
-| empty               | `NoPassword` | allowed             | allowed    | allowed                  | denied            |
-| `!td-service`       | `Service`    | denied              | denied     | denied                   | **allowed**       |
-| `!`, `!!`, `*`      | `Locked`     | denied              | **denied** | **denied**               | denied            |
-| anything else       | `Hashed`     | **denied**          | allowed    | allowed                  | denied            |
-| no entry / no file  | —            | denied              | denied     | denied                   | denied            |
+| `/etc/shadow` field | class        | interactive `login` | `login -f` | `exec-as` (forced) | `exec-service-as` |
+| ------------------- | ------------ | ------------------- | ---------- | ------------------ | ----------------- |
+| empty               | `NoPassword` | allowed             | allowed    | allowed            | denied            |
+| `!td-service`       | `Service`    | denied              | denied     | denied             | **allowed**       |
+| `!`, `!!`, `*`      | `Locked`     | denied              | **denied** | **denied**         | denied            |
+| anything else       | `Hashed`     | **denied**          | allowed    | allowed            | denied            |
+| no entry / no file  | —            | denied              | denied     | denied             | denied            |
 
 Consequences worth stating plainly:
 
 - An account with a real password hash **cannot log in interactively**.
   This build cannot verify one, and treating an unverifiable secret as
   absent would be the escalation. Root can still start a session for it
-  (`login -f`, `su`) — that grants nothing root did not already have,
+  (`login -f`, `exec-as`) — that grants nothing root did not already have,
   and denying it would only break the ordinary "root may become anyone"
   semantics.
 - `Locked` is denied even on the forced paths, which is stricter than
@@ -425,11 +431,11 @@ and its td-svc unit restarts it whenever it ends (`restart=always`), so
 any exit would be a reboot or a respawn loop. A signal still ends it:
 Ctrl-C or Ctrl-\ typed on the serial line, `SIGHUP` or `SIGTERM` ends
 td-login with a non-zero status, so the `&&` skips the reboot and td-svc
-respawns the greeter into the same gate. `su` is an administrative path
-on no machine (§4), and root SSH and root's empty shadow field are
-retired before any machine can enroll (TOKEN-LOGIN.md, "Enrollment
-requires §L.1 elevation"). The forced paths (`login -f`, `su`,
-`exec-as`, `exec-primary`, `exec-service-as`) keep this section's rules:
+respawns the greeter into the same gate. td ships no `su` (§4), and
+root SSH and root's empty shadow field are retired before any machine
+can enroll (TOKEN-LOGIN.md, "Enrollment requires §L.1 elevation"). The
+forced paths (`login -f`, `exec-as`, `exec-primary`,
+`exec-service-as`) keep this section's rules:
 they change credentials only for an all-root caller (§4) and are
 otherwise no-ops. A greeter must therefore use `login-primary`:
 `build_autologin` has no `login -f` fallback for a non-primary autologin
@@ -492,7 +498,7 @@ before root token I/O; an assertion binds the exact request. Session
 startup clears old releases before graphical input begins, and generation
 teardown reaps any worker before clearing its release. Typed credential writes use a human-authenticated sealed descriptor and
 physical W selection of one queued request; one presented token assertion
-authorizes that operation. There is no root-console write bypass. No login, `su` or keyboard-consent
+authorizes that operation. There is no root-console write bypass. No login or keyboard-consent
 behavior substitutes for that authorization.
 
 Local system installation is a separate named root operation,
@@ -502,7 +508,7 @@ its full manifest ID; the root-drawn approval key, typed after complete
 presentation, authorizes only that installation, and Enter does not.
 td-authd passes its pinned source directory to the fixed
 installed helper, which signs with the already-provisioned installation key
-and uses the existing boot transaction. Neither td-login nor su elevates the
+and uses the existing boot transaction. td-login does not elevate the
 caller. This does not change human login, hardware authentication, credential
 release or sensitive protector policy. See td-authd/DESIGN.md and
 td-install/DESIGN.md for admission and lifetime limits.
@@ -525,41 +531,35 @@ rather than assumed:
 - `creds::may_switch` requires **all four uid columns** to be 0, not
   just the effective one. Under a setuid-root exec the real uid stays
   the caller's while the effective one is 0, so an "is the effective uid
-  0" gate would admit an unprivileged caller — and since `su` takes the
-  forced policy path (§3), that caller would reach root *without
+  0" gate would admit an unprivileged caller — and since `exec-as` takes
+  the forced policy path (§3), that caller would reach root *without
   authenticating*. The two checks are independent: one would have to
   fail silently and the other be edited for the boundary to move.
 
 It follows that:
 
-- A1 cannot use `su` to become another user. `creds::may_switch` refuses
-  a caller that is not root in every uid column, and the kernel would
-  refuse the syscalls anyway; the check exists so the failure is a named
-  diagnostic rather than an `EPERM` from somewhere in the middle of a
-  switch.
-- `su` is therefore no administrative path: it is a root-only privilege
-  drop, whose callers on a td image are root-run boot-health probes
-  (§8). `APPLICATIONS.md` §L.1's L6 deletes the applet and moves those
-  probes to `exec-primary`.
-- The `-s SHELL` and `-c CMD` options of `su`, which in a setuid
-  program would be an escalation surface (choose the program root
-  runs), are inert: only root can reach the credential switch at all,
-  and root can already exec anything.
-- **`su` permutes its options**, so a flag may appear after the user
-  name — `su -s /bin/sh tester -c '…'` is the form td's own boot
-  scripts use, and it is what busybox's `getopt32` does. The
-  consequence is worth stating: in `su USER $UNTRUSTED`, a word in
-  `$UNTRUSTED` that looks like an option is consumed by `su` rather
-  than passed to the shell, so an injected `-s /bin/sh` would override
-  the account's own shell. That is reachable only from a *root* script
-  interpolating untrusted words — root can exec anything anyway — td
-  ships no such script and no restricted shell, and `--` ends option
-  parsing for a caller that wants it. Kept for busybox compatibility;
-  revisit if td ever grows an account whose shell is a confinement.
-- `su` to *yourself* is a no-op switch — `apply` returns early when the
-  kernel's view already equals the target — so it neither needs nor
-  attempts privilege. The session-cgroup join is independently idempotent: a
-  same-user invocation already in the leaf performs no write.
+- A1 cannot use `exec-as` or `exec-primary` to become another user.
+  `creds::may_switch` refuses a caller that is not root in every uid
+  column, and the kernel would refuse the syscalls anyway; the check
+  exists so the failure is a named diagnostic rather than an `EPERM`
+  from somewhere in the middle of a switch.
+- So no td-login front end is an administrative path: each is a
+  root-only privilege drop. td ships no `su`. `APPLICATIONS.md` §L.1's
+  L6 deleted the applet, whose only callers were root-run boot-health
+  probes, and moved them to `exec-primary` (§5, §8); a stale `/bin/su`
+  link or `td-login su` reaches usage and exit 2, and the image's shape
+  check refuses a packed `/bin/su`.
+- `exec-as`'s program and argument tail, which in a setuid program would
+  be an escalation surface (choose the program root runs), are inert:
+  only root can reach the credential switch at all, and root can already
+  exec anything. Its grammar has no options and a mandatory `--`, so no
+  argument word is ever consumed as one.
+- A switch to the credentials already held is a no-op — `apply` returns
+  early when the kernel's view already equals the target — so it attempts
+  no privilege change. Only root targeting root reaches it: a non-root
+  caller's `exec-as` fails reading the root-only `/etc/shadow` first. The
+  session-cgroup join is independently idempotent: a same-user invocation
+  already in the leaf performs no write.
 
 This is why the crate is `#![deny(unsafe_code)]` with a three-syscall
 exception rather than a program with a carefully audited setuid entry
@@ -569,22 +569,42 @@ exist.
 ## 5. Environment, and what the session inherits
 
 A3 controls the environment td-login is handed. For a **login session**
-(`login`, or `su -`/`su -l`) that environment is discarded: the session
+(`login`) that environment is discarded: the session
 starts from `PATH=/bin`, plus `HOME`, `SHELL`, `USER`, `LOGNAME` derived
 from the account database, plus `TERM` carried through because the
 terminal type is a property of the terminal, not of the caller. `login
 -p` preserves the rest on the caller's explicit say-so — it is a flag
 only root can reach, and root already owns the machine.
 
-For a **non-login `su`** the environment is preserved (this is what
-makes `su -c` usable from a script), but `HOME`, `SHELL`, `USER`,
-`LOGNAME` and `PATH` are still overwritten so they describe the target
-account rather than the caller's.
+No front end other than root's `login -p` keeps the caller's
+environment. The non-login `su`, which kept it and overwrote only those
+five variables, was deleted with its applet (`APPLICATIONS.md` §L.1,
+L6). The root-run boot-health probes it carried run through
+`exec-primary -- /bin/sh -c '…'` under the rule below, which differs
+in three ways: the probe's shell inherits only the five identity
+variables, starts in `/` rather than the caller's directory, and sees
+the account's `SHELL` rather than the `/bin/sh` that `su -s` named.
+`system-x86-64`'s
+`every_primary_probe_reads_only_what_it_assigns_or_its_identity` holds
+every such body to reading only `HOME`, `USER`, `LOGNAME` and `PATH`
+or a variable that a bare top-level `NAME=value` statement of the body
+assigned first, and to never reading `SHELL`. It is a conservative scan
+of the shell's own parameter reads, not a shell: an assignment inside a
+subshell, substitution, group or conditional, or as a command prefix,
+does not count, and a body using a construct it does not model —
+`eval`, `.`, `[[`, a function, a `for` list, a here-document, `${!…}`,
+any name inside `$((…))` (td-sh evaluates one recursively), a program
+runner such as `env` or `exec` given an operand that expands, or a
+shell's name anywhere but as `which`'s operand without exactly `-c`
+and one literal script that holds no `$` and passes the same scan —
+fails the test. A program the body runs that reads its environment
+sees only what `exec-primary` gave and the body exported.
 
-For **`exec-as` and `exec-service-as`** the environment is discarded
-ENTIRELY — these are the only front ends where nothing at all of the
-caller's survives, `TERM` included. What they start is a SUPERVISED
-DAEMON, whose environment ought to be a property of its unit; td-svc has
+For **`exec-as`, `exec-primary` and `exec-service-as`** the environment
+is discarded ENTIRELY — these are the only front ends where nothing at
+all of the caller's survives, `TERM` included, and each starts in `/`.
+What they start is a SUPERVISED DAEMON or a root-run probe, whose
+environment ought to be a property of its unit or script; td-svc has
 no `env=` key to make it one, so preserving would hand a long-lived
 unprivileged service whatever the supervisor happened to inherit from the
 boot path — undeclared, and not necessarily the same on a restart as on
@@ -737,11 +757,15 @@ assert equality against `/proc/self/status`.
   fixture is a host diagnostic supplied with the target td-login binary,
   not image content.
 - The boot exercises login's forced-session path through `login-primary`
-  and credential health probes through `su`. Unit tests cover the login
-  applet's basename route; the image shape check pins its symlink.
+  and credential health probes through `exec-primary`. Unit tests cover
+  the login applet's basename route and refuse `su` by either entry
+  form; the image shape check pins the login symlink and refuses a
+  `/bin/su`. A recipe unit test holds every `exec-primary` probe body to
+  the environment §5 gives it.
 - `TD-LOGIN-RUN-OK` is the credential-specific evidence. `/etc/bootsuccess`
-  runs `su` to the unprivileged user and has `td-login verify-credentials`
-  read `/proc/self/status` back, asserting the exact uid, gid and
+  runs `exec-primary` to the unprivileged user, and as root `exec-as` to
+  the same account, and in each has `td-login verify-credentials` read
+  `/proc/self/status` back, asserting the exact uid, gid and
   supplementary set. A switch that "worked" but left a residual group
   attached prints no marker and reds the boot oracle — which is the one
   failure mode every other check on the image would pass.

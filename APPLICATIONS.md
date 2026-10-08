@@ -596,9 +596,9 @@ particular name is one a reader could mistake for a general-purpose "run
 this as anyone". The `--` is REQUIRED, which is the whole parser: with no
 options of its own, a mandatory separator removes the only ambiguity
 available and keeps a later option from colliding with an argument that
-already works. And the environment is EMPTIED — not merely `su -`'s
-fresh one, which keeps `TERM`, but the five identity variables and
-nothing else. A supervised daemon's environment should be a property of
+already works. And the environment is EMPTIED — not merely a login
+session's fresh one, which keeps `TERM`, but the five identity variables
+and nothing else. A supervised daemon's environment should be a property of
 its unit and td-svc has no `env=` key to make it one, so anything
 carried across makes what a daemon sees a function of the boot path;
 `TERM` is the case that proves the rule rather than an exception to it,
@@ -5772,9 +5772,9 @@ marker while that count is under `BUS_MARKER_GRACE_SWEEPS` — a delay of a
 fixed few seconds, never a withheld `td-boot success`, which is exactly
 the difference between a retry and a veto.
 
-The probe is also the eighth `su` block in that farm and the only one
-with a bounded wait of its own, which is why the guest's per-iteration
-budget and the host's boot ceiling both moved with it.
+The probe is also the eighth unprivileged block in that farm and the
+only one with a bounded wait of its own, which is why the guest's
+per-iteration budget and the host's boot ceiling both moved with it.
 
 **What the marker does NOT say.** It is the handshake and nothing more,
 because `probe` is the handshake and nothing more. Read a green marker as
@@ -8878,13 +8878,15 @@ unimplemented and supplies no account-password prompt.
 
 #### Administration today, and retiring the escape hatch
 
-**What administers a td machine today.** td-login's `su` cannot raise
-privilege: `creds::may_switch` refuses a caller that is not root in all
-four uid columns (`td-login/THREAT-MODEL.md` §4), so it is a root-only
-privilege drop. Its callers are root-run boot-health probes, thirteen
-`/etc/bootsuccess` legs, the `TD-LOGIN-RUN-OK` one among them, and the
-network self-test. Root's empty shadow field opens no console session,
-since the console logs in only through `login-primary`. The one
+**What administers a td machine today.** No td-login front end can
+raise privilege: `creds::may_switch` refuses a caller that is not root
+in all four uid columns (`td-login/THREAT-MODEL.md` §4), so each is a
+root-only privilege drop, and since L6 there is no `su`. Root-run
+boot-health probes, thirteen `/etc/bootsuccess` legs, the
+`TD-LOGIN-RUN-OK` one among them, and the network self-test drop to the
+primary account through `exec-primary`. Root's empty shadow field opens
+no console session, since the console logs in only through
+`login-primary`. The one
 interactive administrative path is root SSH, which the ordinary policy's
 `PermitRootLogin prohibit-password` admits only for a key someone seeded
 into `/var/lib/td/ssh/authorized_keys`; a fresh install has none. The
@@ -8898,18 +8900,24 @@ deployment through `deploy-rollback`, since L4 rename it through
 
 **Retiring the escape hatch.** The escape hatch is root's remaining
 administrative surface: the `su` applet, root's empty shadow field and
-root SSH. Until the steps below land, all three remain. Both steps land
-only after `deploy-rollback` is live (L3), so no build is left without
-an administrative path:
+root SSH. L6 has removed the first; root's empty shadow field and root
+SSH remain until L7. Both steps land only after `deploy-rollback` is
+live (L3), so no build is left without an administrative path:
 
-1. **L6 deletes the `su` applet** and its `/bin/su` link. Its probes
-   move to `td-login exec-primary -- /bin/sh -c '…'`, which differs from
-   a non-login `su` in three ways (`td-login/THREAT-MODEL.md` §5): the
-   environment holds only the five identity variables, where `su` kept
-   the caller's and overwrote five; the working directory is `/`; and
-   `SHELL` is the account's shell. L6 adds a recipe unit test that each
-   moved probe body reads only variables it assigns or those five, and
-   flags any read of `$SHELL`, whose value changes.
+1. **L6 deletes the `su` applet** and its `/bin/su` link; it has
+   landed. Its probes moved to `td-login exec-primary -- /bin/sh -c
+   '…'`, which differs from a non-login `su` in three ways
+   (`td-login/THREAT-MODEL.md` §5): the environment holds only the five
+   identity variables, where `su` kept the caller's and overwrote five;
+   the working directory is `/`; and `SHELL` is the account's shell. A
+   recipe unit test,
+   `every_primary_probe_reads_only_what_it_assigns_or_its_identity`,
+   holds each moved probe body to reading only `HOME`, `USER`,
+   `LOGNAME`, `PATH` or a variable a bare top-level statement of the
+   body assigned first, flags any read of `$SHELL`, whose value
+   changed, and fails any body using a shell construct it does not
+   model, a nested shell among them unless it is handed exactly `-c`
+   and a literal script that expands nothing and passes the same scan.
 2. **L7 locks root.** Root's shadow field becomes `!`, which every
    td-login path refuses, and both SSH forms carry `PermitRootLogin no`,
    so they differ only by `AllowUsers`. Boot-health probes already run
@@ -8933,8 +8941,8 @@ enrollment, follows L7.
 
 The workstream's commits, in landing order. Each is one landing, and
 none repairs an earlier one. Each amends the documents whose current
-statements it changes, including those named here. L0 to L5 have
-landed; L6 and L7 are targets.
+statements it changes, including those named here. L0 to L6 have
+landed; L7 is a target.
 
 - **L0**, documents only: this specification. Nothing ships.
 - **L1**, the consent codec, inert: consent tags 11 (`deploy-rollback`)

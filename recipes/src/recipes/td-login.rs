@@ -9,10 +9,11 @@ use crate::types::{Recipe, Step};
 // ONE source of truth and cannot drift; the path escapes the
 // `recipes/src/recipes/*.rs` catalog glob, so it is not itself a recipe module.
 //
-// SCOPE: the busybox applets that CHANGE WHO A PROCESS IS — `login` (what getty
-// execs, through /etc/autologin) and `su` (what every unprivileged health leg on
-// the image goes through). They are one binary because they are one operation
-// with two front ends: resolve an account, decide whether a session may start,
+// SCOPE: the programs that CHANGE WHO A PROCESS IS — the `login` applet (what
+// the greeter reaches through `login-primary`) and the `exec-*` subcommands
+// (supervised units, and every unprivileged health leg on the image through
+// `exec-primary`). They are one binary because they are one operation with
+// several front ends: resolve an account, decide whether a session may start,
 // then switch credentials once, in one place, in one order.
 //
 // td-login/THREAT-MODEL.md is the specification, and the reason this is not
@@ -32,15 +33,16 @@ use crate::types::{Recipe, Step};
 // where nothing can read back what actually took. The readback is the whole
 // defence; see THREAT-MODEL.md section 2.
 //
-// system-x86-64 SHIPS this as the /bin/{login,su} farm, off busybox. Unlike
-// the td-util cutover the success paths need no synthetic probe:
-// `td-login login-primary` is how the image reaches its greeter, and /etc/bootsuccess runs health legs
-// through `su`; rootcheck's ownership and host-key probes use literal
-// execution subcommands. A failed credential transition fails the boot
+// system-x86-64 SHIPS this as /bin/td-login and the /bin/login farm, off
+// busybox. Unlike the td-util cutover the success paths need no synthetic
+// probe: `td-login login-primary` is how the image reaches its greeter, and
+// /etc/bootsuccess and /etc/rootcheck run their unprivileged legs through
+// `td-login exec-primary`. A failed credential transition fails the boot
 // outright. What the boot could NOT see is a switch that "worked" while
 // leaving a residual credential behind — every marker still prints — so the
-// health target additionally runs `td-login verify-credentials` THROUGH `su`
-// and gates TD-LOGIN-RUN-OK on the kernel's own readback.
+// health target additionally runs `td-login verify-credentials` THROUGH
+// `exec-primary` and `exec-as` and gates TD-LOGIN-RUN-OK on the kernel's own
+// readback.
 //
 // Why mesboot-style (rustc invoked directly) rather than `Recipe::rust`, and why
 // static: identical to td-sh/td-util/td-init/td-kexec. `login` is the program
@@ -89,7 +91,6 @@ const MODULES: &[(&str, &str)] = &[
     ),
     ("session", include_str!("../../../td-login/src/session.rs")),
     ("status", include_str!("../../../td-login/src/status.rs")),
-    ("su", include_str!("../../../td-login/src/su.rs")),
     ("sys", include_str!("../../../td-login/src/sys.rs")),
     ("tty", include_str!("../../../td-login/src/tty.rs")),
 ];

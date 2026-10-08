@@ -115,8 +115,8 @@ fn may_switch(before: &Status) -> Result<(), String> {
     // is never installed setuid-root, and this is what turns that from a
     // packaging promise into a refusal: under a setuid-root exec the real uid
     // stays the caller's while the effective one is 0, so an "is the effective
-    // uid 0" gate would let an unprivileged caller through — and `su` takes the
-    // forced policy path, so they would reach root without authenticating. The
+    // uid 0" gate would let an unprivileged caller through — and `exec-as` takes
+    // the forced policy path, so they would reach root without authenticating. The
     // recipe's shape check asserts the shipped binary carries no setuid bit;
     // this asserts it a second way, at the moment it would matter.
     if before.uid != [0; 4] {
@@ -152,8 +152,8 @@ fn may_switch(before: &Status) -> Result<(), String> {
 /// and if it is not what was asked for, nobody execs anything.
 pub fn apply(want: &Credentials) -> Result<(), String> {
     let before = Status::read()?;
-    // Already there: `su` to yourself, or a `login -f` for the user we already
-    // are. Nothing to change, and nothing to be privileged for.
+    // Already there: `exec-as` to yourself, or a `login -f` for the user we
+    // already are. Nothing to change, and nothing to be privileged for.
     if want.matches(&before).is_ok() {
         return Ok(());
     }
@@ -229,7 +229,7 @@ mod tests {
         let mut seen = ok.clone();
         seen.cap_inh = 0x0000_0008_0000_0000;
         assert!(want.matches(&seen).is_ok());
-        // Becoming root legitimately (su root, login -f root) is not a residue.
+        // Becoming root legitimately (login -f root) is not a residue.
         let root = Credentials::new(0, 0, &[]);
         let mut seen = status([0; 4], [0; 4], &[0]);
         seen.cap_prm = 0x0000_01ff_ffff_ffff;
@@ -289,8 +289,8 @@ mod tests {
     /// The never-setuid-root boundary, enforced rather than assumed. Under a
     /// setuid-root exec the real uid stays the caller's and the effective one is
     /// 0, so a gate that asked only about the effective uid would let an
-    /// unprivileged caller switch — and `su` takes the forced policy path, so
-    /// they would become root without authenticating.
+    /// unprivileged caller switch — and `exec-as` takes the forced policy path,
+    /// so they would become root without authenticating.
     #[test]
     fn a_process_whose_uid_columns_disagree_may_not_switch() {
         for uid in [

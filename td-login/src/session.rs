@@ -32,8 +32,8 @@ pub const ROOTDIR: &str = "/";
 pub enum Env {
     /// A login session: discard the caller's environment except `TERM`.
     Fresh,
-    /// `su` without `-`, or `login -p`: keep it, but still restate the five
-    /// variables that describe WHO the session belongs to.
+    /// `login -p`: keep it, but still restate the five variables that
+    /// describe WHO the session belongs to.
     Preserve,
     /// `exec-as`: discard ALL of it, `TERM` included, leaving exactly the five
     /// identity variables.
@@ -66,24 +66,17 @@ pub struct Session {
     pub arg0: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
-    /// `None` INHERITS the caller's directory. That is not the same as `/`: a
-    /// plain `su` must leave the caller where it was, and chdir'ing into a
-    /// directory the target user cannot traverse would fail the exec for a
-    /// reason unrelated to the credentials.
-    pub cwd: Option<String>,
+    /// Always set: a login session's home (or `/`), and `/` for `exec-*`, so
+    /// no session keeps the caller's directory.
+    pub cwd: String,
 }
 
-/// The environment a session starts with.
-///
-/// `shell` is passed separately from `account` because `su -s SHELL` runs a
-/// program the account does not name, and `SHELL` must describe the program this
-/// session is actually running — a shell that reports one interpreter while
-/// running another is a lie every re-exec inside the session then acts on.
+/// The environment a session starts with. `SHELL` is always the account's own
+/// shell: it describes the account, not the program being started.
 /// `inherited` is passed in rather than read from the process so the decision is
 /// testable.
 pub fn environment(
     account: &Account,
-    shell: &str,
     mode: Env,
     inherited: &[(String, String)],
 ) -> Vec<(String, String)> {
@@ -112,7 +105,7 @@ pub fn environment(
     }
     for (key, value) in [
         ("HOME", account.home.as_str()),
-        ("SHELL", shell),
+        ("SHELL", account.shell.as_str()),
         ("USER", account.name.as_str()),
         ("LOGNAME", account.name.as_str()),
         ("PATH", PATH),
@@ -180,9 +173,7 @@ pub fn enter(session: &Session) -> Result<u8, String> {
     for (key, value) in &session.env {
         command.env(key, value);
     }
-    if let Some(cwd) = &session.cwd {
-        command.current_dir(cwd);
-    }
+    command.current_dir(&session.cwd);
     let failure = command.exec();
     Err(format!(
         "cannot exec {} as {}: {failure}",
@@ -234,7 +225,7 @@ mod tests {
             ("LD_PRELOAD", "/tmp/x.so"),
             ("SSH_AUTH_SOCK", "/tmp/agent"),
         ]);
-        let env = environment(&account(), "/bin/sh", Env::Fresh, &caller);
+        let env = environment(&account(), Env::Fresh, &caller);
         assert_eq!(value(&env, "TERM"), Some("vt100"));
         assert_eq!(value(&env, "PATH"), Some("/bin"));
         assert_eq!(value(&env, "HOME"), Some("/home/tester"));
@@ -258,7 +249,7 @@ mod tests {
             ("PATH", "/tmp/evil"),
             ("EDITOR", "vi"),
         ]);
-        let env = environment(&account(), "/bin/sh", Env::Preserve, &caller);
+        let env = environment(&account(), Env::Preserve, &caller);
         assert_eq!(value(&env, "HOME"), Some("/home/tester"));
         assert_eq!(value(&env, "USER"), Some("tester"));
         assert_eq!(value(&env, "LOGNAME"), Some("tester"));
@@ -272,7 +263,7 @@ mod tests {
     /// empty TERM is a value programs act on, and absence is what they expect.
     #[test]
     fn an_absent_term_is_not_invented() {
-        let env = environment(&account(), "/bin/sh", Env::Fresh, &pairs(&[("PATH", "/x")]));
+        let env = environment(&account(), Env::Fresh, &pairs(&[("PATH", "/x")]));
         assert_eq!(value(&env, "TERM"), None);
         assert_eq!(env.len(), 5);
     }
@@ -291,7 +282,7 @@ mod tests {
             ("XDG_RUNTIME_DIR", "/run/user/0"),
             ("LD_PRELOAD", "/tmp/x.so"),
         ]);
-        let env = environment(&account(), "/bin/sh", Env::Service, &caller);
+        let env = environment(&account(), Env::Service, &caller);
         assert_eq!(value(&env, "TERM"), None, "a daemon has no terminal");
         assert_eq!(value(&env, "XDG_RUNTIME_DIR"), None);
         assert_eq!(value(&env, "LD_PRELOAD"), None);
@@ -319,7 +310,7 @@ mod tests {
             ("TERM", "evil"),
         ]);
         for mode in [Env::Fresh, Env::Preserve] {
-            let env = environment(&account(), "/bin/sh", mode, &caller);
+            let env = environment(&account(), mode, &caller);
             for key in ["PATH", "HOME", "SHELL", "USER", "LOGNAME"] {
                 assert_eq!(
                     env.iter().filter(|(k, _)| k == key).count(),
@@ -332,18 +323,24 @@ mod tests {
         }
         // ...and a duplicate we do NOT override collapses to the one `getenv`
         // would have answered with, rather than being carried through twice.
-        let env = environment(&account(), "/bin/sh", Env::Preserve, &caller);
+        let env = environment(&account(), Env::Preserve, &caller);
         assert_eq!(env.iter().filter(|(k, _)| k == "TERM").count(), 1);
     }
 
-    /// `su -s SHELL` runs a program the account does not name, and the session's
-    /// `SHELL` must be that program. Reporting the account's instead would have
-    /// every re-exec inside the session reach for an interpreter it is not using.
+    /// `SHELL` is the account's shell in every mode, whatever the caller's
+    /// said: it describes the account, not the program being started.
     #[test]
-    fn the_shell_variable_names_the_program_actually_run() {
-        let env = environment(&account(), "/bin/td-sh", Env::Fresh, &[]);
-        assert_eq!(value(&env, "SHELL"), Some("/bin/td-sh"));
-        assert_eq!(value(&env, "HOME"), Some("/home/tester"));
+    fn the_shell_variable_is_the_accounts_shell() {
+        let shell = Account {
+            shell: "/bin/td-sh".into(),
+            ..account()
+        };
+        let caller = pairs(&[("SHELL", "/tmp/evil")]);
+        for mode in [Env::Fresh, Env::Preserve, Env::Service] {
+            let env = environment(&shell, mode, &caller);
+            assert_eq!(value(&env, "SHELL"), Some("/bin/td-sh"), "{mode:?}");
+            assert_eq!(value(&env, "HOME"), Some("/home/tester"), "{mode:?}");
+        }
     }
 
     #[test]

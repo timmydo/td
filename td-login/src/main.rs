@@ -1,13 +1,13 @@
 #![deny(unsafe_code)]
 //! td-login — the static, dependency-free multicall behind td's credential
-//! switch: the busybox applets that change who a process is.
+//! switch: the programs that change who a process is.
 //!
-//! `login` starts a session for a named user (this is what getty execs, through
-//! `/etc/autologin`), and `su` runs a shell or one command as another user (this
-//! is what every unprivileged health leg on a td image goes through). They are
-//! one binary because they are one operation with two front ends: resolve an
-//! account, decide whether a session may start, and then change credentials —
-//! once, in one place, in one order.
+//! `login` starts a session for a named user (the greeter reaches it through
+//! `login-primary`), and the `exec-*` subcommands run one literal argv as
+//! another user (supervised units, and every unprivileged health probe through
+//! `exec-primary`). They are one binary because they are one operation with
+//! several front ends: resolve an account, decide whether a session may start,
+//! and then change credentials — once, in one place, in one order.
 //!
 //! **td-login/THREAT-MODEL.md is the specification.** A credential-ordering bug
 //! here is privilege escalation, not a malfunction, so the ordering, the
@@ -48,28 +48,29 @@ mod login_state;
 mod primary_account;
 mod session;
 mod status;
-mod su;
 mod sys;
 mod tty;
 
 use std::io::Write;
 use std::process::ExitCode;
 
-/// The account `su` targets when none is named, and the only uid that can reach
-/// a credential switch at all.
-pub const ROOT: &str = "root";
-
 type Applet = fn(&[String]) -> Result<u8, String>;
 
 /// Every applet this multicall serves, paired with the function that runs it.
 /// ONE table, so a name cannot exist without an arm or an arm without a name —
 /// `--list`, argv[0] dispatch, and the shipped /bin symlink farm all read it.
-const APPLETS: &[(&str, Applet)] = &[("login", login::run), ("su", su::run)];
+/// There is no `su` (APPLICATIONS.md §L.1, L6); root-run probes use
+/// `exec-primary`.
+const APPLETS: &[(&str, Applet)] = &[("login", login::run)];
+
+/// The multicall's own name, the one basename that reaches the explicit form.
+const SELF: &str = "td-login";
 
 /// The multicall's own readback subcommand, not an applet: it gets no `/bin`
-/// symlink and no place in the farm. `/etc/bootsuccess` runs it THROUGH `su` so
-/// the kernel's view of the switched process is compared against what the switch
-/// asked for — the one regression every other check on the image would pass.
+/// symlink and no place in the farm. `/etc/bootsuccess` runs it THROUGH
+/// `exec-primary` so the kernel's view of the switched process is compared
+/// against what the switch asked for — the one regression every other check on
+/// the image would pass.
 const VERIFY: &str = "verify-credentials";
 
 /// `exec-as USER -- PROGRAM [ARG…]`: run a literal argv as another user, with no
@@ -80,7 +81,7 @@ const VERIFY: &str = "verify-credentials";
 /// never invoke it by basename, so a `/bin/exec-as` symlink would put a name on
 /// the image that nothing calls and no farm list accounts for. It is also a
 /// name a person could mistake for a general-purpose "run this as anyone" tool,
-/// which is worth not hanging in `/bin` beside `su`.
+/// which is worth not hanging in `/bin`.
 const EXEC_AS: &str = "exec-as";
 /// A service identity is marked separately in `/etc/shadow`; this exact
 /// subcommand is the only front end that admits that class.
@@ -210,21 +211,28 @@ enum Route<'a> {
 }
 
 /// Route an argv: argv[0]'s basename first (the busybox convention, and how the
-/// shipped `/bin/login` and `/bin/su` symlinks arrive), then the explicit
-/// `td-login <applet>` form.
+/// shipped `/bin/login` symlink arrives), then the explicit `td-login <applet>`
+/// form.
 ///
 /// NEITHER subcommand is reachable by basename; see `VERIFY` and `EXEC_AS` for
 /// why. That is roster hygiene and NOT a boundary: `/bin/td-login` is itself a
 /// shipped symlink, so anything on the image can already spell
 /// `td-login exec-as`. What stops an unprivileged caller is `creds::may_switch`
 /// over all four uid columns — never the absence of a second symlink.
+///
+/// Any other basename is usage before argv[1] is looked at: a stale link to a
+/// retired applet (`/bin/su` since APPLICATIONS.md §L.1, L6) must not reach
+/// the explicit form, where `su exec-primary -- /bin/sh` would start a shell.
 fn route(argv: &[String]) -> Route<'_> {
-    let prog = argv.first().map(String::as_str).unwrap_or("td-login");
-    if lookup(basename(prog)).is_some() {
+    let prog = basename(argv.first().map(String::as_str).unwrap_or(SELF));
+    if lookup(prog).is_some() {
         return Route::Applet {
-            name: basename(prog),
+            name: prog,
             args_from: 1,
         };
+    }
+    if prog != SELF {
+        return Route::Usage;
     }
     match argv.get(1).map(String::as_str) {
         Some(a) if lookup(a).is_some() => Route::Applet {
@@ -250,13 +258,13 @@ fn route(argv: &[String]) -> Route<'_> {
 /// `verify-credentials --uid U --gid G [--groups G[,G…]]`: read
 /// `/proc/self/status` and assert this process's credentials are EXACTLY the
 /// given set — all four uid columns, all four gid columns, and the supplementary
-/// set with the primary gid folded in, which is how `login`/`su` compute it.
+/// set with the primary gid folded in, which is how `login`/`exec-as` compute it.
 ///
 /// `--groups` takes the SUPPLEMENTARY list, not the whole set: it is the list
 /// `/etc/group` yields, so the probe on the image and the code being probed are
 /// written the same way and cannot be right for different reasons. Stated
 /// exactly, the assertion is `kernel_groups == sort(dedup(groups + {gid}))` --
-/// `Credentials::new` folds the primary gid in, as `login`/`su` do. So this
+/// `Credentials::new` folds the primary gid in, as `login`/`exec-as` do. So this
 /// probe answers "is this process the session td-login says it built", which is
 /// what it is for; it is NOT a general-purpose "are my credentials X" oracle,
 /// and pointing it at a process nobody switched fails whenever that process's
@@ -385,7 +393,7 @@ mod tests {
     #[test]
     fn basename_strips_every_leading_component() {
         assert_eq!(basename("/bin/login"), "login");
-        assert_eq!(basename("su"), "su");
+        assert_eq!(basename("login"), "login");
         assert_eq!(basename("/td/store/abc-td-login/bin/login"), "login");
         // A trailing slash yields an empty basename rather than the parent -- it
         // is not an applet, so dispatch falls through to the argv[1] form.
@@ -418,8 +426,25 @@ mod tests {
     /// The roster is the shipped /bin symlink farm, so a rename is a visible
     /// change to the image, not an internal one.
     #[test]
-    fn the_roster_is_the_credential_pair() {
-        assert_eq!(names(), vec!["login", "su"]);
+    fn the_roster_is_login_alone() {
+        assert_eq!(names(), vec!["login"]);
+    }
+
+    /// `su` is no applet by either entry form: a stale `/bin/su` symlink, or a
+    /// caller still spelling `td-login su`, reaches usage and exit 2, never a
+    /// credential switch (APPLICATIONS.md §L.1, L6).
+    #[test]
+    fn su_is_not_served_by_either_entry_form() {
+        assert!(lookup("su").is_none());
+        assert_eq!(route(&argv(&["/bin/su", "-c", "id"])), Route::Usage);
+        // A stale `su -> td-login` link reaches no subcommand either.
+        assert_eq!(
+            route(&argv(&["/bin/su", EXEC_PRIMARY, "--", "/bin/sh"])),
+            Route::Usage
+        );
+        assert_eq!(route(&argv(&["/bin/su", "--list"])), Route::Usage);
+        assert_eq!(route(&argv(&["su", "login", "-f", "root"])), Route::Usage);
+        assert_eq!(route(&argv(&["td-login", "su", "tester"])), Route::Usage);
     }
 
     fn argv(xs: &[&str]) -> Vec<String> {
@@ -505,16 +530,9 @@ mod tests {
             }
         );
         assert_eq!(
-            route(&argv(&["/bin/su", "-c", "id"])),
+            route(&argv(&["td-login", "login", "-f", "tester"])),
             Route::Applet {
-                name: "su",
-                args_from: 1
-            }
-        );
-        assert_eq!(
-            route(&argv(&["td-login", "su", "tester"])),
-            Route::Applet {
-                name: "su",
+                name: "login",
                 args_from: 2
             }
         );
@@ -583,7 +601,7 @@ mod tests {
     }
 
     /// The probe's argv, including the forms the generated boot script uses.
-    /// It runs unprivileged inside `su`, so it asserts against whatever the
+    /// It runs unprivileged inside `exec-primary`, so it asserts against whatever the
     /// runner is; here only the parse and the comparison are exercised.
     #[test]
     fn the_readback_probe_parses_and_compares() {
@@ -739,8 +757,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            12,
-            "expected ten local modules and the two audited shared modules"
+            11,
+            "expected nine local modules and the two audited shared modules"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -752,7 +770,7 @@ mod confinement {
         }
     }
 
-    /// The eleven local files plus the two shared sources are the complete
+    /// The ten local files plus the two shared sources are the complete
     /// input.
     ///
     /// The scan above proves every `mod` line has a file and every file has a
@@ -764,7 +782,7 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn the_scan_holds_exactly_the_thirteen_audited_modules() {
+    fn the_scan_holds_exactly_the_twelve_audited_modules() {
         let scan::Tree { rs, other } = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
@@ -780,7 +798,6 @@ mod confinement {
                 "primary_account.rs",
                 "session.rs",
                 "status.rs",
-                "su.rs",
                 "sys.rs",
                 "tty.rs",
             ],
@@ -802,7 +819,7 @@ mod confinement {
     /// `may_start_session`, so every other scan in this file stays green while
     /// the crate grows a switch nobody authorized.
     ///
-    /// Two halves, and the second is the point: exactly the three front-end
+    /// Two halves, and the second is the point: exactly the two front-end
     /// modules call it, AND each reaches an authorization boundary. The
     /// service-only function shares `exec_as.rs` with the ordinary one, so the
     /// next test pins that distinct chain inside the function bodies.
@@ -817,7 +834,7 @@ mod confinement {
         let paths: Vec<&str> = callers.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             paths,
-            ["exec_as.rs", "login.rs", "su.rs"],
+            ["exec_as.rs", "login.rs"],
             "`session::enter` switches credentials and execs; its callers are the \
              front ends and adding one is a reviewed change"
         );
@@ -835,9 +852,10 @@ mod confinement {
     /// `db::may_start_session` answers whether an account may start a session at
     /// all — the locked and needs-a-password refusals — so a front end naming it
     /// is one deciding that policy for itself. It may be named in its own module
-    /// and in `login.rs`, where `authorize` lives, and nowhere else. `su` carried
-    /// its own copy of four of `authorize`'s five steps until this landing: two
-    /// places to change one policy, with the compiler checking neither.
+    /// and in `login.rs`, where `authorize` lives, and nowhere else. The
+    /// retired `su` once carried its own copy of four of `authorize`'s five
+    /// steps: two places to change one policy, with the compiler checking
+    /// neither.
     ///
     /// The name is assembled rather than spelled, as the unsafe-lint scan's is —
     /// written whole, this test's own source would make `main.rs` a caller.

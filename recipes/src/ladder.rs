@@ -831,7 +831,7 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// in the generated scripts, so the retry budgets are the same at either value.
 ///
 /// Raised again, for the same reason and by the same route: the session-bus probe is
-/// an eighth `su` block in the health farm, and it is the only one with a bounded
+/// an eighth unprivileged block in the health farm, and it is the only one with a bounded
 /// wait of its own — `td-busd probe` allows five seconds for an `OK` line, which a
 /// broker that is WEDGED rather than absent will spend in full. That went into the
 /// guest's per-iteration budget, and this follows it.
@@ -947,28 +947,28 @@ pub const TD_TXT_RUNTIME_MARKER: &str = "TD-TXT-RUN-OK";
 /// reaches the health target unless td-init ran the inittab and pivoted the root.
 pub const TD_INIT_RUNTIME_MARKER: &str = "TD-INIT-RUN-OK";
 
-/// Printed by `/etc/bootsuccess` only after `/bin/su` — td-login — has switched to
+/// Printed by `/etc/bootsuccess` only after `td-login exec-primary` has switched to
 /// the unprivileged login user AND the kernel's own view of the switched process
 /// matched what the switch asked for, read back out of `/proc/self/status` by
 /// `td-login verify-credentials`.
 ///
 /// Unlike the td-util and td-init farms, td-login's success path needs no synthetic
-/// probe: `login -f` is how this image reaches its greeter and `su` is how every
-/// other unprivileged health leg runs, so a td-login that fails to start a session
-/// fails the boot outright. What those legs CANNOT see is the failure that matters
-/// most — a switch that started a working session while leaving a residual
+/// probe: `login-primary` is how this image reaches its greeter and `exec-primary` is
+/// how every other unprivileged health leg runs, so a td-login that fails to start a
+/// session fails the boot outright. What those legs CANNOT see is the failure that
+/// matters most — a switch that started a working session while leaving a residual
 /// credential attached. A `setuid(2)` issued before `setgroups(2)` drops the uid and
 /// silently keeps root's supplementary groups; every marker on this image still
 /// prints. So this one asserts the RESULT: all four uid columns, all four gid
 /// columns, and the supplementary set exactly. See td-login/THREAT-MODEL.md.
 ///
-/// It now gates on `exec-as` as well, and that half needed a leg of its own for a
-/// reason worth recording: `exec-as` is the front end a SUPERVISOR uses, so it runs
-/// as root and drops, where every other unprivileged health leg has already dropped
-/// by the time it runs. A copy inside the greeter's `su` would fail `setgroups(2)`
-/// with EPERM and prove nothing. Both legs point at the same readback, so the marker
-/// still means one thing — this crate's credential switch produced the credentials
-/// it named — proven now through both front ends the image has rather than one.
+/// It gates on the literal `exec-as` as well, and that half needs a leg of its own:
+/// `exec-as` is the front end a SUPERVISOR uses, so it runs as root and drops, where
+/// the readback inside `exec-primary` has already dropped by the time it runs. A copy
+/// inside that shell would fail `setgroups(2)` with EPERM and prove nothing. Both legs
+/// point at the same readback, so the marker still means one thing — this crate's
+/// credential switch produced the credentials it named — proven through both front
+/// ends the image has rather than one.
 pub const TD_LOGIN_RUNTIME_MARKER: &str = "TD-LOGIN-RUN-OK";
 
 /// Printed by `/etc/bootsuccess` only after the session bus answered a real

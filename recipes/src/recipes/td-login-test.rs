@@ -88,11 +88,10 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-login --list failed' >&2; exit 1; }}; \
-                     for a in login su; do \
-                         printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-login does not serve applet '$a'\" >&2; exit 1; }}; \
-                     done; \
+                     printf '%s\\n' \"$l\" | grep -q -x -F login || {{ echo \"td-login does not serve applet 'login'\" >&2; exit 1; }}; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 2 ] || {{ echo \"td-login serves $n applets, expected exactly 2 — update this check deliberately when adding one\" >&2; exit 1; }}; \
+                     [ \"$n\" -eq 1 ] || {{ echo \"td-login serves $n applets, expected exactly 1 — update this check deliberately when adding one\" >&2; exit 1; }}; \
+                     if printf '%s\\n' \"$l\" | grep -q -x -F su; then echo 'td-login still lists su, which APPLICATIONS.md L6 deleted' >&2; exit 1; fi; \
                      if printf '%s\\n' \"$l\" | grep -q -x -F verify-credentials; then echo 'verify-credentials is a probe, not an applet; listing it would put an unaccounted name in the /bin farm' >&2; exit 1; fi"
                 ),
             ],
@@ -114,11 +113,14 @@ pub fn recipe() -> Recipe {
                      [ $? -eq 2 ] || {{ echo 'td-login must exit 2 on an unknown applet (usage error)' >&2; exit 1; }}; \
                      '{bin}' >/dev/null 2>&1; \
                      [ $? -eq 2 ] || {{ echo 'td-login must exit 2 with no argument at all' >&2; exit 1; }}; \
-                     e=$('{bin}' su -Z 2>&1); \
-                     [ $? -ne 0 ] || {{ echo 'su accepted an unknown option instead of refusing it' >&2; exit 1; }}; \
-                     case \"$e\" in *unrecognised*) : ;; *) echo \"su refused an unknown option for the wrong reason: $e\" >&2; exit 1;; esac; \
-                     e=$('{bin}' su -s relative/sh root 2>&1); \
-                     [ $? -ne 0 ] || {{ echo 'su accepted a RELATIVE -s shell; it execs by absolute path with no PATH search, so a relative one resolves against the caller directory' >&2; exit 1; }}; \
+                     '{bin}' su root >/dev/null 2>&1; \
+                     [ $? -eq 2 ] || {{ echo 'td-login su did not exit 2 (usage); su is no applet since APPLICATIONS.md L6' >&2; exit 1; }}; \
+                     e=$('{bin}' exec-as -l -- /bin/true 2>&1); \
+                     [ $? -ne 0 ] || {{ echo 'exec-as accepted an option instead of refusing it' >&2; exit 1; }}; \
+                     case \"$e\" in *\"takes no options\"*) : ;; *) echo \"exec-as refused an option for the wrong reason: $e\" >&2; exit 1;; esac; \
+                     e=$('{bin}' exec-primary -- relative/sh 2>&1); \
+                     [ $? -ne 0 ] || {{ echo 'exec-primary accepted a RELATIVE program; it execs by absolute path with no PATH search, so a relative one resolves against the caller directory' >&2; exit 1; }}; \
+                     case \"$e\" in *\"is not an absolute path\"*) : ;; *) echo \"exec-primary refused a relative program for the wrong reason: $e\" >&2; exit 1;; esac; \
                      e=$('{bin}' login -f 2>&1); \
                      [ $? -ne 0 ] || {{ echo 'login accepted -f with no user name' >&2; exit 1; }}; \
                      e=$('{bin}' login -f root extra 2>&1); \
@@ -126,9 +128,12 @@ pub fn recipe() -> Recipe {
                      d='{{root}}/argv0'; mkdir -p \"$d\"; \
                      ln -sf '{bin}' \"$d/su\" || {{ echo 'could not build the argv[0] symlink' >&2; exit 1; }}; \
                      ln -sf '{bin}' \"$d/login\" || {{ echo 'could not build the argv[0] symlink' >&2; exit 1; }}; \
-                     e=$(\"$d/su\" -Z 2>&1); \
-                     [ $? -ne 0 ] || {{ echo 'argv[0] dispatch: /bin/su -> td-login did not reach su — this is the form the shipped symlink farm uses' >&2; exit 1; }}; \
-                     case \"$e\" in su:*) : ;; *) echo \"argv[0] dispatch reached the wrong applet: $e\" >&2; exit 1;; esac; \
+                     \"$d/su\" root >/dev/null 2>&1; \
+                     [ $? -eq 2 ] || {{ echo 'argv[0] dispatch: a stale su -> td-login symlink must reach usage (exit 2), not a credential switch' >&2; exit 1; }}; \
+                     \"$d/su\" exec-primary -- /bin/sh -c 'exit 0' >/dev/null 2>&1; \
+                     [ $? -eq 2 ] || {{ echo 'argv[0] dispatch: a stale su -> td-login symlink reached the exec-primary subcommand instead of usage (exit 2)' >&2; exit 1; }}; \
+                     \"$d/su\" --list >/dev/null 2>&1; \
+                     [ $? -eq 2 ] || {{ echo 'argv[0] dispatch: a stale su -> td-login symlink reached --list instead of usage (exit 2)' >&2; exit 1; }}; \
                      e=$(\"$d/login\" --nope 2>&1); \
                      case \"$e\" in login:*) : ;; *) echo \"argv[0] dispatch: /bin/login -> td-login reached the wrong applet: $e\" >&2; exit 1;; esac; \
                      ln -sf '{bin}' \"$d/verify-credentials\" || {{ echo 'could not build the probe symlink' >&2; exit 1; }}; \
@@ -164,7 +169,7 @@ pub fn recipe() -> Recipe {
                          '{bin}' verify-credentials --gid \"$g\" >/dev/null 2>&1 && \
                              {{ echo 'verify-credentials ran without --uid instead of refusing' >&2; exit 1; }}; \
                          ok=1; why=''; \
-                         case \",$gr,\" in *\",$g,\"*) : ;; *) ok=0; why=\"this sandbox's primary gid $g is absent from its own supplementary set [$gr], and the probe folds the gid in the way login/su do\";; esac; \
+                         case \",$gr,\" in *\",$g,\"*) : ;; *) ok=0; why=\"this sandbox's primary gid $g is absent from its own supplementary set [$gr], and the probe folds the gid in the way login and exec-as do\";; esac; \
                          if [ \"$u\" != 0 ]; then \
                              c=$(grep '^CapPrm:' /proc/self/status | cut -f2)$(grep '^CapEff:' /proc/self/status | cut -f2)$(grep '^CapAmb:' /proc/self/status | cut -f2); \
                              case \"$c\" in *[!0]*) ok=0; why=\"this sandbox runs as uid $u while still holding capabilities ($c), which the probe reads as a residual credential\";; esac; \
@@ -191,7 +196,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-login is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the two applets login/su, dispatches through both the argv[0] and `td-login <applet>` forms, keeps verify-credentials off the argv[0] farm, refuses the ambiguous and unknown argv forms, and its credential readback agrees with /proc/self/status while rejecting a wrong uid, gid or supplementary set\n".into(),
+        content: "PASS: td-login is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the one applet login and no su by either form, nor any subcommand through a stale su link, dispatches through both the argv[0] and `td-login <applet>` forms, keeps verify-credentials off the argv[0] farm, refuses the ambiguous and unknown argv forms, and its credential readback agrees with /proc/self/status while rejecting a wrong uid, gid or supplementary set\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -204,7 +209,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-login-test: build-plan --auto builds td-login (td's static credential multicall: login/su, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the argv refusals, and the credential readback probe the image's TD-LOGIN-RUN-OK marker rests on"
+echo ">> recipe-check td-login-test: build-plan --auto builds td-login (td's static credential multicall: login and the exec-* subcommands, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the argv refusals, and the credential readback probe the image's TD-LOGIN-RUN-OK marker rests on"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-login-test 1
 "#,

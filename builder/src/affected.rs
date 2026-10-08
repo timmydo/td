@@ -1697,7 +1697,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // td-login: the target-built static credential multicall (login/su), a standalone
+    // td-login: the target-built static credential multicall (login, exec-*), a standalone
     // std-only crate OUTSIDE the engine workspace — same routing as td-init, whose
     // unsafe-exception shape it shares. Its unit tests AND its confinement tests (the
     // scoped-allow count, the three-syscall roster, and the ORDER the credential
@@ -1706,7 +1706,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // into the td-login RECIPE, so a source edit changes the TARGET artifact and a
     // static-link regression is invisible to host cargo — so also route to
     // recipe-checks (recipe-checks statically links + exercises it via
-    // td-login-test) AND it is packed into system-x86-64 as the /bin/{login,su} farm,
+    // td-login-test) AND it is packed into system-x86-64 as the /bin/login farm,
     // so a source edit here changes how the machine hands out credentials. Its RECIPE
     // files under recipes/src/recipes/ are routed by the recipes arm above, and
     // THREAT-MODEL.md by the docs arm above that — the confinement tests read the

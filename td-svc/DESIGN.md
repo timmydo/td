@@ -218,7 +218,7 @@ A unit whose leader hands its processes to another cgroup declares
 `cgroup=session` and gets no leaf. Its limits are refused rather than written
 into a leaf its processes have already left — §3's accepted-and-ignored rule,
 applied to a promise the kernel would keep against the wrong cgroup. A leader
-is handed off when it IS `td-login`/`su`, and equally when a shell leader
+is handed off when it IS `td-login`, and equally when a shell leader
 `exec`s one and is replaced; without the `exec` the shell stays and the unit
 keeps its leaf.
 

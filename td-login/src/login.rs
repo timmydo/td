@@ -234,11 +234,11 @@ fn start(name: &str, forced: bool, mode: Env, status: &Status) -> Result<u8, Str
 /// changes any state, which is what makes it safe for the prompt loop to retry.
 ///
 /// `pub(crate)` because it is the crate's ONE authentication decision and every
-/// front end reaches it: `login` through `start` and the prompt loop, `su` and
-/// `exec-as` with `forced`. `su` used to carry its own copy of four of these
-/// five steps — one policy in two places, with the compiler checking only the
-/// `match` — and `the_session_policy_is_decided_in_one_place` is what stops a
-/// third appearing.
+/// front end reaches it: `login` through `start` and the prompt loop, `exec-as`
+/// and `exec-primary` with `forced`. A front end with its own copy of these
+/// five steps would be one policy in two places, with the compiler checking
+/// only the `match`; `the_session_policy_is_decided_in_one_place` stops one
+/// appearing.
 pub(crate) fn authorize(name: &str, forced: bool) -> Result<Account, String> {
     if !plausible_name(name) {
         return Err(format!("{name:?} is not a plausible user name"));
@@ -305,8 +305,8 @@ fn commit(account: &Account, mode: Env, status: &Status) -> Result<u8, String> {
         program: account.shell.clone(),
         arg0: session::login_arg0(&account.shell),
         args: Vec::new(),
-        env: session::environment(account, &account.shell, mode, &session::inherited()),
-        cwd: Some(cwd),
+        env: session::environment(account, mode, &session::inherited()),
+        cwd,
     };
     session::enter(&session)
 }

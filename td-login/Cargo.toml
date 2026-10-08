@@ -2,7 +2,7 @@
 name = "td-login"
 version = "0.1.0"
 edition = "2021"
-description = "Static dependency-free multicall for td's credential switch (login, su)"
+description = "Static dependency-free multicall for td's credential switch (login, exec-as)"
 license = "MIT"
 
 [[bin]]

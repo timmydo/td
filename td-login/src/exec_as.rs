@@ -1,19 +1,17 @@
 //! `exec-as` — run one named program as another user, with no shell anywhere.
 //!
 //! td-svc has no `user=` field. Its unprivileged units use `exec-primary` or
-//! `exec-service-as`, sharing the literal `exec-as` grammar. The former `su -c`
-//! launch form passed a string through a shell, which could reinterpret spaces,
-//! glob characters and dollar signs before the supervised program started.
-//! Direct execution avoids that extra shell parser: the words the unit writes
-//! are the words the program receives.
+//! `exec-service-as`, sharing the literal `exec-as` grammar, and so do the
+//! root-run boot-health probes. There is no shell between the caller and the
+//! program unless the caller names one: the words the unit writes are the
+//! words the program receives.
 //!
-//! It is the same operation `su` performs, minus the shell: resolve the account,
-//! refuse a locked one, build the session, and hand it to `session::enter`, which
-//! is the crate's ONE credential switch and carries the `/proc/self/status`
-//! readback with it. So this applet adds no syscall and no second way to become
-//! somebody — `main.rs`'s confinement test asserts `session::enter` stays the
-//! only caller of `creds::apply`, and this file is a new caller of `enter`, not
-//! of `apply`.
+//! Resolve the account, refuse a locked one, build the session, and hand it to
+//! `session::enter`, which is the crate's ONE credential switch and carries the
+//! `/proc/self/status` readback with it. So this adds no syscall and no second
+//! way to become somebody — `main.rs`'s confinement test asserts
+//! `session::enter` stays the only caller of `creds::apply`, and this file is a
+//! caller of `enter`, not of `apply`.
 
 use crate::creds::Credentials;
 use crate::db;
@@ -24,7 +22,7 @@ use crate::session::{self, Env, Session};
 #[derive(Debug, PartialEq, Eq)]
 pub struct Options {
     pub user: String,
-    /// Absolute path to exec. No `PATH` search happens, as in `login` and `su -s`.
+    /// Absolute path to exec. No `PATH` search happens, as in `login`.
     pub program: String,
     pub args: Vec<String>,
 }
@@ -32,12 +30,11 @@ pub struct Options {
 /// `exec-as USER -- PROGRAM [ARG…]`.
 ///
 /// The `--` is REQUIRED rather than optional, and that is the whole of the
-/// parser. `su` permutes its options around the user name because the image's
-/// own scripts depend on it; this form has no options at all, so a separator that
-/// must be there removes the only ambiguity available — whether a leading-dash
-/// word after the user is an option for `exec-as` or the first argument of the
-/// program. It is also what keeps this parser from growing: an option added later
-/// cannot be confused with an argument that already works.
+/// parser. This form has no options at all, so a separator that must be there
+/// removes the only ambiguity available — whether a leading-dash word after the
+/// user is an option for `exec-as` or the first argument of the program. It is
+/// also what keeps this parser from growing: an option added later cannot be
+/// confused with an argument that already works.
 pub fn parse(args: &[String]) -> Result<Options, String> {
     let Some(user) = args.first() else {
         return Err("no user named".into());
@@ -76,19 +73,19 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
 }
 
 /// Build the session `run` will enter. Pure — every input is passed in — so the
-/// four decisions this applet makes beyond `su`'s are assertable without an
-/// `exec`: the environment mode, what `SHELL` names, `argv[0]`, and the working
-/// directory. `run` is then only the database lookups and the switch.
+/// four decisions this front end makes are assertable without an `exec`: the
+/// environment mode, what `SHELL` names, `argv[0]`, and the working directory.
+/// `run` is then only the database lookups and the switch.
 fn session_for(
     account: &db::Account,
     groups: &[u32],
     opts: Options,
     inherited: &[(String, String)],
 ) -> Session {
-    // The ACCOUNT's shell, not the program: `su -s` names the program because
-    // there it IS the session's interpreter, and a daemon is not one —
-    // `SHELL=/bin/td-busd` re-execs the daemon for anything that spawns $SHELL.
-    let env = session::environment(account, &account.shell, Env::Service, inherited);
+    // `SHELL` is the ACCOUNT's shell, not the program: a daemon is no
+    // interpreter, and `SHELL=/bin/td-busd` would re-exec the daemon for
+    // anything that spawns $SHELL.
+    let env = session::environment(account, Env::Service, inherited);
     Session {
         creds: Credentials::new(account.uid, account.gid, groups),
         // Plain basename: a leading `-` is what makes a shell source a login
@@ -99,17 +96,17 @@ fn session_for(
         env,
         // `/`, not the caller's. A daemon holding the supervisor's directory
         // pins that mount for as long as it runs.
-        cwd: Some(session::ROOTDIR.to_string()),
+        cwd: session::ROOTDIR.to_string(),
     }
 }
 
 pub fn run(args: &[String]) -> Result<u8, String> {
     let opts = parse(args).map_err(|e| format!("{e}\nusage: exec-as USER -- PROGRAM [ARG…]"))?;
-    // FORCED, exactly as `su` is — not because reaching a switch needs root,
-    // which is false: `creds::apply` returns early when the credentials already
-    // match, so `exec-as tester` run BY tester is a no-op. What needs root is a
-    // switch that CHANGES something, and `creds::may_switch` refuses that over
-    // all four uid columns. THREAT-MODEL.md §3.
+    // FORCED, as `login -f` is. What needs root is a switch that CHANGES
+    // something, and `creds::may_switch` refuses that over all four uid
+    // columns; `creds::apply` returns early when the credentials already
+    // match, which only root targeting root reaches, since `authorize` reads
+    // the root-only `/etc/shadow` first. THREAT-MODEL.md §3.
     let account = login::authorize(&opts.user, true)?;
     let groups = db::supplementary(&opts.user)?;
     let session = session_for(&account, &groups, opts, &session::inherited());
@@ -186,8 +183,8 @@ mod tests {
         None
     }
 
-    /// The four decisions this applet makes beyond `su`'s, pinned together
-    /// because each is a silent failure rather than a loud one.
+    /// The four decisions this front end makes, pinned together because each
+    /// is a silent failure rather than a loud one.
     #[test]
     fn the_session_a_daemon_gets() {
         let opts = parse(&argv(&["tester", "--", "/bin/td-busd", "run"])).unwrap();
@@ -227,7 +224,7 @@ mod tests {
 
         // `/`, not the caller's directory: the supervisor's cwd is the one
         // piece of its state that would otherwise reach the daemon.
-        assert_eq!(s.cwd.as_deref(), Some(session::ROOTDIR));
+        assert_eq!(s.cwd, session::ROOTDIR);
     }
 
     #[test]
