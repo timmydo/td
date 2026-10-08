@@ -767,6 +767,32 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
     let title = flat(&requests[1].text());
     assert_eq!(title["model"], "anthropic/claude-haiku-4.5");
     assert!(title["messages.1.content"].contains("What is a sparse checkout?"));
+    // Its exchange is kept for the Debug view as a stream's is, though
+    // it was not streamed.
+    let titled = events
+        .iter()
+        .find(|e| {
+            matches!(
+                e.kind,
+                Kind::Request {
+                    purpose: Purpose::Title,
+                    ..
+                }
+            )
+        })
+        .unwrap()
+        .seq;
+    let record = td_agent::wire::read(&h.state.conversation(&h.id), titled).unwrap();
+    assert!(
+        record.starts_with("POST https://openrouter.ai/api/v1/chat/completions\n"),
+        "{record}"
+    );
+    assert!(!record.contains(KEY), "{record}");
+    assert!(
+        record.contains(&format!("{}\nstatus 200\n", td_agent::wire::REPLY)),
+        "{record}"
+    );
+    assert!(record.contains("td-agent read a whole reply"), "{record}");
     // Reserved worst case: the estimated prompt at the cache-write rate,
     // max_tokens at the completion rate. Spent what usage said.
     let request = events

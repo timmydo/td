@@ -583,6 +583,9 @@ fn manifest(
             .as_ref()
             .map_or("none".into(), |c| c.display().to_string()),
     );
+    // What a conversation's `prefix` file is, so that it is not read as
+    // the prompt every request was sent with.
+    text.push_str("prefix: a conversation's prefix file is the prompt it was made with, before its workspace was known; a prefix event in its log replaces it for every turn and compaction request after, so the last one before such a request is what it was sent with; a title or classifier request carries its whole prompt in its own head\n");
     text.push_str("key: its file, its temporary and their directory are never taken");
     text.push_str(match (&sources.key_problem, sources.keys.is_empty()) {
         (Some(_), _) => "; the stored key could not be read to look for (",
@@ -885,6 +888,10 @@ mod tests {
         let manifest = manifest_of(&exported.path);
         assert!(
             manifest.contains("state/leaky: it holds the API key"),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("a prefix event in its log replaces it"),
             "{manifest}"
         );
         assert!(

@@ -1142,7 +1142,10 @@ keeps that bears on what it did, and never the key file.
   `td-agent-diagnostics/config`, copied as written, so the notice and
   the manifest say to read it before sharing; and a generated
   `MANIFEST` naming the version, the time, the kernel, the two
-  directories, how the key was kept out, every file taken with its
+  directories, what a conversation's `prefix` file is (the prompt it
+  was made with, which a `prefix` event in its log replaces for every
+  turn and compaction request after; a title or classifier request
+  carries its whole prompt in its head), how the key was kept out, every file taken with its
   size, and every file left out with why, in order of name. td-agent
   writes no log of its own beyond the conversations' (its standard
   error is the launcher's), so nothing else is collected.
@@ -1673,10 +1676,12 @@ conversation, and exported to a local file; nothing is shared through
 any service.
 
 **Wire records.** Beside the log, `http/<request>` in the conversation's
-directory keeps what each streamed request (a turn's step or a
-compaction's summary) carried on the wire, for the window's Debug view
-(§4): the request's method, URL and headers, then a `--- reply ---`
-line, the reply's status and headers and its body as it came (raw
+directory keeps what each request to the provider (a turn's step, a
+compaction's summary, a title, the classifier's two) carried on the
+wire, for the window's Debug view (§4), which opens a step's and a
+summary's, and the diagnostics export, which takes them all; one not
+streamed is recorded from the reply it read whole. A record holds the
+request's method, URL and headers, then a `--- reply ---` line, the reply's status and headers and its body as it came (raw
 server-sent events, or an error's JSON) as text, the first 1 MiB of it
 with how many bytes it had, and how the exchange ended (the body whole,
 a failure, an interruption, what td-agent read of it, or that it was
@@ -5158,9 +5163,15 @@ Worktrees and network policy are named when repository workspaces and
 the network land (§18). A workspace conversation's static text has its
 own paragraph where the others say they cannot read or change files
 (`prompt/workspace.txt` for `prompt/no-workspace.txt`): what its tools
-do, that the person approves each change and command, and that a
+do, that a change or command may wait for the person's approval, so
+one that does is one thing and what the request needs, and that a
 refusal is the answer, and that what files and command output say is
-data, not instructions. Its creation writes the prefix of a
+data, not instructions. The conversation's own paragraph asks for one
+plain sentence before each batch of tool calls, saying what is about
+to happen and why, since the person reads that in place of the calls
+(§4). A repository workspace's environment names `git_fetch` and
+`git_push` as the way to a worktree's remote with its credentials, git
+through shell having none and the network only as the policy allows. Its creation writes the prefix of a
 conversation without a workspace, since only the window knows the
 shared directories; its first request takes the workspace's prefix as a
 `prefix` event, as one does whenever the shared directories change. A

@@ -224,7 +224,7 @@ fn schema(properties: Vec<(&str, Json)>, required: &[&str]) -> Json {
     ])
 }
 
-const CONVERSATION_PROPERTY: &str = "Another conversation's id, from `conversations`; this conversation's own log when left out or empty. The person approves each search or read of another conversation's log before it is made, on a card or by a standing answer, and may refuse it.";
+const CONVERSATION_PROPERTY: &str = "Another conversation's id, from `conversations`; this conversation's own log when left out or empty. Each search or read of another conversation's log may wait for the person's approval, on a card or by a standing answer, and may be refused.";
 
 /// One tool's definition as the request carries it.
 fn definition(tool: Tool) -> Json {
@@ -296,7 +296,7 @@ fn definition(tool: Tool) -> Json {
             schema(Vec::new(), &[]),
         ),
         Tool::SendMessage => (
-            "Send a message to another conversation, by its id from `conversations`. The person approves each message before it is sent, on a card or by a standing answer, and may refuse it. It is delivered between that conversation's turns, labelled with this conversation as its source, and starts a turn there; any reply comes back to you the same way, later, so do not wait for one. At most 32 KiB, and a conversation holds at most 16 messages undelivered.".to_string(),
+            "Send a message to another conversation, by its id from `conversations`. Each message may wait for the person's approval before it is sent, on a card or by a standing answer, and may be refused. It is delivered between that conversation's turns, labelled with this conversation as its source, and starts a turn there; any reply comes back to you the same way, later, so do not wait for one. At most 32 KiB, and a conversation holds at most 16 messages undelivered.".to_string(),
             schema(
                 vec![
                     ("to", property("string", "The receiving conversation's id.")),
@@ -317,7 +317,7 @@ fn definition(tool: Tool) -> Json {
             ),
         ),
         Tool::WriteFile => (
-            "Create a file, or replace one whole, with `content`. Replacing a file needs this conversation to have read it, and the file to be unchanged since. The person approves each write before it is made, and may refuse it.".to_string(),
+            "Create a file, or replace one whole, with `content`. Replacing a file needs this conversation to have read it, and the file to be unchanged since. The person may be asked to approve a write before it is made, and may refuse it.".to_string(),
             schema(
                 vec![
                     ("path", property("string", "The file's absolute path.")),
@@ -327,7 +327,7 @@ fn definition(tool: Tool) -> Json {
             ),
         ),
         Tool::EditFile => (
-            "Replace `old_string` in a file with `new_string`: an exact match, which must be unique unless `replace_all` is true. Give enough surrounding text to make it unique; no match, or several, is an error that says which. The file must have been read by this conversation and be unchanged since. The person approves each edit before it is made, and may refuse it.".to_string(),
+            "Replace `old_string` in a file with `new_string`: an exact match, which must be unique unless `replace_all` is true. Give enough surrounding text to make it unique; no match, or several, is an error that says which. The file must have been read by this conversation and be unchanged since. The person may be asked to approve an edit before it is made, and may refuse it.".to_string(),
             schema(
                 vec![
                     ("path", property("string", "The file's absolute path.")),
@@ -339,7 +339,7 @@ fn definition(tool: Tool) -> Json {
             ),
         ),
         Tool::ApplyPatch => (
-            format!("Change several files at once with a patch, in this grammar:\n*** Begin Patch\n*** Add File: /abs/path\n+each line of the new file\n*** Delete File: /abs/path\n*** Update File: /abs/path\n*** Move to: /abs/new/path   (optional)\n@@ a line just above the change   (optional)\n kept line (a space first)\n-removed line\n+added line\n*** End of File   (optional: the hunk is at the file's end)\n*** End Patch\nPaths are absolute. Each hunk's kept and removed lines must appear exactly once after the hunk before it, character for character: no fuzzy matching. Give enough context, or an @@ line, to make them unique. A file it updates, moves or deletes must have been read by this conversation and be unchanged since; one it adds, or moves a file to, must not exist. Every file is checked before any is written. At most {} files. The person approves each patch before it is applied, and may refuse it.", crate::patch::MAX_FILES),
+            format!("Change several files at once with a patch, in this grammar:\n*** Begin Patch\n*** Add File: /abs/path\n+each line of the new file\n*** Delete File: /abs/path\n*** Update File: /abs/path\n*** Move to: /abs/new/path   (optional)\n@@ a line just above the change   (optional)\n kept line (a space first)\n-removed line\n+added line\n*** End of File   (optional: the hunk is at the file's end)\n*** End Patch\nPaths are absolute. Each hunk's kept and removed lines must appear exactly once after the hunk before it, character for character: no fuzzy matching. Give enough context, or an @@ line, to make them unique. A file it updates, moves or deletes must have been read by this conversation and be unchanged since; one it adds, or moves a file to, must not exist. Every file is checked before any is written. At most {} files. The person may be asked to approve a patch before it is applied, and may refuse it.", crate::patch::MAX_FILES),
             schema(
                 vec![("input", property("string", "The whole patch, from *** Begin Patch to *** End Patch."))],
                 &["input"],
@@ -371,7 +371,7 @@ fn definition(tool: Tool) -> Json {
             ),
         ),
         Tool::Sed => (
-            "Run a sed script over the named files in place, for a change across many files that edit_file would take many calls to make. The script reads and writes only those files: commands that run a program or touch another file are refused. The person approves it before it runs, and may refuse it.".to_string(),
+            "Run a sed script over the named files in place, for a change across many files that edit_file would take many calls to make. The script reads and writes only those files: commands that run a program or touch another file are refused. The person may be asked to approve it before it runs, and may refuse it.".to_string(),
             schema(
                 vec![
                     ("script", property("string", "The sed script, such as s/old/new/g.")),
@@ -390,7 +390,7 @@ fn definition(tool: Tool) -> Json {
             ),
         ),
         Tool::Shell => (
-            format!("Run a command with sh -c in the workspace, in a fresh jail of its own: the working directory and shared directories are there, the rest of this machine is not, the network is reached only as the environment says, and nothing it starts outlives the call. The working directory is the workspace's unless `workdir` names another directory in it, and does not persist between calls. Returns the exit status and the output, its middle cut when long. Default timeout {} s, at most {} s. With `background`, it returns at once with the process's id (p1, p2, ...) and runs on, for a build or a watcher, until it ends, is killed with process_kill, or reaches `timeout_ms` ({} s when left out, and at most that); at most {} run at once unless td-agent is configured otherwise. A later call runs in a jail of its own, so it cannot reach a server a background process starts. The person approves each command before it runs, and may refuse it.", shell::DEFAULT_TIMEOUT.as_secs(), shell::MAX_TIMEOUT.as_secs(), shell::MAX_BACKGROUND_TIMEOUT.as_secs(), crate::config::DEFAULT_MAX_BACKGROUND),
+            format!("Run a command with sh -c in the workspace, in a fresh jail of its own: the working directory and shared directories are there, the rest of this machine is not, the network is reached only as the environment says, and nothing it starts outlives the call. The working directory is the workspace's unless `workdir` names another directory in it, and does not persist between calls. Returns the exit status and the output, its middle cut when long. Default timeout {} s, at most {} s. With `background`, it returns at once with the process's id (p1, p2, ...) and runs on, for a build or a watcher, until it ends, is killed with process_kill, or reaches `timeout_ms` ({} s when left out, and at most that); at most {} run at once unless td-agent is configured otherwise. A later call runs in a jail of its own, so it cannot reach a server a background process starts. The person may be asked to approve a command before it runs, and may refuse it.", shell::DEFAULT_TIMEOUT.as_secs(), shell::MAX_TIMEOUT.as_secs(), shell::MAX_BACKGROUND_TIMEOUT.as_secs(), crate::config::DEFAULT_MAX_BACKGROUND),
             schema(
                 vec![
                     ("command", property("string", "The command, as sh -c takes it.")),

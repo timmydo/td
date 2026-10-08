@@ -5670,6 +5670,31 @@ impl Session {
         end
     }
 
+    /// A request not streamed, `request` posted to `url`, and what came of
+    /// it, kept beside the log as a streamed one's exchange is, for the
+    /// window's Debug view (DESIGN.md §6).
+    fn captured(
+        &self,
+        request: u64,
+        key: &Secret,
+        url: &str,
+        sent: &Result<td_fetch_client::Response, td_fetch_client::Error>,
+    ) {
+        let mut record = crate::wire::Record::new("POST", url, &client::headers(key.expose()));
+        match sent {
+            Ok(response) => {
+                record.head(response.status, &response.headers);
+                record.chunk(&response.body);
+                record.end("td-agent read a whole reply".into());
+            }
+            // Refused before it was sent, as a thread that could not be
+            // started is.
+            Err(td_fetch_client::Error::Refused(why)) => record.end(format!("not sent: {why}")),
+            Err(e) => record.end(format!("td-agent read a failure: {e:?}")),
+        }
+        self.keep_record(request, &record, key);
+    }
+
     /// Request `request`'s record, kept beside the log; one that cannot
     /// be is said on standard error, the request unaffected.
     fn keep_record(&self, request: u64, record: &crate::wire::Record, key: &Secret) {
@@ -5849,7 +5874,14 @@ impl Session {
         })?;
         self.sync()?;
         let body = format!("{{{head}}}");
-        let (usage, cost, outcome) = match client::classify(post(&client, &key, &body)) {
+        let sent = post(&client, &key, &body);
+        self.captured(
+            request.seq,
+            &key,
+            &format!("{}/chat/completions", client.base_url),
+            &sent,
+        );
+        let (usage, cost, outcome) = match client::classify(sent) {
             Ok(completion) => {
                 let cost = charge(completion.usage, pricing, reserved);
                 match client::title(completion.content.as_deref().unwrap_or_default()) {
@@ -6056,7 +6088,14 @@ impl Session {
                 td_fetch_client::post(&url, &headers, body.as_bytes(), Some(client::MAX_REPLY))
             })
         });
-        let answer = client::classify(post(&client, &key, &format!("{{{head}}}")));
+        let sent = post(&client, &key, &format!("{{{head}}}"));
+        self.captured(
+            reasoning_request,
+            &key,
+            &format!("{}/chat/completions", client.base_url),
+            &sent,
+        );
+        let answer = client::classify(sent);
         let replied = asked.map(|spawned| match spawned {
             Ok(thread) => thread.join().unwrap_or_else(|_| {
                 Err(td_fetch_client::Error::Io(
@@ -6068,6 +6107,9 @@ impl Session {
                 "no thread could ask Jev: {e}"
             ))),
         });
+        if let (Ok((url, _, _, _, request)), Some(sent)) = (&jev, &replied) {
+            self.captured(*request, &key, url, sent);
+        }
         let (verdict, usage, cost, outcome) = match answer {
             Ok(completion) => {
                 let cost = charge(completion.usage, pricing, reserved);
