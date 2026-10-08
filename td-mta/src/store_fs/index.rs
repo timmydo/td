@@ -1515,6 +1515,9 @@ fn next_change(
         };
         let seq = fixed_blob::<8>(row, 0)?;
         let operation: u32 = row.get(1).map_err(sql)?;
+        if u64::from(operation) >= MAX_OPERATIONS as u64 {
+            return Err(ports::Error::Corrupt);
+        }
         let action: i64 = row.get(2).map_err(sql)?;
         let action = match action {
             1 => ChangeAction::Created,
@@ -2122,6 +2125,121 @@ mod tests {
             assert_eq!(old.next_change(start, ObjectType::Mailbox), Ok(expected));
         }
         assert!(wrong.is_empty(), "nonexact change metadata: {wrong:?}");
+    }
+    #[test]
+    fn change_reader_rejects_out_of_range_stored_operation_ordinals() {
+        let mut wrong = Vec::new();
+        for ordinal in [
+            0,
+            4095,
+            -1,
+            4096,
+            i64::from(u32::MAX),
+            i64::from(u32::MAX) + 1,
+        ] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = IndexStore::create(
+                &mut root,
+                StoreEpoch::from_bytes([9; 16]),
+                Arc::new(Timer(AtomicU64::new(1))),
+                2,
+                deadline(),
+            )
+            .unwrap();
+            store.create_account(ACCOUNT, deadline()).unwrap();
+            let value = mailbox("one", None);
+            let operations = [
+                Operation::put(Table::Mailboxes, ID.as_bytes(), &value).unwrap(),
+                Operation::change(ObjectType::Mailbox, ChangeAction::Created, ID.as_bytes()),
+            ];
+            assert_eq!(
+                store.commit(
+                    &td_crypto::Provider,
+                    CommitRequest {
+                        account: ACCOUNT,
+                        expected: Sequence::default(),
+                        utc_ms: 0,
+                        deadline: deadline(),
+                    },
+                    &operations,
+                    &mut []
+                ),
+                Ok(Sequence::from_u64(1))
+            );
+            let start = ChangeCursor {
+                sequence: Sequence::default(),
+                operation: u32::MAX,
+            };
+            let mut old = store.view(ACCOUNT, deadline()).unwrap();
+            let original = old.next_change(start, ObjectType::Mailbox).unwrap();
+            assert_eq!(
+                original,
+                ChangeStep::Record(ChangeRecord {
+                    cursor: ChangeCursor {
+                        sequence: Sequence::from_u64(1),
+                        operation: 1
+                    },
+                    change: Change {
+                        kind: ObjectType::Mailbox,
+                        id: *ID.as_bytes(),
+                        action: ChangeAction::Created
+                    },
+                })
+            );
+            lock(&store.writer)
+                .unwrap()
+                .native
+                .run(|db| {
+                    db.execute_batch("PRAGMA ignore_check_constraints=ON")
+                        .map_err(sql)?;
+                    assert_eq!(
+                        db.execute(
+                            "UPDATE changes SET operation=?1 WHERE account=?2",
+                            params![ordinal, ACCOUNT.as_bytes().as_slice()]
+                        )
+                        .map_err(sql)?,
+                        1
+                    );
+                    db.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                        .map_err(sql)
+                })
+                .unwrap();
+            let mut current = store.view(ACCOUNT, deadline()).unwrap();
+            let actual = current.next_change(start, ObjectType::Mailbox);
+            if (0..=4095).contains(&ordinal) {
+                let expected = ChangeRecord {
+                    cursor: ChangeCursor {
+                        sequence: Sequence::from_u64(1),
+                        operation: u32::try_from(ordinal).unwrap(),
+                    },
+                    change: Change {
+                        kind: ObjectType::Mailbox,
+                        id: *ID.as_bytes(),
+                        action: ChangeAction::Created,
+                    },
+                };
+                assert_eq!(actual, Ok(ChangeStep::Record(expected)));
+                assert_eq!(
+                    current.next_change(expected.cursor, ObjectType::Mailbox),
+                    Ok(ChangeStep::Complete)
+                );
+                assert_eq!(
+                    current.next_change(
+                        ChangeCursor {
+                            sequence: Sequence::from_u64(1),
+                            operation: u32::MAX
+                        },
+                        ObjectType::Mailbox
+                    ),
+                    Ok(ChangeStep::Complete)
+                );
+            } else if actual != Err(ports::Error::Corrupt) {
+                wrong.push((ordinal, actual));
+            }
+            assert_eq!(old.next_change(start, ObjectType::Mailbox), Ok(original));
+        }
+        assert!(wrong.is_empty(), "out-of-range stored ordinals: {wrong:?}");
     }
     #[test]
     fn changes_use_native_order_and_reject_incoherent_or_duplicate_actions() {

@@ -144,6 +144,10 @@ For each change row selected by the native range query, the sequence must
 have eight bytes and the object ID sixteen. Short or oversized blobs
 return Corrupt; the reader never pads them or treats their stored width
 as caller scratch exhaustion. These checks do not scan unselected rows.
+A selected change's stored operation ordinal must be 0 through 4095,
+below MAX_OPERATIONS; an out-of-range value returns Corrupt. The caller's
+u32::MAX cursor remains a valid instruction to skip a sequence, never a
+valid stored ordinal.
 Change actions must agree with pre/post existence, and a unique native index
 refuses duplicate changes for one object within a transaction.
 
