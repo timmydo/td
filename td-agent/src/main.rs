@@ -53,7 +53,11 @@ the review to standard output; td-agent review --help says more.\n\
 \n\
 td-agent calibrate puts the classifier fixtures in FIXTURES to both of\n\
 its stages, live, and counts their false allows and escalations;\n\
-td-agent calibrate --help says more.\n";
+td-agent calibrate --help says more.\n\
+\n\
+td-agent check-jail runs one workspace instance as a conversation\n\
+would, from TD_AGENT_JAIL and TD_AGENT_TXT, writes a file in it and\n\
+runs git there, and prints TD-AGENT-JAIL-OK when all of it held.\n";
 
 /// `td-agent conversation ID --state-dir DIR [--create ROLE [--workspace
 /// WORKSPACE]]`: the window starts these; a person does not.
@@ -132,6 +136,7 @@ fn main() -> ExitCode {
         Some((first, rest)) if first == "conversation" => conversation(rest),
         Some((first, rest)) if first == "review" => td_agent::review::run(rest),
         Some((first, rest)) if first == "calibrate" => td_agent::calibrate::run(rest),
+        Some((first, rest)) if first == "check-jail" => td_agent::check::run(rest),
         Some((first, rest)) if first == "tool-host" => td_agent::toolhost::Config::parse(rest)
             .and_then(|config| {
                 td_agent::toolhost::serve(std::io::stdin(), std::io::stdout(), config)

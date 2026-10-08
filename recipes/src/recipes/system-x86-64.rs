@@ -22,14 +22,14 @@ use crate::ladder::{
     SYSTEM_ETC_RO_MARKER, SYSTEM_LOGIN_DIRECTORY_MARKER, SYSTEM_NET_REACH_MARKER,
     SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER, SYSTEM_PERSIST_READ_MARKER,
     SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER, SYSTEM_SHUTDOWN_MARKER,
-    SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER, TD_APPLICATIONS_PLACED_MARKER,
-    TD_BUSD_RUNTIME_MARKER, TD_CLAUDE_TERMINAL_MARKER, TD_FETCH_BOOT_MARKER,
-    TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER, TD_FIREFOX_INPUT_FAILED_MARKER,
-    TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER, TD_FIREFOX_SUPPORT_MARKER,
-    TD_INIT_RUNTIME_MARKER, TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
-    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY,
-    TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY, TD_NEWS_NAME,
-    TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
+    SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER, TD_AGENT_JAIL_BOOT_MARKER,
+    TD_APPLICATIONS_PLACED_MARKER, TD_BUSD_RUNTIME_MARKER, TD_CLAUDE_TERMINAL_MARKER,
+    TD_FETCH_BOOT_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER,
+    TD_FIREFOX_INPUT_FAILED_MARKER, TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER,
+    TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_KILL_REAPS_MARKER,
+    TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
+    TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY,
+    TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_SETUP_LIVE_MARKER,
     TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
@@ -1365,6 +1365,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "claude-files",
     "claude-launch",
     "fetch-evidence",
+    "agent-evidence",
     "portal-files",
     "firefox-handoff",
     "portal",
@@ -1724,6 +1725,21 @@ fn build_td_svc_conf() -> String {
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-login exec-primary -- /bin/td-fetchd probe /run/user/{ui_uid}/td-fetch/socket && /bin/echo {fetch_marker}'\n\
          after=fetchd,firefox-tls-setup\n\
          requires=fetchd\n\
+         timeout={application_evidence}\n\
+         \n\
+         # td-agent's workspace jail on td (td-agent/DESIGN.md §8, \"On td\"):\n\
+         # under the autotest token, once the egress relay answers its probe\n\
+         # as td's account, `td-agent check-jail` launches one workspace\n\
+         # instance from the image's td-jail and td-txt, as the launcher\n\
+         # card's td-agent launches its tools; its tool host writes in the\n\
+         # worktree and a jailed shell runs git through td's /bin and /td.\n\
+         # It prints {agent_jail_marker} itself, and nothing when any of it fails.\n\
+         [agent-evidence]\n\
+         type=oneshot\n\
+         cgroup=session\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-login exec-primary -- /bin/td-egressd probe /run/user/{ui_uid}/td-egress/socket >/dev/null && exec /bin/td-login exec-primary -- /bin/env TD_AGENT_JAIL=/bin/td-jail TD_AGENT_TXT=/bin/td-txt /bin/td-agent check-jail'\n\
+         after=egressd\n\
+         requires=egressd\n\
          timeout={application_evidence}\n\
          \n\
          # Root prepares one read-only mapped Downloads view for the portal.\n\
@@ -2212,6 +2228,7 @@ fn build_td_svc_conf() -> String {
         mail_marker = TD_MAIL_BOOT_MARKER,
         news_marker = TD_NEWS_BOOT_MARKER,
         fetch_marker = TD_FETCH_BOOT_MARKER,
+        agent_jail_marker = TD_AGENT_JAIL_BOOT_MARKER,
         application_settle = APPLICATION_SETTLE_SECS,
         application_workspace = TERMINAL_APPLICATION_WORKSPACE,
         application_evidence = svc_timeouts::APPLICATION_EVIDENCE,
@@ -8277,6 +8294,7 @@ mod tests {
             ("busd", vec!["seat"]),
             ("fetchd", vec!["seat", "netup"]),
             ("egressd", vec!["seat", "netup"]),
+            ("agent-evidence", vec!["egressd"]),
             ("mail-fetch", vec!["td-firstboot", "netup"]),
             ("news-fetch", vec!["td-firstboot", "netup"]),
             ("firefox-files", vec!["td-firstboot"]),
@@ -14751,6 +14769,28 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         );
         assert_eq!(unit_key("egressd", "requires").as_deref(), Some("seat"));
         assert_eq!(unit_key("egressd", "restart").as_deref(), Some("always"));
+        // The boot's proof: the relay's probe, then td-agent's own check,
+        // as td's account, from the image's programs.
+        let evidence = unit_key("agent-evidence", "exec").unwrap();
+        let probe = evidence
+            .find("/bin/td-login exec-primary -- /bin/td-egressd probe /run/user/1000/td-egress/socket")
+            .unwrap();
+        let check = evidence
+            .find("exec /bin/td-login exec-primary -- /bin/env TD_AGENT_JAIL=/bin/td-jail TD_AGENT_TXT=/bin/td-txt /bin/td-agent check-jail")
+            .unwrap();
+        assert!(probe < check, "{evidence}");
+        assert_eq!(
+            unit_key("agent-evidence", "requires").as_deref(),
+            Some("egressd")
+        );
+        // td-agent prints the marker the boot oracle latches.
+        let check_rs = include_str!("../../../td-agent/src/check.rs");
+        assert!(check_rs.contains(&format!(
+            "pub const MARKER: &str = \"{TD_AGENT_JAIL_BOOT_MARKER}\";"
+        )));
+        // Its own budget ends before td-svc would kill it.
+        assert!(check_rs.contains("pub const BUDGET: Duration = Duration::from_secs(45);"));
+        assert!(45 < svc_timeouts::APPLICATION_EVIDENCE);
     }
 
     #[test]

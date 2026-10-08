@@ -1240,6 +1240,13 @@ pub const TD_NEWS_BOOT_MARKER: &str = "TD-NEWS-RUNNING";
 // markers above: their jails carry `sockets=fetch`, and stage 2 refuses to
 // launch without the socket bound.
 pub const TD_FETCH_BOOT_MARKER: &str = "TD-FETCH-OK";
+// Printed by `td-agent check-jail`, which the `agent-evidence` unit runs as
+// td's account under the autotest token once the egress relay answers its
+// probe: one workspace instance launched from the image's td-jail and
+// td-txt, as the launcher card's td-agent launches its tools, wrote a file
+// in its worktree and ran git through td's `/bin` and `/td` (td-agent
+// DESIGN.md §8, "On td").
+pub const TD_AGENT_JAIL_BOOT_MARKER: &str = "TD-AGENT-JAIL-OK";
 // Printed by the `placement-evidence` unit under the autotest token once the
 // view is back on the first workspace and the compositor's own report shows
 // it active, the applications' workspace occupied, and one window on the

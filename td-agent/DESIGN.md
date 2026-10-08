@@ -3154,7 +3154,11 @@ td admits for its account alone (APPLICATIONS.md §C), with td's `/td`
 bound where its `/bin` links resolve; its tools' `PATH` is td's `/bin`.
 td-agent so holds what the human holds; what keeps the model to a
 workspace is the workspace jail and the approval policy (§11), as on a
-host, not an application jail around td-agent itself.
+host, not an application jail around td-agent itself. `td-agent
+check-jail` launches one instance as a conversation would, from
+`TD_AGENT_JAIL` and `TD_AGENT_TXT`, writes a file in its worktree and
+runs git there, and prints `TD-AGENT-JAIL-OK`; the image's boot runs it
+as td's account (§18, 17).
 
 ## 9. Git
 
@@ -6423,13 +6427,19 @@ in parallel with it.
     stubs that `history_read` resolves, and the card that offers to
     compact a long conversation whose cache has gone cold before
     resending it (§14, "Resuming cold").
-17. **Packaging.** A recipe, an application package with
-    `sockets=wayland;fetch` and the egress socket, the portal credential,
-    the in-td jail path of §8 with its td-authd amendment, and a boot
-    oracle. git ships on td as an explicitly reviewed non-Rust package
-    (AGENTS.md), with its TLS closure and the frame-pointer and debug
-    companion obligations of `td-profiler/DESIGN.md`, named in that
-    landing.
+17. **Packaging.** td-agent as a program of td's account (§8, "On
+    td"), the user's choice over a jailed application: td-jail admitting
+    the workspace kind for td's account with td's trees
+    (APPLICATIONS.md §C); the `td-agent` recipe, its realized-output
+    check, `/bin/td-agent`, and the `egressd` unit (§10, §17); the
+    launcher's card through td-authd's request `0c`; and a boot oracle,
+    the `agent-evidence` unit, which runs `td-agent check-jail` as td's
+    account once the relay answers its probe: one workspace instance
+    from the image's td-jail and td-txt writes in its worktree and runs
+    git through td's `/bin` and `/td`, and prints `TD-AGENT-JAIL-OK`,
+    which the boot requires. git ships on td as an explicitly reviewed
+    non-Rust package (AGENTS.md). The oracle does not start the window
+    from the card or reach a model.
 
 After these: resource limits (§8), schedules (§3), the `question` tool
 (§12), a loopback shared by a
@@ -6440,8 +6450,6 @@ Messages dialect.
 
 ## 19. Open questions
 
-- **Host system trees.** The exact §X amendment that lets a `workspace`
-  instance bind the host's system trees and `/etc` read-only.
 - **Resource limits.** For the later limits of §8: how the launch obtains
   a delegated cgroup v2 subtree, from a systemd user manager's transient
   scope (whose delegated controllers depend on its version and must be
@@ -6465,11 +6473,6 @@ Messages dialect.
 - **Wake budget.** Whether twenty wakes between human messages (§3) is
   the right bound for conversations messaging each other, and whether
   it should count turns or cost.
-- **The jail inside td.** The root request listener td-authd would need to
-  start a workspace instance for a jailed td-agent, how the workspace root
-  and shared directories become portal grants, and how the git worker
-  reaches remotes from a jailed td-agent, which holds no network and no
-  SSH agent.
 - **Partial clones.** The store is a full clone. A blobless clone would
   make large repositories cheap, but a sparse checkout widened in the jail
   would then need objects the jail cannot fetch; the git worker would have

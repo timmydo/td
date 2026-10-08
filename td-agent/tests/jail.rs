@@ -94,6 +94,52 @@ fn shell(client: &mut Client, command: &str) -> String {
     .text
 }
 
+/// `td-agent check-jail`, as the image's boot runs it: its marker alone,
+/// and its scratch tree gone after. Its state directory is reached
+/// through a link, as td's `/home` is a link to `/var/home`, and td-jail
+/// admits only a canonical worktree.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn the_jail_check_prints_its_marker_and_leaves_nothing() {
+    let scratch = Scratch::new("check");
+    std::fs::create_dir(scratch.0.join("shared/real")).unwrap();
+    std::os::unix::fs::symlink("real", scratch.0.join("shared/home")).unwrap();
+    let state = scratch.0.join("shared/real/state");
+    let out = Command::new(PROGRAM)
+        .arg("check-jail")
+        .env("XDG_STATE_HOME", scratch.0.join("shared/home/state"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("{}\n", td_agent::check::MARKER)
+    );
+    // The state directory it made stays; its scratch tree inside does not.
+    assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+}
+
+/// Without a jail named, the check fails and prints no marker.
+#[test]
+fn the_jail_check_without_a_jail_prints_nothing() {
+    let scratch = Scratch::new("nocheck");
+    let out = Command::new(PROGRAM)
+        .arg("check-jail")
+        .env_remove(jail::JAIL_VAR)
+        .env("XDG_STATE_HOME", scratch.0.join("shared/state"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains(jail::JAIL_VAR));
+}
+
 #[test]
 #[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
 fn the_jailed_tool_host_works_inside_its_policy() {
