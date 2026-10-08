@@ -97,7 +97,8 @@ submission or recipient PUT/DELETE, checking exact final ordinal coverage
 with indexed reads before COMMIT. A group inconsistency rolls back the entire
 transaction. The core also preserves existing immutable
 submission/envelope identity, the uncertainty latch, retained attempt history
-and one-way failure-notice state as specified in STORAGE.md. It refuses
+and one-way failure-notice state, plus an already-present completedAt, as
+specified in STORAGE.md. It refuses
 revival or a new attempt on terminal recipients, preserves Accepted/Canceled
 state, allows Failed only to remain Failed or join whole-group cancellation,
 and keeps terminal OutcomeUnknown terminal and uncertain. Terminal phase,
@@ -232,6 +233,8 @@ worker result with an old attempt/fence is rejected before writing state.
 
 completedAt is set once every recipient has no future dispatch obligation;
 it is a wall-clock observation and can precede sendAt after a clock step.
+Once present, preserve that exact timestamp in every subsequent submission
+update, including cancellation and failure-notice updates.
 Retain accepted/canceled submission records and their blobs for at least
 30 days after completion by default. Failed and terminal OutcomeUnknown
 records remain until explicit administrator deletion; storing a notice does

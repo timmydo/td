@@ -237,10 +237,15 @@ before transport I/O. The stored source/destination shape alone does not
 establish any of those permissions or transport ordering.
 The core compares only the immediately prior ID; it retains no AttemptId
 registry and does not establish worker fences. Counter exhaustion still
-requires service pause and operator intervention. Actual notice creation,
-creation authorization and submission deletion/retention policy remain
-service obligations. The core does not preserve completedAt's historical
-value; the service must not use an arbitrary rewrite to shorten retention.
+requires service pause and operator intervention. Actual notice creation
+and creation authorization remain service obligations. Once completedAt is
+present, surviving submission PUTs must preserve its exact value, including
+during whole-group cancellation.
+An intermediate unset PUT or DELETE cannot reset that original observation.
+A pending row may retain absence or acquire its first completion timestamp;
+final group checks still require completion exactly when obligations end.
+The core does not validate the timestamp against the current clock or sendAt;
+clock validation and retention/deletion authorization remain service work.
 Preserving notice history does not prove the referenced failure Email was
 created.
 The service must forbid creation of a new notice solely for cancellation

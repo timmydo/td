@@ -2317,6 +2317,8 @@ coverage, aggregate queue-state validation and preservation of the named
 immutable queue identity/uncertainty/attempt-history fields are implemented
 in the core, including one-way Pending/Stored failure-notice history and
 terminal recipient state/attempt/phase/reply/reason/uncertainty preservation.
+The core also preserves an existing completedAt timestamp through later
+updates and cancellation, without proving its clock authority.
 STORAGE.md also defines reply retention outside active attempts and the
 empty-diagnostic requirement on attempt-count advances. It defines count/ID
 progression, eligible-source/Prepared-entry checks, adjacent active phase

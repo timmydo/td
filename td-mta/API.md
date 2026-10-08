@@ -6617,7 +6617,10 @@ original deadline/VM fuel. Inconsistent groups reject with
 Conflict; native deadline, capacity and I/O errors retain their classifications.
 Before row writes, surviving queue PUTs preserve STORAGE.md's immutable
 identity, uncertainty, attempt-history and failure-notice fields against the
-original rows. STORAGE.md defines reply retention outside active attempts
+original rows. A present completedAt also retains its exact original value
+across surviving submission PUTs, including whole-group cancellation;
+initial completion does not impose timestamp chronology. STORAGE.md defines
+reply retention outside active attempts
 and the empty-diagnostic requirement on attempt-count advances. It also
 defines count/ID progression, eligible-source/Prepared-entry checks,
 adjacent active phase advances, and acceptance/cancellation and DATA-reply

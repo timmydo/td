@@ -1403,3 +1403,277 @@ fn pending_recipients_cannot_reenter_in_flight_with_the_previous_attempt() {
         "previous attempt was revived: {accepted:?}"
     );
 }
+
+fn assert_submission(store: &IndexStore<'_>, expected: SubmissionRow<'_>, sequence: u64) {
+    let mut view = store.view(ACCOUNT, deadline()).unwrap();
+    assert_eq!(
+        view.identity().committed_sequence,
+        Sequence::from_u64(sequence)
+    );
+    let mut scratch = [0; 1024];
+    assert_eq!(
+        view.get(Key::Submission(SUBMISSION), &mut scratch)
+            .unwrap()
+            .unwrap()
+            .0,
+        Row::Submission(expected)
+    );
+}
+
+#[test]
+fn completed_timestamp_is_retained_across_terminal_updates_and_repeated_keys() {
+    let mut unexpected = Vec::new();
+    for encoded in [false, true] {
+        for state in [
+            RecipientState::Accepted,
+            RecipientState::Canceled,
+            RecipientState::Failed,
+            RecipientState::OutcomeUnknown,
+        ] {
+            for time in [i64::MIN, -1, 2, i64::MAX] {
+                for repeated in [false, true] {
+                    let fixture = Fixture::new();
+                    let mut root = fixture.locked();
+                    let store = open(&mut root);
+                    let original = terminal(state);
+                    let mut sub = submission(1);
+                    sub.completed_at = Some(1);
+                    if matches!(
+                        state,
+                        RecipientState::Failed | RecipientState::OutcomeUnknown
+                    ) {
+                        sub.notification = NotificationState::Pending;
+                    }
+                    create_group(&store, sub, &[(0, original)], encoded).unwrap();
+                    let changed = RecipientRow {
+                        diagnostic: "terminal diagnostic update",
+                        ..original
+                    };
+                    let next = SubmissionRow {
+                        completed_at: Some(time),
+                        ..sub
+                    };
+                    assert_fresh_group(next, &[(0, changed)], encoded);
+                    let key = recipient_key(0);
+                    let row = encode(Row::Recipient(changed));
+                    let diag = Operation::put(Table::Recipients, &key, &row).unwrap();
+                    let bytes = encode(Row::Submission(next));
+                    let bad =
+                        Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &bytes).unwrap();
+                    let unset_bytes = encode(Row::Submission(SubmissionRow {
+                        completed_at: None,
+                        ..sub
+                    }));
+                    let unset =
+                        Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &unset_bytes)
+                            .unwrap();
+                    let delete =
+                        Operation::delete(Table::Submissions, SUBMISSION.as_bytes()).unwrap();
+                    let operations = if repeated {
+                        vec![unset, delete, bad, diag]
+                    } else {
+                        vec![diag, bad]
+                    };
+                    let result = apply(&store, 1, &operations, encoded);
+                    if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                        unexpected.push((encoded, state, time, repeated, result));
+                        continue;
+                    }
+                    assert_recipient(&store, original);
+                    assert_submission(&store, sub, 1);
+                    let good_bytes = encode(Row::Submission(sub));
+                    let good =
+                        Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &good_bytes)
+                            .unwrap();
+                    assert_eq!(
+                        apply(&store, 1, &[bad, delete, good, diag], encoded),
+                        Ok(Sequence::from_u64(2))
+                    );
+                    assert_recipient(&store, changed);
+                    assert_submission(&store, sub, 2);
+                }
+            }
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "completed timestamp rewritten: {unexpected:?}"
+    );
+}
+
+#[test]
+fn cancellation_of_completed_failure_keeps_time_and_notice() {
+    let mut unexpected = Vec::new();
+    for encoded in [false, true] {
+        for stored in [false, true] {
+            for time in [-6, 0] {
+                let fixture = Fixture::new();
+                let mut root = fixture.locked();
+                let store = open(&mut root);
+                let original = terminal(RecipientState::Failed);
+                let mut sub = submission(1);
+                sub.completed_at = Some(-5);
+                sub.notification = if stored {
+                    NotificationState::Stored
+                } else {
+                    NotificationState::Pending
+                };
+                sub.notification_email = stored.then_some(EmailId::from_bytes([14; 16]));
+                create_group(&store, sub, &[(0, original)], encoded).unwrap();
+                let canceled = RecipientRow {
+                    state: RecipientState::Canceled,
+                    reason: FailureReason::Canceled,
+                    ..original
+                };
+                let next = SubmissionRow {
+                    completed_at: Some(time),
+                    ..sub
+                };
+                assert_fresh_group(next, &[(0, canceled)], encoded);
+                let key = recipient_key(0);
+                let row = encode(Row::Recipient(canceled));
+                let cancel = Operation::put(Table::Recipients, &key, &row).unwrap();
+                let bytes = encode(Row::Submission(next));
+                let bad =
+                    Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &bytes).unwrap();
+                let result = apply(&store, 1, &[cancel, bad], encoded);
+                if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                    unexpected.push((encoded, stored, time, result));
+                    continue;
+                }
+                assert_recipient(&store, original);
+                assert_submission(&store, sub, 1);
+                let good_bytes = encode(Row::Submission(sub));
+                let good =
+                    Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &good_bytes).unwrap();
+                assert_eq!(
+                    apply(&store, 1, &[cancel, good], encoded),
+                    Ok(Sequence::from_u64(2))
+                );
+                assert_recipient(&store, canceled);
+                assert_submission(&store, sub, 2);
+            }
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "cancellation rewrote completion time: {unexpected:?}"
+    );
+}
+
+#[test]
+fn initial_completion_accepts_signed_clock_observation_and_retains_it() {
+    for encoded in [false, true] {
+        for time in [i64::MIN, -1, 0, i64::MAX] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = open(&mut root);
+            create_group(&store, submission(1), &[(0, queued())], encoded).unwrap();
+            let pending = encode(Row::Submission(submission(1)));
+            assert_eq!(
+                apply(
+                    &store,
+                    1,
+                    &[
+                        Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &pending)
+                            .unwrap()
+                    ],
+                    encoded
+                ),
+                Ok(Sequence::from_u64(2))
+            );
+            let sub = SubmissionRow {
+                completed_at: Some(time),
+                notification: NotificationState::Pending,
+                ..submission(1)
+            };
+            let row = encode(Row::Recipient(terminal(RecipientState::Failed)));
+            let key = recipient_key(0);
+            let bytes = encode(Row::Submission(sub));
+            let complete =
+                Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &bytes).unwrap();
+            assert_eq!(
+                apply(
+                    &store,
+                    2,
+                    &[
+                        Operation::put(Table::Recipients, &key, &row).unwrap(),
+                        complete
+                    ],
+                    encoded
+                ),
+                Ok(Sequence::from_u64(3))
+            );
+            assert_submission(&store, sub, 3);
+            assert_eq!(
+                apply(&store, 3, &[complete], encoded),
+                Ok(Sequence::from_u64(4))
+            );
+            assert_submission(&store, sub, 4);
+        }
+    }
+}
+
+#[test]
+fn storing_a_failure_notice_keeps_the_original_completion_time() {
+    let mut unexpected = Vec::new();
+    for encoded in [false, true] {
+        for state in [RecipientState::Failed, RecipientState::OutcomeUnknown] {
+            for time in [-1, 2] {
+                let fixture = Fixture::new();
+                let mut root = fixture.locked();
+                let store = open(&mut root);
+                let original = terminal(state);
+                let sub = SubmissionRow {
+                    completed_at: Some(1),
+                    notification: NotificationState::Pending,
+                    ..submission(1)
+                };
+                create_group(&store, sub, &[(0, original)], encoded).unwrap();
+                let stored = SubmissionRow {
+                    notification: NotificationState::Stored,
+                    notification_email: Some(EmailId::from_bytes([14; 16])),
+                    ..sub
+                };
+                let next = SubmissionRow {
+                    completed_at: Some(time),
+                    ..stored
+                };
+                // Notice Email creation remains a separate service obligation.
+                assert_fresh_group(next, &[(0, original)], encoded);
+                let bytes = encode(Row::Submission(next));
+                let result = apply(
+                    &store,
+                    1,
+                    &[Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &bytes).unwrap()],
+                    encoded,
+                );
+                if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                    unexpected.push((encoded, state, time, result));
+                    continue;
+                }
+                assert_submission(&store, sub, 1);
+                assert_recipient(&store, original);
+                let bytes = encode(Row::Submission(stored));
+                assert_eq!(
+                    apply(
+                        &store,
+                        1,
+                        &[
+                            Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &bytes)
+                                .unwrap()
+                        ],
+                        encoded
+                    ),
+                    Ok(Sequence::from_u64(2))
+                );
+                assert_submission(&store, stored, 2);
+                assert_recipient(&store, original);
+            }
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "notice rewrote completion time: {unexpected:?}"
+    );
+}
