@@ -48,6 +48,8 @@ mod operations;
 #[path = "index/row_history.rs"]
 mod row_history;
 use operations::Operations;
+#[path = "index/threading.rs"]
+mod threading;
 #[path = "index/usage.rs"]
 mod usage;
 pub use usage::LogicalUsage;

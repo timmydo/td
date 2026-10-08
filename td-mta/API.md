@@ -6519,6 +6519,14 @@ changes are refused. A view retains its original monotonic deadline and VM
 fuel; clock/VM-budget failure or reversed time is sticky. Drop ends the read transaction
 before returning its connection; failed rollback retires the slot.
 
+IndexReadView::thread_anchor(message_id, value) resolves an already parsed
+Message-ID to optional (EmailId, ThreadId) metadata in the captured view.
+It uses caller scratch for the selected Email row; format::MAX_VALUE_BYTES
+(65536 bytes) suffices for every valid row. No match returns None;
+invalid input, insufficient scratch, corruption and native failures remain
+errors. STORAGE.md owns byte matching, duplicate selection and resource
+bounds. The result grants no body pin or mutation authority.
+
 IndexReadView::logical_usage returns account-scoped LogicalUsage with its
 captured ViewIdentity. IndexStore::usage_fence supplies whole-store totals
 while retaining the cold writer fence, plus verified StoreFileUsage.

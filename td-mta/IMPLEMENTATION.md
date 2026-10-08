@@ -551,6 +551,10 @@ shared bounded history pass compares final effects to the original account
 snapshot. New Email assignment, anchor maintenance, ID allocation and
 mutation authorization remain service work; STORAGE.md owns the boundary.
 
+Snapshot-bound exact anchor resolution is implemented by
+IndexReadView::thread_anchor as specified in STORAGE.md. Header candidate
+selection and creation ordering remain service work.
+
 Final ThreadAnchor cardinality checks are implemented as specified in
 STORAGE.md.
 

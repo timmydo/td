@@ -815,6 +815,32 @@ Resource/I/O failure is an explicit temporary error, not permission
 to silently choose a different thread. Authoritative anchor lookup remains
 available without a cache, using bounded-work indexed SQLite access.
 
+IndexReadView::thread_anchor resolves one already parsed Message-ID in its
+captured account snapshot. The input must contain 1..1004 UTF-8 bytes;
+header syntax, CFWS removal and candidate ordering remain caller work.
+The caller skips overlength IDs under POLICY.md section 5 before calling
+this helper; they retain their place in the References lookback limit.
+The native primary-key lookup uses exact message_id equality and selects
+the smallest unsigned Email ID, including the all-zero ID, with LIMIT 1.
+It neither case-folds nor normalizes the supplied ID. No match returns
+None; it does not allocate a new thread or fall back to another candidate.
+
+The selected anchor's changed sequence must not exceed the view endpoint.
+The resolver then uses the existing typed point reads for its Email and
+Thread, validating their rows and changed sequences. A missing or corrupt
+selected target returns Corrupt instead of selecting a different Email.
+One indexed anchor lookup and two logical point reads share the original
+read transaction, deadline and VM allowance; an Email's bounded SMTP
+receipt decoding can perform additional native child-row work. Caller
+value scratch holds the Email row; format::MAX_VALUE_BYTES (65536 bytes)
+holds every valid row. SMTP receipt lists have their own 32768-byte and
+1000-recipient ceilings. Insufficient scratch returns Capacity.
+Errors never mean no match. Returned Email/Thread IDs are passive metadata,
+not body pins or write authority. Lost snapshots and native budget failures
+retain the read view's existing sticky failure behavior. This native helper
+does not implement header selection, creation-frame ordering or the future
+authenticated Store adapter.
+
 The native committing writer checks each surviving ThreadAnchor PUT after
 row writes against the final account view. An indexed lookup using
 anchors_email(account,email_id) tests for a second anchor with LIMIT 1
