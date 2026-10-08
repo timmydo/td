@@ -44,8 +44,8 @@ mod relational;
 use relational::SCHEMA;
 #[path = "index/operations.rs"]
 mod operations;
-#[path = "index/queue_history.rs"]
-mod queue_history;
+#[path = "index/row_history.rs"]
+mod row_history;
 use operations::Operations;
 #[path = "index/usage.rs"]
 mod usage;
@@ -771,7 +771,7 @@ impl<'r> IndexStore<'r> {
                 }
             }
         }
-        queue_history::validate(native, &mut view, operations, scratch)?;
+        row_history::validate(native, &mut view, operations, scratch)?;
         for ordinal in 0..operations.len() {
             native.check()?;
             let op = operations.get(ordinal)?;
@@ -3136,6 +3136,303 @@ mod tests {
         );
         let consumed = before - lock(&view.native().unwrap().budget).unwrap().remaining;
         assert!(consumed < 100, "absent kind consumed {consumed} VM steps");
+    }
+
+    fn commit_encoded_rows(
+        store: &IndexStore<'_>,
+        request: CommitRequest,
+        operations: &[Operation<'_>],
+        sources: &mut [BlobSource<'_>],
+    ) -> Result<Sequence, CommitError> {
+        let length = operations.iter().map(|op| op.encoded_len().unwrap()).sum();
+        let mut bytes = vec![0; length];
+        let mut offset = 0;
+        for operation in operations {
+            offset += operation.encode(&mut bytes[offset..]).unwrap();
+        }
+        let mut slots = vec![None; operations.len()];
+        let batch = crate::format::batch::Batch::decode(
+            ports::TransactionInput {
+                bytes: &bytes,
+                count: operations.len(),
+            },
+            &mut slots,
+        )
+        .unwrap();
+        store.commit_batch(&td_crypto::Provider, request, &batch, sources)
+    }
+
+    #[test]
+    fn native_email_thread_assignment_survives_typed_and_encoded_replacement() {
+        fn commit(
+            store: &IndexStore<'_>,
+            expected: u64,
+            operations: &[Operation<'_>],
+            sources: &mut [BlobSource<'_>],
+            encoded: bool,
+        ) -> Result<Sequence, CommitError> {
+            let request = CommitRequest {
+                account: ACCOUNT,
+                expected: Sequence::from_u64(expected),
+                utc_ms: 0,
+                deadline: deadline(),
+            };
+            if !encoded {
+                return store.commit(&td_crypto::Provider, request, operations, sources);
+            }
+            commit_encoded_rows(store, request, operations, sources)
+        }
+        let mut unexpected = Vec::new();
+        for encoded in [false, true] {
+            for variant in 0..3 {
+                let fixture = Fixture::new();
+                let mut root = fixture.locked();
+                let store = IndexStore::create(
+                    &mut root,
+                    StoreEpoch::from_bytes([9; 16]),
+                    Arc::new(Timer(AtomicU64::new(1))),
+                    2,
+                    deadline(),
+                )
+                .unwrap();
+                store.create_account(ACCOUNT, deadline()).unwrap();
+                let blob = BlobId::from_bytes([4; 16]);
+                let fresh = BlobId::from_bytes([8; 16]);
+                let thread = ThreadId::from_bytes([5; 16]);
+                let other = ThreadId::from_bytes([7; 16]);
+                let email = EmailId::from_bytes([6; 16]);
+                let original = EmailRow {
+                    blob,
+                    thread,
+                    received_at: 0,
+                    origin: EmailOrigin::Jmap,
+                };
+                let original_bytes = encode(Row::Email(original));
+                let changed_bytes = encode(Row::Email(EmailRow {
+                    thread: other,
+                    ..original
+                }));
+                let thread_bytes = encode(Row::Thread);
+                let empty_blob = encode(Row::Blob(BlobRow {
+                    kind: BlobKind::Message,
+                    length: 0,
+                    digest: td_crypto::Provider.sha256().unwrap().finish().unwrap(),
+                    created_at: 0,
+                }));
+                let good =
+                    Operation::put(Table::Emails, email.as_bytes(), &original_bytes).unwrap();
+                let bad = Operation::put(Table::Emails, email.as_bytes(), &changed_bytes).unwrap();
+                let delete = Operation::delete(Table::Emails, email.as_bytes()).unwrap();
+                assert_eq!(
+                    commit(
+                        &store,
+                        0,
+                        &[
+                            Operation::put(Table::Blobs, blob.as_bytes(), &empty_blob).unwrap(),
+                            Operation::put(Table::Threads, thread.as_bytes(), &thread_bytes)
+                                .unwrap(),
+                            Operation::put(Table::Threads, other.as_bytes(), &thread_bytes)
+                                .unwrap(),
+                            good,
+                        ],
+                        &mut [BlobSource {
+                            id: blob,
+                            source: &mut b"".as_slice()
+                        }],
+                        encoded
+                    ),
+                    Ok(Sequence::from_u64(1))
+                );
+                let mut old = store.view(ACCOUNT, deadline()).unwrap();
+                let body = b"new body";
+                let mut hash = td_crypto::Provider.sha256().unwrap();
+                hash.update(body).unwrap();
+                let fresh_bytes = encode(Row::Blob(BlobRow {
+                    kind: BlobKind::Message,
+                    length: body.len() as u64,
+                    digest: hash.finish().unwrap(),
+                    created_at: 0,
+                }));
+                let fresh_put =
+                    Operation::put(Table::Blobs, fresh.as_bytes(), &fresh_bytes).unwrap();
+                let mut operations = vec![fresh_put];
+                match variant {
+                    0 => operations.push(bad),
+                    1 => operations.extend([good, bad]),
+                    _ => operations.extend([delete, bad]),
+                }
+                let mut input = body.as_slice();
+                let result = commit(
+                    &store,
+                    1,
+                    &operations,
+                    &mut [BlobSource {
+                        id: fresh,
+                        source: &mut input,
+                    }],
+                    encoded,
+                );
+                if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                    unexpected.push((encoded, variant, result));
+                    continue;
+                }
+                assert_eq!(input, body.as_slice(), "history refusal consumed body");
+                let mut now = store.view(ACCOUNT, deadline()).unwrap();
+                assert_eq!(now.identity().committed_sequence, Sequence::from_u64(1));
+                assert_eq!(
+                    now.get(Key::Email(email), &mut [0; 512]).unwrap(),
+                    Some((Row::Email(original), Sequence::from_u64(1)))
+                );
+                assert!(now.get(Key::Blob(fresh), &mut [0; 128]).unwrap().is_none());
+                drop(now);
+                // Superseded thread changes are harmless; the original final assignment survives.
+                assert_eq!(
+                    commit(
+                        &store,
+                        1,
+                        &[fresh_put, bad, delete, good],
+                        &mut [BlobSource {
+                            id: fresh,
+                            source: &mut input
+                        }],
+                        encoded
+                    ),
+                    Ok(Sequence::from_u64(2))
+                );
+                assert!(input.is_empty());
+                // New identities may join another thread; this guard does not select it.
+                let new_email = EmailId::from_bytes([10; 16]);
+                assert_eq!(
+                    commit(
+                        &store,
+                        2,
+                        &[
+                            Operation::put(Table::Emails, new_email.as_bytes(), &changed_bytes)
+                                .unwrap(),
+                            bad,
+                            delete,
+                        ],
+                        &mut [],
+                        encoded
+                    ),
+                    Ok(Sequence::from_u64(3))
+                );
+                let mut now = store.view(ACCOUNT, deadline()).unwrap();
+                assert_eq!(
+                    now.get(Key::Email(new_email), &mut [0; 512]).unwrap(),
+                    Some((
+                        Row::Email(EmailRow {
+                            thread: other,
+                            ..original
+                        }),
+                        Sequence::from_u64(3)
+                    ))
+                );
+                assert!(now.get(Key::Email(email), &mut [0; 512]).unwrap().is_none());
+                assert_eq!(
+                    old.get(Key::Email(email), &mut [0; 512]).unwrap(),
+                    Some((Row::Email(original), Sequence::from_u64(1)))
+                );
+            }
+        }
+        assert!(
+            unexpected.is_empty(),
+            "thread assignments changed: {unexpected:?}"
+        );
+    }
+
+    #[test]
+    fn native_maximum_email_history_batch_fits_one_deadline() {
+        struct RealClock(std::time::Instant);
+        impl Clock for RealClock {
+            fn sample(&self) -> Result<Time, ports::Error> {
+                Ok(Time {
+                    utc_ms: 0,
+                    monotonic: Tick(
+                        u64::try_from(self.0.elapsed().as_millis())
+                            .map_err(|_| ports::Error::Capacity)?,
+                    ),
+                })
+            }
+        }
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let clock = Arc::new(RealClock(std::time::Instant::now()));
+        let request = |expected| CommitRequest {
+            account: ACCOUNT,
+            expected: Sequence::from_u64(expected),
+            utc_ms: 0,
+            deadline: Deadline::after(clock.sample().unwrap().monotonic, 30_000).unwrap(),
+        };
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            clock.clone(),
+            1,
+            request(0).deadline,
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, request(0).deadline).unwrap();
+        let blob = BlobId::from_bytes([4; 16]);
+        let thread = ThreadId::from_bytes([5; 16]);
+        let blob_bytes = encode(Row::Blob(BlobRow {
+            kind: BlobKind::Message,
+            length: 0,
+            digest: td_crypto::Provider.sha256().unwrap().finish().unwrap(),
+            created_at: 0,
+        }));
+        let thread_bytes = encode(Row::Thread);
+        store
+            .commit(
+                &td_crypto::Provider,
+                request(0),
+                &[
+                    Operation::put(Table::Blobs, blob.as_bytes(), &blob_bytes).unwrap(),
+                    Operation::put(Table::Threads, thread.as_bytes(), &thread_bytes).unwrap(),
+                ],
+                &mut [BlobSource {
+                    id: blob,
+                    source: &mut b"".as_slice(),
+                }],
+            )
+            .unwrap();
+        let ids: Vec<_> = (0u128..4096)
+            .map(|id| EmailId::from_bytes(id.to_be_bytes()))
+            .collect();
+        let email = encode(Row::Email(EmailRow {
+            blob,
+            thread,
+            received_at: 0,
+            origin: EmailOrigin::Jmap,
+        }));
+        let operations: Vec<_> = ids
+            .iter()
+            .map(|id| Operation::put(Table::Emails, id.as_bytes(), &email).unwrap())
+            .collect();
+        assert_eq!(
+            store.commit(&td_crypto::Provider, request(1), &operations, &mut []),
+            Ok(Sequence::from_u64(2))
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            commit_encoded_rows(&store, request(2), &operations, &mut []),
+            Ok(Sequence::from_u64(3))
+        );
+        eprintln!(
+            "4096 Email history PUTs: {:?}; debug_assertions={}",
+            started.elapsed(),
+            cfg!(debug_assertions)
+        );
+        let mut view = store.view(ACCOUNT, request(3).deadline).unwrap();
+        for id in ids {
+            assert_eq!(
+                view.get(Key::Email(id), &mut [0; 512]).unwrap(),
+                Some((
+                    Row::decode(Table::Emails, &email).unwrap(),
+                    Sequence::from_u64(3)
+                ))
+            );
+        }
     }
 
     #[test]

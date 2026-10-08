@@ -3,6 +3,7 @@ use super::*;
 use crate::format::batch::Batch;
 use crate::ports::OperationKind;
 
+const HISTORY_TABLES: &[Table] = &[Table::Emails, Table::Submissions, Table::Recipients];
 const QUEUE_TABLES: &[Table] = &[Table::Submissions, Table::Recipients];
 
 #[derive(Clone, Copy)]
@@ -64,6 +65,12 @@ impl<'o, 'i> Operations<'o, 'i> {
                 batch.row_key(index).map_err(|_| ports::Error::Invalid)
             }
         }
+    }
+    pub(super) fn history_key(self, index: usize) -> Result<Option<Key<'i>>, ports::Error> {
+        self.key(index, HISTORY_TABLES, false)
+    }
+    pub(super) fn history_put_key(self, index: usize) -> Result<Option<Key<'i>>, ports::Error> {
+        self.key(index, HISTORY_TABLES, true)
     }
     pub(super) fn queue_key(self, index: usize) -> Result<Option<Key<'i>>, ports::Error> {
         self.key(index, QUEUE_TABLES, false)

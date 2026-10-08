@@ -6615,6 +6615,13 @@ Prepared may retain previous replies. This checks stored shape, not current
 reply provenance. Indexed point/successor reads reuse writer scratch and the
 original deadline/VM fuel. Inconsistent groups reject with
 Conflict; native deadline, capacity and I/O errors retain their classifications.
+Before row writes, surviving Email PUTs preserve the thread ID from the
+original account row. A final replacement with a different thread returns
+Conflict even if both threads exist. Repeated keys and DELETE/reinsert
+cannot bypass this comparison; final deletion and new Email rows have no
+assignment comparison. Initial threading, anchor maintenance, ID allocation
+and mutation authorization remain service work. STORAGE.md owns the shared
+bounded history scan.
 Before row writes, a final DELETE of an existing Submission requires a
 completion timestamp in its original row. Intermediate completion PUTs or
 DELETE/reinsert cannot replace that prior commit. Missing original

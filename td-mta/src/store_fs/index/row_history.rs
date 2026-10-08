@@ -1,4 +1,4 @@
-//! Preserve retained queue history against the pre-transaction rows.
+//! Preserve email assignments and queue history against pre-transaction rows.
 use super::*;
 use crate::format::row::{
     AttemptPhase, FailureReason, NotificationState, RecipientRow, RecipientState, SubmissionRow,
@@ -12,10 +12,10 @@ pub(super) fn validate(
 ) -> Result<(), ports::Error> {
     for position in 0..operations.len() {
         native.check()?;
-        let Some(key) = operations.queue_key(position)? else {
+        let Some(key) = operations.history_key(position)? else {
             continue;
         };
-        if matches!(key, Key::Recipient(_, _)) && operations.queue_put_key(position)?.is_none() {
+        if !matches!(key, Key::Submission(_)) && operations.history_put_key(position)?.is_none() {
             continue;
         }
         let Some((previous, _)) = view.get(key, scratch)? else {
@@ -26,6 +26,14 @@ pub(super) fn validate(
         }
         native.check()?;
         let valid = match (key, previous, operations.get(position)?.value()) {
+            (
+                Key::Email(_),
+                Row::Email(previous),
+                Value::Row(Mutation::Put {
+                    row: Row::Email(next),
+                    ..
+                }),
+            ) => previous.thread == next.thread,
             (Key::Submission(_), Row::Submission(previous), Value::Row(Mutation::Delete(_))) => {
                 previous.completed_at.is_some()
             }
@@ -68,7 +76,7 @@ fn is_final(
         if scan % 64 == 0 {
             native.check()?;
         }
-        if operations.queue_key(later)? == Some(key) {
+        if operations.history_key(later)? == Some(key) {
             return Ok(false);
         }
     }

@@ -142,6 +142,16 @@ above i64::MAX; overflow refuses mutation. Account creation is bounded to 128.
 Change actions must agree with pre/post existence, and a unique native index
 refuses duplicate changes for one object within a transaction.
 
+Before applying rows, a surviving Email PUT must retain the thread ID from
+its original account transaction row. Repeated keys and DELETE/reinsert
+cannot change that assignment within one transaction. A different final
+thread returns Conflict before body streaming or row writes, even when
+both threads exist. Intermediate replacements followed by the original
+assignment or final deletion are allowed by this guard. New Email rows
+have no original assignment to compare. Initial thread selection, anchor
+maintenance, ID allocation/reuse and mutation authorization remain service
+obligations; this guard preserves only the existing thread assignment.
+
 Before applying rows, a final DELETE of an existing Submission requires an
 original completedAt. An intermediate completion PUT or DELETE/reinsert
 cannot supply that prior durable completion. This prevents deletion of an
@@ -250,14 +260,15 @@ A mismatch returns Conflict before body streaming or row writes.
 A DELETE followed by a PUT cannot reset that history within the transaction;
 intermediate PUT values have no separate durable effect.
 
-The scan projects queue keys without decoding unrelated rows and reuses
-writer scratch. The outer pass makes one queue-key projection per position
-and at most 4096 further PUT-key projections to skip Recipient DELETEs.
-Recipient DELETE positions and operations without an original row skip the
-later-key scan. Submission DELETEs read original rows and check final
-effects alongside PUTs. At most 4096 original point reads and 8386560
-later-key projections are possible; repeated keys may repeat an original
-point read.
+The scan projects Email, Submission and Recipient keys without decoding
+unrelated rows and reuses writer scratch. The outer pass makes one
+history-key projection per position and at most 4096 further PUT-key
+projections to skip Email and Recipient DELETEs. Those DELETE positions
+and operations without an original row skip the later-key scan.
+Submission DELETEs read original rows and check final effects alongside
+PUTs. At most 4096 original point reads and 8386560 later-key
+projections are possible; repeated keys may repeat an original point
+read.
 The quadratic scan samples the original deadline at least every 64 bounded
 key projections and before final value decoding; all SQL shares the
 original native allowance. The additional notice scan visits every
@@ -268,13 +279,13 @@ positions belonging to those submissions, S + M <= N: each recipient
 belongs to at most one qualifying submission. The additional projections
 are at most S*N + M*N <= N*N, or 16777216 at N=4096, plus at most 4096
 recipient value decodes. The combined later-key and additional-scan
-ceiling is 25163776 projections. There are no additional SQL reads or
+ceiling is 25163776 projections. The notice scan adds no SQL reads or
 allocations. Each forward scan checks the original deadline every 64
 projections; the notice scan also checks immediately after its nested
 later-key scan, including superseded PUTs, and before decoding. The
-maximum-batch test covers both recipient history and 2048 simultaneous
-notice completions. It is fixture evidence, not a promise that every
-store/host can finish within its deadline.
+maximum-batch tests cover 4096 distinct Email PUTs, recipient history
+and 2048 simultaneous notice completions. These are fixture evidence, not
+a promise that every store/host can finish within its deadline.
 This preserves named history fields, not the full transition graph. The
 counter/ID comparison does not authorize dispatch or prove random/global ID
 freshness: the service must obtain a fresh ID from Entropy, reject collisions,

@@ -545,6 +545,12 @@ synchronous native boundaries; deadline checks cannot interrupt their
 individual calls. Body/source failure rolls back metadata
 and bytes together. Expired leases require explicit deletion before body removal.
 
+Surviving Email PUTs preserve the original thread assignment before row
+writes or body streaming, including DELETE/reinsert within the batch. The
+shared bounded history pass compares final effects to the original account
+snapshot. New Email assignment, anchor maintenance, ID allocation and
+mutation authorization remain service work; STORAGE.md owns the boundary.
+
 Affected submissions receive final recipient coverage and queue-state
 validation within the same transaction. Point/successor reads check each
 affected group once under the original native scope, reusing the complete
