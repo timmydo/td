@@ -146,10 +146,15 @@ fn a_message_sent_just_before_moving_away_is_delivered_on_reopening() {
     // Sent while A's process is still starting, then away at once: the
     // process may go before it reads the message.
     supervisor.send("kept".into()).unwrap();
+    // Queued, the window shows, until the process takes it: B's own
+    // queue is its, empty.
+    assert_eq!(supervisor.queued(), ["kept"]);
     supervisor.open(b, Some(Role::Conversation)).unwrap();
+    assert!(supervisor.queued().is_empty());
     supervisor.open(a.clone(), None).unwrap();
     let mut heard = Vec::new();
     until(&mut supervisor, &mut heard, |h| delivered(h) == 1);
+    assert!(supervisor.queued().is_empty());
     drop(supervisor);
     let (conversation, _) = Conversation::open(&state, &a, None, Duration::ZERO).unwrap();
     let texts: Vec<&str> = conversation

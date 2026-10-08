@@ -1117,16 +1117,7 @@ impl Session {
             self.send(&Up::Delivered { delivery });
             return Ok(());
         }
-        let refused = if text.len() > MAX_TEXT {
-            Some(format!("a message is at most {MAX_TEXT} bytes"))
-        } else if text.trim().is_empty() {
-            Some("an empty message".to_string())
-        } else if !self.conversation.has_room(text.len()) {
-            Some("the conversation's log is full; start another conversation".to_string())
-        } else {
-            None
-        };
-        if let Some(reason) = refused {
+        if let Some(reason) = self.refusal(&text) {
             self.send(&Up::Refused { delivery, reason });
             return Ok(());
         }
@@ -1160,6 +1151,60 @@ impl Session {
             self.send(&Up::Title { title });
         }
         self.turn(started.seq)
+    }
+
+    /// Why a message from the person is not taken, if it is not.
+    fn refusal(&self, text: &str) -> Option<String> {
+        if text.len() > MAX_TEXT {
+            Some(format!("a message is at most {MAX_TEXT} bytes"))
+        } else if text.trim().is_empty() {
+            Some("an empty message".to_string())
+        } else if !self.conversation.has_room(text.len()) {
+            Some("the conversation's log is full; start another conversation".to_string())
+        } else {
+            None
+        }
+    }
+
+    /// The person's messages that came while the turn ran, ahead of any
+    /// pause: taken into it between steps, so that its next request
+    /// reads them (DESIGN.md §2). A pause, and what came after it, waits
+    /// for the turn to end, as every other frame does.
+    fn steer(&mut self) -> Result<(), String> {
+        loop {
+            // An interrupted turn takes nothing: what came with the
+            // interrupt starts a turn of its own.
+            if self.interrupt {
+                return Ok(());
+            }
+            let next = self
+                .queue
+                .iter()
+                .take_while(|down| !matches!(down, Down::Pause { .. }))
+                .position(|down| matches!(down, Down::User { .. }));
+            let Some(Down::User { delivery, text }) = next.and_then(|at| self.queue.remove(at))
+            else {
+                return Ok(());
+            };
+            if self.conversation.delivered(&delivery) {
+                self.send(&Up::Delivered { delivery });
+                continue;
+            }
+            if let Some(reason) = self.refusal(&text) {
+                self.send(&Up::Refused { delivery, reason });
+                continue;
+            }
+            let logged = self
+                .conversation
+                .append(Kind::User {
+                    delivery: delivery.clone(),
+                    text,
+                })?
+                .clone();
+            self.sync()?;
+            self.send(&Up::Event(logged));
+            self.send(&Up::Delivered { delivery });
+        }
     }
 
     /// The last turn again, when it ended in a failure that may pass.
@@ -1223,6 +1268,7 @@ impl Session {
         let mut replied = false;
         for _ in 0..MAX_STEPS {
             self.between()?;
+            self.steer()?;
             let outcome = self.exchange(turn, None)?;
             if outcome.limited {
                 return self.wrap_up(turn, replied, outcome.text);

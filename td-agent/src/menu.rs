@@ -31,6 +31,8 @@ pub const ROW_MENU: &str = "S-F10";
 /// What a menu item does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
+    /// Interrupt the open conversation's running turn, as `Escape` does.
+    Stop,
     /// Choose a new conversation's workspace template, as `C-n` does.
     New,
     /// Open the Messages window, as `C-S-m` does.
@@ -115,6 +117,8 @@ pub const DELETE: &str = "Delete conversation\u{2026}";
 /// The Conversation menu's item, checked while archived conversations
 /// show in the list.
 pub const SHOW_ARCHIVED: &str = "Show archived";
+/// The Conversation menu's item that interrupts the running turn.
+pub const STOP: &str = "Stop turn";
 /// The Conversation menu's item, checked while the transcript shows each
 /// tool call and result rather than a step's summary line.
 pub const SHOW_ACTIVITY: &str = "Show tool activity";
@@ -143,6 +147,8 @@ pub struct State<'a> {
     pub reasoning: bool,
     pub show_archived: bool,
     pub show_activity: bool,
+    /// The open conversation is running a turn.
+    pub running: bool,
     /// Whether the open conversation's workspace is in `auto` mode; none
     /// without one.
     pub auto: Option<bool>,
@@ -179,6 +185,11 @@ pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, m
         parent: None,
         row: row("Conversation", "", true, false),
         item: Item::Submenu,
+    });
+    nodes.push(Node {
+        parent: Some(conversation),
+        row: row(STOP, "Escape", state.running, false),
+        item: Item::Action(Action::Stop),
     });
     nodes.push(Node {
         parent: Some(conversation),
@@ -361,6 +372,7 @@ mod tests {
         reasoning: true,
         show_archived: false,
         show_activity: false,
+        running: false,
         auto: None,
     };
 
@@ -472,9 +484,16 @@ mod tests {
         let shown = State {
             show_archived: true,
             show_activity: false,
+            running: false,
             ..closed
         };
         assert!(!checked(OPENED) && checked(shown) && enabled(shown, SHOW_ARCHIVED));
+        // Stop turn is there only while a turn runs.
+        let running = State {
+            running: true,
+            ..OPENED
+        };
+        assert!(enabled(running, STOP) && !enabled(OPENED, STOP));
     }
 
     #[test]

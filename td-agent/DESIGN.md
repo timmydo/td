@@ -360,6 +360,25 @@ ends (§5), and a window that adopts a conversation mid-stream draws
 only the deltas after it opened, until the logged reply replaces them.
 A background conversation's deltas are dropped.
 
+**As built (a message during a turn).** A `user` frame that comes while
+a turn runs is taken into the turn at its next step, before that
+step's request (the first step's too, so one sent as a turn starts,
+however it started, joins it), so the person can steer work under way: refused, or
+logged and acknowledged with `delivered`, as one between turns is, and
+the request reads it after the last step's tool results, where the
+log puts it. It belongs to that turn: it is given no turn start of its
+own, and a reopened log's repair (§5) gives one only to a message
+logged while no turn ran. Only those queued ahead of any `pause` are
+taken, and none once an interrupt is heard; one behind a pause waits
+for the turn to end, as the pause does, so that the pause still comes
+first, and one that came with an interrupt starts a turn of its own.
+Every other frame still waits for the turn to end, a message from
+another conversation among them (§3), and so does a `compact`,
+`choose` or `clear_todo` the person sent before the message, which
+then applies after the message's turn.
+`prompt/conversation.txt` tells the model the person may write while
+it works, and that such a message comes before its plan.
+
 **As built (increment 8).** The window routes messages between
 conversations. Up, `send` carries a `send_message` the human allowed
 (an id of the sender's, the receiver's id and the text), and `query`
@@ -401,7 +420,8 @@ which comes after the start of any turn the resumption begins.
 
 **As built (the File menu).** A `setup` may come again, and replaces the
 first: a conversation process takes it between turns, as it takes any
-frame that comes while a turn runs, so the turn under way finishes with
+frame that comes while a turn runs but the person's own message (§2, a
+message during a turn), so the turn under way finishes with
 the settings it began with. Of the frames queued meanwhile it is taken
 first, with any `choose` (the Conversation menu, below) in the order
 they came, so the next turn has it whatever came before it, and a pause
@@ -826,7 +846,14 @@ block, an excerpt of the result whose copy action copies the whole,
 marked `error` when it is one, and every approval. A stream's frame
 for a reply the redraw already showed whole draws nothing. It holds
 for the window's life and is not saved. A pause, a resumption and a cleared
-list are `td-agent` notices.
+list are `td-agent` notices. A message sent while a turn runs is taken
+into it at its next step (§2), and until its process takes it, it
+shows above the todo list, in the strip under the transcript, so an
+open list cut off at the strip's bound never hides it: a line each, at
+most three, the last saying how many more: `queued: ` and its first
+line while a turn runs, or `sending: ` while none does. The lines are
+the supervisor's `pending`, which the window reads after each poll, so
+a restart's resend keeps them.
 
 **As built (the File menu).** A menu bar, td-ui's `chrome::Bar`, takes
 the window's top row, and the split lies under it. Its headers, `File`,
@@ -920,7 +947,7 @@ conversation uses it from now on.
 
 **As built (the Messages window).** The status row keeps to items of a
 fixed width: the state, `C-r asks again` while a turn may be asked
-again, `no key: F10`, a count of the notes not yet read (`2 new
+again, else `Escape stops` while a turn runs, `no key: F10`, a count of the notes not yet read (`2 new
 messages: C-S-m`), `workspace: C-S-w` for a repository workspace (§7,
 As built (increment 11, the workspace card)), the mode and the network
 policy (§10), first so a narrow row never cuts them off, the model and
@@ -1015,11 +1042,13 @@ a conversation with no model of its own uses, can be chosen from the
 window too (below).
 
 - **The menu.** The bar's second header, `Conversation`, lies between
-  `File` and `Help`. Its items are `Model…`, which opens the picker below, and
+  `File` and `Help`. Its first item is `Stop turn`, shown with
+  `Escape` and enabled while a turn runs, which does what `Escape`
+  does. Then come `Model…`, which opens the picker below, and
   `Effort`, a submenu of every effort §15 admits (`none`, `minimal`,
   `low`, `medium`, `high`, `xhigh`), the open conversation's checked.
-  Choosing one asks for it at once. Both items are off with no
-  conversation open, and `Effort` is off for a model whose cached
+  Choosing one asks for it at once. `Model…` and `Effort` are off with
+  no conversation open, and `Effort` is off for a model whose cached
   `supported_parameters` lacks `reasoning`, since it would not be sent
   (§5). `Show tool activity` (§4) follows `Show archived`, last. The
   menu shows state, so the window builds it again, at a new
@@ -1752,11 +1781,13 @@ workspace, model, mode and parent are null until the increments that set
 them. `prefix` is empty, since there is no request yet. The log holds a
 user message with its delivery id, a `turn` effect started and finished
 (`no model`), an interruption, and a notice. A user message and its
-started record are synced together, and the finished record when the
-turn ends. On load, a torn final line is truncated away and a notice
+started record are synced together (one taken into a running turn at
+a step, §2, has no started record of its own), and the finished record
+when the turn ends. On load, a torn final line is truncated away and a notice
 saying so is appended; a whole line that does not parse, or a sequence
-gap, refuses the log; a user message logged without its turn's start,
-the process having died between the two lines, is given one; and an
+gap, refuses the log; a user message logged without its turn's start
+while no turn ran, the process having died between the two lines, is
+given one; and an
 effect started and not finished gets one interruption record. A log
 longer than 256 MiB is refused rather than read, so a message is
 accepted only while the log has room for it at its longest and 64 KiB

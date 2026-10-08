@@ -2308,13 +2308,23 @@ impl Conversation {
     /// human's, and another conversation's that was not held.
     fn unturned(&self) -> Vec<u64> {
         let mut users = Vec::new();
+        // The turns under way: a person's message logged during one was
+        // taken into it at a step (DESIGN.md §2) and needs no turn.
+        let mut running: Vec<u64> = Vec::new();
         for event in &self.events {
             match &event.kind {
+                Kind::User { .. } if !running.is_empty() => {}
                 Kind::User { .. } | Kind::Message { held: None, .. } => users.push(event.seq),
                 Kind::Started {
                     effect: Effect::Turn,
                     of,
-                } => users.retain(|seq| seq != of),
+                } => {
+                    users.retain(|seq| seq != of);
+                    running.push(event.seq);
+                }
+                Kind::Finished { started, .. } | Kind::Interrupted { started } => {
+                    running.retain(|seq| seq != started)
+                }
                 _ => {}
             }
         }

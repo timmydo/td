@@ -69,6 +69,8 @@ const LONG_PREFIX: &str = "the conversation's prefix file is longer than the win
 const COMPOSER_ROWS: usize = 6;
 /// The most rows the todo list takes when shown whole.
 const TODO_ROWS: usize = 12;
+/// The most rows the queued messages take.
+const QUEUED_ROWS: usize = 3;
 /// The split's child minima, in logical pixels.
 const LIST_MIN: u32 = 160;
 const CONVERSATION_MIN: u32 = 320;
@@ -633,6 +635,9 @@ pub struct App {
     /// Whether the transcript shows each tool call and result, rather
     /// than each step's summary line (DESIGN.md §4).
     show_activity: bool,
+    /// The open conversation's messages sent and not yet taken, as the
+    /// supervisor holds them.
+    queued: Vec<String>,
     /// The open conversation's todo list, and whether it is shown whole.
     todo: Vec<TodoItem>,
     todo_open: bool,
@@ -818,6 +823,7 @@ impl App {
             labels: Vec::new(),
             show_archived: false,
             show_activity: false,
+            queued: Vec::new(),
             todo: Vec::new(),
             todo_open: false,
             messages: Vec::new(),
@@ -1010,6 +1016,8 @@ impl App {
         };
         let retry = if self.meter.retry {
             " | C-r asks again"
+        } else if self.running() {
+            " | Escape stops"
         } else {
             ""
         };
@@ -1279,6 +1287,40 @@ impl App {
 
     pub fn shows_activity(&self) -> bool {
         self.show_activity
+    }
+
+    /// The open conversation's messages sent and not yet taken: shown
+    /// above the todo list until its process takes each (DESIGN.md §4).
+    pub fn set_queued(&mut self, queued: Vec<String>) {
+        if queued != self.queued {
+            self.queued = queued;
+            self.place();
+        }
+    }
+
+    /// The queued messages' lines as drawn, at most `QUEUED_ROWS`, the
+    /// last saying how many more there are.
+    pub fn queued_lines(&self) -> Vec<String> {
+        let lead = if self.running() { "queued" } else { "sending" };
+        let mut lines: Vec<String> = self
+            .queued
+            .iter()
+            .take(QUEUED_ROWS)
+            .map(|text| {
+                let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                let first: String = tools::visible(first.trim()).chars().take(200).collect();
+                format!("{lead}: {first}")
+            })
+            .collect();
+        if self.queued.len() > QUEUED_ROWS {
+            if let Some(last) = lines.last_mut() {
+                *last = format!(
+                    "\u{2026} {} more {lead}",
+                    self.queued.len() - QUEUED_ROWS + 1
+                );
+            }
+        }
+        lines
     }
 
     /// Shows each tool call and result in the transcript, or folds each
@@ -2434,6 +2476,12 @@ impl App {
         }
     }
 
+    /// The rows the strip under the transcript takes: the queued
+    /// messages', then the todo list's.
+    fn strip_rows(&self) -> usize {
+        self.todo_rows() + self.queued.len().min(QUEUED_ROWS)
+    }
+
     /// The todo list's lines as drawn: collapsed, the item in progress,
     /// or the first not done; open, every item that fits.
     pub fn todo_lines(&self) -> Vec<String> {
@@ -2879,7 +2927,7 @@ impl App {
     /// The panes where the split's layout puts them. A drag of the
     /// divider comes here alone: a resize of the split would end it.
     fn place(&mut self) {
-        let todo_rows = self.todo_rows();
+        let todo_rows = self.strip_rows();
         self.regions = self.split.layout().map(|layout| {
             let s = self.surface.scale.value();
             let right = layout.second;
@@ -3018,6 +3066,16 @@ impl App {
             self.set_active(id.clone());
             self.requests.push(Request::Open(id));
         }
+    }
+
+    /// Interrupts the open conversation's running turn, as `Escape` and
+    /// Conversation → Stop turn do.
+    fn stop(&mut self) {
+        if !self.running() {
+            return;
+        }
+        self.requests.push(Request::Interrupt);
+        self.note("interrupting the turn");
     }
 
     /// Whether the open conversation is running a turn.
@@ -3422,6 +3480,7 @@ impl App {
             menu::Action::Keys => self.keys_chosen = true,
             menu::Action::ShowArchived => self.toggle_archived(),
             menu::Action::ShowActivity => self.toggle_activity(),
+            menu::Action::Stop => self.stop(),
             menu::Action::Archive => self.archive_row(true),
             menu::Action::Unarchive => self.archive_row(false),
             menu::Action::DeleteRow => {
@@ -3720,6 +3779,7 @@ impl App {
             reasoning: self.reasoning(model),
             show_archived: self.show_archived,
             show_activity: self.show_activity,
+            running: self.running(),
             auto: self.workspace_mode().map(|mode| mode == Mode::Auto),
         };
         match menu::menu(self.surface, state, revision) {
@@ -4808,11 +4868,7 @@ impl App {
             }
             // While a turn runs, Escape is the window's; else the
             // focused widget's.
-            "Escape" if !repeat && self.running() => {
-                self.requests.push(Request::Interrupt);
-                self.note("interrupting the turn");
-                return;
-            }
+            "Escape" if !repeat && self.running() => return self.stop(),
 
             "F6" => {
                 let next = match self.focus {
@@ -5059,7 +5115,8 @@ impl App {
         Cell::new(text).unwrap_or_else(|_| Cell::empty())
     }
 
-    /// The todo list, a line to an item, over the chrome.
+    /// The queued messages, then the todo list, a line to an item, over
+    /// the chrome.
     fn emit_todo(&self, rect: Rect, damage: Rect, sink: &mut dyn FnMut(Draw)) {
         let Some(clip) = rect.intersection(damage) else {
             return;
@@ -5072,7 +5129,14 @@ impl App {
                 color: CHROME,
             },
         });
-        for (at, line) in self.todo_lines().iter().enumerate() {
+        // The queued messages first: an open todo list cut off at the
+        // strip's bound loses its last items, not them.
+        for (at, line) in self
+            .queued_lines()
+            .into_iter()
+            .chain(self.todo_lines())
+            .enumerate()
+        {
             raster::text_run(
                 self.surface.scale,
                 line.chars(),
@@ -6291,6 +6355,35 @@ pub mod tests {
         assert!(!shown.contains("cut short"), "settled");
     }
 
+    /// While a turn runs the status row says Escape stops it, and
+    /// Conversation → Stop turn does what Escape does; messages sent and
+    /// not yet taken show under the transcript until taken.
+    #[test]
+    fn a_running_turn_can_be_seen_stopped_and_written_to() {
+        let mut app = app();
+        assert!(!app.status_line().contains("Escape stops"));
+        app.menu_action(menu::Action::Stop);
+        assert!(app.take_requests().is_empty());
+        turn(&mut app, 1, "hello");
+        assert!(app.status_line().contains("running | Escape stops"));
+        app.menu_action(menu::Action::Stop);
+        assert_eq!(app.take_requests(), [Request::Interrupt]);
+        assert_eq!(app.notice(), Some("interrupting the turn"));
+        let before = app.regions.unwrap().transcript.height;
+        app.set_queued(vec!["\n  and also\u{1b} this\nmore".into()]);
+        assert_eq!(app.queued_lines(), ["queued: and also<U+001B> this"]);
+        assert!(app.regions.unwrap().transcript.height < before);
+        assert!(text(&app).contains("queued: and also"));
+        app.set_queued((0..5).map(|n| format!("m{n}")).collect());
+        assert_eq!(
+            app.queued_lines(),
+            ["queued: m0", "queued: m1", "\u{2026} 3 more queued",]
+        );
+        app.set_queued(Vec::new());
+        assert!(app.queued_lines().is_empty());
+        assert_eq!(app.regions.unwrap().transcript.height, before);
+    }
+
     /// Escape is the window's while a turn runs, asking to interrupt it,
     /// and the focused widget's otherwise.
     #[test]
@@ -6549,6 +6642,28 @@ pub mod tests {
             content: content.into(),
             status,
         }
+    }
+
+    #[test]
+    fn a_queued_message_shows_over_an_open_todo_list() {
+        let mut app = app();
+        let items = (0..12)
+            .map(|n| todo_item(&format!("step {n}"), Status::Pending))
+            .collect();
+        app.update(
+            at(
+                1,
+                Kind::Todo {
+                    items,
+                    cleared: false,
+                },
+            ),
+            0,
+        );
+        key(&mut app, "C-t");
+        app.set_queued(vec!["the late word".into()]);
+        let shown = text(&app);
+        assert!(shown.contains("sending: the late word"), "{shown}");
     }
 
     #[test]

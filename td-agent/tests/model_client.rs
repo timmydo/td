@@ -2039,6 +2039,126 @@ fn a_template_workspace_binds_its_own_shared_directories() {
     }
 }
 
+/// A message the person sends while a turn runs is taken into it at its
+/// next step, its next request carrying it; one sent after a pause waits
+/// for the turn to end, as the pause does.
+#[test]
+fn a_message_sent_during_a_turn_is_read_at_its_next_step() {
+    let mut h = Harness::new_in(
+        "steer",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Tidy the notes.");
+    let (call, _, _) = h.until_ask();
+    h.say("Use the archive folder instead.");
+    h.down(&Down::Pause { paused: true });
+    h.say("And after the pause.");
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let users: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        users,
+        ["Tidy the notes.", "Use the archive folder instead."]
+    );
+    // Logged after the step's result, and read there.
+    let at = |found: &dyn Fn(&Kind) -> bool| events.iter().position(|e| found(&e.kind));
+    let steered = at(&|k| matches!(k, Kind::User { text, .. } if text.starts_with("Use"))).unwrap();
+    let result = at(&|k| matches!(k, Kind::ToolResult { .. })).unwrap();
+    assert!(result < steered, "{events:#?}");
+    let second = h.mock.requests()[1].text();
+    let (tool, message) = (
+        second.find("\"role\":\"tool\"").unwrap(),
+        second.find("Use the archive folder instead.").unwrap(),
+    );
+    assert!(tool < message, "{second}");
+    assert!(!second.contains("after the pause"), "{second}");
+    // The pause, then the message that resumes it and starts a turn.
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let last = h.mock.requests().last().unwrap().text();
+    assert!(last.contains("And after the pause."), "{last}");
+    // Opened again, the steered message needs no turn of its own: no
+    // turn is made up for it, and none is interrupted.
+    let (conversation, _h) = h.close();
+    let events = conversation.events();
+    let started = events
+        .iter()
+        .filter(|e| matches!(e.kind, Kind::Started { .. }))
+        .count();
+    assert_eq!(started, 2, "{events:#?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, Kind::Interrupted { .. })),
+        "{events:#?}"
+    );
+}
+
+/// A message that comes with an interrupt is not taken into the turn
+/// the interrupt ends: it starts a turn of its own.
+#[test]
+fn a_message_sent_with_an_interrupt_starts_its_own_turn() {
+    let mut h = Harness::new_in(
+        "steer-interrupt",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Tidy the notes.");
+    let (call, _, _) = h.until_ask();
+    h.down(&Down::Interrupt);
+    h.say("Do something else.");
+    assert_eq!(h.until_withdrawn(), call);
+    let (events, outcome, _) = h.turn();
+    assert!(
+        outcome.starts_with("interrupted between tool calls"),
+        "{outcome}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.kind, Kind::User { text, .. } if text.starts_with("Do"))),
+        "{events:#?}"
+    );
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let started = events.iter().find_map(|e| match &e.kind {
+        Kind::Started { of, .. } => Some(*of),
+        _ => None,
+    });
+    let user = events.iter().find_map(|e| match &e.kind {
+        Kind::User { text, .. } if text.starts_with("Do") => Some(e.seq),
+        _ => None,
+    });
+    assert_eq!(started, user, "{events:#?}");
+}
+
 /// An allowed command runs, here to say the jail is missing; one asked
 /// while the turn is interrupted is withdrawn and not run.
 #[test]

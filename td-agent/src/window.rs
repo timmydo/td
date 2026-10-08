@@ -395,6 +395,7 @@ impl Session {
                     if let Err(e) = self.supervisor.send(text.clone()) {
                         self.app.restore(&text, e);
                     }
+                    self.app.set_queued(self.supervisor.queued());
                 }
                 Request::Retry => {
                     if let Err(e) = self.supervisor.retry() {
@@ -1156,6 +1157,7 @@ impl Session {
         }
         let today = self.ledger.today(now);
         self.app.set_today(today);
+        self.app.set_queued(self.supervisor.queued());
         self.fetched();
         self.exported();
         self.surveyed();

@@ -366,6 +366,24 @@ impl Supervisor {
         self.children.get_mut(at)
     }
 
+    /// The open conversation's messages sent and not yet taken, oldest
+    /// first: a turn running takes them at its next step, or when it
+    /// ends.
+    pub fn queued(&self) -> Vec<String> {
+        self.open
+            .as_ref()
+            .and_then(|id| self.at(id))
+            .and_then(|at| self.children.get(at))
+            .map(|running| {
+                running
+                    .pending
+                    .iter()
+                    .map(|(_, text)| text.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The open conversation's process id, while it runs.
     pub fn pid(&self) -> Option<u32> {
         let at = self.open.as_ref().and_then(|id| self.at(id))?;
