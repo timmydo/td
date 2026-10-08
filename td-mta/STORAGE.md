@@ -145,9 +145,13 @@ refuses duplicate changes for one object within a transaction.
 Before applying rows, compare each existing Submission/Recipient with its
 final operation when it is a PUT, using the original account transaction snapshot.
 Submission email/thread/identity, transmitted blob, reverse path, creation
-and expiry times, and recipient count are immutable. A Pending failure notice
-cannot return to None. A Stored notice must remain Stored with its original
-historical notificationEmail, even after the visible Email is deleted.
+and expiry times, and recipient count are immutable. An existing
+submission cannot change a None notice directly to Stored: Pending must
+commit first. An intermediate Pending PUT or DELETE cannot satisfy that
+prior commitment. If the original submission was already completed with
+None, its notice must remain None. A Pending failure notice cannot return
+to None. A Stored notice must remain Stored with its original historical
+notificationEmail, even after the visible Email is deleted.
 Cancellation preserves either retained notice state. Recipient address is
 immutable and uncertainty cannot clear. A changed attemptCount must be exactly
 one checked increment, with an attempt ID different from the immediately
@@ -255,9 +259,11 @@ clock validation and retention/deletion authorization remain service work.
 Preserving notice history does not prove the referenced failure Email was
 created.
 The service must forbid creation of a new notice solely for cancellation
-and atomically create the failure Email with the Stored transition. The core
-currently accepts notice creation on a wholly Canceled group and a Stored
-reference without Email creation; these are explicit service-layer gaps.
+and atomically create the failure Email with the Stored transition. The
+core still accepts Pending introduced when a previously unfinished group
+first becomes wholly Canceled. Initial notice state on newly created rows
+is not authorized by this history check, and Stored still does not require
+Email creation; these are explicit service-layer gaps.
 Once committed, the retained history cannot be repaired by clearing the
 notice state or replacing its historical Email ID.
 

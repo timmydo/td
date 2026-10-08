@@ -100,14 +100,16 @@ with indexed reads before COMMIT. A group inconsistency rolls back the entire
 transaction. The core also preserves existing immutable
 submission/envelope identity, the uncertainty latch, retained attempt history
 and one-way failure-notice state, plus an already-present completedAt, as
-specified in STORAGE.md. It also preserves RCPT replies from existing
-InFlight/Body or InFlight/AcceptancePossible rows until a later attempt
-commits Prepared. It refuses revival or a new attempt on terminal
-recipients, preserves Accepted/Canceled state, allows Failed only to
-remain Failed or join whole-group cancellation, and keeps terminal
-OutcomeUnknown terminal and uncertain. Terminal phase, uncertainty and
-actual replies are fixed, with a reason change only for Failed becoming
-Canceled; diagnostic text can still change.
+specified in STORAGE.md. For an existing submission, None cannot advance
+directly to Stored: Pending must commit first. An already completed
+submission with None must retain None. The core also preserves RCPT
+replies from existing InFlight/Body or InFlight/AcceptancePossible rows
+until a later attempt commits Prepared. It refuses revival or a new
+attempt on terminal recipients, preserves Accepted/Canceled state, allows
+Failed only to remain Failed or join whole-group cancellation, and keeps
+terminal OutcomeUnknown terminal and uncertain. Terminal phase,
+uncertainty and actual replies are fixed, with a reason change only for
+Failed becoming Canceled; diagnostic text can still change.
 It compares final PUTs with original rows before writing, so repeated keys
 cannot reset history within a transaction. Full transition checks, creation
 and deletion authorization, and attempt fences remain service obligations.

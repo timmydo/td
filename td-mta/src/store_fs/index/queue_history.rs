@@ -58,7 +58,11 @@ fn submission(old: SubmissionRow<'_>, next: SubmissionRow<'_>) -> bool {
         && old.recipient_count == next.recipient_count
         && (old.completed_at.is_none() || old.completed_at == next.completed_at)
         && match old.notification {
-            NotificationState::None => true,
+            NotificationState::None => {
+                next.notification == NotificationState::None
+                    || (old.completed_at.is_none()
+                        && next.notification == NotificationState::Pending)
+            }
             NotificationState::Pending => next.notification != NotificationState::None,
             NotificationState::Stored => {
                 next.notification == NotificationState::Stored

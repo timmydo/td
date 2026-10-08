@@ -6617,7 +6617,9 @@ original deadline/VM fuel. Inconsistent groups reject with
 Conflict; native deadline, capacity and I/O errors retain their classifications.
 Before row writes, surviving queue PUTs preserve STORAGE.md's immutable
 identity, uncertainty, attempt-history and failure-notice fields against the
-original rows. A present completedAt also retains its exact original value
+original rows. Existing None notices cannot advance directly to Stored;
+Pending must commit first. An already completed submission with None must
+retain None. A present completedAt also retains its exact original value
 across surviving submission PUTs, including whole-group cancellation;
 initial completion does not impose timestamp chronology. STORAGE.md defines
 reply retention outside active attempts, RCPT retention after an active
