@@ -100,12 +100,20 @@ and every retained connection together. Page-cache targets are not hard
 reservations: this calculation alone does not qualify their combined peak.
 
 Runtime scopes retain one original monotonic clock/deadline and 8000000
-interruptible VM steps. Opening validates only fixed schema/header state under that same bound. Full
-integrity maintenance has a separate 1099511627776-step ceiling derived from
-the 8 GiB physical cap, under an explicitly supplied deadline. An interrupted
-maintenance scan reports failure without making the store impossible to open. Clock reversal or work failure stays sticky.
-COMMIT and ROLLBACK finish without progress interruption; a late clock sample
-does not obscure the actual durable result. Busy never extends a deadline.
+interruptible VM steps. Opening validates only fixed schema/header state
+under that same bound. Full integrity maintenance has a separate
+1099511627776-step ceiling derived from the 8 GiB physical cap, under an
+explicitly supplied deadline. An interrupted maintenance scan reports
+failure without making the store impossible to open. Clock reversal or
+work failure stays sticky. Account creation, object/history
+transactions, view capture, integrity validation, usage fences and
+checkpoints carry the clock observation from writer-fence acquisition
+into native scope initialization. A reversal across that handoff returns
+Invalid before SQL work. A refused view capture returns its unused
+reader slot; a later independently admitted request may start a fresh
+scope. COMMIT and ROLLBACK finish without progress interruption; a late
+clock sample does not obscure the actual durable result. Busy never
+extends a deadline.
 
 ### Atomic body and metadata commit
 

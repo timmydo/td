@@ -260,6 +260,19 @@ impl Native {
         };
         Ok(())
     }
+    fn begin_work_after(
+        &self,
+        deadline: Deadline,
+        previous: ports::Tick,
+    ) -> Result<(), ports::Error> {
+        self.begin_work(deadline)?;
+        let mut budget = lock(&self.budget)?;
+        if budget.last < previous {
+            budget.failure = Some(ports::Error::Invalid);
+            return Err(ports::Error::Invalid);
+        }
+        Ok(())
+    }
     fn checked_sample(&self) -> Result<ports::Time, ports::Error> {
         let mut budget = lock(&self.budget)?;
         if let Some(error) = budget.failure {
@@ -531,9 +544,6 @@ impl<'r> IndexStore<'r> {
             clock,
         })
     }
-    fn writer(&self, deadline: Deadline) -> Result<MutexGuard<'_, Writer>, ports::Error> {
-        self.writer_observed(deadline).map(|(writer, _)| writer)
-    }
     fn writer_observed(
         &self,
         deadline: Deadline,
@@ -559,13 +569,15 @@ impl<'r> IndexStore<'r> {
         account: AccountId,
         deadline: Deadline,
     ) -> Result<(), CommitError> {
-        let mut writer = self.writer(deadline).map_err(CommitError::Rejected)?;
+        let (mut writer, acquired) = self
+            .writer_observed(deadline)
+            .map_err(CommitError::Rejected)?;
         if writer.stopped {
             return Err(CommitError::Rejected(ports::Error::WriterStopped));
         }
         writer
             .native
-            .begin_work(deadline)
+            .begin_work_after(deadline, acquired)
             .map_err(CommitError::Rejected)?;
         reserve_wal(self.root).map_err(CommitError::Rejected)?;
         let result = writer.native.run(|db| {
@@ -598,7 +610,7 @@ impl<'r> IndexStore<'r> {
         account: AccountId,
         deadline: Deadline,
     ) -> Result<IndexReadView<'_, 'r>, ports::Error> {
-        let _writer = self.writer(deadline)?;
+        let (_writer, acquired) = self.writer_observed(deadline)?;
         let mut pool = lock(&self.readers)?;
         let slot = pool
             .iter()
@@ -609,7 +621,7 @@ impl<'r> IndexStore<'r> {
             return Err(ports::Error::Corrupt);
         };
         drop(pool);
-        let result = native.begin_work(deadline).and_then(|()| {
+        let result = native.begin_work_after(deadline, acquired).and_then(|()| {
             native.run(|db| {
                 db.execute_batch("BEGIN DEFERRED").map_err(sql)?;
                 identity(db, account, self.epoch)
@@ -675,13 +687,15 @@ impl<'r> IndexStore<'r> {
         deadline: Deadline,
         apply: impl FnOnce(&Native, &mut [u8]) -> Result<T, ports::Error>,
     ) -> Result<T, CommitError> {
-        let mut writer = self.writer(deadline).map_err(CommitError::Rejected)?;
+        let (mut writer, acquired) = self
+            .writer_observed(deadline)
+            .map_err(CommitError::Rejected)?;
         if writer.stopped {
             return Err(CommitError::Rejected(ports::Error::WriterStopped));
         }
         writer
             .native
-            .begin_work(deadline)
+            .begin_work_after(deadline, acquired)
             .map_err(CommitError::Rejected)?;
         let Writer {
             native, scratch, ..
@@ -928,11 +942,11 @@ impl<'r> IndexStore<'r> {
     }
     /// Full validation under the writer fence; new views and commits return Busy.
     pub fn validate_integrity(&self, deadline: Deadline) -> Result<(), ports::Error> {
-        let writer = self.writer(deadline)?;
+        let (writer, acquired) = self.writer_observed(deadline)?;
         if writer.stopped {
             return Err(ports::Error::WriterStopped);
         }
-        writer.native.begin_work(deadline)?;
+        writer.native.begin_work_after(deadline, acquired)?;
         lock(&writer.native.budget)?.remaining = INTEGRITY_VM_STEPS;
         writer.native.run(|db| {
             let check: String = db
@@ -976,11 +990,7 @@ impl<'r> IndexStore<'r> {
         {
             return Err(ports::Error::Busy);
         }
-        writer.native.begin_work(deadline)?;
-        let started = lock(&writer.native.budget)?.last;
-        if started < acquired {
-            return Err(ports::Error::Invalid);
-        }
+        writer.native.begin_work_after(deadline, acquired)?;
         writer.native.run(|db| {
             let (busy, _, _): (i64, i64, i64) = db
                 .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
@@ -1633,6 +1643,168 @@ mod tests {
     const ACCOUNT: AccountId = AccountId::from_bytes([1; 16]);
     const ID: MailboxId = MailboxId::from_bytes([2; 16]);
     const MEMBERSHIP_EMAIL: &str = "SELECT email_id FROM memberships INDEXED BY memberships_mailbox WHERE account=?1 AND mailbox_id=?2";
+    #[test]
+    fn writer_entry_observation_is_preserved_by_native_scope_handoff() {
+        const COUNTS: &str =
+            "SELECT (SELECT count(*) FROM accounts),(SELECT count(*) FROM changes)";
+        struct HandoffClock(Mutex<(std::collections::VecDeque<ports::Tick>, ports::Tick)>);
+        impl Clock for HandoffClock {
+            fn sample(&self) -> Result<ports::Time, ports::Error> {
+                let mut state = self.0.lock().unwrap();
+                if let Some(next) = state.0.pop_front() {
+                    state.1 = next;
+                }
+                Ok(ports::Time {
+                    utc_ms: 0,
+                    monotonic: state.1,
+                })
+            }
+        }
+        fn rejected(result: Result<(), CommitError>) -> Result<(), ports::Error> {
+            result.map_err(|error| match error {
+                CommitError::Rejected(error) => error,
+                CommitError::Indeterminate(error) => {
+                    panic!("unexpected uncertain commit: {error:?}")
+                }
+            })
+        }
+        let mut wrong = Vec::new();
+        for entry in [
+            "create_account",
+            "commit",
+            "prune_history",
+            "view",
+            "validate_integrity",
+            "usage_fence",
+            "checkpoint",
+        ] {
+            for (acquired, started) in [(9, 8), (8, 8), (8, 9)] {
+                let fixture = Fixture::new();
+                let mut root = fixture.locked();
+                let clock = Arc::new(HandoffClock(Mutex::new((
+                    std::collections::VecDeque::new(),
+                    Tick(1),
+                ))));
+                let store = IndexStore::create(
+                    &mut root,
+                    StoreEpoch::from_bytes([9; 16]),
+                    clock.clone(),
+                    1,
+                    deadline(),
+                )
+                .unwrap();
+                store.create_account(ACCOUNT, deadline()).unwrap();
+                let initial = mailbox("initial", None);
+                let initial_ops = [
+                    Operation::put(Table::Mailboxes, ID.as_bytes(), &initial).unwrap(),
+                    Operation::change(ObjectType::Mailbox, ChangeAction::Created, ID.as_bytes()),
+                ];
+                let request = CommitRequest {
+                    account: ACCOUNT,
+                    expected: Sequence::default(),
+                    utc_ms: 0,
+                    deadline: deadline(),
+                };
+                store
+                    .commit(&td_crypto::Provider, request, &initial_ops, &mut [])
+                    .unwrap();
+                let identity = store.view(ACCOUNT, deadline()).unwrap().identity();
+                let changed = mailbox("changed", None);
+                let changed_ops = [
+                    Operation::put(Table::Mailboxes, ID.as_bytes(), &changed).unwrap(),
+                    Operation::change(ObjectType::Mailbox, ChangeAction::Updated, ID.as_bytes()),
+                ];
+                clock.0.lock().unwrap().0 = [Tick(acquired), Tick(started)].into();
+                let actual = match entry {
+                    "create_account" => {
+                        rejected(store.create_account(AccountId::from_bytes([3; 16]), deadline()))
+                    }
+                    "commit" => rejected(
+                        store
+                            .commit(
+                                &td_crypto::Provider,
+                                CommitRequest {
+                                    expected: Sequence::from_u64(1),
+                                    ..request
+                                },
+                                &changed_ops,
+                                &mut [],
+                            )
+                            .map(|_| ()),
+                    ),
+                    "prune_history" => rejected(
+                        store
+                            .prune_history(HistoryPruneRequest {
+                                account: ACCOUNT,
+                                expected: Sequence::from_u64(1),
+                                through: Sequence::from_u64(1),
+                                max_rows: 1,
+                                deadline: deadline(),
+                            })
+                            .map(|_| ()),
+                    ),
+                    "view" => store.view(ACCOUNT, deadline()).map(drop),
+                    "validate_integrity" => store.validate_integrity(deadline()),
+                    "usage_fence" => store.usage_fence(deadline()).map(drop),
+                    "checkpoint" => store.checkpoint(deadline()),
+                    _ => panic!("unknown fixture"),
+                };
+                assert!(clock.0.lock().unwrap().0.is_empty(), "{entry}");
+                if started < acquired {
+                    if actual != Err(ports::Error::Invalid) {
+                        wrong.push((entry, "handoff", actual));
+                    } else {
+                        let writer = lock(&store.writer).unwrap();
+                        assert!(
+                            lock(&writer.native.connection).unwrap().is_autocommit(),
+                            "{entry}"
+                        );
+                        assert!(!writer.stopped, "{entry}");
+                        let sticky = if entry == "view" {
+                            let readers = lock(&store.readers).unwrap();
+                            let ReaderSlot::Available(native) = readers.first().unwrap() else {
+                                panic!("refused capture did not return its slot")
+                            };
+                            native.check()
+                        } else {
+                            writer.native.check()
+                        };
+                        if sticky != Err(ports::Error::Invalid) {
+                            wrong.push((entry, "stickiness", sticky));
+                        }
+                        drop(writer);
+                        let mut next = store.view(ACCOUNT, deadline()).unwrap();
+                        assert_eq!(next.identity(), identity, "{entry}");
+                        let mut bytes = [0; 128];
+                        let (row, sequence) =
+                            next.get(Key::Mailbox(ID), &mut bytes).unwrap().unwrap();
+                        assert!(
+                            matches!(row, Row::Mailbox(row) if row.name == "initial"),
+                            "{entry}"
+                        );
+                        assert_eq!(sequence, Sequence::from_u64(1), "{entry}");
+                        let counts: (i64, i64) = next
+                            .native()
+                            .unwrap()
+                            .run(|db| {
+                                db.query_row(COUNTS, [], |row| Ok((row.get(0)?, row.get(1)?)))
+                                    .map_err(sql)
+                            })
+                            .unwrap();
+                        assert_eq!(counts, (1, 1), "{entry}");
+                        drop(next);
+                        if entry != "view" {
+                            assert_eq!(store.validate_integrity(deadline()), Ok(()), "{entry}");
+                        }
+                    }
+                } else {
+                    assert_eq!(actual, Ok(()), "{entry} {acquired}->{started}");
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "reversed handoffs accepted: {wrong:?}");
+    }
+
     #[test]
     fn lost_read_transactions_never_resume_under_an_old_view_identity() {
         let fixture = Fixture::new();

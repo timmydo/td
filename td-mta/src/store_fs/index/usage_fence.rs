@@ -62,11 +62,11 @@ impl IndexStore<'_> {
     /// Cold whole-store capture, preserving the writer fence for reconciliation.
     /// The future coordinator must also quiesce workers and reconcile pending effects.
     pub fn usage_fence(&self, deadline: Deadline) -> Result<UsageFence<'_>, ports::Error> {
-        let mut writer = self.writer(deadline)?;
+        let (mut writer, acquired) = self.writer_observed(deadline)?;
         if writer.stopped {
             return Err(ports::Error::WriterStopped);
         }
-        writer.native.begin_work(deadline)?;
+        writer.native.begin_work_after(deadline, acquired)?;
         let result = writer.native.run(|db| {
             db.execute_batch("BEGIN DEFERRED").map_err(sql)?;
             let mut total = StoreLogicalUsage {
