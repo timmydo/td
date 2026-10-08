@@ -10380,6 +10380,20 @@ webpki-roots, and no decoder. So:
    application calls them, and td-agent's model client
    (`td-agent/DESIGN.md` §5) is the first that does, streaming each
    turn through `post_stream`.
+
+   A request may carry a `public` line, with no value, for a URL that
+   neither the person nor the application chose: td-agent's `web_fetch`
+   (`td-agent/DESIGN.md` §12), whose model picks it. Every address the
+   resolver returns is then also judged by the egress relay's predicate
+   (item 6), against this machine's own addresses and networks read
+   once for the request, so a model's URL reaches no LAN host, no
+   private, shared or translated address, and no listener on this
+   machine's routable address, whatever it names; one refused address
+   refuses the request, as in item 6. Without the line nothing changes:
+   the grant still reaches a LAN, as `shared=network` did. An older
+   service refuses the line as an unknown head key, so a client asking
+   for it never gets less. The client module's `get_public` sends it
+   with `redirects 0`, its caller judging each `location`.
 4. Evidence. The boot VM has no route out, so the evidence is the socket
    and the policy: `[fetch-evidence]` connects as the UI user, asks for
    a loopback URL and expects the exact refusal; inside the jail, the
@@ -10407,9 +10421,9 @@ webpki-roots, and no decoder. So:
    its unmounted sockets. What it does not buy: a destination policy. An
    application with the grant reaches any `http` or `https` host the
    machine can, as `shared=network` allowed, less loopback and the link;
-   a listener on the machine's own routable address is among what it
-   reaches, since the tier's crate forbids `unsafe` and cannot enumerate
-   the interfaces; and a name that answers the resolver one way now and
+   a LAN, and a listener on the machine's own routable address, are among
+   what it reaches unless the request says `public` (item 3); and a name
+   that answers the resolver one way now and
    another way later is defended only as far as the address it returned
    is the one connected to; and a name lookup is outside every deadline
    of a counted request, since ureq resolves through a blocking call, so

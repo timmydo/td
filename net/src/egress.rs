@@ -554,7 +554,7 @@ impl Local {
     /// `/proc/net/fib_trie`. IPv6: every interface's address, from
     /// `/proc/net/if_inet6`, and every route with no next hop, from
     /// `/proc/net/ipv6_route`.
-    fn read() -> Result<Local, String> {
+    pub(crate) fn read() -> Result<Local, String> {
         let read = |path: &str| std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"));
         // A kernel built without IPv6 has no such files, and no such
         // address or network.

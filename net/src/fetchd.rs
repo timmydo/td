@@ -40,10 +40,13 @@
 // client that must carry a credential across a redirect asks for none and
 // follows the `location` it is handed itself, a relative one joined against
 // its URL; and gives the whole exchange with the origin five minutes over
-// `http.rs`'s connect deadline. What it does not do is decide destinations:
-// an application with the grant reaches any other host, as `shared=network`
-// let it, a listener on the machine's own routable address among them, since
-// a crate without `unsafe` cannot enumerate the interfaces; a name that
+// `http.rs`'s connect deadline. A request's `public` line, for a URL a model
+// chose, judges every resolved address by the egress relay's stricter
+// predicate as well, against this machine's own networks, so that the URL
+// reaches no LAN. What it does not do otherwise is decide destinations:
+// without `public`, an application with the grant reaches any other host, as
+// `shared=network` let it, a LAN's and a listener on the machine's own
+// routable address among them; a name that
 // answers the resolver one way now and another way later is defended only as
 // far as the address it returned is the one connected to; and a name lookup
 // is outside every deadline, ureq's resolver being a blocking call (all four
@@ -374,6 +377,9 @@ struct Request {
     redirects: Option<u32>,
     /// The reply's body framed as it arrives rather than counted first.
     stream: bool,
+    /// Public destinations only: the egress relay's address predicate
+    /// applied as well, for a URL a model chose.
+    public: bool,
     body: Vec<u8>,
 }
 
@@ -711,6 +717,7 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Fault> {
     let mut limit = MAX_RESPONSE_BODY;
     let mut redirects = None;
     let mut stream = false;
+    let mut public = false;
     let mut body_len = 0u64;
     let mut seen = std::collections::BTreeSet::new();
     loop {
@@ -771,6 +778,12 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Fault> {
                 }
                 stream = true;
             }
+            "public" => {
+                if line != "public" {
+                    return Err(Fault::Malformed("public takes no value".into()));
+                }
+                public = true;
+            }
             other => return Err(Fault::Malformed(format!("head key {other:?}"))),
         }
     }
@@ -798,6 +811,7 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Fault> {
         limit,
         redirects,
         stream,
+        public,
         body,
     })
 }
@@ -837,6 +851,9 @@ fn parse_header(text: &str) -> Result<(String, String), Fault> {
 /// rather than as the transport error ureq wraps it in.
 struct PolicyResolver {
     policy: Policy,
+    /// For a `public` request, this machine's own addresses and networks,
+    /// read once for it, and the relay's predicate over every address.
+    public: Option<crate::egress::Local>,
     refusal: Mutex<Option<String>>,
 }
 
@@ -847,9 +864,19 @@ impl ureq::Resolver for PolicyResolver {
             return Err(io::Error::other(format!("{netloc}: no address")));
         }
         for address in &addresses {
-            if let Some(reason) = refused_address(address.ip(), self.policy) {
+            let ip = address.ip();
+            let reason = refused_address(ip, self.policy)
+                .map(str::to_string)
+                .or_else(|| {
+                    let local = self.public.as_ref()?;
+                    let policy = crate::egress::Policy {
+                        allow_loopback: self.policy.allow_loopback,
+                    };
+                    crate::egress::refused(ip, local, policy).map(|why| format!("{ip} is {why}"))
+                });
+            if let Some(reason) = reason {
                 if let Ok(mut refusal) = self.refusal.lock() {
-                    *refusal = Some(reason.to_string());
+                    *refusal = Some(reason.clone());
                 }
                 return Err(io::Error::other(format!("{netloc}: {reason}")));
             }
@@ -908,8 +935,18 @@ fn open(
     timing: Timing,
 ) -> Result<(OriginHead, ureq::Response), Fault> {
     check_scheme(&request.url)?;
+    let public = if request.public {
+        Some(crate::egress::Local::read().map_err(|e| {
+            Fault::Refused(format!(
+                "this machine's own networks could not be read: {e}"
+            ))
+        })?)
+    } else {
+        None
+    };
     let resolver = Arc::new(PolicyResolver {
         policy,
+        public,
         refusal: Mutex::new(None),
     });
     let builder = ureq::AgentBuilder::new()
@@ -942,6 +979,7 @@ fn open(
         limit: _,
         redirects: _,
         stream: _,
+        public: _,
         body: request_body,
     } = request;
     let mut call = agent.request(method.as_str(), &url);
@@ -1192,27 +1230,38 @@ fn spawn_origin(policy: Policy, limits: Limits) -> io::Result<Child> {
 
 /// The request, written for the origin process to read as a client's.
 fn hand_over(mut input: impl Write, request: Request) {
-    let mut head = format!(
-        "{PROTOCOL}\nmethod {}\nurl {}\n",
-        request.method.as_str(),
-        request.url
-    );
-    for (name, value) in &request.headers {
+    // Whole, so that a field added to a request is handed over or said
+    // not to be.
+    let Request {
+        method,
+        url,
+        headers,
+        limit,
+        redirects,
+        stream: _,
+        public,
+        body,
+    } = request;
+    let mut head = format!("{PROTOCOL}\nmethod {}\nurl {url}\n", method.as_str());
+    for (name, value) in &headers {
         // The one space `parse_header` strips is written only where the
         // value begins with one, so no line grows past what was read.
         let space = if value.starts_with(' ') { " " } else { "" };
         head.push_str(&format!("header {name}:{space}{value}\n"));
     }
-    head.push_str(&format!("limit {}\n", request.limit));
-    if let Some(redirects) = request.redirects {
+    head.push_str(&format!("limit {limit}\n"));
+    if let Some(redirects) = redirects {
         head.push_str(&format!("redirects {redirects}\n"));
     }
-    head.push_str(&format!("stream\nbody {}\n\n", request.body.len()));
+    if public {
+        head.push_str("public\n");
+    }
+    head.push_str(&format!("stream\nbody {}\n\n", body.len()));
     // A process that died before taking it says so by its stdout ending,
     // which the relay hears.
     let _ = input
         .write_all(head.as_bytes())
-        .and_then(|()| input.write_all(&request.body))
+        .and_then(|()| input.write_all(&body))
         .and_then(|()| input.flush());
 }
 
@@ -1997,6 +2046,7 @@ mod tests {
         // refusal, and resolves a literal without a resolver.
         let resolver = PolicyResolver {
             policy: STRICT,
+            public: None,
             refusal: Mutex::new(None),
         };
         let resolved = resolver.resolve("93.184.216.34:443").unwrap();
@@ -2020,6 +2070,86 @@ mod tests {
                 "{netloc}"
             );
         }
+        // A LAN's address is the grant's to reach, and not a public
+        // request's: that one is judged by the relay's predicate as well,
+        // embedded and translated forms included.
+        assert!(resolver.resolve("10.0.0.1:80").is_ok());
+        let public = PolicyResolver {
+            policy: STRICT,
+            public: Some(crate::egress::Local::default()),
+            refusal: Mutex::new(None),
+        };
+        assert!(public.resolve("93.184.216.34:443").is_ok());
+        for (netloc, reason) in [
+            ("10.0.0.1:80", "10.0.0.1 is private (RFC 1918)"),
+            ("192.168.1.1:80", "192.168.1.1 is private (RFC 1918)"),
+            ("100.64.0.1:80", "carrier-grade NAT"),
+            ("[fd12::1]:80", "unique-local"),
+            ("[2002:c0a8:101::1]:80", "private (RFC 1918)"),
+            ("168.63.129.16:80", "platform endpoint"),
+            ("127.0.0.1:80", "loopback address"),
+        ] {
+            let err = public.resolve(netloc).unwrap_err().to_string();
+            assert!(err.contains(reason), "{netloc}: {err}");
+            let refusal = public.refusal.lock().unwrap().clone().unwrap_or_default();
+            assert!(refusal.contains(reason), "{netloc}: {refusal}");
+        }
+    }
+
+    /// `public` takes no value; it applies the relay's predicate (above)
+    /// before anything is sent.
+    #[test]
+    fn a_public_line_takes_no_value_and_refuses_a_private_destination() {
+        let request = parse(&request_bytes("method GET\nurl https://h/p\npublic\n", b"")).unwrap();
+        assert!(request.public);
+        assert!(
+            !parse(&request_bytes("method GET\nurl https://h/p\n", b""))
+                .unwrap()
+                .public
+        );
+        for (head, reason) in [
+            (
+                "method GET\nurl http://h/\npublic yes\n",
+                "public takes no value",
+            ),
+            ("method GET\nurl http://h/\npublic\npublic\n", "repeated"),
+        ] {
+            let err = parse(&request_bytes(head, b"")).unwrap_err();
+            assert!(err.contains(reason), "{head:?}: {err}");
+        }
+        let request = parse(&request_bytes(
+            "method GET\nurl http://10.0.0.1:9/\nredirects 0\npublic\n",
+            b"",
+        ))
+        .unwrap();
+        let refused = match perform(request, STRICT, Duration::from_millis(300)) {
+            Err(fault) => fault.line(),
+            Ok(_) => String::new(),
+        };
+        // Private, or this machine's own network where it is on one.
+        assert!(
+            refused.starts_with("error refused: 10.0.0.1 is "),
+            "{refused}"
+        );
+        // A redirect's hop is judged as the first was: an origin on
+        // loopback, which the test policy admits, sends a public request
+        // on to a private address, and it is refused there.
+        let (port, server) = origin(
+            1,
+            vec![(
+                "/r",
+                "HTTP/1.1 302 Found\r\nLocation: http://10.0.0.1:9/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            )],
+        )
+        .unwrap();
+        let head = format!("method GET\nurl http://127.0.0.1:{port}/r\nredirects 1\npublic\n");
+        let request = parse(&request_bytes(&head, b"")).unwrap();
+        let refused = match perform(request, LENIENT, Duration::from_secs(2)) {
+            Err(fault) => fault.line(),
+            Ok(_) => String::new(),
+        };
+        assert!(refused.contains("10.0.0.1 is "), "{refused}");
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     #[test]
@@ -2625,6 +2755,18 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(parse(&handed).unwrap().redirects, Some(0));
+        assert!(!parse(&handed).unwrap().public);
+        // A public request stays public in the origin process.
+        let mut handed = Vec::new();
+        hand_over(
+            &mut handed,
+            parse(&request_bytes(
+                "method GET\nurl http://h/\nredirects 0\npublic\nstream\n",
+                b"",
+            ))
+            .unwrap(),
+        );
+        assert!(parse(&handed).unwrap().public);
         // A header written without the space, at the line bound, stays
         // within it; one whose value begins with a space keeps it.
         let long = format!(

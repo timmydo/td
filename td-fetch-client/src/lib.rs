@@ -221,6 +221,32 @@ pub fn get(
     request("GET", url, headers, &[], limit, redirects)
 }
 
+/// `get` of a URL someone else chose, the service following no redirect
+/// and refusing a host that names or resolves to a private address as
+/// well as the ones it always refuses: td-agent's `web_fetch`, which
+/// judges each `location` as a destination of its own.
+#[allow(dead_code)]
+pub fn get_public(
+    url: &str,
+    headers: &[(&str, &str)],
+    limit: Option<u64>,
+) -> Result<Response, Error> {
+    let limit = limit.unwrap_or(DEFAULT_LIMIT);
+    let (mut reader, written) = send(
+        "GET",
+        url,
+        headers,
+        &[],
+        limit,
+        Shape {
+            redirects: Some(0),
+            stream: false,
+            public: true,
+        },
+    )?;
+    settle(read_reply(&mut reader, limit), written)
+}
+
 /// POST `body` to `url` with `headers` (names in lower case). A reader has
 /// no POST; the module is one text in both applications.
 #[allow(dead_code)]
@@ -266,7 +292,18 @@ fn request(
     redirects: Option<u32>,
 ) -> Result<Response, Error> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT);
-    let (mut reader, written) = send(method, url, headers, body, limit, redirects, false)?;
+    let (mut reader, written) = send(
+        method,
+        url,
+        headers,
+        body,
+        limit,
+        Shape {
+            redirects,
+            stream: false,
+            public: false,
+        },
+    )?;
     settle(read_reply(&mut reader, limit), written)
 }
 
@@ -279,7 +316,18 @@ fn stream(
     redirects: Option<u32>,
 ) -> Result<Stream, Error> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT);
-    let (mut reader, written) = send(method, url, headers, body, limit, redirects, true)?;
+    let (mut reader, written) = send(
+        method,
+        url,
+        headers,
+        body,
+        limit,
+        Shape {
+            redirects,
+            stream: true,
+            public: false,
+        },
+    )?;
     // A streamed head may take the service's whole total to come, the
     // origin's every step within its idle deadline; the frames then come
     // within that deadline of each other.
@@ -301,6 +349,13 @@ fn stream(
     })
 }
 
+/// A request's optional lines: `redirects N`, `stream` and `public`.
+struct Shape {
+    redirects: Option<u32>,
+    stream: bool,
+    public: bool,
+}
+
 /// Connect and write the request whole: the reader for the reply, and how
 /// the write went, which matters only if the reply says nothing.
 fn send(
@@ -309,9 +364,13 @@ fn send(
     headers: &[(&str, &str)],
     body: &[u8],
     limit: u64,
-    redirects: Option<u32>,
-    stream: bool,
+    shape: Shape,
 ) -> Result<(BufReader<UnixStream>, std::io::Result<()>), Error> {
+    let Shape {
+        redirects,
+        stream,
+        public,
+    } = shape;
     check_head(url, headers)?;
     let path = socket_path().ok_or_else(|| Error::Io("no td-fetch socket".into()))?;
     let mut socket = UnixStream::connect(&path).map_err(|e| Error::Io(format!("connect: {e}")))?;
@@ -335,6 +394,9 @@ fn send(
     }
     if stream {
         head.push_str("stream\n");
+    }
+    if public {
+        head.push_str("public\n");
     }
     head.push_str(&format!("body {}\n\n", body.len()));
     // Written whole before anything is read; the service may already have
@@ -883,7 +945,7 @@ mod tests {
         let (go, wait) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             let mut asked = Vec::new();
-            for turn in 0..4 {
+            for turn in 0..5 {
                 let (stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(&stream);
                 asked.push(read_request(&mut reader));
@@ -901,7 +963,7 @@ mod tests {
                         let _ = wait.recv_timeout(Duration::from_secs(10));
                         let _ = out.write_all(b"chunk 4\nhi\n\nend\n");
                     }
-                    2 => {
+                    2 | 4 => {
                         let _ = out.write_all(b"td-fetch 1\nstatus 200\nbody 2\n\nok");
                     }
                     _ => {
@@ -943,6 +1005,9 @@ mod tests {
             (302, Some("/x"))
         );
         assert_eq!(stream.next_chunk().unwrap(), None);
+        // A public GET follows nothing and asks for public addresses.
+        let response = get_public("https://h/page", &[], Some(1000)).unwrap();
+        assert_eq!(response.body, b"ok");
         let asked = server.join().unwrap();
         assert_eq!(
             asked[1],
@@ -960,6 +1025,10 @@ mod tests {
         assert_eq!(
             asked[3].0,
             format!("{PROTOCOL}\nmethod GET\nurl https://h/feed\nlimit {DEFAULT_LIMIT}\nredirects 0\nstream\nbody 0\n")
+        );
+        assert_eq!(
+            asked[4].0,
+            format!("{PROTOCOL}\nmethod GET\nurl https://h/page\nlimit 1000\nredirects 0\npublic\nbody 0\n")
         );
         std::env::remove_var("XDG_RUNTIME_DIR");
         let _ = std::fs::remove_dir_all(&dir);
