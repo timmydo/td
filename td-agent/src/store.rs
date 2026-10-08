@@ -1231,86 +1231,6 @@ impl Status {
     }
 }
 
-/// The steps a conversation's log can undo and redo (DESIGN.md §12),
-/// by their snapshots' places: a snapshot is done, an undo moves the
-/// latest done to the undone, a redo the latest undone back, and a new
-/// snapshot leaves nothing to redo.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Steps {
-    done: Vec<u64>,
-    undone: Vec<u64>,
-}
-
-impl Steps {
-    pub fn of(events: &[Event]) -> Self {
-        let mut steps = Self::default();
-        for event in events {
-            steps.apply(event);
-        }
-        steps
-    }
-
-    /// `event`, the next in the log, counted.
-    pub fn apply(&mut self, event: &Event) {
-        match event.kind {
-            Kind::Snapshot { .. } => {
-                self.done.push(event.seq);
-                self.undone.clear();
-            }
-            Kind::Restore { step, undo: true } if self.done.last() == Some(&step) => {
-                self.done.pop();
-                self.undone.push(step);
-            }
-            Kind::Restore { step, undo: false } if self.undone.last() == Some(&step) => {
-                self.undone.pop();
-                self.done.push(step);
-            }
-            _ => {}
-        }
-    }
-
-    /// The step an undo would undo, its snapshot's place.
-    pub fn undo(&self) -> Option<u64> {
-        self.done.last().copied()
-    }
-
-    /// The step a redo would redo.
-    pub fn redo(&self) -> Option<u64> {
-        self.undone.last().copied()
-    }
-}
-
-/// A worktree a step changed (DESIGN.md §12): its checkout, its trees
-/// before and after, and the files changed, as many as
-/// `snapshot::MAX_CHANGED`, and how many more. The trees and the names
-/// are a jail's.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Snapped {
-    pub checkout: String,
-    pub before: String,
-    pub after: String,
-    pub changed: Vec<String>,
-    pub more: u64,
-}
-
-/// The background processes of `events` running at any time after the
-/// event at `since`: started, and not ended by then.
-pub fn running_since(events: &[Event], since: u64) -> Vec<u64> {
-    let mut out: Vec<u64> = Vec::new();
-    for event in events {
-        match &event.kind {
-            Kind::Process { number, .. } => out.push(*number),
-            Kind::Ended { number, .. } if event.seq <= since => {
-                if let Some(at) = out.iter().rposition(|n| n == number) {
-                    out.remove(at);
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
 /// One item of a todo list.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TodoItem {
@@ -1511,18 +1431,17 @@ pub enum Kind {
     /// The todo list as written, whole (DESIGN.md §12); `cleared` when the
     /// human cleared it from the window.
     Todo { items: Vec<TodoItem>, cleared: bool },
-    /// The worktrees the step of the reply at `reply` changed, each as a
-    /// git tree before and after it, and the background processes running
-    /// while it ran, whose changes it may hold (DESIGN.md §12).
-    Snapshot {
-        reply: u64,
-        worktrees: Vec<Snapped>,
-        background: Vec<u64>,
+    /// A record of a kind td-agent no longer makes, named by its `kind`:
+    /// the step snapshots (`snapshot`) and their undo and redo (`undo`,
+    /// `redo`) an older td-agent logged, read so that its logs open, and
+    /// otherwise nothing but `trees`: a snapshot's worktrees, each its
+    /// checkout and the tree after its step, which a compaction made
+    /// then carried, so that its carried text is rebuilt byte for byte
+    /// (DESIGN.md §6, §14).
+    Retired {
+        kind: String,
+        trees: Vec<(String, String)>,
     },
-    /// The human undid the step whose snapshot is at `step`, its
-    /// worktrees brought back to their trees before it, or, not `undo`,
-    /// redid it (DESIGN.md §12).
-    Restore { step: u64, undo: bool },
     /// Background process `number` (`p1` is 1) started, by the `ToolCall`
     /// at `call`, running `command` (DESIGN.md §12).
     Process {
@@ -1766,42 +1685,20 @@ impl Event {
                     put("cleared", Json::Bool(true));
                 }
             }
-            Kind::Snapshot {
-                reply,
-                worktrees,
-                background,
-            } => {
-                put("kind", Json::Str("snapshot".into()));
-                put("reply", Json::from(*reply));
-                if !background.is_empty() {
-                    put(
-                        "background",
-                        Json::Arr(background.iter().map(|n| Json::from(*n)).collect()),
-                    );
+            Kind::Retired { kind, trees } => {
+                put("kind", Json::Str(kind.clone()));
+                if !trees.is_empty() {
+                    let trees = trees
+                        .iter()
+                        .map(|(checkout, after)| {
+                            Json::Obj(vec![
+                                ("checkout".into(), Json::Str(checkout.clone())),
+                                ("after".into(), Json::Str(after.clone())),
+                            ])
+                        })
+                        .collect();
+                    put("worktrees", Json::Arr(trees));
                 }
-                let worktrees = worktrees
-                    .iter()
-                    .map(|one| {
-                        Json::Obj(vec![
-                            ("checkout".into(), Json::Str(one.checkout.clone())),
-                            ("before".into(), Json::Str(one.before.clone())),
-                            ("after".into(), Json::Str(one.after.clone())),
-                            (
-                                "changed".into(),
-                                Json::Arr(one.changed.iter().cloned().map(Json::Str).collect()),
-                            ),
-                            ("more".into(), Json::from(one.more)),
-                        ])
-                    })
-                    .collect();
-                put("worktrees", Json::Arr(worktrees));
-            }
-            Kind::Restore { step, undo } => {
-                put(
-                    "kind",
-                    Json::Str(if *undo { "undo" } else { "redo" }.into()),
-                );
-                put("step", Json::from(*step));
             }
             Kind::Process {
                 number,
@@ -2068,62 +1965,22 @@ impl Event {
                     Some(word) => Some(Held::parse(&word).ok_or("an unknown hold")?),
                 },
             },
-            Some(undo @ ("undo" | "redo")) => Kind::Restore {
-                step: number("step")?,
-                undo: undo == "undo",
-            },
-            Some("snapshot") => Kind::Snapshot {
-                reply: number("reply")?,
-                background: match value.get("background") {
-                    None => Vec::new(),
-                    Some(numbers) => numbers
-                        .as_arr()
-                        .ok_or("background that is no list")?
-                        .iter()
-                        .map(|n| n.as_u64().ok_or("a background process that is no number"))
-                        .collect::<Result<_, _>>()?,
-                },
-                worktrees: value
+            Some(retired @ ("snapshot" | "undo" | "redo")) => Kind::Retired {
+                kind: retired.into(),
+                // Each worktree's checkout and tree after, where both are
+                // text; nothing else of it is read.
+                trees: value
                     .get("worktrees")
                     .and_then(Json::as_arr)
-                    .ok_or("no worktrees")?
-                    .iter()
-                    .map(|one| {
-                        let text = |name: &str| {
-                            one.get(name)
-                                .and_then(Json::as_str)
-                                .map(String::from)
-                                .ok_or_else(|| format!("a worktree with no {name}"))
-                        };
-                        let tree = |name: &str| {
-                            text(name).and_then(|id| {
-                                crate::git::object_id(&id)
-                                    .then_some(id)
-                                    .ok_or_else(|| format!("a {name} tree that is no id"))
+                    .map(|all| {
+                        all.iter()
+                            .filter_map(|one| {
+                                let text = |name: &str| one.get(name).and_then(Json::as_str);
+                                Some((text("checkout")?.to_string(), text("after")?.to_string()))
                             })
-                        };
-                        Ok(Snapped {
-                            checkout: text("checkout")?,
-                            before: tree("before")?,
-                            after: tree("after")?,
-                            changed: one
-                                .get("changed")
-                                .and_then(Json::as_arr)
-                                .ok_or("a worktree with no changed files")?
-                                .iter()
-                                .map(|name| {
-                                    name.as_str()
-                                        .map(String::from)
-                                        .ok_or("a changed file that is no name")
-                                })
-                                .collect::<Result<_, _>>()?,
-                            more: one
-                                .get("more")
-                                .and_then(Json::as_u64)
-                                .ok_or("a worktree with no count")?,
-                        })
+                            .collect()
                     })
-                    .collect::<Result<_, String>>()?,
+                    .unwrap_or_default(),
             },
             Some("compaction") => Kind::Compaction {
                 pruned: value
@@ -3195,43 +3052,6 @@ pub mod tests {
         assert_eq!(conversation.events().len(), 3);
     }
 
-    /// A step names each background process that ran while it did: one
-    /// still running, or ended after it began, not one ended before.
-    #[test]
-    fn a_step_names_the_background_processes_running_while_it_ran() {
-        let process = |seq, number| Event {
-            seq,
-            time: 0,
-            kind: Kind::Process {
-                number,
-                call: 0,
-                command: "make".into(),
-            },
-        };
-        let ended = |seq, number| Event {
-            seq,
-            time: 0,
-            kind: Kind::Ended {
-                number,
-                how: "exit status 0".into(),
-                tail: None,
-                held: None,
-            },
-        };
-        let events = [
-            process(1, 1),
-            process(2, 2),
-            process(3, 3),
-            ended(4, 1),
-            // The step's reply.
-            ended(6, 2),
-            process(7, 4),
-        ];
-        assert_eq!(running_since(&events, 5), vec![2, 3, 4]);
-        assert_eq!(running_since(&events, 6), vec![3, 4]);
-        assert_eq!(running_since(&events[..3], 5), vec![1, 2, 3]);
-    }
-
     /// No background process outlives its conversation's process: one
     /// the log has running when it opens is recorded lost, once.
     #[test]
@@ -3296,87 +3116,39 @@ pub mod tests {
         assert_eq!(conversation.events().len(), 8, "recorded once");
     }
 
+    /// An older td-agent's step snapshots and undo and redo records, as
+    /// it wrote them, are read as retired, so its logs still open; any
+    /// other kind unknown still refuses the log.
     #[test]
-    fn steps_are_undone_latest_first_and_a_new_one_ends_redo() {
-        let at = |seq: u64, kind: Kind| Event { seq, time: 0, kind };
-        let snap = |seq: u64| {
-            at(
-                seq,
-                Kind::Snapshot {
-                    reply: seq,
-                    background: Vec::new(),
-                    worktrees: Vec::new(),
-                },
-            )
-        };
-        let restore = |seq: u64, step: u64, undo: bool| at(seq, Kind::Restore { step, undo });
-        let mut events = vec![snap(1), snap(2)];
-        assert_eq!(
-            (Steps::of(&events).undo(), Steps::of(&events).redo()),
-            (Some(2), None)
-        );
-        events.push(restore(3, 2, true));
-        assert_eq!(
-            (Steps::of(&events).undo(), Steps::of(&events).redo()),
-            (Some(1), Some(2))
-        );
-        events.push(restore(4, 1, true));
-        assert_eq!(
-            (Steps::of(&events).undo(), Steps::of(&events).redo()),
-            (None, Some(1))
-        );
-        // A restore of any other step counts for nothing.
-        events.push(restore(5, 2, false));
-        assert_eq!(
-            (Steps::of(&events).undo(), Steps::of(&events).redo()),
-            (None, Some(1))
-        );
-        events.push(restore(6, 1, false));
-        assert_eq!(
-            (Steps::of(&events).undo(), Steps::of(&events).redo()),
-            (Some(1), Some(2))
-        );
-        // A new step leaves nothing to redo.
-        events.push(snap(7));
-        assert_eq!(
-            (Steps::of(&events).undo(), Steps::of(&events).redo()),
-            (Some(7), None)
-        );
-    }
-
-    #[test]
-    fn a_snapshot_with_a_tree_that_is_no_id_is_refused() {
-        let event = Event {
-            seq: 1,
-            time: 0,
-            kind: Kind::Snapshot {
-                reply: 1,
-                background: Vec::new(),
-                worktrees: vec![Snapped {
-                    checkout: "/w".into(),
-                    before: "a".repeat(40),
-                    after: "HEAD".into(),
-                    changed: Vec::new(),
-                    more: 0,
-                }],
-            },
-        };
-        assert!(Event::from_json(&event.to_json()).is_err());
-        let fine = Event {
-            kind: Kind::Snapshot {
-                reply: 1,
-                background: Vec::new(),
-                worktrees: vec![Snapped {
-                    checkout: "/w".into(),
-                    before: "a".repeat(40),
-                    after: "b".repeat(64),
-                    changed: Vec::new(),
-                    more: 0,
-                }],
-            },
-            ..event
-        };
-        assert_eq!(Event::from_json(&fine.to_json()).unwrap(), fine);
+    fn an_older_logs_snapshot_and_undo_records_are_read_as_retired() {
+        for (line, kind, trees) in [
+            (
+                r#"{"seq":5,"time":1,"kind":"snapshot","reply":3,"background":[1],"worktrees":[{"checkout":"/w/td","before":"aaaa","after":"bbbb","changed":["a"],"more":0}]}"#,
+                "snapshot",
+                vec![("/w/td".to_string(), "bbbb".to_string())],
+            ),
+            (
+                r#"{"seq":6,"time":1,"kind":"undo","step":5}"#,
+                "undo",
+                Vec::new(),
+            ),
+            (
+                r#"{"seq":7,"time":1,"kind":"redo","step":5}"#,
+                "redo",
+                Vec::new(),
+            ),
+        ] {
+            let event = Event::from_json(&td_json::parse(line).unwrap()).unwrap();
+            assert_eq!(
+                event.kind,
+                Kind::Retired {
+                    kind: kind.into(),
+                    trees
+                }
+            );
+        }
+        let unknown = td_json::parse(r#"{"seq":8,"time":1,"kind":"rewound"}"#).unwrap();
+        assert!(Event::from_json(&unknown).is_err());
     }
 
     #[test]
@@ -3461,13 +3233,13 @@ pub mod tests {
                 probabilities: None,
                 reason: Some("read-only".into()),
             },
-            Kind::Restore {
-                step: 9,
-                undo: true,
+            Kind::Retired {
+                kind: "undo".into(),
+                trees: Vec::new(),
             },
-            Kind::Restore {
-                step: 9,
-                undo: false,
+            Kind::Retired {
+                kind: "redo".into(),
+                trees: Vec::new(),
             },
             Kind::Process {
                 number: 1,
@@ -3480,16 +3252,9 @@ pub mod tests {
                 tail: Some("built\n<U+001B>[0m".into()),
                 held: Some(Held::Budget),
             },
-            Kind::Snapshot {
-                reply: 3,
-                background: vec![1, 2],
-                worktrees: vec![Snapped {
-                    checkout: "/w/td".into(),
-                    before: "a".repeat(40),
-                    after: "b".repeat(40),
-                    changed: vec!["src/\u{1}x.rs".into(), "new \"one\"".into()],
-                    more: 2,
-                }],
+            Kind::Retired {
+                kind: "snapshot".into(),
+                trees: vec![("/w/td".into(), "b".repeat(40))],
             },
         ];
         let written = {

@@ -31,10 +31,11 @@ directory and scratch workspaces; the peers step, which made every
 conversation a peer (§3), templates, the Messages window, and the row's
 menu that archives and deletes (§4, §7); increment 11, the repository
 store, admitted remotes, background fetch, sparse worktrees prepared
-asynchronously, step snapshots with undo, and notifications (§7, §9,
-§12); increment 12, background processes (§12); increment 13, rules,
-cards, modes, the two-stage classifier with its calibrated threshold,
-the circuit breaker and the trust mark (§11); and increment 16,
+asynchronously, and notifications (§7, §9, §12; its step snapshots
+with undo were later removed); increment 12, background processes
+(§12); increment 13, rules, cards, modes, the two-stage classifier
+with its calibrated threshold, the circuit breaker and the trust mark
+(§11); and increment 16,
 compaction, by hand and past `compact_at`, and the card that asks how to
 resume a conversation whose cache has gone cold (§14). Increment 14,
 the push and fetch tools, is built; increment 15, the network, is
@@ -92,8 +93,9 @@ and the design depends on none of it beyond the wire formats of §5.
 ## 1. Boundary and philosophy
 
 Product references: Claude Code and Codex CLI for the loop, tools and
-approval model; opencode for workspaces, child sessions and per-step
-snapshots (§16 records what td-agent takes from it); mini-swe-agent for
+approval model; opencode for workspaces and child sessions (§16 records
+what td-agent takes from it, and that its per-step snapshots were taken
+and dropped); mini-swe-agent for
 how little scaffolding a strong model needs; Aider and SWE-agent for the
 measured effect of edit formats and tool ergonomics. td-agent
 reimplements none of them and inherits none of their compatibility claims.
@@ -168,8 +170,8 @@ There are four parties, and the design is the separation between them:
    multiplexed protocol over the pipe the agent holds. **Every reply the
    tool host sends is jail-controlled data**: a process in the jail running
    as the same user can replace or impersonate it, so file contents,
-   snapshots, digests and instruction text that come back are untrusted
-   input, never authority.
+   digests and instruction text that come back are untrusted input, never
+   authority.
 3. **The fetch service** carries model traffic only. No jail instance is
    ever given its socket.
 4. **The egress relay**, a td-net applet beside fetchd, carries a jail's
@@ -236,7 +238,7 @@ restarted window process cannot start a second writer while an old
 conversation process is still exiting; it runs the rules and the
 classifier of §11; and it starts every jail instance the conversation
 uses, on a host and on td alike (§8): its own file-tool
-instance, `shell`, `grep`, `sed`, snapshot, background and maintenance
+instance, `shell`, `grep`, `sed`, background and maintenance
 instances, forks included. Workspace maintenance that no turn asks for
 (the periodic remote-tracking update, the counts `conversations` shows,
 the check before archiving or deleting, §7) runs in the workspace's own
@@ -1646,14 +1648,17 @@ removal whose lock nobody holds), holding:
     human), its probabilities where Jev gave them, and the reason;
   - a tool result as returned to the model, and the full result when the
     returned one was cut;
-  - a step snapshot (§12);
   - a todo list as written (§12);
   - the human's choice of the conversation's model and effort (§4);
   - a background process started, exited, killed or lost (§12);
   - a notification or notice delivered to the conversation (§3, §7, §12);
   - usage and cost;
   - a compaction (§14);
-  - an interruption, an undo or a redo.
+  - an interruption;
+  - a retired record: an older td-agent's `snapshot`, `undo` or `redo`
+    event, read as its kind, and a snapshot's worktrees as each one's
+    checkout and tree after, so the log still opens and otherwise
+    nothing (§12); any other kind td-agent does not know refuses the log.
 
 Every request ever sent is a pure function of `prefix` and `log`, so
 replaying the log reproduces the exact bytes previously sent, which is
@@ -2662,8 +2667,8 @@ to stop.
 A workspace's jail is a policy, started as td-jail instances. Each
 conversation has one long-lived instance serving its file tools; it runs
 the tool host alone, which starts no process, and is replaced when the
-ready worktrees change. Each `shell`, `grep`, `sed`, snapshot and
-maintenance call is an instance of its own. td-jail tears an instance
+ready worktrees change. Each `shell`, `grep`, `sed` and maintenance
+call is an instance of its own. td-jail tears an instance
 down with every process in it when its entry exits or its stage 1 dies,
 so a timeout or an interruption, which kills the instance, also ends
 every descendant, and nothing a foreground command started can go on
@@ -3108,9 +3113,10 @@ untracked files, ignored ones aside (past its 64 KiB answer, "more
 than could be counted"), writing no index, and an index lock a killed
 tool left stops nothing; `rev-list --count --exclude=refs/remotes/*
 --exclude=refs/td-agent/* --all --not BASE...` the commits any ref
-but a remote-tracking one (upstream's, which `track` sets) or a step
-snapshot's (td-agent's undo, §12) reaches that none of the bases do, which td-agent
-passes from its own record, every base of the repository's worktrees;
+but a remote-tracking one (upstream's, which `track` sets) or one
+under `refs/td-agent/` (an older td-agent's step snapshots, §12)
+reaches that none of the bases do, which td-agent passes from its own
+record, every base of the repository's worktrees;
 it answers `changes N ahead M`, read back as the jail's word, nothing
 more. A workspace
 repository is never fetched into: its third, `track`, sets each base's
@@ -3349,10 +3355,9 @@ rest.
 **Object lifetime.** Workspace and publish repositories borrow the
 store's objects, and store gc cannot see their refs, so the store never
 prunes while any workspace exists: its gc repacks with unreachable
-objects kept. Snapshots (§12) are kept reachable by
-`refs/td-agent/snapshots/<worktree>` in the workspace repository, which
-is the conversation's own, and
-workspace gc, in a maintenance instance, keeps what those refs reach.
+objects kept. The snapshot refs an older td-agent left under
+`refs/td-agent/snapshots/` in a workspace repository (§12) are refs, so
+any gc keeps what they reach, until the workspace is removed.
 
 A repository workspace's history is therefore the agent's to make and the
 human's, or the classifier's, to publish, as in td's own workflow, where a
@@ -3440,7 +3445,7 @@ fetch's news does, and records it; its result says, for each base, where
 upstream, or that the refs could not be set, and logs no news of its
 own; refs it could not set are tried again, and said to the human, when
 the window next tells the bases. It changes no branch, file or ref
-outside `refs/remotes/`, so it is not snapshotted and needs no approval
+outside `refs/remotes/`, so it needs no approval
 (§11), and nothing bounds how often a model asks for it; an asked fetch
 goes before queued background fetches, so many conversations asking at
 once can hold those back.
@@ -4601,8 +4606,7 @@ and git tools, as far as the workspace has what they act on.
   for a substitution across many files that `edit_file` would take many
   calls to make. td-txt's sed has no command that starts a process, and
   `--sandbox` refuses `r`, `R`, `w`, `W` and the `w` flag, so a script
-  reads and writes only the named files; its effects are recorded by the
-  step snapshot like any edit.
+  reads and writes only the named files.
 - **`glob {pattern, path?}`**: implemented in the tool host in std, capped
   and sorted.
 - **`todo_write {items: [{content, status}]}`**: the todo list (below).
@@ -4625,122 +4629,23 @@ Paths are absolute. Worktrees and shared directories are bound at their
 real paths, so the paths the model sees are the paths the human sees. A
 relative path is an error naming the worktrees.
 
-**Step snapshots and undo.** Before and after each model step that
-changes files, the tool host records each worktree's state as a git tree,
-with `git add -A` into a private index in the instance's `/tmp` and
-`git write-tree`, into the workspace repository's objects, and commits the
-tree onto `refs/td-agent/snapshots/<worktree>` so gc keeps it; the log
-records the tree ids and the files that changed. This is opencode's
-shadow-git design, without the shadow repository, since every worktree is
-already a repository. The human can undo a step, which restores its
-changed files from the before-tree, and redo it, through the tool host in
-a jail instance, never as a write by an agent process. A snapshot is
-jail-controlled data, good for undo within the same jail and for showing
-diffs, and never trusted outside it. It covers tracked files and
-untracked files git does not ignore: ignored files (`target/`, `.env`)
-and shared directories are not snapshotted, and undo cannot restore them.
-A directory or scratch workspace without git records pre-images of
-`write_file`, `edit_file` and `sed` targets instead, which `--sandbox`
-makes the whole of what `sed` can write.
-
-**As built (increment 11, step snapshots).** A repository workspace's
-step snapshots are recorded, and undone and redone (below); a
-directory or scratch workspace's pre-images come later. A step whose reply
-calls a tool that acts (`write_file`, `edit_file`, `sed`, `shell`) is
-snapshotted before its first call and after its last, however its
-calls end, each time in a fresh tool instance by td-agent's own call,
-`snapshot` (`host::Call::Snapshot`, `src/snapshot.rs`), which no model
-can make and no card asks: it names each ready worktree's checkout and
-the host's git by the path it resolves to, as maintenance does, since
-an instance's `PATH` need not hold one. For each, the tool host copies
-the worktree's index, its time with it, to a private one in the
-instance's `/tmp`, so the worktree's own, and what is staged in it,
-are left alone while its stat cache spares rereading a tracked file
-unchanged since and its sparse checkout keeps what lies outside it;
-clears assume-unchanged marks in the copy, so a change under one is
-taken; and runs `git add -A --sparse`, taking a file made outside a
-sparse checkout too, and `git write-tree` with it. Git runs with no
-configuration, ignore rules or attributes from the home or the system
-(`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM`,
-`GIT_ATTR_NOSYSTEM`, `core.excludesFile` and `core.attributesFile`
-`/dev/null`), attributes from an empty tree (`GIT_ATTR_SOURCE`) and
-`core.autocrlf=false`, so each blob is its file's bytes whatever a
-`.gitattributes` says and what the model plants in its home neither
-hides a file nor converts one, and with no hooks or fsmonitor; the
-host's git must be 2.40 or later, since an older one ignores
-`GIT_ATTR_SOURCE` without a word. It commits the tree onto
-`refs/td-agent/snapshots/<worktree>`, its worktree's id, over what it
-read there, unless that is a commit holding the tree already; a value
-there that is no commit, which the jail can write, is replaced, not
-taken as a parent. Against the trees before, it names the files
-changed (`diff-tree -r -z --name-only --no-renames`), at most 40 per
-worktree of at most 200 bytes each, within 16 KiB per worktree and
-256 KiB in all as JSON escapes them, the rest counted, so the answer,
-escaped again, fits a frame and the record a log line; the
-conversation refuses an answer past those bounds. Each worktree the
-step changed is
-logged in one `snapshot` event of its reply: its checkout, its trees
-before and after, and those names, which the window and
-`history_read` show made visible, since a jail wrote them; the model
-is not given it; the window shows one notice for the step. A snapshot
-that cannot be taken, a tool instance that cannot start, git that
-fails, or one past 60 seconds, is said in a notice once a process,
-that step is not recorded, and no other is tried in the turn, so a
-slow or failing one costs a turn once; a record with no room left in
-the log, or that cannot be written, is the same. The removal survey
-does not count a snapshot's commits as work.
-
-**As built (increment 11, undo and redo).** `C-z` (the driven action
-`undo`) undoes the open conversation's latest recorded step and
-`C-S-z` (`redo`) redoes the latest undone, naming it by its
-`snapshot` event's place; the window refuses either while a turn
-runs, and both sides count the steps from the log alike
-(`store::Steps`): each `snapshot` is done, an undo moves the latest
-done to the undone, a redo the latest undone back, and a new
-`snapshot` leaves nothing to redo. The conversation refuses, saying
-why in a notice, a step that is not the latest to undo or redo, as a
-request that waited out a turn may be, one whose worktrees are not
-all ready, a removed workspace, no settings from the window, and a
-log without room for the record and the notification at their most,
-checked before a file is written. It asks a fresh tool instance, by
-its own call `restore` (`host::Call::Restore`, `snapshot::restore`),
-to bring each worktree the step changed from one tree to the other:
-after for before to undo, the reverse to redo. The tool host first,
-before writing any, checks each worktree: at the tree it is to leave,
-written as a snapshot is, so nothing changed since, by a later step,
-the human or a process, is overwritten, or at the tree it brings
-already, an earlier try's, which it then leaves; no submodule among
-what differs (`diff-tree --raw`, mode 160000), since git writes
-none; and nothing a tree cannot hold, an ignored file, where it
-writes: at a path the tree it brings adds, unless a file of the very
-bytes it writes there (`hash-object --no-filters`) or a directory
-holding only files it removes, nor on the way to one, unless a
-directory or a file it removes. A tree comparison cannot see ignored
-files, which `checkout-index -f` would otherwise write over or delete
-in a directory in its way. Then, in each, it removes the files the
-tree it brings lacks, through no link and never a directory, and the
-directories that leaves empty; writes the rest that differ with `git
-checkout-index -f` from a private index of that tree, attributes
-from the empty tree; checks the worktree is now that tree; and moves
-the snapshot ref to it. Each file written is its blob's bytes and
-mode, since the repository's `config` and `info/`, which could name
-a filter or attributes, are td-agent's, bound read-only in the jail
-(§9). A path git names must be plain: no `..`, `.`, empty or `.git`
-name. The worktree's own index, its commits and the ignored files
-the checks allow are left as they are: an undo restores files, not a
-commit the step made. A failure names its worktree and those
-restored before it, and a retry passes over those. The window keeps
-the conversation's process, though left, from asking until the
-conversation says it is done (`Up::Restored`), after its record, a
-count of those asked; a process that fails meanwhile is restarted
-unasked, so its count ends. Why one failed is quoted, as a
-notification quotes it. Done,
-the conversation logs an `undo` or `redo` event naming the step and
-tells the model in a notification, which wakes no turn: the person
-undid, or redid, its step, and the files it changed, made visible
-and at most 1000 characters. While a background process runs, an
-undo or a redo is refused before any other check (As built
-(increment 12, lifetime)).
+**No step snapshots or undo.** Step snapshots of a repository
+workspace's worktrees, with `C-z` undo and `C-S-z` redo, were built
+(increment 11) and removed at the user's choice (2026-10-07): git in the
+worktree is the record of a step's changes, and td-agent keeps none of
+its own. An older td-agent's `snapshot`, `undo` and `redo` records are
+read as retired (`store::Kind::Retired`), so its logs open, and are
+otherwise nothing: not shown, and rendered by `history_read` as a
+record of an older td-agent. A retired snapshot keeps each worktree's
+checkout and tree after its step, and a compaction's carried state
+lists each worktree's last as it did when snapshots were made ("[The
+workspace's worktrees, each with the tree its last step snapshot
+recorded …]"), so that a compaction made then is rebuilt byte for byte
+and an older conversation's cached prefix and Debug view hold; a
+conversation since has none. The refs it left under
+`refs/td-agent/snapshots/` keep their objects until the workspace is
+removed and are never counted as work (§9). `C-z` is no longer the
+window's; it reaches the composer.
 
 **Background processes.** A `shell` call with `background: true` keeps
 its instance running after the call returns, for a build, a watcher or a
@@ -4782,12 +4687,6 @@ background process keeps its conversation process running (§2). Each
 instance has its own network namespace, so a server one call starts is
 not reachable from a later call's instance; §19 records that.
 
-A background process can change a worktree between and during steps, so
-a step snapshot may include its changes, and the step's diff says that
-background processes were running. Undo and redo are refused while any
-background process of the workspace runs, since a restore could
-overwrite what one wrote or be overwritten by it.
-
 **As built (increment 12, lifetime).** `shell` takes `background`; with
 it the call is `host::Call::Background`, its `timeout_ms` from 1 ms to
 24 hours and 24 hours when left out, decided on a card of its own ("Run
@@ -4802,7 +4701,7 @@ has (`bench::limit`). The call's result is its id. The tool host runs it
 as a `shell`, but answers with how it ended alone. How it ended comes
 back through the inbox: heard, the process runs no more for the cap,
 `process_list` and `process_kill`, and it is logged as an `ended` event
-between a turn's steps, before an undo or a redo, or while idle (then
+between a turn's steps or while idle (then
 synced), as one bounded line with every control named, since a replaced
 tool host could say anything: its exit status as a call's says it
 (`timed out after ...` when the tool host's own timeout ended it),
@@ -4817,13 +4716,11 @@ open the log records each process still running there as `lost`
 (`store::PROCESS_LOST`), as it records an interrupted call. The window
 counts a conversation's running processes from those events (a restart,
 or a hello, zeroes the count before the log replays) and keeps its
-process while any runs. An undo or a redo is refused before any other
-check while one runs, whichever step it names. The output store,
-`process_output`, `process_wait` and the list's output size came next
-(As built (increment 12, output)), then the exit notice,
-`conversations`' count and the step's note (As built (increment 12,
-notices)). The window's process list and the status row's count came
-last (As built (increment 12, window)).
+process while any runs. The output store, `process_output`,
+`process_wait` and the list's output size came next (As built
+(increment 12, output)), then the exit notice and `conversations`'
+count (As built (increment 12, notices)). The window's process list
+and the status row's count came last (As built (increment 12, window)).
 
 **As built (increment 12, output).** The tool host sends a background
 call's output up as it comes, waiting for room rather than dropping what
@@ -4875,8 +4772,8 @@ gives, which may carry the jail's standard error, is quoted, at most 300
 characters. Whether its end is known already, a kill or a watcher that
 could not start, which its call said, is carried apart from that text,
 and such an end wakes nothing. An end heard during a turn is logged
-between its steps, where the next request reads it, and before an undo
-or a redo, and so is the end of a process whose watcher could not start;
+between its steps, where the next request reads it, and so is the end
+of a process whose watcher could not start;
 one heard while the conversation is idle starts a turn whose `of` is the
 end, counted against the wake budget as a message's (`wake::spent`),
 held as a message is when the conversation is paused or the budget is
@@ -4886,11 +4783,7 @@ end and its turn's start are both logged before either is sent, and the
 window is told first (`Up::Waking`) that a turn comes, keeping the
 process until its start arrives even when that end was its last
 process's. `conversations` counts each conversation's running processes
-from its log. A step's snapshot names the processes running at any time
-after its reply (`store::running_since`), and the window and
-`history_read` say it may hold their changes. The end of one heard as a
-person undoes wakes nothing: the undo is theirs, and the notice is read
-with their next turn.
+from its log.
 
 **As built (increment 12, window).** The window keeps each
 conversation's running processes from its events, the open one's and
@@ -5145,10 +5038,9 @@ head and tail beside it as the result's `kept`, never sent back, and
 drops `kept` before the result when the line would be too long. The
 window does not yet show a command's output as it comes. `write_file`,
 `edit_file`, `sed` and `shell` are decided by the human before they run
-(§11, `ask` mode); the rest run. A repository workspace's steps are
-snapshotted and can be undone (above); a change the human allowed in a
-directory or scratch workspace stays, and td-agent cannot take it
-back.
+(§11, `ask` mode); the rest run. A change the human allowed stays, and
+td-agent cannot take it back; in a repository workspace, git in the
+worktree shows it (above).
 
 ## 13. Prompting
 
@@ -5378,9 +5270,7 @@ where td-agent's own labels do:
   kept within 16 KiB, and the sequence numbers of any older ones left
   out;
 - the current todo list (§12);
-- the workspace's worktrees, each with the tree its last step's
-  snapshot recorded (the log keeps no branch, and the view is the
-  log's), and the background processes with their states.
+- the background processes with their states.
 
 The summary and the todo list are labelled as the model's own notes, not
 instructions. The recent tail is the latest steps that fit both
@@ -5453,9 +5343,9 @@ labels stand at, then the events from the tail on. The carried state is
 drawn from the log before the compaction: the first message with its
 source, cut at 8 KiB with the rest named; the person's messages before
 the tail, the newest within 16 KiB, the others' sequence numbers named;
-the todo list, labelled as the model's notes; each worktree's checkout
-and the tree its last step snapshot recorded (the log keeps no branch or
-commit); and the background processes with their states. Pruning
+the todo list, labelled as the model's notes; an older td-agent's
+worktrees with their last snapshotted trees, where its log has retired
+snapshots (§12); and the background processes with their states. Pruning
 considers only what that view sends. A summary that fails, is cut short
 or calls tools, comes back empty, cannot fit its last step, or leaves
 the view still past `compact_at` stops the turn and says why; a later
@@ -5688,7 +5578,7 @@ kind. td-agent's position on its features:
 
 | Feature | td-agent |
 |---|---|
-| Shadow-git step snapshots, undo and redo | adopted, in the worktrees' own repositories (§12) |
+| Shadow-git step snapshots, undo and redo | not adopted: built in increment 11 and removed, since git in the worktree is the record (§12) |
 | `doom_loop`: three identical calls ask | adopted (§11) |
 | `question` tool | adopted (§12) |
 | Child sessions, background subagents that notify | adapted as peer conversations that message and read one another through crossings (§3) |
@@ -5732,8 +5622,8 @@ kind. td-agent's position on its features:
   the base, and a pending tool result; remote-tracking updates in a
   maintenance instance and their notifications; export, strict import and
   a push of the exact id to a local bare remote; protected-branch, force,
-  deletion, tag and scan-match routing; a force push's lease; snapshot
-  refs with undo and redo; store gc keeping borrowed objects; and
+  deletion, tag and scan-match routing; a force push's lease; store gc
+  keeping borrowed objects; and
   archiving or deleting the conversation of a dirty workspace only on
   confirmation. A planted reflog, `FETCH_HEAD` or
   `worktrees/` symlink in a workspace repository must change nothing
@@ -6200,48 +6090,12 @@ thread answering a refresh for the window with its bases;
 remotes only, each once with its bases once, none whose fetch is
 pending, and a base moving only from a commit known before; the store
 thread's queue a preparation before queued background fetches.
-For step snapshots, `src/snapshot.rs` covers a worktree kept as a tree
-on its ref with its own index and what is staged in it left alone, an
-edit, a deletion and an addition named and an ignored file not, no
-new commit when nothing changed, the answer crossing whole and one for
-other worktrees refused, other worktrees, a tree that is no id, a
-mismatched count, git by a relative path and a repository's own
-checkout refused, many changes counted past the bound, a file made
-outside a sparse checkout named and none outside it taken as deleted,
-ignore rules and attributes in the home, `.gitattributes` in the tree
-and the repository's `core.autocrlf` changing nothing and a blob its
-file's bytes, a blob or a dangling id planted on the ref replaced, an edit under an assume-unchanged mark named with the
-worktree's mark left, naming cut at each bound with the rest counted,
-and the escaped bounds checked per worktree and in all, the most an
-answer may hold fitting a frame; `src/store.rs` the `snapshot` event replaying exactly
-and one with a tree that is no id refused; `src/repo.rs` a snapshot's
-commit not counted as work;
-`tests/model_client.rs` a step that writes only its todo list not
-snapshotted, one that runs a command snapshotted first and, with no
-jail, said once before its first call, and no `snapshot` event; and
-the live `tests/jail.rs` preparation test a snapshot in the
-conversation's own kind of instance, its ref holding its tree, a
-file made between two named, and that step undone, redone and undone
-there. For undo and redo, `src/snapshot.rs` covers an edit, a
-deletion emptying a directory, an addition in a new one, a mode and a
-link turned file each restored and redone, an ignored file left, a
-file restored as its bytes under `.gitattributes`, the ref moved, a
-worktree changed since refused with nothing written, mismatched or
-non-id trees and other worktrees refused, paths that are not plain
-refused, no removal through a link or of a directory, and emptied
-directories pruned; `src/store.rs` the steps counted from the log;
-`src/ui.rs` `C-z` and `C-S-z` naming the latest step, refused while a
-turn runs, and nothing to redo after a new step;
-`tests/model_client.rs` a step not the latest and one whose worktree
-is not ready refused, and one past those checks failing short of a
-jail with no `undo` logged; and `tests/processes.rs` a conversation
-asked to undo kept, though left, until it says it is done, and one
-restarted meanwhile not kept for it. Against
-what no snapshot holds, `src/snapshot.rs` covers an ignored file in a
-directory to become a file, one where a directory must be, and a file
-ignored after the step and edited since each refused with nothing
-written, that file as it was allowed, a submodule refused, and a
-retry of a restore done already changing nothing.
+For the retired step snapshots, `src/store.rs` covers an older log's
+`snapshot`, `undo` and `redo` records read as retired, a snapshot's
+trees kept, and any other unknown kind still refused, and the replay
+test round-trips a retired record; `src/compact.rs` a retired
+snapshot's tree carried as before; `src/repo.rs` an older td-agent's
+snapshot ref not counted as work.
 For a call told a worktree's state, `src/conversation.rs` covers a
 read into a worktree still checking out, a command in a ready first
 worktree and a path outside every worktree passing, a path climbing
@@ -6485,9 +6339,10 @@ in parallel with it.
     instances; admitted remotes; the store and its background fetch;
     workspace repositories over alternates with the git mount chain;
     sparse worktrees prepared asynchronously; local commits and step
-    snapshots; repository templates, refused until now, and the
-    workspace card; the worktree cleanup on archiving or deleting a
-    repository workspace's conversation; and the notifications of §3.
+    snapshots with undo and redo, built here and removed later (§12);
+    repository templates, refused until now, and the workspace card;
+    the worktree cleanup on archiving or deleting a repository
+    workspace's conversation; and the notifications of §3.
 12. **Background processes.** `background` on `shell`, the process tools,
     the output store, exit notices, and the window's process list.
 13. **Rules and auto mode.** Rules, cards, repetition, both classifier

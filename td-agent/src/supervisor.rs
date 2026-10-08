@@ -98,9 +98,6 @@ struct Running {
     /// The remotes it asked the window for and has not said prepared:
     /// a repository workspace being made ready, kept until it is.
     preparing: Vec<String>,
-    /// Undos and redos asked of it and not yet heard done: its files may
-    /// be half written, so it is kept until they are.
-    restoring: u32,
     /// Its background processes running, by its log: none survives it,
     /// so it is kept while any runs (DESIGN.md §12).
     background: u32,
@@ -123,7 +120,6 @@ impl Running {
             || self.resuming
             || self.waking
             || !self.preparing.is_empty()
-            || self.restoring > 0
             || self.background > 0
             || self.compacting > 0
             || !self.pending.is_empty()
@@ -246,7 +242,6 @@ impl Supervisor {
             failed: false,
             busy: None,
             preparing: Vec::new(),
-            restoring: 0,
             background: 0,
             compacting: 0,
             replayed: 0,
@@ -288,9 +283,6 @@ impl Supervisor {
         }
         if matches!(down, Down::Pause { paused: false }) {
             running.resuming = true;
-        }
-        if matches!(down, Down::Restore { .. }) {
-            running.restoring = running.restoring.saturating_add(1);
         }
         Ok(())
     }
@@ -445,7 +437,6 @@ impl Supervisor {
             failed: false,
             busy: None,
             preparing: Vec::new(),
-            restoring: 0,
             background: 0,
             compacting: 0,
             replayed: 0,
@@ -679,10 +670,7 @@ impl Supervisor {
             running.waking = false;
             // What it was asked to compact went with it.
             running.compacting = 0;
-            // Its process gone, nothing is half written by it any more,
-            // and the new one is not asked again; its background
-            // processes went with it.
-            running.restoring = 0;
+            // Its background processes went with its process.
             running.background = 0;
             if running.restarts >= MAX_RESTARTS {
                 running.failed = true;
@@ -818,7 +806,6 @@ fn drain(running: &mut Running, updates: &mut Vec<(Id, Update)>) -> Option<Strin
                             }
                         }
                         Up::Prepared { remote } => running.preparing.retain(|r| r != remote),
-                        Up::Restored => running.restoring = running.restoring.saturating_sub(1),
                         Up::Waking => running.waking = true,
                         Up::Event(event) => match event.kind {
                             // Logged after any turn it starts, whose start

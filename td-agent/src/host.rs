@@ -104,24 +104,6 @@ pub enum Call {
         paths: Vec<String>,
         extended: bool,
     },
-    /// td-agent's own, never a model's: each of `checkouts` recorded as a
-    /// git tree onto its snapshot ref with `git`, the host's by the path
-    /// it resolves to, and, given `before`'s trees in their order, the
-    /// files changed since named (DESIGN.md §12).
-    Snapshot {
-        git: String,
-        checkouts: Vec<String>,
-        before: Vec<String>,
-    },
-    /// td-agent's own, never a model's: each of `checkouts` brought from
-    /// tree `from` to tree `to` with `git`, refused unless each is at its
-    /// `from` now; a step undone or redone (DESIGN.md §12).
-    Restore {
-        git: String,
-        checkouts: Vec<String>,
-        from: Vec<String>,
-        to: Vec<String>,
-    },
 }
 
 /// A proxied connection's frame (DESIGN.md §10), over the same pipe as
@@ -398,8 +380,6 @@ impl Call {
             Self::Background { .. } => "background",
             Self::Grep { .. } => "grep",
             Self::Sed { .. } => "sed",
-            Self::Snapshot { .. } => "snapshot",
-            Self::Restore { .. } => "restore",
         }
     }
 
@@ -500,38 +480,6 @@ impl Call {
                 ),
                 ("extended", Json::Bool(*extended)),
             ]),
-            Self::Snapshot {
-                git,
-                checkouts,
-                before,
-            } => member(vec![
-                ("git", Json::Str(git.clone())),
-                (
-                    "checkouts",
-                    Json::Arr(checkouts.iter().cloned().map(Json::Str).collect()),
-                ),
-                (
-                    "before",
-                    Json::Arr(before.iter().cloned().map(Json::Str).collect()),
-                ),
-            ]),
-            Self::Restore {
-                git,
-                checkouts,
-                from,
-                to,
-            } => member(vec![
-                ("git", Json::Str(git.clone())),
-                (
-                    "checkouts",
-                    Json::Arr(checkouts.iter().cloned().map(Json::Str).collect()),
-                ),
-                (
-                    "from",
-                    Json::Arr(from.iter().cloned().map(Json::Str).collect()),
-                ),
-                ("to", Json::Arr(to.iter().cloned().map(Json::Str).collect())),
-            ]),
         }
     }
 
@@ -561,18 +509,6 @@ impl Call {
             }
         };
         let flag = |name: &str| args.get(name).is_some_and(Json::is_true);
-        let texts = |name: &str| -> Result<Vec<String>, String> {
-            args.get(name)
-                .and_then(Json::as_arr)
-                .ok_or_else(|| format!("{tool}: no `{name}`"))?
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(String::from)
-                        .ok_or_else(|| format!("{tool}: `{name}` holds something not a string"))
-                })
-                .collect()
-        };
         Ok(match tool {
             "read_file" => Self::Read {
                 path: text("path")?,
@@ -639,17 +575,6 @@ impl Call {
                     })
                     .collect::<Result<_, _>>()?,
                 extended: flag("extended"),
-            },
-            "snapshot" => Self::Snapshot {
-                git: text("git")?,
-                checkouts: texts("checkouts")?,
-                before: texts("before")?,
-            },
-            "restore" => Self::Restore {
-                git: text("git")?,
-                checkouts: texts("checkouts")?,
-                from: texts("from")?,
-                to: texts("to")?,
             },
             other => return Err(format!("no tool {other:?}")),
         })
@@ -1196,17 +1121,6 @@ mod tests {
                 script: "s/a/b/".into(),
                 paths: vec!["/w/a".into()],
                 extended: false,
-            },
-            Call::Snapshot {
-                git: "/usr/bin/git".into(),
-                checkouts: vec!["/w/a".into(), "/w/b".into()],
-                before: vec!["a".repeat(40), "b".repeat(40)],
-            },
-            Call::Restore {
-                git: "/usr/bin/git".into(),
-                checkouts: vec!["/w/a".into()],
-                from: vec!["a".repeat(40)],
-                to: vec!["b".repeat(40)],
             },
         ];
         for (n, call) in calls.into_iter().enumerate() {

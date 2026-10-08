@@ -126,9 +126,11 @@ fn kind(event: &Event) -> &'static str {
         Kind::ToolCall { .. } => "tool_call",
         Kind::ToolResult { .. } => "tool_result",
         Kind::Todo { .. } => "todo",
-        Kind::Snapshot { .. } => "snapshot",
-        Kind::Restore { undo: true, .. } => "undo",
-        Kind::Restore { undo: false, .. } => "redo",
+        Kind::Retired { kind, .. } => match kind.as_str() {
+            "undo" => "undo",
+            "redo" => "redo",
+            _ => "snapshot",
+        },
         Kind::Process { .. } => "process",
         Kind::Ended { .. } => "ended",
         Kind::Compaction { .. } => "compaction",
@@ -136,37 +138,6 @@ fn kind(event: &Event) -> &'static str {
         Kind::Choice { .. } => "choice",
         Kind::Approval { .. } => "approval",
     }
-}
-
-/// What a step's snapshot says of the background processes running while
-/// it ran (DESIGN.md §12).
-pub fn running_line(background: &[u64]) -> String {
-    let names: Vec<String> = background.iter().map(|n| format!("p{n}")).collect();
-    format!(
-        "background processes were running ({}), so it may hold their changes",
-        names.join(", ")
-    )
-}
-
-/// A worktree a step changed, on one line: its checkout, its trees, and
-/// the files changed, each made visible, since a jail named them.
-pub fn snapshot_line(one: &crate::store::Snapped) -> String {
-    let short = |id: &str| id.chars().take(12).collect::<String>();
-    let mut names: Vec<String> = one
-        .changed
-        .iter()
-        .map(|name| crate::tools::visible(name))
-        .collect();
-    if one.more > 0 {
-        names.push(format!("and {} more", one.more));
-    }
-    format!(
-        "{} ({}..{}): {}",
-        crate::tools::visible(&one.checkout),
-        short(&one.before),
-        short(&one.after),
-        names.join(", ")
-    )
 }
 
 /// An event rendered whole, as `history_read` pages it.
@@ -258,22 +229,10 @@ pub fn render(event: &Event) -> String {
             items,
         } if items.is_empty() => "the person cleared the todo list".into(),
         Kind::Todo { items, .. } => crate::tools::todo_text(items),
-        Kind::Snapshot {
-            reply,
-            worktrees,
-            background,
-        } => {
-            let mut out = format!("the step of #{reply} changed files, snapshotted");
-            for one in worktrees {
-                out.push_str(&format!("\n{}", snapshot_line(one)));
-            }
-            if !background.is_empty() {
-                out.push_str(&format!("\n{}", running_line(background)));
-            }
-            out
-        }
-        Kind::Restore { step, undo: true } => {
-            format!("the person undid the step snapshotted at #{step}")
+        // An older td-agent's step snapshots and undo; none are made now.
+        Kind::Retired { kind, .. } => {
+            let a = if kind.starts_with('u') { "an" } else { "a" };
+            format!("{a} {kind} record of an older td-agent")
         }
         Kind::Process {
             number,
@@ -300,9 +259,6 @@ pub fn render(event: &Event) -> String {
                 text.push_str(&format!("; the tail of its output:\n{tail}"));
             }
             text
-        }
-        Kind::Restore { step, undo: false } => {
-            format!("the person redid the step snapshotted at #{step}")
         }
         Kind::Compaction { pruned, summary } => compacted(pruned, summary.as_ref()),
         Kind::Pause { paused: true } => "the person paused this conversation".into(),

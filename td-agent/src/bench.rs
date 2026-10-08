@@ -42,12 +42,7 @@ pub struct Bench {
 pub fn fresh(call: &Call) -> bool {
     matches!(
         call,
-        Call::Shell { .. }
-            | Call::Background { .. }
-            | Call::Grep { .. }
-            | Call::Sed { .. }
-            | Call::Snapshot { .. }
-            | Call::Restore { .. }
+        Call::Shell { .. } | Call::Background { .. } | Call::Grep { .. } | Call::Sed { .. }
     )
 }
 

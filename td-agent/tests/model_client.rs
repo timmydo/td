@@ -538,8 +538,7 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Kind::ToolCall { .. } => "tool_call",
             Kind::ToolResult { .. } => "tool_result",
             Kind::Todo { .. } => "todo",
-            Kind::Snapshot { .. } => "snapshot",
-            Kind::Restore { .. } => "restore",
+            Kind::Retired { .. } => "retired",
             Kind::Process { .. } => "process",
             Kind::Ended { .. } => "ended",
             Kind::Compaction { .. } => "compaction",
@@ -2560,226 +2559,6 @@ fn a_call_into_a_worktree_not_prepared_is_told_so_without_a_card() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// A step of a repository workspace that may change files is
-/// snapshotted before and after it, one that cannot is not, and a
-/// snapshot that cannot be taken, here with no jail, is said once
-/// (DESIGN.md §12).
-#[test]
-fn a_step_that_may_change_files_is_snapshotted_or_says_why_not_once() {
-    let base = std::env::temp_dir().join(format!(
-        "td-agent-model-snap-{}-{}",
-        std::process::id(),
-        td_agent::store::random_hex(4).unwrap()
-    ));
-    let template = td_agent::config::Template {
-        network: None,
-        name: "td".into(),
-        repos: vec![td_agent::config::Repo {
-            remote: "https://example.org/a/td".into(),
-            base: "main".into(),
-            branch: "agent".into(),
-            sparse: None,
-        }],
-        shared: None,
-    };
-    let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
-    let made = td_agent::workspace::repositories(
-        &template,
-        &Id::random().unwrap(),
-        &base.join("data"),
-        &base.join("trees"),
-        &admitted,
-        0,
-    )
-    .unwrap();
-    let repository = made.entries[0].repository.clone();
-    let argument = td_agent::workspace::Workspace::Repositories(made).argument();
-    let h = Harness::new_in(
-        "snap",
-        Role::Conversation,
-        Some(argument.to_str().unwrap()),
-        false,
-        vec![
-            Reply::sse("stream-tool-todo.sse"),
-            Reply::sse("stream-sonnet.sse"),
-            Reply::ok("title.json"),
-            Reply::sse("stream-tool-workspace.sse"),
-            Reply::sse("stream-sonnet.sse"),
-            Reply::sse("stream-tool-workspace-stop.sse"),
-            Reply::sse("stream-sonnet.sse"),
-        ],
-    );
-    // Prepared, as if checked out before.
-    let (mut conversation, mut h) = h.close();
-    conversation.set_prepared(&repository).unwrap();
-    drop(conversation);
-    h.reopen();
-    h.setup(Client::default());
-    let unsnapped = |events: &[Event]| {
-        events
-            .iter()
-            .filter(|e| matches!(&e.kind, Kind::Notice { text } if text.starts_with("a step's snapshot was not recorded")))
-            .count()
-    };
-    // A step that writes only its todo list changes no worktree.
-    h.say("Plan the tidying.");
-    let (events, outcome, _) = h.turn();
-    assert_eq!(outcome, "replied", "{}", h.said());
-    assert_eq!(unsnapped(&events), 0, "{events:?}");
-    // One that runs a command is snapshotted first: with no jail, said.
-    let refuse = |h: &mut Harness| {
-        let (call, _, _) = h.until_ask();
-        h.down(&Down::Decision {
-            call,
-            allow: false,
-            always: None,
-        });
-        h.turn()
-    };
-    h.say("Tidy the notes.");
-    let (events, outcome, _) = refuse(&mut h);
-    assert_eq!(outcome, "replied", "{}", h.said());
-    let mut heard = std::mem::take(&mut h.heard);
-    heard.extend(events);
-    assert_eq!(unsnapped(&heard), 1, "{heard:?}");
-    // Said before the step's first call.
-    let said = heard
-        .iter()
-        .position(
-            |e| matches!(&e.kind, Kind::Notice { text } if text.starts_with("a step's snapshot")),
-        )
-        .unwrap();
-    let first = heard
-        .iter()
-        .position(|e| matches!(e.kind, Kind::ToolCall { .. }))
-        .unwrap();
-    assert!(said < first, "{heard:?}");
-    // Once only.
-    h.say("Tidy them again.");
-    let (events, outcome, _) = refuse(&mut h);
-    assert_eq!(outcome, "replied", "{}", h.said());
-    let mut heard = std::mem::take(&mut h.heard);
-    heard.extend(events);
-    assert_eq!(unsnapped(&heard), 0, "{heard:?}");
-    // An undo is of the latest step only, and why not is said; a reopened
-    // process replays its log first, up to `after`.
-    let notice = |h: &mut Harness, after: u64| loop {
-        if let Up::Event(Event {
-            seq,
-            kind: Kind::Notice { text },
-            ..
-        }) = h.next()
-        {
-            if seq > after {
-                break text;
-            }
-        }
-    };
-    h.down(&Down::Restore {
-        step: 1,
-        undo: true,
-    });
-    assert_eq!(
-        notice(&mut h, 0),
-        "the step could not be undone: it is not the latest step to undo"
-    );
-    let (mut conversation, mut h) = h.close();
-    assert!(!conversation
-        .events()
-        .iter()
-        .any(|e| matches!(e.kind, Kind::Snapshot { .. })),);
-    // Steps as if snapshotted: one in a worktree not this workspace's,
-    // then one in its own, which with no jail is not restored.
-    let snapped = |checkout: &str| Kind::Snapshot {
-        reply: 1,
-        background: Vec::new(),
-        worktrees: vec![td_agent::store::Snapped {
-            checkout: checkout.into(),
-            before: "a".repeat(40),
-            after: "b".repeat(40),
-            changed: vec!["notes".into()],
-            more: 0,
-        }],
-    };
-    let elsewhere = conversation.append(snapped("/elsewhere")).unwrap().seq;
-    let checkout = conversation
-        .meta()
-        .workspace
-        .clone()
-        .map(|workspace| match workspace {
-            td_agent::workspace::Workspace::Repositories(made) => {
-                made.entries[0].checkout.display().to_string()
-            }
-            other => panic!("{other:?}"),
-        });
-    let own = conversation
-        .append(snapped(&checkout.unwrap()))
-        .unwrap()
-        .seq;
-    conversation.sync().unwrap();
-    let after = own;
-    drop(conversation);
-    h.reopen();
-    h.setup(Client::default());
-    h.down(&Down::Restore {
-        step: elsewhere,
-        undo: true,
-    });
-    assert_eq!(
-        notice(&mut h, after),
-        "the step could not be undone: it is not the latest step to undo"
-    );
-    h.down(&Down::Restore {
-        step: own,
-        undo: false,
-    });
-    assert_eq!(
-        notice(&mut h, after),
-        "the step could not be redone: it is not the latest step to redo"
-    );
-    h.down(&Down::Restore {
-        step: own,
-        undo: true,
-    });
-    // Past the step's checks, git or the jail is what is missing here.
-    let refused = notice(&mut h, after);
-    assert!(
-        refused.starts_with("the step could not be undone: ")
-            && !refused.contains("latest")
-            && !refused.contains("not ready"),
-        "{refused}"
-    );
-    let (mut conversation, mut h) = h.close();
-    // Undone as if it had been, the one before is next, and not ready.
-    let after = conversation
-        .append(Kind::Restore {
-            step: own,
-            undo: true,
-        })
-        .unwrap()
-        .seq;
-    conversation.sync().unwrap();
-    drop(conversation);
-    h.reopen();
-    h.setup(Client::default());
-    h.down(&Down::Restore {
-        step: elsewhere,
-        undo: true,
-    });
-    assert_eq!(
-        notice(&mut h, after),
-        "the step could not be undone: /elsewhere is not ready"
-    );
-    let (conversation, _h) = h.close();
-    let restored = conversation
-        .events()
-        .iter()
-        .filter(|e| matches!(e.kind, Kind::Restore { .. }))
-        .count();
-    assert_eq!(restored, 1, "only the one appended here");
-    let _ = std::fs::remove_dir_all(&base);
-}
-
 /// A command the person allows runs in the conversation's jail, in its
 /// scratch workspace, and a search runs there without asking.
 #[test]
@@ -3375,8 +3154,8 @@ fn the_process_list_is_the_latest_and_bounded() {
 /// A background command runs on in its own jail after its call returns,
 /// numbered from the log; at most `max_background` run at once; one is
 /// listed while it runs, and its end, by itself or killed, is logged;
-/// no undo runs meanwhile; and one still running when its conversation's
-/// process ends is lost (DESIGN.md §12).
+/// and one still running when its conversation's process ends is lost
+/// (DESIGN.md §12).
 #[test]
 #[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
 fn a_background_command_runs_on_until_it_ends_or_is_killed() {
@@ -3449,25 +3228,6 @@ fn a_background_command_runs_on_until_it_ends_or_is_killed() {
         ),
         "{woke}"
     );
-    // While one runs, nothing is restored, whichever step.
-    h.down(&Down::Restore {
-        step: 1,
-        undo: true,
-    });
-    loop {
-        if let Up::Event(Event {
-            kind: Kind::Notice { text },
-            ..
-        }) = h.next()
-        {
-            assert_eq!(
-                text,
-                "the step could not be undone: background processes are running (p1); kill them first"
-            );
-            break;
-        }
-    }
-
     h.mock.then(vec![
         Reply::sse("stream-tool-background-kill.sse"),
         Reply::sse("stream-sonnet.sse"),

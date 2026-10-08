@@ -19,8 +19,7 @@
 //! The open conversation's todo list (DESIGN.md §12), when it has one, is
 //! drawn above the composer, collapsed to the item in progress; `C-t`
 //! shows the whole list and `C-S-t` clears it. `C-S-p` pauses or resumes
-//! the open conversation (§3). `C-z` undoes its latest step that changed
-//! files, `C-S-z` redoes the latest undone (§12).
+//! the open conversation (§3).
 //!
 //! A menu bar holds the File, Conversation and Help menus (`menu`), which
 //! a press on a header opens, `F10` opening File. File → Set OpenRouter
@@ -308,10 +307,6 @@ pub enum Request {
         turn: u64,
         choice: crate::protocol::Resumed,
     },
-    /// Undo the open conversation's step snapshotted at this place.
-    Undo(u64),
-    /// Redo it.
-    Redo(u64),
     /// Save the split's preferred share.
     SaveShare(u32, u32),
     /// Store the OpenRouter key from the key dialog, replacing a stored
@@ -635,8 +630,6 @@ pub struct App {
     /// The open conversation's todo list, and whether it is shown whole.
     todo: Vec<TodoItem>,
     todo_open: bool,
-    /// The open conversation's steps to undo and redo, from its log.
-    steps: crate::store::Steps,
     /// Each user message's sequence number and its index in the
     /// transcript, and each started turn's and its user message's.
     messages: Vec<(u64, usize)>,
@@ -820,7 +813,6 @@ impl App {
             show_archived: false,
             todo: Vec::new(),
             todo_open: false,
-            steps: crate::store::Steps::default(),
             messages: Vec::new(),
             exchanges: Vec::new(),
             turns: Vec::new(),
@@ -1673,7 +1665,6 @@ impl App {
         self.system_shown = false;
         self.streaming = None;
         self.undrawn = None;
-        self.steps = crate::store::Steps::default();
         if !self.todo.is_empty() {
             self.todo.clear();
             self.place();
@@ -1861,7 +1852,6 @@ impl App {
                 | Up::Push { .. }
                 | Up::Heads { .. }
                 | Up::Prepared { .. }
-                | Up::Restored
                 | Up::Waking,
             )
             | Update::Undeliverable { .. } => {}
@@ -1903,7 +1893,6 @@ impl App {
             return;
         }
         self.last_seq = event.seq;
-        self.steps.apply(&event);
         if let Some(id) = self.active.clone() {
             if self.heard_process(&id, &event.kind) {
                 self.refresh_list();
@@ -2255,27 +2244,8 @@ impl App {
                     self.note(format!("the transcript refused a tool result: {e}"));
                 }
             }
-            Kind::Snapshot {
-                worktrees,
-                background,
-                ..
-            } => {
-                let mut lines: Vec<String> = worktrees
-                    .iter()
-                    .map(crate::history::snapshot_line)
-                    .collect();
-                if !background.is_empty() {
-                    lines.push(crate::history::running_line(&background));
-                }
-                self.notice_message(&format!(
-                    "this step changed {}; C-z undoes it",
-                    lines.join("; ")
-                ));
-            }
-            Kind::Restore { step, undo } => self.notice_message(&format!(
-                "you {} the step snapshotted at #{step}",
-                if undo { "undid" } else { "redid" }
-            )),
+            // An older td-agent's step snapshots and undo: nothing now.
+            Kind::Retired { .. } => {}
             // The `shell` call's result says it started.
             Kind::Process { .. } => {}
             Kind::Ended {
@@ -2974,28 +2944,6 @@ impl App {
         if self.active.as_ref() != Some(&id) || self.active_failed() {
             self.set_active(id.clone());
             self.requests.push(Request::Open(id));
-        }
-    }
-
-    /// Asks the open conversation to undo its latest step, or redo the
-    /// latest undone, naming it, between turns (DESIGN.md §12).
-    fn restore_step(&mut self, undo: bool) {
-        if self.active.is_none() {
-            return;
-        }
-        if self.running() {
-            return self.note("a step is undone or redone between turns");
-        }
-        let step = if undo {
-            self.steps.undo()
-        } else {
-            self.steps.redo()
-        };
-        match step {
-            Some(step) if undo => self.requests.push(Request::Undo(step)),
-            Some(step) => self.requests.push(Request::Redo(step)),
-            None if undo => self.note("no step to undo"),
-            None => self.note("no step to redo"),
         }
     }
 
@@ -4760,7 +4708,6 @@ impl App {
                 }
                 return;
             }
-            "C-z" | "C-S-z" if !repeat => return self.restore_step(chord == "C-z"),
             "C-S-p" if !repeat => {
                 let paused = self
                     .active
@@ -6588,113 +6535,6 @@ pub mod tests {
     }
 
     #[test]
-    fn c_z_undoes_the_latest_step_and_c_s_z_redoes_it_between_turns() {
-        let mut app = app();
-        key(&mut app, "C-z");
-        assert!(app.take_requests().is_empty());
-        assert!(app.notice().unwrap().contains("no step to undo"));
-        let snapshot = |seq: u64| {
-            at(
-                seq,
-                Kind::Snapshot {
-                    reply: seq - 1,
-                    background: if seq == 5 { vec![1, 3] } else { Vec::new() },
-                    worktrees: vec![crate::store::Snapped {
-                        checkout: "/w/td".into(),
-                        before: "a".repeat(40),
-                        after: "b".repeat(40),
-                        changed: vec!["src/x\u{1b}.rs".into()],
-                        more: 2,
-                    }],
-                },
-            )
-        };
-        app.update(snapshot(3), 0);
-        app.update(snapshot(5), 0);
-        assert!(text(&app).contains("this step changed /w/td"));
-        assert!(text(&app).contains("background processes were running (p1, p3)"));
-        key(&mut app, "C-z");
-        assert_eq!(app.take_requests(), [Request::Undo(5)]);
-        // Only between turns.
-        app.update(
-            at(
-                6,
-                Kind::Started {
-                    effect: crate::store::Effect::Turn,
-                    of: 1,
-                },
-            ),
-            0,
-        );
-        key(&mut app, "C-z");
-        assert!(app.take_requests().is_empty());
-        assert!(app.notice().unwrap().contains("between turns"));
-        app.update(
-            at(
-                7,
-                Kind::Finished {
-                    started: 6,
-                    outcome: "replied".into(),
-                    retry: false,
-                },
-            ),
-            0,
-        );
-        app.update(
-            at(
-                8,
-                Kind::Restore {
-                    step: 5,
-                    undo: true,
-                },
-            ),
-            0,
-        );
-        assert!(text(&app).contains("you undid the step snapshotted at #5"));
-        // A background process's start is its call's result, and its
-        // row under its conversation's; its end is a notice.
-        let shown = app.transcript.len();
-        app.update(
-            at(
-                9,
-                Kind::Process {
-                    number: 1,
-                    call: 2,
-                    command: "make".into(),
-                },
-            ),
-            0,
-        );
-        assert_eq!(app.transcript.len(), shown);
-        assert!(text(&app).contains("p1 make"));
-        assert!(app.status_line().ends_with("| 1 background"));
-        app.update(
-            at(
-                10,
-                Kind::Ended {
-                    number: 1,
-                    how: "exit status 2".into(),
-                    tail: None,
-                    held: None,
-                },
-            ),
-            0,
-        );
-        assert!(text(&app).contains("background process p1 ended: exit status 2"));
-        assert!(!text(&app).contains("p1 make"));
-        assert!(app.status_line().ends_with("| 0 background"));
-        key(&mut app, "C-z");
-        assert_eq!(app.take_requests(), [Request::Undo(3)]);
-        key(&mut app, "C-S-z");
-        assert_eq!(app.take_requests(), [Request::Redo(5)]);
-        // A new step leaves nothing to redo.
-        app.update(snapshot(11), 0);
-        key(&mut app, "C-S-z");
-        assert!(app.take_requests().is_empty());
-        assert!(app.notice().unwrap().contains("no step to redo"));
-    }
-
-    #[test]
     fn c_s_p_pauses_and_resumes_and_the_list_says_paused() {
         let mut app = app();
         app.update(
@@ -6951,6 +6791,49 @@ pub mod tests {
     /// A conversation's background processes are rows under its own,
     /// counted on the status row, each with a menu to show its output or
     /// kill it; its output shows read-only (DESIGN.md §12).
+    /// The open conversation's background process's end is a notice
+    /// saying how, and drops it from the status row's count (DESIGN.md
+    /// §12).
+    #[test]
+    fn the_open_conversations_background_process_ending_is_said() {
+        let mut app = app();
+        turn(&mut app, 1, "build it");
+        app.update(
+            at(
+                3,
+                Kind::Process {
+                    number: 1,
+                    call: 2,
+                    command: "make".into(),
+                },
+            ),
+            0,
+        );
+        assert!(app.status_line().ends_with("| 1 background"));
+        app.update(
+            at(
+                4,
+                Kind::Ended {
+                    number: 1,
+                    how: "exit status 2".into(),
+                    tail: None,
+                    held: Some(crate::store::Held::Paused),
+                },
+            ),
+            0,
+        );
+        let shown = text(&app);
+        assert!(
+            shown.contains("background process p1 ended: exit status 2"),
+            "{shown}"
+        );
+        assert!(
+            app.status_line().ends_with("| 0 background"),
+            "{}",
+            app.status_line()
+        );
+    }
+
     #[test]
     fn background_processes_are_listed_under_their_conversation() {
         let mut app = app();

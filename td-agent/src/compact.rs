@@ -213,16 +213,15 @@ pub fn carried(before: &[Event], at: u64, tail: u64, summary: &str) -> String {
             )));
         }
     }
-    // Each worktree as its last step snapshot left it.
+    // An older td-agent's step snapshots: each worktree as the last left
+    // it, carried as it carried them, so that a compaction made then is
+    // rebuilt byte for byte; none are made now (DESIGN.md §12).
     let mut worktrees: Vec<(&str, &str)> = Vec::new();
     for event in before {
-        if let Kind::Snapshot {
-            worktrees: snapped, ..
-        } = &event.kind
-        {
-            for one in snapped {
-                worktrees.retain(|(checkout, _)| *checkout != one.checkout);
-                worktrees.push((&one.checkout, &one.after));
+        if let Kind::Retired { trees, .. } = &event.kind {
+            for (checkout, after) in trees {
+                worktrees.retain(|(c, _)| *c != checkout.as_str());
+                worktrees.push((checkout, after));
             }
         }
     }
@@ -630,16 +629,10 @@ mod tests {
         ));
         events.push(event(
             6,
-            Kind::Snapshot {
-                reply: 3,
-                worktrees: vec![crate::store::Snapped {
-                    checkout: "/w/td".into(),
-                    before: "c0ffee".into(),
-                    after: "beef01".into(),
-                    changed: Vec::new(),
-                    more: 0,
-                }],
-                background: Vec::new(),
+            // An older td-agent's step snapshot, carried as it was.
+            Kind::Retired {
+                kind: "snapshot".into(),
+                trees: vec![("/w/td".into(), "beef01".into())],
             },
         ));
         events.push(request(7, Purpose::Turn));

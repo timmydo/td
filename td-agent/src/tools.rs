@@ -165,11 +165,6 @@ impl Tool {
         )
     }
 
-    /// Whether the workspace tool named `name` acts (`acts`).
-    pub fn acting(name: &str) -> bool {
-        Self::find(Kit::Repositories, name).is_some_and(Self::acts)
-    }
-
     fn find(kit: Kit, name: &str) -> Option<Self> {
         Self::all(kit).into_iter().find(|t| t.name() == name)
     }
@@ -1401,19 +1396,6 @@ pub fn card(call: &Call) -> (String, Vec<String>) {
             card.line(visible(pattern));
             "Search the workspace"
         }
-        // td-agent's own, which no card asks.
-        Call::Snapshot { checkouts, .. } => {
-            for checkout in checkouts {
-                card.line(visible(checkout));
-            }
-            "Snapshot the worktrees"
-        }
-        Call::Restore { checkouts, .. } => {
-            for checkout in checkouts {
-                card.line(visible(checkout));
-            }
-            "Restore the worktrees"
-        }
     };
     (title.to_string(), card.done())
 }
@@ -1576,6 +1558,11 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
 
+    /// Whether the workspace tool named `name` acts (`acts`).
+    fn acting(name: &str) -> bool {
+        Tool::find(Kit::Repositories, name).is_some_and(Tool::acts)
+    }
+
     /// Every tool of either set is known by its name, and nothing else
     /// a model might call one.
     #[test]
@@ -1663,7 +1650,7 @@ mod tests {
                 "{wrong}"
             );
         }
-        assert!(!Tool::acting("git_fetch"));
+        assert!(!acting("git_fetch"));
         assert!(known("git_fetch"));
         let prefix = prefix(Kit::Repositories, "s");
         assert!(prefix.contains("\"git_fetch\""));
@@ -1708,7 +1695,7 @@ mod tests {
                 "{wrong}"
             );
         }
-        assert!(!Tool::acting("git_push"));
+        assert!(!acting("git_push"));
         assert!(known("git_push"));
         assert!(prefix(Kit::Repositories, "s").contains("\"git_push\""));
     }
@@ -1822,7 +1809,7 @@ mod tests {
             }
             _ => panic!("not a host call"),
         }
-        assert!(Tool::acting("apply_patch"));
+        assert!(acting("apply_patch"));
         let broken = Json::Obj(vec![(
             "input".into(),
             Json::Str("*** Begin Patch\n".into()),
@@ -1913,7 +1900,7 @@ mod tests {
             call("process_kill", r#"{"id":" p12 "}"#).unwrap(),
             Args::Kill(12)
         );
-        assert!(!Tool::acting("process_kill"));
+        assert!(!acting("process_kill"));
         assert_eq!(
             call("process_output", r#"{"id":"p2"}"#).unwrap(),
             Args::Output {
@@ -1941,7 +1928,7 @@ mod tests {
                 timeout_ms: 600_000
             }
         );
-        assert!(!Tool::acting("process_output") && !Tool::acting("process_wait"));
+        assert!(!acting("process_output") && !acting("process_wait"));
         assert!(parse("process_list", "{}").is_err());
         assert_eq!(
             call("read_file", r#"{"path":"/w/a","offset":3}"#).unwrap(),

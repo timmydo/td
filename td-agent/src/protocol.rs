@@ -100,8 +100,6 @@ pub enum Down {
         /// sets none.
         mode: crate::config::Mode,
     },
-    /// Undo, or redo, the step snapshotted at `step` (DESIGN.md §12).
-    Restore { step: u64, undo: bool },
     /// The human chose the conversation's model and reasoning effort,
     /// whole; none is the configuration's.
     Choose {
@@ -268,10 +266,6 @@ pub enum Up {
         remote: String,
         bases: Vec<String>,
     },
-    /// The conversation is done with an undo or a redo the window asked
-    /// for, done or not: until then the window keeps its process
-    /// (DESIGN.md §12).
-    Restored,
     /// A background process's end is about to start a turn: until the
     /// turn's start, the window keeps the process (DESIGN.md §12).
     Waking,
@@ -758,13 +752,6 @@ impl Down {
                     },
                 ],
             ),
-            Self::Restore { step, undo } => typed(
-                "restore",
-                vec![
-                    ("step".into(), Json::from(*step)),
-                    ("undo".into(), Json::Bool(*undo)),
-                ],
-            ),
             Self::Choose { model, effort } => typed(
                 "choose",
                 vec![
@@ -992,16 +979,6 @@ impl Down {
                     .and_then(Json::as_u64)
                     .ok_or("a kill with no number")?,
             }),
-            Some("restore") => Ok(Self::Restore {
-                step: value
-                    .get("step")
-                    .and_then(Json::as_u64)
-                    .ok_or("a restore with no step")?,
-                undo: value
-                    .get("undo")
-                    .and_then(Json::as_bool)
-                    .ok_or("a restore with no undo")?,
-            }),
             Some("choose") => {
                 let model = maybe(&value, "model")?;
                 let effort = maybe(&value, "effort")?;
@@ -1197,7 +1174,6 @@ impl Up {
                 ],
             ),
             Self::Query { id } => typed("query", vec![("id".into(), Json::from(*id))]),
-            Self::Restored => typed("restored", Vec::new()),
             Self::Waking => typed("waking", Vec::new()),
             Self::Prepared { remote } => typed(
                 "prepared",
@@ -1467,7 +1443,6 @@ impl Up {
                 remote: string(&value, "remote")?,
                 bases: strings(&value, "bases")?,
             },
-            Some("restored") => Self::Restored,
             Some("waking") => Self::Waking,
             Some("prepared") => Self::Prepared {
                 remote: string(&value, "remote")?,
@@ -1811,7 +1786,6 @@ mod tests {
             Up::Prepared {
                 remote: "https://github.com/timmydo/td".into(),
             },
-            Up::Restored,
             Up::Waking,
             Up::Heads {
                 remote: "https://github.com/timmydo/td".into(),
@@ -1959,14 +1933,6 @@ mod tests {
                 version: 3,
                 rules: Err("rules: line 1: names no tool".into()),
                 mode: crate::config::Mode::Ask,
-            },
-            Down::Restore {
-                step: 7,
-                undo: true,
-            },
-            Down::Restore {
-                step: 9,
-                undo: false,
             },
             Down::Decision {
                 call: 7,
