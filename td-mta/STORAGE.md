@@ -153,10 +153,21 @@ immutable and uncertainty cannot clear. A changed attemptCount must be exactly
 one checked increment, with an attempt ID different from the immediately
 previous row. Its original state must be Queued, RetryWait or OutcomeUnknown
 with a next attempt, and its final state must be InFlight/Prepared. An active
-InFlight attempt cannot be replaced by incrementing the count. Prepared and
+InFlight attempt cannot be replaced by incrementing the count. A count-advancing
+Prepared update must carry an empty diagnostic; nonempty text refuses with
+Conflict rather than being normalized by the adapter. Prepared and
 a later phase cannot be combined into one count-advancing transaction: the
 final PUT is compared with the original row. This constrains stored history;
 it does not prove when the caller performs transport I/O.
+If the original recipient is not InFlight, both reply fields stay unchanged,
+including on dispatch into a new Prepared attempt. An intermediate Prepared
+PUT or DELETE cannot authorize a reply change in that transaction. After
+Prepared commits, the active attempt can record applicable replies; matching
+those updates to a current worker and enforcing reply ordering remain service
+obligations. An original InFlight row can still change replies when becoming
+Canceled or expiring if the final group is valid; the coordinator must enforce
+QUEUE.md's reply retention on those local outcomes. This common rule also
+preserves terminal recipients' replies.
 When attemptCount is unchanged, attempt ID and lastAttemptAt stay unchanged.
 An InFlight final row then also requires an original InFlight row: re-entry
 into InFlight cannot reuse a pending recipient's previous count/ID/time.
@@ -174,8 +185,8 @@ commit from Body, and an intermediate phase or DELETE cannot make an
 exposed attempt cancelable. Stored phase history does not prove current
 reply provenance, worker fencing or actual transport ordering.
 Other outcome transitions, such as RetryWait becoming Failed with reason
-SmtpPermanent, and replacement of retained replies without an active attempt
-are still accepted by this core when the final group is otherwise valid.
+SmtpPermanent when a retained reply satisfies the final-state checks, are
+still accepted by this core when the final group is otherwise valid.
 They remain explicit coordinator-validation gaps, not proof of a fenced SMTP
 result. From InFlight/AcceptancePossible, a certain RetryWait requires
 SmtpTemporary and a stored DATA 4xx; Failed requires SmtpPermanent with a
@@ -196,7 +207,7 @@ Failed recipients remain Failed or become Canceled as part of a valid
 whole-submission cancellation. OutcomeUnknown without a next attempt remains
 OutcomeUnknown without a next attempt. All these terminal rows retain their
 attempt count, so their attempt ID/time cannot change either. They also keep
-phase, uncertainty and both replies unchanged; reason stays unchanged except
+phase and uncertainty unchanged; reason stays unchanged except
 for Failed becoming Canceled. Diagnostics can still change. Reply comparison
 is bounded by the existing row limits and borrows the decoded strings. This
 preserves recorded history; it does not prove the original replies' authority.

@@ -6614,11 +6614,12 @@ writer scratch and original deadline/VM fuel. Inconsistent groups reject with
 Conflict; native deadline, capacity and I/O errors retain their classifications.
 Before row writes, surviving queue PUTs preserve STORAGE.md's immutable
 identity, uncertainty, attempt-history and failure-notice fields against the
-original rows. STORAGE.md defines their attempt-count/ID progression and
-eligible-source/Prepared-entry checks, adjacent active phase advances and
-the acceptance/cancellation boundaries and DATA-reply requirements for certain
-outcomes from an existing AcceptancePossible attempt.
-Remaining outcome transitions, same-attempt reply changes, phase changes
+original rows. STORAGE.md defines reply retention outside active attempts
+and the empty-diagnostic requirement on attempt-count advances. It also
+defines count/ID progression, eligible-source/Prepared-entry checks,
+adjacent active phase advances, and acceptance/cancellation and DATA-reply
+requirements for certain outcomes from existing AcceptancePossible attempts.
+Remaining outcome transitions, reply updates by active attempts, phase changes
 outside InFlight and transport ordering still require coordinator validation.
 Terminal recipients cannot regain dispatch obligations or a new attempt;
 Accepted/Canceled remain in their states, Failed can only remain

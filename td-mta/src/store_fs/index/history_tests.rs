@@ -1,17 +1,4 @@
 use super::*;
-fn uncertain() -> RecipientRow<'static> {
-    RecipientRow {
-        state: RecipientState::OutcomeUnknown,
-        uncertain: true,
-        attempt: Some(AttemptId::from_bytes([8; 16])),
-        attempt_count: 3,
-        last_attempt_at: Some(1),
-        phase: AttemptPhase::Final,
-        next_attempt_at: Some(2),
-        reason: FailureReason::Network,
-        ..queued()
-    }
-}
 #[test]
 fn recipient_history_survives_typed_and_encoded_updates() {
     for encoded in [false, true] {
@@ -1001,25 +988,6 @@ fn terminal_final_operation_wins_and_attempted_cancellation_retains_replies() {
     }
 }
 
-fn next_attempt(mut row: RecipientRow<'_>) -> RecipientRow<'_> {
-    row.state = RecipientState::InFlight;
-    row.phase = AttemptPhase::Prepared;
-    row.reason = FailureReason::None;
-    row.next_attempt_at = None;
-    row.attempt_count = row.attempt_count.checked_add(1).unwrap();
-    row.attempt = Some(AttemptId::from_bytes([9; 16]));
-    row.last_attempt_at = Some(2);
-    row
-}
-fn pending_attempt(state: RecipientState) -> RecipientRow<'static> {
-    if state == RecipientState::Queued {
-        return queued();
-    }
-    let mut row = uncertain();
-    row.state = state;
-    row.uncertain = state == RecipientState::OutcomeUnknown;
-    row
-}
 #[test]
 fn a_new_attempt_advances_once_and_changes_the_previous_id() {
     let mut accepted = Vec::new();

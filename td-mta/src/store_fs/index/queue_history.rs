@@ -68,6 +68,8 @@ fn submission(old: SubmissionRow<'_>, next: SubmissionRow<'_>) -> bool {
 fn recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
     old.address == next.address
         && terminal_recipient(old, next)
+        && (old.state == RecipientState::InFlight
+            || (old.rcpt_reply == next.rcpt_reply && old.data_reply == next.data_reply))
         && acceptance_boundary(old, next)
         && (!old.uncertain || next.uncertain)
         && if next.attempt_count == old.attempt_count {
@@ -84,6 +86,7 @@ fn recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
             eligible
                 && next.state == RecipientState::InFlight
                 && next.phase == AttemptPhase::Prepared
+                && next.diagnostic.is_empty()
                 && old.attempt_count.checked_add(1) == Some(next.attempt_count)
                 && next.attempt != old.attempt
         }
@@ -141,8 +144,6 @@ fn terminal_recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
         && old.attempt_count == next.attempt_count
         && old.phase == next.phase
         && old.uncertain == next.uncertain
-        && old.rcpt_reply == next.rcpt_reply
-        && old.data_reply == next.data_reply
         && (old.reason == next.reason
             || (old.state == S::Failed
                 && next.state == S::Canceled

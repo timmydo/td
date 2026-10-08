@@ -13,18 +13,6 @@ fn in_flight(phase: AttemptPhase) -> RecipientRow<'static> {
     }
 }
 
-fn assert_recipient(store: &IndexStore<'_>, expected: RecipientRow<'_>) {
-    let mut view = store.view(ACCOUNT, deadline()).unwrap();
-    let mut scratch = [0; 65536];
-    assert_eq!(
-        view.get(Key::Recipient(SUBMISSION, 0), &mut scratch)
-            .unwrap()
-            .unwrap()
-            .0,
-        Row::Recipient(expected)
-    );
-}
-
 #[test]
 fn active_attempt_cannot_skip_or_regress_a_durable_phase() {
     use AttemptPhase::{AcceptancePossible, Body, Prepared};

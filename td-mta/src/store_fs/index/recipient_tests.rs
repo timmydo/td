@@ -764,9 +764,6 @@ fn encoded_deadline_after_body_chunk_rolls_back_and_preserves_blob_id_reuse() {
     store.validate_integrity(deadline()).unwrap();
 }
 
-#[path = "history_tests.rs"]
-mod history_tests;
-
 fn apply(
     store: &IndexStore<'_>,
     sequence: u64,
@@ -793,5 +790,56 @@ fn assert_fresh_group(
     );
 }
 
+fn uncertain() -> RecipientRow<'static> {
+    RecipientRow {
+        state: RecipientState::OutcomeUnknown,
+        uncertain: true,
+        attempt: Some(AttemptId::from_bytes([8; 16])),
+        attempt_count: 3,
+        last_attempt_at: Some(1),
+        phase: AttemptPhase::Final,
+        next_attempt_at: Some(2),
+        reason: FailureReason::Network,
+        ..queued()
+    }
+}
+fn next_attempt(mut row: RecipientRow<'_>) -> RecipientRow<'_> {
+    row.state = RecipientState::InFlight;
+    row.phase = AttemptPhase::Prepared;
+    row.reason = FailureReason::None;
+    row.next_attempt_at = None;
+    row.attempt_count = row.attempt_count.checked_add(1).unwrap();
+    row.attempt = Some(AttemptId::from_bytes([9; 16]));
+    row.last_attempt_at = Some(2);
+    row.diagnostic = "";
+    row
+}
+fn pending_attempt(state: RecipientState) -> RecipientRow<'static> {
+    if state == RecipientState::Queued {
+        return queued();
+    }
+    let mut row = uncertain();
+    row.state = state;
+    row.uncertain = state == RecipientState::OutcomeUnknown;
+    row
+}
+fn assert_recipient(store: &IndexStore<'_>, expected: RecipientRow<'_>) {
+    let mut view = store.view(ACCOUNT, deadline()).unwrap();
+    let mut scratch = [0; 65536];
+    assert_eq!(
+        view.get(Key::Recipient(SUBMISSION, 0), &mut scratch)
+            .unwrap()
+            .unwrap()
+            .0,
+        Row::Recipient(expected)
+    );
+}
+
+#[path = "history_tests.rs"]
+mod history_tests;
+
 #[path = "phase_tests.rs"]
 mod phase_tests;
+
+#[path = "reply_tests.rs"]
+mod reply_tests;
