@@ -766,3 +766,32 @@ fn encoded_deadline_after_body_chunk_rolls_back_and_preserves_blob_id_reuse() {
 
 #[path = "history_tests.rs"]
 mod history_tests;
+
+fn apply(
+    store: &IndexStore<'_>,
+    sequence: u64,
+    operations: &[Operation<'_>],
+    encoded: bool,
+) -> Result<Sequence, CommitError> {
+    if encoded {
+        commit_encoded(store, request(sequence), operations, &mut [])
+    } else {
+        store.commit(&td_crypto::Provider, request(sequence), operations, &mut [])
+    }
+}
+fn assert_fresh_group(
+    sub: SubmissionRow<'_>,
+    recipients: &[(u32, RecipientRow<'_>)],
+    encoded: bool,
+) {
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let store = open(&mut root);
+    assert_eq!(
+        create_group(&store, sub, recipients, encoded),
+        Ok(Sequence::from_u64(1))
+    );
+}
+
+#[path = "phase_tests.rs"]
+mod phase_tests;

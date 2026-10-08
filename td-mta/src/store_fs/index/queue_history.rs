@@ -73,6 +73,7 @@ fn recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
             (next.state != RecipientState::InFlight || old.state == RecipientState::InFlight)
                 && next.attempt == old.attempt
                 && next.last_attempt_at == old.last_attempt_at
+                && active_phase(old, next)
         } else {
             let eligible = matches!(
                 old.state,
@@ -85,6 +86,19 @@ fn recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
                 && old.attempt_count.checked_add(1) == Some(next.attempt_count)
                 && next.attempt != old.attempt
         }
+}
+
+fn active_phase(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
+    if old.state != RecipientState::InFlight || next.state != RecipientState::InFlight {
+        return true;
+    }
+    use AttemptPhase as P;
+    matches!(
+        (old.phase, next.phase),
+        (P::Prepared, P::Prepared | P::Body)
+            | (P::Body, P::Body | P::AcceptancePossible)
+            | (P::AcceptancePossible, P::AcceptancePossible)
+    )
 }
 
 fn terminal_recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {

@@ -2318,8 +2318,9 @@ immutable queue identity/uncertainty/attempt-history fields are implemented
 in the core, including one-way Pending/Stored failure-notice history and
 terminal recipient state/attempt/phase/reply/reason/uncertainty preservation.
 STORAGE.md also defines the implemented attempt-count/ID progression and
-eligible-source/Prepared-entry checks. Complete same-attempt transition and
-worker validation, transport ordering, entropy/collision
+eligible-source/Prepared-entry checks and adjacent active phase advances.
+Complete outcome transition and worker validation, same-attempt reply changes,
+phase changes outside InFlight, transport ordering, entropy/collision
 checks, changed-object coverage, category quota reconciliation and request
 idempotence remain service work.
 Bind the implemented bounded

@@ -160,6 +160,12 @@ it does not prove when the caller performs transport I/O.
 When attemptCount is unchanged, attempt ID and lastAttemptAt stay unchanged.
 An InFlight final row then also requires an original InFlight row: re-entry
 into InFlight cannot reuse a pending recipient's previous count/ID/time.
+When both original and final rows are InFlight, the phase may stay the same
+or advance one step: Prepared to Body, then Body to AcceptancePossible.
+AcceptancePossible cannot return to an earlier phase. A final
+AcceptancePossible PUT against an original Prepared row refuses even when
+an intermediate PUT names Body: Body must commit in a separate transaction.
+These checks do not constrain transitions out of InFlight to an outcome.
 Same-count pending-to-outcome changes, such as RetryWait becoming Accepted
 or replacing retained replies without an active attempt, are still accepted
 by this core when the final group is otherwise valid. They remain explicit

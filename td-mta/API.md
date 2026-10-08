@@ -6615,8 +6615,9 @@ Conflict; native deadline, capacity and I/O errors retain their classifications.
 Before row writes, surviving queue PUTs preserve STORAGE.md's immutable
 identity, uncertainty, attempt-history and failure-notice fields against the
 original rows. STORAGE.md defines their attempt-count/ID progression and
-eligible-source/Prepared-entry checks. Remaining phase/outcome transitions
-and transport ordering still require coordinator validation.
+eligible-source/Prepared-entry checks and adjacent active phase advances.
+Remaining outcome transitions, same-attempt reply changes, phase changes
+outside InFlight and transport ordering still require coordinator validation.
 Terminal recipients cannot regain dispatch obligations or a new attempt;
 Accepted/Canceled remain in their states, Failed can only remain
 Failed or join a valid whole-group cancellation, and terminal OutcomeUnknown

@@ -1,16 +1,4 @@
 use super::*;
-fn apply(
-    store: &IndexStore<'_>,
-    sequence: u64,
-    operations: &[Operation<'_>],
-    encoded: bool,
-) -> Result<Sequence, CommitError> {
-    if encoded {
-        commit_encoded(store, request(sequence), operations, &mut [])
-    } else {
-        store.commit(&td_crypto::Provider, request(sequence), operations, &mut [])
-    }
-}
 fn uncertain() -> RecipientRow<'static> {
     RecipientRow {
         state: RecipientState::OutcomeUnknown,
@@ -1202,19 +1190,6 @@ fn the_last_attempt_count_is_usable_without_wrapping_or_replacing_its_id() {
     }
 }
 
-fn assert_fresh_group(
-    sub: SubmissionRow<'_>,
-    recipients: &[(u32, RecipientRow<'_>)],
-    encoded: bool,
-) {
-    let fixture = Fixture::new();
-    let mut root = fixture.locked();
-    let store = open(&mut root);
-    assert_eq!(
-        create_group(&store, sub, recipients, encoded),
-        Ok(Sequence::from_u64(1))
-    );
-}
 #[test]
 fn a_new_attempt_must_first_commit_the_prepared_phase() {
     let mut accepted = Vec::new();
