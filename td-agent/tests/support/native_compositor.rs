@@ -273,6 +273,14 @@ fn messages_typed_into_the_window_land_in_each_conversations_log() {
     wait(&agent, "hi lands in its log, titled", || {
         (agent.conversations() == [first(&["hi"])]).then_some(())
     });
+    // Its turn, which has no model here, ends while it is open: a turn's
+    // end raises a conversation in the list, so one that ended after the
+    // next conversation's message would list this first and leave
+    // Control-PageDown nothing below.
+    wait(&agent, "hi's turn ends in the open window", || {
+        let shown = agent.text();
+        (shown.contains("no model") || shown.contains("not answered")).then_some(())
+    });
 
     compositor.chord(&[KEY_LEFTCTRL], KEY_N);
     compositor.chord(&[], KEY_Y);
