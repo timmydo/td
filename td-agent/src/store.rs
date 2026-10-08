@@ -1394,6 +1394,17 @@ pub enum Kind {
         status: Option<String>,
         held: Option<Held>,
     },
+    /// A schedule's firing (DESIGN.md §3), with the window's delivery id,
+    /// which a receiver logs once: the schedule, the conversation whose
+    /// model asked for it (none when the person made it), its text, and
+    /// why it started no turn, when it did not.
+    Fired {
+        delivery: String,
+        schedule: String,
+        author: Option<Id>,
+        text: String,
+        skipped: Option<String>,
+    },
     /// Tool call `id` of the assistant message at `reply` started: logged
     /// and synced before it runs (DESIGN.md §6, Recovery).
     ToolCall {
@@ -1618,6 +1629,22 @@ impl Event {
                 }
                 if let Some(held) = held {
                     put("held", Json::Str(held.word().into()));
+                }
+            }
+            Kind::Fired {
+                delivery,
+                schedule,
+                author,
+                text,
+                skipped,
+            } => {
+                put("kind", Json::Str("fired".into()));
+                put("delivery", Json::Str(delivery.clone()));
+                put("schedule", Json::Str(schedule.clone()));
+                put("maker", Json::Str(crate::schedule::maker(author.as_ref())));
+                put("text", Json::Str(text.clone()));
+                if let Some(skipped) = skipped {
+                    put("skipped", Json::Str(skipped.clone()));
                 }
             }
             Kind::ToolCall { reply, id, name } => {
@@ -1895,6 +1922,13 @@ impl Event {
                     None => None,
                     Some(word) => Some(Held::parse(&word).ok_or("held is not a reason")?),
                 },
+            },
+            Some("fired") => Kind::Fired {
+                delivery: string("delivery")?,
+                schedule: string("schedule")?,
+                author: crate::schedule::maker_from(&string("maker")?)?,
+                text: string("text")?,
+                skipped: optional("skipped")?,
             },
             Some("tool_call") => Kind::ToolCall {
                 reply: number("reply")?,
@@ -2299,7 +2333,9 @@ impl Conversation {
     /// conversation's, is already logged.
     pub fn delivered(&self, delivery: &str) -> bool {
         self.events.iter().any(|e| match &e.kind {
-            Kind::User { delivery: d, .. } | Kind::Message { delivery: d, .. } => d == delivery,
+            Kind::User { delivery: d, .. }
+            | Kind::Message { delivery: d, .. }
+            | Kind::Fired { delivery: d, .. } => d == delivery,
             _ => false,
         })
     }
@@ -2314,7 +2350,9 @@ impl Conversation {
         for event in &self.events {
             match &event.kind {
                 Kind::User { .. } if !running.is_empty() => {}
-                Kind::User { .. } | Kind::Message { held: None, .. } => users.push(event.seq),
+                Kind::User { .. }
+                | Kind::Message { held: None, .. }
+                | Kind::Fired { skipped: None, .. } => users.push(event.seq),
                 Kind::Started {
                     effect: Effect::Turn,
                     of,
@@ -3265,6 +3303,21 @@ pub mod tests {
             Kind::Retired {
                 kind: "snapshot".into(),
                 trees: vec![("/w/td".into(), "b".repeat(40))],
+            },
+            // Skipped, as an unskipped one would be given its turn at load.
+            Kind::Fired {
+                delivery: "d3".into(),
+                schedule: "0a1b2c3d".into(),
+                author: None,
+                text: "nightly \"check\"".into(),
+                skipped: Some("a turn was still running".into()),
+            },
+            Kind::Fired {
+                delivery: "d4".into(),
+                schedule: "0a1b2c3d".into(),
+                author: Some(Id::random().unwrap()),
+                text: "nightly".into(),
+                skipped: Some("the conversation was paused".into()),
             },
         ];
         let written = {

@@ -152,6 +152,17 @@ pub fn carried(before: &[Event], at: u64, tail: u64, summary: &str) -> String {
             let label = label.trim_start_matches('[').trim_end_matches(']');
             Some((e.seq, label.to_string(), text))
         }
+        Kind::Fired {
+            schedule,
+            author,
+            text,
+            skipped: None,
+            ..
+        } => {
+            let label = crate::client::fired_label(schedule, author.as_ref());
+            let label = label.trim_start_matches('[').trim_end_matches(']');
+            Some((e.seq, label.to_string(), text))
+        }
         _ => None,
     });
     if let Some((seq, source, text)) = first {
@@ -395,9 +406,14 @@ pub fn prunable(events: &[Event], protect: u64, minimum: u64) -> Vec<u64> {
                     content.len()
                 }
             }
-            Kind::User { text, .. } | Kind::Notification { text } | Kind::Message { text, .. } => {
-                text.len()
-            }
+            Kind::User { text, .. }
+            | Kind::Notification { text }
+            | Kind::Message { text, .. }
+            | Kind::Fired {
+                text,
+                skipped: None,
+                ..
+            } => text.len(),
             Kind::Ended { tail, .. } => tail.as_ref().map_or(0, String::len),
             Kind::Assistant {
                 content,

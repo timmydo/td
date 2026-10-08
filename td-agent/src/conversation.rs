@@ -1087,6 +1087,13 @@ impl Session {
                     text,
                     status,
                 } => self.message(delivery, from, role, text, status)?,
+                Down::Fire {
+                    delivery,
+                    schedule,
+                    author,
+                    text,
+                    skipped,
+                } => self.fire(delivery, schedule, author, text, skipped)?,
                 Down::Retry => self.retry()?,
                 Down::Pause { paused } => self.pause(paused)?,
                 Down::ClearTodo => self.clear_todo()?,
@@ -3423,10 +3430,15 @@ impl Session {
                 .events()
                 .iter()
                 .any(|event| matches!(event.kind, Kind::User { .. }))
-            && !self
-                .queue
-                .iter()
-                .any(|down| matches!(down, Down::User { .. } | Down::Message { .. } | Down::Retry))
+            && !self.queue.iter().any(|down| {
+                matches!(
+                    down,
+                    Down::User { .. }
+                        | Down::Message { .. }
+                        | Down::Fire { skipped: None, .. }
+                        | Down::Retry
+                )
+            })
             && !self.repeated(&remote, &said);
         if !wakes {
             self.done_with(&remote);
@@ -4042,10 +4054,15 @@ impl Session {
             && self.setup.as_ref().is_some_and(|(key, _)| key.is_ok())
             && !self.gone
             && self.ended.is_none()
-            && !self
-                .queue
-                .iter()
-                .any(|down| matches!(down, Down::User { .. } | Down::Message { .. } | Down::Retry));
+            && !self.queue.iter().any(|down| {
+                matches!(
+                    down,
+                    Down::User { .. }
+                        | Down::Message { .. }
+                        | Down::Fire { skipped: None, .. }
+                        | Down::Retry
+                )
+            });
         // What the jail said, its tool host maybe replaced: one bounded
         // line.
         let logged = self
@@ -5855,6 +5872,71 @@ impl Session {
         }
     }
 
+    /// A schedule's firing (DESIGN.md §3): logged once, as a message is,
+    /// and a turn started for it unless the window said why not or the
+    /// human has paused the conversation, when it is logged skipped and
+    /// starts none, now or on resuming. It is not a wake: the schedule's
+    /// own times bound it.
+    fn fire(
+        &mut self,
+        delivery: String,
+        schedule: String,
+        author: Option<Id>,
+        text: String,
+        skipped: Option<String>,
+    ) -> Result<(), String> {
+        if self.conversation.delivered(&delivery) {
+            self.send(&Up::Delivered { delivery });
+            return Ok(());
+        }
+        if text.len() > tools::MAX_MESSAGE || !self.conversation.has_room(text.len()) {
+            let reason = if text.len() > tools::MAX_MESSAGE {
+                format!("a message is at most {} bytes", tools::MAX_MESSAGE)
+            } else {
+                "the conversation's log is full".to_string()
+            };
+            self.send(&Up::Refused { delivery, reason });
+            return Ok(());
+        }
+        let skipped = skipped.or_else(|| {
+            self.conversation
+                .meta()
+                .paused
+                .then(|| "the conversation was paused".to_string())
+        });
+        let logged = self
+            .conversation
+            .append(Kind::Fired {
+                delivery: delivery.clone(),
+                schedule,
+                author,
+                text,
+                skipped: skipped.clone(),
+            })?
+            .clone();
+        let started = match skipped {
+            None => Some(
+                self.conversation
+                    .append(Kind::Started {
+                        effect: Effect::Turn,
+                        of: logged.seq,
+                    })?
+                    .clone(),
+            ),
+            Some(_) => None,
+        };
+        self.sync()?;
+        self.send(&Up::Event(logged));
+        if let Some(started) = &started {
+            self.send(&Up::Event(started.clone()));
+        }
+        self.send(&Up::Delivered { delivery });
+        match started {
+            Some(started) => self.turn(started.seq),
+            None => Ok(()),
+        }
+    }
+
     /// The human chose the conversation's model and effort, which apply
     /// from its next request: logged, then kept in `meta`.
     fn choose(&mut self, model: Option<String>, effort: Option<String>) -> Result<(), String> {
@@ -6594,10 +6676,17 @@ impl Session {
     fn classifier_state(&self, pending: &classifier::Pending) -> td_json::Json {
         use td_json::Json;
         let events = self.conversation.events();
+        // A schedule the person made delivers their own words.
         let human: Vec<String> = events
             .iter()
             .filter_map(|e| match &e.kind {
-                Kind::User { text, .. } => Some(text.clone()),
+                Kind::User { text, .. }
+                | Kind::Fired {
+                    text,
+                    author: None,
+                    skipped: None,
+                    ..
+                } => Some(text.clone()),
                 _ => None,
             })
             .collect();
@@ -6712,7 +6801,8 @@ impl Session {
     }
 
     /// What other conversations sent this one, the latest few, for the
-    /// classifier's untrusted field.
+    /// classifier's untrusted field: a schedule a model asked for among
+    /// them, which the person approved to run, not as their words.
     fn received(&self) -> Option<String> {
         let received: Vec<&str> = self
             .conversation
@@ -6720,7 +6810,12 @@ impl Session {
             .iter()
             .rev()
             .filter_map(|e| match &e.kind {
-                Kind::Message { text, .. } => Some(text.as_str()),
+                Kind::Message { text, .. }
+                | Kind::Fired {
+                    text,
+                    author: Some(_),
+                    ..
+                } => Some(text.as_str()),
                 _ => None,
             })
             .take(4)
@@ -6945,7 +7040,7 @@ fn take(queue: &mut VecDeque<Down>) -> Option<Down> {
         .or_else(|| {
             queue
                 .iter()
-                .position(|down| !matches!(down, Down::Message { .. }))
+                .position(|down| !matches!(down, Down::Message { .. } | Down::Fire { .. }))
                 .filter(|at| matches!(queue.get(*at), Some(Down::Pause { .. })))
         })
         .unwrap_or(0);

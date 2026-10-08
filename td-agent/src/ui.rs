@@ -355,6 +355,8 @@ pub enum Request {
     /// Compact the open conversation, with a focus for its summary
     /// (DESIGN.md §14).
     Compact(Option<String>),
+    /// A schedule command from the composer (DESIGN.md §3).
+    Schedule(crate::schedule::Command),
     /// The human's answer to `conversation`'s cold-resume card for turn
     /// `turn` (DESIGN.md §14).
     Resume {
@@ -2420,6 +2422,33 @@ impl App {
                     Err(e) => self.note(format!("the transcript refused a message: {e}")),
                 }
             }
+            Kind::Fired {
+                schedule,
+                author,
+                text,
+                skipped,
+                ..
+            } => {
+                let header = match &author {
+                    None => format!("schedule {schedule}"),
+                    Some(author) => {
+                        format!("schedule {schedule}, asked for by {}", self.named(author))
+                    }
+                };
+                let skipped = skipped.map(|why| format!("skipped: {why}"));
+                let pushed = Message::new(&header)
+                    .and_then(|m| m.text(&text))
+                    .and_then(|m| match &skipped {
+                        Some(skipped) => m.verdict(skipped, Tone::Neutral),
+                        None => Ok(m),
+                    })
+                    .map_err(|e| e.to_string())
+                    .and_then(|m| self.push_message(m));
+                match pushed {
+                    Ok(index) => self.messages.push((event.seq, index)),
+                    Err(e) => self.note(format!("the transcript refused a firing: {e}")),
+                }
+            }
             // Folded, a result says only that it failed, on one line; the
             // step's line says what was called.
             Kind::ToolResult {
@@ -2566,7 +2595,7 @@ impl App {
 
     /// Conversation `id` as a message's header names it: its title, short,
     /// and the start of its id.
-    fn named(&self, id: &Id) -> String {
+    pub fn named(&self, id: &Id) -> String {
         let short: String = id.as_str().chars().take(8).collect();
         match self.rows.iter().find(|r| &r.id == id) {
             Some(row) => {
@@ -3266,6 +3295,20 @@ impl App {
             ));
             return;
         }
+        // The schedule commands are the human's, not messages (§3), and
+        // the window's, whatever the open conversation's process is.
+        if let Some(command) = crate::schedule::command(&text) {
+            match command {
+                Ok(command) => {
+                    self.composer.fresh();
+                    self.apply_focus();
+                    self.requests.push(Request::Schedule(command));
+                    self.touch();
+                }
+                Err(why) => self.note(why),
+            }
+            return;
+        }
         if self.active_failed() {
             self.note(
                 "the conversation's process failed; open it again (Return on its row) to retry",
@@ -3753,6 +3796,35 @@ impl App {
             id.clone(),
             format!("p{number} output{command}"),
             &entries,
+        ) {
+            Ok(panel) => {
+                self.notes = Some(panel);
+                self.apply_focus();
+                self.touch();
+            }
+            Err(why) => self.note(why),
+        }
+    }
+
+    /// The schedules, listed read-only over the open conversation as its
+    /// process output is; with none open, said as notes.
+    pub fn show_schedules(&mut self, entries: &[(String, String)]) {
+        if entries.is_empty() {
+            self.note("there are no schedules");
+            return;
+        }
+        let Some(id) = self.active.clone() else {
+            for (header, _) in entries {
+                self.note(header.clone());
+            }
+            return;
+        };
+        match crate::notes::Panel::output(
+            self.surface,
+            body(self.surface),
+            id,
+            format!("{} schedules; /unschedule ID removes one", entries.len()),
+            entries,
         ) {
             Ok(panel) => {
                 self.notes = Some(panel);
@@ -5657,6 +5729,72 @@ pub mod tests {
         app.composer.fresh();
         app.menu_action(menu::Action::Compact);
         assert_eq!(app.take_requests(), [Request::Compact(None)]);
+    }
+
+    /// The schedule commands are the human's, asked of the session, not
+    /// sent; a malformed one is said and kept in the composer (§3).
+    #[test]
+    fn the_schedule_commands_are_asked_from_the_composer() {
+        let mut app = app();
+        app.add_row(row(9, 1));
+        app.set_active(id(9));
+        assert!(app
+            .composer
+            .insert("/schedule 0 9 * * 1-5 check the build")
+            .unwrap());
+        key(&mut app, "Return");
+        assert_eq!(
+            app.take_requests(),
+            [Request::Schedule(crate::schedule::Command::Add {
+                when: "0 9 * * 1-5".into(),
+                text: "check the build".into(),
+                catch_up: false,
+            })]
+        );
+        assert_eq!(app.composed(), "");
+        assert!(app.composer.insert("/schedules").unwrap());
+        key(&mut app, "Return");
+        assert_eq!(
+            app.take_requests(),
+            [Request::Schedule(crate::schedule::Command::List)]
+        );
+        assert!(app.composer.insert("/schedule 0 9 * * 8 never").unwrap());
+        key(&mut app, "Return");
+        assert!(app.take_requests().is_empty());
+        assert_eq!(app.composed(), "/schedule 0 9 * * 8 never");
+        assert!(app.log.last().is_some_and(|n| n.contains("outside 0 to 7")));
+        // Listed over the open conversation, read-only.
+        app.show_schedules(&[("schedule 0a1b2c3d".into(), "0 9 * * *\nto x".into())]);
+        assert!(app.notes.is_some());
+    }
+
+    /// A firing shows under its schedule, the conversation that asked for
+    /// it named, and a skipped one says why.
+    #[test]
+    fn a_firing_shows_in_the_transcript_with_why_it_was_skipped() {
+        let mut app = app();
+        app.add_row(row(3, 1));
+        app.update(
+            at(
+                1,
+                Kind::Fired {
+                    delivery: "d".into(),
+                    schedule: "0a1b2c3d".into(),
+                    author: Some(id(3)),
+                    text: "the nightly check".into(),
+                    skipped: Some("a turn was still running".into()),
+                },
+            ),
+            0,
+        );
+        let shown = text(&app);
+        for said in [
+            "schedule 0a1b2c3d, asked for by",
+            "the nightly check",
+            "skipped: a turn was still running",
+        ] {
+            assert!(shown.contains(said), "{said} in {shown}");
+        }
     }
 
     #[test]

@@ -104,6 +104,15 @@ fn message(
     }
 }
 
+/// A schedule's firing's label, with why it started no turn.
+fn fired(schedule: &str, author: Option<&crate::store::Id>, skipped: Option<&str>) -> String {
+    let label = client::fired_label(schedule, author);
+    match skipped {
+        None => label,
+        Some(why) => format!("{label} (it started no turn: {why})"),
+    }
+}
+
 /// An event's kind as the header names it.
 fn kind(event: &Event) -> &'static str {
     match &event.kind {
@@ -113,6 +122,7 @@ fn kind(event: &Event) -> &'static str {
             ..
         } => "orchestrator",
         Kind::Message { .. } => "conversation",
+        Kind::Fired { .. } => "schedule",
         Kind::Started { .. } => "started",
         Kind::Finished { .. } => "finished",
         Kind::Interrupted { .. } => "interrupted",
@@ -152,6 +162,16 @@ pub fn render(event: &Event) -> String {
             held,
             ..
         } => format!("{}\n{text}", message(from, *role, status.as_deref(), *held)),
+        Kind::Fired {
+            schedule,
+            author,
+            text,
+            skipped,
+            ..
+        } => format!(
+            "{}\n{text}",
+            fired(schedule, author.as_ref(), skipped.as_deref())
+        ),
         Kind::Started {
             effect: Effect::Turn,
             of,
@@ -296,6 +316,19 @@ fn compacted(pruned: &[u64], summary: Option<&crate::store::Summarize>) -> Strin
 fn searchable(event: &Event) -> Vec<(Searchable, String)> {
     match &event.kind {
         Kind::User { text, .. } => vec![(Searchable::User, text.clone())],
+        Kind::Fired {
+            schedule,
+            author,
+            text,
+            skipped,
+            ..
+        } => vec![(
+            Searchable::Schedule,
+            format!(
+                "{}\n{text}",
+                fired(schedule, author.as_ref(), skipped.as_deref())
+            ),
+        )],
         Kind::Message {
             from,
             role,

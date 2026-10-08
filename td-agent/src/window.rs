@@ -335,6 +335,11 @@ pub struct Session {
     stores: Option<crate::git::Service>,
     /// Deletions of repository workspaces' conversations under way.
     removals: Vec<Removal>,
+    /// The schedules (DESIGN.md §3), and when the soonest fires next:
+    /// at once when the window starts, so a time missed while it did not
+    /// run is handled first.
+    schedules: crate::schedule::Schedules,
+    next_fire: Option<u64>,
     /// The background store fetches (DESIGN.md §7, Keeping current):
     /// how often, when the next is due, the remotes whose fetch has not
     /// answered yet, and each base's commit as last fetched.
@@ -417,6 +422,7 @@ impl Session {
                         self.app.note(e);
                     }
                 }
+                Request::Schedule(command) => self.schedule(command),
                 Request::ClearTodo => {
                     if let Err(e) = self.supervisor.tell(&Down::ClearTodo) {
                         self.app.note(e);
@@ -1559,6 +1565,135 @@ impl Session {
         }
     }
 
+    /// Queues each schedule's firing that is due (DESIGN.md §3), which the
+    /// next poll delivers as it does any message. One to a conversation
+    /// the window sees running a turn, or paused, is delivered to be
+    /// logged skipped; one to a conversation archived, failed or gone
+    /// fires nothing.
+    fn fire(&mut self) {
+        let now = store::now();
+        if self.next_fire.is_none_or(|at| now < at) {
+            return;
+        }
+        let directory = self.app.directory();
+        let target = |id: &Id| crate::schedule::target(&directory, id);
+        match self.schedules.due(now, &target) {
+            Ok(due) => {
+                for due in due {
+                    let schedule = due.schedule.clone();
+                    if let Err(e) = self.post.fire(due) {
+                        eprintln!("td-agent: schedule {schedule} could not fire: {e}");
+                        self.app
+                            .note(format!("schedule {schedule} could not fire: {e}"));
+                    }
+                }
+                self.next_fire = self.schedules.soonest();
+            }
+            // Nothing fires that is not journaled first: tried again in a
+            // minute, said each time.
+            Err(e) => {
+                eprintln!("td-agent: the schedules could not be saved, so none fired: {e}");
+                self.app.note(format!(
+                    "the schedules could not be saved, so none fired: {e}"
+                ));
+                self.next_fire = now.checked_add(60);
+            }
+        }
+    }
+
+    /// The composer's schedule commands (DESIGN.md §3).
+    fn schedule(&mut self, command: crate::schedule::Command) {
+        use crate::schedule::Command;
+        let now = store::now();
+        match command {
+            Command::Add {
+                when,
+                text,
+                catch_up,
+            } => {
+                let Some(to) = self.app.active().cloned() else {
+                    self.app.note("no conversation is open");
+                    return;
+                };
+                match self
+                    .schedules
+                    .add(&when, to, text.clone(), catch_up, None, now)
+                {
+                    Ok(made) => {
+                        let next = self.schedules.upcoming(&made, now, 3).join(", ");
+                        let catching = if made.catch_up {
+                            "; a time missed while td-agent is not running fires once at startup"
+                        } else {
+                            ""
+                        };
+                        self.app.note(format!(
+                            "schedule {} made: {}, next {next}{catching}",
+                            made.id, made.written
+                        ));
+                        self.next_fire = self.schedules.soonest();
+                    }
+                    // The command goes back to the composer, as a message
+                    // that could not be sent does.
+                    Err(e) => {
+                        let catching = if catch_up { "catch-up " } else { "" };
+                        self.app.restore(
+                            &format!("/schedule {catching}{when} {text}"),
+                            format!("no schedule was made: {e}"),
+                        );
+                    }
+                }
+            }
+            Command::List => {
+                let directory = self.app.directory();
+                let entries: Vec<(String, String)> = self
+                    .schedules
+                    .list()
+                    .iter()
+                    .map(|s| {
+                        let to = match directory.iter().find(|e| e.id == s.to) {
+                            None => "a conversation since deleted, so it fires nothing".into(),
+                            Some(e) if e.archived => {
+                                format!("{}, archived, so it fires nothing", self.app.named(&s.to))
+                            }
+                            Some(e) if e.failed => format!(
+                                "{}, whose process failed, so it fires nothing until reopened",
+                                self.app.named(&s.to)
+                            ),
+                            Some(_) => self.app.named(&s.to),
+                        };
+                        let next = self.schedules.upcoming(s, now, 3);
+                        let next = match next.is_empty() {
+                            true => "never again".to_string(),
+                            false => next.join(", "),
+                        };
+                        let by = match &s.author {
+                            None => "you".to_string(),
+                            Some(author) => self.app.named(author),
+                        };
+                        let catching = if s.catch_up { "; catches up" } else { "" };
+                        // The expression in the body: a header has a bound
+                        // a long one passes.
+                        (
+                            format!("schedule {}", s.id),
+                            format!(
+                                "{}\nto {to}; made by {by}{catching}\nnext: {next}\n{}",
+                                s.written, s.text
+                            ),
+                        )
+                    })
+                    .collect();
+                self.app.show_schedules(&entries);
+            }
+            Command::Remove(id) => match self.schedules.remove(&id) {
+                Ok(removed) => {
+                    self.app.note(format!("schedule {} removed", removed.id));
+                    self.next_fire = self.schedules.soonest();
+                }
+                Err(e) => self.app.note(format!("no schedule was removed: {e}")),
+            },
+        }
+    }
+
     /// Asks the store thread to fetch, in the background, each admitted
     /// remote a live repository workspace uses, every `fetch_interval`
     /// (DESIGN.md §7, Keeping current); one still fetching is not asked
@@ -2126,6 +2261,7 @@ impl Handler for Session {
         self.hear();
         self.stored();
         self.refresh();
+        self.fire();
         self.control();
         self.serve();
         self.flow()
@@ -2423,6 +2559,11 @@ pub fn run(
         }
     };
     let ledger = Ledger::load(Some(state.root()), client.limits.day, store::now());
+    let (schedules, problem) = crate::schedule::Schedules::load(&state, td_civil::Zone::local());
+    if let Some(problem) = problem {
+        eprintln!("td-agent: the schedules: {problem}");
+        app.note(format!("the schedules: {problem}"));
+    }
     let (outbox, problems) = Outbox::load(&state);
     for problem in &problems {
         eprintln!("td-agent: the outbox: {problem}");
@@ -2464,6 +2605,8 @@ pub fn run(
         }),
         data,
         removals: Vec::new(),
+        schedules,
+        next_fire: Some(0),
         fetch_interval: config.fetch_interval(),
         next_refresh: Instant::now(),
         refreshing: Vec::new(),

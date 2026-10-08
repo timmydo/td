@@ -74,6 +74,18 @@ pub enum Down {
         text: String,
         status: Option<String>,
     },
+    /// A schedule's firing (DESIGN.md §3), which the receiver logs once
+    /// by its delivery id and takes between turns as a message: the
+    /// schedule, the conversation whose model asked for it (none when the
+    /// person made it), its text, and why it starts no turn, when the
+    /// window knows it will not.
+    Fire {
+        delivery: String,
+        schedule: String,
+        author: Option<Id>,
+        text: String,
+        skipped: Option<String>,
+    },
     /// The answer to a `Send` of the same id: queued, or why not.
     Sent { id: u64, refusal: Option<String> },
     /// The answer to a `Query` of the same id: each conversation's state
@@ -708,6 +720,25 @@ impl Down {
                     ("status".into(), optional(status)),
                 ],
             ),
+            Self::Fire {
+                delivery,
+                schedule,
+                author,
+                text,
+                skipped,
+            } => typed(
+                "fire",
+                vec![
+                    ("delivery".into(), Json::Str(delivery.clone())),
+                    ("schedule".into(), Json::Str(schedule.clone())),
+                    (
+                        "author".into(),
+                        optional(&author.as_ref().map(ToString::to_string)),
+                    ),
+                    ("text".into(), Json::Str(text.clone())),
+                    ("skipped".into(), optional(skipped)),
+                ],
+            ),
             Self::Sent { id, refusal } => typed(
                 "sent",
                 vec![
@@ -920,6 +951,22 @@ impl Down {
                     role: Role::parse(&string(&value, "role")?).ok_or("a malformed role")?,
                     text: string(&value, "text")?,
                     status: maybe(&value, "status")?,
+                })
+            }
+            Some("fire") => {
+                let delivery = string(&value, "delivery")?;
+                if !delivery_ok(&delivery) {
+                    return Err("a malformed delivery id".into());
+                }
+                Ok(Self::Fire {
+                    delivery,
+                    schedule: string(&value, "schedule")?,
+                    author: match maybe(&value, "author")? {
+                        None => None,
+                        Some(author) => Some(Id::parse(&author).ok_or("a malformed author")?),
+                    },
+                    text: string(&value, "text")?,
+                    skipped: maybe(&value, "skipped")?,
                 })
             }
             Some("sent") => Ok(Self::Sent {
@@ -1925,6 +1972,20 @@ mod tests {
                 role: Role::Orchestrator,
                 text: "go".into(),
                 status: None,
+            },
+            Down::Fire {
+                delivery: delivery_text(),
+                schedule: "0a1b2c3d".into(),
+                author: None,
+                text: "\u{1}".repeat(crate::tools::MAX_MESSAGE),
+                skipped: None,
+            },
+            Down::Fire {
+                delivery: delivery_text(),
+                schedule: "0a1b2c3d".into(),
+                author: Some(other.clone()),
+                text: "check".into(),
+                skipped: Some("a turn was running".into()),
             },
             Down::Sent {
                 id: 1,

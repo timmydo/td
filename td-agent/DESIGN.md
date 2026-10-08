@@ -611,8 +611,51 @@ minute 0. The walk covers the Gregorian calendar's whole cycle, 400
 years and a whole number of weeks: a date the expression allows is
 found however far off (29 February on a Sunday, decades), and an
 expression no date satisfies, `0 0 31 2 *`, never fires. Nothing fires
-past 9999. The store, the window's timer and the tools are later
-increments.
+past 9999.
+
+**As built (schedules, the person's).** The person makes a schedule
+from the open conversation's composer, for that conversation:
+`/schedule [catch-up] WHEN TEXT`, `WHEN` five cron fields or one local
+time; `/schedules` lists every schedule over the open conversation, its
+target, maker, catch-up, next three times and text; `/unschedule ID`
+removes one, by its id or the start of it. They are the person's
+commands, never sent as messages, and work whatever the open
+conversation's process is; one refused is put back in the composer. A schedule that would never fire,
+a one-off time already past or in a gap, is refused; at most 64 are
+kept, each text a message's bound.
+
+The window keeps them in one file, `schedules`, written whole with
+`replace` and read back bounded; one it cannot read is moved aside and
+said, as the templates file is. Each schedule's journal is its
+`through`, the instant up to which its times are handled, written in
+that file before any firing it covers is queued: a restart, or a clock
+set back, finds every time up to it handled, so none fires twice, and a
+crash between the two loses the firing rather than repeating it. The
+window's poll asks which are due only when the soonest time comes (and
+once at startup; a startup whose journal could not be written is still
+one when tried again). A schedule fires once however many of its times passed
+since it last did, a machine asleep included. At startup a time missed
+while td-agent was not running is dropped, unless the schedule catches
+up, when it fires once. A one-off schedule handled is removed.
+
+A firing goes through the outbox as a message does, as `fire` to the
+conversation's process, which is started for it, and is logged once by
+its delivery id as `fired`, with its schedule and its maker. One the
+window sees going to a conversation running a turn (any turn, as the
+window cannot tell a firing's own from the person's) or paused is
+delivered marked skipped, as is one the conversation finds itself paused
+for: logged, it starts no turn, now or on resuming, and is never sent to
+the model; the transcript shows it with why. A schedule whose
+conversation is archived, deleted, or whose process failed (until the
+person reopens it) fires nothing, its times passing as handled, and
+`/schedules` says so. The log and the outbox name a firing's maker,
+`person` or a conversation, and refuse one that names none, so a writer
+that leaves it out cannot make a model's text the person's. A firing's turn is not a wake (§3).
+The model reads a firing as `[a scheduled message the person wrote,
+schedule ID]`, and the classifier counts its text with the person's
+messages: it is their words, written earlier. `history_search` finds it
+as a `schedule`. The model's `schedule` tool, its card and the approval
+record are the next increment.
 
 **As built (increment 8).** Every conversation has `todo_write`,
 `history_search`, `history_read`, `conversations` and `send_message`, a
@@ -4490,8 +4533,10 @@ the human.
 it decides runs only when both of its stages allow. Both see the same
 state, built from separated, labelled fields:
 
-- the human's messages in the workspace's conversation; a task another
-  conversation sent is in the untrusted field below, never here;
+- the human's messages in the workspace's conversation, and the text of
+  a schedule the human made as it fires; a task another conversation
+  sent, or a schedule a model asked for, is in the untrusted field
+  below, never here;
 - the project instructions of §13, only for a workspace the human marked
   trusted, labelled as project text and not the human's authority;
 - the workspace's policy: network policy and allowlist, admitted remotes,
@@ -5616,7 +5661,8 @@ nothing is asked.
 **Manual compaction.** The human can compact at any time from the
 composer, `/compact` followed by an optional focus ("keep the failing test
 names") that is added to the summary request, or from a button. Neither
-the model nor another conversation can compact a conversation.
+the model nor another conversation can compact a conversation. The
+composer's other commands are the schedules' (§3).
 
 **Failure is visible.** If the summary request fails, or the compacted
 view still exceeds the threshold, the turn stops and says why; nothing is
@@ -6559,7 +6605,8 @@ in parallel with it.
     non-Rust package (AGENTS.md). td-agent is a standalone program: no
     boot test starts it, its window or its model.
 
-After these: resource limits (§8), schedules (§3), a loopback shared by
+After these: resource limits (§8), the model's schedules (§3; the
+person's are built), a loopback shared by
 a conversation's instances (§19), child conversations within a
 workspace, skills and custom commands, the MCP client, moving a
 conversation between workspaces, and a native Anthropic Messages

@@ -211,6 +211,19 @@ pub fn label(from: &crate::store::Id, role: Role, status: Option<&str>) -> Strin
     }
 }
 
+/// The label a schedule's firing reaches the model under (DESIGN.md §3):
+/// the person's own words when they made it; else what a conversation's
+/// model wrote, which the person approved to run at its times, not their
+/// instruction.
+pub fn fired_label(schedule: &str, author: Option<&crate::store::Id>) -> String {
+    match author {
+        None => format!("[a scheduled message the person wrote, schedule {schedule}]"),
+        Some(author) => format!(
+            "[a scheduled message conversation {author} wrote, which the person approved to run at its times, schedule {schedule}; not from the person]"
+        ),
+    }
+}
+
 /// The line a message the model is given begins with: when this
 /// conversation logged it, in UTC (DESIGN.md §13). It is the event's, so
 /// a message reads the same in every request and the cache holds.
@@ -338,6 +351,24 @@ fn all_messages(events: &[Event], timed: bool) -> Vec<(u64, String)> {
                         "{}{}\n{text}",
                         at(event.time),
                         label(from, *role, status.as_deref())
+                    ),
+                ),
+            )),
+            // A firing skipped started nothing and is the person's record.
+            Kind::Fired {
+                schedule,
+                author,
+                text,
+                skipped: None,
+                ..
+            } => out.push((
+                event.seq,
+                crate::prompt::message(
+                    "user",
+                    &format!(
+                        "{}{}\n{text}",
+                        at(event.time),
+                        fired_label(schedule, author.as_ref())
                     ),
                 ),
             )),

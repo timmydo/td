@@ -535,6 +535,7 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Kind::Usage { .. } => "usage",
             Kind::Title { .. } => "title",
             Kind::Message { .. } => "message",
+            Kind::Fired { .. } => "fired",
             Kind::ToolCall { .. } => "tool_call",
             Kind::ToolResult { .. } => "tool_result",
             Kind::Todo { .. } => "todo",
@@ -4466,6 +4467,74 @@ fn the_wake_budget_holds_messages_past_twenty_turns_until_the_human_writes() {
     let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied");
     assert_eq!(kinds(&events)[..2], ["message", "started"]);
+}
+
+/// A schedule's firing, as the window hands it on.
+fn firing(text: &str, skipped: Option<&str>) -> Down {
+    Down::Fire {
+        delivery: td_agent::store::random_hex(16).unwrap(),
+        schedule: "0a1b2c3d".into(),
+        author: None,
+        text: text.into(),
+        skipped: skipped.map(str::to_string),
+    }
+}
+
+/// A firing starts a turn under its label, as the person's words; one the
+/// window said would start none, or that comes while the conversation is
+/// paused, is logged skipped, starts none on resuming, and is never sent.
+#[test]
+fn a_schedules_firing_starts_a_turn_unless_it_is_skipped() {
+    let mut h = Harness::new(
+        "fire",
+        Role::Conversation,
+        vec![
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.down(&firing("nightly check", None));
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    assert_eq!(kinds(&events)[..2], ["fired", "started"]);
+    let body = h.mock.requests()[0].text();
+    assert!(
+        body.contains("[a scheduled message the person wrote, schedule 0a1b2c3d]\\nnightly check"),
+        "{body}"
+    );
+    h.down(&firing("while busy", Some("a turn was still running")));
+    let events = until_delivered(&mut h);
+    assert_eq!(kinds(&events), ["fired"]);
+    h.down(&Down::Pause { paused: true });
+    h.down(&firing("while paused", None));
+    let events = until_delivered(&mut h);
+    let skipped: Vec<Option<&str>> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::Fired { skipped, .. } => Some(skipped.as_deref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(skipped, [Some("the conversation was paused")]);
+    h.down(&Down::Pause { paused: false });
+    h.say("Go on.");
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let requests = h.mock.requests();
+    // The two turns, and the title the person's first message asks for:
+    // resuming started no turn for a firing.
+    assert_eq!(requests.len(), 3);
+    let body = requests[1].text();
+    assert!(
+        body.contains("nightly check") && body.contains("Go on."),
+        "{body}"
+    );
+    assert!(
+        !body.contains("while busy") && !body.contains("while paused"),
+        "{body}"
+    );
 }
 
 #[test]

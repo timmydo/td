@@ -28,19 +28,36 @@ const MAX_FILE: u64 = 256 * 1024;
 /// The most conversations a `States` answer names.
 const MAX_STATES: usize = 1000;
 
-/// A message queued for its receiver. Its `role` and `status` are a
-/// sender's from before there were only conversations, which an outbox
-/// may still hold: the orchestrator, or a report's status.
+/// A message queued for its receiver.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Queued {
     pub to: Id,
     pub delivery: String,
-    pub from: Id,
-    pub role: Role,
+    pub source: Source,
     pub text: String,
-    pub status: Option<String>,
     /// Its place in the outbox's order.
     order: u64,
+}
+
+/// Where a queued message comes from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Source {
+    /// Another conversation. Its `role` and `status` are a sender's from
+    /// before there were only conversations, which an outbox may still
+    /// hold: the orchestrator, or a report's status.
+    Conversation {
+        from: Id,
+        role: Role,
+        status: Option<String>,
+    },
+    /// A schedule's firing (DESIGN.md §3): the conversation whose model
+    /// asked for it, none when the person made it, and why it starts no
+    /// turn, when the window knew it would not.
+    Schedule {
+        schedule: String,
+        author: Option<Id>,
+        skipped: Option<String>,
+    },
 }
 
 impl Queued {
@@ -49,13 +66,55 @@ impl Queued {
     }
 
     fn down(&self) -> Down {
-        Down::Message {
-            delivery: self.delivery.clone(),
-            from: self.from.clone(),
-            role: self.role,
-            text: self.text.clone(),
-            status: self.status.clone(),
+        match &self.source {
+            Source::Conversation { from, role, status } => Down::Message {
+                delivery: self.delivery.clone(),
+                from: from.clone(),
+                role: *role,
+                text: self.text.clone(),
+                status: status.clone(),
+            },
+            Source::Schedule {
+                schedule,
+                author,
+                skipped,
+            } => Down::Fire {
+                delivery: self.delivery.clone(),
+                schedule: schedule.clone(),
+                author: author.clone(),
+                text: self.text.clone(),
+                skipped: skipped.clone(),
+            },
         }
+    }
+
+    fn json(&self) -> Json {
+        let mut pairs = Vec::new();
+        match &self.source {
+            Source::Conversation { from, role, status } => {
+                pairs.push(("from".into(), Json::Str(from.to_string())));
+                pairs.push(("role".into(), Json::Str(role.word().into())));
+                if let Some(status) = status {
+                    pairs.push(("status".into(), Json::Str(status.clone())));
+                }
+            }
+            Source::Schedule {
+                schedule,
+                author,
+                skipped,
+            } => {
+                pairs.push(("schedule".into(), Json::Str(schedule.clone())));
+                pairs.push((
+                    "maker".into(),
+                    Json::Str(crate::schedule::maker(author.as_ref())),
+                ));
+                if let Some(skipped) = skipped {
+                    pairs.push(("skipped".into(), Json::Str(skipped.clone())));
+                }
+            }
+        }
+        pairs.push(("text".into(), Json::Str(self.text.clone())));
+        Json::Obj(pairs)
     }
 }
 
@@ -122,13 +181,36 @@ impl Outbox {
 
     /// Queues a message, written whole before this returns.
     pub fn post(&mut self, to: Id, from: Id, text: String) -> Result<(), String> {
+        self.queue(
+            to,
+            Source::Conversation {
+                from,
+                role: Role::Conversation,
+                status: None,
+            },
+            text,
+        )
+    }
+
+    /// Queues a schedule's firing, written whole before this returns.
+    pub fn fire(&mut self, due: crate::schedule::Due) -> Result<(), String> {
+        self.queue(
+            due.to,
+            Source::Schedule {
+                schedule: due.schedule,
+                author: due.author,
+                skipped: due.skipped,
+            },
+            due.text,
+        )
+    }
+
+    fn queue(&mut self, to: Id, source: Source, text: String) -> Result<(), String> {
         let message = Queued {
             delivery: store::random_hex(16)?,
             to,
-            from,
-            role: Role::Conversation,
+            source,
             text,
-            status: None,
             order: self.next,
         };
         let dir = self.dir.join(message.to.as_str());
@@ -141,19 +223,7 @@ impl Outbox {
             .create(&dir)
             .and_then(|()| std::fs::File::open(&self.dir)?.sync_all())
             .map_err(|e| format!("{}: {e}", dir.display()))?;
-        let mut pairs = vec![
-            ("from".into(), Json::Str(message.from.to_string())),
-            ("role".into(), Json::Str(message.role.word().into())),
-            ("text".into(), Json::Str(message.text.clone())),
-        ];
-        if let Some(status) = &message.status {
-            pairs.push(("status".into(), Json::Str(status.clone())));
-        }
-        store::replace(
-            &dir,
-            &message.file(),
-            Json::Obj(pairs).to_string().as_bytes(),
-        )?;
+        store::replace(&dir, &message.file(), message.json().to_string().as_bytes())?;
         self.next = self.next.saturating_add(1);
         self.queued.push(message);
         Ok(())
@@ -202,16 +272,26 @@ fn read(to: &Id, name: &str, path: &std::path::Path) -> Result<Queued, String> {
     let bytes = store::read_bounded(path, MAX_FILE).map_err(|e| e.to_string())?;
     let value = td_json::parse_slice(&bytes).map_err(|e| e.to_string())?;
     let text = |name: &str| value.get(name).and_then(Json::as_str);
+    let source = match text("schedule") {
+        Some(schedule) => Source::Schedule {
+            schedule: schedule.to_string(),
+            author: crate::schedule::maker_from(text("maker").ok_or("no maker")?)?,
+            skipped: text("skipped").map(str::to_string),
+        },
+        None => Source::Conversation {
+            from: text("from").and_then(Id::parse).ok_or("no sender")?,
+            role: text("role").and_then(Role::parse).ok_or("no role")?,
+            status: text("status").map(str::to_string),
+        },
+    };
     Ok(Queued {
         to: to.clone(),
         delivery: delivery.to_string(),
-        from: text("from").and_then(Id::parse).ok_or("no sender")?,
-        role: text("role").and_then(Role::parse).ok_or("no role")?,
+        source,
         text: text("text")
             .filter(|t| t.len() <= tools::MAX_MESSAGE)
             .ok_or("no text, or one past a message's bound")?
             .to_string(),
-        status: text("status").map(str::to_string),
         order,
     })
 }
@@ -328,9 +408,19 @@ impl Post {
             }
             Update::Up(Up::Delivered { delivery }) => self.outbox.delivered(from, delivery).err(),
             Update::Undeliverable { delivery, reason } => {
-                let refused = format!(
-                    "conversation {from} refused a message from another conversation: {reason}"
-                );
+                let what = match self
+                    .outbox
+                    .queued()
+                    .iter()
+                    .find(|q| &q.to == from && &q.delivery == delivery)
+                    .map(|q| &q.source)
+                {
+                    Some(Source::Schedule { schedule, .. }) => {
+                        format!("schedule {schedule}'s firing")
+                    }
+                    _ => "a message from another conversation".to_string(),
+                };
+                let refused = format!("conversation {from} refused {what}: {reason}");
                 Some(match self.outbox.delivered(from, delivery) {
                     Ok(()) => refused,
                     Err(e) => format!("{refused}; removing it from the outbox: {e}"),
@@ -338,6 +428,19 @@ impl Post {
             }
             _ => None,
         }
+    }
+
+    /// Queues a schedule's firing, as many as a receiver holds undelivered
+    /// at most, as messages are.
+    pub fn fire(&mut self, due: crate::schedule::Due) -> Result<(), String> {
+        if self.outbox.count(&due.to) >= tools::MAX_UNDELIVERED {
+            return Err(format!(
+                "conversation {} already holds {} messages undelivered",
+                due.to,
+                tools::MAX_UNDELIVERED
+            ));
+        }
+        self.outbox.fire(due)
     }
 
     /// Hands every queued message to its receiver's process, starting one
@@ -419,10 +522,14 @@ mod tests {
         let (mut again, problems) = Outbox::load(&state);
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(again.queued(), outbox.queued());
-        assert!(again
-            .queued()
-            .iter()
-            .all(|q| q.role == Role::Conversation && q.status.is_none()));
+        assert!(again.queued().iter().all(|q| matches!(
+            q.source,
+            Source::Conversation {
+                role: Role::Conversation,
+                status: None,
+                ..
+            }
+        )));
         assert_eq!(again.count(&id(1)), 2);
         let first = again.queued()[0].delivery.clone();
         again.delivered(&id(1), &first).unwrap();
@@ -433,6 +540,41 @@ mod tests {
         let texts: Vec<&str> = third.queued().iter().map(|q| q.text.as_str()).collect();
         assert_eq!(texts, ["second \"quoted\"", "third"]);
         assert_eq!(third.next, 4, "orders keep rising");
+    }
+
+    /// A schedule's firing is queued as a message is, and read back whole
+    /// to be delivered as a firing.
+    #[test]
+    fn a_firing_is_queued_and_read_back_as_one() {
+        let scratch = Scratch::new("firing");
+        let state = scratch.state();
+        receivers(&state, &[1]);
+        let (mut outbox, _) = Outbox::load(&state);
+        for (author, skipped) in [(None, None), (Some(id(2)), Some("paused".to_string()))] {
+            outbox
+                .fire(crate::schedule::Due {
+                    schedule: "0a1b2c3d".into(),
+                    to: id(1),
+                    text: "check".into(),
+                    author,
+                    skipped,
+                })
+                .unwrap();
+        }
+        let (again, problems) = Outbox::load(&state);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(again.queued(), outbox.queued());
+        let downs: Vec<Down> = again.queued().iter().map(Queued::down).collect();
+        assert!(matches!(
+            &downs[0],
+            Down::Fire { schedule, author: None, text, skipped: None, .. }
+                if schedule == "0a1b2c3d" && text == "check"
+        ));
+        assert!(matches!(
+            &downs[1],
+            Down::Fire { author: Some(author), skipped: Some(why), .. }
+                if *author == id(2) && why == "paused"
+        ));
     }
 
     /// A message an outbox from before peers holds, from the orchestrator
@@ -453,8 +595,14 @@ mod tests {
         let (outbox, problems) = Outbox::load(&state);
         assert!(problems.is_empty(), "{problems:?}");
         let queued = &outbox.queued()[0];
-        assert_eq!(queued.role, Role::Orchestrator);
-        assert_eq!(queued.status.as_deref(), Some("done"));
+        assert_eq!(
+            queued.source,
+            Source::Conversation {
+                from: id(2),
+                role: Role::Orchestrator,
+                status: Some("done".into())
+            }
+        );
         assert_eq!(outbox.next, 8);
     }
 

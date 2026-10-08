@@ -195,4 +195,22 @@ mod tests {
         events.push(ended(4, Some(Held::Budget)));
         assert!(told(&events));
     }
+
+    /// A schedule's firing is bounded by its own times: its turn is no
+    /// wake.
+    #[test]
+    fn a_firings_turn_is_not_a_wake() {
+        let fired = event(
+            1,
+            1,
+            Kind::Fired {
+                delivery: "d".into(),
+                schedule: "0a1b2c3d".into(),
+                author: Some(Id::parse(&"a".repeat(32)).unwrap()),
+                text: "x".into(),
+                skipped: None,
+            },
+        );
+        assert_eq!(spent(&[fired, started(2, 1, 1)]), 0);
+    }
 }
