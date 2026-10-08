@@ -1654,6 +1654,22 @@ fn the_scrollbars_end_is_the_last_page_at_any_height() {
     }
 }
 
+/// An owner focuses a message itself, its header revealed as
+/// `PreviousMessage` reveals one; one past the list is refused.
+#[test]
+fn focus_on_focuses_and_reveals_a_message() {
+    let mut list = long(1);
+    assert!(list.following());
+    assert!(list.focus_on(0));
+    assert_eq!(list.focused_message(), Some(0));
+    assert_eq!(first(&list), "H0");
+    assert!(!list.focus_on(0), "nothing changed");
+    assert!(!list.focus_on(30));
+    assert_eq!(list.focused_message(), Some(0));
+    assert!(list.focus_on(29));
+    assert!(rows(&list).contains(&"H29".to_string()));
+}
+
 /// A thumb drawn at the track's start while the view is a little past
 /// the top still reaches the top when its edge is dragged there.
 #[test]

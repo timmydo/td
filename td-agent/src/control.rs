@@ -72,6 +72,18 @@ pub const BINDINGS: &[Binding] = &[
         help: "Open the conversation below the open one.",
     },
     Binding {
+        name: "previous-yours",
+        chord: Some("C-Up"),
+        arguments: "",
+        help: "Show your message before the transcript's focused one, or your last.",
+    },
+    Binding {
+        name: "next-yours",
+        chord: Some("C-Down"),
+        arguments: "",
+        help: "Show your message after the transcript's focused one.",
+    },
+    Binding {
         name: "send",
         chord: Some("C-Return"),
         arguments: "",

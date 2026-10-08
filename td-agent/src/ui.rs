@@ -71,6 +71,8 @@ const COMPOSER_ROWS: usize = 6;
 const TODO_ROWS: usize = 12;
 /// The most rows the queued messages take.
 const QUEUED_ROWS: usize = 3;
+/// The header of the person's own messages in the transcript.
+const YOU: &str = "you";
 /// The split's child minima, in logical pixels.
 const LIST_MIN: u32 = 160;
 const CONVERSATION_MIN: u32 = 320;
@@ -1974,7 +1976,7 @@ impl App {
         };
         match event.kind {
             Kind::User { text, .. } => {
-                let pushed = Message::new("you")
+                let pushed = Message::new(YOU)
                     .and_then(|m| m.text(&text))
                     .map_err(|e| e.to_string())
                     .and_then(|m| self.push_message(m));
@@ -3065,6 +3067,33 @@ impl App {
         if self.active.as_ref() != Some(&id) || self.active_failed() {
             self.set_active(id.clone());
             self.requests.push(Request::Open(id));
+        }
+    }
+
+    /// Focuses and shows the person's message before the transcript's
+    /// focused one, or after it, as `C-Up` and `C-Down` do: from the end
+    /// with none focused, so the first `C-Up` finds the last. The
+    /// keyboard stays where it was.
+    fn jump_to_yours(&mut self, back: bool) {
+        let len = self.transcript.len();
+        let from = self.transcript.focused_message();
+        let yours = |index: usize| {
+            self.transcript
+                .message(index)
+                .is_some_and(|message| message.label() == YOU)
+        };
+        let found = if back {
+            (0..from.unwrap_or(len)).rev().find(|&index| yours(index))
+        } else {
+            (from.map_or(len, |focused| focused + 1)..len).find(|&index| yours(index))
+        };
+        match found {
+            Some(index) => {
+                self.transcript.focus_on(index);
+                self.touch();
+            }
+            None if back => self.note("no earlier message of yours"),
+            None => self.note("no later message of yours"),
         }
     }
 
@@ -4857,6 +4886,8 @@ impl App {
             }
             "C-PageUp" => return self.switch(-1),
             "C-PageDown" => return self.switch(1),
+            "C-Up" => return self.jump_to_yours(true),
+            "C-Down" => return self.jump_to_yours(false),
             "C-Return" if !repeat => return self.send(),
             "C-r" if !repeat => {
                 if self.meter.retry {
@@ -6382,6 +6413,63 @@ pub mod tests {
         app.set_queued(Vec::new());
         assert!(app.queued_lines().is_empty());
         assert_eq!(app.regions.unwrap().transcript.height, before);
+    }
+
+    /// C-Up and C-Down show the person's own messages in turn, from the
+    /// end, passing over the rest, and say when there is none further;
+    /// the keyboard stays in the composer.
+    #[test]
+    fn c_up_and_c_down_step_through_the_persons_messages() {
+        let mut app = app();
+        app.update(user(1, "first"), 0);
+        app.update(
+            at(
+                2,
+                Kind::Notice {
+                    text: "between".into(),
+                },
+            ),
+            0,
+        );
+        app.update(user(3, "second"), 0);
+        app.update(
+            at(
+                4,
+                Kind::Notice {
+                    text: "after".into(),
+                },
+            ),
+            0,
+        );
+        let focus = app.focus();
+        let focused = |app: &App| {
+            app.transcript()
+                .focused_message()
+                .and_then(|index| app.transcript().message_text(index).ok())
+                .map(|text| text.to_string())
+        };
+        key(&mut app, "C-Down");
+        assert_eq!(app.notice(), Some("no later message of yours"));
+        key(&mut app, "C-Up");
+        assert!(focused(&app).unwrap().contains("second"));
+        key(&mut app, "C-Up");
+        assert!(focused(&app).unwrap().contains("first"));
+        key(&mut app, "C-Up");
+        assert_eq!(app.notice(), Some("no earlier message of yours"));
+        assert!(focused(&app).unwrap().contains("first"));
+        key(&mut app, "C-Down");
+        assert!(focused(&app).unwrap().contains("second"));
+        key(&mut app, "C-Down");
+        assert_eq!(app.notice(), Some("no later message of yours"));
+        assert_eq!(app.focus(), focus);
+        // From a focused message not the person's: the nearest of theirs
+        // each way.
+        app.transcript.focus_on(1);
+        key(&mut app, "C-Up");
+        assert!(focused(&app).unwrap().contains("first"));
+        app.transcript.focus_on(1);
+        key(&mut app, "C-Down");
+        assert!(focused(&app).unwrap().contains("second"));
     }
 
     /// Escape is the window's while a turn runs, asking to interrupt it,

@@ -740,10 +740,16 @@ is the list's own, under the same raster and typeface contracts as the
 toolkit's other widgets.
 
 **Keys.** `C-n` new conversation, through the template chooser of §7,
-`C-PageUp`/`C-PageDown` previous/next conversation, `Escape` interrupt
-the running turn. A card never takes focus by itself, so a `y` typed
-into the composer as a card appears answers nothing; the human focuses
-the card (`C-Space` or the pointer) and then answers `y` or `n`.
+`C-PageUp`/`C-PageDown` previous/next conversation, `C-Up`/`C-Down` the
+person's own message before or after the transcript's focused one
+(from the end with none focused, so the first `C-Up` shows the last;
+the keyboard stays where it was, a note says when there is none, and
+the focus stays put past the last, `End` in the transcript going back
+to the end; driven as `previous-yours` and `next-yours`), `Escape`
+interrupt the running turn. A card never takes focus by itself, so a
+`y` typed into the composer as a card appears answers nothing; the
+human focuses the card (`C-Space` or the pointer) and then answers `y`
+or `n`.
 
 The window is operable through td-ui's driven control socket (td-ui/DESIGN.md,
 "The semantic seam"), which is how the native compositor tests and an

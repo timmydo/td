@@ -1650,7 +1650,8 @@ fold pressed at the end keeping its title where it was; the scrollbar's
 thumb at the foot at the end, at the top at the start and the whole
 track disabled when everything fits, and dragged, jumped to, released
 and cancelled; `NextMessage` and
-`PreviousMessage` focusing and revealing a header, and `Toggle` folding
+`PreviousMessage` focusing and revealing a header, as `focus_on` does
+for its owner (one past the list refused), and `Toggle` folding
 the focused message and revealing its header; a drag past the view
 scrolling a row a motion and asking a repaint when only the view moved;
 a drag across a header into the next message copying its text with a
@@ -3097,7 +3098,10 @@ message, on the copy button it copies the message whole, and on an
 action button it copies nothing and `Outcome` is `Action` with the
 message's index, at the press as a copy is. The list has no key for
 an action: its owner binds one if it wants, on `focused_message`, as
-td-agent does. A press on a title row folds the section.
+td-agent does. An owner moves the focus itself with `focus_on`, which
+reveals the message's header as `NextMessage` does; td-agent's keys to
+the person's own messages use it. A press on a title row folds the
+section.
 
 Copies go through the window's `Clipboard` (see "Widget window") while
 the event is delivered, the button's at its press and the keys' at

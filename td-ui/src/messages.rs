@@ -1583,6 +1583,20 @@ impl Controller {
         Self::offer(self.message_text(index).map(Some), clipboard)
     }
 
+    /// Focuses message `index` and scrolls so its header is shown, as
+    /// `NextMessage` and `PreviousMessage` do; false when there is no
+    /// such message, or nothing changed.
+    pub fn focus_on(&mut self, index: usize) -> bool {
+        if index >= self.messages.len() {
+            return false;
+        }
+        let changed = self.focus != Some(index);
+        self.focus = Some(index);
+        let top = self.top;
+        self.reveal(index);
+        changed || top != self.top
+    }
+
     /// Scrolls so a message's header is shown.
     fn reveal(&mut self, index: usize) {
         let Some(&header) = self.first_line.get(index) else {
