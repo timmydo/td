@@ -159,6 +159,9 @@ pub struct Tokens {
     pub reasoning: u64,
 }
 
+/// The day's limit's name, which begins the window's refusal past it.
+pub const DAY: &str = "max_cost_per_day";
+
 /// The three spending limits, each `None` when configured `none`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
@@ -168,10 +171,10 @@ pub struct Limits {
 }
 
 impl Default for Limits {
-    /// The shipped defaults: 1, 10 and 25 credits (DESIGN.md §15).
+    /// The shipped defaults: 5, 10 and 25 credits (DESIGN.md §15).
     fn default() -> Self {
         Self {
-            turn: Some(ONE),
+            turn: Some(5 * ONE),
             conversation: Some(10 * ONE),
             day: Some(25 * ONE),
         }

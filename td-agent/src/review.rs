@@ -259,6 +259,7 @@ pub fn head(plan: &Plan, client: &Client) -> String {
         effort: plan.effort.as_deref(),
         client,
         cache: false,
+        tools: true,
     })
 }
 

@@ -138,7 +138,7 @@ impl Ledger {
         now: u64,
     ) -> Result<(), String> {
         self.roll(now);
-        cost::within("max_cost_per_day", self.limit, self.spent, amount)?;
+        cost::within(cost::DAY, self.limit, self.spent, amount)?;
         self.spent = self.spent.saturating_add(amount);
         if let Err(e) = self.save() {
             self.spent = self.spent.saturating_sub(amount);

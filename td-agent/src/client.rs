@@ -69,6 +69,10 @@ pub struct Params<'a> {
     /// Whether an Anthropic model is asked to cache the prompt: a turn's
     /// is resent, a review's never is.
     pub cache: bool,
+    /// Whether the model may call the tools the prefix defines; when
+    /// not, `tool_choice` is `none`, the tools still defined so that the
+    /// system prompt and tools stay cached (DESIGN.md §5).
+    pub tools: bool,
 }
 
 /// `provider`: never routed to a provider that would drop a parameter,
@@ -111,6 +115,9 @@ pub fn head(params: &Params<'_>) -> String {
             "reasoning".into(),
             Json::Obj(vec![("effort".into(), Json::Str(effort.into()))]),
         ));
+    }
+    if !params.tools {
+        pairs.push(("tool_choice".into(), Json::Str("none".into())));
     }
     pairs.push(("provider".into(), provider(params.client)));
     // Anthropic's models cache only where asked (DESIGN.md §5).
@@ -1102,6 +1109,7 @@ mod tests {
             effort: Some("medium"),
             client: &client,
             cache: true,
+            tools: true,
         };
         assert_eq!(
             head(&params),
@@ -1120,6 +1128,7 @@ mod tests {
             effort: None,
             client: &allow,
             cache: true,
+            tools: true,
         };
         assert_eq!(
             head(&params),

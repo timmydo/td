@@ -176,8 +176,19 @@ const DEFAULT: &str = "`model` or the default model (Conversation \u{2192} Defau
 /// message queued, the conversations' states.
 const ANSWER_WAIT: Duration = Duration::from_secs(30);
 /// The most steps one turn takes, each a request answered by a reply; a
-/// rate-limited request asked again is the same step (DESIGN.md §5).
-pub const MAX_STEPS: usize = 40;
+/// rate-limited request asked again is the same step (DESIGN.md §5). A
+/// guard against a model that never stops; the spending limits are the
+/// budget.
+pub const MAX_STEPS: usize = 500;
+/// The most a turn's last request, asking where the work stands once a
+/// limit is reached, may reply with (DESIGN.md §5).
+pub const WRAP_TOKENS: u64 = 8192;
+/// How a turn a limit ended says so, first in its outcome, which the
+/// window shows as neither answered nor failed.
+pub const LIMIT: &str = "limit: ";
+/// What answers a call the turn's last request made, though it was asked
+/// for none.
+const CALL_PAST_LIMIT: &str = "not run: the turn reached a limit and asked for no more tool calls";
 /// The most conversations `conversations` lists.
 const MAX_LISTED: usize = 200;
 /// What a call the human interrupted before it ran is answered with.
@@ -806,6 +817,9 @@ struct Outcome {
     retry: bool,
     replied: bool,
     calls: Option<u64>,
+    /// Whether a spending limit refused the request, which the turn
+    /// answers by asking where the work stands (`wrap_up`).
+    limited: bool,
 }
 
 impl Outcome {
@@ -815,6 +829,14 @@ impl Outcome {
             retry: false,
             replied: false,
             calls: None,
+            limited: false,
+        }
+    }
+
+    fn limit(text: impl Into<String>) -> Self {
+        Self {
+            limited: true,
+            ..Self::stop(text)
         }
     }
 
@@ -1215,7 +1237,10 @@ impl Session {
         let mut replied = false;
         for _ in 0..MAX_STEPS {
             self.between()?;
-            let outcome = self.exchange(turn)?;
+            let outcome = self.exchange(turn, None)?;
+            if outcome.limited {
+                return self.wrap_up(turn, replied, outcome.text);
+            }
             let Some(reply) = outcome.calls else {
                 return Ok(Outcome {
                     replied: replied || outcome.replied,
@@ -1233,12 +1258,63 @@ impl Session {
             }
         }
         // Every step replied, or the loop would have ended.
+        self.wrap_up(
+            turn,
+            true,
+            format!("this turn has taken {MAX_STEPS} steps, each a reply the model gave, the most one turn takes"),
+        )
+    }
+
+    /// The turn's last request, once `why`, a limit, refuses another
+    /// step: the model is told so and asked, without tools, where the
+    /// work stands, within the limits like any request (DESIGN.md §5).
+    /// The turn ends either way, its outcome saying the limit.
+    fn wrap_up(&mut self, turn: u64, replied: bool, why: String) -> Result<Outcome, String> {
+        self.between()?;
+        let asked = self.exchange(turn, Some(&why))?;
+        let replied = replied || asked.replied;
+        if let Some(reply) = asked.calls {
+            self.unrun(reply, CALL_PAST_LIMIT)?;
+        }
+        // Never asked again: C-r would start the work over with tools,
+        // as a new turn. A message goes on from here instead.
+        let text = if asked.replied {
+            let calls = if asked.calls.is_some() {
+                ", and the tool calls it made anyway were not run"
+            } else {
+                ""
+            };
+            format!("{LIMIT}{why}. The model was asked, without tools, where the work stands{calls}; a message goes on from there")
+        } else {
+            format!(
+                "{LIMIT}{why}. Asking the model where the work stands was not done: {}",
+                asked.text
+            )
+        };
         Ok(Outcome {
-            replied: true,
-            ..Outcome::stop(format!(
-                "stopped after {MAX_STEPS} steps, each a reply the model gave, the most one turn takes; every tool call has its result, and a message goes on from there"
-            ))
+            replied,
+            limited: true,
+            ..Outcome::stop(text)
         })
+    }
+
+    /// Answers every call of the reply at `reply` as not run, with `why`.
+    fn unrun(&mut self, reply: u64, why: &str) -> Result<(), String> {
+        let calls = self
+            .conversation
+            .events()
+            .iter()
+            .rev()
+            .find(|e| e.seq == reply)
+            .and_then(|e| match &e.kind {
+                Kind::Assistant { calls, .. } => Some(calls.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        for call in &calls {
+            self.result(reply, call, 0, why.into(), true, Beside::default())?;
+        }
+        Ok(())
     }
 
     /// Whether `turn` is the first of the conversation's turns begun by the
@@ -1503,7 +1579,32 @@ impl Session {
     }
 
     /// The turn's exchange with the model, retrying a rate limit.
-    fn exchange(&mut self, turn: u64) -> Result<Outcome, String> {
+    /// One step's request, or with `wrap` the turn's last (`wrap_up`):
+    /// `wrap`, the limit reached, is said to the model in a notification
+    /// asking where the work stands, logged once the request is known to
+    /// fit, and the request has no tools and a reply of at most
+    /// `WRAP_TOKENS`. A step a spending limit refuses is `limited`.
+    fn exchange(&mut self, turn: u64, wrap: Option<&str>) -> Result<Outcome, String> {
+        let mut probe = None;
+        let outcome = self.exchange_held(turn, wrap, &mut probe);
+        // The last request's grant from the window, held for it, is
+        // given back when it was not sent.
+        if let Some(id) = probe {
+            self.spent(id, 0);
+        }
+        outcome
+    }
+
+    /// `exchange`, holding in `probe` the window's grant for the last
+    /// request from before its notice is logged until it is sent, so
+    /// that no other conversation's request takes the day's room
+    /// between.
+    fn exchange_held(
+        &mut self,
+        turn: u64,
+        wrap: Option<&str>,
+        probe: &mut Option<u64>,
+    ) -> Result<Outcome, String> {
         let Asking {
             key,
             client,
@@ -1515,6 +1616,15 @@ impl Session {
             Err(why) => return Ok(Outcome::stop(why)),
         };
         let pricing = model.as_ref().and_then(|m| m.pricing);
+        let notice = wrap.map(|why| {
+            format!("{why}, so this turn stops here. Without calling a tool, say briefly what you did, what is left to do, and the state of the files: what you changed that is not finished or not checked. The person can raise the limit or tell you to go on.")
+        });
+        let mut noticed = false;
+        let mut wrap_tokens = WRAP_TOKENS;
+        // Where `tool_choice` cannot be sent, `require_parameters` routing
+        // to no endpoint of a model that does not list it, or of one not
+        // listed, the notice alone asks.
+        let tools = wrap.is_none() || !model.as_ref().is_some_and(|m| m.supports("tool_choice"));
         let mut attempt = 0u32;
         // Compaction prunes, then summarizes, once a request, and a
         // context-length refusal is asked again once (DESIGN.md §14).
@@ -1537,6 +1647,9 @@ impl Session {
             let prefix_text = prefix_text.as_str();
             let messages = client::messages(events, client::timed(prefix_text));
             let mut max_tokens = max_tokens(model.as_ref());
+            if wrap.is_some() {
+                max_tokens = max_tokens.min(wrap_tokens);
+            }
             let effort = model
                 .as_ref()
                 .is_none_or(|m| m.supports("reasoning"))
@@ -1548,14 +1661,22 @@ impl Session {
                     effort,
                     client: &client,
                     cache: true,
+                    tools,
                 });
                 let body = client::turn_body(&head, prefix_text, &messages)?;
                 Ok((head, body))
             };
             let (mut head, mut body) = build(max_tokens)?;
-            let estimate = client::estimate(events, body.len() as u64);
-            // Resuming cold asks first, once a turn (DESIGN.md §14).
-            if !cold_asked && stage == Stage::Whole {
+            // The notice not yet logged is counted as if it were, with
+            // room for how it is framed, so the request with it fits too.
+            let unlogged = notice
+                .as_ref()
+                .filter(|_| !noticed)
+                .map_or(0, |n| n.len() as u64 + 256);
+            let estimate = client::estimate(events, (body.len() as u64).saturating_add(unlogged));
+            // Resuming cold asks first, once a turn (DESIGN.md §14); a
+            // turn's last request comes after a step that did.
+            if wrap.is_none() && !cold_asked && stage == Stage::Whole {
                 cold_asked = true;
                 match self.resume_cold(
                     turn,
@@ -1576,7 +1697,10 @@ impl Session {
                 }
             }
             if let Some(context) = model.as_ref().and_then(|m| m.context_length) {
+                // Not compacted for the turn's last request, whose reply is
+                // bounded small; past the context, it is not sent (below).
                 if let Some(room) = compact::past(estimate, max_tokens, context, client.compact_at)
+                    .filter(|_| wrap.is_none())
                 {
                     if !client.auto_compact {
                         return Ok(Outcome::stop(format!(
@@ -1631,12 +1755,17 @@ impl Session {
                     reserved,
                 )
             }) {
-                return Ok(Outcome::stop(why));
+                return Ok(if wrap.is_some() {
+                    Outcome::stop(why)
+                } else {
+                    Outcome::limit(why)
+                });
             }
             // Room for the reply, and for every call it may make to be
             // answered, if only as not run (`answer`), at load or after.
             let calls = (crate::assemble::MAX_ENTRIES as u64).saturating_mul(CALL_RECORDS);
             let room = (body.len() as u64)
+                .saturating_add(unlogged)
                 .saturating_add(client::MAX_REPLY.saturating_mul(2))
                 .saturating_add(calls);
             if !self.conversation.has_room_for(room) {
@@ -1644,8 +1773,35 @@ impl Session {
                     "the conversation's log is full; start another conversation",
                 ));
             }
-            let id = match self.reserve(reserved) {
+            // The last request fits, the day's limit included, which only
+            // the window can say, and its grant is held: its notice is
+            // logged, and the request made again with it.
+            if let Some(text) = notice.as_ref().filter(|_| !noticed) {
+                // Nothing logged for a request that will not be sent.
+                if self.interrupt {
+                    return Ok(Outcome::again("interrupted before its request was sent"));
+                }
+                match self.reserve(reserved) {
+                    Ok(id) => *probe = Some(id),
+                    Err(why) => return Ok(Outcome::stop(why)),
+                }
+                self.log(Kind::Notification { text: text.clone() })?;
+                noticed = true;
+                // Its reply no larger than was reserved for, however the
+                // context's clamp moves with the logged notice.
+                wrap_tokens = max_tokens;
+                continue;
+            }
+            let granted = match probe.take() {
+                Some(id) => Ok(id),
+                None => self.reserve(reserved),
+            };
+            let id = match granted {
                 Ok(id) => id,
+                // The day's limit, which the window holds, as the others.
+                Err(why) if wrap.is_none() && why.starts_with(&format!("{} ", cost::DAY)) => {
+                    return Ok(Outcome::limit(why));
+                }
                 // Nothing was sent; a turn the closing window cut short
                 // may be asked again when the conversation is reopened.
                 Err(why) => {
@@ -1718,8 +1874,10 @@ impl Session {
                 }
                 // Past the context by the provider's count, not ours: what
                 // can be pruned is, and the request asked again, once.
+                // Not for the last request, which is not compacted for.
                 Failure::Stop { status, message }
                     if client.auto_compact
+                        && wrap.is_none()
                         && !refused_context
                         && client::context_exceeded(status, &message) =>
                 {
@@ -1858,6 +2016,7 @@ impl Session {
             effort: None,
             client,
             cache: true,
+            tools: true,
         });
         let fits = |body: &str| {
             model
@@ -2387,6 +2546,7 @@ impl Session {
             retry: false,
             replied: true,
             calls: (!completion.calls.is_empty()).then_some(logged),
+            limited: false,
         })
     }
 

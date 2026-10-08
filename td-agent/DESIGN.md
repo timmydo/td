@@ -1240,7 +1240,8 @@ nothing optional is sent. There is no
 `parallel_tool_calls`, which few models list (none of Anthropic's,
 OpenAI's or Google's), and no `tool_choice`, which some do not
 (Amazon's Nova, for one) and whose `auto` is the default when `tools`
-are sent. A model that runs calls in parallel does so unasked.
+are sent, but in a turn's last request at a limit, which says `none` to
+a model the models list says takes it ("Spending limits", below). A model that runs calls in parallel does so unasked.
 `provider.data_collection` is configuration (§15); the shipped default
 is `deny`.
 
@@ -1285,8 +1286,29 @@ apply (the cache-write rate where it exceeds the prompt rate), plus
 `max_tokens` at the completion rate, plus any per-request fee. A request
 whose reservation would carry the turn's accumulated cost past
 `max_cost_per_turn`, the conversation's past `max_cost_per_conversation`,
-or the day's total past `max_cost_per_day`, is not sent; the turn stops
-and says which limit. A model without pricing cannot be reserved against
+or the day's total past `max_cost_per_day`, is not sent. A turn's step
+so refused is replaced by the turn's last request, which tells the
+model which limit and asks, without tools, where the work stands: what
+it did, what is left, and the state of the files. It is a notification
+(§3) the log keeps, then a request with `tool_choice` `none` (the tools
+still defined, so the system prompt and tools stay cached, though on
+Anthropic's models a changed `tool_choice` writes the messages' cache
+again, which the reservation's cache-write rate already prices; a model
+the models list does not say takes `tool_choice` is asked by the
+notification alone) and `max_tokens` at most 8,192, reserved and
+refused like any other: it is sent only when it fits every limit. The
+notification is logged only once the request fits the turn's and
+conversation's limits and the log's room, the turn is not interrupted,
+and the window has granted the day's, which is held for it, so that a
+notification is not left unanswered; the reply is held to what was
+reserved before it. It is not compacted for, nor pruned for when the
+provider refuses its length; past the model's context it is not sent,
+and it is never asked again (C-r would start the work over). A call its reply makes anyway is
+answered as not run. The turn ends either way, its outcome beginning
+`limit: ` and saying which limit and whether the model was asked, and
+the window marks the message "stopped at a limit", neither answered
+nor failed. The conversation's own prompt says each turn is bounded so,
+and how it ends. A model without pricing cannot be reserved against
 and is refused while a limit is set.
 
 The review command (§2) has no conversation and no day's ledger, which
@@ -1336,7 +1358,8 @@ it fits a log line. `http-referer` is `https://github.com/timmydo/td`.
 
 - **The body** is `{HEAD,"messages":[PREFIX…,MESSAGES…]}`. `HEAD` is the
   exact text of the other members, logged with the request: `model`,
-  `max_tokens`, `reasoning: {effort}`, `provider: {require_parameters:
+  `max_tokens`, `reasoning: {effort}`, `tool_choice: "none"` in a
+  turn's last request at a limit (§5), `provider: {require_parameters:
   true, data_collection}`, and `cache_control` for `anthropic/*`. The
   prefix's messages come from §6's prefix. `MESSAGES` are the user
   messages and turn replies logged before the request, a reply as
@@ -1535,9 +1558,11 @@ any request, naming the setting that chose it.
   "content":…}` after the reply, itself sent as
   `{"role":"assistant","content":…,"tool_calls":[…]}` with `content`
   null when it has no text. A reply with no calls ends the turn. A turn
-  stops after 40 steps, each a reply (a rate-limited request asked
-  again is the same step), saying so, every call answered; a message
-  goes on from there. A reply that finishes `tool_calls` with no calls
+  takes at most 500 steps, each a reply (a rate-limited request asked
+  again is the same step), every call answered: a guard against a model
+  that never stops, the spending limits being the budget. Past it, the
+  turn ends with the last request a spending limit would bring (§5,
+  "Spending limits"); a message goes on from there. A reply that finishes `tool_calls` with no calls
   ends the turn as replied.
 - **Arguments** are parsed under a 256 KiB bound as a JSON object whose
   members are all named by the tool; empty arguments are `{}`. Anything
@@ -5546,7 +5571,7 @@ default; `jev_threshold`'s is calibrated (§11):
 - `mode`: `auto` or `ask`; default `auto`
 - `data_collection`: `deny` or `allow`; default `deny`
 - `max_cost_per_turn`, `max_cost_per_conversation` and `max_cost_per_day`,
-  in credits (§5); defaults 1, 10 and 25, and `none` disables any
+  in credits (§5); defaults 5, 10 and 25, and `none` disables any
 - `workspace_root`; default `~/td-agent`
 - `shared`: the host directories bound into every workspace (§8), an
   array of tables each with a `path` and an optional `write`, default

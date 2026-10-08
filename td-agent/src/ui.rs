@@ -1987,6 +1987,9 @@ impl App {
                     ("replied", Tone::Good)
                 } else if outcome == "no model" {
                     ("no model", Tone::Neutral)
+                } else if outcome.starts_with(crate::conversation::LIMIT) {
+                    // A limit the human set, reached: not a failure.
+                    ("stopped at a limit", Tone::Neutral)
                 } else {
                     ("not answered", Tone::Bad)
                 };
@@ -6296,6 +6299,35 @@ pub mod tests {
             "{shown}"
         );
         assert!(app.status_line().contains("C-r asks again"));
+    }
+
+    /// A limit the human set, reached, is neither an answer nor a
+    /// failure: the message says so, and the outcome is shown.
+    #[test]
+    fn a_turn_a_limit_ended_is_marked_neutrally() {
+        let mut app = app();
+        turn(&mut app, 1, "hello");
+        app.update(at(3, request(2, cost::ONE)), 0);
+        let outcome = format!(
+            "{}max_cost_per_turn is $5.0000: $4.9000 is spent and this request reserves up to $0.9000. The model was asked, without tools, where the work stands; a message goes on from there",
+            crate::conversation::LIMIT
+        );
+        app.update(
+            at(
+                4,
+                Kind::Finished {
+                    started: 2,
+                    outcome,
+                    retry: false,
+                },
+            ),
+            0,
+        );
+        let shown = text(&app);
+        assert!(shown.contains("stopped at a limit"), "{shown}");
+        assert!(!shown.contains("not answered"), "{shown}");
+        assert!(shown.contains("max_cost_per_turn is $5.0000"), "{shown}");
+        assert!(!app.status_line().contains("C-r asks again"));
     }
 
     #[test]

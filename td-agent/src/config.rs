@@ -1702,7 +1702,7 @@ mod tests {
         assert_eq!(
             client.limits,
             Limits {
-                turn: Some(cost::ONE),
+                turn: Some(5 * cost::ONE),
                 conversation: Some(10 * cost::ONE),
                 day: Some(25 * cost::ONE)
             }

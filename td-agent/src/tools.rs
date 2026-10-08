@@ -1618,7 +1618,9 @@ mod tests {
             );
             // `require_parameters` would route a request carrying either
             // to no endpoint of a model that does not list it; `auto` is
-            // the default, and parallel calls need no asking.
+            // the default, and parallel calls need no asking. Only a
+            // turn's last request, at a limit, says `none`, to a model
+            // that lists it.
             assert!(value.get("tool_choice").is_none());
             assert!(value.get("parallel_tool_calls").is_none());
             let Json::Obj(members) = &value else {

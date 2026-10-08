@@ -1296,11 +1296,14 @@ fn spending_limits_refuse_a_request_before_it_is_sent() {
     });
     h.say("hello");
     let (events, outcome, _) = h.turn();
+    // Not even the request asking where the work stands fits.
     assert!(
-        outcome.starts_with("max_cost_per_turn is $0.0010"),
+        outcome.starts_with("limit: max_cost_per_turn is $0.0010"),
         "{outcome}"
     );
+    assert!(outcome.contains("was not done"), "{outcome}");
     assert!(!kinds(&events).contains(&"request"));
+    assert!(!kinds(&events).contains(&"notification"));
     assert!(h.mock.requests().is_empty());
     assert!(h.reserved.is_empty(), "refused before asking the window");
     // The day's, which the window holds.
@@ -1309,10 +1312,12 @@ fn spending_limits_refuse_a_request_before_it_is_sent() {
     h.setup(Client::default());
     h.say("hello");
     let (events, outcome, _) = h.turn();
-    assert!(outcome.starts_with("max_cost_per_day"), "{outcome}");
+    assert!(outcome.starts_with("limit: max_cost_per_day"), "{outcome}");
     assert!(!kinds(&events).contains(&"request"));
+    // The window refused the last request too, before its notice.
+    assert!(!kinds(&events).contains(&"notification"));
     assert!(h.mock.requests().is_empty());
-    assert_eq!(h.reserved.len(), 1);
+    assert_eq!(h.reserved.len(), 2);
     // A model with no price, while a limit is set.
     let mut h = Harness::new("unpriced", Role::Orchestrator, Vec::new());
     h.setup(Client {
@@ -3720,6 +3725,87 @@ fn malformed_arguments_are_answered_with_an_error_and_the_turn_goes_on() {
     assert_eq!(h.mock.requests().len(), 2);
 }
 
+/// A step the turn's spending limit refuses is replaced by one last
+/// request, without tools and with a small reply, asking where the work
+/// stands, sent when it fits the limit.
+#[test]
+fn a_turn_at_its_limit_asks_where_the_work_stands() {
+    let mut h = Harness::new(
+        "wrap",
+        Role::Orchestrator,
+        vec![Reply::sse("stream-sonnet.sse")],
+    );
+    // Past a whole step's reservation, within the last request's.
+    h.setup(Client {
+        limits: Limits {
+            turn: Some(ONE / 5),
+            ..Limits::default()
+        },
+        ..Client::default()
+    });
+    h.say("hello");
+    let (events, outcome, retry) = h.turn();
+    assert!(
+        outcome.starts_with("limit: max_cost_per_turn is $0.2000"),
+        "{outcome}"
+    );
+    assert!(outcome.contains("where the work stands;"), "{outcome}");
+    assert!(!retry);
+    let kinds = kinds(&events);
+    let notice = kinds.iter().position(|k| *k == "notification").unwrap();
+    assert_eq!(kinds[notice + 1], "request", "{kinds:?}");
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 1);
+    // The window's grant, asked before the notice, is the one it is sent
+    // under.
+    assert_eq!(h.reserved.len(), 1, "{:?}", h.reserved);
+    let body = flat(&requests[0].text());
+    assert_eq!(body["tool_choice"], "none");
+    assert_eq!(
+        body["max_tokens"],
+        td_agent::conversation::WRAP_TOKENS.to_string()
+    );
+    // The tools are still defined, so the cached prefix is the same.
+    assert!(body.contains_key("tools.0.function.name"), "{body:?}");
+    // The notice, the request's last message: the reply comes after it.
+    let notice = body
+        .iter()
+        .find(|(k, v)| k.ends_with(".content") && v.contains("so this turn stops here"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .unwrap();
+    assert!(
+        notice.1.contains("max_cost_per_turn is $0.2000"),
+        "{notice:?}"
+    );
+    let index: usize = notice.0.split('.').nth(1).unwrap().parse().unwrap();
+    assert!(!body.contains_key(&format!("messages.{}.role", index + 1)));
+}
+
+/// A last request that fails ends the turn at its limit all the same:
+/// not to be asked again, which would start the work over.
+#[test]
+fn a_failed_last_request_is_not_asked_again() {
+    let mut h = Harness::new(
+        "wrap-failed",
+        Role::Orchestrator,
+        vec![Reply::status(502, "error-502.json")],
+    );
+    h.setup(Client {
+        limits: Limits {
+            turn: Some(ONE / 5),
+            ..Limits::default()
+        },
+        ..Client::default()
+    });
+    h.say("hello");
+    let (events, outcome, retry) = h.turn();
+    assert!(outcome.starts_with("limit: max_cost_per_turn"), "{outcome}");
+    assert!(outcome.contains("was not done: error 502"), "{outcome}");
+    assert!(!retry);
+    assert!(kinds(&events).contains(&"notification"));
+    assert_eq!(h.mock.requests().len(), 1);
+}
+
 #[test]
 fn the_step_bound_ends_a_turn_that_keeps_calling_tools() {
     let steps = td_agent::conversation::MAX_STEPS;
@@ -3728,18 +3814,33 @@ fn the_step_bound_ends_a_turn_that_keeps_calling_tools() {
         Role::Orchestrator,
         vec![Reply::sse("stream-tool-todo.sse"); steps + 1],
     );
-    h.setup(Client::default());
+    // The step bound alone, the money unbounded.
+    h.setup(Client {
+        limits: Limits {
+            turn: None,
+            conversation: None,
+            day: None,
+        },
+        ..Client::default()
+    });
     h.say("Plan it forever.");
     let (events, outcome, retry) = h.turn();
     assert!(
-        outcome.starts_with(&format!("stopped after {steps} steps")),
+        outcome.starts_with(&format!("limit: this turn has taken {steps} steps")),
         "{outcome}"
     );
+    // The last request asked for no tools; the call it made anyway is
+    // answered, not run.
+    assert!(outcome.contains("were not run"), "{outcome}");
     assert!(!retry);
-    assert_eq!(h.mock.requests().len(), steps);
-    assert_eq!(results(&events).len(), steps, "every call answered");
-    let last = kinds(&events);
-    assert_eq!(last[last.len() - 2], "tool_result");
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), steps + 1);
+    assert!(!requests[steps - 1].text().contains("\"tool_choice\""));
+    assert!(requests[steps].text().contains("\"tool_choice\":\"none\""));
+    let results = results(&events);
+    assert_eq!(results.len(), steps + 1, "every call answered");
+    let (_, content, error) = results.last().unwrap();
+    assert!(*error && content.contains("reached a limit"), "{content}");
 }
 
 #[test]
