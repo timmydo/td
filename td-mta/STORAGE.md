@@ -140,6 +140,9 @@ target is deleted. Bounded parent walking also refuses mailbox cycles. Exact
 unsigned account sequences use eight-byte big-endian blobs, preserving values
 above i64::MAX; overflow refuses mutation. Account creation is bounded to 128.
 Account endpoint and history-floor reads require exactly eight bytes.
+The decoded history floor must not exceed the committed endpoint; an
+incoherent account identity returns Corrupt during view capture or before
+transaction mutation. This validation does not activate history pruning.
 For each change row selected by the native range query, the sequence must
 have eight bytes and the object ID sixteen. Short or oversized blobs
 return Corrupt; the reader never pads them or treats their stored width

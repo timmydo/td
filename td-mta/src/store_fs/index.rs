@@ -1215,13 +1215,16 @@ fn identity(
         .query([account.as_bytes().as_slice()])
         .map_err(sql)?;
     let row = rows.next().map_err(sql)?.ok_or(ports::Error::NotFound)?;
-    let endpoint = fixed_blob::<8>(row, 0)?;
-    let floor = fixed_blob::<8>(row, 1)?;
+    let committed_sequence = sequence(&fixed_blob::<8>(row, 0)?)?;
+    let history_floor = sequence(&fixed_blob::<8>(row, 1)?)?;
+    if history_floor > committed_sequence {
+        return Err(ports::Error::Corrupt);
+    }
     Ok(ViewIdentity {
         account,
         epoch,
-        committed_sequence: sequence(&endpoint)?,
-        history_floor: sequence(&floor)?,
+        committed_sequence,
+        history_floor,
     })
 }
 struct TransactionView<'a> {
@@ -2240,6 +2243,131 @@ mod tests {
             assert_eq!(old.next_change(start, ObjectType::Mailbox), Ok(original));
         }
         assert!(wrong.is_empty(), "out-of-range stored ordinals: {wrong:?}");
+    }
+    #[test]
+    fn account_snapshot_floor_cannot_exceed_its_endpoint() {
+        let mut wrong_views = Vec::new();
+        let mut wrong_commits = Vec::new();
+        for (endpoint, floor) in [
+            (0, 0),
+            (7, 0),
+            (7, 7),
+            (u64::MAX, 1 << 63),
+            (u64::MAX, u64::MAX),
+            (0, 1),
+            (7, 8),
+            (u64::MAX - 1, u64::MAX),
+            (7, 1 << 63),
+        ] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = IndexStore::create(
+                &mut root,
+                StoreEpoch::from_bytes([9; 16]),
+                Arc::new(Timer(AtomicU64::new(1))),
+                2,
+                deadline(),
+            )
+            .unwrap();
+            store.create_account(ACCOUNT, deadline()).unwrap();
+            let old = store.view(ACCOUNT, deadline()).unwrap();
+            let original = old.identity();
+            lock(&store.writer)
+                .unwrap()
+                .native
+                .run(|db| {
+                    assert_eq!(
+                        db.execute(
+                            "UPDATE accounts SET sequence=?1,floor=?2 WHERE id=?3",
+                            params![
+                                endpoint.to_be_bytes().as_slice(),
+                                floor.to_be_bytes().as_slice(),
+                                ACCOUNT.as_bytes().as_slice()
+                            ]
+                        )
+                        .map_err(sql)?,
+                        1
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            let actual = store.view(ACCOUNT, deadline()).map(|view| view.identity());
+            if floor <= endpoint {
+                assert_eq!(
+                    actual,
+                    Ok(ViewIdentity {
+                        committed_sequence: Sequence::from_u64(endpoint),
+                        history_floor: Sequence::from_u64(floor),
+                        ..original
+                    })
+                );
+            } else if actual != Err(ports::Error::Corrupt) {
+                wrong_views.push((endpoint, floor, actual));
+            }
+            let value = mailbox("one", None);
+            let put = Operation::put(Table::Mailboxes, ID.as_bytes(), &value).unwrap();
+            let committed = store.commit(
+                &td_crypto::Provider,
+                CommitRequest {
+                    account: ACCOUNT,
+                    expected: Sequence::from_u64(endpoint),
+                    utc_ms: 0,
+                    deadline: deadline(),
+                },
+                &[put],
+                &mut [],
+            );
+            if floor <= endpoint {
+                let expected = endpoint
+                    .checked_add(1)
+                    .map(Sequence::from_u64)
+                    .ok_or(CommitError::Rejected(ports::Error::Capacity));
+                assert_eq!(committed, expected);
+            } else if committed != Err(CommitError::Rejected(ports::Error::Corrupt)) {
+                wrong_commits.push((endpoint, floor, committed));
+            } else {
+                lock(&store.writer)
+                    .unwrap()
+                    .native
+                    .run(|db| {
+                        let actual: (Vec<u8>, Vec<u8>) = db
+                            .query_row(
+                                "SELECT sequence,floor FROM accounts WHERE id=?1",
+                                [ACCOUNT.as_bytes().as_slice()],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )
+                            .map_err(sql)?;
+                        assert_eq!(
+                            actual,
+                            (
+                                endpoint.to_be_bytes().to_vec(),
+                                floor.to_be_bytes().to_vec()
+                            )
+                        );
+                        assert_eq!(
+                            db.query_row(
+                                "SELECT count(*) FROM mailboxes WHERE account=?1",
+                                [ACCOUNT.as_bytes().as_slice()],
+                                |row| row.get::<_, u32>(0)
+                            )
+                            .map_err(sql)?,
+                            0
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            assert_eq!(
+                old.native()
+                    .unwrap()
+                    .run(|db| identity(db, ACCOUNT, original.epoch)),
+                Ok(original)
+            );
+        }
+        assert!(
+            wrong_views.is_empty() && wrong_commits.is_empty(),
+            "incoherent views: {wrong_views:?}; commits: {wrong_commits:?}"
+        );
     }
     #[test]
     fn changes_use_native_order_and_reject_incoherent_or_duplicate_actions() {
