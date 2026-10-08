@@ -30,10 +30,11 @@ fn recipient_history_survives_typed_and_encoded_updates() {
         let fixture = Fixture::new();
         let mut root = fixture.locked();
         let store = open(&mut root);
-        create(&store, 1, &[0]).unwrap();
+        create_with_recipient(&store, 1, &[0], uncertain(), encoded).unwrap();
         let key = recipient_key(0);
         let initial = uncertain();
         let bytes = encode(Row::Recipient(initial));
+        // An identical PUT remains valid with retained attempt history.
         apply(
             &store,
             1,
@@ -88,11 +89,12 @@ fn repeated_keys_compare_the_final_effect_with_the_original_history() {
         let fixture = Fixture::new();
         let mut root = fixture.locked();
         let store = open(&mut root);
-        create(&store, 1, &[0]).unwrap();
+        create_with_recipient(&store, 1, &[0], uncertain(), encoded).unwrap();
         let key = recipient_key(0);
         let initial = uncertain();
         let original = encode(Row::Recipient(initial));
         let good = Operation::put(Table::Recipients, &key, &original).unwrap();
+        // An identical PUT remains valid with retained attempt history.
         apply(&store, 1, &[good], encoded).unwrap();
         let mut changed = initial;
         changed.uncertain = false;
@@ -237,12 +239,13 @@ fn existing_attempt_can_gain_uncertainty_then_start_a_fresh_attempt() {
         let fixture = Fixture::new();
         let mut root = fixture.locked();
         let store = open(&mut root);
-        create(&store, 1, &[0]).unwrap();
         let key = recipient_key(0);
         let mut row = uncertain();
         row.uncertain = false;
         row.state = RecipientState::RetryWait;
+        create_with_recipient(&store, 1, &[0], row, encoded).unwrap();
         let bytes = encode(Row::Recipient(row));
+        // An identical PUT remains valid with retained attempt history.
         apply(
             &store,
             1,
@@ -623,6 +626,7 @@ fn terminal(state: RecipientState) -> RecipientRow<'static> {
         RecipientState::Canceled => row.reason = FailureReason::Canceled,
         RecipientState::OutcomeUnknown => {
             row = uncertain();
+            row.attempt_count = 1;
             row.state = state;
             row.next_attempt_at = None;
             row.reason = FailureReason::Expired;
@@ -999,6 +1003,172 @@ fn terminal_final_operation_wins_and_attempted_cancellation_retains_replies() {
                 .unwrap()
                 .0,
             Row::Recipient(canceled)
+        );
+    }
+}
+
+fn next_attempt(mut row: RecipientRow<'_>) -> RecipientRow<'_> {
+    row.state = RecipientState::InFlight;
+    row.phase = AttemptPhase::Prepared;
+    row.reason = FailureReason::None;
+    row.next_attempt_at = None;
+    row.attempt_count = row.attempt_count.checked_add(1).unwrap();
+    row.attempt = Some(AttemptId::from_bytes([9; 16]));
+    row.last_attempt_at = Some(2);
+    row
+}
+fn pending_attempt(state: RecipientState) -> RecipientRow<'static> {
+    if state == RecipientState::Queued {
+        return queued();
+    }
+    let mut row = uncertain();
+    row.state = state;
+    row.uncertain = state == RecipientState::OutcomeUnknown;
+    row
+}
+#[test]
+fn a_new_attempt_advances_once_and_changes_the_previous_id() {
+    let mut accepted = Vec::new();
+    for encoded in [false, true] {
+        for state in [
+            RecipientState::Queued,
+            RecipientState::RetryWait,
+            RecipientState::OutcomeUnknown,
+        ] {
+            for reused in [false, true] {
+                if reused && state == RecipientState::Queued {
+                    continue;
+                }
+                let fixture = Fixture::new();
+                let mut root = fixture.locked();
+                let store = open(&mut root);
+                let original = pending_attempt(state);
+                create_with_recipient(&store, 1, &[0], original, encoded).unwrap();
+                let mut next = next_attempt(original);
+                if reused {
+                    next.attempt = original.attempt;
+                } else {
+                    next.attempt_count += 1;
+                }
+                let bytes = encode(Row::Recipient(next));
+                let key = recipient_key(0);
+                let result = apply(
+                    &store,
+                    1,
+                    &[Operation::put(Table::Recipients, &key, &bytes).unwrap()],
+                    encoded,
+                );
+                if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                    accepted.push((encoded, state, reused, result));
+                    continue;
+                }
+                let valid = next_attempt(original);
+                let valid_bytes = encode(Row::Recipient(valid));
+                assert_eq!(
+                    apply(
+                        &store,
+                        1,
+                        &[Operation::put(Table::Recipients, &key, &valid_bytes).unwrap()],
+                        encoded
+                    ),
+                    Ok(Sequence::from_u64(2))
+                );
+                let mut view = store.view(ACCOUNT, deadline()).unwrap();
+                let mut scratch = [0; 65536];
+                assert_eq!(
+                    view.get(Key::Recipient(SUBMISSION, 0), &mut scratch)
+                        .unwrap()
+                        .unwrap()
+                        .0,
+                    Row::Recipient(valid)
+                );
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "invalid attempt advance was not rejected: {accepted:?}"
+    );
+}
+#[test]
+fn final_attempt_put_controls_repeated_keys_against_the_original_row() {
+    for encoded in [false, true] {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = open(&mut root);
+        let original = pending_attempt(RecipientState::RetryWait);
+        create_with_recipient(&store, 1, &[0], original, encoded).unwrap();
+        let key = recipient_key(0);
+        let valid = next_attempt(original);
+        let valid_bytes = encode(Row::Recipient(valid));
+        let good = Operation::put(Table::Recipients, &key, &valid_bytes).unwrap();
+        let mut skipped = valid;
+        skipped.attempt_count += 1;
+        let bytes = encode(Row::Recipient(skipped));
+        let bad = Operation::put(Table::Recipients, &key, &bytes).unwrap();
+        let delete = Operation::delete(Table::Recipients, &key).unwrap();
+        rejected(apply(&store, 1, &[good, bad], encoded));
+        let mut chained = skipped;
+        chained.attempt = Some(AttemptId::from_bytes([10; 16]));
+        chained.last_attempt_at = Some(3);
+        let chained_bytes = encode(Row::Recipient(chained));
+        let chained_put = Operation::put(Table::Recipients, &key, &chained_bytes).unwrap();
+        rejected(apply(&store, 1, &[good, chained_put], encoded));
+        rejected(apply(&store, 1, &[delete, bad], encoded));
+        assert_eq!(
+            apply(&store, 1, &[bad, delete, good], encoded),
+            Ok(Sequence::from_u64(2))
+        );
+    }
+}
+#[test]
+fn the_last_attempt_count_is_usable_without_wrapping_or_replacing_its_id() {
+    for encoded in [false, true] {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = open(&mut root);
+        let mut original = pending_attempt(RecipientState::RetryWait);
+        original.attempt_count = u32::MAX - 1;
+        create_with_recipient(&store, 1, &[0], original, encoded).unwrap();
+        let key = recipient_key(0);
+        let last = next_attempt(original);
+        let bytes = encode(Row::Recipient(last));
+        assert_eq!(
+            apply(
+                &store,
+                1,
+                &[Operation::put(Table::Recipients, &key, &bytes).unwrap()],
+                encoded
+            ),
+            Ok(Sequence::from_u64(2))
+        );
+        let wrapped = encode(Row::Recipient(queued()));
+        rejected(apply(
+            &store,
+            2,
+            &[Operation::put(Table::Recipients, &key, &wrapped).unwrap()],
+            encoded,
+        ));
+        let mut replacement = last;
+        replacement.attempt = Some(AttemptId::from_bytes([10; 16]));
+        let replacement_bytes = encode(Row::Recipient(replacement));
+        rejected(apply(
+            &store,
+            2,
+            &[Operation::put(Table::Recipients, &key, &replacement_bytes).unwrap()],
+            encoded,
+        ));
+        let mut retained = last;
+        retained.diagnostic = "last attempt remains owned";
+        let retained_bytes = encode(Row::Recipient(retained));
+        assert_eq!(
+            apply(
+                &store,
+                2,
+                &[Operation::put(Table::Recipients, &key, &retained_bytes).unwrap()],
+                encoded
+            ),
+            Ok(Sequence::from_u64(3))
         );
     }
 }

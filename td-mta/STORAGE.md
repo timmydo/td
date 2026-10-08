@@ -149,9 +149,11 @@ and expiry times, and recipient count are immutable. A Pending failure notice
 cannot return to None. A Stored notice must remain Stored with its original
 historical notificationEmail, even after the visible Email is deleted.
 Cancellation preserves either retained notice state. Recipient address is
-immutable; uncertainty cannot clear and attemptCount cannot decrease.
-When attemptCount is unchanged, attempt ID and lastAttemptAt must also stay
-unchanged. Accepted and Canceled recipients remain in their respective states.
+immutable and uncertainty cannot clear. A changed attemptCount must be exactly
+one checked increment, with an attempt ID different from the immediately
+previous row. When attemptCount is unchanged, attempt ID and lastAttemptAt
+must also stay unchanged. Accepted and Canceled recipients remain in their
+respective states.
 Failed recipients remain Failed or become Canceled as part of a valid
 whole-submission cancellation. OutcomeUnknown without a next attempt remains
 OutcomeUnknown without a next attempt. All these terminal rows retain their
@@ -173,13 +175,18 @@ key projections and before final value decoding; all SQL shares the original
 native allowance. The maximum-batch test is fixture evidence, not a promise
 that every store/host can finish within its deadline.
 
-This preserves named history fields, not the full transition graph. New
-attempt authority must still require a fresh ID and exactly one checked
-count increment. Actual notice creation, creation authorization and
-submission deletion/retention policy remain service obligations. The core
-does not preserve completedAt's historical value; the service must not use
-an arbitrary rewrite to shorten retention. Preserving
-notice history does not prove the referenced failure Email was created.
+This preserves named history fields, not the full transition graph. The
+counter/ID comparison does not authorize dispatch or prove random/global ID
+freshness: the service must obtain a fresh ID from Entropy, reject collisions,
+authorize the source state and time, and persist Prepared before dispatch.
+The core compares only the immediately prior ID; it retains no AttemptId
+registry and does not establish worker fences. Counter exhaustion still
+requires service pause and operator intervention. Actual notice creation,
+creation authorization and submission deletion/retention policy remain
+service obligations. The core does not preserve completedAt's historical
+value; the service must not use an arbitrary rewrite to shorten retention.
+Preserving notice history does not prove the referenced failure Email was
+created.
 The service must forbid creation of a new notice solely for cancellation
 and atomically create the failure Email with the Stored transition. The core
 currently accepts notice creation on a wholly Canceled group and a Stored

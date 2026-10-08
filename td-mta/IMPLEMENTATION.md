@@ -2317,9 +2317,10 @@ coverage, aggregate queue-state validation and preservation of the named
 immutable queue identity/uncertainty/attempt-history fields are implemented
 in the core, including one-way Pending/Stored failure-notice history and
 terminal recipient state/attempt/phase/reply/reason/uncertainty preservation.
-Complete nonterminal
-queue-transition validation, changed-object coverage,
-category quota reconciliation and request idempotence remain service work.
+STORAGE.md also defines the implemented attempt-count/ID progression checks.
+Complete nonterminal transition and worker validation, entropy/collision
+checks, changed-object coverage, category quota reconciliation and request
+idempotence remain service work.
 Bind the implemented bounded
 IngressSpool ownership to authorized reservations before wiring body sources
 to service commits. Native indexes serve metadata

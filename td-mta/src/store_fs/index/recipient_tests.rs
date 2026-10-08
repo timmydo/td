@@ -100,6 +100,15 @@ fn create_with(
     ordinals: &[u32],
     encoded: bool,
 ) -> Result<Sequence, CommitError> {
+    create_with_recipient(store, count, ordinals, queued(), encoded)
+}
+fn create_with_recipient(
+    store: &IndexStore<'_>,
+    count: u32,
+    ordinals: &[u32],
+    recipient: RecipientRow<'_>,
+    encoded: bool,
+) -> Result<Sequence, CommitError> {
     let body = b"a prepared message";
     let mut digest = td_crypto::Provider.sha256().unwrap();
     digest.update(body).unwrap();
@@ -110,7 +119,7 @@ fn create_with(
         created_at: 0,
     }));
     let sub = encode(Row::Submission(submission(count)));
-    let recipient = encode(Row::Recipient(queued()));
+    let recipient = encode(Row::Recipient(recipient));
     let keys: Vec<_> = ordinals.iter().copied().map(recipient_key).collect();
     let mut operations = vec![
         Operation::put(Table::Blobs, BLOB.as_bytes(), &blob).unwrap(),

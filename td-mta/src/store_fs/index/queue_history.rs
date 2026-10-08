@@ -69,9 +69,12 @@ fn recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
     old.address == next.address
         && terminal_recipient(old, next)
         && (!old.uncertain || next.uncertain)
-        && next.attempt_count >= old.attempt_count
-        && (next.attempt_count != old.attempt_count
-            || (next.attempt == old.attempt && next.last_attempt_at == old.last_attempt_at))
+        && if next.attempt_count == old.attempt_count {
+            next.attempt == old.attempt && next.last_attempt_at == old.last_attempt_at
+        } else {
+            old.attempt_count.checked_add(1) == Some(next.attempt_count)
+                && next.attempt != old.attempt
+        }
 }
 
 fn terminal_recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
