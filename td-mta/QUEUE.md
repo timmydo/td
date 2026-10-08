@@ -88,6 +88,12 @@ final-view consistency check: retained replies do not establish transition
 history, worker identity or a valid fence. Those remain transaction/dispatcher
 obligations. Queue errors identify the submission and optional recipient ordinal.
 
+SQLite commits reuse that state validator for every submission affected by
+submission or recipient PUT/DELETE, checking exact final ordinal coverage
+with indexed reads before COMMIT. A group inconsistency rolls back the entire
+transaction. This enforces final consistency only; authorization, historical
+transition checks and attempt fences remain required at the service boundary.
+
 ## 3. Attempt and restart transitions
 
 The single route dispatches at most one SMTP transaction at a time. Select

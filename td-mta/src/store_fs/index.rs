@@ -16,6 +16,8 @@ use crate::{
     row_references::ReferenceCheck,
     store_paths::{Name, RootEntry},
 };
+#[cfg(test)]
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{params, types::ValueRef, Connection, OpenFlags};
 use std::{
     fs::{self, OpenOptions},
@@ -44,6 +46,9 @@ mod backup;
 #[cfg(test)]
 #[path = "index/crash_tests.rs"]
 mod crash_tests;
+#[cfg(test)]
+#[path = "index/recipient_tests.rs"]
+mod recipient_tests;
 #[cfg(test)]
 #[path = "index/wal_qualification.rs"]
 mod wal_qualification;
@@ -837,6 +842,7 @@ impl<'r> IndexStore<'r> {
                 }
             }
         }
+        validate_recipients(&mut view, operations, scratch)?;
         native.run(|db| {
             db.execute(
                 "UPDATE accounts SET sequence=?2 WHERE id=?1",
@@ -1358,6 +1364,70 @@ fn next<'a>(
         last_change,
     }))
 }
+fn submission_id(operation: Operation<'_>) -> Option<crate::ids::SubmissionId> {
+    match operation.value() {
+        Value::Row(Mutation::Put { key, .. } | Mutation::Delete(key)) => match key {
+            Key::Submission(id) | Key::Recipient(id, _) => Some(id),
+            _ => None,
+        },
+        Value::Change(_) => None,
+    }
+}
+
+fn validate_recipients(
+    view: &mut TransactionView<'_>,
+    operations: &[Operation<'_>],
+    value: &mut [u8],
+) -> Result<(), ports::Error> {
+    for (position, operation) in operations.iter().copied().enumerate() {
+        view.native.check()?;
+        let Some(id) = submission_id(operation) else {
+            continue;
+        };
+        // At most 4096 supplied operations; no queue-sized set or account scan.
+        if operations
+            .get(..position)
+            .ok_or(ports::Error::Invalid)?
+            .iter()
+            .copied()
+            .any(|prior| submission_id(prior) == Some(id))
+        {
+            continue;
+        }
+        let Some((row, _)) = view.get(Key::Submission(id), value)? else {
+            // Deferred foreign keys reject any children of a deleted parent.
+            continue;
+        };
+        let Row::Submission(row) = row else {
+            return Err(ports::Error::Corrupt);
+        };
+        let count = row.recipient_count;
+        let mut group = crate::recipient_sweep::QueueGroup::new(row);
+        for ordinal in 0..count {
+            let Some((Row::Recipient(row), _)) = view.get(Key::Recipient(id, ordinal), value)?
+            else {
+                return Err(ports::Error::Conflict);
+            };
+            group.recipient(row).map_err(|_| ports::Error::Conflict)?;
+        }
+        let mut cursor = [0; 20];
+        let last = count.checked_sub(1).ok_or(ports::Error::Corrupt)?;
+        let length = Key::Recipient(id, last)
+            .encode(&mut cursor)
+            .map_err(|_| ports::Error::Corrupt)?;
+        let after = cursor.get(..length).ok_or(ports::Error::Corrupt)?;
+        let mut key = [0; 20];
+        if view
+            .next(Table::Recipients, Some(after), &mut key, value)?
+            .is_some_and(|record| matches!(record.key, Key::Recipient(found, _) if found == id))
+        {
+            return Err(ports::Error::Conflict);
+        }
+        group.finish().map_err(|_| ports::Error::Conflict)?;
+    }
+    Ok(())
+}
+
 fn next_change(
     native: &Native,
     identity: ViewIdentity,

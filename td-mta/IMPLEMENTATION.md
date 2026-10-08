@@ -545,9 +545,18 @@ synchronous native boundaries; deadline checks cannot interrupt their
 individual calls. Body/source failure rolls back metadata
 and bytes together. Expired leases require explicit deletion before body removal.
 
-Before protocol activation, implement bounded provisional ingress staging,
-its quota accounting and crash cleanup, and the authenticated ports::Store
-adapter. The current begin_blob/finish/StagedBlob contracts do not implement
+Affected submissions receive final recipient coverage and queue-state
+validation within the same transaction. Point/successor reads check each
+affected group once under the original native scope, reusing the complete
+recipient sweep's state validator. Missing/extra recipients, invalid reply
+states, inconsistent completion/notification and partial cancellation reject
+body and metadata together. Historical transitions and worker authority remain
+separate policy work.
+
+Bounded provisional ingress staging, full-slot quota accounting and crash
+cleanup are implemented by IngressSpool. Before protocol activation, connect
+that ownership to the authenticated ports::Store adapter. The current
+begin_blob/finish/StagedBlob contracts do not implement
 that store. The synchronous core accepts prepared bounded sources; it must
 not hold its global writer while an untrusted network peer supplies bytes.
 Also complete mutation/queue policy, quota/result reconciliation,
@@ -2288,11 +2297,12 @@ dependency.
 planning, bounded history pruning, backup and unreferenced-blob deletion scheduling.
 
 Use the existing SQLite core for mailbox/email/thread/submission metadata;
-do not add a second replay or checkpoint implementation. Complete aggregate
-recipient and queue-transition validation, changed-object coverage, category
-quota reconciliation and request idempotence. Implement provisional ingress
-staging with bounded capacity and restart cleanup before wiring body sources
-to the serialized commit. Native indexes serve metadata
+do not add a second replay or checkpoint implementation. Final recipient
+coverage and aggregate queue-state validation are implemented in the core.
+Complete queue-transition validation, changed-object coverage, category
+quota reconciliation and request idempotence. Bind the implemented bounded
+IngressSpool ownership to authorized reservations before wiring body sources
+to service commits. Native indexes serve metadata
 queries; parsed-body/search caches remain disposable. Authoritative database
 values must survive cache rebuilds. Maintenance respects captured SQLite
 snapshots, fixed disk/heap ceilings and atomic body/metadata commits.

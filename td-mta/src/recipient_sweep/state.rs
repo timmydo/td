@@ -11,7 +11,7 @@ pub enum QueueError {
     PartialCancellation,
 }
 
-pub(super) struct Group {
+pub(crate) struct Group {
     completed: bool,
     notification: NotificationState,
     pending: bool,
@@ -20,7 +20,7 @@ pub(super) struct Group {
     other: bool,
 }
 impl Group {
-    pub(super) fn new(row: SubmissionRow<'_>) -> Self {
+    pub(crate) fn new(row: SubmissionRow<'_>) -> Self {
         Self {
             completed: row.completed_at.is_some(),
             notification: row.notification,
@@ -30,7 +30,7 @@ impl Group {
             other: false,
         }
     }
-    pub(super) fn recipient(&mut self, row: RecipientRow<'_>) -> Result<(), QueueError> {
+    pub(crate) fn recipient(&mut self, row: RecipientRow<'_>) -> Result<(), QueueError> {
         validate(row)?;
         self.pending |= matches!(
             row.state,
@@ -45,7 +45,7 @@ impl Group {
         self.other |= row.state != RecipientState::Canceled;
         Ok(())
     }
-    pub(super) fn finish(&self) -> Result<(), QueueError> {
+    pub(crate) fn finish(&self) -> Result<(), QueueError> {
         if self.completed == self.pending {
             return Err(QueueError::Completion);
         }

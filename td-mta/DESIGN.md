@@ -23,7 +23,9 @@ The custom journal/checkpoint/replay engine has been removed atomically.
 Protocol authorization, full mutation policy, operational tools, native
 resource and complete crash/fault qualification, and service activation
 remain unimplemented.
-Pure mailbox-parent, reference and recipient validators remain reusable.
+Mailbox-parent, reference and recipient validators remain reusable. SQLite
+commits check final recipient coverage and queue-state aggregates for affected
+submissions under the original bounded transaction scope.
 Committed bodies need no separate file publication. The separate IngressSpool
 primitive supplies bounded disposable SMTP/JMAP
 ingress files, full per-slot quotas and cleanup under its own root lock.

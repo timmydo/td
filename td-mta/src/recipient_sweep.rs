@@ -6,6 +6,7 @@ use crate::{
     ids::SubmissionId,
     ports::{self, ReadView, ViewIdentity},
 };
+pub(crate) use state::Group as QueueGroup;
 pub use state::QueueError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {

@@ -33,7 +33,8 @@ use td_mta::mailbox_parents;
 mod measured_mailbox_sweep;
 #[path = "../src/recipient_sweep.rs"]
 #[allow(unused)]
-mod measured_recipient_sweep;
+mod recipient_sweep;
+use recipient_sweep as measured_recipient_sweep;
 #[path = "../src/reference_sweep.rs"]
 #[allow(unused)]
 mod measured_reference_sweep;

@@ -570,6 +570,10 @@ use td_mta::{
     bounded, config, format, ids, limits, mailbox_parents, ports, row_references, store_paths,
 };
 #[cfg(td_native_alloc_probe)]
+#[path = "../src/recipient_sweep.rs"]
+#[allow(dead_code)]
+mod recipient_sweep;
+#[cfg(td_native_alloc_probe)]
 #[path = "support/sqlite_body_scenario.rs"]
 mod sqlite_body_scenario;
 #[cfg(td_native_alloc_probe)]

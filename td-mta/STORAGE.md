@@ -135,13 +135,33 @@ above i64::MAX; overflow refuses mutation. Account creation is bounded to 128.
 Change actions must agree with pre/post existence, and a unique native index
 refuses duplicate changes for one object within a transaction.
 
+Before COMMIT, every submission named by a Submission or Recipient PUT/DELETE
+is checked once against the final transaction view. Reuse the recipient
+sweep's QUEUE.md state and aggregate validator: require exactly ordinals
+0 through recipient_count-1, valid recipient states/replies, matching
+completedAt/notification state and whole-submission cancellation. Missing or
+extra recipients and inconsistent groups reject the entire transaction,
+including streamed bodies and changes. Deleted parents rely on deferred
+foreign keys to reject any surviving children. Repeated row operations retain
+their final effect, regardless of caller order.
+
+One group uses a parent point read, at most 1000 recipient point reads and
+one indexed successor lookup to exclude trailing recipients. That lookup may
+inspect the next group's first row; unrelated groups are never enumerated.
+Deduplication examines
+at most the bounded 4096-operation batch, using fixed scalar/key state and
+the existing writer scratch. All groups share the original native deadline
+and VM fuel; exhaustion rolls back rather than admitting a partial check.
+These checks establish final consistency, not transition history, worker
+fences, authorization or actual SMTP acceptance.
+
 Successful synchronous FULL COMMIT plus autocommit proves durability and
 returns its sequence, including when the deadline expires during completion.
 Pre-COMMIT failures and deferred-constraint/busy refusals reject after rollback;
 failed rollback retires the writer. Other COMMIT failures are indeterminate
 and stop writes until reopen/recovery. New read snapshots remain available.
 Never acknowledge before a proven successful COMMIT. Queue transitions,
-recipient aggregates, authorization, result idempotence and ports::Store
+authorization, result idempotence and ports::Store
 coordination remain service work; the low-level core grants no permission.
 
 ### Snapshots, changes, reclamation and backup

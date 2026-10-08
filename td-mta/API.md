@@ -6588,9 +6588,14 @@ The serialized transaction checks the expected sequence, applies operations
 in caller order, validates final owning references and parent chains, records
 changes and updates the unsigned account sequence. Change actions agree with
 pre/post existence; a native unique index refuses duplicate object changes.
-Repeated row keys take their last effect. Caller authorization, queue
-transitions, aggregate recipient policy and complete changed-object coverage
-remain the coordinator's responsibility.
+Repeated row keys take their last effect. Final recipient coverage, individual
+queue state and submission completion/notification/cancellation aggregates
+are checked once per affected submission before COMMIT, including groups
+changed only by recipient deletion. Indexed point/successor reads reuse the
+writer scratch and original deadline/VM fuel. Inconsistent groups reject with
+Conflict; native deadline, capacity and I/O errors retain their classifications.
+Caller authorization, historical queue transitions, worker fencing and
+complete changed-object coverage remain the coordinator's responsibility.
 
 COMMIT with synchronous FULL precedes success. CommitError::Rejected means
 the pre-COMMIT check or a deferred-constraint/busy refusal rejected the

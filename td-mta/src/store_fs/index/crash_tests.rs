@@ -319,6 +319,11 @@ fn stopped_checkpoint_backup_restores_bodies_metadata_and_queue_retention() {
         notification_email: None,
     }));
     let membership = encode(Row::Membership);
+    let recipient = encode(Row::Recipient(super::recipient_tests::queued()));
+    let mut recipient_key = [0; 20];
+    Key::Recipient(submission, 0)
+        .encode(&mut recipient_key)
+        .unwrap();
     let mut membership_key = [0; 32];
     Key::Membership(EMAIL, MAILBOX)
         .encode(&mut membership_key)
@@ -343,6 +348,7 @@ fn stopped_checkpoint_backup_restores_bodies_metadata_and_queue_retention() {
             Operation::put(Table::Emails, deleted_email.as_bytes(), &queued_email).unwrap(),
             Operation::put(Table::Memberships, &membership_key, &membership).unwrap(),
             Operation::put(Table::Submissions, submission.as_bytes(), &queued).unwrap(),
+            Operation::put(Table::Recipients, &recipient_key, &recipient).unwrap(),
         ];
         let mut first = Generated {
             remaining: BODY_BYTES,
@@ -431,6 +437,10 @@ fn stopped_checkpoint_backup_restores_bodies_metadata_and_queue_retention() {
     assert!(
         matches!(view.get(Key::Submission(submission), &mut bytes).unwrap(), Some((Row::Submission(row), _)) if row.transmitted_blob == queued_blob)
     );
+    assert!(matches!(
+        view.get(Key::Recipient(submission, 0), &mut bytes).unwrap(),
+        Some((Row::Recipient(row), _)) if row == super::recipient_tests::queued()
+    ));
     verify_body(&mut view, BLOB);
     verify_body(&mut view, queued_blob);
 }
