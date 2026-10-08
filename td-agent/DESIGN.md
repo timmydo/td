@@ -594,6 +594,26 @@ increments of §18:
   A firing to a conversation the human has paused is skipped and logged
   the same way.
 
+**As built (schedules, the clock).** `schedule.rs` reads when a schedule
+fires and nothing else yet: a cron expression parsed field by field into
+the set of values each allows (a field beginning with `*` does not
+restrict, so `*/2` in a day field leaves the other to decide, as cron
+reads it; `N/S` steps from N to the field's end; 7 is folded into 0), or
+a single local time `YYYY-MM-DDTHH:MM`, nothing else. Its instants in a
+zone, td-civil's TZif zone, are found by walking local dates from the
+local date of the instant after which the next is wanted, taking each
+time the expression allows in order and the earliest instant whose local
+time it is: a time in a gap has none and is skipped, one that repeats is
+taken at its first, so a schedule that fires every few minutes is quiet
+through the hour that repeats when clocks go back, where cron would run
+it again. A step is an increment of up to three digits, so `*/60` is
+minute 0. The walk covers the Gregorian calendar's whole cycle, 400
+years and a whole number of weeks: a date the expression allows is
+found however far off (29 February on a Sunday, decades), and an
+expression no date satisfies, `0 0 31 2 *`, never fires. Nothing fires
+past 9999. The store, the window's timer and the tools are later
+increments.
+
 **As built (increment 8).** Every conversation has `todo_write`,
 `history_search`, `history_read`, `conversations` and `send_message`, a
 workspace's tools after them (§12). The crossing rules are those above:
