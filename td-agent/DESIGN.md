@@ -4158,6 +4158,7 @@ flag lets injected text lower its own bar.
 | reading or messaging another conversation (§3) | human | classifier |
 | `schedule` | human | human |
 | `schedules`, `cancel_schedule` of the schedules delivering to it | run | run |
+| `skill`, the person's own files | run | run |
 | network to a destination on the workspace allowlist, a command's or `web_fetch`'s | run | run |
 | network to another destination, policy `allowlist`, a command's or `web_fetch`'s | human | classifier |
 | git_push, unprotected branch, no force, clean scan | human | classifier |
@@ -4794,6 +4795,8 @@ and git tools, as far as the workspace has what they act on.
 - **`question {question, options?}`**: asks the person and waits for
   their answer, as opencode's `question` does; every conversation has it
   (As built (`question`), below).
+- **`skill {name, file?}`**: one of the person's skills, which the
+  prefix lists, or one of its files (As built (skills), below).
 - **`request_directory {path, write?}`**: asks for an extra host directory
   bound into this workspace's later instances, admitted per §8 and decided
   per §11.
@@ -5066,6 +5069,47 @@ wait unanswered, as does the window going; the call says so. A
 connection card held for the classifier while the question waits is put
 to the person, who is there. The step's folded line says "asked" and
 the question's start.
+
+**As built (skills).** The person's skills are directories in the
+`skills` directory beside the configuration file, a place no jail binds
+(§8), laid out as Agent Skills has them: a directory `NAME` (1 to 64
+lowercase ASCII letters, digits and single hyphens, no hyphen at either
+end) holding `SKILL.md`, whose front matter gives `description` (at
+most 1,024 bytes) and, if anything, a `name` that is the directory's;
+its other files are references and scripts. The front matter is read
+in YAML's simple forms: a plain value, which indented lines after it
+continue and a `#` at its start or after a space ends, a double-quoted one with `\"` and `\\`, a
+single-quoted one with `''`, or a `>` or `|` block, its header's
+comment passed over; a byte-order mark
+and space after a `---` are allowed, and anything nested or not a
+field is passed over. Every file and
+directory is read as the person's commands are (§15): of its own,
+never through a link, whose target could be a place a workspace
+writes, opened without blocking, at most 64 KiB of UTF-8. The first 64
+skills by name are listed last in the system message (§13), each by
+name and description, under a line saying that a skill fitting the
+task is to be read with `skill` before starting and followed as far as
+it serves what the person asked, being guidance, not their request,
+and perhaps another author's. The conversation process reads the
+directory, of the environment it was started in, for each request's
+prefix, so a skill added, edited or removed changes the prefix from the
+next request, with a `prefix` event (§6); one that cannot be read is
+left out, and a directory that cannot be (a link among them) lists
+none, which `/skills` says. What `skill` returns is the file's text with line ends made `\n` and
+every character that would not show, but a tab, marked as a card marks
+it (§11), so a skill hides nothing from a person who reads it.
+`skill {name}` returns `SKILL.md` after its front matter
+and names, after it, the skill's other files, three levels deep, at
+most 64; `skill {name, file}` returns one of them, a relative path with
+nothing but names in it, each directory on the way its own too. Both
+are run without a card in either mode (§11): what they read is the
+person's own, crossing nothing. Nothing in a skill runs where it is,
+which the tool says: a script reaches a workspace only as the model
+writes it there, as any file. `/skills` in the composer lists them over
+the open conversation, with the ones refused and why: a name that is no
+skill's, no `SKILL.md`, a link, no description, a name that is not the
+directory's. Skills inside a workspace's repositories are the model's
+to read as files, and are not listed.
 
 **As built (`web_fetch`).** A workspace's conversation has
 `web_fetch {url, offset?, max_bytes?}`, which the conversation process
@@ -5349,6 +5393,8 @@ paragraph.
    as ordinary, untrusted tool output. A sparse checkout that omits a
    routed document is widened by the model when the routing sends it
    there.
+5. **Skills:** the person's skills, by name and what each is for, which
+   `skill` reads (§12).
 
 The prompt texts live as plain files under `td-agent/prompt/` and are
 compiled in with `include_str!`. They are named `.txt`, not `.md`: they
@@ -5700,8 +5746,8 @@ nothing is asked.
 composer, `/compact` followed by an optional focus ("keep the failing test
 names") that is added to the summary request, or from a button. Neither
 the model nor another conversation can compact a conversation. The
-composer's other commands are the schedules' (§3) and the person's own
-(§15).
+composer's other commands are the schedules' (§3), `/skills` (§12) and
+the person's own (§15).
 
 **Failure is visible.** If the summary request fails, or the compacted
 view still exceeds the threshold, the turn stops and says why; nothing is
@@ -5845,7 +5891,7 @@ the `commands` directory beside the configuration file, a place no jail
 binds (§8), so their text is the person's. A name is 1 to 32 lowercase
 ASCII letters, digits and `-`, starting with a letter; the composer's
 own commands (`/commands`, `/compact`, `/schedule`, `/schedules`,
-`/unschedule`) are never looked up. `/NAME ARGS` in the composer asks
+`/skills`, `/unschedule`) are never looked up. `/NAME ARGS` in the composer asks
 the window, which reads the file when it is sent: a regular file of its
 own in a directory of its own, never through a link, whose target could
 be a place a workspace writes, opened without blocking, so a FIFO
@@ -5858,9 +5904,9 @@ that text. One that cannot be read, is too long with its arguments or
 comes to nothing is said, and what was typed put back in the composer. With no such file the text goes as
 typed, so a message that merely starts with a slash and a word, `/tmp
 is full`, still reaches the model. `/commands` lists them over the open
-conversation, the first 128 by name, each with its first line that is
-not blank in its first 4 KiB, cut to 120 characters, and how many more
-there are; a file named as one of the composer's own commands is listed
+conversation, the first 128 by name of the first 1,024 entries the
+directory gives, each with its first line that is not blank in its
+first 4 KiB, cut to 120 characters, and how many more there are; a file named as one of the composer's own commands is listed
 as never used.
 
 ## 16. Prior art: opencode
@@ -5890,7 +5936,7 @@ kind. td-agent's position on its features:
 | JS plugins and code-mode `execute` | not adopted: no embedded runtime |
 | LSP diagnostics and formatters after edits | not adopted for now; opencode itself turned both off by default |
 | Custom commands | adopted, as the person's files beside the configuration (§15) |
-| Skills | later, as plain files |
+| Skills | adopted, as the person's files beside the configuration, read by `skill` (§12) |
 | MCP | later (§12) |
 
 ## 17. Testing
@@ -6670,10 +6716,10 @@ in parallel with it.
 
 After these: resource limits (§8), a loopback shared by
 a conversation's instances (§19), child conversations within a
-workspace, skills, the MCP client, moving a
+workspace, the MCP client, moving a
 conversation between workspaces, and a native Anthropic Messages
-dialect. `web_fetch`, `question`, schedules and the person's commands
-are built (§3, §12, §15).
+dialect. `web_fetch`, `question`, schedules, skills and the person's
+commands are built (§3, §12, §15).
 
 ## 19. Open questions
 

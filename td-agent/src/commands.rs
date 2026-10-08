@@ -13,7 +13,14 @@ pub const DIR: &str = "commands";
 const ARGUMENTS: &str = "$ARGUMENTS";
 
 /// The composer's own commands, never looked up as files.
-const BUILT_IN: &[&str] = &["commands", "compact", "schedule", "schedules", "unschedule"];
+const BUILT_IN: &[&str] = &[
+    "commands",
+    "compact",
+    "schedule",
+    "schedules",
+    "skills",
+    "unschedule",
+];
 
 /// The most commands `/commands` lists, of the most directory entries it
 /// reads; the most characters of a first line it shows, and bytes of
@@ -28,6 +35,8 @@ const MAX_HEAD: u64 = 4096;
 pub enum Typed {
     /// `/commands`: list them.
     List,
+    /// `/skills`: list the person's skills (DESIGN.md §12).
+    Skills,
     /// `/NAME ARGS`: command NAME's text, when there is such a command.
     Run { name: String, args: String },
 }
@@ -49,11 +58,13 @@ pub fn typed(text: &str) -> Option<Result<Typed, String>> {
     let (name, args) = rest
         .split_once(char::is_whitespace)
         .map_or((rest, ""), |(name, args)| (name, args.trim()));
-    if name == "commands" {
-        return Some(match args.is_empty() {
-            true => Ok(Typed::List),
-            false => Err("/commands takes nothing".into()),
-        });
+    for (word, typed) in [("commands", Typed::List), ("skills", Typed::Skills)] {
+        if name == word {
+            return Some(match args.is_empty() {
+                true => Ok(typed),
+                false => Err(format!("/{word} takes nothing")),
+            });
+        }
     }
     if !name_ok(name) || BUILT_IN.contains(&name) {
         return None;
@@ -240,6 +251,8 @@ mod tests {
         );
         assert_eq!(typed("/commands"), Some(Ok(Typed::List)));
         assert!(matches!(typed("/commands x"), Some(Err(_))));
+        assert_eq!(typed("/skills"), Some(Ok(Typed::Skills)));
+        assert!(matches!(typed("/skills all"), Some(Err(_))));
         for text in [
             "fix it",
             "/usr/bin is missing",

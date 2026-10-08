@@ -189,6 +189,17 @@ fn parts(call: &Call) -> Vec<Part> {
                 URL_CHARS
             ))
         ))],
+        "skill" => vec![Part::Run(format!(
+            "read skill {}{}",
+            visible(&cut(
+                text(&value, "name").unwrap_or_default().trim(),
+                URL_CHARS
+            )),
+            match text(&value, "file").unwrap_or_default().trim() {
+                "" => String::new(),
+                file => format!("'s {}", visible(&cut(file, URL_CHARS))),
+            }
+        ))],
         "schedule" => vec![Part::Run(format!(
             "scheduled {}",
             visible(&cut(

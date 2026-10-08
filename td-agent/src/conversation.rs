@@ -398,7 +398,14 @@ pub fn run(
         .as_fd()
         .try_clone_to_owned()
         .map_err(|e| format!("standard input: {e}"))?;
-    serve_in(UnixStream::from(socket), state, id, create, workspace)
+    serve_in(
+        UnixStream::from(socket),
+        state,
+        id,
+        create,
+        workspace,
+        crate::skills::dir(),
+    )
 }
 
 /// What the reader thread, and a stream's thread, hand on.
@@ -562,17 +569,19 @@ pub fn serve(
     id: &Id,
     create: Option<Role>,
 ) -> Result<(), String> {
-    serve_in(stream, state, id, create, None)
+    serve_in(stream, state, id, create, None, None)
 }
 
 /// `serve`, creating the conversation in `workspace`; a workspace is
-/// given only with the role it is created as.
+/// given only with the role it is created as. `skills` is the person's
+/// skills' directory.
 pub fn serve_in(
     stream: UnixStream,
     state: &StateDir,
     id: &Id,
     create: Option<Role>,
     workspace: Option<Workspace>,
+    skills: Option<PathBuf>,
 ) -> Result<(), String> {
     let (conversation, load) = match (create, workspace) {
         (Some(role), workspace) => Conversation::create(state, id, role, workspace, LOCK_WAIT)?,
@@ -593,6 +602,7 @@ pub fn serve_in(
     let (sender, inbox) = listen(reader)?;
     let mut session = Session {
         conversation,
+        skills,
         writer: stream,
         inbox,
         sender,
@@ -880,6 +890,8 @@ fn charge(
 
 struct Session {
     conversation: Conversation,
+    /// The person's skills' directory (DESIGN.md §12).
+    skills: Option<PathBuf>,
     writer: UnixStream,
     inbox: Receiver<Inbound>,
     /// The inbox's sender, which each stream's thread hands on through.
@@ -3687,8 +3699,19 @@ impl Session {
     /// and named, with its tools.
     fn expected_prefix(&mut self, client: &Client) -> Result<String, String> {
         let meta = self.conversation.meta().clone();
+        // Listed as they are now, so one added is offered from the next
+        // request, as a changed prefix.
+        let skills = self
+            .skills
+            .as_deref()
+            .and_then(|dir| crate::skills::scan(dir).ok())
+            .and_then(|found| crate::skills::index(&found.skills));
         let Some(workspace) = &meta.workspace else {
-            return Ok(crate::prompt::prefix(meta.created));
+            return Ok(crate::prompt::prefix_with(
+                meta.created,
+                None,
+                skills.as_deref(),
+            ));
         };
         let state = StateDir::at(self.state.clone());
         // The network its commands reach, as the settings give it now,
@@ -3732,7 +3755,11 @@ impl Session {
             network,
             allowlist: &client.network_allowlist,
         };
-        Ok(crate::prompt::prefix_in(meta.created, Some(&place)))
+        Ok(crate::prompt::prefix_with(
+            meta.created,
+            Some(&place),
+            skills.as_deref(),
+        ))
     }
 
     /// Runs a workspace tool's call, the `ToolCall` record `started`, in
@@ -5200,6 +5227,13 @@ impl Session {
             } => self.schedule(started, when, to, text, catch_up),
             Args::Schedules => self.ask_schedules(ScheduleOp::List),
             Args::CancelSchedule(schedule) => self.ask_schedules(ScheduleOp::Cancel { schedule }),
+            Args::Skill { name, file } => match &self.skills {
+                Some(dir) => crate::skills::read(dir, &name, file.as_deref()),
+                None => Err(
+                    "there are no skills: neither XDG_CONFIG_HOME nor HOME is an absolute path"
+                        .into(),
+                ),
+            },
             // `answer` runs these through `host`, with their record.
             Args::Host { .. } => Err("a workspace tool runs only in the jail".into()),
         })

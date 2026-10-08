@@ -367,6 +367,8 @@ pub enum Request {
     },
     /// List the person's commands.
     Commands,
+    /// List the person's skills.
+    Skills,
     /// The human's answer to `conversation`'s cold-resume card for turn
     /// `turn` (DESIGN.md §14).
     Resume {
@@ -3328,10 +3330,14 @@ impl App {
                 self.note(why.clone());
                 return;
             }
-            Some(Ok(crate::commands::Typed::List)) => {
+            Some(Ok(listing @ (crate::commands::Typed::List | crate::commands::Typed::Skills))) => {
+                let request = match listing {
+                    crate::commands::Typed::Skills => Request::Skills,
+                    _ => Request::Commands,
+                };
                 self.composer.fresh();
                 self.apply_focus();
-                self.requests.push(Request::Commands);
+                self.requests.push(request);
                 self.touch();
                 return;
             }
@@ -3869,7 +3875,42 @@ impl App {
             "there are no commands: each is a file NAME.md in the commands directory beside td-agent's configuration",
             format!(
                 "{} commands; /NAME ARGS sends one's text, ARGS in place of $ARGUMENTS",
-                entries.len()
+                commands.len() + more
+            ),
+        );
+    }
+
+    /// The person's skills, by name with what each is for, and the ones
+    /// refused with why (DESIGN.md §12).
+    pub fn show_skills(&mut self, found: &crate::skills::Found) {
+        let mut entries: Vec<(String, String)> = found
+            .skills
+            .iter()
+            .map(|skill| {
+                (
+                    skill.name.clone(),
+                    crate::tools::visible(&skill.description),
+                )
+            })
+            .chain(
+                found
+                    .refused
+                    .iter()
+                    .map(|(name, why)| (name.clone(), format!("refused: {why}"))),
+            )
+            .collect();
+        if found.more > 0 {
+            entries.push((
+                format!("{} more", found.more),
+                "not offered; the first by name are".into(),
+            ));
+        }
+        self.show_listing(
+            &entries,
+            "there are no skills: each is a directory NAME with a SKILL.md in the skills directory beside td-agent's configuration",
+            format!(
+                "{} skills, offered to every conversation by what each is for",
+                found.skills.len() + found.more
             ),
         );
     }
@@ -5876,6 +5917,24 @@ pub mod tests {
             .last()
             .is_some_and(|n| n.contains("there are no commands")));
         app.show_commands(&[("review".into(), "Review the PR.".into())], 1);
+        assert!(app.notes.is_some());
+        app.notes = None;
+        assert!(app.composer.insert("/skills").unwrap());
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [Request::Skills]);
+        app.show_skills(&crate::skills::Found::default());
+        assert!(app
+            .log
+            .last()
+            .is_some_and(|n| n.contains("there are no skills")));
+        app.show_skills(&crate::skills::Found {
+            skills: vec![crate::skills::Skill {
+                name: "pdf".into(),
+                description: "Forms.".into(),
+            }],
+            refused: vec![("bad".into(), "it has no SKILL.md".into())],
+            more: 0,
+        });
         assert!(app.notes.is_some());
     }
 

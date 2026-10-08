@@ -688,7 +688,9 @@ fn conversation(state: &Path, id: &Id, create: Option<Role>) -> (std::process::C
     let mut command = Command::new(PROGRAM);
     command
         .args(["conversation", id.as_str(), "--state-dir"])
-        .arg(state);
+        .arg(state)
+        // Not the developer's own skills.
+        .env("XDG_CONFIG_HOME", state.join("config"));
     if let Some(role) = create {
         command.args(["--create", role.word()]);
     }

@@ -89,6 +89,11 @@ pub fn prefix(created: u64) -> String {
 
 /// `prefix`, for a conversation that works in `place`.
 pub fn prefix_in(created: u64, place: Option<&Place>) -> String {
+    prefix_with(created, place, None)
+}
+
+/// `prefix_in`, with the person's skills listed last (DESIGN.md §13).
+pub fn prefix_with(created: u64, place: Option<&Place>, skills: Option<&str>) -> String {
     let text = CONVERSATION.replacen(
         TOOLS,
         if place.is_some() {
@@ -107,6 +112,10 @@ pub fn prefix_in(created: u64, place: Option<&Place>) -> String {
     if let Some(project) = place.and_then(project) {
         system.push_str("\n\n");
         system.push_str(&project);
+    }
+    if let Some(skills) = skills {
+        system.push_str("\n\n");
+        system.push_str(skills);
     }
     let kit = match place {
         None => crate::tools::Kit::Conversation,

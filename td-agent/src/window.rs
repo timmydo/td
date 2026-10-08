@@ -343,6 +343,8 @@ pub struct Session {
     /// The person's commands' directory, beside the configuration
     /// (DESIGN.md §15).
     commands: Option<PathBuf>,
+    /// The person's skills' directory, beside it (DESIGN.md §12).
+    skills: Option<PathBuf>,
     /// The background store fetches (DESIGN.md §7, Keeping current):
     /// how often, when the next is due, the remotes whose fetch has not
     /// answered yet, and each base's commit as last fetched.
@@ -415,6 +417,13 @@ impl Session {
                     Some(Err(why)) => self.app.note(why),
                     None => self.app.note(
                         "neither XDG_CONFIG_HOME nor HOME is an absolute path, so there are no commands",
+                    ),
+                },
+                Request::Skills => match self.skills.as_deref().map(crate::skills::scan) {
+                    Some(Ok(found)) => self.app.show_skills(&found),
+                    Some(Err(why)) => self.app.note(why),
+                    None => self.app.note(
+                        "neither XDG_CONFIG_HOME nor HOME is an absolute path, so there are no skills",
                     ),
                 },
                 Request::Retry => {
@@ -2675,6 +2684,7 @@ pub fn run(
             std::env::var_os("HOME"),
         )
         .and_then(|file| file.parent().map(|dir| dir.join(crate::commands::DIR))),
+        skills: crate::skills::dir(),
         fetch_interval: config.fetch_interval(),
         next_refresh: Instant::now(),
         refreshing: Vec::new(),

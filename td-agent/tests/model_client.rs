@@ -459,7 +459,9 @@ fn spawn(
         .args(["conversation", id.as_str(), "--state-dir"])
         .arg(state.root())
         .env_clear()
-        .env("XDG_RUNTIME_DIR", runtime);
+        .env("XDG_RUNTIME_DIR", runtime)
+        // The person's skills, which a test may write.
+        .env("XDG_CONFIG_HOME", runtime.parent().unwrap().join("config"));
     if let Some(role) = create {
         command.args(["--create", role.word()]);
     }
@@ -763,7 +765,8 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
     assert_eq!(body["tools.6.function.name"], "schedule");
     assert_eq!(body["tools.7.function.name"], "schedules");
     assert_eq!(body["tools.8.function.name"], "cancel_schedule");
-    assert!(!body.contains_key("tools.9.type"), "no report");
+    assert_eq!(body["tools.9.function.name"], "skill");
+    assert!(!body.contains_key("tools.10.type"), "no report");
     // `require_parameters` routes only to an endpoint that lists every
     // parameter sent, so each member, but those it does not route on, is
     // one the model lists; the title's as well.
@@ -4981,6 +4984,51 @@ fn a_crossing_asks_the_person_and_a_refusal_is_the_calls_result() {
         matches!(approvals[..], [Kind::Approval { outcome, by, .. }] if outcome == "deny" && by == "human"),
         "{approvals:?}"
     );
+}
+
+/// The person's skills are listed in the system message by name and what
+/// each is for, as they are at each request; `skill` reads one, its
+/// other files named, and one of those files.
+#[test]
+fn a_skill_is_offered_and_read() {
+    let mut h = Harness::new(
+        "skill",
+        Role::Conversation,
+        vec![
+            Reply::sse("stream-tool-skill.sse"),
+            Reply::sse("stream-tool-skill-file.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    let skill = h.root.join("config/td-agent/skills/pdf");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: pdf\ndescription: Fill PDF forms.\n---\n\n# PDF\nRead forms.md first.\n",
+    )
+    .unwrap();
+    std::fs::write(skill.join("forms.md"), "the forms").unwrap();
+    h.setup(Client::default());
+    h.say("Fill in the form.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let said = results(&events);
+    assert!(
+        said[0]
+            .1
+            .starts_with("# PDF\nRead forms.md first.\n\n[The skill's other files"),
+        "{}",
+        said[0].1
+    );
+    assert!(
+        said[0].1.ends_with("no workspace: forms.md]"),
+        "{}",
+        said[0].1
+    );
+    assert_eq!(said[1].1, "the forms");
+    let first = h.mock.requests()[0].text();
+    assert!(first.contains("- pdf: Fill PDF forms."), "{first}");
 }
 
 /// A harness in auto mode, with conversation `b…` beside it.

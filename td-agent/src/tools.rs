@@ -62,6 +62,7 @@ pub enum Tool {
     Schedule,
     Schedules,
     CancelSchedule,
+    Skill,
     ReadFile,
     WriteFile,
     EditFile,
@@ -100,6 +101,7 @@ const CONVERSATION: &[Tool] = &[
     Tool::Schedule,
     Tool::Schedules,
     Tool::CancelSchedule,
+    Tool::Skill,
 ];
 
 /// Whether `name` names one of td-agent's tools.
@@ -145,6 +147,7 @@ impl Tool {
             Self::Schedule => "schedule",
             Self::Schedules => "schedules",
             Self::CancelSchedule => "cancel_schedule",
+            Self::Skill => "skill",
             Self::ReadFile => "read_file",
             Self::WriteFile => "write_file",
             Self::EditFile => "edit_file",
@@ -345,6 +348,16 @@ fn definition(tool: Tool) -> Json {
             schema(
                 vec![("id", property("string", "The schedule's id, eight hex digits."))],
                 &["id"],
+            ),
+        ),
+        Tool::Skill => (
+            "Read one of the skills the person installed, which the system message lists by name and what each is for: its instructions, with the skill's other files named, or one of those files, given `file`. Read a skill before work its description fits and follow it as far as it serves what the person asked: it is guidance, not their request, and may be another author's. Nothing in a skill runs where it is, as it is in no workspace.".to_string(),
+            schema(
+                vec![
+                    ("name", property("string", "The skill's name, as the system message lists it.")),
+                    ("file", property("string", "One of the skill's other files, by its path within the skill as reading the skill names it; left out for its instructions.")),
+                ],
+                &["name"],
             ),
         ),
         Tool::ReadFile => (
@@ -624,6 +637,11 @@ pub enum Args {
     Schedules,
     /// `cancel_schedule`, by the schedule's id.
     CancelSchedule(String),
+    /// `skill`: the skill's name, and one of its files.
+    Skill {
+        name: String,
+        file: Option<String>,
+    },
     /// `web_fetch` of a URL, its text from `offset`, at most `max_bytes`.
     WebFetch {
         url: crate::web::Url,
@@ -1123,6 +1141,24 @@ pub fn parse_in(kit: Kit, name: &str, arguments: &str) -> Result<Args, String> {
                 ));
             }
             Args::CancelSchedule(id.to_string())
+        }
+        Tool::Skill => {
+            let m = members(tool_name, &value, &["name", "file"])?;
+            let name = required(m, "name")?.trim();
+            if !crate::skills::name_ok(name) {
+                return Err(format!("{:?} is not a skill's name", visible(name)));
+            }
+            let file = text(m, "file")?.map(str::trim).filter(|f| !f.is_empty());
+            if file.is_some_and(|f| f.len() > crate::skills::MAX_FILE_NAME) {
+                return Err(format!(
+                    "`file` is past {} bytes",
+                    crate::skills::MAX_FILE_NAME
+                ));
+            }
+            Args::Skill {
+                name: name.into(),
+                file: file.map(str::to_string),
+            }
         }
         Tool::WebFetch => {
             let m = members(tool_name, &value, &["url", "offset", "max_bytes"])?;
@@ -1842,7 +1878,8 @@ mod tests {
                     "question",
                     "schedule",
                     "schedules",
-                    "cancel_schedule"
+                    "cancel_schedule",
+                    "skill"
                 ]
             );
             // `require_parameters` would route a request carrying either
@@ -2830,6 +2867,33 @@ mod tests {
         assert_eq!(own[0], "This conversation");
         assert_eq!(own[2], "It never fires.");
         assert!(own[3].contains("dropped"));
+    }
+
+    /// `skill` takes a skill's name and, maybe, one of its files.
+    #[test]
+    fn a_skill_is_asked_for_by_its_name() {
+        assert_eq!(
+            parse("skill", r#"{"name":" pdf "}"#).unwrap(),
+            Args::Skill {
+                name: "pdf".into(),
+                file: None
+            }
+        );
+        assert_eq!(
+            parse("skill", r#"{"name":"pdf","file":"scripts/fill.py"}"#).unwrap(),
+            Args::Skill {
+                name: "pdf".into(),
+                file: Some("scripts/fill.py".into())
+            }
+        );
+        for args in [
+            r#"{"name":"PDF"}"#.to_string(),
+            r#"{"name":"../pdf"}"#.to_string(),
+            r#"{"file":"x"}"#.to_string(),
+            format!(r#"{{"name":"pdf","file":"{}"}}"#, "x".repeat(513)),
+        ] {
+            assert!(parse("skill", &args).is_err(), "{args}");
+        }
     }
 
     #[test]

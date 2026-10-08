@@ -76,6 +76,7 @@ pub mod schedule;
 #[path = "../../engine/src/sha256.rs"]
 mod sha256;
 pub mod shell;
+pub mod skills;
 pub mod span;
 pub mod sse;
 pub mod store;
