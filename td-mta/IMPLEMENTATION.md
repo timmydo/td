@@ -2323,7 +2323,10 @@ original group, first cancellation cannot introduce Pending: the core
 rejects matching final Canceled recipient PUTs on an existing None-to-Pending
 submission update.
 The core also preserves an existing completedAt timestamp through later
-updates and cancellation, without proving its clock authority.
+updates and cancellation, without proving its clock authority. A final
+DELETE of an existing Submission requires completion in its original row;
+intermediate completion cannot stand in for a prior commit. Deletion age,
+category and administrator authorization remain service work.
 STORAGE.md also defines reply retention outside active attempts, RCPT
 retention after an active attempt reaches Body, both-reply retention on
 cancellation, and the empty-diagnostic requirement on attempt-count

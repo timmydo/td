@@ -142,8 +142,17 @@ above i64::MAX; overflow refuses mutation. Account creation is bounded to 128.
 Change actions must agree with pre/post existence, and a unique native index
 refuses duplicate changes for one object within a transaction.
 
-Before applying rows, compare each existing Submission/Recipient with its
-final operation when it is a PUT, using the original account transaction snapshot.
+Before applying rows, a final DELETE of an existing Submission requires an
+original completedAt. An intermediate completion PUT or DELETE/reinsert
+cannot supply that prior durable completion. This prevents deletion of an
+existing unfinished consistent group; it does not authorize deletion of a
+completed group. Retention age, category, administrator authorization,
+acknowledgement and storing a Pending notice before deletion remain service
+obligations. Operations on new rows have no
+original history for this guard to compare. Recipient DELETEs remain under
+final ordinal coverage and foreign-key checks.
+For surviving PUTs, compare each existing Submission/Recipient with the
+original account transaction snapshot.
 Submission email/thread/identity, transmitted blob, reverse path, creation
 and expiry times, and recipient count are immutable. An existing
 submission cannot change a None notice directly to Stored: Pending must
@@ -242,9 +251,13 @@ A DELETE followed by a PUT cannot reset that history within the transaction;
 intermediate PUT values have no separate durable effect.
 
 The scan projects queue keys without decoding unrelated rows and reuses
-writer scratch. DELETE positions and PUTs without an original row skip the
-later-key scan. At most 4096 original point reads and 8386560 later-key
-projections are possible; repeated keys may repeat an original point read.
+writer scratch. The outer pass makes one queue-key projection per position
+and at most 4096 further PUT-key projections to skip Recipient DELETEs.
+Recipient DELETE positions and operations without an original row skip the
+later-key scan. Submission DELETEs read original rows and check final
+effects alongside PUTs. At most 4096 original point reads and 8386560
+later-key projections are possible; repeated keys may repeat an original
+point read.
 The quadratic scan samples the original deadline at least every 64 bounded
 key projections and before final value decoding; all SQL shares the
 original native allowance. The additional notice scan visits every

@@ -237,14 +237,69 @@ fn immutable_recipient_count_and_whole_group_deletion_check_final_rows() {
             .unwrap()
             .is_some());
         drop(retained);
+        let canceled = encode(Row::Recipient(RecipientRow {
+            state: RecipientState::Canceled,
+            reason: FailureReason::Canceled,
+            next_attempt_at: None,
+            ..queued()
+        }));
+        let completed = encode(Row::Submission(SubmissionRow {
+            completed_at: Some(1),
+            ..submission(2)
+        }));
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                request(1),
+                &[
+                    Operation::put(Table::Recipients, &key0, &canceled).unwrap(),
+                    Operation::put(Table::Recipients, &key1, &canceled).unwrap(),
+                    Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &completed).unwrap(),
+                ],
+                &mut []
+            ),
+            Ok(Sequence::from_u64(2))
+        );
+        for operations in [
+            &[parent][..],
+            &[parent, remove0][..],
+            &[remove0, parent][..],
+        ] {
+            rejected(store.commit(&td_crypto::Provider, request(2), operations, &mut []));
+            let mut retained = store.view(ACCOUNT, deadline()).unwrap();
+            assert_eq!(
+                retained.identity().committed_sequence,
+                Sequence::from_u64(2)
+            );
+            assert_eq!(
+                retained
+                    .get(Key::Submission(SUBMISSION), &mut [0; 1024])
+                    .unwrap(),
+                Some((
+                    Row::decode(Table::Submissions, &completed).unwrap(),
+                    Sequence::from_u64(2)
+                ))
+            );
+            for ordinal in 0..2 {
+                assert_eq!(
+                    retained
+                        .get(Key::Recipient(SUBMISSION, ordinal), &mut [0; 1024])
+                        .unwrap(),
+                    Some((
+                        Row::decode(Table::Recipients, &canceled).unwrap(),
+                        Sequence::from_u64(2)
+                    ))
+                );
+            }
+        }
         let delete = if parent_first {
             [parent, remove0, remove1]
         } else {
             [remove0, remove1, parent]
         };
         assert_eq!(
-            store.commit(&td_crypto::Provider, request(1), &delete, &mut []),
-            Ok(Sequence::from_u64(2))
+            store.commit(&td_crypto::Provider, request(2), &delete, &mut []),
+            Ok(Sequence::from_u64(3))
         );
         let mut old = old;
         assert!(old

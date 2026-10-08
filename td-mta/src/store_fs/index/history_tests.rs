@@ -2158,3 +2158,201 @@ fn first_cancellation_notice_check_uses_the_final_submission_put() {
         assert_recipient(&store, canceled);
     }
 }
+
+#[test]
+fn pending_submission_deletion_requires_a_prior_completion_commit() {
+    #[derive(Clone, Copy, Debug)]
+    enum Intermediate {
+        Direct,
+        Completed,
+        DeleteCompleted,
+        CompletedGroup,
+    }
+    let prepared = RecipientRow {
+        state: RecipientState::InFlight,
+        phase: AttemptPhase::Prepared,
+        uncertain: false,
+        reason: FailureReason::None,
+        next_attempt_at: None,
+        ..uncertain()
+    };
+    let body = RecipientRow {
+        phase: AttemptPhase::Body,
+        rcpt_reply: Some("250 recipient accepted"),
+        ..prepared
+    };
+    let exposed = RecipientRow {
+        phase: AttemptPhase::AcceptancePossible,
+        ..body
+    };
+    let unknown_exposed = RecipientRow {
+        phase: AttemptPhase::AcceptancePossible,
+        ..uncertain()
+    };
+    let cases = &[
+        ("queued", queued()),
+        ("retry wait", pending_attempt(RecipientState::RetryWait)),
+        ("prepared", prepared),
+        ("body", body),
+        ("exposed", exposed),
+        ("unknown final", uncertain()),
+        ("unknown exposed", unknown_exposed),
+    ];
+    let mut unexpected = Vec::new();
+    for encoded in [false, true] {
+        for state in [
+            RecipientState::Accepted,
+            RecipientState::Canceled,
+            RecipientState::Failed,
+            RecipientState::OutcomeUnknown,
+        ] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = open(&mut root);
+            let sub = SubmissionRow {
+                completed_at: Some(1),
+                notification: if matches!(
+                    state,
+                    RecipientState::Failed | RecipientState::OutcomeUnknown
+                ) {
+                    NotificationState::Pending
+                } else {
+                    NotificationState::None
+                },
+                ..submission(1)
+            };
+            // The core permits Pending here; the service must store its notice first.
+            create_group(&store, sub, &[(0, terminal(state))], encoded).unwrap();
+            let key = recipient_key(0);
+            assert_eq!(
+                apply(
+                    &store,
+                    1,
+                    &[
+                        Operation::delete(Table::Submissions, SUBMISSION.as_bytes()).unwrap(),
+                        Operation::delete(Table::Recipients, &key).unwrap(),
+                    ],
+                    encoded
+                ),
+                Ok(Sequence::from_u64(2))
+            );
+        }
+        for &(name, original) in cases {
+            for intermediate in [
+                Intermediate::Direct,
+                Intermediate::Completed,
+                Intermediate::DeleteCompleted,
+                Intermediate::CompletedGroup,
+            ] {
+                for parent_first in [false, true] {
+                    let fixture = Fixture::new();
+                    let mut root = fixture.locked();
+                    let store = open(&mut root);
+                    create_group(&store, submission(1), &[(0, original)], encoded).unwrap();
+                    let key = recipient_key(0);
+                    let parent =
+                        Operation::delete(Table::Submissions, SUBMISSION.as_bytes()).unwrap();
+                    let child = Operation::delete(Table::Recipients, &key).unwrap();
+                    let transient = encode(Row::Submission(SubmissionRow {
+                        completed_at: Some(1),
+                        ..submission(1)
+                    }));
+                    let completed =
+                        Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &transient)
+                            .unwrap();
+                    let unknown =
+                        original.uncertain || original.phase == AttemptPhase::AcceptancePossible;
+                    let ended = RecipientRow {
+                        state: if unknown {
+                            RecipientState::OutcomeUnknown
+                        } else {
+                            RecipientState::Failed
+                        },
+                        phase: if original.attempt_count == 0 {
+                            AttemptPhase::None
+                        } else {
+                            AttemptPhase::Final
+                        },
+                        uncertain: unknown,
+                        reason: FailureReason::Expired,
+                        next_attempt_at: None,
+                        ..original
+                    };
+                    let sub = SubmissionRow {
+                        completed_at: Some(2),
+                        notification: NotificationState::Pending,
+                        ..submission(1)
+                    };
+                    let sub_bytes = encode(Row::Submission(sub));
+                    let ended_bytes = encode(Row::Recipient(ended));
+                    let mut operations = Vec::new();
+                    if !parent_first && !matches!(intermediate, Intermediate::CompletedGroup) {
+                        operations.push(child);
+                    }
+                    match intermediate {
+                        Intermediate::Direct => {}
+                        Intermediate::Completed => operations.push(completed),
+                        Intermediate::DeleteCompleted => operations.extend([parent, completed]),
+                        Intermediate::CompletedGroup => operations.extend([
+                            Operation::put(Table::Recipients, &key, &ended_bytes).unwrap(),
+                            Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes)
+                                .unwrap(),
+                        ]),
+                    }
+                    if !parent_first && matches!(intermediate, Intermediate::CompletedGroup) {
+                        operations.push(child);
+                    }
+                    operations.push(parent);
+                    if parent_first {
+                        operations.push(child);
+                    }
+                    let result = apply(&store, 1, &operations, encoded);
+                    if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                        unexpected.push((encoded, name, intermediate, parent_first, result));
+                        continue;
+                    }
+                    assert_submission(&store, submission(1), 1);
+                    assert_recipient(&store, original);
+                    assert_eq!(
+                        apply(
+                            &store,
+                            1,
+                            &[
+                                Operation::put(
+                                    Table::Submissions,
+                                    SUBMISSION.as_bytes(),
+                                    &sub_bytes
+                                )
+                                .unwrap(),
+                                Operation::put(Table::Recipients, &key, &ended_bytes).unwrap(),
+                            ],
+                            encoded
+                        ),
+                        Ok(Sequence::from_u64(2))
+                    );
+                    assert_submission(&store, sub, 2);
+                    assert_recipient(&store, ended);
+                    assert_eq!(
+                        apply(&store, 2, &[parent, child], encoded),
+                        Ok(Sequence::from_u64(3))
+                    );
+                    let mut view = store.view(ACCOUNT, deadline()).unwrap();
+                    assert_eq!(view.identity().committed_sequence, Sequence::from_u64(3));
+                    let mut scratch = [0; 1024];
+                    assert!(view
+                        .get(Key::Submission(SUBMISSION), &mut scratch)
+                        .unwrap()
+                        .is_none());
+                    assert!(view
+                        .get(Key::Recipient(SUBMISSION, 0), &mut scratch)
+                        .unwrap()
+                        .is_none());
+                }
+            }
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "pending responsibility deleted: {unexpected:?}"
+    );
+}

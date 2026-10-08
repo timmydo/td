@@ -12,9 +12,12 @@ pub(super) fn validate(
 ) -> Result<(), ports::Error> {
     for position in 0..operations.len() {
         native.check()?;
-        let Some(key) = operations.queue_put_key(position)? else {
+        let Some(key) = operations.queue_key(position)? else {
             continue;
         };
+        if matches!(key, Key::Recipient(_, _)) && operations.queue_put_key(position)?.is_none() {
+            continue;
+        }
         let Some((previous, _)) = view.get(key, scratch)? else {
             continue;
         };
@@ -22,20 +25,31 @@ pub(super) fn validate(
             continue;
         }
         native.check()?;
-        let Value::Row(Mutation::Put { row, .. }) = operations.get(position)?.value() else {
-            continue;
-        };
-
-        let valid = match (key, previous, row) {
-            (Key::Submission(id), Row::Submission(previous), Row::Submission(next)) => {
+        let valid = match (key, previous, operations.get(position)?.value()) {
+            (Key::Submission(_), Row::Submission(previous), Value::Row(Mutation::Delete(_))) => {
+                previous.completed_at.is_some()
+            }
+            (
+                Key::Submission(id),
+                Row::Submission(previous),
+                Value::Row(Mutation::Put {
+                    row: Row::Submission(next),
+                    ..
+                }),
+            ) => {
                 submission(previous, next)
                     && (previous.notification != NotificationState::None
                         || next.notification != NotificationState::Pending
                         || !has_final_cancellation(native, operations, id)?)
             }
-            (Key::Recipient(_, _), Row::Recipient(previous), Row::Recipient(next)) => {
-                recipient(previous, next)
-            }
+            (
+                Key::Recipient(_, _),
+                Row::Recipient(previous),
+                Value::Row(Mutation::Put {
+                    row: Row::Recipient(next),
+                    ..
+                }),
+            ) => recipient(previous, next),
             _ => return Err(ports::Error::Corrupt),
         };
         if !valid {

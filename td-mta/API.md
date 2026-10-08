@@ -6615,6 +6615,11 @@ Prepared may retain previous replies. This checks stored shape, not current
 reply provenance. Indexed point/successor reads reuse writer scratch and the
 original deadline/VM fuel. Inconsistent groups reject with
 Conflict; native deadline, capacity and I/O errors retain their classifications.
+Before row writes, a final DELETE of an existing Submission requires a
+completion timestamp in its original row. Intermediate completion PUTs or
+DELETE/reinsert cannot replace that prior commit. Missing original
+completion returns Conflict; completed deletion still needs service
+retention/category/administrator authorization.
 Before row writes, surviving queue PUTs preserve STORAGE.md's immutable
 identity, uncertainty, attempt-history and failure-notice fields against
 the original rows. Existing None notices cannot advance directly to

@@ -230,6 +230,27 @@ fn categories_deduplicate_references_and_follow_retained_snapshot_rows() {
         &store,
         ACCOUNT,
         1,
+        &[
+            (Key::Submission(FIRST), Row::Submission(completed)),
+            (Key::Recipient(FIRST, 0), Row::Recipient(canceled)),
+        ],
+        &[],
+        &mut [],
+    );
+    assert_eq!(
+        amounts(
+            store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .logical_usage()
+                .unwrap()
+        ),
+        [8, 3, 5, 3, 2]
+    );
+    commit(
+        &store,
+        ACCOUNT,
+        2,
         &[],
         &[
             Key::Recipient(FIRST, 0),
@@ -251,7 +272,7 @@ fn categories_deduplicate_references_and_follow_retained_snapshot_rows() {
     commit(
         &store,
         ACCOUNT,
-        2,
+        3,
         &[],
         &[Key::Blob(UPLOAD), Key::Blob(EMPTY)],
         &mut [],
@@ -262,11 +283,11 @@ fn categories_deduplicate_references_and_follow_retained_snapshot_rows() {
         .logical_usage()
         .unwrap();
     assert_eq!(amounts(current), [3, 1, 0, 3, 1]);
-    assert_eq!(current.identity.committed_sequence, Sequence::from_u64(3));
+    assert_eq!(current.identity.committed_sequence, Sequence::from_u64(4));
     commit(
         &store,
         ACCOUNT,
-        3,
+        4,
         &[],
         &[Key::Recipient(SECOND, 0), Key::Submission(SECOND)],
         &mut [],

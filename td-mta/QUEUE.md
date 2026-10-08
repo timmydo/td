@@ -114,9 +114,15 @@ only to remain Failed or join whole-group cancellation, and keeps terminal
 OutcomeUnknown terminal and uncertain. Terminal phase, uncertainty and
 actual replies are fixed, with a reason change only for Failed becoming
 Canceled; diagnostic text can still change.
-It compares final PUTs with original rows before writing, so repeated keys
-cannot reset history within a transaction. Full transition checks, creation
-and deletion authorization, and attempt fences remain service obligations.
+A final DELETE of an existing Submission also requires completedAt in the
+original row: completion must commit separately before removal. This
+protects existing unfinished consistent groups, not retention age or
+permission to destroy a completed record. Storing a Pending notice before
+deletion remains a service obligation. The core compares final PUTs and
+final Submission DELETEs with original rows before writing, so repeated
+keys cannot reset history within a transaction. Full transition checks,
+creation and deletion authorization, and attempt fences remain service
+obligations.
 
 ## 3. Attempt and restart transitions
 
