@@ -224,13 +224,19 @@ mod fido_virtual;
 #[cfg(test)]
 mod fido_uhid;
 
-/// Valid elevation descriptions, consent tags 11 and 12, for `owner`.
-/// td-secret decodes them through the shared consent codec but performs
-/// neither, so every worker's operation match must refuse them.
+/// Valid descriptions of the operations the approval key confirms,
+/// consent tags 5 (`deploy-publish`), 11 and 12, for `owner`. td-secret
+/// decodes them through the shared consent codec but performs none, so
+/// every worker's operation match must refuse them.
 #[cfg(test)]
 fn elevation_descriptions(owner: u32) -> Vec<Vec<u8>> {
     let key = consent::ApprovalKey::new(*b"47").unwrap();
     [
+        consent::Operation::Install {
+            key,
+            deployment: "c".repeat(64),
+            requester: owner,
+        },
         consent::Operation::DeployRollback {
             key,
             current: "a".repeat(64),
@@ -300,7 +306,7 @@ mod confinement {
             fingerprint(include_str!("enrollment_operation.rs")),
             0x44a7a283c11747d6
         );
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x68e38f4ad9c4584d, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0xf1e2c5245f2e49a3, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
         // The shared consent's hostname rules: firstboot's one copy.
         let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
         assert!(production.contains(

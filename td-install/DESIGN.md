@@ -429,8 +429,10 @@ source directory descriptor owned by the configured requester (UID 1000),
 not a pathname. It is not an elevation command or a user consent flow.
 The authority must admit and present the exact manifest ID before invoking
 it. `./update` (or `./update install`) builds the current checkout and queues
-that operation through td-authd. Physical I selects it and a fresh Enter
-after complete presentation confirms it, as specified in td-authd/DESIGN.md.
+that operation through td-authd as `deploy-publish`, which the principal
+table must grant. Physical I selects it, and its root-drawn approval
+key, typed after complete presentation, confirms it; Enter does not, as
+specified in td-authd/DESIGN.md.
 
 The helper requires the existing root-owned 0700 installation signing
 state and single-link 0600 key. It never creates or replaces an identity.

@@ -495,10 +495,12 @@ physical W selection of one queued request; one presented token assertion
 authorizes that operation. There is no root-console write bypass. No login, `su` or keyboard-consent
 behavior substitutes for that authorization.
 
-Local system installation is a separate named root operation. The paired
-compositor selects one queued build with physical I and presents its full
-manifest ID; a fresh Enter after complete presentation authorizes only that
-installation. td-authd passes its pinned source directory to the fixed
+Local system installation is a separate named root operation,
+`deploy-publish`, which the principal table must grant the account. The
+paired compositor selects one queued build with physical I and presents
+its full manifest ID; the root-drawn approval key, typed after complete
+presentation, authorizes only that installation, and Enter does not.
+td-authd passes its pinned source directory to the fixed
 installed helper, which signs with the already-provisioned installation key
 and uses the existing boot transaction. Neither td-login nor su elevates the
 caller. This does not change human login, hardware authentication, credential

@@ -130,7 +130,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0x68e38f4ad9c4584d,
+        0xf1e2c5245f2e49a3,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -309,6 +309,55 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "installation: {forbidden}"
         );
     }
+    // Request 19's `deploy-publish` (td-authd/DESIGN.md, "Elevation
+    // operations"): the update queue's own backoff row and the production
+    // table, the table's grant checked and the backoff written before the
+    // admission byte as admission's last steps, a refusal's byte sent
+    // before the connection closes; a key drawn beside the nonce; and at
+    // commit the confirmation consumed, then the backoff cleared, before
+    // the one helper starts.
+    for pin in [
+        "            backoff: Backoff::system(Row::Update),\n            table: Table::load,",
+        "ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))",
+        "                key: approval_key(key)?,",
+        "                    Err(refused) => {\n                        let _ = self.stream.write(&[refused.byte()]);\n                        return Err(error(refused));\n                    }",
+        "        self.committed = true;\n        // The approval clears the queue's backoff; one root cannot clear\n        // fails the installation before anything starts, said on the\n        // authority's standard error as admission's refusal is.\n        if let Err(why) = self.backoff.approved() {\n            let _ = writeln!(\n                io::stderr(),\n                \"td-authd: update installation failed: clear the backoff: {why}\"\n            );\n            self.result = Some(false);\n            return Ok(());\n        }\n        let child = spawn(source, deployment);",
+    ] {
+        assert!(installation.contains(pin), "deployment.rs: {pin}");
+    }
+    let admit = installation.split("\nfn admit(").nth(1).unwrap();
+    let admit = admit.split("\n}\n").next().unwrap();
+    assert!(admit.ends_with(
+        "    if !table()\n        .map_err(Refused::Other)?\n        .grants(owner, DeployPublish)\n    {\n        return Err(Refused::Other(\n            \"the principal table does not grant the requester\".into(),\n        ));\n    }\n    backoff.admitted(entry, now).map_err(unusable)?;\n    Ok(ready)"
+    ));
+    assert!(
+        admit.find("if entry.refuses(now) {").unwrap()
+            < admit.find("Ready::capture(body, owner)").unwrap()
+    );
+    assert_eq!(installation.matches("backoff.admitted(").count(), 1);
+    assert_eq!(installation.matches(".approved()").count(), 1);
+    assert_eq!(installation.matches("Ready::capture(").count(), 1);
+    assert_eq!(installation.matches("table: Table::load,").count(), 1);
+    assert_eq!(installation.matches(".grants(").count(), 1);
+    assert!(session.contains(
+        "            Request::Install => self.begin_install(crate::elevation::Table::load),\n"
+    ));
+    // The table before the queue, the queue before the record.
+    let begin = session.split("    fn begin_install(").nth(1).unwrap();
+    let begin = begin.split("\n    }\n").next().unwrap();
+    assert!(
+        begin
+            .find("if let Some(setup) = &mut self.setup {")
+            .unwrap()
+            < begin.find("if !table().is_ok_and(").unwrap()
+    );
+    assert!(
+        begin
+            .find("table.grants(self.owner, DeployPublish)")
+            .unwrap()
+            < begin.find("intake.select()").unwrap()
+    );
+    assert_eq!(session.matches("vec![0x99, 2]").count(), 1);
     // Request 1d (td-authd/DESIGN.md, "Elevation operations"): the table
     // before the selectors, both before a description; the selectors only
     // through the shared reader's held volume, read again before acting;
@@ -377,7 +426,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         "if sys::peer_uid(&stream)? != owner {",
         "        if owner != 1000 {\n            return Err(\"unsupported hostname requester\".into());",
         "            table: Table::load,",
-        "            backoff: Backoff::system(),",
+        "            backoff: Backoff::system(Row::Hostname),",
         "        self.committed = true;\n        self.result = Some(save(&self.saved, self.owner, &self.backoff, old, new).is_ok());",
         "    backoff.approved()?;\n    let saved = saved::read_hostname(path, owner)?",
         "    saved::write_hostname(path, &Hostname::parse(new)?)",
@@ -448,10 +497,10 @@ fn the_production_source_and_raw_boundary_are_closed() {
         "const NOFOLLOW: i32 = 0x20000;",
         "const NONBLOCK: i32 = 0x800;",
         "const DIRECTORY_ONLY: i32 = 0x10000;",
-        "Self::at(Path::new(DIRECTORY), (0, 0))",
+        "Self::at(Path::new(DIRECTORY), (0, 0), row)",
         "|| metadata.mode() & 0o7777 != 0o600",
         "|| metadata.mode() & 0o7777 != 0o700",
-        "saved::write_synced(&self.directory.join(FILE), &encode(entry), 0o600, None)?;",
+        "saved::write_synced(&self.directory.join(FILE), &encode(rows), 0o600, None)?;",
         // The directory, when missing, beneath an admitted parent: std's
         // DirBuilder, mode 0700, then permissions set again by path.
         "        std::fs::DirBuilder::new()\n            .mode(0o700)\n            .create(&self.directory)",
@@ -871,18 +920,18 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const LAUNCH_FINGERPRINT: u64 = 0x8d0878401a4a3195;
 const MAIN_FINGERPRINT: u64 = 0x135c5f3446a5e962;
-const SESSION_FINGERPRINT: u64 = 0x2be3178662459652;
+const SESSION_FINGERPRINT: u64 = 0x76c8a7eb107a7ec4;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;
 const WRITE_REQUEST_FINGERPRINT: u64 = 0x188c619caba6ceb8;
 
-const INSTALLATION_FINGERPRINT: u64 = 0xef204bb2bf5e35a3;
+const INSTALLATION_FINGERPRINT: u64 = 0x580cef152d0817d5;
 const SHARED_LOGIN_TIER_FINGERPRINT: u64 = 0x776bbefe45e5b0c4;
 const ROLLBACK_FINGERPRINT: u64 = 0xcd1fcb60e072626d;
 const ELEVATION_FINGERPRINT: u64 = 0x3a8baf08764bbaaf;
-const SET_HOSTNAME_FINGERPRINT: u64 = 0x414d01c48e579332;
-const BACKOFF_FINGERPRINT: u64 = 0x050d78d1bcc7c748;
+const SET_HOSTNAME_FINGERPRINT: u64 = 0x739785d15e0c7fa8;
+const BACKOFF_FINGERPRINT: u64 = 0x2749dbb039baaa3a;
 const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
 const DISK_INSTALL_FINGERPRINT: u64 = 0x4dffa721ec6b8471;
 const CONSENT_CODEC_FINGERPRINT: u64 = 0x19d3fcff02c2bb2a;

@@ -1461,7 +1461,12 @@ fn a_login_operation_occupies_the_one_operation_slot() {
         .is_err());
     assert!(session.inspect_with(|_| panic!("inspection")).is_err());
     assert_eq!(session.begin_write().unwrap(), [0x98, 0]);
-    assert_eq!(session.begin_install().unwrap(), [0x99, 0]);
+    assert_eq!(
+        session
+            .begin_install(|| panic!("table read while busy"))
+            .unwrap(),
+        [0x99, 0]
+    );
     // Teardown reaps the worker before the generation's own cleanup.
     let pid = match session.operation.as_ref().unwrap() {
         Active::Login(op) => op.fixture_pid().unwrap(),
@@ -1566,6 +1571,11 @@ fn a_live_session_answers_unenrolled_without_reading() {
     session.close_with(|_| fixture("cleanup_child")).unwrap();
 }
 
+/// The image's v1 principal table.
+fn v1() -> Result<crate::elevation::Table, String> {
+    crate::elevation::Table::parse(crate::elevation::tests::V1)
+}
+
 /// What the queued update's requester reads once root is done with it: its
 /// completion byte, then the end.
 fn retired(requester: &mut UnixStream) -> Vec<u8> {
@@ -1633,17 +1643,22 @@ fn an_update_that_cannot_read_the_record_is_refused_before_any_description() {
         let update = Fixture::marked(tier);
         let (intake, mut requester) = queued(&update);
         session.installations = Some(intake);
-        let answer = session.answer(Request::Install).unwrap();
+        let answer = session.begin_install(v1).unwrap();
         let case = format!("{machine:?} {tier:?}");
         if admitted {
             assert_eq!(answer[0], 0x92, "{case}");
             let description = Description::decode(&answer[1..]).unwrap();
+            let Operation::Install {
+                key: _,
+                deployment,
+                requester,
+            } = description.operation()
+            else {
+                panic!("not an installation: {case}");
+            };
             assert_eq!(
-                description.operation(),
-                &Operation::Install {
-                    deployment: update.id().into(),
-                    requester: 1000,
-                },
+                (deployment.as_str(), *requester),
+                (update.id(), 1000),
                 "{case}"
             );
             assert!(matches!(session.operation, Some(Active::Install(_))));
@@ -1657,7 +1672,7 @@ fn an_update_that_cannot_read_the_record_is_refused_before_any_description() {
             assert!(!session.installations.as_ref().unwrap().selected_alive());
             assert_eq!(retired(&mut requester), [0], "{case}");
             // Retired: there is nothing left to select.
-            assert_eq!(session.answer(Request::Install).unwrap(), [0x99, 0]);
+            assert_eq!(session.begin_install(v1).unwrap(), [0x99, 0]);
         }
         session.close_with(|_| fixture("cleanup_child")).unwrap();
     }
@@ -1681,7 +1696,7 @@ fn a_marker_read_past_its_budget_refuses_inside_the_channels_receive() {
     hurry(&mut intake, Duration::ZERO);
     session.installations = Some(intake);
     let started = Instant::now();
-    let answer = session.answer(Request::Install).unwrap();
+    let answer = session.begin_install(v1).unwrap();
     let took = started.elapsed();
     assert_eq!(answer, [0x99, 1]);
     assert!(took < Duration::from_secs(4), "{took:?}");
@@ -1708,7 +1723,7 @@ fn an_updates_fresh_read_refreshes_the_cached_state() {
     let update = Fixture::marked(Some(&marker(&[1])));
     let (intake, _requester) = queued(&update);
     session.installations = Some(intake);
-    assert_eq!(session.answer(Request::Install).unwrap()[0], 0x92);
+    assert_eq!(session.begin_install(v1).unwrap()[0], 0x92);
     assert_eq!(runs.get(), 2);
     session.close_with(|_| fixture("cleanup_child")).unwrap();
     // The record gone: request 19's read is unenrolled, refusing nothing,
@@ -1724,7 +1739,7 @@ fn an_updates_fresh_read_refreshes_the_cached_state() {
     let update = Fixture::marked(None);
     let (intake, _requester) = queued(&update);
     session.installations = Some(intake);
-    assert_eq!(session.answer(Request::Install).unwrap()[0], 0x92);
+    assert_eq!(session.begin_install(v1).unwrap()[0], 0x92);
     assert_eq!(
         session.answer(Request::LoginState).unwrap(),
         answer(&[0], "td-laptop")
@@ -1807,4 +1822,44 @@ fn root_login_supervision_meets_the_production_worker() {
     assert_eq!(state(&mut session), [0]);
     assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
     session.close().unwrap();
+}
+
+/// Request 19 (td-authd/DESIGN.md, "Elevation operations"): the principal
+/// table's `deploy-publish` row for the owner, before the queued update is
+/// taken or any description exists; a miss, or a table that cannot be
+/// read, answers 99 02 and leaves the request queued for a granted
+/// selection, whose tag 5 carries the approval key. A live boot's disk
+/// review consults no table (`select_disk`).
+#[test]
+fn an_update_needs_the_deploy_publish_row_before_any_description() {
+    use crate::deployment::tests::{queued, Fixture};
+    use crate::elevation::Table;
+    use crate::login_status::tests::{never, Root};
+    let root = Root::new();
+    let mut session = Session::new(1000, "tester").unwrap();
+    session.login_state = root.status(never());
+    prepare(&mut session);
+    let update = Fixture::new();
+    let (intake, _requester) = queued(&update);
+    session.installations = Some(intake);
+    for table in [
+        Table::parse("td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\n"),
+        Table::parse("td-elevation-v1\n1001\tdeploy-publish\n"),
+        Err("no table".to_string()),
+    ] {
+        assert_eq!(session.begin_install(|| table).unwrap(), [0x99, 2]);
+        assert!(session.operation.is_none() && !session.installing);
+    }
+    assert_eq!(update.backoff().read().unwrap().count(), 1);
+    let answer = session.begin_install(v1).unwrap();
+    assert_eq!(answer[0], 0x92);
+    let described = Description::decode(&answer[1..]).unwrap();
+    let Operation::Install { key, .. } = described.operation() else {
+        panic!("not an installation");
+    };
+    assert!(key
+        .digits()
+        .iter()
+        .all(|digit| (b'2'..=b'9').contains(digit)));
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
 }

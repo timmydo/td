@@ -8706,7 +8706,7 @@ waits for the primed user, and fires its request so the compositor reads
 that Enter as consent. A minimum display time does not help — the user
 is already reaching. So the prompt names a key chosen at random per
 request, which a fake prompt cannot know and a primed reflex supplies
-only by chance ("The v1 operations (target)", Consent).
+only by chance ("The v1 operations", Consent).
 
 **A security key remains optional and stronger**: a full assertion over a
 domain-separated, versioned, length-prefixed canonical encoding of the
@@ -8731,8 +8731,8 @@ required before enabling consent or a WebAuthn grant.
 immutable presentation and a token assertion now mediate credential writes,
 enrollment and release. The broader operation vocabulary here remains a
 target; the compositor's randomized-key confirmation is live for
-`deploy-rollback` and `set-hostname`, the elevations production performs
-(L3 and L4 below).
+`deploy-rollback`, `set-hostname` and `deploy-publish`, the elevations
+production performs (L3 to L5 below).
 The kernel now carries USB PCI xHCI, generic HID,
 USB HID and hidraw. The root-only worker implements the narrow CTAP HID
 transport described in `td-secret/DESIGN.md`; it does not grant consent.
@@ -8742,15 +8742,16 @@ secure attention never selects or confirms with (`td-compositor/DESIGN.md`,
 "Physical secure attention"). Physical input hardware remains trusted;
 keyboard events never prove a FIDO assertion.
 
-#### The v1 operations (target)
+#### The v1 operations
 
 It says what the first operations are and why; the elevation
 increments below (L1 to L7) build them, and each part stays a target
 until the increment named for it lands with its evidence. So far the
 consent descriptions (L1), the compositor's approval-key confirmation
-(L2), `deploy-rollback` with the principal table (L3) and `set-hostname`
-with its intake and backoff (L4) exist: both operations are live, and
-`deploy-publish` remains a target. The protocol, encodings and write rules are in
+(L2), `deploy-rollback` with the principal table (L3), `set-hostname`
+with its intake and backoff (L4) and `deploy-publish` with the update
+queue's backoff (L5) exist: all three operations are live. The protocol,
+encodings and write rules are in
 `td-authd/DESIGN.md`, "Elevation operations"; which key presses
 confirm is in `td-compositor/DESIGN.md`, "Elevation consent".
 
@@ -8758,7 +8759,7 @@ confirm is in `td-compositor/DESIGN.md`, "Elevation consent".
 |---|---|---|---|
 | `deploy-rollback` | the attention menu's `B`; there is no requester process | the full current and previous deployment IDs, which root reads from the `boot/current` and `boot/previous` selectors under the read-only `/run/td-volume/td` | `/bin/td-boot on-volume rollback /run/td-update CURRENT PREVIOUS` |
 | `set-hostname` | a typed public intake modelled on the update queue, with a notice; the attention menu's `H` selects it | the new name, a `Hostname` parsed by the shared `td-firstboot/src/hostname.rs`, beside the old name | root writes `/var/lib/td/hostname` canonically |
-| `deploy-publish`, from L5 | today's update queue (request 19) and the menu's `I` | the full deployment ID of a locally built system, as today | today's `/bin/td-update apply-operation ID` |
+| `deploy-publish` | the update queue (request 19), with a notice, and the menu's `I` | the full deployment ID of a locally built system | `/bin/td-update apply-operation ID` |
 
 **`deploy-rollback`.** The person opens secure attention and presses
 `B`; nothing outside the compositor asks, so there is no requester to
@@ -8798,9 +8799,9 @@ or primed reflex, which no fixed key can. The alphabet also keeps a
 security key's OTP interface from approving even where the compositor
 fails to exclude it (`td-compositor/DESIGN.md`, "A security key's own
 keyboard"): it types modhex letters and Enter, never a digit 2 to 9.
-What such a missed device keeps is selecting `B` or `H`, both modhex,
-and, if its static-password slot was reprogrammed to type fixed digits,
-one guess per request like any other. Consent is the same with or
+What such a missed device keeps is selecting `B`, `H` or `I`, all
+modhex, and, if its static-password slot was reprogrammed to type fixed
+digits, one guess per request like any other. Consent is the same with or
 without an enrolled login key: a login-key assertion over the request is
 deferred, and nothing here claims one.
 
@@ -8826,27 +8827,28 @@ nothing falls back. What remains is physical access, as
 `td-login/TOKEN-LOGIN.md`'s "Recovery" describes it, and td-boot's
 automatic rollback, which consumes a boot attempt before kexec and
 returns to `previous` when a deployment's attempts are exhausted
-(`td-install/DESIGN.md`).
+(`td-install/DESIGN.md`). A backoff file root cannot use blocks updates
+and renames until it is repaired the same way (`td-authd/DESIGN.md`,
+"Elevation operations", Backoff).
 
 **Update installation and login-key disclosures take the approval key.**
-Today `I` selects a queued update and a fresh Enter after full
-presentation installs it (`td-compositor/DESIGN.md`, "Physical
-installation confirmation"). L5 replaces that Enter with the approval
-key, atomically, and makes the update `deploy-publish` in the principal
-table. The login-key disclosures, enrollment's and the one-key and
-remove-every-key removal disclosures (`td-login/TOKEN-LOGIN.md`,
-increment 5, after L7), take the approval key from the start. The live
-medium's whole-disk installation, which `I` selects on a live boot,
-keeps its fresh Enter: it runs on the live medium, before any installed
-principal exists, so there is no principal table to consult. It keeps
-Enter's weaker answer to a reflex press, which the approval key closes
-on the installed system.
+Since L5 `I` selects a queued update, `deploy-publish` in the principal
+table, and its approval key, typed on the fully presented prompt,
+installs it; Enter does not (`td-compositor/DESIGN.md`, "Physical
+installation confirmation"). The login-key disclosures, enrollment's and
+the one-key and remove-every-key removal disclosures
+(`td-login/TOKEN-LOGIN.md`, increment 5, after L7), take the approval
+key from the start. The live medium's whole-disk installation, which `I`
+selects on a live boot, keeps its fresh Enter: it runs on the live
+medium, before any installed principal exists, so there is no principal
+table to consult. It keeps Enter's weaker answer to a reflex press,
+which the approval key closes on the installed system.
 
 #### Threats a consent dialog invites
 
 | threat | answer |
 |---|---|
-| **Prompt fatigue** — a rogue app requests repeatedly until the user approves to stop it | Rate-limit every intake a requester can queue on, with a durable backoff and a denial count ("The v1 operations (target)", Backoff); and above all keep the legitimate prompt RARE, which is why application launch never routes through it |
+| **Prompt fatigue** — a rogue app requests repeatedly until the user approves to stop it | Rate-limit every intake a requester can queue on, with a durable backoff and a denial count ("The v1 operations", Backoff); and above all keep the legitimate prompt RARE, which is why application launch never routes through it |
 | **Confused timing** — a request fired as the user reaches to approve another | Requests QUEUE rather than stack, the prompt names the requester, and a new request cannot replace a displayed one. The randomized key is what actually answers this |
 | **Fake prompt to train the habit** | An imitation cannot learn the randomized key and cannot receive the keystroke while the real prompt holds input. NOT answered by "a touch goes to the token regardless of what is on screen" — that same fact is the hidraw race above |
 | **Input-focus theft** | Exclusive input for the prompt's lifetime; no client receives those events at all |
@@ -8890,8 +8892,9 @@ stock image's own boot health exercises that path under the QEMU
 autotest token with a disposable seeded key
 (`TD-OPENSSH-ADMIN-ROUNDTRIP`). Physical access is the other path.
 Since L3 the session owner can also return the machine to its previous
-deployment through `deploy-rollback`, and since L4 rename it through
-`set-hostname`; neither raises privilege beyond its one operation.
+deployment through `deploy-rollback`, since L4 rename it through
+`set-hostname`, and since L5 its update installation is
+`deploy-publish`; none raises privilege beyond its one operation.
 
 **Retiring the escape hatch.** The escape hatch is root's remaining
 administrative surface: the `su` applet, root's empty shadow field and
@@ -8930,8 +8933,8 @@ enrollment, follows L7.
 
 The workstream's commits, in landing order. Each is one landing, and
 none repairs an earlier one. Each amends the documents whose current
-statements it changes, including those named here. L0 to L4 have
-landed; L5 to L7 are targets.
+statements it changes, including those named here. L0 to L5 have
+landed; L6 and L7 are targets.
 
 - **L0**, documents only: this specification. Nothing ships.
 - **L1**, the consent codec, inert: consent tags 11 (`deploy-rollback`)

@@ -721,7 +721,9 @@ impl Guest {
         })
     }
 
-    fn prompt(&mut self, id: &str, path: &Path) -> Result<()> {
+    /// Ctrl+Alt+Esc, the menu, and `I`: the installation prompt for
+    /// exactly deployment `id`, and the approval key it shows.
+    fn prompt(&mut self, id: &str, path: &Path) -> Result<[u8; 2]> {
         self.key(&["ctrl", "alt", "esc"])?;
         let end = self.deadline.min(Instant::now() + Duration::from_secs(20));
         self.qmp()?.move_absolute_until(0, 0, end)?;
@@ -745,26 +747,38 @@ impl Guest {
             thread::sleep(Duration::from_millis(100));
         }
         self.key(&["i"])?;
-        let end = self.deadline.min(Instant::now() + Duration::from_secs(20));
-        loop {
-            self.qmp()?
-                .exchange_until(
-                    &format!(
-                        "{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":{filename}}}}}"
-                    ),
-                    end,
-                )
-                .map_err(|error| format!("capture installation prompt: {error}"))?;
-            if prompt_matches(&read_capture(path)?, id)? {
-                return Ok(());
-            }
-            if Instant::now() >= end {
-                return Err(
-                    "trusted prompt pixels did not match the full expected installation".into(),
-                );
-            }
-            thread::sleep(Duration::from_millis(100));
+        let mut key = None;
+        self.screen_until(
+            path,
+            Duration::from_secs(20),
+            "the full expected installation prompt",
+            |pixels| {
+                key = install_prompt_key(pixels, id)?;
+                Ok(key.is_some())
+            },
+        )?;
+        key.ok_or_else(|| "the installation prompt showed no key".into())
+    }
+
+    /// For two seconds every capture is still the installation prompt for
+    /// `id` with `key`.
+    fn hold_install_prompt(
+        &mut self,
+        path: &Path,
+        id: &str,
+        key: [u8; 2],
+        after: &str,
+    ) -> Result<()> {
+        let end = Instant::now() + Duration::from_secs(2);
+        let mut left = false;
+        self.screen_until(path, Duration::from_secs(4), after, |pixels| {
+            left = install_prompt_key(pixels, id)? != Some(key);
+            Ok(left || Instant::now() >= end)
+        })?;
+        if left {
+            return Err(format!("the installation prompt left after {after}"));
         }
+        Ok(())
     }
 }
 
@@ -1027,6 +1041,11 @@ fn selector(guest: &mut Guest, slot: &str) -> Result<String> {
 const ROLLBACK_TOP: usize = 224;
 /// The hostname prompt, tag 12's ten rows, one more than tag 11's.
 const HOSTNAME_TOP: usize = 204;
+/// The installation prompt, tag 5's nine rows, as many as tag 11's.
+const INSTALL_TOP: usize = 224;
+/// The update client's refusal when root answers 03, the queue's backoff
+/// running.
+const UPDATE_BACKING_OFF: &str = "the installation queue is backing off after unapproved requests";
 const PROMPT_PITCH: usize = 40;
 const BUSY_NOTICE: &str = "PREVIOUS REQUEST IS STILL FINISHING";
 const ROLLED_BACK_NOTICE: &str = "ROLLED BACK - RESTART TO BOOT IT";
@@ -1078,6 +1097,24 @@ fn hostname_prompt_key(pixels: &[u8], old: &str, new: &str) -> Result<Option<[u8
             &format!("OLD NAME: {old}"),
             &format!("NEW NAME: {new}"),
             RESTART_COMPLETES,
+        ],
+    )
+}
+
+/// Whether `pixels` are the installation prompt (tag 5) for exactly
+/// deployment `id`, and if so the approval key it shows.
+fn install_prompt_key(pixels: &[u8], id: &str) -> Result<Option<[u8; 2]>> {
+    if !canonical_id(id) {
+        return Err("invalid expected deployment ID".into());
+    }
+    prompt_key(
+        pixels,
+        INSTALL_TOP,
+        &[
+            "INSTALL BUILT SYSTEM",
+            &format!("DEPLOYMENT: {id}"),
+            "PREVIOUS SYSTEM KEPT FOR ROLLBACK",
+            "RESTART REQUIRED TO USE THIS SYSTEM",
         ],
     )
 }
@@ -1368,6 +1405,47 @@ pub(crate) fn run_deploy_rollback(runner: &crate::check_runner::RecipeCheckRunne
     Ok(())
 }
 
+/// The update queue's backoff (td-authd/DESIGN.md, "Elevation
+/// operations", "Backoff"): the request admitted at `admitted`, by the
+/// guest's clock, and cancelled has counted, so a request for `id` inside
+/// its window is refused as backing off, root's own reason, before the
+/// source is read; the oracle then waits the window out. A cancellation
+/// that outlasts the window fails as slow rather than as a missing
+/// refusal.
+fn update_backoff(guest: &mut Guest, id: &str, admitted: u64) -> Result<()> {
+    let closes = admitted.saturating_add(FIRST_REFUSAL);
+    let at = guest_time(guest)?;
+    if at.saturating_add(EDGE) >= closes {
+        return Err(format!(
+            "the cancellation outlasted the backoff window (t0={admitted}, at={at})"
+        ));
+    }
+    let answer = guest.scalar(
+        &format!(
+            "out=$(/bin/td-authd request-update /var/home/tester {id} 2>&1); \
+             echo \"TD-UPDATE-REFUSED=$? $out\""
+        ),
+        |line| line.starts_with("TD-UPDATE-REFUSED="),
+    )?;
+    if answer.starts_with("TD-UPDATE-REFUSED=0 ") || !answer.contains(UPDATE_BACKING_OFF) {
+        return Err(format!(
+            "the backoff did not refuse a request within its window: {answer}"
+        ));
+    }
+    println!(
+        "[qemu-update] the cancelled request counted: the queue refused the next as backing off"
+    );
+    loop {
+        let at = guest_time(guest)?;
+        if at >= closes.saturating_add(EDGE) {
+            return Ok(());
+        }
+        thread::sleep(
+            Duration::from_secs(closes.saturating_add(EDGE) - at).min(Duration::from_secs(10)),
+        );
+    }
+}
+
 fn once(flag: &mut bool, matches: bool, action: &str) -> Result<()> {
     if *flag || !matches {
         return Err(format!("unexpected or duplicate {action}"));
@@ -1636,22 +1714,43 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
     let source = guest.scalar("git hash-object td-update/src/main.rs", git_id)?;
     println!("[qemu-update] building successor from the guest checkout");
     let successor = guest.update_ready(1)?;
+    let admitted = guest_time(&mut guest)?;
     if initial == successor {
         return Err("native update did not produce a distinct deployment".into());
     }
-    guest.prompt(&successor, &options.work.join("cancel.ppm"))?;
+    // Enter goes only to the attempt then cancelled: an Enter that
+    // committed would keep its prompt while the helper copies, but this
+    // attempt must still end unsuccessful, leave both selectors, and keep
+    // its backoff count, which only a commit clears and the refusal below
+    // needs.
+    let capture = options.work.join("cancel.ppm");
+    let key = guest.prompt(&successor, &capture)?;
+    println!(
+        "[qemu-update] prompt names {successor}; key {}",
+        String::from_utf8_lossy(&key)
+    );
+    guest.key(&["ret"])?;
+    guest.hold_install_prompt(&capture, &successor, key, "Enter")?;
     guest.key(&["esc"])?;
     guest.update_done(1, false)?;
     if selector(&mut guest, "current")? != initial || selector(&mut guest, "previous")? != previous
     {
-        return Err("cancelled update changed the deployment selectors".into());
+        return Err("Enter and the cancellation changed the deployment selectors".into());
     }
-    println!("[qemu-update] cancellation preserved both selectors; requesting installation");
+    update_backoff(&mut guest, &successor, admitted)?;
+    println!(
+        "[qemu-update] Enter installed nothing; the cancellation kept both selectors and the \
+         backoff count; requesting installation"
+    );
     if guest.update_ready(2)? != successor {
         return Err("unchanged checkout produced a different deployment".into());
     }
-    guest.prompt(&successor, &options.work.join("install.ppm"))?;
-    guest.key(&["ret"])?;
+    let key = guest.prompt(&successor, &options.work.join("install.ppm"))?;
+    println!("[qemu-update] typing key {}", String::from_utf8_lossy(&key));
+    for digit in key {
+        let (name, _) = digit_key(digit)?;
+        guest.key(&[name])?;
+    }
     guest.update_done(2, true)?;
     if selector(&mut guest, "current")? != successor || selector(&mut guest, "previous")? != initial
     {
@@ -1676,11 +1775,11 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
             &options, deadline, &initial, &successor, &public, &source, &token,
         )?;
     }
-    let report = format!("initial={initial}\nsuccessor={successor}\npublic={public}\nsource={source}\ncancel_preserved_selectors=true\nphysical_prompt_verified=true\ninstalled_and_booted=true\nuser_data_preserved=true\nautomatic_rollback_verified={}\naccelerator={}\n", options.rollback, options.accel);
+    let report = format!("initial={initial}\nsuccessor={successor}\npublic={public}\nsource={source}\ncancel_preserved_selectors=true\nbackoff_refused_within_window=true\nphysical_prompt_verified=true\nenter_refused=true\napproval_key_installed=true\ninstalled_and_booted=true\nuser_data_preserved=true\nautomatic_rollback_verified={}\naccelerator={}\n", options.rollback, options.accel);
     private_file(&options.work.join("result.txt"))?
         .write_all(report.as_bytes())
         .map_err(|e| format!("write oracle result: {e}"))?;
-    println!("[qemu-update] PASS: native build, cancellation, confirmed installation, reboot and persistence");
+    println!("[qemu-update] PASS: native build, cancellation, backoff, Enter refused, key-confirmed installation, reboot and persistence");
     Ok(())
 }
 
@@ -1991,35 +2090,10 @@ pub(super) fn menu_pixels_match(pixels: &[u8]) -> Result<bool> {
         && menu_row_matches(pixels, 456, "I: REVIEW PENDING SYSTEM INSTALLATION")?)
 }
 
-fn prompt_matches(bytes: &[u8], id: &str) -> Result<bool> {
-    prompt_pixels_match(ppm(bytes)?, id)
-}
-
 /// Whether a capture's pixels are the trusted installation prompt for
-/// deployment `id`.
+/// deployment `id`, its approval key whichever of the 64 it shows.
 pub(super) fn prompt_pixels_match(pixels: &[u8], id: &str) -> Result<bool> {
-    if !canonical_id(id) {
-        return Err("invalid expected deployment ID".into());
-    }
-    // Eight rows including the variable countdown, 32px glyphs + 8px gaps.
-    // Check every static row independently of the compositor's text builder.
-    for (row, text) in [
-        "TD SECURE ATTENTION",
-        "SESSION USER 1000",
-        "INSTALL BUILT SYSTEM",
-        &format!("DEPLOYMENT: {id}"),
-        "PREVIOUS SYSTEM KEPT FOR ROLLBACK",
-        "RESTART REQUIRED TO USE THIS SYSTEM",
-        "ENTER: INSTALL   ESC: CANCEL",
-    ]
-    .iter()
-    .enumerate()
-    {
-        if !row_matches(pixels, 244 + row * 40, text)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(install_prompt_key(pixels, id)?.is_some())
 }
 
 #[cfg(test)]
@@ -2173,34 +2247,31 @@ mod tests {
         );
     }
 
-    fn screenshot(id: &str) -> Vec<u8> {
-        let mut pixels = [24, 32, 40].repeat(1280 * 800);
-        for (row, text) in [
-            "TD SECURE ATTENTION",
-            "SESSION USER 1000",
-            "INSTALL BUILT SYSTEM",
-            &format!("DEPLOYMENT: {id}"),
-            "PREVIOUS SYSTEM KEPT FOR ROLLBACK",
-            "RESTART REQUIRED TO USE THIS SYSTEM",
-            "ENTER: INSTALL   ESC: CANCEL",
+    /// The installation prompt as td-authd renders tag 5 and the
+    /// compositor centres it with its time line.
+    fn install_rows(id: &str, key: &str) -> Vec<(usize, String)> {
+        let [first, second] = key.as_bytes() else {
+            panic!("a key is two digits");
+        };
+        [
+            "TD SECURE ATTENTION".to_string(),
+            "SESSION USER 1000".into(),
+            "INSTALL BUILT SYSTEM".into(),
+            format!("DEPLOYMENT: {id}"),
+            "PREVIOUS SYSTEM KEPT FOR ROLLBACK".into(),
+            "RESTART REQUIRED TO USE THIS SYSTEM".into(),
+            format!(
+                "APPROVE: TYPE {} THEN {}",
+                char::from(*first),
+                char::from(*second)
+            ),
+            "ESC: CANCEL".into(),
+            "TIME LEFT WHEN SHOWN: 120 S".into(),
         ]
-        .iter()
+        .into_iter()
         .enumerate()
-        {
-            for (column, character) in text.bytes().enumerate() {
-                for y in 0..32 {
-                    for x in 0..16 {
-                        if ascii_pixel(character, x / 2, y / 2).unwrap() {
-                            let offset = ((244 + row * 40 + y) * 1280 + 24 + column * 16 + x) * 3;
-                            pixels[offset..offset + 3].copy_from_slice(&[255; 3]);
-                        }
-                    }
-                }
-            }
-        }
-        let mut bytes = b"P6\n1280 800\n255\n".to_vec();
-        bytes.extend(pixels);
-        bytes
+        .map(|(row, text)| (224 + row * 40, text))
+        .collect()
     }
 
     #[test]
@@ -2567,9 +2638,9 @@ mod tests {
             None
         );
         // The installation prompt is not a rollback's.
-        let install = screenshot(&current);
+        let install = unifont_pixels(&install_rows(&current, "47"));
         assert_eq!(
-            rollback_prompt_key(ppm(&install).unwrap(), &current, &previous).unwrap(),
+            rollback_prompt_key(&install, &current, &previous).unwrap(),
             None
         );
         assert!(rollback_prompt_key(&pixels, "AB", &previous).is_err());
@@ -2712,6 +2783,23 @@ mod tests {
         ] {
             assert!(client.contains(line), "{line}");
         }
+        // Tag 5's rows, and the update client's refusal and notice.
+        for row in [
+            "\"INSTALL BUILT SYSTEM\"",
+            "format!(\"DEPLOYMENT: {deployment}\")",
+            "\"PREVIOUS SYSTEM KEPT FOR ROLLBACK\"",
+            "\"RESTART REQUIRED TO USE THIS SYSTEM\"",
+        ] {
+            assert!(consent.contains(row), "{row}");
+        }
+        let update = include_str!("../../../../../../td-authd/src/deployment.rs");
+        for line in [
+            "\"Update {deployment} is ready. Press Ctrl+Alt+Escape, then I to review it.\"",
+            "\"update was not admitted: the installation queue is backing off \\\n                 after unapproved requests\"",
+        ] {
+            assert!(update.contains(line), "{line}");
+        }
+        assert!(UPDATE_BACKING_OFF.starts_with("the installation queue is backing off"));
         let main = include_str!("../../../../../../td-compositor/src/main.rs");
         assert!(main.contains(&format!(
             "const CONTROL_SOCKET_ENV: &str = \"TD_CONTROL_SOCKET\";"
@@ -2758,19 +2846,79 @@ mod tests {
         assert!(menu_row_matches(&pixels, top, "a").is_err());
     }
 
+    /// The installation prompt (tag 5, since L5) is read for its full
+    /// deployment ID and its approval key, every row but the time line
+    /// required; L4's Enter row is no prompt at all.
     #[test]
-    fn physical_confirmation_requires_the_complete_expected_prompt() {
+    fn the_installation_prompt_is_read_for_its_id_and_key() {
         let id = "ab".repeat(32);
-        let image = screenshot(&id);
-        assert!(prompt_matches(&image, &id).unwrap());
-        assert!(!prompt_matches(&image, &"cd".repeat(32)).unwrap());
-        for row in 0..7 {
-            let mut corrupt = image.clone();
-            let offset = b"P6\n1280 800\n255\n".len() + (244 + row * 40) * 1280 * 3;
-            corrupt[offset..offset + 32 * 1280 * 3].fill(0);
-            assert!(!prompt_matches(&corrupt, &id).unwrap(), "missing row {row}");
+        for key in ["47", "22", "99", "58"] {
+            let pixels = unifont_pixels(&install_rows(&id, key));
+            assert_eq!(
+                install_prompt_key(&pixels, &id).unwrap(),
+                Some(<[u8; 2]>::try_from(key.as_bytes()).unwrap()),
+                "{key}"
+            );
+            assert!(prompt_pixels_match(&pixels, &id).unwrap());
+            assert_eq!(install_prompt_key(&pixels, &"cd".repeat(32)).unwrap(), None);
         }
-        assert!(prompt_matches(&image[..image.len() - 1], &id).is_err());
+        for missing in 0..8 {
+            let mut rows = install_rows(&id, "47");
+            rows.remove(missing);
+            assert_eq!(
+                install_prompt_key(&unifont_pixels(&rows), &id).unwrap(),
+                None,
+                "row {missing}"
+            );
+        }
+        let pixels = unifont_pixels(&install_rows(&id, "17"));
+        assert_eq!(install_prompt_key(&pixels, &id).unwrap(), None);
+        // The prompt Enter confirmed until L4: its last rows moved up one
+        // and carried no key.
+        let mut enter: Vec<(usize, String)> = install_rows(&id, "47")
+            .into_iter()
+            .take(6)
+            .map(|(top, text)| (top + 20, text))
+            .collect();
+        enter.push((484, "ENTER: INSTALL   ESC: CANCEL".into()));
+        assert!(!prompt_pixels_match(&unifont_pixels(&enter), &id).unwrap());
+        // A rollback's prompt is not an installation's.
+        let rollback = unifont_pixels(&rollback_rows(&id, &"cd".repeat(32), "47"));
+        assert_eq!(install_prompt_key(&rollback, &id).unwrap(), None);
+        assert!(install_prompt_key(&pixels, "AB").is_err());
+    }
+
+    /// qemu-update cannot run without an operator's installation, so its
+    /// order is pinned here: Enter reaches only the first attempt, which
+    /// must then end unsuccessful by Escape with both selectors and the
+    /// backoff's refusal intact; the second attempt is installed by its
+    /// key alone.
+    #[test]
+    fn the_update_leg_sends_enter_only_to_the_cancelled_attempt() {
+        let source = include_str!("update.rs");
+        let run = source.split("\npub(crate) fn run_cli(").nth(1).unwrap();
+        let run = run.split("\n}\n").next().unwrap();
+        let at = |needle: &str| {
+            assert_eq!(run.matches(needle).count(), 1, "{needle}");
+            run.find(needle).unwrap()
+        };
+        let order = [
+            "guest.update_ready(1)?",
+            "guest.key(&[\"ret\"])?;",
+            "guest.hold_install_prompt(&capture, &successor, key, \"Enter\")?;",
+            "guest.key(&[\"esc\"])?;",
+            "guest.update_done(1, false)?;",
+            "\"Enter and the cancellation changed the deployment selectors\"",
+            "update_backoff(&mut guest, &successor, admitted)?;",
+            "guest.update_ready(2)?",
+            "for digit in key {",
+            "guest.update_done(2, true)?;",
+        ];
+        for pair in order.windows(2) {
+            assert!(at(pair[0]) < at(pair[1]), "{} before {}", pair[0], pair[1]);
+        }
+        assert!(run.contains("approval_key_installed=true"));
+        assert!(run.contains("enter_refused=true"));
     }
 
     #[test]
@@ -2778,7 +2926,10 @@ mod tests {
     fn captured_installation_prompt_matches() {
         let path = std::env::var("TD_UPDATE_PROMPT_CAPTURE").unwrap();
         let id = std::env::var("TD_UPDATE_PROMPT_ID").unwrap();
-        assert!(prompt_matches(&read_capture(Path::new(&path)).unwrap(), &id).unwrap());
+        let bytes = read_capture(Path::new(&path)).unwrap();
+        assert!(install_prompt_key(ppm(&bytes).unwrap(), &id)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

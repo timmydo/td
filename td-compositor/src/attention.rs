@@ -744,10 +744,11 @@ mod tests {
         );
     }
 
-    /// The elevation prompts, rollback with both IDs and a hostname change
-    /// with both names at 63 bytes, are shown whole with a time line from
-    /// 800x600, and 320x200, which cannot hold their wrapped arguments,
-    /// refuses rather than clips. The key is on the prompt.
+    /// The approval-key prompts, rollback with both IDs, a hostname change
+    /// with both names at 63 bytes and an update with its full ID, are
+    /// shown whole with a time line from 800x600, and 320x200, which cannot
+    /// hold their wrapped arguments, refuses rather than clips. The key is
+    /// on the prompt.
     #[test]
     fn the_widest_elevation_prompts_fit_an_800_by_600_output() {
         use crate::authority::consent::ApprovalKey;
@@ -764,6 +765,11 @@ mod tests {
                     requester: 65533,
                     old: "a".repeat(63),
                     new: "b".repeat(63),
+                },
+                Operation::Install {
+                    key,
+                    deployment: "c".repeat(64),
+                    requester: 65533,
                 },
             ]
             .map(|operation| Request::new([1; 32], 65533, operation).unwrap())

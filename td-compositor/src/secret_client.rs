@@ -315,8 +315,8 @@ impl Selection {
         }
     }
     /// Whether a physical confirmation on the presented prompt must come
-    /// before commit: a fresh Enter for an installation, the approval key
-    /// for an elevation.
+    /// before commit: the approval key for an update or an elevation, a
+    /// fresh Enter for a live boot's whole-disk installation.
     fn confirms(&self) -> bool {
         matches!(self, Self::Install | Self::Elevation(_))
     }
@@ -349,6 +349,16 @@ impl Elevation {
             Self::Rollback => vec![0x1d],
             Self::Hostname => vec![0x1e],
         }
+    }
+}
+
+/// The approval key `request` carries: an update's (`deploy-publish`) or
+/// an elevation's. Every other description, a whole-disk installation's
+/// among them, has none.
+fn approval_key(request: &Request) -> Option<ApprovalKey> {
+    match request.operation() {
+        Operation::Install { key, .. } => Some(*key),
+        _ => Elevation::of(request).map(|(_, key)| key),
     }
 }
 
@@ -889,7 +899,9 @@ impl Attempt {
             && runtime.attention_request_visible(&presented.request)
     }
 
-    /// Only the physical evdev adapter can offer a confirmation key.
+    /// A fresh Enter, which only the physical evdev adapter can offer,
+    /// confirms a live boot's whole-disk installation and nothing else: an
+    /// update takes its approval key.
     pub fn confirm_install(&self, _origin: &EvdevOrigin, timestamp: u128) -> Result<(), String> {
         if self.selection != Selection::Install || !self.active() {
             return Ok(());
@@ -900,7 +912,9 @@ impl Attempt {
             .lock()
             .map_err(|_| "presentation receipt lock poisoned")?;
         if let Some(presented) = &*presentation {
-            if self.answers(&runtime, presented, timestamp) {
+            if matches!(presented.request.operation(), Operation::InstallDisk { .. })
+                && self.answers(&runtime, presented, timestamp)
+            {
                 self.confirmed.store(true, Ordering::SeqCst);
             }
         }
@@ -908,10 +922,11 @@ impl Attempt {
     }
 
     /// One approval-key digit, `2` to `9` in ASCII, pressed at `timestamp`,
-    /// which only the physical evdev adapter can offer: answers whether it
-    /// ended the request. A press the prompt cannot answer (stamped before
-    /// the prompt was on glass or before the first digit, a withdrawn or
-    /// replaced prompt, a key already typed) neither advances nor ends it.
+    /// which only the physical evdev adapter can offer, for an update or an
+    /// elevation: answers whether it ended the request. A press the prompt
+    /// cannot answer (stamped before the prompt was on glass or before the
+    /// first digit, a withdrawn or replaced prompt, a key already typed)
+    /// neither advances nor ends it.
     /// A digit that matches its position advances, and the second confirms;
     /// one that does not cancels the attempt, as Escape does, and the
     /// adapter then drains the screen.
@@ -921,7 +936,7 @@ impl Attempt {
         digit: u8,
         timestamp: u128,
     ) -> Result<bool, String> {
-        if !matches!(self.selection, Selection::Elevation(_))
+        if !matches!(self.selection, Selection::Install | Selection::Elevation(_))
             || !(b'2'..=b'9').contains(&digit)
             || !self.active()
         {
@@ -939,7 +954,7 @@ impl Attempt {
             else {
                 return Ok(false);
             };
-            let Some((_, key)) = Elevation::of(&presented.request) else {
+            let Some(key) = approval_key(&presented.request) else {
                 return Ok(false);
             };
             let digits = key.digits();
@@ -1278,9 +1293,13 @@ impl Client {
             return attempt.notice(crate::attention::Notice::NoInstall);
         }
         // Root refused the queued update before any description: nothing
-        // is presented (td-authd/DESIGN.md, amendment 8).
+        // is presented (td-authd/DESIGN.md, amendment 8, and "Elevation
+        // operations" for the principal table's `deploy-publish` row).
         if attempt.selection == Selection::Install && response == [0x99, 1] {
             return attempt.notice(crate::attention::Notice::UpdateRefused);
+        }
+        if attempt.selection == Selection::Install && response == [0x99, 2] {
+            return attempt.notice(crate::attention::Notice::ElevationRefused);
         }
         // Root refused the elevation before any description
         // (td-authd/DESIGN.md, "Elevation operations"): a busy slot, the
@@ -1898,6 +1917,7 @@ mod tests {
         for (reply, notice) in [
             (vec![0x99, 1], Notice::UpdateRefused),
             (vec![0x99, 0], Notice::NoInstall),
+            (vec![0x99, 2], Notice::ElevationRefused),
         ] {
             let mut screen = Screen::new();
             Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
@@ -1912,12 +1932,22 @@ mod tests {
             assert_eq!(runtime.attention_shown(), Some(notice));
             assert!(!runtime.attention_request_visible(&request()));
         }
-        // Neither refusal is a write's or another selection's answer.
+        // No refusal is a write's or another selection's answer, and no
+        // other byte is one.
         for selection in [Selection::Write, Selection::Unlock(Role::Primary)] {
+            for reply in [vec![0x99, 1], vec![0x99, 2]] {
+                let mut screen = Screen::new();
+                Arc::get_mut(&mut screen.attempt).unwrap().selection = selection.clone();
+                assert!(Client::default()
+                    .start(&mut wire(vec![reply]), Arc::clone(&screen.attempt))
+                    .is_err());
+            }
+        }
+        for reply in [vec![0x99, 3], vec![0x99], vec![0x99, 2, 0]] {
             let mut screen = Screen::new();
-            Arc::get_mut(&mut screen.attempt).unwrap().selection = selection;
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
             assert!(Client::default()
-                .start(&mut wire(vec![vec![0x99, 1]]), Arc::clone(&screen.attempt))
+                .start(&mut wire(vec![reply]), Arc::clone(&screen.attempt))
                 .is_err());
         }
     }
@@ -1958,19 +1988,114 @@ mod tests {
             .is_err());
     }
 
-    #[test]
-    fn installation_waits_for_fresh_enter_after_complete_presentation() {
-        let mut screen = Screen::new();
-        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
-        let request = Request::new(
+    /// Root's description of a queued update for the owner, carrying
+    /// `key`.
+    fn update(key: &[u8; 2]) -> Request {
+        Request::new(
             [42; 32],
             1000,
             Operation::Install {
+                key: crate::authority::consent::ApprovalKey::new(*key).unwrap(),
                 deployment: "ab".repeat(32),
                 requester: 1000,
             },
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// An update (`deploy-publish`) commits once, only after its two
+    /// digits are typed in order on the presented prompt, and the commit
+    /// is root's exact description, so it carries the key typed. Enter,
+    /// fresh or not, confirms nothing.
+    #[test]
+    fn an_update_commits_only_after_its_key_is_typed_never_on_enter() {
+        let mut screen = Screen::new();
+        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+        let described = update(b"58");
+        let invitation = status(5, &described);
+        let (mut client, mut wire, shown) = presented_elevation(
+            &screen,
+            &described,
+            vec![
+                invitation.clone(),
+                invitation.clone(),
+                invitation,
+                vec![0x94],
+                status(6, &described),
+            ],
+        );
+        assert_eq!(wire.calls[0], [0x19]);
+        // Invited to commit, the client waits: Enter after presentation,
+        // or at any later time, confirms nothing.
+        for at in [shown + 1, shown + 2, u128::MAX] {
+            screen
+                .attempt
+                .confirm_install(&crate::input::test_origin(), at)
+                .unwrap();
+        }
+        assert!(!confirmed(&screen) && screen.attempt.active());
+        client.tick(&mut wire).unwrap();
+        assert_eq!(sent(&wire, 0x14), 0);
+        assert!(!press(&screen, b'5', shown + 3));
+        client.tick(&mut wire).unwrap();
+        assert_eq!(sent(&wire, 0x14), 0);
+        assert!(!press(&screen, b'8', shown + 4));
+        assert!(confirmed(&screen));
+        client.tick(&mut wire).unwrap();
+        let commits: Vec<_> = wire
+            .calls
+            .iter()
+            .filter(|call| call.first() == Some(&0x14))
+            .collect();
+        assert_eq!(commits, [&description(&[0x14], &described)]);
+        assert_eq!(commits[0][46..48], *b"58");
+        client.tick(&mut wire).unwrap();
+        assert!(client.pending.is_none());
+        assert_eq!(
+            screen.attempt.runtime.lock().unwrap().attention_shown(),
+            Some(Notice::Installed)
+        );
+        assert_eq!(sent(&wire, 0x14), 1);
+    }
+
+    /// An update's wrong digit, at either position, ends it unapproved as
+    /// an elevation's does; a digit stamped before the prompt was on glass
+    /// neither advances nor ends it.
+    #[test]
+    fn an_updates_wrong_digit_ends_it_and_an_early_one_counts_for_nothing() {
+        for typed_first in [false, true] {
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+            let described = update(b"58");
+            let (mut client, mut wire, shown) = presented_elevation(
+                &screen,
+                &described,
+                vec![vec![0x95, 0], status(7, &described)],
+            );
+            for (digit, at) in [(b'5', shown), (b'9', shown - 1), (b'0', shown + 1)] {
+                assert!(!press(&screen, digit, at));
+            }
+            assert!(screen.attempt.active());
+            if typed_first {
+                assert!(!press(&screen, b'5', shown + 1));
+            }
+            assert!(press(&screen, b'9', shown + 2));
+            assert!(!screen.attempt.active() && !confirmed(&screen));
+            assert!(!press(&screen, b'8', shown + 3));
+            client.tick(&mut wire).unwrap();
+            assert!(client.pending.is_none());
+            assert_eq!(sent(&wire, 0x15), 1);
+            assert_eq!(sent(&wire, 0x14), 0);
+        }
+    }
+
+    /// A live boot's whole-disk installation keeps its fresh Enter after
+    /// complete presentation, and no digit confirms or ends it.
+    #[test]
+    fn a_disk_installation_waits_for_fresh_enter_and_takes_no_digit() {
+        let mut screen = Screen::new();
+        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+        let request = disk(crate::authority::consent::Storage::Unencrypted);
         let tagged = |tag: &[u8]| [tag, request.encode().as_slice()].concat();
         let mut wire = wire(vec![
             tagged(&[0x92]),
@@ -1999,6 +2124,10 @@ mod tests {
             .as_ref()
             .unwrap()
             .after;
+        for digit in *b"23456789" {
+            assert!(!press(&screen, digit, completed + 1));
+        }
+        assert!(!confirmed(&screen) && screen.attempt.active());
         screen
             .attempt
             .confirm_install(&crate::input::test_origin(), completed)
@@ -2141,15 +2270,7 @@ mod tests {
         for cancel in [false, true] {
             let mut screen = Screen::new();
             Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
-            let request = Request::new(
-                [42; 32],
-                1000,
-                Operation::Install {
-                    deployment: "ab".repeat(32),
-                    requester: 1000,
-                },
-            )
-            .unwrap();
+            let request = disk(crate::authority::consent::Storage::Unencrypted);
             screen.attempt.present(request).unwrap();
             if cancel {
                 screen.attempt.cancel();
@@ -2364,10 +2485,10 @@ mod tests {
         }
     }
 
-    /// Enter never confirms an elevation, nor can an installation's Enter
-    /// path, nor a digit anything but an elevation.
+    /// Enter never confirms an elevation, nor a digit anything without a
+    /// key: a disk installation, or a write.
     #[test]
-    fn enter_never_confirms_an_elevation_nor_a_digit_an_installation() {
+    fn enter_never_confirms_an_elevation_nor_a_digit_a_keyless_prompt() {
         for &elevation in ELEVATIONS {
             let screen = elevation_screen(elevation);
             let described = super::tests::elevation(elevation, b"47");
@@ -2384,22 +2505,21 @@ mod tests {
             assert_eq!(sent(&wire, 0x14), 0);
             assert!(!screen.attempt.commit());
         }
-        let mut screen = Screen::new();
-        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
-        let request = Request::new(
-            [42; 32],
-            1000,
-            Operation::Install {
-                deployment: "ab".repeat(32),
-                requester: 1000,
-            },
-        )
-        .unwrap();
-        screen.attempt.present(request).unwrap();
-        for digit in *b"23456789" {
-            assert!(!press(&screen, digit, u128::MAX));
+        for (selection, request) in [
+            (
+                Selection::Install,
+                disk(crate::authority::consent::Storage::DeviceBound),
+            ),
+            (Selection::Write, update(b"47")),
+        ] {
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = selection;
+            screen.attempt.present(request).unwrap();
+            for digit in *b"23456789" {
+                assert!(!press(&screen, digit, u128::MAX));
+            }
+            assert!(!confirmed(&screen) && screen.attempt.active());
         }
-        assert!(!confirmed(&screen) && screen.attempt.active());
     }
 
     /// A digit stamped before the prompt was on glass, or the second before
@@ -2536,15 +2656,7 @@ mod tests {
             },
         )
         .unwrap();
-        let update = Request::new(
-            [42; 32],
-            1000,
-            Operation::Install {
-                deployment: "ab".repeat(32),
-                requester: 1000,
-            },
-        )
-        .unwrap();
+        let update = update(b"47");
         for (selection, described) in [
             (
                 Selection::Elevation(Elevation::Rollback),

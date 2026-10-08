@@ -3,7 +3,7 @@
 //! `1e` describes it beside the saved name under a fresh nonce and approval
 //! key; after the person's commit root saves the new name canonically.
 
-use crate::backoff::{self, Backoff, Entry};
+use crate::backoff::{self, Backoff, Entry, Refused, Row, BACKING_OFF, REFUSED};
 use crate::consent::{ApprovalKey, Operation, Request};
 use crate::deployment::{bind_intake, unlink_intake};
 use crate::elevation::{self, Table};
@@ -21,11 +21,9 @@ use std::time::{Duration, Instant};
 
 const SOCKET: &str = "/run/td-authd/1000/hostname";
 const GREETING: &[u8; 8] = b"TDHST01\n";
-/// The reply to a whole frame: admitted, refused while the backoff runs,
-/// or refused otherwise.
+/// The reply to a whole frame admitted; `backoff::Refused` gives a
+/// refusal's.
 const ADMITTED: u8 = 2;
-const BACKING_OFF: u8 = 3;
-const REFUSED: u8 = 4;
 /// The saved name, which `/etc/hostname` links to (td-install/INSTALLER.md).
 const SAVED: &str = "/var/lib/td/hostname";
 /// How long presentation and commit may take after selection.
@@ -59,33 +57,6 @@ impl Refusal {
                 Self::Principal => 1,
             },
         ]
-    }
-}
-
-/// Why a whole frame was refused, which its reply byte says.
-#[derive(Debug)]
-enum Refused {
-    /// The backoff runs.
-    Backoff,
-    /// The saved name, the table, or a backoff root cannot read or write.
-    Other(String),
-}
-
-impl Refused {
-    fn byte(&self) -> u8 {
-        match self {
-            Self::Backoff => BACKING_OFF,
-            Self::Other(_) => REFUSED,
-        }
-    }
-}
-
-impl std::fmt::Display for Refused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Backoff => f.write_str("the hostname intake is backing off"),
-            Self::Other(why) => f.write_str(why),
-        }
     }
 }
 
@@ -129,7 +100,7 @@ impl Places {
         Self {
             saved: PathBuf::from(SAVED),
             owner: 0,
-            backoff: Backoff::system(),
+            backoff: Backoff::system(Row::Hostname),
             table: Table::load,
         }
     }

@@ -168,11 +168,13 @@ git pull --ff-only
 The updater builds with the installed toolchain and the source-bootstrap
 graph. The first build fetches declared sources and builds the graph locally;
 later builds reuse local outputs. When installation is requested, press
-Ctrl+Alt+Escape, then I. Review the deployment ID and press Enter to approve,
-or Escape to cancel. The authorized operation signs with this installation's
-key and installs the successor. Restart explicitly to boot it; the previous
-deployment remains available for recovery. Use `./update build` to stop after
-building without requesting installation.
+Ctrl+Alt+Escape, then I. Review the deployment ID and type the two digits the
+prompt shows to approve, or press Escape to cancel; Enter does not approve. A
+request left unapproved makes the next wait, longer each time. The authorized
+operation signs with this installation's key and installs the successor.
+Restart explicitly to boot it; the previous deployment remains available for
+recovery. Use `./update build` to stop after building without requesting
+installation.
 
 The checkout, build cache and other user state persist across updates and
 rollback. The source bundle is companion data outside the signed deployment;

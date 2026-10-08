@@ -1022,7 +1022,7 @@ fn human_bytes(bytes: u64) -> String {
 /// The README that ships beside the images.
 fn installation_readme(deployment_id: &str, format: DiskFormat) -> String {
     let disk = format.file_name();
-    format!("# td VM installation\n\nRun `./start` to boot. Guest writes persist in `{disk}`. The Btrfs volume\nprovides 2 TiB of sparse virtual capacity for local builds; physical disk\nusage grows as the guest writes.\n\nThis disk owns a unique deployment signing key in `/var/lib/td-deploy`.\nIts public key is installed in the accompanying boot selector and volume.\nKeep this directory private: copying the disk also copies the identity.\nCreate another installation to obtain a new identity.\n\nDeployment: `{deployment_id}`\n\nThe source checkout is initialized at `~/src/td`. Inspect `git remote -v`\nand configure origin if absent. Run `git pull --ff-only` for new source,\nthen `./update` to build a successor. When prompted,\npress Ctrl+Alt+Escape, I, and Enter after reviewing its deployment ID.\nRestart to boot the installed system; the previous system is retained.\nUse `./update build` to build without installing.\n\n`SHA256SUMS` records the initial files; the disk changes after first boot.\nQEMU {} or newer is required. Use `TD_QEMU_ACCEL=tcg` for software emulation\nand `TD_VM_MEMORY` to set guest RAM in MiB.\n", format.minimum_qemu())
+    format!("# td VM installation\n\nRun `./start` to boot. Guest writes persist in `{disk}`. The Btrfs volume\nprovides 2 TiB of sparse virtual capacity for local builds; physical disk\nusage grows as the guest writes.\n\nThis disk owns a unique deployment signing key in `/var/lib/td-deploy`.\nIts public key is installed in the accompanying boot selector and volume.\nKeep this directory private: copying the disk also copies the identity.\nCreate another installation to obtain a new identity.\n\nDeployment: `{deployment_id}`\n\nThe source checkout is initialized at `~/src/td`. Inspect `git remote -v`\nand configure origin if absent. Run `git pull --ff-only` for new source,\nthen `./update` to build a successor. When prompted, press\nCtrl+Alt+Escape, then I. Review the deployment ID and type the two digits\nthe prompt shows to approve; Enter does not approve, and Escape cancels.\nRestart to boot the installed system; the previous system is retained.\nUse `./update build` to build without installing.\n\n`SHA256SUMS` records the initial files; the disk changes after first boot.\nQEMU {} or newer is required. Use `TD_QEMU_ACCEL=tcg` for software emulation\nand `TD_VM_MEMORY` to set guest RAM in MiB.\n", format.minimum_qemu())
 }
 
 fn readme(deployment_id: &str, format: DiskFormat) -> String {
@@ -1740,6 +1740,18 @@ mod tests {
         assert!(text.contains("--persist"));
         assert!(text.contains("not a distribution channel"));
         assert!(text.contains("git pull"));
+    }
+
+    /// An installation's README gives the update consent as it is: the
+    /// prompt's two digits approve, and Enter does not
+    /// (td-update/DESIGN.md).
+    #[test]
+    fn the_installation_readme_says_the_update_takes_its_approval_key() {
+        let text = installation_readme("abc123", DiskFormat::Raw);
+        assert!(text.contains("type the two digits\nthe prompt shows to approve"));
+        assert!(text.contains("Enter does not approve"));
+        assert!(text.contains("Escape cancels"));
+        assert!(!text.contains("I, and Enter"));
     }
 
     /// The README's stated qemu floor must match the image beside it. A bundle

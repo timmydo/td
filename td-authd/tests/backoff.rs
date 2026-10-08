@@ -29,7 +29,11 @@ impl Scratch {
     }
 
     pub(crate) fn backoff(&self) -> Backoff {
-        Backoff::at(&self.path.join("authd"), self.owner)
+        self.backoff_for(Row::Hostname)
+    }
+
+    pub(crate) fn backoff_for(&self, row: Row) -> Backoff {
+        Backoff::at(&self.path.join("authd"), self.owner, row)
     }
 
     pub(crate) fn file(&self) -> PathBuf {
@@ -99,14 +103,36 @@ fn each_unapproved_request_doubles_the_refusal_from_30_to_960_seconds() {
     );
 }
 
+fn hostname(count: u32, until: u64) -> Rows {
+    Rows {
+        hostname: Entry { count, until },
+        update: Entry::default(),
+    }
+}
+
+fn update(count: u32, until: u64) -> Rows {
+    Rows {
+        hostname: Entry::default(),
+        update: Entry { count, until },
+    }
+}
+
 #[test]
 fn the_file_grammar_is_exact() {
-    assert_eq!(parse("td-authd-backoff-v1\n").unwrap(), Entry::default());
+    assert_eq!(parse("td-authd-backoff-v1\n").unwrap(), Rows::default());
     assert_eq!(
         parse("td-authd-backoff-v1\nhostname\t3\t1700000000\n").unwrap(),
-        Entry {
-            count: 3,
-            until: 1_700_000_000
+        hostname(3, 1_700_000_000)
+    );
+    assert_eq!(
+        parse("td-authd-backoff-v1\nupdate\t2\t1700000000\n").unwrap(),
+        update(2, 1_700_000_000)
+    );
+    assert_eq!(
+        parse("td-authd-backoff-v1\nhostname\t3\t5\nupdate\t1\t7\n").unwrap(),
+        Rows {
+            hostname: Entry { count: 3, until: 5 },
+            update: Entry { count: 1, until: 7 },
         }
     );
     for text in [
@@ -120,7 +146,12 @@ fn the_file_grammar_is_exact() {
         "td-authd-backoff-v1\nhostname\t3\n",
         "td-authd-backoff-v1\nhostname\t3\t5\t6\n",
         "td-authd-backoff-v1\nhostname 3 5\n",
-        "td-authd-backoff-v1\nupdate\t3\t5\n",
+        "td-authd-backoff-v1\nupdates\t3\t5\n",
+        "td-authd-backoff-v1\ndeploy-publish\t3\t5\n",
+        "td-authd-backoff-v1\nupdate\t3\t5\nhostname\t3\t5\n",
+        "td-authd-backoff-v1\nupdate\t3\t5\nupdate\t3\t5\n",
+        "td-authd-backoff-v1\nupdate\t0\t5\n",
+        "td-authd-backoff-v1\nhostname\t3\t5\nupdate\t3\t5\n\n",
         "td-authd-backoff-v1\nhostname\t-3\t5\n",
         "td-authd-backoff-v1\nhostname\t4294967296\t5\n",
         "td-authd-backoff-v1\nhostname\t3\t18446744073709551616\n",
@@ -128,21 +159,69 @@ fn the_file_grammar_is_exact() {
     ] {
         assert!(parse(text).is_err(), "{text:?}");
     }
-    for entry in [
-        Entry::default(),
-        Entry { count: 1, until: 0 },
-        Entry {
-            count: u32::MAX,
-            until: u64::MAX,
+    let widest = Entry {
+        count: u32::MAX,
+        until: u64::MAX,
+    };
+    for rows in [
+        Rows::default(),
+        hostname(1, 0),
+        update(1, 0),
+        Rows {
+            hostname: widest,
+            update: widest,
         },
     ] {
-        let encoded = encode(entry);
-        assert_eq!(
-            parse(std::str::from_utf8(&encoded).unwrap()).unwrap(),
-            entry
-        );
+        let encoded = encode(rows);
+        assert!(encoded.len() as u64 <= LIMIT);
+        assert_eq!(parse(std::str::from_utf8(&encoded).unwrap()).unwrap(), rows);
     }
-    assert_eq!(encode(Entry::default()), b"td-authd-backoff-v1\n");
+    assert_eq!(encode(Rows::default()), b"td-authd-backoff-v1\n");
+}
+
+/// Each intake reads and writes its own row and keeps the other's: the
+/// update queue's count neither refuses nor clears the hostname intake's,
+/// and a file either cannot read refuses both.
+#[test]
+fn each_intake_keeps_its_own_row_beside_the_others() {
+    let scratch = Scratch::new();
+    let hostnames = scratch.backoff_for(Row::Hostname);
+    let updates = scratch.backoff_for(Row::Update);
+    hostnames.admitted(Entry::default(), 1000).unwrap();
+    assert_eq!(updates.read().unwrap(), Entry::default());
+    updates.admitted(Entry::default(), 2000).unwrap();
+    assert_eq!(
+        fs::read(scratch.file()).unwrap(),
+        b"td-authd-backoff-v1\nhostname\t1\t1210\nupdate\t1\t2210\n"
+    );
+    assert_eq!(
+        hostnames.read().unwrap(),
+        Entry {
+            count: 1,
+            until: 1210
+        }
+    );
+    assert_eq!(updates.approved().unwrap(), Entry::default());
+    assert_eq!(
+        fs::read(scratch.file()).unwrap(),
+        b"td-authd-backoff-v1\nhostname\t1\t1210\n"
+    );
+    updates.admitted(Entry::default(), 3000).unwrap();
+    assert_eq!(hostnames.approved().unwrap(), Entry::default());
+    assert_eq!(
+        fs::read(scratch.file()).unwrap(),
+        b"td-authd-backoff-v1\nupdate\t1\t3210\n"
+    );
+    scratch.write(b"td-authd-backoff-v1\nhostname\tlots\t5\n");
+    for backoff in [&hostnames, &updates] {
+        assert!(backoff.read().is_err());
+        assert!(backoff.admitted(Entry::default(), 1000).is_err());
+        assert!(backoff.approved().is_err());
+    }
+    assert_eq!(
+        fs::read(scratch.file()).unwrap(),
+        b"td-authd-backoff-v1\nhostname\tlots\t5\n"
+    );
 }
 
 /// Missing reads as zero; each write is synced into a created 0700
@@ -239,6 +318,7 @@ fn a_file_root_cannot_admit_refuses_and_is_left_alone() {
     let foreign = Backoff::at(
         &scratch.path.join("authd"),
         (scratch.owner.0.wrapping_add(1), scratch.owner.1),
+        Row::Hostname,
     );
     assert!(foreign.read().is_err());
     assert!(foreign.admitted(Entry::default(), 1000).is_err());
@@ -254,7 +334,11 @@ fn the_directory_is_created_only_beneath_a_protected_parent() {
     assert!(!scratch.path.join("authd").exists());
     fs::set_permissions(&scratch.path, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(scratch.backoff().admitted(Entry::default(), 1000).is_ok());
-    let nested = Backoff::at(&scratch.path.join("absent").join("authd"), scratch.owner);
+    let nested = Backoff::at(
+        &scratch.path.join("absent").join("authd"),
+        scratch.owner,
+        Row::Hostname,
+    );
     assert!(nested.admitted(Entry::default(), 1000).is_err());
 }
 

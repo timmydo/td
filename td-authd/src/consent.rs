@@ -68,8 +68,8 @@ pub type Fingerprint = [u8; 4];
 pub const PROMPT_COLUMNS: usize = 34;
 
 /// The approval key an elevation prompt asks for: two ASCII digits, each
-/// `2` to `9`, typed in order (td-authd/DESIGN.md, "Elevation operations
-/// (target)"). No other value can be constructed.
+/// `2` to `9`, typed in order (td-authd/DESIGN.md, "Elevation
+/// operations"). No other value can be constructed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApprovalKey([u8; 2]);
 
@@ -397,7 +397,9 @@ fn hex_digit(byte: u8) -> Option<u8> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
+    /// `deploy-publish`: install a locally built deployment as current.
     Install {
+        key: ApprovalKey,
         deployment: String,
         requester: u32,
     },
@@ -553,6 +555,7 @@ impl Request {
         }
         match &operation {
             Operation::Install {
+                key: _,
                 deployment,
                 requester,
             } if !deployment_id(deployment) || *requester != owner => {
@@ -813,10 +816,12 @@ impl Request {
         bytes.extend_from_slice(&self.owner.to_be_bytes());
         match &self.operation {
             Operation::Install {
+                key,
                 deployment,
                 requester,
             } => {
                 bytes.push(5);
+                bytes.extend_from_slice(&key.digits());
                 bytes.extend_from_slice(&requester.to_be_bytes());
                 bytes.extend_from_slice(deployment.as_bytes());
             }
@@ -965,6 +970,7 @@ impl Request {
         let owner = input.number()?;
         let operation = match input.byte()? {
             5 => Operation::Install {
+                key: input.approval_key()?,
                 requester: input.number()?,
                 deployment: input.deployment()?,
             },
@@ -1121,12 +1127,14 @@ impl Request {
             format!("SESSION USER {}", self.owner),
         ];
         match &self.operation {
-            Operation::Install { deployment, .. } => {
+            Operation::Install {
+                key, deployment, ..
+            } => {
                 lines.push("INSTALL BUILT SYSTEM".into());
                 lines.push(format!("DEPLOYMENT: {deployment}"));
                 lines.push("PREVIOUS SYSTEM KEPT FOR ROLLBACK".into());
                 lines.push("RESTART REQUIRED TO USE THIS SYSTEM".into());
-                lines.push("ENTER: INSTALL   ESC: CANCEL".into());
+                approval_lines(&mut lines, *key);
             }
             Operation::InstallDisk {
                 requester: _,
@@ -1587,58 +1595,6 @@ mod tests {
         assert_eq!(unlock.following_enrollment_step().unwrap(), None);
     }
 
-    #[test]
-    fn installation_has_one_canonical_id_and_the_requester_must_be_its_owner() {
-        for id in [
-            "a".repeat(63),
-            "a".repeat(65),
-            "A".repeat(64),
-            "g".repeat(64),
-            format!("{}\n", "a".repeat(63)),
-        ] {
-            assert!(Request::new(
-                [1; 32],
-                1000,
-                Operation::Install {
-                    deployment: id,
-                    requester: 1000
-                }
-            )
-            .is_err());
-        }
-        assert!(Request::new(
-            [1; 32],
-            1000,
-            Operation::Install {
-                deployment: "a".repeat(64),
-                requester: 1001
-            }
-        )
-        .is_err());
-        let request = Request::new(
-            [1; 32],
-            1000,
-            Operation::Install {
-                deployment: "a".repeat(64),
-                requester: 1000,
-            },
-        )
-        .unwrap();
-        let mut literal = b"TDCONS01".to_vec();
-        literal.extend([1; 32]);
-        literal.extend([0, 0, 3, 232, 5, 0, 0, 3, 232]);
-        literal.extend([b'a'; 64]);
-        assert_eq!(request.encode(), literal);
-        assert!(request
-            .lines()
-            .iter()
-            .any(|line| line == &format!("DEPLOYMENT: {}", "a".repeat(64))));
-        assert!(request
-            .lines()
-            .iter()
-            .any(|line| line == "ENTER: INSTALL   ESC: CANCEL"));
-    }
-
     const CURRENT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const PREVIOUS: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
@@ -1656,9 +1612,9 @@ mod tests {
 
     fn approval_key(request: &Request) -> Option<ApprovalKey> {
         match request.operation() {
-            Operation::DeployRollback { key, .. } | Operation::SetHostname { key, .. } => {
-                Some(*key)
-            }
+            Operation::Install { key, .. }
+            | Operation::DeployRollback { key, .. }
+            | Operation::SetHostname { key, .. } => Some(*key),
             _ => None,
         }
     }
@@ -1670,6 +1626,62 @@ mod tests {
             old: old.into(),
             new: new.into(),
         }
+    }
+
+    fn install(deployment: &str, requester: u32) -> Operation {
+        Operation::Install {
+            key: approval(b"58"),
+            deployment: deployment.into(),
+            requester,
+        }
+    }
+
+    /// Tag 5 carries the approval key right after its tag byte, then the
+    /// requester and one canonical ID, 115 bytes in all; its rows end with
+    /// the key's, and no row offers Enter.
+    #[test]
+    fn installation_has_one_canonical_id_and_the_requester_must_be_its_owner() {
+        for id in [
+            "a".repeat(63),
+            "a".repeat(65),
+            "A".repeat(64),
+            "g".repeat(64),
+            format!("{}\n", "a".repeat(63)),
+        ] {
+            assert!(Request::new([1; 32], 1000, install(&id, 1000)).is_err());
+        }
+        assert!(Request::new([1; 32], 1000, install(&"a".repeat(64), 1001)).is_err());
+        let request = Request::new([1; 32], 1000, install(&"a".repeat(64), 1000)).unwrap();
+        let mut literal = b"TDCONS01".to_vec();
+        literal.extend([1; 32]);
+        literal.extend([0, 0, 3, 232, 5, b'5', b'8', 0, 0, 3, 232]);
+        literal.extend([b'a'; 64]);
+        assert_eq!(literal.len(), 115);
+        assert_eq!(request.encode(), literal);
+        assert_eq!(Request::decode(&literal).unwrap(), request);
+        assert_eq!(
+            request.lines(),
+            [
+                "TD SECURE ATTENTION".to_string(),
+                "SESSION USER 1000".into(),
+                "INSTALL BUILT SYSTEM".into(),
+                format!("DEPLOYMENT: {}", "a".repeat(64)),
+                "PREVIOUS SYSTEM KEPT FOR ROLLBACK".into(),
+                "RESTART REQUIRED TO USE THIS SYSTEM".into(),
+                "APPROVE: TYPE 5 THEN 8".into(),
+                "ESC: CANCEL".into(),
+            ]
+        );
+        assert!(!request.lines().iter().any(|line| line.contains("ENTER")));
+        // L4's keyless tag-5 value no longer decodes.
+        let mut keyless = b"TDCONS01".to_vec();
+        keyless.extend([1; 32]);
+        keyless.extend([0, 0, 3, 232, 5, 0, 0, 3, 232]);
+        keyless.extend([b'a'; 64]);
+        assert_eq!(
+            Request::decode(&keyless).err().unwrap(),
+            "invalid consent approval key"
+        );
     }
 
     /// The literal tag-11 and tag-12 values: the key right after the tag
@@ -1724,11 +1736,16 @@ mod tests {
         );
     }
 
-    /// Bytes 45 and 46 are the key, in typing order, for both tags: a
-    /// swapped pair is the other key, never the same one or a refusal.
+    /// Bytes 45 and 46 are the key, in typing order, for every tag that
+    /// carries one: a swapped pair is the other key, never the same one or
+    /// a refusal.
     #[test]
     fn the_approval_key_follows_the_tag_byte_in_typing_order() {
-        for operation in [rollback(CURRENT, PREVIOUS), rename(1000, "td", "my-laptop")] {
+        for operation in [
+            install(CURRENT, 1000),
+            rollback(CURRENT, PREVIOUS),
+            rename(1000, "td", "my-laptop"),
+        ] {
             let request = Request::new([1; 32], 1000, operation).unwrap();
             let bytes = request.encode();
             let key = approval_key(&request).unwrap();
@@ -1750,7 +1767,8 @@ mod tests {
     }
 
     /// Exactly the 64 keys of two digits from 2 to 9 exist, and a decoder
-    /// refuses every other byte at either position of either tag.
+    /// refuses every other byte at either position of every tag carrying
+    /// one.
     #[test]
     fn every_approval_digit_outside_two_to_nine_refuses() {
         let mut admitted = 0;
@@ -1766,7 +1784,11 @@ mod tests {
             }
         }
         assert_eq!(admitted, 64);
-        for operation in [rollback(CURRENT, PREVIOUS), rename(1000, "td", "my-laptop")] {
+        for operation in [
+            install(CURRENT, 1000),
+            rollback(CURRENT, PREVIOUS),
+            rename(1000, "td", "my-laptop"),
+        ] {
             let bytes = Request::new([1; 32], 1000, operation).unwrap().encode();
             for index in [45, 46] {
                 for byte in 0..=255u8 {
@@ -1941,6 +1963,15 @@ mod tests {
     /// generic Escape row.
     #[test]
     fn elevation_rows_end_with_the_key_and_its_escape() {
+        // An installation's rows predate the key; its key rows fit as the
+        // others' do.
+        let lines = Request::new([1; 32], 65533, install(CURRENT, 65533))
+            .unwrap()
+            .lines();
+        assert_eq!(lines[lines.len() - 1], "ESC: CANCEL");
+        assert!(lines[lines.len() - 2].starts_with("APPROVE: TYPE "));
+        assert!(lines[lines.len() - 2].len() <= PROMPT_COLUMNS);
+        assert!(!lines.iter().any(|line| line == "ESC TO CANCEL"));
         for operation in [
             rollback(CURRENT, PREVIOUS),
             rename(65533, &"a".repeat(63), &"b".repeat(63)),
@@ -2241,6 +2272,7 @@ mod tests {
     fn every_operation_roundtrips_and_refuses_truncation_or_trailing_bytes() {
         let mut operations = vec![
             Operation::Install {
+                key: ApprovalKey::new(*b"92").unwrap(),
                 deployment: "ab".repeat(32),
                 requester: 1000,
             },

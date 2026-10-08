@@ -1810,15 +1810,17 @@ password, remembered consent, privileged shell or crypto dependency in apps.
 The shared named transport also serves td-authd's local installation intake,
 specified in its design and UNSAFE.md section 16. That consumer rejects all
 incoming rights and retains only sender pidfds. It adds no raw operations or
-credential access. Consent tag 5 describes a system installation; secret
-workers reject it, and physical Enter for installation cannot substitute for
-a token-bound secret operation.
+credential access. Consent tag 5 describes a system installation,
+`deploy-publish`, confirmed since L5 by its approval key; secret workers
+reject it, and that key cannot substitute for a token-bound secret
+operation.
 
 Consent tags 11 and 12 describe the elevation operations `deploy-rollback`
 and `set-hostname` (td-authd/DESIGN.md, "Elevation operations").
-td-secret's copy of the shared codec decodes them, so their refusal rests on
-each worker's operation match: the unlock, enrollment, credential write and
-login-key workers each reject both, which a test feeds every worker.
+td-secret's copy of the shared codec decodes tags 5, 11 and 12, so their
+refusal rests on each worker's operation match: the unlock, enrollment,
+credential write and login-key workers each reject all three, which a
+test feeds every worker.
 
 ## Login record codec
 
@@ -2933,8 +2935,13 @@ source directory it owns: a deployment whose initramfs carries no
 marker and one whose marker lists another version are refused at the
 menu's `I` with `UPDATE CANNOT READ LOGIN KEYS`, and a copy of the
 booted deployment, whose C10b marker the guest reads first, reaches
-its prompt, which Escape cancels. `Super+l` follows a Caps Lock, since
-the unlock's close discards the keyboard's first fresh report.
+its prompt, which Escape cancels. Each request counts in td-authd's
+update backoff: after it ends, the backoff file holds the `update` row
+and the account's next request is refused as backing off, and root's
+fixture then removes the file rather than wait out the window
+(td-authd/DESIGN.md, "Elevation operations"). `Super+l` follows a Caps
+Lock, since the unlock's close discards the keyboard's first fresh
+report.
 
 A recorder, a shell wrapper bind-mounted over the `td-secret` binary,
 appends each run's verb to a log and runs a copy of the binary; td-authd

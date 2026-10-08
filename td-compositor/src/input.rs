@@ -342,7 +342,7 @@ struct KeyDecision {
     notice: Option<crate::attention::Notice>,
     confirm_install: Option<u128>,
     /// An approval-key digit (`approval_digit`) and its evdev time. The
-    /// attempt takes it only for its presented elevation prompt.
+    /// attempt takes it only for its presented update or elevation prompt.
     approval: Option<(u8, u128)>,
     /// A key for the PIN field and its evdev time. The attempt takes it only
     /// while its field is open and was on glass before the press.
@@ -1491,9 +1491,9 @@ trait InputTarget {
     fn confirm_install(&mut self, _timestamp: u128) -> Result<(), String> {
         Ok(())
     }
-    /// An approval-key digit for the attempt's presented elevation prompt:
-    /// answers whether it ended the request. A target with no attempt
-    /// takes none.
+    /// An approval-key digit for the attempt's presented update or
+    /// elevation prompt: answers whether it ended the request. A target
+    /// with no attempt takes none.
     fn approval_digit(&mut self, _digit: u8, _timestamp: u128) -> Result<bool, String> {
         Ok(false)
     }

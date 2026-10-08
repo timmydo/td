@@ -1063,9 +1063,10 @@ nonwrapping nanoseconds. Both operations reuse the existing syscall body
 and add no scoped allow. Source confinement pins the clock, operand widths,
 request, syscall, and caller modules. Input selects the clock; runtime
 orders its cutoff sample after ordinary-screen restoration, exercised by
-its transition tests. The presentation sample bounds installation Enter
-confirmation: only a later physical evdev timestamp can confirm the
-still-visible exact request. No clock or request value changes.
+its transition tests. The presentation sample bounds a disk installation's
+Enter confirmation and every approval-key digit, an update's included: only
+a later physical evdev timestamp can confirm the still-visible exact
+request. No clock or request value changes.
 
 
 ## 7. `td-util` — the diagnostics multicall
@@ -2830,8 +2831,11 @@ forwarding API is used. The request contains a bounded source path and
 manifest ID. Root opens and pins that requester-owned directory through safe
 std and later transfers only its own directory File as the fixed installation
 helper's stdin. The private compositor channel still transfers no descriptors.
-The complete controller source and fixed child argv are pinned by confinement
-and behavioral tests. No instruction, syscall, option or allowance is added.
+Since L5 it keeps the queue's backoff row through `td-authd/src/backoff.rs`,
+as the hostname intake below does, and answers a refused frame with one
+byte through safe std. The complete controller source and fixed child argv
+are pinned by confinement and behavioral tests. No instruction, syscall,
+option or allowance is added.
 
 ### Whole-disk installation intake
 

@@ -353,7 +353,7 @@ impl Session {
             }
             Request::Inspect => self.inspect_with(Inspection::start),
             Request::Write => self.begin_write(),
-            Request::Install => self.begin_install(),
+            Request::Install => self.begin_install(crate::elevation::Table::load),
             Request::Rollback => self.begin_rollback(
                 crate::elevation::Table::load,
                 Path::new(crate::login_tier::VOLUME),
@@ -494,7 +494,15 @@ impl Session {
         }
     }
 
-    fn begin_install(&mut self) -> Result<Vec<u8>, String> {
+    /// Request 19: on a live boot the open disk review, which no principal
+    /// table governs; otherwise the table's `deploy-publish` row for the
+    /// owner, then the queued update and its login-record check, each
+    /// before any description.
+    fn begin_install(
+        &mut self,
+        table: impl FnOnce() -> Result<crate::elevation::Table, String>,
+    ) -> Result<Vec<u8>, String> {
+        use crate::elevation::Operation::DeployPublish;
         if !self.prepared
             || self.cleanup.is_some()
             || self.operation.is_some()
@@ -523,6 +531,10 @@ impl Session {
             self.event = Some(Event::Waiting);
             return Ok(answer);
         }
+        // The requester is the owner: the intake admits no other UID.
+        if !table().is_ok_and(|table| table.grants(self.owner, DeployPublish)) {
+            return Ok(vec![0x99, 2]);
+        }
         let intake = self
             .installations
             .as_mut()
@@ -538,7 +550,7 @@ impl Session {
             intake.finish(false);
             return Ok(vec![0x99, 1]);
         }
-        let operation = match crate::deployment::Installation::start(self.owner, ready) {
+        let operation = match intake.describe(self.owner, ready) {
             Ok(operation) => operation,
             Err(_) => {
                 intake.finish(false);

@@ -5894,14 +5894,22 @@ I selects the root installation request: on an installed system the update
 queued by `./update`, on a live boot the installation service's open
 whole-disk review. The returned description must be Install or InstallDisk
 for requester and session owner 1000. No ready request displays NO
-INSTALLATION IS READY TO REVIEW. An update's complete prompt names the full
-deployment ID, retention of the previous system and the need to restart,
-with Enter to install and Escape to cancel; a disk installation's is its
-fixed summary. The public requester cannot open this screen.
+INSTALLATION IS READY TO REVIEW; root's `99 01` shows UPDATE CANNOT READ
+LOGIN KEYS and its `99 02`, the principal table refusing
+`deploy-publish`, REFUSED BY THE ELEVATION TABLE, each presenting
+nothing; another `99` byte ends the paired generation. An update's
+complete prompt names the full deployment ID, retention of the previous
+system and the need to restart, then its approval key's rows; since L5
+it is confirmed by that key alone, as an elevation is ("Elevation
+consent" below), and Enter never confirms it. A disk installation's is
+its fixed summary, with Enter to install and Escape to cancel. The
+public requester cannot open this screen.
 
-A completed presentation also carries a CLOCK_MONOTONIC sample taken after
+The rest of this section is the disk installation's Enter. A completed
+presentation also carries a CLOCK_MONOTONIC sample taken after
 successful full-frame submission. Only the evdev adapter can offer a fresh
-Enter press to the selected Attempt. Its timestamp must be strictly later
+Enter press to the selected Attempt, and only a presented InstallDisk
+description takes it. Its timestamp must be strictly later
 than that sample, the exact request must still be visible outside drain,
 and the 120-second attention lifetime must remain active. Repeats, held
 logical keys, queued earlier events, Enter before presentation, ordinary
@@ -5909,9 +5917,10 @@ control/input APIs and a replaced or hidden prompt cannot confirm. Failed
 clock sampling returns no presentation receipt. Runtime retains the sole
 monotonic syscall caller role; secret_client consumes the returned sample.
 
-The existing atomic cancellation/commit transition consumes that confirmation
-before sending the exact private commit. Repeated status invitations without
-Enter only wait. What follows commit depends on the description's storage.
+The existing atomic cancellation/commit transition consumes that
+confirmation, or an update's typed key, before sending the exact private
+commit. Repeated status invitations without it only wait. What follows
+commit depends on the description's storage.
 An update or an unencrypted disk installation keeps its prompt until the
 operation ends; success then displays SYSTEM INSTALLED and a restart
 instruction. A device-bound disk installation completes only after its
@@ -5939,8 +5948,10 @@ protocol is in td-authd/DESIGN.md.
 
 Implemented and live for `deploy-rollback` (L3) and `set-hostname`
 (L4): `B` and `H`, their menu rows, the confirmation below, root's
-refusals and the success screens. APPLICATIONS.md §L.1, "The v1
-operations (target)", says what the operations are and why, and
+refusals and the success screens; and since L5 for an update
+(`deploy-publish`), which `I` selects ("Physical installation
+confirmation" above). APPLICATIONS.md §L.1, "The v1
+operations", says what the operations are and why, and
 "Elevation increments" when each part lands; td-authd/DESIGN.md,
 "Elevation operations", gives the protocol. This section alone says
 which input confirms.
@@ -6009,33 +6020,38 @@ two keyboards are taken in the order their reports are read, not by
 timestamp, so the right digits typed across two keyboards within
 milliseconds can end the request as a wrong digit; that fails safe.
 
-Everything else neither advances nor ends the request: Enter, which
-never confirms; a digit stamped before presentation, or held from before
-it; 0, 1 and the keypad; a digit under Control, Alt or Super; repeats
-and held logical keys; a digit after the key is complete; and injected,
-automation, control, Wayland and bridge input. A security key's own
-keyboard neither advances nor ends the key, though its Escape still
-cancels. A replaced or hidden prompt confirms nothing.
+An update's prompt takes its key under the same rules. Everything else
+neither advances nor ends the request: Enter, which never confirms; a
+digit stamped before presentation, or held from before it; 0, 1 and the
+keypad; a digit under Control, Alt or Super; repeats and held logical
+keys; a digit after the key is complete; and injected, automation,
+control, Wayland and bridge input. A security key's own keyboard neither
+advances nor ends the key, though its Escape still cancels. A replaced
+or hidden prompt confirms nothing.
 
-Host tests drive a rollback's and a hostname change's prompt against a
-scripted authority to its one commit and its success screen and through
-each `9d` and `9e` answer above, and the `1f` decoder, the `H` row's
-forms and the menu taking the answer held as it opens; device-dispatcher tests cover `B`'s and `H`'s selection,
+Host tests drive a rollback's, a hostname change's and an update's
+prompt against a scripted authority to its one commit and its success
+screen, an update's Enter confirming nothing and its wrong digit ending
+it, a disk installation's Enter confirming and no digit, through each
+`9d` and `9e` answer above and request 19's `99 02`, and the `1f`
+decoder, the `H` row's forms and the menu taking the answer held as it
+opens; device-dispatcher tests cover `B`'s and `H`'s selection,
 the digits offered, the drain after a wrong one, a security key's own
 keyboard and the lock surface. Source pins hold what they cannot: that
 no test-only switch decides `B` or `H`, and that only the evdev target
-offers the attempt a digit. `qemu-deploy-rollback` reads a booted
-system's rollback and hostname prompts and their keys and the `H` row
-off the screen and shows that Enter and a wrong digit commit nothing
-and that production's control socket refuses key requests outright
-(td-authd/DESIGN.md, "Elevation operations").
+offers the attempt a digit, and that Enter answers a disk installation
+alone. `qemu-deploy-rollback` reads a booted system's rollback and
+hostname prompts and their keys and the `H` row off the screen and shows
+that Enter and a wrong digit commit nothing and that production's
+control socket refuses key requests outright (td-authd/DESIGN.md,
+"Elevation operations"); `qemu-update` reads an update's key and shows
+Enter installing nothing (td-update/DESIGN.md).
 
 The approval key appears only on the private prompt, so ordinary
-rendering never carries it. In L5 an update's confirmation moves from
-Enter to the key under these rules, atomically, and the login-key
-disclosures, enrollment's and the one-key and remove-every-key removal
-disclosures (TOKEN-LOGIN.md increment 5), use it from the start; a live
-boot's whole-disk installation keeps its fresh Enter.
+rendering never carries it. The login-key disclosures, enrollment's and
+the one-key and remove-every-key removal disclosures (TOKEN-LOGIN.md
+increment 5), use it from the start; a live boot's whole-disk
+installation keeps its fresh Enter.
 
 ### Login-key operations
 

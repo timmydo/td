@@ -992,7 +992,7 @@ scope. The person chooses:
 
 Either choice first shows an enrollment disclosure, confirmed by the
 root-drawn approval key under `td-compositor/DESIGN.md`, "Elevation
-consent (target)", never by Enter. It states that from then on the
+consent", never by Enter. It states that from then on the
 machine boots and locks to a screen only an enrolled key and its PIN
 open; that open console and SSH sessions end now, and SSH for any
 account but the primary is refused from then on (root SSH already is,

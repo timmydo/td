@@ -1,6 +1,10 @@
-//! One queued local build and one physically confirmed installation.
+//! One queued local build and one installation confirmed by its approval
+//! key: `deploy-publish` (td-authd/DESIGN.md, "Consent for a locally built
+//! system" and "Elevation operations").
 
-use crate::consent::{self, Operation as Description, Request};
+use crate::backoff::{self, Backoff, Refused, Row, BACKING_OFF, REFUSED};
+use crate::consent::{self, ApprovalKey, Operation as Description, Request};
+use crate::elevation::{Operation::DeployPublish, Table};
 use crate::login_tier;
 use crate::secret_sys as sys;
 use crate::unlock::Event;
@@ -19,6 +23,8 @@ const LIMIT: usize = 64 + 4096;
 const NOFOLLOW: i32 = 0x20000;
 const NONBLOCK: i32 = 0x800;
 const PATH_ONLY: i32 = 0x200000;
+/// The reply to a whole frame admitted; `backoff::Refused` gives a
+/// refusal's.
 const ADMITTED: u8 = 2;
 /// Request 19's marker read gives up here, reading no version, so the
 /// request refuses: beside amendment 1's two-second helper it stays inside
@@ -189,7 +195,11 @@ impl Pending {
         }
         Ok(())
     }
-    fn poll(&mut self) -> io::Result<()> {
+    /// The frame, then `admit` decides: its success sends admission byte
+    /// 02, and its refusal that refusal's byte before the connection
+    /// closes.
+    fn poll(&mut self, admit: impl FnOnce(&[u8]) -> Result<Ready, Refused>) -> io::Result<()> {
+        let mut admit = Some(admit);
         self.live()?;
         for _ in 0..4 {
             if self.greeting < GREETING.len() {
@@ -242,12 +252,18 @@ impl Pending {
                 2
             };
             if self.bytes.len() == expected && expected > 2 {
-                self.ready = Some(Ready::capture(
-                    self.bytes
-                        .get(2..)
-                        .ok_or_else(|| error("missing update request"))?,
-                    self.owner,
-                )?);
+                let admit = admit.take().ok_or_else(|| error("update admitted twice"))?;
+                let body = self
+                    .bytes
+                    .get(2..)
+                    .ok_or_else(|| error("missing update request"))?;
+                match admit(body) {
+                    Ok(ready) => self.ready = Some(ready),
+                    Err(refused) => {
+                        let _ = self.stream.write(&[refused.byte()]);
+                        return Err(error(refused));
+                    }
+                }
                 return self.live();
             }
             let mut bytes = [0; LIMIT + 2];
@@ -275,9 +291,49 @@ impl Pending {
     }
 }
 
+/// A request is admitted only outside the backoff, once its source and
+/// manifest check and the table grants its requester, the owner,
+/// `deploy-publish`, and only once the backoff counts it, so a request
+/// that later ends any way but approval, a teardown or crash included,
+/// has counted.
+fn admit(
+    backoff: &Backoff,
+    table: fn() -> Result<Table, String>,
+    owner: u32,
+    body: &[u8],
+) -> Result<Ready, Refused> {
+    let now = backoff::now();
+    let entry = backoff.read().map_err(unusable)?;
+    // Only a deadline cut to its bound is written back.
+    let entry = backoff.clamp(entry, now).map_err(unusable)?;
+    if entry.refuses(now) {
+        return Err(Refused::Backoff);
+    }
+    let ready = Ready::capture(body, owner).map_err(|e| Refused::Other(e.to_string()))?;
+    if !table()
+        .map_err(Refused::Other)?
+        .grants(owner, DeployPublish)
+    {
+        return Err(Refused::Other(
+            "the principal table does not grant the requester".into(),
+        ));
+    }
+    backoff.admitted(entry, now).map_err(unusable)?;
+    Ok(ready)
+}
+
+/// A backoff that cannot be read or written refuses the intake, said on
+/// the authority's standard error.
+fn unusable(why: String) -> Refused {
+    let _ = writeln!(io::stderr(), "td-authd: update intake refused: {why}");
+    Refused::Other(why)
+}
+
 pub(crate) struct Intake {
     listener: UnixListener,
     owner: u32,
+    backoff: Backoff,
+    table: fn() -> Result<Table, String>,
     pending: Option<Pending>,
     in_flight: bool,
     identity: (u64, u64),
@@ -342,6 +398,8 @@ impl Intake {
         Ok(Self {
             listener,
             owner,
+            backoff: Backoff::system(Row::Update),
+            table: Table::load,
             pending: None,
             in_flight: false,
             identity,
@@ -353,12 +411,20 @@ impl Intake {
                 self.pending = Pending::new(stream, self.owner).ok();
             }
         }
-        if self
-            .pending
-            .as_mut()
-            .is_some_and(|pending| pending.poll().is_err())
-        {
-            self.pending = None;
+        let Self {
+            pending,
+            backoff,
+            table,
+            owner,
+            ..
+        } = self;
+        // An admitted request counted at admission, however it ends.
+        if pending.as_mut().is_some_and(|request| {
+            request
+                .poll(|body| admit(backoff, *table, *owner, body))
+                .is_err()
+        }) {
+            *pending = None;
         }
     }
     pub fn select(&mut self) -> Result<Ready, String> {
@@ -379,6 +445,10 @@ impl Intake {
         pending.deadline = Some(expires(120).map_err(|e| e.to_string())?);
         self.in_flight = true;
         Ok(captured)
+    }
+    /// The description of `ready`; the backoff counted it at admission.
+    pub fn describe(&self, owner: u32, ready: Ready) -> Result<Installation, String> {
+        Installation::start(owner, ready, self.backoff.clone())
     }
     pub fn selected_alive(&self) -> bool {
         self.pending
@@ -436,9 +506,24 @@ pub(crate) fn request(source: &str, deployment: &str) -> Result<(), String> {
     let mut reply = [0];
     stream
         .read_exact(&mut reply)
-        .map_err(|e| format!("update admission failed: {e}"))?;
-    if reply != [ADMITTED] {
-        return Err("update was not admitted".into());
+        .map_err(|e| format!("update was not admitted (disconnected): {e}"))?;
+    match reply {
+        [ADMITTED] => (),
+        [BACKING_OFF] => {
+            return Err(
+                "update was not admitted: the installation queue is backing off \
+                 after unapproved requests"
+                    .into(),
+            )
+        }
+        [REFUSED] => {
+            return Err(
+                "update was not admitted: the source or its manifest does not \
+                 check, or an unusable backoff refuses it"
+                    .into(),
+            )
+        }
+        _ => return Err("update was not admitted".into()),
     }
     writeln!(
         io::stdout(),
@@ -458,9 +543,15 @@ pub(crate) fn request(source: &str, deployment: &str) -> Result<(), String> {
     }
 }
 
+/// Each digit `2` plus its own random byte modulo 8, as the rollback's.
+fn approval_key(bytes: [u8; 2]) -> Result<ApprovalKey, String> {
+    ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))
+}
+
 pub(crate) struct Installation {
     request: Request,
     source: Option<File>,
+    backoff: Backoff,
     presented: bool,
     committed: bool,
     deadline: Instant,
@@ -468,18 +559,25 @@ pub(crate) struct Installation {
     result: Option<bool>,
 }
 impl Installation {
-    pub fn start(owner: u32, ready: Ready) -> Result<Self, String> {
+    /// Tag 5 for `ready` under a fresh nonce and approval key, each drawn
+    /// from `/dev/urandom`.
+    fn start(owner: u32, ready: Ready, backoff: Backoff) -> Result<Self, String> {
         if owner != 1000 {
             return Err("unsupported installation owner".into());
         }
         let mut nonce = [0; 32];
+        let mut key = [0; 2];
         File::open("/dev/urandom")
-            .and_then(|mut file| file.read_exact(&mut nonce))
-            .map_err(|e| e.to_string())?;
+            .and_then(|mut random| {
+                random.read_exact(&mut nonce)?;
+                random.read_exact(&mut key)
+            })
+            .map_err(|e| format!("draw the installation's nonce and key: {e}"))?;
         let request = Request::new(
             nonce,
             owner,
             Description::Install {
+                key: approval_key(key)?,
                 deployment: ready.deployment,
                 requester: owner,
             },
@@ -487,6 +585,7 @@ impl Installation {
         Ok(Self {
             request,
             source: Some(ready.source),
+            backoff,
             presented: false,
             committed: false,
             deadline: expires(120).map_err(|e| e.to_string())?,
@@ -541,6 +640,17 @@ impl Installation {
         };
         let source = self.source.take().ok_or("missing approved source")?;
         self.committed = true;
+        // The approval clears the queue's backoff; one root cannot clear
+        // fails the installation before anything starts, said on the
+        // authority's standard error as admission's refusal is.
+        if let Err(why) = self.backoff.approved() {
+            let _ = writeln!(
+                io::stderr(),
+                "td-authd: update installation failed: clear the backoff: {why}"
+            );
+            self.result = Some(false);
+            return Ok(());
+        }
         let child = spawn(source, deployment);
         match child {
             Ok(child) => self.child = Some(child),

@@ -51,6 +51,9 @@ const KEY_L: u8 = 0x0f;
 const KEY_I: u8 = 0x0c;
 const SSH_REPLY: &str = "TD-LOGIN-SYSTEM-SSH";
 const UPDATE_READY: &str = " is ready. Press Ctrl+Alt+Escape, then I to review it.";
+const UPDATE_BACKING_OFF: &str = "the installation queue is backing off after unapproved requests";
+/// td-authd's backoff file; its update row counts each admitted request.
+const BACKOFF: &str = "/var/lib/td/authd/backoff";
 
 fn phase() -> &'static str {
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap();
@@ -660,7 +663,9 @@ fn repair(damage: &str) {
 /// A queued update whose source is `bundle`, as the primary account, and
 /// the attention menu's `I` on it: `refused`, or its prompt for `id`
 /// cancelled. Either way Escape returns to the desktop and the request
-/// ends unfinished.
+/// ends unfinished, and it counted: the next request is refused while
+/// the queue backs off, until root's fixture removes the backoff rather
+/// than wait out its 210 seconds.
 fn update(host: &mut Host, keyboard: &mut Keyboard, bundle: &Path, id: &str, refused: bool) {
     for path in fs::read_dir(bundle).unwrap() {
         chown(path.unwrap().path(), Some(UID), Some(UID)).unwrap();
@@ -708,6 +713,20 @@ fn update(host: &mut Host, keyboard: &mut Keyboard, bundle: &Path, id: &str, ref
         "{}",
         fs::read_to_string(&log).unwrap()
     );
+    let backoff = fs::read_to_string(BACKOFF).unwrap();
+    assert!(backoff.contains("\nupdate\t"), "{backoff}");
+    let output = Command::new("/bin/td-login")
+        .args(["exec-as", "tester", "--", "/bin/td-authd", "request-update"])
+        .arg(bundle)
+        .arg(id)
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{said}");
+    assert!(said.contains(UPDATE_BACKING_OFF), "{said}");
+    fs::remove_file(BACKOFF).unwrap();
 }
 
 /// The three updates: a deployment with no marker and one whose marker

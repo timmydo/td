@@ -1226,7 +1226,7 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("../../td-authd/src/consent.rs")),
-            0x68e38f4ad9c4584d,
+            0xf1e2c5245f2e49a3,
             "shared consent changed: reconcile td-secret/src/lib.rs, td-authd/tests/confinement.rs and this pin"
         );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);
@@ -3315,11 +3315,12 @@ pub struct MappedRegion {
 
     /// Elevation consent (DESIGN.md, "Elevation consent"): `B` asks root
     /// for a rollback in every build, since L3, and `H` for the queued
-    /// hostname change, since L4; and an elevation's one commit, root's
-    /// exact description and so its key, follows only the two digits the
-    /// evdev adapter offers. What a runtime test cannot see is held here:
-    /// that no test-only switch decides `B` or `H`, and that no other path
-    /// confirms.
+    /// hostname change, since L4; and an elevation's or, since L5, an
+    /// update's one commit, root's exact description and so its key,
+    /// follows only the two digits the evdev adapter offers. What a
+    /// runtime test cannot see is held here: that no test-only switch
+    /// decides `B` or `H`, and that no other path confirms; Enter confirms
+    /// only a live boot's whole-disk installation.
     #[test]
     fn b_and_h_select_elevations_and_only_the_typed_key_commits_one() {
         let input = production(include_str!("input.rs"));
@@ -3393,8 +3394,9 @@ pub struct MappedRegion {
                 }
             }
         }
-        // The client: an elevation commits only once confirmed, and only
-        // the second matching digit, or an installation's Enter, confirms.
+        // The client: an elevation or an update commits only once
+        // confirmed, and only the second matching digit, or a whole-disk
+        // installation's Enter, confirms.
         assert!(client.contains(
             "    fn confirms(&self) -> bool {\n        \
              matches!(self, Self::Install | Self::Elevation(_))\n    }\n"
@@ -3414,6 +3416,25 @@ pub struct MappedRegion {
         assert!(
             approve.contains(".filter(|presented| self.answers(&runtime, presented, timestamp))")
         );
+        // Since L5 an update takes the key, from the one key reader, and
+        // Enter answers a whole-disk installation alone.
+        assert!(approve.contains(
+            "        if !matches!(self.selection, Selection::Install | Selection::Elevation(_))\n"
+        ));
+        assert!(approve
+            .contains("            let Some(key) = approval_key(&presented.request) else {\n"));
+        assert!(client.contains(
+            "fn approval_key(request: &Request) -> Option<ApprovalKey> {\n    \
+             match request.operation() {\n        \
+             Operation::Install { key, .. } => Some(*key),\n        \
+             _ => Elevation::of(request).map(|(_, key)| key),\n    }\n}\n"
+        ));
+        assert_eq!(occurrences(client, "approval_key("), 2);
+        let confirm = body(client, "    pub fn confirm_install(");
+        assert!(confirm.contains(
+            "            if matches!(presented.request.operation(), Operation::InstallDisk { .. })\n                \
+             && self.answers(&runtime, presented, timestamp)\n"
+        ));
         let answers = body(client, "    fn answers(");
         assert!(answers.contains(
             "        timestamp > presented.after\n            && self.active()\n            \

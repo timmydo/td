@@ -1,8 +1,9 @@
 //! The public elevation intakes' backoff (td-authd/DESIGN.md, "Elevation
 //! operations", "Backoff"): each intake's count of admitted requests not
 //! yet approved and the wall-clock second before which it refuses another,
-//! in one root-owned file on `@var` that neither a new authority
-//! generation nor a reboot clears. Only an approval clears it.
+//! one row per intake in one root-owned file on `@var` that neither a new
+//! authority generation nor a reboot clears. Only an approval clears an
+//! intake's row.
 
 use crate::saved;
 use std::fs::{File, OpenOptions};
@@ -15,8 +16,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DIRECTORY: &str = "/var/lib/td/authd";
 const FILE: &str = "backoff";
 const HEADER: &str = "td-authd-backoff-v1";
-/// The hostname intake's row; L5 adds the update queue's.
-const HOSTNAME: &str = "hostname";
 const LIMIT: u64 = 256;
 const NOFOLLOW: i32 = 0x20000;
 const NONBLOCK: i32 = 0x800;
@@ -28,6 +27,81 @@ const LAST: u64 = 960;
 /// The longest an admitted request lives: its 60-second selection window,
 /// then its 120-second consent window. Its refusal runs past that.
 const LIFETIME: u64 = 180;
+
+/// The reply to a whole frame an intake refuses: while its backoff runs,
+/// or for any other reason.
+pub(crate) const BACKING_OFF: u8 = 3;
+pub(crate) const REFUSED: u8 = 4;
+
+/// Why an intake refused a whole frame, which its reply byte says.
+#[derive(Debug)]
+pub(crate) enum Refused {
+    /// The backoff runs.
+    Backoff,
+    /// Anything else, a backoff root cannot read or write included.
+    Other(String),
+}
+
+impl Refused {
+    pub fn byte(&self) -> u8 {
+        match self {
+            Self::Backoff => BACKING_OFF,
+            Self::Other(_) => REFUSED,
+        }
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backoff => f.write_str("the intake is backing off"),
+            Self::Other(why) => f.write_str(why),
+        }
+    }
+}
+
+/// An intake with a row, in the file's order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Row {
+    /// The hostname intake, from L4.
+    Hostname,
+    /// The update queue, from L5.
+    Update,
+}
+
+impl Row {
+    const ALL: &'static [Self] = &[Self::Hostname, Self::Update];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Hostname => "hostname",
+            Self::Update => "update",
+        }
+    }
+}
+
+/// Every intake's entry, as the file holds them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Rows {
+    hostname: Entry,
+    update: Entry,
+}
+
+impl Rows {
+    fn get(self, row: Row) -> Entry {
+        match row {
+            Row::Hostname => self.hostname,
+            Row::Update => self.update,
+        }
+    }
+
+    fn set(&mut self, row: Row, entry: Entry) {
+        match row {
+            Row::Hostname => self.hostname = entry,
+            Row::Update => self.update = entry,
+        }
+    }
+}
 
 /// One intake's consecutive unapproved requests and the second, since the
 /// epoch, before which it refuses another.
@@ -78,34 +152,42 @@ pub(crate) fn now() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-/// The backoff file's directory and the owner it and the file must have.
+/// The backoff file's directory, the owner it and the file must have, and
+/// the intake whose row this reads and writes.
 #[derive(Clone, Debug)]
 pub(crate) struct Backoff {
     directory: PathBuf,
     owner: (u32, u32),
+    row: Row,
 }
 
 impl Backoff {
-    /// `/var/lib/td/authd/backoff`, root's.
-    pub fn system() -> Self {
-        Self::at(Path::new(DIRECTORY), (0, 0))
+    /// `row` in `/var/lib/td/authd/backoff`, root's.
+    pub fn system(row: Row) -> Self {
+        Self::at(Path::new(DIRECTORY), (0, 0), row)
     }
 
-    pub(crate) fn at(directory: &Path, owner: (u32, u32)) -> Self {
+    pub(crate) fn at(directory: &Path, owner: (u32, u32), row: Row) -> Self {
         Self {
             directory: directory.to_path_buf(),
             owner,
+            row,
         }
     }
 
-    /// The hostname intake's entry: zero while the directory or the file
-    /// is missing. The directory must be the owner's, mode 0700, and the
+    /// This intake's entry: zero while the directory or the file is
+    /// missing, or the file has no row for it.
+    pub fn read(&self) -> Result<Entry, String> {
+        Ok(self.rows()?.get(self.row))
+    }
+
+    /// Every row. The directory must be the owner's, mode 0700, and the
     /// file one link of the owner's, mode 0600, within its bound, read
     /// without following a link or waiting on a FIFO, in the exact grammar.
-    pub fn read(&self) -> Result<Entry, String> {
+    fn rows(&self) -> Result<Rows, String> {
         let directory = match self.directory() {
             Ok(directory) => directory,
-            Err(why) if why.kind() == std::io::ErrorKind::NotFound => return Ok(Entry::default()),
+            Err(why) if why.kind() == std::io::ErrorKind::NotFound => return Ok(Rows::default()),
             Err(why) => return Err(format!("open the backoff directory: {why}")),
         };
         self.admit_directory(&directory)?;
@@ -115,7 +197,7 @@ impl Backoff {
             .open(format!("/proc/self/fd/{}/{FILE}", directory.as_raw_fd()))
         {
             Ok(file) => file,
-            Err(why) if why.kind() == std::io::ErrorKind::NotFound => return Ok(Entry::default()),
+            Err(why) if why.kind() == std::io::ErrorKind::NotFound => return Ok(Rows::default()),
             Err(why) => return Err(format!("open the backoff file: {why}")),
         };
         let metadata = file.metadata().map_err(|e| e.to_string())?;
@@ -152,7 +234,7 @@ impl Backoff {
         self.record(entry.after(now, LIFETIME))
     }
 
-    /// An approval clears the count and the refusal.
+    /// An approval clears this intake's count and refusal.
     pub fn approved(&self) -> Result<Entry, String> {
         self.record(Entry::default())
     }
@@ -175,8 +257,10 @@ impl Backoff {
         Ok(())
     }
 
-    /// Writes `entry`, synced, creating the directory, mode 0700, beneath
-    /// a parent of the owner's that no other may write.
+    /// Writes `entry` as this intake's row beside the others as read,
+    /// synced, creating the directory, mode 0700, beneath a parent of the
+    /// owner's that no other may write. A file that cannot be read is not
+    /// replaced.
     fn record(&self, entry: Entry) -> Result<Entry, String> {
         let directory = match self.directory() {
             Ok(directory) => directory,
@@ -184,7 +268,9 @@ impl Backoff {
             Err(why) => return Err(format!("open the backoff directory: {why}")),
         };
         self.admit_directory(&directory)?;
-        saved::write_synced(&self.directory.join(FILE), &encode(entry), 0o600, None)?;
+        let mut rows = self.rows()?;
+        rows.set(self.row, entry);
+        saved::write_synced(&self.directory.join(FILE), &encode(rows), 0o600, None)?;
         Ok(entry)
     }
 
@@ -208,38 +294,40 @@ impl Backoff {
     }
 }
 
-/// `td-authd-backoff-v1`, then the hostname intake's row when its count is
-/// not zero: `hostname`, the count and the second, each after a tab, in
-/// canonical decimal, every line newline-terminated.
-fn parse(text: &str) -> Result<Entry, String> {
+/// `td-authd-backoff-v1`, then a row for each intake whose count is not
+/// zero, `hostname` before `update`: its name, the count and the second,
+/// each after a tab, in canonical decimal, every line newline-terminated.
+fn parse(text: &str) -> Result<Rows, String> {
     let invalid = || "the backoff file is malformed".to_string();
     let body = text.strip_suffix('\n').ok_or_else(invalid)?;
     let mut lines = body.split('\n');
     if lines.next() != Some(HEADER) {
         return Err(invalid());
     }
-    let entry = match lines.next() {
-        None => Entry::default(),
-        Some(row) => {
-            let mut fields = row.split('\t');
-            if fields.next() != Some(HOSTNAME) {
-                return Err(invalid());
-            }
-            let count = fields.next().and_then(decimal).ok_or_else(invalid)?;
-            let until = fields.next().and_then(decimal).ok_or_else(invalid)?;
-            if fields.next().is_some() || count == 0 {
-                return Err(invalid());
-            }
+    let mut rows = Rows::default();
+    // Each row only after the ones before it, never twice.
+    let mut order = Row::ALL.iter();
+    for line in lines {
+        let mut fields = line.split('\t');
+        let name = fields.next();
+        let row = order
+            .by_ref()
+            .find(|row| Some(row.name()) == name)
+            .ok_or_else(invalid)?;
+        let count = fields.next().and_then(decimal).ok_or_else(invalid)?;
+        let until = fields.next().and_then(decimal).ok_or_else(invalid)?;
+        if fields.next().is_some() || count == 0 {
+            return Err(invalid());
+        }
+        rows.set(
+            *row,
             Entry {
                 count: u32::try_from(count).map_err(|_| invalid())?,
                 until,
-            }
-        }
-    };
-    if lines.next().is_some() {
-        return Err(invalid());
+            },
+        );
     }
-    Ok(entry)
+    Ok(rows)
 }
 
 fn decimal(text: &str) -> Option<u64> {
@@ -252,10 +340,18 @@ fn decimal(text: &str) -> Option<u64> {
     text.parse().ok()
 }
 
-fn encode(entry: Entry) -> Vec<u8> {
+fn encode(rows: Rows) -> Vec<u8> {
     let mut text = format!("{HEADER}\n");
-    if entry.count != 0 {
-        text.push_str(&format!("{HOSTNAME}\t{}\t{}\n", entry.count, entry.until));
+    for row in Row::ALL {
+        let entry = rows.get(*row);
+        if entry.count != 0 {
+            text.push_str(&format!(
+                "{}\t{}\t{}\n",
+                row.name(),
+                entry.count,
+                entry.until
+            ));
+        }
     }
     text.into_bytes()
 }

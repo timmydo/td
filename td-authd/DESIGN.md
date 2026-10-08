@@ -1619,7 +1619,18 @@ body length covers exactly 64 lowercase hexadecimal ID bytes followed by a
 UTF-8 absolute path of at most 4096 bytes. NUL and parent traversal refuse.
 Root pins the final directory without following a symlink, requires its
 owner to be UID 1000, and checks a bounded requester-owned regular manifest
-through that descriptor against the ID before sending admission byte 02.
+through that descriptor against the ID. Since L5 the queue has the
+hostname intake's durable backoff ("Elevation operations", Backoff):
+before the source is read a running backoff refuses; after the checks
+the principal table must grant the requester, the owner,
+`deploy-publish`, as the hostname intake's must grant `set-hostname`;
+then root writes the queue's count before sending admission byte 02.
+A refused whole frame is answered as the hostname intake's is: 03 while
+the backoff refuses, 04 for any other reason (a source or manifest that
+does not check, a table that does not grant the requester or cannot be
+read, or a backoff root cannot read or write); a malformed
+frame is closed without one. The client prints which, or that the update
+is ready and how to review it.
 Intermediate path lookup and regular-file reads are synchronous filesystem
 operations; the byte/deadline bounds do not promise latency on a stalled
 filesystem. This queue cannot execute the source or open an arbitrary root
@@ -1628,24 +1639,34 @@ bound socket work. Admission expires in five seconds; a sent admission
 receipt starts a sixty-second selection window. Extra traffic, foreign
 senders, descriptors, disconnect or expiry retire the pending request.
 
-Only private request 19 selects a queued installation; no ready request or
-a busy operation slot answers 99 00. On an enrolled or unavailable
-machine, a queued deployment that cannot read the login record answers
-99 01 and is retired with completion byte 00 ("Login keys and session
-lock", amendment 8). A selection holds the directory File,
-generates a fresh 32-byte nonce and answers 92 DESCRIPTION. The description
-is consent tag 5: owner, nonce, requester UID and full deployment ID. It
-shares one operation slot with secret operations and read-only inspection.
-The root installation controller accepts exact presentation (13) and then
-one exact commit (14), within 120 seconds of selection. The compositor must
-obtain a fresh physical Enter after presenting the whole description before
-sending commit. Root rechecks the submitting process immediately beforehand.
-Keyboard confirmation authorizes this installation only; it cannot release
+Only private request 19 selects a queued installation, the operation
+`deploy-publish` (APPLICATIONS.md §L.1). A busy operation slot answers
+99 00 first. Root then reads the principal table again, as admission
+did, and answers 99 02 unless its `deploy-publish` row grants the
+session owner, the only requester the intake admits ("Elevation
+operations"), leaving the request queued; then no ready request answers
+99 00. On an enrolled or unavailable machine, a queued deployment that
+cannot read the login record answers 99 01 and is retired with
+completion byte 00 ("Login keys and session lock", amendment 8). A
+selection holds the directory File, draws a fresh 32-byte nonce and the
+two-byte approval key from `/dev/urandom` and answers 92 DESCRIPTION.
+The description is consent tag 5: owner, nonce, key, requester UID and
+full deployment ID. It shares one operation slot with secret operations
+and read-only inspection. The root installation controller accepts exact
+presentation (13) and then one exact commit (14), within 120 seconds of
+selection, each carrying the description and so its key. The compositor
+sends commit only after the key is typed on the fully presented prompt
+(td-compositor/DESIGN.md, "Elevation consent"); Enter confirms nothing.
+Root rechecks the submitting process immediately beforehand. Keyboard
+confirmation authorizes this installation only; it cannot release
 secrets or authorize protector changes.
 
-After commit, root spawns only `/bin/td-update apply-operation ID`, with an
-empty environment, cwd `/`, the held directory File on stdin, null stdout
-and authority stderr. The helper's independent admission and transaction are
+At commit root consumes the confirmation, then clears the queue's
+backoff; a backoff it cannot clear fails the installation before
+anything starts. It then spawns only `/bin/td-update apply-operation
+ID`, with an empty environment, cwd `/`, the held directory File on
+stdin, null stdout and authority stderr; a backoff it cannot clear is
+said there. The helper's independent admission and transaction are
 specified in td-install/DESIGN.md. No key, command, device or mountpoint is
 selected by a requester. The confirmation is consumed even if spawn fails.
 Closing the screen or losing the public client after commit cannot revoke
@@ -1656,7 +1677,8 @@ for its completion read. Only a successful helper exit permits public byte 01
 and private completion; failure returns byte 00. Missing completion is an
 uncertain result and never causes automatic retry. Restart is explicit.
 
-Before commit, Escape, requester loss or expiry cancels without launching.
+Before commit, Escape, a wrong digit, requester loss or expiry cancels
+without launching, and the request has counted.
 On failed-generation teardown, the controller kills and reaps its direct
 helper before secret-session cleanup. This alone cannot prove that the
 helper's boot-transaction descendant is gone. td-svc's existing authority
@@ -1664,6 +1686,21 @@ cgroup owns every descendant and forbids a replacement generation until the
 entire previous cgroup is empty; helpers never detach from that containment.
 The boot transaction owns recovery of interrupted publication. No privileged
 shell, setuid entry, remembered consent or new credential switch is added.
+
+Host tests drive the queue's backoff (a request admitted only once
+counted, 03 within the backoff with nothing written, 04 for a manifest
+that does not check or a table that does not grant the requester,
+uncounted, or for a backoff root cannot read or write, until a write
+succeeds), each description's fresh nonce and key, request 19's 99 02
+for a table without the owner's `deploy-publish` row or none at all,
+before the queue is touched, and only a commit clearing the count,
+before the helper starts or instead of it. Confinement pins hold the
+queue's backoff row and table, the grant and then the write ending
+admission, the reply byte, the key's draw, the clear before the spawn,
+and the table before the queue in request 19. `qemu-update`
+(td-update/DESIGN.md) reads the key off a booted system's prompt, shows
+a cancelled request refusing the next inside its window and Enter
+installing nothing, and types the key.
 
 ## Whole-disk installation intake
 
@@ -1720,9 +1757,12 @@ the review's storage. A review it cannot show (a name consent refuses),
 or whose operation cannot start, is declined as unavailable at once and
 answers 99 00. Otherwise it
 answers 92 DESCRIPTION and holds the slot. Presentation (13), then one
-commit (14) after a fresh physical Enter, within 120 seconds, as for an
-update. Commit sends consent naming the review; Escape before commit sends
-declined, and expiry sends expired. If the service ended the review first
+commit (14), within 120 seconds, as for an update, but after a fresh
+physical Enter: tag 6 carries no approval key, and no principal table
+is consulted, since the live medium has no installed principal
+(APPLICATIONS.md §L.1). Commit sends consent naming the review; Escape
+before commit sends declined, and expiry sends expired. If the service
+ended the review first
 (the installer withdrew or left, or the service stopped), Enter consents to
 nothing: presentation changes nothing, and commit of the same description
 answers 94 without sending and the operation fails. After commit only the
@@ -1756,13 +1796,14 @@ staged into the target authority recipe.
 ## Elevation operations
 
 Implemented and live: `deploy-rollback` (L3), from the principal table
-and request `1d` through its commit and td-boot's checked pair, and
+and request `1d` through its commit and td-boot's checked pair;
 `set-hostname` (L4), from its intake and backoff through request `1e`'s
-commit and the canonical write. The rest of this section is a target:
-tag 5's key bytes, `deploy-publish`'s row for request 19 and the update
-intake's backoff (L5), and the login tags' key bytes (TOKEN-LOGIN.md's
-increment 5). APPLICATIONS.md §L.1, "The v1 operations (target)", says
-what `deploy-rollback`, `set-hostname` and `deploy-publish` are and why,
+commit and the canonical write; and `deploy-publish` (L5), tag 5's key
+bytes, the table's row for request 19 and the update queue's backoff
+("Consent for a locally built system"). The rest of this section is a
+target: the login tags' key bytes (TOKEN-LOGIN.md's increment 5).
+APPLICATIONS.md §L.1, "The v1 operations", says what
+`deploy-rollback`, `set-hostname` and `deploy-publish` are and why,
 and its "Elevation increments" which commit lands each part;
 `td-compositor/DESIGN.md`, "Elevation consent", says which presses
 confirm. The private channel routes requests `10` to `1f` to the secret
@@ -1788,11 +1829,13 @@ Both stay under the 256-byte bound. Each renders its operation, both IDs
 or the requester and both names, and that a restart completes it, then
 ends its description with the key's rows, `APPROVE: TYPE 4 THEN 7` and
 `ESC: CANCEL`, in place of the generic Escape row; every fixed row fits
-the narrowest prompt, so wrapping never splits the key. In L5 tag 5
-gains the same two bytes after its tag byte, 115 bytes in all, so an
-update's description carries its key. Tag 6, the live disk
-installation, gains none. TOKEN-LOGIN.md's increment 5 adds the same two
-bytes, right after the tag byte, to the login tags whose descriptions
+the narrowest prompt, so wrapping never splits the key. Since L5 tag 5
+carries the same two bytes after its tag byte, before its requester and
+ID, 115 bytes in all, and its rows end with the same key rows; its
+restart row, 35 columns, wraps at the narrowest prompt, above them, so
+the key is still never split. Tag 6, the live disk installation,
+carries none. TOKEN-LOGIN.md's increment 5 adds the same two bytes,
+right after the tag byte, to the login tags whose descriptions
 carry a disclosure: enrollment (8) and removal (10), whose one-key and
 remove-every-key disclosures it confirms. Root draws a fresh key for
 each presented description, so each step of a multi-step enrollment has
@@ -1808,16 +1851,16 @@ or the slot is busy, `01` when the principal table refuses or cannot be
 read, and for `1d` `02` when the selectors cannot be read or name one
 deployment. Root reads `/etc/td-elevation.tsv` here, before any
 description exists, and for `1d` the table before the selectors, so a
-refused owner reads no volume; from L5 request 19 consults its
-`deploy-publish` row
-the same way and answers a miss with a new `99 02`, beside today's
-`99 00` (nothing ready or busy) and `99 01` (cannot read the login
-record). Presentation (`13`), then one commit (`14`), each with the
+refused owner reads no volume; request 19 on an installed system
+consults its `deploy-publish` row the same way and answers a miss with
+`99 02`, beside `99 00` (nothing ready or busy) and `99 01` (cannot read
+the login record). Presentation (`13`), then one commit (`14`), each with the
 exact description and so its key, follow within 120 seconds of selection
 and are answered `93` and `94`, as for request 19. The compositor sends
 commit only after the key is typed on the fully presented prompt. Root
 cannot observe those presses: it trusts the paired compositor for them,
-as it trusts that compositor's Enter for request 19. Root rechecks the
+as it trusts that compositor's Enter for a live boot's disk review. Root
+rechecks the
 submitting process immediately before acting and consumes the nonce
 first, so a consumed nonce is never reused, even when the operation then
 fails. Escape, expiry or, for a hostname, requester loss before commit
@@ -1836,22 +1879,22 @@ each turn of its authority worker and the attention menu's `H` row shows
 the answer it holds when the menu opens. The answer grants nothing; `1e`
 selects the request and checks the table again.
 
-**Principal table.** `elevation.rs` reads it at each `1d` and `1e`, and
-at each hostname admission. `/etc` is
-opened as a directory without following a link and must be root's and
-writable by neither group nor other; the table is opened through that
-descriptor's `/proc/self/fd` path with `O_NOFOLLOW | O_NONBLOCK` and
-admitted only as a regular root-owned file of mode exactly 0444, with
-one link and at most 4096 bytes, before a byte is read. Its text is the
-line `td-elevation-v1`, then at most 64 rows in strictly increasing UID
-order, each a canonical decimal UID from 1000 to 65533 and one or more
-operations, each after a tab, from `deploy-rollback`, `set-hostname`
-and `deploy-publish` in that order without a repeat; every line ends in
-a newline, and nothing else is admitted. The system recipe ships the v1
-row, `1000`, then all three operations (`build_elevation_table`), as
-regular immutable `/etc` content its shape check holds at 0444. Any
-departure refuses as the table's `01`; the table grants and never
-denies.
+**Principal table.** `elevation.rs` reads it at each `1d` and `1e`, at
+each request 19 on an installed system, and at each hostname and update
+admission. `/etc` is opened as a directory without following a link and
+must be root's and writable by neither group nor other; the table is
+opened through that descriptor's `/proc/self/fd` path with `O_NOFOLLOW |
+O_NONBLOCK` and admitted only as a regular root-owned file of mode
+exactly 0444, with one link and at most 4096 bytes, before a byte is
+read. Its text is the line `td-elevation-v1`, then at most 64 rows in
+strictly increasing UID order, each a canonical decimal UID from 1000 to
+65533 and one or more operations, each after a tab, from
+`deploy-rollback`, `set-hostname` and `deploy-publish` in that order
+without a repeat; every line ends in a newline, and nothing else is
+admitted. The system recipe ships the v1 row, `1000`, then all three
+operations (`build_elevation_table`), as regular immutable `/etc`
+content its shape check holds at 0444. Any departure refuses as the
+table's `01`; the table grants and never denies.
 
 **`deploy-rollback`.** At `1d`, after the table, `rollback.rs` opens
 `/run/td-volume/td` and reads `boot/current` and `boot/previous` through
@@ -1930,47 +1973,60 @@ describes tag 12; a failure of any of these ends the request as
 `9e 00`, and the client reads 00. The request counted at admission, so
 one that fails here has counted though no prompt was shown.
 
-**Backoff.** The hostname intake from L4, and the update intake from L5,
-each queue one request at a time. Every admitted request counts until an
-approval: the intake refuses new requests until 30 seconds after the
-latest an admitted request can end, doubling with each consecutive
-unapproved request to at most 960 seconds; an approval resets it. Each
-intake's count and wall-clock refusal deadline live in one root-owned
-mode-0600 file, `/var/lib/td/authd/backoff`, in a root-owned mode-0700
-directory on `@var`, so neither a new authority generation nor a reboot
-clears them. Root writes the increment, synced, at admission, before the
-admission byte, with a deadline 180 seconds on, the request's selection
-and consent windows, plus the delay, and clears it only on approval. The
+**Backoff.** The hostname intake, since L4, and the update queue, since
+L5, each queue one request at a time and keep a backoff of their own.
+Every admitted request counts until an approval: the intake refuses new
+requests until 30 seconds after the latest an admitted request can end,
+doubling with each consecutive unapproved request to at most 960
+seconds; an approval resets it. Each intake's count and wall-clock
+refusal deadline live in one root-owned mode-0600 file,
+`/var/lib/td/authd/backoff`, in a root-owned mode-0700 directory on
+`@var`, so neither a new authority generation nor a reboot clears them.
+Root writes the increment, synced, at admission, before the admission
+byte, with a deadline 180 seconds on, the request's selection and
+consent windows, plus the delay, and clears it only on approval. The
 bound is approximate: sending the admission byte, within the five-second
 admission, can start the selection window up to five seconds after the
 write. So however a request ends, declined, expired, a wrong key,
 requester loss, a failure before its prompt, or a teardown or crash of
 the authority before or after selection, it has counted; a crash between
 the write and the admission byte counts a request the client never heard
-admitted. Any process of UID 1000 can spend that shared count: each
-request it gets admitted delays the person's own renames by up to 180
-plus 960 seconds, and one that asks again as each deadline passes can
-keep them waiting indefinitely; that is the accepted trade
+admitted. Any process of UID 1000 can spend an intake's shared count:
+each request it gets admitted delays the person's own renames or updates
+by up to 180 plus 960 seconds, and one that asks again as each deadline
+passes can keep them waiting indefinitely; that is the accepted trade
 APPLICATIONS.md §L.1's prompt-spam row names. The file is the line
-`td-authd-backoff-v1`, then, while the hostname intake's count is not
-zero, one row: `hostname`, the count and the deadline in seconds since
-the epoch, each after a tab in canonical decimal; every line ends in a
-newline, and L5 adds the update queue's row. It is written through
-`td-firstboot/src/saved.rs`'s synced temporary and rename, and admitted
-only as one link of root's, mode 0600, at most 256 bytes, opened without
-following a link or waiting on a FIFO; a missing directory is created by
-std, mode 0700, beneath a parent of root's that no other may write. A
-missing directory or file reads as zero; a malformed file, or one root
-cannot read, refuses the intake with a named diagnostic on root's
-standard error and `1f`'s `02`. A failed write does the same and stays
-until a later write succeeds, whatever is read in between: admission
-retries the write, so the first one that succeeds admits again. The
-standing failure is the generation's: a new authority generation starts
-without it, and its first admission refuses again by failing the same
-write. The deadline is wall-clock. One set forward shortens the refusal;
-one set back cannot lengthen it past 180 plus 960 seconds from when
-admission reads it, since admission cuts a later deadline to that bound
-and writes the cut one back.
+`td-authd-backoff-v1`, then a row for each intake whose count is not
+zero, `hostname` before `update`: its name, the count and the deadline
+in seconds since the epoch, each after a tab in canonical decimal; every
+line ends in a newline. Each intake writes its own row and keeps the
+other's as read, so a file root cannot read is never replaced. It is
+written through `td-firstboot/src/saved.rs`'s synced temporary and
+rename, and admitted only as one link of root's, mode 0600, at most 256
+bytes, opened without following a link or waiting on a FIFO; a missing
+directory is created by std, mode 0700, beneath a parent of root's that
+no other may write. A missing directory or file reads as zero; a
+malformed file, or one root cannot read, refuses both intakes with a
+named diagnostic on root's standard error, and the hostname intake's
+`1f` answers `02`. A failed write does the same and stays until a later
+write succeeds, whatever is read in between: admission retries the
+write, so the first one that succeeds admits again. The standing failure
+is the generation's: a new authority generation starts without it, and
+its first admission refuses again by failing the same write. The
+deadline is wall-clock. One set forward shortens the refusal; one set
+back cannot lengthen it past 180 plus 960 seconds from when admission
+reads it, since admission cuts a later deadline to that bound and writes
+the cut one back.
+
+Recovery from an unusable backoff is outside td's operations, since
+nothing td offers the person writes `/var/lib/td/authd`: a file root
+cannot read blocks every update and every rename until it is repaired
+or removed, which a missing file then reads as zero, from physical
+access as `td-login/TOKEN-LOGIN.md`'s "Recovery" describes it.
+`deploy-rollback` does not help, since it selects a deployment and
+leaves `@var`, the file included, as it is. A full or read-only `@var`
+fails the write, and so blocks updates and renames, until space is freed
+or the volume is writable again; the next admission then writes.
 
 **`set-hostname` after commit.** Root consumes the confirmation, then
 clears the backoff, then re-reads `/var/lib/td/hostname` with
