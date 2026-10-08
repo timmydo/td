@@ -591,7 +591,7 @@ Also complete mutation/queue policy, quota/result reconciliation,
 guarded-stack and combined
 native/RSS qualification, the full 8 GiB database checkpoint, normal WAL
 admission scheduling and portable maximum-WAL resource qualification,
-the full crash/fault matrix, history maintenance and operational
+the full crash/fault matrix, retention scheduling and operational
 inspection/backup/restore. No legacy store migration is required.
 SQLite durability alone grants neither authorization nor a memory qualification.
 
@@ -2359,6 +2359,13 @@ to service commits. Native indexes serve metadata
 queries; parsed-body/search caches remain disposable. Authoritative database
 values must survive cache rebuilds. Maintenance respects captured SQLite
 snapshots, fixed disk/heap ceilings and atomic body/metadata commits.
+
+The native prune_history primitive now atomically advances an account's
+history floor without advancing its committed endpoint and reclaims at most
+4096 retired rows per call. Repeated calls may finish physical cleanup behind
+the floor; old snapshots retain original history. STORAGE.md defines native
+bounds, conflict handling and passive receipts. Choosing retention boundaries,
+scheduling work and reconciling admission/physical usage remain M08 work.
 
 **Acceptance:** snapshots across commits/checkpoints, pool exhaustion, native
 page/WAL/heap capacity, failed body streaming, indeterminate COMMIT recovery,

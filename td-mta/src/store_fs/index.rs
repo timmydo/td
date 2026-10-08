@@ -17,7 +17,7 @@ use crate::{
     store_paths::{Name, RootEntry},
 };
 #[cfg(test)]
-use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 use rusqlite::{params, types::ValueRef, Connection, OpenFlags};
 use std::{
     fs::{self, OpenOptions},
@@ -48,8 +48,11 @@ mod operations;
 #[path = "index/row_history.rs"]
 mod row_history;
 use operations::Operations;
+#[path = "index/history.rs"]
+mod history;
 #[path = "index/threading.rs"]
 mod threading;
+pub use history::{HistoryPruneRequest, HistoryPruned};
 #[path = "index/usage.rs"]
 mod usage;
 pub use usage::LogicalUsage;
@@ -663,20 +666,27 @@ impl<'r> IndexStore<'r> {
         operations: Operations<'_, '_>,
         sources: &mut [BlobSource<'_>],
     ) -> Result<Sequence, CommitError> {
-        let mut writer = self
-            .writer(request.deadline)
-            .map_err(CommitError::Rejected)?;
+        self.transaction(request.deadline, |native, scratch| {
+            self.apply(native, crypto, request, operations, sources, scratch)
+        })
+    }
+    fn transaction<T>(
+        &self,
+        deadline: Deadline,
+        apply: impl FnOnce(&Native, &mut [u8]) -> Result<T, ports::Error>,
+    ) -> Result<T, CommitError> {
+        let mut writer = self.writer(deadline).map_err(CommitError::Rejected)?;
         if writer.stopped {
             return Err(CommitError::Rejected(ports::Error::WriterStopped));
         }
         writer
             .native
-            .begin_work(request.deadline)
+            .begin_work(deadline)
             .map_err(CommitError::Rejected)?;
         let Writer {
             native, scratch, ..
         } = &mut *writer;
-        let result = self.apply(native, crypto, request, operations, sources, scratch);
+        let result = apply(native, scratch);
         match result {
             Ok(next) => {
                 finish_commit(&mut writer)?;
@@ -1502,7 +1512,11 @@ fn next_change(
             return Err(ports::Error::Invalid);
         }
     }
-    if after.sequence < identity.history_floor {
+    if after.sequence < identity.history_floor
+        || (after.sequence == identity.history_floor
+            && identity.history_floor != Sequence::default()
+            && after.operation != u32::MAX)
+    {
         return Err(ports::Error::HistoryLost);
     }
     if after.sequence > identity.committed_sequence {

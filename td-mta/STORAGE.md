@@ -142,7 +142,8 @@ above i64::MAX; overflow refuses mutation. Account creation is bounded to 128.
 Account endpoint and history-floor reads require exactly eight bytes.
 The decoded history floor must not exceed the committed endpoint; an
 incoherent account identity returns Corrupt during view capture or before
-transaction mutation. This validation does not activate history pruning.
+transaction mutation. Explicit history retirement is described below;
+ordinary object commits preserve the floor.
 For each change row selected by the native range query, the sequence must
 have eight bytes and the object ID sixteen. Short or oversized blobs
 return Corrupt; the reader never pads them or treats their stored width
@@ -464,9 +465,51 @@ bind the returned ledger to a store; trusted coordination must do both.
 No duplicate used-counter table, reservation, effect
 ticket or authenticated mutation authority is created.
 
-Changes use the native account/kind/sequence/operation indexes. History pruning
-is not activated; floor remains zero and the hard database ceiling can refuse
-writes until an explicit maintenance policy is implemented.
+Changes use the native account/kind/sequence/operation indexes.
+IndexStore::prune_history supplies explicit bounded history retirement and
+physical row reclamation. Its HistoryPruneRequest identifies an account,
+expected committed endpoint, inclusive through sequence, max_rows in
+1 through 4096, and one deadline. The trusted caller owns retention policy,
+account authorization and resource admission; there is no automatic pruning
+or retention scheduler. A changed endpoint or a through sequence below the
+current floor returns Conflict; a future boundary or invalid row limit returns
+Invalid. The account must exist and its captured counters must be coherent.
+
+Under the existing writer mutex, BEGIN IMMEDIATE and original native scope,
+pruning raises the floor to through without advancing the committed endpoint.
+It selects at most max_rows plus one retired keys through the changes primary
+key (account, sequence, operation), retaining only a count and last key. The
+selected keys, including lookahead, require exact eight-byte sequences and
+operation ordinals from 0 through 4095. It deletes at most max_rows entries
+in primary-key order, verifies the deletion count, and commits the floor and
+deletion together through the ordinary commit-outcome machinery. No bodies,
+object rows or new change events are written. No schema migration is needed.
+This is a bounded selected-prefix check, not a global history audit.
+
+HistoryPruned returns the committed ViewIdentity, removed row count and more
+flag only after known successful COMMIT. The flag describes retired rows
+remaining in that transaction snapshot. Repeating through equal to the floor
+continues cleanup; a zero-row result is valid. Partial physical deletion of a
+sequence is safe because the entire sequence is already retired atomically.
+New views reject cursors below the floor with HistoryLost. At a nonzero
+floor, only operation u32::MAX, the completed-sequence sentinel, is accepted;
+other operation cursors return HistoryLost because unconsumed changes may
+have been retired. This conservative rule also refuses operation 4095.
+The completed-sequence sentinel skips the entire floor sequence, including
+rows awaiting reclamation. Floor-zero cursors retain their original rules;
+ordinary writes never produce sequence-zero changes.
+Retained WAL views keep their old floor and complete original history.
+The receipt is passive metadata, not ownership of a view or admission credit.
+
+Pruning shares the ordinary 8000000-step native budget, deadline, WAL room
+check, disk/heap bounds, rollback handling and Rejected/Indeterminate commit
+classification. An indeterminate outcome stops the writer until recovery.
+A row cap bounds deletion work, not elapsed native I/O or completion at every
+physical store size. Callers may retry smaller row caps after Capacity.
+Reclaimed rows do not imply shorter database/WAL files or released ledger
+charges: free pages, checkpoints, retained views and quota reconciliation
+remain distinct. Runtime retention scheduling and admission integration are
+unimplemented; the hard database ceiling may still refuse writes.
 
 Backup must capture one consistent SQLite state. Stop service activity,
 checkpoint successfully, close every connection, then copy the main database;

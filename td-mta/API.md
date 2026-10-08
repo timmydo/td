@@ -6519,6 +6519,18 @@ changes are refused. A view retains its original monotonic deadline and VM
 fuel; clock/VM-budget failure or reversed time is sticky. Drop ends the read transaction
 before returning its connection; failed rollback retires the slot.
 
+IndexStore::prune_history accepts HistoryPruneRequest (account, expected
+endpoint, inclusive through sequence, max_rows, deadline). It atomically
+retires complete sequences and deletes a bounded prefix of retired rows.
+HistoryPruned reports the unchanged endpoint, new floor, removed count and
+whether retired rows remain. Repeating the same floor continues cleanup.
+At a nonzero floor, only the completed-sequence cursor (operation u32::MAX)
+is accepted; other operation cursors return HistoryLost to signal potentially
+lost changes. Older captured views retain their original floor and history.
+CommitError preserves rejected versus indeterminate
+outcomes. [STORAGE.md](STORAGE.md) owns exact bounds and caller obligations;
+this low-level helper supplies no retention policy or authorization.
+
 IndexReadView::thread_anchor(message_id, value) resolves an already parsed
 Message-ID to optional (EmailId, ThreadId) metadata in the captured view.
 It uses caller scratch for the selected Email row; format::MAX_VALUE_BYTES
@@ -6556,8 +6568,8 @@ Blob deletion is part of the metadata transaction; existing views retain the
 old body through WAL. Committed bodies need no external-file collector.
 Provisional ingress preparation is implemented by the separate IngressSpool
 primitive; protocol admission and acknowledgement remain service
-responsibilities. The core does not implement online backup, history
-maintenance or runtime slot arbitration.
+responsibilities. The core does not implement online backup, retention
+scheduling or runtime slot arbitration.
 
 ## 3. Reserve, stage, commit
 

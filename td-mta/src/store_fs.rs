@@ -11,8 +11,8 @@ use std::{
 mod index;
 pub use index::{
     AuxiliaryUsage, BackupError, BackupReceipt, BlobSource, CommitError, CommitRequest,
-    IndexReadView, IndexStore, LedgerInitError, LogicalUsage, StoreFileUsage, StoreLogicalUsage,
-    UsageFence,
+    HistoryPruneRequest, HistoryPruned, IndexReadView, IndexStore, LedgerInitError, LogicalUsage,
+    StoreFileUsage, StoreLogicalUsage, UsageFence,
 };
 #[path = "store_fs/pinned.rs"]
 mod pinned;
