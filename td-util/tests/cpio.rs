@@ -65,7 +65,8 @@ fn lists_and_extracts_newc() {
     let a = archive(&[
         ("etc", 0o040755, b""),
         ("etc/motd", 0o100644, b"hello\n"),
-        ("bin/sh", 0o120777, b"td-sh"),
+        // gen_init_cpio stores a link target with its C string NUL.
+        ("bin/sh", 0o120777, b"td-sh\0"),
         ("../escape", 0o100644, b"x"),
     ]);
     std::fs::write(d.join("a.cpio"), &a).unwrap();
@@ -85,6 +86,16 @@ fn lists_and_extracts_newc() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "etc/motd\n");
+    // -v names a symlink's target, and only a symlink's.
+    let out = Command::new(tdu)
+        .args(["cpio", "-tv", "-F", "a.cpio"])
+        .current_dir(&d)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "etc\netc/motd\nbin/sh -> td-sh\n../escape\n"
+    );
     std::fs::create_dir_all(d.join("x")).unwrap();
     let st = Command::new(tdu)
         .args(["cpio", "-id", "-F", "../a.cpio"])

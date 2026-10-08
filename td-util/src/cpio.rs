@@ -1,6 +1,9 @@
 //! `cpio -t` and `cpio -i` for newc archives (`070701`/`070702`), the format
-//! the kernel's `gen_init_cpio` writes. Listing and extraction only: td
-//! builds archives with `gen_init_cpio` or the engine writer. Extraction stays
+//! the kernel's `gen_init_cpio` writes. `-t -v` adds ` -> TARGET` to a
+//! symlink's name, which is what an image check reads; it is display text,
+//! not GNU's `ls -l` listing, and a name holding ` -> ` reads the same.
+//! Listing and extraction only: td builds archives with `gen_init_cpio` or
+//! the engine writer. Extraction stays
 //! under the current directory: a name with a `..` component is refused, a
 //! leading `/` dropped, and every ancestor that already exists must be a real
 //! directory, so an archive cannot plant a link and then write through it.
@@ -81,6 +84,15 @@ pub fn members(archive: &[u8]) -> Result<Vec<Member<'_>>, String> {
         });
         at = align4(data_start + size);
     }
+}
+
+/// A symlink member's target: its data up to the first NUL, since
+/// `gen_init_cpio` stores the target with its C string terminator.
+fn link_target(data: &[u8]) -> &[u8] {
+    data.iter()
+        .position(|b| *b == 0)
+        .and_then(|n| data.get(..n))
+        .unwrap_or(data)
 }
 
 fn align4(n: usize) -> usize {
@@ -174,6 +186,10 @@ pub fn run(args: &[String]) -> Result<u8, String> {
         let shown = String::from_utf8_lossy(m.name).into_owned();
         if list {
             listing.push_str(&shown);
+            if verbose && m.mode & S_IFMT == S_IFLNK {
+                listing.push_str(" -> ");
+                listing.push_str(&String::from_utf8_lossy(link_target(m.data)));
+            }
             listing.push('\n');
             continue;
         }
@@ -250,7 +266,8 @@ impl Extract {
             S_IFLNK => {
                 clear(path, self.unconditional)?;
                 let dest = std::ffi::OsStr::new(
-                    std::str::from_utf8(m.data).map_err(|_| "non-UTF-8 link target")?,
+                    std::str::from_utf8(link_target(m.data))
+                        .map_err(|_| "non-UTF-8 link target")?,
                 );
                 std::os::unix::fs::symlink(dest, path).map_err(|e| e.to_string())
             }
