@@ -993,7 +993,8 @@ refusal that repeats on every boot, such as a key handed for an
 unencrypted volume, a malformed member or a key cryptsetup rejects
 against the header's digest, reboots without end, each cycle running
 the selector's release again, until the volume or the selector is
-repaired from the live medium.
+repaired from outside td (APPLICATIONS.md §L.1, Recovery: td ships no
+privileged recovery environment).
 
 Then, as defence in depth and before cryptsetup runs, it attempts to
 unseal each td token the selector would try (td-protector's release
@@ -1637,9 +1638,9 @@ measured deployment and the boot's first minutes. A recovery release
 admits nothing, so recovery never logs in. Root on the running system is
 trusted and could forge a record or remove the markers; a compromised
 deployment is outside Scope. The recovery key's holder can repair the
-login state from the live medium, as on a device-bound volume
-(TOKEN-LOGIN.md, "Recovery"); it is a storage credential with full
-authority, which is why it is never typed at a login prompt.
+login state from an external recovery environment, as on a device-bound
+volume (TOKEN-LOGIN.md, "Recovery"); it is a storage credential with
+full authority, which is why it is never typed at a login prompt.
 
 ### Re-encrypting upgrade
 
@@ -2163,11 +2164,12 @@ commit.
      gate; the owner may defer or drop it.
 9. Activate the protected tier only with trusted login/lock
    (td-login/TOKEN-LOGIN.md) and operation consent, with no automatic login
-   in that profile, and only after `su` and root's empty shadow field have
-   retired as APPLICATIONS.md §L.1, "Retiring the escape hatch",
-   specifies (its L6 and L7). Activation lifts td-authd's refusal of
-   increment 8's storage operations and adds their disclosures; it
-   requires 8a to 8h and their hardware evidence, not 8i.
+   in that profile, and only with `su` and root's empty shadow field
+   retired, as APPLICATIONS.md §L.1, "Retiring the escape hatch",
+   specifies; its L6 and L7 have retired both, so this condition holds.
+   Activation lifts td-authd's refusal of increment 8's storage
+   operations and adds their disclosures; it requires 8a to 8h and their
+   hardware evidence, not 8i.
 
 ## Acceptance evidence
 
@@ -2576,8 +2578,11 @@ Increment 8's evidence, by sub-increment:
   as it searches for the recovery key. It installs device-bound as
   `qemu-boot-encrypted` does, seeds an enrolled login record as
   `login-desktop` does, attaches a display, and runs these legs:
-  - **Upgrade, TPM primary.** Phase 1 as root over the serial shell
-    with token A as recovery; the upgrade boot with A, the PIN twice and
+  - **Upgrade, TPM primary.** Phase 1 through its own path
+    ("Re-encrypting upgrade", Phase 1: td-authd's physical consent,
+    which the host answers on the attached display as the other consent
+    oracles do; no root login exists, APPLICATIONS.md §L.1) with token A
+    as recovery; the upgrade boot with A, the PIN twice and
     the recovery key; reencryption's progress, with journal resilience
     on the virtual disk, which states no atomic write unit; then the
     host parses both header copies (tpm-pin, fido2, recovery-key and

@@ -249,9 +249,9 @@ which erases one chosen whole disk and installs td onto it, offline. Storage is
 encrypted to the machine where it has a usable TPM 2.0 and a screen and
 keyboard the startup recovery prompt can use, and unencrypted otherwise
 ([the encryption contract](td-install/ENCRYPTION.md) "Activation"); either
-way the installed account logs in automatically, and root keeps
-the stock image's empty password field ([AGENTS.md](AGENTS.md) principle 7
-owns that cutover). Version 1 is validated on x86-64 UEFI under QEMU only;
+way the installed account logs in automatically, and root is locked,
+with no console or SSH login ([AGENTS.md](AGENTS.md) principle 7).
+Version 1 is validated on x86-64 UEFI under QEMU only;
 real hardware is the next milestone. [The installer
 contract](td-install/INSTALLER.md) says what version 1 does and what of it
 remains.

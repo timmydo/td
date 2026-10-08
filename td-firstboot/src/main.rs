@@ -177,12 +177,15 @@ url = \"https://blog.rust-lang.org/feed.xml\"
 ";
 
 /// Shipped into a fresh `authorized_keys` so the file exists (the daemon reads it
-/// on every connection) while authorizing nobody.
+/// on every connection) while authorizing nobody. On a td image it serves no
+/// account at all (td-login/TOKEN-LOGIN.md, "SSH").
 const AUTHORIZED_KEYS_HEADER: &str = "\
 # td OpenSSH authorized_keys - one public key per line.\n\
-# Empty => deny all. This file is per-machine state under /var, reached through\n\
-# the /etc/ssh/authorized_keys symlink; adding a key here grants ROOT-equivalent\n\
-# admin access to this machine and needs no image rebuild.\n";
+# This file is per-machine state under /var, reached through the\n\
+# /etc/ssh/authorized_keys symlink. On a td image it admits no account: sshd\n\
+# refuses root, every other account but the primary is locked, and the\n\
+# primary uses its own boot-generated file. A root key here is live again\n\
+# only if the machine rolls back to a deployment built before root was locked.\n";
 
 /// Did this boot have to create the thing, or was it already there? One `Created`
 /// anywhere makes the whole run a first boot.
@@ -1372,16 +1375,14 @@ fn provision_authorized_keys(path: &Path) -> Result<Outcome, Failure> {
                     !line.is_empty() && !line.starts_with('#')
                 })
                 .count();
-            // Repair the mode every boot, not just at create. This file is a
-            // root-equivalent grant: if anything ever widened it, a local user
-            // could append their own key and the change would survive reboots.
+            // Repair the mode every boot, not just at create. It admits no
+            // account on a td image, but a deployment older than L7 read it as
+            // root's: if anything ever widened it, a local user could append a
+            // key that a rollback would honour, and it would survive reboots.
             let metadata = std::fs::metadata(path)
                 .map_err(|e| Failure::Failed(format!("stat {}: {e}", path.display())))?;
             enforce_mode(path, &metadata, 0o600)?;
-            emit_err(&format!(
-                "td-firstboot: {} authorizes {keys} key(s)\n",
-                path.display()
-            ));
+            emit_err(&authorized_keys_report(path, keys));
             Ok(Outcome::Present)
         }
         None => {
@@ -1389,6 +1390,22 @@ fn provision_authorized_keys(path: &Path) -> Result<Outcome, Failure> {
             Ok(Outcome::Created)
         }
     }
+}
+
+/// The console line for the persistent authorization file. Keys there admit no
+/// one on this deployment, but a rollback to one older than L7 restores root
+/// SSH with them (APPLICATIONS.md §L.1, "The rollback window"), so a file that
+/// holds any says so. Nothing on this deployment can remove them.
+fn authorized_keys_report(path: &Path, keys: usize) -> String {
+    let mut line = format!("td-firstboot: {} holds {keys} key(s)\n", path.display());
+    if keys > 0 {
+        line.push_str(&format!(
+            "td-firstboot: warning: no account logs in with {}; a deployment built before \
+             root was locked admits root with its keys, and only physical access can remove them\n",
+            path.display()
+        ));
+    }
+    line
 }
 
 /// Read a file that is expected to be absent on a first boot. Any error OTHER
@@ -2177,6 +2194,27 @@ mod tests {
         }
     }
 
+    /// A held key admits no one now but would admit root after a rollback to a
+    /// deployment from before root was locked, so the console says so; an
+    /// empty file is one plain line.
+    #[test]
+    fn a_held_authorized_key_warns_of_the_rollback_window() {
+        let path = Path::new("/var/lib/td/ssh/authorized_keys");
+        assert_eq!(
+            authorized_keys_report(path, 0),
+            "td-firstboot: /var/lib/td/ssh/authorized_keys holds 0 key(s)\n"
+        );
+        let held = authorized_keys_report(path, 2);
+        assert!(held.starts_with("td-firstboot: /var/lib/td/ssh/authorized_keys holds 2 key(s)\n"));
+        assert!(held.contains("warning: no account logs in with"), "{held}");
+        assert!(held.contains("admits root with its keys"), "{held}");
+        assert!(
+            held.contains("only physical access can remove them"),
+            "{held}"
+        );
+        assert_eq!(held.lines().count(), 2);
+    }
+
     #[test]
     fn a_public_identity_is_one_ed25519_line_with_an_encoded_key() {
         assert_eq!(
@@ -2214,8 +2252,8 @@ mod ssh_forms {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
 
-    /// The policy as rendered before the login-key tier, for `alice`,
-    /// written out independently of the formatter.
+    /// The policy as rendered before the login-key tier and APPLICATIONS.md
+    /// §L.1's L7, for `alice`, written out independently of the formatter.
     const BEFORE: &str = "Port 22\n\
         ListenAddress 0.0.0.0\n\
         HostKey /etc/ssh/ssh_host_ed25519_key\n\
@@ -2255,16 +2293,20 @@ mod ssh_forms {
         "abcdefghijklmnopqrstuvwxyz012345",
     ];
 
-    /// td-login/TOKEN-LOGIN.md, "SSH": the enforced form's only difference.
-    const ORDINARY_ADMISSION: &str = "PermitRootLogin prohibit-password\n";
+    /// L7's only change: root, which `BEFORE` admitted with a key, is refused.
+    const ROOT_BEFORE_L7: &str = "PermitRootLogin prohibit-password\n";
+    const ROOT_REFUSED: &str = "PermitRootLogin no\n";
 
-    fn before(name: &str) -> String {
-        BEFORE.replace("Match User alice\n", &format!("Match User {name}\n"))
+    fn ordinary(name: &str) -> String {
+        BEFORE
+            .replace(ROOT_BEFORE_L7, ROOT_REFUSED)
+            .replace("Match User alice\n", &format!("Match User {name}\n"))
     }
 
+    /// td-login/TOKEN-LOGIN.md, "SSH": the enforced form's only difference.
     fn enforced(name: &str) -> String {
-        before(name).replace(
-            ORDINARY_ADMISSION,
+        ordinary(name).replace(
+            ROOT_REFUSED,
             &format!("PermitRootLogin no\nAllowUsers {name}\n"),
         )
     }
@@ -2321,31 +2363,37 @@ mod ssh_forms {
         }
     }
 
+    /// The ordinary form is the policy from before the tier but for L7's
+    /// one line: root refused, and nothing else moved.
     #[test]
-    fn the_ordinary_form_is_the_policy_from_before_the_tier_byte_for_byte() {
+    fn the_ordinary_form_refuses_root_and_is_otherwise_the_policy_before_the_tier() {
+        assert_eq!(BEFORE.matches(ROOT_BEFORE_L7).count(), 1);
+        let ordinary_alice = ordinary("alice");
+        assert_eq!(ordinary_alice.matches(ROOT_REFUSED).count(), 1);
+        assert!(!ordinary_alice.contains("prohibit-password"));
+        assert!(!ordinary_alice.contains("AllowUsers"));
         for name in NAMES {
             assert_eq!(
                 ssh_policy::config(name, ssh_policy::Form::Ordinary),
-                before(name)
+                ordinary(name)
             );
         }
         let root = Root::new();
         for name in NAMES {
-            assert_eq!(root.policy(name), before(name));
+            assert_eq!(root.policy(name), ordinary(name));
         }
         // Temporaries, other names and another account's record are not the record.
         for entry in ["tmp-0123", "cutover-reboot", "1001", "100", "10000"] {
             std::fs::write(root.login().join(entry), b"").unwrap();
         }
-        assert_eq!(root.policy("alice"), BEFORE);
+        assert_eq!(root.policy("alice"), ordinary("alice"));
     }
 
-    /// The exact enforced bytes TOKEN-LOGIN.md pins: the one admission line
-    /// becomes `PermitRootLogin no` then `AllowUsers PRIMARY`, still in the
-    /// global section before the primary's `Match` block; nothing else moves.
+    /// The exact enforced bytes TOKEN-LOGIN.md pins: `AllowUsers PRIMARY`
+    /// follows `PermitRootLogin no`, still in the global section before the
+    /// primary's `Match` block; nothing else moves.
     #[test]
     fn the_enforced_form_refuses_root_and_admits_only_the_primary() {
-        assert_eq!(BEFORE.matches(ORDINARY_ADMISSION).count(), 1);
         for name in NAMES {
             let policy = ssh_policy::config(name, ssh_policy::Form::Enforced);
             assert_eq!(policy, enforced(name));
@@ -2408,7 +2456,7 @@ mod ssh_forms {
         std::fs::create_dir(&record).unwrap();
         assert_eq!(root.policy("tester"), enforced("tester"));
         std::fs::remove_dir(&record).unwrap();
-        assert_eq!(root.policy("alice"), BEFORE);
+        assert_eq!(root.policy("alice"), ordinary("alice"));
     }
 
     /// Each way the directory is damaged, including one that only the
@@ -2442,7 +2490,7 @@ mod ssh_forms {
         check(&root);
         std::fs::remove_file(&login).unwrap();
         std::fs::rename(&held, &login).unwrap();
-        assert_eq!(root.policy("alice"), BEFORE);
+        assert_eq!(root.policy("alice"), ordinary("alice"));
         let td = root.root.join("var/lib/td");
         let real = root.root.join("var/lib/real");
         std::fs::rename(&td, &real).unwrap();
@@ -2469,7 +2517,7 @@ mod ssh_forms {
             sshd_policy("alice", &root.root.join("absent"), root.owner),
             enforced("alice")
         );
-        assert_eq!(root.policy("alice"), BEFORE);
+        assert_eq!(root.policy("alice"), ordinary("alice"));
     }
 
     /// A read that fails other than by damage is the predicate's error:
@@ -2489,7 +2537,7 @@ mod ssh_forms {
             assert_eq!(root.policy("alice"), enforced("alice"));
         }
         std::fs::set_permissions(&td, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(root.policy("alice"), BEFORE);
+        assert_eq!(root.policy("alice"), ordinary("alice"));
     }
 
     /// The name both forms admit is the one the shared account validation

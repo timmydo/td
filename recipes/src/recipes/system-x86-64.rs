@@ -17,19 +17,19 @@ use crate::ladder::{
     GIT_RUNTIME_MARKER, GREETER_MARKER, KERNEL_AUDIT_CMDLINE_TOKEN, NETTEST_CMDLINE_TOKEN,
     NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
     PERSIST_WRITE_CMDLINE_TOKEN, POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER,
-    SETUP_INPUT_CMDLINE_TOKEN, SSHD_MARKER, SYSTEM_BOOT_SUCCESS_MARKER,
-    SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_DEPLOY_ROLLBACK_MARKER, SYSTEM_ETC_MUTABLE_MARKER,
-    SYSTEM_ETC_RO_MARKER, SYSTEM_LOGIN_DIRECTORY_MARKER, SYSTEM_NET_REACH_MARKER,
-    SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER, SYSTEM_PERSIST_READ_MARKER,
-    SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER, SYSTEM_SHUTDOWN_MARKER,
-    SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER, TD_APPLICATIONS_PLACED_MARKER,
-    TD_BUSD_RUNTIME_MARKER, TD_CLAUDE_TERMINAL_MARKER, TD_FETCH_BOOT_MARKER,
-    TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER, TD_FIREFOX_INPUT_FAILED_MARKER,
-    TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER, TD_FIREFOX_SUPPORT_MARKER,
-    TD_INIT_RUNTIME_MARKER, TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
-    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY,
-    TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY, TD_NEWS_NAME,
-    TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
+    ROOT_SSH_REFUSAL_KEY_FINGERPRINT, ROOT_SSH_REFUSED_MARKER, SETUP_INPUT_CMDLINE_TOKEN,
+    SSHD_MARKER, SU_ABSENT_MARKER, SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER,
+    SYSTEM_DEPLOY_ROLLBACK_MARKER, SYSTEM_ETC_MUTABLE_MARKER, SYSTEM_ETC_RO_MARKER,
+    SYSTEM_LOGIN_DIRECTORY_MARKER, SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER,
+    SYSTEM_NET_UP_MARKER, SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER,
+    SYSTEM_ROOT_RO_MARKER, SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER,
+    SYSTEM_STATE_WRITABLE_MARKER, TD_APPLICATIONS_PLACED_MARKER, TD_BUSD_RUNTIME_MARKER,
+    TD_CLAUDE_TERMINAL_MARKER, TD_FETCH_BOOT_MARKER, TD_FIREFOX_BOOT_MARKER,
+    TD_FIREFOX_CONTENT_MARKER, TD_FIREFOX_INPUT_FAILED_MARKER, TD_FIREFOX_SECCOMP_AUDIT_MARKER,
+    TD_FIREFOX_SOAK_MARKER, TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER,
+    TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER,
+    TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER,
+    TD_NEWS_ENTRY, TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_SETUP_LIVE_MARKER,
     TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
@@ -511,6 +511,8 @@ const SYSTEM: SystemDef = SystemDef {
            Type 'exit' (or Ctrl-D) to power off the VM; Ctrl-A X quits qemu.\n\n",
     autologin: "tester",
     users: &[
+        // Locked (`!`): no td-login path or sshd admits root
+        // (APPLICATIONS.md §L.1, L7).
         User {
             name: "root",
             uid: 0,
@@ -519,7 +521,7 @@ const SYSTEM: SystemDef = SystemDef {
             home: "/root",
             shell: "/bin/sh",
             groups: &[],
-            passwordless: true,
+            passwordless: false,
             service_only: false,
         },
         User {
@@ -1211,6 +1213,9 @@ fn gets_generic_persistent_home_setup(user: &User) -> bool {
     // Root is handled explicitly; supervised service homes are volatile.
     user.uid != 0 && !user.service_only
 }
+
+/// Root's generated record, which the autotest health leg requires whole.
+const ROOT_SHADOW_LINE: &str = "root:!:19000:0:99999:7:::";
 
 fn build_shadow(sys: &SystemDef) -> String {
     let mut s = String::new();
@@ -2395,16 +2400,16 @@ fn build_deployment_init(sys: &SystemDef) -> String {
          /bin/td-util chmod 0755 /sysroot/var/lib /sysroot/var/lib/td-test\n\
          /bin/td-util chmod 0555 /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
          fi\n\
-         if /bin/td-util test -e /sysroot{QEMU_OPENSSH_ADMIN_PRIVATE_KEY}; then\n\
-         /bin/td-util test -f /sysroot{QEMU_OPENSSH_ADMIN_PRIVATE_KEY}\n\
+         if /bin/td-util test -e /sysroot{QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY}; then\n\
+         /bin/td-util test -f /sysroot{QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY}\n\
          /bin/td-util test -f /sysroot{SSHD_AUTHORIZED_KEYS_STATE}\n\
          /bin/td-util chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-test \
-         /sysroot{QEMU_OPENSSH_ADMIN_PRIVATE_KEY} /sysroot/var/lib/td \
+         /sysroot{QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} /sysroot/var/lib/td \
          /sysroot/var/lib/td/ssh /sysroot{SSHD_AUTHORIZED_KEYS_STATE}\n\
          /bin/td-util chmod 0755 /sysroot/var/lib /sysroot/var/lib/td-test \
          /sysroot/var/lib/td\n\
          /bin/td-util chmod 0700 /sysroot/var/lib/td/ssh\n\
-         /bin/td-util chmod 0600 /sysroot{QEMU_OPENSSH_ADMIN_PRIVATE_KEY} \
+         /bin/td-util chmod 0600 /sysroot{QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} \
          /sysroot{SSHD_AUTHORIZED_KEYS_STATE}\n\
          fi\n"
     ));
@@ -3206,8 +3211,9 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     let update = td_boot_protocol::UPDATE_VERB;
     // The human may read its private self-test key but must not own the public
     // AuthorizedKeysFile that grants it access. Under the QEMU autotest token, a
-    // separately preseeded root-only fixture exercises the persistent default
-    // authorization path without changing it during the boot.
+    // separately preseeded root-only fixture authorizes a loopback root key in the
+    // persistent default path, which the boot reads without changing: root's locked
+    // field and `PermitRootLogin no` must refuse it (APPLICATIONS.md §L.1, L7).
     format!(
         "#!/bin/sh\n\
          set -f\n\
@@ -3219,10 +3225,10 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          {health_user_setup}\n\
          deployment=$(/bin/td-util cat /run/td-deployment 2>/dev/null)\n\
          /bin/td-util test -n \"$deployment\" || fail\n\
-         wait={BOOT_SUCCESS_RETRY_SECS}; admin_fixture=0\n\
+         wait={BOOT_SUCCESS_RETRY_SECS}; refusal_fixture=0\n\
          for token in $(/bin/td-util cat /proc/cmdline); do \
          case \"$token\" in \
-         {AUTOTEST_CMDLINE_TOKEN}) admin_fixture=1;; \
+         {AUTOTEST_CMDLINE_TOKEN}) refusal_fixture=1;; \
          {BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}*) \
          wait=${{token#{BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}}};; esac; done\n\
          case \"$wait\" in ''|*[!0-9]*|0) wait={BOOT_SUCCESS_RETRY_SECS};; esac\n\
@@ -3245,9 +3251,11 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          /bin/td-util printf '127.0.0.1 %s %s\\n' \"$1\" \"$2\" > /run/td-ssh-known-hosts || fail\n\
          /bin/chown {UI_UID}:{UI_GID} /run/td-ssh-known-hosts || fail\n\
          /bin/chmod 0644 /run/td-ssh-known-hosts || fail\n\
-         if [ \"$admin_fixture\" = 1 ]; then \
-         /bin/td-util test -f {QEMU_OPENSSH_ADMIN_PRIVATE_KEY} || fail; \
-         admin=$(/bin/ssh -F /dev/null -i {QEMU_OPENSSH_ADMIN_PRIVATE_KEY} \
+         if [ \"$refusal_fixture\" = 1 ]; then \
+         /bin/td-util test -f {QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} || fail; \
+         /bin/grep -q -x -F '{ROOT_SHADOW_LINE}' /etc/shadow || \
+         {{ echo \"td-login: root's shadow field is not locked\"; fail; }}; \
+         rootssh=$(/bin/ssh -F /dev/null -v -i {QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} \
          -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
          -o UserKnownHostsFile=/run/td-ssh-known-hosts \
          -o GlobalKnownHostsFile=/dev/null \
@@ -3256,9 +3264,21 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          -o HostKeyAlgorithms={OPENSSH_KEY_ALGORITHMS} \
          -o PubkeyAcceptedAlgorithms={OPENSSH_KEY_ALGORITHMS} \
          -o Ciphers={OPENSSH_CIPHERS} -o Compression=no \
-         root@127.0.0.1 /bin/echo TD-OPENSSH-ADMIN-ROUNDTRIP 2>&1); admin_status=$?\n\
-         [ \"$admin_status\" = 0 ] && [ \"$admin\" = TD-OPENSSH-ADMIN-ROUNDTRIP ] || \
-         {{ echo \"OpenSSH: persistent administrator path failed: $admin\"; fail; }}; fi\n\
+         root@127.0.0.1 /bin/echo TD-ROOT-SSH-ADMITTED 2>&1); rootssh_status=$?\n\
+         [ \"$rootssh_status\" = 255 ] || \
+         {{ echo \"OpenSSH: root login was not refused: $rootssh\"; fail; }}\n\
+         case \"$rootssh\" in \
+         *'Offering public key: {QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} ED25519 \
+         {ROOT_SSH_REFUSAL_KEY_FINGERPRINT}'*'Permission denied (publickey)'*) ;; \
+         *) echo \"OpenSSH: the root key was not offered and then refused: $rootssh\"; \
+         fail;; esac\n\
+         echo {ROOT_SSH_REFUSED_MARKER}\n\
+         bin=$(/bin/ls -1 -A /bin) || fail\n\
+         /bin/td-util printf '%s\\n' \"$bin\" | /bin/grep -q -x -F sh || \
+         {{ echo \"td-login: the /bin listing lacks sh\"; fail; }}\n\
+         if /bin/td-util printf '%s\\n' \"$bin\" | /bin/grep -q -x -F su; then \
+         echo \"td-login: /bin lists su\"; fail; fi\n\
+         echo {SU_ABSENT_MARKER}; fi\n\
          n=0\n\
          bg={BUS_MARKER_GRACE_SWEEPS}\n\
          [ \"$bg\" -ge \"$wait\" ] && bg=$((wait-1))\n\
@@ -3799,15 +3819,17 @@ const MUTABLE_ETC: &[MutableEtc] = &[
         etc: "ssh/authorized_keys",
         target: SSHD_AUTHORIZED_KEYS_STATE,
         state: State::Persistent,
-        why: "granting admin access is a per-machine act; an image-baked file would grant it \
-              on every machine that boots the image, and only a rebuild could revoke it",
+        why: "sshd's persistent AuthorizedKeysFile, which admits no account on a td image \
+              (td-login/TOKEN-LOGIN.md, \"SSH\"); per-machine so that keys a pre-L7 \
+              deployment would honour as root's belong to the machine, never the image, \
+              and are removed without a rebuild",
     },
 ];
 
 // Required early-boot output; sshd never falls back to an optional config.
 const SSHD_CONFIG: &str = "/run/td-sshd.conf";
 const SSHD_AUTHORIZED_KEYS_STATE: &str = "/var/lib/td/ssh/authorized_keys";
-const QEMU_OPENSSH_ADMIN_PRIVATE_KEY: &str = "/var/lib/td-test/openssh-admin-selftest";
+const QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY: &str = "/var/lib/td-test/root-ssh-refusal-key";
 
 fn build_ssh_config() -> String {
     format!(
@@ -6012,6 +6034,25 @@ mod tests {
             seen.iter().any(|(_, name)| *name == SSHD_PRIVSEP_USER),
             "the appended sshd entry is missing, so this read the wrong roster"
         );
+    }
+
+    /// APPLICATIONS.md §L.1, L7: root's field is the ordinary lock, which
+    /// td-login refuses on every path, forced ones included, and which sshd
+    /// refuses before any key; only the primary keeps an empty field.
+    #[test]
+    fn root_is_locked_and_only_the_primary_is_passwordless() {
+        let shadow = build_shadow(&SYSTEM);
+        let root: Vec<&str> = shadow
+            .lines()
+            .filter(|line| line.starts_with("root:"))
+            .collect();
+        assert_eq!(root, [ROOT_SHADOW_LINE]);
+        let empty: Vec<&str> = shadow
+            .lines()
+            .filter_map(|line| line.strip_suffix(":19000:0:99999:7:::"))
+            .filter_map(|line| line.strip_suffix(':'))
+            .collect();
+        assert_eq!(empty, [SYSTEM.autologin]);
     }
 
     #[test]
@@ -9392,6 +9433,13 @@ mod tests {
                 "user '{}' cannot be both passwordless and service-only",
                 u.name
             );
+            // APPLICATIONS.md §L.1, L7: root's shadow field is `!`, which every
+            // td-login path and sshd refuse; root login is never re-enabled.
+            assert!(
+                !(u.uid == 0 && (u.passwordless || u.service_only)),
+                "uid 0 ('{}') must stay locked: its shadow field is `!`",
+                u.name
+            );
             if u.service_only {
                 assert_eq!(
                     u.shell, "/bin/false",
@@ -11115,12 +11163,12 @@ mod tests {
             "the service must run the foreground OpenSSH daemon against the reviewed config"
         );
         // TOKEN-LOGIN.md, "SSH": the login state selects the form; both keep
-        // every reviewed line, and the enforced one refuses root and admits
-        // only the primary.
+        // every reviewed line and refuse root (APPLICATIONS.md §L.1, L7), and
+        // the enforced one admits only the primary.
         for (form, admission) in [
             (
                 ssh_policy::Form::Ordinary,
-                &["PermitRootLogin prohibit-password", "Match User alice"][..],
+                &["PermitRootLogin no", "Match User alice"][..],
             ),
             (
                 ssh_policy::Form::Enforced,
@@ -11206,27 +11254,71 @@ mod tests {
         );
     }
 
+    /// APPLICATIONS.md §L.1, L7: the seeded root key is refusal evidence, not
+    /// an administrative path; the primary's volatile key still logs in.
     #[test]
-    fn boot_health_exercises_both_openssh_authorization_paths() {
+    fn boot_health_proves_root_refused_and_the_primary_admitted() {
         let bootsuccess = build_bootsuccess(&SYSTEM);
-        let gate_at = bootsuccess
-            .find("if [ \"$admin_fixture\" = 1 ]; then")
-            .unwrap_or_else(|| unreachable!("the disposable admin fixture is not gated"));
-        let key_at = bootsuccess
-            .find(QEMU_OPENSSH_ADMIN_PRIVATE_KEY)
-            .unwrap_or_else(|| unreachable!("the disposable admin private key is not used"));
-        let login_at = bootsuccess
-            .find("root@127.0.0.1 /bin/echo TD-OPENSSH-ADMIN-ROUNDTRIP")
-            .unwrap_or_else(|| unreachable!("the persistent administrator path is not used"));
-        assert!(gate_at < key_at && key_at < login_at);
+        assert!(!bootsuccess.contains("TD-OPENSSH-ADMIN-ROUNDTRIP"));
+        let at = |needle: &str| {
+            bootsuccess
+                .find(needle)
+                .unwrap_or_else(|| panic!("boot health lacks {needle:?}"))
+        };
+        let gate = at("if [ \"$refusal_fixture\" = 1 ]; then");
+        let key = at(&format!(
+            "/bin/td-util test -f {QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} || fail"
+        ));
+        let locked = at(&format!(
+            "/bin/grep -q -x -F '{ROOT_SHADOW_LINE}' /etc/shadow || \
+             {{ echo \"td-login: root's shadow field is not locked\"; fail; }}"
+        ));
+        let verbose = at(&format!(
+            "/bin/ssh -F /dev/null -v -i {QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} "
+        ));
+        let login = at("root@127.0.0.1 /bin/echo TD-ROOT-SSH-ADMITTED 2>&1); rootssh_status=$?");
+        // Refused means the client offered the seeded key and the daemon then
+        // denied it: ssh's own 255, the key's offer, then the publickey denial,
+        // in that order. A connection failure offers nothing, and a key the
+        // client could not load is never offered.
+        let refused = at(&format!(
+            "[ \"$rootssh_status\" = 255 ] || \
+             {{ echo \"OpenSSH: root login was not refused: $rootssh\"; fail; }}\n\
+             case \"$rootssh\" in \
+             *'Offering public key: {QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} ED25519 \
+             {ROOT_SSH_REFUSAL_KEY_FINGERPRINT}'*'Permission denied (publickey)'*) ;; \
+             *) echo \"OpenSSH: the root key was not offered and then refused: $rootssh\"; \
+             fail;; esac\n\
+             echo {ROOT_SSH_REFUSED_MARKER}\n"
+        ));
+        // A listing rather than a path test, so a dangling link counts and no
+        // script names the retired path; `sh` is the listing's control.
+        let su = at(&format!(
+            "bin=$(/bin/ls -1 -A /bin) || fail\n\
+             /bin/td-util printf '%s\\n' \"$bin\" | /bin/grep -q -x -F sh || \
+             {{ echo \"td-login: the /bin listing lacks sh\"; fail; }}\n\
+             if /bin/td-util printf '%s\\n' \"$bin\" | /bin/grep -q -x -F su; then \
+             echo \"td-login: /bin lists su\"; fail; fi\n\
+             echo {SU_ABSENT_MARKER}; fi\n"
+        ));
         assert!(
-            bootsuccess.contains(&format!("{AUTOTEST_CMDLINE_TOKEN}) admin_fixture=1")),
-            "only an explicit QEMU autotest boot may expect the disposable admin fixture"
+            gate < key
+                && key < locked
+                && locked < verbose
+                && verbose < login
+                && login < refused
+                && refused < su
+        );
+        assert_eq!(bootsuccess.matches(ROOT_SSH_REFUSED_MARKER).count(), 1);
+        assert_eq!(bootsuccess.matches(SU_ABSENT_MARKER).count(), 1);
+        assert!(
+            bootsuccess.contains(&format!("{AUTOTEST_CMDLINE_TOKEN}) refusal_fixture=1")),
+            "only an explicit QEMU autotest boot may expect the disposable root fixture"
         );
         assert!(
             !bootsuccess.contains(SSHD_AUTHORIZED_KEYS)
                 && !bootsuccess.contains(SSHD_AUTHORIZED_KEYS_STATE),
-            "boot health must never read, append, replace, or remove live administrator state"
+            "boot health must never read, append, replace, or remove live authorization state"
         );
         assert!(
             bootsuccess.contains("\"$USER@127.0.0.1\" /bin/echo TD-OPENSSH-ROUNDTRIP"),
@@ -11668,7 +11760,7 @@ mod tests {
                 && init.contains("chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-test")
                 && init.contains("chmod 0555 /sysroot/var/lib/td-test/td-jail-seccomp-probe")
                 && init.contains(&format!(
-                    "chmod 0600 /sysroot{QEMU_OPENSSH_ADMIN_PRIVATE_KEY}",
+                    "chmod 0600 /sysroot{QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY}",
                 ))
                 && init.contains(&format!("/sysroot{SSHD_AUTHORIZED_KEYS_STATE}")),
             "selected init must normalize persistent state ownership and modes"

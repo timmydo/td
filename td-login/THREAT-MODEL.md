@@ -74,28 +74,28 @@ shared source used by the realized OpenSSH recipe test. The daemon
 requires this configuration file explicitly; there is no optional include or
 fallback configuration. Generation failure stops boot before user processes,
 and the caller serializes publication against all account readers. This
-changes no credential transition or authentication method. Since
+changes no credential transition or authentication method. Neither
+form admits root (`TOKEN-LOGIN.md`, "SSH", states the rule). Since
 `TOKEN-LOGIN.md`'s increment 4 (C6) the render reads the login state
-through the shared predicate (§3) under the root it renders, and renders
-this policy byte for byte only where that state is unenrolled. Enrolled,
-and every unavailable cause including a failed read, renders the
-enforced form, which replaces `PermitRootLogin prohibit-password` with
-`PermitRootLogin no` and `AllowUsers` naming only that admitted account
-(`TOKEN-LOGIN.md`, "SSH", pins the bytes). The stock image never contains
-a record and firstboot ensures the directory at every boot, so it renders
-the ordinary policy; the enforced form acts only where a record or an
-invalid directory exists.
+through the shared predicate (§3) under the root it renders, and
+renders the ordinary policy only where that state is unenrolled.
+Enrolled, and every unavailable cause including a failed
+read, renders the enforced form, which adds `AllowUsers` naming only
+that admitted account after the root line (`TOKEN-LOGIN.md`, "SSH",
+pins the bytes). The stock image never contains a record and firstboot
+ensures the directory at every boot, so it renders the ordinary policy;
+the enforced form acts only where a record or an invalid directory
+exists.
 The boot-health login uses a fresh volatile key for the unprivileged UI account,
 but its root-owned authorization line is constrained by OpenSSH `restrict` and
 `from="127.0.0.1"`; possession of that key cannot create a network-reachable
-login. The persistent administrator path is exercised separately only in the
-disposable, unenrolled QEMU volume: it is preseeded with a
-loopback-restricted public key and a root-only matching private fixture
-before boot. Boot health reads those fixtures but never rewrites live
-administrator authorization state. Root SSH with a key is today's one
-interactive administrative path (td-login is none, §4);
-[`APPLICATIONS.md`](../APPLICATIONS.md) §L.1's L7 refuses it in both
-forms, and the same seeded key then proves the refusal.
+login. Root has no SSH login, and no other interactive one: its shadow
+field is `!` (§3) and td-login is no administrative path (§4). The
+disposable, unenrolled QEMU volume is preseeded with a loopback-restricted
+root public key in the persistent authorization file and a root-only
+matching private fixture; under the autotest token boot health reads
+both, never rewriting live authorization state, and requires the daemon
+to refuse that key (§8).
 
 The resource boundary is also an asset. The application identity must enter
 its delegated session cgroup before it loses root, otherwise a
@@ -246,10 +246,11 @@ needed for is a switch that CHANGES something, and §4's
 `creds::may_switch` is what refuses one, over all four uid columns. A
 switch to the credentials the caller already holds takes `creds::apply`'s
 early return instead and starts a program with no privilege that caller
-lacked. Only root targeting root reaches that case today: the forced path
+lacked. Only root targeting root could reach that case: the forced path
 reads the root-only `/etc/shadow` before any switch, so `exec-as tester`
-or `exec-primary` run as tester fails there. The forced path skips a
-password; it does not hand one out.
+or `exec-primary` run as tester fails there, and on a td image root's
+field is `!`, which the forced path refuses too (below). The forced path
+skips a password; it does not hand one out.
 
 Ordinary `exec-as` shares `login -f`'s forced policy, and by construction
 rather than by coincidence: both human-session front ends, `login` and
@@ -386,14 +387,22 @@ Consequences worth stating plainly:
   also requires that user to be the primary account `login-primary`
   selects, and `build_autologin` refuses the build otherwise: the console
   logs in only through that selector.
-- Both interactive accounts on the stock image, `root` and `tester`, are
+- The stock image's one interactive account, `tester`, is
   `passwordless: true`, so the console is trusted **by image
-  configuration**, not by td-login. The service identities above are
-  locked. These are properties of the shipped `SYSTEM` const, and the
-  interactive behavior is unchanged from the busybox chain this replaces,
-  which also accepted the empty shadow field without prompting. Root's
-  empty field opens no console session, since the console logs in only
-  through `login-primary`; `APPLICATIONS.md` §L.1's L7 makes it `!`.
+  configuration**, not by td-login. The interactive behavior is
+  unchanged from the busybox chain this replaces, which also accepted
+  the empty shadow field without prompting. Root's field is `!`
+  (`APPLICATIONS.md` §L.1, L7): `Locked`, which every column above
+  refuses, the forced paths included, and which
+  `system_def_is_self_consistent` holds for uid 0. Root needs no session
+  of its own: td-svc runs root's units and probes directly, and
+  `exec-as` and `exec-primary` only drop from root. A failed boot opens
+  none either: td-init fails the boot instead of starting a console
+  shell when `switch_root` refuses or the inittab is unusable
+  ([`APPLICATIONS.md`](../APPLICATIONS.md) §L.1, "Administration
+  today"). The service
+  identities above are locked. These are properties of the shipped
+  `SYSTEM` const.
 
 **Login keys: the console refusal.** Under
 [`TOKEN-LOGIN.md`](TOKEN-LOGIN.md), enrolling a FIDO2 login key publishes
@@ -431,9 +440,11 @@ and its td-svc unit restarts it whenever it ends (`restart=always`), so
 any exit would be a reboot or a respawn loop. A signal still ends it:
 Ctrl-C or Ctrl-\ typed on the serial line, `SIGHUP` or `SIGTERM` ends
 td-login with a non-zero status, so the `&&` skips the reboot and td-svc
-respawns the greeter into the same gate. td ships no `su` (§4), and
-root SSH and root's empty shadow field are retired before any machine
-can enroll (TOKEN-LOGIN.md, "Enrollment requires §L.1 elevation"). The
+respawns the greeter into the same gate. td ships no `su` (§4), root's
+shadow field is `!`, neither SSH form admits root (§1) and td-init
+starts no console shell (§3's stock bullet), all before any
+machine can enroll (TOKEN-LOGIN.md, "Enrollment requires §L.1
+elevation"). The
 forced paths (`login -f`, `exec-as`, `exec-primary`,
 `exec-service-as`) keep this section's rules:
 they change credentials only for an all-root caller (§4) and are
@@ -556,8 +567,9 @@ It follows that:
   argument word is ever consumed as one.
 - A switch to the credentials already held is a no-op — `apply` returns
   early when the kernel's view already equals the target — so it attempts
-  no privilege change. Only root targeting root reaches it: a non-root
-  caller's `exec-as` fails reading the root-only `/etc/shadow` first. The
+  no privilege change. Only root targeting a root it may enter reaches
+  it: a non-root caller's `exec-as` fails reading the root-only
+  `/etc/shadow` first, and a td image's locked root is refused (§3). The
   session-cgroup join is independently idempotent: a same-user invocation
   already in the leaf performs no write.
 
@@ -769,6 +781,23 @@ assert equality against `/proc/self/status`.
   supplementary set. A switch that "worked" but left a residual group
   attached prints no marker and reds the boot oracle — which is the one
   failure mode every other check on the image would pass.
+- Root's retirement (`APPLICATIONS.md` §L.1, L7) has two markers in the
+  same `/etc/bootsuccess` run, under the autotest token. This is where
+  their conditions are stated. `TD-ROOT-SSH-REFUSED` prints once root's
+  record reads exactly `root:!:…` and `ssh -v` with the loopback root key
+  the disposable volume seeds into the persistent authorization file
+  exits 255, its output showing the client offering that key, by its
+  pinned fingerprint, before `Permission denied (publickey)`: a
+  connection that failed offers nothing, so it cannot pass.
+  `TD-SU-ABSENT` prints once a listing of `/bin` holds `sh` and no `su`,
+  so a dangling link counts as present. Either failure fails the
+  deployment's health; `qemu-boot-system` and `qemu-install-system`
+  require both markers. A recipe unit test pins root's generated record
+  and that only the primary's field is empty, and a host test pins that
+  the fixture's private and public halves are one key with that
+  fingerprint. td-init's unit tests hold that neither PID-1 failure path,
+  an applet returning or an unusable inittab, yields a job or starts a
+  shell.
 - The console refusal's host tests run the gate in spawned processes
   against temporary roots: for a caller root in some column, enrolled, a
   missing directory, a non-directory and a foreign owner each write the

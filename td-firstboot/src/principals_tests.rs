@@ -6,7 +6,7 @@ const TABLE: &str = "td-principals-v1\nsession\t1000\t993\t991\t989\nsession\t10
 
 const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\ntester:x:1000:1000:Tester:/home/tester:/bin/sh\nother:x:1001:1001:Other:/home/other:/bin/sh\n";
 const GROUP: &str = "root:x:0:\ntester:x:1000:\nother:x:1001:\nwheel:x:10:tester\n";
-const SHADOW: &str = "root::0:0:99999:7:::\ntester::0:0:99999:7:::\nother::0:0:99999:7:::\n";
+const SHADOW: &str = "root:!:0:0:99999:7:::\ntester::0:0:99999:7:::\nother::0:0:99999:7:::\n";
 
 #[test]
 fn primary_table_rename_preserves_credentials_reservations_and_other_fields() {
@@ -534,7 +534,7 @@ fn the_full_account_check_rejects_a_second_name_for_the_human_uid() {
     let registry = Registry::parse("td-principals-v1\nsession\t1000\t993\t992\t991\n").unwrap();
     let passwd = "root:x:0:0:root:/root:/bin/sh\ntester:x:1000:1000:Test:/home/tester:/bin/sh\n";
     let group = "root:x:0:\ntester:x:1000:\n";
-    let shadow = "root::1:0:99999:7:::\ntester::1:0:99999:7:::\n";
+    let shadow = "root:!:1:0:99999:7:::\ntester::1:0:99999:7:::\n";
     assert!(registry.verify_accounts(passwd, group, shadow).is_ok());
     assert!(registry
         .verify_accounts(

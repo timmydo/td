@@ -236,11 +236,9 @@ fn boot_interactive(
     init_cpio: &Path,
     disk: &Path,
 ) -> Result<(), String> {
-    // No `panic=-1` here (unlike the headless qemu_boot oracle, which uses it to
-    // auto-exit on panic): an interactive operator wants a kernel panic left ON SCREEN
-    // to read, then quits with Ctrl-A X — an auto-reboot would scroll it away. No autotest
-    // token either, so the greeter is a normal interactive shell (it powers off on `exit`,
-    // not immediately).
+    // No `panic=` here; the kernel's built-in `panic=-1` still reboots on a panic, so an
+    // operator reads one in the serial log. No autotest token either, so the greeter is a
+    // normal interactive shell (it powers off on `exit`, not immediately).
     let mut command = interactive_command(
         qemu,
         accel,

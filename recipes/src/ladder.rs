@@ -918,6 +918,22 @@ pub const GIT_RUNTIME_MARKER: &str = "TD-GIT-RUN-OK";
 /// public-key authentication, remote exec, and the libcrypto-free runtime closure.
 pub const SSHD_MARKER: &str = "TD-SSHD-OK";
 
+/// Printed by the root-owned health target, only under the QEMU autotest token, after
+/// root's `/etc/shadow` field reads exactly `!` and the running daemon refuses the
+/// loopback root key the disposable test volume seeds into the persistent
+/// authorization file, which the client offered first (td-login/THREAT-MODEL.md §8).
+pub const ROOT_SSH_REFUSED_MARKER: &str = "TD-ROOT-SSH-REFUSED";
+
+/// The OpenSSH fingerprint of that seeded root key. Health requires the client to log
+/// offering exactly this key before the refusal counts, so a key that never reached
+/// the daemon is not evidence; a host test derives it from the fixture's public blob.
+pub const ROOT_SSH_REFUSAL_KEY_FINGERPRINT: &str =
+    "SHA256:7bGtBoc60emJordMICWlxUawPtxs9Vs/xOd1s/eKvuY";
+
+/// Printed beside `ROOT_SSH_REFUSED_MARKER` after a listing of the running root's `/bin`
+/// holds `sh` and no `su`, dangling links included (APPLICATIONS.md §L.1, L6 and L7).
+pub const SU_ABSENT_MARKER: &str = "TD-SU-ABSENT";
+
 /// Printed by the root-owned health target only after EVERY `/bin` name the static td-util
 /// multicall serves exits 0 as the unprivileged login user. Absolute paths cover the shipped
 /// symlinks and argv[0] dispatch plus `/proc` and `/dev/kmsg` reads skipped in the sandbox.

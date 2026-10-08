@@ -97,15 +97,15 @@ release note may describe this tier as available before its acceptance
 evidence exists.
 
 **Enrollment requires §L.1 elevation.** Enrolling a key refuses every
-interactive login, and on a fresh install there is no `su` and root has
-no SSH key, so an enrolled machine would otherwise have no
-administrative path. The activation increment therefore lands
-only after the `APPLICATIONS.md` §L.1 consent-only elevation workstream,
-whose "Elevation increments" L1 to L7 make `deploy-rollback`,
-`set-hostname` and `deploy-publish` approval-key operations and then
-delete `su` and lock root ("Retiring the escape hatch"). Enrollment does
-not exist on any build without that elevation. Root login is never
-re-enabled as an administrative path.
+interactive login, and there is no `su` and root has no login at all,
+so an enrolled machine would otherwise have no administrative path. The
+activation increment therefore lands only after the `APPLICATIONS.md`
+§L.1 consent-only elevation workstream, whose "Elevation increments" L1
+to L7, all landed, made `deploy-rollback`, `set-hostname` and
+`deploy-publish` approval-key operations and then deleted `su` and
+locked root ("Retiring the escape hatch"). Enrollment does not exist on
+any build without that elevation. Root login is never re-enabled as an
+administrative path.
 
 ## The tier
 
@@ -765,29 +765,41 @@ and its private key is readable by UID 1000 itself, so it grants nothing
 the session lacks and nothing off the machine. `/etc/bootsuccess`
 generates both on every boot (`build_bootsuccess` in
 `recipes/src/recipes/system-x86-64.rs`), and the policy's `Match` block
-names that file (`td-firstboot/src/ssh_policy.rs`). Root and non-primary
-accounts use the persistent root-owned `/etc/ssh/authorized_keys`, empty
-on a fresh install.
+names that file (`td-firstboot/src/ssh_policy.rs`). Root has no SSH
+login in either form: both carry `PermitRootLogin no` (`APPLICATIONS.md`
+§L.1, L7), and root's shadow field is `!`. This is that rule's one
+statement; other documents point here.
+
+The persistent root-owned `/etc/ssh/authorized_keys`, empty on a fresh
+install, admits no account on a td image: root is refused, every
+account but the primary is locked, and the primary's `Match` block names
+its own file. It remains as the carrier of the QEMU root-refusal
+fixture's key, and the enforced form's `AllowUsers` is defence in depth
+over it. A deployment older than L7 reads it as root's
+(`APPLICATIONS.md` §L.1, "The rollback window"), which is why firstboot
+warns while it holds a key.
 
 In the enrolled and unavailable states the rendered policy takes its
-**enforced form**: `PermitRootLogin no`, and no account but the primary is
-admitted. SSH then opens no session without a login key except that
-self-test. Only a verifiably unenrolled state renders the ordinary policy.
-At every boot stage-1 init's `td-firstboot render-primary-sshd /sysroot`,
-right after the directory step ("The login record") and before `sshd`
-starts, renders the form that matches the login state, decided by the
+**enforced form**, which admits no account but the primary. SSH then
+opens no session without a login key except that self-test. Only a
+verifiably unenrolled state renders the ordinary policy. At every boot
+stage-1 init's `td-firstboot render-primary-sshd /sysroot`, right after
+the directory step ("The login record") and before `sshd` starts,
+renders the form that matches the login state, decided by the
 directory-and-name check alone, with no helper: a valid directory
-without the record name renders the ordinary policy, byte for byte the
-one rendered before this tier, and anything else the enforced form. The
-cutover renders it within a boot. The QEMU persistent-administrator
-fixture therefore runs only on unenrolled images.
+without the record name renders the ordinary policy, and anything else
+the enforced form. The ordinary policy is byte for byte the one rendered
+before this tier but for L7's root line, `PermitRootLogin no` where it
+was `PermitRootLogin prohibit-password`. The cutover renders it within a
+boot. The QEMU root-refusal fixture (`APPLICATIONS.md` §L.1, "Retiring
+the escape hatch") runs on unenrolled images, and root is refused in
+both forms.
 
-The two forms differ in one place. The ordinary policy's global line
-`PermitRootLogin prohibit-password` becomes, in the enforced form, the
-two lines `PermitRootLogin no` and `AllowUsers NAME`, in that order and
-still in the global section before the primary's `Match User NAME`
-block, NAME being the admitted primary account; every other byte is
-the same. The shared account validation admits only a lowercase letter
+The two forms differ in one place. The enforced form adds the line
+`AllowUsers NAME` right after `PermitRootLogin no`, still in the global
+section before the primary's `Match User NAME` block, NAME being the
+admitted primary account; every other byte is the same. The shared
+account validation admits only a lowercase letter
 followed by lowercase letters, digits, `_` and `-`, so NAME carries none
 of OpenSSH's pattern characters and `AllowUsers` names that one account.
 Firstboot reads the accounts first, whose failure still stops boot, then
@@ -795,11 +807,9 @@ the state under the same root it renders under, for UID 1000's record
 with root:root as the owner. The predicate answers every failure to read
 as unavailable, never as unenrolled, so a read that fails renders the
 enforced form and nothing falls back to the ordinary one. The realized
-OpenSSH recipe test checks both forms with the built `sshd -T`.
-`APPLICATIONS.md` §L.1's L7 will give the ordinary policy
-`PermitRootLogin no` too, so the forms then differ only by `AllowUsers
-NAME`, and turn the persistent-administrator fixture into refusal
-evidence.
+OpenSSH recipe test checks both forms with the built `sshd -T`, and the
+stock image's boot health proves root's seeded key refused
+(`TD-ROOT-SSH-REFUSED`, `THREAT-MODEL.md` §8).
 
 ## Cutover
 
@@ -807,8 +817,8 @@ Whenever the login state moves between unenrolled and enforced (enrolled
 or unavailable), by an operation or otherwise, td revokes every
 interactive session that the other state allowed: a serial session the
 greeter started before enrollment would otherwise keep a UID-1000 shell on
-`ttyS0`, and an SSH session for root or another account would outlive the
-policy that admitted it. td-authd renders the SSH policy for the new
+`ttyS0`, and an SSH session the other policy admitted would outlive
+it. td-authd renders the SSH policy for the new
 state, restarts `sshd` and `greeter` through td-svc, and reports
 completion only after observing that each old containment is empty and a
 new instance runs; its exact mechanism, deadline, reconciliation, notice
@@ -1074,18 +1084,21 @@ lost key and add a replacement.
 With every key lost or every PIN blocked, no td path logs in, locally or
 over SSH, and §L.1 elevation needs an unlocked session. There is no
 password, recovery code or fallback; recovery is physical only, and that
-is deliberate. On an unencrypted volume, anyone who can start other code
-on the machine (a firmware boot menu, a UEFI shell, another OS, or td's
-live medium, whose session offers a terminal) can mount `@var` and
-delete `/var/lib/td/login/1000`, which restores automatic login. The
+is deliberate. td ships no privileged recovery environment, and its live
+medium is none: the live session is unprivileged (`APPLICATIONS.md`
+§L.1, Recovery). On an unencrypted volume, anyone who can start an
+external recovery environment on the machine (another OS, through a
+firmware boot menu or a UEFI shell) can mount `@var` and delete
+`/var/lib/td/login/1000`, which restores automatic login. The
 same access repairs the unavailable state. A damaged record is removed
 the same way, which also restores automatic login, or replaced by an
 intact copy of the same machine's record. A damaged directory is
 removed, or restored as a root:root mode-0700 directory, and the next
 boot's firstboot recreates or accepts it. That is the owner's recovery
-and the bypass named in Scope. On a device-bound volume the live medium
-cannot unseal, because it caps PCR 12; the volume's recovery key opens
-it from the live medium for the same repair. On a planned protected
+and the bypass named in Scope. On a device-bound volume such an
+environment cannot unseal, because the TPM releases the volume only to
+td's own selector (`td-install/ENCRYPTION.md`); the volume's recovery
+key opens it there for the same repair. On a planned protected
 volume, a boot admitted by its disk PIN or a primary disk token starts
 unlocked, a recovery boot starts locked (`td-install/ENCRYPTION.md`,
 "Verified account handoff"), and lost login keys are replaced with a
@@ -1101,8 +1114,8 @@ A key and its PIN are required only to unlock and to add or remove keys,
 which is how recovery policy changes. Ordinary elevation is the §L.1
 consent-only mechanism, which an enrolled machine always has
 ("Enrollment requires §L.1 elevation", above, owns that prerequisite).
-On such a machine `su` no longer exists and root's shadow field is
-locked (§L.1's L6 and L7), interactive root login is refused
+As on every td machine, `su` no longer exists and root's shadow field
+is locked (§L.1's L6 and L7), interactive root login is refused
 (`THREAT-MODEL.md` §3) and root SSH is refused (SSH). Root remains
 reachable only through root-owned services and physical access, and root
 can remove or rewrite the record, so a change made as root bypasses the
@@ -1261,7 +1274,7 @@ The stock VM stays unenrolled: no recipe or firstboot path writes a record,
 and its valid, empty directory is decided unenrolled without any helper,
 so this tier leaves the existing serial-console and SSH oracles unchanged.
 `APPLICATIONS.md` §L.1's L7, which locks root and refuses root SSH in
-both forms, changes them on its own account.
+both forms, changed them on its own account.
 
 QEMU proves protocol composition, td's state machine, the refusal paths,
 the trusted input and display path, relock on crash and resume, console
@@ -1693,9 +1706,9 @@ and the oracle that shows it.
      reasoned `dead_code` allowance, as td-secret compiles the shared
      hash.
 
-**Prerequisite:** the §L.1 elevation workstream lands next, through its
-L7 (`APPLICATIONS.md` §L.1, "Elevation increments"), as "Enrollment
-requires §L.1 elevation" above requires.
+**Prerequisite:** the §L.1 elevation workstream through its L7
+(`APPLICATIONS.md` §L.1, "Elevation increments"), which has landed, as
+"Enrollment requires §L.1 elevation" above requires.
 
 5. **Activation:** enrollment UI and automatic-login cutover, the
    in-boot SSH render (`td-firstboot render-ssh-policy`), the `stop=leaf`

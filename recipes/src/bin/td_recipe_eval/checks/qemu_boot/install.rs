@@ -1852,12 +1852,12 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         (
             protocol::SYSTEM_AUTOTEST_PRIVATE.into(),
             0o600,
-            OPENSSH_ADMIN_PRIVATE_KEY.as_bytes().to_vec(),
+            ROOT_SSH_REFUSAL_PRIVATE_KEY.as_bytes().to_vec(),
         ),
         (
             protocol::SYSTEM_AUTOTEST_AUTHORIZED.into(),
             0o600,
-            OPENSSH_ADMIN_AUTHORIZATION.as_bytes().to_vec(),
+            ROOT_SSH_REFUSAL_AUTHORIZATION.as_bytes().to_vec(),
         ),
     ]);
     let live = scratch.dir.join("installer.cpio");
@@ -1981,6 +1981,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
                 )?;
                 let device = format!("/dev/{}", partition_name(bus.name(false), 2));
                 validate_installed_system(&result, &uuid, &device, &id, false)?;
+                // The autotest boot's health ran the refusal leg against the
+                // root key `seed_system_autotest` put on this volume.
+                require_root_refusal(&result, "installed application evidence")?;
                 require_installed_applications(&result)?;
                 require_same_identity(
                     &first,

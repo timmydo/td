@@ -53,8 +53,9 @@ pub(crate) fn platform() -> Vec<&'static str> {
     ]
 }
 
-/// Kernel command line. No `panic=-1`: an operator wants a panic left on screen
-/// to read. No autotest token, so the greeter is an ordinary interactive shell.
+/// Kernel command line. It adds no `panic=`; the kernel's built-in `panic=-1`
+/// still reboots on a panic. No autotest token, so the greeter is an ordinary
+/// interactive shell.
 pub(crate) const APPEND: &str = "console=ttyS0 rdinit=/init";
 
 /// The blockdev id tying `-drive` to `-device`.

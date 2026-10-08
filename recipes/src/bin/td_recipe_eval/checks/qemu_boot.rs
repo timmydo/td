@@ -108,6 +108,13 @@ const GIT_RUNTIME_MARKER: &str = td_recipe::ladder::GIT_RUNTIME_MARKER;
 /// Printed by the root-owned health target after an unprivileged SSH loopback self-test.
 const SSHD_MARKER: &str = td_recipe::ladder::SSHD_MARKER;
 
+/// Printed under the autotest token once root's field reads `!` and the seeded root
+/// key's SSH login is refused (APPLICATIONS.md §L.1, L7).
+const ROOT_SSH_REFUSED_MARKER: &str = td_recipe::ladder::ROOT_SSH_REFUSED_MARKER;
+
+/// Printed beside it once a listing of `/bin` holds `sh` and no `su`.
+const SU_ABSENT_MARKER: &str = td_recipe::ladder::SU_ABSENT_MARKER;
+
 /// Printed by the root-owned health target after every td-util farm name runs unprivileged.
 const TD_UTIL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_UTIL_RUNTIME_MARKER;
 /// Printed by the root-owned health target once `/bin/grep` and `/bin/sed` — td-txt — gave
@@ -243,18 +250,18 @@ const FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN: &str =
 const TD_PROFILER_ATTRIBUTION_MARKER: &str = td_recipe::td_profiler_contract::ATTRIBUTION_MARKER;
 const TD_PROFILER_EVIDENCE_CONSOLE_PREFIX: &str = "profiler-evidence: ";
 const TD_JAIL_SECCOMP_PROBE_PATH: &str = "@var/lib/td-test/td-jail-seccomp-probe";
-const OPENSSH_ADMIN_PRIVATE_KEY_PATH: &str = "@var/lib/td-test/openssh-admin-selftest";
-const OPENSSH_ADMIN_AUTHORIZED_KEYS_PATH: &str = "@var/lib/td/ssh/authorized_keys";
-const OPENSSH_ADMIN_PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+const ROOT_SSH_REFUSAL_PRIVATE_KEY_PATH: &str = "@var/lib/td-test/root-ssh-refusal-key";
+const ROOT_SSH_REFUSAL_AUTHORIZED_KEYS_PATH: &str = "@var/lib/td/ssh/authorized_keys";
+const ROOT_SSH_REFUSAL_PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
-QyNTUxOQAAACDttFO36sAow04EvJONx4QLcsNSvaO4foqkQnmGvQ1XpgAAAKBfGiUOXxol\n\
-DgAAAAtzc2gtZWQyNTUxOQAAACDttFO36sAow04EvJONx4QLcsNSvaO4foqkQnmGvQ1Xpg\n\
-AAAEA6XhI4oqkaNE8b9UunfEu7W6mEcxaOPIEElYPFdCiuku20U7fqwCjDTgS8k43HhAty\n\
-w1K9o7h+iqRCeYa9DVemAAAAFnRkLXFlbXUtYWRtaW4tc2VsZnRlc3QBAgMEBQYH\n\
+QyNTUxOQAAACCtLl5XhYEe4+YSA83i38MHbvIrKkW1UZAo6nM8oUPqdwAAAJigHuSMoB7k\n\
+jAAAAAtzc2gtZWQyNTUxOQAAACCtLl5XhYEe4+YSA83i38MHbvIrKkW1UZAo6nM8oUPqdw\n\
+AAAEBHFZTEuNzFLCLFfjH5IEcRuyr4XsTVQVPTU0UJZ3n2aa0uXleFgR7j5hIDzeLfwwdu\n\
+8isqRbVRkCjqczyhQ+p3AAAAFHRkLXFlbXUtcm9vdC1yZWZ1c2FsAQ==\n\
 -----END OPENSSH PRIVATE KEY-----\n";
-const OPENSSH_ADMIN_AUTHORIZATION: &str = "restrict,from=\"127.0.0.1\" ssh-ed25519 \
-AAAAC3NzaC1lZDI1NTE5AAAAIO20U7fqwCjDTgS8k43HhAtyw1K9o7h+iqRCeYa9DVem \
-td-qemu-admin-selftest\n";
+const ROOT_SSH_REFUSAL_AUTHORIZATION: &str = "restrict,from=\"127.0.0.1\" ssh-ed25519 \
+AAAAC3NzaC1lZDI1NTE5AAAAIK0uXleFgR7j5hIDzeLfwwdu8isqRbVRkCjqczyhQ+p3 \
+td-qemu-root-refusal\n";
 
 /// Printed after the unprivileged software compositor paints and listens.
 const TD_WAYLAND_RUNTIME_MARKER: &str = td_recipe::ladder::TD_WAYLAND_RUNTIME_MARKER;
@@ -524,6 +531,8 @@ struct ConsoleEvidence {
     ripgrep_fd_runtime: bool,
     git_runtime: bool,
     sshd: bool,
+    root_ssh_refused: bool,
+    su_absent: bool,
     td_util_runtime: bool,
     td_txt_runtime: bool,
     td_init_runtime: bool,
@@ -1342,8 +1351,10 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          target-owned writable @var \
          ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), ran uutils \
          ({UUTILS_RUNTIME_MARKER}), ripgrep+fd ({RIPGREP_FD_RUNTIME_MARKER}), Git plus its \
-         installed CA bundle ({GIT_RUNTIME_MARKER}), OpenSSH through both the preseeded default \
-         administrator path and restricted tester path ({SSHD_MARKER}), td-util \
+         installed CA bundle ({GIT_RUNTIME_MARKER}), OpenSSH through the restricted tester \
+         path ({SSHD_MARKER}) while root's field read `!` and the daemon refused the \
+         preseeded root key ({ROOT_SSH_REFUSED_MARKER}) on a root with no /bin/su \
+         ({SU_ABSENT_MARKER}), td-util \
          ({TD_UTIL_RUNTIME_MARKER}), td-txt's grep+sed answering correctly over the live \
          /proc ({TD_TXT_RUNTIME_MARKER}), the td-init boot glue ({TD_INIT_RUNTIME_MARKER}) and a \
          td-login credential switch the switched process read back and confirmed \
@@ -2017,6 +2028,9 @@ fn validate_system_boot(
             tail(&result.console, 80)
         ));
     }
+    // Health runs the refusal leg before its probe loop and fails there, so a
+    // refusal that did not hold leaves every loop marker absent too.
+    require_root_refusal(result, ordinal)?;
     if !result.evidence.uutils_runtime {
         return Err(format!(
             "the greeter was reached and root checks passed, but the uutils runtime marker \
@@ -2443,6 +2457,34 @@ fn validate_system_boot(
         ));
     }
     require_primary_profile(result, "tester")
+}
+
+/// APPLICATIONS.md §L.1, L7: an autotest boot's health refuses the root key
+/// the disposable volume seeds and finds no `/bin/su`. Boot health fails the
+/// deployment before either marker if root is admitted or `su` exists.
+fn require_root_refusal(result: &BootResult, context: &str) -> Result<(), String> {
+    for (present, marker, what) in [
+        (
+            result.evidence.root_ssh_refused,
+            ROOT_SSH_REFUSED_MARKER,
+            "root's /etc/shadow field read exactly `!` and the running daemon refused the \
+             seeded loopback root key (exit 255, `Permission denied (publickey)`)",
+        ),
+        (
+            result.evidence.su_absent,
+            SU_ABSENT_MARKER,
+            "a listing of /bin holds sh and no su entry, a dangling link included",
+        ),
+    ] {
+        if !present {
+            return Err(format!(
+                "the {context} boot did not report {marker:?}: boot health must show that \
+                 {what}. Last serial output:\n{}",
+                tail(&result.console, 80)
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn require_primary_profile(result: &BootResult, name: &str) -> Result<(), String> {
@@ -3503,7 +3545,7 @@ fn create_persistent_volume_layout(
         super::release_source::copy_to_volume(source, &seed)?;
     }
     if system_runtime_fixtures {
-        stage_openssh_admin_fixture(&seed)?;
+        stage_root_ssh_refusal_fixture(&seed)?;
     }
     if let Some(probe) = seccomp_probe {
         stage_td_jail_seccomp_probe(&seed, probe)?;
@@ -3600,22 +3642,23 @@ fn create_persistent_volume_layout(
     })
 }
 
-/// Seed the disposable system-boot volume with a root login that exercises the
-/// daemon's default persistent AuthorizedKeysFile. The private half exists only
+/// Seed the disposable system-boot volume with a loopback root key in the
+/// daemon's default persistent AuthorizedKeysFile, which boot health requires
+/// the daemon to refuse (APPLICATIONS.md §L.1, L7). The private half exists only
 /// in this host-side test fixture; the authorization is loopback-restricted, and
 /// the guest health probe never rewrites either file.
-fn stage_openssh_admin_fixture(seed: &Path) -> Result<(), String> {
-    let private = seed.join(OPENSSH_ADMIN_PRIVATE_KEY_PATH);
-    let authorized = seed.join(OPENSSH_ADMIN_AUTHORIZED_KEYS_PATH);
+fn stage_root_ssh_refusal_fixture(seed: &Path) -> Result<(), String> {
+    let private = seed.join(ROOT_SSH_REFUSAL_PRIVATE_KEY_PATH);
+    let authorized = seed.join(ROOT_SSH_REFUSAL_AUTHORIZED_KEYS_PATH);
     let private_parent = private.parent().ok_or_else(|| {
         format!(
-            "OpenSSH admin fixture key has no parent: {}",
+            "root SSH refusal fixture key has no parent: {}",
             private.display()
         )
     })?;
     let authorized_parent = authorized.parent().ok_or_else(|| {
         format!(
-            "OpenSSH admin fixture authorization has no parent: {}",
+            "root SSH refusal fixture authorization has no parent: {}",
             authorized.display()
         )
     })?;
@@ -3627,25 +3670,25 @@ fn stage_openssh_admin_fixture(seed: &Path) -> Result<(), String> {
     ] {
         fs::create_dir_all(&directory).map_err(|e| {
             format!(
-                "create OpenSSH admin fixture directory {}: {e}",
+                "create root SSH refusal fixture directory {}: {e}",
                 directory.display()
             )
         })?;
         fs::set_permissions(&directory, fs::Permissions::from_mode(mode)).map_err(|e| {
             format!(
-                "chmod OpenSSH admin fixture directory {}: {e}",
+                "chmod root SSH refusal fixture directory {}: {e}",
                 directory.display()
             )
         })?;
     }
     for (path, contents) in [
-        (&private, OPENSSH_ADMIN_PRIVATE_KEY),
-        (&authorized, OPENSSH_ADMIN_AUTHORIZATION),
+        (&private, ROOT_SSH_REFUSAL_PRIVATE_KEY),
+        (&authorized, ROOT_SSH_REFUSAL_AUTHORIZATION),
     ] {
         fs::write(path, contents)
-            .map_err(|e| format!("write OpenSSH admin fixture {}: {e}", path.display()))?;
+            .map_err(|e| format!("write root SSH refusal fixture {}: {e}", path.display()))?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("chmod OpenSSH admin fixture {}: {e}", path.display()))?;
+            .map_err(|e| format!("chmod root SSH refusal fixture {}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -6585,6 +6628,8 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         RIPGREP_FD_RUNTIME_MARKER.len(),
         GIT_RUNTIME_MARKER.len(),
         SSHD_MARKER.len(),
+        ROOT_SSH_REFUSED_MARKER.len(),
+        SU_ABSENT_MARKER.len(),
         TD_UTIL_RUNTIME_MARKER.len(),
         TD_TXT_RUNTIME_MARKER.len(),
         TD_INIT_RUNTIME_MARKER.len(),
@@ -6858,6 +6903,12 @@ fn latch_console_evidence_from(
         GIT_RUNTIME_MARKER.as_bytes(),
     );
     latch_marker(&mut evidence.sshd, buf, SSHD_MARKER.as_bytes());
+    latch_marker(
+        &mut evidence.root_ssh_refused,
+        buf,
+        ROOT_SSH_REFUSED_MARKER.as_bytes(),
+    );
+    latch_marker(&mut evidence.su_absent, buf, SU_ABSENT_MARKER.as_bytes());
     latch_marker(
         &mut evidence.td_util_runtime,
         buf,
@@ -10965,26 +11016,26 @@ mod tests {
     }
 
     #[test]
-    fn openssh_admin_login_is_a_root_only_disposable_volume_fixture() {
+    fn openssh_root_refusal_key_is_a_root_only_disposable_volume_fixture() {
         let seq = AtomicU64::new(2250);
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _guard = Scratch { dir: dir.clone() };
         let seed = dir.join("seed");
         fs::create_dir(&seed).unwrap();
 
-        stage_openssh_admin_fixture(&seed).unwrap();
+        stage_root_ssh_refusal_fixture(&seed).unwrap();
 
-        let private = seed.join(OPENSSH_ADMIN_PRIVATE_KEY_PATH);
-        let authorized = seed.join(OPENSSH_ADMIN_AUTHORIZED_KEYS_PATH);
+        let private = seed.join(ROOT_SSH_REFUSAL_PRIVATE_KEY_PATH);
+        let authorized = seed.join(ROOT_SSH_REFUSAL_AUTHORIZED_KEYS_PATH);
         assert_eq!(
             fs::read_to_string(&private).unwrap(),
-            OPENSSH_ADMIN_PRIVATE_KEY
+            ROOT_SSH_REFUSAL_PRIVATE_KEY
         );
         assert_eq!(
             fs::read_to_string(&authorized).unwrap(),
-            OPENSSH_ADMIN_AUTHORIZATION
+            ROOT_SSH_REFUSAL_AUTHORIZATION
         );
-        assert!(OPENSSH_ADMIN_AUTHORIZATION.starts_with("restrict,from=\"127.0.0.1\" "));
+        assert!(ROOT_SSH_REFUSAL_AUTHORIZATION.starts_with("restrict,from=\"127.0.0.1\" "));
         for path in [&private, &authorized] {
             assert_eq!(
                 fs::metadata(path).unwrap().permissions().mode() & 0o777,
@@ -10998,6 +11049,101 @@ mod tests {
                 .mode()
                 & 0o777,
             0o700
+        );
+    }
+
+    const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    fn b64_decode(text: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        let (mut acc, mut bits) = (0u32, 0u32);
+        for c in text
+            .bytes()
+            .filter(|c| !c.is_ascii_whitespace() && *c != b'=')
+        {
+            let v = B64.iter().position(|b| *b == c).unwrap() as u32;
+            acc = (acc << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+                acc &= (1 << bits) - 1;
+            }
+        }
+        out
+    }
+
+    fn b64_encode_unpadded(bytes: &[u8]) -> String {
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+            for i in 0..=chunk.len() {
+                out.push(B64[(n >> (18 - 6 * i) & 63) as usize] as char);
+            }
+        }
+        out
+    }
+
+    /// One SSH wire `string`, advancing `at` past it.
+    fn wire_string<'a>(bytes: &'a [u8], at: &mut usize) -> &'a [u8] {
+        let len = u32::from_be_bytes(bytes[*at..*at + 4].try_into().unwrap()) as usize;
+        let value = &bytes[*at + 4..*at + 4 + len];
+        *at += 4 + len;
+        value
+    }
+
+    /// The refusal fixture's halves are one key, and the fingerprint boot health
+    /// requires the client to offer is that key's: without this, a private key
+    /// that no longer matched the seeded authorization would still be offered
+    /// and refused, and `TD-ROOT-SSH-REFUSED` would prove nothing about root.
+    #[test]
+    fn the_root_refusal_fixture_halves_pair_and_carry_the_pinned_fingerprint() {
+        let mut words = ROOT_SSH_REFUSAL_AUTHORIZATION.split_whitespace();
+        assert_eq!(words.next(), Some("restrict,from=\"127.0.0.1\""));
+        assert_eq!(words.next(), Some("ssh-ed25519"));
+        let authorized_blob = b64_decode(words.next().unwrap());
+        let comment = words.next().unwrap();
+        assert_eq!(words.next(), None);
+
+        let body: String = ROOT_SSH_REFUSAL_PRIVATE_KEY
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let key = b64_decode(&body);
+        let magic = b"openssh-key-v1\0";
+        assert_eq!(&key[..magic.len()], magic);
+        let mut at = magic.len();
+        assert_eq!(wire_string(&key, &mut at), b"none", "cipher");
+        assert_eq!(wire_string(&key, &mut at), b"none", "kdf");
+        assert_eq!(wire_string(&key, &mut at), b"", "kdf options");
+        assert_eq!(&key[at..at + 4], &1u32.to_be_bytes(), "one key");
+        at += 4;
+        assert_eq!(wire_string(&key, &mut at), &authorized_blob[..]);
+        let private = wire_string(&key, &mut at);
+        let mut p = 8; // the two check words
+        assert_eq!(&private[..4], &private[4..8], "check words");
+        assert_eq!(wire_string(private, &mut p), b"ssh-ed25519");
+        let public = wire_string(private, &mut p).to_vec();
+        let secret = wire_string(private, &mut p);
+        assert_eq!(wire_string(private, &mut p), comment.as_bytes());
+        let seed: [u8; 32] = secret[..32].try_into().unwrap();
+        assert_eq!(&secret[32..], &public[..]);
+        assert_eq!(
+            td_engine::ed25519_sign::public_key(&seed).unwrap()[..],
+            public[..]
+        );
+        let mut at = 0;
+        assert_eq!(wire_string(&authorized_blob, &mut at), b"ssh-ed25519");
+        assert_eq!(wire_string(&authorized_blob, &mut at), &public[..]);
+
+        let mut digest = td_engine::sha256::Sha256::new();
+        digest.update(&authorized_blob);
+        assert_eq!(
+            format!("SHA256:{}", b64_encode_unpadded(&digest.finalize())),
+            td_recipe::ladder::ROOT_SSH_REFUSAL_KEY_FINGERPRINT
         );
     }
 
@@ -11146,6 +11292,8 @@ mod tests {
             GIT_HTTPS_RUNTIME_MARKER,
             FIREFOX_NETWORK_RUNTIME_MARKER,
             SSHD_MARKER,
+            ROOT_SSH_REFUSED_MARKER,
+            SU_ABSENT_MARKER,
             TD_UTIL_RUNTIME_MARKER,
             TD_TXT_RUNTIME_MARKER,
             TD_INIT_RUNTIME_MARKER,
@@ -11558,6 +11706,8 @@ mod tests {
         evidence.root_read_only = true;
         evidence.selected_current = true;
         evidence.sshd = true;
+        evidence.root_ssh_refused = true;
+        evidence.su_absent = true;
         evidence.state_owner = true;
         evidence.state_writable = true;
         evidence.target = true;
@@ -11695,6 +11845,56 @@ mod tests {
                 .unwrap_err()
                 .contains("boot-attempt budget"));
         }
+    }
+
+    /// APPLICATIONS.md §L.1, L7: each refusal marker has its own row.
+    #[test]
+    fn root_refusal_markers_are_required_for_every_healthy_boot() {
+        let healthy = BootResult {
+            evidence: healthy_evidence(),
+            exited_clean: true,
+            marker_killed: false,
+            reason: String::new(),
+            console: "TD-PRIMARY-PROFILE-READY tester\n".into(),
+            elapsed: Duration::from_secs(1),
+            firefox_audio: FirefoxAudioCapture::NotRequested,
+        };
+        let validate = |result: &BootResult| {
+            validate_system_boot(
+                result,
+                PersistencePhase::None,
+                IdentityPhase::Fresh,
+                "first",
+                SelectionExpectation::Current,
+            )
+        };
+        let mut result = healthy;
+        result.evidence.shutdown = true;
+        assert_eq!(validate(&result), Ok(()));
+        let rows: [(fn(&mut ConsoleEvidence), &str); 2] = [
+            (
+                |evidence| evidence.root_ssh_refused = false,
+                ROOT_SSH_REFUSED_MARKER,
+            ),
+            (|evidence| evidence.su_absent = false, SU_ABSENT_MARKER),
+        ];
+        for (clear, marker) in rows {
+            let mut missing = BootResult {
+                evidence: healthy_evidence(),
+                exited_clean: true,
+                marker_killed: false,
+                reason: String::new(),
+                console: result.console.clone(),
+                elapsed: Duration::from_secs(1),
+                firefox_audio: FirefoxAudioCapture::NotRequested,
+            };
+            missing.evidence.shutdown = true;
+            clear(&mut missing.evidence);
+            let complaint = validate(&missing).unwrap_err();
+            assert!(complaint.contains(marker), "{complaint}");
+            assert!(require_root_refusal(&missing, "first").is_err());
+        }
+        assert_eq!(require_root_refusal(&result, "first"), Ok(()));
     }
 
     #[test]
@@ -12824,6 +13024,8 @@ mod tests {
             RIPGREP_FD_RUNTIME_MARKER,
             GIT_RUNTIME_MARKER,
             SSHD_MARKER,
+            ROOT_SSH_REFUSED_MARKER,
+            SU_ABSENT_MARKER,
             TD_UTIL_RUNTIME_MARKER,
             TD_TXT_RUNTIME_MARKER,
             TD_BUSD_RUNTIME_MARKER,
@@ -12893,6 +13095,8 @@ mod tests {
         assert!(evidence.ripgrep_fd_runtime);
         assert!(evidence.git_runtime);
         assert!(evidence.sshd);
+        assert!(evidence.root_ssh_refused);
+        assert!(evidence.su_absent);
         assert!(evidence.td_util_runtime);
         assert!(evidence.td_txt_runtime);
         assert!(evidence.td_busd_runtime);

@@ -135,9 +135,9 @@ fn usage() -> String {
 /// not testable through a process that is not PID 1.
 #[derive(Debug, PartialEq, Eq)]
 enum Route<'a> {
-    /// Run this applet, with argv from `args_from` onwards. `fallback` marks the
-    /// PID-1 rescue below, which is worth a console line because nothing in the
-    /// argv asked for it.
+    /// Run this applet, with argv from `args_from` onwards. `fallback` marks
+    /// PID 1's dispatch miss routed to init, which is worth a console line
+    /// because nothing in the argv asked for it.
     Applet {
         name: &'a str,
         args_from: usize,
@@ -231,27 +231,31 @@ fn main() -> ExitCode {
     }
     match outcome(&result, pid1) {
         Outcome::Exit(code) => ExitCode::from(code),
-        Outcome::Rescue => rescue(),
+        Outcome::FailBoot => fail_boot(),
     }
 }
 
-/// What to do with an applet's return value. `route` refuses to send PID 1
-/// anywhere that exits, and then this is where that rule was being broken:
-/// EVERY applet can return, and a return here is `main` exiting, which for PID 1
-/// is "Attempted to kill init" — a kernel panic. switch_root's preflight is the
-/// case that matters. Its whole purpose is to report a bad new root BEFORE the
-/// mounts move; reporting it and then panicking the kernel spends that work on a
-/// better-timed panic instead of a survivable one.
+/// What to do with an applet's return value. Every applet can return, and for
+/// PID 1 a return is `main` exiting: "Attempted to kill init", a kernel panic.
+/// That panic is how PID 1 fails a boot, as the deployment initramfs's own
+/// refusals do. td's command line carries `panic=-1`, so the machine reboots
+/// at once, and a pending deployment's spent attempt counts toward td-boot's
+/// automatic rollback; only a later `panic=0` would leave the panic on screen
+/// to read. switch_root's preflight still reports a bad new root before any
+/// mount moves, so the cause is on the console above the panic.
+///
+/// No shell starts in its place. One here would be root's, on the console,
+/// with no login, and root has none (APPLICATIONS.md §L.1, L7).
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     Exit(u8),
-    /// PID 1 may not exit at all — not even successfully.
-    Rescue,
+    /// PID 1 returned: say so and fail the boot, whatever the applet returned.
+    FailBoot,
 }
 
 fn outcome(result: &Result<u8, String>, pid1: bool) -> Outcome {
     if pid1 {
-        return Outcome::Rescue;
+        return Outcome::FailBoot;
     }
     match result {
         Ok(code) => Outcome::Exit(*code),
@@ -259,36 +263,11 @@ fn outcome(result: &Result<u8, String>, pid1: bool) -> Outcome {
     }
 }
 
-/// Shells to try, in order, when PID 1 has nothing left to run.
-const RESCUE_SHELLS: [&str; 2] = ["/bin/sh", "/bin/td-sh"];
-
-/// Keep PID 1 alive after an applet returned. A shell is the useful outcome: at
-/// this point nothing has been moved or chrooted, so the initramfs the operator
-/// booted is entirely intact and its shell can diagnose what the applet
-/// refused. `cttyhack` gives that shell a controlling terminal and only returns
-/// if the exec failed.
-///
-/// If no shell execs, park instead of returning. Parking reaps, because PID 1
-/// still inherits every orphan on the system, and a zombie it never reaps is a
-/// slot leak for as long as the machine is up.
-fn rescue() -> ExitCode {
-    emit_err("td-init: PID 1 cannot exit; starting a rescue shell\n");
-    for shell in RESCUE_SHELLS {
-        if std::path::Path::new(shell).exists() {
-            let argv = [shell.to_string()];
-            if let Err(e) = cttyhack::run(&argv) {
-                emit_err(&format!("td-init: {e}\n"));
-            }
-        }
-    }
-    emit_err("td-init: no rescue shell; parking\n");
-    loop {
-        // Blocking, so this costs nothing while idle; the sleep is only for the
-        // no-children case, which returns immediately and would otherwise spin.
-        if let Ok(sys::Reaped::NoChildren) = sys::wait_any(false) {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-    }
+/// The applet's own complaint is already on the console; this line says what
+/// follows it.
+fn fail_boot() -> ExitCode {
+    emit_err("td-init: PID 1 has nothing left to run; failing this boot\n");
+    ExitCode::from(1)
 }
 
 #[cfg(test)]
@@ -360,19 +339,19 @@ mod tests {
     /// path directly (no symlink, hence no applet basename) must still boot.
     #[test]
     fn pid_1_is_never_routed_to_something_that_exits() {
-        let rescue = Route::Applet {
+        let init = Route::Applet {
             name: "init",
             args_from: 1,
             fallback: true,
         };
         assert_eq!(
             route(&argv(&["/td/store/abc-td-init/bin/td-init"]), true),
-            rescue
+            init
         );
-        assert_eq!(route(&argv(&["td-init", "nosuch"]), true), rescue);
-        assert_eq!(route(&argv(&["td-init", "--list"]), true), rescue);
-        assert_eq!(route(&[], true), rescue);
-        // A real applet still wins over the rescue, so `/sbin/init` and an
+        assert_eq!(route(&argv(&["td-init", "nosuch"]), true), init);
+        assert_eq!(route(&argv(&["td-init", "--list"]), true), init);
+        assert_eq!(route(&[], true), init);
+        // A real applet still wins over the fallback, so `/sbin/init` and an
         // explicit `td-init init` are unaffected by it.
         assert_eq!(
             route(&argv(&["/sbin/init", "-f", "/etc/x"]), true),
@@ -390,18 +369,18 @@ mod tests {
         );
     }
 
-    /// ...and having been routed to one, PID 1 must not exit when it RETURNS.
-    /// The applet above is the case: `switch_root` refusing a bad new root is
-    /// the preflight working, and exiting on it converts a survivable refusal
-    /// into the kernel panic the preflight exists to avoid. Success is no
-    /// different — PID 1 exiting 0 panics exactly as PID 1 exiting 1 does.
+    /// ...and having been routed to one, PID 1 RETURNING fails the boot, never
+    /// starts a shell: `switch_root` refusing a bad new root and `init` refusing
+    /// an unusable table both end here, and a shell would be root's with no
+    /// login. Success is no different — an applet PID 1 ran returned, so there
+    /// is nothing left to boot.
     #[test]
-    fn pid_1_never_exits_whatever_the_applet_returned() {
+    fn pid_1_fails_the_boot_whatever_the_applet_returned() {
         assert_eq!(
             outcome(&Err("no init in the new root".into()), true),
-            Outcome::Rescue
+            Outcome::FailBoot
         );
-        assert_eq!(outcome(&Ok(0), true), Outcome::Rescue);
+        assert_eq!(outcome(&Ok(0), true), Outcome::FailBoot);
         // Anywhere else the exit status is the applet's own, and an error is 1.
         assert_eq!(outcome(&Ok(0), false), Outcome::Exit(0));
         assert_eq!(outcome(&Ok(3), false), Outcome::Exit(3));
@@ -502,10 +481,32 @@ mod confinement {
             "--stdin must issue both calls itself"
         );
         assert!(setsid < ctty, "setsid(2) must precede TIOCSCTTY");
-        // And it must not degrade the way the rescue path deliberately does:
+        // And it must not degrade the way the plain mode deliberately does:
         // every step of the claim propagates.
         assert_eq!(claim.matches('?').count(), 2);
         assert!(!claim.contains("emit_err"));
+    }
+
+    /// Neither PID-1 failure path reaches a shell (APPLICATIONS.md §L.1, L7):
+    /// `main` runs cttyhack only as the applet its table names, and init names
+    /// no shell or console wrapper of its own. Code only, so the fixtures the
+    /// tests parse do not count.
+    #[test]
+    fn no_pid_1_failure_path_starts_a_shell() {
+        let main = code_only(&source("main.rs"));
+        assert_eq!(main.matches(concat!("cttyhack", "::run")).count(), 1);
+        let init = code_only(&source("init.rs"));
+        for (path, code) in [("main.rs", &main), ("init.rs", &init)] {
+            for word in [
+                concat!("/bin/", "td-sh"),
+                concat!("::", "respawn:"),
+                concat!("rescue", "()"),
+            ] {
+                assert!(!code.contains(word), "{path} names {word}");
+            }
+        }
+        assert!(!main.contains(concat!("\"/bin/", "sh\"")));
+        assert!(!init.contains(concat!("cttyhack", " /bin/sh")));
     }
 
     /// The syscalls UNSAFE.md records for this crate, with the x86_64 number

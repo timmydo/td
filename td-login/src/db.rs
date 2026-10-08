@@ -290,7 +290,7 @@ mod tests {
     const PW: &str = "root:x:0:0:root:/root:/bin/sh\n\
                       tester:x:1000:1000:Test User:/home/tester:/bin/sh\n";
     const GR: &str = "root:x:0:\ntester:x:1000:\nwheel:x:10:tester\ntty:x:5:\n";
-    const SH: &str = "root::19000:0:99999:7:::\ntester::19000:0:99999:7:::\n";
+    const SH: &str = "root:!:19000:0:99999:7:::\ntester::19000:0:99999:7:::\n";
 
     #[test]
     fn the_shipped_database_resolves() {
@@ -306,6 +306,7 @@ mod tests {
             Vec::<u32>::new()
         );
         assert_eq!(secret_in(SH, SHADOW, "tester").unwrap(), Secret::NoPassword);
+        assert_eq!(secret_in(SH, SHADOW, "root").unwrap(), Secret::Locked);
     }
 
     /// A TRUNCATED shadow record must not read as "no password". This is the
@@ -322,7 +323,7 @@ mod tests {
             "tester::19000:0:99999:7::",
             "tester:!:19000:0:99999:7::::extra",
         ] {
-            let text = format!("root::19000:0:99999:7:::\n{truncated}\n");
+            let text = format!("root:!:19000:0:99999:7:::\n{truncated}\n");
             let err = secret_in(&text, SHADOW, "tester").unwrap_err();
             assert!(
                 err.contains("colon-separated fields"),

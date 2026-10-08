@@ -247,16 +247,18 @@ paragraph is a target contract rather than a whole-image completeness claim.
    this ships. Other secrets require a second recovery token or an explicit
    unrecoverability decision.
 
-Principle 7 is a target, not a current claim. The stock VM writes empty
-shadow fields for `root` and `tester` and auto-logs in. There is no `su`;
-the one administrative login is root SSH, for a key someone seeded. The
-paired compositor and `td-authd` provide physical secure attention,
+Principle 7 is a target, not a current claim. The stock VM writes an
+empty shadow field for `tester` and auto-logs in. Root is locked (`!`)
+and there is no `su`; no console or SSH login reaches root.
+Administration is the session owner's approval-key operations; without
+consent, recovery is td-boot's automatic rollback or physical access
+(`APPLICATIONS.md` §L.1, "Recovery").
+The paired compositor and `td-authd` provide physical secure attention,
 explicit token enrollment and token-gated secret release. File and
 TPM-only stores cannot serve application credentials. Typed credential
 writes require their own presented token operation; they cannot use an
-existing session release. The stock VM remains unenrolled. Do not make a
-user-facing flow depend on root SSH; see `APPLICATIONS.md` §L.1 and
-`td-login/THREAT-MODEL.md`. The
+existing session release. The stock VM remains unenrolled. See
+`APPLICATIONS.md` §L.1 and `td-login/THREAT-MODEL.md`. The
 device-bound encrypted default, which the installer chooses on machines
 with a usable TPM and a keyboard console, releases storage to TPM
 possession alone; it is device binding under this principle and advances
@@ -269,8 +271,7 @@ compositor's locked start, `Super+l` and attention `L`, which act only
 once a key is enrolled or the login directory is not valid, though every
 paired session consumes `Super+l` and shows `L`) lets the installed
 account trade auto-login for a FIDO2 key plus PIN at boot and session
-lock; that document states what it does not protect, and `APPLICATIONS.md`
-§L.1 states when root's empty shadow field and root SSH retire.
+lock; that document states what it does not protect.
 
 # Tests
 

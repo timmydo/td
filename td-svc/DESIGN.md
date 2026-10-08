@@ -1436,25 +1436,29 @@ Log capture (§7) is what remains. Sections above describe the completed
 design; anything not yet built is specified here so the later landing
 implements a reviewed target rather than an improvised one.
 
-### A table with no units, and the rescue td-init has but td-svc does not
+### A table with no units
 
-`td-init` falls back to a built-in `::respawn:/bin/cttyhack /bin/sh` when
-`/etc/inittab` is unreadable, precisely so a broken table still leaves a
-shell on the console. After the cutover the console is a *unit*, so td-svc
-handed an unreadable or missing table has no such floor: it prints the load
-error, comes up with zero services, and — having no exit path — idles
-forever while PID 1 never respawns it. One line, then silence
-indistinguishable from a healthy boot.
+`td-init` fails the boot when `/etc/inittab` is unreadable or yields no
+jobs: PID 1 reports it and returns, the kernel panics, and `panic=-1`
+reboots, spending a pending deployment's boot attempt. It offers no
+console shell, which would be root's with no login
+([`APPLICATIONS.md`](../APPLICATIONS.md) §L.1, L7). td-svc handed an
+unreadable or missing table has no such exit: it prints the load error,
+comes up with zero services, and — having no exit path — idles forever
+while PID 1 never respawns it. One line, then
+silence indistinguishable from a healthy boot, and no reboot for the
+rollback to count.
 
 The build-time guards cover the *generated* table (`td-svc check` runs over
 it during the image build, and the recipe derives the inittab's `-f`, the
 generated file, and that check from one constant), so reaching this state
 takes a corrupted erofs. It is still the worst outcome in this document, so
-until there is a rescue unit td-svc at least keeps *saying* so, on a slow
-throttle rather than once: a supervisor with no units repeats that fact
-every `SILENT_TABLE_COMPLAINT` and names the file to go look at. Repeating
-is not recovering. A built-in fallback console — td-init's answer, one
-level up — is the fix, and it belongs with the landing that owns rescue.
+until a later landing fails the boot here too td-svc at least keeps
+*saying* so, on a slow throttle rather than once: a supervisor with no
+units repeats that fact every `SILENT_TABLE_COMPLAINT` and names the file
+to go look at. Repeating is not recovering. The fix is td-init's answer
+one level up — fail the boot so the rollback counts it — never a fallback
+console.
 
 ### Nothing reconciles a supervisor that died
 

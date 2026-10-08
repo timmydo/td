@@ -8823,13 +8823,23 @@ them into its own image; no user's home or setting adds one.
 
 **Recovery.** When consent is unavailable (no seat, a compositor that
 cannot reach the secure path, a refusing table) the operations refuse;
-nothing falls back. What remains is physical access, as
-`td-login/TOKEN-LOGIN.md`'s "Recovery" describes it, and td-boot's
-automatic rollback, which consumes a boot attempt before kexec and
-returns to `previous` when a deployment's attempts are exhausted
-(`td-install/DESIGN.md`). A backoff file root cannot use blocks updates
-and renames until it is repaired the same way (`td-authd/DESIGN.md`,
-"Elevation operations", Backoff).
+nothing falls back. No running td system grants root: no login reaches
+root, a failed boot offers no console shell ("Administration today"
+below), and the live medium's session is as unprivileged as any other.
+What remains is td-boot's automatic rollback, which consumes a boot
+attempt before kexec and returns to `previous` when a deployment's
+attempts are exhausted (`td-install/DESIGN.md`), or physical access. At
+the machine, an external recovery environment that can mount the volume,
+such as another operating system the firmware starts, repairs it; so
+does td's own kernel started with load options edited at the firmware,
+since a later `init=` or `rdinit=` overrides td's built-in command line
+and both initramfs carry `/bin/sh`. Either opens an unencrypted volume.
+An encrypted volume opens only with its recovery key: edited load
+options change what a device-bound protector measures, so it does not
+release (`td-install/ENCRYPTION.md`). `td-login/TOKEN-LOGIN.md`'s
+"Recovery" names the login-state repairs made that way. A backoff file
+root cannot use blocks updates and renames until it is repaired the same
+way (`td-authd/DESIGN.md`, "Elevation operations", Backoff).
 
 **Update installation and login-key disclosures take the approval key.**
 Since L5 `I` selects a queued update, `deploy-publish` in the principal
@@ -8884,25 +8894,36 @@ in all four uid columns (`td-login/THREAT-MODEL.md` §4), so each is a
 root-only privilege drop, and since L6 there is no `su`. Root-run
 boot-health probes, thirteen `/etc/bootsuccess` legs, the
 `TD-LOGIN-RUN-OK` one among them, and the network self-test drop to the
-primary account through `exec-primary`. Root's empty shadow field opens
-no console session, since the console logs in only through
-`login-primary`. The one
-interactive administrative path is root SSH, which the ordinary policy's
-`PermitRootLogin prohibit-password` admits only for a key someone seeded
-into `/var/lib/td/ssh/authorized_keys`; a fresh install has none. The
-stock image's own boot health exercises that path under the QEMU
-autotest token with a disposable seeded key
-(`TD-OPENSSH-ADMIN-ROUNDTRIP`). Physical access is the other path.
-Since L3 the session owner can also return the machine to its previous
-deployment through `deploy-rollback`, since L4 rename it through
-`set-hostname`, and since L5 its update installation is
-`deploy-publish`; none raises privilege beyond its one operation.
+primary account through `exec-primary`. Since L7 root has no login at
+all: its shadow field is `!`, which every td-login path refuses, and
+neither SSH form admits root (`td-login/TOKEN-LOGIN.md`, "SSH"). Root
+runs only what td-svc and the image start as root.
 
-**Retiring the escape hatch.** The escape hatch is root's remaining
-administrative surface: the `su` applet, root's empty shadow field and
-root SSH. L6 has removed the first; root's empty shadow field and root
-SSH remain until L7. Both steps land only after `deploy-rollback` is
-live (L3), so no build is left without an administrative path:
+Nor does a failed boot open a root shell. When `switch_root` refuses
+the new root, or `/etc/inittab` is unreadable or yields no jobs, td-init
+reports the cause on the console and PID 1 returns, which panics the
+kernel (`Outcome` in `td-init/src/main.rs`), as the deployment
+initramfs's own refusals do. td's `panic=-1` reboots at once: a pending
+deployment spends a boot attempt and is rolled back when they are gone,
+and an acknowledged one, which has no countdown, reboots until it is
+repaired from outside (`td-install/ENCRYPTION.md`'s account of the same
+loop). A live medium has no countdown either, so a broken one reboots
+until it is replaced. Only a later `panic=0` on the command line would
+leave the panic on screen.
+
+Administration is the session owner's three consent operations: since L3
+`deploy-rollback` returns the machine to its previous deployment, since
+L4 `set-hostname` renames it, and since L5 `deploy-publish` installs a
+locally built update. Each is one enumerated operation that root
+performs after the approval key, and none raises privilege beyond it
+("The v1 operations"). When consent is unavailable, recovery is the
+automatic rollback or physical access ("The v1 operations", Recovery).
+
+**Retiring the escape hatch.** The escape hatch was root's remaining
+administrative surface: the `su` applet, root's empty shadow field, root
+SSH, and td-init's console shells. L6 removed the first and L7 the rest.
+Both steps landed only after `deploy-rollback` was live (L3), so no
+build is left without an administrative path.
 
 1. **L6 deletes the `su` applet** and its `/bin/su` link; it has
    landed. Its probes moved to `td-login exec-primary -- /bin/sh -c
@@ -8918,31 +8939,53 @@ live (L3), so no build is left without an administrative path:
    changed, and fails any body using a shell construct it does not
    model, a nested shell among them unless it is handed exactly `-c`
    and a literal script that expands nothing and passes the same scan.
-2. **L7 locks root.** Root's shadow field becomes `!`, which every
-   td-login path refuses, and both SSH forms carry `PermitRootLogin no`,
-   so they differ only by `AllowUsers`. Boot-health probes already run
-   as root under td-svc and need no root login. L7 deletes the
-   `TD-OPENSSH-ADMIN-ROUNDTRIP` leg, which tests a path that no longer
-   exists, and puts the refusal evidence in the same stock-image
+2. **L7 locks root**; it has landed. Root's shadow field is `!`, which
+   every td-login path refuses, and neither SSH form admits root
+   (`td-login/TOKEN-LOGIN.md`, "SSH"), so the forms differ only by
+   `AllowUsers`. td-init's two console shells, the rescue shell PID 1
+   started when an applet returned and the built-in inittab's respawned
+   console shell, are gone: each failure now fails the boot (above).
+   Boot-health probes run as root under td-svc and need no root login.
+   L7 deleted the `TD-OPENSSH-ADMIN-ROUNDTRIP` leg, which tested a path
+   that no longer exists, and put the refusal evidence,
+   `TD-ROOT-SSH-REFUSED` and `TD-SU-ABSENT`, in the same stock-image
    `/etc/bootsuccess` run under the autotest token, which
-   `qemu-boot-system` and the installed-system QEMU path drive: the root
-   key the existing fixture seeds (`stage_openssh_admin_fixture` in
-   `qemu_boot.rs`, and `td-install-qemu-test`'s `seed_system_autotest`
-   for an installed volume) is refused, and `/bin/su` is absent. Nothing
-   else uses that key, so no test-only fixture unit replaces it; a later
-   test that needs root in the guest uses a root-owned fixture unit in
-   the test-only system image, as `qemu-login-system` does. The stock
-   image has no root login at all.
+   `qemu-boot-system` and the installed-system QEMU path drive;
+   `td-login/THREAT-MODEL.md` §8 states each marker's conditions. The
+   root key the refusal fixture seeds (`stage_root_ssh_refusal_fixture`
+   in `qemu_boot.rs`, and `td-install-qemu-test`'s
+   `seed_system_autotest` for an installed volume) stays in the
+   persistent authorization file as that evidence. Nothing else uses
+   it; a later test that needs root in the guest uses a root-owned
+   fixture unit in the test-only system image, as `qemu-login-system`
+   does, whose fixture likewise finds a root key it appends refused in
+   both forms. The stock image has no root login at all.
+
+**The rollback window.** Root login is never re-enabled on an L7 or
+newer deployment, and that is the whole of the claim. While a deployment
+older than L7 is `previous`, rolling back to it, by `deploy-rollback` or
+by the automatic rollback, restores what it carried: root's empty shadow
+field and `PermitRootLogin prohibit-password`, so any root key in the
+persistent `/var/lib/td/ssh/authorized_keys` admits root over SSH again;
+td-init's console rescue shells; and, from a deployment older than L6,
+`/bin/su`, with which the automatically logged-in console account
+becomes root with no key at all. The window closes when a second L7 or
+newer publish displaces that `previous`, so a machine updated from such
+a deployment publishes again promptly. Operators remove root keys from
+that file before upgrading; afterwards no td deployment lets anyone edit
+it, and only physical access can ("Recovery" above). At every boot
+firstboot reports how many keys the file holds and warns on the console
+while it holds any.
 
 `td-login/TOKEN-LOGIN.md`'s increment 5, which activates login-key
-enrollment, follows L7.
+enrollment, may follow now that L7 has landed.
 
 #### Elevation increments
 
 The workstream's commits, in landing order. Each is one landing, and
 none repairs an earlier one. Each amends the documents whose current
-statements it changes, including those named here. L0 to L6 have
-landed; L7 is a target.
+statements it changes, including those named here. L0 to L7 have
+landed.
 
 - **L0**, documents only: this specification. Nothing ships.
 - **L1**, the consent codec, inert: consent tags 11 (`deploy-rollback`)
@@ -8988,10 +9031,17 @@ landed; L7 is a target.
   `td-svc/DESIGN.md`'s handed-off leaders; `td-install/INSTALLER.md`'s
   boot-health probes; §D's "eighth `su` block" and this section's
   account of today; and `AGENTS.md`'s principle 7 paragraph. After L3.
-- **L7**, root locked and root SSH refused in both forms, with the
-  roundtrip's deletion and the refusal evidence above. It amends the
-  principle 7 paragraph of `AGENTS.md`, `td-login/THREAT-MODEL.md` §1
-  and §3 and `td-login/TOKEN-LOGIN.md`'s "SSH". After L3 and L6.
+- **L7**, root locked, root SSH refused in both forms and td-init's
+  console shells retired, with the roundtrip's deletion, the refusal
+  evidence and the rollback window above. It amends the principle 7
+  paragraph of `AGENTS.md`, `td-login/THREAT-MODEL.md` §1, §3 and §8,
+  `td-login/TOKEN-LOGIN.md`'s "SSH", "Cutover", "Recovery" and its
+  other statements of L7 as pending, this section's account of today
+  and Recovery, `td-install/INSTALLER.md`'s SSH policy and recovery
+  paragraphs, `td-install/ENCRYPTION.md`'s item 9, its live-medium
+  repairs and its upgrade oracle, `td-svc/DESIGN.md`'s table with no
+  units, `UNSAFE.md` §3's cttyhack paragraph, `td-vm/DESIGN.md`, §W.7
+  and `README.md`. After L3 and L6.
 
 ## M. Hardware rendering — not painting into the corner
 
@@ -10147,17 +10197,16 @@ there as read-only copies.
 
 **Diagnosis.** `mail` and `news` are started once at boot by td-svc
 units with `restart=never`, so a client that exits stays gone until the
-operator starts it again. Today the two ways to do that are a reboot and
-`td-svc restart` from a root shell, which in a session means root SSH
-with a key (§L.1), and AGENTS.md forbids making a user-facing flow
-depend on the latter. Both programs now draw in td-ui windows of their
-own (§W.8, "Reworked"), so the pty the terminal grant insisted on is no
-longer in the way; what is missing is a user-level request that starts
-the program in a fresh window. Claude remains the terminal case: running
-it from a shell in the terminal window does not work, since td-jail's
-`devices=tty` grant makes the entry a session leader on a fresh pty and
-acquires that pty with `TIOCSCTTY`, which fails when the pty is already
-the shell's controlling terminal.
+operator starts it again. Today the one way to do that is a reboot:
+`td-svc restart` needs a root shell, and since §L.1's L7 no session has
+one, because root has no login. Both programs now draw in td-ui windows
+of their own (§W.8, "Reworked"), so the pty the terminal grant insisted
+on is no longer in the way; what is missing is a user-level request
+that starts the program in a fresh window. Claude remains the terminal
+case: running it from a shell in the terminal window does not work,
+since td-jail's `devices=tty` grant makes the entry a session leader on
+a fresh pty and acquires that pty with `TIOCSCTTY`, which fails when the
+pty is already the shell's controlling terminal.
 
 **Plan.** (1) The compositor's launcher already builds `td-term run`
 for a new terminal window on a key chord; it gains a request that

@@ -1013,7 +1013,7 @@ fn root_inspection_observes_file_state_without_publishing_or_repairing() {
         ("/etc/group", "root:x:0:\ntester:x:1000:\n", 0o644),
         (
             "/etc/shadow",
-            "root::1:0:99999:7:::\ntester::1:0:99999:7:::\n",
+            "root:!:1:0:99999:7:::\ntester::1:0:99999:7:::\n",
             0o600,
         ),
     ] {

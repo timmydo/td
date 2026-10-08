@@ -520,7 +520,7 @@ replaces. busybox getty re-acquires the terminal with `TIOCSCTTY(1)`, a
 steal; td-init passes the same pinned `NO_STEAL` 0 cttyhack does, so a
 terminal a LIVE session still holds is EPERM. Where the two applets then
 differ is what that means: cttyhack degrades and execs anyway, because a
-rescue shell without job control beats no shell, and getty REFUSES —
+shell without job control beats no shell, and getty REFUSES —
 the caller asked for a login session on this terminal, and one with no
 controlling terminal is a session where Ctrl-C reaches nothing and
 `login`'s child cannot be signalled. Refusing is also what the shipped

@@ -22,7 +22,7 @@
 //! before it respawns the greeter (td-svc/DESIGN.md, "Stopping").
 //!
 //! Unlike `cttyhack`, a terminal that cannot be claimed is FATAL here. cttyhack
-//! degrades because a rescue shell without job control still beats no shell;
+//! degrades because a shell without job control still beats no shell;
 //! getty has the opposite duty — the caller asked for a login session on this
 //! terminal, and a session with no controlling terminal is one where Ctrl-C
 //! reaches nothing and `login`'s child cannot be signalled. Failing is also what

@@ -9,20 +9,21 @@ pub const OPENSSH_KEX_ALGORITHMS: &str =
 pub const OPENSSH_KEY_ALGORITHMS: &str = "ssh-ed25519";
 pub const OPENSSH_CIPHERS: &str = "chacha20-poly1305@openssh.com";
 
-/// td-login/TOKEN-LOGIN.md, "SSH": the login state selects the form.
+/// td-login/TOKEN-LOGIN.md, "SSH": the login state selects the form. Both
+/// refuse root (APPLICATIONS.md §L.1, L7); they differ only by `AllowUsers`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Form {
-    /// Only a verifiably unenrolled machine: the policy from before the tier.
+    /// Only a verifiably unenrolled machine.
     Ordinary,
-    /// Enrolled or unavailable: no root, and no account but the primary.
+    /// Enrolled or unavailable: no account but the primary.
     Enforced,
 }
 
 /// The caller supplies the already admitted primary account name, never raw input.
 pub fn config(primary_name: &str, form: Form) -> String {
-    let admission = match form {
-        Form::Ordinary => "PermitRootLogin prohibit-password\n".to_owned(),
-        Form::Enforced => format!("PermitRootLogin no\nAllowUsers {primary_name}\n"),
+    let allow = match form {
+        Form::Ordinary => String::new(),
+        Form::Enforced => format!("AllowUsers {primary_name}\n"),
     };
     format!(
         "Port 22\n\
@@ -36,7 +37,8 @@ pub fn config(primary_name: &str, form: Form) -> String {
          ChallengeResponseAuthentication no\n\
          HostbasedAuthentication no\n\
          PermitEmptyPasswords no\n\
-         {admission}\
+         PermitRootLogin no\n\
+         {allow}\
          StrictModes yes\n\
          KexAlgorithms {OPENSSH_KEX_ALGORITHMS}\n\
          HostKeyAlgorithms {OPENSSH_KEY_ALGORITHMS}\n\

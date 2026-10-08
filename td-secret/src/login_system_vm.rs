@@ -9,7 +9,7 @@
 
 use super::*;
 use std::os::unix::fs::chown;
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 
 /// The boots, in order. `seed` enrolls two keys on an unenrolled machine;
 /// `locked` is the first enrolled boot; each `damaged-` boot shows its
@@ -349,8 +349,8 @@ fn unlock(host: &mut Host, keyboard: &mut Keyboard, key: &Virtual) {
 }
 
 /// `ssh` to `user` on loopback with `identity`, as root or as the primary
-/// account: whether the command ran.
-fn ssh(as_primary: bool, user: &str, identity: &str) -> bool {
+/// account, `-v` when `verbose`.
+fn ssh_output(as_primary: bool, user: &str, identity: &str, verbose: bool) -> Output {
     let mut command = if as_primary {
         let mut command = Command::new("/bin/td-login");
         command.args(["exec-as", "tester", "--", "/bin/ssh"]);
@@ -358,8 +358,12 @@ fn ssh(as_primary: bool, user: &str, identity: &str) -> bool {
     } else {
         Command::new("/bin/ssh")
     };
+    command.args(["-F", "/dev/null"]);
+    if verbose {
+        command.arg("-v");
+    }
     command
-        .args(["-F", "/dev/null", "-i", identity])
+        .args(["-i", identity])
         .args(["-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes"])
         .args(["-o", "StrictHostKeyChecking=yes"])
         .args(["-o", "UserKnownHostsFile=/run/td-ssh-known-hosts"])
@@ -379,24 +383,41 @@ fn ssh(as_primary: bool, user: &str, identity: &str) -> bool {
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     );
+    output
+}
+
+/// Whether the command ran.
+fn ssh(as_primary: bool, user: &str, identity: &str) -> bool {
+    let output = ssh_output(as_primary, user, identity, false);
     output.status.success() && output.stdout == format!("{SSH_REPLY}\n").as_bytes()
 }
 
-/// The boot's sshd form: the ordinary one admits root's loopback key, the
-/// enforced one refuses it; both admit the primary account's, which boot
-/// health made.
+/// Whether the daemon refused `identity` for `user` after the client offered
+/// it: ssh's own 255, no command output, and the offer before the publickey
+/// denial. A connection that failed offered nothing, so it is not a refusal.
+fn ssh_refused(user: &str, identity: &str) -> bool {
+    let output = ssh_output(false, user, identity, true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let offered = stderr.find(&format!("Offering public key: {identity} ED25519 "));
+    let denied = stderr.rfind("Permission denied (publickey)");
+    output.status.code() == Some(255)
+        && output.stdout.is_empty()
+        && matches!((offered, denied), (Some(o), Some(d)) if o < d)
+}
+
+/// The boot's sshd form: both refuse a loopback root key in the persistent
+/// file (APPLICATIONS.md §L.1, L7) and admit the primary account's, which
+/// boot health made; only the enforced one names `AllowUsers`.
 fn sshd(enforced: bool) {
     let config = fs::read_to_string("/run/td-sshd.conf").unwrap();
+    assert!(!config.contains("prohibit-password"), "{config}");
     if enforced {
         assert!(
             config.contains("PermitRootLogin no\nAllowUsers tester\n"),
             "{config}"
         );
     } else {
-        assert!(
-            config.contains("PermitRootLogin prohibit-password\n"),
-            "{config}"
-        );
+        assert!(config.contains("PermitRootLogin no\n"), "{config}");
         assert!(!config.contains("AllowUsers"), "{config}");
     }
     let identity = Path::new(WORK).join("root-key");
@@ -427,7 +448,7 @@ fn sshd(enforced: bool) {
     write!(authorized, "restrict,from=\"127.0.0.1\" {public}").unwrap();
     authorized.sync_all().unwrap();
     let identity = identity.to_str().unwrap();
-    assert_eq!(ssh(false, "root", identity), !enforced, "root over SSH");
+    assert!(ssh_refused("root", identity), "root over SSH");
     assert!(
         ssh(true, "tester", "/run/td-ssh-selftest"),
         "the primary over SSH"

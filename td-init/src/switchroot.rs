@@ -6,12 +6,14 @@
 //! rootfs, the only place switch_root runs.
 //!
 //! Everything fallible happens BEFORE the first mount moves — INIT is proven
-//! executable inside the new root, and NEWROOT proven a mount point — because a
-//! failure after `chroot(2)` is an unrecoverable kernel panic. One window
-//! remains, as it does in util-linux: the API mounts move before the root does,
-//! so a failed root move strands them under NEWROOT. The old rootfs is freed in
-//! that same window — busybox's order — so a failed root move also leaves no
-//! rescue shell behind. Everything that can be checked has been by then.
+//! executable inside the new root, and NEWROOT proven a mount point — so a
+//! refusal names its cause on the console while the initramfs is intact. As
+//! PID 1 the refusal then fails the boot (`main`'s `Outcome`): the kernel
+//! panics, td's `panic=-1` reboots, and a pending deployment's attempt is
+//! spent. No shell is offered (APPLICATIONS.md §L.1, L7). One window remains, as it does in
+//! util-linux: the API mounts move before the root does, so a failed root move
+//! strands them under NEWROOT. The old rootfs is freed in that same window —
+//! busybox's order. Everything that can be checked has been by then.
 
 use crate::sys;
 use std::collections::VecDeque;

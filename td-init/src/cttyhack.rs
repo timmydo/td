@@ -4,13 +4,16 @@
 //! `TIOCSCTTY` is EPERM for it and the shell it execs comes up with no
 //! controlling terminal: no job control, and ^C kills nothing. This applet is
 //! the standard fix — `setsid(2)`, open the console, claim it, exec — and it is
-//! why init's own inittab spawns shells through it rather than directly.
+//! why a busybox inittab spawns console shells through it. td's own table
+//! spawns none, and td-init offers no shell when PID 1 fails (APPLICATIONS.md
+//! §L.1, L7).
 //!
 //! No `dup2(2)` is needed to put the console on 0/1/2: `Stdio::from(File)` makes
 //! `CommandExt::exec` do that redirection in its own (safe) pre-exec setup.
 //!
 //! If the console cannot be claimed the program is exec'd anyway, on inherited
-//! stdio. cttyhack must never be the reason a rescue shell fails to start.
+//! stdio. cttyhack must never be the reason the shell it was asked for fails
+//! to start.
 //!
 //! `--stdin` is the exception, and it is td-authd's terminal launch's: the caller
 //! has already put a PTY slave on descriptor zero and needs the child to LEAD a
@@ -176,15 +179,15 @@ fn claim_console() -> Result<File, String> {
         .custom_flags(O_NOCTTY)
         .open(&path)
         .map_err(|e| format!("{path}: {e}"))?;
-    // A failed claim is reported, never fatal: a rescue shell without job
-    // control still beats no shell at all.
+    // A failed claim is reported, never fatal: a shell without job control
+    // still beats no shell at all.
     claim(console.as_raw_fd(), &path);
     Ok(console)
 }
 
 /// `--stdin`'s claim. `setsid(2)` unconditionally, so an inherited controlling
 /// terminal is dropped rather than kept alongside the new one, then the same
-/// non-stealing `TIOCSCTTY(0)` the rescue path uses. Every failure is fatal:
+/// non-stealing `TIOCSCTTY(0)` the plain mode uses. Every failure is fatal:
 /// the caller asked for a session on this terminal, and half of one is not it.
 fn claim_stdin_session() -> Result<(), String> {
     stdin_precondition(std::io::stdin().is_terminal())?;
@@ -272,7 +275,7 @@ mod tests {
         assert_eq!(split_mode(&[]), (false, &[][..]));
     }
 
-    /// `--stdin` fails closed. Rescue mode degrades to no controlling terminal
+    /// `--stdin` fails closed. Plain mode degrades to no controlling terminal
     /// because a shell without job control beats no shell; a terminal emulator
     /// has no such fallback, so a descriptor that is not a terminal is refused
     /// before `setsid(2)` is issued at all.
@@ -290,7 +293,7 @@ mod tests {
     /// means a live session has it — the kernel releases the association when a
     /// session leader exits, so "still held" and "still alive" are the same
     /// fact — and `cttyhack sh` typed at an operator's own console is exactly
-    /// that case. A rescue shell without job control beats taking their
+    /// that case. A shell without job control beats taking their
     /// terminal away, so the applet continues without one.
     #[test]
     fn a_terminal_held_by_a_live_session_is_left_alone() {

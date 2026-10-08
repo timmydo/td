@@ -242,7 +242,8 @@ for the initial stock-desktop lifecycle increment. The image producer owns:
   The image increment must pin and test the exact prefix/mount arrangement.
 - td-compositor, td-term, matching terminfo, and an ordinary development-user
   session. The provisioner creates state through its fixed service operation;
-  the UI must not depend on root SSH (APPLICATIONS.md §L.1).
+  root has no login, SSH included, so no step can need one
+  (APPLICATIONS.md §L.1, L7).
 - The reviewed Claude application payload and runtime, with its working
   directories, configuration, credentials, and child tools reachable through
   its proper launch path. Claude is the only guest agent until td-agent

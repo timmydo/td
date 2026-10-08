@@ -262,7 +262,7 @@ fn init() {
         ("/var/lib/td/principals.tsv",table,0o600),
         ("/etc/passwd","root:x:0:0:root:/root:/bin/false\nalice:x:1000:1000:Test:/home/alice:/bin/false\ntdc1000:x:993:993:Compositor:/run:/bin/false\n",0o644),
         ("/etc/group","root:x:0:\nalice:x:1000:\ntdc1000:x:993:\n",0o644),
-        ("/etc/shadow","root::1:0:99999:7:::\nalice::1:0:99999:7:::\ntdc1000:!td-service:1:0:99999:7:::\n",0o600),
+        ("/etc/shadow","root:!:1:0:99999:7:::\nalice::1:0:99999:7:::\ntdc1000:!td-service:1:0:99999:7:::\n",0o600),
     ] { fs::write(path,text).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(mode)).unwrap(); }
     // Unenrolled: td-login's console logins, login-primary among them, refuse
     // and park unless this root-owned 0700 directory lacks the record.

@@ -1434,8 +1434,9 @@ fn consent_report(
     installation_consent::Report::decode(&payload)
 }
 
-/// The installed application oracle uses the standard VM's loopback-only SSH
-/// fixture. Its inputs exist only on the full-system diagnostic ISO.
+/// The installed application oracle uses the standard VM's loopback-only root
+/// SSH key, which that boot's health requires sshd to refuse (APPLICATIONS.md
+/// §L.1, L7). Its inputs exist only on the full-system diagnostic ISO.
 fn seed_system_autotest(source: &Path, state: &Path) -> Result<(), String> {
     let private = read(&source.join(SYSTEM_AUTOTEST_PRIVATE), 4096)?;
     let authorized = read(&source.join(SYSTEM_AUTOTEST_AUTHORIZED), 4096)?;
@@ -1449,7 +1450,7 @@ fn seed_system_autotest(source: &Path, state: &Path) -> Result<(), String> {
             .map_err(|error| format!("chmod {}: {error}", path.display()))?;
     }
     for (relative, bytes) in [
-        ("lib/td-test/openssh-admin-selftest", private),
+        ("lib/td-test/root-ssh-refusal-key", private),
         ("lib/td/ssh/authorized_keys", authorized),
     ] {
         let path = state.join(relative);
@@ -2129,7 +2130,7 @@ mod tests {
         seed_system_autotest(&source.0, &state.0).unwrap();
         for (relative, expected) in [
             (
-                "lib/td-test/openssh-admin-selftest",
+                "lib/td-test/root-ssh-refusal-key",
                 b"private fixture".as_slice(),
             ),
             ("lib/td/ssh/authorized_keys", b"public fixture".as_slice()),

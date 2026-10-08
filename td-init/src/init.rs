@@ -15,7 +15,14 @@
 //! `init --dry-run [-f FILE]` prints on stdout the jobs it would run, preceded
 //! by any complaint about the table so a report read through a pipe is never
 //! jobs alone. It exits non-zero on any such complaint, including a table that
-//! yielded no jobs and fell back to the built-in one.
+//! yielded no jobs.
+//!
+//! There is no built-in table. A table that will not open, or yields no jobs,
+//! fails the boot: PID 1 reports it and returns, and `main` lets that return
+//! panic the kernel, which td's `panic=-1` turns into a reboot; a pending
+//! deployment's spent attempt counts toward td-boot's automatic rollback. A
+//! console shell in its place would be root's with no login (APPLICATIONS.md
+//! §L.1, L7).
 
 use crate::sys;
 use std::fs::OpenOptions;
@@ -33,14 +40,6 @@ const DEFAULT_ENV: &[(&str, &str)] = &[
     ("SHELL", "/bin/sh"),
     ("USER", "root"),
 ];
-
-/// The table used when `/etc/inittab` is unreadable: bring the system up, then
-/// keep a shell on the console. `cttyhack` is what makes that shell a session
-/// leader with a controlling terminal, so job control works in a rescue.
-const DEFAULT_TABLE: &str = "\
-::sysinit:/etc/init.d/rcS
-::respawn:/bin/cttyhack /bin/sh
-";
 
 /// A respawn job that dies faster than this is restarted only after
 /// `RESPAWN_DELAY`, so a broken command cannot spin the machine.
@@ -251,36 +250,34 @@ pub fn parse_inittab(text: &str) -> (Vec<Entry>, Vec<String>) {
     (entries, problems)
 }
 
-/// The built-in table plus the reason it is being used, prefixed to whatever
-/// else the caller had to say.
-fn fall_back(why: String) -> (Vec<Entry>, Vec<String>) {
-    let (entries, problems) = parse_inittab(DEFAULT_TABLE);
-    let mut all = vec![why];
-    all.extend(problems);
-    (entries, all)
-}
+/// What every unusable-table complaint ends with, so the report and the
+/// console both say what PID 1 does about it.
+const UNUSABLE: &str = "PID 1 fails the boot on it";
 
+/// The table's jobs and complaints. A table that would not open yields no
+/// jobs and says why; so does one that opens and yields none, which is as
+/// unusable: an empty file, an all-comment file, and a table whose every
+/// action td rejects all land here. busybox installs a console shell instead;
+/// td does not (the module header).
 fn load(path: &str) -> (Vec<Entry>, Vec<String>) {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) => return fall_back(format!("{path}: {e}; using the built-in table")),
+        Err(e) => return (Vec::new(), vec![format!("{path}: {e}; {UNUSABLE}")]),
     };
-    let (entries, problems) = parse_inittab(&text);
-    if !entries.is_empty() {
-        return (entries, problems);
+    let (entries, mut problems) = parse_inittab(&text);
+    if entries.is_empty() {
+        problems.push(format!("{path}: no usable entries; {UNUSABLE}"));
     }
-    // A table that yields NO jobs is as unusable as one that would not open:
-    // supervise() would idle forever with no console shell, which is a machine
-    // that is up and cannot be repaired from its own console. An empty file, an
-    // all-comment file, and a table whose every action td rejects all land here.
-    // busybox init installs its defaults on an empty action list for the same
-    // reason.
-    let (entries, note) = fall_back(format!(
-        "{path}: no usable entries; using the built-in table"
-    ));
-    let mut all = problems;
-    all.extend(note);
-    (entries, all)
+    (entries, problems)
+}
+
+/// The jobs PID 1 runs, or the refusal that fails the boot: never a job
+/// it made up.
+fn jobs(path: &str, entries: Vec<Entry>) -> Result<Vec<Entry>, String> {
+    if entries.is_empty() {
+        return Err(format!("{path}: no table to run; failing the boot"));
+    }
+    Ok(entries)
 }
 
 // ── running jobs ────────────────────────────────────────────────────────────
@@ -566,8 +563,8 @@ const METACHARACTERS: [char; 14] = [
 /// hands the redirect over literally, so the answer turns on which program
 /// actually runs, not on a `-c` appearing somewhere.
 ///
-/// Wrappers are transparent because a real inittab is mostly wrappers — the
-/// built-in table's own `cttyhack /bin/sh -c ...` does run a shell, and calling
+/// Wrappers are transparent because a real inittab is mostly wrappers — a
+/// busybox table's `cttyhack /bin/sh -c ...` does run a shell, and calling
 /// that field "passed through as an argument" would be the opposite of true.
 /// Each execs the rest of its argv, so step over it and ask again of what is
 /// left. busybox is the same shape with its applet in argv[1].
@@ -671,9 +668,9 @@ fn dry_run(entries: &[Entry], problems: &[String]) -> Result<u8, String> {
 fn report(entries: &[Entry], problems: &[String]) -> String {
     let mut out = String::new();
     // On stdout, ahead of the jobs, because one of these is "your table yielded
-    // nothing, so what follows is the BUILT-IN table" — and an operator reading
-    // the report through a pipe would otherwise see jobs that are not in their
-    // file with the explanation on a stream they are not looking at.
+    // nothing, so PID 1 fails the boot" — and an operator reading the report
+    // through a pipe would otherwise see no jobs and no reason on the stream
+    // they are looking at.
     for problem in problems {
         out.push_str(&format!("# {problem}\n"));
     }
@@ -779,7 +776,7 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     for problem in &problems {
         log(problem);
     }
-    boot(entries)
+    boot(jobs(&opts.path, entries)?)
 }
 
 #[cfg(test)]
@@ -897,32 +894,12 @@ mod tests {
         assert!(split_argv(r"/bin/sh \").is_err());
     }
 
-    /// The built-in table is what an image with no `/etc/inittab` boots, so it
-    /// must parse cleanly and keep a shell on the console.
+    /// No shell stands in for a table PID 1 cannot use: a missing table, and
+    /// one that opens and yields no jobs, both come back with no job at all and
+    /// the reason, and PID 1's `jobs` turns that into the refusal that fails
+    /// the boot (APPLICATIONS.md §L.1, L7).
     #[test]
-    fn the_built_in_table_is_valid() {
-        let (entries, problems) = parse_inittab(DEFAULT_TABLE);
-        assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[1].action, Action::Respawn);
-        assert!(entries[1].argv.first().unwrap().ends_with("cttyhack"));
-    }
-
-    #[test]
-    fn a_missing_inittab_falls_back_to_the_built_in_table() {
-        let (entries, problems) = load("/nonexistent/inittab");
-        assert_eq!(entries.len(), 2);
-        assert!(problems
-            .first()
-            .unwrap()
-            .contains("using the built-in table"));
-    }
-
-    /// A table that OPENS but yields no jobs is just as unusable as one that
-    /// does not: PID 1 would idle forever with no console shell, which is a
-    /// machine that is up and cannot be repaired from its own console.
-    #[test]
-    fn a_table_with_no_usable_entries_falls_back_too() {
+    fn an_unusable_table_fails_the_boot_and_runs_no_shell() {
         let dir = std::env::temp_dir().join(format!("td-init-tab-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let write = |name: &str, text: &str| {
@@ -931,6 +908,7 @@ mod tests {
             p.to_string_lossy().into_owned()
         };
 
+        let mut unusable = vec![("missing".to_string(), "/nonexistent/inittab".to_string())];
         for (name, text) in [
             ("empty", ""),
             ("comments", "# nothing but a comment\n\n"),
@@ -941,23 +919,28 @@ mod tests {
                 "::ctrlaltdel:/bin/reboot\n::shutdown:/bin/umount -a -r\n",
             ),
         ] {
-            let (entries, problems) = load(&write(name, text));
-            assert_eq!(entries.len(), 2, "{name} did not fall back: {problems:?}");
+            unusable.push((name.to_string(), write(name, text)));
+        }
+        for (name, path) in &unusable {
+            let (entries, problems) = load(path);
+            assert!(entries.is_empty(), "{name} yielded jobs: {entries:?}");
             assert!(
-                problems
-                    .iter()
-                    .any(|p| p.contains("using the built-in table")),
+                problems.last().is_some_and(|p| p.ends_with(UNUSABLE)),
                 "{name}: {problems:?}"
             );
+            let refusal = jobs(path, entries).unwrap_err();
+            assert!(refusal.contains("failing the boot"), "{name}: {refusal}");
         }
 
         // A table with even ONE usable job is the operator's, and is left alone.
-        let (entries, problems) = load(&write("one", "::once:/bin/true\n::bogus:/bin/false\n"));
+        let one = write("one", "::once:/bin/true\n::bogus:/bin/false\n");
+        let (entries, problems) = load(&one);
         assert_eq!(entries.len(), 1);
         assert!(
-            !problems.iter().any(|p| p.contains("built-in")),
+            !problems.iter().any(|p| p.contains(UNUSABLE)),
             "{problems:?}"
         );
+        assert_eq!(jobs(&one, entries).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -970,11 +953,11 @@ mod tests {
         assert_eq!(dry_run(&good, &none), Ok(0));
         let (some, problems) = parse_inittab("nonsense\n");
         assert_eq!(dry_run(&some, &problems), Ok(1));
-        // A table that yields no jobs is unusable even with nothing rejected, and
-        // `load` quietly substitutes the built-in one — so the validator has to
-        // fail on it too, or `-f /dev/null` reads as a clean bill of health.
-        let (fell_back, why) = load("/nonexistent/inittab");
-        assert_eq!(dry_run(&fell_back, &why), Ok(1));
+        // A table that yields no jobs is unusable even with nothing rejected, so
+        // the validator has to fail on it too, or `-f /dev/null` reads as a
+        // clean bill of health for a table PID 1 refuses.
+        let (none_run, why) = load("/nonexistent/inittab");
+        assert_eq!(dry_run(&none_run, &why), Ok(1));
     }
 
     /// Supervising from a process that is not PID 1 re-runs sysinit and duplicates
@@ -996,21 +979,15 @@ mod tests {
         );
     }
 
-    /// The jobs printed may not be the operator's at all: `load` substitutes the
-    /// built-in table for one it could not use. The reason therefore rides
-    /// stdout WITH the jobs and ahead of them — logged to stderr it is a caption
-    /// on a stream nobody reading the report through a pipe is looking at.
+    /// An unusable table prints no jobs, so the reason is the whole report, on
+    /// stdout where a reader of the pipe sees it, and it says what PID 1 does.
     #[test]
-    fn the_report_says_up_front_when_the_jobs_are_not_the_operators() {
+    fn the_report_says_why_a_table_runs_nothing() {
         let (entries, problems) = load("/nonexistent/inittab");
         let text = report(&entries, &problems);
-        let first = text.lines().next().unwrap_or("");
-        assert!(first.starts_with("# "), "not a leading note: {text}");
-        assert!(first.contains("using the built-in table"), "{text}");
-        // ...and the jobs are still there, after it.
-        assert!(text.contains("respawn"), "{text}");
-        let at = |needle: &str| text.match_indices(needle).next().map(|(i, _)| i).unwrap();
-        assert!(at("built-in table") < at("respawn"), "{text}");
+        assert!(text.starts_with("# /nonexistent/inittab: "), "{text}");
+        assert!(text.trim_end().ends_with(UNUSABLE), "{text}");
+        assert_eq!(text.lines().count(), 1, "{text}");
         // A table with nothing to say about it is jobs alone.
         let (good, none) = parse_inittab("::once:/bin/true\n");
         assert_eq!(report(&good, &none), "once - /bin/true\n");
@@ -1075,7 +1052,7 @@ mod tests {
         );
         assert_eq!(sw(&args(&["/bin/bash", "-c", "x >/dev/log"])), None);
         // A wrapper runs the shell behind it, so the note must not claim
-        // otherwise. cttyhack is the one the BUILT-IN table itself uses.
+        // otherwise. cttyhack is the one busybox tables use for a console.
         for wrapped in [
             ["/bin/cttyhack", "/bin/sh", "-c", "echo $HOME"],
             ["/sbin/setsid", "/bin/sh", "-c", "echo $HOME"],
