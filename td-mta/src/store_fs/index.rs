@@ -111,19 +111,14 @@ fn sequence(bytes: &[u8]) -> Result<Sequence, ports::Error> {
         bytes.try_into().map_err(|_| ports::Error::Corrupt)?,
     )))
 }
-fn copy_blob(
+fn fixed_blob<const N: usize>(
     row: &rusqlite::Row<'_>,
     column: usize,
-    output: &mut [u8],
-) -> Result<usize, ports::Error> {
+) -> Result<[u8; N], ports::Error> {
     let ValueRef::Blob(bytes) = row.get_ref(column).map_err(sql)? else {
         return Err(ports::Error::Corrupt);
     };
-    output
-        .get_mut(..bytes.len())
-        .ok_or(ports::Error::Capacity)?
-        .copy_from_slice(bytes);
-    Ok(bytes.len())
+    bytes.try_into().map_err(|_| ports::Error::Corrupt)
 }
 struct Budget {
     deadline: Deadline,
@@ -1220,10 +1215,8 @@ fn identity(
         .query([account.as_bytes().as_slice()])
         .map_err(sql)?;
     let row = rows.next().map_err(sql)?.ok_or(ports::Error::NotFound)?;
-    let mut endpoint = [0; 8];
-    let mut floor = [0; 8];
-    copy_blob(row, 0, &mut endpoint)?;
-    copy_blob(row, 1, &mut floor)?;
+    let endpoint = fixed_blob::<8>(row, 0)?;
+    let floor = fixed_blob::<8>(row, 1)?;
     Ok(ViewIdentity {
         account,
         epoch,
@@ -1520,8 +1513,7 @@ fn next_change(
         let Some(row) = rows.next().map_err(sql)? else {
             return Ok(ChangeStep::Complete);
         };
-        let mut seq = [0; 8];
-        copy_blob(row, 0, &mut seq)?;
+        let seq = fixed_blob::<8>(row, 0)?;
         let operation: u32 = row.get(1).map_err(sql)?;
         let action: i64 = row.get(2).map_err(sql)?;
         let action = match action {
@@ -1530,8 +1522,7 @@ fn next_change(
             3 => ChangeAction::Destroyed,
             _ => return Err(ports::Error::Corrupt),
         };
-        let mut id = [0; 16];
-        copy_blob(row, 3, &mut id)?;
+        let id = fixed_blob::<16>(row, 3)?;
         Ok(ChangeStep::Record(ChangeRecord {
             cursor: ChangeCursor {
                 sequence: sequence(&seq)?,
@@ -1950,6 +1941,187 @@ mod tests {
             ),
             Err(CommitError::Rejected(ports::Error::Capacity))
         );
+    }
+    #[test]
+    fn account_identity_rejects_nonexact_blob_widths() {
+        let mut wrong = Vec::new();
+        for column in ["sequence", "floor"] {
+            for length in [0, 7, 9] {
+                let fixture = Fixture::new();
+                let mut root = fixture.locked();
+                let store = IndexStore::create(
+                    &mut root,
+                    StoreEpoch::from_bytes([9; 16]),
+                    Arc::new(Timer(AtomicU64::new(1))),
+                    2,
+                    deadline(),
+                )
+                .unwrap();
+                store.create_account(ACCOUNT, deadline()).unwrap();
+                let old = store.view(ACCOUNT, deadline()).unwrap();
+                let original = old.identity();
+                lock(&store.writer)
+                    .unwrap()
+                    .native
+                    .run(|db| {
+                        db.execute_batch("PRAGMA ignore_check_constraints=ON")
+                            .map_err(sql)?;
+                        let statement = if column == "sequence" {
+                            "UPDATE accounts SET sequence=?1 WHERE id=?2"
+                        } else {
+                            "UPDATE accounts SET floor=?1 WHERE id=?2"
+                        };
+                        assert_eq!(
+                            db.execute(
+                                statement,
+                                params![vec![0u8; length], ACCOUNT.as_bytes().as_slice()]
+                            )
+                            .map_err(sql)?,
+                            1
+                        );
+                        db.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                            .map_err(sql)
+                    })
+                    .unwrap();
+                let actual = store.view(ACCOUNT, deadline()).map(|view| view.identity());
+                if actual != Err(ports::Error::Corrupt) {
+                    wrong.push((column, length, actual));
+                }
+                assert_eq!(
+                    old.native()
+                        .unwrap()
+                        .run(|db| identity(db, ACCOUNT, original.epoch)),
+                    Ok(original)
+                );
+                lock(&store.writer)
+                    .unwrap()
+                    .native
+                    .run(|db| {
+                        db.execute(
+                            "UPDATE accounts SET sequence=?1,floor=?1 WHERE id=?2",
+                            params![0u64.to_be_bytes().as_slice(), ACCOUNT.as_bytes().as_slice()],
+                        )
+                        .map_err(sql)?;
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(
+                    store.view(ACCOUNT, deadline()).unwrap().identity(),
+                    original
+                );
+            }
+        }
+        assert!(wrong.is_empty(), "nonexact account metadata: {wrong:?}");
+    }
+    #[test]
+    fn change_reader_rejects_nonexact_blob_widths() {
+        let mut wrong = Vec::new();
+        for (column, length) in [
+            ("sequence", 7),
+            ("sequence", 9),
+            ("object", 0),
+            ("object", 15),
+            ("object", 17),
+        ] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = IndexStore::create(
+                &mut root,
+                StoreEpoch::from_bytes([9; 16]),
+                Arc::new(Timer(AtomicU64::new(1))),
+                2,
+                deadline(),
+            )
+            .unwrap();
+            store.create_account(ACCOUNT, deadline()).unwrap();
+            let value = mailbox("one", None);
+            let operations = [
+                Operation::put(Table::Mailboxes, ID.as_bytes(), &value).unwrap(),
+                Operation::change(ObjectType::Mailbox, ChangeAction::Created, ID.as_bytes()),
+            ];
+            assert_eq!(
+                store.commit(
+                    &td_crypto::Provider,
+                    CommitRequest {
+                        account: ACCOUNT,
+                        expected: Sequence::default(),
+                        utc_ms: 0,
+                        deadline: deadline(),
+                    },
+                    &operations,
+                    &mut []
+                ),
+                Ok(Sequence::from_u64(1))
+            );
+            // Keep both malformed sequence blobs inside the native range seek.
+            lock(&store.writer)
+                .unwrap()
+                .native
+                .run(|db| {
+                    db.execute(
+                        "UPDATE accounts SET sequence=?1 WHERE id=?2",
+                        params![
+                            512u64.to_be_bytes().as_slice(),
+                            ACCOUNT.as_bytes().as_slice()
+                        ],
+                    )
+                    .map_err(sql)?;
+                    Ok(())
+                })
+                .unwrap();
+            let start = ChangeCursor {
+                sequence: Sequence::default(),
+                operation: u32::MAX,
+            };
+            let expected = ChangeStep::Record(ChangeRecord {
+                cursor: ChangeCursor {
+                    sequence: Sequence::from_u64(1),
+                    operation: 1,
+                },
+                change: Change {
+                    kind: ObjectType::Mailbox,
+                    id: *ID.as_bytes(),
+                    action: ChangeAction::Created,
+                },
+            });
+            let mut old = store.view(ACCOUNT, deadline()).unwrap();
+            assert_eq!(old.next_change(start, ObjectType::Mailbox), Ok(expected));
+            let mut malformed = vec![0u8; length];
+            if column == "sequence" {
+                if length == 7 {
+                    malformed[6] = 1;
+                } else {
+                    malformed[7] = 1;
+                }
+            }
+            lock(&store.writer)
+                .unwrap()
+                .native
+                .run(|db| {
+                    db.execute_batch("PRAGMA ignore_check_constraints=ON")
+                        .map_err(sql)?;
+                    let statement = if column == "sequence" {
+                        "UPDATE changes SET sequence=?1 WHERE account=?2"
+                    } else {
+                        "UPDATE changes SET object=?1 WHERE account=?2"
+                    };
+                    assert_eq!(
+                        db.execute(statement, params![malformed, ACCOUNT.as_bytes().as_slice()])
+                            .map_err(sql)?,
+                        1
+                    );
+                    db.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                        .map_err(sql)
+                })
+                .unwrap();
+            let mut current = store.view(ACCOUNT, deadline()).unwrap();
+            let actual = current.next_change(start, ObjectType::Mailbox);
+            if actual != Err(ports::Error::Corrupt) {
+                wrong.push((column, length, actual));
+            }
+            assert_eq!(old.next_change(start, ObjectType::Mailbox), Ok(expected));
+        }
+        assert!(wrong.is_empty(), "nonexact change metadata: {wrong:?}");
     }
     #[test]
     fn changes_use_native_order_and_reject_incoherent_or_duplicate_actions() {

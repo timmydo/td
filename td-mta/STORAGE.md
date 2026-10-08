@@ -139,6 +139,11 @@ Native deferred foreign keys enforce final owning relationships even when a
 target is deleted. Bounded parent walking also refuses mailbox cycles. Exact
 unsigned account sequences use eight-byte big-endian blobs, preserving values
 above i64::MAX; overflow refuses mutation. Account creation is bounded to 128.
+Account endpoint and history-floor reads require exactly eight bytes.
+For each change row selected by the native range query, the sequence must
+have eight bytes and the object ID sixteen. Short or oversized blobs
+return Corrupt; the reader never pads them or treats their stored width
+as caller scratch exhaustion. These checks do not scan unselected rows.
 Change actions must agree with pre/post existence, and a unique native index
 refuses duplicate changes for one object within a transaction.
 
