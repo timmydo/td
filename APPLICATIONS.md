@@ -11144,7 +11144,7 @@ background process group of its own, it is stopped by a terminal set to
 `tostop` when it writes an error there, its fetches then waiting until
 the application ends. Every fetch the applications make goes through
 that service, as on td, since they carry no network client of their own
-(td-agent makes none until its model client, td-agent/DESIGN.md §18);
+(td-agent's model requests among them, td-agent/DESIGN.md);
 that is a property of the applications, not a boundary this launch
 enforces, and nothing of §W's confinement holds here. This section's
 two-configuration rule reads the launch as availability: the

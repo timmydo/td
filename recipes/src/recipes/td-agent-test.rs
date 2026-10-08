@@ -5,7 +5,7 @@ const BIN: &str = "{in:td-agent}/bin/td-agent";
 /// td-agent's realized-output check: the binary exists, is static, and
 /// answers its three help modes, which read no state, configuration or key.
 /// The window needs a compositor and the model a network, which a build
-/// sandbox has neither of; the boot oracle starts it on td.
+/// sandbox has neither of.
 pub fn recipe() -> Recipe {
     let steps = vec![
         Step::Require {

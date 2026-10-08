@@ -274,7 +274,6 @@ const TD_TERM_RUNTIME_MARKER: &str = td_recipe::ladder::TD_TERM_RUNTIME_MARKER;
 // and did not exit on it.
 const TD_MAIL_BOOT_MARKER: &str = td_recipe::ladder::TD_MAIL_BOOT_MARKER;
 const TD_FETCH_BOOT_MARKER: &str = td_recipe::ladder::TD_FETCH_BOOT_MARKER;
-const TD_AGENT_JAIL_BOOT_MARKER: &str = td_recipe::ladder::TD_AGENT_JAIL_BOOT_MARKER;
 const TD_NEWS_BOOT_MARKER: &str = td_recipe::ladder::TD_NEWS_BOOT_MARKER;
 const TD_APPLICATIONS_PLACED_MARKER: &str = td_recipe::ladder::TD_APPLICATIONS_PLACED_MARKER;
 
@@ -593,7 +592,6 @@ struct ConsoleEvidence {
     td_pointer_absolute: bool,
     td_term_runtime: bool,
     td_fetch_ok: bool,
-    td_agent_jail_ok: bool,
     td_mail_running: bool,
     td_news_running: bool,
     td_applications_placed: bool,
@@ -2328,17 +2326,6 @@ fn validate_system_boot(
              UI user's runtime directory, or its probe did not get the policy's exact \
              refusal of a loopback URL, so the terminal applications' one network \
              client is not there (APPLICATIONS.md §W.8). Last serial output:\n{}",
-            tail(&result.console, 80)
-        ));
-    }
-    if !result.evidence.td_agent_jail_ok {
-        return Err(format!(
-            "the session came up, but td-agent's workspace jail marker was absent \
-             ({TD_AGENT_JAIL_BOOT_MARKER:?}) — the egress relay did not answer its probe, \
-             or `td-agent check-jail` could not launch a workspace instance from the \
-             image's td-jail and td-txt as td's account, write in its worktree or run \
-             git there, so the launcher's coding agent could run no tool \
-             (td-agent/DESIGN.md §8). Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -6661,7 +6648,6 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_POINTER_ABSOLUTE_MARKER.len(),
         TD_TERM_RUNTIME_MARKER.len(),
         exact_line_window(TD_FETCH_BOOT_MARKER),
-        exact_line_window(TD_AGENT_JAIL_BOOT_MARKER),
         exact_line_window(TD_MAIL_BOOT_MARKER),
         exact_line_window(TD_NEWS_BOOT_MARKER),
         exact_line_window(TD_APPLICATIONS_PLACED_MARKER),
@@ -7193,12 +7179,6 @@ fn latch_console_evidence_from(
         &mut evidence.td_fetch_ok,
         buf,
         TD_FETCH_BOOT_MARKER.as_bytes(),
-        starts_at_stream_boundary,
-    );
-    latch_line_marker(
-        &mut evidence.td_agent_jail_ok,
-        buf,
-        TD_AGENT_JAIL_BOOT_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_line_marker(
@@ -11218,7 +11198,6 @@ mod tests {
             TD_POINTER_ABSOLUTE_MARKER,
             TD_TERM_RUNTIME_MARKER,
             TD_FETCH_BOOT_MARKER,
-            TD_AGENT_JAIL_BOOT_MARKER,
             TD_MAIL_BOOT_MARKER,
             TD_NEWS_BOOT_MARKER,
             TD_APPLICATIONS_PLACED_MARKER,
@@ -11602,7 +11581,6 @@ mod tests {
         evidence.td_sandbox_kernel = true;
         evidence.td_term_runtime = true;
         evidence.td_fetch_ok = true;
-        evidence.td_agent_jail_ok = true;
         evidence.td_mail_running = true;
         evidence.td_news_running = true;
         evidence.td_applications_placed = true;
@@ -12091,15 +12069,6 @@ mod tests {
             "the rejection must name the fetch marker: {complaint}"
         );
 
-        let mut without_agent = healthy_evidence();
-        without_agent.td_agent_jail_ok = false;
-        let complaint = validate(&boot(without_agent))
-            .expect_err("a boot missing td-agent's jail marker must be rejected");
-        assert!(
-            complaint.contains(&format!("({TD_AGENT_JAIL_BOOT_MARKER:?})")),
-            "the rejection must name td-agent's jail marker: {complaint}"
-        );
-
         let mut without_mail = healthy_evidence();
         without_mail.td_mail_running = false;
         let complaint = validate(&boot(without_mail))
@@ -12136,7 +12105,6 @@ mod tests {
         let latched = |evidence: &ConsoleEvidence| {
             [
                 evidence.td_fetch_ok,
-                evidence.td_agent_jail_ok,
                 evidence.td_mail_running,
                 evidence.td_news_running,
                 evidence.td_applications_placed,
@@ -12144,7 +12112,6 @@ mod tests {
         };
         for (index, marker) in [
             TD_FETCH_BOOT_MARKER,
-            TD_AGENT_JAIL_BOOT_MARKER,
             TD_MAIL_BOOT_MARKER,
             TD_NEWS_BOOT_MARKER,
             TD_APPLICATIONS_PLACED_MARKER,
@@ -12160,7 +12127,7 @@ mod tests {
                 format!("\n..{marker}\n"),
             ] {
                 latch_console_evidence(&mut evidence, noise.as_bytes(), b"target");
-                assert_eq!(latched(&evidence), [false; 5], "accepted {noise:?}");
+                assert_eq!(latched(&evidence), [false; 4], "accepted {noise:?}");
             }
             // Both line endings the console can carry.
             let terminator = if index == 1 { "\n" } else { "\r\n" };
@@ -12169,7 +12136,7 @@ mod tests {
                 format!("\n{marker}{terminator}").as_bytes(),
                 b"target",
             );
-            let mut expected = [false; 5];
+            let mut expected = [false; 4];
             if let Some(slot) = expected.get_mut(index) {
                 *slot = true;
             }

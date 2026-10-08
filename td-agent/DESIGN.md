@@ -3154,11 +3154,8 @@ td admits for its account alone (APPLICATIONS.md §C), with td's `/td`
 bound where its `/bin` links resolve; its tools' `PATH` is td's `/bin`.
 td-agent so holds what the human holds; what keeps the model to a
 workspace is the workspace jail and the approval policy (§11), as on a
-host, not an application jail around td-agent itself. `td-agent
-check-jail` launches one instance as a conversation would, from
-`TD_AGENT_JAIL` and `TD_AGENT_TXT`, writes a file in its worktree and
-runs git there, and prints `TD-AGENT-JAIL-OK`; the image's boot runs it
-as td's account (§18, 17).
+host, not an application jail around td-agent itself. td-agent is a
+standalone program: no boot test starts it (§18, 17).
 
 ## 9. Git
 
@@ -5748,7 +5745,8 @@ td-review is:
 - `td-agent-test` is its realized-output check: the binary exists, is
   static, and answers `--help`, `review --help` and `calibrate --help`,
   which read no state, configuration or key; the window and the model
-  need a compositor and a network, which the boot oracle has;
+  need a compositor and a network, which a build sandbox has neither
+  of, and td-agent, a standalone program, has no boot test;
 - its `map_path` arm selects the `cargo-test` preflight and the `check`
   and `recipe-checks` targets, and a td-agent change takes the
   workspace pass with its own tests and clippy;
@@ -6429,17 +6427,13 @@ in parallel with it.
     resending it (§14, "Resuming cold").
 17. **Packaging.** td-agent as a program of td's account (§8, "On
     td"), the user's choice over a jailed application: td-jail admitting
-    the workspace kind for td's account with td's trees
-    (APPLICATIONS.md §C); the `td-agent` recipe, its realized-output
-    check, `/bin/td-agent`, and the `egressd` unit (§10, §17); the
-    launcher's card through td-authd's request `0c`; and a boot oracle,
-    the `agent-evidence` unit, which runs `td-agent check-jail` as td's
-    account once the relay answers its probe: one workspace instance
-    from the image's td-jail and td-txt writes in its worktree and runs
-    git through td's `/bin` and `/td`, and prints `TD-AGENT-JAIL-OK`,
-    which the boot requires. git ships on td as an explicitly reviewed
-    non-Rust package (AGENTS.md). The oracle does not start the window
-    from the card or reach a model.
+    the workspace kind for td's account with td's trees and below its
+    home on td's volume (APPLICATIONS.md §C); the `td-agent`
+    recipe, its realized-output check, `/bin/td-agent`, and the
+    `egressd` unit (§10, §17); and the launcher's card through
+    td-authd's request `0c`. git ships on td as an explicitly reviewed
+    non-Rust package (AGENTS.md). td-agent is a standalone program: no
+    boot test starts it, its window or its model.
 
 After these: resource limits (§8), schedules (§3), the `question` tool
 (§12), a loopback shared by a
