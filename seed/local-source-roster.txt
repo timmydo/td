@@ -10,7 +10,7 @@
 # local-source-roster > seed/local-source-roster.txt` when a recipe adds,
 # removes, or renames a `local_source'/`local_source_trees' declaration —
 # an ordinary edit inside a staged tree does not move a row.
-td-agent-source td-agent td-civil,td-fetch-client,td-fs,td-json,td-toml,td-ui,td-compositor,engine,td-test-compositor
+td-agent-source td-agent td-civil,td-fetch-client,td-fs,td-html,td-json,td-toml,td-ui,td-compositor,engine,td-test-compositor
 td-dua-source td-dua td-civil,td-json,td-ui,td-compositor
 td-editor-source td-editor td-civil,td-ui,td-compositor,td-test-compositor
 td-install-qemu-test-source td-install-qemu-test

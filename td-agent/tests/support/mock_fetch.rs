@@ -203,6 +203,8 @@ pub struct Recorded {
     pub limit: Option<u64>,
     pub redirects: Option<u32>,
     pub stream: bool,
+    /// Public destinations only, `web_fetch`'s.
+    pub public: bool,
     pub body: Vec<u8>,
 }
 
@@ -498,6 +500,7 @@ fn read_request(reader: &mut impl BufRead) -> Result<Recorded, String> {
         limit: None,
         redirects: None,
         stream: false,
+        public: false,
         body: Vec::new(),
     };
     let mut length = 0usize;
@@ -517,6 +520,7 @@ fn read_request(reader: &mut impl BufRead) -> Result<Recorded, String> {
             "limit" => request.limit = value.parse().ok(),
             "redirects" => request.redirects = value.parse().ok(),
             "stream" => request.stream = true,
+            "public" => request.public = true,
             "body" => length = value.parse().map_err(|_| "a body length")?,
             other => return Err(format!("head key {other:?}")),
         }

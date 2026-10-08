@@ -18,6 +18,8 @@ const STEP_LINES: usize = 240;
 const LINE_CHARS: usize = 200;
 /// The most characters of a command a summary names.
 const COMMAND_CHARS: usize = 24;
+/// How much of a fetched URL is said, a host and some of its path.
+const URL_CHARS: usize = 60;
 /// The most characters of reasoning standing for a reply's text.
 const REASONING_CHARS: usize = 300;
 
@@ -180,6 +182,13 @@ fn parts(call: &Call) -> Vec<Part> {
                 visible(&cut(first.trim(), COMMAND_CHARS))
             ))]
         }
+        "web_fetch" => vec![Part::Run(format!(
+            "fetched {}",
+            visible(&cut(
+                text(&value, "url").unwrap_or_default().trim(),
+                URL_CHARS
+            ))
+        ))],
         _ => Vec::new(),
     };
     // A file with no name is no file.
@@ -552,6 +561,13 @@ mod tests {
             ("background".into(), Json::Bool(true)),
         ]);
         assert_eq!(summary(&[call("shell", started)]), "started make serve");
+        assert_eq!(
+            summary(&[call(
+                "web_fetch",
+                args(&[("url", "https://docs.example.org/x")])
+            )]),
+            "fetched https://docs.example.org/x"
+        );
         // A patch's lines are counted by their marks, a removed line
         // that is also kept still counted.
         let patch = "*** Begin Patch\n*** Update File: /w/k.rs\n@@\n a\n-a\n+b\n*** Move to: /w/l.rs\n*** End Patch\n";

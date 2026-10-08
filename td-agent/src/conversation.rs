@@ -188,6 +188,10 @@ const CALL_PAST_LIMIT: &str = "not run: the turn reached a limit and asked for n
 const MAX_LISTED: usize = 200;
 /// What a call the human interrupted before it ran is answered with.
 const CALL_SKIPPED: &str = "not run: the person interrupted the turn before this call ran";
+/// What a `web_fetch` the person interrupted while it fetched is answered
+/// with.
+const FETCH_STOPPED: &str =
+    "stopped: the person interrupted the turn while the page was being fetched";
 /// What a call the human refused is answered with (DESIGN.md §11).
 const CALL_REFUSED: &str = "not run: the person refused this call. That is their answer: do not try to reach the same result another way. Say what you needed it for and ask how they would like to go on";
 /// The most messages to one conversation a standing answer sends, since
@@ -298,6 +302,11 @@ enum Judged<'a> {
         op: crate::rules::Crossed,
         to: &'a str,
     },
+    /// A connection td-agent makes for the model, `web_fetch`'s, to
+    /// `destination`, judged as a command's would be (DESIGN.md §10).
+    Network {
+        destination: &'a crate::config::Destination,
+    },
     /// A push of `branch` to `remote`, and why it is the person's
     /// whatever the rules allow, if it is.
     Push {
@@ -306,6 +315,9 @@ enum Judged<'a> {
         theirs: Option<&'a str>,
     },
 }
+
+/// A card's title, its lines, and what an answer to it may be kept as.
+type Card = (String, Vec<String>, Option<crate::rules::Offer>);
 
 /// What the rules make of a host call.
 enum Ruling {
@@ -5002,6 +5014,26 @@ impl Session {
                     _ => Ruling::Card(None),
                 };
             }
+            // By the workspace's network policy and the network rules, as
+            // a command's connection is: the allowlist alone asking, in
+            // `auto` mode, is the classifier's.
+            Judged::Network { destination } => {
+                return match self.bench.judge(destination) {
+                    crate::egress::Judgment::Open => Ruling::Run(Some(format!(
+                        "the workspace's network policy and rules open {}",
+                        destination.text()
+                    ))),
+                    crate::egress::Judgment::Refuse(why) => Ruling::Deny(tools::visible(&why)),
+                    crate::egress::Judgment::Ask { allow: true, .. }
+                        if self.workspace_mode() == crate::config::Mode::Auto =>
+                    {
+                        Ruling::Auto
+                    }
+                    crate::egress::Judgment::Ask { why, .. } => {
+                        Ruling::Card(Some(tools::visible(&why)))
+                    }
+                };
+            }
             // A crossing is the human's unless they answered it for
             // good; with their rules unread, it is theirs.
             Judged::Cross { op, to } => {
@@ -5057,6 +5089,11 @@ impl Session {
         repeated: bool,
     ) -> Result<Result<String, String>, String> {
         Ok(match args {
+            Args::WebFetch {
+                url,
+                offset,
+                max_bytes,
+            } => self.web_fetch(started, url, offset, max_bytes, repeated)?,
             Args::GitFetch { worktree } => self.git_fetch(&worktree)?,
             Args::GitPush {
                 worktree,
@@ -5176,11 +5213,42 @@ impl Session {
             op,
             to: target.as_str(),
         };
+        let pending = |me: &Self, client: &Client| me.crossing(&meta, reach, client);
+        let card = |me: &Self| {
+            let (title, details) = tools::crossing_card(target, &meta.title, reach);
+            // With the human's rules unread, no answer can be kept.
+            let always = me.human.1.is_ok().then(|| crate::rules::Offer::Crossing {
+                op,
+                to: target.as_str().to_string(),
+            });
+            (title, details, always)
+        };
+        Ok(self
+            .approve(started, &judged, repeated, &pending, &card)?
+            .map(|()| Some(meta.id.clone())))
+    }
+
+    /// Whether the call `started`, judged as `judged`, may go on (DESIGN.md
+    /// §11): a rule's deny refuses it and an allow lets it; `auto`'s column
+    /// asks the classifier what `pending` says, but a `repeated` call is
+    /// the human's; else, or when the classifier does not allow it, the
+    /// human decides on the card `make_card` makes, with what it offers to
+    /// remember. Until a decision holds it is judged again when a policy
+    /// comes after the one it was judged by. Why not, when not, which the
+    /// call is answered with; an error of the log's own ends the process.
+    fn approve(
+        &mut self,
+        started: u64,
+        judged: &Judged<'_>,
+        repeated: bool,
+        pending: &dyn Fn(&Self, &Client) -> classifier::Pending,
+        make_card: &dyn Fn(&Self) -> Card,
+    ) -> Result<Result<(), String>, String> {
         // Until a decision holds, as a host call's, judged again when a
         // policy comes after the one it was judged by: one taken while
         // the classifier was asked included.
         let mut ruled_at = self.human.0;
-        let mut ruling = self.ruling(&judged);
+        let mut ruling = self.ruling(judged);
         loop {
             let mut human = false;
             // Who let it run, Jev's probabilities and why, logged once the
@@ -5208,12 +5276,12 @@ impl Session {
                 // a repeated call is the human's.
                 Ruling::Auto if repeated => Some(Some(REPEATED_WHY.to_string())),
                 Ruling::Auto => {
-                    let outcome = self.classify(|me, client| me.crossing(&meta, reach, client))?;
+                    let outcome = self.classify(|me, client| pending(me, client))?;
                     // A policy taken while it was asked is judged first:
                     // a deny in force is never put to the person.
                     if self.human.0 != ruled_at {
                         ruled_at = self.human.0;
-                        ruling = self.ruling(&judged);
+                        ruling = self.ruling(judged);
                         continue;
                     }
                     if outcome.allow {
@@ -5243,25 +5311,20 @@ impl Session {
             };
             if let Some(asked) = card {
                 {
-                    let (title, mut details) = tools::crossing_card(target, &meta.title, reach);
+                    let (title, mut details, always) = make_card(self);
                     if let Some(jev) = &jev {
                         details.insert(0, format!("Jev: {jev}."));
                     }
                     if let Some(why) = &asked {
                         details.insert(0, format!("Asked because {why}."));
                     }
-                    // With the human's rules unread, no answer can be kept.
-                    let always = self.human.1.is_ok().then(|| crate::rules::Offer::Crossing {
-                        op,
-                        to: target.as_str().to_string(),
-                    });
                     let decided = self.decide(
                         started,
                         title,
                         details,
                         asked.as_deref(),
                         always,
-                        Some(&judged),
+                        Some(judged),
                     )?;
                     // The card was judged again at every policy it saw.
                     ruled_at = self.human.0;
@@ -5282,7 +5345,7 @@ impl Session {
             }
             if self.human.0 != ruled_at {
                 ruled_at = self.human.0;
-                match self.ruling(&judged) {
+                match self.ruling(judged) {
                     Ruling::Deny(why) => {
                         self.log(Kind::Approval {
                             call: started,
@@ -5311,7 +5374,188 @@ impl Session {
             }
             break;
         }
-        Ok(Ok(Some(meta.id)))
+        Ok(Ok(()))
+    }
+
+    /// `web_fetch` (DESIGN.md §12): the text at `url`, from `offset`, at
+    /// most `max_bytes`. Each hop's destination is approved as a command's
+    /// connection would be, once a call: a redirect back to one already
+    /// let through is not asked again. The service follows nothing and
+    /// reaches only public addresses; this follows a `location` itself,
+    /// at most `web::MAX_REDIRECTS` times.
+    fn web_fetch(
+        &mut self,
+        started: u64,
+        mut url: crate::web::Url,
+        offset: u64,
+        max_bytes: usize,
+        repeated: bool,
+    ) -> Result<Result<String, String>, String> {
+        let first = url.text();
+        let mut through: Vec<crate::config::Destination> = Vec::new();
+        let mut hops = 0;
+        loop {
+            if through.contains(&url.destination) {
+                // Let through once, it is asked nothing again; a deny taken
+                // since still refuses it.
+                self.hear();
+                if self.interrupt || self.gone {
+                    return Ok(Err(FETCH_STOPPED.into()));
+                }
+                let judged = Judged::Network {
+                    destination: &url.destination,
+                };
+                if let Ruling::Deny(why) = self.ruling(&judged) {
+                    self.log(Kind::Approval {
+                        call: started,
+                        outcome: "deny".into(),
+                        by: "rule".into(),
+                        probabilities: None,
+                        reason: Some(why.clone()),
+                    })?;
+                    return Ok(Err(ruled(&why)));
+                }
+            } else {
+                let text = url.text();
+                let destination = url.destination.clone();
+                let judged = Judged::Network {
+                    destination: &destination,
+                };
+                let pending =
+                    |me: &Self, client: &Client| me.fetch_pending(&destination, &text, client);
+                let card = |me: &Self| me.fetch_card(&destination, &text, hops > 0);
+                if let Err(why) = self.approve(started, &judged, repeated, &pending, &card)? {
+                    return Ok(Err(why));
+                }
+                through.push(url.destination.clone());
+            }
+            let response = match self.get_page(&url.text()) {
+                Ok(response) => response,
+                Err(why) => return Ok(Err(why)),
+            };
+            if let (300..=399, Some(location)) = (response.status, response.header("location")) {
+                hops += 1;
+                if hops > crate::web::MAX_REDIRECTS {
+                    return Ok(Err(format!(
+                        "{first} redirected more than {} times",
+                        crate::web::MAX_REDIRECTS
+                    )));
+                }
+                url = match url.join(location) {
+                    Ok(next) => next,
+                    Err(why) => {
+                        return Ok(Err(format!(
+                            "{} redirected to {}, which is not fetched: {why}",
+                            url.text(),
+                            tools::visible(location)
+                        )))
+                    }
+                };
+                continue;
+            }
+            let kind = response.header("content-type");
+            return Ok(crate::web::text(kind, &response.body).and_then(|text| {
+                crate::web::page(&url.text(), response.status, kind, &text, offset, max_bytes)
+            }));
+        }
+    }
+
+    /// GET `url` through the fetch service, public destinations only and
+    /// no redirect followed, on a thread of its own so that an interrupt
+    /// or the window going ends the wait at once; the thread then ends by
+    /// the service's own deadline, its answer dropped.
+    fn get_page(&mut self, url: &str) -> Result<td_fetch_client::Response, String> {
+        let (send, answer) = std::sync::mpsc::channel();
+        let owned = url.to_string();
+        std::thread::Builder::new()
+            .name("web_fetch".into())
+            .spawn(move || {
+                let headers = [("accept", crate::web::ACCEPT)];
+                let got = td_fetch_client::get_public(&owned, &headers, Some(crate::web::MAX_BODY));
+                let _ = send.send(got);
+            })
+            .map_err(|e| format!("the fetch could not be started: {e}"))?;
+        loop {
+            match answer.recv_timeout(Duration::from_millis(50)) {
+                Ok(got) => return got.map_err(|e| format!("the fetch failed: {e}")),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("the fetch ended without an answer".into())
+                }
+            }
+            self.hear();
+            if self.interrupt || self.gone {
+                return Err(FETCH_STOPPED.into());
+            }
+        }
+    }
+
+    /// A fetch of `url` from `destination` as the classifier is asked it,
+    /// under the network action a command's connection is: this
+    /// conversation's content possibly carried there in the URL, which a
+    /// model wrote and so is untrusted, whole.
+    fn fetch_pending(
+        &self,
+        destination: &crate::config::Destination,
+        url: &str,
+        client: &Client,
+    ) -> classifier::Pending {
+        let named = destination.text();
+        let mut untrusted = Vec::new();
+        if let Some(received) = self.received() {
+            untrusted.push(("received", received));
+        }
+        classifier::Pending {
+            action: "network",
+            source: side(self.conversation.meta(), client),
+            receiver: None,
+            remote: None,
+            destination: Some(named.clone()),
+            evidence: None,
+            detail: format!(
+                "let td-agent fetch a URL on {named} for this conversation, outside the jail, its text coming back into the conversation; the URL's path and query reach {named}; the workspace's policy is allowlist and {named} is not on its allowlist"
+            ),
+            payload: Some(("url", url.to_string())),
+            untrusted,
+        }
+    }
+
+    /// The card that asks the person whether td-agent may fetch `url`
+    /// from `destination`, a redirect's when `redirected`; it offers to
+    /// remember a network rule as a connection's card does, unless a rule
+    /// asks or the rules are unread.
+    fn fetch_card(
+        &self,
+        destination: &crate::config::Destination,
+        url: &str,
+        redirected: bool,
+    ) -> Card {
+        let named = destination.text();
+        let allow = matches!(
+            self.bench.judge(destination),
+            crate::egress::Judgment::Ask { allow: true, .. }
+        );
+        let always = if self.human.1.is_ok() {
+            crate::rules::Always::checked(allow, vec![format!("network {named}")])
+                .ok()
+                .map(crate::rules::Offer::Rules)
+        } else {
+            None
+        };
+        let how = if redirected {
+            "A page the model asked for redirects to"
+        } else {
+            "The model asks td-agent to fetch"
+        };
+        (
+            format!("Let td-agent fetch from {named}?"),
+            vec![
+                format!("{how} {}, outside the workspace's jail.", tools::visible(url)),
+                format!("Its text comes back into this conversation, and so to its model provider; the URL's path and query reach {named}."),
+                format!("Allow fetches it, and lets this call's redirects back to {named} through; Deny refuses it."),
+            ],
+            always,
+        )
     }
 
     /// `read` over the log of conversation `other`, this conversation's

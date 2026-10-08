@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use mock_fetch::{fixture, MockFetch, Reply, Tail};
+use mock_fetch::{fixture, MockFetch, Recorded, Reply, Tail};
 use td_agent::config::Client;
 use td_agent::cost::{Limits, ONE};
 use td_agent::frame;
@@ -2862,6 +2862,386 @@ fn a_commands_connection_off_the_allowlist_waits_on_a_card() {
         ("deny", "rule")
     );
     assert!(approvals[1].2.contains("deny network third.test:80"));
+}
+
+/// The GETs a conversation made through the mock: `web_fetch`'s.
+fn gets(h: &Harness) -> Vec<Recorded> {
+    h.mock
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "GET")
+        .collect()
+}
+
+/// `web_fetch` of a host off the allowlist waits on a card that offers
+/// the network rule; allowed, td-agent asks the service for the URL,
+/// public destinations only and no redirect followed, follows a redirect
+/// back to the same host itself without asking again, and answers with
+/// the page as text.
+#[test]
+fn a_web_fetch_off_the_allowlist_asks_and_answers_with_the_pages_text() {
+    let page = "<html><body><h1>Guide</h1><p>Install it with <a href=\"/dl\">the download</a>.</p></body></html>";
+    let mut h = Harness::new_in(
+        "web",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-web-fetch.sse"),
+            Reply::Http {
+                status: 301,
+                headers: vec![("location".into(), "/guide/".into())],
+                body: Vec::new(),
+            },
+            Reply::Http {
+                status: 200,
+                headers: vec![("content-type".into(), "text/html; charset=utf-8".into())],
+                body: page.as_bytes().to_vec(),
+            },
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Read the install guide.");
+    let (call, title, details) = h.until_ask();
+    assert_eq!(title, "Let td-agent fetch from docs.example.org?");
+    assert!(
+        details[0].contains("docs.example.org is not on this workspace's allowlist"),
+        "{details:?}"
+    );
+    assert_eq!(
+        details[1],
+        "The model asks td-agent to fetch https://docs.example.org/guide, outside the workspace's jail."
+    );
+    assert!(h.always.is_some());
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let results = results(&events);
+    assert_eq!(results[0].0, "toolu_web_01");
+    let text = &results[0].1;
+    assert!(!results[0].2, "{text}");
+    assert!(
+        text.starts_with("https://docs.example.org/guide/\nstatus 200, text/html; charset=utf-8, "),
+        "{text}"
+    );
+    assert!(text.contains("Install it with"), "{text}");
+    assert!(!text.contains("<p>"), "{text}");
+    let gets = gets(&h);
+    let urls: Vec<&str> = gets.iter().map(|r| r.url.as_str()).collect();
+    assert_eq!(
+        urls,
+        [
+            "https://docs.example.org/guide",
+            "https://docs.example.org/guide/"
+        ]
+    );
+    assert!(gets.iter().all(|r| r.public && r.redirects == Some(0)));
+    let approvals = approvals(&events);
+    assert_eq!(approvals.len(), 1, "{approvals:?}");
+    assert_eq!(
+        (approvals[0].1.as_str(), approvals[0].2.as_str()),
+        ("allow", "human")
+    );
+}
+
+/// A host let through once is not asked about again in the call, but a
+/// deny taken since refuses it: allowed, it redirects to another host,
+/// whose card waits while the person denies the first; allowed too, the
+/// second redirects back to the first, which is refused by the rule.
+#[test]
+fn a_deny_taken_during_a_web_fetch_refuses_a_host_let_through() {
+    let mut h = Harness::new_in(
+        "web-deny",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-web-fetch.sse"),
+            Reply::Http {
+                status: 302,
+                headers: vec![("location".into(), "https://other.example.net/".into())],
+                body: Vec::new(),
+            },
+            Reply::Http {
+                status: 302,
+                headers: vec![("location".into(), "https://docs.example.org/back".into())],
+                body: Vec::new(),
+            },
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Read the install guide.");
+    let (first, _, _) = h.until_ask();
+    h.down(&Down::Decision {
+        call: first,
+        allow: true,
+        always: None,
+    });
+    let (second, title, _) = h.until_ask();
+    assert_eq!(title, "Let td-agent fetch from other.example.net?");
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(format!(
+            "[conversation {}]\ndeny network docs.example.org\n",
+            h.id.as_str()
+        )),
+        mode: td_agent::config::Mode::Ask,
+    });
+    h.down(&Down::Decision {
+        call: second,
+        allow: true,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let results = results(&events);
+    assert!(results[0].2, "{results:?}");
+    assert!(
+        results[0].1.contains("deny network docs.example.org"),
+        "{results:?}"
+    );
+    assert_eq!(gets(&h).len(), 2);
+    let decided: Vec<(String, String)> =
+        approvals(&events).into_iter().map(|a| (a.1, a.2)).collect();
+    let pairs: Vec<(&str, &str)> = decided
+        .iter()
+        .map(|(o, b)| (o.as_str(), b.as_str()))
+        .collect();
+    assert_eq!(
+        pairs,
+        [("allow", "human"), ("allow", "human"), ("deny", "rule")]
+    );
+}
+
+/// A workspace whose network policy is off fetches nothing; a call
+/// redirected more than five times is refused at the sixth; and one
+/// interrupted while it fetches ends at once, saying so.
+#[test]
+fn a_web_fetch_is_refused_by_off_bounded_in_redirects_and_interrupted() {
+    let off = Client {
+        network: td_agent::config::Network::Off,
+        ..Client::default()
+    };
+    let mut h = Harness::new_in(
+        "web-off",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-web-fetch.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(off);
+    h.say("Read the install guide.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let said = results(&events);
+    assert!(
+        said[0].1.contains("this workspace's network policy is off"),
+        "{said:?}"
+    );
+    assert!(gets(&h).is_empty());
+
+    let again = Reply::Http {
+        status: 302,
+        headers: vec![("location".into(), "/again".into())],
+        body: Vec::new(),
+    };
+    let mut script = vec![Reply::sse("stream-tool-web-fetch.sse")];
+    script.extend(std::iter::repeat_n(again, 6));
+    script.extend([Reply::sse("stream-sonnet.sse"), Reply::ok("title.json")]);
+    let mut h = Harness::new_in(
+        "web-loop",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        script,
+    );
+    h.setup(Client::default());
+    let allow = format!(
+        "[conversation {}]\nallow network docs.example.org\n",
+        h.id.as_str()
+    );
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(allow.clone()),
+        mode: td_agent::config::Mode::Ask,
+    });
+    h.say("Read the install guide.");
+    let (events, _, _) = h.turn();
+    let said = results(&events);
+    assert!(
+        said[0]
+            .1
+            .contains("https://docs.example.org/guide redirected more than 5 times"),
+        "{said:?}"
+    );
+    assert_eq!(gets(&h).len(), 6);
+
+    let mut h = Harness::new_in(
+        "web-stop",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![Reply::sse("stream-tool-web-fetch.sse"), Reply::Hang],
+    );
+    h.setup(Client::default());
+    let allow = format!(
+        "[conversation {}]\nallow network docs.example.org\n",
+        h.id.as_str()
+    );
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(allow),
+        mode: td_agent::config::Mode::Ask,
+    });
+    h.say("Read the install guide.");
+    // The turn's request charged, then the fetch under way.
+    h.until_spent(1);
+    h.mock.wait_for(2);
+    let began = Instant::now();
+    h.down(&Down::Interrupt);
+    let (events, _, _) = h.turn();
+    assert!(began.elapsed() < Duration::from_secs(5));
+    let said = results(&events);
+    assert!(
+        said[0]
+            .1
+            .contains("interrupted the turn while the page was being fetched"),
+        "{said:?}"
+    );
+}
+
+/// In `auto`, a fetch the allowlist alone asks about is the classifier's,
+/// asked it as a connection, the destination named and the URL whole
+/// among what the model wrote; allowed, it goes with no card.
+#[test]
+fn the_classifier_decides_a_web_fetch_in_auto_mode() {
+    let mut h = Harness::new_in(
+        "web-auto",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-web-fetch.sse"),
+            Reply::Http {
+                status: 200,
+                headers: vec![("content-type".into(), "text/plain".into())],
+                body: b"step one".to_vec(),
+            },
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.mock
+        .route("typesafe/jev", vec![Reply::ok("jev-matches.json")]);
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![Reply::ok("classifier-allow.json")],
+    );
+    h.setup(Client {
+        allow_data_collection: true,
+        jev_threshold: 900,
+        ..Client::default()
+    });
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    h.say("Read the install guide.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let results = results(&events);
+    assert!(results[0].1.ends_with("\n\nstep one"), "{results:?}");
+    let decided: Vec<(String, String)> =
+        approvals(&events).into_iter().map(|a| (a.1, a.2)).collect();
+    assert_eq!(decided, [("allow".to_string(), "classifier".to_string())]);
+    let asked = h
+        .mock
+        .requests()
+        .into_iter()
+        .find(|r| r.text().contains("gpt-oss-safeguard"))
+        .map(|r| r.text())
+        .unwrap();
+    assert!(asked.contains(r#"\"kind\":\"network\""#), "{asked}");
+    assert!(
+        asked.contains(r#"\"destination\":\"docs.example.org\""#),
+        "{asked}"
+    );
+    assert!(asked.contains("https://docs.example.org/guide"), "{asked}");
+}
+
+/// A rule that allows the host lets the fetch go with no card, logged as
+/// the rule's; a redirect to another host off the allowlist is a card of
+/// its own, and refused there, nothing is fetched from it.
+#[test]
+fn a_web_fetchs_redirect_to_another_host_is_asked_about_again() {
+    let mut h = Harness::new_in(
+        "web-redirect",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-web-fetch.sse"),
+            Reply::Http {
+                status: 302,
+                headers: vec![("location".into(), "https://other.example.net/x?k=v".into())],
+                body: Vec::new(),
+            },
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(format!(
+            "[conversation {}]\nallow network docs.example.org\n",
+            h.id.as_str()
+        )),
+        mode: td_agent::config::Mode::Ask,
+    });
+    h.say("Read the install guide.");
+    let (call, title, details) = h.until_ask();
+    assert_eq!(title, "Let td-agent fetch from other.example.net?");
+    assert_eq!(
+        details[1],
+        "A page the model asked for redirects to https://other.example.net/x?k=v, outside the workspace's jail."
+    );
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let results = results(&events);
+    assert!(results[0].2, "{results:?}");
+    assert_eq!(gets(&h).len(), 1);
+    let approvals = approvals(&events);
+    let decided: Vec<(&str, &str)> = approvals
+        .iter()
+        .map(|a| (a.1.as_str(), a.2.as_str()))
+        .collect();
+    assert_eq!(decided, [("allow", "rule"), ("deny", "human")]);
+    assert!(
+        approvals[0]
+            .3
+            .as_deref()
+            .is_some_and(|why| why.contains("open docs.example.org")),
+        "{approvals:?}"
+    );
 }
 
 /// In `auto`, a connection the allowlist alone asks about goes to the

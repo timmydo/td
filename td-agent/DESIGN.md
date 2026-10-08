@@ -172,8 +172,11 @@ There are four parties, and the design is the separation between them:
    as the same user can replace or impersonate it, so file contents,
    digests and instruction text that come back are untrusted input, never
    authority.
-3. **The fetch service** carries model traffic only. No jail instance is
-   ever given its socket.
+3. **The fetch service** carries the conversation process's own
+   requests: model traffic, and `web_fetch`'s pages (§12), each a
+   network destination decided under §11 and fetched with the request's
+   `public` line, so it reaches no private, local or own address. No
+   jail instance is ever given its socket.
 4. **The egress relay**, a td-net applet beside fetchd, carries a jail's
    permitted network traffic (§10). td-agent decides each destination; the
    relay refuses loopback, link-local, private and the machine's own
@@ -4057,8 +4060,8 @@ flag lets injected text lower its own bar.
 | file edits, sed, shell (background and local commits included) inside the jail | human | run |
 | reading or messaging another conversation (§3) | human | classifier |
 | `schedule` | human | human |
-| network to a destination on the workspace allowlist | run | run |
-| network to another destination, policy `allowlist` | human | classifier |
+| network to a destination on the workspace allowlist, a command's or `web_fetch`'s | run | run |
+| network to another destination, policy `allowlist`, a command's or `web_fetch`'s | human | classifier |
 | git_push, unprotected branch, no force, clean scan | human | classifier |
 | git_push to a protected branch, forced, or a scan match | human | human |
 | `request_directory`, read-only | human | classifier |
@@ -4678,6 +4681,9 @@ and git tools, as far as the workspace has what they act on.
   **`process_kill`**: background processes (below).
 - **`history_search`** and **`history_read`**: the conversation's full
   log (below).
+- **`web_fetch {url, offset?, max_bytes?}`**: a page's text, fetched by
+  the conversation process through the fetch service, its destination
+  judged as a command's connection is (below).
 - **`conversations`** and **`send_message`**: other conversations (§3).
 - **`schedule`**, **`schedules`** and **`cancel_schedule`**: later, with
   schedules (§3).
@@ -4918,10 +4924,60 @@ the provider returned it as text. The stubs and summaries compaction
 writes name the sequence numbers they replace, so a model can recover
 what a summary dropped.
 
-Planned later, each its own increment: `web_fetch`,
-made by the conversation process through the fetch service as a network
-crossing; a `task` tool for summarizing child conversations within a
-workspace; and an MCP stdio client.
+Planned later, each its own increment: a `task` tool for summarizing
+child conversations within a workspace, and an MCP stdio client.
+
+**As built (`web_fetch`).** A workspace's conversation has
+`web_fetch {url, offset?, max_bytes?}`, which the conversation process
+runs, not the tool host: it fetches through the fetch service, whose
+socket no jail holds (§2). The URL is taken only as `http` or `https` of
+printable ASCII, with no user or password, backslash or
+percent-encoding in its authority, and a host that is a DNS name whose
+last label is not a number, an IPv4 address or a bracketed IPv6 address
+(the allowlist's own rule, §10); it is rebuilt from those parts, its
+fragment dropped and its path's `.` and `..` segments (and their
+`%2e` spellings) taken away as the service's parser takes them, so the
+host judged is the host every parser reads, the fetch service's
+included, and the URL said is the one fetched. Its destination is
+judged as a command's connection is (§10, §11): the network policy, the
+network rules, the
+allowlist, then the person on a card in `ask` mode or the classifier in
+`auto` mode, asked under the `network` action with the URL whole among
+what the model wrote, since its path and query reach the destination.
+The card offers the same `network HOST` rule a connection's does. A
+policy of `off` refuses it. The judging is the one approval loop the
+crossings of §3 go through, so a policy taken while it waits judges it
+again and a repeated call is the person's.
+
+The request carries `public` and asks for no redirect
+(APPLICATIONS.md §W.8): the service refuses a destination that resolves
+to a private, shared, translated or local address, or this machine's
+own, whatever the allowlist says, and a `location` comes back to td-agent,
+which joins it to the URL, takes it as it took the first (a scheme, a
+letter first, not followed by `//`, which parsers read differently, is
+refused), and
+judges its destination again: a destination already let through in the
+call is not asked again, so a redirect back to the same host goes
+without a second card, but a deny taken since still refuses it. At
+most five redirects. The response is at most 8 MiB. A page
+(`text/html`, `application/xhtml+xml`, or a body that begins as one) is
+rendered as text by td-html, its first 2 MiB at a width of 100
+columns, which bounds a table's columns so that a wide cell does not pad
+every row to it, its links listed at the end; text types
+and an untyped UTF-8 body come as they are, decoded as UTF-8 with
+anything else replaced, whatever charset is declared; anything else is
+refused by its type. Control characters other than newline and tab are
+dropped. The answer names the URL, the status and the type, the text's
+length, and the part shown, `max_bytes` (32 KiB by default, at most
+256 KiB) from `offset`, both moved back to a character's start, and
+where to read on; a part always holds at least the character at its
+offset, so reading on moves. The fetch runs on a thread so that an
+interrupt ends the call at once, saying so, the thread left to the
+service's own deadline. A page cut at 2 MiB says so at its end, and
+`<pre>` text wider than the width is wrapped. What comes back is
+untrusted content like any tool result, and the tool's description
+says so. A conversation with no workspace has no network
+policy, so it has no `web_fetch`.
 
 **As built (increment 8).** The conversation tools run in the
 conversation process; their definitions are JSON schemas with
@@ -6447,11 +6503,10 @@ in parallel with it.
     boot test starts it, its window or its model.
 
 After these: resource limits (§8), schedules (§3), the `question` tool
-(§12), a loopback shared by a
-conversation's instances (§19), `web_fetch`, child
+(§12), a loopback shared by a conversation's instances (§19), child
 conversations within a workspace, skills and custom commands, the MCP
 client, moving a conversation between workspaces, and a native Anthropic
-Messages dialect.
+Messages dialect. `web_fetch` is built (§12).
 
 ## 19. Open questions
 
