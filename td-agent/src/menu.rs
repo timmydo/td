@@ -63,6 +63,9 @@ pub enum Action {
     DefaultModel,
     /// Show archived conversations in the list, or hide them again.
     ShowArchived,
+    /// Show each tool call and result in the transcript, or fold a step's
+    /// calls into its summary line again.
+    ShowActivity,
     /// The row menu's: archive its conversation.
     Archive,
     /// The row menu's: bring its archived conversation back.
@@ -112,6 +115,9 @@ pub const DELETE: &str = "Delete conversation\u{2026}";
 /// The Conversation menu's item, checked while archived conversations
 /// show in the list.
 pub const SHOW_ARCHIVED: &str = "Show archived";
+/// The Conversation menu's item, checked while the transcript shows each
+/// tool call and result rather than a step's summary line.
+pub const SHOW_ACTIVITY: &str = "Show tool activity";
 /// The Conversation menu's item, checked while the open conversation's
 /// workspace is in `auto` mode.
 pub const AUTO_MODE: &str = "Auto mode in this workspace";
@@ -136,6 +142,7 @@ pub struct State<'a> {
     pub effort: &'a str,
     pub reasoning: bool,
     pub show_archived: bool,
+    pub show_activity: bool,
     /// Whether the open conversation's workspace is in `auto` mode; none
     /// without one.
     pub auto: Option<bool>,
@@ -223,6 +230,11 @@ pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, m
         parent: Some(conversation),
         row: row(SHOW_ARCHIVED, "", true, state.show_archived),
         item: Item::Action(Action::ShowArchived),
+    });
+    nodes.push(Node {
+        parent: Some(conversation),
+        row: row(SHOW_ACTIVITY, "", true, state.show_activity),
+        item: Item::Action(Action::ShowActivity),
     });
     let help = nodes.len();
     nodes.push(Node {
@@ -348,6 +360,7 @@ mod tests {
         effort: "high",
         reasoning: true,
         show_archived: false,
+        show_activity: false,
         auto: None,
     };
 
@@ -458,6 +471,7 @@ mod tests {
         };
         let shown = State {
             show_archived: true,
+            show_activity: false,
             ..closed
         };
         assert!(!checked(OPENED) && checked(shown) && enabled(shown, SHOW_ARCHIVED));

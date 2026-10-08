@@ -307,6 +307,9 @@ pub enum Request {
         turn: u64,
         choice: crate::protocol::Resumed,
     },
+    /// Draw the open conversation's transcript again from its log, as
+    /// showing or folding tool activity asks.
+    Redraw,
     /// Save the split's preferred share.
     SaveShare(u32, u32),
     /// Store the OpenRouter key from the key dialog, replacing a stored
@@ -627,6 +630,9 @@ pub struct App {
     labels: Vec<String>,
     /// Whether the list shows archived conversations.
     show_archived: bool,
+    /// Whether the transcript shows each tool call and result, rather
+    /// than each step's summary line (DESIGN.md §4).
+    show_activity: bool,
     /// The open conversation's todo list, and whether it is shown whole.
     todo: Vec<TodoItem>,
     todo_open: bool,
@@ -811,6 +817,7 @@ impl App {
             log: crate::notes::Log::default(),
             labels: Vec::new(),
             show_archived: false,
+            show_activity: false,
             todo: Vec::new(),
             todo_open: false,
             messages: Vec::new(),
@@ -1268,6 +1275,21 @@ impl App {
     /// Whether the list shows archived conversations.
     pub fn shows_archived(&self) -> bool {
         self.show_archived
+    }
+
+    pub fn shows_activity(&self) -> bool {
+        self.show_activity
+    }
+
+    /// Shows each tool call and result in the transcript, or folds each
+    /// step's calls into its summary line again, as Conversation → Show
+    /// tool activity does: the open conversation is drawn again.
+    pub fn toggle_activity(&mut self) {
+        self.show_activity = !self.show_activity;
+        if self.active.is_some() {
+            self.requests.push(Request::Redraw);
+        }
+        self.touch();
     }
 
     /// Shows archived conversations in the list, or hides them again, as
@@ -2088,6 +2110,7 @@ impl App {
                 request,
                 content,
                 reasoning,
+                details,
                 finish,
                 incomplete,
                 calls,
@@ -2095,16 +2118,36 @@ impl App {
             } => {
                 let reasoning = reasoning.filter(|r| !r.trim().is_empty());
                 let text = content.unwrap_or_default();
-                let text = match (text.is_empty(), calls.is_empty()) {
-                    (true, true) => "(no text)",
-                    (true, false) => "(tool calls)",
+                // A reply with calls and no text stands on its reasoning's
+                // summary, which the model may give where it gave no
+                // sentence (DESIGN.md §4).
+                let thought = (text.is_empty() && !calls.is_empty())
+                    .then(|| {
+                        crate::activity::reasoning_summary(details.as_deref(), reasoning.as_deref())
+                    })
+                    .flatten();
+                let text = match (text.is_empty(), calls.is_empty(), &thought) {
+                    (true, true, _) => "(no text)",
+                    (true, false, Some(thought)) => thought,
+                    (true, false, None) => "(tool calls)",
                     _ => &text,
                 };
-                let called = calls
-                    .iter()
-                    .map(|c| format!("{}({})", c.name, c.arguments))
-                    .collect::<Vec<String>>()
-                    .join("\n");
+                // Each call whole while tool activity shows; else one line
+                // for them all, the calls and their edits behind it.
+                let (title, called, folded) = if self.show_activity {
+                    let called = calls
+                        .iter()
+                        .map(|c| format!("{}({})", c.name, c.arguments))
+                        .collect::<Vec<String>>()
+                        .join("\n");
+                    ("tool calls".to_string(), called, false)
+                } else {
+                    (
+                        crate::activity::summary(&calls),
+                        crate::activity::detail(&calls),
+                        true,
+                    )
+                };
                 let verdict = if incomplete {
                     Some(("incomplete", Tone::Bad))
                 } else if finish == "stop" {
@@ -2118,9 +2161,10 @@ impl App {
                 }
                 let message = message
                     .and_then(|m| m.text(text))
-                    .and_then(|m| match called.is_empty() {
-                        true => Ok(m),
-                        false => m.excerpt("tool calls", &called),
+                    .and_then(|m| match (calls.is_empty(), folded) {
+                        (true, _) => Ok(m),
+                        (false, true) => m.section(&title, &called, true),
+                        (false, false) => m.excerpt(&title, &called),
                     })
                     .and_then(|m| match verdict {
                         Some((verdict, tone)) => m.verdict(verdict, tone),
@@ -2140,7 +2184,7 @@ impl App {
                                 .as_deref()
                                 .into_iter()
                                 .chain([text])
-                                .chain((!called.is_empty()).then_some(called.as_str()))
+                                .chain((!calls.is_empty()).then_some(called.as_str()))
                                 .collect();
                             self.settle_stream(&sections, verdict, message)
                         }
@@ -2224,6 +2268,24 @@ impl App {
                     Err(e) => self.note(format!("the transcript refused a message: {e}")),
                 }
             }
+            // Folded, a result says only that it failed, on one line; the
+            // step's line says what was called.
+            Kind::ToolResult {
+                name,
+                content,
+                error,
+                ..
+            } if !self.show_activity => {
+                if error {
+                    let first = content.lines().next().unwrap_or_default();
+                    let first: String = first.chars().take(300).collect();
+                    self.notice_message(&format!(
+                        "tool {} failed: {}",
+                        crate::tools::visible(&name),
+                        crate::tools::visible(&first)
+                    ));
+                }
+            }
             Kind::ToolResult {
                 name,
                 content,
@@ -2294,6 +2356,11 @@ impl App {
                     "resumed"
                 });
             }
+            // Folded, a call allowed by the mode, a rule or the classifier
+            // says nothing the step's line does not; the person's answer,
+            // a refusal and a question are said.
+            Kind::Approval { outcome, by, .. }
+                if outcome == "allow" && by != "human" && !self.show_activity => {}
             Kind::Approval { outcome, by, .. } => {
                 self.notice_message(&format!("approval: {outcome}, decided by {by}"));
             }
@@ -2448,7 +2515,13 @@ impl App {
     fn delta(&mut self, request: u64, reasoning: &str, content: &str) {
         // A compaction's summary is shown whole, folded, when it comes.
         let summary = self.meter.request(request).map(|r| r.0) == Some(Purpose::Compact);
-        if (reasoning.is_empty() && content.is_empty()) || self.undrawn == Some(request) || summary
+        // A reply already shown whole, as a redraw that read the log
+        // before the stream's last frames came shows it, takes no more.
+        let shown = self.meter.replies.iter().any(|(r, _)| *r == request);
+        if (reasoning.is_empty() && content.is_empty())
+            || self.undrawn == Some(request)
+            || summary
+            || shown
         {
             return;
         }
@@ -3348,6 +3421,7 @@ impl App {
             // The list is the window's: `input_live` reports the choice.
             menu::Action::Keys => self.keys_chosen = true,
             menu::Action::ShowArchived => self.toggle_archived(),
+            menu::Action::ShowActivity => self.toggle_activity(),
             menu::Action::Archive => self.archive_row(true),
             menu::Action::Unarchive => self.archive_row(false),
             menu::Action::DeleteRow => {
@@ -3645,6 +3719,7 @@ impl App {
             effort: self.effort(),
             reasoning: self.reasoning(model),
             show_archived: self.show_archived,
+            show_activity: self.show_activity,
             auto: self.workspace_mode().map(|mode| mode == Mode::Auto),
         };
         match menu::menu(self.surface, state, revision) {
@@ -6580,6 +6655,8 @@ pub mod tests {
     #[test]
     fn messages_tool_calls_and_results_show_in_the_transcript() {
         let mut app = app();
+        // Each call and result whole, as Show tool activity draws them.
+        app.show_activity = true;
         app.update(
             at(
                 1,
@@ -6698,8 +6775,146 @@ pub mod tests {
             0,
         );
         let shown = text(&app);
-        assert!(shown.contains("todo_write({\"items\":[]})"), "{shown}");
+        // Folded to the step's line, the calls behind it.
+        assert!(shown.contains("todo_write"), "{shown}");
+        assert!(!shown.contains("todo_write({"), "{shown}");
         assert_eq!(shown.matches("I will plan.").count(), 1, "{shown}");
+        // A frame that comes after the reply is shown whole, as one can
+        // after a redraw read the log, draws nothing.
+        let drawn = app.transcript().len();
+        app.update(delta(3, "", " late"), 0);
+        assert_eq!(app.transcript().len(), drawn);
+        assert!(!text(&app).contains("late"));
+    }
+
+    /// By default a step is its text and one folded line for its calls;
+    /// a result says only that it failed, a mode's approval nothing, and
+    /// a reply with no text stands on its reasoning's summary. Show tool
+    /// activity asks for the transcript again (DESIGN.md §4).
+    #[test]
+    fn a_steps_tool_activity_is_one_folded_line_by_default() {
+        let mut app = app();
+        turn(&mut app, 1, "fix it");
+        app.update(at(3, request(2, 0)), 0);
+        let call = |id: &str, name: &str, arguments: &str| crate::store::Call {
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        };
+        app.update(
+            at(
+                4,
+                Kind::Assistant {
+                    request: 3,
+                    content: None,
+                    reasoning: Some("First the parser.\n\nNow read both files.".into()),
+                    details: None,
+                    finish: "tool_calls".into(),
+                    incomplete: false,
+                    calls: vec![
+                        call("c1", "read_file", r#"{"path":"/w/a.rs"}"#),
+                        call("c2", "read_file", r#"{"path":"/w/b.rs"}"#),
+                        call(
+                            "c3",
+                            "edit_file",
+                            r#"{"path":"/w/a.rs","old_string":"x","new_string":"y\nz"}"#,
+                        ),
+                    ],
+                },
+            ),
+            0,
+        );
+        let result = |seq, id: &str, name: &str, content: &str, error| {
+            at(
+                seq,
+                Kind::ToolResult {
+                    reply: 4,
+                    id: id.into(),
+                    name: name.into(),
+                    call: 0,
+                    content: content.into(),
+                    error,
+                    kept: None,
+                    digest: None,
+                    digests: Vec::new(),
+                },
+            )
+        };
+        app.update(result(5, "c1", "read_file", "     1\tfn a() {}", false), 0);
+        app.update(
+            at(
+                6,
+                Kind::Approval {
+                    call: 0,
+                    outcome: "allow".into(),
+                    by: "classifier".into(),
+                    probabilities: None,
+                    reason: None,
+                },
+            ),
+            0,
+        );
+        app.update(
+            result(
+                7,
+                "c3",
+                "edit_file",
+                "/w/a.rs changed since it was read\nmore",
+                true,
+            ),
+            0,
+        );
+        app.update(
+            at(
+                8,
+                Kind::Approval {
+                    call: 2,
+                    outcome: "deny".into(),
+                    by: "rule".into(),
+                    probabilities: None,
+                    reason: None,
+                },
+            ),
+            0,
+        );
+        app.update(
+            at(
+                9,
+                Kind::Approval {
+                    call: 1,
+                    outcome: "allow".into(),
+                    by: "human".into(),
+                    probabilities: None,
+                    reason: None,
+                },
+            ),
+            0,
+        );
+        let shown = text(&app);
+        for said in [
+            "approval: deny, decided by rule",
+            "approval: allow, decided by human",
+            "Now read both files.",
+            "read 2 files · edited a.rs (+2 −1)",
+            "tool edit_file failed: /w/a.rs changed since it was read",
+        ] {
+            assert!(shown.contains(said), "{said} in {shown}");
+        }
+        for unsaid in [
+            "(tool calls)",
+            "read_file({",
+            "fn a() {}",
+            "decided by classifier",
+            "tool read_file",
+            "+z",
+        ] {
+            assert!(!shown.contains(unsaid), "{unsaid} in {shown}");
+        }
+        // Shown, the transcript is asked for again; the menu item checks.
+        assert!(!app.shows_activity());
+        app.menu_action(menu::Action::ShowActivity);
+        assert!(app.shows_activity());
+        assert!(app.take_requests().contains(&Request::Redraw));
     }
 
     #[test]

@@ -426,6 +426,20 @@ impl Session {
                         self.app.note(e);
                     }
                 }
+                // The open conversation's log read again and replayed, as
+                // opening an adopted one does.
+                Request::Redraw => {
+                    if let Some(id) = self.app.active().cloned() {
+                        match store::read_log(&self.state, &id) {
+                            Ok(events) => {
+                                let prefix = store::read_prefix(&self.state, &id);
+                                self.app
+                                    .replay(prefix.as_deref().map_err(String::as_str), events);
+                            }
+                            Err(e) => self.app.note(format!("the conversation's log: {e}")),
+                        }
+                    }
+                }
                 Request::SaveShare(first, total) => {
                     if let Err(e) = self.state.save_share(first, total) {
                         self.app.note(e);

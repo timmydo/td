@@ -803,11 +803,30 @@ are `pause`, `todo` and `clear-todo`. The transcript shows a message
 from another conversation under its sender, a report an older log
 holds with its status, and one held with the verdict `held: paused` or
 `held: wake budget`; it gets the status of the turn it starts as a human
-message does. A reply that calls tools carries a `tool calls` excerpt
-naming each call with its arguments, and each result is a `tool NAME`
+message does. A step's tool activity is folded by default
+(`activity.rs`): a reply that calls tools carries one collapsed section
+whose title is a line for all its calls, at most 120 bytes, in the order
+their kinds first came (`read 3 files · grep ×2 · edited tools.rs (+2
+−3) · ran cargo test…`), files told apart by whole path and named by
+their last part, a patch's lines counted by their marks, a command
+left running said as `started`, and a call with nothing to name said
+by its tool; expanded, it names each call, an edit's, write's or
+patch's lines as a diff, a sed call's script and files, a command's
+text, each call within 40 lines and the step within 240. A result says
+nothing unless it failed, then a `td-agent` notice of its first line;
+an approval the mode, a rule or the classifier gave says nothing, and
+the person's answer, a refusal and a question are said as before. A reply
+with calls and no text stands on its reasoning's summary, the
+`reasoning.summary` entries of its `reasoning_details` or else the last
+paragraph of its reasoning, in place of `(tool calls)`. Conversation →
+`Show tool activity`, checked while it shows, draws the open
+conversation again from its log with each call whole: a `tool calls`
+excerpt naming each call with its arguments, each result a `tool NAME`
 block, an excerpt of the result whose copy action copies the whole,
-marked `error` when it is one. A pause, a resumption and a cleared list
-are `td-agent` notices.
+marked `error` when it is one, and every approval. A stream's frame
+for a reply the redraw already showed whole draws nothing. It holds
+for the window's life and is not saved. A pause, a resumption and a cleared
+list are `td-agent` notices.
 
 **As built (the File menu).** A menu bar, td-ui's `chrome::Bar`, takes
 the window's top row, and the split lies under it. Its headers, `File`,
@@ -959,6 +978,8 @@ starts with the most recently active conversation not archived. The
 driven actions are `row-menu` and `show-archived`, and the state gains
 `archived` (how many there are), `shown` (`all` or `unarchived`) and
 `row-menu` (the conversation the open row menu is of, else `none`).
+`show-activity` is Show tool activity's, and the state's last value is
+`activity` (`shown` or `folded`).
 
 **As built (the key list).** `F1` shows td-ui's key list over the
 window (td-ui/DESIGN.md, "Key list"). Its first section is every chord
@@ -1000,7 +1021,8 @@ window too (below).
   Choosing one asks for it at once. Both items are off with no
   conversation open, and `Effort` is off for a model whose cached
   `supported_parameters` lacks `reasoning`, since it would not be sent
-  (§5). The menu shows state, so the window builds it again, at a new
+  (§5). `Show tool activity` (§4) follows `Show archived`, last. The
+  menu shows state, so the window builds it again, at a new
   revision, from the state of the moment each time it opens, by `F10`
   or a press on a header; while it is open nothing rebuilds it.
 - **The picker** is td-ui's finder (td-ui/DESIGN.md) over the cached

@@ -31,6 +31,7 @@
 #![forbid(unsafe_code)]
 
 pub mod accounts;
+pub mod activity;
 pub mod assemble;
 pub mod bench;
 pub mod calibrate;

@@ -138,6 +138,12 @@ pub const BINDINGS: &[Binding] = &[
         help: "Conversation > Show archived: show archived conversations in the list, or hide them again.",
     },
     Binding {
+        name: "show-activity",
+        chord: None,
+        arguments: "",
+        help: "Conversation > Show tool activity: show each tool call and result in the transcript, or fold each step's calls into its summary line again.",
+    },
+    Binding {
         name: "set-key",
         chord: None,
         arguments: "",
@@ -234,6 +240,7 @@ impl Controller for Remote<'_> {
                 | "compact-conversation"
                 | "default-model"
                 | "show-archived"
+                | "show-activity"
         ) {
             let before = self.app.generation();
             match name {
@@ -245,6 +252,7 @@ impl Controller for Remote<'_> {
                 "compact-conversation" => self.app.compact(None),
                 "default-model" => self.app.open_default_picker(),
                 "show-archived" => self.app.toggle_archived(),
+                "show-activity" => self.app.toggle_activity(),
                 _ => self.app.export_diagnostics(),
             }
             return Ok(self.outcome(before));
@@ -324,7 +332,7 @@ impl Controller for Remote<'_> {
             |chooser| chooser.folder().display().to_string(),
         );
         Ok(format!(
-            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tpicking={}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tdefault={}\tchooser={}\tnotes={}\tunread={}\tnote={}\tarchived={}\tshown={}\trow-menu={}\tstatus={}\tcard={}\ttemplate={}",
+            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tpicking={}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tdefault={}\tchooser={}\tnotes={}\tunread={}\tnote={}\tarchived={}\tshown={}\trow-menu={}\tstatus={}\tcard={}\ttemplate={}\tactivity={}",
             app.rows().len(),
             active.map_or("none", |id| id.as_str()),
             app.focus().word(),
@@ -356,6 +364,7 @@ impl Controller for Remote<'_> {
             // The template dialog's part, as the key dialog's: what its
             // fields hold is read through `text`.
             app.template_dialog().map_or("none", |template| template.part()),
+            if app.shows_activity() { "shown" } else { "folded" },
         ))
     }
 
@@ -448,6 +457,9 @@ mod tests {
         assert!(remote.state().unwrap().contains("\trow-menu=none\t"));
         assert!(driven::request(&mut remote, b"1\t3\taction\tshow-archived").ends_with("changed"));
         assert!(remote.state().unwrap().contains("\tshown=all\t"));
+        assert!(remote.state().unwrap().ends_with("\tactivity=folded"));
+        assert!(driven::request(&mut remote, b"1\t4\taction\tshow-activity").ends_with("changed"));
+        assert!(remote.state().unwrap().ends_with("\tactivity=shown"));
     }
 
     /// The template dialog and Edit template… through the seam: the
@@ -456,18 +468,18 @@ mod tests {
     fn the_template_dialog_is_driven() {
         let mut app = crate::ui::tests::app();
         let mut remote = Remote { app: &mut app };
-        assert!(remote.state().unwrap().ends_with("\ttemplate=none"));
+        assert!(remote.state().unwrap().contains("\ttemplate=none\t"));
         assert!(driven::request(&mut remote, b"1\t1\taction\tedit-template").ends_with("changed"));
         assert!(remote.app.notice().unwrap().contains("New template"));
         assert!(driven::request(&mut remote, b"1\t2\taction\tnew-template").ends_with("changed"));
-        assert!(remote.state().unwrap().ends_with("\ttemplate=name"));
+        assert!(remote.state().unwrap().contains("\ttemplate=name\t"));
         driven::request(&mut remote, format!("1\t3\tkey\t{}", hex("Tab")).as_bytes());
-        assert!(remote.state().unwrap().ends_with("\ttemplate=remote"));
+        assert!(remote.state().unwrap().contains("\ttemplate=remote\t"));
         driven::request(
             &mut remote,
             format!("1\t4\tkey\t{}", hex("Escape")).as_bytes(),
         );
-        assert!(remote.state().unwrap().ends_with("\ttemplate=none"));
+        assert!(remote.state().unwrap().contains("\ttemplate=none\t"));
         remote
             .app
             .set_saved_templates(vec![crate::config::Template {
