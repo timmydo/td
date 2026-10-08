@@ -38,6 +38,7 @@ const INTEGRITY_VM_STEPS: u64 = MAX_PAGES * PAGE_BYTES * 128;
 const MAX_SHM_BYTES: u64 = crate::limits::SQLITE_WAL_INDEX_BYTES as u64;
 const MAX_BODY_BYTES: u64 = crate::limits::MAX_MESSAGE_BYTES as u64;
 const APP_ID: i64 = 0x54444d41;
+const SECOND_ANCHOR: &str = "SELECT EXISTS(SELECT 1 FROM thread_anchors INDEXED BY anchors_email WHERE account=?1 AND email_id=?2 LIMIT 1 OFFSET 1)";
 const NEXT_CHANGE: &str = "SELECT sequence,operation,action,object FROM changes INDEXED BY changes_kind WHERE account=?1 AND kind=?2 AND (sequence>?3 OR (sequence=?3 AND operation>?4)) AND sequence<=?5 ORDER BY sequence,operation LIMIT 1";
 #[path = "index/relational.rs"]
 mod relational;
@@ -876,6 +877,19 @@ impl<'r> IndexStore<'r> {
                     _ => ports::Error::Conflict,
                 })?
             {}
+            if let Key::ThreadAnchor(_, email) = key {
+                let duplicate: bool = native.run(|db| {
+                    db.query_row(
+                        SECOND_ANCHOR,
+                        params![account.as_bytes().as_slice(), email.as_bytes().as_slice()],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql)
+                })?;
+                if duplicate {
+                    return Err(ports::Error::Conflict);
+                }
+            }
             if let Key::Mailbox(id) = key {
                 let mut walk =
                     crate::mailbox_parents::ParentWalk::new(identity, id, MAX_OPERATIONS as u64)
@@ -3433,6 +3447,289 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn native_thread_anchors_allow_only_one_final_anchor_per_email() {
+        fn apply(
+            store: &IndexStore<'_>,
+            account: AccountId,
+            expected: u64,
+            operations: &[Operation<'_>],
+            sources: &mut [BlobSource<'_>],
+            encoded: bool,
+        ) -> Result<Sequence, CommitError> {
+            let request = CommitRequest {
+                account,
+                expected: Sequence::from_u64(expected),
+                utc_ms: 0,
+                deadline: deadline(),
+            };
+            if encoded {
+                commit_encoded_rows(store, request, operations, sources)
+            } else {
+                store.commit(&td_crypto::Provider, request, operations, sources)
+            }
+        }
+        fn anchor_key(name: &str, email: EmailId) -> Vec<u8> {
+            let mut bytes = vec![0; 1024];
+            let length = Key::ThreadAnchor(name, email).encode(&mut bytes).unwrap();
+            bytes.truncate(length);
+            bytes
+        }
+        #[derive(Clone, Copy, Debug)]
+        enum Form {
+            Both,
+            Reverse,
+            OnlyNew,
+        }
+        let mut unexpected = Vec::new();
+        for encoded in [false, true] {
+            for existing in [false, true] {
+                for form in [Form::Both, Form::Reverse, Form::OnlyNew] {
+                    if matches!(form, Form::OnlyNew) && !existing {
+                        continue;
+                    }
+                    let reverse = matches!(form, Form::Reverse);
+                    let fixture = Fixture::new();
+                    let mut root = fixture.locked();
+                    let store = IndexStore::create(
+                        &mut root,
+                        StoreEpoch::from_bytes([9; 16]),
+                        Arc::new(Timer(AtomicU64::new(1))),
+                        2,
+                        deadline(),
+                    )
+                    .unwrap();
+                    let other = AccountId::from_bytes([11; 16]);
+                    let blob = BlobId::from_bytes([4; 16]);
+                    let fresh = BlobId::from_bytes([8; 16]);
+                    let thread = ThreadId::from_bytes([5; 16]);
+                    let email = EmailId::from_bytes([6; 16]);
+                    let row = EmailRow {
+                        blob,
+                        thread,
+                        received_at: 0,
+                        origin: EmailOrigin::Jmap,
+                    };
+                    let email_bytes = encode(Row::Email(row));
+                    let thread_bytes = encode(Row::Thread);
+                    let blob_bytes = encode(Row::Blob(BlobRow {
+                        kind: BlobKind::Message,
+                        length: 0,
+                        digest: td_crypto::Provider.sha256().unwrap().finish().unwrap(),
+                        created_at: 0,
+                    }));
+                    let first = anchor_key("first@example.test", email);
+                    let second = anchor_key("second@example.test", email);
+                    let put_first = Operation::put(Table::ThreadAnchors, &first, &[]).unwrap();
+                    let put_second = Operation::put(Table::ThreadAnchors, &second, &[]).unwrap();
+                    let delete_first = Operation::delete(Table::ThreadAnchors, &first).unwrap();
+                    let delete_second = Operation::delete(Table::ThreadAnchors, &second).unwrap();
+                    for account in [ACCOUNT, other] {
+                        store.create_account(account, deadline()).unwrap();
+                        let mut setup = vec![
+                            Operation::put(Table::Blobs, blob.as_bytes(), &blob_bytes).unwrap(),
+                            Operation::put(Table::Threads, thread.as_bytes(), &thread_bytes)
+                                .unwrap(),
+                            Operation::put(Table::Emails, email.as_bytes(), &email_bytes).unwrap(),
+                        ];
+                        if account == other {
+                            setup.push(put_second);
+                        } else if existing {
+                            setup.push(put_first);
+                        }
+                        assert_eq!(
+                            apply(
+                                &store,
+                                account,
+                                0,
+                                &setup,
+                                &mut [BlobSource {
+                                    id: blob,
+                                    source: &mut b"".as_slice()
+                                }],
+                                encoded
+                            ),
+                            Ok(Sequence::from_u64(1))
+                        );
+                    }
+                    lock(&store.writer)
+                        .unwrap()
+                        .native
+                        .run(|db| {
+                            let mut statement = db
+                                .prepare(&format!("EXPLAIN QUERY PLAN {SECOND_ANCHOR}"))
+                                .map_err(sql)?;
+                            let details = statement
+                                .query_map(
+                                    params![
+                                        ACCOUNT.as_bytes().as_slice(),
+                                        email.as_bytes().as_slice()
+                                    ],
+                                    |row| row.get::<_, String>(3),
+                                )
+                                .map_err(sql)?
+                                .collect::<Result<Vec<_>, _>>()
+                                .map_err(sql)?;
+                            assert!(
+                                details
+                                    .iter()
+                                    .any(|detail| detail.contains(
+                                        "SEARCH thread_anchors USING COVERING INDEX anchors_email"
+                                    ) && detail.contains("account=? AND email_id=?")),
+                                "{details:?}"
+                            );
+                            Ok(())
+                        })
+                        .unwrap();
+                    let body = b"fresh body";
+                    let mut hash = td_crypto::Provider.sha256().unwrap();
+                    hash.update(body).unwrap();
+                    let fresh_bytes = encode(Row::Blob(BlobRow {
+                        kind: BlobKind::Message,
+                        length: body.len() as u64,
+                        digest: hash.finish().unwrap(),
+                        created_at: 0,
+                    }));
+                    let fresh_put =
+                        Operation::put(Table::Blobs, fresh.as_bytes(), &fresh_bytes).unwrap();
+                    let operations = match form {
+                        Form::Both => vec![fresh_put, put_first, put_second],
+                        Form::Reverse => vec![fresh_put, put_second, put_first],
+                        Form::OnlyNew => vec![fresh_put, put_second],
+                    };
+                    let mut old = store.view(ACCOUNT, deadline()).unwrap();
+                    let mut input = body.as_slice();
+                    let result = apply(
+                        &store,
+                        ACCOUNT,
+                        1,
+                        &operations,
+                        &mut [BlobSource {
+                            id: fresh,
+                            source: &mut input,
+                        }],
+                        encoded,
+                    );
+                    if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                        unexpected.push((encoded, existing, form, result));
+                        continue;
+                    }
+                    let mut now = store.view(ACCOUNT, deadline()).unwrap();
+                    assert_eq!(now.identity().committed_sequence, Sequence::from_u64(1));
+                    assert_eq!(
+                        now.get(Key::ThreadAnchor("first@example.test", email), &mut [0; 64])
+                            .unwrap(),
+                        existing.then_some((Row::ThreadAnchor, Sequence::from_u64(1)))
+                    );
+                    assert!(now
+                        .get(
+                            Key::ThreadAnchor("second@example.test", email),
+                            &mut [0; 64]
+                        )
+                        .unwrap()
+                        .is_none());
+                    assert!(now.get(Key::Blob(fresh), &mut [0; 128]).unwrap().is_none());
+                    drop(now);
+                    // Final-state refusal can consume the prepared source; retry uses a fresh reader.
+                    let mut input = body.as_slice();
+                    assert_eq!(
+                        apply(
+                            &store,
+                            ACCOUNT,
+                            1,
+                            &[fresh_put, put_first, put_second, delete_first],
+                            &mut [BlobSource {
+                                id: fresh,
+                                source: &mut input
+                            }],
+                            encoded
+                        ),
+                        Ok(Sequence::from_u64(2))
+                    );
+                    let replace = if reverse {
+                        [delete_second, put_first]
+                    } else {
+                        [put_first, delete_second]
+                    };
+                    assert_eq!(
+                        apply(&store, ACCOUNT, 2, &replace, &mut [], encoded),
+                        Ok(Sequence::from_u64(3))
+                    );
+                    assert_eq!(
+                        apply(
+                            &store,
+                            ACCOUNT,
+                            3,
+                            &[put_first, put_first],
+                            &mut [],
+                            encoded
+                        ),
+                        Ok(Sequence::from_u64(4))
+                    );
+                    // A duplicated Message-ID across different Emails remains valid.
+                    let new_email = EmailId::from_bytes([10; 16]);
+                    let duplicate = anchor_key("first@example.test", new_email);
+                    assert_eq!(
+                        apply(
+                            &store,
+                            ACCOUNT,
+                            4,
+                            &[
+                                Operation::put(Table::ThreadAnchors, &duplicate, &[]).unwrap(),
+                                Operation::put(Table::Emails, new_email.as_bytes(), &email_bytes)
+                                    .unwrap(),
+                            ],
+                            &mut [],
+                            encoded
+                        ),
+                        Ok(Sequence::from_u64(5))
+                    );
+                    let mut now = store.view(ACCOUNT, deadline()).unwrap();
+                    assert_eq!(
+                        now.get(Key::ThreadAnchor("first@example.test", email), &mut [0; 64])
+                            .unwrap(),
+                        Some((Row::ThreadAnchor, Sequence::from_u64(4)))
+                    );
+                    assert_eq!(
+                        now.get(
+                            Key::ThreadAnchor("first@example.test", new_email),
+                            &mut [0; 64]
+                        )
+                        .unwrap(),
+                        Some((Row::ThreadAnchor, Sequence::from_u64(5)))
+                    );
+                    assert!(now
+                        .get(
+                            Key::ThreadAnchor("second@example.test", email),
+                            &mut [0; 64]
+                        )
+                        .unwrap()
+                        .is_none());
+                    assert_eq!(
+                        old.get(Key::ThreadAnchor("first@example.test", email), &mut [0; 64])
+                            .unwrap(),
+                        existing.then_some((Row::ThreadAnchor, Sequence::from_u64(1)))
+                    );
+                    drop(now);
+                    let mut other_view = store.view(other, deadline()).unwrap();
+                    assert_eq!(
+                        other_view
+                            .get(
+                                Key::ThreadAnchor("second@example.test", email),
+                                &mut [0; 64]
+                            )
+                            .unwrap(),
+                        Some((Row::ThreadAnchor, Sequence::from_u64(1)))
+                    );
+                }
+            }
+        }
+        assert!(
+            unexpected.is_empty(),
+            "multiple anchors committed: {unexpected:?}"
+        );
     }
 
     #[test]

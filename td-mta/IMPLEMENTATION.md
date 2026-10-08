@@ -551,6 +551,9 @@ shared bounded history pass compares final effects to the original account
 snapshot. New Email assignment, anchor maintenance, ID allocation and
 mutation authorization remain service work; STORAGE.md owns the boundary.
 
+Final ThreadAnchor cardinality checks are implemented as specified in
+STORAGE.md.
+
 Affected submissions receive final recipient coverage and queue-state
 validation within the same transaction. Point/successor reads check each
 affected group once under the original native scope, reusing the complete

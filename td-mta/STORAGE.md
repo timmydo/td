@@ -815,6 +815,26 @@ Resource/I/O failure is an explicit temporary error, not permission
 to silently choose a different thread. Authoritative anchor lookup remains
 available without a cache, using bounded-work indexed SQLite access.
 
+The native committing writer checks each surviving ThreadAnchor PUT after
+row writes against the final account view. An indexed lookup using
+anchors_email(account,email_id) tests for a second anchor with LIMIT 1
+OFFSET 1, visiting at most two matching entries. A second anchor returns
+Conflict and rolls back metadata and bodies together; a prepared body
+source may already have been consumed. Up to 4096 such lookups share the
+original transaction deadline and VM allowance, including repeated PUTs.
+Intermediate duplicate anchors repaired by final deletion are allowed.
+One Message-ID may still anchor several different Emails, and the same
+Email ID in another account does not contribute to this check.
+
+This preserves the per-Email cardinality rule from an initially
+consistent store: any new duplicate requires a surviving anchor PUT. It
+is not a whole-store integrity scan. The separate validate_integrity
+operation checks SQLite structure and foreign keys, not this cardinality
+rule. Selecting the first valid header ID, proving anchor/body
+correspondence and authorizing anchor changes remain service
+obligations. Deferred owning foreign keys require anchor removal with
+Email deletion.
+
 A committing writer validates these rules, blob kinds, keyword limits and
 submission/blob pins. Derived counters are calculated or cached, never
 independently authoritative. A transaction that updates folder membership also

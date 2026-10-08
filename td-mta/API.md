@@ -6602,19 +6602,23 @@ untrusted network streams. IngressSpool supplies one such prepared source.
 It is temporary preparation,
 not a durability or protocol-admission claim of this low-level API.
 
-The serialized transaction checks the expected sequence, applies operations
-in caller order, validates final owning references and parent chains, records
-changes and updates the unsigned account sequence. Change actions agree with
-pre/post existence; a native unique index refuses duplicate object changes.
-Repeated row keys take their last effect. Final recipient coverage, individual
-queue state and submission completion/notification/cancellation aggregates
-are checked once per affected submission before COMMIT, including groups
+The serialized transaction checks the expected sequence, applies
+operations in caller order, validates final owning references and parent
+chains, records changes and updates the unsigned account sequence.
+Change actions agree with pre/post existence; a native unique index
+refuses duplicate object changes. Repeated row keys take their last
+effect. ThreadAnchor cardinality violations return Conflict; prepared
+source bytes may already have been consumed. STORAGE.md owns this final
+state check and its scope. Final recipient coverage, individual queue
+state and submission completion/notification/cancellation aggregates are
+checked once per affected submission before COMMIT, including groups
 changed only by recipient deletion. InFlight/Body and
-InFlight/AcceptancePossible require positive RCPT and absent DATA replies;
-Prepared may retain previous replies. This checks stored shape, not current
-reply provenance. Indexed point/successor reads reuse writer scratch and the
-original deadline/VM fuel. Inconsistent groups reject with
-Conflict; native deadline, capacity and I/O errors retain their classifications.
+InFlight/AcceptancePossible require positive RCPT and absent DATA
+replies; Prepared may retain previous replies. This checks stored shape,
+not current reply provenance. Indexed point/successor reads reuse writer
+scratch and the original deadline/VM fuel. Inconsistent groups reject
+with Conflict; native deadline, capacity and I/O errors retain their
+classifications.
 Before row writes, surviving Email PUTs preserve the thread ID from the
 original account row. A final replacement with a different thread returns
 Conflict even if both threads exist. Repeated keys and DELETE/reinsert
