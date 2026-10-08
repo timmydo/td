@@ -6612,8 +6612,12 @@ are checked once per affected submission before COMMIT, including groups
 changed only by recipient deletion. Indexed point/successor reads reuse the
 writer scratch and original deadline/VM fuel. Inconsistent groups reject with
 Conflict; native deadline, capacity and I/O errors retain their classifications.
-Caller authorization, historical queue transitions, worker fencing and
-complete changed-object coverage remain the coordinator's responsibility.
+Before row writes, surviving queue PUTs preserve STORAGE.md's immutable
+identity, uncertainty and attempt-history fields against the original rows.
+Repeated keys use their final effect, including DELETE then PUT. Violations
+return Conflict before streaming a body. Full historical transition checks,
+caller authorization, worker fencing and complete changed-object coverage
+remain the coordinator's responsibility.
 
 COMMIT with synchronous FULL precedes success. CommitError::Rejected means
 the pre-COMMIT check or a deferred-constraint/busy refusal rejected the

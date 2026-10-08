@@ -44,6 +44,8 @@ mod relational;
 use relational::SCHEMA;
 #[path = "index/operations.rs"]
 mod operations;
+#[path = "index/queue_history.rs"]
+mod queue_history;
 use operations::Operations;
 #[path = "index/usage.rs"]
 mod usage;
@@ -769,6 +771,7 @@ impl<'r> IndexStore<'r> {
                 }
             }
         }
+        queue_history::validate(native, &mut view, operations, scratch)?;
         for ordinal in 0..operations.len() {
             native.check()?;
             let op = operations.get(ordinal)?;

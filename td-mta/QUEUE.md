@@ -91,8 +91,12 @@ obligations. Queue errors identify the submission and optional recipient ordinal
 SQLite commits reuse that state validator for every submission affected by
 submission or recipient PUT/DELETE, checking exact final ordinal coverage
 with indexed reads before COMMIT. A group inconsistency rolls back the entire
-transaction. This enforces final consistency only; authorization, historical
-transition checks and attempt fences remain required at the service boundary.
+transaction. The core also preserves existing immutable
+submission/envelope identity,
+the uncertainty latch and retained attempt history as specified in STORAGE.md.
+It compares final PUTs with original rows before writing, so repeated keys
+cannot reset history within a transaction. Full transition checks, creation
+and deletion authorization, and attempt fences remain service obligations.
 
 ## 3. Attempt and restart transitions
 

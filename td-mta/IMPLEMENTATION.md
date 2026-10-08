@@ -2313,9 +2313,11 @@ planning, bounded history pruning, backup and unreferenced-blob deletion schedul
 
 Use the existing SQLite core for mailbox/email/thread/submission metadata;
 do not add a second replay or checkpoint implementation. Final recipient
-coverage and aggregate queue-state validation are implemented in the core.
-Complete queue-transition validation, changed-object coverage, category
-quota reconciliation and request idempotence. Bind the implemented bounded
+coverage, aggregate queue-state validation and preservation of the named
+immutable queue identity/uncertainty/attempt-history fields are implemented
+in the core. Complete queue-transition validation, changed-object coverage,
+category quota reconciliation and request idempotence remain service work.
+Bind the implemented bounded
 IngressSpool ownership to authorized reservations before wiring body sources
 to service commits. Native indexes serve metadata
 queries; parsed-body/search caches remain disposable. Authoritative database

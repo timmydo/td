@@ -3,6 +3,8 @@ use super::*;
 use crate::format::batch::Batch;
 use crate::ports::OperationKind;
 
+const QUEUE_TABLES: &[Table] = &[Table::Submissions, Table::Recipients];
+
 #[derive(Clone, Copy)]
 pub(super) enum Operations<'o, 'i> {
     Typed(&'o [Operation<'i>]),
@@ -63,6 +65,12 @@ impl<'o, 'i> Operations<'o, 'i> {
             }
         }
     }
+    pub(super) fn queue_key(self, index: usize) -> Result<Option<Key<'i>>, ports::Error> {
+        self.key(index, QUEUE_TABLES, false)
+    }
+    pub(super) fn queue_put_key(self, index: usize) -> Result<Option<Key<'i>>, ports::Error> {
+        self.key(index, QUEUE_TABLES, true)
+    }
     pub(super) fn blob_put(self, index: usize) -> Result<Option<BlobId>, ports::Error> {
         Ok(match self.key(index, &[Table::Blobs], true)? {
             Some(Key::Blob(id)) => Some(id),
@@ -73,11 +81,9 @@ impl<'o, 'i> Operations<'o, 'i> {
         self,
         index: usize,
     ) -> Result<Option<crate::ids::SubmissionId>, ports::Error> {
-        Ok(
-            match self.key(index, &[Table::Submissions, Table::Recipients], false)? {
-                Some(Key::Submission(id) | Key::Recipient(id, _)) => Some(id),
-                _ => None,
-            },
-        )
+        Ok(match self.queue_key(index)? {
+            Some(Key::Submission(id) | Key::Recipient(id, _)) => Some(id),
+            _ => None,
+        })
     }
 }

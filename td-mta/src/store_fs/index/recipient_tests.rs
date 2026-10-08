@@ -175,7 +175,7 @@ fn missing_recipients_roll_back_streamed_body_registry_metadata_and_changes() {
 }
 
 #[test]
-fn recipient_deletion_count_shrink_and_whole_group_deletion_check_final_rows() {
+fn immutable_recipient_count_and_whole_group_deletion_check_final_rows() {
     for parent_first in [false, true] {
         let fixture = Fixture::new();
         let mut root = fixture.locked();
@@ -191,21 +191,18 @@ fn recipient_deletion_count_shrink_and_whole_group_deletion_check_final_rows() {
             rejected(store.commit(&td_crypto::Provider, request(1), operations, &mut []));
         }
         let old = store.view(ACCOUNT, deadline()).unwrap();
-        assert_eq!(
-            store.commit(
-                &td_crypto::Provider,
-                request(1),
-                &[shrink, remove1],
-                &mut []
-            ),
-            Ok(Sequence::from_u64(2))
-        );
+        rejected(store.commit(
+            &td_crypto::Provider,
+            request(1),
+            &[shrink, remove1],
+            &mut [],
+        ));
         let parent = Operation::delete(Table::Submissions, SUBMISSION.as_bytes()).unwrap();
-        rejected(store.commit(&td_crypto::Provider, request(2), &[parent], &mut []));
+        rejected(store.commit(&td_crypto::Provider, request(1), &[parent], &mut []));
         let mut retained = store.view(ACCOUNT, deadline()).unwrap();
         assert_eq!(
             retained.identity().committed_sequence,
-            Sequence::from_u64(2)
+            Sequence::from_u64(1)
         );
         assert!(retained
             .get(Key::Recipient(SUBMISSION, 0), &mut [0; 1024])
@@ -213,13 +210,13 @@ fn recipient_deletion_count_shrink_and_whole_group_deletion_check_final_rows() {
             .is_some());
         drop(retained);
         let delete = if parent_first {
-            [parent, remove0]
+            [parent, remove0, remove1]
         } else {
-            [remove0, parent]
+            [remove0, remove1, parent]
         };
         assert_eq!(
-            store.commit(&td_crypto::Provider, request(2), &delete, &mut []),
-            Ok(Sequence::from_u64(3))
+            store.commit(&td_crypto::Provider, request(1), &delete, &mut []),
+            Ok(Sequence::from_u64(2))
         );
         let mut old = old;
         assert!(old
@@ -340,27 +337,31 @@ fn accepted_reply_and_failure_notice_rules_reuse_the_queue_validator() {
         Ok(Sequence::from_u64(2))
     );
 
-    // The core checks final state only; historical transition authority remains external.
+    // Use a separate unattempted group for the failure-notice rule.
+    let failure_fixture = Fixture::new();
+    let mut failure_root = failure_fixture.locked();
+    let store = open(&mut failure_root);
+    create(&store, 1, &[0]).unwrap();
     let mut failed = queued();
     failed.state = RecipientState::Failed;
     failed.reason = FailureReason::Expired;
     failed.next_attempt_at = None;
     let row = encode(Row::Recipient(failed));
     let failure = Operation::put(Table::Recipients, &key, &row).unwrap();
-    rejected(store.commit(&td_crypto::Provider, request(2), &[failure], &mut []));
+    rejected(store.commit(&td_crypto::Provider, request(1), &[failure], &mut []));
     sub.notification = NotificationState::Pending;
     let noticed = encode(Row::Submission(sub));
     assert_eq!(
         store.commit(
             &td_crypto::Provider,
-            request(2),
+            request(1),
             &[
                 failure,
                 Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &noticed).unwrap()
             ],
             &mut []
         ),
-        Ok(Sequence::from_u64(3))
+        Ok(Sequence::from_u64(2))
     );
 }
 
@@ -730,3 +731,6 @@ fn encoded_deadline_after_body_chunk_rolls_back_and_preserves_blob_id_reuse() {
     );
     store.validate_integrity(deadline()).unwrap();
 }
+
+#[path = "history_tests.rs"]
+mod history_tests;

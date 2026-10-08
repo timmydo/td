@@ -142,6 +142,30 @@ above i64::MAX; overflow refuses mutation. Account creation is bounded to 128.
 Change actions must agree with pre/post existence, and a unique native index
 refuses duplicate changes for one object within a transaction.
 
+Before applying rows, compare each existing Submission/Recipient with its
+final operation when it is a PUT, using the original account transaction snapshot.
+Submission email/thread/identity, transmitted blob, reverse path, creation
+and expiry times, and recipient count are immutable. Recipient address is
+immutable; uncertainty cannot clear and attemptCount cannot decrease.
+When attemptCount is unchanged, attempt ID and lastAttemptAt must also stay
+unchanged. A mismatch returns Conflict before body streaming or row writes.
+A DELETE followed by a PUT cannot reset that history within the transaction;
+intermediate PUT values have no separate durable effect.
+
+The scan projects queue keys without decoding unrelated rows and reuses
+writer scratch. DELETE positions and PUTs without an original row skip the
+later-key scan. At most 4096 original point reads and 8386560 later-key
+projections are possible; repeated keys may repeat an original point read.
+The quadratic scan samples the original deadline at least every 64 bounded
+key projections and before final value decoding; all SQL shares the original
+native allowance. The maximum-batch test is fixture evidence, not a promise
+that every store/host can finish within its deadline.
+
+This preserves named history fields, not the full transition graph. New
+attempt authority must still require a fresh ID and exactly one checked
+count increment. Notification Stored/email retention, creation authorization
+and deletion/retention policy also remain service obligations.
+
 Before COMMIT, every submission named by a Submission or Recipient PUT/DELETE
 is checked once against the final transaction view. Reuse the recipient
 sweep's QUEUE.md state and aggregate validator: require exactly ordinals
@@ -159,8 +183,9 @@ Deduplication examines
 at most the bounded 4096-operation batch, using fixed scalar/key state and
 the existing writer scratch. All groups share the original native deadline
 and VM fuel; exhaustion rolls back rather than admitting a partial check.
-These checks establish final consistency, not transition history, worker
-fences, authorization or actual SMTP acceptance.
+Group checks establish final consistency; the separate pre-transaction
+comparison preserves the named history fields above. Neither grants worker
+fences, authorization, complete transition validation or SMTP acceptance.
 
 Successful synchronous FULL COMMIT plus autocommit proves durability and
 returns its sequence, including when the deadline expires during completion.
