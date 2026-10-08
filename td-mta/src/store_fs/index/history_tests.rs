@@ -1404,22 +1404,6 @@ fn pending_recipients_cannot_reenter_in_flight_with_the_previous_attempt() {
     );
 }
 
-fn assert_submission(store: &IndexStore<'_>, expected: SubmissionRow<'_>, sequence: u64) {
-    let mut view = store.view(ACCOUNT, deadline()).unwrap();
-    assert_eq!(
-        view.identity().committed_sequence,
-        Sequence::from_u64(sequence)
-    );
-    let mut scratch = [0; 1024];
-    assert_eq!(
-        view.get(Key::Submission(SUBMISSION), &mut scratch)
-            .unwrap()
-            .unwrap()
-            .0,
-        Row::Submission(expected)
-    );
-}
-
 #[test]
 fn completed_timestamp_is_retained_across_terminal_updates_and_repeated_keys() {
     let mut unexpected = Vec::new();

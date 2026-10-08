@@ -162,12 +162,18 @@ it does not prove when the caller performs transport I/O.
 If the original recipient is not InFlight, both reply fields stay unchanged,
 including on dispatch into a new Prepared attempt. An intermediate Prepared
 PUT or DELETE cannot authorize a reply change in that transaction. After
-Prepared commits, the active attempt can record applicable replies; matching
-those updates to a current worker and enforcing reply ordering remain service
-obligations. An original InFlight row can still change replies when becoming
-Canceled or expiring if the final group is valid; the coordinator must enforce
-QUEUE.md's reply retention on those local outcomes. This common rule also
-preserves terminal recipients' replies.
+Prepared commits, the active attempt can record applicable replies. Once
+the original InFlight row is in Body or AcceptancePossible, its RCPT reply
+must remain unchanged in the final PUT, including outcome transitions. A
+later attempt can record a new RCPT reply after its own Prepared commit.
+Applicable DATA outcomes can still be recorded with the retained RCPT
+reply. Matching updates to a current worker and enforcing remaining reply
+ordering remain service obligations. On local cancellation/expiry the core
+does not check either reply from an original Prepared row, or DATA from
+later active phases. The coordinator must refuse reply changes and
+invented DATA replies for those local outcomes. Final group and
+acceptance-exposure checks still apply. Both reply fields on terminal
+recipients remain fixed.
 When attemptCount is unchanged, attempt ID and lastAttemptAt stay unchanged.
 An InFlight final row then also requires an original InFlight row: re-entry
 into InFlight cannot reuse a pending recipient's previous count/ID/time.

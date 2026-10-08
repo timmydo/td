@@ -6620,13 +6620,14 @@ identity, uncertainty, attempt-history and failure-notice fields against the
 original rows. A present completedAt also retains its exact original value
 across surviving submission PUTs, including whole-group cancellation;
 initial completion does not impose timestamp chronology. STORAGE.md defines
-reply retention outside active attempts
-and the empty-diagnostic requirement on attempt-count advances. It also
-defines count/ID progression, eligible-source/Prepared-entry checks,
-adjacent active phase advances, and acceptance/cancellation and DATA-reply
-requirements for certain outcomes from existing AcceptancePossible attempts.
-Remaining outcome transitions, reply updates by active attempts, phase changes
-outside InFlight and transport ordering still require coordinator validation.
+reply retention outside active attempts, RCPT retention after an active
+attempt reaches Body, and the empty-diagnostic requirement on attempt-count
+advances. It also defines count/ID progression,
+eligible-source/Prepared-entry checks, adjacent active phase advances, and
+acceptance/cancellation and DATA-reply requirements for certain outcomes
+from existing AcceptancePossible attempts. Remaining outcome transitions,
+other reply updates, phase changes outside InFlight and transport ordering
+still require coordinator validation.
 Terminal recipients cannot regain dispatch obligations or a new attempt;
 Accepted/Canceled remain in their states, Failed can only remain
 Failed or join a valid whole-group cancellation, and terminal OutcomeUnknown

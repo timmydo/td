@@ -67,7 +67,9 @@ attempt, attemptCount and lastAttemptAt are either all absent/zero or all presen
 InFlight/Body and InFlight/AcceptancePossible require a positive RCPT reply
 and absent dataReply: the new RCPT clears earlier DATA history before body
 transmission, and interim 354 is not stored. Prepared may retain earlier
-replies.
+replies. After an attempt durably reaches Body, preserve its recorded RCPT
+reply through all remaining phases and outcomes. A subsequent attempt may
+record a new RCPT reply after its own Prepared commit.
 Accepted requires positive RCPT and positive final DATA replies, reason None.
 Failed requires a permanent SMTP refusal or Expired; route/authentication
 failures cannot directly produce it. RetryWait requires at least one attempt
@@ -98,12 +100,14 @@ with indexed reads before COMMIT. A group inconsistency rolls back the entire
 transaction. The core also preserves existing immutable
 submission/envelope identity, the uncertainty latch, retained attempt history
 and one-way failure-notice state, plus an already-present completedAt, as
-specified in STORAGE.md. It refuses
-revival or a new attempt on terminal recipients, preserves Accepted/Canceled
-state, allows Failed only to remain Failed or join whole-group cancellation,
-and keeps terminal OutcomeUnknown terminal and uncertain. Terminal phase,
-uncertainty and actual replies are fixed, with a reason change only for
-Failed becoming Canceled; diagnostic text can still change.
+specified in STORAGE.md. It also preserves RCPT replies from existing
+InFlight/Body or InFlight/AcceptancePossible rows until a later attempt
+commits Prepared. It refuses revival or a new attempt on terminal
+recipients, preserves Accepted/Canceled state, allows Failed only to
+remain Failed or join whole-group cancellation, and keeps terminal
+OutcomeUnknown terminal and uncertain. Terminal phase, uncertainty and
+actual replies are fixed, with a reason change only for Failed becoming
+Canceled; diagnostic text can still change.
 It compares final PUTs with original rows before writing, so repeated keys
 cannot reset history within a transaction. Full transition checks, creation
 and deletion authorization, and attempt fences remain service obligations.

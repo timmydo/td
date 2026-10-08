@@ -835,6 +835,22 @@ fn assert_recipient(store: &IndexStore<'_>, expected: RecipientRow<'_>) {
     );
 }
 
+fn assert_submission(store: &IndexStore<'_>, expected: SubmissionRow<'_>, sequence: u64) {
+    let mut view = store.view(ACCOUNT, deadline()).unwrap();
+    assert_eq!(
+        view.identity().committed_sequence,
+        Sequence::from_u64(sequence)
+    );
+    let mut scratch = [0; 1024];
+    assert_eq!(
+        view.get(Key::Submission(SUBMISSION), &mut scratch)
+            .unwrap()
+            .unwrap()
+            .0,
+        Row::Submission(expected)
+    );
+}
+
 #[path = "history_tests.rs"]
 mod history_tests;
 

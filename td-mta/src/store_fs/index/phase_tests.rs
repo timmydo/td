@@ -936,3 +936,203 @@ fn recovery_refuses_body_rows_without_current_reply_shape() {
         }
     }
 }
+
+#[test]
+fn body_rcpt_reply_survives_phase_and_outcome_updates() {
+    use AttemptPhase::{AcceptancePossible, Body, Final};
+    let body = in_flight(Body);
+    let exposed = in_flight(AcceptancePossible);
+    let uncertain_body = RecipientRow {
+        uncertain: true,
+        ..body
+    };
+    let retry = RecipientRow {
+        state: RecipientState::RetryWait,
+        phase: Final,
+        reason: FailureReason::Network,
+        next_attempt_at: Some(2),
+        ..body
+    };
+    let expired = RecipientRow {
+        state: RecipientState::Failed,
+        phase: Final,
+        reason: FailureReason::Expired,
+        ..body
+    };
+    let canceled = RecipientRow {
+        state: RecipientState::Canceled,
+        phase: Final,
+        reason: FailureReason::Canceled,
+        ..body
+    };
+    let unknown = RecipientRow {
+        state: RecipientState::OutcomeUnknown,
+        phase: Final,
+        uncertain: true,
+        reason: FailureReason::Network,
+        next_attempt_at: Some(2),
+        ..body
+    };
+    let unknown_expired = RecipientRow {
+        reason: FailureReason::Expired,
+        next_attempt_at: None,
+        ..unknown
+    };
+    let deferred = RecipientRow {
+        reason: FailureReason::SmtpTemporary,
+        data_reply: Some("450 DATA deferred"),
+        ..retry
+    };
+    let refused = RecipientRow {
+        reason: FailureReason::SmtpPermanent,
+        data_reply: Some("550 DATA refused"),
+        ..expired
+    };
+    let deferred_expired = RecipientRow {
+        data_reply: Some("450 DATA deferred"),
+        ..expired
+    };
+    let cases = &[
+        ("Body unchanged", body, body),
+        ("Body to exposure", body, exposed),
+        ("Body network retry", body, retry),
+        ("Body expiry", body, expired),
+        ("Body cancellation", body, canceled),
+        ("Body prior uncertainty recovery", uncertain_body, unknown),
+        (
+            "Body prior uncertainty expiry",
+            uncertain_body,
+            unknown_expired,
+        ),
+        ("Exposure unchanged", exposed, exposed),
+        ("Exposure recovery", exposed, unknown),
+        ("Exposure expiry", exposed, unknown_expired),
+        ("Exposure DATA deferral", exposed, deferred),
+        ("Exposure DATA refusal", exposed, refused),
+        (
+            "Exposure DATA deferral at expiry",
+            exposed,
+            deferred_expired,
+        ),
+        ("Exposure acceptance", exposed, accepted(exposed)),
+    ];
+    let mut unexpected = Vec::new();
+    for encoded in [false, true] {
+        for &(name, original, good) in cases {
+            let terminal = good.state != RecipientState::InFlight && good.next_attempt_at.is_none();
+            let sub = SubmissionRow {
+                completed_at: terminal.then_some(2),
+                notification: if terminal
+                    && matches!(
+                        good.state,
+                        RecipientState::Failed | RecipientState::OutcomeUnknown
+                    ) {
+                    NotificationState::Pending
+                } else {
+                    NotificationState::None
+                },
+                ..submission(1)
+            };
+            for rcpt in [None, Some("251 different RCPT response")] {
+                if rcpt.is_none()
+                    && matches!(
+                        good.state,
+                        RecipientState::InFlight | RecipientState::Accepted
+                    )
+                {
+                    continue;
+                }
+                let bad = RecipientRow {
+                    rcpt_reply: rcpt,
+                    ..good
+                };
+                assert_fresh_group(sub, &[(0, bad)], encoded);
+                for repeated in [false, true] {
+                    let fixture = Fixture::new();
+                    let mut root = fixture.locked();
+                    let store = open(&mut root);
+                    create_group(&store, submission(1), &[(0, original)], encoded).unwrap();
+                    let key = recipient_key(0);
+                    let bad_bytes = encode(Row::Recipient(bad));
+                    let good_bytes = encode(Row::Recipient(good));
+                    let bad_op = Operation::put(Table::Recipients, &key, &bad_bytes).unwrap();
+                    let good_op = Operation::put(Table::Recipients, &key, &good_bytes).unwrap();
+                    let delete = Operation::delete(Table::Recipients, &key).unwrap();
+                    let sub_bytes = encode(Row::Submission(sub));
+                    let update =
+                        Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes)
+                            .unwrap();
+                    let operations = if repeated {
+                        vec![update, good_op, delete, bad_op]
+                    } else {
+                        vec![update, bad_op]
+                    };
+                    let result = apply(&store, 1, &operations, encoded);
+                    if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                        unexpected.push((encoded, name, rcpt, repeated, result));
+                        continue;
+                    }
+                    assert_recipient(&store, original);
+                    assert_submission(&store, submission(1), 1);
+                    assert_eq!(
+                        apply(&store, 1, &[update, bad_op, delete, good_op], encoded),
+                        Ok(Sequence::from_u64(2))
+                    );
+                    assert_recipient(&store, good);
+                    assert_submission(&store, sub, 2);
+                }
+            }
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "body RCPT history changed: {unexpected:?}"
+    );
+}
+
+#[test]
+fn later_prepared_attempt_can_record_a_new_rcpt_reply() {
+    for encoded in [false, true] {
+        for phase in [AttemptPhase::Body, AttemptPhase::AcceptancePossible] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = open(&mut root);
+            let original = in_flight(phase);
+            create_group(&store, submission(1), &[(0, original)], encoded).unwrap();
+            let uncertain = phase == AttemptPhase::AcceptancePossible;
+            let pending = RecipientRow {
+                state: if uncertain {
+                    RecipientState::OutcomeUnknown
+                } else {
+                    RecipientState::RetryWait
+                },
+                phase: AttemptPhase::Final,
+                uncertain,
+                reason: FailureReason::Network,
+                next_attempt_at: Some(2),
+                ..original
+            };
+            let prepared = next_attempt(pending);
+            let body = RecipientRow {
+                phase: AttemptPhase::Body,
+                rcpt_reply: Some("251 current attempt RCPT response"),
+                ..prepared
+            };
+            let key = recipient_key(0);
+            for (sequence, row) in [(1, pending), (2, prepared), (3, body)] {
+                let bytes = encode(Row::Recipient(row));
+                assert_eq!(
+                    apply(
+                        &store,
+                        sequence,
+                        &[Operation::put(Table::Recipients, &key, &bytes).unwrap()],
+                        encoded
+                    ),
+                    Ok(Sequence::from_u64(sequence + 1))
+                );
+                assert_recipient(&store, row);
+                assert_submission(&store, submission(1), sequence + 1);
+            }
+        }
+    }
+}
