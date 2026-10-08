@@ -646,7 +646,14 @@ operation under the existing pre-commit cancellation rules. After the
 commit the screen drains as Escape's does and the result is not shown:
 root finishes a committed operation whatever the screen does. In a
 login-unlock lifetime, already on the lock surface, the lock counts as
-Escape, so even a committed unlock leaves the session locked.
+Escape, so even a committed unlock leaves the session locked. No key
+started a lid's or a resume's close, so input then settles by time
+rather than discarding each device's first report: keys typed after
+the lock and past its 100 ms window are taken, the unlock chord whole.
+A resume is found by the batch of reports that follows it and locks
+before that batch is routed, so that batch's own keys, stamped before
+the lock, are dropped (`td-compositor/DESIGN.md`, "Physical secure
+attention").
 
 While locked:
 
@@ -705,12 +712,15 @@ after the PIN comes the touch. The worker compares the record with its
 baseline before identify and again before its success. td-authd reports
 success only after the worker's success frame and observed exit, and the
 compositor then drains held input and restores the ordinary screen and
-focus. Only that success for the unlock the compositor committed, with
-no Escape since, unlocks: an Escape that came first, even after the
-commit, keeps the session locked. A failure shows its typed reason on
-the trusted screen; Escape returns to the lock surface. One
-unlock is allowed per attention lifetime. Unlocking starts no process,
-switches no credential and releases no secret.
+focus. No key started that close, so input settles by time rather than
+discarding each device's first report, and the first key typed past its
+100 ms window reaches the session (`td-compositor/DESIGN.md`, "Physical
+secure attention"). Only that success for the unlock the compositor
+committed, with no Escape since, unlocks: an Escape that came first,
+even after the commit, keeps the session locked. A failure shows its
+typed reason on the trusted screen; Escape returns to the lock surface.
+One unlock is allowed per attention lifetime. Unlocking starts no
+process, switches no credential and releases no secret.
 
 ## Locked boot
 

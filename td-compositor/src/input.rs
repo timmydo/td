@@ -305,9 +305,9 @@ struct KeyBindings {
     /// profile's alone.
     resume: Option<Arc<Resume>>,
     cutoff: Option<u128>,
-    /// The screen draining now was closed by the seat itself, not a key
-    /// (`Seat::release`).
-    self_close: bool,
+    /// The screen draining now began closing without a key
+    /// (`Seat::close_itself`, `lock_for_suspend`).
+    keyless_close: Option<KeylessClose>,
     /// After such a close, the end of the settle window that replaces the
     /// first-report discard for `cutoff`.
     settled: Option<u128>,
@@ -480,7 +480,7 @@ impl KeyBindings {
                 && held(KEY_LEFTCTRL, KEY_RIGHTCTRL)
                 && held(KEY_LEFTALT, KEY_RIGHTALT);
             self.attention = AttentionState::Open;
-            self.self_close = false;
+            self.keyless_close = None;
             self.secret_selected = false;
             self.login_screen = LoginScreen::Closed;
             self.login_shown = None;
@@ -1547,15 +1547,47 @@ struct LiveInputTarget {
     seat: Seat,
 }
 
-/// How long after a self-close a report is still taken to straddle it:
-/// a driver flushes a report in the call that began it, far inside this.
+/// How long after a close no key started a report is still taken to
+/// straddle it: a driver flushes a report in the call that began it, far
+/// inside this.
 const SELF_CLOSE_SETTLE: u128 = 100_000_000;
 /// Said on standard error, which reaches the console, when the seat closes
-/// a screen itself, and at the first report past its settle window: times
-/// and a count only, never which keys, since td-setup's next keys are the
-/// typed-back recovery key.
+/// a screen itself, by which close, and at the first report past its
+/// settle window: times and a count only, never which keys, since the next
+/// keys may be td-setup's typed-back recovery key or whatever the person
+/// types into the session they just unlocked.
 pub(crate) const SELF_CLOSE_MARKER: &str = "TD-ATTENTION-SELF-CLOSE";
+pub(crate) const UNLOCK_CLOSE_MARKER: &str = "TD-ATTENTION-UNLOCK-CLOSE";
+pub(crate) const SUSPEND_CLOSE_MARKER: &str = "TD-ATTENTION-SUSPEND-CLOSE";
 pub(crate) const SETTLED_MARKER: &str = "TD-ATTENTION-SETTLED";
+
+/// A close of the attention screen that no key started. A key's close,
+/// Escape's or the menu's `L`, leaves each device's first report to be
+/// discarded, and that key's release absorbs the discard; a close no key
+/// started has nothing to absorb it, so it settles by time
+/// (`SELF_CLOSE_SETTLE`) instead, and the person's next key is not lost.
+/// The kind is fixed when the drain starts: a drain that held keys or
+/// buttons, or a device's removal, later complete closes as it began.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeylessClose {
+    /// Root's `06` for a committed login unlock (`Seat::unlocked`).
+    Unlock,
+    /// A committed device-bound disk installation's notice
+    /// (`Seat::release`).
+    Install,
+    /// A lid close's or a resume's lock (`lock_for_suspend`).
+    Suspend,
+}
+
+impl KeylessClose {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Unlock => UNLOCK_CLOSE_MARKER,
+            Self::Install => SELF_CLOSE_MARKER,
+            Self::Suspend => SUSPEND_CLOSE_MARKER,
+        }
+    }
+}
 
 /// Writes `line` and its newline to standard error in one call: `eprintln!`
 /// writes each formatting piece separately, and on the shared console
@@ -1588,26 +1620,12 @@ impl Seat {
     /// under the bindings lock no Escape interleaves, and one that came
     /// first ended the lifetime still locked. Held input drains first, as
     /// after Escape, under `RELEASE KEYS AND BUTTONS`; a close that fails
-    /// keeps capture, as there.
+    /// keeps capture, as there. The close settles by time.
     pub(crate) fn unlocked(&self, attempt: &crate::secret_client::Attempt) -> Result<(), String> {
-        let (Some(bindings), Some(target)) = (self.bindings.upgrade(), self.target.upgrade())
-        else {
-            return Ok(());
-        };
-        let mut bindings = bindings
-            .lock()
-            .map_err(|_| "input bindings lock poisoned".to_string())?;
-        let mut target = target
-            .lock()
-            .map_err(|_| "input target lock poisoned".to_string())?;
-        let current = target
-            .secret_attempt
-            .as_ref()
-            .is_some_and(|current| std::ptr::eq(Arc::as_ptr(current), attempt));
-        if !current || bindings.attention != AttentionState::Open || !attempt.unlock_committed() {
-            return Ok(());
-        }
-        {
+        let closed = self.close_itself(attempt, KeylessClose::Unlock, |bindings, target| {
+            if !attempt.unlock_committed() {
+                return Ok(());
+            }
             let mut runtime = target
                 .runtime
                 .lock()
@@ -1617,9 +1635,9 @@ impl Seat {
             bindings.attention = AttentionState::Draining;
             // The runtime's drain, not the target's: that one cancels the
             // attempt, and this one succeeded.
-            runtime.drain_attention(&origin)?;
-        }
-        if let Err(error) = finish_attention(&mut *target, &mut bindings) {
+            runtime.drain_attention(&origin)
+        })?;
+        if let Some(Err(error)) = closed {
             let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
         }
         Ok(())
@@ -1628,19 +1646,39 @@ impl Seat {
     /// Drains and, once no key or button is held, closes the screen, as
     /// Escape does, if it is open and still `attempt`'s: after a committed
     /// device-bound disk installation's notice, whose recovery key td-setup
-    /// shows. The close settles by time (`SELF_CLOSE_SETTLE`). A drain that
-    /// fails leaves the screen open as it was, for Escape.
+    /// shows. The close settles by time. A drain that fails leaves the
+    /// screen open as it was, for Escape.
     pub(crate) fn release(&self, attempt: &crate::secret_client::Attempt) -> Result<(), String> {
+        self.close_itself(attempt, KeylessClose::Install, |bindings, target| {
+            bindings.attention = AttentionState::Draining;
+            let drained = target.drain_attention();
+            if drained.is_err() {
+                bindings.attention = AttentionState::Open;
+            }
+            drained
+        })?
+        .ok_or_else(|| "the input seat that opened attention is gone".to_string())?
+    }
+
+    /// The seat's own close of `attempt`'s screen, which no key started:
+    /// under the bindings, then the target, and only while `attempt`'s
+    /// screen is the open one. `drain` drains it, or leaves it open; once
+    /// it is draining, the close is `close`, which settles by time, and
+    /// the screen closes as soon as no key or button is held. Answers
+    /// `None` when the seat is gone, and otherwise the close's own result.
+    fn close_itself(
+        &self,
+        attempt: &crate::secret_client::Attempt,
+        close: KeylessClose,
+        drain: impl FnOnce(&mut KeyBindings, &mut LiveInputTarget) -> Result<(), String>,
+    ) -> Result<Option<Result<(), String>>, String> {
         let (Some(bindings), Some(target)) = (self.bindings.upgrade(), self.target.upgrade())
         else {
-            return Err("the input seat that opened attention is gone".into());
+            return Ok(None);
         };
         let mut bindings = bindings
             .lock()
             .map_err(|_| "input bindings lock poisoned".to_string())?;
-        if bindings.attention != AttentionState::Open {
-            return Ok(());
-        }
         let mut target = target
             .lock()
             .map_err(|_| "input target lock poisoned".to_string())?;
@@ -1648,17 +1686,16 @@ impl Seat {
             .secret_attempt
             .as_ref()
             .is_some_and(|current| std::ptr::eq(Arc::as_ptr(current), attempt));
-        if !current {
-            return Ok(());
+        if !current || bindings.attention != AttentionState::Open {
+            return Ok(Some(Ok(())));
         }
-        bindings.attention = AttentionState::Draining;
-        bindings.self_close = true;
-        if let Err(error) = target.drain_attention() {
-            bindings.attention = AttentionState::Open;
-            bindings.self_close = false;
-            return Err(error);
+        let drained = drain(&mut bindings, &mut target);
+        if bindings.attention != AttentionState::Draining {
+            return drained.map(|()| Some(Ok(())));
         }
-        finish_attention(&mut *target, &mut bindings)
+        bindings.keyless_close = Some(close);
+        drained?;
+        Ok(Some(finish_attention(&mut *target, &mut bindings)))
     }
 }
 
@@ -1703,7 +1740,8 @@ fn lock_session<T: InputTarget>(
 /// items 6 and 7), which call it holding the bindings: in the paired
 /// profile alone, and only while root's last `1a` answer is enrolled or
 /// unavailable. Otherwise it does nothing. An open attention lifetime ends
-/// as `lock_session` ends it, as Escape does.
+/// as `lock_session` ends it, as Escape does, except that no key started
+/// its close, which therefore settles (`KeylessClose::Suspend`).
 fn lock_for_suspend<T: InputTarget>(
     target: &Mutex<T>,
     bindings: &mut KeyBindings,
@@ -1714,6 +1752,9 @@ fn lock_for_suspend<T: InputTarget>(
     let mut target = target
         .lock()
         .map_err(|_| "input target lock poisoned".to_string())?;
+    if bindings.attention == AttentionState::Open {
+        bindings.keyless_close = Some(KeylessClose::Suspend);
+    }
     lock_session(&mut *target, bindings).map(|_| ())
 }
 
@@ -3120,11 +3161,12 @@ fn finish_attention<T: InputTarget>(
             return Err(error);
         }
         bindings.cutoff = Some(cutoff);
-        bindings.settled = std::mem::take(&mut bindings.self_close)
-            .then(|| cutoff.saturating_add(SELF_CLOSE_SETTLE));
-        bindings.settle_dropped = bindings.settled.map(|settled| {
+        let close = bindings.keyless_close.take();
+        bindings.settled = close.map(|_| cutoff.saturating_add(SELF_CLOSE_SETTLE));
+        bindings.settle_dropped = close.zip(bindings.settled).map(|(close, settled)| {
             say_line(&format!(
-                "{SELF_CLOSE_MARKER} cutoff={cutoff} settle-until={settled}"
+                "{} cutoff={cutoff} settle-until={settled}",
+                close.marker()
             ));
             0
         });
@@ -8653,7 +8695,7 @@ mod tests {
         {
             let bindings = bindings.lock().unwrap();
             assert!(bindings.attention == AttentionState::Open);
-            assert!(!bindings.self_close);
+            assert_eq!(bindings.keyless_close, None);
             assert_eq!(bindings.settled, None);
         }
         runtime.lock().unwrap().enable_attention(true);
@@ -8674,7 +8716,7 @@ mod tests {
             let bindings = bindings.lock().unwrap();
             let cutoff = bindings.cutoff.unwrap();
             assert_eq!(bindings.settled, Some(cutoff + SELF_CLOSE_SETTLE));
-            assert!(!bindings.self_close);
+            assert_eq!(bindings.keyless_close, None);
         }
         feed(&[
             key(KEY_LEFTCTRL, KEY_PRESS),
@@ -11197,6 +11239,153 @@ mod tests {
         );
     }
 
+    /// Root's `06` and the seat that unlocked: the unlock driven to its
+    /// success with no key held, attention closed onto the client.
+    fn unlocked_seat() -> LockedSeat {
+        let seat = LockedSeat::new(&[]);
+        let (mut client, mut root) = seat.committed();
+        root.replies.push_back(status(6, &pin_step()));
+        run(&mut client, &mut root).unwrap();
+        assert!(!seat.locked() && !seat.attention_open());
+        seat
+    }
+
+    /// `events` read from `device` by its own reader, which has seen no
+    /// report since the last close.
+    fn read_events(seat: &LockedSeat, device: usize, state: &mut DeviceState, events: Vec<Event>) {
+        for event in events {
+            apply_device_event(
+                seat.target.as_ref(),
+                event,
+                device,
+                seat.bindings.as_ref(),
+                state,
+            )
+            .unwrap();
+        }
+    }
+
+    /// `events` as one batch read by the whole device dispatcher, with no
+    /// report before them.
+    fn read_batch(seat: &LockedSeat, device: usize, events: Vec<Event>) {
+        let data = events.into_iter().flat_map(encode).collect();
+        read_device(
+            Path::new("event-test"),
+            &mut ChunkedReader::new(data, Vec::new()),
+            device,
+            seat.target.as_ref(),
+            seat.bindings.as_ref(),
+            None,
+            &mut || None,
+        )
+        .unwrap();
+    }
+
+    /// Root's `06`, which no key started, closes attention onto a settle
+    /// window rather than each device's first-report discard: the
+    /// person's first key after the unlock reaches the session, from the
+    /// keyboard that typed the PIN and from another alike.
+    #[test]
+    fn the_first_key_after_an_unlock_reaches_the_session() {
+        let seat = unlocked_seat();
+        let (events, _stop) = seat
+            .runtime
+            .lock()
+            .unwrap()
+            .subscribe_keyboard(1)
+            .unwrap()
+            .split();
+        for (device, code) in [(0, KEY_A), (1, KEY_B)] {
+            let mut resync = || None;
+            let mut state = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, true);
+            read_events(&seat, device, &mut state, later(presses(&[code], 80)));
+        }
+        let (a, b) = (u32::from(KEY_A), u32::from(KEY_B));
+        assert_eq!(LockedSeat::client_keys(&events), [a, a, b, b]);
+        let bindings = seat.bindings.lock().unwrap();
+        let cutoff = bindings.cutoff.unwrap();
+        assert_eq!(bindings.settled, Some(cutoff + SELF_CLOSE_SETTLE));
+        assert_eq!(bindings.keyless_close, None);
+        // The first report taken past the window said its count.
+        assert_eq!(bindings.settle_dropped, None);
+    }
+
+    /// A key pressed inside an unlock's settle window and released past
+    /// it is dropped whole: neither its press nor its release reaches the
+    /// session, nothing stays held, and the window counts the report it
+    /// dropped. The next key reaches the session.
+    #[test]
+    fn a_key_straddling_an_unlocks_settle_window_is_dropped_whole() {
+        let seat = unlocked_seat();
+        let cutoff = seat.bindings.lock().unwrap().cutoff.unwrap();
+        assert_eq!(seat.bindings.lock().unwrap().settle_dropped, Some(0));
+        let (events, _stop) = seat
+            .runtime
+            .lock()
+            .unwrap()
+            .subscribe_keyboard(1)
+            .unwrap()
+            .split();
+        let mut resync = || None;
+        let mut state = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, true);
+        let mut report = |code, value, at: u128| {
+            let stamped = [key(code, value), syn(1)].map(|mut event| {
+                event.timestamp = at;
+                event
+            });
+            read_events(&seat, 0, &mut state, stamped.to_vec());
+        };
+        report(KEY_ENTER, KEY_PRESS, cutoff + SELF_CLOSE_SETTLE / 2);
+        assert_eq!(seat.bindings.lock().unwrap().settle_dropped, Some(1));
+        report(KEY_ENTER, KEY_RELEASE, cutoff + SELF_CLOSE_SETTLE * 3 / 2);
+        {
+            let bindings = seat.bindings.lock().unwrap();
+            assert_eq!(bindings.settle_dropped, None);
+            assert!(bindings.pressed.is_empty());
+            assert!(bindings.forwarded.is_empty());
+        }
+        assert!(LockedSeat::client_keys(&events).is_empty());
+        report(KEY_B, KEY_PRESS, cutoff + 3 * SELF_CLOSE_SETTLE);
+        report(KEY_B, KEY_RELEASE, cutoff + 4 * SELF_CLOSE_SETTLE);
+        let b = u32::from(KEY_B);
+        assert_eq!(LockedSeat::client_keys(&events), [b, b]);
+        assert!(seat.bindings.lock().unwrap().pressed.is_empty());
+    }
+
+    /// Escape's close keeps the first-report discard: the Escape
+    /// release's own report absorbs it on the keyboard that closed, whose
+    /// next key reaches the session, while another device's first report
+    /// after the close is discarded however late, and its next is taken.
+    #[test]
+    fn an_escape_close_keeps_the_first_report_discard() {
+        let seat = LockedSeat::open(&[]);
+        let mut resync = || None;
+        let mut keyboard = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, true);
+        read_events(&seat, 0, &mut keyboard, later(chord_reports(10)));
+        assert!(seat.attention_open());
+        read_events(&seat, 0, &mut keyboard, later(presses(&[KEY_ESC], 20)));
+        assert!(!seat.attention_open());
+        {
+            let bindings = seat.bindings.lock().unwrap();
+            assert!(bindings.cutoff.is_some());
+            assert_eq!(bindings.settled, None);
+            assert_eq!(bindings.settle_dropped, None);
+        }
+        let (events, _stop) = seat
+            .runtime
+            .lock()
+            .unwrap()
+            .subscribe_keyboard(1)
+            .unwrap()
+            .split();
+        read_events(&seat, 0, &mut keyboard, later(presses(&[KEY_A], 30)));
+        let mut resync = || None;
+        let mut other = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, true);
+        read_events(&seat, 1, &mut other, later(presses(&[KEY_B, KEY_C], 40)));
+        let (a, c) = (u32::from(KEY_A), u32::from(KEY_C));
+        assert_eq!(LockedSeat::client_keys(&events), [a, a, c, c]);
+    }
+
     /// Locking goes through the bindings: the launcher's and the help
     /// sheet's capture close with the overlays the runtime closes, so no
     /// key is routed to an overlay that is gone.
@@ -12885,6 +13074,137 @@ mod tests {
             assert!(!seat.attention_open() && seat.locked());
             assert!(seat.glass() == seat.lock_surface());
             assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
+        }
+    }
+
+    /// Whether the chord just read opened the lock surface's unlock.
+    fn unlock_opened(seat: &LockedSeat) -> bool {
+        seat.attention_open()
+            && seat.queued.attempt().is_some_and(|attempt| {
+                attempt.selection()
+                    == &crate::secret_client::Selection::Login(
+                        crate::secret_client::LoginSelection::Unlock,
+                    )
+            })
+    }
+
+    /// A lid close's or a resume's lock while attention is open is a
+    /// close no key started, so it settles rather than discarding each
+    /// device's first report. A key inside the window is dropped and
+    /// counted, both its reports; another keyboard's first report after
+    /// the lock, the unlock chord's Control press on the lock surface, is
+    /// taken, and the chord opens the unlock at once.
+    #[test]
+    fn a_suspend_lock_settles_and_keeps_the_next_key() {
+        for trigger in TRIGGERS {
+            let seat = LockedSeat::open(&[]);
+            let mut resync = || None;
+            let mut keyboard = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, true);
+            read_events(&seat, 0, &mut keyboard, later(chord_reports(10)));
+            assert!(seat.attention_open() && !seat.locked(), "{trigger:?}");
+            seat.trigger(*trigger).unwrap();
+            assert!(!seat.attention_open() && seat.locked(), "{trigger:?}");
+            let cutoff = seat.bindings.lock().unwrap().cutoff.unwrap();
+            assert_eq!(
+                seat.bindings.lock().unwrap().settled,
+                Some(cutoff + SELF_CLOSE_SETTLE)
+            );
+            let inside = [KEY_PRESS, KEY_RELEASE]
+                .into_iter()
+                .zip(1u128..)
+                .flat_map(|(value, n)| {
+                    [key(KEY_LEFTCTRL, value), syn(1)].map(|mut event| {
+                        event.timestamp = cutoff + n * SELF_CLOSE_SETTLE / 4;
+                        event
+                    })
+                })
+                .collect();
+            read_events(&seat, 0, &mut keyboard, inside);
+            {
+                let bindings = seat.bindings.lock().unwrap();
+                assert_eq!(bindings.settle_dropped, Some(2), "{trigger:?}");
+                assert!(bindings.pressed.is_empty());
+            }
+            let mut resync = || None;
+            let mut other = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, true);
+            read_events(&seat, 1, &mut other, later(chord_reports(30)));
+            assert!(unlock_opened(&seat), "{trigger:?}");
+            assert_eq!(seat.bindings.lock().unwrap().settle_dropped, None);
+        }
+    }
+
+    /// A resume found by a reader's batch (item 7) locks before that
+    /// batch is routed. The batch's own reports were stamped before the
+    /// lock's cutoff, so they are dropped as stale, the chord in them
+    /// too, and not counted: this pins that drop. The lock settles, so
+    /// the next batch, from a reader with no report since, is taken whole
+    /// and its chord opens the unlock at once.
+    #[test]
+    fn a_resumes_own_batch_is_dropped_and_the_next_taken_whole() {
+        let seat = LockedSeat::open(&[]);
+        let (_resume, clocks) = seat.resume();
+        seat.chord(10);
+        assert!(seat.attention_open() && !seat.locked());
+        clocks.advance(Duration::from_secs(1));
+        clocks.suspend(Duration::from_secs(3));
+        // Stamped early in this host's monotonic time, as reports queued
+        // across the suspend are stamped before the lock that reads them.
+        let batch = chord_reports(30);
+        let stamped = batch.iter().map(|event| event.timestamp).max().unwrap();
+        read_batch(&seat, 0, batch);
+        assert!(seat.locked() && !seat.attention_open());
+        assert!(seat.queued.attempt().is_none());
+        {
+            let bindings = seat.bindings.lock().unwrap();
+            let cutoff = bindings.cutoff.unwrap();
+            assert!(stamped < cutoff);
+            assert_eq!(bindings.settled, Some(cutoff + SELF_CLOSE_SETTLE));
+            assert_eq!(bindings.settle_dropped, Some(0));
+        }
+        read_batch(&seat, 0, later(chord_reports(50)));
+        assert!(unlock_opened(&seat));
+    }
+
+    /// A lid or resume lock that arrives while Escape's drain waits on a
+    /// held key does not change the close's kind, fixed when Escape
+    /// started the drain: the close is a key's and keeps the first-report
+    /// discard, so another device's first report after it, a chord's
+    /// Control press, is dropped, and that device's next chord unlocks.
+    #[test]
+    fn a_suspend_lock_during_escapes_held_drain_stays_a_key_close() {
+        for trigger in TRIGGERS {
+            let seat = LockedSeat::open(&[]);
+            let mut resync = || None;
+            let mut keyboard = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, true);
+            read_events(&seat, 0, &mut keyboard, later(chord_reports(10)));
+            let held = vec![
+                at_millis(key(KEY_LEFTSHIFT, KEY_PRESS), 20),
+                syn(20),
+                at_millis(key(KEY_ESC, KEY_PRESS), 21),
+                syn(21),
+                at_millis(key(KEY_ESC, KEY_RELEASE), 22),
+                syn(22),
+            ];
+            read_events(&seat, 0, &mut keyboard, later(held));
+            assert!(seat.bindings.lock().unwrap().attention == AttentionState::Draining);
+            seat.trigger(*trigger).unwrap();
+            assert!(seat.locked(), "{trigger:?}");
+            assert!(seat.bindings.lock().unwrap().attention == AttentionState::Draining);
+            let release = vec![at_millis(key(KEY_LEFTSHIFT, KEY_RELEASE), 30), syn(30)];
+            read_events(&seat, 0, &mut keyboard, later(release));
+            assert!(!seat.attention_open(), "{trigger:?}");
+            {
+                let bindings = seat.bindings.lock().unwrap();
+                assert_eq!(bindings.keyless_close, None);
+                assert_eq!(bindings.settled, None, "{trigger:?}");
+            }
+            let mut resync = || None;
+            let mut other = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, true);
+            read_events(&seat, 1, &mut other, later(chord_reports(40)));
+            assert!(!seat.attention_open(), "{trigger:?}");
+            assert!(seat.queued.attempt().is_none());
+            read_events(&seat, 1, &mut other, later(chord_reports(50)));
+            assert!(unlock_opened(&seat), "{trigger:?}");
         }
     }
 

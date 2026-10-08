@@ -5819,21 +5819,43 @@ kernel queue. Each device discards through its first `SYN_REPORT` under a
 new cutoff, even if the whole report has a newer timestamp: the input core
 can buffer a value before close and timestamp its report only when it
 flushes afterward. This conservatively drops the first wholly fresh report
-from an idle device as well. After the seat closes a committed
-device-bound installation's screen itself, which no key did ("Physical
-installation confirmation"), that discard would take the person's next
-key, so it is replaced by a 100 ms settle window instead: a report
-stamped at or before the cutoff plus 100 ms is discarded, and the first
-one after it is taken. A driver flushes a report in the call that began
-it, far inside that window. So a key pressed within 100 ms of a self-close
-is discarded, by design: its press never reaches the session, and its
-release, if later, is taken by the seat but not forwarded. The close is
-said on standard error, which reaches the console, as
-`TD-ATTENTION-SELF-CLOSE` with the cutoff and the window's end, and the
-first report taken past the window says `TD-ATTENTION-SETTLED` with the
-count of reports the window dropped: times and a count only, never a key,
-since td-setup's next keys are the typed-back recovery key. Later stale
-records are discarded through their report boundary; they cannot restore
+from an idle device as well. One rule says which close keeps that discard.
+A close a key started keeps it: the key's release report absorbs it on the
+keyboard that closed. Those are Escape's; the menu's `L`, when it locks for
+an enrolled or unavailable account; and `Super+l`'s, which the open screen
+reads as its own key: on the menu as `L`, so it locks and closes as `L`
+does, and on any other screen, or for an unenrolled account, it closes
+nothing. A close no key started has nothing to absorb it, so the discard
+would take the person's next key; it settles by time instead. There are
+three such closes: a login unlock's after root's `06` ("The lock surface"),
+a device-bound installation's after its notice ("Physical installation
+confirmation"), and a lid close's or a resume's lock (`lock_for_suspend`,
+items 6 and 7 of "Session lock and login-key entry"), whose next key may be
+the unlock chord. A resume found by a reader's batch locks before that
+batch is routed, so the batch's own reports, stamped before the cutoff, are
+discarded as stale, a chord in them too; the next batch is taken once past
+the window. A close's kind is fixed when its drain starts: a drain that
+waits for held keys or buttons, or ends when a device is unplugged, closes
+as it began. So a lid or resume lock that arrives while Escape's drain
+waits on a held key stays a key close, and another device's first report
+after it is still discarded; one that arrives during an unlock's drain
+still says `TD-ATTENTION-UNLOCK-CLOSE`. Nothing else closes the screen: it
+has no timeout, no client can reach it, the compositor handles no VT
+switch, and a compositor restart starts a new generation with no screen
+open. Settling, a report stamped at or before the cutoff plus 100 ms is
+discarded, and the first one after it is taken. A driver flushes a report
+in the call that began it, far inside that window. So a key pressed within
+100 ms of such a close is discarded, by design: its press never reaches the
+session, and its release, if later, is taken by the seat but not forwarded.
+The close is said on standard error, which reaches the console, as
+`TD-ATTENTION-UNLOCK-CLOSE` for an unlock, `TD-ATTENTION-SELF-CLOSE` for an
+installation or `TD-ATTENTION-SUSPEND-CLOSE` for a lid or resume lock, with
+the cutoff and the window's end, and the first report taken past the window
+says `TD-ATTENTION-SETTLED` with that cutoff and the count of reports the
+window dropped: times and a count only, never a key, since the next keys
+may be td-setup's typed-back recovery key, the unlock chord, or whatever
+the person types into the session just unlocked. Later stale records are
+discarded through their report boundary; they cannot restore
 modifiers or pointer buttons. At each discarded report boundary, a tablet
 re-reads EVIOCGABS and refreshes its held position, including when
 quarantine swallowed a SYN_DROPPED marker; a touchpad instead forgets its
@@ -5853,14 +5875,14 @@ Cancellation displays `RELEASE KEYS AND BUTTONS` until every admitted held
 key, button and partial pointer report drains. Device removal performs both
 keyboard and pointer cleanup before checking that condition. A stuck device
 can keep input captured; there is no timeout that silently returns input to
-applications. Two closes are not started by Escape, and both drain the
-same way: a login unlock's after root's `06` ("The lock surface"), which
-keeps the first-report discard, and a committed device-bound disk
-installation's after its notice ("Physical installation confirmation"),
-which settles as above. If the installation's drain fails, the screen
-stays open as it was, and Escape still closes it. Unplugging the device
-drains its bookkeeping. The current fixed device roster requires
-compositor restart to add a replacement.
+applications. The closes no key started drain the same way and settle as
+above: a login unlock's after root's `06` ("The lock surface") and a
+committed device-bound disk installation's after its notice ("Physical
+installation confirmation"), which one shared seat path
+(`Seat::close_itself`) makes, and a lid or resume lock's. If the
+installation's drain fails, the screen stays open as it was, and Escape
+still closes it. Unplugging the device drains its bookkeeping. The current
+fixed device roster requires compositor restart to add a replacement.
 Direct-profile readers retain their per-device partial-report fast path;
 they never claim secure attention or use the trusted timestamp cutoff.
 
@@ -6274,7 +6296,10 @@ the runtime's drain and not the target's, which would cancel the
 attempt that succeeded. The screen keeps `SESSION UNLOCKED` above
 `RELEASE KEYS AND BUTTONS`, without Escape's `CANCELLING REQUEST`,
 until every held key and button is released; attention then closes,
-and the ordinary screen, focus and cutoff return as for any close.
+and the ordinary screen, focus and cutoff return as for any close. No
+key started that close, so it settles by time ("Physical secure
+attention"): the first key the person types after the unlock reaches
+the session once it is stamped past the window.
 An Escape that came first, even after the commit, ends the lifetime
 still locked whatever root then reports. A `06` out of order, before
 the commit, for another step or nonce, or as a new lifetime's first
@@ -6294,11 +6319,18 @@ the chord's unlock with no menu, one per lifetime and a new one after
 Escape; a security key's own keyboard refused; the whole chained unlock
 through the device dispatcher, its PIN typed on the keyboard, to `06`,
 unlocked with the window on glass and focused; a `06` with a key held,
-drained under its success notice until the release; locking with the
+drained under its success notice until the release; the first key after
+an unlock reaching the session from either keyboard, a key straddling
+its settle window dropped whole, Escape's close still discarding another
+device's first report, a lid or resume lock over an open screen
+settling, a report inside its window dropped and counted, so the chord
+that follows unlocks at once, a resume's triggering batch dropped as
+stale and the next batch's chord taken whole, and a lid or resume lock
+during Escape's held drain staying a key close; locking with the
 launcher or sheet open, their capture closed; a failure's text, still
-locked; Escape before and after the commit, still locked; and forged
-and out-of-order `06`s. Host tests of the locked start cover the
-decision for each state, unenrolled, no answer and the direct profile;
+locked; Escape before and after the commit, still locked; and forged and
+out-of-order `06`s. Host tests of the locked start cover the decision
+for each state, unenrolled, no answer and the direct profile;
 every frame a recording output is handed, the first being the lock
 surface; relock in each generation after an unlock; the rows' exact
 places and a 63-byte hostname's wrap at 1280x800, 800x600 and 320x200;
