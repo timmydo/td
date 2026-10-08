@@ -19,6 +19,8 @@ use td_crypto::Digest;
 
 // Compile filesystem and checker sources with their cfg(test) fixtures.
 // Filesystem fixtures need no production exception for the mapped test identity.
+#[cfg(test)]
+use td_mta::sync;
 use td_mta::{bounded, config, format, ids, limits, ownership, ports, store_paths, wire};
 #[path = "../src/admission.rs"]
 #[allow(unused)] // Keep quota/work helpers in this measured source compilation.

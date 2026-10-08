@@ -6869,8 +6869,27 @@ inspection, and both consume the engine. STORAGE.md owns recovery of the
 brief two-link publication state, original clock handoff and filesystem
 limits. This is an offline storage primitive; it grants no CLI, online backup,
 quota reservation, body-integrity or service-activation claim. Opening a
-snapshot permits offline inspection; restoring it for service requires a fresh
-epoch, which remains unimplemented.
+snapshot permits offline inspection; restoring it for service requires a
+fresh epoch.
+
+IndexStore::renew_epoch(self, entropy: &mut dyn ports::Entropy,
+deadline: Deadline) -> Result<Self, CommitError> supplies that low-level
+epoch replacement. It consumes the engine on every outcome, refuses a
+forgotten-view marker, reserves existing WAL headroom and makes one
+16-byte fill from an admitted warmed entropy source. A candidate equal
+to the current epoch returns Rejected(Conflict); a failed fill discards
+the whole candidate. Native clock/deadline failure after fill takes
+precedence over its returned entropy error. A conditional update
+verifies the persisted old epoch, then uses the ordinary commit
+classifier. Known success returns the owner with the new durable epoch;
+no error returns an owner. The caller retains the root and may reopen to
+establish persisted state, especially after Indeterminate. All other
+stored data and account endpoints/floors remain unchanged.
+
+STORAGE.md owns the original scope, entropy freshness and synchronous
+cleanup limits. This primitive grants no restore authorization,
+verification, resource admission or service activation; the operational
+restore command remains unimplemented.
 
 ### Disposable prepared ingress inputs
 

@@ -2605,6 +2605,12 @@ until a separate consistency protocol exists. Preserve a pre-repair copy
 or manifest sufficient to audit changes. Rebuild indexes independently. Change
 store epoch on restore and refuse incompatible formats without altering them.
 
+The native offline primitives now include consuming IndexStore::backup
+and IndexStore::renew_epoch. The latter atomically replaces the epoch
+from admitted entropy while preserving account histories and bodies;
+every error consumes its owner. These primitives do not complete the
+restore command, selection/verification workflow or service activation.
+
 **Acceptance:** backup while receiving and compacting, restore elsewhere, then
 verify every committed blob/reference/folder/queue record. Detect interior
 corruption and missing blobs. Repair never invents accepted contents or drops

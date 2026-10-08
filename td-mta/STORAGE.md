@@ -562,11 +562,39 @@ source while retaining the original lock.
 The snapshot contains authoritative bodies and metadata, but receipt success
 does not verify every body digest or domain invariant. The snapshot may be opened for
 offline inspection with ordinary IndexStore::open and its normal checks.
-Serving a restored snapshot requires a fresh epoch so old client state tokens
-cannot identify a different history; that restore operation is not implemented.
-Online backup, operational restore commands, verification/repair and history
-maintenance tools remain unimplemented.
-SQLite integrity checks do not replace digest and domain validation.
+Serving a restored snapshot requires a fresh epoch so old client state
+tokens cannot identify a different history. IndexStore::renew_epoch
+consumes the engine and obtains one 16-byte candidate from the caller's
+admitted, warmed entropy source. A candidate equal to the current epoch
+refuses with Conflict; there is no retry loop. All bytes from a failed
+fill are discarded. Other 16-byte values follow the existing StoreEpoch
+domain. Freshness across previous histories and other stores relies on
+the admitted entropy source, not this single comparison.
+
+Under the exclusive writer fence, a forgotten-view marker refuses with
+Busy, the existing WAL headroom bound applies, and one original native
+deadline/clock scope covers acquisition, entropy and SQL. Checks before
+and after entropy fill preserve that scope even when fill returns an
+error. Synchronous native entropy may block or abort; those checks do
+not make it interruptible. BEGIN IMMEDIATE and a conditional store-epoch
+update require the persisted old epoch to match the owner; a missing or
+mismatched row refuses with Corrupt. The ordinary commit classifier
+governs acknowledgement: only known durable success updates the
+in-memory epoch and returns the owner, including success observed after
+the deadline. Accounts, endpoints, floors, objects, body chunks,
+retained changes and the used-blob-ID registry are preserved.
+
+A live borrowed view or body prevents consuming the engine. Every
+returned error also consumes it, so an indeterminate commit cannot leave
+a reusable owner with a stale epoch. The caller retains the root lock
+and may reopen to inspect the persisted result; reopening alone grants
+no service activation. Connection destruction retains its existing
+synchronous cleanup limits. Authorization, stopped service activity,
+resource admission, backup selection, digest/domain verification and
+compatible configuration/credentials remain caller responsibilities.
+Online backup, operational restore commands, verification/repair and
+history maintenance tools remain unimplemented. SQLite integrity checks
+do not replace digest and domain validation.
 
 ### Disposable ingress staging
 

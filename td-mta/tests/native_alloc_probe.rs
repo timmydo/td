@@ -565,6 +565,8 @@ fn tls_remote_chain() {
     println!("tls-{scenario}-allocation-v1: native passed");
 }
 
+#[cfg(all(test, td_native_alloc_probe))]
+use td_mta::sync;
 #[cfg(td_native_alloc_probe)]
 use td_mta::{
     admission, bounded, config, format, ids, limits, mailbox_parents, ownership, ports,

@@ -66,6 +66,8 @@ mod backup;
 #[cfg(test)]
 #[path = "index/crash_tests.rs"]
 mod crash_tests;
+#[path = "index/epoch.rs"]
+mod epoch;
 #[cfg(test)]
 #[path = "index/recipient_tests.rs"]
 mod recipient_tests;

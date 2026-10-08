@@ -160,6 +160,8 @@ mod tls_generation_scenario;
 #[path = "support/tls_remote_chain_scenario.rs"]
 mod tls_remote_chain_scenario;
 
+#[cfg(test)]
+use td_mta::sync;
 use td_mta::{
     admission, bounded, config, format, ids, limits, mailbox_parents, ownership, ports,
     row_references, store_paths,
