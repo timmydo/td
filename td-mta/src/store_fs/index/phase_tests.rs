@@ -593,125 +593,109 @@ fn exposed_attempt_cannot_end_certain_without_a_definitive_data_refusal() {
 }
 
 #[test]
-fn exposed_attempt_cannot_reuse_a_retained_data_refusal() {
-    use AttemptPhase::{AcceptancePossible, Body, Prepared};
+fn legacy_exposed_attempt_cannot_reuse_a_retained_data_refusal() {
+    use AttemptPhase::{AcceptancePossible, Prepared};
     let mut unexpected = Vec::new();
     for encoded in [false, true] {
-        for chained in [false, true] {
-            for (state, reason, reply, retry) in [
-                (
-                    RecipientState::RetryWait,
-                    FailureReason::SmtpTemporary,
-                    "450 retained from prior attempt",
-                    Some(2),
-                ),
-                (
-                    RecipientState::Failed,
-                    FailureReason::SmtpPermanent,
-                    "550 retained from prior attempt",
-                    None,
-                ),
-                (
-                    RecipientState::Failed,
-                    FailureReason::Expired,
-                    "450 retained from prior attempt",
-                    None,
-                ),
-                (
-                    RecipientState::Failed,
-                    FailureReason::Expired,
-                    "550 retained from prior attempt",
-                    None,
-                ),
-            ] {
-                let fixture = Fixture::new();
-                let mut root = fixture.locked();
-                let store = open(&mut root);
-                let original = RecipientRow {
-                    data_reply: Some(reply),
-                    ..in_flight(AcceptancePossible)
-                };
-                let mut initial = original;
-                if chained {
-                    initial.phase = Prepared;
-                }
-                create_group(
-                    &store,
-                    submission(2),
-                    &[(0, initial), (1, queued())],
-                    encoded,
+        for (state, reason, reply, retry) in [
+            (
+                RecipientState::RetryWait,
+                FailureReason::SmtpTemporary,
+                "450 retained from prior attempt",
+                Some(2),
+            ),
+            (
+                RecipientState::Failed,
+                FailureReason::SmtpPermanent,
+                "550 retained from prior attempt",
+                None,
+            ),
+            (
+                RecipientState::Failed,
+                FailureReason::Expired,
+                "450 retained from prior attempt",
+                None,
+            ),
+            (
+                RecipientState::Failed,
+                FailureReason::Expired,
+                "550 retained from prior attempt",
+                None,
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = open(&mut root);
+            let original = RecipientRow {
+                data_reply: Some(reply),
+                ..in_flight(AcceptancePossible)
+            };
+            let initial = RecipientRow {
+                phase: Prepared,
+                ..original
+            };
+            create_group(
+                &store,
+                submission(2),
+                &[(0, initial), (1, queued())],
+                encoded,
+            )
+            .unwrap();
+            // Seed a legacy row that current final-state validation refuses.
+            // History must still reject otherwise valid certain outcomes.
+            {
+                let writer = lock(&store.writer).unwrap();
+                let db = lock(&writer.native.connection).unwrap();
+                relational::put(
+                    &db,
+                    ACCOUNT,
+                    Key::Recipient(SUBMISSION, 0),
+                    Row::Recipient(original),
+                    Sequence::from_u64(1),
                 )
                 .unwrap();
-                let key = recipient_key(0);
-                let mut sequence = 1;
-                if chained {
-                    for phase in [Body, AcceptancePossible] {
-                        let bytes = encode(Row::Recipient(RecipientRow { phase, ..original }));
-                        assert_eq!(
-                            apply(
-                                &store,
-                                sequence,
-                                &[Operation::put(Table::Recipients, &key, &bytes).unwrap()],
-                                encoded,
-                            ),
-                            Ok(Sequence::from_u64(sequence + 1))
-                        );
-                        sequence += 1;
-                    }
-                }
-                let next = RecipientRow {
-                    state,
-                    phase: AttemptPhase::Final,
-                    next_attempt_at: retry,
-                    reason,
-                    ..original
-                };
-                assert_fresh_group(submission(2), &[(0, next), (1, queued())], encoded);
-                let bytes = encode(Row::Recipient(next));
-                let result = apply(
+            }
+            let key = recipient_key(0);
+            let sequence = 1;
+            let next = RecipientRow {
+                state,
+                phase: AttemptPhase::Final,
+                next_attempt_at: retry,
+                reason,
+                ..original
+            };
+            assert_fresh_group(submission(2), &[(0, next), (1, queued())], encoded);
+            let bytes = encode(Row::Recipient(next));
+            let result = apply(
+                &store,
+                sequence,
+                &[Operation::put(Table::Recipients, &key, &bytes).unwrap()],
+                encoded,
+            );
+            if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                unexpected.push((encoded, reason, reply, result));
+                continue;
+            }
+            assert_recipient(&store, original);
+            let unresolved = RecipientRow {
+                state: RecipientState::OutcomeUnknown,
+                phase: AttemptPhase::Final,
+                uncertain: true,
+                reason: FailureReason::Uncertain,
+                next_attempt_at: Some(3),
+                ..original
+            };
+            let bytes = encode(Row::Recipient(unresolved));
+            assert_eq!(
+                apply(
                     &store,
                     sequence,
                     &[Operation::put(Table::Recipients, &key, &bytes).unwrap()],
                     encoded,
-                );
-                if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
-                    unexpected.push((encoded, chained, reason, reply, result));
-                    continue;
-                }
-                assert_recipient(&store, original);
-                let mut retained = original;
-                retained.diagnostic = "retained reply cannot resolve exposure";
-                let bytes = encode(Row::Recipient(retained));
-                assert_eq!(
-                    apply(
-                        &store,
-                        sequence,
-                        &[Operation::put(Table::Recipients, &key, &bytes).unwrap()],
-                        encoded,
-                    ),
-                    Ok(Sequence::from_u64(sequence + 1))
-                );
-                assert_recipient(&store, retained);
-                let unresolved = RecipientRow {
-                    state: RecipientState::OutcomeUnknown,
-                    phase: AttemptPhase::Final,
-                    uncertain: true,
-                    reason: FailureReason::Uncertain,
-                    next_attempt_at: Some(3),
-                    ..retained
-                };
-                let bytes = encode(Row::Recipient(unresolved));
-                assert_eq!(
-                    apply(
-                        &store,
-                        sequence + 1,
-                        &[Operation::put(Table::Recipients, &key, &bytes).unwrap()],
-                        encoded,
-                    ),
-                    Ok(Sequence::from_u64(sequence + 2))
-                );
-                assert_recipient(&store, unresolved);
-            }
+                ),
+                Ok(Sequence::from_u64(sequence + 1))
+            );
+            assert_recipient(&store, unresolved);
         }
     }
     assert!(
@@ -775,6 +759,180 @@ fn exposed_attempt_can_record_uncertain_recovery_and_refusal_outcomes() {
                 Ok(Sequence::from_u64(2))
             );
             assert_recipient(&store, next);
+        }
+    }
+}
+
+#[test]
+fn body_reply_shape_is_checked_on_creation_and_final_update() {
+    use AttemptPhase::{AcceptancePossible, Body, Prepared};
+    let mut unexpected = Vec::new();
+    for encoded in [false, true] {
+        for phase in [Body, AcceptancePossible] {
+            for creation in [false, true] {
+                for (rcpt, data) in [
+                    (None, None),
+                    (Some("354 continue"), None),
+                    (Some("450 deferred"), None),
+                    (Some("550 refused"), None),
+                    (Some("250-fake"), None),
+                    (Some("299 invalid"), None),
+                    (Some("ok"), None),
+                    (Some("250 recipient accepted"), Some("250 old accepted")),
+                    (Some("250 recipient accepted"), Some("354 continue")),
+                    (Some("250 recipient accepted"), Some("450 old deferred")),
+                    (Some("250 recipient accepted"), Some("550 old refused")),
+                ] {
+                    let fixture = Fixture::new();
+                    let mut root = fixture.locked();
+                    let store = open(&mut root);
+                    let bad = RecipientRow {
+                        rcpt_reply: rcpt,
+                        data_reply: data,
+                        ..in_flight(phase)
+                    };
+                    let good = in_flight(phase);
+                    let mut original = in_flight(if phase == Body { Prepared } else { Body });
+                    if phase == Body {
+                        original.data_reply = Some("450 retained from prior attempt");
+                    }
+                    let key = recipient_key(0);
+                    let bad_bytes = encode(Row::Recipient(bad));
+                    let good_bytes = encode(Row::Recipient(good));
+                    let bad_op = Operation::put(Table::Recipients, &key, &bad_bytes).unwrap();
+                    let good_op = Operation::put(Table::Recipients, &key, &good_bytes).unwrap();
+                    let result = if creation {
+                        create_group(&store, submission(1), &[(0, bad)], encoded)
+                    } else {
+                        create_group(&store, submission(1), &[(0, original)], encoded).unwrap();
+                        apply(&store, 1, &[good_op, bad_op], encoded)
+                    };
+                    if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                        unexpected.push((encoded, phase, creation, rcpt, data, result));
+                        continue;
+                    }
+                    let view = store.view(ACCOUNT, deadline()).unwrap();
+                    assert_eq!(
+                        view.identity().committed_sequence,
+                        Sequence::from_u64(u64::from(!creation))
+                    );
+                    drop(view);
+                    if creation {
+                        assert_eq!(
+                            create_group(&store, submission(1), &[(0, good)], encoded),
+                            Ok(Sequence::from_u64(1))
+                        );
+                    } else {
+                        assert_recipient(&store, original);
+                        assert_eq!(
+                            apply(
+                                &store,
+                                1,
+                                &[
+                                    bad_op,
+                                    Operation::delete(Table::Recipients, &key).unwrap(),
+                                    good_op
+                                ],
+                                encoded
+                            ),
+                            Ok(Sequence::from_u64(2))
+                        );
+                    }
+                    assert_recipient(&store, good);
+                }
+            }
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "invalid body replies committed: {unexpected:?}"
+    );
+}
+
+#[test]
+fn recovery_refuses_body_rows_without_current_reply_shape() {
+    use crate::recipient_sweep::{Error, QueueError, Step, Sweep};
+    for phase in [AttemptPhase::Body, AttemptPhase::AcceptancePossible] {
+        for stale_data in [false, true] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = open(&mut root);
+            let valid = in_flight(phase);
+            create_group(&store, submission(1), &[(0, valid)], false).unwrap();
+            let mut invalid = valid;
+            if stale_data {
+                invalid.data_reply = Some("250 retained from an older attempt");
+            } else {
+                invalid.rcpt_reply = None;
+            }
+            {
+                let writer = lock(&store.writer).unwrap();
+                let db = lock(&writer.native.connection).unwrap();
+                relational::put(
+                    &db,
+                    ACCOUNT,
+                    Key::Recipient(SUBMISSION, 0),
+                    Row::Recipient(invalid),
+                    Sequence::from_u64(1),
+                )
+                .unwrap();
+            }
+            let mut view = store.view(ACCOUNT, deadline()).unwrap();
+            let mut sweep = Sweep::new(view.identity(), 2);
+            let mut key = [0; 20];
+            let mut value = [0; 1024];
+            assert_eq!(
+                sweep.advance(&mut view, &mut key, &mut value),
+                Ok(Step::Submission {
+                    id: SUBMISSION,
+                    count: 1
+                })
+            );
+            assert_eq!(
+                sweep.advance(&mut view, &mut key, &mut value),
+                Err(Error::Queue {
+                    submission: SUBMISSION,
+                    ordinal: Some(0),
+                    error: QueueError::RecipientState
+                })
+            );
+            assert_eq!(
+                sweep.advance(&mut view, &mut key, &mut value),
+                Err(Error::Failed)
+            );
+            assert!(matches!(sweep.finish(), Err(Error::Failed)));
+            drop(view);
+            // A separately repaired fixture completes with the same row budget.
+            {
+                let writer = lock(&store.writer).unwrap();
+                let db = lock(&writer.native.connection).unwrap();
+                relational::put(
+                    &db,
+                    ACCOUNT,
+                    Key::Recipient(SUBMISSION, 0),
+                    Row::Recipient(valid),
+                    Sequence::from_u64(1),
+                )
+                .unwrap();
+            }
+            let mut view = store.view(ACCOUNT, deadline()).unwrap();
+            let mut sweep = Sweep::new(view.identity(), 2);
+            for expected in [
+                Step::Submission {
+                    id: SUBMISSION,
+                    count: 1,
+                },
+                Step::Recipient {
+                    submission: SUBMISSION,
+                    ordinal: 0,
+                },
+                Step::SubmissionsEnd,
+                Step::Complete,
+            ] {
+                assert_eq!(sweep.advance(&mut view, &mut key, &mut value), Ok(expected));
+            }
+            let complete = sweep.finish().unwrap();
+            assert_eq!(complete.recipients(), 1);
         }
     }
 }

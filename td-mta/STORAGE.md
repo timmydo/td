@@ -193,10 +193,15 @@ SmtpTemporary and a stored DATA 4xx; Failed requires SmtpPermanent with a
 stored DATA 5xx, or Expired with a stored DATA 4xx/5xx. Both require the
 original row's DATA reply to be absent: QUEUE.md requires the new RCPT reply
 to clear old DATA history and forbids storing interim 354. A retained negative
-DATA reply cannot resolve an exposed attempt, even if carried through separate
-Prepared, Body and AcceptancePossible commits. OutcomeUnknown remains available
-to preserve uncertainty. The shared stored-reply classifier checks the code
-and separator; an RCPT refusal alone is insufficient.
+DATA reply cannot justify a certain failure/retry from an older exposed row;
+this is a defensive history check, not support for that stored shape. Recovery
+and final-state validation refuse InFlight/Body or AcceptancePossible with
+retained DATA. No queue worker has shipped and no migration of such rows is
+provided. The history check alone does not prevent an older exposed row with
+retained positive DATA from becoming Accepted; current result authority still
+requires the coordinator. OutcomeUnknown remains available for uncertainty. The shared
+stored-reply classifier checks the code and separator; an RCPT refusal alone
+is insufficient.
 Other certain retry/failure shapes refuse, so a network/protocol failure
 cannot discard exposure and permit later cancellation. Stored negative
 replies are necessary here, but do not prove a definitive result from the
@@ -700,10 +705,14 @@ failed/unfinished state cannot finish, and repeated completion still checks view
 identity without another read.
 
 Each recipient also obeys QUEUE.md's current-state phase, retry-presence,
-uncertainty and failure-reason rules. Accepted requires positive RCPT and final
-DATA reply codes; definitive SMTP failure/retry requires the applicable stored
-negative code. Unattempted recipients cannot carry replies. Code/separator
-checks do not replace wire parsing or full JMAP reply normalization. Historical
+uncertainty and failure-reason rules. InFlight/Body and
+InFlight/AcceptancePossible require a positive RCPT reply and absent DATA
+reply, while Prepared may retain earlier replies. The same rule applies to
+recovery and final groups in typed/encoded commits, including newly created
+rows. Accepted requires positive RCPT and final DATA reply codes; definitive
+SMTP failure/retry requires the applicable stored negative code. Unattempted
+recipients cannot carry replies. Code/separator checks do not replace wire
+parsing or full JMAP reply normalization. Historical
 replies alone never authorize an attempt result or prove its fence.
 
 For each exact group, completedAt must be present exactly when no recipient

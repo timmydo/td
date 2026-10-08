@@ -93,6 +93,8 @@ fn validate(row: RecipientRow<'_>) -> Result<(), QueueError> {
             matches!(row.phase, P::Prepared | P::Body | P::AcceptancePossible)
                 && !next
                 && row.reason == F::None
+                && (row.phase == P::Prepared
+                    || (reply_class(row.rcpt_reply) == Some(2) && row.data_reply.is_none()))
         }
         S::RetryWait => {
             row.phase == P::Final
@@ -238,6 +240,7 @@ mod tests {
         for phase in [AttemptPhase::Body, AttemptPhase::AcceptancePossible] {
             let mut row = recipient(S::InFlight);
             row.phase = phase;
+            row.rcpt_reply = Some("250 recipient ok");
             row.uncertain = true;
             assert_eq!(check(row), Ok(()));
         }
@@ -313,6 +316,49 @@ mod tests {
             row.data_reply = Some(reply);
             assert_eq!(check(row), Ok(()));
         }
+    }
+    #[test]
+    fn body_phases_require_positive_rcpt_and_no_data_reply() {
+        let mut unexpected = Vec::new();
+        for phase in [AttemptPhase::Body, AttemptPhase::AcceptancePossible] {
+            for (rcpt, data) in [
+                (None, None),
+                (Some("354 continue"), None),
+                (Some("450 deferred"), None),
+                (Some("550 refused"), None),
+                (Some("250-fake"), None),
+                (Some("299 invalid"), None),
+                (Some("ok"), None),
+                (Some("250 recipient ok"), Some("250 old accepted")),
+                (Some("250 recipient ok"), Some("354 continue")),
+                (Some("250 recipient ok"), Some("450 old deferred")),
+                (Some("250 recipient ok"), Some("550 old refused")),
+            ] {
+                let mut row = recipient(RecipientState::InFlight);
+                row.rcpt_reply = rcpt;
+                row.data_reply = data;
+                // Prepared retains previous replies until this attempt replies.
+                assert_eq!(check(row), Ok(()));
+                row.phase = phase;
+                let result = check(row);
+                if result != Err(QueueError::RecipientState) {
+                    unexpected.push((phase, rcpt, data, result));
+                }
+            }
+            for reply in ["250", "250 recipient ok", "251 forwarded"] {
+                let mut row = recipient(RecipientState::InFlight);
+                row.phase = phase;
+                row.rcpt_reply = Some(reply);
+                for uncertain in [false, true] {
+                    row.uncertain = uncertain;
+                    assert_eq!(check(row), Ok(()));
+                }
+            }
+        }
+        assert!(
+            unexpected.is_empty(),
+            "invalid body replies: {unexpected:?}"
+        );
     }
     #[test]
     fn group_completion_notifications_and_atomic_cancellation() {

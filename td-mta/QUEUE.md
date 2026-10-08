@@ -64,6 +64,10 @@ attempt, attemptCount and lastAttemptAt are either all absent/zero or all presen
 | Canceled | None if never attempted, otherwise Final | Absent | Guaranteed no delivery, uncertainty false, reason Canceled |
 | OutcomeUnknown | AcceptancePossible or Final | Present while retry eligible, otherwise absent | Acceptance may have occurred; uncertainty true |
 
+InFlight/Body and InFlight/AcceptancePossible require a positive RCPT reply
+and absent dataReply: the new RCPT clears earlier DATA history before body
+transmission, and interim 354 is not stored. Prepared may retain earlier
+replies.
 Accepted requires positive RCPT and positive final DATA replies, reason None.
 Failed requires a permanent SMTP refusal or Expired; route/authentication
 failures cannot directly produce it. RetryWait requires at least one attempt
