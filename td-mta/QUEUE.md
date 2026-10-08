@@ -104,12 +104,14 @@ specified in STORAGE.md. For an existing submission, None cannot advance
 directly to Stored: Pending must commit first. An already completed
 submission with None must retain None. The core also preserves RCPT
 replies from existing InFlight/Body or InFlight/AcceptancePossible rows
-until a later attempt commits Prepared. It refuses revival or a new
-attempt on terminal recipients, preserves Accepted/Canceled state, allows
-Failed only to remain Failed or join whole-group cancellation, and keeps
-terminal OutcomeUnknown terminal and uncertain. Terminal phase,
-uncertainty and actual replies are fixed, with a reason change only for
-Failed becoming Canceled; diagnostic text can still change.
+until a later attempt commits Prepared. A final Canceled row preserves
+both original replies, including from an active Prepared or Body attempt.
+The core refuses revival or a new attempt on terminal recipients,
+preserves Accepted/Canceled state, allows Failed only to remain Failed or
+join whole-group cancellation, and keeps terminal OutcomeUnknown terminal
+and uncertain. Terminal phase, uncertainty and actual replies are fixed,
+with a reason change only for Failed becoming Canceled; diagnostic text
+can still change.
 It compares final PUTs with original rows before writing, so repeated keys
 cannot reset history within a transaction. Full transition checks, creation
 and deletion authorization, and attempt fences remain service obligations.
@@ -220,8 +222,11 @@ fence and close any Prepared/Body attempt before committing cancellation.
 Refuse if any recipient is Accepted, has uncertainty, or is currently in
 AcceptancePossible. An already wholly Canceled submission is an idempotent
 success. Before fencing or changing rows, compute and reserve the complete
-cancellation transaction, retaining actual replies. Refuse with cannotUnsend (CLI
-limit reason) if it cannot fit the byte/operation ceiling or obtain capacity;
+cancellation transaction, retaining durably committed replies. A reply
+received but not yet committed by a worker enters retained history only if
+that worker commits it before the cancellation fence. Refuse with
+cannotUnsend (CLI limit reason) if the transaction cannot fit the
+byte/operation ceiling or obtain capacity;
 never split cancellation or discard replies to fit it. Thus up to 1000 fresh
 queued recipients can cancel together, but a large attempted submission with
 long reply history may require explicit refusal. Failed recipients with no

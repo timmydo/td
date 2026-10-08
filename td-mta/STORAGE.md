@@ -163,21 +163,24 @@ Conflict rather than being normalized by the adapter. Prepared and
 a later phase cannot be combined into one count-advancing transaction: the
 final PUT is compared with the original row. This constrains stored history;
 it does not prove when the caller performs transport I/O.
-If the original recipient is not InFlight, both reply fields stay unchanged,
-including on dispatch into a new Prepared attempt. An intermediate Prepared
-PUT or DELETE cannot authorize a reply change in that transaction. After
-Prepared commits, the active attempt can record applicable replies. Once
-the original InFlight row is in Body or AcceptancePossible, its RCPT reply
+If the original recipient is not InFlight, both reply fields stay
+unchanged, including on dispatch into a new Prepared attempt. A final
+Canceled row also retains both original replies, including cancellation
+from InFlight/Prepared or InFlight/Body. Cancellation cannot invent,
+replace or clear either reply. An intermediate Prepared PUT or DELETE
+cannot authorize a reply change in that transaction. After Prepared
+commits, the active attempt can record applicable replies. Once the
+original InFlight row is in Body or AcceptancePossible, its RCPT reply
 must remain unchanged in the final PUT, including outcome transitions. A
 later attempt can record a new RCPT reply after its own Prepared commit.
 Applicable DATA outcomes can still be recorded with the retained RCPT
 reply. Matching updates to a current worker and enforcing remaining reply
-ordering remain service obligations. On local cancellation/expiry the core
-does not check either reply from an original Prepared row, or DATA from
-later active phases. The coordinator must refuse reply changes and
-invented DATA replies for those local outcomes. Final group and
-acceptance-exposure checks still apply. Both reply fields on terminal
-recipients remain fixed.
+ordering remain service obligations. For other local outcomes, including
+expiry, restart recovery and a local abort, the core does not check either
+reply from an original Prepared row, or DATA from later active phases. The
+coordinator must refuse reply changes and invented DATA replies for those
+local outcomes. Final group and acceptance-exposure checks still apply.
+Both reply fields on terminal recipients remain fixed.
 When attemptCount is unchanged, attempt ID and lastAttemptAt stay unchanged.
 An InFlight final row then also requires an original InFlight row: re-entry
 into InFlight cannot reuse a pending recipient's previous count/ID/time.

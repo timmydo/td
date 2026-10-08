@@ -1136,3 +1136,101 @@ fn later_prepared_attempt_can_record_a_new_rcpt_reply() {
         }
     }
 }
+
+#[test]
+fn active_cancellation_cannot_change_either_reply() {
+    use AttemptPhase::{Body, Final, Prepared};
+    let prepared = in_flight(Prepared);
+    let empty = RecipientRow {
+        rcpt_reply: None,
+        ..prepared
+    };
+    let history = RecipientRow {
+        data_reply: Some("450 earlier message deferred"),
+        ..prepared
+    };
+    let body = in_flight(Body);
+    let cases = &[
+        ("Prepared invent RCPT", empty, Some("250 invented"), None),
+        ("Prepared invent DATA", empty, None, Some("550 invented")),
+        ("Prepared clear RCPT", history, None, history.data_reply),
+        (
+            "Prepared replace RCPT",
+            history,
+            Some("550 replacement"),
+            history.data_reply,
+        ),
+        ("Prepared clear DATA", history, history.rcpt_reply, None),
+        (
+            "Prepared replace DATA",
+            history,
+            history.rcpt_reply,
+            Some("550 replacement"),
+        ),
+        (
+            "Body invent DATA",
+            body,
+            body.rcpt_reply,
+            Some("550 invented"),
+        ),
+    ];
+    let mut unexpected = Vec::new();
+    for encoded in [false, true] {
+        for &(name, original, rcpt_reply, data_reply) in cases {
+            let canceled = RecipientRow {
+                state: RecipientState::Canceled,
+                phase: Final,
+                reason: FailureReason::Canceled,
+                diagnostic: "canceled locally",
+                ..original
+            };
+            let changed = RecipientRow {
+                rcpt_reply,
+                data_reply,
+                ..canceled
+            };
+            let sub = SubmissionRow {
+                completed_at: Some(2),
+                ..submission(1)
+            };
+            assert_fresh_group(sub, &[(0, changed)], encoded);
+            for repeated in [false, true] {
+                let fixture = Fixture::new();
+                let mut root = fixture.locked();
+                let store = open(&mut root);
+                create_group(&store, submission(1), &[(0, original)], encoded).unwrap();
+                let key = recipient_key(0);
+                let changed_bytes = encode(Row::Recipient(changed));
+                let bad = Operation::put(Table::Recipients, &key, &changed_bytes).unwrap();
+                let canceled_bytes = encode(Row::Recipient(canceled));
+                let good = Operation::put(Table::Recipients, &key, &canceled_bytes).unwrap();
+                let delete = Operation::delete(Table::Recipients, &key).unwrap();
+                let sub_bytes = encode(Row::Submission(sub));
+                let complete =
+                    Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes).unwrap();
+                let operations = if repeated {
+                    vec![good, delete, bad, complete]
+                } else {
+                    vec![bad, complete]
+                };
+                let result = apply(&store, 1, &operations, encoded);
+                if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                    unexpected.push((encoded, name, repeated, result));
+                    continue;
+                }
+                assert_recipient(&store, original);
+                assert_submission(&store, submission(1), 1);
+                assert_eq!(
+                    apply(&store, 1, &[bad, delete, good, complete], encoded),
+                    Ok(Sequence::from_u64(2))
+                );
+                assert_recipient(&store, canceled);
+                assert_submission(&store, sub, 2);
+            }
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "cancellation changed replies: {unexpected:?}"
+    );
+}

@@ -2322,13 +2322,14 @@ already completed submissions with None retain None.
 The core also preserves an existing completedAt timestamp through later
 updates and cancellation, without proving its clock authority.
 STORAGE.md also defines reply retention outside active attempts, RCPT
-retention after an active attempt reaches Body, and the empty-diagnostic
-requirement on attempt-count advances. It defines count/ID progression,
-eligible-source/Prepared-entry checks, adjacent active phase advances, and
-acceptance/cancellation and DATA-reply requirements for certain outcomes
-from existing AcceptancePossible attempts. Final-state checks require
-positive RCPT and absent DATA replies in InFlight/Body and
-InFlight/AcceptancePossible; Prepared may retain earlier replies.
+retention after an active attempt reaches Body, both-reply retention on
+cancellation, and the empty-diagnostic requirement on attempt-count
+advances. It defines count/ID progression, eligible-source/Prepared-entry
+checks, adjacent active phase advances, and acceptance/cancellation and
+DATA-reply requirements for certain outcomes from existing
+AcceptancePossible attempts. Final-state checks require positive RCPT and
+absent DATA replies in InFlight/Body and InFlight/AcceptancePossible;
+Prepared may retain earlier replies.
 Complete outcome transition and worker validation, reply updates by active
 attempts, phase changes outside InFlight, transport ordering, entropy/collision
 checks, changed-object coverage, category quota reconciliation and request

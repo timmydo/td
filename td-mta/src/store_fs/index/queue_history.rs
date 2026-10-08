@@ -97,7 +97,7 @@ fn recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
 }
 
 fn reply_history(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
-    if old.state != RecipientState::InFlight {
+    if old.state != RecipientState::InFlight || next.state == RecipientState::Canceled {
         return old.rcpt_reply == next.rcpt_reply && old.data_reply == next.data_reply;
     }
     !matches!(
