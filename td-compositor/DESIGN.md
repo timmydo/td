@@ -6201,7 +6201,15 @@ as D14 keeps such a session locked. Unenrolled, the live medium's every
 answer, starts unlocked, and the direct development profile has no
 authority and never locks. Every generation, a restarted compositor's
 included, therefore starts locked on that rule, and no client pixel of
-that generation precedes the lock surface on glass. Under fbdev the
+that generation precedes the lock surface on glass. Planned, not
+current: `td-install/ENCRYPTION.md` increment 8's verified account
+handoff adds one exception, the connect-time answer's admission byte
+(`td-authd/DESIGN.md`, amendment 9): `01` makes that first paint the
+session instead, for that generation alone, and the source pin then
+names it as the one condition under which an enrolled or unavailable
+answer does not lock the first paint. The same amendment's cause `0d`,
+an unenrolled protected machine, is an unavailable answer and locks.
+Under fbdev the
 previous generation's last frame stays in `/dev/fb0` across a restart
 until the first paint replaces it; it discloses nothing that generation
 had not already shown. The scene's lock state is private to it, and

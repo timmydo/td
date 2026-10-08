@@ -442,8 +442,9 @@ orphan in td's copy and a foreign token's in cryptsetup's.
   that token, falling back to the next released one and, when none is
   left, to recovery. It never halts on it.
 - A LUKS2 reencryption keyslot names no token and is an orphan by this
-  rule; the protected-tier upgrade, which re-encrypts online, must run
-  no plan while one exists.
+  rule; the protected-tier upgrade, which re-encrypts online, runs only
+  its own planner while one or its `td-upgrade` token exists ("Protected
+  roles (planned)").
 
 What is old depends on the transition. The first-boot transition retires
 the first-boot keyslot and token. When a device-bound protector released
@@ -553,6 +554,133 @@ device never keeps releasing to the first-boot protector alone without
 its owner seeing it. And a header td refuses is still capped, with
 nothing tried: the cap closes release on an encrypted volume whatever
 its header holds.
+
+## Protected roles (planned)
+
+Nothing in this section is current. ENCRYPTION.md increment 8 adds the
+protected tier's roles here ("Protected tier" there owns the flows and
+the shapes; this section owns the formats, policies and plan rules),
+each landing in the sub-increment ENCRYPTION.md names.
+
+**PIN.** `pin::Pin` holds 6 to 63 bytes, each 0x20 to 0x7e, as typed;
+`parse` refuses any other entry, naming the byte offset or the length
+and never a byte, and is the only constructor. It is zeroed on drop and
+neither `Debug`, `Display` nor `Clone`. `auth_value(salt)` is
+HMAC-SHA256 keyed with the 32-byte salt over `td/disk-protector/pin/v1`,
+a zero byte and the PIN, returned in a zeroing owner.
+
+**tpm-pin policy.** PolicyPCR over the SHA-256 bank selecting PCRs 4, 9
+and 12 (and 7 when the seal names it), with the composite of the
+expected PCR 4, PCR 9 (and PCR 7) and a literal-zero PCR 12, then
+PolicyAuthValue, then PolicyCommandCode(Unseal). The sealed object has
+`PROTECTED_ATTRIBUTES`: fixedTPM, fixedParent and adminWithPolicy, with
+userWithAuth and noDA clear, and the authValue `auth_value` gives. A
+literal test pins the digest for fixed PCR values. Whether a new seal
+names PCR 7 is td-boot's reading of the measured boot (ENCRYPTION.md,
+"Firmware authentication"), never a header field. `chain_check`
+computes the release-time digest from a PCR_Read, compares it with the
+sealed public area's authPolicy, requires the storage primary's Name to
+equal the token's, and loads the object with `load_and_flush`, sending
+no authorization; it answers whether the PIN may be asked.
+
+**Lockout.** `lockout::seal(volume_key, uuid, l, name)` and `open`
+implement ENCRYPTION.md's lockout token: HKDF-SHA256 over the volume key
+with the info `td/disk-protector/lockout/v1`, a zero byte, the UUID and
+the nonce, 64 bytes split into `k_enc` and `k_mac`; the ciphertext is
+`L` XOR `k_enc`; the tag is HMAC-SHA256 under `k_mac` over the nonce,
+ciphertext and Name, compared in constant time. `take`, `prove`,
+`reset` and `clear` are the sequences that section gives, the
+parameters `DA_MAX_TRIES` 32, `DA_RECOVERY_SECS` 600 and
+`DA_LOCKOUT_RECOVERY_SECS` 86400 pinned by test; none matches
+parameters in place of a proof.
+
+**Tokens.** Each protected token is a LUKS2 token object with exactly
+these keys, in this order, every text a canonical decimal or lowercase
+hexadecimal string as the device-bound format's are:
+
+```text
+{"type":"td-protector","keyslots":["N"],"role":"tpm-pin",
+ "account":"1000","pcrs":"4,9","primary":"HEX","salt":"HEX",
+ "public":"HEX","private":"HEX"}
+{"type":"td-protector","keyslots":["N"],"role":"fido2-primary",
+ "account":"1000","credential":"HEX","salt":"HEX","x":"HEX","y":"HEX"}
+{"type":"td-protector","keyslots":["N"],"role":"recovery-key"}
+{"type":"td-protector","keyslots":[],"role":"lockout",
+ "primary":"HEX","nonce":"HEX","ciphertext":"HEX","tag":"HEX"}
+{"type":"td-protector","keyslots":[],"role":"secure-boot",
+ "salt":"HEX","public":"HEX","private":"HEX"}
+{"type":"td-protector","keyslots":[],"role":"config","tags":["HEX"]}
+{"type":"td-protector","keyslots":[],"role":"update-retry",
+ "pair":"HEX","tag":"HEX"}
+{"type":"td-upgrade","keyslots":[],"shape":"tpm","from":"HEX"}
+{"type":"td-request","keyslots":[],"operation":"pin-change"}
+```
+
+`pcrs` is `4,9` or `4,7,9`; `primary` is the storage primary's 34-byte
+Name; `role` of a FIDO2 token is `fido2-primary` or `fido2-recovery`,
+and a pending one has empty `keyslots`; `shape` is `tpm` or `fido2`;
+`from` is 32 bytes; `tags` holds one or two distinct 32-byte HMAC-SHA256
+tags; `pair` is the SHA-256 over the staged pair's two digests and `tag`
+its 32-byte HMAC-SHA256 under the update-retry key; `operation` is
+`pin-change` or `tpm-clear`; `account` is `1000`. `salt`, `x`, `y`,
+`nonce`, `ciphertext` and `tag` are 32 bytes, `public` and `private`
+keep the device-bound bounds (the secure-boot token's sized for an
+RSA-2048 key), and `credential` is 1 to 255 bytes. The `td-upgrade` and
+`td-request` types are their own, so that a selector from before
+increment 8 ignores them as foreign tokens; their empty `keyslots`, the
+lockout's, the secure-boot, config and update-retry tokens' make none of
+them an orphan. `config::tag(volume_key, uuid, bytes)` is
+ENCRYPTION.md's configuration tag ("Firmware authentication"), checked
+in constant time; the secure-boot and config tokens land with 8i.
+
+**Headers.** The reader classifies a header as device-bound (first-boot
+or device-bound td tokens), protected (tpm-pin, fido2 or recovery-key
+tokens) or upgrading (a `td-upgrade` token beside either kind); one
+holding both kinds without a `td-upgrade` token refuses, as does a
+second `td-upgrade` or `td-request` token. A device-bound header keeps
+the four-token bound for its own td tokens. A protected or upgrading
+header admits at most fourteen tokens of td's types, orphans included:
+at most two tpm-pin, four fido2, one recovery-key marker, one lockout,
+one secure-boot, one config, one update-retry, one `td-upgrade`, one
+`td-request` and one first-boot or device-bound during U0. `decode`
+keeps its 4096-byte bound per token, which the largest fido2 and
+secure-boot tokens fit.
+
+**Plans on protected headers.** The recovery keyslot is the one the
+`recovery-key` marker names; an orphan is any keyslot no token of any
+type names and any td token naming a keyslot that does not exist. Two
+tpm-pin tokens may name one keyslot, an update's pre-seal; after a
+release, the plan retires every tpm-pin token but the one that released
+or was resealed this boot, and every tpm-pin keyslot no remaining token
+names. A boot's plan never retires a fido2 token, its keyslot or the
+recovery keyslot: only "Protector management" removes one, under the
+shape minimums. The reseal's plan adds its keyslot under the released
+secret, imports its token, tests it, then retires every other tpm-pin
+keyslot and token. While a `td-upgrade` token remains, only the upgrade
+planner runs, over ENCRYPTION.md's states U0 to U5, read from the header
+alone: the data segment's digest against `from`, cryptsetup's
+online-reencryption requirement, and which tokens exist. A pending
+fido2 token without a `td-upgrade` token is an orphan. The planner
+computes each step's resulting JSON size and refuses a step whose header
+would not fit the 12 KiB area, before writing.
+
+**Runner.** The runner gains `reencrypt` in three spelled shapes, the
+upgrade's initialization with `--resilience checksum` or `--resilience
+journal` (ENCRYPTION.md's argument list) and `--resume-only`, each with
+`--active-name td-selector` and the key on standard input, and `token
+import` with and without `--token-replace` for a token id. Its
+`luksKillSlot` floor stays 32 bytes, which a FIDO2 passphrase and the
+recovery key's 48 digits meet.
+
+**Release.** `release::release` gains the protected path: its
+`Released` names the method (tpm-pin, fido2-primary, fido2-recovery or
+recovery key) that the admission record follows; FIDO2 comes through a
+`release::Fido` interface that td-boot's worker implements and tests
+script; the chain check, warning and verified reseal run before the cap
+and the lockout's take, proof and reset after the keyslot test, as
+ENCRYPTION.md's "Protected release" says. Its bounds grow by the FIDO2
+attempts, which are the person's, one seal and one verifying unseal per
+reseal, and the lockout's four commands.
 
 ## Bounds
 

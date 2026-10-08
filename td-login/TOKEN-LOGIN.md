@@ -352,16 +352,22 @@ flows, including its fixed relying party `td.invalid`; login credentials
 are separated from notebook and application-store credentials by
 credential, challenge domain and salt. Creation uses fixed login display
 labels and requests no credProtect. Admission also refuses a key whose
-getInfo options carry `alwaysUv` with the value true; one reporting false
-is admitted. A key with built-in UV, such as a biometric key, is used with
-its PIN only: td never requests built-in UV. A key without a configured PIN
-is refused before any creation, with an instruction to set one using
-another tool, and a key that cannot hold a PIN is refused as unsupported;
-td never sets, changes or resets a PIN or a key. Every
-operation requires exactly one connected FIDO device and refuses none or
-several before asking for a PIN, so the add and enrollment flows tell the
-person to remove the authorizing or previous key before inserting the
-next.
+getInfo options carry `alwaysUv` with the value true; one reporting
+false is admitted. Planned with `td-install/ENCRYPTION.md` increment 8
+(8b): admission also requires getInfo's versions to include `FIDO_2_1`,
+since CTAP 2.0's hmac-secret returns the same output with or without the
+PIN, so a stolen key would unlock without it; and the probe step adds
+one assertion with presence and no PIN, which must find no credential or
+return an output different from the repeat's, or the key is refused as
+unable to require its PIN. A key with built-in UV, such as a biometric
+key, is used with its PIN only: td never requests built-in UV. A key
+without a configured PIN is refused before any creation, with an
+instruction to set one using another tool, and a key that cannot hold a
+PIN is refused as unsupported; td never sets, changes or resets a PIN or
+a key. Every operation requires exactly one connected FIDO device and
+refuses none or several before asking for a PIN, so the add and
+enrollment flows tell the person to remove the authorizing or previous
+key before inserting the next.
 
 Every client-data hash is SHA-256 over `td-login/operation/v1`, a zero
 byte, a phase byte, the u32-length-prefixed complete canonical description
@@ -732,7 +738,10 @@ processes before authentication discloses nothing on an unencrypted disk
 and grants no interactive access, and it keeps boot health, which requires
 the terminal, unchanged. The follow-up that releases the secret store at
 login, and the protected tier's "one fresh session" rule, must revisit
-this and may hold session start until the first unlock.
+this and may hold session start until the first unlock. The one
+planned exception to a locked start is the protected tier's admitted
+first generation, which `td-install/ENCRYPTION.md`, "Verified account
+handoff", owns.
 
 The serial greeter's console login, and every other interactive td-login
 path, is refused as `THREAT-MODEL.md` §3 specifies.
@@ -858,10 +867,11 @@ a new version cannot ship a marker that omits it.
 
 The marker is not in the manifest. td-boot's `parse_manifest` admits
 exactly the four-line `td-deployment-v1` form, and an installed
-selector, which td has no operation to update
-(`td-install/ENCRYPTION.md`), would refuse every deployment carrying a
-fifth line or a new manifest version. The initramfs is already covered,
-and a member that nothing at boot reads changes no boot.
+selector, which nothing updates but its owner's consented selector
+update (planned, `td-install/ENCRYPTION.md` increment 8), would refuse
+every deployment carrying a fifth line or a new manifest version. The
+initramfs is already covered, and a member that nothing at boot reads
+changes no boot.
 
 A reader opens the deployment's `manifest` and `initramfs.cpio` through
 a held directory descriptor, each with `O_NOFOLLOW | O_NONBLOCK` (as
@@ -982,22 +992,56 @@ bypasses the lock; and that a backup key can be added later.
 Every key is created, proved, repeated and probed before anything is
 published; publication then makes the cutover above.
 
-**Adding a key** (`A`) refuses at eight keys before any token. One enrolled
-key and its PIN authorize it with an authorize-phase assertion. At a
-connect step the person then removes that key and connects only the new
-one, which is created with every enrolled credential excluded, proved,
+**Adding a key** (`A`) refuses at eight keys before any token. One
+enrolled key and its PIN authorize it with an authorize-phase assertion,
+or, on a planned protected volume, a disk proof (below). At a connect
+step the person then removes that key and connects only the new one,
+which is created with every enrolled credential excluded, proved,
 repeated and probed, and the record is published against the unchanged
 baseline.
 
 **Removing keys** (`D`) takes a nonempty set selected by digit. The
 description names each selected key by its position in the record's
 canonical slot order, which the digits show, and its fingerprint, so two
-keys that share a fingerprint stay distinct. One
-enrolled key and its PIN authorize it, and that key may be in the set.
-Leaving exactly one key requires the one-key disclosure. Removing every key
-requires a disclosure that the machine will log in without a key, confirmed
-the same way; the record is then unlinked and the cutover restores console
-login and the ordinary SSH policy.
+keys that share a fingerprint stay distinct. One enrolled key and its
+PIN authorize it, or on a planned protected volume a disk proof
+(below), and that key may be in the set. Leaving exactly one
+key requires the one-key disclosure. Removing every key is refused on a
+planned protected volume, where the machine never logs in without a key;
+elsewhere it requires a disclosure that the machine will log in without
+a key, confirmed the same way; the record is then unlinked and the
+cutover restores console login and the ordinary SSH policy.
+
+**On a planned protected volume** (`td-install/ENCRYPTION.md` increment
+8; td-authd's `/var/lib/td/login/protected` marker present), this is the
+one place the rule is stated. Removing every key is refused, as above.
+A first enrollment, an addition, and a removal of keys the person no
+longer holds may each be authorized, instead of an enrolled key's
+assertion, by a disk proof made fresh inside that operation from an
+unlocked session. Either proof must open a keyslot, since a header
+token alone is something anyone who can write the disk can add:
+
+- the volume's 48-digit recovery key, typed into the compositor's PIN
+  field on the operation's step, a secure-attention surface no client
+  draws, and tested by the worker with `cryptsetup open
+  --test-passphrase` on the keyslot the volume's `recovery-key` marker
+  names, the key on standard input; or
+- an authorize-phase assertion from a disk security key, with its PIN
+  and touch, whose client data is the disk domain's over this
+  operation's canonical description, requesting hmac-secret under UV:
+  the worker verifies the signature under the header token's public
+  key, derives that token's passphrase from the output
+  (ENCRYPTION.md, "FIDO2 protectors"), and tests it with `cryptsetup
+  open --test-passphrase` on the keyslot the token names.
+
+The recovery key is not hardware-backed, and is acceptable here because
+its holder already has equal power offline: from the live medium it
+opens the volume and can rewrite the login record ("Recovery"). The
+step's description names which proof it asks for and the operation it
+authorizes; the operation's physical selection and consent are the ones
+above; and one proof authorizes that one operation, with nothing
+remembered after it. A session admitted at boot does not authorize it:
+admission only unlocks the first frame.
 
 Every enrolled key with its PIN holds full authority: whoever holds one key
 and its PIN can remove the others and add their own. The remedies are to
@@ -1017,16 +1061,20 @@ over SSH, and §L.1 elevation needs an unlocked session. There is no
 password, recovery code or fallback; recovery is physical only, and that
 is deliberate. On an unencrypted volume, anyone who can start other code
 on the machine (a firmware boot menu, a UEFI shell, another OS, or td's
-live medium, whose session offers a terminal) can mount `@var` and delete
-`/var/lib/td/login/1000`, which restores automatic login. The same access
-repairs the unavailable state. A damaged record is removed the same way,
-which also restores automatic login, or replaced by an intact copy of the
-same machine's record. A damaged directory is removed, or restored as a
-root:root mode-0700 directory, and the next boot's firstboot recreates or
-accepts it. That is the owner's recovery and the bypass named in Scope.
-On a device-bound volume the live medium cannot unseal, because it caps
-PCR 12; the volume's recovery key opens it from the live medium for the
-same repair. The future protected tier has its own recovery.
+live medium, whose session offers a terminal) can mount `@var` and
+delete `/var/lib/td/login/1000`, which restores automatic login. The
+same access repairs the unavailable state. A damaged record is removed
+the same way, which also restores automatic login, or replaced by an
+intact copy of the same machine's record. A damaged directory is
+removed, or restored as a root:root mode-0700 directory, and the next
+boot's firstboot recreates or accepts it. That is the owner's recovery
+and the bypass named in Scope. On a device-bound volume the live medium
+cannot unseal, because it caps PCR 12; the volume's recovery key opens
+it from the live medium for the same repair. On a planned protected
+volume, a boot admitted by its disk PIN or a primary disk token starts
+unlocked, a recovery boot starts locked (`td-install/ENCRYPTION.md`,
+"Verified account handoff"), and lost login keys are replaced with a
+disk proof ("Enrollment, addition and removal").
 
 A firmware supervisor password and boot-order lock narrow the physical
 path on hardware that has them; td makes no claim about them. The record
@@ -1051,9 +1099,13 @@ of that account's data, which needs no root (§L.1 scope).
 **Disk encryption.** The device-bound tier and this one each keep their own
 scope; `td-install/ENCRYPTION.md`, "Device-bound default", owns the rule
 that their combination is not lost-laptop protection. Login records are
-not disk protectors and never become ones; activating the protected tier
-decides how its FIDO2 protectors relate to these keys, and its stricter
-second-token rule governs disk protectors.
+not disk protectors and never become ones. The protected tier's plan
+(`td-install/ENCRYPTION.md` increment 8, "FIDO2 protectors") keeps its
+disk credentials separate: created for the disk, held in the volume's
+LUKS2 header rather than the record, with their own client-data domain
+and salts. One physical key may hold a login credential and a disk
+credential, and enrolling either never creates or changes the other;
+that tier's shape minimums govern disk protectors.
 
 **Secret store.** Application-store enrollment, release and writes
 (`APPLICATIONS.md` §W.4) are unchanged and use their own TPM-bound

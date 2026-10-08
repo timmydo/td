@@ -251,6 +251,19 @@ atomic cutover removes the active legacy mechanism, not storage history.
 
 ## FIDO2 protocol prerequisites
 
+Planned, not current: `td-install/ENCRYPTION.md` increment 8 (8a)
+moves the CTAP code this section and PORTABLE.md describe (report
+framing, CBOR, the CTAP codecs, the PIN protocols, hmac-secret, P-256,
+AES, hidraw admission with its worker, and the test-only virtual
+authenticator) into the std-only sibling crate `td-fido`, which forbids
+`unsafe`, with no behaviour change, so that td-boot's selector can
+unlock a disk with a FIDO2 token and td-tpm can salt its sessions;
+td-secret keeps its stores, workers, records and its `unsafe` surface,
+and its tests and guests pass unchanged. The module names below then
+name td-fido's files. The dependency-free boundary PORTABLE.md states is
+unchanged. Increment 8b then requires `FIDO_2_1` and a no-PIN probe at
+login-key creation (TOKEN-LOGIN.md, "Token profile").
+
 `fido_hid.rs` implements the 64-byte CTAP HID report profile from
 [CTAP 2.3 section 11.2](https://fidoalliance.org/specs/fido-v2.3-ps-20260226/fido-client-to-authenticator-protocol-v2.3-ps-20260226.html).
 It contains no device enumeration, device I/O, authorization or release

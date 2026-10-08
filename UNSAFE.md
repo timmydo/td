@@ -105,6 +105,24 @@ device's size is a `seek`, and its sector size is a file under `/sys`;
 `td-install/DESIGN.md`'s D8 keeps it that way except for that one recorded
 surface.
 
+Planned, not current: `td-install/ENCRYPTION.md` increment 8's protected
+tier is planned to add no surface ("Unsafe and syscall surfaces" there).
+td-tpm's new commands are bytes over its safe file I/O, its session
+cryptography td-fido's safe code. td-boot's FIDO2 `fido-worker` reads
+and writes `/dev/hidrawN` with std file I/O and reads the report
+descriptor from sysfs, so no hidraw ioctl (`HIDIOCGRDESC` or another)
+joins any roster, and the `td-fido` crate it shares with td-secret and
+td-tpm forbids `unsafe`, td-secret keeping its own §15 surface; so does
+the planned `td-fat`. PIN entry is secret-line's existing surface (§3),
+the admission record rides td-kexec's existing calls (§1), the event log
+and power-supply reads are file reads, and securityfs and the optional
+Secure Boot enrollment's efivarfs are mounted through td-init's existing
+`mount` applet, and the selector attaches a verified `root.erofs` with
+its existing `losetup` applet; enrollment only creates variables,
+needing no `FS_IOC_SETFLAGS`. A sub-increment that finds it needs a
+syscall, an ioctl request or an allowance amends this file in its own
+commit.
+
 `td-ui`, the shared UI toolkit that td-editor depends on by path, joined
 the roster when the editor's Wayland transport moved into it (§19). It
 denies `unsafe` at its crate root; the keymap compiler, repeat policy,

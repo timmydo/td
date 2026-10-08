@@ -86,6 +86,58 @@ The crate owns the protocol and nothing a consumer persists or decides:
   password-session reply. Both take a `u8` index and refuse one outside
   the `PcrSelection` range.
 
+## Planned: protected-tier commands
+
+Nothing here is current. `td-install/ENCRYPTION.md` increment 8 (8a,
+and 8i for signing) adds, still as bytes over the same safe file I/O and
+with no syscall surface. The crate then depends on one sibling,
+`td-fido = { path = "../td-fido" }`, for P-256 and AES, and on no other
+crate; "It is pure `std`, depends on no crate" above then reads "on
+td-fido alone".
+
+- **Salted sessions.** A policy session may be salted to the storage
+  primary: td-tpm draws an ephemeral P-256 key, sends its public point
+  as TPM2_StartAuthSession's `encryptedSalt`, derives the salt by KDFe
+  from the shared point with the primary's public point, and derives
+  the session key by KDFa from the salt and both nonces. td-fido's AES
+  gains the AES-128 key schedule for it. Such a session sets
+  `decrypt` and `encrypt` with AES-128 in CFB mode, so a command's first
+  sensitive parameter and a response's are encrypted under keys KDFa
+  derives from the session key and authValue. The primary's Name is
+  returned for the consumer to compare with the one it recorded.
+- **HMAC policy sessions.** A policy session may carry PolicyAuthValue,
+  after which `call` computes the command HMAC, HMAC-SHA256 keyed with
+  the session key followed by the object's authValue with its trailing
+  zero bytes removed, over cpHash, the two nonces and the session
+  attributes, and verifies the response HMAC over rpHash before it
+  trusts or decrypts a reply. The authValue is the caller's zeroing
+  owner, borrowed for the command.
+- **Sealing with an authValue.** `seal_object` takes an optional
+  authValue for TPM2B_SENSITIVE_CREATE's userAuth, sent encrypted in a
+  salted session, and the consumer's attributes, so a consumer can seal
+  with noDA clear.
+- **Typed authorization refusals.** `UnsealError`'s refusal names
+  `TPM_RC_AUTH_FAIL` on a session (0x98e for session 1) and
+  `TPM_RC_LOCKOUT` (0x921) as their own kinds.
+- **Dictionary-attack state.** TPM2_GetCapability of
+  `TPM_CAP_TPM_PROPERTIES` for `TPM_PT_PERMANENT`,
+  `TPM_PT_LOCKOUT_COUNTER`, `TPM_PT_MAX_AUTH_FAIL`,
+  `TPM_PT_LOCKOUT_INTERVAL` and `TPM_PT_LOCKOUT_RECOVERY`, each reply
+  checked for exactly the properties asked.
+- **Lockout hierarchy.** TPM2_HierarchyChangeAuth of `TPM_RH_LOCKOUT`
+  from the empty authorization to a caller's value,
+  TPM2_DictionaryAttackParameters, TPM2_DictionaryAttackLockReset and
+  TPM2_Clear under it, each in a salted HMAC session, the new
+  authorization sent encrypted.
+- **Signing keys (8i).** Creating an RSA-2048 signing key under the
+  storage primary with a policy and an authValue, transient or kept by
+  the caller; TPM2_Sign with RSASSA over a caller's SHA-256 digest;
+  PolicyOR; and TPM2_ObjectChangeAuth, which returns a new private area
+  under a new authValue.
+
+Which PCRs, PINs, parameters, Names and keys these serve stays the
+consumer's.
+
 ## What belongs to consumers
 
 Envelope formats, what a payload contains, which PCRs a policy selects,
@@ -98,7 +150,9 @@ secret and PCR 12 cap in `td-protector/DESIGN.md`, and its tokens and
 recovery flow in `td-install/ENCRYPTION.md`.
 
 Sessions are neither salted nor parameter-encrypted. Physical TPM-bus
-interposition is outside every current consumer's boundary.
+interposition is outside every current consumer's boundary; the planned
+protected tier salts its sessions (above, and `td-install/ENCRYPTION.md`,
+"PIN and dictionary-attack policy").
 
 ## Bounds
 

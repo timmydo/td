@@ -2045,6 +2045,43 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    marker; no machine enrolls before increment 5, and an unenrolled
    machine reads no marker. The full-system refusal, in
    `qemu-login-system` (C11), depends on C10b's marked deployments.
+9. **Session admission (planned).** `td-install/ENCRYPTION.md`
+   increment 8's "Verified account handoff" owns the admission record
+   and the rules td-authd applies to it. At a generation's Prepare,
+   before the compositor's first `1a`, root reads, unlinks and judges
+   `/run/td-admit/v1` after creating `/run/td-admit/consumed`
+   exclusively, and creates `/var/lib/td/login/protected` on a valid
+   record. With that marker present an unenrolled login state is
+   answered as unavailable with the new cause `0d`, so it locks as
+   every unavailable answer does; the lock surface says no login key is
+   enrolled and that a boot with the disk PIN or a primary disk token
+   admits the session. The `9a` answer
+   gains one final byte after the revocation byte: `01` in the first
+   answer of a generation the record admitted, `00` in every other
+   answer. The compositor then paints the session rather than the lock
+   surface for that generation's first frame (`td-compositor/DESIGN.md`,
+   "The lock surface"). The admission authorizes no login-key
+   operation; with the marker present the worker applies
+   TOKEN-LOGIN.md's protected-volume rule ("Enrollment, addition and
+   removal"). Both peers ship the byte atomically, still `TDLA003`, as
+   request `1a` did.
+10. **Storage operations (planned).** One fixed root `td-install
+    storage-operation --uid 1000` child per operation, sharing the
+    single operation slot and the login worker's launch, framing,
+    presentation, commit rounds, cancellation and teardown, carries
+    ENCRYPTION.md increment 8's selector update, upgrade and its
+    cancellation, protector management (token addition and removal,
+    recovery-key removal, the PIN-change and TPM-clear requests) and
+    optional Secure Boot enrollment. Physical selection alone starts
+    one, from a storage screen of the attention menu; each presented
+    step's description names the operation, its tokens' fingerprints
+    and, for a PIN or recovery-key step, which secret it asks for;
+    secrets reach it through `1c`. Until ENCRYPTION.md's item 9 a
+    production build refuses every storage operation, as it refuses
+    login writes before activation. Its request bytes, consent tags and
+    screen are fixed by increment 8e's first commit, a documentation
+    commit amending this section and `td-compositor/DESIGN.md` before
+    their code.
 
 TOKEN-LOGIN.md, "Placement", owns the rule that only physical input starts
 a login operation.

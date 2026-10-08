@@ -255,9 +255,10 @@ installed first boot, and the typed-back recovery key covers its failure.
 The review discloses that the recovery key is the only way back if the
 TPM, firmware measurements or boot chain change.
 
-td has no selector-update operation. One that is added must specify a
-crash-safe protector transition for both ESP files before it ships; until
-then a changed selector reaches recovery and its confirmed reseal.
+td has no selector-update operation. Increment 8 specifies one, with its
+crash-safe commit of both ESP files and its protector transition
+("Selector update"); until it lands, and on a device-bound volume after
+it, a changed selector reaches recovery and its confirmed reseal.
 
 TPM bus interposition is an invasive hardware attack, outside Scope; this
 tier's unseal sessions need not be salted or encrypted. The protector
@@ -276,15 +277,20 @@ this probe passes and the live system shows a keyboard console,
 unencrypted with the disclosure otherwise, and it refuses neither
 ("Activation").
 
-Upgrading to the protected tier enrolls and verifies its protectors, then
-re-encrypts the volume online to a fresh volume key, keeping only those
-protectors' keyslots and so dropping the device-bound protector and
-recovery key. Re-encryption defeats retained copies of the old key and
-header; it does not remove persistence left by anyone who was root on the
-device-bound system, which with automatic login and `su` is anyone at the
-keyboard. Such prior compromise is outside Scope, so a protected-tier
-claim on an upgraded volume is no stronger than the device-bound system's
-integrity before the upgrade.
+Upgrading to the protected tier re-encrypts the volume to a fresh volume
+key, drops the device-bound protector and keeps the recovery key as the
+recovery protector, its keyslot rewrapped ("Re-encrypting upgrade",
+increment 8's target). The rotation is required, not a precaution: the
+device-bound volume key was released to TPM possession alone on every
+boot, so anyone who held the machine and its TPM before the upgrade
+could have taken it, and no new protector would protect a key already
+taken. Re-encryption defeats retained copies of the old key and header
+for what the volume holds afterwards, not old ciphertext an SSD keeps in
+stale flash pages; it does not remove persistence left by anyone who was
+root on the device-bound system, which with automatic login and `su` is
+anyone at the keyboard. Such prior compromise is outside Scope, so a
+protected-tier claim on an upgraded volume is no stronger than the
+device-bound system's integrity before the upgrade.
 
 ## Device-bound formatting
 
@@ -797,21 +803,25 @@ the live selector caps as MEDIA.md says.
 
 ## Authentication and recovery
 
-This section and the next govern the protected tier except where they name
-the device-bound tier. Protected unlock is **TPM 2.0 plus PIN**. The PIN
-authorizes a hardware-held secret with persistent dictionary-attack
-protection, not a short LUKS passphrase susceptible to offline guessing.
-Release also requires an approved measured boot state. In this tier TPM
-possession alone never logs a person in. An enrolled **FIDO2 token plus
-PIN** is an alternative primary method and the recovery method when the TPM
-is lost or replaced. Require the token's `hmac-secret` capability and user
-verification; touch alone is insufficient. These are alternative
-protectors, not a requirement to present both devices.
+This section and the next govern the protected tier except where they
+name the device-bound tier; "Protected tier" below is increment 8's
+specification of how, none of it current. Protected unlock is **TPM 2.0
+plus PIN**. The PIN authorizes a hardware-held secret with persistent
+dictionary-attack protection, not a short LUKS passphrase susceptible to
+offline guessing. Release also requires an approved measured boot state.
+In this tier TPM possession alone never logs a person in. An enrolled
+**FIDO2 token plus PIN** is an alternative primary method and the
+recovery method when the TPM is lost or replaced. Require the token's
+`hmac-secret` capability and user verification; touch alone is
+insufficient. These are alternative protectors, not a requirement to
+present both devices. The recovery key remains a recovery protector
+beside them; "Protectors and shapes" states the minimums every shape
+keeps.
 
 Enrollment generates a random volume key on the machine, binds protectors
-to an explicit account, and verifies primary and separately stored recovery
-token unlock before declaring success. A FIDO2 primary needs a second token.
-Recovery must not require the failed TPM or its old PCR state. It enters a
+to an explicit account, and verifies primary and recovery unlock before
+declaring success. Recovery must not require the failed TPM or its old
+PCR state. It enters a
 trusted recovery flow, not an automatic desktop login; replacing a protector
 requires fresh authentication. Never silently create a plaintext fallback,
 clear a TPM, reset a token, or discard the last working protector.
@@ -834,20 +844,34 @@ different format and policy; it is not a disk protector or recovery path.
 
 ## Boot and authority boundaries
 
-In the protected tier, authenticate the initial boot code and measure the
-selector, its initramfs and command line before selector-stage release.
-That trusted selector authenticates the selected deployment after opening
-the volume; it cannot require a measurement of unreadable deployment bytes
-to unlock that volume. Measure the verified deployment and its boot
-arguments before second-stage release or handoff, with a policy that covers
-both stages explicitly. Firmware/key provisioning and TPM policy-authorized
-updates must preserve both `current` and the approved `previous` fallback.
-Exact-PCR enrollment without an update/recovery policy cannot ship as the
-default. The device-bound tier is the stated exception: it authenticates no
-pre-selector code and releases on exact PolicyPCR without PolicyAuthorize.
-Its update and recovery policy is the recovery key with a confirmed
-selector-stage reseal. It releases only at the selector stage, so
-deployment updates never change its release values.
+In the protected tier, firmware measures the selector EFI image into PCR
+4, and the EFI stub its initramfs and any load options into PCR 9,
+before selector-stage release, which requires those exact values and PCR
+12 at zero ("Protected release"). Firmware-enforced authentication of
+that entry, UEFI Secure Boot under the machine's own keys with the
+selector's initramfs inside the signed image, is the optional "Firmware
+authentication" increment; it does not gate activation. Without it the
+tier authenticates no pre-selector code, as the device-bound tier does
+not: a boot chain changed by someone holding the machine is refused by
+release, not by firmware, and a counterfeit selector can still record
+the PIN ("Protected release", "Threat and limits"). The trusted selector
+authenticates the selected deployment after opening the volume; it
+cannot require a measurement of unreadable deployment bytes to unlock
+that volume. It then measures the verified deployment and its boot
+arguments into PCR 11 before the handoff, its prepared selector carrying
+the measurement policy ("Selector update"), and hands the volume key
+off: there is no second-stage release, so no policy binds PCR 11, and
+deployment updates and rollbacks never change release values. `current`
+and the approved `previous` fallback are therefore both preserved by
+construction. Its update policy is td's own selector update, which the
+installed selector predicts and seals ahead before its cap, and its
+recovery policy for any other change is an enrolled FIDO2 token with its
+PIN, or the recovery key, and a confirmed selector-stage reseal
+("Changed boot chains and updates"), so its exact-PCR enrollment ships
+with both. The device-bound tier releases on exact PolicyPCR without
+PolicyAuthorize too. Its update and recovery policy is the recovery key
+with a confirmed selector-stage reseal. It releases only at the selector
+stage, so deployment updates never change its release values.
 
 The [selector measurement prerequisite](DESIGN.md#selector-deployment-measurement-prerequisite)
 now records the verified deployment and exact handoff arguments in PCR 11
@@ -866,16 +890,20 @@ plaintext key on the command line or in a stored initramfs is forbidden.
 This handoff is an explicit implementation gate, not existing machinery.
 
 The device-bound tier uses a bounded volatile handoff, which the protected
-tier may adopt. After authenticating the selected deployment and making its
-configured PCR 11 measurement, the selector copies the verified
-deployment initramfs into an unlinked memfd, verifies that copy against the
-manifest, appends one 4-byte-aligned cpio archive holding only the volume
-key, seals the
+tier adopts, adding the admission record beside the key ("Verified
+account handoff"). After authenticating the selected deployment and
+making its configured PCR 11 measurement, the selector copies the
+verified deployment initramfs into an unlinked memfd, verifies that copy
+against the manifest, appends one 4-byte-aligned cpio archive holding
+only the volume key (and, on a protected volume, the admission record),
+seals the
 memfd and passes it to `kexec_file_load`. The appended archive is outside
 the signed manifest and the measured event. Its single member's name and
 the 64-byte key length are td-boot protocol constants and a permanent v1
-contract: td has no selector-update operation, so an installed selector
-hands every later deployment the same format. A deployment from before
+contract: an installed selector may never be updated (increment 8's
+selector update is a consented operation, not an automatic one), so it
+hands every later deployment the same format, and a later selector keeps
+it. A deployment from before
 increment 6 on an encrypted volume has no key reader; it fails closed.
 Its initramfs finds no Btrfs volume under the handed-off UUID, or
 refuses the LUKS2 one as not yet supported, so its init fails and
@@ -1012,6 +1040,959 @@ requires fresh hardware-backed PIN verification bound to that operation.
 No client surface, synthetic input, remote-control interface, or untrusted
 same-uid process may impersonate the trusted UI or approve a request.
 
+## Protected tier
+
+This section is increment 8's target and none of it is current; item 9
+activates it. It specifies the protected tier that "Authentication and
+recovery" and "Boot and authority boundaries" require, over the
+device-bound tier's volume format, release order, PCR 12 cap and
+volatile handoff, which it keeps. td-protector carries its policies,
+token formats and planner (td-protector/DESIGN.md, "Protected roles
+(planned)"), and td-tpm the commands it adds (td-tpm/DESIGN.md,
+"Planned: protected-tier commands"). The storage operations here that
+run on the booted system are refused by td-authd until item 9; root can
+run their worker directly, which is how the oracles reach them. The
+selector's half is not unreachable before item 9: from 8c on, the
+installed selector parses protected headers, and anyone who can write
+the disk can forge one. Every sub-increment's selector code therefore
+fails closed on a forged header: it releases only through a protector
+it verified, writes an admission record only after such a release,
+and kills a keyslot or removes a token only by the planner's rules.
+
+### Protectors and shapes
+
+A protected volume's protectors are keyslots of four kinds:
+
+- **tpm-pin**: a 32-byte `/dev/random` secret sealed by the TPM under
+  exact PolicyPCR over the SHA-256 bank (PCR 4 and PCR 9 at their
+  expected values, PCR 7 too when the measured boot shows Secure Boot
+  enabled, "Firmware authentication", and PCR 12 at its literal reset
+  value of zero), then PolicyAuthValue, then
+  PolicyCommandCode(Unseal). Its authValue derives from a PIN ("PIN and
+  dictionary-attack policy"), and its noDA attribute is clear, so a
+  wrong PIN counts against the TPM's lockout.
+- **fido2-primary** and **fido2-recovery**: a passphrase derived from an
+  enrolled FIDO2 credential's hmac-secret output under user
+  verification ("FIDO2 protectors"). No TPM takes part.
+- **recovery key**: the device-bound tier's 48-digit recovery key, kept
+  through the upgrade and rewrapped by its reencryption, its keyslot
+  named by a `recovery-key` marker token.
+
+Every td token names the account it admits, the primary account at UID
+1000, the one principal td-login/TOKEN-LOGIN.md's tier has. A volume
+has one of two shapes, and this is the one place their minimums are
+stated:
+
+- **TPM primary**: one tpm-pin protector, the recovery key, and zero to
+  four fido2-recovery tokens.
+- **FIDO2 primary**: one to three fido2-primary and zero to three
+  fido2-recovery tokens, at most four FIDO2 tokens, and either at least
+  two FIDO2 tokens or the recovery key, so that one lost token is never
+  the last way in (AGENTS.md principle 7).
+
+The recovery key is removable only in the FIDO2 shape while two FIDO2
+tokens remain ("Protector management"). The enrollment screens recommend
+a FIDO2 recovery token beside the recovery key, and say that td asks for
+separate keys but cannot prove distinct hardware; exclusion lists keep
+the credentials distinct. Anyone holding an enrolled token and its PIN,
+or the recovery key, holds full authority over the volume's protectors,
+as an enrolled login key does over the login record. A release by a
+primary protector (tpm-pin, fido2-primary) admits one session ("Verified
+account handoff"); a release by a fido2-recovery token or the recovery
+key unlocks storage and admits none.
+
+### PIN and dictionary-attack policy
+
+The TPM PIN is 6 to 63 bytes, each printable ASCII from 0x20 to 0x7e,
+space included, taken exactly as typed. Both paths that read it go by
+key position on the US layout: the selector's consoles under the
+kernel's built-in keymap ("Keyboard console") and the compositor's PIN
+field under its `us` keymap (td-compositor/DESIGN.md, "The PIN field"),
+so the same keys give the same PIN whatever their caps show; the
+enrollment and change screens say so, and that a PIN of digits alone
+avoids the question. td-protector's PIN codec refuses any other entry
+before the TPM sees it, so a malformed entry costs no attempt. A FIDO2
+PIN is the token's own, under TOKEN-LOGIN.md's 4-to-63-byte
+printable-ASCII profile; td never sets, changes or resets one.
+
+A tpm-pin object's authValue is HMAC-SHA256 keyed with its 32-byte salt
+over `td/disk-protector/pin/v1`, one zero byte and the PIN. The salt is
+random per sealed object and public in its token, so two objects sealed
+under one PIN have unrelated authValues; it slows no guess, which the
+TPM's lockout bounds.
+
+**Bus.** Every command a PIN or td's lockout authorization authorizes,
+and every Unseal, runs in a session salted to td's storage primary:
+td-tpm encrypts the session salt to the primary's ECC P-256 key (an
+ephemeral ECDH key and KDFe), so the session key is unknown to anyone
+recording the bus, and sets the session's encrypt and decrypt
+attributes with AES-128 in CFB mode, so Unseal's response, the
+protector secret, and a new authorization sent to the TPM cross it
+encrypted. The command HMAC is keyed with that session key and the
+authValue, so a recording gives no offline test of the PIN. The
+primary's Name is recorded in each tpm-pin and lockout token when it is
+first written and must match at every later use: trust on first use. An
+interposer present at that first seal defeats it; one that appears
+later is refused as a changed TPM. td-tpm takes P-256 and AES from
+td-fido by path ("FIDO2 protectors"); the kernel's own TPM bus
+protection (`TCG_TPM2_HMAC`) stays off as pinned.
+
+**Lockout.** The TPM's dictionary-attack lockout is the only guess
+limit: td keeps no counter of its own, and the TPM keeps its counter in
+non-volatile state. td sets maxTries 32, recoveryTime 600 seconds and
+lockoutRecovery 86400 seconds, and holds the lockout hierarchy's
+authorization, without which these bound nothing: anyone who boots
+another system on the machine could reset the counter
+(TPM2_DictionaryAttackLockReset) after each lockout and return to the
+genuine prompt. td keeps it as a `lockout` token, encrypted under the
+volume key:
+
+- The authorization `L` is 32 bytes from `/dev/random`. A write draws a
+  fresh 32-byte nonce and derives 64 bytes, `k_enc` then `k_mac`, by
+  HKDF-SHA256 with the volume key as input keying material, an empty
+  salt and the info `td/disk-protector/lockout/v1`, a zero byte, the
+  volume's 16-byte UUID and the nonce. The token holds the nonce, `L`
+  XORed with `k_enc`, the storage primary's Name, and a tag,
+  HMAC-SHA256 under `k_mac` over the nonce, that ciphertext and the
+  Name; td-protector verifies the tag in constant time before it uses
+  `L`. td reads it only in the selector, after the cap, with the volume
+  key in hand; td's code on the running system and in the deployment
+  initramfs never decrypts it, though root on the running system,
+  which can read the volume key from the device-mapper table, could.
+- **Taking it** runs after the cap and only after the released
+  keyslot's test passed, so a boot that has proven nothing never changes
+  TPM state irreversibly; the lockout hierarchy binds no PCR. With
+  `TPM_PT_PERMANENT`'s `lockoutAuthSet` clear, td first imports the
+  token with a fresh `L`, replacing any token present, then sends
+  TPM2_HierarchyChangeAuth for `TPM_RH_LOCKOUT` from the empty
+  authorization to `L`, TPM2_DictionaryAttackParameters with the three
+  values under `L`, and TPM2_DictionaryAttackLockReset under `L`, whose
+  success proves possession. A crash before the change leaves a token
+  the next take replaces; one after it leaves the token holding the `L`
+  the TPM now has.
+- **Proving it**, with `lockoutAuthSet` set, needs a token whose tag
+  verifies under this volume key and whose Name is this TPM's primary:
+  td sends TPM2_DictionaryAttackParameters with the three values under
+  `L`, which also repairs them. Anything else is a TPM td cannot prove:
+  `lockoutAuthSet` set without a token (another system, such as a
+  Windows installation, provisioned it), a tag that fails, another
+  primary, or a refused proof. td never matches parameters instead. It
+  refuses the TPM-primary shape on such a TPM, naming the reason, and
+  sends nothing further to its lockout hierarchy that boot; a refused
+  proof costs that hierarchy's one attempt, which the TPM's own
+  lockoutRecovery bounds. The FIDO2 shape and the recovery key remain,
+  and a TPM clear from firmware makes the TPM eligible again. A second
+  td installation on the same TPM, another disk or a reinstallation,
+  therefore finds the lockout taken by the first and is refused the
+  TPM shape until the TPM is cleared; the screens say so.
+- Before it seals a new tpm-pin object, before the cap, the selector
+  reads `TPM_PT_PERMANENT`, which needs no authorization: with
+  `lockoutAuthSet` set and no lockout token it asks no new PIN and seals
+  nothing. Otherwise it seals and verifies before the cap, and a take or
+  proof that then fails after the cap discards the object before its
+  import.
+- **Counter.** After any release whose keyslot test passed, a non-zero
+  `TPM_PT_LOCKOUT_COUNTER` is printed (`td: the TPM counted N wrong PINs
+  since its last reset`), a sign of guessing when the owner made no
+  mistakes. After a fido2 or recovery-key release, td then resets the
+  counter under `L`, so a person locked out recovers with a token or the
+  recovery key; a PIN release leaves it to decay.
+- **Clearing.** A TPM clear requested from the running system
+  ("Protector management") is TPM2_Clear under `L`, run by the selector
+  after a release.
+
+A wrong PIN fails with `TPM_RC_AUTH_FAIL` on Unseal's session (0x98e), a
+locked-out TPM with `TPM_RC_LOCKOUT` (0x921). The TPM compares a policy
+session's digest with the object's authPolicy before it checks the
+session's HMAC, so a changed chain and a closed cap are refused without
+consuming an attempt; the emulator tests pin that order against the
+pinned swtpm. Disclosed: after 32 wrong PINs one attempt returns every
+ten minutes the TPM is powered; a TPM may count a power loss without an
+orderly shutdown as a failure, which shows as fewer attempts; and a
+firmware TPM (AMD fTPM, Intel PTT) keeps its counter in the platform's
+SPI flash, so someone who can rewrite that flash can roll the counter
+back and take 32 more guesses each time. A discrete TPM resists that
+attack, and the enrollment screen says which kind the machine has.
+
+### Protected release
+
+The installed selector reads a protected header by its tokens: tpm-pin,
+fido2 or recovery-key tokens and no first-boot or device-bound one,
+td-protector refusing any mixture outside the upgrade's states
+("Re-encrypting upgrade"). Its release order keeps the device-bound
+order's rules (no C parser before the cap, the cap after every attempt,
+the plan only after the cap, the TPM wait) and replaces steps 2 and 3:
+
+1. td's reader loads the header, as step 1.
+2. Before the cap, the release loop runs on the consoles, each entry
+   one run of secret-line, read and zeroed as the recovery key is
+   ("Selector release"), with no limit on entries; end of input or a
+   failed applet halts as there.
+   - **Chain check.** In the TPM-primary shape td-protector first checks
+     that the tpm-pin object can release here, asking for nothing and
+     costing no attempt: the policy digest over the PCRs the token
+     names as they read now, a literal-zero PCR 12, PolicyAuthValue and
+     Unseal must equal the sealed public area's authPolicy; the storage
+     primary's Name must equal the token's; and the TPM must load the
+     object, which verifies its private area. With two tpm-pin tokens
+     (an update's pre-seal, "Selector update") either may pass.
+   - **Warning.** When no tpm-pin object passes although the TPM loads
+     one, before any other prompt the console prints `td: WARNING: this
+     machine's boot chain is not the one td sealed. Firmware, its
+     settings or option ROMs, Secure Boot, or td's selector changed. If
+     you did not change them, someone may have: a security key or the
+     recovery key used now unlocks the disk for whatever is running.`
+     A Load refusal or another primary prints that the TPM was cleared,
+     replaced or is being intercepted. No TPM device, no SHA-256 bank
+     or a lockout each print their own line. The warning is the genuine
+     selector's: a counterfeit selector prints none ("Threat and
+     limits").
+   - **TPM PIN.** When an object passes and the TPM is not locked out,
+     the selector prints how many attempts remain
+     (`TPM_PT_MAX_AUTH_FAIL` less `TPM_PT_LOCKOUT_COUNTER`) and prompts
+     `td PIN (empty for another way): `. An entry the codec refuses
+     prompts again; an admitted one runs Unseal, and a wrong PIN
+     prompts again with the new count. In the FIDO2-primary shape the
+     loop starts at the next prompt.
+   - **Another way.** The prompt is `td: connect one security key and
+     press Enter, or type the recovery key: `. An empty entry starts
+     the selector's FIDO2 worker ("FIDO2 protectors"), which requires
+     exactly one connected FIDO device, identifies its credential among
+     the header's fido2 tokens by a silent assertion, reads its PIN
+     retries, and prompts `td security key PIN (N attempts left): `;
+     after the PIN it prints `td: touch your security key`.
+     TOKEN-LOGIN.md's PIN statuses and a key not enrolled here are
+     console lines that return to this prompt. Any other entry goes to
+     the recovery-key codec, whose refusals prompt again; an admitted
+     key is held for its test after the cap, and ends TPM attempts for
+     this boot.
+   - **Reseal.** When a FIDO2 token or the recovery key was chosen in
+     the TPM-primary shape and no tpm-pin object passed (a changed
+     chain, a cleared or different TPM, or none on the header), and the
+     TPM has a SHA-256 bank with PCR 4 and PCR 9 measured and may be
+     sealed to (the pre-cap rule in "Lockout"), the console warns that
+     confirming binds release to this boot chain and retires every
+     other tpm-pin protector, and asks, as the device-bound reseal does;
+     exactly `reseal` confirms. Confirmed, it prompts `td new PIN: ` and
+     `td new PIN again: ` until two entries the codec admits are equal,
+     seals a fresh secret to the observed values and a literal-zero PCR
+     12, and unseals it once with that PIN, requiring the same secret:
+     PCR 12 is still zero, so unlike the device-bound reseal this one is
+     verified before the cap. A failed seal or verification says so and
+     keeps nothing. The FIDO2-primary shape has no tpm-pin protector and
+     offers none.
+   - **Requests.** After a PIN release, a requested PIN change
+     ("Protector management") or else a staged selector update's
+     pre-seal ("Selector update") runs here, before the cap; never both
+     in one boot, so a staged update waits for the next PIN boot.
+3. The cap runs as step 4, whenever a TPM device exists. A FIDO2 token
+   and the recovery key release without a TPM, so a selector that found
+   none still boots; the cap is then skipped with its console line, and
+   PCR 12 stays open to a TPM the kernel exposes later, whose tpm-pin
+   protector still needs the PIN.
+4. After the cap the released keyslot is tested with its secret: the
+   recovery key on the keyslot its marker names, where a wrong key
+   prompts again for a security key or the recovery key, since neither
+   needs the TPM. The selector then opens the mapping and takes the
+   volume key with the released secret, as the device-bound order
+   does, and under Secure Boot verifies `TDCONFIG` against the volume
+   before its trusted key selects or verifies anything ("Firmware
+   authentication"). The plan then runs as step 5: a confirmed
+   reseal's keyslot is added under the released secret, its token
+   imported and its keyslot tested, then every other tpm-pin keyslot
+   and token is retired, and orphans are removed under the protected
+   rules (td-protector, "Protected roles"). The lockout take or proof,
+   the counter, a requested TPM clear, and a staged update's
+   authentication, import and commit follow in that order, each needing
+   the volume key or the open volume. The selector then selects, writes
+   the admission record ("Verified account handoff"), and hands off as
+   today.
+
+The deployment initramfs's post-cap check ("Boot and authority
+boundaries") tries each tpm-pin token by PolicyPCR alone, which the
+closed cap refuses with `TPM_RC_VALUE` before any authorization: it
+never sends Unseal or a PIN, and a PolicyPCR that passes halts as a
+release does. A fido2 token and the recovery key release nothing
+without a person, so the check attempts neither.
+
+**Threat and limits.** A finder of the powered-off machine, or of its
+disk, needs the PIN with this TPM on this boot chain, or an enrolled
+token with its PIN, or the recovery key: the TPM gives 32 guesses and
+then one per ten minutes, subject to the firmware-TPM rollback above,
+and a FIDO2 token its own retry counter. Without "Firmware
+authentication", nothing authenticates the selector before it runs.
+Anyone who can write the ESP while the machine is away from its owner
+can replace `BOOTX64.EFI` or `INITRD` with a look-alike prompt. PCR
+binding makes the TPM refuse release to that code, but cannot stop it
+recording the PIN, and a second visit can restore the genuine selector
+and type the recorded PIN: TPM plus PIN without Secure Boot does not
+withstand an attacker with two visits. Secure Boot with a firmware setup
+password closes that path; Secure Boot alone does not ("Firmware
+authentication"). Nor does the tier protect a running or suspended
+machine, whose key is in RAM (Scope), a PIN observed as it is typed, or
+a TPM bus interposer present at the first seal.
+
+### FIDO2 protectors
+
+A disk credential is created on TOKEN-LOGIN.md's token profile ("Token
+profile": PORTABLE.md's creation codec, ES256, `rk=false`, hmac-secret,
+a configured client PIN, `alwaysUv` not true, no built-in UV requested,
+signed backup flags and enterprise attestation refused, and getInfo's
+versions including `FIDO_2_1`) with relying party `td.invalid` and the
+labels `td disk` for the relying party's name and the user's name and
+display name. CTAP 2.0's hmac-secret holds one secret per credential, so
+an assertion without the PIN returns the same output as one with it,
+and a stolen key would open the disk without its PIN; CTAP 2.1 keeps the
+two apart. The profile therefore requires `FIDO_2_1`, and creation's
+probe adds one assertion with presence and no PIN, which must either
+find no credential or return an output different from the repeat's, or
+the key is refused as unable to require its PIN. Its creation excludes
+every credential the header's fido2 tokens and the operation already
+name; it is proved, repeated and probed as TOKEN-LOGIN.md's new key is,
+each with its PIN and touch, the repeat reproducing the proof's output
+exactly. A credential ID longer than 255 bytes is refused before any
+PIN, which bounds the header ("Re-encrypting upgrade"). Login, notebook
+and application-store credentials are separate credentials on the same
+relying party: each domain has its own client-data domain and salt, and
+one physical key may hold any of them.
+
+A fido2 token carries the credential ID, a random 32-byte hmac-secret
+salt, the credential's P-256 public key and its role. Its keyslot
+passphrase is 32 bytes of HKDF-SHA256 with the hmac-secret output for
+that salt as input keying material, an empty salt, and an info string
+of `td/disk-protector/fido2/v1`, a zero byte, the volume's 16-byte UUID
+and the u32-length-prefixed credential ID; it reaches cryptsetup as a
+key file, never argv.
+
+Every assertion's client-data hash is SHA-256 over
+`td/disk-protector/operation/v1`, a zero byte, a phase byte, the
+u32-length-prefixed canonical description of what it authorizes, and
+32 fresh kernel-random bytes. The phases are unlock 1, create 2, prove
+3, repeat 4, probe 5 and authorize 6, the last for "Protector
+management". td verifies the relying-party hash, UP and UV set, and
+the signature over the authenticator data and that hash under the
+token's public key with td-fido's software P-256, so FIDO2 release
+needs no TPM; then it decrypts the hmac-secret output. The signature
+binds the assertion to this operation; the keyslot test after the cap
+proves the output.
+
+The selector's FIDO2 client is td-boot's `fido-worker` verb, which
+td-boot starts from `/proc/self/exe` as td-secret starts its
+`hid-worker`, under td-secret's root admission ("USB token transport":
+at most 256 fixed `/dev/hidrawN` names, a root-owned mode-0600
+character device, USB HID bus metadata and the FIDO report descriptor
+read from sysfs) with its two-minute absolute deadline and independent
+watchdog. devtmpfs creates the nodes and the kernel already builds USB,
+xHCI, EHCI, HID, hidraw and USB HID in, so the selector loads no module
+and needs no new binary under D6. UHID is never on the boot path. The
+CTAP code td-secret, td-boot and td-tpm then share (report framing,
+CBOR, the CTAP codecs, the PIN protocols, hmac-secret, P-256, AES and
+hidraw admission) moves into one std-only sibling crate, `td-fido`,
+which forbids `unsafe` (AGENTS.md principle 2); what needs `unsafe`
+stays in td-secret.
+
+**Threat and limits.** FIDO2 release binds no measurement, and the
+salt is public in the header. Presenting a token and typing its PIN
+into an altered boot chain gives the volume away at once: whatever runs
+reads the salt, asks the token for the output under that PIN, and
+derives the passphrase. Because a TPM-primary machine's ordinary boots
+and td's own selector updates ask only for the PIN ("Changed boot
+chains and updates"), a request for a token or the recovery key there
+is exceptional, and the warning above precedes it; the owner should
+present one only knowing why the chain changed. A FIDO2-primary volume
+presents its token at every boot and so does not withstand a boot chain
+altered between boots; it suits a machine without a usable TPM, and its
+enrollment screen says so. A lost token is revoked by removing its
+keyslot ("Protector management"); an old header copy still holds it.
+
+### Changed boot chains and updates
+
+Release values change only with the selector or the firmware:
+deployment updates, rollback and the `previous` fallback never change
+them ("Boot and authority boundaries"). td's own selector updates are
+predicted and sealed ahead ("Selector update"), so the boot after one
+asks only for the PIN. Everything else that moves PCR 4, PCR 7 or PCR 9
+fails the chain check before any PIN is asked and shows the warning: a
+firmware update td does not perform, changed firmware settings, option
+ROMs or Secure Boot state, a load option, a mispredicted update, and a
+cleared or replaced TPM. The owner then releases with an enrolled FIDO2
+token or the recovery key and confirms the reseal ("Protected release"),
+and later boots take the PIN again. There is no PolicyAuthorize, signing
+key or NV counter; every seal is exact PolicyPCR over values the genuine
+selector observed or computed.
+
+**Threat and limits.** A changed chain cannot obtain release without a
+token or the recovery key; a cleared TPM costs the tpm-pin protector,
+never the volume. A firmware update needs one of them at the next boot,
+so one must stay reachable.
+
+### Selector update
+
+`td-install storage-operation`'s `selector-update` replaces the ESP's
+`EFI/BOOT/BOOTX64.EFI` and `EFI/BOOT/INITRD` with the running
+deployment's kernel and a selector prepared from the running root's
+stock template (`/lib/td-boot/selector-initramfs.cpio`) by
+`prepare-selector`'s rules, with the installation's trusted key as the
+volume holds it and the volume UUID of `td.volume=`; on a protected
+volume, and for the upgrade, the prepared selector also carries
+`etc/td/boot-measurement` (DESIGN.md "Selector deployment measurement
+prerequisite"). Under Secure Boot the pair is the signed image and
+`TDCONFIG` instead ("Firmware authentication"). It runs only from a
+`current` deployment that was acknowledged, with no pending attempt, so
+the kernel and template come from a deployment known to boot; both are
+read from the verified deployment through the held volume and checked
+against its manifest.
+
+td's bounded FAT32 code, the std-only sibling crate `td-fat` that
+td-install and td-boot share, admits the held disk's ESP, the td
+layout's first GPT partition, only when its `EFI/BOOT` directory's first
+sector holds every entry the update touches, as td's layout writes
+them, and its free clusters hold the new files beside the old ones;
+otherwise nothing is written. Clusters allocated in the FATs but
+reachable from no directory entry, an earlier interrupted update's, are
+freed first. Each commit is one write of that directory sector, synced,
+after the new data is written and chained in both FATs and synced; the
+old chains are freed after it. The commit assumes the device writes one
+logical sector whole on power loss. NVMe's AWUPF covers at least one
+block; SATA and eMMC devices state no such unit, so the assumption is
+unproven there, and evidence for a device class is a power-cut series
+on it (`qemu` cannot provide one) or its documented atomic write unit.
+The review discloses it.
+
+The update takes one of two forms:
+
+- **Direct**, on a device-bound volume, during the upgrade, and on a
+  FIDO2-primary volume, where release binds nothing td could predict:
+  the running system writes the new pair and commits it, both entries'
+  first cluster and size in the one sector write. The next boot of a
+  device-bound volume reaches recovery and its confirmed reseal.
+- **Staged**, on a TPM-primary volume, in three phases:
+  1. **Stage.** The running system writes the new pair as
+     `BOOTX64.NEW` and `INITRD.NEW` and adds both entries in one sector
+     write, after removing any earlier staged entries. The consent
+     screen says the next boot asks for the PIN and completes the
+     update.
+  2. **Pre-seal**, at the next boot, before the cap, by the installed
+     selector after a PIN release. It reads each staged file once with
+     `td-fat`, computing in that one pass the digests every later step
+     uses: `BOOTX64.NEW`'s SHA-256 and Authenticode SHA-256 and
+     `INITRD.NEW`'s SHA-256. It authenticates nothing yet: before the
+     cap it can read no deployment. It predicts the new chain's PCR 4
+     and PCR 9 from the event log ("Prediction" below) and seals the
+     secret this boot released, with the PIN typed this boot under a
+     fresh salt, to the predicted values and a literal-zero PCR 12. The
+     object, which would share the released keyslot, stays in RAM: it is
+     inert until the commit imports it, and it cannot be verified, since
+     its chain is not running.
+  3. **Commit**, in the same boot after the cap and before any import.
+     With the volume open, the selector authenticates the staged pair
+     against the volume's `current` deployment, whose manifest it
+     verifies as it does to boot it: `BOOTX64.NEW`'s SHA-256 must equal
+     that manifest's `bzImage`; and, after it hashes `root.erofs` once
+     against the manifest, attaches it with td-init's `losetup` applet
+     (UNSAFE.md §3) and mounts it read-only, `INITRD.NEW` must be that
+     root's `/lib/td-boot/selector-initramfs.cpio` followed by exactly
+     the archive `prepare-selector` appends with this selector's own
+     trusted key, volume UUID and measurement policy (the same
+     `engine/src/cpio.rs` writer): the SHA-256 of those bytes must equal
+     the digest the pre-seal took, so what was predicted is what was
+     authenticated. Only then does it import the predicted object as a
+     second tpm-pin token naming the same keyslot, and commit: one
+     sector write points `BOOTX64.EFI` and `INITRD` at the first
+     clusters and sizes the pre-seal read and hashed, never at entries
+     it reads again, and deletes the staged entries; then the old chains
+     are freed.
+
+  Any authenticity failure (another kernel, another template, another
+  appended archive, a deployment that is not `current`) discards the
+  object and deletes the staged update in one sector write, with a
+  console line naming the check; an older signed selector therefore
+  never installs. A failed prediction with every authenticity check
+  passed keeps the staged update and retries the pre-seal at the next
+  PIN boot, recording the retry in an `update-retry` token that binds
+  the staged pair's digests under a tag HKDF-SHA256 derives from the
+  volume key (info `td/disk-protector/update-retry/v1`, a zero byte and
+  the volume UUID), so it cannot be forged on the ESP or the header.
+  When the retry's prediction fails again, its authenticity checks pass
+  and that token verifies for the same pair, the console offers to
+  complete the update anyway, saying that the machine restarts at once
+  and the next boot will show the chain warning once and ask for a
+  security key or the recovery key, which is expected; exactly `update`
+  commits without a predicted object and reboots immediately, so the
+  warning boot happens while the owner is present, and any other answer
+  deletes the staged update. The commit and the deletion remove the
+  retry token. Someone with firmware access can still force the two
+  prediction failures (a one-time boot entry that fails and returns logs
+  a refused event), which costs the owner one token or recovery-key boot
+  they are present for. The boot after a commit releases with the
+  predicted object and the PIN, and its plan retires the other tpm-pin
+  token; its keyslot stays, named by the one that released. A
+  misprediction fails the chain check, shows the warning, and needs a
+  token or the recovery key and a reseal, which retires both objects.
+
+  **Prediction.** The selector mounts securityfs and reads the TCG
+  event log as Linux presents it, the firmware's crypto-agile log with
+  the final-events table appended. It requires the Spec ID event to
+  list SHA-256, takes each event's SHA-256 digest, skips `EV_NO_ACTION`
+  events, which extend nothing, and replays PCR 4, PCR 7 and PCR 9 from
+  zero. PCR 9 then takes td's own extensions, which follow
+  ExitBootServices and so are in no firmware log: under Secure Boot the
+  configuration event ("Firmware authentication"), whose digest the
+  selector recorded when it extended it. Each replay must equal the
+  PCR as read. It refuses a log whose events may not recur at the next
+  boot: an `EV_EFI_ACTION` "Returning from EFI Application from Boot
+  Option" (a boot attempt that failed or returned), more than one
+  `EV_EFI_BOOT_SERVICES_APPLICATION` in PCR 4 (a boot menu, shell or
+  one-time boot entry that ran before the selector), or any PCR 4 event
+  but the calling action, separators and that one application. It
+  requires that application's digest to be the Authenticode SHA-256 of
+  the running `BOOTX64.EFI` and exactly one PCR 9 event, the EFI stub's
+  initrd measurement, to be the running `INITRD`'s SHA-256. Replaying
+  with the staged files' digests in those events gives the predicted
+  PCR 4 and PCR 9; PCR 7 keeps its value.
+
+| Interrupted | ESP and header after | Next boot |
+| --- | --- | --- |
+| Staging, before its sector write | old pair, leaked clusters | ordinary; the next update reclaims |
+| After staging | old pair, staged entries | pre-seal and commit |
+| Pre-seal, or after the cap before the import | unchanged | the same again |
+| After the import, before the commit | old pair, two tpm-pin tokens | old object releases; plan retires the predicted token; pre-seal again |
+| After the commit, before freeing | new pair, leaked clusters | predicted object releases; the next update reclaims |
+| Deleting a staged update | old pair, with or without staged entries | ordinary, or the same deletion again |
+| Direct, before its sector write | old pair, leaked clusters | ordinary; the next update reclaims |
+| Direct, after it | new pair | the changed chain's path |
+
+No previous selector is kept; a selector that does not boot is repaired
+from the live medium, by hand.
+
+**Threat and limits.** Staging needs root on the running system and
+physical consent. Anyone who can write the ESP can also stage files, but
+the predicted object leaves RAM only after the pair is authenticated
+against the volume's `current` deployment, so a forged staging gains no
+seal and no installation, and an older signed selector is refused.
+Between the import and the next boot the old chain's object stays
+valid, which lets that genuine chain boot once more.
+
+### Verified account handoff
+
+One primary authentication unlocks storage and admits its account to
+one fresh session. Every protected boot's selector writes an admission
+record after its release, once its PCR 11 measurement of the selected
+deployment has succeeded. The record is 46 bytes: `TDADMIT1` (8 bytes),
+version 1 (1), the big-endian u32 UID the released token names (4), the
+method (1: 0 for no admission, after a fido2-recovery or recovery-key
+release and in every upgrade boot; 1 tpm-pin; 2 fido2-primary), and the
+selected deployment's 32-byte manifest ID (32). td-kexec carries it
+beside the key, on a second pipe, as a second archive member
+`td-admit-v1`, a regular file of mode 0400 owned by root with exactly
+those bytes, under the rules the key member has (`--fds-key-admit DIGEST
+KEY RECORD CMDLINE`, the record written and its write end closed before
+td-kexec starts).
+
+The deployment initramfs never carries it to disk. `mount-root` handles
+the key as today and leaves the record; a new verb, `td-boot admit
+/sysroot/run`, which the deployment init runs right after it mounts the
+system's `/run` tmpfs, inspects the member as `mount-root` inspects the
+key, writes it to a fresh root:root mode-0700 `/sysroot/run/td-admit` as
+`v1`, a single-link root:root mode-0600 file created exclusively, and
+removes the member, whether or not it passed. A failure writes nothing
+and is no refusal: a lost record costs a login, not a boot. A deployment
+from before the verb leaves the member in its initramfs root, which
+`switch_root` frees.
+
+td-authd reads it at a paired generation's Prepare, before the
+compositor's first `1a`. It opens `/run/td-admit/v1` without following
+links, requires the file's ownership, mode, single link and exact size
+on a `/run` that is tmpfs, reads it and unlinks it, then creates
+`/run/td-admit/consumed` exclusively (`O_CREAT|O_EXCL`, mode 0600)
+before judging it; an existing marker discards the record, so a boot
+admits at most once, and a record copied back after consumption admits
+nothing. Any valid record makes td-authd create the persistent marker
+`/var/lib/td/login/protected` if absent; with it present, an unenrolled
+login state locks as an enrolled one does (td-authd/DESIGN.md, amendment
+9). A record with method 1 or 2 admits the generation only when its UID
+is the primary account's, its manifest ID is the running deployment's
+(`/run/td-deployment`), and the deployment kernel's `CLOCK_BOOTTIME`,
+which starts at the `kexec` just after the selector wrote the record and
+so measures the record's age, reads at most 300 seconds. The first `1a`
+answer then says so, and the compositor's first paint is the session
+rather than the lock surface (td-compositor/DESIGN.md, "The lock
+surface"). Every later generation, `Super+l`, a lid close and a resume
+lock as TOKEN-LOGIN.md specifies, and unlock needs a login key.
+
+**Login keys.** Admission unlocks one first frame; it authorizes no
+login-key operation. Replacing lost login keys on a protected machine
+takes a fresh proof at that moment, the recovery key or a disk security
+key, under the rule TOKEN-LOGIN.md "Enrollment, addition and removal"
+states. Upgrade's first phase requires an enrolled login state, and the
+last login key cannot be removed on a protected machine, so a recovery
+boot never finds an unlocked session.
+
+**Threat and limits.** The record is the non-replayable authentication
+result: it exists only in RAM, crosses only the sealed memfd and a
+root-only tmpfs, admits once per boot, and binds the account, the
+measured deployment and the boot's first minutes. A recovery release
+admits nothing, so recovery never logs in. Root on the running system is
+trusted and could forge a record or remove the markers; a compromised
+deployment is outside Scope. The recovery key's holder can repair the
+login state from the live medium, as on a device-bound volume
+(TOKEN-LOGIN.md, "Recovery"); it is a storage credential with full
+authority, which is why it is never typed at a login prompt.
+
+### Re-encrypting upgrade
+
+A device-bound volume becomes protected in two phases: a running-system
+phase that gathers what needs the person's tokens and writes no secret,
+and an upgrade boot of the selector that rotates the volume key. The
+rotation is required ("Device-bound default").
+
+**Phase 1** is `td-install storage-operation`'s `upgrade`, under
+td-authd's physical consent. It requires a converged device-bound header
+(keyslot 0 and one device-bound protector), no reencryption in progress,
+an acknowledged `current`, and an enrolled login state (TOKEN-LOGIN.md).
+The person chooses the shape, TPM primary being the default; the
+FIDO2-primary choice discloses both trade-offs: an altered selector can
+take the volume from a single presentation of the key, while a firmware
+TPM's guess counter rolls back with its flash ("Lockout"). The TPM shape
+is offered only when a TPM with a SHA-256 bank is present and its
+`TPM_PT_PERMANENT`, read without authorization, shows `lockoutAuthSet`
+clear, since a device-bound volume holds no lockout token that could
+prove a set one; otherwise the screen says why and offers the FIDO2
+shape. Each FIDO2 credential is created, proved, repeated and probed
+("FIDO2 protectors") through the compositor's PIN field. The worker then
+writes, each a key-less header commit: the selector update in its direct
+form, so the selector that reads what follows understands it; each fido2
+token with empty `keyslots`, a pending token; and last the `td-upgrade`
+token, a token type of its own holding only the shape and `from`, the
+SHA-256 of the data segment's digest and salt as they are now
+(td-protector, "Protected roles"). A pending fido2 token is pending only
+beside a `td-upgrade` token; without one it is an orphan the next plan
+removes, so a crash inside phase 1 leaves a device-bound volume that
+boots through recovery and its confirmed reseal, the selector having
+changed, and the person runs phase 1 again. Before consenting, the
+review discloses the upgrade boot's duration (about one read and one
+write of the whole volume, two writes with journal resilience), that it
+needs mains power, that the machine is not usable during it, that the
+recovery key is needed at that boot and stays the recovery protector,
+and that the tokens and the new PIN are asked for then.
+`storage-operation`'s `upgrade-cancel` removes the `td-upgrade` token
+while the header is in state U0.
+
+**The upgrade boot** is the selector's flow while the header carries a
+`td-upgrade` token. Its state is read from the header alone:
+
+| State | Header |
+| --- | --- |
+| U0 | device-bound token and keyslot, keyslot 0, pending tokens, `td-upgrade`; digest equals `from` |
+| U1 | no device-bound token or keyslot; digest equals `from`; no reencryption |
+| U2 | cryptsetup's online-reencryption requirement present |
+| U3 | digest differs from `from`; no requirement; no `recovery-key` marker |
+| U4 | marker present; some pending token or the tpm-pin token (TPM shape) or the lockout token (TPM shape) missing |
+| U5 | marker, every fido2 token with a keyslot, and in the TPM shape the tpm-pin and lockout tokens, unless the TPM became unusable (below) |
+
+1. **Before the cap.** In U0, the selector first requires mains power:
+   a `/sys/class/power_supply` entry of type `Mains` online, or no
+   `Battery` entry. Without it the console says the upgrade waits for
+   mains power, and the boot runs the device-bound recovery flow with
+   nothing upgraded. In U0 an empty entry at the first prompt asks
+   whether to cancel, and exactly `cancel` confirms: the boot runs the
+   device-bound recovery flow, and its plan removes the `td-upgrade`
+   token, after which the pending tokens are orphans it removes too.
+   After U0 nothing cancels, and the prompts say so. The selector then
+   gathers what the state still needs: for each pending fido2 token in
+   turn, its key alone, its PIN and a touch, the assertion verified
+   under the token's public key and the passphrase derived; in the TPM
+   shape without a tpm-pin token, the new PIN twice (the pre-cap rule
+   in "Lockout" applying), a fresh secret sealed to the observed PCR 4
+   and PCR 9 (and PCR 7 when measured on) and a literal-zero PCR 12,
+   and one Unseal verifying it; and the recovery key. In U5 it gathers
+   nothing and runs the protected release instead.
+2. **The cap.**
+3. **After the cap**, every step authorized by the recovery key, tested
+   first on the recovery keyslot: keyslot 0 in U0 and U1; in U2 by
+   `reencrypt --resume-only` itself, since cryptsetup then holds a
+   keyslot for each volume key; in U3 the one `luks2` keyslot no token
+   names, since reencryption may have moved it; from U4 the keyslot the
+   marker names. The steps run in order
+   from the state found, each a commit the console reports:
+   - U0 to U1: kill the device-bound keyslots, then remove the
+     first-boot and device-bound tokens; a token naming a killed
+     keyslot is an orphan the step removes.
+   - U1 to U3: open the mapping `td-selector` with the recovery key and
+     re-encrypt it online: `cryptsetup reencrypt` on the held partition
+     with `--active-name td-selector`, `--key-slot` naming the recovery
+     keyslot, `--use-random`, formatting's cipher, key size, sector size
+     and PBKDF2 parameters, the recovery key on standard input
+     (td-protector's runner spells the list), and `--resilience
+     checksum` when the disk's `queue/atomic_write_unit_max_bytes` is
+     at least 4096, otherwise `--resilience journal`. Progress is
+     reported at least every percent. In U2 the step is `reencrypt
+     --resume-only` with the same key, before anything else and before
+     any handoff, since the handoff carries one volume key; a resumption
+     on battery warns and continues. td-boot admits the mapping by
+     discovery's walk only once reencryption has ended and cryptsetup
+     has removed its helper devices.
+   - U3 to U4: import the `recovery-key` marker naming the recovery
+     keyslot.
+   - U4 to U5: kill any `luks2` keyslot no token names but the marked
+     one, an add an earlier attempt left; then for each pending fido2
+     token add its keyslot and replace the token with one naming it
+     (`token import --token-replace`), testing each; in the TPM shape
+     add the tpm-pin keyslot, import its token and test it, then take
+     the lockout ("Lockout"). When the TPM has become unusable for td
+     since phase 1 (absent, without a SHA-256 bank, or with a lockout
+     authorization td cannot prove), the console says so and U4 ends
+     without a tpm-pin or lockout token: the volume completes as a
+     TPM-primary volume with no tpm-pin protector, as after a TPM clear,
+     whose boots ask for a token or the recovery key and offer the
+     reseal once the TPM is eligible again.
+   - U5 to protected: remove the `td-upgrade` token.
+
+   The selector keeps the mapping it opened, takes the volume key with
+   the recovery key and hands off with an admission record of method 0.
+   A boot that finds U5, which a crash just before the last step leaves,
+   releases as a protected boot, with the PIN or a primary token, and
+   its plan removes the `td-upgrade` token, so the upgrade's end needs
+   no recovery key.
+
+| Interrupted | Next boot |
+| --- | --- |
+| Phase 1, before `td-upgrade` | device-bound recovery and reseal; pending tokens removed; phase 1 again |
+| Upgrade boot, before the first commit | U0 again, cancel still offered |
+| U0 to U1, between kill and removal | U1 after the orphan's removal |
+| U1, U2 | reencryption starts or resumes with the recovery key |
+| U3 | marker import |
+| U4, after an add before its token | that keyslot killed as an orphan, the add repeated; a lost tpm-pin secret means the PIN is asked again before the cap |
+| U4, inside the lockout take | the take's own crash rule ("Lockout") |
+| U5 | protected release; `td-upgrade` removed |
+
+Both resilience modes keep their hotzone in the keyslots area, so the
+upgrade needs no free space on the volume ("Device-bound formatting");
+checksum resilience relies on whole atomic writes of the 4096-byte
+sector, which only a device stating such a unit provides, and journal
+resilience writes the data twice. The header's 12 KiB JSON area must
+hold the largest state the upgrade or a protected volume reaches: four
+fido2 tokens at the 255-byte credential bound, the `td-upgrade` token,
+the marker, two tpm-pin tokens, the lockout, Secure Boot, config and
+update-retry tokens, a request, their keyslots, and in U2 cryptsetup's
+reencryption keyslot, segments and second digest. It is estimated at
+about 9.5 KiB. 8a's codec tests and 8f's planner tests build each worst
+case with the pinned cryptsetup on a header file, the U2 one by
+`reencrypt --init-only`, and require at least 1 KiB to spare; if the
+measurement leaves less, the credential bound or the token counts shrink
+in that commit, amending this section. The planner computes each step's
+resulting JSON size and refuses a step whose header would not fit,
+before writing.
+
+**Threat and limits.** Rotation makes the old volume key, and any copy
+of it taken while the volume was device-bound, useless for what is
+written afterwards and for the logical blocks reencryption rewrites. It
+does not reach old ciphertext an SSD keeps in stale flash pages after
+remapping: someone holding the old key and the flash itself may still
+read data as it was before the upgrade. The recovery key opens the new
+key as before. The upgrade inherits whatever the device-bound system's
+root left behind (Scope).
+
+### Protector management
+
+On a protected volume `td-install storage-operation` adds a FIDO2
+token, removes FIDO2 tokens, removes the recovery key, requests a TPM
+PIN change, and requests a TPM clear, each under td-authd's physical
+consent. Addition and removal are authorized either by a fresh
+authorize-phase assertion over the operation's canonical description
+from an enrolled FIDO2 token that remains afterwards, whose derived
+passphrase is the key `luksAddKey` and `luksKillSlot` are given, or by
+the recovery key typed in the PIN field, which cryptsetup tests as the
+same key; the authorization is also the cryptsetup authority. An
+addition creates the new credential with every enrolled one excluded. A
+removal refuses to leave a shape below its minimums ("Protectors and
+shapes"). These, and the keyslot test of TOKEN-LOGIN.md's disk proof,
+are the running system's only key-bearing cryptsetup commands
+(DESIGN.md "Full-system volume consumers").
+
+The PIN change and the TPM clear need the TPM before the cap or the
+lockout authorization, which only the selector has, so the running
+system imports a key-less request token and the selector carries it out:
+
+- **PIN change.** At the next PIN boot, after the release and before the
+  cap, the selector says a PIN change was requested and prompts `td new
+  PIN (empty to cancel): `; an empty entry declines, and the plan
+  removes the request after the cap, since anyone who can write the disk
+  can plant one. Otherwise it asks the new PIN again, seals a fresh
+  secret under it to the observed values and verifies it by one Unseal,
+  and, with a Secure Boot db key present, changes that key's
+  authorization from the old PIN to the new (TPM2_ObjectChangeAuth).
+  After the cap it adds the new keyslot under the old secret, imports
+  and tests the new token, retires the old tpm-pin keyslot and token,
+  replaces the db key's blob, and removes the request last. A crash
+  before the new token leaves the old PIN working and the request in
+  place, which repeats; one after it leaves both PINs working until a
+  boot's plan retires the protector that did not release. The old PIN is
+  this operation's fresh authentication.
+- **TPM clear.** After a release and the cap, the console says that
+  clearing the TPM destroys every object under its storage hierarchy:
+  the tpm-pin protector, the Secure Boot db key and td-secret's TPM
+  objects; exactly `clear` confirms, and TPM2_Clear runs under `L`;
+  any other answer declines and the plan removes the request, which
+  anyone who can write the disk could have planted. The
+  plan then retires the tpm-pin keyslot and token and the lockout token
+  and removes the request. The next boot asks for a token or the
+  recovery key and offers the reseal, which takes the lockout anew.
+
+**Threat and limits.** A removed protector stays in old header copies;
+TPM2_ObjectChangeAuth leaves the db key's old blob valid under the old
+PIN wherever a copy of it survives.
+
+### Firmware authentication (optional)
+
+UEFI Secure Boot under keys the machine generates is an optional
+strengthening and does not gate item 9. It is offered only in the
+TPM-primary shape.
+
+- **Image.** Authenticode on `BOOTX64.EFI` alone would leave the
+  external `INITRD`, which holds the selector and its PIN prompt,
+  unauthenticated: the EFI stub loads and measures it but verifies
+  nothing. Under Secure Boot the selector is instead one signed PE, the
+  sealed selector image: a second build of td's kernel with the stock
+  selector initramfs built in (`INITRAMFS_SOURCE`) and a built-in
+  command line that firmware cannot change (`CMDLINE_OVERRIDE`) and
+  that names `noinitrd`. `CMDLINE_OVERRIDE` alone is not enough: in
+  Linux 7.1.4 `efi_load_initrd` (`efi-stub-helper.c` in
+  `drivers/firmware/efi/libstub`) loads an initrd offered through the
+  `LINUX_EFI_INITRD_MEDIA_GUID` LoadFile2 device path whatever the
+  command line says, and the kernel unpacks an external initramfs over
+  the built-in one, where it can replace `/init`. The x86 stub parses
+  `CONFIG_CMDLINE` with `efi_parse_options` before it loads an initrd
+  (`x86-stub.c`), and `noinitrd` there sets `efi_noinitrd`, which makes
+  `efi_load_initrd` return before either the LoadFile2 or the
+  `initrd=` path; the firmware's load options are never parsed. The
+  recipe's configuration check pins all three, and the image carries
+  the kernel and every line of selector code under firmware's check.
+  The deployment's root image ships the unsigned sealed image as
+  `/lib/td-boot/selector.efi`, beside the template. The recipe graph
+  builds it, a second kernel compile; a third-party stub that reads
+  embedded sections is excluded by D6, and relinking per installation
+  would need a toolchain on the running system.
+- **Configuration.** The per-installation values `prepare-selector`
+  appends today (trusted key, volume UUID, measurement policy) become
+  the data file `EFI/BOOT/TDCONFIG`, written by the same
+  `engine/src/cpio.rs` writer as a cpio archive. The selector reads it
+  once, extends its SHA-256 into PCR 9 with TPM2_PCR_Extend before
+  parsing it, and keeps that digest for prediction ("Selector update",
+  "Prediction"); tpm-pin seals bind it through PCR 9. A replaced
+  `TDCONFIG` changes PCR 9, so the PIN releases nothing, but a token or
+  the recovery key still releases after the warning, and the attacker's
+  trusted key would then select an attacker-signed deployment. So the
+  volume authenticates it: a `config` token holds one or two
+  HMAC-SHA256 tags over `TDCONFIG`'s bytes under a key HKDF-SHA256
+  derives from the volume key with the info `td/disk-protector/config/v1`,
+  a zero byte and the volume UUID. After every release and the volume
+  key's retrieval, before the trusted key selects or verifies anything,
+  the selector requires `TDCONFIG`'s tag to be in the token, compared in
+  constant time; otherwise it zeroes the key and halts, saying the
+  ESP's configuration is not this volume's. A staged update's
+  `TDCONFIG.NEW` must equal what this selector writes from its own
+  authenticated values; when its bytes differ, the commit adds its tag
+  to the token before the sector write and the next boot's plan drops
+  the old one, so a crash between them leaves both pairs valid. While
+  both tags are valid, a one-boot rollback to the old `TDCONFIG` is
+  possible, only when the trusted key or measurement policy changed,
+  and only through a token or recovery-key boot, since PCR 9 refuses
+  the PIN.
+- **Enrollment** is `storage-operation`'s `secure-boot-enroll`, with
+  the PIN in the PIN field, in two steps around one boot, because only a
+  selector holding the volume key can write the first `config` tag:
+  1. The running system requires the firmware in setup mode
+     (`SetupMode` 1, no PK). It refuses when the event log's PCR 2
+     records an option ROM driver (`EV_EFI_BOOT_SERVICES_DRIVER` or
+     `EV_EFI_RUNTIME_SERVICES_DRIVER`), which a td-only db would stop
+     from loading. It creates the db key, signs the root's
+     `/lib/td-boot/selector.efi` with it and stages the signed image and
+     `TDCONFIG.NEW` as a staged selector update. The next PIN boot
+     authenticates them as any staged update (the image by its
+     Authenticode SHA-256 against the root's unsigned image,
+     `TDCONFIG.NEW` against this selector's own values), predicts PCR 4
+     from the image and PCR 9 without the stub's initrd event and with
+     the configuration extension, writes the first `config` tag, and
+     commits; the selector-update sector write renames `INITRD`'s entry
+     to `TDCONFIG`. Secure Boot is still off, so the signed image boots
+     as an unsigned one would and the PIN releases.
+  2. The running system then mounts efivarfs with td-init's `mount` for
+     the operation alone and, accepting whatever KEK and db the
+     firmware kept through its PK clear, replaces both whole with
+     non-append writes: db (signed by KEK), then KEK (signed by PK),
+     then PK (self-signed), whose creation ends setup mode. dbx is left
+     as the firmware has it. It reads back db, KEK and PK as exactly
+     td's lists and `SetupMode` 0. The next boot, with Secure Boot on,
+     moves PCR 7, shows the warning, and needs a token or the recovery
+     key and a reseal, which binds PCR 7; the consent screen says so.
+  td enrolls no Microsoft or vendor certificate, so firmware dbx
+  updates signed by them no longer apply.
+- **Keys.** PK and KEK are RSA-2048 keys created in the TPM, used to
+  sign their enrollment payloads, flushed, and never stored: they are
+  discarded after enrollment. The db key is an RSA-2048 signing key
+  under the storage primary (fixedTPM, fixedParent, sensitiveDataOrigin,
+  sign, adminWithPolicy; userWithAuth and noDA clear) whose policy is
+  PolicyOR of PolicyAuthValue then PolicyCommandCode(Sign) and
+  PolicyAuthValue then PolicyCommandCode(ObjectChangeAuth), its
+  authValue derived from the TPM PIN under its own salt; a PIN change
+  rebinds it. Its blob lives in the `secure-boot` token, so the selector
+  can rebind it before the cap, and its certificate in
+  `/var/lib/td/secure-boot`, root-only on the volume. td writes the
+  self-signed X.509 v3 certificates, the EFI signature lists and
+  authenticated variable payloads in DER itself, the TPM signing each
+  SHA-256 digest (TPM2_Sign, RSASSA); no key is downloaded, published
+  or held anywhere else (principle 5).
+- **PCR 7.** A tpm-pin seal names PCR 7 exactly when the event log,
+  replayed to the PCR 7 value read, records `SecureBoot` enabled; no
+  header field decides it. Turning Secure Boot off moves PCR 7, which
+  fails the chain check with the warning.
+- **Updates.** A staged selector update signs the new image with the db
+  key, the PIN in the PIN field authorizing TPM2_Sign, and stages it
+  with `TDCONFIG.NEW`. The commit authenticates the image by its
+  Authenticode SHA-256 against `current`'s `/lib/td-boot/selector.efi`
+  and `TDCONFIG.NEW` against this selector's own authenticated values,
+  as "Selector update" does the unsigned pair. Authenticode's
+  hash leaves out the certificate table, so the pre-seal predicts PCR 4
+  from the image as for an unsigned one, PCR 9 by replacing the
+  configuration extension's digest, and keeps PCR 7, whose authority
+  event names the same db certificate.
+- **Kernel.** `EFIVAR_FS` is built in and mounted by nothing but
+  enrollment; lockdown stays off (no lockdown LSM) and `KEXEC_SIG` stays
+  off, since td-boot authenticates deployments itself.
+
+**Threat and limits.** With Secure Boot and a firmware setup password,
+firmware runs only the td-signed image, which holds every line of the
+selector and loads no initramfs from outside it, and `TDCONFIG` is
+authenticated by the volume before it selects anything, so a PIN prompt
+on that machine is td's. Without the password, anyone holding the
+machine can turn Secure Boot off; PCR 7 then refuses release and the
+genuine selector warns, but a look-alike prompt can again record the
+PIN, as without Secure Boot. A cleared TPM loses the db key: the signed
+image keeps booting, but no new one can be signed until Secure Boot is
+reset in setup and enrolled again.
+
+### Unsafe and syscall surfaces
+
+No piece of increment 8 adds an `unsafe` surface. td-tpm's new commands
+are bytes over its safe file I/O on `/dev/tpmrm0`, its session
+cryptography td-fido's safe code. The FIDO2 boot client reads and writes
+`/dev/hidrawN` with std file I/O and reads the report descriptor from
+sysfs, so it needs no `HIDIOCGRDESC` or other hidraw ioctl; `td-fido`
+and `td-fat` forbid `unsafe`. PIN entry is the existing secret-line
+applet with new prompt operands. The admission record travels through
+td-kexec's existing memfd, pipe and sealing calls (UNSAFE.md §1). The
+ESP commits are positioned writes and `fsync` on the held disk; the
+event log, power supplies and the disk's atomic write unit are sysfs and
+securityfs reads; securityfs and efivarfs are mounted by td-init's
+existing `mount` applet, which takes the filesystem type as an operand,
+and the commit's read of `root.erofs` uses its existing `losetup` applet
+(UNSAFE.md §3), and enrollment only creates variables, which needs no
+`FS_IOC_SETFLAGS`. The upgrade and management are cryptsetup children of
+td-protector's runner. UNSAFE.md records this plan beside td-boot's
+entry; a commit that finds it needs a syscall amends UNSAFE.md in that
+commit.
+
 ## Independently landable increments
 
 1. This design, its device-bound amendment, and atomic reconciliation of the
@@ -1080,15 +2061,111 @@ same-uid process may impersonate the trusted UI or approve a request.
    activation, which deletes the storage operand, makes the default,
    changes the review, td-authd's consent summary and INSTALLER.md's
    disclosures, and adds its oracle legs.
-8. In successive increments, add authenticated firmware entry, TPM PIN
-   release and update policies, FIDO2 primary/recovery, the verified account
-   handoff and the re-encrypting upgrade. Exercise them together before
-   activation.
+8. In successive increments, add TPM PIN release, FIDO2 primary and
+   recovery, the verified account handoff, the predicted selector
+   update, the re-encrypting upgrade and protector management, exercise
+   them together before activation, and offer firmware authentication
+   ("Protected tier"). Each sub-increment below is independently
+   landable and each commit green. None is reachable through td's own
+   operations before item 9: td-authd refuses every storage operation in
+   a production build, so only root running the worker directly, as the
+   oracles do, writes a protected or upgrading header. From 8c on, the
+   installed selector's protected paths are reachable through a forged
+   header by anyone who can write the disk, so 8c and every later
+   selector commit test that forged headers fail closed. Selectors from
+   8a to 8e read a `td-upgrade` token and its pending tokens through
+   td-protector's reader and boot such a header as a device-bound one,
+   leaving them untouched, so a later selector can still upgrade it. A
+   commit that changes the shipped selector or deployment initramfs runs
+   `check integration` by hand, and `qemu-boot-encrypted` keeps passing
+   unchanged on device-bound headers. Its commits, in order:
+   - **8a, primitives.** This specification; the `td-fido` crate, moved
+     out of td-secret with no behaviour change, td-secret its first
+     consumer; td-tpm's salted sessions (ECDH to the storage primary
+     through td-fido's P-256, AES-128-CFB parameter encryption) and HMAC
+     policy sessions with PolicyAuthValue, sealing with an authValue
+     and noDA clear, Unseal's typed `TPM_RC_AUTH_FAIL` and
+     `TPM_RC_LOCKOUT`, and GetCapability of the dictionary-attack
+     properties; td-tpm's lockout commands (TPM2_HierarchyChangeAuth,
+     TPM2_DictionaryAttackParameters, TPM2_DictionaryAttackLockReset and
+     TPM2_Clear); td-protector's PIN codec, authValue derivation,
+     tpm-pin policy and chain check; td-protector's protected token
+     codecs (tpm-pin, fido2, `recovery-key`, `lockout`, `td-upgrade`,
+     `td-request`), the lockout token's encryption, and the reader's
+     protected bounds, with the real-cryptsetup header measurements.
+     All library code, called by nothing in production.
+   - **8b, FIDO2 boot client.** td-fido's disk-protector flows
+     (identify, the UV hmac-secret assertion with signature
+     verification, passphrase derivation, and creation with proof,
+     repeat and the no-PIN probe) and its `FIDO_2_1` admission; the same
+     admission and probe in td-secret's login-key creation
+     (TOKEN-LOGIN.md, "Token profile"); td-boot's `fido-worker` verb over
+     root hidraw admission, linked into td-boot and run by nothing yet.
+   - **8c, protected selector release.** td-protector's planner rules
+     for protected headers (pure), forged headers among their tests;
+     its protected release orchestration: the chain check and warning,
+     the TPM PIN, the security key, the recovery key, the verified
+     pre-cap reseal and the plan, over a `release::Fido` interface; the
+     lockout take, proof, counter and reset after the cap; td-boot's
+     prompts and wiring through secret-line and the worker, with the
+     deployment initramfs's PolicyPCR-only check of tpm-pin tokens.
+   - **8d, verified account handoff.** td-kexec's `--fds-key-admit` and
+     second member; td-boot's admission record in the selector and its
+     `admit` verb with the deployment init's line; then, as one commit
+     since the paired peers ship atomically, still `TDLA003`: td-authd's
+     consumption with its consumed and protected markers, amendment 9's
+     admission byte in `9a`, an unenrolled protected machine locking,
+     and the compositor's admitted first paint; then TOKEN-LOGIN.md's
+     protected-volume rule: the disk proof for login-key operations and
+     the last-key refusal (td-authd and td-secret's login operation).
+   - **8e, predicted selector update.** A documentation commit fixing
+     td-authd's storage-operation wire (amendment 10) and the
+     compositor's storage screen before their code; the `td-fat` crate
+     (bounded FAT32 reader, reclaim, staging and the one-sector
+     commits); td-boot's event-log reader, its refusal rules and PCR 4
+     and PCR 9 prediction, with the kernel's `SECURITYFS` pin;
+     td-init's `losetup` applet linked into the selector initramfs, with
+     its D6 binding and the image check that requires it;
+     `storage-operation`'s `selector-update` in both forms, with
+     td-authd's supervision, which refuses it in production; the
+     selector's pre-seal, its authentication against `current`'s
+     `bzImage` and `root.erofs`, its retry token, deletion and immediate
+     reboot after `update`, and the commit.
+   - **8f, re-encrypting upgrade.** td-protector's upgrade planner over
+     the states U0 to U5 and the runner's `reencrypt` (initialization in
+     both resilience modes and `--resume-only`) and `token import`
+     shapes; the `upgrade` and `upgrade-cancel` operations, with phase
+     1's `TPM_PT_PERMANENT` check; the selector's upgrade boot with its
+     power check and U4's exit for a TPM that became unusable.
+   - **8g, protector management.** `storage-operation`'s FIDO2 token
+     addition and removal and recovery-key removal; the PIN-change
+     request and its selector half; the TPM-clear request and its
+     selector half.
+   - **8h, the combined oracle.** The host's virtual FIDO2 authenticator
+     over QEMU `usb-redir` ("Acceptance evidence"); then
+     `qemu-boot-protected` with every leg below. The hardware evidence
+     follows it and precedes item 9.
+   - **8i, firmware authentication (optional).** The sealed selector
+     image's recipe (the second kernel build with the selector initramfs
+     built in, `CMDLINE_OVERRIDE` and `noinitrd`, its configuration
+     check, and `/lib/td-boot/selector.efi` in the root image) and the
+     kernel's `EFIVAR_FS` pin; the selector's `TDCONFIG` reading, PCR 9
+     extension and recorded event, and the `config` token and its check
+     after release; td-tpm's RSA signing keys, TPM2_Sign, PolicyOR and
+     TPM2_ObjectChangeAuth; td-install's DER, X.509, signature-list,
+     authenticated-variable and Authenticode writers (pure);
+     `secure-boot-enroll` in its two steps, with its option-ROM refusal
+     and readback, PCR 7 from the measured state, signing in the staged
+     update, and the db key's rebinding in the PIN change; and its
+     oracle legs. It may land before or after item 9, which it does not
+     gate; the owner may defer or drop it.
 9. Activate the protected tier only with trusted login/lock
    (td-login/TOKEN-LOGIN.md) and operation consent, with no automatic login
    in that profile, and only after `su` and root's empty shadow field have
    retired as APPLICATIONS.md §L.1, "Retiring the escape hatch",
-   specifies.
+   specifies. Activation lifts td-authd's refusal of increment 8's
+   storage operations and adds their disclosures; it requires 8a to 8h
+   and their hardware evidence, not 8i.
 
 ## Acceptance evidence
 
@@ -1368,3 +2445,223 @@ artifacts. Prove that recovery cannot silently log in, lock cannot be
 bypassed, and injected input or a replayed approval cannot authorize an
 operation. Hardware FIDO2 interoperability evidence is required in addition
 to mocks.
+
+Increment 8's evidence, by sub-increment:
+
+- **8a.** td-secret's existing tests and `qemu-secret` guests pass
+  unchanged over `td-fido`. td-tpm unit tests pin, against independent
+  vectors (`td-tpm/tests/session_vectors.py`, a host fixture tool like
+  td-secret's), the salted session's ECDH, KDFe and session key, its
+  AES-128-CFB parameter encryption both ways, the HMAC session's command
+  and response bytes, the PolicyAuthValue digest literal, authValue
+  trimming, each new command's bytes, and the typed `TPM_RC_AUTH_FAIL`,
+  `TPM_RC_LOCKOUT` and refused lockout-authorization replies.
+  td-protector's pin the tpm-pin policy digest for fixed PCR values, the
+  PIN codec's bounds (5, 6, 63 and 64 bytes, 0x1f and 0x7f refused, a
+  space admitted), the authValue and lockout-token derivations against
+  independent vectors, every protected token's exact encoding and
+  refusals (a lockout tag under another volume key, another primary's
+  Name), and, using the pinned cryptsetup on header files built in the
+  test, the largest protected and upgrading headers, the U2 one by
+  `reencrypt --init-only`, each with at least 1 KiB of the JSON area
+  spare. Ignored emulator tests against the pinned swtpm: seal and
+  unseal with the right PIN in a salted session; a wrong PIN refused
+  with 0x98e and the counter raised, still raised after a swtpm restart;
+  lockout after 32 wrong PINs with 0x921, the right PIN refused while
+  locked out; a changed PCR 4 and a closed PCR 12 each refused without
+  the counter moving; a fresh TPM state refusing at Load; another
+  primary's Name refused before Unseal; and the lockout commands' take,
+  proof, reset and clear, with a proof under a wrong authorization
+  refused.
+- **8b.** td-fido's tests drive the disk flows against the virtual
+  authenticator with independent literal vectors
+  (`td-fido/tests/disk_vectors.py`): the client-data hashes of every
+  phase, the passphrase derivation, a signature under another key, an
+  unenrolled credential, each PIN status, and a credential ID of 256
+  bytes refused. The virtual authenticator gains a CTAP 2.0 mode whose
+  hmac-secret has one secret: a key reporting only `FIDO_2_0` is
+  refused before any PIN, and one claiming `FIDO_2_1` whose no-PIN
+  probe returns the UV output is refused at creation, for disk and
+  login credentials alike. td-boot's tests drive the worker over a
+  scripted transport, its deadline and its refusal of none or two
+  devices.
+- **8c.** Release tests over the scripted TPM, a scripted FIDO2 worker
+  and the scripted cryptsetup, which requires PCR 12 capped before every
+  command: a PIN release; a codec-refused entry costing no TPM command;
+  wrong PINs and their counts; lockout turning to another way; a changed
+  chain, a fresh TPM and another primary each asking no PIN and
+  printing the warning before any other prompt; each FIDO2 role and the
+  recovery key releasing, a wrong recovery key prompting again after the
+  cap; the reseal declined, confirmed, verified before the cap, and
+  failing at its seal and verification; the pre-cap lockout rule
+  refusing a seal; the take, proof, refusal of a TPM td cannot prove,
+  counter report and reset, each after the keyslot test and never
+  before; a FIDO2-primary header offering no reseal; no TPM device;
+  every plan step interrupted, with the next boot completing it; and
+  forged headers (a tpm-pin object under a policy that is not td's, a
+  token naming another token's keyslot, a lockout token whose tag fails,
+  bounds exceeded, mixtures outside the upgrade's states) each releasing
+  nothing it did not verify and writing nothing outside the planner's
+  rules. td-boot's tests hold the prompts and that no secret reaches a
+  console line.
+- **8d.** td-kexec's tests: the second member's exact 46 bytes after the
+  key's, both pipes' refusals as the key's, and none without the flag.
+  td-boot's: the record written after every protected release and after
+  PCR 11, with method 0 after recovery; `admit`'s file checks, its
+  exclusive create and its removal of the member on every path.
+  td-authd's: the consumption order (unlinked, consumed marker created,
+  then judged), a second record in one boot discarded, each refusal
+  (UID, manifest ID, age, unenrolled, method 0), the protected marker
+  making an unenrolled state lock, the admission byte only in the
+  generation's first answer, a login-key operation on a protected
+  machine authorized by a fresh recovery key or disk-token assertion
+  whose derived passphrase opens its keyslot, and refused with a wrong
+  one, a stale one, none (an admitted session included) or a validly
+  signed assertion from a fido2 token added to the header without a
+  keyslot it opens, and the last-key removal refused there. The
+  compositor's: an admitted first paint unlocked, every other generation
+  locked, and `Super+l` after admission locking.
+- **8e.** FAT tests over images built in the test: admission of td's
+  layout and refusal of a foreign `EFI/BOOT` directory or too little
+  space; staging and both commits cut before, inside and after each of
+  their writes, each leaving exactly the old pair, the old pair with
+  complete staged entries, or the new pair, and the next update
+  reclaiming leaked clusters; and an independent FAT reader agreeing.
+  Prediction tests over event logs recorded from OVMF and from the
+  hardware machines: the replay's equality with the PCRs, the
+  substitution, and refusal of a log that does not replay, of none or
+  two matching events, of a "Returning from EFI Application" action or
+  a second boot application, of a log without SHA-256, and of a
+  truncated or oversized log, with `EV_NO_ACTION` events skipped and the
+  final-events table included. Commit tests: a staged `INITRD.NEW`
+  holding another template with this selector's exact appended archive,
+  another kernel, and a pair from `previous` each delete the staged
+  update after the cap with no object imported; a prediction failure
+  with an authentic pair keeps it and writes the retry token, and only
+  the retry's failure with that token verifying offers `update`, which
+  reboots at once; a retry token forged, copied from another volume or
+  naming another pair offers nothing.
+- **8f.** Planner tests drive the upgrade from each state U0 to U5 to
+  every cut in the table, crashes inside reencryption in both resilience
+  modes among them, and require one final header: tpm-pin or
+  fido2-primary, fido2 and recovery-key protectors only, the lockout
+  token in the TPM shape, no `td-upgrade` token, and the recovery key
+  opening it. A cancelled upgrade and an interrupted phase 1 each leave
+  a device-bound header without pending tokens. U5 completes with a PIN
+  and no recovery key. A missing mains supply in U0 upgrades nothing.
+  Phase 1 refuses the TPM shape on a TPM whose `lockoutAuthSet` is set;
+  a TPM that becomes unusable before U4 ends the upgrade without a
+  tpm-pin protector.
+- **8g.** Each operation's authorization (a stale assertion, another
+  operation's description, a token not enrolled, a wrong recovery key),
+  the minimums, a PIN change and a TPM clear each cut at every commit,
+  and each declined (an empty new PIN, an answer other than `clear`)
+  removing its request.
+- **8h.** `td-recipe-eval qemu-boot-protected --tpm
+  /absolute/path/to/swtpm`, outside the integration tier and an
+  unprovisioned host gap without `--tpm`, as `qemu-boot-encrypted` is.
+  Its FIDO2 tokens are host-side virtual authenticators attached through
+  QEMU's `usb-redir` device to a socket the host serves, speaking the
+  usbredir protocol for one USB HID FIDO device each, so the shipped
+  selector and the running system see them as hardware keys behind
+  xHCI; their CTAP state machine is the virtual authenticator
+  (td-secret/DESIGN.md, "Virtual authenticator", then td-fido's), with
+  its test-only ES256 signer and persistent state, which the host
+  evaluator compiles as a host check source. A host QEMU built without
+  usbredir is an unprovisioned host gap (exit 69). Because the host
+  holds each virtual credential's secrets, it can compute every
+  hmac-secret output and derived passphrase, and it searches for them
+  as it searches for the recovery key. It installs device-bound as
+  `qemu-boot-encrypted` does, seeds an enrolled login record as
+  `login-desktop` does, attaches a display, and runs these legs:
+  - **Upgrade, TPM primary.** Phase 1 as root over the serial shell
+    with token A as recovery; the upgrade boot with A, the PIN twice and
+    the recovery key; reencryption's progress, with journal resilience
+    on the virtual disk, which states no atomic write unit; then the
+    host parses both header copies (tpm-pin, fido2, recovery-key and
+    lockout tokens and their keyslots, no device-bound token, no
+    `td-upgrade` token), requires the recovery key still to open the
+    volume, and requires every data-segment sector to differ from its
+    copy taken before the upgrade. The inspection guest takes the new
+    volume key, which must differ from the old one it took before.
+  - **Interrupted upgrade.** Copies of the disk cut at each row of the
+    upgrade's crash table, inside reencryption at three points; each
+    next boot converges to the same header shape and the system boots,
+    the U5 copy with the PIN alone.
+  - **PIN boot and one interaction.** The PIN alone releases; the first
+    frame (QMP `screendump`) is the session, not the lock surface;
+    `Super+l` then locks. The record copied back into `/run/td-admit`
+    by root within 300 seconds after consumption, followed by a restart
+    of the paired pair, leaves the lock surface.
+  - **Wrong PIN and lockout.** Wrong PINs lower the console's count; 32
+    lock the TPM out; the lockout persists across a QEMU and swtpm
+    restart; token A then releases as recovery, the first frame is the
+    lock surface, and the console reports the count and resets it, so
+    the next boot takes the PIN.
+  - **Predicted update.** `selector-update` from an acknowledged
+    deployment; the next boot asks for the PIN, pre-seals and commits;
+    the boot after it asks for the PIN alone and retires the old
+    object. A staged `INITRD.NEW` built from another template with the
+    correct appended archive is deleted after the cap and the next boot
+    asks for the PIN on the old chain.
+  - **Changed chain, fresh TPM, no TPM.** A changed `INITRD`, a changed
+    `BOOTX64.EFI` and a load option each print the warning before any
+    prompt and ask no PIN; token A releases, the reseal is confirmed
+    with a new PIN and verified before the cap, and the next boot takes
+    that PIN. The recovery key does the same. A fresh swtpm state does
+    the same and the reseal takes its lockout. With no TPM attached
+    token A releases and the console says the cap was skipped.
+  - **TPM td cannot prove.** The host sets the lockout authorization of
+    a fresh swtpm state to a value of its own, with td-tpm's command
+    compiled as a host check source; the reseal is refused before any
+    new PIN, naming the reason, and token A and the recovery key still
+    boot.
+  - **Tokens.** An unenrolled token C is refused as not enrolled; two
+    keys at once and none are refused; a no-PIN assertion opens nothing.
+  - **FIDO2 primary.** A second installation upgraded with A as primary
+    and B as recovery: A's boot is admitted and B's is not.
+  - **Recovery on an unenrolled login state.** With the protected marker
+    present, root removes the login record; a recovery-key boot starts
+    locked; the next PIN boot's first frame is the session, where a key
+    is enrolled with the recovery key typed as the disk proof, and a
+    second attempt without a proof is refused.
+  - **Management.** The recovery key, authorizing, adds token B; B,
+    authorizing, adds C and removes A; A is then refused and the header
+    holds no keyslot for it; a PIN change requested on the running
+    system takes effect at the next boot, the old PIN refused after it;
+    a TPM clear requested and confirmed leaves the next boot asking for
+    a token; a removal below the minimum is refused.
+  - **Rollback.** A pending deployment that fails its attempts falls
+    back to `previous` with no new PIN or token asked.
+  - **Inspection.** Neither PIN, any derived passphrase or hmac-secret
+    output, the lockout authorization, the old or new volume key nor the
+    recovery key appears on the whole disk, the ESP, the opened volume's
+    plaintext, any console or any sampled `/proc/*/cmdline`, and the
+    swtpm channel's recorded traffic carries no protector secret in
+    clear; the record appears on no disk.
+  The hardware evidence follows on a discrete TPM 2.0 machine (not the
+  T430s, whose TPM is 1.2), a firmware-TPM machine, and a machine whose
+  TPM a Windows installation provisioned (refused until cleared, then
+  admitted), with two FIDO2 keys of different vendors reporting
+  `FIDO_2_1` with hmac-secret and a client PIN, and one CTAP 2.0-only
+  key, which must be refused: an upgrade, PIN boots, a predicted
+  update, a wrong PIN's count, each key's boot and the first frame,
+  recorded in that commit's message before item 9 lands. The
+  single-sector ESP commit stays a disclosed assumption on SATA and eMMC
+  devices unless that evidence includes a power-cut series on one.
+- **8i.** OVMF's Secure Boot build with SMM (`TD_QEMU_EFI_CODE` naming
+  it; its absence an unprovisioned host gap): enrollment's first step
+  as a predicted staged update that writes the first `config` tag and
+  boots with the PIN alone, then its second from setup mode with KEK
+  and db left populated, replaced whole and read back;
+  refusal with an option ROM in PCR 2's log (QEMU's `romfile` on a PCI
+  device); the sealed image booting with Secure Boot on after a reseal
+  naming PCR 7; an unsigned image refused by firmware with no td line on
+  the console; a replaced `TDCONFIG` booting the genuine selector, which
+  warns, releases nothing to the PIN, and after a token release halts
+  before selecting; a boot entry whose load options name `initrd=` an
+  initramfs whose `/init` writes a marker to the console, which never
+  appears while the built-in `/init`'s line does;
+  Secure Boot turned off refusing the tpm-pin protector; a staged signed
+  update predicted and released with the PIN alone; and a PIN change
+  after which the db key signs only under the new PIN.

@@ -1336,7 +1336,15 @@ is the walk above, so a mapping over another device, or whose Btrfs
 carries another UUID or none, refuses. The running system never opens
 or unlocks the volume: it runs no cryptsetup, reaches no TPM and reads
 no key, so a LUKS2 partition with no active mapping, or with an active
-mapping under another name, refuses. Device-mapper refuses, or defers
+mapping under another name, refuses. The planned exception is
+ENCRYPTION.md increment 8's `td-install storage-operation`: the
+upgrade's first phase reads one TPM capability, it and the requests
+import key-less tokens, protector management adds and kills keyslots
+under a FIDO2 passphrase or the recovery key, a login-key disk proof
+tests one of them on its keyslot, the selector update writes the ESP, and Secure
+Boot enrollment signs with a TPM-held key and writes EFI variables;
+none of them opens the volume or reads its key.
+Device-mapper refuses, or defers
 until the last close, removing a mapping that is open, so the held
 descriptor keeps the mapping for the operation; root reloading its
 table is a privileged device administrator's change, outside this
@@ -2267,7 +2275,9 @@ stronger claim than it is:
   `td-boot`, after firmware has already run the stub. Chaining to the
   platform's own trust root (shim, MOK, a signed PE) is a separate trust
   policy increment with its own key management, and D2's fail-closed check is
-  not a substitute for it.
+  not a substitute for it. ENCRYPTION.md increment 8 plans it as an
+  optional increment: a signed image holding the selector's initramfs,
+  and a TPM-held db key ("Firmware authentication").
 - **No measured boot / TPM.** Nothing is sealed to PCRs.
 - **No ESP redundancy.** One ESP. A machine whose ESP is destroyed is
   recovered by reinstalling it, not by a second copy.
