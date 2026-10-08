@@ -2,6 +2,7 @@
 //! SQLite owns metadata persistence; raw message files own body bytes.
 use std::fmt;
 
+pub mod batch;
 pub mod key;
 pub mod operation;
 pub mod row;

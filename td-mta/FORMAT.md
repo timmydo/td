@@ -118,6 +118,24 @@ final reference validation. Each changed object has at most one CHANGE.
 A batch is not a disk journal format and contains no custom frame header,
 footer, checksum, generation or replay descriptor.
 
+`format::batch::Batch::decode` binds a complete nonempty TransactionInput to
+its original immutable bytes and caller-reserved Option<StagedOperation>
+slots. It checks the hard byte/count limits, exact declared count, every
+operation's complete local codec and end of input before returning a Batch.
+Truncation, extra operations/bytes, malformed rows or insufficient slots yield
+no whole-batch binding. Slots written before refusal are provisional offsets,
+never authority; slots beyond the declared count are untouched.
+
+The binding borrows its checked slot prefix immutably, so neither original
+bytes nor offsets can change while it remains usable. `get` re-decodes one
+original extent, returns None beyond the checked count, and creates no row
+copy or operation array. Repeated row keys and known Identity CHANGE syntax
+remain locally valid; final-state checks and v1 Identity refusal still belong
+to the store. Decoding is synchronous bounded work over at most 1 MiB/4096
+operations, with no internal meter or deadline. The caller admits the whole
+pass and every replay in its original work/deadline scope. Complete framing
+confers no account, quota, prepared-body or commit authority.
+
 ## 6. Positional row values
 
 The table tag selects the row; values carry no repeated kind/schema tag.

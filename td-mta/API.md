@@ -6565,6 +6565,14 @@ That adapter must bind prepared ownership to authenticated reservations before
 SMTP/JMAP ingress is activated. The future coordinator must keep
 slow peers outside the global writer while they deliver their messages.
 
+`format::batch::Batch::decode` validates the entire encoded TransactionInput
+using caller-reserved offset slots and retains immutable original bytes.
+Indexed `get` returns a reborrowed locally valid Operation, never a copied
+row arena. FORMAT.md owns exact framing, limits and provisional-output rules.
+This synchronous codec grants no reservation or account authority; caller
+work/deadline admission and the authenticated Store adapter remain separate.
+IndexStore still accepts the typed operation slice below.
+
 IndexStore::commit accepts Crypto, CommitRequest, a bounded Operation slice
 and a mutable slice of BlobSource { id, source: &mut dyn std::io::Read }.
 CommitRequest carries account, expected sequence, UTC validation time and

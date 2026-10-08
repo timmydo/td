@@ -12,7 +12,10 @@ checked resource planning only. [RESOURCES.md](RESOURCES.md) records its checked
 byte ledger; [CONFORMANCE.md](CONFORMANCE.md) inventories the unimplemented JMAP
 contract and current client calls. There are no protocol handlers or listeners.
 Checked scalar/key/row and operation codecs define bounded application
-values in [FORMAT.md](FORMAT.md). SQLite owns relational metadata, immutable
+values in [FORMAT.md](FORMAT.md). Its complete batch decoder binds exact
+encoded input to caller-reserved offset slots without copying row data;
+authenticated transaction coordination remains separate. SQLite owns
+relational metadata, immutable
 body chunks, atomic transactions, native indexes, WAL snapshots and crash
 recovery. The store_fs adapter verifies streamed bodies inside their metadata
 transaction and retains the read snapshot through MIME processing. A fixed

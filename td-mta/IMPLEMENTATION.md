@@ -553,6 +553,12 @@ states, inconsistent completion/notification and partial cancellation reject
 body and metadata together. Historical transitions and worker authority remain
 separate policy work.
 
+Complete encoded transaction framing and local row decoding use
+format::batch::Batch with the existing caller-reserved offset slots. The
+binding retains original bytes; exact count and EOF precede whole success.
+The authenticated coordinator must admit this synchronous work and wire its
+operations to the SQLite core without a second operation array.
+
 Bounded provisional ingress staging, full-slot quota accounting and crash
 cleanup are implemented by IngressSpool. Before protocol activation, connect
 that ownership to the authenticated ports::Store adapter. The current

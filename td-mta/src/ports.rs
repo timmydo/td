@@ -223,7 +223,8 @@ pub enum Mutation<'a> {
     Delete(Key<'a>),
 }
 /// Canonical FORMAT PUT/DELETE/CHANGE operations, without a transaction header.
-/// The store validates count, framing, rows and references before any append.
+/// format::batch validates complete local framing; the store checks final
+/// references and policy before committing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionInput<'a> {
     pub bytes: &'a [u8],
@@ -236,7 +237,8 @@ pub enum OperationKind {
     Change(ChangeAction),
 }
 /// Owned offsets into TransactionInput, never references into a reusable arena.
-/// All ranges are validated by the store; Rust layout is not serialized.
+/// Batch validates its own offsets; copied offsets alone grant no authority.
+/// Rust layout is not serialized.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StagedOperation {
     pub kind: OperationKind,
