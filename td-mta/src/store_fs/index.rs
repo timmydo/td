@@ -1492,6 +1492,16 @@ fn next_change(
     after: ChangeCursor,
     kind: ObjectType,
 ) -> Result<ChangeStep, ports::Error> {
+    match kind {
+        ObjectType::Mailbox
+        | ObjectType::Thread
+        | ObjectType::Email
+        | ObjectType::EmailSubmission => {}
+        ObjectType::Identity => {
+            native.check()?;
+            return Err(ports::Error::Invalid);
+        }
+    }
     if after.sequence < identity.history_floor {
         return Err(ports::Error::HistoryLost);
     }
@@ -2368,6 +2378,156 @@ mod tests {
             wrong_views.is_empty() && wrong_commits.is_empty(),
             "incoherent views: {wrong_views:?}; commits: {wrong_commits:?}"
         );
+    }
+    #[test]
+    fn native_change_reader_refuses_identity_requests_before_querying() {
+        const INSERT_IDENTITY: &str = "INSERT INTO changes(account,sequence,operation,kind,action,object) VALUES(?1,?2,2,4,1,?3)";
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let clock = Arc::new(Timer(AtomicU64::new(1)));
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            clock.clone(),
+            2,
+            deadline(),
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        let start = ChangeCursor {
+            sequence: Sequence::default(),
+            operation: u32::MAX,
+        };
+        let mut wrong = Vec::new();
+        fn identity_request(
+            view: &mut IndexReadView<'_, '_>,
+            start: ChangeCursor,
+            wrong: &mut Vec<Result<ChangeStep, ports::Error>>,
+        ) {
+            let seen = Arc::new(AtomicU64::new(0));
+            let reads = Arc::clone(&seen);
+            lock(&view.native().unwrap().connection)
+                .unwrap()
+                .authorizer(Some(move |context: AuthContext<'_>| {
+                    if matches!(context.action, AuthAction::Select) {
+                        reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Authorization::Allow
+                }))
+                .unwrap();
+            let actual = view.next_change(start, ObjectType::Identity);
+            if actual != Err(ports::Error::Invalid) {
+                wrong.push(actual);
+            } else {
+                assert_eq!(seen.load(Ordering::Relaxed), 0);
+            }
+            assert!(view.next_change(start, ObjectType::Mailbox).is_ok());
+            assert!(seen.load(Ordering::Relaxed) > 0);
+            lock(&view.native().unwrap().connection)
+                .unwrap()
+                .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                .unwrap();
+        }
+        let mut old = store.view(ACCOUNT, deadline()).unwrap();
+        identity_request(&mut old, start, &mut wrong);
+        for kind in [
+            ObjectType::Mailbox,
+            ObjectType::Thread,
+            ObjectType::Email,
+            ObjectType::EmailSubmission,
+        ] {
+            assert_eq!(old.next_change(start, kind), Ok(ChangeStep::Complete));
+        }
+        let request = CommitRequest {
+            account: ACCOUNT,
+            expected: Sequence::default(),
+            utc_ms: 0,
+            deadline: deadline(),
+        };
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                request,
+                &[Operation::change(
+                    ObjectType::Identity,
+                    ChangeAction::Created,
+                    ID.as_bytes()
+                )],
+                &mut []
+            ),
+            Err(CommitError::Rejected(ports::Error::Invalid))
+        );
+        let value = mailbox("one", None);
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                request,
+                &[
+                    Operation::put(Table::Mailboxes, ID.as_bytes(), &value).unwrap(),
+                    Operation::change(ObjectType::Mailbox, ChangeAction::Created, ID.as_bytes()),
+                ],
+                &mut []
+            ),
+            Ok(Sequence::from_u64(1))
+        );
+        lock(&store.writer)
+            .unwrap()
+            .native
+            .run(|db| {
+                db.execute_batch("PRAGMA ignore_check_constraints=ON")
+                    .map_err(sql)?;
+                assert_eq!(
+                    db.execute(
+                        INSERT_IDENTITY,
+                        params![
+                            ACCOUNT.as_bytes().as_slice(),
+                            1u64.to_be_bytes().as_slice(),
+                            ID.as_bytes().as_slice()
+                        ]
+                    )
+                    .map_err(sql)?,
+                    1
+                );
+                db.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                    .map_err(sql)
+            })
+            .unwrap();
+        let mut current = store.view(ACCOUNT, deadline()).unwrap();
+        identity_request(&mut current, start, &mut wrong);
+        let expected = ChangeRecord {
+            cursor: ChangeCursor {
+                sequence: Sequence::from_u64(1),
+                operation: 1,
+            },
+            change: Change {
+                kind: ObjectType::Mailbox,
+                id: *ID.as_bytes(),
+                action: ChangeAction::Created,
+            },
+        };
+        assert_eq!(
+            current.next_change(start, ObjectType::Mailbox),
+            Ok(ChangeStep::Record(expected))
+        );
+        assert_eq!(
+            current.next_change(expected.cursor, ObjectType::Mailbox),
+            Ok(ChangeStep::Complete)
+        );
+        assert_eq!(
+            old.next_change(start, ObjectType::Mailbox),
+            Ok(ChangeStep::Complete)
+        );
+        clock.0.store(101, Ordering::Relaxed);
+        assert_eq!(
+            current.next_change(start, ObjectType::Identity),
+            Err(ports::Error::Deadline)
+        );
+        clock.0.store(1, Ordering::Relaxed);
+        assert_eq!(
+            current.next_change(start, ObjectType::Identity),
+            Err(ports::Error::Deadline)
+        );
+        assert!(wrong.is_empty(), "unsupported Identity requests: {wrong:?}");
     }
     #[test]
     fn changes_use_native_order_and_reject_incoherent_or_duplicate_actions() {
