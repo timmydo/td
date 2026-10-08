@@ -5131,7 +5131,10 @@ reserved like any request; the first line of the task stands until then.
 `prompt/conversation.txt` and `prompt/title.txt`, with the workspace
 paragraphs below. With no tools, no environment block and no project
 instructions yet, the prefix is the static text alone, which says that
-the conversation has no tools and that the window shows plain text. A
+the conversation has no tools and that the window shows plain text,
+naming the Markdown marks its replies are not to use (headings,
+emphasis, backticks and fences, tables) and the plain forms a list,
+steps and code take; files it writes keep their own format. A
 title request is the title prompt and one user message quoting the
 first message and the start of the reply, each cut to 4 KiB, with
 `max_tokens` 256. It is sent once, after a conversation's first reply.

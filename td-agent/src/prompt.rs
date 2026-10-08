@@ -646,6 +646,10 @@ mod tests {
             "{content}"
         );
         assert!(
+            content.contains("renders no Markdown, so write them in plain text"),
+            "{content}"
+        );
+        assert!(
             content.contains("- Workspace: /home/u/notes, a directory of the person's"),
             "{content}"
         );
