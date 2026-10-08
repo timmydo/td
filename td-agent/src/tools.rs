@@ -59,6 +59,9 @@ pub enum Tool {
     Conversations,
     SendMessage,
     Question,
+    Schedule,
+    Schedules,
+    CancelSchedule,
     ReadFile,
     WriteFile,
     EditFile,
@@ -94,6 +97,9 @@ const CONVERSATION: &[Tool] = &[
     Tool::Conversations,
     Tool::SendMessage,
     Tool::Question,
+    Tool::Schedule,
+    Tool::Schedules,
+    Tool::CancelSchedule,
 ];
 
 /// Whether `name` names one of td-agent's tools.
@@ -136,6 +142,9 @@ impl Tool {
             Self::Conversations => "conversations",
             Self::SendMessage => "send_message",
             Self::Question => "question",
+            Self::Schedule => "schedule",
+            Self::Schedules => "schedules",
+            Self::CancelSchedule => "cancel_schedule",
             Self::ReadFile => "read_file",
             Self::WriteFile => "write_file",
             Self::EditFile => "edit_file",
@@ -313,6 +322,29 @@ fn definition(tool: Tool) -> Json {
                     ("text", property("string", "The message.")),
                 ],
                 &["to", "text"],
+            ),
+        ),
+        Tool::Schedule => (
+            "Ask the person to schedule a message to a conversation, this one or another, by its id from `conversations`: at the times a five-field cron expression gives (minute hour day-of-month month day-of-week; numbers, `*`, lists, ranges and steps; no names), or once at one local time written YYYY-MM-DDTHH:MM, in the person's time zone. Each time, the text is delivered labelled as this schedule's, written by this conversation, and starts a turn there, spending money while the person may be away, so the person always decides on a card, which shows the next three times; they may refuse. A time missed while td-agent is not running is dropped unless `catch_up` asks for one at startup. Use it only when the person asked for recurring or later work.".to_string(),
+            schema(
+                vec![
+                    ("when", property("string", "Five cron fields, or one local time YYYY-MM-DDTHH:MM.")),
+                    ("to", property("string", "The receiving conversation's id; this conversation's own to schedule yourself.")),
+                    ("text", property("string", "The message each time delivers, as much as its card shows whole: at most 160 lines, each at most 2,048 bytes, 48 KiB in all.")),
+                    ("catch_up", property("boolean", "Fire once at startup for a time missed while td-agent was not running; false when left out.")),
+                ],
+                &["when", "to", "text"],
+            ),
+        ),
+        Tool::Schedules => (
+            "List the schedules that deliver to this conversation, whoever made them: each one's id, when it fires and its next times, who made it, and the start of its text.".to_string(),
+            schema(Vec::new(), &[]),
+        ),
+        Tool::CancelSchedule => (
+            "Cancel a schedule that delivers to this conversation, by its id from `schedules`. A schedule delivering elsewhere is the person's to cancel.".to_string(),
+            schema(
+                vec![("id", property("string", "The schedule's id, eight hex digits."))],
+                &["id"],
             ),
         ),
         Tool::ReadFile => (
@@ -580,6 +612,18 @@ pub enum Args {
         question: String,
         options: Vec<String>,
     },
+    /// `schedule`: when, as written and checked; the receiver; the text;
+    /// whether a missed time is made up at startup.
+    Schedule {
+        when: String,
+        to: Id,
+        text: String,
+        catch_up: bool,
+    },
+    /// `schedules`.
+    Schedules,
+    /// `cancel_schedule`, by the schedule's id.
+    CancelSchedule(String),
     /// `web_fetch` of a URL, its text from `offset`, at most `max_bytes`.
     WebFetch {
         url: crate::web::Url,
@@ -1053,6 +1097,32 @@ pub fn parse_in(kit: Kit, name: &str, arguments: &str) -> Result<Args, String> {
                 question: question.to_string(),
                 options,
             }
+        }
+        Tool::Schedule => {
+            let m = members(tool_name, &value, &["when", "to", "text", "catch_up"])?;
+            let when = required(m, "when")?.trim();
+            crate::schedule::When::parse(when)?;
+            Args::Schedule {
+                when: when.to_string(),
+                to: conversation_id(required(m, "to")?, "to", "")?,
+                text: shown_whole(message_text(m, "text")?)?,
+                catch_up: flag(m, "catch_up")?,
+            }
+        }
+        Tool::Schedules => {
+            members(tool_name, &value, &[])?;
+            Args::Schedules
+        }
+        Tool::CancelSchedule => {
+            let m = members(tool_name, &value, &["id"])?;
+            let id = required(m, "id")?.trim();
+            if !crate::schedule::id_ok(id) {
+                return Err(format!(
+                    "{:?} is not a schedule's id, eight hex digits",
+                    visible(id)
+                ));
+            }
+            Args::CancelSchedule(id.to_string())
         }
         Tool::WebFetch => {
             let m = members(tool_name, &value, &["url", "offset", "max_bytes"])?;
@@ -1564,6 +1634,61 @@ pub fn crossing_card(target: &Id, title: &str, reach: Reach) -> (String, Vec<Str
     (heading.to_string(), card.done())
 }
 
+/// The most lines of a schedule's text, which its card shows whole.
+const SCHEDULE_LINES: usize = PART_LINES * 2;
+
+/// `text` when a schedule's card can show it whole, as the person
+/// approves all of it (DESIGN.md §3).
+pub fn shown_whole(text: String) -> Result<String, String> {
+    let lines: Vec<String> = pieces(&text).into_iter().map(visible).collect();
+    let bytes: usize = lines.iter().map(String::len).sum();
+    match lines.len() <= SCHEDULE_LINES
+        && bytes < PART_BYTES
+        && lines.iter().all(|line| line.len() <= CARD_LINE_BYTES)
+    {
+        true => Ok(text),
+        false => Err(format!(
+            "the text is more than its card shows whole: at most {SCHEDULE_LINES} lines, each at most {CARD_LINE_BYTES} bytes, {} KiB in all",
+            PART_BYTES / 1024
+        )),
+    }
+}
+
+/// The card that asks the person whether this conversation may make a
+/// schedule (DESIGN.md §3): only theirs to decide, as it spends money
+/// unattended. It shows the receiver, when and the next times, the
+/// catch-up choice and the text whole.
+pub fn schedule_card(
+    target: &Id,
+    title: &str,
+    own: bool,
+    when: &str,
+    next: &[String],
+    catch_up: bool,
+    text: &str,
+) -> (String, Vec<String>) {
+    let mut card = Lines::default();
+    card.line(match own {
+        true => "This conversation".to_string(),
+        false => format!("Conversation {target}, titled {}", visible(title)),
+    });
+    card.line(format!(
+        "gets this message at {}, labelled as this schedule's, written by this conversation, not by you, each time starting a turn and spending money while you may be away.",
+        visible(when)
+    ));
+    card.line(match next.is_empty() {
+        true => "It never fires.".to_string(),
+        false => format!("Next: {}.", next.join(", ")),
+    });
+    card.line(match catch_up {
+        true => "A time missed while td-agent is not running fires once at startup.".to_string(),
+        false => "A time missed while td-agent is not running is dropped.".to_string(),
+    });
+    card.line("When it fires, the classifier that judges that turn's crossings in auto mode counts the work this text plainly asks for as asked for by you.".into());
+    card.text("", text, SCHEDULE_LINES);
+    ("Schedule a message".to_string(), card.done())
+}
+
 /// The most lines each list of a push's card shows, so every part of
 /// it shows.
 const PUSH_PART: usize = 40;
@@ -1714,7 +1839,10 @@ mod tests {
                     "history_read",
                     "conversations",
                     "send_message",
-                    "question"
+                    "question",
+                    "schedule",
+                    "schedules",
+                    "cancel_schedule"
                 ]
             );
             // `require_parameters` would route a request carrying either
@@ -2617,6 +2745,93 @@ mod tests {
     /// A crossing's card names the other conversation, its title made
     /// visible, and shows a message whole or says where a read's findings
     /// go.
+    /// `schedule` checks when it fires and the text as a message's;
+    /// `cancel_schedule` takes a schedule's id; the card says what the
+    /// person decides, the next times among it.
+    #[test]
+    fn a_schedule_is_checked_and_its_card_shows_its_times() {
+        let to = "b".repeat(32);
+        let args = parse(
+            "schedule",
+            &format!(r#"{{"when":" 0 9 * * 1-5 ","to":"{to}","text":"check"}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            Args::Schedule {
+                when: "0 9 * * 1-5".into(),
+                to: Id::parse(&to).unwrap(),
+                text: "check".into(),
+                catch_up: false,
+            }
+        );
+        for (name, args) in [
+            (
+                "schedule",
+                format!(r#"{{"when":"0 9 * *","to":"{to}","text":"x"}}"#),
+            ),
+            (
+                "schedule",
+                format!(r#"{{"when":"0 9 * * *","to":"{to}","text":" "}}"#),
+            ),
+            (
+                "schedule",
+                format!(r#"{{"when":"0 9 * * *","to":"{to}","text":"x","catch_up":"yes"}}"#),
+            ),
+            ("cancel_schedule", r#"{"id":"0A1B2C3D"}"#.to_string()),
+            ("cancel_schedule", r#"{"id":"0a1b"}"#.to_string()),
+            (
+                "schedule",
+                format!(
+                    r#"{{"when":"0 9 * * *","to":"{to}","text":"{}"}}"#,
+                    "x\\n".repeat(161)
+                ),
+            ),
+            (
+                "schedule",
+                format!(
+                    r#"{{"when":"0 9 * * *","to":"{to}","text":"{}"}}"#,
+                    "x".repeat(2049)
+                ),
+            ),
+        ] {
+            assert!(parse(name, &args).is_err(), "{args}");
+        }
+        let most = format!(
+            r#"{{"when":"0 9 * * *","to":"{to}","text":"{}"}}"#,
+            format!("{}\\n", "x".repeat(2048)).repeat(15)
+        );
+        assert!(parse("schedule", &most).is_ok(), "the card shows it whole");
+        assert_eq!(
+            parse("cancel_schedule", r#"{"id":"0a1b2c3d"}"#).unwrap(),
+            Args::CancelSchedule("0a1b2c3d".into())
+        );
+        let next = [
+            "2026-10-09 09:00".to_string(),
+            "2026-10-12 09:00".to_string(),
+        ];
+        let (title, details) = schedule_card(
+            &Id::parse(&to).unwrap(),
+            "Nightly",
+            false,
+            "0 9 * * 1-5",
+            &next,
+            true,
+            "check",
+        );
+        assert_eq!(title, "Schedule a message");
+        assert_eq!(details[0], format!("Conversation {to}, titled Nightly"));
+        assert!(details[1].contains("at 0 9 * * 1-5") && details[1].contains("not by you"));
+        assert_eq!(details[2], "Next: 2026-10-09 09:00, 2026-10-12 09:00.");
+        assert!(details[3].contains("fires once at startup"));
+        assert!(details[4].contains("as asked for by you"));
+        assert_eq!(details[5], "check");
+        let (_, own) = schedule_card(&Id::parse(&to).unwrap(), "", true, "x", &[], false, "t");
+        assert_eq!(own[0], "This conversation");
+        assert_eq!(own[2], "It never fires.");
+        assert!(own[3].contains("dropped"));
+    }
+
     #[test]
     fn a_crossing_card_shows_what_crosses() {
         let (title, lines) =

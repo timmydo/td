@@ -31,7 +31,7 @@ use td_agent::cost::{Limits, ONE};
 use td_agent::frame;
 use td_agent::key::Secret;
 use td_agent::models::Models;
-use td_agent::protocol::{Down, Up};
+use td_agent::protocol::{Down, ScheduleOp, Up};
 use td_agent::store::{Basis, Conversation, Event, Held, Id, Kind, Purpose, Role, StateDir};
 
 /// Whether `content` is `text` after its `[received <UTC time>]` line.
@@ -67,6 +67,8 @@ struct Harness {
     spent: Vec<(u64, u64)>,
     /// Every message sent through the window: to and text.
     sent: Vec<(Id, String)>,
+    /// What the window was asked of the schedules, which it answered.
+    scheduled: Vec<ScheduleOp>,
     /// Every streamed delta: its request, reasoning and text.
     deltas: Vec<(u64, String, String)>,
     /// Events `until_text` heard, which the next `turn` begins with.
@@ -139,6 +141,7 @@ impl Harness {
             reserved: Vec::new(),
             spent: Vec::new(),
             sent: Vec::new(),
+            scheduled: Vec::new(),
             deltas: Vec::new(),
             brakes: Vec::new(),
             heard: Vec::new(),
@@ -203,6 +206,21 @@ impl Harness {
                 id: *id,
                 states: Vec::new(),
             }),
+            Up::Schedule { id, op } => {
+                self.scheduled.push(op.clone());
+                let answer = match op {
+                    ScheduleOp::Add { .. } => "schedule 0a1b2c3d made",
+                    ScheduleOp::Times { .. } => {
+                        "2026-10-09 09:00\n2026-10-12 09:00\n2026-10-13 09:00"
+                    }
+                    ScheduleOp::List => "0a1b2c3d: 0 9 * * 1-5; made by this conversation",
+                    ScheduleOp::Cancel { .. } => "schedule 0a1b2c3d cancelled",
+                };
+                self.down(&Down::Scheduled {
+                    id: *id,
+                    answer: Ok(answer.into()),
+                });
+            }
             Up::Brake { why } => self.brakes.push(why.clone()),
             Up::Delta {
                 request,
@@ -742,7 +760,10 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
     assert_eq!(body["tools.0.function.name"], "todo_write");
     assert_eq!(body["tools.4.function.name"], "send_message");
     assert_eq!(body["tools.5.function.name"], "question");
-    assert!(!body.contains_key("tools.6.type"), "no report");
+    assert_eq!(body["tools.6.function.name"], "schedule");
+    assert_eq!(body["tools.7.function.name"], "schedules");
+    assert_eq!(body["tools.8.function.name"], "cancel_schedule");
+    assert!(!body.contains_key("tools.9.type"), "no report");
     // `require_parameters` routes only to an endpoint that lists every
     // parameter sent, so each member, but those it does not route on, is
     // one the model lists; the title's as well.
@@ -4960,6 +4981,200 @@ fn a_crossing_asks_the_person_and_a_refusal_is_the_calls_result() {
         matches!(approvals[..], [Kind::Approval { outcome, by, .. }] if outcome == "deny" && by == "human"),
         "{approvals:?}"
     );
+}
+
+/// A harness in auto mode, with conversation `b…` beside it.
+fn auto_beside(name: &str, replies: Vec<Reply>) -> (Harness, Id) {
+    let h = Harness::new_in(name, Role::Conversation, Some("scratch"), false, replies);
+    let other = Id::parse(&"b".repeat(32)).unwrap();
+    drop(
+        Conversation::open(
+            &h.state,
+            &other,
+            Some(Role::Conversation),
+            Duration::from_secs(3),
+        )
+        .unwrap(),
+    );
+    (h, other)
+}
+
+/// A schedule is the person's alone, in auto mode too: no classifier is
+/// asked and the card offers nothing to keep. Allowed, the window is
+/// asked to make it; refused, it is not.
+#[test]
+fn a_schedule_is_the_persons_to_decide_even_in_auto_mode() {
+    let (mut h, other) = auto_beside(
+        "schedule",
+        vec![
+            Reply::sse("stream-tool-schedule.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-tool-schedule.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client::default());
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    h.say("Check the nightly build every weekday morning.");
+    let (call, title, details) = h.until_ask();
+    assert_eq!(title, "Schedule a message");
+    assert!(h.always.is_none(), "nothing to keep");
+    assert_eq!(
+        details[0],
+        "Asked because a schedule spends money while you may be away, so only you decide it."
+    );
+    assert_eq!(
+        details[1],
+        format!("Conversation {other}, titled New conversation")
+    );
+    assert_eq!(
+        details[3], "Next: 2026-10-09 09:00, 2026-10-12 09:00, 2026-10-13 09:00.",
+        "the window's times"
+    );
+    assert!(details[4].contains("fires once at startup"), "{details:?}");
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(
+        h.scheduled,
+        [
+            ScheduleOp::Times {
+                when: "0 9 * * 1-5".into()
+            },
+            ScheduleOp::Add {
+                when: "0 9 * * 1-5".into(),
+                to: other.clone(),
+                text: "Check the nightly build and say how it went.".into(),
+                catch_up: true,
+            }
+        ]
+    );
+    let said = results(&events);
+    assert_eq!(said[0].1, "schedule 0a1b2c3d made");
+    assert!(
+        !h.mock
+            .requests()
+            .iter()
+            .any(|r| r.text().contains("decisions") || r.text().contains("safeguard")),
+        "no classifier was asked"
+    );
+    h.say("Another.");
+    let (call, _, _) = h.until_ask();
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    assert!(results(&events)[0]
+        .1
+        .contains("the person refused this call"));
+    assert_eq!(
+        h.scheduled
+            .iter()
+            .filter(|op| matches!(op, ScheduleOp::Add { .. }))
+            .count(),
+        1,
+        "a refused schedule is never asked of the window"
+    );
+}
+
+/// `schedules` and `cancel_schedule` ask the window, with no card.
+#[test]
+fn schedules_are_listed_and_cancelled_through_the_window() {
+    let mut h = Harness::new(
+        "schedules",
+        Role::Conversation,
+        vec![
+            Reply::sse("stream-tool-schedules.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-tool-cancel-schedule.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("What is scheduled here?");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(results(&events)[0].1.starts_with("0a1b2c3d: "));
+    h.say("Cancel it.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    assert_eq!(results(&events)[0].1, "schedule 0a1b2c3d cancelled");
+    assert_eq!(
+        h.scheduled,
+        [
+            ScheduleOp::List,
+            ScheduleOp::Cancel {
+                schedule: "0a1b2c3d".into()
+            }
+        ]
+    );
+}
+
+/// A turn a model-made schedule's firing started gives the classifier
+/// the person's approval of it, as their standing decision; the text
+/// stays untrusted.
+#[test]
+fn the_classifier_is_told_a_model_made_schedule_was_approved() {
+    let (mut h, other) = auto_beside(
+        "approved",
+        vec![
+            Reply::sse("stream-tool-send.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.mock
+        .route("typesafe/jev", vec![Reply::ok("jev-matches.json")]);
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![Reply::ok("classifier-allow.json")],
+    );
+    h.setup(Client {
+        allow_data_collection: true,
+        ..Client::default()
+    });
+    h.down(&Down::Policy {
+        version: 1,
+        rules: Ok(String::new()),
+        mode: td_agent::config::Mode::Auto,
+    });
+    h.down(&Down::Fire {
+        delivery: td_agent::store::random_hex(16).unwrap(),
+        schedule: "0a1b2c3d".into(),
+        author: Some(other.clone()),
+        text: "Ask the other conversation for its notes.".into(),
+        skipped: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let asked: Vec<String> = h
+        .mock
+        .requests()
+        .iter()
+        .map(|r| r.text())
+        .filter(|t| t.contains("approved_schedule"))
+        .collect();
+    assert!(!asked.is_empty(), "the classifier was told");
+    for told in [
+        "made_by",
+        &other.to_string(),
+        "Ask the other conversation for its notes.",
+        "the person read its text whole on a card",
+    ] {
+        assert!(asked[0].contains(told), "{told}: {}", asked[0]);
+    }
 }
 
 /// A standing allow for messages sends three to one conversation since

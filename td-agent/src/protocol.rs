@@ -88,6 +88,12 @@ pub enum Down {
     },
     /// The answer to a `Send` of the same id: queued, or why not.
     Sent { id: u64, refusal: Option<String> },
+    /// The answer to a `Schedule` of the same id: what was done, or why
+    /// not.
+    Scheduled {
+        id: u64,
+        answer: Result<String, String>,
+    },
     /// The answer to a `Query` of the same id: each conversation's state
     /// as the window knows it.
     States { id: u64, states: Vec<(Id, String)> },
@@ -248,6 +254,13 @@ pub enum Up {
     Query {
         id: u64,
     },
+    /// `schedule`, the person having allowed it on its card, or
+    /// `schedules` or `cancel_schedule` (DESIGN.md §3): the window, which
+    /// keeps the schedules, answers with `Scheduled`.
+    Schedule {
+        id: u64,
+        op: ScheduleOp,
+    },
     /// A card for the human (DESIGN.md §11): may call `call` (its
     /// `ToolCall`'s sequence number) run, as `title` and `details` say?
     /// The window answers with `Decision`. `always` is what its "always"
@@ -330,6 +343,26 @@ pub enum Up {
         lease: Option<String>,
         asks: bool,
     },
+}
+
+/// What a conversation's `Schedule` asks of the window (DESIGN.md §3).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScheduleOp {
+    /// Make a schedule the person approved on its card, made by the
+    /// asking conversation.
+    Add {
+        when: String,
+        to: Id,
+        text: String,
+        catch_up: bool,
+    },
+    /// The next times `when` gives, in the zone the schedules fire in,
+    /// for the card; refused when it never fires.
+    Times { when: String },
+    /// List the schedules delivering to the asking conversation.
+    List,
+    /// Cancel one delivering to the asking conversation.
+    Cancel { schedule: String },
 }
 
 fn typed(kind: &str, mut pairs: Vec<(String, Json)>) -> Vec<u8> {
@@ -739,6 +772,16 @@ impl Down {
                     ("skipped".into(), optional(skipped)),
                 ],
             ),
+            Self::Scheduled { id, answer } => typed(
+                "scheduled",
+                vec![
+                    ("id".into(), Json::from(*id)),
+                    match answer {
+                        Ok(text) => ("answer".into(), Json::Str(text.clone())),
+                        Err(why) => ("refusal".into(), Json::Str(why.clone())),
+                    },
+                ],
+            ),
             Self::Sent { id, refusal } => typed(
                 "sent",
                 vec![
@@ -969,6 +1012,14 @@ impl Down {
                     skipped: maybe(&value, "skipped")?,
                 })
             }
+            Some("scheduled") => Ok(Self::Scheduled {
+                id: number(&value, "id")?,
+                answer: match (value.get("answer"), value.get("refusal")) {
+                    (Some(Json::Str(text)), None) => Ok(text.clone()),
+                    (None, Some(Json::Str(why))) => Err(why.clone()),
+                    _ => return Err("a schedule's answer with neither or both".into()),
+                },
+            }),
             Some("sent") => Ok(Self::Sent {
                 id: number(&value, "id")?,
                 refusal: maybe(&value, "refusal")?,
@@ -1229,6 +1280,33 @@ impl Up {
                 ],
             ),
             Self::Query { id } => typed("query", vec![("id".into(), Json::from(*id))]),
+            Self::Schedule { id, op } => {
+                let mut pairs = vec![("id".into(), Json::from(*id))];
+                match op {
+                    ScheduleOp::Add {
+                        when,
+                        to,
+                        text,
+                        catch_up,
+                    } => pairs.extend([
+                        ("op".into(), Json::Str("add".into())),
+                        ("when".into(), Json::Str(when.clone())),
+                        ("to".into(), Json::Str(to.to_string())),
+                        ("text".into(), Json::Str(text.clone())),
+                        ("catch_up".into(), Json::Bool(*catch_up)),
+                    ]),
+                    ScheduleOp::Times { when } => pairs.extend([
+                        ("op".into(), Json::Str("times".into())),
+                        ("when".into(), Json::Str(when.clone())),
+                    ]),
+                    ScheduleOp::List => pairs.push(("op".into(), Json::Str("list".into()))),
+                    ScheduleOp::Cancel { schedule } => pairs.extend([
+                        ("op".into(), Json::Str("cancel".into())),
+                        ("schedule".into(), Json::Str(schedule.clone())),
+                    ]),
+                }
+                typed("schedule", pairs)
+            }
             Self::Waking => typed("waking", Vec::new()),
             Self::Prepared { remote } => typed(
                 "prepared",
@@ -1433,6 +1511,28 @@ impl Up {
             },
             Some("query") => Self::Query {
                 id: number(&value, "id")?,
+            },
+            Some("schedule") => Self::Schedule {
+                id: number(&value, "id")?,
+                op: match string(&value, "op")?.as_str() {
+                    "add" => ScheduleOp::Add {
+                        when: string(&value, "when")?,
+                        to: Id::parse(&string(&value, "to")?).ok_or("a malformed receiver")?,
+                        text: string(&value, "text")?,
+                        catch_up: value
+                            .get("catch_up")
+                            .and_then(Json::as_bool)
+                            .ok_or("no catch_up")?,
+                    },
+                    "times" => ScheduleOp::Times {
+                        when: string(&value, "when")?,
+                    },
+                    "list" => ScheduleOp::List,
+                    "cancel" => ScheduleOp::Cancel {
+                        schedule: string(&value, "schedule")?,
+                    },
+                    _ => return Err("an unknown schedule operation".into()),
+                },
             },
             Some("resume") => Self::Resume {
                 turn: number(&value, "turn")?,
@@ -1854,6 +1954,31 @@ mod tests {
                 text: "hi".into(),
             },
             Up::Query { id: 6 },
+            Up::Schedule {
+                id: 7,
+                op: ScheduleOp::Add {
+                    when: "0 9 * * 1-5".into(),
+                    to: Id::parse(&"b".repeat(32)).unwrap(),
+                    text: "\u{1}".repeat(crate::tools::MAX_MESSAGE),
+                    catch_up: true,
+                },
+            },
+            Up::Schedule {
+                id: 8,
+                op: ScheduleOp::List,
+            },
+            Up::Schedule {
+                id: 19,
+                op: ScheduleOp::Times {
+                    when: "2026-10-09T09:00".into(),
+                },
+            },
+            Up::Schedule {
+                id: 9,
+                op: ScheduleOp::Cancel {
+                    schedule: "0a1b2c3d".into(),
+                },
+            },
             Up::Fetch {
                 remote: "https://github.com/timmydo/td".into(),
                 bases: vec!["main".into(), "next".into()],
@@ -1990,6 +2115,14 @@ mod tests {
             Down::Sent {
                 id: 1,
                 refusal: None,
+            },
+            Down::Scheduled {
+                id: 3,
+                answer: Ok("schedule 0a1b2c3d made".into()),
+            },
+            Down::Scheduled {
+                id: 4,
+                answer: Err("refused".into()),
             },
             Down::Sent {
                 id: 2,

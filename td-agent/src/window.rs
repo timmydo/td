@@ -954,6 +954,9 @@ impl Session {
                 eprintln!("td-agent: {note}");
                 self.app.note(note);
             }
+            if let Update::Up(Up::Schedule { id: ask, op }) = &update {
+                self.schedule_for(&id, *ask, op.clone(), &directory);
+            }
             match &update {
                 // A card is the window's, whichever conversation is open.
                 Update::Up(Up::Ask {
@@ -1599,6 +1602,42 @@ impl Session {
                 self.next_fire = now.checked_add(60);
             }
         }
+    }
+
+    /// A conversation's `schedule`, which the person allowed on its card,
+    /// `schedules` or `cancel_schedule` answered (DESIGN.md §3); one made
+    /// or cancelled is said to the person.
+    fn schedule_for(
+        &mut self,
+        from: &Id,
+        ask: u64,
+        op: crate::protocol::ScheduleOp,
+        directory: &[crate::post::Entry],
+    ) {
+        use crate::schedule::Change;
+        let archived = |id: &Id| directory.iter().find(|e| &e.id == id).map(|e| e.archived);
+        let (answer, change) = self.schedules.answer(from, op, &archived, store::now());
+        match &change {
+            Some(Change::Made {
+                id,
+                to,
+                written,
+                next,
+            }) => self.app.note(format!(
+                "{} made schedule {id}, to {}: {written}, next {next}; /unschedule {id} removes it",
+                self.app.named(from),
+                self.app.named(to),
+            )),
+            Some(Change::Cancelled(id)) => self
+                .app
+                .note(format!("{} cancelled schedule {id}", self.app.named(from))),
+            None => {}
+        }
+        if change.is_some() {
+            self.next_fire = self.schedules.soonest();
+        }
+        self.supervisor
+            .answer(from, &Down::Scheduled { id: ask, answer });
     }
 
     /// The composer's schedule commands (DESIGN.md §3).

@@ -229,6 +229,19 @@ pub struct Schedule {
     pub through: u64,
 }
 
+/// What answering a conversation changed, for the window to tell the
+/// person and re-time its timer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Change {
+    Made {
+        id: String,
+        to: crate::store::Id,
+        written: String,
+        next: String,
+    },
+    Cancelled(String),
+}
+
 /// A firing due: its schedule, and why it starts no turn, when it does
 /// not.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -325,7 +338,7 @@ impl Schedule {
 }
 
 /// A schedule's id: eight lowercase hex digits.
-fn id_ok(id: &str) -> bool {
+pub fn id_ok(id: &str) -> bool {
     id.len() == 8 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
@@ -533,20 +546,132 @@ impl Schedules {
 
     /// A UTC instant as a local time, `YYYY-MM-DD HH:MM`.
     pub fn local(&self, at: u64) -> String {
-        let (civil, _) = self.zone.to_local(i64::try_from(at).unwrap_or(i64::MAX));
-        format!(
-            "{} {:02}:{:02}",
-            td_civil::format_ymd(&civil),
-            civil.hour,
-            civil.minute
-        )
+        local(&self.zone, at)
+    }
+
+    /// Conversation `from`'s `schedule`, which the person allowed on its
+    /// card, `schedules` or `cancel_schedule` answered (DESIGN.md §3):
+    /// it lists and cancels only the schedules delivering to it, and one
+    /// it makes is made by it, to a conversation `archived` knows and
+    /// says is not archived, with a text its card showed whole.
+    pub fn answer(
+        &mut self,
+        from: &crate::store::Id,
+        op: crate::protocol::ScheduleOp,
+        archived: &dyn Fn(&crate::store::Id) -> Option<bool>,
+        now: u64,
+    ) -> (Result<String, String>, Option<Change>) {
+        use crate::protocol::ScheduleOp;
+        match op {
+            ScheduleOp::Add {
+                when,
+                to,
+                text,
+                catch_up,
+            } => {
+                let made = match archived(&to) {
+                    None => Err(format!("there is no conversation {to}")),
+                    Some(true) => Err(format!(
+                        "conversation {to} is archived; schedules to it fire nothing"
+                    )),
+                    Some(false) => crate::tools::shown_whole(text).and_then(|text| {
+                        self.add(&when, to, text, catch_up, Some(from.clone()), now)
+                    }),
+                };
+                match made {
+                    Err(why) => (Err(why), None),
+                    Ok(made) => {
+                        let next = self.upcoming(&made, now, 3).join(", ");
+                        (
+                            Ok(format!(
+                                "schedule {} made, delivering to conversation {}: {}, next {next}",
+                                made.id, made.to, made.written
+                            )),
+                            Some(Change::Made {
+                                id: made.id,
+                                to: made.to,
+                                written: made.written,
+                                next,
+                            }),
+                        )
+                    }
+                }
+            }
+            ScheduleOp::Times { when } => (
+                When::parse(&when).and_then(|parsed| {
+                    let next = self.times(&parsed, now, 3);
+                    match next.is_empty() {
+                        true => Err(format!("{when} never comes after now")),
+                        false => Ok(next.join("\n")),
+                    }
+                }),
+                None,
+            ),
+            ScheduleOp::List => {
+                let lines: Vec<String> = self
+                    .list
+                    .iter()
+                    .filter(|s| &s.to == from)
+                    .map(|s| {
+                        let next = self.upcoming(s, now, 3);
+                        let next = match next.is_empty() {
+                            true => "never again".to_string(),
+                            false => next.join(", "),
+                        };
+                        let by = match &s.author {
+                            None => "the person".to_string(),
+                            Some(author) if author == from => "this conversation".to_string(),
+                            Some(author) => format!("conversation {author}"),
+                        };
+                        let text: String = s.text.chars().take(300).collect();
+                        let more = if text.len() < s.text.len() { "…" } else { "" };
+                        format!(
+                            "{}: {}; next {next}; made by {by}; catch_up {}; text: {}{more}",
+                            s.id,
+                            s.written,
+                            s.catch_up,
+                            crate::tools::visible(&text)
+                        )
+                    })
+                    .collect();
+                (
+                    Ok(match lines.is_empty() {
+                        true => "no schedule delivers to this conversation".to_string(),
+                        false => lines.join("\n"),
+                    }),
+                    None,
+                )
+            }
+            ScheduleOp::Cancel { schedule } => {
+                if !self.list.iter().any(|s| s.id == schedule && &s.to == from) {
+                    return (
+                        Err(format!(
+                            "no schedule {schedule} delivers to this conversation; one delivering elsewhere is the person's to cancel"
+                        )),
+                        None,
+                    );
+                }
+                match self.remove(&schedule) {
+                    Err(why) => (Err(why), None),
+                    Ok(removed) => (
+                        Ok(format!("schedule {} cancelled", removed.id)),
+                        Some(Change::Cancelled(removed.id)),
+                    ),
+                }
+            }
+        }
     }
 
     /// Schedule `s`'s next `count` times after `now`, as local times.
     pub fn upcoming(&self, s: &Schedule, now: u64, count: usize) -> Vec<String> {
-        let after = i64::try_from(s.through.max(now)).unwrap_or(i64::MAX);
-        s.when
-            .upcoming(&self.zone, after, count)
+        self.times(&s.when, s.through.max(now), count)
+    }
+
+    /// The next `count` times `when` gives after `after`, as local times
+    /// in the zone the schedules fire in.
+    pub fn times(&self, when: &When, after: u64, count: usize) -> Vec<String> {
+        let after = i64::try_from(after).unwrap_or(i64::MAX);
+        when.upcoming(&self.zone, after, count)
             .into_iter()
             .filter_map(|at| u64::try_from(at).ok())
             .map(|at| self.local(at))
@@ -582,6 +707,17 @@ pub fn target(directory: &[crate::post::Entry], id: &crate::store::Id) -> Target
         Some(e) if e.state == "paused" => Target::Live(Some("the conversation was paused".into())),
         Some(_) => Target::Live(None),
     }
+}
+
+/// A UTC instant as a local time in `zone`, `YYYY-MM-DD HH:MM`.
+pub fn local(zone: &Zone, at: u64) -> String {
+    let (civil, _) = zone.to_local(i64::try_from(at).unwrap_or(i64::MAX));
+    format!(
+        "{} {:02}:{:02}",
+        td_civil::format_ymd(&civil),
+        civil.hour,
+        civil.minute
+    )
 }
 
 /// What a firing's conversation is to the window.
@@ -664,7 +800,7 @@ fn add(rest: &str) -> Result<Command, String> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
 
     fn utc(text: &str) -> i64 {
@@ -948,6 +1084,111 @@ mod tests {
         for text in ["/schedulex 1 2 3 4 5 x", "schedule 1 2 3 4 5 x", "hello"] {
             assert_eq!(command(text), None, "{text}");
         }
+    }
+
+    /// The window's answers to conversations (DESIGN.md §3): one lists
+    /// and cancels only the schedules delivering to it, makes one only to
+    /// a conversation there and not archived, with a text its card shows
+    /// whole, as its maker, and is given the times an expression fires at.
+    #[test]
+    fn a_conversation_reaches_only_the_schedules_delivering_to_it() {
+        use crate::protocol::ScheduleOp;
+        let scratch = crate::store::tests::Scratch::new("asked");
+        let state = scratch.state();
+        let now = utc("2026-10-08 12:00") as u64;
+        let (mut schedules, _) = Schedules::load(&state, Zone::utc());
+        let (a, b, gone) = (conversation(1), conversation(2), conversation(3));
+        let archived = |id: &crate::store::Id| match id {
+            _ if *id == a => Some(false),
+            _ if *id == b => Some(true),
+            _ => None,
+        };
+        let add = |to: &crate::store::Id, text: &str| ScheduleOp::Add {
+            when: "0 9 * * *".into(),
+            to: to.clone(),
+            text: text.into(),
+            catch_up: false,
+        };
+        assert_eq!(
+            schedules.answer(&a, add(&b, "x"), &archived, now),
+            (
+                Err(format!(
+                    "conversation {b} is archived; schedules to it fire nothing"
+                )),
+                None
+            )
+        );
+        let refused = |answer: (Result<String, String>, Option<Change>)| answer.0.unwrap_err();
+        assert!(
+            refused(schedules.answer(&a, add(&gone, "x"), &archived, now))
+                .starts_with("there is no conversation")
+        );
+        assert!(
+            refused(schedules.answer(&a, add(&a, &"x".repeat(2049)), &archived, now))
+                .contains("shows whole")
+        );
+        assert!(schedules.list().is_empty());
+        let (made, change) = schedules.answer(&b, add(&a, "check"), &archived, now);
+        let Some(Change::Made { id, to, next, .. }) = change else {
+            panic!("{change:?}");
+        };
+        assert!(made.unwrap().starts_with(&format!("schedule {id} made")));
+        assert_eq!(to, a);
+        assert_eq!(next, "2026-10-09 09:00, 2026-10-10 09:00, 2026-10-11 09:00");
+        assert_eq!(schedules.list()[0].author, Some(b.clone()));
+        let theirs = schedules
+            .add("0 10 * * *", b.clone(), "secret".into(), false, None, now)
+            .unwrap();
+        let listed = schedules
+            .answer(&a, ScheduleOp::List, &archived, now)
+            .0
+            .unwrap();
+        assert!(
+            listed.starts_with(&format!("{id}: 0 9 * * *; ")),
+            "{listed}"
+        );
+        assert!(
+            listed.contains(&format!("made by conversation {b}")),
+            "{listed}"
+        );
+        assert!(!listed.contains("secret"), "{listed}");
+        assert_eq!(
+            schedules.answer(&gone, ScheduleOp::List, &archived, now).0,
+            Ok("no schedule delivers to this conversation".into())
+        );
+        let cancel = |schedule: &str| ScheduleOp::Cancel {
+            schedule: schedule.into(),
+        };
+        assert!(schedules
+            .answer(&a, cancel(&theirs.id), &archived, now)
+            .0
+            .is_err());
+        // The id whole, not its start.
+        assert!(schedules
+            .answer(&a, cancel(&id[..4]), &archived, now)
+            .0
+            .is_err());
+        assert_eq!(schedules.list().len(), 2);
+        assert_eq!(
+            schedules.answer(&a, cancel(&id), &archived, now),
+            (
+                Ok(format!("schedule {id} cancelled")),
+                Some(Change::Cancelled(id.clone()))
+            )
+        );
+        assert_eq!(schedules.list().len(), 1);
+        let times = |when: &str| ScheduleOp::Times { when: when.into() };
+        assert_eq!(
+            schedules.answer(&a, times("0 9 * * *"), &archived, now),
+            (
+                Ok("2026-10-09 09:00\n2026-10-10 09:00\n2026-10-11 09:00".into()),
+                None
+            )
+        );
+        assert!(
+            refused(schedules.answer(&a, times("2026-10-01T09:00"), &archived, now))
+                .contains("never comes")
+        );
     }
 
     #[test]

@@ -57,7 +57,7 @@ use crate::host;
 use crate::key::Secret;
 use crate::models::{Model, Models};
 use crate::output;
-use crate::protocol::{Down, Fetched as Stored, Resumed, Up, MAX_TEXT};
+use crate::protocol::{Down, Fetched as Stored, Resumed, ScheduleOp, Up, MAX_TEXT};
 use crate::shell;
 use crate::sse::{self, Fault};
 use crate::store::{
@@ -188,6 +188,13 @@ const CALL_PAST_LIMIT: &str = "not run: the turn reached a limit and asked for n
 const MAX_LISTED: usize = 200;
 /// What a call the human interrupted before it ran is answered with.
 const CALL_SKIPPED: &str = "not run: the person interrupted the turn before this call ran";
+
+/// Why a `schedule` card is the person's alone (DESIGN.md §3, §11).
+const SCHEDULE_ASKED: &str = "a schedule spends money while you may be away, so only you decide it";
+
+/// What the classifier is told of a model-made schedule whose firing
+/// started the turn.
+const SCHEDULE_APPROVAL: &str = "this turn was started by this schedule, which the conversation made_by asked for; the person read its text whole on a card and approved delivering it at its times, so the work the text plainly asks for counts as theirs; it grants nothing more";
 /// What a `web_fetch` the person interrupted while it fetched is answered
 /// with.
 const FETCH_STOPPED: &str =
@@ -1119,6 +1126,7 @@ impl Session {
                 | Down::Resumed { .. }
                 | Down::Interrupt
                 | Down::Sent { .. }
+                | Down::Scheduled { .. }
                 | Down::States { .. }
                 | Down::Decision { .. } => {}
             }
@@ -5184,6 +5192,14 @@ impl Session {
                     Err(why) => Err(why),
                 }
             }
+            Args::Schedule {
+                when,
+                to,
+                text,
+                catch_up,
+            } => self.schedule(started, when, to, text, catch_up),
+            Args::Schedules => self.ask_schedules(ScheduleOp::List),
+            Args::CancelSchedule(schedule) => self.ask_schedules(ScheduleOp::Cancel { schedule }),
             // `answer` runs these through `host`, with their record.
             Args::Host { .. } => Err("a workspace tool runs only in the jail".into()),
         })
@@ -5730,6 +5746,84 @@ impl Session {
                 refusal: Some(why),
                 ..
             } => Err(why),
+            _ => Err("the window answered something else".into()),
+        }
+    }
+
+    /// `schedule` (DESIGN.md §3): only the person decides it, on a card,
+    /// in either mode, as it spends money unattended: no rule, standing
+    /// answer or classifier stands in, and the card offers none to keep.
+    /// Allowed, the window makes it, made by this conversation.
+    fn schedule(
+        &mut self,
+        started: u64,
+        when: String,
+        to: Id,
+        text: String,
+        catch_up: bool,
+    ) -> Result<String, String> {
+        let own = to == self.conversation.meta().id;
+        let title = match own {
+            true => String::new(),
+            false => match self.metas().into_iter().find(|m| m.id == to) {
+                Some(meta) => meta.title,
+                None => return Err(format!("there is no conversation {to}")),
+            },
+        };
+        // The window's times, in the zone its timer fires in.
+        let next = self.ask_schedules(ScheduleOp::Times { when: when.clone() })?;
+        let next: Vec<String> = next.lines().map(str::to_string).collect();
+        if next.is_empty() {
+            return Err(format!("{when} never comes after now"));
+        }
+        let (title, mut details) =
+            tools::schedule_card(&to, &title, own, &when, &next, catch_up, &text);
+        details.insert(0, format!("Asked because {SCHEDULE_ASKED}."));
+        match self.decide(started, title, details, Some(SCHEDULE_ASKED), None, None)? {
+            Decided::Allowed => {}
+            Decided::Refused => return Err(CALL_REFUSED.into()),
+            // With nothing judged, no rule can release or refuse it.
+            Decided::Undecided | Decided::Released | Decided::Ruled(_) => {
+                return Err(CALL_UNDECIDED.into())
+            }
+        }
+        // An interrupt that came with the decision, or before it.
+        self.hear();
+        if self.interrupt {
+            return Err(CALL_SKIPPED.into());
+        }
+        self.ask_schedules(ScheduleOp::Add {
+            when,
+            to,
+            text,
+            catch_up,
+        })
+    }
+
+    /// Asks the window, which keeps the schedules, to make, list or
+    /// cancel one, and waits for its answer.
+    fn ask_schedules(&mut self, op: ScheduleOp) -> Result<String, String> {
+        // `schedules` lists only the ones delivering here; the person
+        // sees them all.
+        let lost = match &op {
+            ScheduleOp::Add { to, .. } if to == &self.conversation.meta().id => Some(
+                "so whether the schedule was made is unknown; `schedules` lists the ones delivering here, so ask for it again only if it is not among them",
+            ),
+            ScheduleOp::Add { .. } => Some(
+                "so whether the schedule was made is unknown, and `schedules` lists only the ones delivering here; the person sees them all with /schedules, so ask them before asking for it again",
+            ),
+            _ => None,
+        };
+        let id = self.ask_id();
+        self.send(&Up::Schedule { id, op });
+        let answer = self
+            .wait(|down| matches!(down, Down::Scheduled { id: a, .. } if *a == id))
+            .map_err(|why| match lost {
+                Some(lost) => format!("{why}, {lost}"),
+                None => why,
+            })?;
+        match answer {
+            Down::Scheduled { answer, .. } => answer,
             _ => Err("the window answered something else".into()),
         }
     }
@@ -6742,6 +6836,19 @@ impl Session {
                 Json::Arr(allowlist.iter().map(|d| Json::Str(d.text())).collect()),
             ));
         }
+        // A turn a model-made schedule's firing started delivers a text
+        // the person read whole and approved on its card (DESIGN.md §3).
+        if let Some((schedule, maker, text)) = self.fired_turn() {
+            policy.push((
+                "approved_schedule".into(),
+                Json::Obj(vec![
+                    ("schedule".into(), Json::Str(schedule)),
+                    ("made_by".into(), Json::Str(maker.to_string())),
+                    ("text".into(), Json::Str(text)),
+                    ("approval".into(), Json::Str(SCHEDULE_APPROVAL.into())),
+                ]),
+            ));
+        }
         if let Some(remote) = &pending.remote {
             policy.push((
                 "protected_branches".into(),
@@ -6798,6 +6905,32 @@ impl Session {
             self.conversation.meta().workspace.as_ref(),
             remote,
         )
+    }
+
+    /// The schedule, its maker and its text, when a model-made
+    /// schedule's firing started the turn under way.
+    fn fired_turn(&self) -> Option<(String, Id, String)> {
+        let events = self.conversation.events();
+        let of = events.iter().rev().find_map(|e| match e.kind {
+            Kind::Started {
+                effect: Effect::Turn,
+                of,
+            } => Some(of),
+            _ => None,
+        })?;
+        events
+            .iter()
+            .find(|e| e.seq == of)
+            .and_then(|e| match &e.kind {
+                Kind::Fired {
+                    schedule,
+                    author: Some(maker),
+                    text,
+                    skipped: None,
+                    ..
+                } => Some((schedule.clone(), maker.clone(), text.clone())),
+                _ => None,
+            })
     }
 
     /// What other conversations sent this one, the latest few, for the

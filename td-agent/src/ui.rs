@@ -1995,6 +1995,7 @@ impl App {
                 | Up::Resume { .. }
                 | Up::Withdraw { .. }
                 | Up::Question { .. }
+                | Up::Schedule { .. }
                 | Up::Brake { .. },
             ) => {}
             Update::Up(Up::Delivered { .. }) => {

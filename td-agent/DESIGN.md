@@ -654,8 +654,40 @@ that leaves it out cannot make a model's text the person's. A firing's turn is n
 The model reads a firing as `[a scheduled message the person wrote,
 schedule ID]`, and the classifier counts its text with the person's
 messages: it is their words, written earlier. `history_search` finds it
-as a `schedule`. The model's `schedule` tool, its card and the approval
-record are the next increment.
+as a `schedule`.
+
+**As built (schedules, the model's).** Every conversation has
+`schedule {when, to, text, catch_up?}`, `schedules` and
+`cancel_schedule {id}`. `when` is one field, five cron fields or one
+local time, checked as the composer's is; `to` is required, the
+caller's own id (which `conversations` marks) to schedule itself; the
+text is a message's. A `schedule` call goes to the person on a card
+whatever the mode: no rule, standing answer or classifier is consulted,
+and the card offers nothing to keep, so a run of them cannot be allowed
+for good. The card says why it asks, names the receiver ("This
+conversation" for its own), shows the expression, the next three times,
+which the window gives in the zone its timer fires in, the catch-up
+choice, that the classifier will count the work the text plainly asks
+for as the person's, and the text whole: a text longer than the card shows whole
+(160 lines, each 2,048 bytes, 48 KiB) is refused, as is an expression
+that would never fire, before the person is asked. Allowed, the
+conversation asks the window, which keeps the schedules, to make it,
+made by the asking conversation; the window refuses an unknown or
+archived receiver and, whatever the conversation checked, a text the
+card could not show whole, says the schedule to the person with how to remove
+it, and answers with its id and next times. An answer lost is said as
+unknown, with `schedules` named to find out for the caller's own and,
+as `schedules` lists only those, the person's `/schedules` for another. `schedules` lists, and
+`cancel_schedule` cancels by its exact id, only the schedules
+delivering to the caller, whoever made them, with no card: neither
+reaches outside the caller, and a cancellation is said to the person.
+The approval stored with a schedule is its record itself: only the
+window writes it, from the person's card or composer, and nothing
+changes a schedule's receiver, times or text after. A turn a model-made
+schedule's firing started gives the classifier, in the policy field,
+the schedule, its maker and its text, which the person read whole and
+approved to be delivered at its times: both classifiers count the work
+it plainly asks for as the person's, and nothing more.
 
 **As built (increment 8).** Every conversation has `todo_write`,
 `history_search`, `history_read`, `conversations` and `send_message`, a
@@ -4124,6 +4156,7 @@ flag lets injected text lower its own bar.
 | file edits, sed, shell (background and local commits included) inside the jail | human | run |
 | reading or messaging another conversation (§3) | human | classifier |
 | `schedule` | human | human |
+| `schedules`, `cancel_schedule` of the schedules delivering to it | run | run |
 | network to a destination on the workspace allowlist, a command's or `web_fetch`'s | run | run |
 | network to another destination, policy `allowlist`, a command's or `web_fetch`'s | human | classifier |
 | git_push, unprotected branch, no force, clean scan | human | classifier |
@@ -4540,7 +4573,9 @@ state, built from separated, labelled fields:
 - the project instructions of §13, only for a workspace the human marked
   trusted, labelled as project text and not the human's authority;
 - the workspace's policy: network policy and allowlist, admitted remotes,
-  protected branches, rules;
+  protected branches, rules, and, in a turn a model-made schedule's
+  firing started, that schedule, its maker and the text the person
+  approved;
 - the tool calls already made, by name and path, with content arguments
   (file contents, edit strings, sed scripts) elided;
 - for a push, the evidence of §9, computed outside the jail;
@@ -4751,8 +4786,10 @@ and git tools, as far as the workspace has what they act on.
   the conversation process through the fetch service, its destination
   judged as a command's connection is (below).
 - **`conversations`** and **`send_message`**: other conversations (§3).
-- **`schedule`**, **`schedules`** and **`cancel_schedule`**: later, with
-  schedules (§3).
+- **`schedule`**, **`schedules`** and **`cancel_schedule`**: a schedule
+  delivering a message at set times, made only on the person's card,
+  and the ones delivering to the caller listed and cancelled
+  (As built (schedules, the model's), §3).
 - **`question {question, options?}`**: asks the person and waits for
   their answer, as opencode's `question` does; every conversation has it
   (As built (`question`), below).
@@ -6605,12 +6642,11 @@ in parallel with it.
     non-Rust package (AGENTS.md). td-agent is a standalone program: no
     boot test starts it, its window or its model.
 
-After these: resource limits (§8), the model's schedules (§3; the
-person's are built), a loopback shared by
+After these: resource limits (§8), a loopback shared by
 a conversation's instances (§19), child conversations within a
 workspace, skills and custom commands, the MCP client, moving a
 conversation between workspaces, and a native Anthropic Messages
-dialect. `web_fetch` and `question` are built (§12).
+dialect. `web_fetch`, `question` and schedules are built (§3, §12).
 
 ## 19. Open questions
 

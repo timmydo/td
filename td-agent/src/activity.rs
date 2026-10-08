@@ -189,6 +189,13 @@ fn parts(call: &Call) -> Vec<Part> {
                 URL_CHARS
             ))
         ))],
+        "schedule" => vec![Part::Run(format!(
+            "scheduled {}",
+            visible(&cut(
+                text(&value, "when").unwrap_or_default().trim(),
+                URL_CHARS
+            ))
+        ))],
         "web_fetch" => vec![Part::Run(format!(
             "fetched {}",
             visible(&cut(
