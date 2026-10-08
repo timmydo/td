@@ -182,6 +182,13 @@ fn parts(call: &Call) -> Vec<Part> {
                 visible(&cut(first.trim(), COMMAND_CHARS))
             ))]
         }
+        "question" => vec![Part::Run(format!(
+            "asked {}",
+            visible(&cut(
+                text(&value, "question").unwrap_or_default().trim(),
+                URL_CHARS
+            ))
+        ))],
         "web_fetch" => vec![Part::Run(format!(
             "fetched {}",
             visible(&cut(

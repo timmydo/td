@@ -985,6 +985,19 @@ impl Session {
                     self.app.withdraw(&id, Some(*call));
                     continue;
                 }
+                Update::Up(Up::Question {
+                    call,
+                    question,
+                    options,
+                }) => {
+                    self.app.question(crate::ui::Asked {
+                        conversation: id.clone(),
+                        call: *call,
+                        question: question.clone(),
+                        options: options.clone(),
+                    });
+                    continue;
+                }
                 // The classifier's breaker: only ever `ask` (DESIGN.md
                 // §11).
                 Update::Up(Up::Brake { why }) => {

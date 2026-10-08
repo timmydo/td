@@ -740,7 +740,8 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
     assert_eq!(body["tools.0.type"], "function");
     assert_eq!(body["tools.0.function.name"], "todo_write");
     assert_eq!(body["tools.4.function.name"], "send_message");
-    assert!(!body.contains_key("tools.5.type"), "no report");
+    assert_eq!(body["tools.5.function.name"], "question");
+    assert!(!body.contains_key("tools.6.type"), "no report");
     // `require_parameters` routes only to an endpoint that lists every
     // parameter sent, so each member, but those it does not route on, is
     // one the model lists; the title's as well.
@@ -2862,6 +2863,187 @@ fn a_commands_connection_off_the_allowlist_waits_on_a_card() {
         ("deny", "rule")
     );
     assert!(approvals[1].2.contains("deny network third.test:80"));
+}
+
+/// The question a conversation's `question` call asks, as the window
+/// hears it.
+fn until_question(h: &mut Harness) -> (u64, String, Vec<String>) {
+    h.until(|up| match up {
+        Up::Question {
+            call,
+            question,
+            options,
+        } => Some((*call, question.clone(), options.clone())),
+        _ => None,
+    })
+}
+
+/// `question` asks the window and waits; the person's next message
+/// answers it, the model told which option it picked, and that message
+/// is logged as theirs after the call's result, so the next request reads
+/// it; the question is withdrawn once answered.
+#[test]
+fn a_question_waits_for_the_persons_next_message() {
+    let mut h = Harness::new(
+        "question",
+        Role::Conversation,
+        vec![
+            Reply::sse("stream-tool-question.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Clean up the branches.");
+    let (call, question, options) = until_question(&mut h);
+    assert_eq!(question, "Which branch should I keep?");
+    assert_eq!(options, ["main", "next"]);
+    h.say("2");
+    let withdrawn = h.until(|up| match up {
+        Up::Withdraw { call } => Some(*call),
+        _ => None,
+    });
+    assert_eq!(withdrawn, call);
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let results = results(&events);
+    assert_eq!(
+        results[0].1,
+        "The person picked option 2: next. Their answer follows as their next message."
+    );
+    let result = events
+        .iter()
+        .position(|e| matches!(e.kind, Kind::ToolResult { .. }))
+        .unwrap();
+    let answer = events
+        .iter()
+        .position(|e| matches!(&e.kind, Kind::User { text, .. } if text == "2"))
+        .unwrap();
+    assert!(answer > result, "{:?}", kinds(&events));
+    let asked = h
+        .mock
+        .requests()
+        .into_iter()
+        .map(|r| r.text())
+        .find(|text| text.contains("The person picked option 2"))
+        .unwrap();
+    // The person's message, after its received time, follows the result.
+    let at_result = asked.find("The person picked option 2").unwrap();
+    let at_answer = asked.rfind(r#"\n2"}"#).unwrap();
+    assert!(at_answer > at_result, "{asked}");
+}
+
+/// Two questions in one reply are each the person's to answer: the
+/// first's answer, still waiting to be taken into the turn when the second
+/// is asked, was written before it and does not answer it; both answers
+/// are taken in after the results, in order. A message written before the
+/// first step is the turn's already.
+#[test]
+fn each_question_waits_for_a_message_written_after_it() {
+    let mut h = Harness::new(
+        "questions",
+        Role::Conversation,
+        vec![
+            Reply::sse("stream-tool-questions.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Clean up the branches.");
+    h.say("and the tags");
+    let (first, question, _) = until_question(&mut h);
+    assert_eq!(question, "Which branch should I keep?");
+    h.say("2");
+    let (second, question, options) = until_question(&mut h);
+    assert_ne!(second, first);
+    assert_eq!(question, "Delete the others?");
+    assert_eq!(options, ["keep", "delete"]);
+    h.say("1");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let said: Vec<String> = results(&events).into_iter().map(|r| r.1).collect();
+    assert_eq!(
+        said,
+        [
+            "The person picked option 2: next. Their answer follows as their next message.",
+            "The person picked option 1: keep. Their answer follows as their next message."
+        ]
+    );
+    let last_result = events
+        .iter()
+        .rposition(|e| matches!(e.kind, Kind::ToolResult { .. }))
+        .unwrap();
+    let users: Vec<(usize, &str)> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(at, e)| match &e.kind {
+            Kind::User { text, .. } => Some((at, text.as_str())),
+            _ => None,
+        })
+        .collect();
+    let after: Vec<&str> = users
+        .iter()
+        .filter(|(at, _)| *at > last_result)
+        .map(|(_, text)| *text)
+        .collect();
+    assert_eq!(after, ["2", "1"], "{users:?}");
+    assert!(users
+        .iter()
+        .any(|(at, text)| *at < last_result && *text == "and the tags"));
+}
+
+/// A pause while a question waits ends it unanswered, since nothing
+/// written past a pause is taken into the turn; the call says why.
+#[test]
+fn a_pause_ends_a_questions_wait() {
+    let mut h = Harness::new(
+        "question-pause",
+        Role::Conversation,
+        vec![Reply::sse("stream-tool-question.sse")],
+    );
+    h.setup(Client::default());
+    h.say("Clean up the branches.");
+    let (call, _, _) = until_question(&mut h);
+    h.down(&Down::Pause { paused: true });
+    let withdrawn = h.until(|up| match up {
+        Up::Withdraw { call } => Some(*call),
+        _ => None,
+    });
+    assert_eq!(withdrawn, call);
+    let (events, _, _) = h.turn();
+    let said = results(&events);
+    assert_eq!(
+        said[0].1,
+        "error: the person paused the conversation before answering"
+    );
+}
+
+/// An interrupt while the question waits ends it unanswered, and the
+/// call says so.
+#[test]
+fn a_question_left_unanswered_is_stopped_by_an_interrupt() {
+    let mut h = Harness::new(
+        "question-stop",
+        Role::Conversation,
+        vec![Reply::sse("stream-tool-question.sse")],
+    );
+    h.setup(Client::default());
+    h.say("Clean up the branches.");
+    let (call, _, _) = until_question(&mut h);
+    h.down(&Down::Interrupt);
+    let withdrawn = h.until(|up| match up {
+        Up::Withdraw { call } => Some(*call),
+        _ => None,
+    });
+    assert_eq!(withdrawn, call);
+    let (events, _, _) = h.turn();
+    let results = results(&events);
+    assert_eq!(
+        results[0].1,
+        "error: the person stopped the turn without answering"
+    );
+    assert!(results[0].2);
 }
 
 /// The GETs a conversation made through the mock: `web_fetch`'s.

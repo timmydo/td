@@ -71,6 +71,8 @@ const COMPOSER_ROWS: usize = 6;
 const TODO_ROWS: usize = 12;
 /// The most rows the queued messages take.
 const QUEUED_ROWS: usize = 3;
+/// The most rows a question's own text takes in the strip.
+const QUESTION_ROWS: usize = 6;
 /// The header of the person's own messages in the transcript.
 const YOU: &str = "you";
 /// The split's child minima, in logical pixels.
@@ -139,6 +141,55 @@ pub struct Card {
     /// A cold-resume card (DESIGN.md §14), answered compact first, resend
     /// whole or neither, not allow or deny.
     pub resume: bool,
+}
+
+/// `text`'s words after `lead`, wrapped at `columns`, the rows after the
+/// first indented two more than `lead`; at most `rows`, the last ending in
+/// an ellipsis when there is more.
+fn wrap_words(lead: &str, text: &str, columns: usize, rows: usize) -> Vec<String> {
+    let indent = " ".repeat(lead.chars().take_while(|c| *c == ' ').count() + 2);
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = lead.to_string();
+    let mut fresh = true;
+    // A word wider than a row is broken across rows.
+    let piece = columns.saturating_sub(indent.len() + 1).max(8);
+    let pieces = text
+        .split_whitespace()
+        .map(tools::visible)
+        .flat_map(|word| {
+            let chars: Vec<char> = word.chars().collect();
+            chars
+                .chunks(piece)
+                .map(|chunk| chunk.iter().collect::<String>())
+                .collect::<Vec<_>>()
+        });
+    for word in pieces {
+        if !fresh && line.chars().count() + 1 + word.chars().count() > columns {
+            lines.push(std::mem::replace(&mut line, indent.clone()));
+            line.pop();
+        }
+        line.push(' ');
+        line.push_str(&word);
+        fresh = false;
+    }
+    lines.push(line);
+    if lines.len() > rows {
+        lines.truncate(rows);
+        if let Some(last) = lines.last_mut() {
+            last.push_str(" \u{2026}");
+        }
+    }
+    lines
+}
+
+/// A question a conversation's model asks the person (DESIGN.md §12),
+/// until their next message answers it or it is withdrawn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Asked {
+    pub conversation: Id,
+    pub call: u64,
+    pub question: String,
+    pub options: Vec<String>,
 }
 
 /// The human's answer to a card (DESIGN.md §11): allow or deny this once,
@@ -640,6 +691,9 @@ pub struct App {
     /// The open conversation's messages sent and not yet taken, as the
     /// supervisor holds them.
     queued: Vec<String>,
+    /// The questions conversations ask, the open one's above its
+    /// composer.
+    questions: Vec<Asked>,
     /// The open conversation's todo list, and whether it is shown whole.
     todo: Vec<TodoItem>,
     todo_open: bool,
@@ -826,6 +880,7 @@ impl App {
             show_archived: false,
             show_activity: false,
             queued: Vec::new(),
+            questions: Vec::new(),
             todo: Vec::new(),
             todo_open: false,
             messages: Vec::new(),
@@ -1300,6 +1355,47 @@ impl App {
         }
     }
 
+    /// A conversation's model asks the person `asked`: shown above the
+    /// composer when it is the open conversation's, its row saying it asks.
+    pub fn question(&mut self, asked: Asked) {
+        self.questions
+            .retain(|q| (&q.conversation, q.call) != (&asked.conversation, asked.call));
+        self.questions.push(asked);
+        self.refresh_list();
+        self.place();
+    }
+
+    /// The open conversation's question's lines as drawn: the question,
+    /// its options numbered, and how to answer.
+    pub fn question_lines(&self) -> Vec<String> {
+        let Some(asked) = self
+            .active
+            .as_ref()
+            .and_then(|id| self.questions.iter().find(|q| &q.conversation == id))
+        else {
+            return Vec::new();
+        };
+        // Wrapped to the strip, at most `QUESTION_ROWS` rows of it.
+        let columns = self
+            .split
+            .layout()
+            .map_or(80, |layout| {
+                layout.second.width as usize / (CELL_WIDTH * self.surface.scale.value()).max(1)
+            })
+            .saturating_sub(4)
+            .max(20);
+        let mut lines = wrap_words("question:", &asked.question, columns, QUESTION_ROWS);
+        for (at, option) in asked.options.iter().take(tools::MAX_OPTIONS).enumerate() {
+            lines.extend(wrap_words(&format!("  {}.", at + 1), option, columns, 2));
+        }
+        lines.push(if asked.options.is_empty() {
+            "  write your answer and send it; Escape stops the turn".into()
+        } else {
+            "  send an option's number, or write your own answer; Escape stops the turn".into()
+        });
+        lines
+    }
+
     /// The queued messages' lines as drawn, at most `QUEUED_ROWS`, the
     /// last saying how many more there are.
     pub fn queued_lines(&self) -> Vec<String> {
@@ -1528,6 +1624,8 @@ impl App {
         self.refresh_list();
         // The selection follows the conversation opened.
         self.list.select(self.shown_active(), true);
+        // Its question, or none, changes the strip.
+        self.place();
         self.offer();
     }
 
@@ -1559,6 +1657,12 @@ impl App {
     /// card it asked when `call` is none, as its process ended: its card
     /// is closed if shown.
     pub fn withdraw(&mut self, conversation: &Id, call: Option<u64>) {
+        let asked = |q: &Asked| &q.conversation == conversation && call.is_none_or(|n| n == q.call);
+        if self.questions.iter().any(asked) {
+            self.questions.retain(|q| !asked(q));
+            self.refresh_list();
+            self.place();
+        }
         let gone = |c: &Card| &c.conversation == conversation && call.is_none_or(|n| n == c.call);
         if !self.cards.iter().any(gone) {
             return;
@@ -1882,10 +1986,14 @@ impl App {
                 self.refresh_list();
             }
             Update::Up(Up::Event(event)) => self.event(event),
-            // The window hands cards to `ask` and `withdraw`.
-            // The window says what the breaker did.
+            // The window hands cards to `ask` and `withdraw`, questions to
+            // `question`. The window says what the breaker did.
             Update::Up(
-                Up::Ask { .. } | Up::Resume { .. } | Up::Withdraw { .. } | Up::Brake { .. },
+                Up::Ask { .. }
+                | Up::Resume { .. }
+                | Up::Withdraw { .. }
+                | Up::Question { .. }
+                | Up::Brake { .. },
             ) => {}
             Update::Up(Up::Delivered { .. }) => {
                 if let Some(row) = self.active_row() {
@@ -2478,10 +2586,11 @@ impl App {
         }
     }
 
-    /// The rows the strip under the transcript takes: the queued
-    /// messages', then the todo list's.
+    /// The rows the strip under the transcript takes: the open
+    /// conversation's question's, the queued messages', then the todo
+    /// list's.
     fn strip_rows(&self) -> usize {
-        self.todo_rows() + self.queued.len().min(QUEUED_ROWS)
+        self.question_lines().len() + self.todo_rows() + self.queued.len().min(QUEUED_ROWS)
     }
 
     /// The todo list's lines as drawn: collapsed, the item in progress,
@@ -5140,6 +5249,7 @@ impl App {
             1 if self.removals.iter().any(|(of, _, _, _)| of == &row.id) => ASKS,
             1 if self.closing(&row.id) => self.closing_word(&row.id).unwrap_or_default(),
             1 if self.cards.iter().any(|c| c.conversation == row.id) => ASKS,
+            1 if self.questions.iter().any(|q| q.conversation == row.id) => ASKS,
             1 => row.word(),
             _ => self.labels.get(index).map_or("", String::as_str),
         };
@@ -5160,11 +5270,13 @@ impl App {
                 color: CHROME,
             },
         });
-        // The queued messages first: an open todo list cut off at the
-        // strip's bound loses its last items, not them.
+        // The question first, then the queued messages: an open todo
+        // list cut off at the strip's bound loses its last items, not
+        // them.
         for (at, line) in self
-            .queued_lines()
+            .question_lines()
             .into_iter()
+            .chain(self.queued_lines())
             .chain(self.todo_lines())
             .enumerate()
         {
@@ -6413,6 +6525,88 @@ pub mod tests {
         app.set_queued(Vec::new());
         assert!(app.queued_lines().is_empty());
         assert_eq!(app.regions.unwrap().transcript.height, before);
+    }
+
+    /// A long question and option wrap to the strip, a question at most
+    /// six rows of it.
+    #[test]
+    fn a_long_question_wraps_to_the_strip() {
+        assert_eq!(
+            wrap_words("question:", "one two three four", 20, 6),
+            ["question: one two", "  three four"]
+        );
+        assert_eq!(
+            wrap_words("  2.", "alpha beta gamma delta", 14, 2),
+            ["  2. alpha", "    beta gamma …"]
+        );
+        // A word wider than a row is broken across rows.
+        assert_eq!(
+            wrap_words("q:", "averyveryverylongword", 12, 3),
+            ["q: averyvery", "  verylongw", "  ord"]
+        );
+        let mut app = app();
+        app.question(Asked {
+            conversation: id(1),
+            call: 1,
+            question: "word ".repeat(120),
+            options: vec!["x ".repeat(100)],
+        });
+        let lines = app.question_lines();
+        assert_eq!(lines.len(), 6 + 2 + 1, "{lines:?}");
+        assert!(lines[5].ends_with('…'), "{lines:?}");
+        assert!(lines.iter().all(|l| l.chars().count() < 200), "{lines:?}");
+    }
+
+    /// A question the open conversation's model asks shows above the
+    /// composer with its options numbered and how to answer; another
+    /// conversation's row says it asks; a withdrawal takes either away.
+    #[test]
+    fn a_question_shows_above_the_composer_until_withdrawn() {
+        let mut app = app();
+        let before = app.regions.unwrap().transcript.height;
+        app.question(Asked {
+            conversation: id(1),
+            call: 4,
+            question: "Which branch\n should I\tuse?".into(),
+            options: vec!["main".into(), "next\u{1b}".into()],
+        });
+        assert_eq!(
+            app.question_lines(),
+            [
+                "question: Which branch should I use?",
+                "  1. main",
+                "  2. next<U+001B>",
+                "  send an option's number, or write your own answer; Escape stops the turn",
+            ]
+        );
+        assert!(app.regions.unwrap().transcript.height < before);
+        assert!(text(&app).contains("question: Which branch"));
+        app.question(Asked {
+            conversation: id(3),
+            call: 9,
+            question: "Go on?".into(),
+            options: Vec::new(),
+        });
+        let says = |app: &App, of: u8| {
+            let at = app.rows().iter().position(|r| r.id == id(of)).unwrap();
+            app.cell(at, 1).text().to_string()
+        };
+        assert_eq!(says(&app, 3), ASKS);
+        app.withdraw(&id(1), Some(4));
+        assert!(app.question_lines().is_empty());
+        assert_eq!(app.regions.unwrap().transcript.height, before);
+        // Opened, the other's shows, and goes with its process.
+        app.set_active(id(3));
+        assert_eq!(
+            app.question_lines(),
+            [
+                "question: Go on?",
+                "  write your answer and send it; Escape stops the turn",
+            ]
+        );
+        app.withdraw(&id(3), None);
+        assert!(app.question_lines().is_empty());
+        assert_ne!(says(&app, 3), ASKS);
     }
 
     /// C-Up and C-Down show the person's own messages in turn, from the

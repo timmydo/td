@@ -5094,6 +5094,7 @@ impl Session {
                 offset,
                 max_bytes,
             } => self.web_fetch(started, url, offset, max_bytes, repeated)?,
+            Args::Question { question, options } => self.question(started, question, options),
             Args::GitFetch { worktree } => self.git_fetch(&worktree)?,
             Args::GitPush {
                 worktree,
@@ -5375,6 +5376,125 @@ impl Session {
             break;
         }
         Ok(Ok(()))
+    }
+
+    /// `question` (DESIGN.md §12): asks the person, above their composer,
+    /// and waits for their next message, which answers it. That message is
+    /// left waiting where the window put it, so that it is taken into the
+    /// turn after this step's results, as any message written during a
+    /// turn is, logged as theirs; the model is told it follows. One sent
+    /// with an interrupt, or the window going, ends the wait unanswered.
+    fn question(
+        &mut self,
+        started: u64,
+        question: String,
+        options: Vec<String>,
+    ) -> Result<String, String> {
+        self.send(&Up::Question {
+            call: started,
+            question,
+            options: options.clone(),
+        });
+        // What waits already, what the window sent before it heard the
+        // question included, was written before the question was seen,
+        // another question's answer among it: it answers nothing here,
+        // and is taken into the turn in its order as ever.
+        self.hear();
+        // The person is asked already: a connection held back for the
+        // classifier is put to them too, as the wait below does.
+        self.unclassified();
+        let earlier: Vec<String> = self
+            .queue
+            .iter()
+            .filter_map(|down| match down {
+                Down::User { delivery, .. } => Some(delivery.clone()),
+                _ => None,
+            })
+            .collect();
+        let answer = loop {
+            if self.gone || self.interrupt {
+                break None;
+            }
+            // The first message since, as `steer` would take it; one it
+            // would not take is said so and passed over. A pause ends the
+            // wait, a resume as well, since `steer` takes nothing past
+            // either.
+            let mut next = None;
+            for (at, down) in self.queue.iter().enumerate() {
+                match down {
+                    Down::Pause { paused } => {
+                        next = Some(Err(*paused));
+                        break;
+                    }
+                    Down::User { delivery, .. } if !earlier.contains(delivery) => {
+                        next = Some(Ok(at));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            match next {
+                Some(Err(true)) => {
+                    break Some(Err("the person paused the conversation before answering"))
+                }
+                Some(Err(false)) => {
+                    break Some(Err("the person resumed the conversation before answering, which ends the turn first"))
+                }
+                Some(Ok(at)) => {
+                    let taken = match self.queue.get(at) {
+                        Some(Down::User { delivery, text }) => {
+                            if self.conversation.delivered(delivery) {
+                                Err(Up::Delivered {
+                                    delivery: delivery.clone(),
+                                })
+                            } else if let Some(reason) = self.refusal(text) {
+                                Err(Up::Refused {
+                                    delivery: delivery.clone(),
+                                    reason,
+                                })
+                            } else {
+                                Ok(text.clone())
+                            }
+                        }
+                        // Not a message after all: nothing to answer with.
+                        _ => break None,
+                    };
+                    match taken {
+                        Ok(text) => break Some(Ok(text)),
+                        Err(said) => {
+                            self.queue.remove(at);
+                            self.send(&said);
+                            continue;
+                        }
+                    }
+                }
+                None => {}
+            }
+            match self.inbox.recv() {
+                Ok(Inbound::Down(Down::Interrupt)) => self.interrupt = true,
+                Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
+                Ok(Inbound::Down(down)) => self.later(down),
+                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
+                Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Link(asked)) => {
+                    self.link(asked);
+                    self.unclassified();
+                }
+                Ok(Inbound::Broken(why)) => {
+                    eprintln!("td-agent: the window: {why}");
+                    self.gone = true;
+                }
+                Ok(Inbound::Closed) | Err(_) => self.gone = true,
+            }
+        };
+        self.send(&Up::Withdraw { call: started });
+        match answer {
+            Some(Ok(text)) => Ok(tools::answered(&options, &text)),
+            Some(Err(why)) => Err(why.into()),
+            None if self.gone => Err("the window closed before the person answered".into()),
+            None => Err("the person stopped the turn without answering".into()),
+        }
     }
 
     /// `web_fetch` (DESIGN.md §12): the text at `url`, from `offset`, at

@@ -692,8 +692,9 @@ with either as §7 says.
   their result; verdicts; messages from other conversations and
   schedules, labelled with their source; and a divider where compaction
   ran (§14).
-- approval and question cards (§11), composed from the toolkit's existing
+- approval cards (§11), composed from the toolkit's existing
   action buttons and wrapped text block, never transcript text.
+- a question the model asks (§12), above the composer until answered.
 - the todo list (§12), collapsed to its item in progress until opened.
 - the composer, an editable pane. `Return` sends, as `C-Return` does from
   outside a dialog; `S-Return` is a newline.
@@ -4687,9 +4688,9 @@ and git tools, as far as the workspace has what they act on.
 - **`conversations`** and **`send_message`**: other conversations (§3).
 - **`schedule`**, **`schedules`** and **`cancel_schedule`**: later, with
   schedules (§3).
-- **`question {question, options?}`**: asks the human on a card and
-  returns the answer, as opencode's `question` does; every conversation
-  has it, from a later increment (§18).
+- **`question {question, options?}`**: asks the person and waits for
+  their answer, as opencode's `question` does; every conversation has it
+  (As built (`question`), below).
 - **`request_directory {path, write?}`**: asks for an extra host directory
   bound into this workspace's later instances, admitted per §8 and decided
   per §11.
@@ -4926,6 +4927,42 @@ what a summary dropped.
 
 Planned later, each its own increment: a `task` tool for summarizing
 child conversations within a workspace, and an MCP stdio client.
+
+**As built (`question`).** `question {question, options?}` takes one
+question of at most 600 bytes and up to six options, each one line of at
+most 200 bytes. It asks nothing of the rules: it reaches only the
+person. The conversation process sends the window `question` with the
+call; the window shows it in the strip above the composer, before the
+queued messages and the todo list, wrapped to the strip (the question at
+most six rows, an option two), its options numbered and a line saying
+how to answer, while its conversation is the open one, and the
+conversation's row says it asks you otherwise. It is not a card: a card
+is modal and holds no text, and the answer is the person's own words.
+
+The first message the person writes after it answers it. The call first
+reads what the window sent, then notes every message already waiting to
+be taken into the turn, another question's answer among them: those
+were written before the question was seen and answer nothing, so two
+questions in one reply each wait for an answer of their own. It then
+waits, reading the window as a card's wait does, for a message written
+since; one already delivered or refused is said so and passed over. A
+pause, or a resume, ends the wait unanswered, since a message past one
+is not taken into the turn. The answer is left where it is, so that it
+is taken into the turn after the step's results as any message written
+during a turn is (As built (a message during a turn), §2), logged as
+theirs, and so read by the next request after the results, which
+providers require; on a turn's last allowed step it starts a turn of its
+own instead, which can act on it. A message the window sent just before
+it showed the question, still on its way when the call notes what
+waits, is taken as the answer: closing that would need the window to
+name the question it showed. The call answers that the person's answer
+follows, naming
+the option its number picked when it is one, then withdraws the
+question. An interrupt, the message sent with one included, ends the
+wait unanswered, as does the window going; the call says so. A
+connection card held for the classifier while the question waits is put
+to the person, who is there. The step's folded line says "asked" and
+the question's start.
 
 **As built (`web_fetch`).** A workspace's conversation has
 `web_fetch {url, offset?, max_bytes?}`, which the conversation process
@@ -6502,11 +6539,11 @@ in parallel with it.
     non-Rust package (AGENTS.md). td-agent is a standalone program: no
     boot test starts it, its window or its model.
 
-After these: resource limits (§8), schedules (§3), the `question` tool
-(§12), a loopback shared by a conversation's instances (§19), child
-conversations within a workspace, skills and custom commands, the MCP
-client, moving a conversation between workspaces, and a native Anthropic
-Messages dialect. `web_fetch` is built (§12).
+After these: resource limits (§8), schedules (§3), a loopback shared by
+a conversation's instances (§19), child conversations within a
+workspace, skills and custom commands, the MCP client, moving a
+conversation between workspaces, and a native Anthropic Messages
+dialect. `web_fetch` and `question` are built (§12).
 
 ## 19. Open questions
 

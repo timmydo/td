@@ -260,6 +260,14 @@ pub enum Up {
     Withdraw {
         call: u64,
     },
+    /// The model asks the person `question` with `call`, its `question`
+    /// tool's, offering `options`; the person's next message answers it,
+    /// and `Withdraw` ends it (DESIGN.md §12).
+    Question {
+        call: u64,
+        question: String,
+        options: Vec<String>,
+    },
     /// A repository workspace's store for `remote` is wanted: the window
     /// fetches it and resolves `bases` there, and answers with `Fetched`.
     Fetch {
@@ -1300,6 +1308,21 @@ impl Up {
                 typed("ask", members)
             }
             Self::Withdraw { call } => typed("withdraw", vec![("call".into(), Json::from(*call))]),
+            Self::Question {
+                call,
+                question,
+                options,
+            } => typed(
+                "question",
+                vec![
+                    ("call".into(), Json::from(*call)),
+                    ("question".into(), Json::Str(question.clone())),
+                    (
+                        "options".into(),
+                        Json::Arr(options.iter().cloned().map(Json::Str).collect()),
+                    ),
+                ],
+            ),
         }
     }
 
@@ -1418,6 +1441,11 @@ impl Up {
             },
             Some("withdraw") => Self::Withdraw {
                 call: number(&value, "call")?,
+            },
+            Some("question") => Self::Question {
+                call: number(&value, "call")?,
+                question: string(&value, "question")?,
+                options: strings(&value, "options")?,
             },
             Some("fetch") => Self::Fetch {
                 remote: string(&value, "remote")?,
@@ -1830,6 +1858,11 @@ mod tests {
                 }),
             },
             Up::Withdraw { call: 9 },
+            Up::Question {
+                call: 10,
+                question: "Which branch?".into(),
+                options: vec!["main".into(), "next".into()],
+            },
             Up::Event(Event {
                 seq: 1,
                 time: 2,
