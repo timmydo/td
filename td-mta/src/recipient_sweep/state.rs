@@ -64,7 +64,7 @@ impl Group {
 
 // Stored replies can be longer than one wire line after normalization. Only
 // their code/separator is needed here; wire parsing and normalization are separate.
-fn reply_class(reply: Option<&str>) -> Option<u16> {
+pub(crate) fn reply_class(reply: Option<&str>) -> Option<u16> {
     let bytes = reply?.as_bytes();
     let [class @ b'2'..=b'5', b'0'..=b'5', b'0'..=b'9'] = bytes.get(..3)? else {
         return None;

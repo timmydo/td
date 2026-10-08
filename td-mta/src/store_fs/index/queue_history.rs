@@ -68,6 +68,7 @@ fn submission(old: SubmissionRow<'_>, next: SubmissionRow<'_>) -> bool {
 fn recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
     old.address == next.address
         && terminal_recipient(old, next)
+        && acceptance_boundary(old, next)
         && (!old.uncertain || next.uncertain)
         && if next.attempt_count == old.attempt_count {
             (next.state != RecipientState::InFlight || old.state == RecipientState::InFlight)
@@ -86,6 +87,31 @@ fn recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
                 && old.attempt_count.checked_add(1) == Some(next.attempt_count)
                 && next.attempt != old.attempt
         }
+}
+
+fn acceptance_boundary(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
+    use FailureReason as F;
+    use RecipientState as S;
+    let exposed = old.state == S::InFlight && old.phase == AttemptPhase::AcceptancePossible;
+    if !exposed {
+        return next.state != S::Accepted || old.state == S::Accepted;
+    }
+    let data_class = crate::recipient_sweep::reply_class(next.data_reply);
+    match next.state {
+        S::Accepted | S::InFlight | S::OutcomeUnknown => true,
+        S::Queued | S::Canceled => false,
+        S::RetryWait => {
+            old.data_reply.is_none() && next.reason == F::SmtpTemporary && data_class == Some(4)
+        }
+        S::Failed => {
+            old.data_reply.is_none()
+                && match next.reason {
+                    F::SmtpPermanent => data_class == Some(5),
+                    F::Expired => matches!(data_class, Some(4 | 5)),
+                    _ => false,
+                }
+        }
+    }
 }
 
 fn active_phase(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {

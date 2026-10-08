@@ -165,11 +165,32 @@ or advance one step: Prepared to Body, then Body to AcceptancePossible.
 AcceptancePossible cannot return to an earlier phase. A final
 AcceptancePossible PUT against an original Prepared row refuses even when
 an intermediate PUT names Body: Body must commit in a separate transaction.
-These checks do not constrain transitions out of InFlight to an outcome.
-Same-count pending-to-outcome changes, such as RetryWait becoming Accepted
-or replacing retained replies without an active attempt, are still accepted
-by this core when the final group is otherwise valid. They remain explicit
-coordinator-validation gaps, not proof of a fenced SMTP result.
+An existing row may become Accepted only from InFlight/AcceptancePossible;
+an already Accepted row may stay Accepted under the terminal checks below.
+An original InFlight/AcceptancePossible row cannot become Canceled, even
+when its uncertainty bit is false. These boundaries compare the original
+row with the final PUT: AcceptancePossible and Accepted cannot share one
+commit from Body, and an intermediate phase or DELETE cannot make an
+exposed attempt cancelable. Stored phase history does not prove current
+reply provenance, worker fencing or actual transport ordering.
+Other outcome transitions, such as RetryWait becoming Failed with reason
+SmtpPermanent, and replacement of retained replies without an active attempt
+are still accepted by this core when the final group is otherwise valid.
+They remain explicit coordinator-validation gaps, not proof of a fenced SMTP
+result. From InFlight/AcceptancePossible, a certain RetryWait requires
+SmtpTemporary and a stored DATA 4xx; Failed requires SmtpPermanent with a
+stored DATA 5xx, or Expired with a stored DATA 4xx/5xx. Both require the
+original row's DATA reply to be absent: QUEUE.md requires the new RCPT reply
+to clear old DATA history and forbids storing interim 354. A retained negative
+DATA reply cannot resolve an exposed attempt, even if carried through separate
+Prepared, Body and AcceptancePossible commits. OutcomeUnknown remains available
+to preserve uncertainty. The shared stored-reply classifier checks the code
+and separator; an RCPT refusal alone is insufficient.
+Other certain retry/failure shapes refuse, so a network/protocol failure
+cannot discard exposure and permit later cancellation. Stored negative
+replies are necessary here, but do not prove a definitive result from the
+current attempt. The coordinator must establish that provenance and record
+disconnects after exposure as OutcomeUnknown with uncertainty latched.
 Accepted and Canceled recipients remain in their respective states.
 Failed recipients remain Failed or become Canceled as part of a valid
 whole-submission cancellation. OutcomeUnknown without a next attempt remains
