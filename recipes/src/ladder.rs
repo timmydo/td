@@ -1897,7 +1897,6 @@ mod tests {
         ("system-secret-vm-test", "busybox-x86-64"),
         ("system-x86-64", "busybox-x86-64"),
         ("td-jail-test", "busybox-x86-64"),
-        ("td-util-test", "busybox-x86-64"),
     ];
     const RECIPE_SHEBANG_INTERPRETERS: &[&str] =
         &[super::SH, super::POST_BOOTSTRAP_SH, super::POST_RUST_SH];
