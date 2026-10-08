@@ -53,6 +53,9 @@ be reconciled as a zero effect. Quota reductions below actual use refuse
 configuration rather than deleting data. Effective admission intersects all
 applicable quotas; maxSizeUpload does not guarantee available capacity.
 
+The core's IndexReadView::logical_usage supplies passive account observations;
+STORAGE.md owns their counting, snapshot and reconciliation limits.
+
 ### Logical lease implementation
 
 M04c3b1 keeps up to 64 caller-owned cells, with four logical quota pairs per

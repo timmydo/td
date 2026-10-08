@@ -11,6 +11,7 @@ use std::{
 mod index;
 pub use index::{
     BackupError, BackupReceipt, BlobSource, CommitError, CommitRequest, IndexReadView, IndexStore,
+    LogicalUsage,
 };
 #[path = "store_fs/pinned.rs"]
 mod pinned;

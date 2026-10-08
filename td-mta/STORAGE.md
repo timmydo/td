@@ -198,6 +198,34 @@ retain upload bytes until the lease row is explicitly deleted, even after
 expiry. Expiry or revocation removes permission to use an upload, not its
 foreign-key ownership. No custom per-file pin registry is needed.
 
+IndexReadView::logical_usage returns passive LogicalUsage totals with the
+captured ViewIdentity. Count every current BlobRow once, including zero-byte
+and unreferenced bodies. Upload bytes count bodies with a retained lease;
+queue bytes count bodies with at least one retained submission, regardless
+of how many submissions share them. Expired leases and completed submissions
+remain charged until explicit row deletion. Queue count includes every
+retained submission. Current typed foreign keys restrict leases to Upload
+blobs and submissions to Message blobs; LeaseUse::Both names permitted
+upload uses, not overlapping categories. Body bytes are independent of
+category references; deleting a category row alone never reduces that total.
+
+Schema constraints keep each body length in 0..32 MiB; with the fixed
+8 GiB logical database ceiling, valid integer sums fit within SQLite i64.
+Negative aggregate values are rejected before conversion to u64.
+
+Two closed aggregate queries use the same account snapshot and original
+native deadline/VM budget. Correlated existence checks use the lease primary
+key and submissions_blob index; no row collection or deduplication array is
+materialized in Rust. Failure yields no partial report and cannot renew the
+scope. This is synchronous native work and may exhaust the bounded view on a
+large store; it promises neither a coordinator scheduling turn nor completion
+at the physical store ceiling. Old views keep old totals after commits.
+The report is not a quota reservation or a durable-effect ticket. A future
+coordinator must establish a consistent whole-store reconciliation boundary;
+summing arbitrarily timed account views does not establish current global
+usage. Database/WAL files, free pages, pending reservations and disposable
+spools are excluded and require separate physical/resource accounting.
+
 Changes use the native account/kind/sequence/operation indexes. History pruning
 is not activated; floor remains zero and the hard database ceiling can refuse
 writes until an explicit maintenance policy is implemented.

@@ -1,0 +1,447 @@
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+use super::*;
+use crate::{
+    format::row::{
+        BlobKind, BlobRow, FailureReason, LeaseRow, LeaseUse, NotificationState, RecipientState,
+        SubmissionRow,
+    },
+    ids::{DeviceId, EmailId, IdentityId, SubmissionId, ThreadId},
+    ports::{Crypto, Digest, Tick, Time},
+    store_fs::{index::recipient_tests::queued, tests::Fixture},
+};
+use std::sync::atomic::{AtomicU64, Ordering};
+const ACCOUNT: AccountId = AccountId::from_bytes([1; 16]);
+const OTHER: AccountId = AccountId::from_bytes([2; 16]);
+const BODY: BlobId = BlobId::from_bytes([3; 16]);
+const UPLOAD: BlobId = BlobId::from_bytes([4; 16]);
+const EMPTY: BlobId = BlobId::from_bytes([5; 16]);
+const FIRST: SubmissionId = SubmissionId::from_bytes([6; 16]);
+const SECOND: SubmissionId = SubmissionId::from_bytes([7; 16]);
+struct Timer(AtomicU64);
+impl Clock for Timer {
+    fn sample(&self) -> Result<Time, ports::Error> {
+        Ok(Time {
+            utc_ms: 0,
+            monotonic: Tick(self.0.load(Ordering::Relaxed)),
+        })
+    }
+}
+fn deadline() -> Deadline {
+    Deadline::after(Tick(0), 100).unwrap()
+}
+fn encoded(row: Row<'_>) -> Vec<u8> {
+    let mut bytes = vec![0; 65536];
+    let n = row.encode(&mut bytes).unwrap();
+    bytes.truncate(n);
+    bytes
+}
+fn key_bytes(key: Key<'_>) -> Vec<u8> {
+    let mut bytes = vec![0; 1024];
+    let n = key.encode(&mut bytes).unwrap();
+    bytes.truncate(n);
+    bytes
+}
+fn body(kind: BlobKind, bytes: &[u8]) -> Row<'static> {
+    let mut hash = td_crypto::Provider.sha256().unwrap();
+    hash.update(bytes).unwrap();
+    Row::Blob(BlobRow {
+        kind,
+        length: bytes.len() as u64,
+        digest: hash.finish().unwrap(),
+        created_at: 0,
+    })
+}
+fn submission() -> Row<'static> {
+    Row::Submission(SubmissionRow {
+        email: EmailId::from_bytes([8; 16]),
+        thread: ThreadId::from_bytes([9; 16]),
+        identity: IdentityId::from_bytes([10; 16]),
+        transmitted_blob: BODY,
+        reverse_path: "",
+        send_at: 0,
+        expires_at: 432_000_000,
+        recipient_count: 1,
+        completed_at: None,
+        notification: NotificationState::None,
+        notification_email: None,
+    })
+}
+fn commit(
+    store: &IndexStore<'_>,
+    account: AccountId,
+    expected: u64,
+    puts: &[(Key<'_>, Row<'_>)],
+    deletes: &[Key<'_>],
+    sources: &mut [BlobSource<'_>],
+) {
+    let values: Vec<_> = puts
+        .iter()
+        .map(|(key, row)| (key.table(), key_bytes(*key), encoded(*row)))
+        .collect();
+    let removed: Vec<_> = deletes
+        .iter()
+        .map(|key| (key.table(), key_bytes(*key)))
+        .collect();
+    let mut operations: Vec<_> = values
+        .iter()
+        .map(|(table, key, row)| Operation::put(*table, key, row).unwrap())
+        .collect();
+    operations.extend(
+        removed
+            .iter()
+            .map(|(table, key)| Operation::delete(*table, key).unwrap()),
+    );
+    assert_eq!(
+        store.commit(
+            &td_crypto::Provider,
+            CommitRequest {
+                account,
+                expected: Sequence::from_u64(expected),
+                utc_ms: 0,
+                deadline: deadline()
+            },
+            &operations,
+            sources
+        ),
+        Ok(Sequence::from_u64(expected + 1))
+    );
+}
+fn amounts(usage: LogicalUsage) -> [u64; 5] {
+    [
+        usage.body_bytes,
+        usage.blob_count,
+        usage.upload_bytes,
+        usage.queue_bytes,
+        usage.queue_submissions,
+    ]
+}
+
+#[test]
+fn categories_deduplicate_references_and_follow_retained_snapshot_rows() {
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let clock = Arc::new(Timer(AtomicU64::new(1)));
+    let store = IndexStore::create(
+        &mut root,
+        StoreEpoch::from_bytes([20; 16]),
+        clock,
+        3,
+        deadline(),
+    )
+    .unwrap();
+    store.create_account(ACCOUNT, deadline()).unwrap();
+    store.create_account(OTHER, deadline()).unwrap();
+    assert_eq!(
+        amounts(
+            store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .logical_usage()
+                .unwrap()
+        ),
+        [0; 5]
+    );
+    let mut bytes = b"abc".as_slice();
+    let mut upload = b"12345".as_slice();
+    let mut empty = b"".as_slice();
+    let Row::Submission(mut completed) = submission() else {
+        panic!("submission fixture");
+    };
+    completed.completed_at = Some(1);
+    let mut canceled = queued();
+    canceled.state = RecipientState::Canceled;
+    canceled.next_attempt_at = None;
+    canceled.reason = FailureReason::Canceled;
+    commit(
+        &store,
+        ACCOUNT,
+        0,
+        &[
+            (Key::Blob(BODY), body(BlobKind::Message, bytes)),
+            (Key::Blob(UPLOAD), body(BlobKind::Upload, upload)),
+            (Key::Blob(EMPTY), body(BlobKind::Message, empty)),
+            (
+                Key::Lease(UPLOAD),
+                Row::Lease(LeaseRow {
+                    account: ACCOUNT,
+                    device: DeviceId::from_bytes([11; 16]),
+                    expires_at: -1,
+                    uses: LeaseUse::Both,
+                }),
+            ),
+            (Key::Submission(FIRST), submission()),
+            (Key::Submission(SECOND), Row::Submission(completed)),
+            (Key::Recipient(FIRST, 0), Row::Recipient(queued())),
+            (Key::Recipient(SECOND, 0), Row::Recipient(canceled)),
+        ],
+        &[],
+        &mut [
+            BlobSource {
+                id: BODY,
+                source: &mut bytes,
+            },
+            BlobSource {
+                id: UPLOAD,
+                source: &mut upload,
+            },
+            BlobSource {
+                id: EMPTY,
+                source: &mut empty,
+            },
+        ],
+    );
+    let mut foreign = b"foreign".as_slice();
+    let mut foreign_upload = b"up".as_slice();
+    commit(
+        &store,
+        OTHER,
+        0,
+        &[
+            (Key::Blob(BODY), body(BlobKind::Message, foreign)),
+            (Key::Blob(UPLOAD), body(BlobKind::Upload, foreign_upload)),
+        ],
+        &[],
+        &mut [
+            BlobSource {
+                id: BODY,
+                source: &mut foreign,
+            },
+            BlobSource {
+                id: UPLOAD,
+                source: &mut foreign_upload,
+            },
+        ],
+    );
+    let mut old = store.view(ACCOUNT, deadline()).unwrap();
+    let first = old.logical_usage().unwrap();
+    assert_eq!(amounts(first), [8, 3, 5, 3, 2]);
+    assert_eq!(first.identity, old.identity());
+    assert_eq!(
+        amounts(
+            store
+                .view(OTHER, deadline())
+                .unwrap()
+                .logical_usage()
+                .unwrap()
+        ),
+        [9, 2, 0, 0, 0]
+    );
+    commit(
+        &store,
+        ACCOUNT,
+        1,
+        &[],
+        &[
+            Key::Recipient(FIRST, 0),
+            Key::Submission(FIRST),
+            Key::Lease(UPLOAD),
+        ],
+        &mut [],
+    );
+    assert_eq!(
+        amounts(
+            store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .logical_usage()
+                .unwrap()
+        ),
+        [8, 3, 0, 3, 1]
+    );
+    commit(
+        &store,
+        ACCOUNT,
+        2,
+        &[],
+        &[Key::Blob(UPLOAD), Key::Blob(EMPTY)],
+        &mut [],
+    );
+    let current = store
+        .view(ACCOUNT, deadline())
+        .unwrap()
+        .logical_usage()
+        .unwrap();
+    assert_eq!(amounts(current), [3, 1, 0, 3, 1]);
+    assert_eq!(current.identity.committed_sequence, Sequence::from_u64(3));
+    commit(
+        &store,
+        ACCOUNT,
+        3,
+        &[],
+        &[Key::Recipient(SECOND, 0), Key::Submission(SECOND)],
+        &mut [],
+    );
+    assert_eq!(
+        amounts(
+            store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .logical_usage()
+                .unwrap()
+        ),
+        [3, 1, 0, 0, 0]
+    );
+    assert_eq!(old.logical_usage().unwrap(), first);
+    drop(old);
+    store.validate_integrity(deadline()).unwrap();
+}
+#[test]
+fn usage_preserves_original_deadline_and_vm_failure_without_partial_totals() {
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let clock = Arc::new(Timer(AtomicU64::new(1)));
+    let store = IndexStore::create(
+        &mut root,
+        StoreEpoch::from_bytes([21; 16]),
+        clock.clone(),
+        2,
+        deadline(),
+    )
+    .unwrap();
+    store.create_account(ACCOUNT, deadline()).unwrap();
+    let mut expired = store.view(ACCOUNT, deadline()).unwrap();
+    clock.0.store(100, Ordering::Relaxed);
+    assert_eq!(expired.logical_usage(), Err(ports::Error::Deadline));
+    clock.0.store(1, Ordering::Relaxed);
+    assert_eq!(expired.logical_usage(), Err(ports::Error::Deadline));
+    let mut exhausted = store.view(ACCOUNT, deadline()).unwrap();
+    lock(&exhausted.native().unwrap().budget).unwrap().remaining = 0;
+    assert_eq!(exhausted.logical_usage(), Err(ports::Error::Capacity));
+    assert_eq!(exhausted.logical_usage(), Err(ports::Error::Capacity));
+}
+
+#[test]
+fn usage_queries_keep_indexed_account_and_category_probes() {
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let store = IndexStore::create(
+        &mut root,
+        StoreEpoch::from_bytes([22; 16]),
+        Arc::new(Timer(AtomicU64::new(1))),
+        1,
+        deadline(),
+    )
+    .unwrap();
+    let writer = lock(&store.writer).unwrap();
+    let db = lock(&writer.native.connection).unwrap();
+    for query in [BODIES, SUBMISSIONS] {
+        let mut statement = db.prepare(&format!("EXPLAIN QUERY PLAN {query}")).unwrap();
+        let details: Vec<String> = statement
+            .query_map(params![ACCOUNT.as_bytes().as_slice()], |row| row.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            details.iter().all(|detail| !detail.contains("SCAN ")
+                && !detail.contains("AUTOMATIC")
+                && !detail.contains("TEMP B-TREE")),
+            "{details:?}"
+        );
+        if query == BODIES {
+            for required in ["SEARCH b ", "SEARCH l USING PRIMARY KEY (account=? AND blob_id=?)", "SEARCH s USING COVERING INDEX submissions_blob (account=? AND transmitted_blob_id=?)"] {
+                assert!(details.iter().any(|detail| detail.contains(required)), "missing {required}: {details:?}");
+            }
+        } else {
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.starts_with("SEARCH submissions ")
+                        && detail.contains("(account=?)")),
+                "{details:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn populated_scan_and_second_aggregate_consume_the_original_vm_allowance() {
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let store = IndexStore::create(
+        &mut root,
+        StoreEpoch::from_bytes([23; 16]),
+        Arc::new(Timer(AtomicU64::new(1))),
+        1,
+        deadline(),
+    )
+    .unwrap();
+    store.create_account(ACCOUNT, deadline()).unwrap();
+    let mut empty = store.view(ACCOUNT, deadline()).unwrap();
+    let before = lock(&empty.native().unwrap().budget).unwrap().remaining;
+    empty.logical_usage().unwrap();
+    let empty_steps = before - lock(&empty.native().unwrap().budget).unwrap().remaining;
+    drop(empty);
+    let ids: Vec<_> = (0u128..100)
+        .map(|id| BlobId::from_bytes(id.to_be_bytes()))
+        .collect();
+    let mut puts = Vec::new();
+    for (ordinal, id) in ids.iter().copied().enumerate() {
+        let kind = if ordinal % 2 == 0 {
+            BlobKind::Upload
+        } else {
+            BlobKind::Message
+        };
+        puts.push((Key::Blob(id), body(kind, b"")));
+        if kind == BlobKind::Upload {
+            puts.push((
+                Key::Lease(id),
+                Row::Lease(LeaseRow {
+                    account: ACCOUNT,
+                    device: DeviceId::from_bytes([11; 16]),
+                    expires_at: -1,
+                    uses: LeaseUse::Both,
+                }),
+            ));
+        } else {
+            let Row::Submission(mut row) = submission() else {
+                panic!("submission fixture");
+            };
+            row.transmitted_blob = id;
+            let submission_id = SubmissionId::from_bytes(*id.as_bytes());
+            puts.push((Key::Submission(submission_id), Row::Submission(row)));
+            puts.push((Key::Recipient(submission_id, 0), Row::Recipient(queued())));
+        }
+    }
+    let mut streams = vec![b"".as_slice(); ids.len()];
+    let mut sources: Vec<_> = ids
+        .iter()
+        .zip(streams.iter_mut())
+        .map(|(id, source)| BlobSource { id: *id, source })
+        .collect();
+    commit(&store, ACCOUNT, 0, &puts, &[], &mut sources);
+    let mut limited = store.view(ACCOUNT, deadline()).unwrap();
+    lock(&limited.native().unwrap().budget).unwrap().remaining = empty_steps + 32;
+    assert_eq!(limited.logical_usage(), Err(ports::Error::Capacity));
+    assert_eq!(limited.logical_usage(), Err(ports::Error::Capacity));
+    drop(limited);
+    // Calibrate the exact first aggregate's VM cost on the same populated snapshot.
+    let mut measured = store.view(ACCOUNT, deadline()).unwrap();
+    let before = lock(&measured.native().unwrap().budget).unwrap().remaining;
+    measured
+        .read_snapshot(|native| {
+            native.run(|db| {
+                db.query_row(BODIES, params![ACCOUNT.as_bytes().as_slice()], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(sql)
+            })
+        })
+        .unwrap();
+    let body_steps = before - lock(&measured.native().unwrap().budget).unwrap().remaining;
+    drop(measured);
+    let mut second = store.view(ACCOUNT, deadline()).unwrap();
+    lock(&second.native().unwrap().budget).unwrap().remaining = body_steps;
+    assert_eq!(second.logical_usage(), Err(ports::Error::Capacity));
+    assert_eq!(second.logical_usage(), Err(ports::Error::Capacity));
+    drop(second);
+    assert_eq!(
+        amounts(
+            store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .logical_usage()
+                .unwrap()
+        ),
+        [0, 100, 0, 0, 50]
+    );
+}

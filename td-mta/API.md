@@ -6519,6 +6519,10 @@ changes are refused. A view retains its original monotonic deadline and VM
 fuel; clock/VM-budget failure or reversed time is sticky. Drop ends the read transaction
 before returning its connection; failed rollback retires the slot.
 
+IndexReadView::logical_usage returns account-scoped LogicalUsage with its
+captured ViewIdentity. [STORAGE.md](STORAGE.md) owns body/category counting,
+retained ownership, native bounds and the limits of this passive report.
+
 IndexReadView::open_blob_input takes the crypto provider, blob ID and byte
 ceiling. The snapshot supplies the BlobRow, account, original clock and
 deadline. Complete length/digest/EOF verification yields PinnedBlob random

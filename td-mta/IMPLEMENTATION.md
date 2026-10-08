@@ -560,6 +560,10 @@ IndexStore::commit_batch consumes the binding through the same transaction
 path as typed operations; STORAGE.md owns its replay/ownership contract.
 Authenticated admission and transaction coordination remain open.
 
+Snapshot-bound account logical usage is implemented by
+IndexReadView::logical_usage. STORAGE.md defines its exact counting and
+native work boundary; coordinator integration remains open.
+
 Bounded provisional ingress staging, full-slot quota accounting and crash
 cleanup are implemented by IngressSpool. Before protocol activation, connect
 that ownership to the authenticated ports::Store adapter. The current

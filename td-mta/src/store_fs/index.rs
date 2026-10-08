@@ -44,6 +44,9 @@ use relational::SCHEMA;
 #[path = "index/operations.rs"]
 mod operations;
 use operations::Operations;
+#[path = "index/usage.rs"]
+mod usage;
+pub use usage::LogicalUsage;
 #[path = "index/backup.rs"]
 mod backup;
 #[cfg(test)]
