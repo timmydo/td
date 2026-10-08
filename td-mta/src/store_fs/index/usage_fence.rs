@@ -48,8 +48,9 @@ impl StoreLogicalUsage {
 /// Copied totals are observations, not effect or quota authority.
 #[must_use = "retain the writer fence until accounting initialization finishes"]
 pub struct UsageFence<'s> {
-    _writer: MutexGuard<'s, Writer>,
+    writer: MutexGuard<'s, Writer>,
     usage: StoreLogicalUsage,
+    files: StoreFileUsage,
 }
 impl UsageFence<'_> {
     pub fn usage(&self) -> StoreLogicalUsage {
@@ -97,10 +98,114 @@ impl IndexStore<'_> {
             return Err(ports::Error::WriterStopped);
         }
         let usage = result?;
-        writer.native.check()?;
+        let files = StoreFileUsage::capture(self.root, &writer.native)?;
         Ok(UsageFence {
-            _writer: writer,
+            writer,
             usage,
+            files,
         })
     }
 }
+
+/// Verified logical file extents, including allocated/reusable pages and WAL tails.
+/// They do not measure filesystem free space or allocated blocks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreFileUsage {
+    pub database_bytes: u64,
+    pub wal_bytes: u64,
+}
+impl StoreFileUsage {
+    fn capture(root: &LockedRoot, native: &Native) -> Result<Self, ports::Error> {
+        native.check()?;
+        let database = fs::symlink_metadata(db_path(root, RootEntry::Database)?)?;
+        let database_bytes = validated_file_length(root, &database, MAX_PAGES * PAGE_BYTES)?;
+        native.check()?;
+        let wal_bytes = match optional_metadata(&db_path(root, RootEntry::Wal)?)? {
+            Some(metadata) => validated_file_length(root, &metadata, MAX_WAL_BYTES)?,
+            None => 0,
+        };
+        native.check()?;
+        Ok(Self {
+            database_bytes,
+            wal_bytes,
+        })
+    }
+}
+
+/// Trusted cold reconciliation of resources outside the authoritative database.
+/// The caller must quiesce their owners and settle all pending effects first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuxiliaryUsage {
+    pub sort_bytes: u64,
+    pub response_bytes: u64,
+    pub cache_bytes: u64,
+    pub log_bytes: u64,
+    pub cold_bytes: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LedgerInitError {
+    Store(ports::Error),
+    Ledger(crate::admission::logical::Error),
+}
+impl std::fmt::Display for LedgerInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(error) => error.fmt(f),
+            Self::Ledger(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for LedgerInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error),
+            Self::Ledger(error) => Some(error),
+        }
+    }
+}
+impl UsageFence<'_> {
+    pub fn file_usage(&self) -> StoreFileUsage {
+        self.files
+    }
+    /// Consume this cold capture to initialize the existing ledger, then release
+    /// the writer fence. No reservation or effect ticket is fabricated.
+    pub fn initialize_leases<'a>(
+        self,
+        plan: &crate::admission::Plan,
+        auxiliary: AuxiliaryUsage,
+        states: &'a mut [crate::ownership::SlotState],
+        cells: &'a mut [crate::admission::logical::Cell],
+    ) -> Result<crate::admission::logical::Leases<'a>, LedgerInitError> {
+        use crate::admission::{
+            logical,
+            quota::{Kind, Usage},
+        };
+        self.writer.native.check().map_err(LedgerInitError::Store)?;
+        let mut used = Usage::default();
+        for (kind, amount) in [
+            (Kind::BodyBytes, self.usage.body_bytes),
+            (Kind::BlobCount, self.usage.blob_count),
+            (Kind::UploadBytes, self.usage.upload_bytes),
+            (Kind::QueueBytes, self.usage.queue_bytes),
+            (Kind::QueueSubmissions, self.usage.queue_submissions),
+            (Kind::DatabaseBytes, self.files.database_bytes),
+            (Kind::WalBytes, self.files.wal_bytes),
+            (Kind::SortBytes, auxiliary.sort_bytes),
+            (Kind::ResponseBytes, auxiliary.response_bytes),
+            (Kind::CacheBytes, auxiliary.cache_bytes),
+            (Kind::LogBytes, auxiliary.log_bytes),
+            (Kind::ColdBytes, auxiliary.cold_bytes),
+        ] {
+            used.add(kind, amount)
+                .map_err(|error| LedgerInitError::Ledger(error.into()))?;
+        }
+        let ledger =
+            logical::Leases::new(plan, used, states, cells).map_err(LedgerInitError::Ledger)?;
+        self.writer.native.check().map_err(LedgerInitError::Store)?;
+        Ok(ledger)
+    }
+}
+
+#[cfg(test)]
+#[path = "initialization_tests.rs"]
+mod tests;

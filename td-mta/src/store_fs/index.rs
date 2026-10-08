@@ -50,7 +50,9 @@ mod usage;
 pub use usage::LogicalUsage;
 #[path = "index/usage_fence.rs"]
 mod usage_fence;
-pub use usage_fence::{StoreLogicalUsage, UsageFence};
+pub use usage_fence::{
+    AuxiliaryUsage, LedgerInitError, StoreFileUsage, StoreLogicalUsage, UsageFence,
+};
 #[path = "index/backup.rs"]
 mod backup;
 #[cfg(test)]
@@ -1090,7 +1092,13 @@ fn db_path(root: &LockedRoot, entry: RootEntry) -> Result<std::path::PathBuf, po
     Ok(full)
 }
 fn validate_file(root: &LockedRoot, path: &Path, maximum: u64) -> Result<(), ports::Error> {
-    let metadata = fs::symlink_metadata(path)?;
+    validated_file_length(root, &fs::symlink_metadata(path)?, maximum).map(|_| ())
+}
+fn validated_file_length(
+    root: &LockedRoot,
+    metadata: &fs::Metadata,
+    maximum: u64,
+) -> Result<u64, ports::Error> {
     let owner = root.root.directory.metadata()?.uid();
     if !metadata.is_file()
         || metadata.uid() != owner
@@ -1100,7 +1108,7 @@ fn validate_file(root: &LockedRoot, path: &Path, maximum: u64) -> Result<(), por
     {
         return Err(ports::Error::Invalid);
     }
-    Ok(())
+    Ok(metadata.len())
 }
 fn initialize_database_file(file: &fs::File) -> Result<(), ports::Error> {
     // OpenOptions creation mode is filtered by umask; restore only owner bits.

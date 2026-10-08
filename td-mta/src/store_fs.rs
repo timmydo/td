@@ -10,8 +10,9 @@ use std::{
 #[path = "store_fs/index.rs"]
 mod index;
 pub use index::{
-    BackupError, BackupReceipt, BlobSource, CommitError, CommitRequest, IndexReadView, IndexStore,
-    LogicalUsage, StoreLogicalUsage, UsageFence,
+    AuxiliaryUsage, BackupError, BackupReceipt, BlobSource, CommitError, CommitRequest,
+    IndexReadView, IndexStore, LedgerInitError, LogicalUsage, StoreFileUsage, StoreLogicalUsage,
+    UsageFence,
 };
 #[path = "store_fs/pinned.rs"]
 mod pinned;

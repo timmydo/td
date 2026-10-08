@@ -223,7 +223,7 @@ at the physical store ceiling. Old views keep old totals after commits.
 The report is not a quota reservation or a durable-effect ticket. Summing
 arbitrarily timed account views does not establish current global usage.
 Database/WAL files, free pages, pending reservations and disposable
-spools are excluded and require separate physical/resource accounting.
+spools are excluded from this logical report.
 
 IndexStore::usage_fence supplies a cold whole-store logical capture. It takes
 the healthy writer fence, reads at most 128 accounts in one SQLite read
@@ -242,12 +242,44 @@ quota::Usage counters, with no per-account quota dimension. The fence
 therefore retains only whole-store totals. It is for cold coordinator
 initialization, not a runtime admission loop. It has no automatic timeout/drop
 or worker-quiescence authority. The future coordinator must stop outstanding
-workers and reconcile pending
-logical effects plus physical/disposable usage before initializing its one
-ledger under the fence. Copied totals remain passive observations and may
-become stale after drop. No logical charge or reservation is changed here.
+workers and reconcile pending effects plus disposable usage before ledger
+initialization. Copied totals remain passive observations and may become
+stale after drop.
 The normal native work ceiling may refuse large stores; whole-store maximum
 resource qualification and service activation remain open.
+
+After ending the read transaction, the fence also captures StoreFileUsage
+under the same mutex and original clock. The mandatory database and optional
+WAL must remain regular owner-only single-link files under their existing
+length ceilings. An absent WAL contributes zero. File lengths include
+reusable main pages and retained WAL tails; they are logical file extents,
+not a free-space probe or a measurement of filesystem allocated blocks.
+Metadata failure or expiry returns no fence and never substitutes zero for
+an unmeasured present file. The read transaction is already closed on these
+failures. Capture relies on the existing trusted stable-path contract; it
+does not bind SQLite's open descriptors to these paths or detect namespace
+replacement. An absent WAL is valid only within that contract.
+
+WAL-only committed pages do not yet enlarge the main-file extent. Future
+runtime coordination must account for checkpoint growth as well as write
+and rollback growth; initializing these counters reserves no future growth.
+The fixed native 8 GiB main-file ceiling also equals every valid plan's
+DatabaseBytes cap. SQLite's separate 34 MiB WAL-index mapping allowance
+(RESOURCES.md) is outside these two captured file buckets.
+
+UsageFence::initialize_leases consumes the capture, combines its five
+logical counters and two file extents with trusted AuxiliaryUsage for sort,
+response, cache, log and cold state, and invokes the existing logical Leases
+constructor on empty caller-owned cells/slots. All twelve global quota
+buckets must fit their plan; pending charges start empty. The original
+clock is checked before and after construction. Success returns a
+ledger and releases the writer fence; failure releases the fence without
+occupying cells or changing the database. The caller must quiesce other
+resource owners, settle outstanding effects and control publication of the
+initialized ledger. This helper does not enforce global ledger uniqueness or
+bind the returned ledger to a store; trusted coordination must do both.
+No duplicate used-counter table, reservation, effect
+ticket or authenticated mutation authority is created.
 
 Changes use the native account/kind/sequence/operation indexes. History pruning
 is not activated; floor remains zero and the hard database ceiling can refuse

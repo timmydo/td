@@ -6521,8 +6521,11 @@ before returning its connection; failed rollback retires the slot.
 
 IndexReadView::logical_usage returns account-scoped LogicalUsage with its
 captured ViewIdentity. IndexStore::usage_fence supplies whole-store totals
-while retaining the cold writer fence. [STORAGE.md](STORAGE.md) owns counting,
-retained ownership, native bounds and the reconciliation contract.
+while retaining the cold writer fence, plus verified StoreFileUsage.
+UsageFence::initialize_leases consumes it to construct the existing ledger
+from captured totals and trusted AuxiliaryUsage. LedgerInitError preserves
+store and logical-admission failures. [STORAGE.md](STORAGE.md) owns counting,
+retained ownership, native bounds and initialization requirements.
 
 IndexReadView::open_blob_input takes the crypto provider, blob ID and byte
 ceiling. The snapshot supplies the BlobRow, account, original clock and

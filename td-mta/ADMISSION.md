@@ -54,7 +54,10 @@ configuration rather than deleting data. Effective admission intersects all
 applicable quotas; maxSizeUpload does not guarantee available capacity.
 
 The core supplies passive account observations and a cold whole-store
-usage_fence. STORAGE.md owns their counting and reconciliation limits.
+usage_fence. Its consuming initialize_leases path seeds this same ledger
+from captured logical/file usage and trusted auxiliary reconciliation.
+The trusted coordinator owns ledger uniqueness and its store association.
+STORAGE.md owns capture, initialization and quiescence requirements.
 
 ### Logical lease implementation
 

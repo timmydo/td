@@ -563,8 +563,10 @@ Authenticated admission and transaction coordination remain open.
 Snapshot-bound account logical usage is implemented by
 IndexReadView::logical_usage. IndexStore::usage_fence captures whole-store
 totals and retains the writer fence for cold accounting initialization.
-STORAGE.md owns counting and native work bounds; ledger/pending-effect and
-physical-resource integration remain open.
+The capture verifies database/WAL extents and can consume itself to seed
+the existing logical lease ledger with trusted auxiliary usage. STORAGE.md
+owns initialization and quiescence requirements. Runtime mutation/effect
+reconciliation, resource-owner orchestration and activation remain open.
 
 Bounded provisional ingress staging, full-slot quota accounting and crash
 cleanup are implemented by IngressSpool. Before protocol activation, connect
