@@ -220,11 +220,34 @@ materialized in Rust. Failure yields no partial report and cannot renew the
 scope. This is synchronous native work and may exhaust the bounded view on a
 large store; it promises neither a coordinator scheduling turn nor completion
 at the physical store ceiling. Old views keep old totals after commits.
-The report is not a quota reservation or a durable-effect ticket. A future
-coordinator must establish a consistent whole-store reconciliation boundary;
-summing arbitrarily timed account views does not establish current global
-usage. Database/WAL files, free pages, pending reservations and disposable
+The report is not a quota reservation or a durable-effect ticket. Summing
+arbitrarily timed account views does not establish current global usage.
+Database/WAL files, free pages, pending reservations and disposable
 spools are excluded and require separate physical/resource accounting.
+
+IndexStore::usage_fence supplies a cold whole-store logical capture. It takes
+the healthy writer fence, reads at most 128 accounts in one SQLite read
+transaction, reuses the same indexed account aggregates and checks scalar
+addition. One original deadline and the normal native VM allowance govern
+the whole scan.
+After successful read-transaction rollback, UsageFence retains the writer
+mutex until drop. Its StoreLogicalUsage remains current while that fence is
+held; existing views can still read their old snapshots. New views, account
+creation, mutations and maintenance return Busy. Failure exposes no partial
+capture; failed rollback stops the writer until recovery. Indeterminate
+writers cannot issue a fence.
+
+The existing admission::logical::Leases constructor consumes global
+quota::Usage counters, with no per-account quota dimension. The fence
+therefore retains only whole-store totals. It is for cold coordinator
+initialization, not a runtime admission loop. It has no automatic timeout/drop
+or worker-quiescence authority. The future coordinator must stop outstanding
+workers and reconcile pending
+logical effects plus physical/disposable usage before initializing its one
+ledger under the fence. Copied totals remain passive observations and may
+become stale after drop. No logical charge or reservation is changed here.
+The normal native work ceiling may refuse large stores; whole-store maximum
+resource qualification and service activation remain open.
 
 Changes use the native account/kind/sequence/operation indexes. History pruning
 is not activated; floor remains zero and the hard database ceiling can refuse

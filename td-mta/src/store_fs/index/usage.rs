@@ -26,34 +26,36 @@ impl IndexReadView<'_, '_> {
     /// Expiry and completion do not remove retained lease/submission charges.
     pub fn logical_usage(&mut self) -> Result<LogicalUsage, ports::Error> {
         let identity = self.identity;
-        self.read_snapshot(|native| {
-            native.run(|db| {
-                let (body_bytes, blob_count, upload_bytes, queue_bytes): (i64, i64, i64, i64) = db
-                    .query_row(
-                        BODIES,
-                        params![identity.account.as_bytes().as_slice()],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                    )
-                    .map_err(sql)?;
-                let queue_submissions: i64 = db
-                    .query_row(
-                        SUBMISSIONS,
-                        params![identity.account.as_bytes().as_slice()],
-                        |row| row.get(0),
-                    )
-                    .map_err(sql)?;
-                Ok(LogicalUsage {
-                    identity,
-                    body_bytes: u64::try_from(body_bytes).map_err(|_| ports::Error::Corrupt)?,
-                    blob_count: u64::try_from(blob_count).map_err(|_| ports::Error::Corrupt)?,
-                    upload_bytes: u64::try_from(upload_bytes).map_err(|_| ports::Error::Corrupt)?,
-                    queue_bytes: u64::try_from(queue_bytes).map_err(|_| ports::Error::Corrupt)?,
-                    queue_submissions: u64::try_from(queue_submissions)
-                        .map_err(|_| ports::Error::Corrupt)?,
-                })
-            })
-        })
+        self.read_snapshot(|native| native.run(|db| read_account(db, identity)))
     }
+}
+
+pub(super) fn read_account(
+    db: &Connection,
+    identity: ViewIdentity,
+) -> Result<LogicalUsage, ports::Error> {
+    let (body_bytes, blob_count, upload_bytes, queue_bytes): (i64, i64, i64, i64) = db
+        .query_row(
+            BODIES,
+            params![identity.account.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(sql)?;
+    let queue_submissions: i64 = db
+        .query_row(
+            SUBMISSIONS,
+            params![identity.account.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    Ok(LogicalUsage {
+        identity,
+        body_bytes: u64::try_from(body_bytes).map_err(|_| ports::Error::Corrupt)?,
+        blob_count: u64::try_from(blob_count).map_err(|_| ports::Error::Corrupt)?,
+        upload_bytes: u64::try_from(upload_bytes).map_err(|_| ports::Error::Corrupt)?,
+        queue_bytes: u64::try_from(queue_bytes).map_err(|_| ports::Error::Corrupt)?,
+        queue_submissions: u64::try_from(queue_submissions).map_err(|_| ports::Error::Corrupt)?,
+    })
 }
 
 #[cfg(test)]

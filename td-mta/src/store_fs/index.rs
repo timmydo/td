@@ -30,6 +30,7 @@ use crate::limits::{
     SQLITE_MAX_PAGES as MAX_PAGES, SQLITE_PAGE_BYTES as PAGE_BYTES,
     SQLITE_TRANSACTION_WAL_BYTES as TRANSACTION_WAL_BYTES, SQLITE_WAL_BYTES as MAX_WAL_BYTES,
 };
+const MAX_ACCOUNTS: u32 = 128;
 const MAX_OPERATIONS: usize = 4096;
 const MAX_TRANSACTION_BYTES: usize = 1_048_576;
 const VM_STEPS: u64 = 8_000_000;
@@ -47,6 +48,9 @@ use operations::Operations;
 #[path = "index/usage.rs"]
 mod usage;
 pub use usage::LogicalUsage;
+#[path = "index/usage_fence.rs"]
+mod usage_fence;
+pub use usage_fence::{StoreLogicalUsage, UsageFence};
 #[path = "index/backup.rs"]
 mod backup;
 #[cfg(test)]
@@ -563,7 +567,7 @@ impl<'r> IndexStore<'r> {
             let count: i64 = db
                 .query_row("SELECT count(*) FROM accounts", [], |r| r.get(0))
                 .map_err(sql)?;
-            if count >= 128 {
+            if count >= i64::from(MAX_ACCOUNTS) {
                 return Err(ports::Error::Capacity);
             }
             db.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
@@ -3693,6 +3697,10 @@ mod tests {
         assert_eq!(
             store.commit(&td_crypto::Provider, request, &[op], &mut []),
             Err(CommitError::Rejected(ports::Error::WriterStopped))
+        );
+        assert_eq!(
+            store.usage_fence(deadline()).err(),
+            Some(ports::Error::WriterStopped)
         );
         let mut view = store.view(ACCOUNT, deadline()).unwrap();
         let mut bytes = [0; 128];

@@ -53,8 +53,8 @@ be reconciled as a zero effect. Quota reductions below actual use refuse
 configuration rather than deleting data. Effective admission intersects all
 applicable quotas; maxSizeUpload does not guarantee available capacity.
 
-The core's IndexReadView::logical_usage supplies passive account observations;
-STORAGE.md owns their counting, snapshot and reconciliation limits.
+The core supplies passive account observations and a cold whole-store
+usage_fence. STORAGE.md owns their counting and reconciliation limits.
 
 ### Logical lease implementation
 

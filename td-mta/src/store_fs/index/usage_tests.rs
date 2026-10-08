@@ -445,3 +445,351 @@ fn populated_scan_and_second_aggregate_consume_the_original_vm_allowance() {
         [0, 100, 0, 0, 50]
     );
 }
+
+#[test]
+fn whole_store_usage_fence_keeps_writes_busy_but_old_views_readable() {
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let epoch = StoreEpoch::from_bytes([24; 16]);
+    let store = IndexStore::create(
+        &mut root,
+        epoch,
+        Arc::new(Timer(AtomicU64::new(1))),
+        2,
+        deadline(),
+    )
+    .unwrap();
+    let empty = store.usage_fence(deadline()).unwrap();
+    assert_eq!(empty.usage().epoch, epoch);
+    assert_eq!(empty.usage().accounts, 0);
+    assert_eq!(empty.usage().blob_count, 0);
+    drop(empty);
+    for account in [ACCOUNT, OTHER] {
+        store.create_account(account, deadline()).unwrap();
+        let mut bytes = b"same ID, distinct account".as_slice();
+        commit(
+            &store,
+            account,
+            0,
+            &[(Key::Blob(BODY), body(BlobKind::Message, bytes))],
+            &[],
+            &mut [BlobSource {
+                id: BODY,
+                source: &mut bytes,
+            }],
+        );
+    }
+    let mut old = store.view(ACCOUNT, deadline()).unwrap();
+    let original = old.logical_usage().unwrap();
+    let fence = store.usage_fence(deadline()).unwrap();
+    let total = fence.usage();
+    assert_eq!(total.epoch, epoch);
+    assert_eq!(total.accounts, 2);
+    assert_eq!(total.body_bytes, 2 * original.body_bytes);
+    assert_eq!(total.blob_count, 2);
+    assert_eq!(
+        (
+            total.upload_bytes,
+            total.queue_bytes,
+            total.queue_submissions
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        store.view(ACCOUNT, deadline()).err(),
+        Some(ports::Error::Busy)
+    );
+    assert_eq!(
+        store.create_account(AccountId::from_bytes([33; 16]), deadline()),
+        Err(CommitError::Rejected(ports::Error::Busy))
+    );
+    assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
+    let remove = Operation::delete(Table::Blobs, BODY.as_bytes()).unwrap();
+    let request = CommitRequest {
+        account: ACCOUNT,
+        expected: Sequence::from_u64(1),
+        utc_ms: 0,
+        deadline: deadline(),
+    };
+    assert_eq!(
+        store.commit(&td_crypto::Provider, request, &[remove], &mut []),
+        Err(CommitError::Rejected(ports::Error::Busy))
+    );
+    assert_eq!(old.logical_usage().unwrap(), original);
+    drop(fence);
+    assert_eq!(
+        store.commit(&td_crypto::Provider, request, &[remove], &mut []),
+        Ok(Sequence::from_u64(2))
+    );
+    assert_eq!(old.logical_usage().unwrap(), original);
+    drop(old);
+    let after = store.usage_fence(deadline()).unwrap();
+    assert_eq!(after.usage().blob_count, 1);
+    assert_eq!(after.usage().body_bytes, original.body_bytes);
+}
+
+#[test]
+fn usage_fence_query_failure_rolls_back_and_cleanup_failure_stops_the_writer() {
+    for refuse_cleanup in [false, true] {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let clock = Arc::new(Timer(AtomicU64::new(1)));
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([25; 16]),
+            clock.clone(),
+            1,
+            deadline(),
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        let events = Arc::new(AtomicU64::new(0));
+        let hits = Arc::clone(&events);
+        lock(&lock(&store.writer).unwrap().native.connection)
+            .unwrap()
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if refuse_cleanup {
+                    if matches!(context.action, AuthAction::Transaction { .. })
+                        && hits.fetch_add(1, Ordering::Relaxed) == 1
+                    {
+                        return Authorization::Deny;
+                    }
+                } else if matches!(
+                    context.action,
+                    AuthAction::Read {
+                        table_name: "blobs",
+                        ..
+                    }
+                ) {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    return Authorization::Deny;
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+        assert_eq!(
+            store.usage_fence(deadline()).err(),
+            Some(if refuse_cleanup {
+                ports::Error::WriterStopped
+            } else {
+                ports::Error::Io {
+                    kind: std::io::ErrorKind::Other,
+                    os_code: None,
+                }
+            })
+        );
+        assert!(events.load(Ordering::Relaxed) > 0);
+        {
+            let writer = lock(&store.writer).unwrap();
+            let db = lock(&writer.native.connection).unwrap();
+            assert_eq!(writer.stopped, refuse_cleanup);
+            assert_eq!(db.is_autocommit(), !refuse_cleanup);
+            db.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                .unwrap();
+        }
+        if refuse_cleanup {
+            assert_eq!(
+                store.usage_fence(deadline()).err(),
+                Some(ports::Error::WriterStopped)
+            );
+        } else {
+            assert_eq!(store.usage_fence(deadline()).unwrap().usage().accounts, 1);
+            clock.0.store(100, Ordering::Relaxed);
+            assert_eq!(
+                store.usage_fence(deadline()).err(),
+                Some(ports::Error::Deadline)
+            );
+        }
+    }
+}
+
+#[test]
+fn usage_fence_and_creation_share_the_full_account_ceiling() {
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let store = IndexStore::create(
+        &mut root,
+        StoreEpoch::from_bytes([26; 16]),
+        Arc::new(Timer(AtomicU64::new(1))),
+        1,
+        deadline(),
+    )
+    .unwrap();
+    for ordinal in 0..MAX_ACCOUNTS {
+        store
+            .create_account(
+                AccountId::from_bytes(u128::from(ordinal).to_be_bytes()),
+                deadline(),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store.usage_fence(deadline()).unwrap().usage().accounts,
+        MAX_ACCOUNTS
+    );
+    assert_eq!(
+        store.create_account(
+            AccountId::from_bytes(u128::from(MAX_ACCOUNTS).to_be_bytes()),
+            deadline()
+        ),
+        Err(CommitError::Rejected(ports::Error::Capacity))
+    );
+    assert_eq!(
+        store.usage_fence(deadline()).unwrap().usage().accounts,
+        MAX_ACCOUNTS
+    );
+}
+#[test]
+fn dropping_old_views_under_the_fence_returns_or_retires_their_pool_slot() {
+    for refuse_cleanup in [false, true] {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([27; 16]),
+            Arc::new(Timer(AtomicU64::new(1))),
+            1,
+            deadline(),
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        let view = store.view(ACCOUNT, deadline()).unwrap();
+        if refuse_cleanup {
+            lock(&view.native().unwrap().connection)
+                .unwrap()
+                .authorizer(Some(|context: AuthContext<'_>| {
+                    if matches!(context.action, AuthAction::Transaction { .. }) {
+                        Authorization::Deny
+                    } else {
+                        Authorization::Allow
+                    }
+                }))
+                .unwrap();
+        }
+        let fence = store.usage_fence(deadline()).unwrap();
+        drop(view);
+        assert_eq!(
+            matches!(
+                lock(&store.readers).unwrap().first(),
+                Some(ReaderSlot::Retired)
+            ),
+            refuse_cleanup
+        );
+        drop(fence);
+        if refuse_cleanup {
+            assert_eq!(
+                store.view(ACCOUNT, deadline()).err(),
+                Some(ports::Error::Busy)
+            );
+        } else {
+            drop(store.view(ACCOUNT, deadline()).unwrap());
+        }
+    }
+}
+#[test]
+fn whole_store_vm_allowance_is_not_refreshed_between_accounts() {
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let store = IndexStore::create(
+        &mut root,
+        StoreEpoch::from_bytes([28; 16]),
+        Arc::new(Timer(AtomicU64::new(1))),
+        1,
+        deadline(),
+    )
+    .unwrap();
+    store.create_account(ACCOUNT, deadline()).unwrap();
+    drop(store.usage_fence(deadline()).unwrap());
+    let one_account = VM_STEPS
+        - lock(&lock(&store.writer).unwrap().native.budget)
+            .unwrap()
+            .remaining;
+    store.create_account(OTHER, deadline()).unwrap();
+    let budget = Arc::clone(&lock(&store.writer).unwrap().native.budget);
+    let events = Arc::new(AtomicU64::new(0));
+    let hits = Arc::clone(&events);
+    lock(&lock(&store.writer).unwrap().native.connection)
+        .unwrap()
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if matches!(context.action, AuthAction::Transaction { .. })
+                && hits.fetch_add(1, Ordering::Relaxed) == 0
+            {
+                lock(&budget).unwrap().remaining = one_account + 8;
+            }
+            Authorization::Allow
+        }))
+        .unwrap();
+    assert_eq!(
+        store.usage_fence(deadline()).err(),
+        Some(ports::Error::Capacity)
+    );
+    let writer = lock(&store.writer).unwrap();
+    assert!(!writer.stopped);
+    let db = lock(&writer.native.connection).unwrap();
+    assert!(db.is_autocommit());
+    db.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+    drop(db);
+    drop(writer);
+    assert_eq!(events.load(Ordering::Relaxed), 2);
+    assert_eq!(store.usage_fence(deadline()).unwrap().usage().accounts, 2);
+}
+#[test]
+fn expiry_during_capture_or_cleanup_rolls_back_without_stopping_the_writer() {
+    for during_cleanup in [false, true] {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let clock = Arc::new(Timer(AtomicU64::new(1)));
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([29; 16]),
+            clock.clone(),
+            1,
+            deadline(),
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        let timer = Arc::clone(&clock);
+        let events = Arc::new(AtomicU64::new(0));
+        let hits = Arc::clone(&events);
+        lock(&lock(&store.writer).unwrap().native.connection)
+            .unwrap()
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                let expire = if during_cleanup {
+                    matches!(context.action, AuthAction::Transaction { .. })
+                        && hits.fetch_add(1, Ordering::Relaxed) == 1
+                } else if matches!(
+                    context.action,
+                    AuthAction::Read {
+                        table_name: "blobs",
+                        ..
+                    }
+                ) {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    true
+                } else {
+                    false
+                };
+                if expire {
+                    timer.0.store(100, Ordering::Relaxed);
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+        assert_eq!(
+            store.usage_fence(deadline()).err(),
+            Some(ports::Error::Deadline)
+        );
+        assert!(events.load(Ordering::Relaxed) > 0);
+        let writer = lock(&store.writer).unwrap();
+        assert!(!writer.stopped);
+        let db = lock(&writer.native.connection).unwrap();
+        assert!(db.is_autocommit());
+        db.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        drop(db);
+        drop(writer);
+        clock.0.store(1, Ordering::Relaxed);
+        assert_eq!(store.usage_fence(deadline()).unwrap().usage().accounts, 1);
+    }
+}
