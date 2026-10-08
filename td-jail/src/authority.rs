@@ -2080,24 +2080,9 @@ pub(crate) fn require_grant_mount_identities(
     allowed_home_mounts: &BTreeSet<MountIdentity>,
     other_home_mounts: &BTreeSet<MountIdentity>,
 ) -> io::Result<()> {
-    let reserved_overlap = source_mounts.iter().find_map(|source_mount| {
-        reserved_mounts.iter().find_map(|reserved_mount| {
-            if !mount_identities_overlap(source_mount, reserved_mount) {
-                return None;
-            }
-            // A maintenance mount of the filesystem root contains the whole
-            // home; binding one home child does not carry its reserved siblings.
-            let reservation_contains_home = reserved_mount.device == allowed_home_mount.device
-                && reserved_mount.root != allowed_home_mount.root
-                && path_is_same_or_child(&allowed_home_mount.root, &reserved_mount.root);
-            let source_is_below_home = source_mount.device == allowed_home_mount.device
-                && source_mount.root != allowed_home_mount.root
-                && path_is_same_or_child(&source_mount.root, &allowed_home_mount.root);
-            (!(reservation_contains_home && source_is_below_home))
-                .then_some((source_mount, reserved_mount))
-        })
-    });
-    if let Some((source_mount, reserved_mount)) = reserved_overlap {
+    if let Some((source_mount, reserved_mount)) =
+        reserved_alias(source_mounts, reserved_mounts, allowed_home_mount)
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -2139,6 +2124,33 @@ pub(crate) fn require_grant_mount_identities(
         }
     }
     Ok(())
+}
+
+/// The first source identity that aliases a reserved one, and that
+/// reserved one. A reserved identity that strictly contains `home` (a
+/// maintenance mount of the filesystem root, as td's `/run/td-volume`)
+/// does not reject a source strictly below `home`: binding one home child
+/// does not carry its reserved siblings.
+pub(crate) fn reserved_alias<'a>(
+    source_mounts: &'a BTreeSet<MountIdentity>,
+    reserved_mounts: &'a BTreeSet<MountIdentity>,
+    home: &MountIdentity,
+) -> Option<(&'a MountIdentity, &'a MountIdentity)> {
+    source_mounts.iter().find_map(|source_mount| {
+        reserved_mounts.iter().find_map(|reserved_mount| {
+            if !mount_identities_overlap(source_mount, reserved_mount) {
+                return None;
+            }
+            let reservation_contains_home = reserved_mount.device == home.device
+                && reserved_mount.root != home.root
+                && path_is_same_or_child(&home.root, &reserved_mount.root);
+            let source_is_below_home = source_mount.device == home.device
+                && source_mount.root != home.root
+                && path_is_same_or_child(&source_mount.root, &home.root);
+            (!(reservation_contains_home && source_is_below_home))
+                .then_some((source_mount, reserved_mount))
+        })
+    })
 }
 
 pub(crate) fn mount_identities_outside_allowed_home(

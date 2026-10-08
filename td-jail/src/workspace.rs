@@ -599,7 +599,9 @@ fn admit(
                 program.display()
             )));
         }
-        if authority::mount_identity_sets_overlap(&mounts, &reserved_mounts) {
+        // The home as it resolves, last of its spellings (`resolve`), as an
+        // application grant's check takes it.
+        if aliases_reserved(&mounts, &reserved_mounts, homes.last()) {
             return Err(invalid(format!(
                 "workspace directory {} aliases a reserved tree",
                 grant.source.display()
@@ -880,6 +882,22 @@ fn contains_by_identity(
     outer.device == inner.device && path_is_same_or_child(&inner.root, &outer.root)
 }
 
+/// Whether a directory's `mounts` alias a reserved tree: a reservation
+/// strictly containing the caller's resolved `home`, as td's maintenance
+/// mount of its volume at `/run/td-volume` does, admits a directory
+/// strictly below that home, as an application grant's check does. With
+/// no home placed, every alias refuses.
+fn aliases_reserved(
+    mounts: &std::collections::BTreeSet<authority::MountIdentity>,
+    reserved: &std::collections::BTreeSet<authority::MountIdentity>,
+    home: Option<&authority::MountIdentity>,
+) -> bool {
+    match home {
+        Some(home) => authority::reserved_alias(mounts, reserved, home).is_some(),
+        None => authority::mount_identity_sets_overlap(mounts, reserved),
+    }
+}
+
 fn reserved_identities(
     mountinfo: &str,
     reserved: &[&str],
@@ -935,6 +953,65 @@ fn invalid(message: impl Into<String>) -> io::Error {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// td's mounts: a read-only root, the persistent `@var` subvolume at
+    /// `/var` (where `/home` resolves), and the whole volume, root and all,
+    /// at `/run/td-volume` for updates.
+    const TD_MOUNTINFO: &str = "\
+20 1 7:0 / / ro - erofs /dev/loop0 ro
+30 20 0:35 /@var /var rw,nodev,nosuid - btrfs /dev/vda rw
+31 20 0:20 / /run rw,nosuid,nodev - tmpfs tmpfs rw
+32 31 0:35 / /run/td-volume rw,nodev,nosuid,noexec - btrfs /dev/vda rw
+33 20 0:21 / /tmp rw - tmpfs tmpfs rw
+";
+
+    #[test]
+    fn on_td_a_directory_below_the_home_is_not_the_volumes_maintenance_mount() {
+        let identity =
+            |path: &str| authority::mount_identity_for_path(TD_MOUNTINFO, Path::new(path)).unwrap();
+        let tree =
+            |path: &str| authority::mount_tree_identities(TD_MOUNTINFO, Path::new(path)).unwrap();
+        let mut reserved = std::collections::BTreeSet::new();
+        for root in ["/run", "/var/tmp", "/tmp"] {
+            reserved.extend(tree(root));
+        }
+        // The home as it resolves; as passwd names it, through the root's
+        // link, it is placed on the root's own filesystem and exempts nothing.
+        let home = identity("/var/home/tester");
+        let passwd = identity("/home/tester");
+        for admitted in [
+            "/var/home/tester/.local/state/td-agent-check-0/tree",
+            "/var/home/tester/src/td",
+        ] {
+            assert!(
+                !aliases_reserved(&tree(admitted), &reserved, Some(&home)),
+                "{admitted}"
+            );
+            assert!(
+                aliases_reserved(&tree(admitted), &reserved, Some(&passwd)),
+                "{admitted}"
+            );
+        }
+        // The home itself, a reserved tree's own data, and anything on the
+        // volume outside the home stay refused.
+        for refused in [
+            "/var/home/tester",
+            "/var/tmp/x",
+            "/var/lib/x",
+            "/run/td-volume/@var",
+        ] {
+            assert!(
+                aliases_reserved(&tree(refused), &reserved, Some(&home)),
+                "{refused}"
+            );
+        }
+        // Without the home placed, every alias refuses, as before.
+        assert!(aliases_reserved(
+            &tree("/var/home/tester/src/td"),
+            &reserved,
+            None
+        ));
+    }
 
     #[test]
     fn the_spec_is_an_exact_ordered_keyfile() {

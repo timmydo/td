@@ -3581,7 +3581,13 @@ with the kind's own departures:
   reserved trees (`/bin`, `/boot`, `/dev`, `/etc`, `/gnu`, `/lib*`,
   `/nix`, `/opt`, `/proc`, `/run`, `/sbin`, `/sys`, `/td`, `/tmp`,
   `/usr`, `/var/tmp`, a linked one by what it resolves to), by path or by mount
-  identity, and one that is or contains the caller's own home, as passwd
+  identity. As for an application grant, a reserved mount identity that
+  strictly contains the identity of the caller's home as it resolves
+  (td's maintenance mount of its whole volume at `/run/td-volume`) does
+  not by itself refuse a directory whose identity lies strictly below
+  that home's: the directory does not carry its reserved siblings.
+  Refused too is a directory that
+  is or contains the caller's own home, as passwd
   spells it, as it resolves, or through a bind mount of it or of a
   directory above it anywhere in the tree: the home is absent except for
   what lies inside it and was admitted. A tree carrying a
