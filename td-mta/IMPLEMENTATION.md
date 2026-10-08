@@ -2318,7 +2318,10 @@ immutable queue identity/uncertainty/attempt-history fields are implemented
 in the core, including one-way Pending/Stored failure-notice history and
 terminal recipient state/attempt/phase/reply/reason/uncertainty preservation.
 Existing None notices require a separate Pending commit before Stored, and
-already completed submissions with None retain None.
+already completed submissions with None retain None. From a consistent
+original group, first cancellation cannot introduce Pending: the core
+rejects matching final Canceled recipient PUTs on an existing None-to-Pending
+submission update.
 The core also preserves an existing completedAt timestamp through later
 updates and cancellation, without proving its clock authority.
 STORAGE.md also defines reply retention outside active attempts, RCPT

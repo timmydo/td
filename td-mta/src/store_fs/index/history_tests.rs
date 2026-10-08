@@ -349,6 +349,65 @@ fn maximum_distinct_encoded_history_batch_fits_a_production_commit_deadline() {
         commit_encoded(&store, request(sequence), &operations, &mut []),
         Ok(Sequence::from_u64(sequence + 1))
     );
+    sequence += 1;
+    let ids: Vec<_> = (0u16..2048)
+        .map(|ordinal| {
+            let mut bytes = [40; 16];
+            bytes[..2].copy_from_slice(&ordinal.to_be_bytes());
+            SubmissionId::from_bytes(bytes)
+        })
+        .collect();
+    let keys: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            let mut key = [0; 20];
+            Key::Recipient(*id, 0).encode(&mut key).unwrap();
+            key
+        })
+        .collect();
+    let initial = encode(Row::Submission(submission(1)));
+    let mut setup = Vec::new();
+    for (id, key) in ids.iter().zip(&keys) {
+        setup.extend([
+            Operation::put(Table::Submissions, id.as_bytes(), &initial).unwrap(),
+            Operation::put(Table::Recipients, key, &recipient).unwrap(),
+        ]);
+    }
+    assert_eq!(setup.len(), 4096);
+    assert_eq!(
+        commit_encoded(&store, request(sequence), &setup, &mut []),
+        Ok(Sequence::from_u64(sequence + 1))
+    );
+    sequence += 1;
+    let completed = encode(Row::Submission(SubmissionRow {
+        completed_at: Some(2),
+        notification: NotificationState::Pending,
+        ..submission(1)
+    }));
+    let failed = encode(Row::Recipient(RecipientRow {
+        state: RecipientState::Failed,
+        reason: FailureReason::Expired,
+        next_attempt_at: None,
+        ..queued()
+    }));
+    let mut notices = Vec::new();
+    for key in &keys {
+        notices.push(Operation::put(Table::Recipients, key, &failed).unwrap());
+    }
+    for id in &ids {
+        notices.push(Operation::put(Table::Submissions, id.as_bytes(), &completed).unwrap());
+    }
+    assert_eq!(notices.len(), 4096);
+    let started = std::time::Instant::now();
+    assert_eq!(
+        commit_encoded(&store, request(sequence), &notices, &mut []),
+        Ok(Sequence::from_u64(sequence + 1))
+    );
+    eprintln!(
+        "2048 notice completions: {:?}; debug_assertions={}",
+        started.elapsed(),
+        cfg!(debug_assertions)
+    );
 }
 
 fn failed_notice(
@@ -534,66 +593,86 @@ fn a_stored_notice_keeps_its_historical_email_identity() {
 #[test]
 fn notice_history_does_not_prove_service_notice_creation() {
     for encoded in [false, true] {
-        let fixture = Fixture::new();
-        let mut root = fixture.locked();
-        let store = open(&mut root);
-        create(&store, 1, &[0]).unwrap();
-        let mut recipient = queued();
-        recipient.state = RecipientState::Canceled;
-        recipient.reason = FailureReason::Canceled;
-        recipient.next_attempt_at = None;
-        let mut sub = submission(1);
-        sub.completed_at = Some(1);
-        // First-cancellation notice creation still needs coordinator validation.
-        sub.notification = NotificationState::Pending;
-        let key = recipient_key(0);
-        let recipient_bytes = encode(Row::Recipient(recipient));
-        let sub_bytes = encode(Row::Submission(sub));
-        let email = EmailId::from_bytes([14; 16]);
-        let mut skipped = sub;
-        skipped.notification = NotificationState::Stored;
-        skipped.notification_email = Some(email);
-        let skipped_bytes = encode(Row::Submission(skipped));
-        assert_eq!(
+        for state in [RecipientState::Failed, RecipientState::Canceled] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = open(&mut root);
+            create(&store, 1, &[0]).unwrap();
+            let mut recipient = queued();
+            recipient.state = state;
+            recipient.reason = if state == RecipientState::Canceled {
+                FailureReason::Canceled
+            } else {
+                FailureReason::Expired
+            };
+            recipient.next_attempt_at = None;
+            let mut sub = submission(1);
+            sub.completed_at = Some(1);
+            sub.notification = NotificationState::Pending;
+            let key = recipient_key(0);
+            let recipient_bytes = encode(Row::Recipient(recipient));
+            let sub_bytes = encode(Row::Submission(sub));
+            let email = EmailId::from_bytes([14; 16]);
+            let mut skipped = sub;
+            skipped.notification = NotificationState::Stored;
+            skipped.notification_email = Some(email);
+            let skipped_bytes = encode(Row::Submission(skipped));
+            assert_eq!(
+                apply(
+                    &store,
+                    1,
+                    &[
+                        Operation::put(Table::Recipients, &key, &recipient_bytes).unwrap(),
+                        Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &skipped_bytes)
+                            .unwrap(),
+                    ],
+                    encoded,
+                ),
+                Err(CommitError::Rejected(ports::Error::Conflict))
+            );
+            assert_submission(&store, submission(1), 1);
+            assert_recipient(&store, queued());
+            if state == RecipientState::Canceled {
+                rejected(apply(
+                    &store,
+                    1,
+                    &[
+                        Operation::put(Table::Recipients, &key, &recipient_bytes).unwrap(),
+                        Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes)
+                            .unwrap(),
+                    ],
+                    encoded,
+                ));
+                assert_submission(&store, submission(1), 1);
+                assert_recipient(&store, queued());
+                continue;
+            }
             apply(
                 &store,
                 1,
                 &[
                     Operation::put(Table::Recipients, &key, &recipient_bytes).unwrap(),
-                    Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &skipped_bytes)
-                        .unwrap(),
+                    Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes).unwrap(),
                 ],
                 encoded,
-            ),
-            Err(CommitError::Rejected(ports::Error::Conflict))
-        );
-        assert_submission(&store, submission(1), 1);
-        assert_recipient(&store, queued());
-        apply(
-            &store,
-            1,
-            &[
-                Operation::put(Table::Recipients, &key, &recipient_bytes).unwrap(),
-                Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes).unwrap(),
-            ],
-            encoded,
-        )
-        .unwrap();
-        assert_submission(&store, sub, 2);
-        sub.notification = NotificationState::Stored;
-        sub.notification_email = Some(email);
-        let stored = encode(Row::Submission(sub));
-        apply(
-            &store,
-            2,
-            &[Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &stored).unwrap()],
-            encoded,
-        )
-        .unwrap();
-        assert_submission(&store, sub, 3);
-        let mut view = store.view(ACCOUNT, deadline()).unwrap();
-        let mut scratch = [0; 65536];
-        assert!(view.get(Key::Email(email), &mut scratch).unwrap().is_none());
+            )
+            .unwrap();
+            assert_submission(&store, sub, 2);
+            sub.notification = NotificationState::Stored;
+            sub.notification_email = Some(email);
+            let stored = encode(Row::Submission(sub));
+            apply(
+                &store,
+                2,
+                &[Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &stored).unwrap()],
+                encoded,
+            )
+            .unwrap();
+            assert_submission(&store, sub, 3);
+            let mut view = store.view(ACCOUNT, deadline()).unwrap();
+            let mut scratch = [0; 65536];
+            assert!(view.get(Key::Email(email), &mut scratch).unwrap().is_none());
+        }
     }
 }
 
@@ -1817,4 +1896,265 @@ fn completed_cancellation_without_notice_cannot_acquire_one() {
         unexpected.is_empty(),
         "completed cancellation acquired notice: {unexpected:?}"
     );
+}
+
+#[test]
+fn first_cancellation_cannot_create_a_pending_notice() {
+    #[derive(Clone, Copy, Debug)]
+    enum Intermediate {
+        Direct,
+        Failed,
+        Delete,
+    }
+    let canceled = RecipientRow {
+        state: RecipientState::Canceled,
+        reason: FailureReason::Canceled,
+        next_attempt_at: None,
+        ..queued()
+    };
+    let failed = RecipientRow {
+        state: RecipientState::Failed,
+        reason: FailureReason::Expired,
+        next_attempt_at: None,
+        ..queued()
+    };
+    let mut unexpected = Vec::new();
+    for encoded in [false, true] {
+        for count in [1, 2] {
+            let pending = SubmissionRow {
+                completed_at: Some(2),
+                notification: NotificationState::Pending,
+                ..submission(count)
+            };
+            let fresh: Vec<_> = (0..count).map(|ordinal| (ordinal, canceled)).collect();
+            assert_fresh_group(pending, &fresh, encoded);
+            for intermediate in [
+                Intermediate::Direct,
+                Intermediate::Failed,
+                Intermediate::Delete,
+            ] {
+                for parent_first in [false, true] {
+                    let fixture = Fixture::new();
+                    let mut root = fixture.locked();
+                    let store = open(&mut root);
+                    let originals: Vec<_> = (0..count).map(|ordinal| (ordinal, queued())).collect();
+                    create_group(&store, submission(count), &originals, encoded).unwrap();
+                    let keys: Vec<_> = (0..count).map(recipient_key).collect();
+                    let canceled_bytes = encode(Row::Recipient(canceled));
+                    let failed_bytes = encode(Row::Recipient(failed));
+                    let pending_bytes = encode(Row::Submission(pending));
+                    let parent =
+                        Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &pending_bytes)
+                            .unwrap();
+                    let mut operations = Vec::new();
+                    if parent_first {
+                        operations.push(parent);
+                    }
+                    for key in &keys {
+                        match intermediate {
+                            Intermediate::Direct => {}
+                            Intermediate::Failed => operations.push(
+                                Operation::put(Table::Recipients, key, &failed_bytes).unwrap(),
+                            ),
+                            Intermediate::Delete => {
+                                operations.push(Operation::delete(Table::Recipients, key).unwrap())
+                            }
+                        }
+                        operations
+                            .push(Operation::put(Table::Recipients, key, &canceled_bytes).unwrap());
+                    }
+                    if !parent_first {
+                        operations.push(parent);
+                    }
+                    let result = apply(&store, 1, &operations, encoded);
+                    if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                        unexpected.push((encoded, count, intermediate, parent_first, result));
+                        continue;
+                    }
+                    assert_submission(&store, submission(count), 1);
+                    {
+                        let mut view = store.view(ACCOUNT, deadline()).unwrap();
+                        let mut scratch = [0; 1024];
+                        for ordinal in 0..count {
+                            assert_eq!(
+                                view.get(Key::Recipient(SUBMISSION, ordinal), &mut scratch)
+                                    .unwrap()
+                                    .unwrap()
+                                    .0,
+                                Row::Recipient(queued())
+                            );
+                        }
+                    }
+                    // Intermediate cancellation must not defeat a final legitimate failure.
+                    let mut repaired = Vec::new();
+                    if parent_first {
+                        repaired.push(parent);
+                    }
+                    for key in &keys {
+                        repaired
+                            .push(Operation::put(Table::Recipients, key, &canceled_bytes).unwrap());
+                        match intermediate {
+                            Intermediate::Direct => {}
+                            Intermediate::Failed => repaired.push(
+                                Operation::put(Table::Recipients, key, &failed_bytes).unwrap(),
+                            ),
+                            Intermediate::Delete => {
+                                repaired.push(Operation::delete(Table::Recipients, key).unwrap())
+                            }
+                        }
+                        repaired
+                            .push(Operation::put(Table::Recipients, key, &failed_bytes).unwrap());
+                    }
+                    if !parent_first {
+                        repaired.push(parent);
+                    }
+                    assert_eq!(
+                        apply(&store, 1, &repaired, encoded),
+                        Ok(Sequence::from_u64(2))
+                    );
+                    assert_submission(&store, pending, 2);
+                    let mut view = store.view(ACCOUNT, deadline()).unwrap();
+                    let mut scratch = [0; 1024];
+                    for ordinal in 0..count {
+                        assert_eq!(
+                            view.get(Key::Recipient(SUBMISSION, ordinal), &mut scratch)
+                                .unwrap()
+                                .unwrap()
+                                .0,
+                            Row::Recipient(failed)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "first cancellation created notice: {unexpected:?}"
+    );
+}
+
+#[test]
+fn cancellation_in_another_submission_does_not_block_a_failure_notice() {
+    for encoded in [false, true] {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = open(&mut root);
+        create_group(&store, submission(1), &[(0, queued())], encoded).unwrap();
+        let other = SubmissionId::from_bytes([25; 16]);
+        let mut other_key = [0; 20];
+        Key::Recipient(other, 0).encode(&mut other_key).unwrap();
+        let queued_bytes = encode(Row::Recipient(queued()));
+        let initial_bytes = encode(Row::Submission(submission(1)));
+        apply(
+            &store,
+            1,
+            &[
+                Operation::put(Table::Submissions, other.as_bytes(), &initial_bytes).unwrap(),
+                Operation::put(Table::Recipients, &other_key, &queued_bytes).unwrap(),
+            ],
+            encoded,
+        )
+        .unwrap();
+        let completed = SubmissionRow {
+            completed_at: Some(2),
+            ..submission(1)
+        };
+        let pending = SubmissionRow {
+            notification: NotificationState::Pending,
+            ..completed
+        };
+        let failed = RecipientRow {
+            state: RecipientState::Failed,
+            reason: FailureReason::Expired,
+            next_attempt_at: None,
+            ..queued()
+        };
+        let canceled = RecipientRow {
+            state: RecipientState::Canceled,
+            reason: FailureReason::Canceled,
+            next_attempt_at: None,
+            ..queued()
+        };
+        let key = recipient_key(0);
+        let pending_bytes = encode(Row::Submission(pending));
+        let completed_bytes = encode(Row::Submission(completed));
+        let failed_bytes = encode(Row::Recipient(failed));
+        let canceled_bytes = encode(Row::Recipient(canceled));
+        assert_eq!(
+            apply(
+                &store,
+                2,
+                &[
+                    Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &pending_bytes)
+                        .unwrap(),
+                    Operation::put(Table::Recipients, &other_key, &canceled_bytes).unwrap(),
+                    Operation::put(Table::Recipients, &key, &failed_bytes).unwrap(),
+                    Operation::put(Table::Submissions, other.as_bytes(), &completed_bytes).unwrap(),
+                ],
+                encoded
+            ),
+            Ok(Sequence::from_u64(3))
+        );
+        assert_submission(&store, pending, 3);
+        assert_recipient(&store, failed);
+        let mut view = store.view(ACCOUNT, deadline()).unwrap();
+        let mut scratch = [0; 1024];
+        assert_eq!(
+            view.get(Key::Submission(other), &mut scratch)
+                .unwrap()
+                .unwrap()
+                .0,
+            Row::Submission(completed)
+        );
+        assert_eq!(
+            view.get(Key::Recipient(other, 0), &mut scratch)
+                .unwrap()
+                .unwrap()
+                .0,
+            Row::Recipient(canceled)
+        );
+    }
+}
+
+#[test]
+fn first_cancellation_notice_check_uses_the_final_submission_put() {
+    for encoded in [false, true] {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = open(&mut root);
+        create_group(&store, submission(1), &[(0, queued())], encoded).unwrap();
+        let canceled = RecipientRow {
+            state: RecipientState::Canceled,
+            reason: FailureReason::Canceled,
+            next_attempt_at: None,
+            ..queued()
+        };
+        let completed = SubmissionRow {
+            completed_at: Some(2),
+            ..submission(1)
+        };
+        let pending = SubmissionRow {
+            notification: NotificationState::Pending,
+            ..completed
+        };
+        let key = recipient_key(0);
+        let canceled_bytes = encode(Row::Recipient(canceled));
+        let completed_bytes = encode(Row::Submission(completed));
+        let pending_bytes = encode(Row::Submission(pending));
+        let cancel = Operation::put(Table::Recipients, &key, &canceled_bytes).unwrap();
+        let good =
+            Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &completed_bytes).unwrap();
+        let bad =
+            Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &pending_bytes).unwrap();
+        rejected(apply(&store, 1, &[good, cancel, bad], encoded));
+        assert_submission(&store, submission(1), 1);
+        assert_recipient(&store, queued());
+        assert_eq!(
+            apply(&store, 1, &[bad, cancel, good], encoded),
+            Ok(Sequence::from_u64(2))
+        );
+        assert_submission(&store, completed, 2);
+        assert_recipient(&store, canceled);
+    }
 }

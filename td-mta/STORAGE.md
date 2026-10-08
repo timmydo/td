@@ -152,17 +152,25 @@ prior commitment. If the original submission was already completed with
 None, its notice must remain None. A Pending failure notice cannot return
 to None. A Stored notice must remain Stored with its original historical
 notificationEmail, even after the visible Email is deleted.
-Cancellation preserves either retained notice state. Recipient address is
-immutable and uncertainty cannot clear. A changed attemptCount must be exactly
-one checked increment, with an attempt ID different from the immediately
-previous row. Its original state must be Queued, RetryWait or OutcomeUnknown
-with a next attempt, and its final state must be InFlight/Prepared. An active
-InFlight attempt cannot be replaced by incrementing the count. A count-advancing
-Prepared update must carry an empty diagnostic; nonempty text refuses with
-Conflict rather than being normalized by the adapter. Prepared and
-a later phase cannot be combined into one count-advancing transaction: the
-final PUT is compared with the original row. This constrains stored history;
-it does not prove when the caller performs transport I/O.
+Cancellation preserves either retained notice state. For an existing
+None-to-Pending update, a surviving final Canceled recipient PUT for the same
+submission causes Conflict. With the final whole-group checks, this prevents
+first cancellation creating a notice from an initially consistent group:
+an unfinished valid group contains no Canceled recipients, so its first
+cancellation must write one. An already completed None submission cannot
+gain Pending either. This does not replace startup validation of the
+original group.
+Recipient address is immutable and uncertainty cannot clear. A changed
+attemptCount must be exactly one checked increment, with an attempt ID
+different from the immediately previous row. Its original state must be
+Queued, RetryWait or OutcomeUnknown with a next attempt, and its final
+state must be InFlight/Prepared. An active InFlight attempt cannot be
+replaced by incrementing the count. A count-advancing Prepared update must
+carry an empty diagnostic; nonempty text refuses with Conflict rather than
+being normalized by the adapter. Prepared and a later phase cannot be
+combined into one count-advancing transaction: the final PUT is compared
+with the original row. This constrains stored history; it does not prove
+when the caller performs transport I/O.
 If the original recipient is not InFlight, both reply fields stay
 unchanged, including on dispatch into a new Prepared attempt. A final
 Canceled row also retains both original replies, including cancellation
@@ -238,10 +246,22 @@ writer scratch. DELETE positions and PUTs without an original row skip the
 later-key scan. At most 4096 original point reads and 8386560 later-key
 projections are possible; repeated keys may repeat an original point read.
 The quadratic scan samples the original deadline at least every 64 bounded
-key projections and before final value decoding; all SQL shares the original
-native allowance. The maximum-batch test is fixture evidence, not a promise
-that every store/host can finish within its deadline.
-
+key projections and before final value decoding; all SQL shares the
+original native allowance. The additional notice scan visits every
+operation position, projecting queue PUT keys for each qualifying final
+submission PUT and checks later keys before decoding matching survivors.
+With N operations, S qualifying submission PUTs and M recipient PUT
+positions belonging to those submissions, S + M <= N: each recipient
+belongs to at most one qualifying submission. The additional projections
+are at most S*N + M*N <= N*N, or 16777216 at N=4096, plus at most 4096
+recipient value decodes. The combined later-key and additional-scan
+ceiling is 25163776 projections. There are no additional SQL reads or
+allocations. Each forward scan checks the original deadline every 64
+projections; the notice scan also checks immediately after its nested
+later-key scan, including superseded PUTs, and before decoding. The
+maximum-batch test covers both recipient history and 2048 simultaneous
+notice completions. It is fixture evidence, not a promise that every
+store/host can finish within its deadline.
 This preserves named history fields, not the full transition graph. The
 counter/ID comparison does not authorize dispatch or prove random/global ID
 freshness: the service must obtain a fresh ID from Entropy, reject collisions,
@@ -261,12 +281,10 @@ The core does not validate the timestamp against the current clock or sendAt;
 clock validation and retention/deletion authorization remain service work.
 Preserving notice history does not prove the referenced failure Email was
 created.
-The service must forbid creation of a new notice solely for cancellation
-and atomically create the failure Email with the Stored transition. The
-core still accepts Pending introduced when a previously unfinished group
-first becomes wholly Canceled. Initial notice state on newly created rows
-is not authorized by this history check, and Stored still does not require
-Email creation; these are explicit service-layer gaps.
+The service must authorize initial notice state on newly created rows and
+atomically create the failure Email with the Stored transition. New rows
+have no original history for this guard to compare, and Stored still does
+not require Email creation; these are explicit service-layer gaps.
 Once committed, the retained history cannot be repaired by clearing the
 notice state or replacing its historical Email ID.
 

@@ -18,17 +18,7 @@ pub(super) fn validate(
         let Some((previous, _)) = view.get(key, scratch)? else {
             continue;
         };
-        let mut replaced = false;
-        for (scan, later) in (position + 1..operations.len()).enumerate() {
-            if scan % 64 == 0 {
-                native.check()?;
-            }
-            if operations.queue_key(later)? == Some(key) {
-                replaced = true;
-                break;
-            }
-        }
-        if replaced {
+        if !is_final(native, operations, position, key)? {
             continue;
         }
         native.check()?;
@@ -36,9 +26,16 @@ pub(super) fn validate(
             continue;
         };
 
-        let valid = match (previous, row) {
-            (Row::Submission(previous), Row::Submission(next)) => submission(previous, next),
-            (Row::Recipient(previous), Row::Recipient(next)) => recipient(previous, next),
+        let valid = match (key, previous, row) {
+            (Key::Submission(id), Row::Submission(previous), Row::Submission(next)) => {
+                submission(previous, next)
+                    && (previous.notification != NotificationState::None
+                        || next.notification != NotificationState::Pending
+                        || !has_final_cancellation(native, operations, id)?)
+            }
+            (Key::Recipient(_, _), Row::Recipient(previous), Row::Recipient(next)) => {
+                recipient(previous, next)
+            }
             _ => return Err(ports::Error::Corrupt),
         };
         if !valid {
@@ -47,6 +44,57 @@ pub(super) fn validate(
     }
     Ok(())
 }
+fn is_final(
+    native: &Native,
+    operations: Operations<'_, '_>,
+    position: usize,
+    key: Key<'_>,
+) -> Result<bool, ports::Error> {
+    for (scan, later) in (position + 1..operations.len()).enumerate() {
+        if scan % 64 == 0 {
+            native.check()?;
+        }
+        if operations.queue_key(later)? == Some(key) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn has_final_cancellation(
+    native: &Native,
+    operations: Operations<'_, '_>,
+    submission: crate::ids::SubmissionId,
+) -> Result<bool, ports::Error> {
+    for position in 0..operations.len() {
+        if position % 64 == 0 {
+            native.check()?;
+        }
+        let Some(key @ Key::Recipient(id, _)) = operations.queue_put_key(position)? else {
+            continue;
+        };
+        if id != submission {
+            continue;
+        }
+        let survives = is_final(native, operations, position, key)?;
+        native.check()?;
+        if !survives {
+            continue;
+        }
+        let Value::Row(Mutation::Put {
+            row: Row::Recipient(row),
+            ..
+        }) = operations.get(position)?.value()
+        else {
+            return Err(ports::Error::Corrupt);
+        };
+        if row.state == RecipientState::Canceled {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn submission(old: SubmissionRow<'_>, next: SubmissionRow<'_>) -> bool {
     old.email == next.email
         && old.thread == next.thread

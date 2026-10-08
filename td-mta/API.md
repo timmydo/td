@@ -6616,21 +6616,23 @@ reply provenance. Indexed point/successor reads reuse writer scratch and the
 original deadline/VM fuel. Inconsistent groups reject with
 Conflict; native deadline, capacity and I/O errors retain their classifications.
 Before row writes, surviving queue PUTs preserve STORAGE.md's immutable
-identity, uncertainty, attempt-history and failure-notice fields against the
-original rows. Existing None notices cannot advance directly to Stored;
-Pending must commit first. An already completed submission with None must
-retain None. A present completedAt also retains its exact original value
-across surviving submission PUTs, including whole-group cancellation;
-initial completion does not impose timestamp chronology. STORAGE.md
-defines reply retention outside active attempts, RCPT retention after an
-active attempt reaches Body, both-reply retention on cancellation, and the
-empty-diagnostic requirement on attempt-count advances. It also defines
-count/ID progression, eligible-source/Prepared-entry checks, adjacent
-active phase advances, and acceptance/cancellation and DATA-reply
-requirements for certain outcomes from existing AcceptancePossible
-attempts. Remaining outcome transitions, other reply updates, phase
-changes outside InFlight and transport ordering still require coordinator
-validation.
+identity, uncertainty, attempt-history and failure-notice fields against
+the original rows. Existing None notices cannot advance directly to
+Stored; Pending must commit first. An already completed submission with
+None must retain None. An existing None-to-Pending update also refuses a
+final Canceled recipient PUT for that submission; STORAGE.md defines the
+scan bound and the initially consistent group requirement. A present
+completedAt also retains its exact original value across surviving
+submission PUTs, including whole-group cancellation; initial completion
+does not impose timestamp chronology. STORAGE.md defines reply retention
+outside active attempts, RCPT retention after an active attempt reaches
+Body, both-reply retention on cancellation, and the empty-diagnostic
+requirement on attempt-count advances. It also defines count/ID
+progression, eligible-source/Prepared-entry checks, adjacent active phase
+advances, and acceptance/cancellation and DATA-reply requirements for
+certain outcomes from existing AcceptancePossible attempts. Remaining
+outcome transitions, other reply updates, phase changes outside InFlight
+and transport ordering still require coordinator validation.
 Terminal recipients cannot regain dispatch obligations or a new attempt;
 Accepted/Canceled remain in their states, Failed can only remain
 Failed or join a valid whole-group cancellation, and terminal OutcomeUnknown
