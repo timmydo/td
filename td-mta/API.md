@@ -6571,7 +6571,9 @@ Indexed `get` returns a reborrowed locally valid Operation, never a copied
 row arena. FORMAT.md owns exact framing, limits and provisional-output rules.
 This synchronous codec grants no reservation or account authority; caller
 work/deadline admission and the authenticated Store adapter remain separate.
-IndexStore still accepts the typed operation slice below.
+IndexStore::commit_batch accepts a borrowed complete Batch through the same
+transaction path as the typed operation slice. [STORAGE.md](STORAGE.md#atomic-body-and-metadata-commit)
+owns encoded replay, admission lifetime and prepared-source requirements.
 
 IndexStore::commit accepts Crypto, CommitRequest, a bounded Operation slice
 and a mutable slice of BlobSource { id, source: &mut dyn std::io::Read }.

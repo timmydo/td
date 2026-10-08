@@ -92,6 +92,14 @@ fn recipient_key(ordinal: u32) -> [u8; 20] {
     key
 }
 fn create(store: &IndexStore<'_>, count: u32, ordinals: &[u32]) -> Result<Sequence, CommitError> {
+    create_with(store, count, ordinals, false)
+}
+fn create_with(
+    store: &IndexStore<'_>,
+    count: u32,
+    ordinals: &[u32],
+    encoded: bool,
+) -> Result<Sequence, CommitError> {
     let body = b"a prepared message";
     let mut digest = td_crypto::Provider.sha256().unwrap();
     digest.update(body).unwrap();
@@ -117,15 +125,16 @@ fn create(store: &IndexStore<'_>, count: u32, ordinals: &[u32]) -> Result<Sequen
         keys.iter()
             .map(|key| Operation::put(Table::Recipients, key, &recipient).unwrap()),
     );
-    store.commit(
-        &td_crypto::Provider,
-        request(0),
-        &operations,
-        &mut [BlobSource {
-            id: BLOB,
-            source: &mut body.as_slice(),
-        }],
-    )
+    let mut body = body.as_slice();
+    let mut sources = [BlobSource {
+        id: BLOB,
+        source: &mut body,
+    }];
+    if encoded {
+        commit_encoded(store, request(0), &operations, &mut sources)
+    } else {
+        store.commit(&td_crypto::Provider, request(0), &operations, &mut sources)
+    }
 }
 fn rejected(result: Result<Sequence, CommitError>) {
     assert_eq!(result, Err(CommitError::Rejected(ports::Error::Conflict)));
@@ -527,4 +536,197 @@ fn expiry_inside_recipient_validation_rolls_back_the_whole_update() {
         ),
         Ok(Sequence::from_u64(2))
     );
+}
+
+fn commit_encoded(
+    store: &IndexStore<'_>,
+    request: CommitRequest,
+    operations: &[Operation<'_>],
+    sources: &mut [BlobSource<'_>],
+) -> Result<Sequence, CommitError> {
+    let length: usize = operations.iter().map(|op| op.encoded_len().unwrap()).sum();
+    let mut bytes = vec![0; length];
+    let mut offset = 0;
+    for operation in operations {
+        offset += operation.encode(&mut bytes[offset..]).unwrap();
+    }
+    let mut slots = vec![None; operations.len()];
+    let batch = crate::format::batch::Batch::decode(
+        ports::TransactionInput {
+            bytes: &bytes,
+            count: operations.len(),
+        },
+        &mut slots,
+    )
+    .unwrap();
+    store.commit_batch(&td_crypto::Provider, request, &batch, sources)
+}
+
+#[test]
+fn encoded_batches_share_body_rollback_group_validation_and_snapshots() {
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let store = open(&mut root);
+    rejected(create_with(&store, 2, &[0], true));
+    let ordinals: Vec<_> = (0..1000).collect();
+    create_with(&store, 1000, &ordinals, true).unwrap();
+    let mut old = store.view(ACCOUNT, deadline()).unwrap();
+    let key = recipient_key(999);
+    let mut changed = queued();
+    changed.diagnostic = "encoded update";
+    let row = encode(Row::Recipient(changed));
+    let operation = Operation::put(Table::Recipients, &key, &row).unwrap();
+    let repeated = vec![operation; 1000];
+    assert_eq!(
+        commit_encoded(&store, request(1), &repeated, &mut []),
+        Ok(Sequence::from_u64(2))
+    );
+    assert_eq!(
+        commit_encoded(&store, request(1), &[operation], &mut []),
+        Err(CommitError::Rejected(ports::Error::Conflict))
+    );
+    rejected(commit_encoded(
+        &store,
+        request(2),
+        &[Operation::delete(Table::Recipients, &key).unwrap()],
+        &mut [],
+    ));
+    let mut bytes = [0; 1024];
+    assert!(
+        matches!(old.get(Key::Recipient(SUBMISSION, 999), &mut bytes).unwrap(), Some((Row::Recipient(row), _)) if row.diagnostic.is_empty())
+    );
+    let mut fresh = store.view(ACCOUNT, deadline()).unwrap();
+    assert_eq!(fresh.identity().committed_sequence, Sequence::from_u64(2));
+    assert!(
+        matches!(fresh.get(Key::Recipient(SUBMISSION, 999), &mut bytes).unwrap(), Some((Row::Recipient(row), _)) if row.diagnostic == "encoded update")
+    );
+    drop(old);
+    drop(fresh);
+    store.validate_integrity(deadline()).unwrap();
+}
+
+fn blob_value(body: &[u8]) -> Vec<u8> {
+    let mut digest = td_crypto::Provider.sha256().unwrap();
+    digest.update(body).unwrap();
+    encode(Row::Blob(BlobRow {
+        kind: BlobKind::Message,
+        length: body.len() as u64,
+        digest: digest.finish().unwrap(),
+        created_at: 0,
+    }))
+}
+#[test]
+fn encoded_source_matching_refuses_delete_duplicates_and_unmatched_sources() {
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let store = open(&mut root);
+    let body = b"encoded source";
+    let row = blob_value(body);
+    let put = Operation::put(Table::Blobs, BLOB.as_bytes(), &row).unwrap();
+    let other = BlobId::from_bytes([99; 16]);
+    for operations in [
+        vec![Operation::delete(Table::Blobs, BLOB.as_bytes()).unwrap()],
+        vec![put, put],
+        vec![Operation::delete(Table::Blobs, other.as_bytes()).unwrap()],
+    ] {
+        let mut input = body.as_slice();
+        assert_eq!(
+            commit_encoded(
+                &store,
+                request(0),
+                &operations,
+                &mut [BlobSource {
+                    id: BLOB,
+                    source: &mut input
+                }]
+            ),
+            Err(CommitError::Rejected(ports::Error::Invalid))
+        );
+        assert_eq!(input, body);
+        let mut view = store.view(ACCOUNT, deadline()).unwrap();
+        assert_eq!(view.identity().committed_sequence, Sequence::default());
+        assert!(view.get(Key::Blob(BLOB), &mut [0; 128]).unwrap().is_none());
+        drop(view);
+        store.validate_integrity(deadline()).unwrap();
+    }
+}
+#[test]
+fn encoded_deadline_after_body_chunk_rolls_back_and_preserves_blob_id_reuse() {
+    use std::{
+        io::Read,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    struct Timer(AtomicU64);
+    impl Clock for Timer {
+        fn sample(&self) -> Result<Time, ports::Error> {
+            Ok(Time {
+                utc_ms: 0,
+                monotonic: Tick(self.0.load(Ordering::Relaxed)),
+            })
+        }
+    }
+    struct Expiring<'a> {
+        bytes: &'a [u8],
+        clock: Arc<Timer>,
+    }
+    impl Read for Expiring<'_> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.bytes.read(output)?;
+            if count == 0 {
+                self.clock.0.store(100, Ordering::Relaxed);
+            }
+            Ok(count)
+        }
+    }
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let clock = Arc::new(Timer(AtomicU64::new(1)));
+    let store = IndexStore::create(
+        &mut root,
+        StoreEpoch::from_bytes([4; 16]),
+        clock.clone(),
+        1,
+        deadline(),
+    )
+    .unwrap();
+    store.create_account(ACCOUNT, deadline()).unwrap();
+    let body = b"chunk inserted before EOF expiry";
+    let row = blob_value(body);
+    let operation = Operation::put(Table::Blobs, BLOB.as_bytes(), &row).unwrap();
+    let mut source = Expiring {
+        bytes: body,
+        clock: clock.clone(),
+    };
+    assert_eq!(
+        commit_encoded(
+            &store,
+            request(0),
+            &[operation],
+            &mut [BlobSource {
+                id: BLOB,
+                source: &mut source
+            }]
+        ),
+        Err(CommitError::Rejected(ports::Error::Deadline))
+    );
+    assert!(source.bytes.is_empty());
+    clock.0.store(1, Ordering::Relaxed);
+    let mut view = store.view(ACCOUNT, deadline()).unwrap();
+    assert_eq!(view.identity().committed_sequence, Sequence::default());
+    assert!(view.get(Key::Blob(BLOB), &mut [0; 128]).unwrap().is_none());
+    drop(view);
+    let mut source = body.as_slice();
+    assert_eq!(
+        commit_encoded(
+            &store,
+            request(0),
+            &[operation],
+            &mut [BlobSource {
+                id: BLOB,
+                source: &mut source
+            }]
+        ),
+        Ok(Sequence::from_u64(1))
+    );
+    store.validate_integrity(deadline()).unwrap();
 }

@@ -556,8 +556,9 @@ separate policy work.
 Complete encoded transaction framing and local row decoding use
 format::batch::Batch with the existing caller-reserved offset slots. The
 binding retains original bytes; exact count and EOF precede whole success.
-The authenticated coordinator must admit this synchronous work and wire its
-operations to the SQLite core without a second operation array.
+IndexStore::commit_batch consumes the binding through the same transaction
+path as typed operations; STORAGE.md owns its replay/ownership contract.
+Authenticated admission and transaction coordination remain open.
 
 Bounded provisional ingress staging, full-slot quota accounting and crash
 cleanup are implemented by IngressSpool. Before protocol activation, connect

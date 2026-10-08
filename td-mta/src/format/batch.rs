@@ -79,6 +79,25 @@ impl<'i, 's> Batch<'i, 's> {
             slots,
         })
     }
+    /// Passive checked offsets; copies confer no source or commit authority.
+    pub fn descriptor(&self, ordinal: usize) -> Option<StagedOperation> {
+        self.slots.get(ordinal).copied().flatten()
+    }
+    /// Reborrow a mutation key without decoding its row value. CHANGE has no key.
+    pub fn row_key(&self, ordinal: usize) -> Result<Option<super::key::Key<'i>>, Error> {
+        let Some(slot) = self.descriptor(ordinal) else {
+            return Ok(None);
+        };
+        if matches!(slot.kind, crate::ports::OperationKind::Change(_)) {
+            return Ok(None);
+        }
+        let start = usize::try_from(slot.key_offset).map_err(|_| Error::Overflow)?;
+        let end = start
+            .checked_add(usize::try_from(slot.key_len).map_err(|_| Error::Overflow)?)
+            .ok_or(Error::Overflow)?;
+        let bytes = self.bytes.get(start..end).ok_or(Error::Truncated)?;
+        super::key::Key::decode(super::Table::from_tag(slot.type_tag)?, bytes).map(Some)
+    }
     pub fn len(&self) -> usize {
         self.slots.len()
     }

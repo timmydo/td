@@ -129,7 +129,10 @@ never authority; slots beyond the declared count are untouched.
 The binding borrows its checked slot prefix immutably, so neither original
 bytes nor offsets can change while it remains usable. `get` re-decodes one
 original extent, returns None beyond the checked count, and creates no row
-copy or operation array. Repeated row keys and known Identity CHANGE syntax
+copy or operation array. `descriptor` copies one checked offset cell;
+`row_key` decodes only a PUT/DELETE key from the original bytes and returns
+None for CHANGE or an out-of-range ordinal. Neither projection is a separate
+capability. Repeated row keys and known Identity CHANGE syntax
 remain locally valid; final-state checks and v1 Identity refusal still belong
 to the store. Decoding is synchronous bounded work over at most 1 MiB/4096
 operations, with no internal meter or deadline. The caller admits the whole

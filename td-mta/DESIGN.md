@@ -14,7 +14,8 @@ contract and current client calls. There are no protocol handlers or listeners.
 Checked scalar/key/row and operation codecs define bounded application
 values in [FORMAT.md](FORMAT.md). Its complete batch decoder binds exact
 encoded input to caller-reserved offset slots without copying row data;
-authenticated transaction coordination remains separate. SQLite owns
+the SQLite writer consumes that binding through its shared commit path.
+Authenticated transaction coordination remains separate. SQLite owns
 relational metadata, immutable
 body chunks, atomic transactions, native indexes, WAL snapshots and crash
 recovery. The store_fs adapter verifies streamed bodies inside their metadata

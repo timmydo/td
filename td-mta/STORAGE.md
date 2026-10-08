@@ -110,6 +110,13 @@ does not obscure the actual durable result. Busy never extends a deadline.
 ### Atomic body and metadata commit
 
 IndexStore::commit accepts typed operations and mutable BlobSource inputs.
+IndexStore::commit_batch instead borrows a complete format::batch::Batch.
+Both use the same transaction implementation and original native scope.
+Encoded operations reborrow original immutable bytes using checked offset
+slots; no second row arena or operation array is built. Nested source and
+submission matching decode only the relevant fixed-size keys, not row values.
+The caller retains input/slot admission and prepared-source ownership.
+Local framing validation grants no account or reservation authority.
 Each source identifies a BlobId and supplies a std::io::Read. Each source matches exactly one Blob PUT. The matching
 BlobRow supplies the exact expected length, SHA-256, kind and creation time.
 The writer admits the maximum length before inserting a row, then inserts and hashes bounded chunk rows. Exact length, physical

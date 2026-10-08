@@ -41,6 +41,9 @@ const NEXT_CHANGE: &str = "SELECT sequence,operation,action,object FROM changes 
 #[path = "index/relational.rs"]
 mod relational;
 use relational::SCHEMA;
+#[path = "index/operations.rs"]
+mod operations;
+use operations::Operations;
 #[path = "index/backup.rs"]
 mod backup;
 #[cfg(test)]
@@ -631,6 +634,26 @@ impl<'r> IndexStore<'r> {
         operations: &[Operation<'_>],
         sources: &mut [BlobSource<'_>],
     ) -> Result<Sequence, CommitError> {
+        self.commit_operations(crypto, request, Operations::Typed(operations), sources)
+    }
+    /// Commit original validated encoded input through the same writer transaction.
+    /// The caller retains input/slot admission and supplies only prepared body reads.
+    pub fn commit_batch<C: ports::Crypto>(
+        &self,
+        crypto: &C,
+        request: CommitRequest,
+        batch: &crate::format::batch::Batch<'_, '_>,
+        sources: &mut [BlobSource<'_>],
+    ) -> Result<Sequence, CommitError> {
+        self.commit_operations(crypto, request, Operations::Encoded(batch), sources)
+    }
+    fn commit_operations<C: ports::Crypto>(
+        &self,
+        crypto: &C,
+        request: CommitRequest,
+        operations: Operations<'_, '_>,
+        sources: &mut [BlobSource<'_>],
+    ) -> Result<Sequence, CommitError> {
         let mut writer = self
             .writer(request.deadline)
             .map_err(CommitError::Rejected)?;
@@ -663,7 +686,7 @@ impl<'r> IndexStore<'r> {
         native: &Native,
         crypto: &C,
         request: CommitRequest,
-        operations: &[Operation<'_>],
+        operations: Operations<'_, '_>,
         sources: &mut [BlobSource<'_>],
         scratch: &mut [u8],
     ) -> Result<Sequence, ports::Error> {
@@ -683,24 +706,31 @@ impl<'r> IndexStore<'r> {
             return Err(ports::Error::Capacity);
         }
         for (ordinal, source) in sources.iter().enumerate() {
+            native.check()?;
             if sources
                 .get(..ordinal)
                 .ok_or(ports::Error::Invalid)?
                 .iter()
                 .any(|other| other.id == source.id)
-                || operations
-                    .iter()
-                    .filter(|operation| {
-                        matches!(operation.value(),
-                    Value::Row(Mutation::Put { key: Key::Blob(id), .. }) if id == source.id)
-                    })
-                    .count()
-                    != 1
             {
                 return Err(ports::Error::Invalid);
             }
+            let mut matches = 0usize;
+            for position in 0..operations.len() {
+                if operations.blob_put(position)? == Some(source.id) {
+                    matches = matches.checked_add(1).ok_or(ports::Error::Capacity)?;
+                    if matches > 1 {
+                        return Err(ports::Error::Invalid);
+                    }
+                }
+            }
+            if matches != 1 {
+                return Err(ports::Error::Invalid);
+            }
         }
-        let bytes = operations.iter().try_fold(0usize, |n, op| {
+        let bytes = (0..operations.len()).try_fold(0usize, |n, position| {
+            native.check()?;
+            let op = operations.get(position)?;
             n.checked_add(op.encoded_len().map_err(|_| ports::Error::Invalid)?)
                 .ok_or(ports::Error::Capacity)
         })?;
@@ -719,7 +749,9 @@ impl<'r> IndexStore<'r> {
             ..current
         };
         let mut view = TransactionView { native, identity };
-        for op in operations.iter().copied() {
+        for position in 0..operations.len() {
+            native.check()?;
+            let op = operations.get(position)?;
             if let Value::Change(change) = op.value() {
                 let key = change_key(change)?;
                 let existed = view.get(key, scratch)?.is_some();
@@ -728,8 +760,9 @@ impl<'r> IndexStore<'r> {
                 }
             }
         }
-        for (ordinal, op) in operations.iter().copied().enumerate() {
+        for ordinal in 0..operations.len() {
             native.check()?;
+            let op = operations.get(ordinal)?;
             match op.value() {
                 Value::Row(Mutation::Put { key, row }) => {
                     let fresh = if let (Key::Blob(id), Row::Blob(blob)) = (key, row) {
@@ -802,7 +835,9 @@ impl<'r> IndexStore<'r> {
                 }
             }
         }
-        for op in operations.iter().copied() {
+        for position in 0..operations.len() {
+            native.check()?;
+            let op = operations.get(position)?;
             if let Value::Change(change) = op.value() {
                 let exists = view.get(change_key(change)?, scratch)?.is_some();
                 if (change.action == ChangeAction::Destroyed) == exists {
@@ -810,7 +845,9 @@ impl<'r> IndexStore<'r> {
                 }
             }
         }
-        for op in operations.iter().copied() {
+        for position in 0..operations.len() {
+            native.check()?;
+            let op = operations.get(position)?;
             let Value::Row(Mutation::Put { key, .. }) = op.value() else {
                 continue;
             };
@@ -1364,34 +1401,25 @@ fn next<'a>(
         last_change,
     }))
 }
-fn submission_id(operation: Operation<'_>) -> Option<crate::ids::SubmissionId> {
-    match operation.value() {
-        Value::Row(Mutation::Put { key, .. } | Mutation::Delete(key)) => match key {
-            Key::Submission(id) | Key::Recipient(id, _) => Some(id),
-            _ => None,
-        },
-        Value::Change(_) => None,
-    }
-}
-
 fn validate_recipients(
     view: &mut TransactionView<'_>,
-    operations: &[Operation<'_>],
+    operations: Operations<'_, '_>,
     value: &mut [u8],
 ) -> Result<(), ports::Error> {
-    for (position, operation) in operations.iter().copied().enumerate() {
+    for position in 0..operations.len() {
         view.native.check()?;
-        let Some(id) = submission_id(operation) else {
+        let Some(id) = operations.submission(position)? else {
             continue;
         };
         // At most 4096 supplied operations; no queue-sized set or account scan.
-        if operations
-            .get(..position)
-            .ok_or(ports::Error::Invalid)?
-            .iter()
-            .copied()
-            .any(|prior| submission_id(prior) == Some(id))
-        {
+        let mut seen = false;
+        for prior in 0..position {
+            if operations.submission(prior)? == Some(id) {
+                seen = true;
+                break;
+            }
+        }
+        if seen {
             continue;
         }
         let Some((row, _)) = view.get(Key::Submission(id), value)? else {

@@ -2,10 +2,11 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 use td_mta::{
     format::{
-        batch::Batch, operation::Operation, Error, Table, MAX_TRANSACTION_BYTES,
-        MAX_TRANSACTION_OPERATIONS,
+        batch::Batch,
+        operation::{Operation, Value},
+        Error, Table, MAX_TRANSACTION_BYTES, MAX_TRANSACTION_OPERATIONS,
     },
-    ports::{OperationKind, StagedOperation, TransactionInput},
+    ports::{Mutation, OperationKind, StagedOperation, TransactionInput},
 };
 fn hex(input: &str) -> Vec<u8> {
     let digits: String = input.split_whitespace().collect();
@@ -49,12 +50,22 @@ fn literal_mixed_batch_reborrows_original_bytes_and_preserves_slot_suffix() {
             let expected = Operation::decode(&bytes[range]).unwrap();
             let actual = batch.get(i).unwrap().unwrap();
             assert_eq!(actual, expected);
+            assert_eq!(batch.descriptor(i).unwrap().ordinal as usize, i);
+            let expected_key = match expected.value() {
+                Value::Row(Mutation::Put { key, .. } | Mutation::Delete(key)) => Some(key),
+                Value::Change(_) => None,
+            };
+            assert_eq!(batch.row_key(i), Ok(expected_key));
             assert_eq!(actual.key_bytes().as_ptr(), expected.key_bytes().as_ptr());
             assert_eq!(
                 actual.value_bytes().as_ptr(),
                 expected.value_bytes().as_ptr()
             );
         }
+        assert_eq!(batch.row_key(3), Ok(None));
+        assert_eq!(batch.row_key(usize::MAX), Ok(None));
+        assert_eq!(batch.descriptor(3), None);
+        assert_eq!(batch.descriptor(usize::MAX), None);
         assert_eq!(batch.get(3), Ok(None));
         assert_eq!(batch.get(usize::MAX), Ok(None));
     }
