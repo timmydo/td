@@ -2315,7 +2315,8 @@ Use the existing SQLite core for mailbox/email/thread/submission metadata;
 do not add a second replay or checkpoint implementation. Final recipient
 coverage, aggregate queue-state validation and preservation of the named
 immutable queue identity/uncertainty/attempt-history fields are implemented
-in the core. Complete queue-transition validation, changed-object coverage,
+in the core, including one-way Pending/Stored failure-notice history. Complete
+queue-transition validation, changed-object coverage,
 category quota reconciliation and request idempotence remain service work.
 Bind the implemented bounded
 IngressSpool ownership to authorized reservations before wiring body sources

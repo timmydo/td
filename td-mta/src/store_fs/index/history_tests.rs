@@ -372,3 +372,236 @@ fn maximum_distinct_encoded_history_batch_fits_a_production_commit_deadline() {
         Ok(Sequence::from_u64(sequence + 1))
     );
 }
+
+fn failed_notice(
+    store: &IndexStore<'_>,
+    encoded: bool,
+    stored: bool,
+) -> (SubmissionRow<'static>, RecipientRow<'static>, u64) {
+    create(store, 1, &[0]).unwrap();
+    let mut recipient = queued();
+    recipient.state = RecipientState::Failed;
+    recipient.reason = FailureReason::Expired;
+    recipient.next_attempt_at = None;
+    let mut sub = submission(1);
+    sub.completed_at = Some(1);
+    sub.notification = NotificationState::Pending;
+    let key = recipient_key(0);
+    let recipient_bytes = encode(Row::Recipient(recipient));
+    let sub_bytes = encode(Row::Submission(sub));
+    apply(
+        store,
+        1,
+        &[
+            Operation::put(Table::Recipients, &key, &recipient_bytes).unwrap(),
+            Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes).unwrap(),
+        ],
+        encoded,
+    )
+    .unwrap();
+    let sequence = if stored {
+        sub.notification = NotificationState::Stored;
+        sub.notification_email = Some(EmailId::from_bytes([14; 16]));
+        let bytes = encode(Row::Submission(sub));
+        apply(
+            store,
+            2,
+            &[Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &bytes).unwrap()],
+            encoded,
+        )
+        .unwrap();
+        3
+    } else {
+        2
+    };
+    (sub, recipient, sequence)
+}
+
+#[test]
+fn cancellation_cannot_erase_a_pending_failure_notice() {
+    for encoded in [false, true] {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = open(&mut root);
+        let (mut sub, mut recipient, sequence) = failed_notice(&store, encoded, false);
+        recipient.state = RecipientState::Canceled;
+        recipient.reason = FailureReason::Canceled;
+        let key = recipient_key(0);
+        let recipient_bytes = encode(Row::Recipient(recipient));
+        let cancel = Operation::put(Table::Recipients, &key, &recipient_bytes).unwrap();
+        let original = encode(Row::Submission(sub));
+        sub.notification = NotificationState::None;
+        let cleared = encode(Row::Submission(sub));
+        rejected(apply(
+            &store,
+            sequence,
+            &[
+                cancel,
+                Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &cleared).unwrap(),
+            ],
+            encoded,
+        ));
+        assert_eq!(
+            apply(
+                &store,
+                sequence,
+                &[
+                    cancel,
+                    Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &original).unwrap(),
+                ],
+                encoded
+            ),
+            Ok(Sequence::from_u64(sequence + 1))
+        );
+        sub.notification = NotificationState::Stored;
+        sub.notification_email = Some(EmailId::from_bytes([14; 16]));
+        let stored = encode(Row::Submission(sub));
+        assert_eq!(
+            apply(
+                &store,
+                sequence + 1,
+                &[Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &stored).unwrap()],
+                encoded
+            ),
+            Ok(Sequence::from_u64(sequence + 2))
+        );
+    }
+}
+
+#[test]
+fn a_stored_notice_cannot_regress_even_through_delete_and_reinsert() {
+    for encoded in [false, true] {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = open(&mut root);
+        let (sub, recipient, sequence) = failed_notice(&store, encoded, true);
+        let key = recipient_key(0);
+        let delete = Operation::delete(Table::Submissions, SUBMISSION.as_bytes()).unwrap();
+        for clear in [false, true] {
+            let mut changed = sub;
+            changed.notification_email = None;
+            changed.notification = if clear {
+                NotificationState::None
+            } else {
+                NotificationState::Pending
+            };
+            let mut final_recipient = recipient;
+            if clear {
+                final_recipient.state = RecipientState::Canceled;
+                final_recipient.reason = FailureReason::Canceled;
+            }
+            let recipient_bytes = encode(Row::Recipient(final_recipient));
+            let bytes = encode(Row::Submission(changed));
+            rejected(apply(
+                &store,
+                sequence,
+                &[
+                    delete,
+                    Operation::put(Table::Recipients, &key, &recipient_bytes).unwrap(),
+                    Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &bytes).unwrap(),
+                ],
+                encoded,
+            ));
+        }
+        let mut canceled = recipient;
+        canceled.state = RecipientState::Canceled;
+        canceled.reason = FailureReason::Canceled;
+        let bytes = encode(Row::Recipient(canceled));
+        let sub_bytes = encode(Row::Submission(sub));
+        assert_eq!(
+            apply(
+                &store,
+                sequence,
+                &[
+                    delete,
+                    Operation::put(Table::Recipients, &key, &bytes).unwrap(),
+                    Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes).unwrap(),
+                ],
+                encoded
+            ),
+            Ok(Sequence::from_u64(sequence + 1))
+        );
+    }
+}
+
+#[test]
+fn a_stored_notice_keeps_its_historical_email_identity() {
+    for encoded in [false, true] {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = open(&mut root);
+        let (sub, _, sequence) = failed_notice(&store, encoded, true);
+        let original = encode(Row::Submission(sub));
+        let mut changed = sub;
+        changed.notification_email = Some(EmailId::from_bytes([15; 16]));
+        let replacement = encode(Row::Submission(changed));
+        let good = Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &original).unwrap();
+        let bad = Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &replacement).unwrap();
+        let delete = Operation::delete(Table::Submissions, SUBMISSION.as_bytes()).unwrap();
+        rejected(apply(&store, sequence, &[delete, bad], encoded));
+        assert_eq!(
+            apply(&store, sequence, &[bad, good], encoded),
+            Ok(Sequence::from_u64(sequence + 1))
+        );
+        let mut view = store.view(ACCOUNT, deadline()).unwrap();
+        let mut scratch = [0; 65536];
+        let (row, _) = view
+            .get(Key::Submission(SUBMISSION), &mut scratch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row, Row::Submission(sub));
+    }
+}
+
+#[test]
+fn notice_history_does_not_prove_service_notice_creation() {
+    for encoded in [false, true] {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = open(&mut root);
+        create(&store, 1, &[0]).unwrap();
+        let mut recipient = queued();
+        recipient.state = RecipientState::Canceled;
+        recipient.reason = FailureReason::Canceled;
+        recipient.next_attempt_at = None;
+        let mut sub = submission(1);
+        sub.completed_at = Some(1);
+        let key = recipient_key(0);
+        let recipient_bytes = encode(Row::Recipient(recipient));
+        let sub_bytes = encode(Row::Submission(sub));
+        apply(
+            &store,
+            1,
+            &[
+                Operation::put(Table::Recipients, &key, &recipient_bytes).unwrap(),
+                Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes).unwrap(),
+            ],
+            encoded,
+        )
+        .unwrap();
+        // Creation authority is outside this core's retained-history guard.
+        sub.notification = NotificationState::Pending;
+        let pending = encode(Row::Submission(sub));
+        apply(
+            &store,
+            2,
+            &[Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &pending).unwrap()],
+            encoded,
+        )
+        .unwrap();
+        let email = EmailId::from_bytes([14; 16]);
+        sub.notification = NotificationState::Stored;
+        sub.notification_email = Some(email);
+        let stored = encode(Row::Submission(sub));
+        apply(
+            &store,
+            3,
+            &[Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &stored).unwrap()],
+            encoded,
+        )
+        .unwrap();
+        let mut view = store.view(ACCOUNT, deadline()).unwrap();
+        let mut scratch = [0; 65536];
+        assert!(view.get(Key::Email(email), &mut scratch).unwrap().is_none());
+    }
+}

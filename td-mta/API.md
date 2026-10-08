@@ -6613,7 +6613,8 @@ changed only by recipient deletion. Indexed point/successor reads reuse the
 writer scratch and original deadline/VM fuel. Inconsistent groups reject with
 Conflict; native deadline, capacity and I/O errors retain their classifications.
 Before row writes, surviving queue PUTs preserve STORAGE.md's immutable
-identity, uncertainty and attempt-history fields against the original rows.
+identity, uncertainty, attempt-history and failure-notice fields against the
+original rows.
 Repeated keys use their final effect, including DELETE then PUT. Violations
 return Conflict before streaming a body. Full historical transition checks,
 caller authorization, worker fencing and complete changed-object coverage

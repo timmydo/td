@@ -92,8 +92,8 @@ SQLite commits reuse that state validator for every submission affected by
 submission or recipient PUT/DELETE, checking exact final ordinal coverage
 with indexed reads before COMMIT. A group inconsistency rolls back the entire
 transaction. The core also preserves existing immutable
-submission/envelope identity,
-the uncertainty latch and retained attempt history as specified in STORAGE.md.
+submission/envelope identity, the uncertainty latch, retained attempt history
+and one-way failure-notice state as specified in STORAGE.md.
 It compares final PUTs with original rows before writing, so repeated keys
 cannot reset history within a transaction. Full transition checks, creation
 and deletion authorization, and attempt fences remain service obligations.

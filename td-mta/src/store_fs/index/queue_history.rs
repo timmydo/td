@@ -1,6 +1,6 @@
 //! Preserve retained queue history against the pre-transaction rows.
 use super::*;
-use crate::format::row::{RecipientRow, SubmissionRow};
+use crate::format::row::{NotificationState, RecipientRow, SubmissionRow};
 
 pub(super) fn validate(
     native: &Native,
@@ -54,6 +54,14 @@ fn submission(old: SubmissionRow<'_>, next: SubmissionRow<'_>) -> bool {
         && old.send_at == next.send_at
         && old.expires_at == next.expires_at
         && old.recipient_count == next.recipient_count
+        && match old.notification {
+            NotificationState::None => true,
+            NotificationState::Pending => next.notification != NotificationState::None,
+            NotificationState::Stored => {
+                next.notification == NotificationState::Stored
+                    && old.notification_email == next.notification_email
+            }
+        }
 }
 fn recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
     old.address == next.address

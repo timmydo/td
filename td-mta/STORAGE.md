@@ -145,7 +145,10 @@ refuses duplicate changes for one object within a transaction.
 Before applying rows, compare each existing Submission/Recipient with its
 final operation when it is a PUT, using the original account transaction snapshot.
 Submission email/thread/identity, transmitted blob, reverse path, creation
-and expiry times, and recipient count are immutable. Recipient address is
+and expiry times, and recipient count are immutable. A Pending failure notice
+cannot return to None. A Stored notice must remain Stored with its original
+historical notificationEmail, even after the visible Email is deleted.
+Cancellation preserves either retained notice state. Recipient address is
 immutable; uncertainty cannot clear and attemptCount cannot decrease.
 When attemptCount is unchanged, attempt ID and lastAttemptAt must also stay
 unchanged. A mismatch returns Conflict before body streaming or row writes.
@@ -163,8 +166,15 @@ that every store/host can finish within its deadline.
 
 This preserves named history fields, not the full transition graph. New
 attempt authority must still require a fresh ID and exactly one checked
-count increment. Notification Stored/email retention, creation authorization
-and deletion/retention policy also remain service obligations.
+count increment. Actual notice creation, creation authorization and
+submission deletion/retention policy remain service obligations. Preserving
+notice history does not prove the referenced failure Email was created.
+The service must forbid creation of a new notice solely for cancellation
+and atomically create the failure Email with the Stored transition. The core
+currently accepts notice creation on a wholly Canceled group and a Stored
+reference without Email creation; these are explicit service-layer gaps.
+Once committed, the retained history cannot be repaired by clearing the
+notice state or replacing its historical Email ID.
 
 Before COMMIT, every submission named by a Submission or Recipient PUT/DELETE
 is checked once against the final transaction view. Reuse the recipient
