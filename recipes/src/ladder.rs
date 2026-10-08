@@ -1903,8 +1903,6 @@ mod tests {
         // retired from this list as it moves to td's userland.
         ("kexec-spike-x86-64", "busybox-x86-64"),
         ("kexec-spike-x86-64-test", "busybox-x86-64"),
-        ("system-secret-vm-test", "busybox-x86-64"),
-        ("system-x86-64", "busybox-x86-64"),
         ("td-jail-test", "busybox-x86-64"),
     ];
     const RECIPE_SHEBANG_INTERPRETERS: &[&str] =

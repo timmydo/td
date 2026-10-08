@@ -9,14 +9,14 @@ use ssh_policy::{
 use ssh_policy::SSHD_AUTHORIZED_KEYS;
 
 use crate::ladder::{
-    entry_program, post_bootstrap_path, AUTOTEST_CMDLINE_TOKEN, BOOT_FAIL_TARGET_CMDLINE_TOKEN,
-    BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, DEPLOY_INSTALL_CMDLINE_TOKEN,
+    entry_program, post_rust_inputs, post_rust_tool_farm, AUTOTEST_CMDLINE_TOKEN,
+    BOOT_FAIL_TARGET_CMDLINE_TOKEN, BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, DEPLOY_INSTALL_CMDLINE_TOKEN,
     FIREFOX_AUDIT_BACKLOG_CMDLINE_TOKEN, FIREFOX_AUDIT_CMDLINE_TOKEN,
     FIREFOX_AUDIT_LOG_BUFFER_CMDLINE_TOKEN, FIREFOX_INPUT_CMDLINE_TOKEN,
     FIREFOX_NETWORK_RUNTIME_MARKER, GIT_HTTPS_RUNTIME_MARKER, GIT_HTTPS_TEST_URL,
     GIT_RUNTIME_MARKER, GREETER_MARKER, KERNEL_AUDIT_CMDLINE_TOKEN, NETTEST_CMDLINE_TOKEN,
     NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
-    PERSIST_WRITE_CMDLINE_TOKEN, POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER,
+    PERSIST_WRITE_CMDLINE_TOKEN, POST_RUST_SH, RIPGREP_FD_RUNTIME_MARKER,
     ROOT_SSH_REFUSAL_KEY_FINGERPRINT, ROOT_SSH_REFUSED_MARKER, SETUP_INPUT_CMDLINE_TOKEN,
     SSHD_MARKER, SU_ABSENT_MARKER, SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER,
     SYSTEM_DEPLOY_ROLLBACK_MARKER, SYSTEM_ETC_MUTABLE_MARKER, SYSTEM_ETC_RO_MARKER,
@@ -976,12 +976,11 @@ fn td_init_probe(applet: &str, probe: &Probe) -> String {
 const TD_UTIL_APPLETS: &[&str] = &["clear", "which", "free", "ps", "dmesg", "less"];
 
 /// The core file/text userland, served by the uutils `coreutils` multicall (#547). Every
-/// name must be a coreutils utility the built binary implements. The recipe sandbox cannot
-/// exec the dynamically-linked binary to run `coreutils --list` at build time (its interp
-/// resolves an absolute `/td/store` path that only exists on the assembled root, not in the
-/// build tree). A missing applet surfaces on the boot oracle; the engine-native runtime
-/// closure step proves every referenced store item is declared and stages it at its
-/// canonical path. uutils is dynamically linked, so — unlike static busybox — it pulls its
+/// name must be a coreutils utility the built binary implements. Unlike td-util's, the
+/// names are not probed against `coreutils --list` at build time, though the recipe's
+/// tool farm runs this binary in the sandbox. A missing applet surfaces on the boot
+/// oracle; the engine-native runtime closure step proves every referenced store item is
+/// declared and stages it at its canonical path. uutils is dynamically linked, so — unlike static busybox — it pulls its
 /// reachable runtime store closure onto the erofs root.
 const UUTILS_APPLETS: &[&str] = &[
     "uname", "ls", "cat", "echo", "printf", "pwd", "cp", "mv", "rm", "mkdir", "rmdir", "ln", "id",
@@ -5058,12 +5057,12 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
 
 /// A producer-rung shape check on the deployment bundle and staged real-root
 /// scratch tree. For the cpio: real newc magic, a size floor (the static shell alone is
-/// larger), a `busybox cpio -t` parse (the declared INPUT's, as a build tool — this
-/// recipe's own steps run under `busybox sh` too), the members that make it bootable
-/// (incl. the /init pivot script), and each packed binary under /td/store. For the root
-/// tree: /init and /bin/sh are symlinks into /td/store, the key /etc files exist, and
-/// NOTHING busybox is packed — neither a `/bin/busybox` multiplexer entry nor the
-/// package under /td/store. That assertion replaced its own opposite when `getty` moved
+/// larger), a td-util `cpio -t` parse (a reader independent of gen_init_cpio, which
+/// wrote it), the members that make it bootable (incl. the /init pivot script), and
+/// each packed binary under /td/store. For the root tree: /init and /bin/sh are
+/// symlinks into /td/store, the key /etc files exist, and no `/bin/busybox`
+/// multiplexer entry is packed; the package itself is no input of this recipe, so
+/// no store path of it can be. That assertion replaced its own opposite when `getty` moved
 /// to td-init: the check that the binary WAS packed, and that it implemented every name
 /// symlinked at it. What used to be config drift leaving a dead `/bin/getty` is now a
 /// build tool leaking into an image, and both are things only a build-time check sees.
@@ -5083,16 +5082,16 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
 /// a nightly one. The boot ITSELF is still exercised by `td-recipe-eval run` and the headless
 /// `qemu-boot-system` oracle; this only moves the cheaply-decidable half earlier.
 fn shape_check() -> String {
-    "selector='{out}/boot/selector-initramfs.cpio'; selector_manifest='{out}/boot/manifest'; init='{out}/deployment/initramfs.cpio'; root='{root}/real-root'; disk='{out}/deployment/root.erofs'; manifest='{out}/deployment/manifest'; bb='{in:busybox-x86-64}/bin/busybox'; \
+    "selector='{out}/boot/selector-initramfs.cpio'; selector_manifest='{out}/boot/manifest'; init='{out}/deployment/initramfs.cpio'; root='{root}/real-root'; disk='{out}/deployment/root.erofs'; manifest='{out}/deployment/manifest'; tu='{in:td-util}/bin/td-util'; \
      for archive in \"$selector\" \"$init\"; do \
          sz=$(wc -c < \"$archive\"); \
          [ \"$sz\" -ge 65536 ] || { echo \"initramfs $archive: implausibly small ($sz bytes) - the static shell alone is larger\" >&2; exit 1; }; \
          set -- $(od -An -tx1 -N 6 \"$archive\"); \
          [ \"$1$2$3$4$5$6\" = 303730373031 ] || { echo \"initramfs $archive: missing the newc cpio magic 070701\" >&2; exit 1; }; \
-         \"$bb\" cpio -t < \"$archive\" >/dev/null 2>&1 || { echo \"initramfs $archive: busybox cpio -t could not parse the archive\" >&2; exit 1; }; \
+         \"$tu\" cpio -t < \"$archive\" >/dev/null 2>&1 || { echo \"initramfs $archive: td-util cpio -t could not parse the archive\" >&2; exit 1; }; \
      done; \
-     selector_list=$(\"$bb\" cpio -t < \"$selector\" 2>/dev/null); \
-     init_list=$(\"$bb\" cpio -t < \"$init\" 2>/dev/null); \
+     selector_list=$(\"$tu\" cpio -t < \"$selector\" 2>/dev/null); \
+     init_list=$(\"$tu\" cpio -t < \"$init\" 2>/dev/null); \
      for m in init bin/sh bin/td-boot bin/mount bin/umount bin/td-util dev/console proc run volume sysroot; do \
          printf '%s\\n' \"$selector_list\" | grep -q -x -F \"$m\" || { echo \"selector initramfs: cpio member '$m' missing\" >&2; exit 1; }; \
          printf '%s\\n' \"$init_list\" | grep -q -x -F \"$m\" || { echo \"deployment initramfs: cpio member '$m' missing\" >&2; exit 1; }; \
@@ -5125,10 +5124,10 @@ fn shape_check() -> String {
      printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$' || { echo 'selector initramfs: cryptsetup store member missing - /bin/cryptsetup would dangle' >&2; exit 1; }; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/cryptsetup || { echo 'deployment initramfs: bin/cryptsetup missing - td-boot could not open a device-bound volume with the handed-off key' >&2; exit 1; }; \
      printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$' || { echo 'deployment initramfs: cryptsetup store member missing - /bin/cryptsetup would dangle' >&2; exit 1; }; \
-     for a in \"$selector\" \"$init\"; do \"$bb\" cpio -tv < \"$a\" 2>/dev/null | grep -q -F ' bin/cryptsetup -> {in:cryptsetup-x86-64}/bin/cryptsetup.static' || { echo \"initramfs $a: /bin/cryptsetup must link the static cryptsetup td-boot opens volumes with\" >&2; exit 1; }; done; \
+     for a in \"$selector\" \"$init\"; do \"$tu\" cpio -tv < \"$a\" 2>/dev/null | grep -q -x -F 'bin/cryptsetup -> {in:cryptsetup-x86-64}/bin/cryptsetup.static' || { echo \"initramfs $a: /bin/cryptsetup must link the static cryptsetup td-boot opens volumes with\" >&2; exit 1; }; done; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/losetup || { echo 'deployment initramfs: bin/losetup missing - td-boot root-loop could not bind the verified root and the boot would stop there' >&2; exit 1; }; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/losetup; then echo 'selector initramfs: losetup must be deployment-only - the selector kexecs, it never binds a root loop' >&2; exit 1; fi; \
-     \"$bb\" cpio -tv < \"$selector\" 2>/dev/null | grep -q -F ' bin/secret-line -> {in:td-init}/bin/td-init' || { echo 'selector initramfs: /bin/secret-line must link td-init - the recovery flow could not read the recovery key and an encrypted boot that reaches recovery would halt' >&2; exit 1; }; \
+     \"$tu\" cpio -tv < \"$selector\" 2>/dev/null | grep -q -x -F 'bin/secret-line -> {in:td-init}/bin/td-init' || { echo 'selector initramfs: /bin/secret-line must link td-init - the recovery flow could not read the recovery key and an encrypted boot that reaches recovery would halt' >&2; exit 1; }; \
      if printf '%s\\n' \"$init_list\" | grep -q -x -F bin/secret-line; then echo 'deployment initramfs: secret-line must be selector-only - only the selector has a recovery flow' >&2; exit 1; fi; \
      if [ -e \"$root/bin/secret-line\" ] || [ -L \"$root/bin/secret-line\" ]; then echo 'root tree: secret-line must be selector-only - no root farm links it' >&2; exit 1; fi; \
      [ \"$(wc -l < \"$selector_manifest\")\" -eq 2 ] || { echo 'selector manifest: expected header plus one payload entry' >&2; exit 1; }; \
@@ -5300,7 +5299,6 @@ fn shape_check() -> String {
      [ \"$(readlink \"$root/home\")\" = var/home ] || { echo 'root tree: /home must point to var/home' >&2; exit 1; }; \
      [ \"$(readlink \"$root/root\")\" = var/root ] || { echo 'root tree: /root must point to var/root' >&2; exit 1; }; \
      if [ -e \"$root/bin/busybox\" ] || [ -L \"$root/bin/busybox\" ]; then echo 'root tree: /bin/busybox is packed - the multicall left this image with its last applet, and a symlink is how it would come back' >&2; exit 1; fi; \
-     if [ -e \"{root}/real-root{in:busybox-x86-64}\" ] || [ -L \"{root}/real-root{in:busybox-x86-64}\" ]; then echo 'root tree: the busybox package is staged under /td/store - it is a BUILD tool for this recipe and must reach no image' >&2; exit 1; fi; \
      for a in @DROPPED_APPLETS@; do \
          if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then echo \"root tree: /bin/$a is packed, but '$a' is in DROPPED_APPLETS - the busybox retirement dropped this name rather than reimplementing it\" >&2; exit 1; fi; \
          if printf '%s\\n' \"$selector_list\" | grep -q -x -F \"bin/$a\"; then echo \"selector initramfs: bin/$a is packed, but '$a' is in DROPPED_APPLETS\" >&2; exit 1; fi; \
@@ -5353,14 +5351,11 @@ fn shape_check() -> String {
      for a in bzImage initramfs.cpio root.erofs; do \
          grep -q -E \"^[0-9a-f]{64}  $a$\" \"$manifest\" || { echo \"manifest: missing strict SHA-256 entry for $a\" >&2; exit 1; }; \
      done"
-        // Name the declared BusyBox input exactly; a store wildcard could accept
-        // an unrelated or stale BusyBox output.
-        //
         // Validate EVERY packed applet, not just the greeter-critical few. Names are all
-        // shell-safe identifiers, so a space-joined `for` list is safe unquoted. uutils
-        // cannot execute in the build sandbox because its absolute interpreter exists only
-        // inside the assembled root; compare symlink text without resolving it. The headless
-        // boot oracle executes uutils after pivoting and remains the behavioral runtime check.
+        // shell-safe identifiers, so a space-joined `for` list is safe unquoted. Compare
+        // symlink text without resolving it: a /bin link names its target as the booted
+        // root sees it, not as this scratch tree holds it. The headless boot oracle
+        // executes uutils after pivoting and remains the behavioral runtime check.
         // The dropped-name sweep tests -e AND -L because a repacked /bin entry pointing at a
         // target the build tree does not hold is DANGLING, which -e alone reads as absent.
         .replace("@DROPPED_APPLETS@", &DROPPED_APPLETS.join(" "))
@@ -5491,7 +5486,9 @@ fn selector_template_dir() -> &'static str {
 }
 
 pub fn recipe() -> Recipe {
-    let mut steps = Vec::new();
+    // The recipe's own shell steps run under td-sh with the post-Rust tool
+    // farm; nothing the farm links is packed by that route.
+    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
     steps.push(Step::MkDir {
         path: "{out}".into(),
     });
@@ -5510,14 +5507,14 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{out}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "chmod 0755 '{{root}}/real-root' && chmod 0600 '{{root}}/real-root/etc/shadow' && chmod 0444 '{TERMINFO_ENTRY}' '{{root}}/real-root{PRINCIPALS_PATH}' '{{root}}/real-root{ELEVATION_TABLE}' '{{root}}/real-root{BUS_APPLICATION_POLICY}'"
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     steps.push(Step::run(
@@ -5570,13 +5567,13 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 "'{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/selector.spec' > '{root}/selector-initramfs.cpio'; \
                  '{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/deployment.spec' > '{root}/initramfs.cpio'",
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // 3) Materialise the first-class deployment bundle. PackErofs is executed
@@ -5649,16 +5646,12 @@ pub fn recipe() -> Recipe {
         ],
         exec: false,
     });
-    steps.push(
-        Step::run("{out}", &[POST_BOOTSTRAP_SH, "-c", &shape_check()])
-            .env("PATH", &post_bootstrap_path()),
-    );
+    steps.push(Step::run("{out}", &[POST_RUST_SH, "-c", &shape_check()]).env("PATH", "{tools}"));
 
     let recipe = Recipe::mesboot("system-x86-64", "0.2")
-        // busybox: a BUILD TOOL ONLY since `getty` moved to td-init — this recipe's own
-        // steps run under `busybox sh` (POST_BOOTSTRAP_SH) and shape_check parses both
-        // cpio archives with it. Nothing it provides is packed; `nothing_on_the_image_is_
-        // busybox` and shape_check's own staged-tree leg are what hold that apart.
+        // gawk-x86-64-self: the post-Rust tool farm's awk. This recipe's own steps
+        //   run under td-sh with that farm; gawk itself is not packed, and
+        //   `nothing_on_the_image_is_busybox` holds the image free of BusyBox.
         // linux-x86-64: the EXPORTED gen_init_cpio packer (verified STATICALLY linked).
         // uutils: the dynamically-linked `coreutils` multicall packed as the /bin file/text
         //   userland (#547).
@@ -5704,59 +5697,60 @@ pub fn recipe() -> Recipe {
         // btrfs-progs-x86-64: static mkfs.btrfs for a live boot's volatile volume.
         // cryptsetup-x86-64: static cryptsetup a live installer formats a
         //   device-bound volume with, and the deployment initramfs opens one.
-        .native_inputs(&[
-            "busybox-x86-64",
-            "linux-x86-64",
-            "btrfs-progs-x86-64",
-            "cryptsetup-x86-64",
-            "uutils",
-            "ripgrep",
-            "fd",
-            "git-x86-64",
-            "ca-certificates",
-            "tzdata",
-            "jetbrains-mono-nerd-font",
-            "libressl-x86-64",
-            "glibc-x86-64",
-            "openssh-x86-64",
-            "td-netd",
-            "td-boot",
-            "td-kexec",
-            "td-util",
-            "td-txt",
-            "td-sh",
-            "td-init",
-            "td-firstboot",
-            "td-login",
-            "td-authd",
-            "td-svc",
-            "td-profiler",
-            "td-taskmgr",
-            "td-review",
-            "td-agent",
-            "td-term",
-            "td-term-terminfo",
-            "td-photo",
-            "td-editor",
-            "td-pass",
-            "td-dua",
-            "td-jail",
-            "td-seatd",
-            "td-vm-guest",
-            "td-update",
-            "td-install",
-            "td-setup",
-            "td-audio",
-            "td-compositor",
-            "td-busd",
-            "td-portal",
-            "td-secret",
-            "td-net",
-            "rust-toolchain",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-            "td-cc",
-        ])
+        // post_rust_inputs adds the tool farm's providers (td-sh, td-txt,
+        // td-util, uutils, all also packed) and its awk, so the farm and this
+        // list cannot drift apart.
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &[
+                "linux-x86-64",
+                "btrfs-progs-x86-64",
+                "cryptsetup-x86-64",
+                "ripgrep",
+                "fd",
+                "git-x86-64",
+                "ca-certificates",
+                "tzdata",
+                "jetbrains-mono-nerd-font",
+                "libressl-x86-64",
+                "glibc-x86-64",
+                "openssh-x86-64",
+                "td-netd",
+                "td-boot",
+                "td-kexec",
+                "td-init",
+                "td-firstboot",
+                "td-login",
+                "td-authd",
+                "td-svc",
+                "td-profiler",
+                "td-taskmgr",
+                "td-review",
+                "td-agent",
+                "td-term",
+                "td-term-terminfo",
+                "td-photo",
+                "td-editor",
+                "td-pass",
+                "td-dua",
+                "td-jail",
+                "td-seatd",
+                "td-vm-guest",
+                "td-update",
+                "td-install",
+                "td-setup",
+                "td-audio",
+                "td-compositor",
+                "td-busd",
+                "td-portal",
+                "td-secret",
+                "td-net",
+                "rust-toolchain",
+                "gcc-x86-64-self",
+                "binutils-x86-64-self",
+                "td-cc",
+            ],
+        ))
         .steps(steps);
     let application_inputs = application_payload_inputs(&SYSTEM);
     if application_inputs.is_empty() {
@@ -7978,8 +7972,8 @@ mod tests {
             "printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$' || { echo 'deployment initramfs: cryptsetup store member missing",
             // The link's target in both, as the root tree's readlink check
             // pins its own.
-            "for a in \"$selector\" \"$init\"; do \"$bb\" cpio -tv < \"$a\" 2>/dev/null \
-             | grep -q -F ' bin/cryptsetup -> {in:cryptsetup-x86-64}/bin/cryptsetup.static' \
+            "for a in \"$selector\" \"$init\"; do \"$tu\" cpio -tv < \"$a\" 2>/dev/null \
+             | grep -q -x -F 'bin/cryptsetup -> {in:cryptsetup-x86-64}/bin/cryptsetup.static' \
              || { echo \"initramfs $a: /bin/cryptsetup must link the static cryptsetup",
             "root tree: cryptsetup lacks its debug companion",
         ] {
@@ -10910,8 +10904,7 @@ mod tests {
             // The target must name a package this image actually STAGES.
             // Pointing INTO the store is only syntax:
             // `{in:busybox-x86-64}/share/foo` satisfies it and would ship a
-            // dangling link, busybox being a BUILD tool the shape check
-            // separately refuses to find under real-root at all.
+            // dangling link, busybox being no input of this image at all.
             let input = entry
                 .target
                 .split_once('}')
@@ -13574,9 +13567,9 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             restored < packed,
             "the mode is restored after the packer read the tree"
         );
-        // `ls -ld` and `cut`, because the check runs under the post-bootstrap
-        // applet set and `stat` is not in it: a check that named `stat`
-        // refused every image build.
+        // `ls -ld` and `cut`, because the check runs under the post-Rust tool
+        // farm, which links no `stat`: a check that named `stat` would
+        // refuse every image build.
         let check = shape_check();
         assert!(
             check.contains(&format!(
@@ -13584,18 +13577,25 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             )),
             "the root-tree check does not pin the entry's mode"
         );
-        let applets = include_str!("busybox-x86-64.rs");
-        let list = applets
-            .split_once("const POST_BOOTSTRAP_TOOL_APPLETS: &str = \"")
-            .and_then(|(_, rest)| rest.split_once('"'))
-            .map(|(list, _)| list)
-            .expect("the post-bootstrap applet list");
+        let farm: Vec<&str> = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::ToolFarm { links } => Some(links),
+                _ => None,
+            })
+            .flatten()
+            .map(|(name, _)| name.as_str())
+            .collect();
         for applet in ["ls", "cut", "chmod"] {
             assert!(
-                list.split(' ').any(|name| name == applet),
-                "{applet} is not a post-bootstrap applet, so the step or check could not run"
+                farm.contains(&applet),
+                "{applet} is not in the recipe's tool farm, so the step or check could not run"
             );
         }
+        assert!(
+            !farm.contains(&"stat"),
+            "the farm links stat now; see above"
+        );
     }
 
     /// `find` and `xargs` left the image with the multicall, and this is the
@@ -13672,8 +13672,9 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// The real-root leg is the one that changed, so it is the one worth being
     /// precise about: it scans the STEPS, which is where a `CopyTree` of the
     /// package or a `/bin/busybox` symlink would have to appear. `shape_check`
-    /// then re-proves it against the staged tree at build time, because a step
-    /// list is what this file intends and the tree is what the image gets.
+    /// then re-proves the symlink half against the staged tree at build time,
+    /// because a step list is what this file intends and the tree is what the
+    /// image gets; the package half holds because it is no input at all.
     #[test]
     fn nothing_on_the_image_is_busybox() {
         for (phase, spec) in [
@@ -13750,25 +13751,29 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // hold is DANGLING, which `-e` alone reads as absent: exactly how a
         // repacked multiplexer entry would slip through.
         let shape = shape_check();
-        for leg in [
-            r#"if [ -e "$root/bin/busybox" ] || [ -L "$root/bin/busybox" ]; then"#,
-            r#"if [ -e "{root}/real-root{in:busybox-x86-64}" ] || [ -L "{root}/real-root{in:busybox-x86-64}" ]; then"#,
-        ] {
+        for leg in [r#"if [ -e "$root/bin/busybox" ] || [ -L "$root/bin/busybox" ]; then"#] {
             assert!(
                 shape.contains(leg),
                 "shape_check no longer proves this against the STAGED tree, and the \
                  scan above only reads real_root_steps: {leg}"
             );
         }
-        // The recipe still DECLARES busybox as an input, and must: its own steps
-        // run under `busybox sh` (the post-bootstrap tool tier), and shape_check
-        // parses both archives with `busybox cpio -t`. A build tool is not an
-        // image artifact, and conflating the two is how this test would be
-        // "fixed" wrongly the day the input is noticed.
+        // BusyBox is not even a build tool here: the steps run under td-sh
+        // and shape_check parses both archives with td-util's cpio, a reader
+        // independent of the gen_init_cpio that wrote them. Undeclared, its
+        // store path is outside the image's staging paths, which take only
+        // declared inputs (StageRuntimeClosure refuses any other reference).
         assert!(
-            shape_check().contains("cpio -t"),
-            "shape_check no longer parses the archives with the declared build-tool \
-             busybox; if that went away the input should have gone with it"
+            shape_check().contains("\"$tu\" cpio -t"),
+            "shape_check no longer parses the archives with td-util's cpio"
+        );
+        assert!(
+            !super::recipe()
+                .native_inputs
+                .unwrap_or_default()
+                .iter()
+                .any(|input| input == "busybox-x86-64"),
+            "system-x86-64 declares busybox again"
         );
     }
 
@@ -14033,7 +14038,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         }
         let shape = shape_check();
         for leg in [
-            "grep -q -F ' bin/secret-line -> {in:td-init}/bin/td-init'",
+            "grep -q -x -F 'bin/secret-line -> {in:td-init}/bin/td-init'",
             "printf '%s\\n' \"$init_list\" | grep -q -x -F bin/secret-line; then",
             "[ -e \"$root/bin/secret-line\" ] || [ -L \"$root/bin/secret-line\" ]",
         ] {
