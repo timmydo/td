@@ -1,6 +1,8 @@
 //! Preserve retained queue history against the pre-transaction rows.
 use super::*;
-use crate::format::row::{NotificationState, RecipientRow, SubmissionRow};
+use crate::format::row::{
+    FailureReason, NotificationState, RecipientRow, RecipientState, SubmissionRow,
+};
 
 pub(super) fn validate(
     native: &Native,
@@ -65,8 +67,31 @@ fn submission(old: SubmissionRow<'_>, next: SubmissionRow<'_>) -> bool {
 }
 fn recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
     old.address == next.address
+        && terminal_recipient(old, next)
         && (!old.uncertain || next.uncertain)
         && next.attempt_count >= old.attempt_count
         && (next.attempt_count != old.attempt_count
             || (next.attempt == old.attempt && next.last_attempt_at == old.last_attempt_at))
+}
+
+fn terminal_recipient(old: RecipientRow<'_>, next: RecipientRow<'_>) -> bool {
+    use RecipientState as S;
+    let valid_state = match old.state {
+        S::Accepted | S::Canceled => next.state == old.state,
+        S::Failed => matches!(next.state, S::Failed | S::Canceled),
+        S::OutcomeUnknown if old.next_attempt_at.is_none() => {
+            next.state == S::OutcomeUnknown && next.next_attempt_at.is_none()
+        }
+        _ => return true,
+    };
+    valid_state
+        && old.attempt_count == next.attempt_count
+        && old.phase == next.phase
+        && old.uncertain == next.uncertain
+        && old.rcpt_reply == next.rcpt_reply
+        && old.data_reply == next.data_reply
+        && (old.reason == next.reason
+            || (old.state == S::Failed
+                && next.state == S::Canceled
+                && next.reason == FailureReason::Canceled))
 }

@@ -93,7 +93,12 @@ submission or recipient PUT/DELETE, checking exact final ordinal coverage
 with indexed reads before COMMIT. A group inconsistency rolls back the entire
 transaction. The core also preserves existing immutable
 submission/envelope identity, the uncertainty latch, retained attempt history
-and one-way failure-notice state as specified in STORAGE.md.
+and one-way failure-notice state as specified in STORAGE.md. It refuses
+revival or a new attempt on terminal recipients, preserves Accepted/Canceled
+state, allows Failed only to remain Failed or join whole-group cancellation,
+and keeps terminal OutcomeUnknown terminal and uncertain. Terminal phase,
+uncertainty and actual replies are fixed, with a reason change only for
+Failed becoming Canceled; diagnostic text can still change.
 It compares final PUTs with original rows before writing, so repeated keys
 cannot reset history within a transaction. Full transition checks, creation
 and deletion authorization, and attempt fences remain service obligations.
@@ -211,7 +216,10 @@ queued recipients can cancel together, but a large attempted submission with
 long reply history may require explicit refusal. Failed recipients with no
 uncertainty can become Canceled together
 with all remaining recipients: the guarantee is that no recipient received
-the message. Cancellation preserves an existing Pending or Stored failure
+the message. This also permits canceling an already completed, wholly Failed
+submission; the resulting Canceled retention category applies, but the
+cancellation does not itself authorize record deletion or a rewritten
+retention timestamp. Cancellation preserves an existing Pending or Stored failure
 notice and its historical Email ID. It does not create a new notice merely
 because a recipient became Canceled; recovery therefore permits all three
 notification states on a completed, wholly Canceled submission.

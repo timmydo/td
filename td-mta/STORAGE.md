@@ -151,7 +151,16 @@ historical notificationEmail, even after the visible Email is deleted.
 Cancellation preserves either retained notice state. Recipient address is
 immutable; uncertainty cannot clear and attemptCount cannot decrease.
 When attemptCount is unchanged, attempt ID and lastAttemptAt must also stay
-unchanged. A mismatch returns Conflict before body streaming or row writes.
+unchanged. Accepted and Canceled recipients remain in their respective states.
+Failed recipients remain Failed or become Canceled as part of a valid
+whole-submission cancellation. OutcomeUnknown without a next attempt remains
+OutcomeUnknown without a next attempt. All these terminal rows retain their
+attempt count, so their attempt ID/time cannot change either. They also keep
+phase, uncertainty and both replies unchanged; reason stays unchanged except
+for Failed becoming Canceled. Diagnostics can still change. Reply comparison
+is bounded by the existing row limits and borrows the decoded strings. This
+preserves recorded history; it does not prove the original replies' authority.
+A mismatch returns Conflict before body streaming or row writes.
 A DELETE followed by a PUT cannot reset that history within the transaction;
 intermediate PUT values have no separate durable effect.
 
@@ -167,7 +176,9 @@ that every store/host can finish within its deadline.
 This preserves named history fields, not the full transition graph. New
 attempt authority must still require a fresh ID and exactly one checked
 count increment. Actual notice creation, creation authorization and
-submission deletion/retention policy remain service obligations. Preserving
+submission deletion/retention policy remain service obligations. The core
+does not preserve completedAt's historical value; the service must not use
+an arbitrary rewrite to shorten retention. Preserving
 notice history does not prove the referenced failure Email was created.
 The service must forbid creation of a new notice solely for cancellation
 and atomically create the failure Email with the Stored transition. The core

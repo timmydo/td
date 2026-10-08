@@ -605,3 +605,400 @@ fn notice_history_does_not_prove_service_notice_creation() {
         assert!(view.get(Key::Email(email), &mut scratch).unwrap().is_none());
     }
 }
+
+fn terminal(state: RecipientState) -> RecipientRow<'static> {
+    let mut row = queued();
+    row.state = state;
+    row.next_attempt_at = None;
+    match state {
+        RecipientState::Accepted => {
+            row.attempt = Some(AttemptId::from_bytes([8; 16]));
+            row.attempt_count = 1;
+            row.last_attempt_at = Some(1);
+            row.phase = AttemptPhase::Final;
+            row.rcpt_reply = Some("250 accepted");
+            row.data_reply = Some("250 accepted");
+        }
+        RecipientState::Failed => row.reason = FailureReason::Expired,
+        RecipientState::Canceled => row.reason = FailureReason::Canceled,
+        RecipientState::OutcomeUnknown => {
+            row = uncertain();
+            row.state = state;
+            row.next_attempt_at = None;
+            row.reason = FailureReason::Expired;
+        }
+        _ => panic!("test requires a terminal state"),
+    }
+    row
+}
+fn seed_terminal(store: &IndexStore<'_>, state: RecipientState, encoded: bool) {
+    seed_terminal_row(store, terminal(state), encoded);
+}
+fn seed_terminal_row(store: &IndexStore<'_>, row: RecipientRow<'_>, encoded: bool) {
+    create_with(store, 2, &[0, 1], encoded).unwrap();
+    let state = row.state;
+    let row = encode(Row::Recipient(row));
+    let first = recipient_key(0);
+    let second = recipient_key(1);
+    let mut sub = submission(2);
+    if state == RecipientState::Canceled {
+        sub.completed_at = Some(1);
+    }
+    let sub_bytes = encode(Row::Submission(sub));
+    let mut operations = vec![
+        Operation::put(Table::Recipients, &first, &row).unwrap(),
+        Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes).unwrap(),
+    ];
+    if state == RecipientState::Canceled {
+        operations.push(Operation::put(Table::Recipients, &second, &row).unwrap());
+    }
+    apply(store, 1, &operations, encoded).unwrap();
+}
+const TERMINAL_STATES: &[RecipientState] = &[
+    RecipientState::Accepted,
+    RecipientState::Failed,
+    RecipientState::Canceled,
+    RecipientState::OutcomeUnknown,
+];
+#[test]
+fn terminal_recipients_cannot_regain_dispatch_obligations() {
+    let mut accepted = Vec::new();
+    for encoded in [false, true] {
+        for &state in TERMINAL_STATES {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = open(&mut root);
+            seed_terminal(&store, state, encoded);
+            let mut next = terminal(state);
+            match state {
+                RecipientState::Accepted => {
+                    next.state = RecipientState::RetryWait;
+                    next.reason = FailureReason::Network;
+                    next.next_attempt_at = Some(2);
+                }
+                RecipientState::Failed | RecipientState::Canceled => next = queued(),
+                RecipientState::OutcomeUnknown => {
+                    next.reason = FailureReason::Network;
+                    next.next_attempt_at = Some(2);
+                }
+                _ => panic!("test requires a terminal transition"),
+            }
+            let next_bytes = encode(Row::Recipient(next));
+            let first = recipient_key(0);
+            let second = recipient_key(1);
+            let second_bytes = encode(Row::Recipient(queued()));
+            let sub_bytes = encode(Row::Submission(submission(2)));
+            let result = apply(
+                &store,
+                2,
+                &[
+                    Operation::delete(Table::Recipients, &first).unwrap(),
+                    Operation::put(Table::Recipients, &first, &next_bytes).unwrap(),
+                    Operation::put(Table::Recipients, &second, &second_bytes).unwrap(),
+                    Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes).unwrap(),
+                ],
+                encoded,
+            );
+            if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                accepted.push((encoded, state, result));
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "revival was not rejected: {accepted:?}"
+    );
+}
+#[test]
+fn terminal_recipients_cannot_record_a_new_attempt() {
+    let mut accepted = Vec::new();
+    for encoded in [false, true] {
+        for &state in TERMINAL_STATES {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = open(&mut root);
+            seed_terminal(&store, state, encoded);
+            let mut next = terminal(state);
+            next.attempt_count += 1;
+            next.attempt = Some(AttemptId::from_bytes([9; 16]));
+            next.last_attempt_at = Some(2);
+            next.phase = AttemptPhase::Final;
+            let next_bytes = encode(Row::Recipient(next));
+            let first = recipient_key(0);
+            let result = apply(
+                &store,
+                2,
+                &[Operation::put(Table::Recipients, &first, &next_bytes).unwrap()],
+                encoded,
+            );
+            if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                accepted.push((encoded, state, result));
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "new terminal attempt was not rejected: {accepted:?}"
+    );
+}
+#[test]
+fn terminal_history_allows_diagnostics_and_whole_group_failure_cancellation() {
+    for encoded in [false, true] {
+        for &state in TERMINAL_STATES {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = open(&mut root);
+            seed_terminal(&store, state, encoded);
+            let mut next = terminal(state);
+            next.diagnostic = "retained terminal outcome";
+            let next_bytes = encode(Row::Recipient(next));
+            let first = recipient_key(0);
+            let put = Operation::put(Table::Recipients, &first, &next_bytes).unwrap();
+            assert_eq!(
+                apply(
+                    &store,
+                    2,
+                    &[Operation::delete(Table::Recipients, &first).unwrap(), put],
+                    encoded,
+                ),
+                Ok(Sequence::from_u64(3))
+            );
+            if state == RecipientState::Failed {
+                next.state = RecipientState::Canceled;
+                next.reason = FailureReason::Canceled;
+                let bytes = encode(Row::Recipient(next));
+                let second = recipient_key(1);
+                let mut sub = submission(2);
+                sub.completed_at = Some(1);
+                let sub_bytes = encode(Row::Submission(sub));
+                assert_eq!(
+                    apply(
+                        &store,
+                        3,
+                        &[
+                            Operation::put(Table::Recipients, &first, &bytes).unwrap(),
+                            Operation::put(Table::Recipients, &second, &bytes).unwrap(),
+                            Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes)
+                                .unwrap(),
+                        ],
+                        encoded,
+                    ),
+                    Ok(Sequence::from_u64(4))
+                );
+            }
+        }
+    }
+}
+
+fn attempted_terminal(state: RecipientState) -> RecipientRow<'static> {
+    let mut row = terminal(state);
+    if row.attempt_count == 0 {
+        row.attempt = Some(AttemptId::from_bytes([8; 16]));
+        row.attempt_count = 1;
+        row.last_attempt_at = Some(1);
+        row.phase = AttemptPhase::Final;
+    }
+    row.rcpt_reply = Some("250 recipient accepted");
+    row.data_reply = Some(if state == RecipientState::Accepted {
+        "250 delivered"
+    } else {
+        "550 rejected"
+    });
+    if state == RecipientState::Failed {
+        row.reason = FailureReason::SmtpPermanent;
+    }
+    row
+}
+#[test]
+fn terminal_outcomes_cannot_be_reclassified() {
+    let mut accepted = Vec::new();
+    for encoded in [false, true] {
+        for (before, after) in [
+            (RecipientState::Accepted, RecipientState::Failed),
+            (RecipientState::Accepted, RecipientState::OutcomeUnknown),
+            (RecipientState::OutcomeUnknown, RecipientState::Accepted),
+            (RecipientState::Failed, RecipientState::Accepted),
+            (RecipientState::Failed, RecipientState::OutcomeUnknown),
+            (RecipientState::Canceled, RecipientState::Failed),
+        ] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = open(&mut root);
+            seed_terminal_row(&store, attempted_terminal(before), encoded);
+            let mut next = attempted_terminal(before);
+            next.state = after;
+            match after {
+                RecipientState::Accepted => {
+                    next.phase = AttemptPhase::Final;
+                    next.reason = FailureReason::None;
+                    next.rcpt_reply = Some("250 accepted");
+                    next.data_reply = Some("250 accepted");
+                }
+                RecipientState::OutcomeUnknown => {
+                    next.uncertain = true;
+                    next.reason = FailureReason::Expired;
+                }
+                RecipientState::Failed => next.reason = FailureReason::Expired,
+                _ => panic!("test requires a terminal transition"),
+            }
+            let bytes = encode(Row::Recipient(next));
+            let key = recipient_key(0);
+            let mut operations = vec![Operation::put(Table::Recipients, &key, &bytes).unwrap()];
+            let second = recipient_key(1);
+            let mut sub = submission(2);
+            sub.completed_at = Some(1);
+            sub.notification = NotificationState::Pending;
+            let sub_bytes = encode(Row::Submission(sub));
+            if before == RecipientState::Canceled {
+                operations.push(Operation::put(Table::Recipients, &second, &bytes).unwrap());
+                operations.push(
+                    Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes).unwrap(),
+                );
+            }
+            let result = apply(&store, 2, &operations, encoded);
+            if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                accepted.push((encoded, before, after, result));
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "terminal reclassification was not rejected: {accepted:?}"
+    );
+}
+#[test]
+fn terminal_reply_reason_phase_and_uncertainty_history_is_fixed() {
+    let mut accepted = Vec::new();
+    for encoded in [false, true] {
+        for &state in TERMINAL_STATES {
+            for field in 0..5 {
+                if (field == 2
+                    && !matches!(
+                        state,
+                        RecipientState::Failed | RecipientState::OutcomeUnknown
+                    ))
+                    || (field == 3 && state != RecipientState::OutcomeUnknown)
+                    || (field == 4 && state != RecipientState::Accepted)
+                {
+                    continue;
+                }
+                let fixture = Fixture::new();
+                let mut root = fixture.locked();
+                let store = open(&mut root);
+                let mut row = attempted_terminal(state);
+                seed_terminal_row(&store, row, encoded);
+                match field {
+                    0 => row.rcpt_reply = Some("250 replacement recipient reply"),
+                    1 => {
+                        row.data_reply = Some(if state == RecipientState::Accepted {
+                            "250 replacement data reply"
+                        } else {
+                            "550 replacement data reply"
+                        })
+                    }
+                    2 => {
+                        row.reason = if state == RecipientState::Failed {
+                            FailureReason::Expired
+                        } else {
+                            FailureReason::SmtpPermanent
+                        }
+                    }
+                    3 => row.phase = AttemptPhase::AcceptancePossible,
+                    _ => row.uncertain = true,
+                }
+                let key = recipient_key(0);
+                let bytes = encode(Row::Recipient(row));
+                let result = apply(
+                    &store,
+                    2,
+                    &[Operation::put(Table::Recipients, &key, &bytes).unwrap()],
+                    encoded,
+                );
+                if result != Err(CommitError::Rejected(ports::Error::Conflict)) {
+                    accepted.push((encoded, state, field, result));
+                    continue;
+                }
+                let mut retained = attempted_terminal(state);
+                retained.diagnostic = "original outcome retained";
+                let retained_bytes = encode(Row::Recipient(retained));
+                assert_eq!(
+                    apply(
+                        &store,
+                        2,
+                        &[Operation::put(Table::Recipients, &key, &retained_bytes).unwrap()],
+                        encoded
+                    ),
+                    Ok(Sequence::from_u64(3))
+                );
+                let mut view = store.view(ACCOUNT, deadline()).unwrap();
+                let mut scratch = [0; 65536];
+                assert_eq!(
+                    view.get(Key::Recipient(SUBMISSION, 0), &mut scratch)
+                        .unwrap()
+                        .unwrap()
+                        .0,
+                    Row::Recipient(retained)
+                );
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "terminal history replacement was not rejected: {accepted:?}"
+    );
+}
+#[test]
+fn terminal_final_operation_wins_and_attempted_cancellation_retains_replies() {
+    for encoded in [false, true] {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = open(&mut root);
+        let original = attempted_terminal(RecipientState::Failed);
+        seed_terminal_row(&store, original, encoded);
+        let key = recipient_key(0);
+        let bytes = encode(Row::Recipient(original));
+        let good = Operation::put(Table::Recipients, &key, &bytes).unwrap();
+        let mut revival = original;
+        revival.state = RecipientState::RetryWait;
+        revival.reason = FailureReason::Network;
+        revival.next_attempt_at = Some(2);
+        let changed = encode(Row::Recipient(revival));
+        let bad = Operation::put(Table::Recipients, &key, &changed).unwrap();
+        rejected(apply(&store, 2, &[good, bad], encoded));
+        assert_eq!(
+            apply(&store, 2, &[bad, good], encoded),
+            Ok(Sequence::from_u64(3))
+        );
+        let mut canceled = original;
+        canceled.state = RecipientState::Canceled;
+        canceled.reason = FailureReason::Canceled;
+        let canceled_bytes = encode(Row::Recipient(canceled));
+        let second = recipient_key(1);
+        let second_bytes = encode(Row::Recipient(terminal(RecipientState::Canceled)));
+        let mut sub = submission(2);
+        sub.completed_at = Some(1);
+        let sub_bytes = encode(Row::Submission(sub));
+        assert_eq!(
+            apply(
+                &store,
+                3,
+                &[
+                    Operation::put(Table::Recipients, &key, &canceled_bytes).unwrap(),
+                    Operation::put(Table::Recipients, &second, &second_bytes).unwrap(),
+                    Operation::put(Table::Submissions, SUBMISSION.as_bytes(), &sub_bytes).unwrap(),
+                ],
+                encoded
+            ),
+            Ok(Sequence::from_u64(4))
+        );
+        let mut view = store.view(ACCOUNT, deadline()).unwrap();
+        let mut scratch = [0; 65536];
+        assert_eq!(
+            view.get(Key::Recipient(SUBMISSION, 0), &mut scratch)
+                .unwrap()
+                .unwrap()
+                .0,
+            Row::Recipient(canceled)
+        );
+    }
+}
