@@ -23,6 +23,45 @@ use td_ui::raster::{
     LINE_NUMBER, PAPER,
 };
 
+/// The list's scrollbar drags: its thumb grabbed where pressed moves the
+/// window with it, keeping the selection in it; a press on the track
+/// jumps the thumb's middle there; a release, a press or an event the
+/// finder does not read lets the bar go; a short list's bar does nothing.
+#[test]
+fn the_lists_scrollbar_drags_and_its_track_jumps() {
+    let mut f = finder(Choose::Folder, 1);
+    let list = f.list_rect();
+    let x = list.x + i64::from(list.width) - 10;
+    let (top, bottom) = (list.y + 1, list.y + i64::from(list.height) - 1);
+    assert_eq!(f.event(Event::Press { x, y: top }), Outcome::Consumed);
+    assert_eq!(f.event(Event::Move { x, y: bottom }), Outcome::Consumed);
+    let long: Vec<Entry> = (0..40)
+        .map(|i| entry(&format!("f{i:02}"), Kind::Folder))
+        .collect();
+    f.set_listing(Listing::new("/long", long, false).unwrap(), None)
+        .unwrap();
+    // The thumb at the top, grabbed and not moved.
+    assert_eq!(f.event(Event::Press { x, y: top }), Outcome::Consumed);
+    assert_eq!(f.first(), 0);
+    // Dragged to the bottom, even past the finder: the last page.
+    let below = f.rect().y + i64::from(f.rect().height) + 50;
+    assert_eq!(f.event(Event::Move { x, y: below }), Outcome::Changed);
+    assert_eq!(f.first(), 33);
+    assert_eq!(f.selected(), Some(33));
+    assert_eq!(f.event(Event::Release { x, y: below }), Outcome::Consumed);
+    // Let go: a motion is no drag.
+    assert_eq!(f.event(Event::Move { x, y: top }), Outcome::Consumed);
+    assert_eq!(f.first(), 33);
+    // A press on the track jumps the thumb's middle there.
+    assert_eq!(f.event(Event::Press { x, y: top }), Outcome::Changed);
+    assert_eq!(f.first(), 0);
+    assert_eq!(f.selected(), Some(6));
+    // An event the finder does not read lets it go.
+    assert_eq!(f.event(Event::Other), Outcome::Consumed);
+    assert_eq!(f.event(Event::Move { x, y: bottom }), Outcome::Consumed);
+    assert_eq!(f.first(), 0);
+}
+
 fn surface(scale: u8) -> Surface {
     let s = scale as usize;
     Surface::new(640 * s, 400 * s, Scale::new(scale).unwrap()).unwrap()

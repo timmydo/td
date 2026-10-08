@@ -282,6 +282,9 @@ pub struct Controller {
     shown: Vec<usize>,
     selected: usize,
     first: usize,
+    /// Where on its thumb the list's scrollbar was grabbed, while a
+    /// press in its gutter holds it.
+    scrolling: Option<i64>,
     note: String,
     open: bool,
 }
@@ -320,6 +323,7 @@ impl Controller {
             shown,
             selected: 0,
             first: 0,
+            scrolling: None,
             note,
             open: true,
         };
@@ -493,6 +497,8 @@ impl Controller {
             })
             .unwrap_or(0);
         self.first = 0;
+        // Its bar was another list's.
+        self.scrolling = None;
         self.reveal();
     }
 
@@ -504,6 +510,7 @@ impl Controller {
 
     fn close(&mut self, choice: Choice) -> Outcome {
         self.open = false;
+        self.scrolling = None;
         Outcome::Closed(choice)
     }
 
@@ -555,6 +562,11 @@ impl Controller {
         if !self.open {
             return Outcome::Ignored;
         }
+        // A press, or an event the finder does not read, lets a held
+        // scrollbar go: its release was lost.
+        if matches!(event, Event::Press { .. } | Event::Other) {
+            self.scrolling = None;
+        }
         match event {
             Event::Resize { surface, rect } => {
                 let (filter, list) = match Self::layout(surface, rect) {
@@ -598,9 +610,17 @@ impl Controller {
                 self.refresh(None);
                 Outcome::Changed
             }
+            // A held scrollbar follows the pointer wherever it goes, until
+            // the release.
+            Event::Move { y, .. } if self.scrolling.is_some() => self.drag_scrollbar(y),
+            Event::Release { y, .. } if self.scrolling.is_some() => {
+                let outcome = self.drag_scrollbar(y);
+                self.scrolling = None;
+                outcome
+            }
             // Pointer input off the finder is the consumer's, ignored here;
-            // on it, a press picks the shown row under it and the rest is
-            // consumed.
+            // on it, a press picks the shown row under it, or in the list's
+            // gutter holds its scrollbar, and the rest is consumed.
             Event::Press { x, y }
             | Event::Release { x, y }
             | Event::Move { x, y }
@@ -616,30 +636,74 @@ impl Controller {
                 .filter(|position| *position < self.shown.len())
             {
                 Some(position) => self.select(position),
-                None => Outcome::Consumed,
+                None => self.press_scrollbar(x, y),
             },
             Event::Wheel { x, y, rows } => {
                 if self.shown.is_empty() || !self.list.rect().contains(x, y) {
                     return Outcome::Consumed;
                 }
-                let first = self
-                    .first
-                    .saturating_add_signed(rows)
-                    .min(self.shown.len().saturating_sub(self.list.rows()));
-                let last = first
-                    .saturating_add(self.list.rows())
-                    .min(self.shown.len())
-                    .saturating_sub(1);
-                let selected = self.selected.clamp(first, last.max(first));
-                if first == self.first && selected == self.selected {
-                    return Outcome::Consumed;
-                }
-                self.first = first;
-                self.selected = selected;
-                Outcome::Changed
+                self.scroll_to(self.first.saturating_add_signed(rows))
             }
             Event::Release { .. } | Event::Move { .. } | Event::Other => Outcome::Consumed,
         }
+    }
+
+    /// Shows the list from shown row `first`, kept within the last page,
+    /// the selection moved as little as keeps it shown.
+    fn scroll_to(&mut self, first: usize) -> Outcome {
+        if self.shown.is_empty() {
+            return Outcome::Consumed;
+        }
+        let first = first.min(self.shown.len().saturating_sub(self.list.rows()));
+        let last = first
+            .saturating_add(self.list.rows())
+            .min(self.shown.len())
+            .saturating_sub(1);
+        let selected = self.selected.clamp(first, last.max(first));
+        if first == self.first && selected == self.selected {
+            return Outcome::Consumed;
+        }
+        self.first = first;
+        self.selected = selected;
+        Outcome::Changed
+    }
+
+    /// A press in the list's gutter, right of its rows: on the thumb it
+    /// grabs it where pressed, elsewhere the thumb's middle jumps to it;
+    /// either holds the bar until the release.
+    fn press_scrollbar(&mut self, x: i64, y: i64) -> Outcome {
+        let bar = self.list.scrollbar(self.shown.len(), self.first);
+        let rect = self.list.rect();
+        let in_gutter = x >= bar.track.x
+            && x < rect.x + i64::from(rect.width)
+            && y >= bar.track.y
+            && y < bar.track.y + i64::from(bar.track.height);
+        if !in_gutter || !bar.enabled() {
+            return Outcome::Consumed;
+        }
+        let on_thumb = y >= bar.thumb.y && y < bar.thumb.y + i64::from(bar.thumb.height);
+        let grab = if on_thumb {
+            y - bar.thumb.y
+        } else {
+            i64::from(bar.thumb.height / 2)
+        };
+        self.scrolling = Some(grab);
+        self.drag_scrollbar(y)
+    }
+
+    /// The held thumb's leading edge moved to `y` less its grab, from the
+    /// bar as the list stands now.
+    fn drag_scrollbar(&mut self, y: i64) -> Outcome {
+        let Some(grab) = self.scrolling else {
+            return Outcome::Consumed;
+        };
+        let bar = self.list.scrollbar(self.shown.len(), self.first);
+        // A thumb drawn at the track's start may stand for rows past it:
+        // an edge there is the top, whatever the delta.
+        if y.saturating_sub(grab) <= bar.track.y {
+            return self.scroll_to(0);
+        }
+        self.scroll_to(bar.position_at(y, grab, self.first))
     }
 
     /// Paints the finder: chrome under the whole rectangle, the path's

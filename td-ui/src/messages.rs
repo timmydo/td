@@ -540,6 +540,9 @@ pub struct Controller {
     /// The selection's anchor and head.
     selection: Option<(Point, Point)>,
     dragging: bool,
+    /// Where on its thumb the scrollbar was grabbed, while a press in
+    /// the gutter holds it.
+    scrolling: Option<i64>,
     /// A click's release time and place, for the next press to pair with.
     click: Option<(u64, i64, i64)>,
     /// Whether the held press selected a word, so its release is no click.
@@ -568,6 +571,7 @@ impl Controller {
             focus: None,
             selection: None,
             dragging: false,
+            scrolling: None,
             click: None,
             word: false,
         };
@@ -598,6 +602,8 @@ impl Controller {
         anchor: Option<(u32, u32, u32)>,
     ) -> Result<(), Error> {
         self.dragging = false;
+        // A resize lets a held scrollbar go, as the editor's does.
+        self.scrolling = None;
         self.click = None;
         self.laid = false;
         self.lines.clear();
@@ -967,6 +973,83 @@ impl Controller {
 
     fn cell(&self) -> i64 {
         (CELL_WIDTH * self.surface.scale.value()) as i64
+    }
+
+    /// The scrollbar as the list draws it now: its track down the
+    /// gutter, its thumb over the view's share of the rows, in font
+    /// pixels.
+    fn scrollbar(&self) -> Scrollbar {
+        let s = self.surface.scale.value();
+        let track = Rect {
+            x: self.rect.x + i64::from(self.rect.width) - (GUTTER * s) as i64,
+            y: self.rect.y,
+            width: (TRACK * s) as u32,
+            height: self.rect.height,
+        };
+        Scrollbar::new(
+            track,
+            self.view_height() as usize,
+            self.total_y as usize,
+            self.top_y as usize,
+            self.surface.scale,
+            false,
+        )
+    }
+
+    /// A press in the gutter: on the thumb it grabs it where pressed,
+    /// elsewhere the thumb's middle jumps to it; either holds the bar
+    /// until the release, each motion scrolling the view to the thumb.
+    fn press_scrollbar(&mut self, y: i64) -> Outcome {
+        let bar = self.scrollbar();
+        if !bar.enabled() {
+            return Outcome::Consumed;
+        }
+        let on_thumb = y >= bar.thumb.y && y < bar.thumb.y + i64::from(bar.thumb.height);
+        let grab = if on_thumb {
+            y - bar.thumb.y
+        } else {
+            i64::from(bar.thumb.height / 2)
+        };
+        self.scrolling = Some(grab);
+        self.drag_scrollbar(y)
+    }
+
+    /// The held thumb's leading edge moved to `y` less its grab: the
+    /// view follows, from the bar as the list stands now, so rows that
+    /// came or a resize meanwhile are reached.
+    fn drag_scrollbar(&mut self, y: i64) -> Outcome {
+        let Some(grab) = self.scrolling else {
+            return Outcome::Ignored;
+        };
+        let bar = self.scrollbar();
+        // A thumb drawn at the track's start may stand for an offset
+        // past it: an edge there is the top, whatever the delta.
+        let offset = if y.saturating_sub(grab) <= bar.track.y {
+            0
+        } else {
+            bar.position_at(y, grab, self.top_y as usize)
+        };
+        self.scroll_to(offset)
+    }
+
+    /// Scrolls so the row at font-pixel offset `y` is the first shown;
+    /// the bar's end, which may fall short of the last page's row, is
+    /// the last page.
+    fn scroll_to(&mut self, y: usize) -> Outcome {
+        if y as u64 >= self.total_y.saturating_sub(self.view_height()) {
+            return Self::changed(self.set_top(self.max_top()));
+        }
+        let mut start = 0u64;
+        let mut row = self.lines.len().saturating_sub(1);
+        for (index, line) in self.lines.iter().enumerate() {
+            let end = start + line.height();
+            if (y as u64) < end {
+                row = index;
+                break;
+            }
+            start = end;
+        }
+        Self::changed(self.set_top(row))
     }
 
     /// The rows' area: the rectangle less the scrollbar gutter.
@@ -1531,13 +1614,16 @@ impl Controller {
         match event {
             Event::Focus(focused) => {
                 self.dragging &= focused;
+                if !focused {
+                    self.scrolling = None;
+                }
                 let changed = self.focused != focused;
                 self.focused = focused;
                 Self::changed(changed)
             }
             Event::Cancel => {
                 self.click = None;
-                if std::mem::take(&mut self.dragging) {
+                if self.scrolling.take().is_some() | std::mem::take(&mut self.dragging) {
                     Outcome::Consumed
                 } else {
                     Outcome::Ignored
@@ -1545,6 +1631,7 @@ impl Controller {
             }
             _ if !self.laid => {
                 self.dragging = false;
+                self.scrolling = None;
                 Outcome::Ignored
             }
             Event::Key { key, repeat } => self.key(key, repeat, clipboard),
@@ -1562,6 +1649,12 @@ impl Controller {
                 extend,
                 at_ms,
             } => self.press(x, y, extend, at_ms, clipboard),
+            Event::Move { y, .. } if self.scrolling.is_some() => self.drag_scrollbar(y),
+            Event::Release { y, .. } if self.scrolling.is_some() => {
+                let outcome = self.drag_scrollbar(y);
+                self.scrolling = None;
+                outcome
+            }
             Event::Move { x, y } => {
                 if !self.dragging {
                     return Outcome::Ignored;
@@ -1683,13 +1776,14 @@ impl Controller {
         clipboard: &mut dyn Clipboard,
     ) -> Outcome {
         self.dragging = false;
+        self.scrolling = None;
         self.word = false;
         let click = self.click.take();
         if !self.rect.contains(x, y) {
             return Outcome::Ignored;
         }
         if !self.view().contains(x, y) {
-            return Outcome::Consumed;
+            return self.press_scrollbar(y);
         }
         let row = self.rows().find(|(_, _, rect)| rect.contains(x, y));
         let Some((_, line, rect)) = row else {
@@ -1850,21 +1944,7 @@ impl Controller {
                 Kind::Gap => {}
             }
         }
-        let s = self.surface.scale.value();
-        let track = Rect {
-            x: self.rect.x + i64::from(self.rect.width) - (GUTTER * s) as i64,
-            y: self.rect.y,
-            width: (TRACK * s) as u32,
-            height: self.rect.height,
-        };
-        let bar = Scrollbar::new(
-            track,
-            self.view_height() as usize,
-            self.total_y as usize,
-            self.top_y as usize,
-            self.surface.scale,
-            false,
-        );
+        let bar = self.scrollbar();
         fill(
             bar.thumb,
             if bar.enabled() { LINE_NUMBER } else { BORDER },

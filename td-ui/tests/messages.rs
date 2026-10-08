@@ -1614,3 +1614,182 @@ fn the_scrollbar_thumb_tracks_the_view() {
     assert_eq!(color, BORDER);
     assert_eq!(whole.height, still.rect().height);
 }
+
+/// At any height and scale the thumb at the end is the end: grabbed it
+/// stays, and dragged up and back down the list follows again, rows
+/// that came meanwhile included.
+#[test]
+fn the_scrollbars_end_is_the_last_page_at_any_height() {
+    let mut board = Board::default();
+    for scale in 1..=3u8 {
+        for height in [230, 239, 250, 260] {
+            let mut list = list(scale, 30, height);
+            for n in 0..30 {
+                list.push(text("user", &format!("line {n}"))).unwrap();
+            }
+            let rect = list.rect();
+            let s = i64::from(scale);
+            let x = rect.x + i64::from(rect.width) - 10 * s;
+            let foot = rect.y + i64::from(rect.height) - 1;
+            assert!(list.following());
+            let at = format!("scale {scale}, height {height}");
+            assert_eq!(
+                press(&mut list, &mut board, (x, foot), false, 0),
+                Outcome::Consumed,
+                "{at}"
+            );
+            assert!(list.following(), "{at}");
+            list.event(Event::Move { x, y: rect.y }, &mut board);
+            assert!(!list.following(), "{at}");
+            assert_eq!(first(&list), "H0", "{at}");
+            // Rows that come while it is held are reached.
+            for n in 30..35 {
+                list.push(text("user", &format!("line {n}"))).unwrap();
+            }
+            list.event(Event::Move { x, y: foot + 100 }, &mut board);
+            assert!(list.following(), "{at}");
+            assert_eq!(rows(&list).last().unwrap(), "G34", "{at}");
+            release(&mut list, &mut board, (x, foot), 1);
+        }
+    }
+}
+
+/// A thumb drawn at the track's start while the view is a little past
+/// the top still reaches the top when its edge is dragged there.
+#[test]
+fn the_scrollbars_start_is_the_top_however_many_rows() {
+    let mut board = Board::default();
+    let mut list = list(1, 30, 100);
+    for n in 0..400 {
+        list.push(text("user", &format!("line {n}"))).unwrap();
+    }
+    let rect = list.rect();
+    let x = rect.x + i64::from(rect.width) - 10;
+    let foot = rect.y + i64::from(rect.height) - 1;
+    press(&mut list, &mut board, (x, foot), false, 0);
+    // Grabbed at its foot: the edge is the thumb's height above.
+    let thumb = {
+        let gutter = rect.x + i64::from(rect.width) - 16;
+        let mut found = None;
+        list.emit(rect, &mut |draw| {
+            if let Primitive::Fill { rect: fill, .. } = draw.primitive {
+                if fill.x == gutter {
+                    found = Some(fill);
+                }
+            }
+        });
+        found.unwrap()
+    };
+    let grab = foot - thumb.y;
+    list.event(
+        Event::Move {
+            x,
+            y: rect.y + grab + 1,
+        },
+        &mut board,
+    );
+    assert_ne!(first(&list), "H0");
+    list.event(
+        Event::Move {
+            x,
+            y: rect.y + grab,
+        },
+        &mut board,
+    );
+    assert_eq!(first(&list), "H0");
+}
+
+/// The thumb drags: grabbed where pressed, it scrolls the view to where
+/// it is moved, and back to the end follows the list again; a press on
+/// the track jumps the thumb's middle there; a cancel or a release ends
+/// the drag, and a bar with nothing to scroll does nothing.
+#[test]
+fn the_scrollbar_thumb_drags_and_the_track_jumps() {
+    let mut board = Board::default();
+    let thumb = |list: &Controller| {
+        let rect = list.rect();
+        let gutter = rect.x + i64::from(rect.width) - 16;
+        let mut found = None;
+        list.emit(rect, &mut |draw| {
+            if let Primitive::Fill { rect: fill, .. } = draw.primitive {
+                if fill.x == gutter {
+                    found = Some(fill);
+                }
+            }
+        });
+        found.unwrap()
+    };
+    let mut list = long(1);
+    let rect = list.rect();
+    let x = rect.x + i64::from(rect.width) - 10;
+    let end = thumb(&list);
+    let middle = end.y + i64::from(end.height) / 2;
+    assert!(list.following());
+    // Grabbed and not moved: nothing changes.
+    assert_eq!(
+        press(&mut list, &mut board, (x, middle), false, 0),
+        Outcome::Consumed
+    );
+    assert!(list.following());
+    // Up to the top: the first row shows.
+    let up = list.event(Event::Move { x, y: rect.y }, &mut board);
+    assert_eq!(up, Outcome::Changed);
+    assert_eq!(thumb(&list).y, rect.y);
+    assert!(!list.following());
+    assert_eq!(first(&list), "H0");
+    // Back down: the end, followed again.
+    list.event(
+        Event::Move {
+            x,
+            y: rect.y + i64::from(rect.height),
+        },
+        &mut board,
+    );
+    assert!(list.following());
+    assert_eq!(
+        release(
+            &mut list,
+            &mut board,
+            (x, rect.y + i64::from(rect.height)),
+            1
+        ),
+        Outcome::Consumed
+    );
+    // Released: a motion is no drag.
+    assert_eq!(
+        list.event(Event::Move { x, y: rect.y }, &mut board),
+        Outcome::Ignored
+    );
+    assert!(list.following());
+    // A press on the track above the thumb jumps it there.
+    assert_eq!(
+        press(&mut list, &mut board, (x, rect.y + 1), false, 10),
+        Outcome::Changed
+    );
+    assert_eq!(thumb(&list).y, rect.y);
+    // A cancel ends the drag where it is.
+    assert_eq!(list.event(Event::Cancel, &mut board), Outcome::Consumed);
+    assert_eq!(
+        list.event(
+            Event::Move {
+                x,
+                y: rect.y + i64::from(rect.height)
+            },
+            &mut board
+        ),
+        Outcome::Ignored
+    );
+    assert_eq!(thumb(&list).y, rect.y);
+    // Nothing to scroll: the gutter takes the press and does nothing.
+    let mut still = pair(1);
+    let still_x = still.rect().x + i64::from(still.rect().width) - 10;
+    let still_y = still.rect().y + 5;
+    assert_eq!(
+        press(&mut still, &mut board, (still_x, still_y), false, 0),
+        Outcome::Consumed
+    );
+    assert_eq!(
+        still.event(Event::Move { x: still_x, y: 0 }, &mut board),
+        Outcome::Ignored
+    );
+}

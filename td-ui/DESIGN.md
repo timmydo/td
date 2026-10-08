@@ -1648,7 +1648,8 @@ for any row and back, and a trim of older messages keeping the first
 shown row; a view one header tall showing the header and not its gap; a
 fold pressed at the end keeping its title where it was; the scrollbar's
 thumb at the foot at the end, at the top at the start and the whole
-track disabled when everything fits; `NextMessage` and
+track disabled when everything fits, and dragged, jumped to, released
+and cancelled; `NextMessage` and
 `PreviousMessage` focusing and revealing a header, and `Toggle` folding
 the focused message and revealing its header; a drag past the view
 scrolling a row a motion and asking a repaint when only the view moved;
@@ -2628,16 +2629,20 @@ folder itself (`Here`) when folders are chosen, so a selection resting on
 a subfolder cannot be taken for the folder in view, and the selected
 enabled file otherwise; Parent, and Backspace on an empty filter, ascend
 (`Ascend`); Escape cancels. A repeated Activate, Accept, Parent, Escape or
-empty-filter Backspace is consumed. A press on a shown row selects it and
-the wheel over the list moves the window, keeping the selection in it;
-other pointer input on the finder is consumed, and pointer input off its
-rectangle is ignored, the consumer's to act on (its bar, its own
-controls). Descend and Ascend leave the widget as it
-is: the consumer lists the folder and installs it with `set_listing`,
-which clears the filter and the note and selects the entry it names (the
-folder an ascent came from), or says why it could not with `set_note`,
-shown in the status row until the next listing. Resize relays out and
-keeps the selection shown; a layout that cannot hold the finder closes it
+empty-filter Backspace is consumed. A press on a shown row selects it
+and the wheel over the list moves the window, keeping the selection in
+it; a press in the list's scrollbar gutter holds the bar as the message
+list's does, its motions moving the window the same way wherever the
+pointer goes, until the release, the next press, an event the finder
+does not read, a new listing or filter or the close; other pointer input
+on the finder is consumed, and pointer input off its rectangle is
+ignored, the consumer's to act on (its bar, its own controls). Descend
+and Ascend leave the widget as it is: the consumer lists the folder and
+installs it with `set_listing`, which clears the filter and the note and
+selects the entry it names (the folder an ascent came from), or says why
+it could not with `set_note`, shown in the status row until the next
+listing. Resize relays out and keeps the selection shown; a layout that
+cannot hold the finder closes it
 `Unavailable`. A choice, a cancel and an unavailable layout each produce
 one `Closed` outcome; later events are ignored and a closed finder emits
 no draws. The consumer owns physical key bindings, the double click it
@@ -2660,7 +2665,8 @@ holds at the source: no formatting, collecting or boxing in the module.
 text, not capacity), the filter rule, navigation and reveal, an empty
 listing taking every key and press, the outcomes of choosing in either
 mode and of a disabled entry, listing replacement selecting by name, the
-note's life, the press and wheel paths on and off the finder, a meta left
+note's life, the press and wheel paths on and off the finder, the
+scrollbar's drag, jump and release, a meta left
 out of a row too narrow for it, a long query keeping its caret in a
 narrow field, the geometry refusals and resize, and draw-stream and pixel
 oracles at scales one through four keeping every draw inside the
@@ -3042,15 +3048,23 @@ showed; one outside the surface is refused.
 
 The view scrolls by row: `Up` and `Down` a row, `PageUp` and `PageDown`
 to the first row the view did not hold whole and back, `Home` and `End`
-the ends, the wheel a row per row of travel, and a drag past the view's
-top or foot a row per motion. The last page is the earliest row from
-which the rest fit, but never past the last message's last header,
-title, text or more row, so a view too short for a header and its gap
-shows the header. At the end the list follows: a message arriving or text
-streaming in keeps the end shown; scrolled back, the first shown row
-keeps its place in the text through every change, resize and period
-without a layout (the row holding its start, or the title of a section
-folded over it). A fold the user asks for (a press or `Toggle`) keeps
+the ends, the wheel a row per row of travel, a drag past the view's top
+or foot a row per motion, and the scrollbar: a press in the gutter holds
+it until the release or a cancel, on the thumb grabbed where pressed,
+elsewhere its middle jumping to the press, and each motion shows from
+the row the thumb's place falls in (`Scrollbar::position_at` in font
+pixels, as the editor's and the tree table's drags use it, from the bar
+as the list stands at each motion, so rows that came meanwhile are
+reached), the bar's end being the last page, which the list then follows
+again; a resize, a lost layout or a focus loss lets it go; a bar with
+nothing to scroll takes the press and does nothing. The last page is the
+earliest row from which the rest fit, but never past the last message's
+last header, title, text or more row, so a view too short for a header
+and its gap shows the header. At the end the list follows: a message
+arriving or text streaming in keeps the end shown; scrolled back, the
+first shown row keeps its place in the text through every change, resize
+and period without a layout (the row holding its start, or the title of
+a section folded over it). A fold the user asks for (a press or `Toggle`) keeps
 the first shown row rather than the end, so the row pressed stays where
 it was; the list follows again only if that leaves the view at the end.
 `PreviousMessage` and `NextMessage` focus a message, the first shown
