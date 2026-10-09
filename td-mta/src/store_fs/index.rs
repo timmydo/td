@@ -995,6 +995,13 @@ impl<'r> IndexStore<'r> {
             {
                 return Err(ports::Error::Corrupt);
             }
+            drop(statement);
+            let duplicate: bool = db
+                .query_row(ANCHOR_CARDINALITY, [], |row| row.get(0))
+                .map_err(sql)?;
+            if duplicate {
+                return Err(ports::Error::Corrupt);
+            }
             Ok(())
         })
     }
@@ -1099,6 +1106,9 @@ fn write_body<C: ports::Crypto>(
         Ok(())
     })
 }
+const ANCHOR_CARDINALITY: &str = "SELECT EXISTS(
+    SELECT 1 FROM thread_anchors INDEXED BY anchors_email
+    GROUP BY account,email_id HAVING count(*)>1)";
 const BODY_EXTENT: &str = "SELECT
     EXISTS(SELECT 1 FROM blob_chunks c WHERE c.account=b.account AND c.blob=b.id AND c.ordinal<0),
     EXISTS(SELECT 1 FROM blob_chunks c WHERE c.account=b.account AND c.blob=b.id AND c.ordinal>=?2)
@@ -4604,6 +4614,243 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn anchor_maintenance_uses_ordered_index_and_original_work_scope() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        for fault in ["none", "deadline", "reversal", "fuel", "denied"] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let clock = Arc::new(Timer(AtomicU64::new(1)));
+            let store = IndexStore::create(
+                &mut root,
+                StoreEpoch::from_bytes([9; 16]),
+                clock.clone(),
+                1,
+                deadline(),
+            )
+            .unwrap();
+            store.create_account(ACCOUNT, deadline()).unwrap();
+            let (budget, observed) = {
+                let writer = lock(&store.writer).unwrap();
+                let plan: Vec<String> = writer
+                    .native
+                    .run(|db| {
+                        let mut statement = db
+                            .prepare(&format!("EXPLAIN QUERY PLAN {ANCHOR_CARDINALITY}"))
+                            .map_err(sql)?;
+                        let rows = statement.query_map([], |row| row.get(3)).map_err(sql)?;
+                        rows.collect::<Result<_, _>>().map_err(sql)
+                    })
+                    .unwrap();
+                assert!(
+                    plan.iter()
+                        .any(|step| step.contains("COVERING INDEX anchors_email")),
+                    "{plan:?}"
+                );
+                assert!(
+                    !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+                    "{plan:?}"
+                );
+                let budget = writer.native.budget.clone();
+                let hook_budget = budget.clone();
+                let observed = Arc::new(AtomicU64::new(0));
+                let hook_observed = observed.clone();
+                let hook_clock = clock.clone();
+                lock(&writer.native.connection)
+                    .unwrap()
+                    .authorizer(Some(move |context: AuthContext<'_>| {
+                        if matches!(
+                            context.action,
+                            AuthAction::Read {
+                                table_name: "thread_anchors",
+                                column_name: "email_id"
+                            }
+                        ) {
+                            hook_observed.fetch_add(1, Ordering::Relaxed);
+                            match fault {
+                                "deadline" => hook_clock.0.store(100, Ordering::Relaxed),
+                                "reversal" => hook_clock.0.store(0, Ordering::Relaxed),
+                                "fuel" => hook_budget.lock().unwrap().remaining = 0,
+                                "denied" => return Authorization::Deny,
+                                _ => (),
+                            }
+                        }
+                        Authorization::Allow
+                    }))
+                    .unwrap();
+                (budget, observed)
+            };
+            let expected = match fault {
+                "none" => Ok(()),
+                "deadline" => Err(ports::Error::Deadline),
+                "reversal" => Err(ports::Error::Invalid),
+                "fuel" => Err(ports::Error::Capacity),
+                "denied" => Err(ports::Error::Io {
+                    kind: std::io::ErrorKind::Other,
+                    os_code: None,
+                }),
+                _ => panic!("unknown fault"),
+            };
+            assert_eq!(store.validate_integrity(deadline()), expected, "{fault}");
+            assert!(observed.load(Ordering::Relaxed) > 0, "{fault}");
+            {
+                let writer = lock(&store.writer).unwrap();
+                assert!(!writer.stopped);
+                lock(&writer.native.connection)
+                    .unwrap()
+                    .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                    .unwrap();
+            }
+            clock.0.store(1, Ordering::Relaxed);
+            if matches!(fault, "deadline" | "reversal" | "fuel") {
+                assert_eq!(lock(&budget).unwrap().failure, expected.err(), "{fault}");
+            }
+            assert_eq!(store.validate_integrity(deadline()), Ok(()), "{fault}");
+        }
+    }
+
+    #[test]
+    fn integrity_maintenance_rejects_duplicate_anchors_across_all_accounts() {
+        const INSERT: &str =
+            "INSERT INTO thread_anchors(account,message_id,email_id,changed) VALUES(?1,?2,?3,?4)";
+        let other = AccountId::from_bytes([11; 16]);
+        let blob = BlobId::from_bytes([4; 16]);
+        let thread = ThreadId::from_bytes([5; 16]);
+        let email = EmailId::from_bytes([6; 16]);
+        let sibling = EmailId::from_bytes([7; 16]);
+        fn anchor(message: &str, email: EmailId) -> Vec<u8> {
+            let mut bytes = vec![0; 1024];
+            let n = Key::ThreadAnchor(message, email)
+                .encode(&mut bytes)
+                .unwrap();
+            bytes.truncate(n);
+            bytes
+        }
+        let mut unexpected = Vec::new();
+        for damaged in [ACCOUNT, other] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let clock: Arc<dyn Clock> = Arc::new(Timer(AtomicU64::new(1)));
+            let store = IndexStore::create(
+                &mut root,
+                StoreEpoch::from_bytes([9; 16]),
+                clock.clone(),
+                2,
+                deadline(),
+            )
+            .unwrap();
+            let blob_bytes = encode(Row::Blob(BlobRow {
+                kind: BlobKind::Message,
+                length: 0,
+                digest: td_crypto::Provider.sha256().unwrap().finish().unwrap(),
+                created_at: 0,
+            }));
+            let email_bytes = encode(Row::Email(EmailRow {
+                blob,
+                thread,
+                received_at: 0,
+                origin: EmailOrigin::Jmap,
+            }));
+            let thread_bytes = encode(Row::Thread);
+            let first = anchor("first@example.test", email);
+            let duplicate_id = anchor("first@example.test", sibling);
+            let second = anchor("second@example.test", email);
+            for account in [ACCOUNT, other] {
+                store.create_account(account, deadline()).unwrap();
+                let mut operations = vec![
+                    Operation::put(Table::Blobs, blob.as_bytes(), &blob_bytes).unwrap(),
+                    Operation::put(Table::Threads, thread.as_bytes(), &thread_bytes).unwrap(),
+                    Operation::put(Table::Emails, email.as_bytes(), &email_bytes).unwrap(),
+                ];
+                if account == ACCOUNT {
+                    operations.extend([
+                        Operation::put(Table::Emails, sibling.as_bytes(), &email_bytes).unwrap(),
+                        Operation::put(Table::ThreadAnchors, &first, &[]).unwrap(),
+                        Operation::put(Table::ThreadAnchors, &duplicate_id, &[]).unwrap(),
+                    ]);
+                } else {
+                    operations.push(Operation::put(Table::ThreadAnchors, &second, &[]).unwrap());
+                }
+                let mut empty = b"".as_slice();
+                assert_eq!(
+                    store.commit(
+                        &td_crypto::Provider,
+                        CommitRequest {
+                            account,
+                            expected: Sequence::default(),
+                            deadline: deadline(),
+                            utc_ms: 0,
+                        },
+                        &operations,
+                        &mut [BlobSource {
+                            id: blob,
+                            source: &mut empty
+                        }]
+                    ),
+                    Ok(Sequence::from_u64(1))
+                );
+            }
+            assert_eq!(store.validate_integrity(deadline()), Ok(()));
+            let mut retained = store.view(damaged, deadline()).unwrap();
+            {
+                let writer = lock(&store.writer).unwrap();
+                writer
+                    .native
+                    .run(|db| {
+                        db.execute(
+                            INSERT,
+                            params![
+                                damaged.as_bytes().as_slice(),
+                                "extra@example.test",
+                                email.as_bytes().as_slice(),
+                                1u64.to_be_bytes().as_slice()
+                            ],
+                        )
+                        .map_err(sql)?;
+                        let physical: String = db
+                            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+                            .map_err(sql)?;
+                        assert_eq!(physical, "ok");
+                        let mut statement = db.prepare("PRAGMA foreign_key_check").map_err(sql)?;
+                        assert!(statement
+                            .query([])
+                            .map_err(sql)?
+                            .next()
+                            .map_err(sql)?
+                            .is_none());
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let actual = store.validate_integrity(deadline());
+            if actual != Err(ports::Error::Corrupt) {
+                unexpected.push((damaged, actual));
+            }
+            assert!(retained
+                .get(Key::ThreadAnchor("extra@example.test", email), &mut [0; 64])
+                .unwrap()
+                .is_none());
+            drop(retained);
+            // Startup does not make the new maintenance scan implicit.
+            drop(store);
+            let store = IndexStore::open(&mut root, clock, 1, deadline()).unwrap();
+            let mut fresh = store.view(damaged, deadline()).unwrap();
+            assert!(fresh
+                .get(Key::ThreadAnchor("extra@example.test", email), &mut [0; 64])
+                .unwrap()
+                .is_some());
+            drop(fresh);
+            let actual = store.validate_integrity(deadline());
+            if actual != Err(ports::Error::Corrupt) {
+                unexpected.push((damaged, actual));
+            }
+        }
+        assert!(
+            unexpected.is_empty(),
+            "duplicate anchor maintenance accepted: {unexpected:?}"
+        );
     }
 
     #[test]

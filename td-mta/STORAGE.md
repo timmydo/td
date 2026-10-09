@@ -28,16 +28,18 @@ There is no permanent body-file tree, custom journal, replay map or selector.
 
 The safe std adapter requires an operator-controlled stable namespace,
 caller-owned private directories, regular private files with exactly one
-hard link and a retained cooperative LOCK. It does not defend against another
-process with the same filesystem authority replacing paths. SQLite uses its
-bundled Unix VFS; td-owned Rust adds no direct syscall or unsafe allowance.
-A database or sidecar symlink, wrong owner/mode, extra hard link or oversized
-file refuses startup. Creation refuses preexisting database/WAL/SHM paths.
-Application ID, exact schema version 2, closed schema and 4096-byte pages
-are checked before accepting the store. Full quick_check and foreign_key_check
-are explicit validate_integrity maintenance, not an opening scan. SQLite
-validates physical pages on access and body pins verify their full digest. Earlier formats
-are refused; no automatic migration or overwrite is provided.
+hard link and a retained cooperative LOCK. It does not defend against
+another process with the same filesystem authority replacing paths.
+SQLite uses its bundled Unix VFS; td-owned Rust adds no direct syscall
+or unsafe allowance. A database or sidecar symlink, wrong owner/mode,
+extra hard link or oversized file refuses startup. Creation refuses
+preexisting database/WAL/SHM paths. Application ID, exact schema version
+2, closed schema and 4096-byte pages are checked before accepting the
+store. Full quick_check, foreign_key_check and per-Email anchor
+cardinality are explicit validate_integrity maintenance, not an opening
+scan. SQLite validates physical pages on access and body pins verify
+their full digest. Earlier formats are refused; no automatic migration
+or overwrite is provided.
 
 A separate ingress-only locked root holds LOCK and slot-00 through slot-63
 for disposable prepared bytes. It must never share the authoritative database
@@ -987,9 +989,15 @@ Email ID in another account does not contribute to this check.
 This preserves the per-Email cardinality rule from an initially
 consistent store: any new duplicate requires a surviving anchor PUT. It
 is not a whole-store integrity scan. The separate validate_integrity
-operation checks SQLite structure and foreign keys, not this cardinality
-rule. Selecting the first valid header ID, proving anchor/body
-correspondence and authorizing anchor changes remain service
+operation checks this cardinality across every account after SQLite
+quick_check and foreign_key_check. One ordered covering scan of
+anchors_email groups by account and Email ID and refuses a group with
+more than one row as Corrupt. The scan needs no temporary grouping tree
+or body reads. It shares the original writer fence, maintenance deadline
+and finite VM allowance; resource or I/O refusal cannot grant
+completion. This scan is explicit maintenance and does not run during
+open or ordinary commits. Selecting the first valid header ID, proving
+anchor/body correspondence and authorizing anchor changes remain service
 obligations. Deferred owning foreign keys require anchor removal with
 Email deletion.
 
@@ -1169,5 +1177,6 @@ is admitted, not a claim of physical I/O equal to returned MIME bytes.
 
 Full validate_integrity maintenance refuses a stopped writer and holds the
 writer fence throughout its scan. Existing read views remain usable; new view
-capture and commits return Busy until it finishes. It reports physical SQLite
-and foreign-key consistency, not body digests or protocol authorization.
+capture and commits return Busy until it finishes. It reports physical
+SQLite, foreign-key consistency and per-Email anchor cardinality, not
+body digests, full domain consistency or protocol authorization.
