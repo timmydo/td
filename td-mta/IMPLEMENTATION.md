@@ -539,8 +539,9 @@ stores, expected-sequence transactions, deferred owning foreign keys, parent
 cycle checks, 32 MiB body limit and 64 KiB streaming, exact length/EOF/digest
 verification, snapshot-borrowed body readers, permanent blob IDs, native indexed
 changes and explicit WAL checkpoint. Startup checks the closed schema/header
-and epoch; full integrity_check/foreign_key_check belong to the explicit
-validate_integrity maintenance operation. WAL recovery/checkpoint are
+and epoch; full integrity_check/foreign_key_check, anchor cardinality and
+complete blob chunk geometry belong to explicit validate_integrity
+maintenance. WAL recovery/checkpoint are
 synchronous native boundaries; deadline checks cannot interrupt their
 individual calls. Body/source failure rolls back metadata
 and bytes together. Expired leases require explicit deletion before body removal.

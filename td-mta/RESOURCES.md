@@ -2627,9 +2627,11 @@ combined 128 MiB service overlap, or an 8 GiB database checkpoint. The
 test-only producer bypasses normal WAL admission scheduling to reach the
 physical bound; the database is about 32 MiB. Startup avoids a full
 integrity scan; explicit validate_integrity maintenance owns
-integrity_check(1), foreign_key_check and the indexed anchor-cardinality
-scan with a physical-cap-sized finite VM allowance and the caller's
-deadline. Full table/index comparisons may require O(N log N) work and
+integrity_check(1), foreign_key_check, indexed anchor cardinality and
+complete blob chunk geometry with a physical-cap-sized finite VM
+allowance and the caller's deadline. The geometry scan uses two scoped
+chunk primary-key probes per blob, without whole-body buffering or
+hashing. Full table/index comparisons may require O(N log N) work and
 stop after the first physical error. No maximum-database maintenance
 resource qualification is established by the bounded WAL fixture.
 

@@ -6499,16 +6499,20 @@ database; open validates the physical files, closed schema, database
 header and store epoch before accepting metadata. It does not run a full
 database integrity or foreign-key scan at startup. SQLite checks pages
 as accessed; the separate validate_integrity(deadline) maintenance
-operation runs integrity_check(1), foreign_key_check and a global scan
-of per-Email anchor cardinality under an explicit deadline and a finite
-VM allowance sized for the physical database cap. Duplicate anchors for
-one account/Email return Corrupt; one Message-ID may still name several
-Emails. The physical check verifies index/table agreement before the
-indexed domain scan and stops after the first physical error; its work
-may be O(N log N). This is not full domain verification. Complete body
-verification still precedes a body pin. create and open both borrow
-LockedRoot exclusively for the owner's lifetime, preventing independent
-owners from bypassing its transaction/checkpoint fence.
+operation runs integrity_check(1), foreign_key_check and global scans of
+per-Email anchor cardinality and complete blob chunk geometry under an
+explicit deadline and a finite VM allowance sized for the physical
+database cap. Duplicate anchors for one account/Email return Corrupt;
+one Message-ID may still name several Emails. The physical check
+verifies index/table agreement before the indexed domain scan and stops
+after the first physical error; its work may be O(N log N). Every blob
+must have exactly the contiguous chunk ordinals and chunk sizes required
+by its declared length, including no chunks for an empty blob. Malformed
+geometry returns Corrupt. This is not digest or full domain
+verification. Complete body verification still precedes a body pin.
+create and open both borrow LockedRoot exclusively for the owner's
+lifetime, preventing independent owners from bypassing its
+transaction/checkpoint fence.
 
 PinnedBlobInput::finish also refuses negative or trailing stored chunk
 ordinals with Corrupt, including any chunk for an empty body. Its indexed

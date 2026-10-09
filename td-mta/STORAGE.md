@@ -35,11 +35,11 @@ or unsafe allowance. A database or sidecar symlink, wrong owner/mode,
 extra hard link or oversized file refuses startup. Creation refuses
 preexisting database/WAL/SHM paths. Application ID, exact schema version
 2, closed schema and 4096-byte pages are checked before accepting the
-store. Full integrity_check, foreign_key_check and per-Email anchor
-cardinality are explicit validate_integrity maintenance, not an opening
-scan. SQLite validates physical pages on access and body pins verify
-their full digest. Earlier formats are refused; no automatic migration
-or overwrite is provided.
+store. Full integrity_check, foreign_key_check, per-Email anchor
+cardinality and complete blob chunk geometry are explicit
+validate_integrity maintenance, not an opening scan. SQLite validates
+physical pages on access and body pins verify their full digest. Earlier
+formats are refused; no automatic migration or overwrite is provided.
 
 A separate ingress-only locked root holds LOCK and slot-00 through slot-63
 for disposable prepared bytes. It must never share the authoritative database
@@ -1180,8 +1180,20 @@ The WITHOUT ROWID chunk table favors one account/blob/ordinal key lookup;
 its 64 KiB payloads may deepen native B-trees. This fixed per-call amplification
 is admitted, not a claim of physical I/O equal to returned MIME bytes.
 
-Full validate_integrity maintenance refuses a stopped writer and holds the
-writer fence throughout its scan. Existing read views remain usable; new view
-capture and commits return Busy until it finishes. It reports physical
-SQLite, foreign-key consistency and per-Email anchor cardinality, not
-body digests, full domain consistency or protocol authorization.
+Full validate_integrity maintenance refuses a stopped writer and holds
+the writer fence throughout its scan. Existing read views remain usable;
+new view capture and commits return Busy until it finishes. It reports
+physical SQLite, foreign-key consistency, per-Email anchor cardinality
+and complete blob chunk geometry, not body digests, full domain
+consistency or protocol authorization.
+
+After the physical, foreign-key and anchor checks, one global blob scan
+uses two chunk primary-key probes scoped to each account/blob. The
+stored count must equal ceil(length/65536), every ordinal must be in that
+extent, and each chunk must have exactly min(65536, length-ordinal*65536)
+bytes. Unique chunk keys plus count and ordinal bounds establish the
+contiguous layout; an empty blob must have no chunks. Malformed geometry
+returns Corrupt. No whole body is buffered or hashed by this query. It
+shares the original maintenance fence, deadline and finite VM allowance;
+resource, clock or I/O refusal cannot grant completion. Selected body
+pins still perform their own length, digest and extent verification.
