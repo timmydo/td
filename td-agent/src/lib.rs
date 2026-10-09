@@ -69,6 +69,8 @@ pub mod proxy;
 pub mod removal;
 pub mod repo;
 pub mod review;
+pub mod review_session;
+pub mod review_workspace;
 pub mod rules;
 pub mod scan;
 pub mod schedule;

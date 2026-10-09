@@ -421,6 +421,12 @@ fn act(
             command,
             timeout_ms,
             workdir,
+        }
+        | Call::ReviewShell {
+            command,
+            timeout_ms,
+            workdir,
+            ..
         } => {
             let timeout = shell::timeout(*timeout_ms)?;
             let dir = match workdir {
@@ -430,12 +436,19 @@ fn act(
             if !dir.is_dir() {
                 return Err(format!("`workdir` {} is not a directory", dir.display()));
             }
-            let exit = shell::run(
-                shell::shell(command, &dir, config.proxy),
-                timeout,
-                cancel,
-                sink,
-            )?;
+            let mut process = shell::shell(command, &dir, config.proxy);
+            if let Call::ReviewShell { target_dir, .. } = call {
+                if config.proxy {
+                    return Err("review commands cannot use a network proxy".into());
+                }
+                let target = config.path(target_dir, "target_dir")?;
+                std::fs::create_dir_all(&target)
+                    .map_err(|e| format!("{}: {e}", target.display()))?;
+                process
+                    .env("CARGO_TARGET_DIR", target)
+                    .env("CARGO_NET_OFFLINE", "true");
+            }
+            let exit = shell::run(process, timeout, cancel, sink)?;
             Ok(Done {
                 text: exit.render(),
                 kept: Some(exit.output.text()),

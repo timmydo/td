@@ -7262,6 +7262,9 @@ fn unready(
 ) -> Option<String> {
     let first = repositories.entries.first()?;
     let named: Vec<Option<&str>> = match call {
+        host::Call::ReviewShell { .. } => {
+            return Some("review commands are not conversation tools".into())
+        }
         host::Call::Read { path, .. }
         | host::Call::Write { path, .. }
         | host::Call::Edit { path, .. } => vec![Some(path.as_str())],

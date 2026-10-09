@@ -38,9 +38,22 @@ const MAX_MAX_TOKENS: u64 = 200_000;
 const ASCII_BYTES_PER_TOKEN: u64 = 3;
 
 pub const USAGE: &str = "usage: td-agent review [--model MODEL] [--effort LEVEL] \
-                         [--max-tokens N] [--] [FILE]\n\
+                         [--max-tokens N] [--max-cost USD] [--] [FILE]\n\
+       td-agent review --repo DIRECTORY [--commit REV] [--sparse DIRECTORY]...\n\
+                       [--model MODEL] [--effort LEVEL] [--max-tokens N]\n\
+                       [--max-cost USD]\n\
 \n\
-Reviews the git commit in FILE, or on standard input when FILE is absent\n\
+With --repo, reviews REV (HEAD by default) in a disposable sparse checkout,\n\
+with read/search tools and confined commands for tests. Source and git\n\
+metadata are read-only; scratch outputs are writable; network, edits,\n\
+publication and peer tools are unavailable. Changed top-level directories\n\
+are included automatically; --sparse adds directories, and the model can\n\
+widen the checkout. --max-cost caps all model requests in this review,\n\
+defaulting to max_cost_per_turn (or $0.50 when disabled). Missing usage\n\
+is charged at its reservation. The checkout is removed on completion or\n\
+error; after abrupt process death it is collected by the next review.\n\
+\n\
+Without --repo, reviews the git commit in FILE, or on standard input when FILE is absent\n\
 or -, as `git show` prints it: one request to the configured API with\n\
 td-agent's key, the review written to standard output as it arrives and\n\
 the model and provider that served it, its token counts and cost to\n\
@@ -54,7 +67,7 @@ terminal with XDG_RUNTIME_DIR naming /run/user/1000; on a host, as\n\
 ./install-apps installs it from a td checkout, whose launch serves it,\n\
 for example:\n\
 \n\
-  git show HEAD | td-agent review --model google/gemini-3.8-flash --effort high\n";
+  td-agent review --repo . --commit HEAD --model google/gemini-3.8-flash \\\n    --effort high --max-cost 0.50\n";
 
 /// The instruction the model is given. The commit follows it in the
 /// user message, between the markers `{OPEN}` and `{CLOSE}` name.
@@ -81,6 +94,10 @@ pub struct Options {
     pub max_tokens: Option<u64>,
     /// None for standard input.
     pub input: Option<PathBuf>,
+    pub repository: Option<PathBuf>,
+    pub revision: Option<String>,
+    pub sparse: Vec<String>,
+    pub max_cost: Option<u64>,
 }
 
 impl Options {
@@ -124,6 +141,20 @@ impl Options {
                         })?;
                     options.max_tokens = Some(tokens);
                 }
+                "--repo" if !options_done && options.repository.is_none() => {
+                    options.repository = Some(PathBuf::from(value()?));
+                }
+                "--commit" if !options_done && options.revision.is_none() => {
+                    options.revision = Some(value()?);
+                }
+                "--sparse" if !options_done => options.sparse.push(value()?),
+                "--max-cost" if !options_done && options.max_cost.is_none() => {
+                    let text = value()?;
+                    options.max_cost = Some(
+                        crate::cost::parse(&text, false)
+                            .ok_or("--max-cost must be a nonnegative dollar amount")?,
+                    );
+                }
                 "-" if !named => named = true,
                 path if !named && (options_done || !path.starts_with('-')) => {
                     named = true;
@@ -132,6 +163,15 @@ impl Options {
                 _ => return Err(usage()),
             }
         }
+        if options.repository.is_some() && named {
+            return Err("--repo reviews --commit (HEAD by default), not FILE or stdin".into());
+        }
+        if options.repository.is_none()
+            && (options.revision.is_some() || !options.sparse.is_empty())
+        {
+            return Err("--commit and --sparse require --repo".into());
+        }
+        crate::repo::cone(Some(&options.sparse))?;
         Ok(options)
     }
 }
@@ -479,12 +519,24 @@ pub fn run(args: &[String]) -> Result<(), String> {
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME"),
     );
-    let config = config::load(config_path.as_deref())?;
+    let mut config = config::load(config_path.as_deref())?;
     let key_path = config_path
         .as_deref()
         .and_then(crate::key::path)
         .ok_or("no API key: neither XDG_CONFIG_HOME nor HOME is an absolute path")?;
     let key = crate::key::read(&key_path).map_err(|problem| problem.to_string())?;
+    if options.repository.is_some() {
+        return crate::review_session::run(&options, &config.client, &key, &key_path);
+    }
+    if let Some(limit) = options.max_cost {
+        config.client.limits.turn = Some(
+            config
+                .client
+                .limits
+                .turn
+                .map_or(limit, |old| old.min(limit)),
+        );
+    }
     let commit = match options.input.as_deref() {
         Some(path) => read_input(open(path)?)?,
         None if std::io::stdin().is_terminal() => {
@@ -505,12 +557,47 @@ pub fn run(args: &[String]) -> Result<(), String> {
         Err(e) => return Err(e),
     };
     let model = options.model.as_deref().unwrap_or(&client.model);
-    let plan = plan(&options, client, listed.find(model), prompt_tokens(&sized))?;
+    let prompt = if options.max_cost.is_some() {
+        crate::review_session::prompt_bound(&sized)
+    } else {
+        prompt_tokens(&sized)
+    };
+    let plan = plan(&options, client, listed.find(model), prompt)?;
     let body = body(&head(&plan, client), &commit, &nonce)?;
+    let mut out = std::io::stdout().lock();
+    let (completion, served) = request(client, &key, &body, &mut out)?;
+    out.write_all(b"\n")
+        .and_then(|()| out.flush())
+        .map_err(|e| format!("writing the review: {e}"))?;
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "{}",
+        spent(&completion, &served, plan.reserved)
+    );
+    whole(&completion)?;
+    if let Some(limit) = options.max_cost {
+        crate::cost::within(
+            "--max-cost",
+            Some(limit),
+            completion
+                .usage
+                .and_then(|u| u.cost)
+                .unwrap_or(plan.reserved),
+            0,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn request(
+    client: &Client,
+    key: &crate::key::Secret,
+    body: &str,
+    out: &mut impl Write,
+) -> Result<(Completion, Served), String> {
     let url = format!("{}/chat/completions", client.base_url);
     let headers = client::headers(key.expose());
     let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
-    let mut out = std::io::stdout().lock();
     let mut served = Served::default();
     let mut attempt = 0;
     let completion = loop {
@@ -531,7 +618,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Ok(None) => None,
             Err(e) => Some(Err(e.to_string())),
         });
-        match consume(status, head, json, chunks, &mut out, &mut served) {
+        match consume(status, head, json, chunks, out, &mut served) {
             Ok(completion) => break completion,
             Err(ended) => match again(attempt, &ended) {
                 Some(wait) => {
@@ -542,15 +629,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             },
         }
     };
-    out.write_all(b"\n")
-        .and_then(|()| out.flush())
-        .map_err(|e| format!("writing the review: {e}"))?;
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "{}",
-        spent(&completion, &served, plan.reserved)
-    );
-    whole(&completion)
+    Ok((completion, served))
 }
 
 fn open(path: &Path) -> Result<std::fs::File, String> {
@@ -577,6 +656,7 @@ mod tests {
                 effort: Some("high".into()),
                 max_tokens: Some(9),
                 input: Some("c.diff".into()),
+                ..Options::default()
             }
         );
         assert_eq!(Options::parse(&args("-")).unwrap(), Options::default());
@@ -585,6 +665,14 @@ mod tests {
             Some(PathBuf::from("-x.diff"))
         );
         for bad in [
+            "--commit HEAD",
+            "--sparse src",
+            "--repo . -",
+            "--repo . c.diff",
+            "--repo . --repo other",
+            "--repo . --sparse ../outside",
+            "--max-cost invalid",
+            "--max-cost 0.1 --max-cost 0.2",
             "--model",
             "--model a --model b",
             "--model --effort high",
@@ -604,6 +692,14 @@ mod tests {
         }
         let said = Options::parse(&args("--effort extreme")).unwrap_err();
         assert!(said.starts_with("--effort is one of"), "{said}");
+        let repository = Options::parse(&args(
+            "--repo . --commit HEAD --sparse td-agent --sparse td-json --max-cost 0.10",
+        ))
+        .unwrap();
+        assert_eq!(repository.repository, Some(PathBuf::from(".")));
+        assert_eq!(repository.revision.as_deref(), Some("HEAD"));
+        assert_eq!(repository.sparse, ["td-agent", "td-json"]);
+        assert_eq!(repository.max_cost, Some(crate::cost::ONE / 10));
     }
 
     #[test]

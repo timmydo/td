@@ -194,7 +194,8 @@ Publication with the human's credentials happens only through the git
 worker's push, bound to a commit the human or classifier approved.
 
 **The review command** stands apart from those parties: `td-agent review
-[--model MODEL] [--effort LEVEL] [--max-tokens N] [--] [FILE]` is the
+[--model MODEL] [--effort LEVEL] [--max-tokens N] [--max-cost USD]
+[--] [FILE]` is the
 same binary run by a person or an agent from a shell, with no window,
 conversation or jail, for one model's review of one git commit in td's
 review workflow (DEVELOPMENT.md, Code review), where it is meant to take
@@ -219,9 +220,53 @@ stopped with something said: an error, a stream that ends without its
 finish, a reply cut at its token limit, filtered or empty is no review.
 A rate-limited request is asked again as a turn's is. Its cost is
 bounded as §5 says. It keeps nothing, executes nothing the model says,
-and has no tools: a reviewer that reads the rest of the tree is a later
-step. The commit goes to the provider because the person ran the
-command on it.
+and has no tools when reading FILE or standard input. `--max-cost USD`
+may lower the single request's cost limit. The commit goes to the provider
+because the person ran the command on it.
+
+`td-agent review --repo DIRECTORY [--commit REV] [--sparse DIRECTORY]...`
+instead resolves REV (HEAD by default) once to a full commit id and reviews
+it in a disposable sparse checkout. The commit's full message and diff are
+bounded as above. Root files, `.cargo`, and changed top-level directories
+are included; `--sparse` adds cone directories. `expand_sparse` may add
+directories, up to 128 in total, but always checks out the same commit.
+Checkout and sparse expansion run through the existing maintenance jail;
+fixed Git inspection commands disable hooks, external diffs, textconv,
+replacement objects, automatic maintenance and transport. The source
+repository's objects are borrowed read-only, never modified.
+
+This is a separate review capability profile, independent of conversation
+ask/auto mode and its classifier. Its tools are `read_file`, `glob`, `grep`,
+bounded foreground `shell`, and `expand_sparse`. Source, private Git
+metadata and borrowed objects are read-only in each fresh tool jail.
+Only scratch and the private home are writable. Scratch uses the existing
+executable worktree grant so newly built tests can run; source uses a
+non-executable read grant. Cargo receives typed
+`CARGO_TARGET_DIR` pointing to scratch and `CARGO_NET_OFFLINE=true`.
+There is no network proxy, background process, edit, publication, peer,
+approval or credential tool. The classifier cannot grant a crossing in
+this profile. The host tool closure is the existing §8 closure; source
+dependencies or tools outside it remain unavailable. Tests requiring
+source writes or absent inputs must be reported as limitations.
+
+At most 64 model requests run, with a 16 MiB context bound and a single
+cost budget (§5). Tool calls and their results remain intermediate; only
+a whole final reply whose first line exactly identifies the resolved
+subject and full commit id reaches standard output. Reasoning details
+are echoed with their exact wire bytes as in §5. Source and tool results
+are untrusted review material; project instructions cannot widen the
+profile. No conversation or daily ledger is created.
+
+The private run directory is below the key directory's `reviews/`, but
+neither that parent nor the key is mounted into a jail. The controller
+holds an owner lock and serializes creation and cleanup with a sweep lock.
+Ordinary completion and errors remove the checkout, metadata, home and
+scratch. After abrupt process death, the next repository review collects
+directories whose owner lock is free without following symlinks; live
+reviews remain untouched. Hard termination does not promise immediate
+disk cleanup. Cleanup failures are reported. A stale entry that cannot
+be safely collected is reported and left alone so it cannot prevent a
+new review; a successfully cleaned run is not cleaned again by `Drop`.
 
 **One process per conversation.** The window process, `td-agent`, is the
 one the human starts. It owns the window, the configuration, a lock on the
@@ -1484,6 +1529,22 @@ that limit is set. Without that limit, a list that cannot be had leaves
 the model unlisted rather than refusing the review. What it spends is not added to the day's total; it
 is said on standard error, and the provider's own key limit is the
 bound across reviews.
+
+Repository reviews always require a listed, priced model supporting tools
+and `max_tokens`. `--max-cost USD` caps the whole invocation, defaulting to
+`max_cost_per_turn`, or $0.50 if that limit is disabled. Each request must
+also fit the configured per-turn limit. Before each request its worst case
+is reserved against the remaining total, counting the whole serialized
+context (tools and escaped text included) at one token per UTF-8 byte plus
+1024 framing tokens rather than the diff-only ASCII estimate. Reported
+cost replaces that reservation, and missing usage or a failed request
+keeps the reservation.
+An explicit `--max-cost` on a diff-only review uses this byte bound too
+and refuses a final reported charge above the limit.
+No further model request is sent if it would exceed the total. A reported
+charge above the cap stops the review. Pricing is the models list's bound,
+not an independent guarantee about a provider's billing. The total and
+request count are printed to standard error even when the loop fails.
 
 **Errors.** 401 and 402 are shown and stop the turn. 429 retries with
 bounded exponential backoff, honouring `Retry-After`, at most three times:
@@ -6607,6 +6668,16 @@ again `client::RETRIES` times after the provider's `Retry-After` and
 not when it asks for longer than td-agent waits, a counted reply with
 no finish, and one that stopped empty, was
 cut at its limit or was filtered.
+
+Repository review tests cover the cumulative budget and missing usage,
+exact reasoning-detail echo, and the absence of write, publication and
+peer tools. `tests/review_process.rs` additionally runs real Git and jails
+with an offline fetch fixture: source writes fail, scratch writes succeed,
+sparse expansion reads the same revision, forbidden tools and incomplete
+reviews fail, a zero budget sends no completion, and a killed owner's
+workspace is collected by the next invocation. These tests are ignored in
+the ordinary Cargo suite because they require user namespaces and explicit
+`TD_AGENT_JAIL` and `TD_AGENT_TXT` binaries; run them with `--ignored`.
 
 ## 18. Increments
 

@@ -419,6 +419,15 @@ pub fn add_worktree(repository: &Path, worktree: &Worktree) -> Result<PathBuf, S
 /// instance's entry, `td-agent maintain`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Task {
+    /// Widen an immutable review's checkout at its pinned commit.
+    Sparse {
+        git: PathBuf,
+        repository: PathBuf,
+        id: String,
+        checkout: PathBuf,
+        base: String,
+        paths: Vec<String>,
+    },
     /// Makes the worktree's branch at `base`, keeping one an earlier run
     /// made, and checks the worktree out as its sparse patterns select.
     /// Run only before its repository is recorded prepared, when nothing
@@ -519,6 +528,24 @@ impl Task {
     /// Its words after `maintain`.
     pub fn args(&self) -> Vec<OsString> {
         match self {
+            Self::Sparse {
+                git,
+                repository,
+                id,
+                checkout,
+                base,
+                paths,
+            } => [
+                OsString::from("sparse"),
+                git.into(),
+                repository.into(),
+                id.into(),
+                checkout.into(),
+                base.into(),
+            ]
+            .into_iter()
+            .chain(paths.iter().map(OsString::from))
+            .collect(),
             Self::Checkout {
                 git,
                 repository,
@@ -598,6 +625,16 @@ impl Task {
             Ok::<_, String>(path)
         };
         match args {
+            [word, git, repository, id, checkout, base, paths @ ..] if word == "sparse" => {
+                if !git::object_id(base) || paths.len() > 128 {
+                    return Err("invalid sparse review commit or path count".into());
+                }
+                cone(Some(paths))?;
+                Ok(Self::Sparse {
+                    git: absolute(git)?, repository: absolute(repository)?, id: worktree_id(id)?.into(),
+                    checkout: absolute(checkout)?, base: base.clone(), paths: paths.to_vec(),
+                })
+            }
             [word, git, repository, id, checkout, branch, base]
                 if word == "checkout" || word == "export" =>
             {
@@ -681,6 +718,33 @@ impl Task {
     /// Runs the task's git, in the instance, and says what it did.
     pub fn run(&self) -> Result<String, String> {
         match self {
+            Self::Sparse {
+                git,
+                repository,
+                id,
+                checkout,
+                base,
+                paths,
+            } => {
+                let patterns = cone(Some(paths))?;
+                let path = repository
+                    .join("worktrees")
+                    .join(id)
+                    .join("info/sparse-checkout");
+                fs::write(&path, patterns).map_err(|e| format!("{}: {e}", path.display()))?;
+                git::run(
+                    jailed(git, repository, id, checkout).args([
+                        "read-tree",
+                        "--reset",
+                        "-u",
+                        base,
+                    ]),
+                    MAX_SAID,
+                    CHECKOUT_TIME,
+                )
+                .map_err(|e| said("widening the sparse review", &e))?;
+                Ok(format!("sparse checkout widened at {base}"))
+            }
             Self::Checkout {
                 git,
                 repository,
@@ -1894,7 +1958,8 @@ pub(crate) mod tests {
 
     fn task_git(task: &Task) -> PathBuf {
         match task {
-            Task::Checkout { git, .. }
+            Task::Sparse { git, .. }
+            | Task::Checkout { git, .. }
             | Task::Survey { git, .. }
             | Task::Track { git, .. }
             | Task::Export { git, .. } => git.clone(),

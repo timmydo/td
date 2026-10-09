@@ -87,6 +87,7 @@ pub enum Kit {
     Conversation,
     Workspace,
     Repositories,
+    Review,
 }
 
 /// The tools every conversation has, in the order the prefix defines
@@ -135,6 +136,8 @@ const WORKSPACE: &[Tool] = &[
 /// worker, outside the jail.
 const REPOSITORIES: &[Tool] = &[Tool::GitFetch, Tool::GitPush];
 
+const REVIEW: &[Tool] = &[Tool::ReadFile, Tool::Glob, Tool::Grep, Tool::Shell];
+
 impl Tool {
     pub fn name(self) -> &'static str {
         match self {
@@ -168,6 +171,9 @@ impl Tool {
 
     /// The tools a conversation with `kit` has.
     pub fn all(kit: Kit) -> Vec<Self> {
+        if kit == Kit::Review {
+            return REVIEW.to_vec();
+        }
         let mut tools = CONVERSATION.to_vec();
         if kit != Kit::Conversation {
             tools.extend_from_slice(WORKSPACE);
@@ -249,7 +255,7 @@ fn schema(properties: Vec<(&str, Json)>, required: &[&str]) -> Json {
 const CONVERSATION_PROPERTY: &str = "Another conversation's id, from `conversations`; this conversation's own log when left out or empty. Each search or read of another conversation's log may wait for the person's approval, on a card or by a standing answer, and may be refused.";
 
 /// One tool's definition as the request carries it.
-fn definition(tool: Tool) -> Json {
+pub(crate) fn definition(tool: Tool) -> Json {
     let (description, parameters) = match tool {
         Tool::TodoWrite => (
             "Replace this conversation's todo list with the items given, whole. Use it for work of three or more steps: write the plan, keep exactly one item in_progress while you work on it, and mark items done or cancelled as they end. The person sees the list above the composer. At most 50 items of at most 500 bytes of text each, and at most one in_progress. An empty list clears it.".to_string(),
@@ -1464,6 +1470,12 @@ pub fn card(call: &Call) -> (String, Vec<String>) {
             command,
             timeout_ms,
             workdir,
+        }
+        | Call::ReviewShell {
+            command,
+            timeout_ms,
+            workdir,
+            ..
         } => {
             let timeout =
                 timeout_ms.map_or(shell::DEFAULT_TIMEOUT.as_secs(), |ms| ms.div_ceil(1000));

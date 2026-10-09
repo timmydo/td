@@ -83,6 +83,13 @@ pub enum Call {
         timeout_ms: Option<u64>,
         workdir: Option<String>,
     },
+    /// The review controller's command, with a private Cargo output path.
+    ReviewShell {
+        command: String,
+        timeout_ms: Option<u64>,
+        workdir: Option<String>,
+        target_dir: String,
+    },
     /// A `shell` call with `background`: its instance outlives the call
     /// that started it, answered when the command ends (DESIGN.md §12).
     Background {
@@ -377,6 +384,7 @@ impl Call {
             Self::Patch { .. } => "apply_patch",
             Self::Glob { .. } => "glob",
             Self::Shell { .. } => "shell",
+            Self::ReviewShell { .. } => "review_shell",
             Self::Background { .. } => "background",
             Self::Grep { .. } => "grep",
             Self::Sed { .. } => "sed",
@@ -436,6 +444,17 @@ impl Call {
             Self::Glob { pattern, path } => member(vec![
                 ("pattern", Json::Str(pattern.clone())),
                 ("path", opt_str(path.as_deref())),
+            ]),
+            Self::ReviewShell {
+                command,
+                timeout_ms,
+                workdir,
+                target_dir,
+            } => member(vec![
+                ("command", Json::Str(command.clone())),
+                ("timeout_ms", opt_num(*timeout_ms)),
+                ("workdir", opt_str(workdir.as_deref())),
+                ("target_dir", Json::Str(target_dir.clone())),
             ]),
             Self::Shell {
                 command,
@@ -510,6 +529,12 @@ impl Call {
         };
         let flag = |name: &str| args.get(name).is_some_and(Json::is_true);
         Ok(match tool {
+            "review_shell" => Self::ReviewShell {
+                command: text("command")?,
+                timeout_ms: number("timeout_ms")?,
+                workdir: maybe("workdir")?,
+                target_dir: text("target_dir")?,
+            },
             "read_file" => Self::Read {
                 path: text("path")?,
                 offset: number("offset")?,
