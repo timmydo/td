@@ -3303,6 +3303,192 @@ mod tests {
     }
 
     #[test]
+    fn full_reader_pool_preserves_bodies_across_committed_deletion() {
+        use crate::ports::BlobReader;
+        const READERS: usize = 8;
+        const CHUNK: usize = 64 * 1024;
+        const LENGTH: usize = 2 * 1024 * 1024;
+        for completed_before_delete in [false, true] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let clock = Arc::new(Timer(AtomicU64::new(1)));
+            let epoch = StoreEpoch::from_bytes([0x76; 16]);
+            let store =
+                IndexStore::create(&mut root, epoch, clock.clone(), READERS, deadline()).unwrap();
+            store.create_account(ACCOUNT, deadline()).unwrap();
+            let id = BlobId::from_bytes([0x77; 16]);
+            let raw: Vec<u8> = (0..LENGTH)
+                .map(|n| ((n / CHUNK) ^ (n % 251)) as u8)
+                .collect();
+            let row = body_row(&raw, BlobKind::Message);
+            let value = encode(Row::Blob(row));
+            let put = Operation::put(Table::Blobs, id.as_bytes(), &value).unwrap();
+            assert_eq!(
+                store.commit(
+                    &td_crypto::Provider,
+                    request(0),
+                    &[put],
+                    &mut [BlobSource {
+                        id,
+                        source: &mut raw.as_slice(),
+                    }]
+                ),
+                Ok(Sequence::from_u64(1))
+            );
+            store.checkpoint(deadline()).unwrap();
+            let old = ViewIdentity {
+                account: ACCOUNT,
+                epoch,
+                committed_sequence: Sequence::from_u64(1),
+                history_floor: Sequence::default(),
+            };
+            let current = ViewIdentity {
+                committed_sequence: Sequence::from_u64(2),
+                ..old
+            };
+            let mut views: [_; READERS] =
+                std::array::from_fn(|_| Some(store.view(ACCOUNT, deadline()).unwrap()));
+            assert!(views
+                .iter()
+                .all(|view| view.as_ref().unwrap().identity() == old));
+            assert!(matches!(
+                store.view(ACCOUNT, deadline()),
+                Err(ports::Error::Busy)
+            ));
+            let mut scratch = vec![0; CHUNK];
+            let remove = || {
+                assert_eq!(
+                    store.commit(
+                        &td_crypto::Provider,
+                        request(1),
+                        &[Operation::delete(Table::Blobs, id.as_bytes()).unwrap()],
+                        &mut []
+                    ),
+                    Ok(Sequence::from_u64(2))
+                );
+                assert!(matches!(
+                    store.view(ACCOUNT, deadline()),
+                    Err(ports::Error::Busy)
+                ));
+            };
+            {
+                let mut inputs = views.each_mut().map(|view| {
+                    view.as_mut()
+                        .unwrap()
+                        .open_blob_input(&td_crypto::Provider, id, LENGTH as u64)
+                        .unwrap()
+                });
+                for input in &mut inputs {
+                    assert_eq!(input.read(&mut scratch).unwrap(), CHUNK);
+                    assert_eq!(scratch, raw[..CHUNK]);
+                }
+                if !completed_before_delete {
+                    remove();
+                }
+                for position in (CHUNK..LENGTH).step_by(CHUNK) {
+                    for input in &mut inputs {
+                        assert_eq!(input.position(), position as u64);
+                        assert_eq!(input.read(&mut scratch).unwrap(), CHUNK);
+                        assert_eq!(scratch, raw[position..position + CHUNK]);
+                    }
+                }
+                assert!(
+                    inputs
+                        .iter()
+                        .all(|input| input.position() == LENGTH as u64
+                            && input.len() == LENGTH as u64)
+                );
+                let mut pins = inputs.map(|input| input.finish().unwrap());
+                if completed_before_delete {
+                    remove();
+                }
+                for pin in &mut pins {
+                    assert_eq!(pin.len(), LENGTH as u64);
+                    for position in (0..LENGTH).step_by(CHUNK) {
+                        assert_eq!(pin.read_at(position as u64, &mut scratch).unwrap(), CHUNK);
+                        assert_eq!(scratch, raw[position..position + CHUNK]);
+                    }
+                    assert_eq!(
+                        pin.read_at((CHUNK - 1) as u64, &mut scratch).unwrap(),
+                        CHUNK
+                    );
+                    assert_eq!(scratch, raw[CHUNK - 1..2 * CHUNK - 1]);
+                    assert_eq!(pin.read_at((LENGTH - 1) as u64, &mut scratch).unwrap(), 1);
+                    assert_eq!(scratch[0], raw[LENGTH - 1]);
+                    assert_eq!(pin.read_at(LENGTH as u64, &mut scratch).unwrap(), 0);
+                }
+                assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
+            }
+            let mut metadata = [0; 128];
+            for view in views.iter_mut().flatten() {
+                assert_eq!(view.identity(), old);
+                assert_eq!(
+                    view.get(Key::Blob(id), &mut metadata).unwrap(),
+                    Some((Row::Blob(row), Sequence::from_u64(1)))
+                );
+            }
+            drop(views.first_mut().unwrap().take());
+            let mut fresh = store.view(ACCOUNT, deadline()).unwrap();
+            assert_eq!(fresh.identity(), current);
+            assert!(fresh.get(Key::Blob(id), &mut metadata).unwrap().is_none());
+            assert!(matches!(
+                fresh.open_blob_input(&td_crypto::Provider, id, LENGTH as u64),
+                Err(ports::Error::NotFound)
+            ));
+            assert!(matches!(
+                store.view(ACCOUNT, deadline()),
+                Err(ports::Error::Busy)
+            ));
+            assert_eq!(
+                store.commit(
+                    &td_crypto::Provider,
+                    request(2),
+                    &[put],
+                    &mut [BlobSource {
+                        id,
+                        source: &mut raw.as_slice(),
+                    }]
+                ),
+                Err(CommitError::Rejected(ports::Error::Conflict))
+            );
+            for view in views.iter_mut().flatten() {
+                assert_eq!(view.identity(), old);
+                assert_eq!(
+                    view.get(Key::Blob(id), &mut metadata).unwrap(),
+                    Some((Row::Blob(row), Sequence::from_u64(1)))
+                );
+            }
+            assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
+            drop(fresh);
+            drop(views);
+            let returned: [_; READERS] =
+                std::array::from_fn(|_| store.view(ACCOUNT, deadline()).unwrap());
+            assert!(returned.iter().all(|view| view.identity() == current));
+            drop(returned);
+            store.checkpoint(deadline()).unwrap();
+            drop(store);
+            let reopened = IndexStore::open(&mut root, clock, READERS, deadline()).unwrap();
+            reopened.validate_integrity(deadline()).unwrap();
+            let mut view = reopened.view(ACCOUNT, deadline()).unwrap();
+            assert_eq!(view.identity(), current);
+            assert!(view.get(Key::Blob(id), &mut metadata).unwrap().is_none());
+            assert_eq!(
+                reopened.commit(
+                    &td_crypto::Provider,
+                    request(2),
+                    &[put],
+                    &mut [BlobSource {
+                        id,
+                        source: &mut raw.as_slice(),
+                    }]
+                ),
+                Err(CommitError::Rejected(ports::Error::Conflict))
+            );
+            assert_eq!(view.identity(), current);
+        }
+    }
+
+    #[test]
     fn native_database_full_rolls_back_body_metadata_and_id_registration() {
         use crate::{limits::SQLITE_BODY_CHUNK_BYTES, ports::BlobReader};
         const BODY_BYTES: usize = 2 * 1024 * 1024;

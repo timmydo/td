@@ -416,6 +416,20 @@ retain upload bytes until the lease row is explicitly deleted, even after
 expiry. Expiry or revocation removes permission to use an upload, not its
 foreign-key ownership. No custom per-file pin registry is needed.
 
+A bounded native regression exercises public deletion with all eight
+reader slots borrowed over a patterned 2 MiB body. In separate cases,
+the writer commits after the first chunk of each input or after all
+eight digests have produced pins. Every input completes its original
+body and every pin reads all original bytes after deletion. Retained
+views keep their original typed row and full identity; a newly borrowed
+slot sees sequence two and no body while seven old views still see
+sequence one. Ninth captures refuse Busy, checkpoints refuse while old
+views remain, and all eight slots can be reacquired after release.
+Checkpoint/reopen passes physical integrity and preserves deletion and
+permanent-ID reuse refusal. This is sequential native snapshot evidence
+for the bounded fixture, not parallel-thread, portable resource,
+maximum-database, fault or service qualification.
+
 IndexReadView::logical_usage returns passive LogicalUsage totals with the
 captured ViewIdentity. Count every current BlobRow once, including zero-byte
 and unreferenced bodies. Upload bytes count bodies with a retained lease;

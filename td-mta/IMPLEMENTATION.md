@@ -2749,6 +2749,15 @@ interleaved progress on one worker, not parallel threads or writes with
 retained readers, arbitrary-account/maximum-database or whole-service
 overlap.
 
+A separate bounded native fixture passed public deletion while all eight
+reader slots retain the same patterned 2 MiB body. It covers partially
+read inputs and completed pins, all post-deletion bytes/digests, old
+metadata identities, a fresh sequence-two missing-body view alongside
+seven old views, Busy captures/checkpoints, complete slot reuse and
+checkpoint/reopen with physical integrity and permanent-ID refusal.
+This is sequential native snapshot evidence, without a portable
+allocation/RSS/stack, parallel-thread or whole-service claim.
+
 These primitives do not complete the restore command,
 selection/verification workflow or service activation.
 
