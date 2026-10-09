@@ -35,7 +35,7 @@ or unsafe allowance. A database or sidecar symlink, wrong owner/mode,
 extra hard link or oversized file refuses startup. Creation refuses
 preexisting database/WAL/SHM paths. Application ID, exact schema version
 2, closed schema and 4096-byte pages are checked before accepting the
-store. Full quick_check, foreign_key_check and per-Email anchor
+store. Full integrity_check, foreign_key_check and per-Email anchor
 cardinality are explicit validate_integrity maintenance, not an opening
 scan. SQLite validates physical pages on access and body pins verify
 their full digest. Earlier formats are refused; no automatic migration
@@ -990,8 +990,13 @@ This preserves the per-Email cardinality rule from an initially
 consistent store: any new duplicate requires a surviving anchor PUT. It
 is not a whole-store integrity scan. The separate validate_integrity
 operation checks this cardinality across every account after SQLite
-quick_check and foreign_key_check. One ordered covering scan of
-anchors_email groups by account and Email ID and refuses a group with
+integrity_check(1) and foreign_key_check. The full physical check
+verifies index contents against their tables before any domain scan
+trusts an index; quick_check's entry counts alone do not establish that
+agreement. It stops after the first physical error. Its table/index
+comparisons may require O(N log N) work, bounded by the original
+maintenance deadline and finite VM allowance. One ordered covering scan
+of anchors_email groups by account and Email ID and refuses a group with
 more than one row as Corrupt. The scan needs no temporary grouping tree
 or body reads. It shares the original writer fence, maintenance deadline
 and finite VM allowance; resource or I/O refusal cannot grant

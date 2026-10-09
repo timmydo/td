@@ -2626,9 +2626,12 @@ observations do not establish a transient RSS ceiling, native stack peak,
 combined 128 MiB service overlap, or an 8 GiB database checkpoint. The
 test-only producer bypasses normal WAL admission scheduling to reach the
 physical bound; the database is about 32 MiB. Startup avoids a full
-integrity scan; explicit validate_integrity maintenance owns quick_check and
-foreign_key_check with a physical-cap-sized finite VM allowance and the
-caller's deadline.
+integrity scan; explicit validate_integrity maintenance owns
+integrity_check(1), foreign_key_check and the indexed anchor-cardinality
+scan with a physical-cap-sized finite VM allowance and the caller's
+deadline. Full table/index comparisons may require O(N log N) work and
+stop after the first physical error. No maximum-database maintenance
+resource qualification is established by the bounded WAL fixture.
 
 SQLite setup and query calls may allocate Rust/native memory and are excluded
 from pure MIME zero-allocation claims. MIME fixtures prepare a real verified

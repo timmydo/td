@@ -1396,9 +1396,10 @@ partial artifacts distinguishable from successful backups. STORAGE.md owns
 the bounded copy and offline recovery contract; no backup CLI is enabled.
 Old schemas are refused; no data migration is required.
 Startup validates the closed schema and store identity without a full integrity
-scan. Explicit validate_integrity maintenance runs SQLite's database and
-foreign-key checks and the per-Email anchor-cardinality scan specified in
-STORAGE.md; body pins still require exact length/digest verification.
+scan. Explicit validate_integrity maintenance runs SQLite's full
+database/index consistency and foreign-key checks and the per-Email
+anchor-cardinality scan specified in STORAGE.md; body pins still require
+exact length/digest verification.
 SQLite recovery may read the full bounded WAL, and checkpoint may copy the
 entire bounded database in a synchronous native call. Neither promises
 interruption at the application deadline. Native resource and complete

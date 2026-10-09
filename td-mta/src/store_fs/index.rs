@@ -980,7 +980,7 @@ impl<'r> IndexStore<'r> {
         lock(&writer.native.budget)?.remaining = INTEGRITY_VM_STEPS;
         writer.native.run(|db| {
             let check: String = db
-                .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+                .query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))
                 .map_err(sql)?;
             if check != "ok" {
                 return Err(ports::Error::Corrupt);
@@ -4614,6 +4614,156 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn integrity_maintenance_checks_index_contents_before_trusting_anchor_scan() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        const ROOT: &str = "SELECT rootpage FROM sqlite_schema WHERE name='anchors_email'";
+        const INSERT: &str = "INSERT INTO thread_anchors(account,message_id,email_id,changed) VALUES(?1,'second@example.test',?2,?3)";
+        const PRIMARY: &str = "SELECT count(*) FROM thread_anchors NOT INDEXED";
+        const INDEX: &str = "SELECT count(*) FROM thread_anchors INDEXED BY anchors_email";
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let clock: Arc<dyn Clock> = Arc::new(Timer(AtomicU64::new(1)));
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            clock.clone(),
+            1,
+            deadline(),
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        let blob = BlobId::from_bytes([4; 16]);
+        let thread = ThreadId::from_bytes([5; 16]);
+        let email = EmailId::from_bytes([6; 16]);
+        let blob_bytes = encode(Row::Blob(body_row(b"", BlobKind::Message)));
+        let thread_bytes = encode(Row::Thread);
+        let email_bytes = encode(Row::Email(EmailRow {
+            blob,
+            thread,
+            received_at: 0,
+            origin: EmailOrigin::Jmap,
+        }));
+        let mut anchor = [0; 1024];
+        let length = Key::ThreadAnchor("first@example.test", email)
+            .encode(&mut anchor)
+            .unwrap();
+        let mut source = b"".as_slice();
+        store
+            .commit(
+                &td_crypto::Provider,
+                request(0),
+                &[
+                    Operation::put(Table::Blobs, blob.as_bytes(), &blob_bytes).unwrap(),
+                    Operation::put(Table::Threads, thread.as_bytes(), &thread_bytes).unwrap(),
+                    Operation::put(Table::Emails, email.as_bytes(), &email_bytes).unwrap(),
+                    Operation::put(Table::ThreadAnchors, &anchor[..length], &[]).unwrap(),
+                ],
+                &mut [BlobSource {
+                    id: blob,
+                    source: &mut source,
+                }],
+            )
+            .unwrap();
+        assert_eq!(store.validate_integrity(deadline()), Ok(()));
+        let page: u64 = {
+            let writer = lock(&store.writer).unwrap();
+            writer
+                .native
+                .run(|db| {
+                    db.execute(
+                        INSERT,
+                        params![
+                            ACCOUNT.as_bytes().as_slice(),
+                            email.as_bytes().as_slice(),
+                            1u64.to_be_bytes().as_slice()
+                        ],
+                    )
+                    .map_err(sql)?;
+                    let primary: i64 = db.query_row(PRIMARY, [], |row| row.get(0)).map_err(sql)?;
+                    let indexed: i64 = db.query_row(INDEX, [], |row| row.get(0)).map_err(sql)?;
+                    assert_eq!((primary, indexed), (2, 2));
+                    let page: i64 = db.query_row(ROOT, [], |row| row.get(0)).map_err(sql)?;
+                    Ok(u64::try_from(page).unwrap())
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            store.validate_integrity(deadline()),
+            Err(ports::Error::Corrupt)
+        );
+        store.checkpoint(deadline()).unwrap();
+        drop(store);
+        // All SQLite connections are closed before this second DB descriptor.
+        let path = db_path(&root, RootEntry::Database).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let offset = page
+            .checked_sub(1)
+            .unwrap()
+            .checked_mul(PAGE_BYTES)
+            .unwrap();
+        let mut bytes = vec![0; usize::try_from(PAGE_BYTES).unwrap()];
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes[0], 0x0a, "fixture index root must be a leaf");
+        assert_eq!(u16::from_be_bytes([bytes[3], bytes[4]]), 2);
+        let cell = usize::from(u16::from_be_bytes([bytes[10], bytes[11]]));
+        // This small fixture has one-byte payload and record-header varints.
+        assert!(bytes[cell] < 128);
+        assert_eq!(&bytes[cell + 1..cell + 4], &[4, 44, 44]);
+        assert!(bytes[cell + 4] < 128);
+        let account_start = cell + 5;
+        assert_eq!(
+            &bytes[account_start..account_start + 16],
+            ACCOUNT.as_bytes()
+        );
+        let email_start = account_start + 16;
+        assert_eq!(&bytes[email_start..email_start + 16], email.as_bytes());
+        // Keep both entries and their ordering, but detach the second key.
+        bytes[email_start..email_start + 16].fill(7);
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let store = IndexStore::open(&mut root, clock, 1, deadline()).unwrap();
+        {
+            let writer = lock(&store.writer).unwrap();
+            writer
+                .native
+                .run(|db| {
+                    let primary: i64 = db.query_row(PRIMARY, [], |row| row.get(0)).map_err(sql)?;
+                    let indexed: i64 = db.query_row(INDEX, [], |row| row.get(0)).map_err(sql)?;
+                    assert_eq!((primary, indexed), (2, 2));
+                    let quick: String = db
+                        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+                        .map_err(sql)?;
+                    assert_eq!(quick, "ok");
+                    let full: String = db
+                        .query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))
+                        .map_err(sql)?;
+                    assert_ne!(full, "ok");
+                    assert!(full.contains("anchors_email"), "{full}");
+                    let mut statement = db.prepare("PRAGMA foreign_key_check").map_err(sql)?;
+                    assert!(statement
+                        .query([])
+                        .map_err(sql)?
+                        .next()
+                        .map_err(sql)?
+                        .is_none());
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            store.validate_integrity(deadline()),
+            Err(ports::Error::Corrupt)
+        );
     }
 
     #[test]
