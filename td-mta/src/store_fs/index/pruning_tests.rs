@@ -685,15 +685,28 @@ fn pruning_requires_an_existing_account_and_wal_headroom() {
 
 #[test]
 fn full_reader_pool_retains_bodies_and_history_during_bounded_pruning() {
-    pruned_reader_scenario(false);
+    pruned_reader_scenario(PrunedScenario::Cleaned);
 }
 
 #[test]
 fn backup_preserves_retired_history_pending_bounded_cleanup() {
-    pruned_reader_scenario(true);
+    pruned_reader_scenario(PrunedScenario::PendingBackup);
 }
 
-fn pruned_reader_scenario(copy_pending: bool) {
+#[test]
+fn epoch_renewal_preserves_backup_history_pending_cleanup() {
+    pruned_reader_scenario(PrunedScenario::RenewedBackup);
+}
+
+enum PrunedScenario {
+    Cleaned,
+    PendingBackup,
+    RenewedBackup,
+}
+
+fn pruned_reader_scenario(scenario: PrunedScenario) {
+    let copy_pending = !matches!(scenario, PrunedScenario::Cleaned);
+    let renew_pending = matches!(scenario, PrunedScenario::RenewedBackup);
     const READERS: usize = 8;
     const BYTES: usize = 2 * 1024 * 1024;
     let fixture = Fixture::new();
@@ -936,41 +949,48 @@ fn pruned_reader_scenario(copy_pending: bool) {
     }
     store.checkpoint(deadline()).unwrap();
     drop(store);
-    let check_current = |view: &mut IndexReadView<'_, '_>, scratch: &mut [u8]| {
-        assert_eq!(view.identity(), current_identity);
-        assert_eq!(
-            view.get(Key::Blob(blob), scratch).unwrap(),
-            Some((blob_row, Sequence::from_u64(1)))
-        );
-        assert_eq!(
-            view.get(Key::Mailbox(parent), scratch).unwrap(),
-            Some((updated_parent, Sequence::from_u64(2)))
-        );
-        assert_eq!(
-            view.next_change(cursor(0, u32::MAX), ObjectType::Mailbox),
-            Err(ports::Error::HistoryLost)
-        );
-        assert_eq!(
-            view.next_change(cursor(2, u32::MAX), ObjectType::Mailbox)
-                .unwrap(),
-            ChangeStep::Complete
-        );
-        let mut input = view
-            .open_blob_input(&td_crypto::Provider, blob, BYTES as u64)
-            .unwrap();
-        for bytes in body.chunks(65536) {
-            assert_eq!(input.read(scratch).unwrap(), bytes.len());
-            assert_eq!(&*scratch, bytes);
-        }
-        drop(input.finish().unwrap());
-    };
+    let check_current =
+        |view: &mut IndexReadView<'_, '_>, epoch: StoreEpoch, scratch: &mut [u8]| {
+            assert_eq!(
+                view.identity(),
+                ViewIdentity {
+                    epoch,
+                    ..current_identity
+                }
+            );
+            assert_eq!(
+                view.get(Key::Blob(blob), scratch).unwrap(),
+                Some((blob_row, Sequence::from_u64(1)))
+            );
+            assert_eq!(
+                view.get(Key::Mailbox(parent), scratch).unwrap(),
+                Some((updated_parent, Sequence::from_u64(2)))
+            );
+            assert_eq!(
+                view.next_change(cursor(0, u32::MAX), ObjectType::Mailbox),
+                Err(ports::Error::HistoryLost)
+            );
+            assert_eq!(
+                view.next_change(cursor(2, u32::MAX), ObjectType::Mailbox)
+                    .unwrap(),
+                ChangeStep::Complete
+            );
+            let mut input = view
+                .open_blob_input(&td_crypto::Provider, blob, BYTES as u64)
+                .unwrap();
+            for bytes in body.chunks(65536) {
+                assert_eq!(input.read(scratch).unwrap(), bytes.len());
+                assert_eq!(&*scratch, bytes);
+            }
+            drop(input.finish().unwrap());
+        };
     let store = IndexStore::open(&mut root, clock.clone(), READERS, deadline()).unwrap();
     store.validate_integrity(deadline()).unwrap();
     {
         let mut reopened: [_; READERS] =
             std::array::from_fn(|_| store.view(ACCOUNT, deadline()).unwrap());
         for view in &mut reopened {
-            check_current(view, &mut scratch);
+            check_current(view, EPOCH, &mut scratch);
         }
     }
     if copy_pending {
@@ -999,7 +1019,34 @@ fn pruned_reader_scenario(copy_pending: bool) {
             Err(crate::store_fs::LockError::Busy)
         ));
         let source = IndexStore::open(&mut root, clock.clone(), READERS, deadline()).unwrap();
-        let copied = IndexStore::open(&mut copied_root, clock, READERS, deadline()).unwrap();
+        let copied =
+            IndexStore::open(&mut copied_root, clock.clone(), READERS, deadline()).unwrap();
+        let copied_epoch = if renew_pending {
+            StoreEpoch::from_bytes([0xa5; 16])
+        } else {
+            EPOCH
+        };
+        let copied = if renew_pending {
+            struct FreshEntropy(usize);
+            impl ports::Entropy for FreshEntropy {
+                fn fill(&mut self, output: &mut [u8]) -> Result<(), ports::CryptoError> {
+                    assert_eq!(output.len(), 16);
+                    self.0 += 1;
+                    output.fill(0xa5);
+                    Ok(())
+                }
+            }
+            let mut entropy = FreshEntropy(0);
+            let copied = copied.renew_epoch(&mut entropy, deadline()).unwrap();
+            assert_eq!(entropy.0, 1);
+            assert_eq!(copied.epoch(), copied_epoch);
+            drop(copied);
+            IndexStore::open(&mut copied_root, clock, READERS, deadline()).unwrap()
+        } else {
+            copied
+        };
+        assert_eq!(source.epoch(), EPOCH);
+        assert_eq!(copied.epoch(), copied_epoch);
         source.validate_integrity(deadline()).unwrap();
         copied.validate_integrity(deadline()).unwrap();
         {
@@ -1007,10 +1054,15 @@ fn pruned_reader_scenario(copy_pending: bool) {
                 std::array::from_fn(|_| source.view(ACCOUNT, deadline()).unwrap());
             let mut copied_views: [_; READERS] =
                 std::array::from_fn(|_| copied.view(ACCOUNT, deadline()).unwrap());
-            for view in source_views.iter_mut().chain(copied_views.iter_mut()) {
-                check_current(view, &mut scratch);
+            for (views, epoch) in [
+                (&mut source_views, EPOCH),
+                (&mut copied_views, copied_epoch),
+            ] {
+                for view in views {
+                    check_current(view, epoch, &mut scratch);
+                }
             }
-            for store in [&copied, &source] {
+            for (store, epoch) in [(&copied, copied_epoch), (&source, EPOCH)] {
                 assert!(matches!(
                     store.view(ACCOUNT, deadline()),
                     Err(ports::Error::Busy)
@@ -1019,7 +1071,10 @@ fn pruned_reader_scenario(copy_pending: bool) {
                 assert_eq!(
                     store.prune_history(request(2, 2, 1)).unwrap(),
                     HistoryPruned {
-                        identity: current_identity,
+                        identity: ViewIdentity {
+                            epoch,
+                            ..current_identity
+                        },
                         removed: 1,
                         more: false
                     }
@@ -1027,14 +1082,22 @@ fn pruned_reader_scenario(copy_pending: bool) {
                 assert_eq!(
                     store.prune_history(request(2, 2, 1)).unwrap(),
                     HistoryPruned {
-                        identity: current_identity,
+                        identity: ViewIdentity {
+                            epoch,
+                            ..current_identity
+                        },
                         removed: 0,
                         more: false
                     }
                 );
             }
-            for view in source_views.iter_mut().chain(copied_views.iter_mut()) {
-                check_current(view, &mut scratch);
+            for (views, epoch) in [
+                (&mut source_views, EPOCH),
+                (&mut copied_views, copied_epoch),
+            ] {
+                for view in views {
+                    check_current(view, epoch, &mut scratch);
+                }
             }
             for store in [&copied, &source] {
                 assert!(matches!(

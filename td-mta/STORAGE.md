@@ -634,6 +634,35 @@ portable resource limits, parallel work, multi-account/maximal stores,
 normal service retention/admission, full filesystem faults and power
 loss are not qualified.
 
+A third native full-reader scenario renews the copied epoch while one
+retired history row still awaits bounded cleanup. The original fully
+cleaned and pending-backup tests remain independently named through the
+shared scenario. After public backup, the copied store consumes one
+deterministic test-entropy fill of exactly sixteen bytes, renews to the
+independently expected fresh epoch, closes and reopens before any copied
+view is captured. The source retains its original epoch.
+
+Both stores reopen with eight readers each and retain sixteen
+simultaneous views and eighteen native owners. Every view checks the
+independently expected source or copied epoch, sequence two, floor two,
+exact typed body and updated parent with original changed sequences,
+below-floor HistoryLost, completed-floor Complete, every original body
+byte and full digest. While all views remain retained, copied cleanup
+returns one removed row with more false, then zero and false;
+independent source cleanup returns the same receipts under its original
+epoch. All sixteen views repeat the complete checks after cleanup; ninth
+captures and checkpoints remain Busy before and after cleanup. After
+views drop, both checkpoints and physical integrity checks pass.
+
+This is bounded native sequential epoch-renewal and pending-cleanup
+evidence for one account and one 2 MiB body. Deterministic test entropy
+establishes semantic identity expectations, not SystemEntropy
+qualification. No production, unsafe, hook, dependency or cap change is
+introduced. Portable allocation/RSS/stack limits, parallel work,
+multi-account/maximal stores, runtime retention/admission, complete
+filesystem faults, power loss and whole-service behavior are not
+qualified by this fixture.
+
 Backup must capture one consistent SQLite state. Stop service activity,
 checkpoint successfully, close every connection, then copy the main database;
 that snapshot contains bodies and metadata together. Copying only the live
