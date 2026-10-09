@@ -195,7 +195,7 @@ worker's push, bound to a commit the human or classifier approved.
 
 **The review command** stands apart from those parties: `td-agent review
 [--model MODEL] [--effort LEVEL] [--max-tokens N] [--max-cost USD]
-[--] [FILE]` is the
+[--log-dir DIRECTORY] [--] [FILE]` is the
 same binary run by a person or an agent from a shell, with no window,
 conversation or jail, for one model's review of one git commit in td's
 review workflow (DEVELOPMENT.md, Code review), where it is meant to take
@@ -219,7 +219,7 @@ reservation to standard error. It exits non-zero unless the reply
 stopped with something said: an error, a stream that ends without its
 finish, a reply cut at its token limit, filtered or empty is no review.
 A rate-limited request is asked again as a turn's is. Its cost is
-bounded as §5 says. It keeps nothing, executes nothing the model says,
+bounded as §5 says. It retains the session trace below, executes nothing the model says,
 and has no tools when reading FILE or standard input. `--max-cost USD`
 may lower the single request's cost limit. The commit goes to the provider
 because the person ran the command on it.
@@ -256,6 +256,52 @@ subject and full commit id reaches standard output. Reasoning details
 are echoed with their exact wire bytes as in §5. Source and tool results
 are untrusted review material; project instructions cannot widen the
 profile. No conversation or daily ledger is created.
+
+Both review forms retain a private JSONL trace under
+`$XDG_STATE_HOME/td-agent/reviews/` (otherwise
+`~/.local/state/td-agent/reviews/`). `--log-dir DIRECTORY` selects an
+owned private directory outside system trees and disposable workspace
+parents. Repository reviews also require it to be outside the explicitly
+supplied source repository and every tree mounted in their review jail.
+Diff-only reviews consume text and have no source repository or jail. The trace is created after loading a valid
+configuration and key, before workspace setup or any model request, and
+its absolute path is printed on standard error. Files are exclusively
+created mode 0600 in a checked mode-0700 directory; no authorization
+headers or credential configuration are logged. These files contain
+source and provider-returned reasoning and must be treated as private.
+
+Monetary integer fields use pico-dollars (10^-12 dollars), as §5 does.
+Version-1 records have `sequence`, wall-clock `time_ms`, monotonic
+`elapsed_ms`, `kind`, and `data`. They record the exact serialized request
+body (including tools and all context), running agent path and binary
+SHA-256, HTTP status and response headers,
+raw received response chunks as hex, parsed completions, model metadata,
+retries, budget reservations and settlements, effective jail specification
+and limits, tool arguments, raw streamed process bytes as hex, retained output and
+exact model-visible results. A tool's output can be shortened for the
+model while its streamed output remains complete in the trace. Review
+commands send bounded `output_raw` hex frames through blocking queues,
+so a slow log writer applies backpressure instead of losing chunks, and
+invalid UTF-8 bytes are preserved. On command exit, the existing whole
+output drain waits for a quiet pipe, at most 60 seconds; reaching that
+bound is explicitly reported to the model and trace. Outputs from killed
+or interrupted instances can be incomplete and are recorded as such. Reasoning
+is only what the provider returned, including opaque reasoning details;
+provider-internal reasoning is unavailable. Response chunks retain exact
+bytes through the response parser's termination, including malformed
+responses. Log write failures stop the review rather than silently losing
+records; logging adds no model-output, tool-output or log-size limit.
+
+The terminal `end` record reports success or failure; normal repository
+loop exits also record budget totals and cleanup. Records are written
+without application buffering and the completed trace is synced. A
+process killed abruptly may leave an incomplete last line and no `end`
+record; the preceding complete lines remain inspectable. Traces survive
+workspace cleanup and are never automatically pruned. They are diagnostic
+artifacts, not conversations or entries in the daily ledger. Full capture
+has no disk quota: retained traces can exhaust storage and the caller
+owns their removal. A write failure stops the invocation; it does not
+remove earlier diagnostic records.
 
 The private run directory is below the key directory's `reviews/`, but
 neither that parent nor the key is mounted into a jail. The controller

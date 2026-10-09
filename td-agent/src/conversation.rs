@@ -3966,7 +3966,10 @@ impl Session {
             }
             match client.next_reply(HOST_POLL) {
                 // A link's frame goes to its links, never here.
-                None | Some(Ok(host::Up::Output { .. } | host::Up::Link(_))) => {}
+                None
+                | Some(Ok(
+                    host::Up::Output { .. } | host::Up::RawOutput { .. } | host::Up::Link(_),
+                )) => {}
                 // The instance is gone, and with it the call.
                 Some(Err(why)) => return failed(why),
                 Some(Ok(host::Up::Done { outcome, .. })) => {

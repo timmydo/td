@@ -96,7 +96,7 @@ fn definitions() -> Vec<Json> {
                             ("properties".into(), Json::Obj(vec![
                                 ("command".into(), Json::Obj(vec![("type".into(), Json::Str("string".into()))])),
                                 ("workdir".into(), Json::Obj(vec![("type".into(), Json::Str("string".into()))])),
-                                ("timeout_ms".into(), Json::Obj(vec![("type".into(), Json::Str("integer".into())), ("minimum".into(), Json::from(1u64)), ("maximum".into(), Json::from(600_000u64))])),
+                                ("timeout_ms".into(), Json::Obj(vec![("type".into(), Json::Str("integer".into())), ("minimum".into(), Json::from(1u64)), ("maximum".into(), Json::from(review_workspace::MAX_SHELL_TIMEOUT_MS))])),
                             ])),
                             ("required".into(), Json::Arr(vec![Json::Str("command".into())])),
                             ("additionalProperties".into(), Json::Bool(false)),
@@ -233,6 +233,23 @@ pub fn run(
     key: &key::Secret,
     key_path: &Path,
 ) -> Result<(), String> {
+    let mut journal = crate::review_log::Journal::create(
+        options,
+        options.model.as_deref().unwrap_or(&client.model),
+        key_path,
+    )?;
+    let result = run_logged(options, client, key, key_path, &mut journal);
+    let logged = journal.end(&result);
+    crate::review_log::combine(result, logged)
+}
+
+fn run_logged(
+    options: &review::Options,
+    client: &config::Client,
+    key: &key::Secret,
+    key_path: &Path,
+    journal: &mut crate::review_log::Journal,
+) -> Result<(), String> {
     let source = options
         .repository
         .as_deref()
@@ -242,6 +259,40 @@ pub fn run(
         options.revision.as_deref().unwrap_or("HEAD"),
         &options.sparse,
         key_path,
+    )?;
+    workspace.log_environment(journal)?;
+    journal.event(
+        "environment",
+        Json::Obj(vec![
+            ("commit".into(), Json::Str(workspace.commit.clone())),
+            ("subject".into(), Json::Str(workspace.subject.clone())),
+            (
+                "checkout".into(),
+                Json::Str(workspace.checkout.display().to_string()),
+            ),
+            (
+                "scratch".into(),
+                Json::Str(workspace.scratch.display().to_string()),
+            ),
+            (
+                "sparse".into(),
+                Json::Arr(workspace.sparse.iter().cloned().map(Json::Str).collect()),
+            ),
+            ("max_steps".into(), Json::from(MAX_STEPS as u64)),
+            (
+                "tool_controller_timeout_ms".into(),
+                Json::from(review_workspace::TOOL_TIME.as_millis() as u64),
+            ),
+            ("max_context_bytes".into(), Json::from(MAX_CONTEXT as u64)),
+            (
+                "cargo_net_offline".into(),
+                Json::Str(crate::toolhost::REVIEW_CARGO_OFFLINE.into()),
+            ),
+            (
+                "shell_timeout_max_ms".into(),
+                Json::from(review_workspace::MAX_SHELL_TIMEOUT_MS),
+            ),
+        ]),
     )?;
     let expected = format!("REVIEWING: {} ({})", workspace.subject, workspace.commit);
     let system = format!("{INSTRUCTION}\n\nRequired final first line: {expected}\nSource: {}\nScratch: {}\nSparse directories: {}", workspace.checkout.display(), workspace.scratch.display(), workspace.sparse.join(", "));
@@ -264,6 +315,11 @@ pub fn run(
     let supported = listed
         .find(model)
         .ok_or("review model is absent from the models list")?;
+    journal.model(supported)?;
+    journal.event(
+        "per_turn_cost_limit",
+        client.limits.turn.map_or(Json::Null, Json::from),
+    )?;
     if !supported.supports("tools") || !supported.supports("max_tokens") {
         return Err("workspace review needs a model supporting tools and max_tokens".into());
     }
@@ -290,14 +346,22 @@ pub fn run(
         &expected,
         &mut budget,
         &mut out,
+        journal,
     );
     eprintln!("td-agent review: {} model requests; total {} (unreported usage charged at reservation), cap {}", budget.requests, cost::show(budget.charged), cost::show(budget.limit));
     let cleanup = workspace.cleanup();
-    match (result, cleanup) {
-        (Err(why), Err(cleanup)) => Err(format!("{why}; {cleanup}")),
-        (Err(why), _) => Err(why),
-        (Ok(()), cleanup) => cleanup,
-    }
+    let summary = journal.event(
+        "budget_total",
+        Json::Obj(vec![
+            ("requests".into(), Json::from(budget.requests as u64)),
+            ("charged".into(), Json::from(budget.charged)),
+            ("limit".into(), Json::from(budget.limit)),
+        ]),
+    );
+    let cleanup_log = journal.outcome("cleanup", &cleanup);
+    let result = crate::review_log::combine(result, cleanup);
+    let result = crate::review_log::combine(result, summary);
+    crate::review_log::combine(result, cleanup_log)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -312,6 +376,7 @@ fn loop_review(
     expected: &str,
     budget: &mut Budget,
     out: &mut impl Write,
+    journal: &mut crate::review_log::Journal,
 ) -> Result<(), String> {
     let model = options.model.as_deref().unwrap_or(&client.model);
     for _ in 0..MAX_STEPS {
@@ -320,14 +385,36 @@ fn loop_review(
             return Err("review context exceeds 16 MiB; no complete review".into());
         }
         let plan = review::plan(options, client, listed.find(model), prompt_bound(&sized))?;
+        journal.event(
+            "budget_reservation",
+            Json::Obj(vec![
+                ("reserved".into(), Json::from(plan.reserved)),
+                ("charged".into(), Json::from(budget.charged)),
+                ("limit".into(), Json::from(budget.limit)),
+            ]),
+        )?;
         budget.reserve(plan.reserved)?;
         let body = client::turn_body(&review::head(&plan, client), prefix, messages)?;
         // Intermediate assistant text belongs to the tool loop, not the
         // final review artifact. Only a validated final reply reaches stdout.
         let mut buffered = Vec::new();
-        let (reply, served) = review::request(client, key, &body, &mut buffered)?;
+        let (reply, served) = review::request(client, key, &body, &mut buffered, journal)?;
         eprintln!("{}", review::spent(&reply, &served, plan.reserved));
-        budget.settle(plan.reserved, reply.usage)?;
+        let settled = budget.settle(plan.reserved, reply.usage);
+        journal.event(
+            "budget_settlement",
+            Json::Obj(vec![
+                ("charged".into(), Json::from(budget.charged)),
+                (
+                    "reported_cost".into(),
+                    reply
+                        .usage
+                        .and_then(|u| u.cost)
+                        .map_or(Json::Null, Json::from),
+                ),
+            ]),
+        )?;
+        settled?;
         if reply.calls.is_empty() {
             review::whole(&reply)?;
             if reply.content.as_deref().and_then(|s| s.lines().next()) != Some(expected) {
@@ -348,12 +435,43 @@ fn loop_review(
         messages.push(assistant(&reply)?);
         for call in &reply.calls {
             eprintln!("td-agent review: tool {}", tools::visible(&call.name));
+            journal.event(
+                "tool_call",
+                Json::Obj(vec![
+                    ("id".into(), Json::Str(call.id.clone())),
+                    ("name".into(), Json::Str(call.name.clone())),
+                    ("arguments".into(), Json::Str(call.arguments.clone())),
+                ]),
+            )?;
+            let mut logging_error = None;
             let answer = if call.name == "expand_sparse" {
                 expand(workspace, &call.arguments)
             } else {
-                workspace.call(&call.name, &call.arguments)
+                workspace.call_logged(&call.name, &call.arguments, |kind, text| {
+                    let result = if kind == "tool_output_bytes_hex" {
+                        journal.raw(kind, text)
+                    } else {
+                        std::str::from_utf8(text)
+                            .map_err(|e| e.to_string())
+                            .and_then(|text| journal.text(kind, text))
+                    };
+                    if let Err(why) = &result {
+                        logging_error = Some(why.clone());
+                    }
+                    result
+                })
             };
+            if let Some(why) = logging_error {
+                return Err(why);
+            }
             let content = answer.unwrap_or_else(|why| format!("Tool refused or failed: {why}"));
+            journal.event(
+                "tool_result",
+                Json::Obj(vec![
+                    ("id".into(), Json::Str(call.id.clone())),
+                    ("content".into(), Json::Str(content.clone())),
+                ]),
+            )?;
             messages.push(
                 Json::Obj(vec![
                     ("role".into(), Json::Str("tool".into())),

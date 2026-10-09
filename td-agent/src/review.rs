@@ -9,8 +9,8 @@
 //! and what it cost to standard error. The commit is quoted between
 //! markers no commit can hold, so its text is the thing reviewed and
 //! never read as an instruction. Its worst case is reserved against
-//! `max_cost_per_turn` before it is sent (DESIGN.md §5). Nothing is
-//! kept: no conversation, no state.
+//! `max_cost_per_turn` before it is sent (DESIGN.md §5). A private
+//! session trace is kept, without a conversation or daily ledger.
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -38,10 +38,10 @@ const MAX_MAX_TOKENS: u64 = 200_000;
 const ASCII_BYTES_PER_TOKEN: u64 = 3;
 
 pub const USAGE: &str = "usage: td-agent review [--model MODEL] [--effort LEVEL] \
-                         [--max-tokens N] [--max-cost USD] [--] [FILE]\n\
+                         [--max-tokens N] [--max-cost USD] [--log-dir DIRECTORY] [--] [FILE]\n\
        td-agent review --repo DIRECTORY [--commit REV] [--sparse DIRECTORY]...\n\
                        [--model MODEL] [--effort LEVEL] [--max-tokens N]\n\
-                       [--max-cost USD]\n\
+                       [--max-cost USD] [--log-dir DIRECTORY]\n\
 \n\
 With --repo, reviews REV (HEAD by default) in a disposable sparse checkout,\n\
 with read/search tools and confined commands for tests. Source and git\n\
@@ -64,8 +64,14 @@ max_cost_per_turn, priced from the API's models list: for a dear model,\n\
 ask a smaller N or raise that limit. It exits non-zero unless the review\n\
 finished whole. It needs td's fetch service: on td, run it from a\n\
 terminal with XDG_RUNTIME_DIR naming /run/user/1000; on a host, as\n\
-./install-apps installs it from a td checkout, whose launch serves it,\n\
-for example:\n\
+./install-apps installs it from a td checkout, whose launch serves it.\n\
+\n\
+Both review forms retain full session traces after cleanup in\n\
+$XDG_STATE_HOME/td-agent/reviews (or ~/.local/state/td-agent/reviews).\n\
+--log-dir selects another private directory. The\n\
+private JSONL path is printed to stderr before the review starts.\n\
+\n\
+For example:\n\
 \n\
   td-agent review --repo . --commit HEAD --model google/gemini-3.8-flash \\\n    --effort high --max-cost 0.50\n";
 
@@ -98,6 +104,7 @@ pub struct Options {
     pub revision: Option<String>,
     pub sparse: Vec<String>,
     pub max_cost: Option<u64>,
+    pub log_dir: Option<PathBuf>,
 }
 
 impl Options {
@@ -148,6 +155,9 @@ impl Options {
                     options.revision = Some(value()?);
                 }
                 "--sparse" if !options_done => options.sparse.push(value()?),
+                "--log-dir" if !options_done && options.log_dir.is_none() => {
+                    options.log_dir = Some(PathBuf::from(value()?));
+                }
                 "--max-cost" if !options_done && options.max_cost.is_none() => {
                     let text = value()?;
                     options.max_cost = Some(
@@ -528,10 +538,25 @@ pub fn run(args: &[String]) -> Result<(), String> {
     if options.repository.is_some() {
         return crate::review_session::run(&options, &config.client, &key, &key_path);
     }
+    let mut journal = crate::review_log::Journal::create(
+        &options,
+        options.model.as_deref().unwrap_or(&config.client.model),
+        &key_path,
+    )?;
+    let result = run_diff(&options, &mut config.client, &key, &mut journal);
+    let logged = journal.end(&result);
+    crate::review_log::combine(result, logged)
+}
+
+fn run_diff(
+    options: &Options,
+    client_config: &mut Client,
+    key: &crate::key::Secret,
+    journal: &mut crate::review_log::Journal,
+) -> Result<(), String> {
     if let Some(limit) = options.max_cost {
-        config.client.limits.turn = Some(
-            config
-                .client
+        client_config.limits.turn = Some(
+            client_config
                 .limits
                 .turn
                 .map_or(limit, |old| old.min(limit)),
@@ -545,7 +570,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         None => read_input(std::io::stdin().lock())?,
     };
     let nonce = crate::store::random_hex(16)?;
-    let client = &config.client;
+    let client = &*client_config;
     // The prompt is the body's messages; the head is short.
     let sized = body("", &commit, &nonce)?;
     // Without a per-turn limit, a list that cannot be had only leaves
@@ -562,10 +587,24 @@ pub fn run(args: &[String]) -> Result<(), String> {
     } else {
         prompt_tokens(&sized)
     };
-    let plan = plan(&options, client, listed.find(model), prompt)?;
+    if let Some(metadata) = listed.find(model) {
+        journal.model(metadata)?;
+    }
+    let plan = plan(options, client, listed.find(model), prompt)?;
+    journal.event(
+        "budget_reservation",
+        Json::Obj(vec![
+            ("reserved".into(), Json::from(plan.reserved)),
+            ("charged".into(), Json::from(0u64)),
+            (
+                "limit".into(),
+                client.limits.turn.map_or(Json::Null, Json::from),
+            ),
+        ]),
+    )?;
     let body = body(&head(&plan, client), &commit, &nonce)?;
     let mut out = std::io::stdout().lock();
-    let (completion, served) = request(client, &key, &body, &mut out)?;
+    let (completion, served) = request(client, key, &body, &mut out, journal)?;
     out.write_all(b"\n")
         .and_then(|()| out.flush())
         .map_err(|e| format!("writing the review: {e}"))?;
@@ -574,6 +613,23 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "{}",
         spent(&completion, &served, plan.reserved)
     );
+    let charged = completion
+        .usage
+        .and_then(|u| u.cost)
+        .unwrap_or(plan.reserved);
+    journal.event(
+        "budget_settlement",
+        Json::Obj(vec![
+            ("charged".into(), Json::from(charged)),
+            (
+                "reported_cost".into(),
+                completion
+                    .usage
+                    .and_then(|u| u.cost)
+                    .map_or(Json::Null, Json::from),
+            ),
+        ]),
+    )?;
     whole(&completion)?;
     if let Some(limit) = options.max_cost {
         crate::cost::within(
@@ -594,13 +650,16 @@ pub(crate) fn request(
     key: &crate::key::Secret,
     body: &str,
     out: &mut impl Write,
+    journal: &mut crate::review_log::Journal,
 ) -> Result<(Completion, Served), String> {
+    journal.text("request_body", body)?;
     let url = format!("{}/chat/completions", client.base_url);
     let headers = client::headers(key.expose());
     let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
     let mut served = Served::default();
     let mut attempt = 0;
     let completion = loop {
+        journal.event("request_attempt", Json::from(attempt as u64))?;
         let mut stream =
             td_fetch_client::post_stream(&url, &headers, body.as_bytes(), Some(client::MAX_STREAM))
                 .map_err(|e| format!("the request: {e}"))?;
@@ -613,22 +672,94 @@ pub(crate) fn request(
         });
         let status = stream.status;
         let head = stream.headers.clone();
+        journal.event(
+            "response_headers",
+            Json::Arr(
+                head.iter()
+                    .map(|(name, value)| {
+                        Json::Arr(vec![Json::Str(name.clone()), Json::Str(value.clone())])
+                    })
+                    .collect(),
+            ),
+        )?;
+        journal.event("response_status", Json::from(u64::from(status)))?;
+        let mut logging_error = None;
         let chunks = std::iter::from_fn(|| match stream.next_chunk() {
-            Ok(Some(bytes)) => Some(Ok(bytes.to_vec())),
+            Ok(Some(bytes)) => {
+                if let Err(why) = journal.bytes(bytes) {
+                    logging_error = Some(why.clone());
+                    Some(Err(why))
+                } else {
+                    Some(Ok(bytes.to_vec()))
+                }
+            }
             Ok(None) => None,
             Err(e) => Some(Err(e.to_string())),
         });
-        match consume(status, head, json, chunks, out, &mut served) {
+        let consumed = consume(status, head, json, chunks, out, &mut served);
+        if let Some(why) = logging_error {
+            return Err(why);
+        }
+        match consumed {
             Ok(completion) => break completion,
-            Err(ended) => match again(attempt, &ended) {
-                Some(wait) => {
-                    std::thread::sleep(wait);
-                    attempt += 1;
+            Err(ended) => {
+                journal.text("request_error", ended.text())?;
+                match again(attempt, &ended) {
+                    Some(wait) => {
+                        journal.event("retry_wait_ms", Json::from(wait.as_millis() as u64))?;
+                        std::thread::sleep(wait);
+                        attempt += 1;
+                    }
+                    None => {
+                        return Err(ended.text().to_string());
+                    }
                 }
-                None => return Err(ended.text().to_string()),
-            },
+            }
         }
     };
+    journal.event(
+        "completion",
+        Json::Obj(vec![
+            (
+                "content".into(),
+                completion.content.clone().map_or(Json::Null, Json::Str),
+            ),
+            (
+                "reasoning".into(),
+                completion.reasoning.clone().map_or(Json::Null, Json::Str),
+            ),
+            (
+                "reasoning_details".into(),
+                completion.details.clone().map_or(Json::Null, Json::Str),
+            ),
+            ("finish".into(), Json::Str(completion.finish.clone())),
+            (
+                "model".into(),
+                served.model.clone().map_or(Json::Null, Json::Str),
+            ),
+            (
+                "provider".into(),
+                served.provider.clone().map_or(Json::Null, Json::Str),
+            ),
+            (
+                "usage".into(),
+                completion.usage.map_or(Json::Null, |usage| {
+                    Json::Obj(vec![
+                        ("prompt_tokens".into(), Json::from(usage.tokens.prompt)),
+                        (
+                            "completion_tokens".into(),
+                            Json::from(usage.tokens.completion),
+                        ),
+                        (
+                            "reasoning_tokens".into(),
+                            Json::from(usage.tokens.reasoning),
+                        ),
+                        ("cost".into(), usage.cost.map_or(Json::Null, Json::from)),
+                    ])
+                }),
+            ),
+        ]),
+    )?;
     Ok((completion, served))
 }
 
@@ -672,6 +803,8 @@ mod tests {
             "--repo . --repo other",
             "--repo . --sparse ../outside",
             "--max-cost invalid",
+            "--log-dir",
+            "--log-dir a --log-dir b",
             "--max-cost 0.1 --max-cost 0.2",
             "--model",
             "--model a --model b",

@@ -104,10 +104,34 @@ impl Fixture {
             .arg(&self.source)
             .args(["--model", MODEL, "--max-tokens", "4096", "--max-cost", cap])
             .env("XDG_CONFIG_HOME", &self.config)
+            .env("XDG_STATE_HOME", self.root.join("state"))
             .env("XDG_RUNTIME_DIR", mock.runtime())
             .env("TD_AGENT_TEST_KEY_ROOT", &self.root)
             .stdin(Stdio::null());
         cmd
+    }
+
+    fn logs(&self) -> Vec<String> {
+        fs::read_dir(self.root.join("state/td-agent/reviews"))
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                assert_eq!(
+                    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+                let text = fs::read_to_string(path).unwrap();
+                assert!(!text.contains("sk-or-v1-fixture-not-a-real-key"));
+                for (sequence, line) in text.lines().enumerate() {
+                    let event = td_json::parse(line).unwrap();
+                    assert_eq!(
+                        event.get("sequence").and_then(Json::as_u64),
+                        Some(sequence as u64)
+                    );
+                }
+                text
+            })
+            .collect()
     }
 
     fn no_workspaces(&self) {
@@ -241,6 +265,21 @@ fn tools_read_only_source_write_scratch_expand_sparse_and_cleanup() {
                 "shell",
                 Json::Obj(vec![("command".into(), Json::Str("cat dep/data".into()))]),
             ),
+            tool(
+                "shell",
+                Json::Obj(vec![(
+                    "command".into(),
+                    Json::Str(format!(
+                        "if test -e '{}'; then echo LOGS_VISIBLE; else echo LOGS_PRIVATE; fi",
+                        fixture
+                            .root
+                            .join("state/td-agent/reviews")
+                            .display()
+                            .to_string()
+                            .replace('\'', "'\\''")
+                    )),
+                )]),
+            ),
             fixture.final_reply(),
         ],
     );
@@ -251,12 +290,98 @@ fn tools_read_only_source_write_scratch_expand_sparse_and_cleanup() {
         String::from_utf8_lossy(&result.stderr)
     );
     let requests = mock.requests();
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 6);
     assert!(requests[2].text().contains("SOURCE_READ_ONLY"));
     assert!(requests[2].text().contains("ORIGINAL REVIEWED"));
     assert!(requests[2].text().contains("SCRATCH_OK"));
     assert!(requests[4].text().contains("DEPENDENCY"));
+    assert!(requests[5].text().contains("LOGS_PRIVATE"));
     assert!(!requests[1].text().contains("\"name\":\"git_push\""));
+    fixture.no_workspaces();
+    let logs = fixture.logs();
+    assert_eq!(logs.len(), 1);
+    let trace = &logs[0];
+    for kind in [
+        "request_body",
+        "response_bytes_hex",
+        "tool_call",
+        "tool_result",
+        "budget_settlement",
+        "jail_spec",
+        "cleanup",
+        "end",
+    ] {
+        assert!(
+            trace.contains(&format!("\"kind\":\"{kind}\"")),
+            "missing {kind}"
+        );
+    }
+    assert!(trace.contains("SOURCE_READ_ONLY"));
+    assert!(trace.contains("DEPENDENCY"));
+    assert!(trace.lines().last().unwrap().contains("\"success\":true"));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("session log "));
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn full_tool_output_survives_model_truncation() {
+    let fixture = Fixture::new();
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            tool(
+                "shell",
+                Json::Obj(vec![(
+                    "command".into(),
+                    Json::Str(
+                        "printf '%080000d' 0; printf TRACE_MIDDLE; printf '%080000d' 0".into(),
+                    ),
+                )]),
+            ),
+            fixture.final_reply(),
+        ],
+    );
+    let result = run(&fixture, &mock, "0.02");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.requests();
+    let body = td_json::parse(&requests[2].text()).unwrap();
+    let messages = body.get("messages").and_then(Json::as_arr).unwrap();
+    let result = messages
+        .last()
+        .unwrap()
+        .get("content")
+        .and_then(Json::as_str)
+        .unwrap();
+    assert!(!result.contains("TRACE_MIDDLE"));
+    let logs = fixture.logs();
+    let hex: String = logs[0]
+        .lines()
+        .filter_map(|line| {
+            let event = td_json::parse(line).unwrap();
+            (event.get("kind").and_then(Json::as_str) == Some("tool_output_bytes_hex")).then(|| {
+                event
+                    .get("data")
+                    .and_then(Json::as_str)
+                    .unwrap()
+                    .to_string()
+            })
+        })
+        .collect();
+    let output: Vec<u8> = hex
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    assert!(String::from_utf8_lossy(&output).contains("TRACE_MIDDLE"));
+    assert_eq!(output.len(), 160_012);
     fixture.no_workspaces();
 }
 
@@ -338,6 +463,15 @@ fn zero_cap_sends_no_completion_and_cleanup_runs() {
     assert!(!result.status.success());
     assert_eq!(mock.requests().len(), 1);
     fixture.no_workspaces();
+    let logs = fixture.logs();
+    assert_eq!(logs.len(), 1);
+    assert!(logs[0].contains("budget_reservation"));
+    assert!(!logs[0].contains("request_body"));
+    assert!(logs[0]
+        .lines()
+        .last()
+        .unwrap()
+        .contains("\"success\":false"));
 }
 
 #[test]
@@ -372,8 +506,138 @@ fn killed_review_is_collected_on_the_next_invocation() {
     mock.wait_for(2);
     child.kill().unwrap();
     child.wait().unwrap();
+    let interrupted = fixture.logs();
+    assert_eq!(interrupted.len(), 1);
+    assert!(interrupted[0].contains("request_body"));
+    assert!(!interrupted[0].contains("\"kind\":\"end\""));
     mock.then(vec![models()]);
     let result = run(&fixture, &mock, "0");
     assert!(!result.status.success());
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "uses the host CLI key fixture"]
+fn diff_only_trace_keeps_rate_limit_and_malformed_response_bytes() {
+    let fixture = Fixture::new();
+    let limited = b"{\"error\":{\"message\":\"TRY AGAIN\"}}".to_vec();
+    let malformed = b"malformed response \xff".to_vec();
+    let headers = vec![("content-type".into(), "application/json".into())];
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            Reply::Http {
+                status: 429,
+                headers: vec![
+                    ("content-type".into(), "application/json".into()),
+                    ("retry-after".into(), "0".into()),
+                ],
+                body: limited.clone(),
+            },
+            Reply::Http {
+                status: 200,
+                headers,
+                body: malformed.clone(),
+            },
+        ],
+    );
+    let input = fixture.root.join("commit.txt");
+    fs::write(&input, "commit 1234567890\n\n    fixture review\n").unwrap();
+    let template = fixture.command(&mock, "0.02");
+    let mut command = Command::new(PROGRAM);
+    command
+        .args([
+            "review",
+            "--model",
+            MODEL,
+            "--max-tokens",
+            "4096",
+            "--max-cost",
+            "0.02",
+        ])
+        .arg(input)
+        .stdin(Stdio::null());
+    for (name, value) in template.get_envs() {
+        if let Some(value) = value {
+            command.env(name, value);
+        }
+    }
+    let result = command.output().unwrap();
+    assert!(!result.status.success());
+    assert_eq!(mock.requests().len(), 3);
+    let logs = fixture.logs();
+    let events: Vec<Json> = logs[0]
+        .lines()
+        .map(|line| td_json::parse(line).unwrap())
+        .collect();
+    let hex: String = events
+        .iter()
+        .filter(|event| event.get("kind").and_then(Json::as_str) == Some("response_bytes_hex"))
+        .map(|event| event.get("data").and_then(Json::as_str).unwrap())
+        .collect();
+    let raw: Vec<u8> = hex
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    assert_eq!(raw, [limited, malformed].concat());
+    assert!(logs[0].contains("retry_wait_ms"));
+    assert!(logs[0].contains("request_error"));
+    assert!(logs[0]
+        .lines()
+        .last()
+        .unwrap()
+        .contains("\"success\":false"));
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn binary_output_is_preserved_in_trace() {
+    let fixture = Fixture::new();
+    let bytes = 4 * 1024 * 1024;
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            tool(
+                "shell",
+                Json::Obj(vec![(
+                    "command".into(),
+                    Json::Str(format!("head -c {bytes} /dev/zero; printf '\\377'")),
+                )]),
+            ),
+            fixture.final_reply(),
+        ],
+    );
+    let result = run(&fixture, &mock, "0.10");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let logs = fixture.logs();
+    let hex: String = logs[0]
+        .lines()
+        .filter_map(|line| {
+            let event = td_json::parse(line).unwrap();
+            (event.get("kind").and_then(Json::as_str) == Some("tool_output_bytes_hex")).then(|| {
+                event
+                    .get("data")
+                    .and_then(Json::as_str)
+                    .unwrap()
+                    .to_string()
+            })
+        })
+        .collect();
+    assert_eq!(hex.len(), (bytes + 1) * 2);
+    assert!(hex.ends_with("ff"));
+    assert!(hex
+        .strip_suffix("ff")
+        .unwrap()
+        .bytes()
+        .all(|byte| byte == b'0'));
     fixture.no_workspaces();
 }

@@ -10,7 +10,10 @@ use std::time::{Duration, Instant};
 use crate::{git, host, jail, repo, review, tools, workspace};
 
 const GIT_TIME: Duration = Duration::from_secs(120);
-const TOOL_TIME: Duration = Duration::from_secs(660);
+pub(crate) const MAX_SHELL_TIMEOUT_MS: u64 = 600_000;
+pub(crate) const DEFAULT_SHELL_TIMEOUT_MS: u64 = 120_000;
+pub(crate) const TOOL_TIME: Duration =
+    Duration::from_millis(MAX_SHELL_TIMEOUT_MS + 60_000 + 10_000);
 const MAX_PATHS: usize = 128;
 const MAX_TOOL_REPLY: usize = 256 * 1024;
 
@@ -278,6 +281,23 @@ impl Workspace {
         }
     }
 
+    pub(crate) fn log_environment(
+        &self,
+        journal: &mut crate::review_log::Journal,
+    ) -> Result<(), String> {
+        let policy = self.policy();
+        let mut visible = policy.roots();
+        visible.extend(policy.repositories.iter().chain(&policy.objects).cloned());
+        visible.extend([policy.home.clone(), self.root.clone(), self.objects.clone()]);
+        journal.outside(&visible)?;
+        let spec = jail::spec_text(
+            &self.programs,
+            &policy,
+            &jail::system_path(std::env::var_os("PATH").as_deref()),
+        )?;
+        journal.text("jail_spec", &spec)
+    }
+
     pub fn policy(&self) -> jail::Policy {
         jail::Policy {
             home: self.root.join("home"),
@@ -323,6 +343,15 @@ impl Workspace {
     }
 
     pub fn call(&self, name: &str, arguments: &str) -> Result<String, String> {
+        self.call_logged(name, arguments, |_, _| Ok(()))
+    }
+
+    pub(crate) fn call_logged(
+        &self,
+        name: &str,
+        arguments: &str,
+        mut log: impl FnMut(&str, &[u8]) -> Result<(), String>,
+    ) -> Result<String, String> {
         let tools::Args::Host { mut call, .. } =
             tools::parse_in(tools::Kit::Review, name, arguments)?
         else {
@@ -336,7 +365,11 @@ impl Workspace {
         {
             call = host::Call::ReviewShell {
                 command,
-                timeout_ms: Some(timeout_ms.unwrap_or(120_000).min(600_000)),
+                timeout_ms: Some(
+                    timeout_ms
+                        .unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)
+                        .min(MAX_SHELL_TIMEOUT_MS),
+                ),
                 workdir,
                 target_dir: self
                     .scratch
@@ -362,13 +395,22 @@ impl Workspace {
             if let Some(reply) = client.next_reply(left.min(Duration::from_secs(1))) {
                 match reply? {
                     host::Up::Done { id: got, outcome } if got == id => {
-                        let answer = outcome?.text;
+                        let done = outcome?;
+                        if let Some(kept) = &done.kept {
+                            log("tool_kept", kept.as_bytes())?;
+                        }
+                        let answer = done.text;
                         if answer.len() > MAX_TOOL_REPLY {
                             return Err("review tool output exceeds its bound".into());
                         }
                         return Ok(answer);
                     }
-                    host::Up::Output { .. } => {}
+                    host::Up::RawOutput { id: got, bytes } if got == id => {
+                        log("tool_output_bytes_hex", &bytes)?;
+                    }
+                    host::Up::Output { id: got, text } if got == id => {
+                        log("tool_output", text.as_bytes())?;
+                    }
                     _ => return Err("unexpected reply from the review tool host".into()),
                 }
             }

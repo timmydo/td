@@ -337,6 +337,8 @@ pub struct Done {
 pub enum Up {
     /// Output call `id`'s process wrote, as it came.
     Output { id: u64, text: String },
+    /// Exact process bytes for a review call, without display conversion.
+    RawOutput { id: u64, bytes: Vec<u8> },
     /// Call `id` ended: what it came to, or why it was refused.
     Done {
         id: u64,
@@ -656,12 +658,30 @@ impl Down {
     }
 }
 
+pub(crate) fn encode_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 15])
+        .map(|digit| {
+            char::from(if digit < 10 {
+                b'0' + digit
+            } else {
+                b'a' + digit - 10
+            })
+        })
+        .collect()
+}
+
 impl Up {
     pub fn encode(&self) -> Vec<u8> {
         let json = match self {
             Self::Output { id, text } => Json::Obj(vec![
                 ("output".into(), Json::Num(id.to_string())),
                 ("text".into(), Json::Str(text.clone())),
+            ]),
+            Self::RawOutput { id, bytes } => Json::Obj(vec![
+                ("output_raw".into(), Json::from(*id)),
+                ("hex".into(), Json::Str(encode_hex(bytes))),
             ]),
             Self::Done { id, outcome } => {
                 let mut pairs = vec![("done".into(), Json::Num(id.to_string()))];
@@ -711,6 +731,35 @@ impl Up {
             };
         }
         let text = |name: &str| value.get(name).and_then(Json::as_str).map(String::from);
+        if value.get("output_raw").is_some() {
+            let hex = value
+                .get("hex")
+                .and_then(Json::as_str)
+                .ok_or("raw output has no hex bytes")?;
+            if hex.len() > OUTPUT_CHUNK.saturating_mul(2) || !hex.len().is_multiple_of(2) {
+                return Err("raw output exceeds its frame bound or has an odd hex length".into());
+            }
+            let digit = |byte: u8| match byte {
+                b'0'..=b'9' => Ok(byte - b'0'),
+                b'a'..=b'f' => Ok(byte - b'a' + 10),
+                _ => Err("raw output has an invalid hex digit".to_string()),
+            };
+            let bytes = hex
+                .as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| {
+                    let high = digit(*pair.first().ok_or("missing high hex digit")?)?;
+                    let low = digit(*pair.get(1).ok_or("missing low hex digit")?)?;
+                    Ok((high << 4) | low)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            return Ok(Self::RawOutput {
+                id: id_of(&value, "output_raw")?,
+                bytes,
+            });
+        }
         if value.get("output").is_some() {
             return Ok(Self::Output {
                 id: id_of(&value, "output")?,
@@ -919,7 +968,11 @@ impl Client {
                 }
             };
             match reply {
-                Ok(Up::Output { id, .. }) if !self.open.contains(&id) => continue,
+                Ok(Up::Output { id, .. } | Up::RawOutput { id, .. })
+                    if !self.open.contains(&id) =>
+                {
+                    continue
+                }
                 Ok(Up::Done { id, .. }) if !self.open.remove(&id) => continue,
                 Err(e) => return Some(Err(self.failed(e))),
                 other => return Some(other),
@@ -1155,6 +1208,10 @@ mod tests {
         let cancel = Down::Cancel { id: 9 };
         assert_eq!(Down::decode(&cancel.encode()).unwrap(), cancel);
         for up in [
+            Up::RawOutput {
+                id: 1,
+                bytes: vec![0, 255, 195, 169],
+            },
             Up::Output {
                 id: 1,
                 text: "out\n".into(),
@@ -1175,6 +1232,18 @@ mod tests {
         ] {
             assert_eq!(Up::decode(&up.encode()).unwrap(), up);
         }
+        for bad in [
+            br#"{"output_raw":1,"hex":"0"}"#.as_slice(),
+            br#"{"output_raw":1,"hex":"zz"}"#,
+            br#"{"output_raw":1}"#,
+        ] {
+            assert!(Up::decode(bad).is_err());
+        }
+        let large = Json::Obj(vec![
+            ("output_raw".into(), Json::from(1u64)),
+            ("hex".into(), Json::Str("00".repeat(OUTPUT_CHUNK + 1))),
+        ]);
+        assert!(Up::decode(large.to_string().as_bytes()).is_err());
         assert!(Up::decode(b"{\"done\":\"x\"}").is_err());
         assert!(Up::decode(b"{\"done\":1}").is_err());
         assert!(Down::decode(br#"{"call":1,"tool":"rm","args":{}}"#)
@@ -1203,6 +1272,10 @@ mod tests {
             Up::Output {
                 id: 77,
                 text: "forged".into(),
+            },
+            Up::RawOutput {
+                id: 77,
+                bytes: vec![255],
             },
             done(77),
             done(id),

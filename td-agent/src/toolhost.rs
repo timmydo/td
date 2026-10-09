@@ -94,10 +94,11 @@ impl Config {
 /// The calls running, by id, each with its cancel flag.
 type Running = Arc<Mutex<BTreeMap<u64, Arc<AtomicBool>>>>;
 
-/// The most frames waiting for the writer. Live output past this is
-/// dropped rather than waited for, so a conversation slow to read never
-/// holds a call past its timeout; a call's end is always waited for.
+/// The most frames waiting for the writer. Foreground display updates
+/// may be dropped; background and review output waits for room. Review
+/// deadlines also run in the controller, which can tear down the jail.
 const OUTBOX: usize = 256;
+pub(crate) const REVIEW_CARGO_OFFLINE: &str = "true";
 
 /// Writes one reply. A call's end too large for a frame is sent as an
 /// error instead, so the conversation still learns that the call ended;
@@ -228,6 +229,25 @@ pub fn serve(
                 let whole = matches!(call, Call::Background { .. });
                 let spawned = std::thread::Builder::new().spawn(move || {
                     let live = finish.outbox.clone();
+                    if matches!(call, Call::ReviewShell { .. }) {
+                        // Review traces need every byte; bounded queues apply
+                        // backpressure rather than dropping display updates.
+                        finish.end(act(&call, &config, &flag, &mut |chunk| {
+                            for bytes in chunk.chunks(crate::host::OUTPUT_CHUNK) {
+                                if live
+                                    .send(Up::RawOutput {
+                                        id,
+                                        bytes: bytes.to_vec(),
+                                    })
+                                    .is_err()
+                                {
+                                    flag.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                        }));
+                        return;
+                    }
                     finish.end(perform(&call, &config, &flag, &mut |text| {
                         if whole {
                             let _ = live.send(Up::Output { id, text });
@@ -446,11 +466,20 @@ fn act(
                     .map_err(|e| format!("{}: {e}", target.display()))?;
                 process
                     .env("CARGO_TARGET_DIR", target)
-                    .env("CARGO_NET_OFFLINE", "true");
+                    .env("CARGO_NET_OFFLINE", REVIEW_CARGO_OFFLINE);
             }
-            let exit = shell::run(process, timeout, cancel, sink)?;
+            let review = matches!(call, Call::ReviewShell { .. });
+            let exit = if review {
+                shell::run_whole(process, timeout, cancel, sink)?
+            } else {
+                shell::run(process, timeout, cancel, sink)?
+            };
+            let mut text = exit.render();
+            if review && exit.cut {
+                text.push_str(shell::CUT_NOTE);
+            }
             Ok(Done {
-                text: exit.render(),
+                text,
                 kept: Some(exit.output.text()),
                 digest: None,
                 digests: Vec::new(),
@@ -718,6 +747,68 @@ mod tests {
         assert_eq!(bytes, 8_000_000);
         assert_eq!(ended.unwrap().text, "exit status 0");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_output_keeps_raw_bytes_with_a_slow_receiver() {
+        let dir = scratch("review-output");
+        let mut client = hosted(Config {
+            roots: vec![dir.clone()],
+            proxy: false,
+            ..Default::default()
+        });
+        let expected = 16 * 1024 * 1024;
+        let id = client
+            .call(Call::ReviewShell {
+                command: format!("head -c {expected} /dev/zero; printf '\\377'"),
+                timeout_ms: Some(30_000),
+                workdir: None,
+                target_dir: dir.join("target").display().to_string(),
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        let mut output = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let ended = loop {
+            assert!(Instant::now() < deadline, "{} bytes so far", output.len());
+            match client.next_reply(Duration::from_millis(50)) {
+                Some(Ok(Up::RawOutput { id: got, bytes })) if got == id => {
+                    output.extend_from_slice(&bytes);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Some(Ok(Up::Done { id: got, outcome })) if got == id => break outcome,
+                Some(Err(why)) => panic!("{why}"),
+                _ => {}
+            }
+        };
+        assert!(ended.unwrap().text.starts_with("[exit status 0]"));
+        assert_eq!(output.len(), expected + 1);
+        assert_eq!(output.last(), Some(&255));
+        assert!(output
+            .get(..expected)
+            .unwrap()
+            .iter()
+            .all(|byte| *byte == 0));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn review_output_drains_a_descendant_that_keeps_writing() {
+        let dir = scratch("review-drain");
+        let config = Config {
+            roots: vec![dir.clone()],
+            proxy: false,
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        let done = act(&Call::ReviewShell {
+            command: "(i=0; while [ $i -lt 8 ]; do printf .; sleep 0.1; i=$((i+1)); done; printf TRAILING) & printf EARLY".into(),
+            timeout_ms: Some(5_000), workdir: None,
+            target_dir: dir.join("target").display().to_string(),
+        }, &config, &AtomicBool::new(false), &mut |bytes| output.extend_from_slice(bytes)).unwrap();
+        assert!(String::from_utf8(output).unwrap().contains("TRAILING"));
+        assert!(done.text.contains("TRAILING"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

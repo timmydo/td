@@ -13,9 +13,10 @@ use td_agent::workspace::Workspace;
 
 const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
 \x20      td-agent review [--model MODEL] [--effort LEVEL] [--max-tokens N]\n\
-\x20                      [--max-cost USD] [--] [FILE]\n\
+\x20                      [--max-cost USD] [--log-dir DIRECTORY] [--] [FILE]\n\
 \x20      td-agent review --repo DIRECTORY [--commit REV] [--sparse DIRECTORY]...\n\
-\x20                      [--model MODEL] [--effort LEVEL] [--max-tokens N] [--max-cost USD]\n\
+\x20                      [--model MODEL] [--effort LEVEL] [--max-tokens N]\n\
+\x20                      [--max-cost USD] [--log-dir DIRECTORY]\n\
 \x20      td-agent calibrate FIXTURES\n\
 \x20      td-agent --help\n\
 \n\

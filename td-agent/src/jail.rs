@@ -47,7 +47,7 @@ pub struct Programs {
 
 /// The host trees td-jail binds into every instance (APPLICATIONS.md §C,
 /// the `workspace` kind), which a `PATH` directory must resolve into.
-const SYSTEM_TREES: &[&str] = &[
+pub(crate) const SYSTEM_TREES: &[&str] = &[
     "/bin", "/gnu", "/lib", "/lib32", "/lib64", "/libx32", "/nix", "/sbin", "/td", "/usr",
 ];
 
