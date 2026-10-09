@@ -576,6 +576,7 @@ fn sqlite_evidence(output: &str, native: bool, scenario: &str) -> Result<()> {
         "sqlite-account" => ("sqlite-account", SQLITE_ACCOUNT_PHASES),
         "sqlite-backup" => ("sqlite-backup", SQLITE_BACKUP_PHASES),
         "sqlite-epoch" => ("sqlite-epoch", SQLITE_EPOCH_PHASES),
+        "sqlite-multi-account" => ("sqlite-multi-account", SQLITE_EPOCH_PHASES),
         _ => return Err("unknown SQLite observation scenario".into()),
     };
     let domain = if native { "native" } else { "rust" };
@@ -869,6 +870,7 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
         "sqlite-account" => SQLITE_ACCOUNT_PHASES,
         "sqlite-backup" => SQLITE_BACKUP_PHASES,
         "sqlite-epoch" => SQLITE_EPOCH_PHASES,
+        "sqlite-multi-account" => SQLITE_EPOCH_PHASES,
         "client" => &[
             "baseline",
             "config",
@@ -977,7 +979,11 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
 fn sqlite_stack_evidence(output: &str, scenario: &str) -> Result<()> {
     if !matches!(
         scenario,
-        "sqlite-body" | "sqlite-account" | "sqlite-backup" | "sqlite-epoch"
+        "sqlite-body"
+            | "sqlite-account"
+            | "sqlite-backup"
+            | "sqlite-epoch"
+            | "sqlite-multi-account"
     ) {
         return Err("unknown SQLite stack scenario".into());
     }
@@ -1713,6 +1719,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             ("sqlite-account", "--sqlite-account"),
             ("sqlite-backup", "--sqlite-backup"),
             ("sqlite-epoch", "--sqlite-epoch"),
+            ("sqlite-multi-account", "--sqlite-multi-account"),
         ] {
             let mut command = Command::new(path);
             command.arg(argument).env_clear().stdin(Stdio::null());
@@ -1733,6 +1740,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("sqlite-account", Some("--sqlite-account")),
         ("sqlite-backup", Some("--sqlite-backup")),
         ("sqlite-epoch", Some("--sqlite-epoch")),
+        ("sqlite-multi-account", Some("--sqlite-multi-account")),
         ("client", Some("--tls-clients")),
         ("handshake", Some("--tls-handshake")),
         ("entropy", Some("--entropy-workers")),
@@ -1752,7 +1760,11 @@ pub(crate) fn runtime_inner() -> Result<()> {
         let name = format!("rss-probe-{scenario}");
         let timeout = if matches!(
             scenario,
-            "sqlite-body" | "sqlite-account" | "sqlite-backup" | "sqlite-epoch"
+            "sqlite-body"
+                | "sqlite-account"
+                | "sqlite-backup"
+                | "sqlite-epoch"
+                | "sqlite-multi-account"
         ) {
             300
         } else {
@@ -1770,6 +1782,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("sqlite-account", "--sqlite-account-stack"),
         ("sqlite-backup", "--sqlite-backup-stack"),
         ("sqlite-epoch", "--sqlite-epoch-stack"),
+        ("sqlite-multi-account", "--sqlite-multi-account-stack"),
     ] {
         let mut command = Command::new("/artifacts/td-mta-rss-probe");
         command.arg(argument).env_clear().stdin(Stdio::null());
@@ -2546,6 +2559,7 @@ mod tests {
             "sqlite-account",
             "sqlite-backup",
             "sqlite-epoch",
+            "sqlite-multi-account",
         ] {
             let before = format!("{scenario}_stack_before_mapping_bytes=");
             let after = format!("{scenario}_stack_after_mapping_bytes=");
@@ -2558,6 +2572,7 @@ mod tests {
                     "sqlite-account",
                     "sqlite-backup",
                     "sqlite-epoch",
+                    "sqlite-multi-account",
                 ] {
                     if other != scenario {
                         assert!(sqlite_stack_evidence(&output, other).is_err());
@@ -2632,6 +2647,11 @@ mod tests {
             ("sqlite-account", "sqlite-account", SQLITE_ACCOUNT_PHASES),
             ("sqlite-backup", "sqlite-backup", SQLITE_BACKUP_PHASES),
             ("sqlite-epoch", "sqlite-epoch", SQLITE_EPOCH_PHASES),
+            (
+                "sqlite-multi-account",
+                "sqlite-multi-account",
+                SQLITE_EPOCH_PHASES,
+            ),
         ] {
             for native in [false, true] {
                 let domain = if native { "native" } else { "rust" };
@@ -2655,6 +2675,7 @@ mod tests {
                     "sqlite-account",
                     "sqlite-backup",
                     "sqlite-epoch",
+                    "sqlite-multi-account",
                 ] {
                     if other != scenario {
                         assert!(sqlite_evidence(&output, native, other).is_err());

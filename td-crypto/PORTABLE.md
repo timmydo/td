@@ -1166,6 +1166,99 @@ Its BUILD-INPUTS records staged source NAR
 and unchanged vendor NAR
 d122b8e7843f7da35cfb1f393dd0d8aea43ef534e9f5cffddc77a095fe971916.
 
+The complete isolated pinned Rust 1.96.0 release x86-64 musl command
+passed on its first attempt on 2026-10-09: all eight static artifacts,
+API confinement (schema 57, 29 fixtures, 786 reachable items), clean
+runtime, all existing resource/positive/quiet controls, five SQLite
+observer cases and five guarded worker-stack cases. The four earlier
+body/account/backup/epoch selectors remain independently runnable with
+their original phase counts; the new selector has thirteen phases.
+Explicit body and typed-row expectations also strengthen the existing
+account verification paths, and epoch renewal now compares the actual
+supplied entropy output. These measurements are a fresh run of all five
+selectors, not a reuse of earlier artifact evidence.
+
+A separate portable sqlite-multi-account selector now qualifies two
+public accounts sharing the same BlobId and parent/child MailboxId
+values. Each has a distinct uniform 32 MiB body, digest and mailbox
+names: 64 MiB total body bytes. Eight source views alternate four
+captures per account, retain eight partial body inputs across a
+first-account metadata PUT, and finish every byte, complete digest and
+pinned read under a passive usage fence. The fence reports two accounts,
+two blobs and exact 64 MiB body totals, zero upload/queue bytes and
+submissions, and positive bounded main/WAL extents. Both accounts start
+at sequence one and floor zero; the first advances to sequence two while
+the second remains at one. Another commit, checkpoint, second fence and
+ninth view refuse Busy while the fence is held. Old views preserve their
+original metadata; reacquired views show the account-specific endpoints
+and names.
+
+The fixture consumes the source through actual public backup with a
+positive capped receipt covering at least 64 MiB. Source and copy retain
+both complete eight-reader pools and writers together: eighteen native
+owners, without retaining sixteen source/copy views together. Physical
+verification and complete account verification cover both accounts in
+each store. Independent expected mailbox rows and changed sequences,
+every expected account-specific body byte, and exact BlobRow length,
+digest and changed sequence prevent a self-consistent cross-account
+body/metadata swap from passing. Copied public renewal uses one
+sixteen-byte fill from its actual warmed SystemEntropy handle; the
+returned epoch must equal the independently captured supplied bytes and
+differ from the original. Both copied state domains adopt that epoch, it
+survives checkpoint/close/reopen, and both original source state domains
+and contents remain unchanged.
+
+| Case | Observer | Warm baseline | Lifetime requested peak / maximum RSS sample | After teardown |
+| --- | --- | ---: | ---: | ---: |
+| Body | Rust requested bytes | 560 | 199846 | 560 |
+| Body | Wrapped C boundary requested bytes | 1344 | 2943766 | 1344 |
+| Body | Unwrapped RSS, KiB | 3500 | 6992 | 3728 |
+| Account | Rust requested bytes | 624 | 199910 | 624 |
+| Account | Wrapped C boundary requested bytes | 1424 | 2943846 | 1424 |
+| Account | Unwrapped RSS, KiB | 3500 | 6996 | 3736 |
+| Backup | Rust requested bytes | 688 | 333620 | 688 |
+| Backup | Wrapped C boundary requested bytes | 1504 | 4197372 | 1504 |
+| Backup | Unwrapped RSS, KiB | 3504 | 8416 | 3760 |
+| Epoch | Rust requested bytes | 880 | 333812 | 880 |
+| Epoch | Wrapped C boundary requested bytes | 134584 | 4330452 | 134584 |
+| Epoch | Unwrapped RSS, KiB | 4352 | 9136 | 4480 |
+| Multi-account | Rust requested bytes | 880 | 333812 | 880 |
+| Multi-account | Wrapped C boundary requested bytes | 134584 | 4330452 | 134584 |
+| Multi-account | Unwrapped RSS, KiB | 4348 | 9112 | 4476 |
+
+Writable worker mappings before/after were body 253952/253952 bytes,
+account 253952/253952 bytes, backup 253952/253952 bytes, epoch
+249856/249856 bytes, multi-account 253952/253952 bytes. Each has the
+required adjacent inaccessible guard and no grow-down flag, and joins
+before completion. Warm/final native block counts were five for
+body/account/backup and thirteen for epoch/multi-account; the warmed
+entropy handle stays alive.
+
+This qualifies these two accounts and shared IDs in one process or
+guarded worker, without history pruning. It does not qualify arbitrary
+account counts, maximum-database resource use, parallel services, quota
+reservation, effect authorization, initialize_leases, service
+quiescence, full filesystem faults, power loss or whole-service
+readiness. Lifetime requested peaks and exact warm teardown do not
+isolate per-call allocations or assert an allocation-free SQLite
+interval. Wrapped C observations can include Rust System allocations and
+are not disjoint SQLite-only attribution. RSS is sampled at named
+phases, including one first-body writing sample; it does not bound
+transient RSS or separately sample the second body during writing.
+Writable mapping size is not a frame high-water measurement. Rust 2 MiB,
+wrapped C-boundary 17 MiB, sampled RSS growth 24 MiB and guarded
+writable mapping 256 KiB limits remain unchanged, as do SQLite 9 MiB
+per-allocation and 16 MiB process-wide caps across all pools. No
+production API, schema, unsafe surface, syscall, dependency, compiler
+flag, probe shim or stack wrapper changed.
+
+The artifact NAR was
+05daa0360d389694d88587a7fbfcae78997e77ff58cf1561884692ec3a642718.
+Its BUILD-INPUTS records staged source NAR
+b05bd725efbcfe0e0d619f1691b2d327eeaf5f70ceb057f9696f68769de4b16b
+and unchanged vendor NAR
+d122b8e7843f7da35cfb1f393dd0d8aea43ef534e9f5cffddc77a095fe971916.
+
 The retained-reader metadata-writer isolated release x86-64 musl
 qualification on 2026-10-09 passed the complete portable command on its
 first attempt: all eight static artifacts, API confinement, clean

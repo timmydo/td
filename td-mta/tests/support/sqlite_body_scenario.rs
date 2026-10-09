@@ -45,6 +45,7 @@ pub const BODY_BYTES: u64 = 32 * 1024 * 1024;
 const CHUNK_BYTES: usize = 64 * 1024;
 const READERS: usize = 8;
 const ACCOUNT: AccountId = AccountId::from_bytes([0x35; 16]);
+const OTHER: AccountId = AccountId::from_bytes([0x36; 16]);
 const BLOB: BlobId = BlobId::from_bytes([0x46; 16]);
 struct Fixed;
 impl Clock for Fixed {
@@ -56,6 +57,7 @@ impl Clock for Fixed {
     }
 }
 struct Generated<'a> {
+    byte: u8,
     remaining: u64,
     sampled: bool,
     observe: &'a mut dyn FnMut(),
@@ -67,7 +69,7 @@ impl Read for Generated<'_> {
             self.sampled = true;
         }
         let count = output.len().min(CHUNK_BYTES).min(self.remaining as usize);
-        output.get_mut(..count).unwrap().fill(0x5a);
+        output.get_mut(..count).unwrap().fill(self.byte);
         self.remaining -= count as u64;
         Ok(count)
     }
@@ -103,12 +105,17 @@ pub const EPOCH_PHASES: &[&str] = &[
 struct CountingEntropy {
     source: td_crypto::SystemEntropy,
     calls: usize,
+    actual: Option<[u8; 16]>,
 }
 impl td_mta::ports::Entropy for CountingEntropy {
     fn fill(&mut self, output: &mut [u8]) -> Result<(), td_mta::ports::CryptoError> {
         assert_eq!(output.len(), 16);
         self.calls += 1;
-        td_mta::ports::Entropy::fill(&mut self.source, output)
+        td_mta::ports::Entropy::fill(&mut self.source, output)?;
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(output);
+        self.actual = Some(bytes);
+        Ok(())
     }
 }
 fn state(identity: ViewIdentity) -> DataState {
@@ -125,6 +132,7 @@ pub enum Mode {
     Account,
     Backup,
     Epoch,
+    MultiAccount,
 }
 impl Mode {
     pub fn from_argument(argument: &str) -> Option<Self> {
@@ -133,6 +141,7 @@ impl Mode {
             "--sqlite-account" => Some(Self::Account),
             "--sqlite-backup" => Some(Self::Backup),
             "--sqlite-epoch" => Some(Self::Epoch),
+            "--sqlite-multi-account" => Some(Self::MultiAccount),
             _ => None,
         }
     }
@@ -141,7 +150,7 @@ impl Mode {
             Self::Body => PHASES,
             Self::Account => ACCOUNT_PHASES,
             Self::Backup => BACKUP_PHASES,
-            Self::Epoch => EPOCH_PHASES,
+            Self::Epoch | Self::MultiAccount => EPOCH_PHASES,
         }
     }
     pub fn scenario(self) -> &'static str {
@@ -150,10 +159,14 @@ impl Mode {
             Self::Account => "sqlite-account",
             Self::Backup => "sqlite-backup",
             Self::Epoch => "sqlite-epoch",
+            Self::MultiAccount => "sqlite-multi-account",
         }
     }
     fn has_backup(self) -> bool {
-        matches!(self, Self::Backup | Self::Epoch)
+        matches!(self, Self::Backup | Self::Epoch | Self::MultiAccount)
+    }
+    fn renews_epoch(self) -> bool {
+        matches!(self, Self::Epoch | Self::MultiAccount)
     }
     pub fn has_account(self) -> bool {
         self != Self::Body
@@ -161,13 +174,14 @@ impl Mode {
 }
 fn check_account(
     store: &IndexStore<'_>,
+    account: AccountId,
     epoch: StoreEpoch,
     sequence: Sequence,
     deadline: Deadline,
     scratch: &mut [u8],
 ) {
     use crate::store_fs::{AccountCheckLimits, BodyCheckLimits};
-    let mut view = store.maintenance_view(ACCOUNT, deadline).unwrap();
+    let mut view = store.maintenance_view(account, deadline).unwrap();
     let report = view
         .verify_account(
             &td_crypto::Provider,
@@ -186,7 +200,7 @@ fn check_account(
         )
         .unwrap();
     assert_eq!(report.identity(), view.identity());
-    assert_eq!(report.identity().account, ACCOUNT);
+    assert_eq!(report.identity().account, account);
     assert_eq!(store.epoch(), epoch);
     assert_eq!(report.identity().epoch, epoch);
     assert_eq!(report.identity().history_floor, Sequence::default());
@@ -202,6 +216,103 @@ fn check_account(
         (report.bodies().blobs(), report.bodies().bytes()),
         (1, BODY_BYTES)
     );
+    let parent = MailboxId::from_bytes([0x70; 16]);
+    let child = MailboxId::from_bytes([0x71; 16]);
+    let mut metadata = [0; 128];
+    for (id, name, owning_parent, changed) in [
+        (
+            parent,
+            if account == OTHER {
+                "other parent"
+            } else {
+                "updated parent"
+            },
+            None,
+            sequence,
+        ),
+        (
+            child,
+            if account == OTHER {
+                "other child"
+            } else {
+                "child"
+            },
+            Some(parent),
+            Sequence::from_u64(1),
+        ),
+    ] {
+        assert_eq!(
+            view.get(Key::Mailbox(id), &mut metadata).unwrap(),
+            Some((
+                Row::Mailbox(MailboxRow {
+                    name,
+                    parent: owning_parent,
+                    role: None,
+                    sort_order: 0,
+                    subscribed: true,
+                }),
+                changed
+            ))
+        );
+    }
+    let blob = view.get(Key::Blob(BLOB), &mut metadata).unwrap();
+    let mut digest = td_crypto::Provider.sha256().unwrap();
+    let mut input = view
+        .open_blob_input(&td_crypto::Provider, BLOB, BODY_BYTES)
+        .unwrap();
+    assert_eq!(input.len(), BODY_BYTES);
+    while input.position() != BODY_BYTES {
+        assert_eq!(input.read(scratch).unwrap(), CHUNK_BYTES);
+        assert!(scratch.iter().all(|&byte| byte == body_byte(account)));
+        digest.update(scratch).unwrap();
+    }
+    drop(input.finish().unwrap());
+    assert_eq!(
+        blob,
+        Some((
+            Row::Blob(BlobRow {
+                kind: BlobKind::Message,
+                length: BODY_BYTES,
+                digest: digest.finish().unwrap(),
+                created_at: 0,
+            }),
+            Sequence::from_u64(1)
+        ))
+    );
+}
+fn check_accounts(
+    mode: Mode,
+    store: &IndexStore<'_>,
+    epoch: StoreEpoch,
+    sequence: Sequence,
+    deadline: Deadline,
+    scratch: &mut [u8],
+) {
+    check_account(store, ACCOUNT, epoch, sequence, deadline, scratch);
+    if mode == Mode::MultiAccount {
+        check_account(
+            store,
+            OTHER,
+            epoch,
+            Sequence::from_u64(1),
+            deadline,
+            scratch,
+        );
+    }
+}
+fn account_at(mode: Mode, index: usize) -> AccountId {
+    if mode == Mode::MultiAccount && index % 2 == 1 {
+        OTHER
+    } else {
+        ACCOUNT
+    }
+}
+fn body_byte(account: AccountId) -> u8 {
+    if account == OTHER {
+        0xa5
+    } else {
+        0x5a
+    }
 }
 pub fn run(mode: Mode, mut observe: impl FnMut()) {
     // Initialize native process globals before the retention baseline.
@@ -219,9 +330,10 @@ pub fn run(mode: Mode, mut observe: impl FnMut()) {
         );
     });
     // Keep the actual entropy handle on this observing thread, warm before baseline.
-    let mut entropy = (mode == Mode::Epoch).then(|| CountingEntropy {
+    let mut entropy = mode.renews_epoch().then(|| CountingEntropy {
         source: td_crypto::SystemEntropy::try_new().unwrap(),
         calls: 0,
+        actual: None,
     });
     observe();
     with_probe_root(|root| {
@@ -319,8 +431,12 @@ fn run_with_roots(
     )
     .unwrap();
     store.create_account(ACCOUNT, deadline).unwrap();
+    if mode == Mode::MultiAccount {
+        store.create_account(OTHER, deadline).unwrap();
+    }
     observe();
     let mut source = Generated {
+        byte: 0x5a,
         remaining: BODY_BYTES,
         sampled: false,
         observe: &mut *observe,
@@ -339,23 +455,104 @@ fn run_with_roots(
     assert_eq!(source.remaining, 0);
     assert!(source.sampled);
     assert_eq!(initial_sequence, Sequence::from_u64(1));
+    let other_row = if mode == Mode::MultiAccount {
+        scratch.fill(0xa5);
+        let mut digest = td_crypto::Provider.sha256().unwrap();
+        for _ in 0..BODY_BYTES / CHUNK_BYTES as u64 {
+            digest.update(&scratch).unwrap();
+        }
+        let other_row = Row::Blob(BlobRow {
+            kind: BlobKind::Message,
+            length: BODY_BYTES,
+            digest: digest.finish().unwrap(),
+            created_at: 0,
+        });
+        let mut other_bytes = [0; 64];
+        let other_len = other_row.encode(&mut other_bytes).unwrap();
+        let mut parent_bytes = [0; 128];
+        let parent_len = mailbox("other parent", None)
+            .encode(&mut parent_bytes)
+            .unwrap();
+        let mut child_bytes = [0; 128];
+        let child_len = mailbox("other child", Some(parent))
+            .encode(&mut child_bytes)
+            .unwrap();
+        let mut silent = || {};
+        let mut source = Generated {
+            byte: 0xa5,
+            remaining: BODY_BYTES,
+            sampled: false,
+            observe: &mut silent,
+        };
+        assert_eq!(
+            store
+                .commit(
+                    &td_crypto::Provider,
+                    CommitRequest {
+                        account: OTHER,
+                        ..request
+                    },
+                    &[
+                        Operation::put(
+                            Table::Blobs,
+                            BLOB.as_bytes(),
+                            other_bytes.get(..other_len).unwrap()
+                        )
+                        .unwrap(),
+                        Operation::put(
+                            Table::Mailboxes,
+                            parent.as_bytes(),
+                            parent_bytes.get(..parent_len).unwrap()
+                        )
+                        .unwrap(),
+                        Operation::put(
+                            Table::Mailboxes,
+                            child.as_bytes(),
+                            child_bytes.get(..child_len).unwrap()
+                        )
+                        .unwrap(),
+                    ],
+                    &mut [BlobSource {
+                        id: BLOB,
+                        source: &mut source
+                    }],
+                )
+                .unwrap(),
+            Sequence::from_u64(1)
+        );
+        assert_eq!(source.remaining, 0);
+        assert!(source.sampled);
+        Some(other_row)
+    } else {
+        None
+    };
     let sequence = {
         let mut views: [_; READERS] =
-            std::array::from_fn(|_| store.view(ACCOUNT, deadline).unwrap());
+            std::array::from_fn(|index| store.view(account_at(mode, index), deadline).unwrap());
         let identity = views.first().unwrap().identity();
         assert_eq!(identity.account, ACCOUNT);
         assert_eq!(identity.epoch, store.epoch());
         assert_eq!(identity.committed_sequence, initial_sequence);
         assert_eq!(identity.history_floor, Sequence::default());
-        assert!(views.iter().all(|view| view.identity() == identity));
+        for (index, view) in views.iter().enumerate() {
+            assert_eq!(
+                view.identity(),
+                ViewIdentity {
+                    account: account_at(mode, index),
+                    ..identity
+                }
+            );
+        }
         assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
         let mut inputs = views.each_mut().map(|view| {
             view.open_blob_input(&td_crypto::Provider, BLOB, BODY_BYTES)
                 .unwrap()
         });
-        for input in &mut inputs {
+        for (index, input) in inputs.iter_mut().enumerate() {
             assert_eq!(input.read(&mut scratch).unwrap(), CHUNK_BYTES);
-            assert!(scratch.iter().all(|&b| b == 0x5a));
+            assert!(scratch
+                .iter()
+                .all(|&b| b == body_byte(account_at(mode, index))));
         }
         let updated_parent = mailbox("updated parent", None);
         let mut updated_bytes = [0; 128];
@@ -389,7 +586,15 @@ fn run_with_roots(
                 usage.queue_bytes,
                 usage.queue_submissions
             ),
-            (store.epoch(), 1, BODY_BYTES, 1, 0, 0, 0),
+            (
+                store.epoch(),
+                if mode == Mode::MultiAccount { 2 } else { 1 },
+                BODY_BYTES * if mode == Mode::MultiAccount { 2 } else { 1 },
+                if mode == Mode::MultiAccount { 2 } else { 1 },
+                0,
+                0,
+                0
+            ),
         );
         let files = fence.file_usage();
         assert!(
@@ -419,31 +624,68 @@ fn run_with_roots(
         assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
         observe();
         while inputs.first().unwrap().position() != BODY_BYTES {
-            for input in &mut inputs {
+            for (index, input) in inputs.iter_mut().enumerate() {
                 let n = input.read(&mut scratch).unwrap();
                 assert_eq!(n, CHUNK_BYTES);
-                assert!(scratch.get(..n).unwrap().iter().all(|&b| b == 0x5a));
+                assert!(scratch
+                    .get(..n)
+                    .unwrap()
+                    .iter()
+                    .all(|&b| b == body_byte(account_at(mode, index))));
             }
         }
         assert!(inputs
             .iter()
             .all(|input| input.position() == BODY_BYTES && input.len() == BODY_BYTES));
         let mut pins = inputs.map(|input| input.finish().unwrap());
-        for pin in &mut pins {
+        for (index, pin) in pins.iter_mut().enumerate() {
+            let byte = body_byte(account_at(mode, index));
             assert_eq!(pin.len(), BODY_BYTES);
             assert_eq!(pin.read_at(65535, &mut scratch).unwrap(), CHUNK_BYTES);
-            assert!(scratch.iter().all(|&b| b == 0x5a));
+            assert!(scratch.iter().all(|&b| b == byte));
             assert_eq!(pin.read_at(BODY_BYTES - 1, &mut scratch).unwrap(), 1);
-            assert_eq!(scratch.first(), Some(&0x5a));
+            assert_eq!(scratch.first(), Some(&byte));
         }
         assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
         observe();
         drop(fence);
         drop(pins);
         let mut metadata = [0; 128];
-        for view in &mut views {
-            assert_eq!(view.identity(), identity);
-            let expected = account_check.then(|| (mailbox("parent", None), initial_sequence));
+        for (index, view) in views.iter_mut().enumerate() {
+            let account = account_at(mode, index);
+            assert_eq!(
+                view.identity(),
+                ViewIdentity {
+                    account,
+                    ..identity
+                }
+            );
+            let expected = account_check.then(|| {
+                (
+                    mailbox(
+                        if account == OTHER {
+                            "other parent"
+                        } else {
+                            "parent"
+                        },
+                        None,
+                    ),
+                    initial_sequence,
+                )
+            });
+            if mode == Mode::MultiAccount {
+                assert_eq!(
+                    view.get(Key::Blob(BLOB), &mut metadata).unwrap(),
+                    Some((
+                        if account == OTHER {
+                            other_row.unwrap()
+                        } else {
+                            row
+                        },
+                        initial_sequence
+                    ))
+                );
+            }
             assert_eq!(
                 view.get(Key::Mailbox(parent), &mut metadata).unwrap(),
                 expected
@@ -452,26 +694,62 @@ fn run_with_roots(
         sequence
     };
     let mut returned: [_; READERS] =
-        std::array::from_fn(|_| store.view(ACCOUNT, deadline).unwrap());
-    assert!(returned.iter().all(|view| {
-        view.identity()
-            == ViewIdentity {
-                account: ACCOUNT,
+        std::array::from_fn(|index| store.view(account_at(mode, index), deadline).unwrap());
+    for (index, view) in returned.iter().enumerate() {
+        let account = account_at(mode, index);
+        assert_eq!(
+            view.identity(),
+            ViewIdentity {
+                account,
                 epoch: store.epoch(),
-                committed_sequence: sequence,
-                history_floor: Sequence::default(),
+                committed_sequence: if account == OTHER {
+                    initial_sequence
+                } else {
+                    sequence
+                },
+                history_floor: Sequence::default()
             }
-    }));
+        );
+    }
     let mut metadata = [0; 128];
-    for view in &mut returned {
+    for (index, view) in returned.iter_mut().enumerate() {
+        let account = account_at(mode, index);
         assert_eq!(
             view.get(Key::Mailbox(parent), &mut metadata).unwrap(),
-            Some((mailbox("updated parent", None), sequence))
+            Some((
+                mailbox(
+                    if account == OTHER {
+                        "other parent"
+                    } else {
+                        "updated parent"
+                    },
+                    None
+                ),
+                if account == OTHER {
+                    initial_sequence
+                } else {
+                    sequence
+                }
+            ))
         );
+        if mode == Mode::MultiAccount {
+            assert_eq!(
+                view.get(Key::Blob(BLOB), &mut metadata).unwrap(),
+                Some((
+                    if account == OTHER {
+                        other_row.unwrap()
+                    } else {
+                        row
+                    },
+                    initial_sequence
+                ))
+            );
+        }
     }
     drop(returned);
     if account_check {
-        check_account(
+        check_accounts(
+            mode,
             &store,
             StoreEpoch::from_bytes([0x57; 16]),
             sequence,
@@ -481,8 +759,11 @@ fn run_with_roots(
         observe();
     }
     if mode.has_backup() {
-        let prior =
-            (mode == Mode::Epoch).then(|| store.view(ACCOUNT, deadline).unwrap().identity());
+        let prior = mode
+            .renews_epoch()
+            .then(|| store.view(ACCOUNT, deadline).unwrap().identity());
+        let other_prior =
+            (mode == Mode::MultiAccount).then(|| store.view(OTHER, deadline).unwrap().identity());
         let destination = destination.unwrap();
         let receipt = store
             .backup(
@@ -492,11 +773,15 @@ fn run_with_roots(
             )
             .unwrap();
         assert_eq!(receipt.epoch, StoreEpoch::from_bytes([0x57; 16]));
-        assert!(receipt.bytes >= BODY_BYTES && receipt.bytes <= 8 * 1024 * 1024 * 1024);
+        assert!(
+            receipt.bytes >= BODY_BYTES * if mode == Mode::MultiAccount { 2 } else { 1 }
+                && receipt.bytes <= td_mta::limits::SQLITE_DATABASE_BYTES
+        );
         observe();
         let original = IndexStore::open(root, clock.clone(), READERS, deadline).unwrap();
         original.validate_integrity(deadline).unwrap();
-        check_account(
+        check_accounts(
+            mode,
             &original,
             StoreEpoch::from_bytes([0x57; 16]),
             sequence,
@@ -506,7 +791,8 @@ fn run_with_roots(
         observe();
         let restored = IndexStore::open(destination, clock.clone(), READERS, deadline).unwrap();
         restored.validate_integrity(deadline).unwrap();
-        check_account(
+        check_accounts(
+            mode,
             &restored,
             StoreEpoch::from_bytes([0x57; 16]),
             sequence,
@@ -514,7 +800,7 @@ fn run_with_roots(
             &mut scratch,
         );
         observe();
-        if mode == Mode::Epoch {
+        if mode.renews_epoch() {
             let prior = prior.unwrap();
             let old = state(prior);
             assert!(old.is_retained_for(old, prior.history_floor));
@@ -522,6 +808,10 @@ fn run_with_roots(
             let entropy = entropy.unwrap();
             let restored = restored.renew_epoch(entropy, deadline).unwrap();
             assert_eq!(entropy.calls, 1);
+            assert_eq!(
+                restored.epoch(),
+                StoreEpoch::from_bytes(entropy.actual.unwrap())
+            );
             let current = restored.view(ACCOUNT, deadline).unwrap().identity();
             assert_ne!(current.epoch, prior.epoch);
             assert_eq!(
@@ -533,8 +823,24 @@ fn run_with_roots(
             );
             assert!(!old.is_retained_for(state(current), current.history_floor));
             assert!(state(current).is_retained_for(state(current), current.history_floor));
+            if let Some(prior) = other_prior {
+                let expected = ViewIdentity {
+                    epoch: current.epoch,
+                    ..prior
+                };
+                assert_eq!(restored.view(OTHER, deadline).unwrap().identity(), expected);
+                assert!(!state(prior).is_retained_for(state(expected), expected.history_floor));
+                assert!(state(expected).is_retained_for(state(expected), expected.history_floor));
+            }
             restored.validate_integrity(deadline).unwrap();
-            check_account(&restored, current.epoch, sequence, deadline, &mut scratch);
+            check_accounts(
+                mode,
+                &restored,
+                current.epoch,
+                sequence,
+                deadline,
+                &mut scratch,
+            );
             observe();
             restored.checkpoint(deadline).unwrap();
             drop(restored);
@@ -544,13 +850,40 @@ fn run_with_roots(
                 current
             );
             assert!(!old.is_retained_for(state(current), current.history_floor));
+            if let Some(prior) = other_prior {
+                let expected = ViewIdentity {
+                    epoch: current.epoch,
+                    ..prior
+                };
+                assert_eq!(restored.view(OTHER, deadline).unwrap().identity(), expected);
+                assert!(!state(prior).is_retained_for(state(expected), expected.history_floor));
+                assert!(state(expected).is_retained_for(state(expected), expected.history_floor));
+            }
             restored.validate_integrity(deadline).unwrap();
-            check_account(&restored, current.epoch, sequence, deadline, &mut scratch);
+            check_accounts(
+                mode,
+                &restored,
+                current.epoch,
+                sequence,
+                deadline,
+                &mut scratch,
+            );
             observe();
             assert_eq!(original.view(ACCOUNT, deadline).unwrap().identity(), prior);
             assert!(old.is_retained_for(state(prior), prior.history_floor));
+            if let Some(prior) = other_prior {
+                assert_eq!(original.view(OTHER, deadline).unwrap().identity(), prior);
+                assert!(state(prior).is_retained_for(state(prior), prior.history_floor));
+            }
             original.validate_integrity(deadline).unwrap();
-            check_account(&original, prior.epoch, sequence, deadline, &mut scratch);
+            check_accounts(
+                mode,
+                &original,
+                prior.epoch,
+                sequence,
+                deadline,
+                &mut scratch,
+            );
             observe();
         }
         return;
@@ -573,7 +906,8 @@ fn run_with_roots(
         assert!(scratch.iter().all(|&b| b == 0x5a));
     }
     if account_check {
-        check_account(
+        check_accounts(
+            mode,
             &reopened,
             StoreEpoch::from_bytes([0x57; 16]),
             sequence,

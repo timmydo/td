@@ -1021,6 +1021,71 @@ RESOURCES.md and td-crypto/PORTABLE.md record actual observer
 measurements and artifact inputs. Earlier metadata-writer evidence omits
 this fence.
 
+A separate portable sqlite-multi-account selector now qualifies two
+public accounts sharing the same BlobId and parent/child MailboxId
+values. Each has a distinct uniform 32 MiB body, digest and mailbox
+names: 64 MiB total body bytes. Eight source views alternate four
+captures per account, retain eight partial body inputs across a
+first-account metadata PUT, and finish every byte, complete digest and
+pinned read under a passive usage fence. The fence reports two accounts,
+two blobs and exact 64 MiB body totals, zero upload/queue bytes and
+submissions, and positive bounded main/WAL extents. Both accounts start
+at sequence one and floor zero; the first advances to sequence two while
+the second remains at one. Another commit, checkpoint, second fence and
+ninth view refuse Busy while the fence is held. Old views preserve their
+original metadata; reacquired views show the account-specific endpoints
+and names.
+
+The fixture consumes the source through actual public backup with a
+positive capped receipt covering at least 64 MiB. Source and copy retain
+both complete eight-reader pools and writers together: eighteen native
+owners, without retaining sixteen source/copy views together. Physical
+verification and complete account verification cover both accounts in
+each store. Independent expected mailbox rows and changed sequences,
+every expected account-specific body byte, and exact BlobRow length,
+digest and changed sequence prevent a self-consistent cross-account
+body/metadata swap from passing. Copied public renewal uses one
+sixteen-byte fill from its actual warmed SystemEntropy handle; the
+returned epoch must equal the independently captured supplied bytes and
+differ from the original. Both copied state domains adopt that epoch, it
+survives checkpoint/close/reopen, and both original source state domains
+and contents remain unchanged.
+
+The complete isolated pinned Rust 1.96.0 release x86-64 musl command
+passed on its first attempt on 2026-10-09: all eight static artifacts,
+API confinement (schema 57, 29 fixtures, 786 reachable items), clean
+runtime, all existing resource/positive/quiet controls, five SQLite
+observer cases and five guarded worker-stack cases. The four earlier
+body/account/backup/epoch selectors remain independently runnable with
+their original phase counts; the new selector has thirteen phases.
+Explicit body and typed-row expectations also strengthen the existing
+account verification paths, and epoch renewal now compares the actual
+supplied entropy output. These measurements are a fresh run of all five
+selectors, not a reuse of earlier artifact evidence.
+
+This qualifies these two accounts and shared IDs in one process or
+guarded worker, without history pruning. It does not qualify arbitrary
+account counts, maximum-database resource use, parallel services, quota
+reservation, effect authorization, initialize_leases, service
+quiescence, full filesystem faults, power loss or whole-service
+readiness. Lifetime requested peaks and exact warm teardown do not
+isolate per-call allocations or assert an allocation-free SQLite
+interval. Wrapped C observations can include Rust System allocations and
+are not disjoint SQLite-only attribution. RSS is sampled at named
+phases, including one first-body writing sample; it does not bound
+transient RSS or separately sample the second body during writing.
+Writable mapping size is not a frame high-water measurement. Rust 2 MiB,
+wrapped C-boundary 17 MiB, sampled RSS growth 24 MiB and guarded
+writable mapping 256 KiB limits remain unchanged, as do SQLite 9 MiB
+per-allocation and 16 MiB process-wide caps across all pools. No
+production API, schema, unsafe surface, syscall, dependency, compiler
+flag, probe shim or stack wrapper changed.
+
+RESOURCES.md and td-crypto/PORTABLE.md record actual observer
+measurements and artifact inputs. The separate native two-account
+pruning fixture qualifies its floor-two cleanup scenario; this portable
+case retains floor zero.
+
 The shared portable SQLite body/account/backup/epoch fixtures passed a
 public metadata commit with eight retained partial body inputs. After
 the initial 32 MiB body commit at sequence one, all eight views capture
