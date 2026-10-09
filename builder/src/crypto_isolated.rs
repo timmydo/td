@@ -570,6 +570,23 @@ const SQLITE_EPOCH_PHASES: &[&str] = &[
     "dropped",
 ];
 
+const SQLITE_OVERLAPPING_PHASES: &[&str] = &[
+    "baseline",
+    "opened",
+    "writing",
+    "committed",
+    "verified",
+    "account_verified",
+    "backed_up",
+    "source_verified",
+    "restored_verified",
+    "epoch_renewed",
+    "epoch_reopened",
+    "source_preserved",
+    "pools_verified",
+    "dropped",
+];
+
 fn sqlite_evidence(output: &str, native: bool, scenario: &str) -> Result<()> {
     let (prefix, phases) = match scenario {
         "sqlite-body" => ("sqlite", SQLITE_BODY_PHASES),
@@ -577,6 +594,7 @@ fn sqlite_evidence(output: &str, native: bool, scenario: &str) -> Result<()> {
         "sqlite-backup" => ("sqlite-backup", SQLITE_BACKUP_PHASES),
         "sqlite-epoch" => ("sqlite-epoch", SQLITE_EPOCH_PHASES),
         "sqlite-multi-account" => ("sqlite-multi-account", SQLITE_EPOCH_PHASES),
+        "sqlite-overlapping-accounts" => ("sqlite-overlapping-accounts", SQLITE_OVERLAPPING_PHASES),
         _ => return Err("unknown SQLite observation scenario".into()),
     };
     let domain = if native { "native" } else { "rust" };
@@ -871,6 +889,7 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
         "sqlite-backup" => SQLITE_BACKUP_PHASES,
         "sqlite-epoch" => SQLITE_EPOCH_PHASES,
         "sqlite-multi-account" => SQLITE_EPOCH_PHASES,
+        "sqlite-overlapping-accounts" => SQLITE_OVERLAPPING_PHASES,
         "client" => &[
             "baseline",
             "config",
@@ -984,6 +1003,7 @@ fn sqlite_stack_evidence(output: &str, scenario: &str) -> Result<()> {
             | "sqlite-backup"
             | "sqlite-epoch"
             | "sqlite-multi-account"
+            | "sqlite-overlapping-accounts"
     ) {
         return Err("unknown SQLite stack scenario".into());
     }
@@ -1720,6 +1740,10 @@ pub(crate) fn runtime_inner() -> Result<()> {
             ("sqlite-backup", "--sqlite-backup"),
             ("sqlite-epoch", "--sqlite-epoch"),
             ("sqlite-multi-account", "--sqlite-multi-account"),
+            (
+                "sqlite-overlapping-accounts",
+                "--sqlite-overlapping-accounts",
+            ),
         ] {
             let mut command = Command::new(path);
             command.arg(argument).env_clear().stdin(Stdio::null());
@@ -1741,6 +1765,10 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("sqlite-backup", Some("--sqlite-backup")),
         ("sqlite-epoch", Some("--sqlite-epoch")),
         ("sqlite-multi-account", Some("--sqlite-multi-account")),
+        (
+            "sqlite-overlapping-accounts",
+            Some("--sqlite-overlapping-accounts"),
+        ),
         ("client", Some("--tls-clients")),
         ("handshake", Some("--tls-handshake")),
         ("entropy", Some("--entropy-workers")),
@@ -1765,6 +1793,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
                 | "sqlite-backup"
                 | "sqlite-epoch"
                 | "sqlite-multi-account"
+                | "sqlite-overlapping-accounts"
         ) {
             300
         } else {
@@ -1783,6 +1812,10 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("sqlite-backup", "--sqlite-backup-stack"),
         ("sqlite-epoch", "--sqlite-epoch-stack"),
         ("sqlite-multi-account", "--sqlite-multi-account-stack"),
+        (
+            "sqlite-overlapping-accounts",
+            "--sqlite-overlapping-accounts-stack",
+        ),
     ] {
         let mut command = Command::new("/artifacts/td-mta-rss-probe");
         command.arg(argument).env_clear().stdin(Stdio::null());
@@ -2074,6 +2107,56 @@ mod tests {
         }
         assert!(rss_evidence(good.trim_end(), "control").is_err());
         assert!(rss_evidence(&good.replace("-v2:", "-v1:"), "control").is_err());
+    }
+
+    #[test]
+    fn sqlite_rss_requires_all_phases_and_exact_scenario() {
+        let cases: &[(&str, &[&str])] = &[
+            ("sqlite-body", SQLITE_BODY_PHASES),
+            ("sqlite-account", SQLITE_ACCOUNT_PHASES),
+            ("sqlite-backup", SQLITE_BACKUP_PHASES),
+            ("sqlite-epoch", SQLITE_EPOCH_PHASES),
+            ("sqlite-multi-account", SQLITE_EPOCH_PHASES),
+            ("sqlite-overlapping-accounts", SQLITE_OVERLAPPING_PHASES),
+        ];
+        for &(scenario, phases) in cases {
+            let records: Vec<_> = phases
+                .iter()
+                .map(|phase| format!("rss {scenario} {phase} 100\n"))
+                .collect();
+            let footer = format!("rss-observation-v2: {scenario} passed\n");
+            let output = records.concat() + &footer;
+            assert!(rss_evidence(&output, scenario).is_ok());
+            for &(other, _) in cases {
+                if other != scenario {
+                    assert!(rss_evidence(&output, other).is_err());
+                }
+            }
+            for record in &records {
+                assert!(rss_evidence(&output.replacen(record, "", 1), scenario).is_err());
+                assert!(rss_evidence(
+                    &output.replacen(record, &(record.clone() + record), 1),
+                    scenario
+                )
+                .is_err());
+            }
+            let mut reordered = records.clone();
+            reordered.swap(0, 1);
+            assert!(rss_evidence(&(reordered.concat() + &footer), scenario).is_err());
+            for bad in [
+                output.replace(" 100\n", " 0\n"),
+                output.replace(" 100\n", " -1\n"),
+                output.replace(" 100\n", " 18446744073709551616\n"),
+                output.replace(" 100\n", " 100 1\n"),
+                output.replace("passed", "failed"),
+                output.replace("-v2:", "-v1:"),
+                output.replace(&footer, ""),
+                format!("{output}extra\n"),
+            ] {
+                assert!(rss_evidence(&bad, scenario).is_err());
+            }
+            assert!(rss_evidence(output.trim_end(), scenario).is_err());
+        }
     }
 
     #[test]
@@ -2560,6 +2643,7 @@ mod tests {
             "sqlite-backup",
             "sqlite-epoch",
             "sqlite-multi-account",
+            "sqlite-overlapping-accounts",
         ] {
             let before = format!("{scenario}_stack_before_mapping_bytes=");
             let after = format!("{scenario}_stack_after_mapping_bytes=");
@@ -2573,6 +2657,7 @@ mod tests {
                     "sqlite-backup",
                     "sqlite-epoch",
                     "sqlite-multi-account",
+                    "sqlite-overlapping-accounts",
                 ] {
                     if other != scenario {
                         assert!(sqlite_stack_evidence(&output, other).is_err());
@@ -2652,6 +2737,11 @@ mod tests {
                 "sqlite-multi-account",
                 SQLITE_EPOCH_PHASES,
             ),
+            (
+                "sqlite-overlapping-accounts",
+                "sqlite-overlapping-accounts",
+                SQLITE_OVERLAPPING_PHASES,
+            ),
         ] {
             for native in [false, true] {
                 let domain = if native { "native" } else { "rust" };
@@ -2676,6 +2766,7 @@ mod tests {
                     "sqlite-backup",
                     "sqlite-epoch",
                     "sqlite-multi-account",
+                    "sqlite-overlapping-accounts",
                 ] {
                     if other != scenario {
                         assert!(sqlite_evidence(&output, native, other).is_err());

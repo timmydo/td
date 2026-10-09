@@ -102,6 +102,22 @@ pub const EPOCH_PHASES: &[&str] = &[
     "source_preserved",
     "dropped",
 ];
+pub const OVERLAPPING_PHASES: &[&str] = &[
+    "baseline",
+    "opened",
+    "writing",
+    "committed",
+    "verified",
+    "account_verified",
+    "backed_up",
+    "source_verified",
+    "restored_verified",
+    "epoch_renewed",
+    "epoch_reopened",
+    "source_preserved",
+    "pools_verified",
+    "dropped",
+];
 struct CountingEntropy {
     source: td_crypto::SystemEntropy,
     calls: usize,
@@ -133,6 +149,7 @@ pub enum Mode {
     Backup,
     Epoch,
     MultiAccount,
+    OverlappingAccounts,
 }
 impl Mode {
     pub fn from_argument(argument: &str) -> Option<Self> {
@@ -142,6 +159,7 @@ impl Mode {
             "--sqlite-backup" => Some(Self::Backup),
             "--sqlite-epoch" => Some(Self::Epoch),
             "--sqlite-multi-account" => Some(Self::MultiAccount),
+            "--sqlite-overlapping-accounts" => Some(Self::OverlappingAccounts),
             _ => None,
         }
     }
@@ -151,6 +169,7 @@ impl Mode {
             Self::Account => ACCOUNT_PHASES,
             Self::Backup => BACKUP_PHASES,
             Self::Epoch | Self::MultiAccount => EPOCH_PHASES,
+            Self::OverlappingAccounts => OVERLAPPING_PHASES,
         }
     }
     pub fn scenario(self) -> &'static str {
@@ -160,13 +179,23 @@ impl Mode {
             Self::Backup => "sqlite-backup",
             Self::Epoch => "sqlite-epoch",
             Self::MultiAccount => "sqlite-multi-account",
+            Self::OverlappingAccounts => "sqlite-overlapping-accounts",
         }
     }
     fn has_backup(self) -> bool {
-        matches!(self, Self::Backup | Self::Epoch | Self::MultiAccount)
+        matches!(
+            self,
+            Self::Backup | Self::Epoch | Self::MultiAccount | Self::OverlappingAccounts
+        )
     }
     fn renews_epoch(self) -> bool {
-        matches!(self, Self::Epoch | Self::MultiAccount)
+        matches!(
+            self,
+            Self::Epoch | Self::MultiAccount | Self::OverlappingAccounts
+        )
+    }
+    fn has_multiple_accounts(self) -> bool {
+        matches!(self, Self::MultiAccount | Self::OverlappingAccounts)
     }
     pub fn has_account(self) -> bool {
         self != Self::Body
@@ -289,7 +318,7 @@ fn check_accounts(
     scratch: &mut [u8],
 ) {
     check_account(store, ACCOUNT, epoch, sequence, deadline, scratch);
-    if mode == Mode::MultiAccount {
+    if mode.has_multiple_accounts() {
         check_account(
             store,
             OTHER,
@@ -301,7 +330,7 @@ fn check_accounts(
     }
 }
 fn account_at(mode: Mode, index: usize) -> AccountId {
-    if mode == Mode::MultiAccount && index % 2 == 1 {
+    if mode.has_multiple_accounts() && index % 2 == 1 {
         OTHER
     } else {
         ACCOUNT
@@ -431,7 +460,7 @@ fn run_with_roots(
     )
     .unwrap();
     store.create_account(ACCOUNT, deadline).unwrap();
-    if mode == Mode::MultiAccount {
+    if mode.has_multiple_accounts() {
         store.create_account(OTHER, deadline).unwrap();
     }
     observe();
@@ -455,7 +484,7 @@ fn run_with_roots(
     assert_eq!(source.remaining, 0);
     assert!(source.sampled);
     assert_eq!(initial_sequence, Sequence::from_u64(1));
-    let other_row = if mode == Mode::MultiAccount {
+    let other_row = if mode.has_multiple_accounts() {
         scratch.fill(0xa5);
         let mut digest = td_crypto::Provider.sha256().unwrap();
         for _ in 0..BODY_BYTES / CHUNK_BYTES as u64 {
@@ -588,9 +617,9 @@ fn run_with_roots(
             ),
             (
                 store.epoch(),
-                if mode == Mode::MultiAccount { 2 } else { 1 },
-                BODY_BYTES * if mode == Mode::MultiAccount { 2 } else { 1 },
-                if mode == Mode::MultiAccount { 2 } else { 1 },
+                if mode.has_multiple_accounts() { 2 } else { 1 },
+                BODY_BYTES * if mode.has_multiple_accounts() { 2 } else { 1 },
+                if mode.has_multiple_accounts() { 2 } else { 1 },
                 0,
                 0,
                 0
@@ -673,7 +702,7 @@ fn run_with_roots(
                     initial_sequence,
                 )
             });
-            if mode == Mode::MultiAccount {
+            if mode.has_multiple_accounts() {
                 assert_eq!(
                     view.get(Key::Blob(BLOB), &mut metadata).unwrap(),
                     Some((
@@ -732,7 +761,7 @@ fn run_with_roots(
                 }
             ))
         );
-        if mode == Mode::MultiAccount {
+        if mode.has_multiple_accounts() {
             assert_eq!(
                 view.get(Key::Blob(BLOB), &mut metadata).unwrap(),
                 Some((
@@ -762,8 +791,9 @@ fn run_with_roots(
         let prior = mode
             .renews_epoch()
             .then(|| store.view(ACCOUNT, deadline).unwrap().identity());
-        let other_prior =
-            (mode == Mode::MultiAccount).then(|| store.view(OTHER, deadline).unwrap().identity());
+        let other_prior = mode
+            .has_multiple_accounts()
+            .then(|| store.view(OTHER, deadline).unwrap().identity());
         let destination = destination.unwrap();
         let receipt = store
             .backup(
@@ -774,7 +804,7 @@ fn run_with_roots(
             .unwrap();
         assert_eq!(receipt.epoch, StoreEpoch::from_bytes([0x57; 16]));
         assert!(
-            receipt.bytes >= BODY_BYTES * if mode == Mode::MultiAccount { 2 } else { 1 }
+            receipt.bytes >= BODY_BYTES * if mode.has_multiple_accounts() { 2 } else { 1 }
                 && receipt.bytes <= td_mta::limits::SQLITE_DATABASE_BYTES
         );
         observe();
@@ -885,6 +915,154 @@ fn run_with_roots(
                 &mut scratch,
             );
             observe();
+            if mode == Mode::OverlappingAccounts {
+                {
+                    let mut source_views: [_; READERS] = std::array::from_fn(|index| {
+                        original.view(account_at(mode, index), deadline).unwrap()
+                    });
+                    let mut copied_views: [_; READERS] = std::array::from_fn(|index| {
+                        restored.view(account_at(mode, index), deadline).unwrap()
+                    });
+                    let check =
+                        |view: &mut crate::store_fs::IndexReadView<'_, '_>, account, epoch| {
+                            let expected_sequence = if account == OTHER {
+                                Sequence::from_u64(1)
+                            } else {
+                                sequence
+                            };
+                            assert_eq!(
+                                view.identity(),
+                                ViewIdentity {
+                                    account,
+                                    epoch,
+                                    committed_sequence: expected_sequence,
+                                    history_floor: Sequence::default(),
+                                }
+                            );
+                            let mut metadata = [0; 128];
+                            assert_eq!(
+                                view.get(Key::Blob(BLOB), &mut metadata).unwrap(),
+                                Some((
+                                    if account == OTHER {
+                                        other_row.unwrap()
+                                    } else {
+                                        row
+                                    },
+                                    Sequence::from_u64(1)
+                                ))
+                            );
+                            assert_eq!(
+                                view.get(Key::Mailbox(parent), &mut metadata).unwrap(),
+                                Some((
+                                    mailbox(
+                                        if account == OTHER {
+                                            "other parent"
+                                        } else {
+                                            "updated parent"
+                                        },
+                                        None
+                                    ),
+                                    expected_sequence
+                                ))
+                            );
+                            assert_eq!(
+                                view.get(Key::Mailbox(child), &mut metadata).unwrap(),
+                                Some((
+                                    mailbox(
+                                        if account == OTHER {
+                                            "other child"
+                                        } else {
+                                            "child"
+                                        },
+                                        Some(parent)
+                                    ),
+                                    Sequence::from_u64(1)
+                                ))
+                            );
+                        };
+                    for (views, epoch) in [
+                        (&mut source_views, prior.epoch),
+                        (&mut copied_views, current.epoch),
+                    ] {
+                        for (index, view) in views.iter_mut().enumerate() {
+                            check(view, account_at(mode, index), epoch);
+                        }
+                    }
+                    let mut source_inputs = source_views.each_mut().map(|view| {
+                        view.open_blob_input(&td_crypto::Provider, BLOB, BODY_BYTES)
+                            .unwrap()
+                    });
+                    let mut copied_inputs = copied_views.each_mut().map(|view| {
+                        view.open_blob_input(&td_crypto::Provider, BLOB, BODY_BYTES)
+                            .unwrap()
+                    });
+                    for inputs in [&mut source_inputs, &mut copied_inputs] {
+                        for (index, input) in inputs.iter_mut().enumerate() {
+                            assert_eq!(input.len(), BODY_BYTES);
+                            assert_eq!(input.read(&mut scratch).unwrap(), CHUNK_BYTES);
+                            assert_eq!(input.position(), CHUNK_BYTES as u64);
+                            assert!(scratch
+                                .iter()
+                                .all(|&byte| byte == body_byte(account_at(mode, index))));
+                        }
+                    }
+                    for store in [&original, &restored] {
+                        assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
+                        assert_eq!(store.checkpoint(deadline), Err(Error::Busy));
+                    }
+                    for _ in 1..BODY_BYTES / CHUNK_BYTES as u64 {
+                        for inputs in [&mut source_inputs, &mut copied_inputs] {
+                            for (index, input) in inputs.iter_mut().enumerate() {
+                                assert_eq!(input.read(&mut scratch).unwrap(), CHUNK_BYTES);
+                                assert!(scratch
+                                    .iter()
+                                    .all(|&byte| byte == body_byte(account_at(mode, index))));
+                            }
+                        }
+                    }
+                    for inputs in [&source_inputs, &copied_inputs] {
+                        assert!(inputs.iter().all(
+                            |input| input.position() == BODY_BYTES && input.len() == BODY_BYTES
+                        ));
+                    }
+                    let mut source_pins = source_inputs.map(|input| input.finish().unwrap());
+                    let mut copied_pins = copied_inputs.map(|input| input.finish().unwrap());
+                    for pins in [&mut source_pins, &mut copied_pins] {
+                        for (index, pin) in pins.iter_mut().enumerate() {
+                            let byte = body_byte(account_at(mode, index));
+                            assert_eq!(pin.len(), BODY_BYTES);
+                            assert_eq!(pin.read_at(65535, &mut scratch).unwrap(), CHUNK_BYTES);
+                            assert!(scratch.iter().all(|&actual| actual == byte));
+                            assert_eq!(pin.read_at(BODY_BYTES - 1, &mut scratch).unwrap(), 1);
+                            assert_eq!(scratch.first(), Some(&byte));
+                        }
+                    }
+                    for store in [&original, &restored] {
+                        assert!(matches!(store.view(OTHER, deadline), Err(Error::Busy)));
+                        assert_eq!(store.checkpoint(deadline), Err(Error::Busy));
+                    }
+                    observe();
+                    drop(copied_pins);
+                    drop(source_pins);
+                    for (views, epoch) in [
+                        (&mut source_views, prior.epoch),
+                        (&mut copied_views, current.epoch),
+                    ] {
+                        for (index, view) in views.iter_mut().enumerate() {
+                            check(view, account_at(mode, index), epoch);
+                        }
+                    }
+                    for store in [&original, &restored] {
+                        assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
+                        assert_eq!(store.checkpoint(deadline), Err(Error::Busy));
+                    }
+                }
+                for (store, epoch) in [(&original, prior.epoch), (&restored, current.epoch)] {
+                    store.checkpoint(deadline).unwrap();
+                    store.validate_integrity(deadline).unwrap();
+                    check_accounts(mode, store, epoch, sequence, deadline, &mut scratch);
+                }
+            }
         }
         return;
     }

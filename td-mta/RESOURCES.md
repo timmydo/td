@@ -2821,6 +2821,97 @@ fence.
 The complete isolated pinned Rust 1.96.0 release x86-64 musl command
 passed on its first attempt on 2026-10-09: all eight static artifacts,
 API confinement (schema 57, 29 fixtures, 786 reachable items), clean
+runtime, all existing resource/positive/quiet controls, six SQLite
+allocation/RSS cases and six guarded-stack workers. Builder parsers
+accept the exact sixth selector and fourteen-phase protocol, with
+allocation/stack cross-scenario negatives and a six-scenario RSS matrix
+refusing missing/duplicated/reordered phases, malformed values and
+completion records. These measurements are from a fresh six-selector
+run; prior artifact measurements remain historical.
+
+A separate portable sqlite-overlapping-accounts selector extends the
+two-account maximum-body case with sixteen simultaneous loans in the
+source and its renewed copy. Both accounts share BlobId and parent/child
+MailboxId values but have independently expected distinct 32 MiB body
+bytes, digests and names: 64 MiB logical body bytes per root. The first
+account stays at sequence two, the second at one and both at floor zero.
+Public backup, complete physical/account verification, one actual warmed
+SystemEntropy fill with independently captured expected output, durable
+copied epoch reopen and preserved original source remain prerequisites.
+The five previous selectors remain separately runnable with phase counts
+8/9/10/13/13; this sixth selector adds pools_verified before dropped for
+fourteen observations.
+
+Both complete eight-reader pools retain sixteen views and eighteen
+native owners together, alternating four views per account in each root.
+Every view checks its explicitly expected source/copied epoch, account,
+endpoint and floor, original typed BlobRow and changed sequence,
+parent/child names, relationship and changed sequences before and after
+the loans. All sixteen inputs read their first 64 KiB before any
+completes, then interleave the remaining 511 chunks, checking every
+expected byte and completed digest. All sixteen pins remain alive
+through cross-chunk/final-byte checks and the pools_verified
+observation. Both stores refuse ninth views and checkpoints while loans
+or views remain. After views drop, both checkpoint, pass physical
+validation and repeat complete account verification with independent
+byte and typed-row expectations. The caller reuses one 64 KiB scratch
+buffer throughout; no whole-body buffer is introduced.
+
+| Case | Observer | Warm baseline | Lifetime requested peak / maximum RSS sample | After teardown |
+| --- | --- | ---: | ---: | ---: |
+| Body | Rust requested bytes | 560 | 199846 | 560 |
+| Body | Wrapped C boundary requested bytes | 1344 | 2943766 | 1344 |
+| Body | Unwrapped RSS, KiB | 3396 | 6900 | 3636 |
+| Account | Rust requested bytes | 624 | 199910 | 624 |
+| Account | Wrapped C boundary requested bytes | 1424 | 2943846 | 1424 |
+| Account | Unwrapped RSS, KiB | 3396 | 6900 | 3644 |
+| Backup | Rust requested bytes | 688 | 333620 | 688 |
+| Backup | Wrapped C boundary requested bytes | 1504 | 4197372 | 1504 |
+| Backup | Unwrapped RSS, KiB | 3400 | 8320 | 3664 |
+| Epoch | Rust requested bytes | 880 | 333812 | 880 |
+| Epoch | Wrapped C boundary requested bytes | 134584 | 4330452 | 134584 |
+| Epoch | Unwrapped RSS, KiB | 3920 | 8780 | 4124 |
+| Multi-account | Rust requested bytes | 880 | 333812 | 880 |
+| Multi-account | Wrapped C boundary requested bytes | 134584 | 4330452 | 134584 |
+| Multi-account | Unwrapped RSS, KiB | 3924 | 8780 | 4124 |
+| Overlapping-accounts | Rust requested bytes | 944 | 333876 | 944 |
+| Overlapping-accounts | Wrapped C boundary requested bytes | 134664 | 5959652 | 134664 |
+| Overlapping-accounts | Unwrapped RSS, KiB | 3920 | 10384 | 4144 |
+
+Writable worker mappings before/after were body 253952/253952 bytes,
+account 253952/253952 bytes, backup 253952/253952 bytes, epoch
+253952/253952 bytes, multi-account 253952/253952 bytes,
+overlapping-accounts 253952/253952 bytes. Each has its adjacent
+inaccessible guard, no grow-down flag and explicit join. Warm/final
+native block counts were body 5/5, account 5/5, backup 5/5, epoch 13/13,
+multi-account 13/13, overlapping-accounts 13/13. The warmed entropy
+handle remains alive through teardown.
+
+This qualifies this bounded two-account source/copied fixture with
+sixteen maximum-size loans in one process or guarded worker. It performs
+no history pruning or write while these sixteen copied/source loans
+remain, and does not extend the separate native 2 MiB cleanup fixture
+into portable pruning qualification. Lifetime requested peaks and exact
+warm teardown do not prove per-call allocation freedom. Wrapped C
+observations can include Rust System allocations and are not disjoint
+SQLite-only attribution. RSS includes a sample with all sixteen
+pins/views retained but does not bound transient RSS; the second initial
+body write still has no separate writing sample. Writable mapping size
+is not frame high-water. The unchanged limits are Rust 2 MiB, wrapped
+C-boundary 17 MiB, sampled RSS growth 24 MiB, guarded writable mapping
+256 KiB, SQLite per-allocation 9 MiB and process-wide 16 MiB across all
+pools. No arbitrary-account/maximal-database resource, parallel-service,
+quota reservation, effect authorization, initialize_leases, quiescence,
+full filesystem-fault, power-loss or whole-service claim follows. No
+production API, schema, unsafe surface, syscall, hook, allowance,
+dependency, cap, compiler flag, probe shim or stack wrapper changed.
+
+td-crypto/PORTABLE.md records exact artifact and staged inputs. Earlier
+five-selector measurements omit this separate sixteen-loan overlap.
+
+The complete isolated pinned Rust 1.96.0 release x86-64 musl command
+passed on its first attempt on 2026-10-09: all eight static artifacts,
+API confinement (schema 57, 29 fixtures, 786 reachable items), clean
 runtime, all existing resource/positive/quiet controls, five SQLite
 observer cases and five guarded worker-stack cases. The four earlier
 body/account/backup/epoch selectors remain independently runnable with
