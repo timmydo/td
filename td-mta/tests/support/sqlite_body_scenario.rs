@@ -341,23 +341,51 @@ fn run_with_roots(
     assert_eq!(sequence, Sequence::from_u64(1));
     observe();
     {
-        let mut view = store.view(ACCOUNT, deadline).unwrap();
-        let mut input = view
-            .open_blob_input(&td_crypto::Provider, BLOB, BODY_BYTES)
-            .unwrap();
-        while input.position() != input.len() {
-            let n = input.read(&mut scratch).unwrap();
-            assert!(n > 0);
-            assert!(scratch.get(..n).unwrap().iter().all(|&b| b == 0x5a));
+        let mut views: [_; READERS] =
+            std::array::from_fn(|_| store.view(ACCOUNT, deadline).unwrap());
+        let identity = views.first().unwrap().identity();
+        assert_eq!(identity.account, ACCOUNT);
+        assert_eq!(identity.epoch, store.epoch());
+        assert_eq!(identity.committed_sequence, sequence);
+        assert_eq!(identity.history_floor, Sequence::default());
+        assert!(views.iter().all(|view| view.identity() == identity));
+        assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
+        let mut inputs = views.each_mut().map(|view| {
+            view.open_blob_input(&td_crypto::Provider, BLOB, BODY_BYTES)
+                .unwrap()
+        });
+        while inputs.first().unwrap().position() != BODY_BYTES {
+            for input in &mut inputs {
+                let n = input.read(&mut scratch).unwrap();
+                assert_eq!(n, CHUNK_BYTES);
+                assert!(scratch.get(..n).unwrap().iter().all(|&b| b == 0x5a));
+            }
         }
-        let mut pin = input.finish().unwrap();
-        assert_eq!(pin.len(), BODY_BYTES);
-        assert_eq!(pin.read_at(65535, &mut scratch).unwrap(), CHUNK_BYTES);
-        assert!(scratch.iter().all(|&b| b == 0x5a));
-        assert_eq!(pin.read_at(BODY_BYTES - 1, &mut scratch).unwrap(), 1);
-        assert_eq!(scratch.first(), Some(&0x5a));
+        assert!(inputs
+            .iter()
+            .all(|input| input.position() == BODY_BYTES && input.len() == BODY_BYTES));
+        let mut pins = inputs.map(|input| input.finish().unwrap());
+        for pin in &mut pins {
+            assert_eq!(pin.len(), BODY_BYTES);
+            assert_eq!(pin.read_at(65535, &mut scratch).unwrap(), CHUNK_BYTES);
+            assert!(scratch.iter().all(|&b| b == 0x5a));
+            assert_eq!(pin.read_at(BODY_BYTES - 1, &mut scratch).unwrap(), 1);
+            assert_eq!(scratch.first(), Some(&0x5a));
+        }
+        assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
         observe();
     }
+    let returned: [_; READERS] = std::array::from_fn(|_| store.view(ACCOUNT, deadline).unwrap());
+    assert!(returned.iter().all(|view| {
+        view.identity()
+            == ViewIdentity {
+                account: ACCOUNT,
+                epoch: store.epoch(),
+                committed_sequence: sequence,
+                history_floor: Sequence::default(),
+            }
+    }));
+    drop(returned);
     if account_check {
         check_account(
             &store,

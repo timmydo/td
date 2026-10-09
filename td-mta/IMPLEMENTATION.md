@@ -2723,16 +2723,31 @@ inputs. This supplies bounded primitive stack evidence, without claiming
 numeric frame peaks, arbitrary-account/maximum-database paths, complete
 worker composition, full faults, power loss or activation.
 
-The shared portable body/account/backup/epoch resource fixtures now use
-eight readers plus the writer at creation and every reopen. The complete
-isolated static-musl qualification passed under all original allocation,
-RSS and guarded-stack ceilings. Backup/epoch retain both nine-connection
-stores through final verification, qualifying eighteen simultaneous
-owners for this fixed 32 MiB dataset. All phase sequences and semantic
-controls remain. RESOURCES.md and td-crypto/PORTABLE.md record actual
-metrics and inputs. This does not qualify eight borrowed views or
-simultaneous reader/body work, arbitrary-account/maximum-database paths,
-full faults or whole-service overlap.
+The earlier portable pool qualification used eight readers plus the
+writer at creation and every reopen. It ran the shared body, account,
+backup and epoch fixtures. The complete isolated static-musl
+qualification passed under all original allocation, RSS and
+guarded-stack ceilings. Backup/epoch retain both nine-connection stores
+through final verification, qualifying eighteen simultaneous owners for
+this fixed 32 MiB dataset. All phase sequences and semantic controls
+remain. RESOURCES.md and td-crypto/PORTABLE.md record actual metrics and
+inputs. This does not qualify eight borrowed views or simultaneous
+reader/body work, arbitrary-account/maximum-database paths, full faults
+or whole-service overlap.
+
+The shared portable body/account/backup/epoch fixtures also passed eight
+simultaneously retained views and body inputs in initial postcommit
+verification. Fixed arrays and one caller scratch support interleaved
+full 32 MiB reads, eight digest-completed pins, all random-read
+assertions, ninth-view Busy before and after pin construction, and
+reacquisition of all eight slots after release. The verified phase
+observes all eight pins/views alive. All original phase counts, quiet
+Rust controls and resource ceilings remain. RESOURCES.md and
+td-crypto/PORTABLE.md record the successful full isolated qualification.
+This covers same-account/same-body loan lifetime and sequential
+interleaved progress on one worker, not parallel threads or writes with
+retained readers, arbitrary-account/maximum-database or whole-service
+overlap.
 
 These primitives do not complete the restore command,
 selection/verification workflow or service activation.

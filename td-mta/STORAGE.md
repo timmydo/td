@@ -825,14 +825,45 @@ credentials/configuration snapshots, operational restore authorization or
 service activation. No production storage, schema, unsafe, dependency,
 allocator hook or native-cap change is introduced.
 
-The shared portable SQLite body/account/backup/epoch fixtures now
-request the supported maximum eight readers plus one writer at creation
-and every reopen. The source and destination stores in backup/epoch
-overlap with eighteen native owners through the final verification
-observations. The one-reader native warmup before baseline is unchanged.
-This qualifies full owner pools for the fixed 32 MiB body and mailbox
-dataset, not eight simultaneously borrowed views or concurrent reader
-work.
+The shared portable SQLite body/account/backup/epoch fixtures now retain
+eight borrowed views and body inputs together during their initial
+postcommit body verification. Fixed stack arrays retain all loans
+without new Rust heap buffers. Every view matches the complete
+account/epoch/sequence/floor identity; a ninth public capture returns
+Busy. Progress interleaves one 64 KiB read from each input using the
+existing single scratch buffer. Each input consumes all 512 chunks of
+the same 32 MiB body, checks every byte and finishes its own digest. All
+eight resulting pins pass cross-chunk and final-byte random reads. A
+ninth capture still returns Busy while the eight pins and views remain
+alive at the existing verified observation. After release, all eight
+slots are reacquired together with the expected full identity, then
+dropped before account verification or backup.
+
+The complete pinned static-musl command passed all four Rust/native/RSS
+observer cases and all four guarded worker-stack cases with unchanged
+phase counts, quiet Rust controls and resource ceilings. Existing
+backup/epoch source preservation, independently reopened
+physical/account checks and destination-only epoch renewal remain.
+RESOURCES.md and td-crypto/PORTABLE.md record actual measurements and
+artifact inputs.
+
+This qualifies simultaneous loan lifetime, interleaved progress and slot
+reuse for this healthy same-body/same-account fixture on one process or
+guarded worker. It does not qualify parallel threads, writes while
+readers are retained, different accounts/bodies, arbitrary-account or
+maximum-database work, numeric frame peaks, transient RSS, full
+filesystem faults, power loss or whole-worker/service overlap. Earlier
+maximum-pool records qualify owners with one borrowed view at a time and
+remain tied to their own artifact/source hashes.
+
+The earlier maximum-pool-only portable SQLite body/account/backup/epoch
+qualification requested the supported maximum eight readers plus one
+writer at creation and every reopen. The source and destination stores
+in backup/epoch overlap with eighteen native owners through the final
+verification observations. The one-reader native warmup before baseline
+is unchanged. This qualifies full owner pools for the fixed 32 MiB body
+and mailbox dataset, not eight simultaneously borrowed views or
+concurrent reader work.
 
 The complete pinned static-musl qualification passed all four
 Rust/native/RSS observer cases and all four guarded worker-stack cases

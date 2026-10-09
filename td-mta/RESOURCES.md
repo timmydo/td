@@ -2752,14 +2752,71 @@ not a general zero-allocation guarantee or method-only attribution.
 td-crypto/PORTABLE.md records the exact artifact, staged source/vendor
 pins, current SQLite ceilings and qualification limits.
 
-The shared portable SQLite body/account/backup/epoch fixtures now
-request the supported maximum eight readers plus one writer at creation
-and every reopen. The source and destination stores in backup/epoch
-overlap with eighteen native owners through the final verification
-observations. The one-reader native warmup before baseline is unchanged.
-This qualifies full owner pools for the fixed 32 MiB body and mailbox
-dataset, not eight simultaneously borrowed views or concurrent reader
-work.
+The shared portable SQLite body/account/backup/epoch fixtures now retain
+eight borrowed views and body inputs together during their initial
+postcommit body verification. Fixed stack arrays retain all loans
+without new Rust heap buffers. Every view matches the complete
+account/epoch/sequence/floor identity; a ninth public capture returns
+Busy. Progress interleaves one 64 KiB read from each input using the
+existing single scratch buffer. Each input consumes all 512 chunks of
+the same 32 MiB body, checks every byte and finishes its own digest. All
+eight resulting pins pass cross-chunk and final-byte random reads. A
+ninth capture still returns Busy while the eight pins and views remain
+alive at the existing verified observation. After release, all eight
+slots are reacquired together with the expected full identity, then
+dropped before account verification or backup.
+
+| Case | Observer | Warm baseline | Lifetime requested peak / maximum RSS sample | After teardown |
+| --- | --- | ---: | ---: | ---: |
+| Body | Rust requested bytes | 560 | 199846 | 560 |
+| Body | Wrapped C boundary requested bytes | 1344 | 2943694 | 1344 |
+| Body | Unwrapped RSS, KiB | 3340 | 6836 | 3572 |
+| Account | Rust requested bytes | 624 | 199910 | 624 |
+| Account | Wrapped C boundary requested bytes | 1424 | 2944014 | 1424 |
+| Account | Unwrapped RSS, KiB | 3336 | 6836 | 3572 |
+| Backup | Rust requested bytes | 688 | 333620 | 688 |
+| Backup | Wrapped C boundary requested bytes | 1504 | 4197372 | 1504 |
+| Backup | Unwrapped RSS, KiB | 3344 | 8252 | 3596 |
+| Epoch | Rust requested bytes | 880 | 333812 | 880 |
+| Epoch | Wrapped C boundary requested bytes | 134584 | 4330452 | 134584 |
+| Epoch | Unwrapped RSS, KiB | 3872 | 8720 | 4064 |
+
+The complete isolated static-musl command passed, including unchanged
+Rust quiet-allocation controls and exact warm teardown.
+Body/account/backup guarded worker mappings were 253952 bytes and epoch
+was 249856 bytes, equal before and after with the required adjacent
+inaccessible guard and no grow-down flag. These are writable-region
+observations, not measured frame high-water marks. td-crypto/PORTABLE.md
+records the exact artifact and staged inputs.
+
+The original eight/nine/ten/thirteen phase counts, selectors, fixed
+dataset, rollback/refusal/ID-reuse controls, account verification,
+public backup, reopened physical checks, actual warmed entropy renewal
+and original source preservation remain. The pool configuration remains
+eight readers plus one writer, with eighteen native owners in reopened
+backup/epoch source/destination stores. Rust 2 MiB, wrapped C-boundary
+17 MiB, sampled RSS growth 24 MiB and guarded writable stack 256 KiB
+ceilings are unchanged. SQLite retains its 9 MiB per-allocation and 16
+MiB process-wide caps across all pools. No production API, schema,
+unsafe surface, dependency, reservation or native-cap change.
+
+This qualifies simultaneous loan lifetime, interleaved progress and slot
+reuse for this healthy same-body/same-account fixture on one process or
+guarded worker. It does not qualify parallel threads, writes while
+readers are retained, different accounts/bodies, arbitrary-account or
+maximum-database work, numeric frame peaks, transient RSS, full
+filesystem faults, power loss or whole-worker/service overlap. Earlier
+maximum-pool records qualify owners with one borrowed view at a time and
+remain tied to their own artifact/source hashes.
+
+The earlier maximum-pool-only portable SQLite body/account/backup/epoch
+qualification requested the supported maximum eight readers plus one
+writer at creation and every reopen. The source and destination stores
+in backup/epoch overlap with eighteen native owners through the final
+verification observations. The one-reader native warmup before baseline
+is unchanged. This qualifies full owner pools for the fixed 32 MiB body
+and mailbox dataset, not eight simultaneously borrowed views or
+concurrent reader work.
 
 | Case | Observer | Warm baseline | Lifetime requested peak / maximum RSS sample | After teardown |
 | --- | --- | ---: | ---: | ---: |

@@ -1097,20 +1097,92 @@ b6f95f848ef01da6104a5d5404dd0a06f08dcc22f3a7a766ac007378347b86ed
 and unchanged vendor NAR
 d122b8e7843f7da35cfb1f393dd0d8aea43ef534e9f5cffddc77a095fe971916.
 
+The simultaneous-body-reader isolated release x86-64 musl qualification
+on 2026-10-09 passed the complete portable command on its first attempt:
+all eight static artifacts, API confinement, clean runtime, all existing
+resource and positive controls, and the four guarded worker-stack cases.
+Pinned Rust 1.96.0 and declared GNU inputs remain unchanged.
+
+The shared portable SQLite body/account/backup/epoch fixtures now retain
+eight borrowed views and body inputs together during their initial
+postcommit body verification. Fixed stack arrays retain all loans
+without new Rust heap buffers. Every view matches the complete
+account/epoch/sequence/floor identity; a ninth public capture returns
+Busy. Progress interleaves one 64 KiB read from each input using the
+existing single scratch buffer. Each input consumes all 512 chunks of
+the same 32 MiB body, checks every byte and finishes its own digest. All
+eight resulting pins pass cross-chunk and final-byte random reads. A
+ninth capture still returns Busy while the eight pins and views remain
+alive at the existing verified observation. After release, all eight
+slots are reacquired together with the expected full identity, then
+dropped before account verification or backup.
+
+| Case | Observer | Warm baseline | Lifetime requested peak / maximum RSS sample | After teardown |
+| --- | --- | ---: | ---: | ---: |
+| Body | Rust requested bytes | 560 | 199846 | 560 |
+| Body | Wrapped C boundary requested bytes | 1344 | 2943694 | 1344 |
+| Body | Unwrapped RSS, KiB | 3340 | 6836 | 3572 |
+| Account | Rust requested bytes | 624 | 199910 | 624 |
+| Account | Wrapped C boundary requested bytes | 1424 | 2944014 | 1424 |
+| Account | Unwrapped RSS, KiB | 3336 | 6836 | 3572 |
+| Backup | Rust requested bytes | 688 | 333620 | 688 |
+| Backup | Wrapped C boundary requested bytes | 1504 | 4197372 | 1504 |
+| Backup | Unwrapped RSS, KiB | 3344 | 8252 | 3596 |
+| Epoch | Rust requested bytes | 880 | 333812 | 880 |
+| Epoch | Wrapped C boundary requested bytes | 134584 | 4330452 | 134584 |
+| Epoch | Unwrapped RSS, KiB | 3872 | 8720 | 4064 |
+
+The Rust quiet-allocation counter controls remain unchanged and passed.
+Rust live requested bytes and wrapped C-boundary live bytes/block counts
+return exactly to their warm baselines: five native blocks for
+body/account/backup and thirteen for epoch, whose entropy handle remains
+live through its final observation. Wrapped C-boundary observations are
+not SQLite-only attribution. Body/account/backup before/after writable
+mappings were 253952 bytes; epoch was 249856 bytes. Each pair was equal,
+with the required adjacent inaccessible guard and no grow-down flag, and
+the worker joined before completion.
+
+The original eight/nine/ten/thirteen phase counts, selectors, fixed
+dataset, rollback/refusal/ID-reuse controls, account verification,
+public backup, reopened physical checks, actual warmed entropy renewal
+and original source preservation remain. The pool configuration remains
+eight readers plus one writer, with eighteen native owners in reopened
+backup/epoch source/destination stores. Rust 2 MiB, wrapped C-boundary
+17 MiB, sampled RSS growth 24 MiB and guarded writable stack 256 KiB
+ceilings are unchanged. SQLite retains its 9 MiB per-allocation and 16
+MiB process-wide caps across all pools. No production API, schema,
+unsafe surface, dependency, reservation or native-cap change.
+
+This qualifies simultaneous loan lifetime, interleaved progress and slot
+reuse for this healthy same-body/same-account fixture on one process or
+guarded worker. It does not qualify parallel threads, writes while
+readers are retained, different accounts/bodies, arbitrary-account or
+maximum-database work, numeric frame peaks, transient RSS, full
+filesystem faults, power loss or whole-worker/service overlap. Earlier
+maximum-pool records qualify owners with one borrowed view at a time and
+remain tied to their own artifact/source hashes.
+
+The artifact NAR was
+9545c183d5b8f6dfbd4c6527fafc3464274e65631f1dbf4bacc9cd86573f5b2e.
+Its BUILD-INPUTS records staged source NAR
+a20f6c904c8f47129efd3a8fea6b7086b0308e4f50ca6943dc2160c21a8fd69e
+and unchanged vendor NAR
+d122b8e7843f7da35cfb1f393dd0d8aea43ef534e9f5cffddc77a095fe971916.
+
 The maximum-reader-pool isolated x86-64 musl qualification on 2026-10-09
 passed the complete portable command on its first attempt: all eight
 static artifacts, API confinement and clean runtime, every original
 resource/control case, and all four guarded worker-stack cases. Pinned
 Rust 1.96.0 and the declared GNU tool inputs are unchanged.
 
-The shared portable SQLite body/account/backup/epoch fixtures now
-request the supported maximum eight readers plus one writer at creation
-and every reopen. The source and destination stores in backup/epoch
-overlap with eighteen native owners through the final verification
-observations. The one-reader native warmup before baseline is unchanged.
-This qualifies full owner pools for the fixed 32 MiB body and mailbox
-dataset, not eight simultaneously borrowed views or concurrent reader
-work.
+The earlier maximum-pool-only portable SQLite body/account/backup/epoch
+qualification requested the supported maximum eight readers plus one
+writer at creation and every reopen. The source and destination stores
+in backup/epoch overlap with eighteen native owners through the final
+verification observations. The one-reader native warmup before baseline
+is unchanged. This qualifies full owner pools for the fixed 32 MiB body
+and mailbox dataset, not eight simultaneously borrowed views or
+concurrent reader work.
 
 | Case | Observer | Warm baseline | Lifetime requested peak / maximum RSS sample | After teardown |
 | --- | --- | ---: | ---: | ---: |
