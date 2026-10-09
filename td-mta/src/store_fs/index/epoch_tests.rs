@@ -584,3 +584,139 @@ fn distinct_epoch_candidates_include_zero_without_extra_domain_rules() {
     let reopened = IndexStore::open(&mut root, timer, 1, deadline()).unwrap();
     inspect(&reopened, FRESH);
 }
+
+const EPOCH_CRASH_CHILD_CASE: &str = "store_fs::index::epoch::tests::restore_epoch_crash_child";
+
+struct ParkingEntropy<'a> {
+    root: &'a std::path::Path,
+    pause: bool,
+    inner: Entropy,
+}
+impl ports::Entropy for ParkingEntropy<'_> {
+    fn fill(&mut self, output: &mut [u8]) -> Result<(), ports::CryptoError> {
+        ports::Entropy::fill(&mut self.inner, output)?;
+        assert_eq!(self.inner.calls, 1);
+        if self.pause {
+            // The candidate exists only in caller scratch; BEGIN has not run.
+            super::super::crash_tests::acknowledge_and_wait(self.root, "before-epoch-sql");
+        }
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "child endpoint invoked only by the restored-epoch abrupt-death parent oracle"]
+fn restore_epoch_crash_child() {
+    use super::super::crash_tests::{acknowledge_and_wait, PHASE_ENV, ROOT_ENV};
+    let root_path = std::env::var_os(ROOT_ENV).unwrap();
+    let root_path = std::path::Path::new(&root_path);
+    let phase = std::env::var(PHASE_ENV).unwrap();
+    assert!(matches!(
+        phase.as_str(),
+        "before-epoch-sql" | "before-epoch-commit" | "after-epoch-return"
+    ));
+    crate::store_fs::with_probe_root_path(root_path, |root| {
+        let store = IndexStore::open(root, clock(), 2, deadline()).unwrap();
+        inspect(&store, EPOCH);
+        if phase == "before-epoch-commit" {
+            let pause_root = root_path.to_path_buf();
+            lock(&lock(&store.writer).unwrap().native.connection)
+                .unwrap()
+                .commit_hook(Some(move || {
+                    acknowledge_and_wait(&pause_root, "before-epoch-commit");
+                    false
+                }))
+                .unwrap();
+        }
+        let mut entropy = ParkingEntropy {
+            root: root_path,
+            pause: phase == "before-epoch-sql",
+            inner: Entropy::fresh(),
+        };
+        let store = store.renew_epoch(&mut entropy, deadline()).unwrap();
+        assert_eq!(phase, "after-epoch-return");
+        assert_eq!(entropy.inner.calls, 1);
+        inspect(&store, FRESH);
+        assert!(
+            fs::metadata(root_path.join("metadata.sqlite3-wal"))
+                .unwrap()
+                .len()
+                > 32
+        );
+        acknowledge_and_wait(root_path, "after-epoch-return");
+    });
+}
+
+#[test]
+fn restored_epoch_process_death_cuts_preserve_history_and_expected_identity() {
+    for phase in [
+        "before-epoch-sql",
+        "before-epoch-commit",
+        "after-epoch-return",
+    ] {
+        let source = Fixture::new();
+        let destination = Fixture::new();
+        {
+            let mut source_root = source.locked();
+            let mut destination_root = destination.locked();
+            let store =
+                IndexStore::create(&mut source_root, EPOCH, clock(), 2, deadline()).unwrap();
+            seed(&store);
+            inspect(&store, EPOCH);
+            let receipt = store
+                .backup(&mut destination_root, deadline(), &mut [0; 65536])
+                .unwrap();
+            assert_eq!(receipt.epoch, EPOCH);
+        }
+        super::super::crash_tests::kill_child_at(
+            &destination.path,
+            phase,
+            EPOCH_CRASH_CHILD_CASE,
+            None,
+        );
+        let mut source_root = source.locked();
+        let original = IndexStore::open(&mut source_root, clock(), 2, deadline()).unwrap();
+        original.validate_integrity(deadline()).unwrap();
+        inspect(&original, EPOCH);
+        let mut destination_root = destination.locked();
+        let restored = IndexStore::open(&mut destination_root, clock(), 2, deadline()).unwrap();
+        restored.validate_integrity(deadline()).unwrap();
+        let expected = if phase == "after-epoch-return" {
+            FRESH
+        } else {
+            EPOCH
+        };
+        inspect(&restored, expected);
+        let identity = restored.view(ACCOUNT, deadline()).unwrap().identity();
+        let old = DataState {
+            account: ACCOUNT,
+            epoch: EPOCH,
+            kind: DataType::Mailbox,
+            sequence: Sequence::from_u64(2),
+        };
+        let current = DataState {
+            account: identity.account,
+            epoch: identity.epoch,
+            kind: DataType::Mailbox,
+            sequence: identity.committed_sequence,
+        };
+        assert_eq!(
+            old.is_retained_for(current, identity.history_floor),
+            phase != "after-epoch-return"
+        );
+        let value = encode(Row::Blob(blob()));
+        assert_eq!(
+            restored.commit(
+                &td_crypto::Provider,
+                request(2),
+                &[Operation::put(Table::Blobs, DELETED.as_bytes(), &value).unwrap()],
+                &mut [BlobSource {
+                    id: DELETED,
+                    source: &mut std::io::Cursor::new(RAW)
+                }]
+            ),
+            Err(CommitError::Rejected(ports::Error::Conflict))
+        );
+        inspect(&restored, expected);
+    }
+}

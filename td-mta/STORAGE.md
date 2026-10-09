@@ -623,6 +623,24 @@ in-memory epoch and returns the owner, including success observed after
 the deadline. Accounts, endpoints, floors, objects, body chunks,
 retained changes and the used-blob-ID registry are preserved.
 
+The restored-epoch process-death oracle first creates a real backup
+with two accounts, retained history and a permanently used deleted blob
+ID. One child parks inside the supplied entropy fill after preparing
+its candidate but before fill returns or epoch SQL begins. A second
+parks in the existing safe SQLite commit hook after the epoch UPDATE
+and before that hook returns; a third parks after the returned owner
+and new identity are checked, with an actual nonempty WAL retained. The
+parent kills and reaps only that child and reopens the source and
+restored snapshot. The source keeps its old
+epoch; the snapshot retains the old epoch at the before-SQL and
+before-commit cuts and the new one after the known return. Account
+endpoints/floors, retained change, body bytes/digest, empty second account
+and used-ID refusal remain intact.
+Old client state matches both precommit identities. These three bounded
+cuts do not qualify the entire UPDATE/COMMIT window, unknown commit
+outcomes, power loss, entropy uniqueness, full filesystem faults or
+service activation.
+
 A live borrowed view or body prevents consuming the engine. Every
 returned error also consumes it, so an indeterminate commit cannot leave
 a reusable owner with a stale epoch. The caller retains the root lock

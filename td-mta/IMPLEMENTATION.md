@@ -2636,6 +2636,13 @@ separate qualification.
 
 Epoch renewal atomically replaces the epoch from admitted entropy while
 preserving account histories and bodies; every error consumes its owner.
+The restored-epoch process-death oracle creates a real backup and parks
+its recorded child before epoch SQL, in the existing safe commit hook,
+and after a returned owner with a retained WAL. Reopen checks preserve
+account endpoints/floors, history, body contents and used IDs, with the
+old identity at both precommit cuts and a new identity after return.
+STORAGE.md states the bounded cuts and remaining qualification.
+
 These primitives do not complete the restore command,
 selection/verification workflow or service activation.
 

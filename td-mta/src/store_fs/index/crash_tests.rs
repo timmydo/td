@@ -27,8 +27,8 @@ const BODY_BYTES: u64 = 2 * 1024 * 1024;
 const CHILD_CASE: &str = "store_fs::index::crash_tests::crash_child";
 const BACKUP_CHILD_CASE: &str = "store_fs::index::crash_tests::backup_crash_child";
 const DESTINATION_ENV: &str = "TD_MTA_BACKUP_CRASH_DESTINATION";
-const ROOT_ENV: &str = "TD_MTA_CRASH_FIXTURE_ROOT";
-const PHASE_ENV: &str = "TD_MTA_CRASH_FIXTURE_PHASE";
+pub(super) const ROOT_ENV: &str = "TD_MTA_CRASH_FIXTURE_ROOT";
+pub(super) const PHASE_ENV: &str = "TD_MTA_CRASH_FIXTURE_PHASE";
 
 struct Fixed;
 impl Clock for Fixed {
@@ -78,7 +78,7 @@ fn mailbox_row() -> Vec<u8> {
         subscribed: true,
     }))
 }
-fn acknowledge_and_wait(root: &Path, phase: &str) {
+pub(super) fn acknowledge_and_wait(root: &Path, phase: &str) {
     let path = root.join("crash-ready");
     let mut marker = OpenOptions::new()
         .write(true)
@@ -169,7 +169,7 @@ impl Drop for ChildGuard {
 fn kill_at(root: &Path, phase: &str) {
     kill_child_at(root, phase, CHILD_CASE, None);
 }
-fn kill_child_at(root: &Path, phase: &str, case: &str, destination: Option<&Path>) {
+pub(super) fn kill_child_at(root: &Path, phase: &str, case: &str, destination: Option<&Path>) {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args([
