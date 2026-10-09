@@ -720,6 +720,68 @@ cuts do not qualify the entire UPDATE/COMMIT window, unknown commit
 outcomes, power loss, entropy uniqueness, full filesystem faults or
 service activation.
 
+The separate ignored
+maximum_database_backup_epoch_preserves_complete_account fixture qualifies
+known-success epoch replacement on a real body-dominated 8 GiB backup.
+It reuses the bounded public admission and optional padding helper, captures
+the original passive view identity and Email DataState, then consumes the
+source into public backup with one 64 KiB caller buffer. The receipt must
+match the old epoch and exactly 8589934592 bytes; the destination partial
+name must be absent. Both root locks remain held throughout.
+
+The destination opens with eight readers plus the writer, initially matching
+the original identity and all 2097152 pages. Public consuming renew_epoch
+uses exactly one deterministic test entropy fill of 16 bytes with a candidate
+different from the old epoch. The returned identity must change only its
+epoch; the old state becomes stale and the new state retains itself. Full
+physical integrity, every expected typed Blob row and changed sequence,
+endpoint/floor, permanent-ID count, metadata counts, declared bytes and
+original body digests are checked under one maintenance view per account
+pass, without per-body allowance renewal. Checkpoint and reopen retain the
+new epoch and repeat those complete checks. Finally, the source independently
+reopens with its original identity and retained old state and repeats all
+content checks. Stores open sequentially, with nine native connections at a
+time; the destination checkpointed main file and original source remain
+exactly 8 GiB. No eighteen-connection overlap is exercised.
+
+After the optimized native build below, run its library test executable with
+a private disk-backed TMPDIR containing at least 40 GiB free:
+
+```text
+TMPDIR=/path/on/disk timeout --kill-after=5s 2700 target/release/td-builder run-capped "$td_mta_lib_test" --ignored --exact store_fs::index::database_qualification::maximum_database_backup_epoch_preserves_complete_account --nocapture --test-threads=1
+```
+
+Require exit status zero and exactly one passed test. Ordinary gates leave
+this case ignored. Its fixed clock, between-call 30-minute bound, outer
+timeout and owned-root cleanup have the same limitations and procedure as
+the separate maximum-database fixture below.
+
+The 2026-10-09 optimized x86-64 GNU host run used rustc 1.99.0-nightly
+(6f72b5dd5), Linux 7.0.14 and btrfs. Public admission accepted 262 bodies
+with 16 clean Capacity refusals, reaching exactly 2097152 pages without
+padding. Backup copied 8589934592 bytes in 8.518 seconds; known-success
+epoch renewal with one fill took 18.739 milliseconds, including the checked
+post-renewal identity. Physical scans after renewal, after destination reopen
+and on the source took 9.107, 8.726 and 32.466 seconds. Each complete account
+pass verified 8513712128 declared body bytes in 58.013, 57.508 and 57.895
+seconds respectively. Exactly one test passed in 390.55 seconds with zero
+failures. The native library test executable SHA-256 was:
+
+```text
+5515590d41373e92e985ad3e52593f2a66951af0b49cca3297edd2e4bbb97d76
+```
+
+The unchanged 9 MiB individual and 16 MiB shared SQLite requested-allocation
+caps remained active. Six RSS observations were 5592, 11204, 11172, 11412,
+11576 and 11584 KiB; the largest reported VmHWM sample was 11584 KiB.
+This qualifies this healthy full-database epoch primitive and preserved
+body-dominated account, not entropy uniqueness, unknown commit outcomes,
+arbitrary-account metadata, portable/wrapped allocation attribution,
+transient RSS, guarded stack, full filesystem faults, power loss,
+credentials/configuration snapshots, operational restore authorization or
+service activation. No production storage, schema, unsafe, dependency,
+allocator hook or native-cap change is introduced.
+
 A live borrowed view or body prevents consuming the engine. Every
 returned error also consumes it, so an indeterminate commit cannot leave
 a reusable owner with a stale epoch. The caller retains the root lock

@@ -7,6 +7,7 @@ use crate::{
     format::row::{BlobKind, BlobRow},
     ports::{Crypto, Tick, Time},
     store_fs::{AccountCheckLimits, BodyCheckLimits, MAX_FILE_STEP_BYTES},
+    sync::{DataState, DataType},
 };
 use std::{
     io::{self, Read},
@@ -15,6 +16,7 @@ use std::{
 
 const ACCOUNT: AccountId = AccountId::from_bytes([0xc1; 16]);
 const EPOCH: StoreEpoch = StoreEpoch::from_bytes([0xc2; 16]);
+const FRESH: StoreEpoch = StoreEpoch::from_bytes([0xc3; 16]);
 const DATABASE_BYTES: u64 = MAX_PAGES * PAGE_BYTES;
 const LIMIT: Duration = Duration::from_secs(30 * 60);
 const MAX_ATTEMPTS: u64 = 512;
@@ -260,7 +262,12 @@ fn dirty_bodies(store: &IndexStore<'_>, bodies: &[(BlobId, BlobRow)], started: I
         }
     }
 }
-fn verify(store: &IndexStore<'_>, bodies: &[(BlobId, BlobRow)], started: Instant) {
+fn verify(
+    store: &IndexStore<'_>,
+    bodies: &[(BlobId, BlobRow)],
+    started: Instant,
+    epoch: StoreEpoch,
+) {
     bounded(started);
     let phase = Instant::now();
     store.validate_integrity(deadline()).unwrap();
@@ -281,7 +288,8 @@ fn verify(store: &IndexStore<'_>, bodies: &[(BlobId, BlobRow)], started: Instant
     drop(writer);
     let phase = Instant::now();
     let mut view = store.maintenance_view(ACCOUNT, deadline()).unwrap();
-    assert_eq!(view.identity().epoch, EPOCH);
+    assert_eq!(store.epoch(), epoch);
+    assert_eq!(view.identity().epoch, epoch);
     assert_eq!(
         view.identity().committed_sequence,
         Sequence::from_u64(bodies.len() as u64)
@@ -366,13 +374,13 @@ fn maximum_database_checkpoint_and_account_maintenance() {
     assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
     assert_eq!(fs::metadata(&database).unwrap().len(), DATABASE_BYTES);
     memory("checkpointed");
-    verify(&store, &bodies, started);
+    verify(&store, &bodies, started, EPOCH);
     memory("verified");
     drop(store);
     let store = IndexStore::open(&mut root, Arc::new(Fixed), 8, deadline()).unwrap();
     assert_eq!(pages(&store), MAX_PAGES);
     assert_eq!(fs::metadata(&database).unwrap().len(), DATABASE_BYTES);
-    verify(&store, &bodies, started);
+    verify(&store, &bodies, started, EPOCH);
     memory("reopened-verified");
     eprintln!("maximum-database qualified elapsed={:?}", started.elapsed());
 }
@@ -434,17 +442,154 @@ fn maximum_database_backup_preserves_complete_account() {
     {
         let store = IndexStore::open(&mut root, Arc::new(Fixed), 8, deadline()).unwrap();
         assert_eq!(pages(&store), MAX_PAGES);
-        verify(&store, &bodies, started);
+        verify(&store, &bodies, started, EPOCH);
     }
     memory("backup-source-verified");
     {
         let store = IndexStore::open(&mut target, Arc::new(Fixed), 8, deadline()).unwrap();
         assert_eq!(pages(&store), MAX_PAGES);
-        verify(&store, &bodies, started);
+        verify(&store, &bodies, started, EPOCH);
     }
     memory("backup-destination-verified");
     eprintln!(
         "maximum-backup qualified blobs={} bytes={} elapsed={:?}",
+        bodies.len(),
+        receipt.bytes,
+        started.elapsed()
+    );
+}
+
+struct FreshEntropy(usize);
+impl ports::Entropy for FreshEntropy {
+    fn fill(&mut self, output: &mut [u8]) -> Result<(), ports::CryptoError> {
+        assert_eq!(output.len(), 16);
+        self.0 += 1;
+        output.copy_from_slice(FRESH.as_bytes());
+        Ok(())
+    }
+}
+fn state(identity: ViewIdentity) -> DataState {
+    DataState {
+        account: identity.account,
+        epoch: identity.epoch,
+        kind: DataType::Email,
+        sequence: identity.committed_sequence,
+    }
+}
+fn identity(store: &IndexStore<'_>) -> ViewIdentity {
+    store.view(ACCOUNT, deadline()).unwrap().identity()
+}
+
+#[test]
+#[ignore = "explicit qualification renews an 8 GiB backup epoch and verifies both roots"]
+fn maximum_database_backup_epoch_preserves_complete_account() {
+    let started = Instant::now();
+    let source = Fixture::new();
+    let destination = Fixture::new();
+    eprintln!(
+        "maximum-epoch source={} destination={}",
+        source.path.display(),
+        destination.path.display()
+    );
+    memory("epoch-baseline");
+    let mut root = source.locked();
+    let mut target = destination.locked();
+    let store = IndexStore::create(&mut root, EPOCH, Arc::new(Fixed), 8, deadline()).unwrap();
+    store.create_account(ACCOUNT, deadline()).unwrap();
+    let bodies = fill(&store, started);
+    fill_free_pages(&store, started);
+    assert_eq!(pages(&store), MAX_PAGES);
+    let original = identity(&store);
+    let old = state(original);
+    assert!(old.is_retained_for(old, original.history_floor));
+    memory("epoch-filled");
+    let phase = Instant::now();
+    let receipt = store
+        .backup(&mut target, deadline(), &mut [0; MAX_FILE_STEP_BYTES])
+        .unwrap();
+    bounded(started);
+    assert_eq!(
+        receipt,
+        BackupReceipt {
+            epoch: EPOCH,
+            bytes: DATABASE_BYTES
+        }
+    );
+    assert!(
+        fs::symlink_metadata(db_path(&target, RootEntry::BackupPartial).unwrap())
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+    );
+    eprintln!(
+        "maximum-epoch copy bytes={} elapsed={:?}",
+        receipt.bytes,
+        phase.elapsed()
+    );
+    memory("epoch-copied");
+    {
+        let store = IndexStore::open(&mut target, Arc::new(Fixed), 8, deadline()).unwrap();
+        assert_eq!(identity(&store), original);
+        assert_eq!(pages(&store), MAX_PAGES);
+        let mut entropy = FreshEntropy(0);
+        let phase = Instant::now();
+        let store = store.renew_epoch(&mut entropy, deadline()).unwrap();
+        bounded(started);
+        assert_eq!(entropy.0, 1);
+        assert_eq!(
+            identity(&store),
+            ViewIdentity {
+                epoch: FRESH,
+                ..original
+            }
+        );
+        let current = identity(&store);
+        assert!(!old.is_retained_for(state(current), current.history_floor));
+        assert!(state(current).is_retained_for(state(current), current.history_floor));
+        eprintln!(
+            "maximum-epoch renew entropy-fills={} elapsed={:?}",
+            entropy.0,
+            phase.elapsed()
+        );
+        verify(&store, &bodies, started, FRESH);
+        store.checkpoint(deadline()).unwrap();
+        assert_eq!(pages(&store), MAX_PAGES);
+        assert_eq!(
+            fs::metadata(db_path(store.root(), RootEntry::Database).unwrap())
+                .unwrap()
+                .len(),
+            DATABASE_BYTES
+        );
+    }
+    memory("epoch-renewed-verified");
+    {
+        let store = IndexStore::open(&mut target, Arc::new(Fixed), 8, deadline()).unwrap();
+        assert_eq!(
+            identity(&store),
+            ViewIdentity {
+                epoch: FRESH,
+                ..original
+            }
+        );
+        assert!(!old.is_retained_for(state(identity(&store)), original.history_floor));
+        assert_eq!(pages(&store), MAX_PAGES);
+        verify(&store, &bodies, started, FRESH);
+    }
+    memory("epoch-reopened-verified");
+    {
+        let store = IndexStore::open(&mut root, Arc::new(Fixed), 8, deadline()).unwrap();
+        assert_eq!(identity(&store), original);
+        assert!(old.is_retained_for(state(identity(&store)), original.history_floor));
+        assert_eq!(pages(&store), MAX_PAGES);
+        assert_eq!(
+            fs::metadata(db_path(store.root(), RootEntry::Database).unwrap())
+                .unwrap()
+                .len(),
+            DATABASE_BYTES
+        );
+        verify(&store, &bodies, started, EPOCH);
+    }
+    memory("epoch-source-verified");
+    eprintln!(
+        "maximum-epoch qualified blobs={} bytes={} elapsed={:?}",
         bodies.len(),
         receipt.bytes,
         started.elapsed()

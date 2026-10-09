@@ -2678,6 +2678,18 @@ account endpoints/floors, history, body contents and used IDs, with the
 old identity at both precommit cuts and a new identity after return.
 STORAGE.md states the bounded cuts and remaining qualification.
 
+The separate explicit maximum-backup epoch fixture passed known-success
+public epoch renewal on a real body-dominated 8 GiB copy with one
+16-byte deterministic entropy fill. It verified every expected typed row,
+changed sequence, endpoint/floor, permanent-ID count and complete account
+metadata/body digests after renewal, after destination checkpoint/reopen,
+and on the original source. Both locks remain held and stores open
+sequentially with nine native connections. The destination alone changes
+epoch and invalidates old passive state; the source retains its original
+identity. STORAGE.md and RESOURCES.md record the 390.55-second host run and
+its limits. Entropy uniqueness, unknown outcomes, arbitrary metadata,
+portable resources, full faults, power loss and activation remain separate.
+
 These primitives do not complete the restore command,
 selection/verification workflow or service activation.
 

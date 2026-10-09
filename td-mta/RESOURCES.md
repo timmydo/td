@@ -2704,6 +2704,25 @@ or whole-service overlap. STORAGE.md records the invocation, executable
 hash, actual extents and independent verification timings; a receipt
 remains separate from verification.
 
+The distinct maximum-backup epoch fixture passed public consuming epoch
+renewal on the body-dominated full 8 GiB copy, with eight readers plus the
+writer. One deterministic 16-byte test entropy fill changes only the
+destination epoch. Complete physical and account checks pass after renewal,
+after destination checkpoint/reopen, and on the independently reopened
+source, retaining both root locks and nine native owners at a time. Original
+row/sequence/floor/ID-count and body digest checks are preserved; old passive
+state is stale only for the new destination identity. Native caps remain
+9 MiB individual and 16 MiB shared.
+
+The optimized GNU host run passed one test in 390.55 seconds. Six RSS
+observations were 5592, 11204, 11172, 11412, 11576 and 11584 KiB; the largest
+reported VmHWM sample was 11584 KiB. STORAGE.md records the exact invocation,
+executable hash, copy/renewal and three full verification timings. These are
+host observations for this known-success primitive and preserved account,
+not portable/wrapped allocation attribution, transient RSS, guarded stack,
+arbitrary-account metadata, entropy uniqueness, unknown outcomes, full
+faults, power loss, whole-service overlap or operational restore activation.
+
 The separate --sqlite-account mode extends the bounded 32 MiB body
 scenario with parent/child mailboxes and complete account verification
 through maintenance_view and verify_account, including after reopen.
