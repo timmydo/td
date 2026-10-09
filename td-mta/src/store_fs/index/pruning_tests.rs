@@ -698,6 +698,9 @@ fn epoch_renewal_preserves_backup_history_pending_cleanup() {
     pruned_reader_scenario(PrunedScenario::RenewedBackup);
 }
 
+// SQLite's heap cap is process-wide; isolate these full-pool fixtures.
+static FULL_READER_FIXTURE: Mutex<()> = Mutex::new(());
+
 enum PrunedScenario {
     Cleaned,
     PendingBackup,
@@ -705,6 +708,7 @@ enum PrunedScenario {
 }
 
 fn pruned_reader_scenario(scenario: PrunedScenario) {
+    let _fixture_guard = FULL_READER_FIXTURE.lock().unwrap();
     let copy_pending = !matches!(scenario, PrunedScenario::Cleaned);
     let renew_pending = matches!(scenario, PrunedScenario::RenewedBackup);
     const READERS: usize = 8;
@@ -1111,5 +1115,267 @@ fn pruned_reader_scenario(scenario: PrunedScenario) {
         copied.checkpoint(deadline()).unwrap();
         source.validate_integrity(deadline()).unwrap();
         copied.validate_integrity(deadline()).unwrap();
+    }
+}
+
+#[test]
+fn renewed_backup_cleanup_preserves_distinct_accounts_with_shared_object_ids() {
+    let _fixture_guard = FULL_READER_FIXTURE.lock().unwrap();
+    const READERS: usize = 8;
+    const BYTES: usize = 2 * 1024 * 1024;
+    const FRESH: StoreEpoch = StoreEpoch::from_bytes([0xa6; 16]);
+    let fixture = Fixture::new();
+    let destination = Fixture::new();
+    let mut root = fixture.locked();
+    let mut copied_root = destination.locked();
+    let clock = Arc::new(Timer(AtomicU64::new(1)));
+    let store = IndexStore::create(&mut root, EPOCH, clock.clone(), READERS, deadline()).unwrap();
+    let blob = BlobId::from_bytes([4; 16]);
+    let parent = MailboxId::from_bytes([3; 16]);
+    let bodies: [_; 2] = std::array::from_fn(|index| {
+        (0..BYTES)
+            .map(|n| ((n + index * 17) % 251) as u8)
+            .collect::<Vec<_>>()
+    });
+    let blob_rows: [_; 2] = std::array::from_fn(|index| {
+        let mut digest = td_crypto::Provider.sha256().unwrap();
+        digest.update(&bodies[index]).unwrap();
+        Row::Blob(BlobRow {
+            kind: BlobKind::Message,
+            length: BYTES as u64,
+            digest: digest.finish().unwrap(),
+            created_at: 0,
+        })
+    });
+    let mailbox = |name: &'static str| {
+        Row::Mailbox(MailboxRow {
+            name,
+            parent: None,
+            role: None,
+            sort_order: 0,
+            subscribed: true,
+        })
+    };
+    for (index, account) in [ACCOUNT, OTHER].into_iter().enumerate() {
+        store.create_account(account, deadline()).unwrap();
+        let mut body_bytes = [0; 128];
+        let body_len = blob_rows[index].encode(&mut body_bytes).unwrap();
+        let mut parent_bytes = [0; 128];
+        let parent_len = mailbox(if index == 0 { "first" } else { "other" })
+            .encode(&mut parent_bytes)
+            .unwrap();
+        let mut input = bodies[index].as_slice();
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                CommitRequest {
+                    account,
+                    expected: Sequence::default(),
+                    utc_ms: 0,
+                    deadline: deadline()
+                },
+                &[
+                    Operation::put(Table::Blobs, blob.as_bytes(), &body_bytes[..body_len]).unwrap(),
+                    Operation::put(
+                        Table::Mailboxes,
+                        parent.as_bytes(),
+                        &parent_bytes[..parent_len]
+                    )
+                    .unwrap(),
+                    Operation::change(
+                        ObjectType::Mailbox,
+                        ChangeAction::Created,
+                        parent.as_bytes()
+                    ),
+                ],
+                &mut [BlobSource {
+                    id: blob,
+                    source: &mut input
+                }],
+            ),
+            Ok(Sequence::from_u64(1))
+        );
+        assert!(input.is_empty());
+    }
+    mailbox_commit(&store, 1, false);
+    let identity = |account, epoch| ViewIdentity {
+        account,
+        epoch,
+        committed_sequence: Sequence::from_u64(if account == ACCOUNT { 2 } else { 1 }),
+        history_floor: Sequence::from_u64(if account == ACCOUNT { 2 } else { 0 }),
+    };
+    assert_eq!(
+        store.prune_history(request(2, 2, 1)).unwrap(),
+        HistoryPruned {
+            identity: identity(ACCOUNT, EPOCH),
+            removed: 1,
+            more: true,
+        }
+    );
+    let mut scratch = [0; 65536];
+    let receipt = store
+        .backup(&mut copied_root, deadline(), &mut scratch)
+        .unwrap();
+    assert_eq!(receipt.epoch, EPOCH);
+    assert!(
+        receipt.bytes > (2 * BYTES) as u64 && receipt.bytes <= crate::limits::SQLITE_DATABASE_BYTES
+    );
+    assert_eq!(receipt.bytes % PAGE_BYTES, 0);
+    assert_eq!(
+        fs::symlink_metadata(db_path(&copied_root, RootEntry::Database).unwrap())
+            .unwrap()
+            .len(),
+        receipt.bytes
+    );
+    for fixture in [&fixture, &destination] {
+        assert!(matches!(
+            fixture.lock(),
+            Err(crate::store_fs::LockError::Busy)
+        ));
+    }
+    let source = IndexStore::open(&mut root, clock.clone(), READERS, deadline()).unwrap();
+    let copied = IndexStore::open(&mut copied_root, clock.clone(), READERS, deadline()).unwrap();
+    struct FreshEntropy(usize);
+    impl ports::Entropy for FreshEntropy {
+        fn fill(&mut self, output: &mut [u8]) -> Result<(), ports::CryptoError> {
+            assert_eq!(output.len(), 16);
+            self.0 += 1;
+            output.copy_from_slice(FRESH.as_bytes());
+            Ok(())
+        }
+    }
+    let mut entropy = FreshEntropy(0);
+    let copied = copied.renew_epoch(&mut entropy, deadline()).unwrap();
+    assert_eq!(entropy.0, 1);
+    assert_eq!(copied.epoch(), FRESH);
+    drop(copied);
+    let copied = IndexStore::open(&mut copied_root, clock.clone(), READERS, deadline()).unwrap();
+    let check = |view: &mut IndexReadView<'_, '_>, account, epoch, scratch: &mut [u8]| {
+        assert_eq!(view.identity(), identity(account, epoch));
+        let index = if account == ACCOUNT { 0 } else { 1 };
+        assert_eq!(
+            view.get(Key::Blob(blob), scratch).unwrap(),
+            Some((blob_rows[index], Sequence::from_u64(1)))
+        );
+        assert_eq!(
+            view.get(Key::Mailbox(parent), scratch).unwrap(),
+            Some((
+                mailbox(if index == 0 { "updated" } else { "other" }),
+                Sequence::from_u64(if index == 0 { 2 } else { 1 })
+            ))
+        );
+        if account == ACCOUNT {
+            assert_eq!(
+                view.next_change(cursor(0, u32::MAX), ObjectType::Mailbox),
+                Err(ports::Error::HistoryLost)
+            );
+            assert_eq!(
+                view.next_change(cursor(2, u32::MAX), ObjectType::Mailbox)
+                    .unwrap(),
+                ChangeStep::Complete
+            );
+        } else {
+            assert_eq!(account, OTHER);
+            assert_eq!(
+                view.next_change(cursor(0, u32::MAX), ObjectType::Mailbox)
+                    .unwrap(),
+                ChangeStep::Record(ChangeRecord {
+                    cursor: cursor(1, 2),
+                    change: Change {
+                        kind: ObjectType::Mailbox,
+                        action: ChangeAction::Created,
+                        id: *parent.as_bytes()
+                    },
+                })
+            );
+            assert_eq!(
+                view.next_change(cursor(1, 2), ObjectType::Mailbox).unwrap(),
+                ChangeStep::Complete
+            );
+        }
+        let mut input = view
+            .open_blob_input(&td_crypto::Provider, blob, BYTES as u64)
+            .unwrap();
+        for bytes in bodies[index].chunks(65536) {
+            assert_eq!(input.read(scratch).unwrap(), bytes.len());
+            assert_eq!(&*scratch, bytes);
+        }
+        drop(input.finish().unwrap());
+    };
+    assert_eq!(source.epoch(), EPOCH);
+    assert_eq!(copied.epoch(), FRESH);
+    for store in [&source, &copied] {
+        store.validate_integrity(deadline()).unwrap();
+    }
+    {
+        let mut source_views: [_; READERS] = std::array::from_fn(|index| {
+            source
+                .view(if index % 2 == 0 { ACCOUNT } else { OTHER }, deadline())
+                .unwrap()
+        });
+        let mut copied_views: [_; READERS] = std::array::from_fn(|index| {
+            copied
+                .view(if index % 2 == 0 { ACCOUNT } else { OTHER }, deadline())
+                .unwrap()
+        });
+        for (views, epoch) in [(&mut source_views, EPOCH), (&mut copied_views, FRESH)] {
+            for (index, view) in views.iter_mut().enumerate() {
+                check(
+                    view,
+                    if index % 2 == 0 { ACCOUNT } else { OTHER },
+                    epoch,
+                    &mut scratch,
+                );
+            }
+        }
+        for (store, epoch) in [(&copied, FRESH), (&source, EPOCH)] {
+            assert!(matches!(
+                store.view(ACCOUNT, deadline()),
+                Err(ports::Error::Busy)
+            ));
+            assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
+            for removed in [1, 0] {
+                assert_eq!(
+                    store.prune_history(request(2, 2, 1)).unwrap(),
+                    HistoryPruned {
+                        identity: identity(ACCOUNT, epoch),
+                        removed,
+                        more: false
+                    }
+                );
+            }
+        }
+        for (views, epoch) in [(&mut source_views, EPOCH), (&mut copied_views, FRESH)] {
+            for (index, view) in views.iter_mut().enumerate() {
+                check(
+                    view,
+                    if index % 2 == 0 { ACCOUNT } else { OTHER },
+                    epoch,
+                    &mut scratch,
+                );
+            }
+        }
+        for store in [&source, &copied] {
+            assert!(matches!(
+                store.view(OTHER, deadline()),
+                Err(ports::Error::Busy)
+            ));
+            assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
+        }
+    }
+    for store in [&source, &copied] {
+        store.checkpoint(deadline()).unwrap();
+        store.validate_integrity(deadline()).unwrap();
+    }
+    drop(copied);
+    drop(source);
+    let source = IndexStore::open(&mut root, clock.clone(), READERS, deadline()).unwrap();
+    let copied = IndexStore::open(&mut copied_root, clock, READERS, deadline()).unwrap();
+    for (store, epoch) in [(&source, EPOCH), (&copied, FRESH)] {
+        store.validate_integrity(deadline()).unwrap();
+        for account in [ACCOUNT, OTHER] {
+            let mut view = store.view(account, deadline()).unwrap();
+            check(&mut view, account, epoch, &mut scratch);
+        }
     }
 }

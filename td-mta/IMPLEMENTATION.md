@@ -2483,6 +2483,41 @@ multi-account/maximal stores, runtime retention/admission, complete
 filesystem faults, power loss and whole-service behavior are not
 qualified by this fixture.
 
+A separate bounded native fixture qualifies two accounts with identical
+BlobId and MailboxId values but different patterned 2 MiB bodies,
+digests and mailbox names. Public mutations leave the first account at
+sequence two with floor two and one retired history row pending cleanup;
+the second remains at sequence one with floor zero and an exact Created
+history record. A real public backup preserves both accounts. The copy
+renews through one deterministic sixteen-byte test-entropy fill and
+closes/reopens before view capture; source and copied epochs have
+independent fixed expectations.
+
+Both eight-reader pools alternate four views from each account and
+retain sixteen views and eighteen native owners together. Every view
+checks complete explicit account/epoch/endpoint/floor identity, exact
+typed rows and changed sequences, account-specific history, every
+original body byte and full digest. Copied cleanup of the first account
+returns one removed row with more false, then zero and false; source
+cleanup independently returns the same receipts under its original
+epoch. All sixteen retained views repeat the complete checks after
+cleanup. Ninth captures and checkpoints refuse Busy before and after
+cleanup. After views drop, both stores checkpoint, pass physical
+integrity, close and reopen. Fresh views repeat all checks for both
+accounts, including the original history record of the second account;
+this checks persisted account isolation beyond the old retained
+snapshots.
+
+This full-reader fixture family is serialized in the native test process
+because SQLite shares its unchanged 16 MiB heap cap process-wide; each
+fixture retains its full simultaneous pool and view assertions. This
+qualifies only the bounded sequential two-account dataset. Deterministic
+test entropy is not SystemEntropy qualification. No production, unsafe,
+hook, dependency or cap change is introduced. Portable resources,
+arbitrary-account/maximal stores, parallel service work, runtime
+retention/admission, complete filesystem faults, power loss and
+whole-service behavior remain separate.
+
 **Acceptance:** snapshots across commits/checkpoints, pool exhaustion, native
 page/WAL/heap capacity, failed body streaming, indeterminate COMMIT recovery,
 queue references after visible email deletion, history resync, bounded reclamation
