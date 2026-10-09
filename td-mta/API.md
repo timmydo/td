@@ -6546,6 +6546,17 @@ ordinals with Corrupt, including any chunk for an empty body. Its indexed
 extent check shares the original snapshot, deadline and VM fuel; a failed
 check yields no completed pin.
 
+IndexStore::maintenance_view(account, deadline) captures the same pooled
+IndexReadView with the finite full-maintenance VM ceiling instead of the
+ordinary 8000000-step allowance. That allowance is installed once,
+before BEGIN and endpoint capture, under the original writer-acquisition
+clock and supplied deadline. Metadata/body checks consume it without
+renewal. It shares ordinary pool limits, snapshot ownership and cleanup;
+returning the slot does not raise the next ordinary view's allowance.
+This cold verification API is not a physical scan, new body pin or
+promise of maximum-database completion. No protocol or CLI path is
+activated by it.
+
 view captures a real SQLite WAL read transaction under the writer mutex.
 ViewIdentity contains account, epoch, committed_sequence and history_floor.
 Later commits remain invisible. get and next decode bounded typed rows into

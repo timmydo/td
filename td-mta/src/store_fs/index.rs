@@ -641,6 +641,22 @@ impl<'r> IndexStore<'r> {
         account: AccountId,
         deadline: Deadline,
     ) -> Result<IndexReadView<'_, 'r>, ports::Error> {
+        self.capture_view(account, deadline, VM_STEPS)
+    }
+    /// Cold verification view; one finite maintenance allowance covers its lifetime.
+    pub fn maintenance_view(
+        &self,
+        account: AccountId,
+        deadline: Deadline,
+    ) -> Result<IndexReadView<'_, 'r>, ports::Error> {
+        self.capture_view(account, deadline, INTEGRITY_VM_STEPS)
+    }
+    fn capture_view(
+        &self,
+        account: AccountId,
+        deadline: Deadline,
+        steps: u64,
+    ) -> Result<IndexReadView<'_, 'r>, ports::Error> {
         let (_writer, acquired) = self.writer_observed(deadline)?;
         let mut pool = lock(&self.readers)?;
         let slot = pool
@@ -653,6 +669,7 @@ impl<'r> IndexStore<'r> {
         };
         drop(pool);
         let result = native.begin_work_after(deadline, acquired).and_then(|()| {
+            lock(&native.budget)?.remaining = steps;
             native.run(|db| {
                 db.execute_batch("BEGIN DEFERRED").map_err(sql)?;
                 identity(db, account, self.epoch)
@@ -1734,6 +1751,7 @@ mod tests {
             "commit",
             "prune_history",
             "view",
+            "maintenance_view",
             "validate_integrity",
             "usage_fence",
             "checkpoint",
@@ -1804,6 +1822,7 @@ mod tests {
                             .map(|_| ()),
                     ),
                     "view" => store.view(ACCOUNT, deadline()).map(drop),
+                    "maintenance_view" => store.maintenance_view(ACCOUNT, deadline()).map(drop),
                     "validate_integrity" => store.validate_integrity(deadline()),
                     "usage_fence" => store.usage_fence(deadline()).map(drop),
                     "checkpoint" => store.checkpoint(deadline()),
@@ -1820,7 +1839,7 @@ mod tests {
                             "{entry}"
                         );
                         assert!(!writer.stopped, "{entry}");
-                        let sticky = if entry == "view" {
+                        let sticky = if matches!(entry, "view" | "maintenance_view") {
                             let readers = lock(&store.readers).unwrap();
                             let ReaderSlot::Available(native) = readers.first().unwrap() else {
                                 panic!("refused capture did not return its slot")
@@ -1853,7 +1872,7 @@ mod tests {
                             .unwrap();
                         assert_eq!(counts, (1, 1), "{entry}");
                         drop(next);
-                        if entry != "view" {
+                        if !matches!(entry, "view" | "maintenance_view") {
                             assert_eq!(store.validate_integrity(deadline()), Ok(()), "{entry}");
                         }
                     }
@@ -4627,6 +4646,125 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn maintenance_view_keeps_one_allowance_and_resets_the_returned_pool_slot() {
+        use crate::store_fs::{BodyCheckLimits, MAX_FILE_STEP_BYTES};
+        const WORK: &str = "WITH RECURSIVE work(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM work WHERE n<1000000) SELECT max(n) FROM work";
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let clock = Arc::new(Timer(AtomicU64::new(1)));
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            clock.clone(),
+            1,
+            deadline(),
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        for mode in ["normal", "maintenance", "reused"] {
+            let mut view = if mode == "maintenance" {
+                store.maintenance_view(ACCOUNT, deadline()).unwrap()
+            } else {
+                store.view(ACCOUNT, deadline()).unwrap()
+            };
+            assert!(matches!(
+                store.view(ACCOUNT, deadline()),
+                Err(ports::Error::Busy)
+            ));
+            assert!(matches!(
+                store.maintenance_view(ACCOUNT, deadline()),
+                Err(ports::Error::Busy)
+            ));
+            let result: Result<i64, _> = view.read_snapshot(|native| {
+                native.run(|db| db.query_row(WORK, [], |row| row.get(0)).map_err(sql))
+            });
+            let remaining = lock(&view.native().unwrap().budget).unwrap().remaining;
+            if mode == "maintenance" {
+                assert_eq!(result, Ok(1000000));
+                assert!(INTEGRITY_VM_STEPS - remaining > VM_STEPS);
+                let report = view
+                    .verify_bodies(
+                        &td_crypto::Provider,
+                        BodyCheckLimits { blobs: 0, bytes: 0 },
+                        &mut [0; MAX_FILE_STEP_BYTES],
+                    )
+                    .unwrap();
+                assert_eq!((report.blobs(), report.bytes()), (0, 0));
+                let after = lock(&view.native().unwrap().budget).unwrap().remaining;
+                assert!(after < remaining);
+                assert_eq!(view.get(Key::Mailbox(ID), &mut [0; 128]), Ok(None));
+                assert!(lock(&view.native().unwrap().budget).unwrap().remaining < after);
+                clock.0.store(100, Ordering::Relaxed);
+                assert_eq!(
+                    view.get(Key::Mailbox(ID), &mut [0; 128]),
+                    Err(ports::Error::Deadline)
+                );
+                clock.0.store(1, Ordering::Relaxed);
+                assert_eq!(
+                    view.get(Key::Mailbox(ID), &mut [0; 128]),
+                    Err(ports::Error::Deadline)
+                );
+            } else {
+                assert_eq!(result, Err(ports::Error::Capacity), "{mode}");
+                assert_eq!(remaining, 0, "{mode}");
+                assert_eq!(
+                    view.get(Key::Mailbox(ID), &mut [0; 128]),
+                    Err(ports::Error::Capacity),
+                    "{mode}"
+                );
+            }
+            drop(view);
+        }
+    }
+
+    #[test]
+    fn maintenance_view_reuses_snapshot_loss_and_missing_account_cleanup() {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let clock: Arc<dyn Clock> = Arc::new(Timer(AtomicU64::new(1)));
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            clock.clone(),
+            1,
+            deadline(),
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        assert!(matches!(
+            store.maintenance_view(AccountId::from_bytes([11; 16]), deadline()),
+            Err(ports::Error::NotFound)
+        ));
+        let mut view = store.maintenance_view(ACCOUNT, deadline()).unwrap();
+        let identity = view.identity();
+        lock(&view.native().unwrap().connection)
+            .unwrap()
+            .execute_batch("ROLLBACK")
+            .unwrap();
+        assert_eq!(
+            view.get(Key::Mailbox(ID), &mut [0; 128]),
+            Err(ports::Error::Corrupt)
+        );
+        lock(&view.native().unwrap().connection)
+            .unwrap()
+            .execute_batch("BEGIN DEFERRED")
+            .unwrap();
+        assert_eq!(
+            view.get(Key::Mailbox(ID), &mut [0; 128]),
+            Err(ports::Error::Corrupt)
+        );
+        drop(view);
+        assert!(matches!(
+            store.maintenance_view(ACCOUNT, deadline()),
+            Err(ports::Error::Busy)
+        ));
+        drop(store);
+        let store = IndexStore::open(&mut root, clock, 1, deadline()).unwrap();
+        let view = store.maintenance_view(ACCOUNT, deadline()).unwrap();
+        assert_eq!(view.identity(), identity);
     }
 
     fn seed_body_verification(store: &IndexStore<'_>, account: AccountId) {

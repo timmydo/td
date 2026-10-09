@@ -1402,8 +1402,11 @@ anchor-cardinality and complete blob chunk-geometry scans specified in
 STORAGE.md; body pins still require exact length/digest verification.
 The synchronous IndexReadView::verify_bodies primitive verifies every
 enumerated body for one account view under explicit count/byte limits
-and the original snapshot, deadline and VM fuel. Its historical
-completion report grants no body custody or current freshness.
+and the original snapshot, deadline and VM fuel. Explicit cold
+maintenance_view captures the same pooled snapshot with one finite
+full-maintenance VM allowance; ordinary views retain their smaller cap.
+Neither scope renews while verification runs. Its historical completion
+report grants no body custody or current freshness.
 account_checks::combine binds historical metadata/body results only for
 matching full view identities and Blob counts; physical completeness
 and full verification remain separate offline-coordinator requirements.

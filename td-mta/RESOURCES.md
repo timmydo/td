@@ -2635,14 +2635,19 @@ hashing. Full table/index comparisons may require O(N log N) work and
 stop after the first physical error. No maximum-database maintenance
 resource qualification is established by the bounded WAL fixture.
 
-Synchronous account-body verification reuses caller-owned 64 KiB scratch,
-fixed 16-byte cursor/key and 64-byte row buffers, and one inline body
-input/digest at a time. Blob-count and total declared-byte ceilings are
-admitted before each body opens. The original reader-snapshot deadline
-and normal VM fuel apply across enumeration and all body reads/finishes;
-no per-body renewal is permitted. Native query allocations remain within
-the separate SQLite caps. No maximum-database body-verification resource
-or whole-service overlap qualification is claimed.
+Synchronous account-body verification reuses caller-owned 64 KiB
+scratch, fixed 16-byte cursor/key and 64-byte row buffers, and one
+inline body input/digest at a time. Blob-count and total declared-byte
+ceilings are admitted before each body opens. The original
+reader-snapshot deadline and captured VM allowance apply across
+enumeration and all body reads/finishes; no per-body renewal is
+permitted. Explicit cold maintenance_view uses the same
+physical-cap-sized finite VM ceiling as integrity maintenance, installed
+once before capture; ordinary views remain capped at 8000000 steps,
+including after a maintenance slot is returned. Native query allocations
+remain within the separate SQLite caps. No maximum-database
+body-verification resource or whole-service overlap qualification is
+claimed.
 
 SQLite setup and query calls may allocate Rust/native memory and are excluded
 from pure MIME zero-allocation claims. MIME fixtures prepare a real verified

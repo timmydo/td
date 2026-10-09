@@ -2607,7 +2607,10 @@ or manifest sufficient to audit changes. Rebuild indexes independently. Change
 store epoch on restore and refuse incompatible formats without altering them.
 
 The native offline primitives now include consuming IndexStore::backup
-and IndexStore::renew_epoch, plus bounded IndexReadView::verify_bodies.
+and IndexStore::renew_epoch, plus bounded IndexReadView::verify_bodies
+and explicit cold IndexStore::maintenance_view. The latter captures the
+same pooled snapshot with one finite full-maintenance allowance; normal
+view capture retains its ordinary allowance and pool reuse resets it.
 The body pass reuses snapshot-bound inputs and caller scratch, reports
 historical account-snapshot identity/counts only on full completion, and
 remains separate from physical and metadata verification.

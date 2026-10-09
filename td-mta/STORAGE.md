@@ -103,11 +103,17 @@ reservations: this calculation alone does not qualify their combined peak.
 
 Runtime scopes retain one original monotonic clock/deadline and 8000000
 interruptible VM steps. Opening validates only fixed schema/header state
-under that same bound. Full integrity maintenance has a separate
-1099511627776-step ceiling derived from the 8 GiB physical cap, under an
-explicitly supplied deadline. An interrupted maintenance scan reports
-failure without making the store impossible to open. Clock reversal or
-work failure stays sticky. Account creation, object/history
+under that same bound. Full integrity maintenance and explicit cold
+IndexStore::maintenance_view capture have a separate 1099511627776-step
+ceiling derived from the 8 GiB physical cap, under an explicitly supplied
+deadline. A maintenance view installs its allowance only at capture,
+before BEGIN and account endpoint lookup, and retains it for all
+metadata/body work. It uses the ordinary reader pool and snapshot/drop
+rules; a returned slot is reset to the ordinary allowance by view.
+Neither a larger allowance nor a fresh operation extends the captured
+deadline or clears failure within a live view. An interrupted maintenance
+scan reports failure without making the store impossible to open. Clock
+reversal or work failure stays sticky. Account creation, object/history
 transactions, view capture, integrity validation, usage fences and
 checkpoints carry the clock observation from writer-fence acquisition
 into native scope initialization. A reversal across that handoff returns
@@ -1189,7 +1195,9 @@ logical-byte limits are checked before opening each body, and every
 metadata/body query retains the original view deadline and finite VM
 fuel. No per-body allowance or fresh view is acquired. It is synchronous
 maintenance and does not promise one-body scheduling or completion at
-the maximum database size under the normal read-view allowance.
+the maximum database size. Ordinary views retain their normal allowance;
+explicit maintenance views retain their one larger finite allowance.
+Neither kind renews fuel within verification.
 
 CompleteBodies reports the captured ViewIdentity and counts only after
 every enumerated body finishes and enumeration terminates successfully.
