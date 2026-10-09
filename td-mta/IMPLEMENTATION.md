@@ -2518,6 +2518,43 @@ arbitrary-account/maximal stores, parallel service work, runtime
 retention/admission, complete filesystem faults, power loss and
 whole-service behavior remain separate.
 
+A separate native scenario now retains sixteen partial body inputs
+across independent cleanup in the original source and its renewed
+backup. It reuses the public two-account fixture with shared
+BlobId/MailboxId values, distinct patterned 2 MiB bodies and mailbox
+names, first-account sequence two/floor two with one pending retired
+history row, and second-account sequence one/floor zero with its exact
+Created record. Both eight-reader pools alternate four views per
+account, retaining sixteen views and eighteen native owners. The earlier
+scenario remains independently named and runnable.
+
+After complete initial checks of all sixteen views, each new input reads
+its first exact 64 KiB chunk. All sixteen loans remain live while copied
+first-account cleanup returns one/false then zero/false, and original
+first-account cleanup independently returns the same receipts under its
+original epoch. Every remaining chunk is compared to its independently
+expected account-specific pattern, each complete digest is validated by
+finish, and all sixteen returned pins verify cross-chunk and final-byte
+reads. After pins drop, every retained view repeats explicit identity,
+typed-row/changed-sequence, body/digest and account-specific history
+checks. Ninth views and checkpoints refuse Busy before and after
+cleanup. Both stores then checkpoint, pass physical verification, close
+and reopen; fresh views verify both accounts, including preserved
+second-account history.
+
+The complete native invocation passed with 875 library tests and 14
+explicitly ignored cases, all five independently named full-reader
+family cases, passing integration fixtures and 201 documentation tests.
+Formatting and strict mail Clippy passed. The existing safe test-only
+fixture-family mutex covers acquisition through resource teardown and
+preserves each scenario's full simultaneous pools, views and loans. This
+is bounded native semantic evidence under unchanged SQLite caps, not
+portable allocation/RSS/stack, SystemEntropy,
+arbitrary-account/maximal-store, parallel-service, quota/admission, full
+filesystem-fault, power-loss or whole-service qualification. No
+production, schema, unsafe, hook, allowance, syscall, dependency,
+compiler flag or cap change is introduced.
+
 **Acceptance:** snapshots across commits/checkpoints, pool exhaustion, native
 page/WAL/heap capacity, failed body streaming, indeterminate COMMIT recovery,
 queue references after visible email deletion, history resync, bounded reclamation

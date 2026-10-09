@@ -1120,6 +1120,15 @@ fn pruned_reader_scenario(scenario: PrunedScenario) {
 
 #[test]
 fn renewed_backup_cleanup_preserves_distinct_accounts_with_shared_object_ids() {
+    shared_account_cleanup(false);
+}
+
+#[test]
+fn sixteen_partial_inputs_preserve_shared_account_bodies_during_backup_cleanup() {
+    shared_account_cleanup(true);
+}
+
+fn shared_account_cleanup(partial_inputs: bool) {
     let _fixture_guard = FULL_READER_FIXTURE.lock().unwrap();
     const READERS: usize = 8;
     const BYTES: usize = 2 * 1024 * 1024;
@@ -1328,22 +1337,75 @@ fn renewed_backup_cleanup_preserves_distinct_accounts_with_shared_object_ids() {
                 );
             }
         }
-        for (store, epoch) in [(&copied, FRESH), (&source, EPOCH)] {
-            assert!(matches!(
-                store.view(ACCOUNT, deadline()),
-                Err(ports::Error::Busy)
-            ));
-            assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
-            for removed in [1, 0] {
-                assert_eq!(
-                    store.prune_history(request(2, 2, 1)).unwrap(),
-                    HistoryPruned {
-                        identity: identity(ACCOUNT, epoch),
-                        removed,
-                        more: false
-                    }
-                );
+        let cleanup = || {
+            for (store, epoch) in [(&copied, FRESH), (&source, EPOCH)] {
+                assert!(matches!(
+                    store.view(ACCOUNT, deadline()),
+                    Err(ports::Error::Busy)
+                ));
+                assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
+                for removed in [1, 0] {
+                    assert_eq!(
+                        store.prune_history(request(2, 2, 1)).unwrap(),
+                        HistoryPruned {
+                            identity: identity(ACCOUNT, epoch),
+                            removed,
+                            more: false
+                        }
+                    );
+                }
             }
+        };
+        if partial_inputs {
+            let mut source_inputs = source_views.each_mut().map(|view| {
+                view.open_blob_input(&td_crypto::Provider, blob, BYTES as u64)
+                    .unwrap()
+            });
+            let mut copied_inputs = copied_views.each_mut().map(|view| {
+                view.open_blob_input(&td_crypto::Provider, blob, BYTES as u64)
+                    .unwrap()
+            });
+            for inputs in [&mut source_inputs, &mut copied_inputs] {
+                for (index, input) in inputs.iter_mut().enumerate() {
+                    assert_eq!(input.len(), BYTES as u64);
+                    assert_eq!(input.read(&mut scratch).unwrap(), scratch.len());
+                    assert_eq!(input.position(), scratch.len() as u64);
+                    assert_eq!(&scratch[..], &bodies[index % 2][..scratch.len()]);
+                }
+            }
+            cleanup();
+            for offset in (scratch.len()..BYTES).step_by(scratch.len()) {
+                for inputs in [&mut source_inputs, &mut copied_inputs] {
+                    for (index, input) in inputs.iter_mut().enumerate() {
+                        assert_eq!(input.read(&mut scratch).unwrap(), scratch.len());
+                        assert_eq!(
+                            &scratch[..],
+                            &bodies[index % 2][offset..offset + scratch.len()]
+                        );
+                    }
+                }
+            }
+            for inputs in [&source_inputs, &copied_inputs] {
+                assert!(inputs.iter().all(|input| input.position() == BYTES as u64));
+            }
+            let mut source_pins = source_inputs.map(|input| input.finish().unwrap());
+            let mut copied_pins = copied_inputs.map(|input| input.finish().unwrap());
+            for pins in [&mut source_pins, &mut copied_pins] {
+                for (index, pin) in pins.iter_mut().enumerate() {
+                    assert_eq!(pin.len(), BYTES as u64);
+                    assert_eq!(pin.read_at(65535, &mut scratch).unwrap(), scratch.len());
+                    assert_eq!(
+                        &scratch[..],
+                        &bodies[index % 2][65535..65535 + scratch.len()]
+                    );
+                    assert_eq!(pin.read_at(BYTES as u64 - 1, &mut scratch).unwrap(), 1);
+                    assert_eq!(scratch[0], bodies[index % 2][BYTES - 1]);
+                }
+            }
+            drop(copied_pins);
+            drop(source_pins);
+        } else {
+            cleanup();
         }
         for (views, epoch) in [(&mut source_views, EPOCH), (&mut copied_views, FRESH)] {
             for (index, view) in views.iter_mut().enumerate() {
