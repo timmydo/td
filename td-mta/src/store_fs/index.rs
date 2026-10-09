@@ -4767,6 +4767,357 @@ mod tests {
         assert_eq!(view.identity(), identity);
     }
 
+    fn account_check_limits() -> crate::store_fs::AccountCheckLimits {
+        crate::store_fs::AccountCheckLimits {
+            metadata: crate::metadata_sweep::Limits {
+                rows: 5,
+                parent_reads: 3,
+            },
+            bodies: crate::store_fs::BodyCheckLimits {
+                blobs: 3,
+                bytes: 65539,
+            },
+        }
+    }
+
+    #[test]
+    fn account_verification_preserves_old_wal_reports_and_all_explicit_limits() {
+        use crate::store_fs::{AccountCheckError, MAX_FILE_STEP_BYTES};
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            Arc::new(Timer(AtomicU64::new(1))),
+            2,
+            deadline(),
+        )
+        .unwrap();
+        seed_body_verification(&store, ACCOUNT);
+        let parent = MailboxId::from_bytes([7; 16]);
+        let child = MailboxId::from_bytes([8; 16]);
+        store
+            .commit(
+                &td_crypto::Provider,
+                request(3),
+                &[
+                    Operation::put(
+                        Table::Mailboxes,
+                        parent.as_bytes(),
+                        &mailbox("parent", None),
+                    )
+                    .unwrap(),
+                    Operation::put(
+                        Table::Mailboxes,
+                        child.as_bytes(),
+                        &mailbox("child", Some(parent)),
+                    )
+                    .unwrap(),
+                ],
+                &mut [],
+            )
+            .unwrap();
+        let mut old = store.maintenance_view(ACCOUNT, deadline()).unwrap();
+        let original = old.identity();
+        let replacement = BlobId::from_bytes([10; 16]);
+        let value = encode(Row::Blob(body_row(b"yy", BlobKind::Message)));
+        let mut source = b"yy".as_slice();
+        store
+            .commit(
+                &td_crypto::Provider,
+                request(4),
+                &[
+                    Operation::delete(Table::Blobs, BlobId::from_bytes([5; 16]).as_bytes())
+                        .unwrap(),
+                    Operation::put(Table::Blobs, replacement.as_bytes(), &value).unwrap(),
+                ],
+                &mut [BlobSource {
+                    id: replacement,
+                    source: &mut source,
+                }],
+            )
+            .unwrap();
+        let mut scratch = [0; MAX_FILE_STEP_BYTES];
+        let report = old
+            .verify_account(
+                &td_crypto::Provider,
+                17,
+                account_check_limits(),
+                &mut scratch,
+            )
+            .unwrap();
+        assert_eq!(report.identity(), original);
+        assert_eq!(report.metadata().references().utc_ms(), 17);
+        assert_eq!(report.metadata().references().rows(), 5);
+        assert_eq!(report.metadata().mailboxes().mailboxes(), 2);
+        assert_eq!(report.metadata().mailboxes().reads(), 3);
+        assert_eq!(
+            (report.bodies().blobs(), report.bodies().bytes()),
+            (3, 65538)
+        );
+        drop(old);
+        let mut fresh = store.view(ACCOUNT, deadline()).unwrap();
+        let report = fresh
+            .verify_account(
+                &td_crypto::Provider,
+                17,
+                account_check_limits(),
+                &mut scratch,
+            )
+            .unwrap();
+        assert_eq!(report.identity().committed_sequence, Sequence::from_u64(5));
+        assert_eq!(
+            (report.bodies().blobs(), report.bodies().bytes()),
+            (3, 65539)
+        );
+        drop(fresh);
+        for fault in ["rows", "parents", "blobs", "bytes"] {
+            let mut limits = account_check_limits();
+            match fault {
+                "rows" => limits.metadata.rows = 4,
+                "parents" => limits.metadata.parent_reads = 2,
+                "blobs" => limits.bodies.blobs = 2,
+                "bytes" => limits.bodies.bytes = 65538,
+                _ => panic!("unknown fault"),
+            }
+            let mut view = store.maintenance_view(ACCOUNT, deadline()).unwrap();
+            let result = view.verify_account(&td_crypto::Provider, 17, limits, &mut scratch);
+            let expected = match fault {
+                "rows" => AccountCheckError::Metadata(crate::metadata_sweep::Error::References(
+                    crate::reference_sweep::Error::RowLimit,
+                )),
+                "parents" => AccountCheckError::Metadata(crate::metadata_sweep::Error::Mailboxes(
+                    crate::mailbox_sweep::Error::Parent(crate::mailbox_parents::Error::ReadLimit),
+                )),
+                _ => AccountCheckError::Bodies(ports::Error::Capacity),
+            };
+            assert_eq!(result, Err(expected), "{fault}");
+        }
+        let empty = AccountId::from_bytes([11; 16]);
+        store.create_account(empty, deadline()).unwrap();
+        let mut view = store.maintenance_view(empty, deadline()).unwrap();
+        let mut limits = account_check_limits();
+        limits.metadata.rows = 0;
+        limits.metadata.parent_reads = 0;
+        limits.bodies.blobs = 0;
+        limits.bodies.bytes = 0;
+        let report = view
+            .verify_account(&td_crypto::Provider, 17, limits, &mut scratch)
+            .unwrap();
+        assert_eq!(report.identity().account, empty);
+        assert_eq!(
+            (
+                report.metadata().references().rows(),
+                report.bodies().bytes()
+            ),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn account_verification_stops_at_metadata_failure_before_body_work() {
+        use crate::store_fs::{AccountCheckError, MAX_FILE_STEP_BYTES};
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            Arc::new(Timer(AtomicU64::new(1))),
+            1,
+            deadline(),
+        )
+        .unwrap();
+        seed_body_verification(&store, ACCOUNT);
+        {
+            let writer = lock(&store.writer).unwrap();
+            writer.native.run(|db| {
+                db.execute("UPDATE blob_chunks SET body=x'7a' WHERE account=?1 AND blob=?2 AND ordinal=0", params![ACCOUNT.as_bytes().as_slice(), BlobId::from_bytes([5;16]).as_bytes().as_slice()]).map_err(sql)?;
+                Ok(())
+            }).unwrap();
+        }
+        store.validate_integrity(deadline()).unwrap();
+        let mut view = store.maintenance_view(ACCOUNT, deadline()).unwrap();
+        let reads = Arc::new(AtomicU64::new(0));
+        let observed = reads.clone();
+        lock(&view.native().unwrap().connection)
+            .unwrap()
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    AuthAction::Read {
+                        table_name: "blob_chunks",
+                        ..
+                    }
+                ) {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+        let mut scratch = [0; MAX_FILE_STEP_BYTES];
+        let mut limits = account_check_limits();
+        limits.metadata.rows = 0;
+        assert_eq!(
+            view.verify_account(&td_crypto::Provider, 0, limits, &mut scratch),
+            Err(AccountCheckError::Metadata(
+                crate::metadata_sweep::Error::References(crate::reference_sweep::Error::RowLimit)
+            ))
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            view.verify_account(
+                &td_crypto::Provider,
+                0,
+                account_check_limits(),
+                &mut scratch
+            ),
+            Err(AccountCheckError::Bodies(ports::Error::Corrupt))
+        );
+        assert!(reads.load(Ordering::Relaxed) > 0);
+        lock(&view.native().unwrap().connection)
+            .unwrap()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+    }
+
+    #[test]
+    fn account_verification_keeps_one_native_scope_across_metadata_and_bodies() {
+        use crate::store_fs::{AccountCheckError, MAX_FILE_STEP_BYTES};
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        for fault in ["fuel", "deadline", "reversal", "snapshot"] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let clock = Arc::new(Timer(AtomicU64::new(1)));
+            let store = IndexStore::create(
+                &mut root,
+                StoreEpoch::from_bytes([9; 16]),
+                clock.clone(),
+                1,
+                deadline(),
+            )
+            .unwrap();
+            seed_body_verification(&store, ACCOUNT);
+            let mut view = store.maintenance_view(ACCOUNT, deadline()).unwrap();
+            let native = view.native().unwrap();
+            let budget = native.budget.clone();
+            let initial = lock(&budget).unwrap().remaining;
+            let hook_budget = budget.clone();
+            let hook_clock = clock.clone();
+            let seen = Arc::new(AtomicU64::new(0));
+            let hook_seen = seen.clone();
+            if fault == "snapshot" {
+                lock(&native.connection)
+                    .unwrap()
+                    .execute_batch("ROLLBACK")
+                    .unwrap();
+            }
+            lock(&native.connection)
+                .unwrap()
+                .authorizer(Some(move |context: AuthContext<'_>| {
+                    if matches!(
+                        context.action,
+                        AuthAction::Read {
+                            table_name: "blob_chunks",
+                            ..
+                        }
+                    ) && hook_seen.fetch_add(1, Ordering::Relaxed) == 0
+                    {
+                        assert!(hook_budget.lock().unwrap().remaining < initial);
+                        match fault {
+                            "fuel" => hook_budget.lock().unwrap().remaining = 0,
+                            "deadline" => hook_clock.0.store(100, Ordering::Relaxed),
+                            "reversal" => hook_clock.0.store(0, Ordering::Relaxed),
+                            _ => (),
+                        }
+                    }
+                    Authorization::Allow
+                }))
+                .unwrap();
+            let expected = match fault {
+                "fuel" => ports::Error::Capacity,
+                "deadline" => ports::Error::Deadline,
+                "reversal" => ports::Error::Invalid,
+                _ => ports::Error::Corrupt,
+            };
+            let wrapped = if fault == "snapshot" {
+                AccountCheckError::Metadata(crate::metadata_sweep::Error::References(
+                    crate::reference_sweep::Error::View(expected),
+                ))
+            } else {
+                AccountCheckError::Bodies(expected)
+            };
+            let mut scratch = [0; MAX_FILE_STEP_BYTES];
+            assert_eq!(
+                view.verify_account(
+                    &td_crypto::Provider,
+                    0,
+                    account_check_limits(),
+                    &mut scratch
+                ),
+                Err(wrapped),
+                "{fault}"
+            );
+            assert_eq!(seen.load(Ordering::Relaxed) > 0, fault != "snapshot");
+            lock(&view.native().unwrap().connection)
+                .unwrap()
+                .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                .unwrap();
+            clock.0.store(1, Ordering::Relaxed);
+            if fault == "snapshot" {
+                lock(&view.native().unwrap().connection)
+                    .unwrap()
+                    .execute_batch("BEGIN DEFERRED")
+                    .unwrap();
+            } else {
+                assert_eq!(lock(&budget).unwrap().failure, Some(expected));
+            }
+            assert_eq!(
+                view.verify_account(
+                    &td_crypto::Provider,
+                    0,
+                    account_check_limits(),
+                    &mut scratch
+                ),
+                Err(AccountCheckError::Metadata(
+                    crate::metadata_sweep::Error::References(crate::reference_sweep::Error::View(
+                        expected
+                    ))
+                ))
+            );
+            drop(view);
+            if fault == "snapshot" {
+                assert!(matches!(
+                    store.maintenance_view(ACCOUNT, deadline()),
+                    Err(ports::Error::Busy)
+                ));
+                drop(store);
+                let reopened = IndexStore::open(&mut root, clock.clone(), 1, deadline()).unwrap();
+                assert!(reopened
+                    .maintenance_view(ACCOUNT, deadline())
+                    .unwrap()
+                    .verify_account(
+                        &td_crypto::Provider,
+                        0,
+                        account_check_limits(),
+                        &mut scratch
+                    )
+                    .is_ok());
+            } else {
+                assert!(store
+                    .maintenance_view(ACCOUNT, deadline())
+                    .unwrap()
+                    .verify_account(
+                        &td_crypto::Provider,
+                        0,
+                        account_check_limits(),
+                        &mut scratch
+                    )
+                    .is_ok());
+            }
+        }
+    }
+
     fn seed_body_verification(store: &IndexStore<'_>, account: AccountId) {
         store.create_account(account, deadline()).unwrap();
         for (sequence, (tag, length, kind)) in [

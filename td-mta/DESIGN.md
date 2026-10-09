@@ -1410,6 +1410,12 @@ report grants no body custody or current freshness.
 account_checks::combine binds historical metadata/body results only for
 matching full view identities and Blob counts; physical completeness
 and full verification remain separate offline-coordinator requirements.
+IndexReadView::verify_account drives bounded metadata and body checks
+and their report guard on one captured view, reusing caller scratch.
+Explicit metadata/body limits and caller-supplied trusted UTC govern
+admission; all stages spend the original deadline and VM allowance.
+Failure returns no combined report. The historical result retains the
+same separate physical, custody and activation requirements.
 SQLite recovery may read the full bounded WAL, and checkpoint may copy the
 entire bounded database in a synchronous native call. Neither promises
 interruption at the application deadline. Native resource and complete

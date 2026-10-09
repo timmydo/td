@@ -19,8 +19,13 @@ use td_crypto::Digest;
 
 // Compile filesystem and checker sources with their cfg(test) fixtures.
 // Filesystem fixtures need no production exception for the mapped test identity.
+use td_mta::metadata_sweep;
 #[cfg(test)]
 use td_mta::sync;
+pub use td_mta::{mailbox_sweep, reference_sweep};
+#[path = "../src/account_checks.rs"]
+#[allow(unused)] // Match the source-recompiled filesystem report types.
+mod account_checks;
 use td_mta::{bounded, config, format, ids, limits, ownership, ports, store_paths, wire};
 #[path = "../src/admission.rs"]
 #[allow(unused)] // Keep quota/work helpers in this measured source compilation.

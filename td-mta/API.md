@@ -6541,6 +6541,21 @@ old WAL results may combine after a writer commits, while cross-snapshot
 pairs refuse even when their counts match. It is neither physical/full
 store verification nor a body pin, freshness proof or authorization.
 
+IndexReadView::verify_account(crypto, utc_ms, AccountCheckLimits, scratch)
+drives metadata_sweep to completion, verifies all declared bodies, then
+combines both reports from that same view. Limits carry the existing
+metadata row/parent-read ceilings and body count/byte ceilings. Caller
+scratch is reused first as the metadata value buffer and then for body
+streaming, with one fixed metadata key buffer. The caller supplies the
+trusted UTC value for metadata policy; this method does not sample or
+authenticate UTC. Original snapshot, deadline and captured VM allowance
+cover all stages without renewal. AccountCheckError identifies Metadata,
+Bodies or Reports failure and preserves its error source; any failure
+returns no combined report. Empty accounts can complete under zero
+limits. This synchronous account check does not perform physical
+maintenance, acquire a fresh view, grant custody or activate a CLI. Its
+CompleteChecks result retains the historical limitations above.
+
 PinnedBlobInput::finish also refuses negative or trailing stored chunk
 ordinals with Corrupt, including any chunk for an empty body. Its indexed
 extent check shares the original snapshot, deadline and VM fuel; a failed

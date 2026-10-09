@@ -1221,6 +1221,19 @@ writer advances, so the package is neither ongoing freshness nor body
 custody or authority. Physical/index completeness and other full-store
 verification remain separate offline-coordinator requirements.
 
+IndexReadView::verify_account composes the metadata sweep, complete
+body pass and report guard synchronously over the same captured view.
+AccountCheckLimits supplies each existing metadata and body limit;
+trusted metadata UTC comes from the caller. One caller-owned 64 KiB
+scratch buffer serves metadata values before body streaming, beside a
+fixed 1024-byte metadata key buffer and the inline metadata sweep.
+Metadata failure stops before body work; later body or report failure
+also yields no combined completion. Error variants retain their source.
+The original deadline, snapshot and normal-or-maintenance allowance
+cover every stage without renewal. Physical/index validation, whole-store
+coverage, custody, authorization and operational activation remain
+separate requirements; this method returns only historical CompleteChecks.
+
 Full validate_integrity maintenance refuses a stopped writer and holds
 the writer fence throughout its scan. Existing read views remain usable;
 new view capture and commits return Busy until it finishes. It reports

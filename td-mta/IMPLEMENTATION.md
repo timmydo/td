@@ -2617,6 +2617,11 @@ remains separate from physical and metadata verification.
 account_checks::combine packages completed metadata/body reports only
 for matching full view identities and Blob counts; its package remains
 historical, with no physical, custody, freshness or authorization claim.
+IndexReadView::verify_account now drives those metadata/body stages and
+the report guard over one supplied native view with explicit limits and
+caller-supplied trusted UTC. It reuses caller scratch and the original
+snapshot/deadline/allowance, returning no combined report on failure.
+It does not perform the separate physical check or activate a command.
 Epoch renewal atomically replaces the epoch from admitted entropy while
 preserving account histories and bodies; every error consumes its owner.
 These primitives do not complete the restore command,

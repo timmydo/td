@@ -18,6 +18,10 @@ pub use index::{
 mod body_verify;
 pub use body_verify::{BodyCheckLimits, CompleteBodies};
 
+#[path = "store_fs/account_verify.rs"]
+mod account_verify;
+pub use account_verify::{AccountCheckError, AccountCheckLimits};
+
 #[path = "store_fs/pinned.rs"]
 mod pinned;
 #[cfg(test)]

@@ -160,8 +160,13 @@ mod tls_generation_scenario;
 #[path = "support/tls_remote_chain_scenario.rs"]
 mod tls_remote_chain_scenario;
 
+use td_mta::metadata_sweep;
 #[cfg(test)]
 use td_mta::sync;
+pub use td_mta::{mailbox_sweep, reference_sweep};
+#[path = "../src/account_checks.rs"]
+#[allow(unused)] // Match the source-recompiled filesystem report types.
+mod account_checks;
 use td_mta::{
     admission, bounded, config, format, ids, limits, mailbox_parents, ownership, ports,
     row_references, store_paths,

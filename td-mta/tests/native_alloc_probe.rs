@@ -565,8 +565,16 @@ fn tls_remote_chain() {
     println!("tls-{scenario}-allocation-v1: native passed");
 }
 
+#[cfg(td_native_alloc_probe)]
+use td_mta::metadata_sweep;
 #[cfg(all(test, td_native_alloc_probe))]
 use td_mta::sync;
+#[cfg(td_native_alloc_probe)]
+pub use td_mta::{mailbox_sweep, reference_sweep};
+#[cfg(td_native_alloc_probe)]
+#[path = "../src/account_checks.rs"]
+#[allow(unused)] // Match the source-recompiled filesystem report types.
+mod account_checks;
 #[cfg(td_native_alloc_probe)]
 use td_mta::{
     admission, bounded, config, format, ids, limits, mailbox_parents, ownership, ports,

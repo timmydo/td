@@ -2649,6 +2649,14 @@ remain within the separate SQLite caps. No maximum-database
 body-verification resource or whole-service overlap qualification is
 claimed.
 
+Synchronous verify_account first retains the existing inline metadata
+sweep plus a fixed 1024-byte key buffer, reusing the caller's 64 KiB
+scratch for metadata values. After that sweep is consumed, the same
+scratch serves body verification. Explicit row/parent-read and
+blob-count/byte ceilings remain separate. No fresh view or per-stage
+clock/VM allowance is acquired. These fixed owner/buffer bounds do not
+qualify maximum-account completion or whole-service overlap.
+
 SQLite setup and query calls may allocate Rust/native memory and are excluded
 from pure MIME zero-allocation claims. MIME fixtures prepare a real verified
 snapshot body pin cold; their existing intervals measure parser/adapter work
