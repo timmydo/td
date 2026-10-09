@@ -951,6 +951,60 @@ When Codex is the acting agent, run the newest Opus at xhigh:
 git show HEAD | claude -p --model opus --effort xhigh "Do a code review of the git commit on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/claude-review.md
 ```
 
+## Diagnostic reviews through td-agent
+
+`td-agent review` can review an exact commit through OpenRouter, with a
+disposable sparse checkout and confined tools. It is useful for evaluating
+models and inspecting their sessions. It does not change the reviewer
+roster above: substituting it for a required CLI needs the human approval
+and durable record required for an unavailable reviewer.
+
+On a host, use the CLI installed by `./install-apps`, with its fetch
+service and helpers. From the worktree, a small review can start with:
+
+```text
+td-agent review --repo . --commit HEAD \
+  --model anthropic/claude-opus-5.5 --effort high --max-cost 2.00
+```
+
+`--max-cost` bounds the whole invocation, including intermediate model
+requests. Admission reserves a worst case for the next request, so it can
+stop before reported spending reaches the cap. Broad searches and large
+tool results grow later requests; narrow searches and read files in
+sections. A larger cap needs enough OpenRouter credit for requests in
+flight, and increasing it does not fix missing build inputs. The default
+completion allowance is 32768 tokens; reducing it may cut reasoning or
+the final review. An interrupted or budget-stopped run is incomplete,
+even if its trace contains plausible findings.
+
+Require exit status zero and a final `REVIEWING` line naming the exact
+subject and full commit ID. Read the findings and reconcile their
+evidence, tests and limitations. Source is read-only, scratch is writable,
+and Cargo is offline. `--sparse DIRECTORY` supplies extra source trees;
+the model can also expand the checkout. A repository's Cargo runner may
+be absent, and external dependency sources are not supplied from the
+host's caches. Report an unrun test as a limitation. Review tests do not
+replace the branch's `ready` gate.
+
+The private JSONL trace path prints to stderr before setup and survives
+workspace cleanup. `--log-dir DIRECTORY` chooses a private location
+outside the repository and review mounts. The parent agent should inspect
+`end` and `cleanup`, then the budget totals, requests, completions, tool
+arguments and results. A missing `end` means an interrupted trace; a
+failed cleanup needs attention. Compare test output with the final
+report: shell pipelines can hide a failed test behind exit status zero,
+and an empty search is not proof that a contract is absent. The `grep`
+tool uses basic regular expressions unless `extended` is true.
+
+`tool_output_bytes_hex` retains streamed command bytes before model output
+truncation; `tool_result` records what the model received. Request bodies
+and returned reasoning details make repeated calls, context growth and
+tool misunderstandings inspectable. Provider-internal reasoning is not
+available. Traces contain source and reasoning, retain earlier records on
+errors, and have no automatic pruning; the caller owns their retention.
+See `td-agent/DESIGN.md` for the capability profile, trace format and
+limits.
+
 ## Antigravity review
 
 Either acting agent uses Antigravity's `Gemini 3.8 Flash (High)`, whose id is
