@@ -585,6 +585,24 @@ before removing the partial link. Never auto-delete or overwrite a destination
 on an error. The engine is consumed even on refusal; callers may reopen its
 source while retaining the original lock.
 
+The ordinary public copy-refusal oracle passed four cases over a healthy
+2 MiB body and mailbox. An armed supplied clock observes a real 64 KiB
+partial before expiring the original deadline, reversing monotonic time,
+or returning a sample error. Each returns Unpublished with its exact
+reason. A fourth case creates an occupied final name only after the
+partial reaches the checkpointed source length; the real no-replace
+link returns AlreadyExists as IncompletePublication. The complete
+partial and occupied final name remain distinct and unchanged.
+All cases retain both caller-held locks and a mode-0600, one-link partial
+whose every byte matches the source prefix. Destination open refuses,
+source reopen passes physical and complete account verification with
+the original identity, typed rows and body contents, and backup retry
+returns Conflict without changing retained artifacts. Source byte-file
+reads occur only after consuming backup has closed every native owner.
+The supplied sample error is not a filesystem write or sync fault. This
+bounded oracle does not qualify full filesystem faults, successful
+link/unlink crash windows, power loss or resource/stack ceilings.
+
 The ordinary backup abrupt-death oracle kills only its recorded child
 with SIGKILL in two phases. During copying, a test clock observes an
 actual nonempty, incomplete partial file before publication and parks

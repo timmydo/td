@@ -2669,6 +2669,16 @@ refuse; original metadata and exact provisional bytes remain unchanged.
 A receipt is not account verification or repair. STORAGE.md states the
 bounded case and remaining qualification.
 
+The ordinary public copy-refusal oracle passed deadline expiry, clock
+reversal and a supplied sample error after an observed 64 KiB partial,
+plus a real no-replace link collision after the complete copy. It checks
+exact failure classifications, retained locks and artifacts, destination
+refusal, unchanged source identity/typed rows/body verification, and
+nonoverwriting retry refusal. STORAGE.md states the bounded 2 MiB case;
+the clock error is not a filesystem write/sync fault, and full faults,
+successful link/unlink windows, power loss and resource qualification
+remain separate.
+
 Epoch renewal atomically replaces the epoch from admitted entropy while
 preserving account histories and bodies; every error consumes its owner.
 The restored-epoch process-death oracle creates a real backup and parks

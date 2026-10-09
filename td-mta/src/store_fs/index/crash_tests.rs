@@ -14,6 +14,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::process::ExitStatusExt,
     process::{Child, Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -792,4 +793,266 @@ fn backup_preserves_digest_damage_without_granting_account_verification() {
     let restored = IndexStore::open(&mut destination_root, Arc::new(Fixed), 2, deadline()).unwrap();
     verify_digest_damaged_backup(&original);
     verify_digest_damaged_backup(&restored);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CopyRefusal {
+    Deadline,
+    Reversal,
+    SampleError,
+    Collision,
+}
+struct RefusalClock {
+    destination: std::path::PathBuf,
+    full_bytes: AtomicU64,
+    observed: AtomicU64,
+    armed: std::sync::atomic::AtomicBool,
+    refusal: CopyRefusal,
+}
+impl Clock for RefusalClock {
+    fn sample(&self) -> Result<Time, ports::Error> {
+        if self.armed.load(Ordering::Relaxed) && self.observed.load(Ordering::Relaxed) == 0 {
+            match fs::metadata(self.destination.join("metadata.sqlite3.backup-partial")) {
+                Ok(metadata) => {
+                    let threshold = if self.refusal == CopyRefusal::Collision {
+                        self.full_bytes.load(Ordering::Relaxed)
+                    } else {
+                        65536
+                    };
+                    if metadata.len() >= threshold {
+                        self.observed.store(metadata.len(), Ordering::Relaxed);
+                        let tick = match self.refusal {
+                            CopyRefusal::Deadline => Tick(100),
+                            CopyRefusal::Reversal => Tick(0),
+                            CopyRefusal::SampleError => {
+                                return Err(io::Error::from(io::ErrorKind::PermissionDenied).into());
+                            }
+                            CopyRefusal::Collision => {
+                                let mut marker = OpenOptions::new()
+                                    .write(true)
+                                    .create_new(true)
+                                    .mode(0o600)
+                                    .open(self.destination.join("metadata.sqlite3"))
+                                    .unwrap();
+                                marker.write_all(b"occupied").unwrap();
+                                marker
+                                    .set_permissions(fs::Permissions::from_mode(0o600))
+                                    .unwrap();
+                                Tick(1)
+                            }
+                        };
+                        return Ok(Time {
+                            utc_ms: 0,
+                            monotonic: tick,
+                        });
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Fixed.sample()
+    }
+}
+
+// Call only after consuming backup has closed every native owner.
+fn backup_prefix(source: &Path, partial: &Path, bytes: u64) -> [u8; 32] {
+    let mut original = fs::File::open(source).unwrap();
+    let mut copy = fs::File::open(partial).unwrap();
+    let mut expected = [0; 65536];
+    let mut actual = [0; 65536];
+    let mut digest = td_crypto::Provider.sha256().unwrap();
+    let mut seen = 0;
+    loop {
+        let count = copy.read(&mut actual).unwrap();
+        if count == 0 {
+            break;
+        }
+        original
+            .read_exact(expected.get_mut(..count).unwrap())
+            .unwrap();
+        assert_eq!(actual.get(..count), expected.get(..count));
+        digest.update(actual.get(..count).unwrap()).unwrap();
+        seen += count as u64;
+        assert!(seen <= bytes);
+    }
+    assert_eq!(seen, bytes);
+    digest.finish().unwrap()
+}
+fn backup_file_digest(path: &Path, bytes: u64) -> [u8; 32] {
+    let mut file = fs::File::open(path).unwrap();
+    let mut scratch = [0; 65536];
+    let mut digest = td_crypto::Provider.sha256().unwrap();
+    let mut seen = 0;
+    loop {
+        let count = file.read(&mut scratch).unwrap();
+        if count == 0 {
+            break;
+        }
+        digest.update(scratch.get(..count).unwrap()).unwrap();
+        seen += count as u64;
+        assert!(seen <= bytes);
+    }
+    assert_eq!(seen, bytes);
+    digest.finish().unwrap()
+}
+
+#[test]
+fn public_backup_copy_refusals_and_link_collision_preserve_locked_source() {
+    for refusal in [
+        CopyRefusal::Deadline,
+        CopyRefusal::Reversal,
+        CopyRefusal::SampleError,
+        CopyRefusal::Collision,
+    ] {
+        let source = Fixture::new();
+        let destination = Fixture::new();
+        let mut root = source.locked();
+        let mut target = destination.locked();
+        let clock = Arc::new(RefusalClock {
+            destination: destination.path.clone(),
+            full_bytes: AtomicU64::new(0),
+            observed: AtomicU64::new(0),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            refusal,
+        });
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([0x95; 16]),
+            clock.clone(),
+            2,
+            deadline(),
+        )
+        .unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        let blob = blob_row();
+        let mailbox = mailbox_row();
+        let mut body = Generated {
+            remaining: BODY_BYTES,
+            pause_root: None,
+        };
+        store
+            .commit(
+                &td_crypto::Provider,
+                request(0),
+                &[
+                    Operation::put(Table::Blobs, BLOB.as_bytes(), &blob).unwrap(),
+                    Operation::put(Table::Mailboxes, MAILBOX.as_bytes(), &mailbox).unwrap(),
+                ],
+                &mut [BlobSource {
+                    id: BLOB,
+                    source: &mut body,
+                }],
+            )
+            .unwrap();
+        verify_backup_account(&store);
+        let original = store.view(ACCOUNT, deadline()).unwrap().identity();
+        store.checkpoint(deadline()).unwrap();
+        let source_path = source.path.join("metadata.sqlite3");
+        let full = fs::metadata(&source_path).unwrap().len();
+        assert!(full > BODY_BYTES);
+        clock.full_bytes.store(full, Ordering::Relaxed);
+        clock.armed.store(true, Ordering::Relaxed);
+        let result = store.backup(&mut target, deadline(), &mut [0; 65536]);
+        use super::backup::BackupError;
+        match refusal {
+            CopyRefusal::Deadline => assert_eq!(
+                result,
+                Err(BackupError::Unpublished(ports::Error::Deadline))
+            ),
+            CopyRefusal::Reversal => {
+                assert_eq!(result, Err(BackupError::Unpublished(ports::Error::Invalid)))
+            }
+            CopyRefusal::SampleError => assert!(matches!(
+                result,
+                Err(BackupError::Unpublished(ports::Error::Io {
+                    kind: io::ErrorKind::PermissionDenied,
+                    ..
+                }))
+            )),
+            CopyRefusal::Collision => assert!(matches!(
+                result,
+                Err(BackupError::IncompletePublication(ports::Error::Io {
+                    kind: io::ErrorKind::AlreadyExists,
+                    ..
+                }))
+            )),
+        }
+        let partial = destination.path.join("metadata.sqlite3.backup-partial");
+        let final_path = destination.path.join("metadata.sqlite3");
+        let metadata = fs::metadata(&partial).unwrap();
+        assert_eq!(metadata.len(), clock.observed.load(Ordering::Relaxed));
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        if refusal == CopyRefusal::Collision {
+            assert_eq!(metadata.len(), full);
+            assert_eq!(fs::read(&final_path).unwrap(), b"occupied");
+        } else {
+            assert_eq!(metadata.len(), 65536);
+            assert!(metadata.len() < full);
+            assert!(fs::symlink_metadata(&final_path)
+                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound));
+        }
+        assert!(matches!(source.lock(), Err(super::super::LockError::Busy)));
+        assert!(matches!(
+            destination.lock(),
+            Err(super::super::LockError::Busy)
+        ));
+        let digest = backup_prefix(&source_path, &partial, metadata.len());
+        match refusal {
+            CopyRefusal::Collision => assert!(matches!(
+                IndexStore::open(&mut target, Arc::new(Fixed), 1, deadline()),
+                Err(ports::Error::Corrupt),
+            )),
+            _ => assert!(matches!(
+                IndexStore::open(&mut target, Arc::new(Fixed), 1, deadline()),
+                Err(ports::Error::Io {
+                    kind: io::ErrorKind::NotFound,
+                    ..
+                }),
+            )),
+        }
+        assert_eq!(backup_file_digest(&partial, metadata.len()), digest);
+        {
+            let store = IndexStore::open(&mut root, Arc::new(Fixed), 2, deadline()).unwrap();
+            assert_eq!(
+                store.view(ACCOUNT, deadline()).unwrap().identity(),
+                original
+            );
+            verify_backup_account(&store);
+            {
+                let mut view = store.view(ACCOUNT, deadline()).unwrap();
+                assert_eq!(view.identity().history_floor, Sequence::default());
+                let mut scratch = [0; 1024];
+                for (key, expected) in [(Key::Blob(BLOB), &blob), (Key::Mailbox(MAILBOX), &mailbox)]
+                {
+                    let (row, changed) = view.get(key, &mut scratch).unwrap().unwrap();
+                    assert_eq!(encode(row), *expected);
+                    assert_eq!(changed, Sequence::from_u64(1));
+                }
+            }
+            assert_eq!(
+                store.backup(&mut target, deadline(), &mut [0; 65536]),
+                Err(BackupError::Unpublished(ports::Error::Conflict)),
+            );
+        }
+        assert_eq!(backup_file_digest(&partial, metadata.len()), digest);
+        assert_eq!(fs::metadata(&partial).unwrap().nlink(), 1);
+        if refusal == CopyRefusal::Collision {
+            assert_eq!(fs::read(&final_path).unwrap(), b"occupied");
+        } else {
+            assert!(fs::symlink_metadata(&final_path)
+                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound));
+        }
+        let store = IndexStore::open(&mut root, Arc::new(Fixed), 2, deadline()).unwrap();
+        assert_eq!(
+            store.view(ACCOUNT, deadline()).unwrap().identity(),
+            original
+        );
+        verify_backup_account(&store);
+        eprintln!(
+            "backup-refusal {refusal:?} partial={} source={full} source-verified retry-conflict",
+            metadata.len()
+        );
+    }
 }
