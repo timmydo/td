@@ -6514,6 +6514,22 @@ create and open both borrow LockedRoot exclusively for the owner's
 lifetime, preventing independent owners from bypassing its
 transaction/checkpoint fence.
 
+IndexReadView::verify_bodies(crypto, BodyCheckLimits, scratch) performs
+synchronous declared-body verification for one captured account view.
+The caller supplies a fixed 64 KiB scratch buffer and explicit blob-count
+and total declared-byte ceilings, admitted before each body opens. Each
+row is enumerated through the same view, streamed and finished through
+PinnedBlobInput. Original snapshot, deadline and VM fuel cover the whole
+pass without renewal. Any failure returns no completion report.
+CompleteBodies has private identity, blob-count and byte-count fields
+with read-only accessors. It reports historical completion for that
+ViewIdentity; it grants neither body-pin custody nor current freshness.
+Empty accounts can complete under zero limits. This is neither a
+physical/index-consistency check nor full store verification: an offline
+coordinator must establish physical integrity separately and combine
+metadata and body results for the same snapshot. No verification CLI or
+service activation is enabled.
+
 PinnedBlobInput::finish also refuses negative or trailing stored chunk
 ordinals with Corrupt, including any chunk for an empty body. Its indexed
 extent check shares the original snapshot, deadline and VM fuel; a failed

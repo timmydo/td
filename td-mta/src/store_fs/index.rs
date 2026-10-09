@@ -4629,6 +4629,335 @@ mod tests {
         }
     }
 
+    fn seed_body_verification(store: &IndexStore<'_>, account: AccountId) {
+        store.create_account(account, deadline()).unwrap();
+        for (sequence, (tag, length, kind)) in [
+            (4, 0, BlobKind::Message),
+            (5, 1, BlobKind::Upload),
+            (6, 65537, BlobKind::Message),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = BlobId::from_bytes([tag; 16]);
+            let bytes = vec![b'x'; length];
+            let value = encode(Row::Blob(body_row(&bytes, kind)));
+            let mut source = bytes.as_slice();
+            store
+                .commit(
+                    &td_crypto::Provider,
+                    CommitRequest {
+                        account,
+                        ..request(sequence as u64)
+                    },
+                    &[Operation::put(Table::Blobs, id.as_bytes(), &value).unwrap()],
+                    &mut [BlobSource {
+                        id,
+                        source: &mut source,
+                    }],
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn complete_body_verification_reports_one_snapshot_and_enforces_work_limits() {
+        use crate::store_fs::{BodyCheckLimits, MAX_FILE_STEP_BYTES};
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            Arc::new(Timer(AtomicU64::new(1))),
+            3,
+            deadline(),
+        )
+        .unwrap();
+        seed_body_verification(&store, ACCOUNT);
+        let other = AccountId::from_bytes([11; 16]);
+        let empty_account = AccountId::from_bytes([12; 16]);
+        store.create_account(other, deadline()).unwrap();
+        store.create_account(empty_account, deadline()).unwrap();
+        let id = BlobId::from_bytes([4; 16]);
+        let value = encode(Row::Blob(body_row(b"other", BlobKind::Upload)));
+        let mut source = b"other".as_slice();
+        store
+            .commit(
+                &td_crypto::Provider,
+                CommitRequest {
+                    account: other,
+                    ..request(0)
+                },
+                &[Operation::put(Table::Blobs, id.as_bytes(), &value).unwrap()],
+                &mut [BlobSource {
+                    id,
+                    source: &mut source,
+                }],
+            )
+            .unwrap();
+        let mut old = store.view(ACCOUNT, deadline()).unwrap();
+        let original = old.identity();
+        let replacement = BlobId::from_bytes([7; 16]);
+        let value = encode(Row::Blob(body_row(b"yy", BlobKind::Message)));
+        let mut source = b"yy".as_slice();
+        store
+            .commit(
+                &td_crypto::Provider,
+                request(3),
+                &[
+                    Operation::delete(Table::Blobs, BlobId::from_bytes([5; 16]).as_bytes())
+                        .unwrap(),
+                    Operation::put(Table::Blobs, replacement.as_bytes(), &value).unwrap(),
+                ],
+                &mut [BlobSource {
+                    id: replacement,
+                    source: &mut source,
+                }],
+            )
+            .unwrap();
+        let mut scratch = [0; MAX_FILE_STEP_BYTES];
+        let report = old
+            .verify_bodies(
+                &td_crypto::Provider,
+                BodyCheckLimits {
+                    blobs: 3,
+                    bytes: 65538,
+                },
+                &mut scratch,
+            )
+            .unwrap();
+        assert_eq!(
+            (report.identity(), report.blobs(), report.bytes()),
+            (original, 3, 65538)
+        );
+        assert_eq!(old.identity(), original);
+        drop(old);
+        let mut fresh = store.view(ACCOUNT, deadline()).unwrap();
+        let report = fresh
+            .verify_bodies(
+                &td_crypto::Provider,
+                BodyCheckLimits {
+                    blobs: 3,
+                    bytes: 65539,
+                },
+                &mut scratch,
+            )
+            .unwrap();
+        assert_eq!((report.blobs(), report.bytes()), (3, 65539));
+        assert_eq!(report.identity().committed_sequence, Sequence::from_u64(4));
+        drop(fresh);
+        let mut isolated = store.view(other, deadline()).unwrap();
+        let report = isolated
+            .verify_bodies(
+                &td_crypto::Provider,
+                BodyCheckLimits { blobs: 1, bytes: 5 },
+                &mut scratch,
+            )
+            .unwrap();
+        assert_eq!(
+            (report.identity().account, report.blobs(), report.bytes()),
+            (other, 1, 5)
+        );
+        drop(isolated);
+        let mut empty = store.view(empty_account, deadline()).unwrap();
+        let report = empty
+            .verify_bodies(
+                &td_crypto::Provider,
+                BodyCheckLimits { blobs: 0, bytes: 0 },
+                &mut scratch,
+            )
+            .unwrap();
+        assert_eq!((report.blobs(), report.bytes()), (0, 0));
+        drop(empty);
+        for limits in [
+            BodyCheckLimits { blobs: 0, bytes: 0 },
+            BodyCheckLimits {
+                blobs: 2,
+                bytes: 65539,
+            },
+            BodyCheckLimits {
+                blobs: 3,
+                bytes: 65538,
+            },
+        ] {
+            let mut view = store.view(ACCOUNT, deadline()).unwrap();
+            assert_eq!(
+                view.verify_bodies(&td_crypto::Provider, limits, &mut scratch),
+                Err(ports::Error::Capacity)
+            );
+        }
+    }
+
+    #[test]
+    fn complete_body_verification_refuses_same_size_digest_damage_and_empty_extras() {
+        use crate::store_fs::{BodyCheckLimits, MAX_FILE_STEP_BYTES};
+        for (tag, ordinal, extra) in [(5, 0, false), (6, 0, false), (6, 1, false), (4, 0, true)] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let store = IndexStore::create(
+                &mut root,
+                StoreEpoch::from_bytes([9; 16]),
+                Arc::new(Timer(AtomicU64::new(1))),
+                2,
+                deadline(),
+            )
+            .unwrap();
+            seed_body_verification(&store, ACCOUNT);
+            let mut old = store.view(ACCOUNT, deadline()).unwrap();
+            let id = BlobId::from_bytes([tag; 16]);
+            {
+                let writer = lock(&store.writer).unwrap();
+                writer.native.run(|db| {
+                    if extra {
+                        db.execute("INSERT INTO blob_chunks(account,blob,ordinal,body) VALUES(?1,?2,0,x'7a')", params![ACCOUNT.as_bytes().as_slice(), id.as_bytes().as_slice()]).map_err(sql)?;
+                    } else {
+                        let mut bytes: Vec<u8> = db.query_row("SELECT body FROM blob_chunks WHERE account=?1 AND blob=?2 AND ordinal=?3", params![ACCOUNT.as_bytes().as_slice(), id.as_bytes().as_slice(), ordinal], |row| row.get(0)).map_err(sql)?;
+                        bytes.fill(b'z');
+                        assert_eq!(db.execute("UPDATE blob_chunks SET body=?4 WHERE account=?1 AND blob=?2 AND ordinal=?3", params![ACCOUNT.as_bytes().as_slice(), id.as_bytes().as_slice(), ordinal, bytes]).map_err(sql)?, 1);
+                    }
+                    Ok(())
+                }).unwrap();
+            }
+            assert_eq!(
+                store.validate_integrity(deadline()),
+                if extra {
+                    Err(ports::Error::Corrupt)
+                } else {
+                    Ok(())
+                }
+            );
+            let limits = BodyCheckLimits {
+                blobs: 3,
+                bytes: 65538,
+            };
+            let mut scratch = [0; MAX_FILE_STEP_BYTES];
+            let report = old
+                .verify_bodies(&td_crypto::Provider, limits, &mut scratch)
+                .unwrap();
+            assert_eq!((report.blobs(), report.bytes()), (3, 65538));
+            let mut fresh = store.view(ACCOUNT, deadline()).unwrap();
+            assert_eq!(
+                fresh.verify_bodies(&td_crypto::Provider, limits, &mut scratch),
+                Err(ports::Error::Corrupt)
+            );
+        }
+    }
+
+    #[test]
+    fn complete_body_verification_keeps_native_refusals_and_snapshot_custody() {
+        use crate::store_fs::{BodyCheckLimits, MAX_FILE_STEP_BYTES};
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        for fault in ["none", "deadline", "reversal", "fuel", "denied", "snapshot"] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let clock = Arc::new(Timer(AtomicU64::new(1)));
+            let store = IndexStore::create(
+                &mut root,
+                StoreEpoch::from_bytes([9; 16]),
+                clock.clone(),
+                1,
+                deadline(),
+            )
+            .unwrap();
+            seed_body_verification(&store, ACCOUNT);
+            let mut view = store.view(ACCOUNT, deadline()).unwrap();
+            let native = view.native().unwrap();
+            let budget = native.budget.clone();
+            let hook_budget = budget.clone();
+            let observed = Arc::new(AtomicU64::new(0));
+            let hook_observed = observed.clone();
+            let hook_clock = clock.clone();
+            if fault == "snapshot" {
+                lock(&native.connection)
+                    .unwrap()
+                    .execute_batch("ROLLBACK")
+                    .unwrap();
+            }
+            lock(&native.connection)
+                .unwrap()
+                .authorizer(Some(move |context: AuthContext<'_>| {
+                    if matches!(
+                        context.action,
+                        AuthAction::Read {
+                            table_name: "blob_chunks",
+                            column_name: "body"
+                        }
+                    ) {
+                        hook_observed.fetch_add(1, Ordering::Relaxed);
+                        match fault {
+                            "deadline" => hook_clock.0.store(100, Ordering::Relaxed),
+                            "reversal" => hook_clock.0.store(0, Ordering::Relaxed),
+                            "fuel" => hook_budget.lock().unwrap().remaining = 0,
+                            "denied" => return Authorization::Deny,
+                            _ => (),
+                        }
+                    }
+                    Authorization::Allow
+                }))
+                .unwrap();
+            let limits = BodyCheckLimits {
+                blobs: 3,
+                bytes: 65538,
+            };
+            let mut scratch = [0; MAX_FILE_STEP_BYTES];
+            let result = view.verify_bodies(&td_crypto::Provider, limits, &mut scratch);
+            let expected = match fault {
+                "none" => None,
+                "deadline" => Some(ports::Error::Deadline),
+                "reversal" => Some(ports::Error::Invalid),
+                "fuel" => Some(ports::Error::Capacity),
+                "denied" => Some(ports::Error::Io {
+                    kind: std::io::ErrorKind::Other,
+                    os_code: None,
+                }),
+                "snapshot" => Some(ports::Error::Corrupt),
+                _ => panic!("unknown fault"),
+            };
+            assert_eq!(result.as_ref().err().copied(), expected, "{fault}");
+            assert_eq!(
+                observed.load(Ordering::Relaxed) > 0,
+                fault != "snapshot",
+                "{fault}"
+            );
+            lock(&view.native().unwrap().connection)
+                .unwrap()
+                .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                .unwrap();
+            clock.0.store(1, Ordering::Relaxed);
+            if matches!(fault, "deadline" | "reversal" | "fuel") {
+                assert_eq!(lock(&budget).unwrap().failure, expected, "{fault}");
+                assert_eq!(
+                    view.verify_bodies(&td_crypto::Provider, limits, &mut scratch)
+                        .err(),
+                    expected,
+                    "{fault}"
+                );
+            }
+            if fault == "snapshot" {
+                lock(&view.native().unwrap().connection)
+                    .unwrap()
+                    .execute_batch("BEGIN DEFERRED")
+                    .unwrap();
+                assert_eq!(
+                    view.verify_bodies(&td_crypto::Provider, limits, &mut scratch),
+                    Err(ports::Error::Corrupt)
+                );
+            }
+            drop(view);
+            if fault == "snapshot" {
+                assert!(matches!(
+                    store.view(ACCOUNT, deadline()),
+                    Err(ports::Error::Busy)
+                ));
+            } else {
+                let mut healthy = store.view(ACCOUNT, deadline()).unwrap();
+                assert!(healthy
+                    .verify_bodies(&td_crypto::Provider, limits, &mut scratch)
+                    .is_ok());
+            }
+        }
+    }
+
     #[test]
     fn body_geometry_maintenance_uses_scoped_probes_and_original_work_scope() {
         use rusqlite::hooks::{AuthAction, AuthContext, Authorization};

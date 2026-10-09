@@ -1400,6 +1400,11 @@ scan. Explicit validate_integrity maintenance runs SQLite's full
 database/index consistency and foreign-key checks and the per-Email
 anchor-cardinality and complete blob chunk-geometry scans specified in
 STORAGE.md; body pins still require exact length/digest verification.
+The synchronous IndexReadView::verify_bodies primitive verifies every
+enumerated body for one account view under explicit count/byte limits
+and the original snapshot, deadline and VM fuel. Its historical
+completion report grants no body custody or current freshness; physical
+and metadata checks remain separate offline-coordinator requirements.
 SQLite recovery may read the full bounded WAL, and checkpoint may copy the
 entire bounded database in a synchronous native call. Neither promises
 interruption at the application deadline. Native resource and complete

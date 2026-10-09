@@ -1180,6 +1180,28 @@ The WITHOUT ROWID chunk table favors one account/blob/ordinal key lookup;
 its 64 KiB payloads may deepen native B-trees. This fixed per-call amplification
 is admitted, not a claim of physical I/O equal to returned MIME bytes.
 
+The separate IndexReadView::verify_bodies primitive enumerates all
+returned Blob rows for one account snapshot and reuses PinnedBlobInput
+for complete length, digest and extent verification. Caller-owned
+64 KiB scratch is reused for every body; only fixed cursor/row buffers
+and one digest/input owner are retained. Explicit blob-count and total
+logical-byte limits are checked before opening each body, and every
+metadata/body query retains the original view deadline and finite VM
+fuel. No per-body allowance or fresh view is acquired. It is synchronous
+maintenance and does not promise one-body scheduling or completion at
+the maximum database size under the normal read-view allowance.
+
+CompleteBodies reports the captured ViewIdentity and counts only after
+every enumerated body finishes and enumeration terminates successfully.
+An empty account can complete with zero limits; any native, crypto,
+clock, capacity, corruption or snapshot-loss failure yields no report.
+The report is historical data, not a body pin, authentication credential
+or ongoing freshness proof. Physical/index consistency and orphan chunk
+absence require separate whole-store maintenance; metadata checks and
+body reports must identify the same snapshot before an offline
+coordinator combines them. This primitive does not enable the operational
+verify/restore CLI or qualify complete crash/fault/resource behavior.
+
 Full validate_integrity maintenance refuses a stopped writer and holds
 the writer fence throughout its scan. Existing read views remain usable;
 new view capture and commits return Busy until it finishes. It reports

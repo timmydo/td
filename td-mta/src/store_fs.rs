@@ -14,6 +14,10 @@ pub use index::{
     HistoryPruneRequest, HistoryPruned, IndexReadView, IndexStore, LedgerInitError, LogicalUsage,
     StoreFileUsage, StoreLogicalUsage, UsageFence,
 };
+#[path = "store_fs/body_verify.rs"]
+mod body_verify;
+pub use body_verify::{BodyCheckLimits, CompleteBodies};
+
 #[path = "store_fs/pinned.rs"]
 mod pinned;
 #[cfg(test)]

@@ -2607,10 +2607,14 @@ or manifest sufficient to audit changes. Rebuild indexes independently. Change
 store epoch on restore and refuse incompatible formats without altering them.
 
 The native offline primitives now include consuming IndexStore::backup
-and IndexStore::renew_epoch. The latter atomically replaces the epoch
-from admitted entropy while preserving account histories and bodies;
-every error consumes its owner. These primitives do not complete the
-restore command, selection/verification workflow or service activation.
+and IndexStore::renew_epoch, plus bounded IndexReadView::verify_bodies.
+The body pass reuses snapshot-bound inputs and caller scratch, reports
+historical account-snapshot identity/counts only on full completion, and
+remains separate from physical and metadata verification. Epoch renewal
+atomically replaces the epoch from admitted entropy while preserving
+account histories and bodies; every error consumes its owner. These
+primitives do not complete the restore command, selection/verification
+workflow or service activation.
 
 **Acceptance:** backup while receiving and compacting, restore elsewhere, then
 verify every committed blob/reference/folder/queue record. Detect interior
