@@ -2735,7 +2735,7 @@ inputs. This does not qualify eight borrowed views or simultaneous
 reader/body work, arbitrary-account/maximum-database paths, full faults
 or whole-service overlap.
 
-The shared portable body/account/backup/epoch fixtures also passed eight
+The earlier simultaneous-body-reader qualification passed eight
 simultaneously retained views and body inputs in initial postcommit
 verification. Fixed arrays and one caller scratch support interleaved
 full 32 MiB reads, eight digest-completed pins, all random-read
@@ -2757,6 +2757,22 @@ seven old views, Busy captures/checkpoints, complete slot reuse and
 checkpoint/reopen with physical integrity and permanent-ID refusal.
 This is sequential native snapshot evidence, without a portable
 allocation/RSS/stack, parallel-thread or whole-service claim.
+
+The shared portable body/account/backup/epoch fixtures passed a metadata
+PUT while all eight inputs retain their original sequence-one views
+after one 64 KiB chunk each. The writer commits sequence two, creates or
+renames the parent mailbox, and all eight inputs complete the original
+32 MiB body and independent digests. Old views retain original
+identity/metadata; all eight reacquired slots expose the exact updated
+parent and sequence-two identity. The committed observation includes the
+metadata commit and eight partial inputs; the verified observation
+retains eight completed pins/views. All original phase counts, ceilings
+and other controls remain, with later identity checks at sequence two
+and body/account retry success at sequence three. RESOURCES.md and
+td-crypto/PORTABLE.md record full isolated qualification and actual
+metrics. This is bounded sequential metadata-writer/same-body evidence,
+not per-call allocation attribution, all writes/deletion, parallel
+threads, arbitrary-account or whole-service qualification.
 
 These primitives do not complete the restore command,
 selection/verification workflow or service activation.

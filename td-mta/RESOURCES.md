@@ -2752,10 +2752,90 @@ not a general zero-allocation guarantee or method-only attribution.
 td-crypto/PORTABLE.md records the exact artifact, staged source/vendor
 pins, current SQLite ceilings and qualification limits.
 
-The shared portable SQLite body/account/backup/epoch fixtures now retain
-eight borrowed views and body inputs together during their initial
-postcommit body verification. Fixed stack arrays retain all loans
-without new Rust heap buffers. Every view matches the complete
+The shared portable SQLite body/account/backup/epoch fixtures passed a
+public metadata commit with eight retained partial body inputs. After
+the initial 32 MiB body commit at sequence one, all eight views capture
+the same full identity and each input reads its first exact 64 KiB
+chunk. With every input and view retained, the writer puts the parent
+mailbox with name updated parent and commits sequence two. Body mode
+creates that parent; account/backup/epoch modes rename their existing
+parent, preserving the three-row/two-mailbox dataset. Ninth captures
+refuse Busy before and after this commit. The committed observation now
+occurs after the metadata commit with all eight partial inputs alive.
+
+The remaining 511 chunks per input progress sequentially in round-robin
+order through the same caller scratch. Every original body byte and each
+completed digest is checked; all eight pins pass cross-chunk and
+final-byte reads and remain alive with their views at the verified
+observation. After dropping pins, all eight old views retain their
+complete sequence-one identities and the original parent row at changed
+sequence one, or no parent in body mode. Releasing them permits
+simultaneous reacquisition of all eight slots with full sequence-two
+identities and the exact updated parent row at changed sequence two.
+Those views drop before account verification or consuming backup.
+
+| Case | Observer | Warm baseline | Lifetime requested peak / maximum RSS sample | After teardown |
+| --- | --- | ---: | ---: | ---: |
+| Body | Rust requested bytes | 560 | 199846 | 560 |
+| Body | Wrapped C boundary requested bytes | 1344 | 2943734 | 1344 |
+| Body | Unwrapped RSS, KiB | 3356 | 6848 | 3584 |
+| Account | Rust requested bytes | 624 | 199910 | 624 |
+| Account | Wrapped C boundary requested bytes | 1424 | 2943814 | 1424 |
+| Account | Unwrapped RSS, KiB | 3352 | 6848 | 3588 |
+| Backup | Rust requested bytes | 688 | 333620 | 688 |
+| Backup | Wrapped C boundary requested bytes | 1504 | 4197372 | 1504 |
+| Backup | Unwrapped RSS, KiB | 3360 | 8268 | 3612 |
+| Epoch | Rust requested bytes | 880 | 333812 | 880 |
+| Epoch | Wrapped C boundary requested bytes | 134584 | 4330452 | 134584 |
+| Epoch | Unwrapped RSS, KiB | 3884 | 8732 | 4076 |
+
+Rust and wrapped C-boundary requested bytes return exactly to their warm
+baselines. Native warm/final block counts remain five for
+body/account/backup and thirteen for epoch, whose warmed entropy handle
+remains live through its final observation. Wrapped C-boundary
+observations are not SQLite-only attribution. The complete suite also
+passed its unchanged quiet Rust allocation-counter and positive
+controls; the SQLite observer itself enforces the whole-fixture peak and
+exact warm teardown rather than a per-call zero-allocation interval.
+
+Body and backup writable worker mappings were 249856 bytes; account and
+epoch were 253952 bytes. Every mapping was equal before and after, with
+the required adjacent inaccessible guard and no grow-down flag; explicit
+worker joins precede completion. These are writable-region observations,
+not measured frame high-water marks.
+
+The complete isolated static-musl command passed with unchanged resource
+ceilings. td-crypto/PORTABLE.md records the exact artifact and staged
+inputs.
+
+Selectors and the eight/nine/ten/thirteen observation counts remain
+unchanged. Account verification, rollback/refusal/oversized and
+unconsumed-source controls, permanent-ID retry, public backup, reopened
+physical checks, source preservation and actual warmed entropy renewal
+remain. Later account/source/destination identity checks use sequence
+two; the successful body/account retry advances to sequence three. Each
+store still owns eight readers plus one writer; reopened backup/epoch
+source and destination stores retain eighteen native owners together.
+Rust 2 MiB, wrapped C-boundary 17 MiB, sampled RSS growth 24 MiB and
+guarded writable stack 256 KiB ceilings are unchanged. SQLite retains
+separate 9 MiB per-allocation and 16 MiB process-wide caps across all
+pools.
+
+This qualifies the bounded public metadata PUT with retained
+same-account/same-body inputs and sequential interleaved reads on one
+process or guarded worker. It does not qualify parallel threads, every
+write or deletion under portable resource observation, different
+accounts/bodies, arbitrary-account or maximum-database work, numeric
+frame peaks, transient RSS, complete faults, power loss or
+whole-worker/service overlap. Requested-byte peaks and teardown describe
+the combined fixture; they do not isolate allocations inside the
+metadata commit. Earlier simultaneous-reader records remain tied to
+their own artifact/source inputs and omit this metadata commit.
+
+The earlier simultaneous-body-reader qualification retained eight
+borrowed views and body inputs together during their initial postcommit
+body verification. Fixed stack arrays retain all loans without new Rust
+heap buffers. Every view matches the complete
 account/epoch/sequence/floor identity; a ninth public capture returns
 Busy. Progress interleaves one 64 KiB read from each input using the
 existing single scratch buffer. Each input consumes all 512 chunks of

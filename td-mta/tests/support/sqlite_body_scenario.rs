@@ -325,7 +325,7 @@ fn run_with_roots(
         sampled: false,
         observe: &mut *observe,
     };
-    let sequence = store
+    let initial_sequence = store
         .commit(
             &td_crypto::Provider,
             request,
@@ -338,15 +338,14 @@ fn run_with_roots(
         .unwrap();
     assert_eq!(source.remaining, 0);
     assert!(source.sampled);
-    assert_eq!(sequence, Sequence::from_u64(1));
-    observe();
-    {
+    assert_eq!(initial_sequence, Sequence::from_u64(1));
+    let sequence = {
         let mut views: [_; READERS] =
             std::array::from_fn(|_| store.view(ACCOUNT, deadline).unwrap());
         let identity = views.first().unwrap().identity();
         assert_eq!(identity.account, ACCOUNT);
         assert_eq!(identity.epoch, store.epoch());
-        assert_eq!(identity.committed_sequence, sequence);
+        assert_eq!(identity.committed_sequence, initial_sequence);
         assert_eq!(identity.history_floor, Sequence::default());
         assert!(views.iter().all(|view| view.identity() == identity));
         assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
@@ -354,6 +353,32 @@ fn run_with_roots(
             view.open_blob_input(&td_crypto::Provider, BLOB, BODY_BYTES)
                 .unwrap()
         });
+        for input in &mut inputs {
+            assert_eq!(input.read(&mut scratch).unwrap(), CHUNK_BYTES);
+            assert!(scratch.iter().all(|&b| b == 0x5a));
+        }
+        let updated_parent = mailbox("updated parent", None);
+        let mut updated_bytes = [0; 128];
+        let updated_len = updated_parent.encode(&mut updated_bytes).unwrap();
+        let sequence = store
+            .commit(
+                &td_crypto::Provider,
+                CommitRequest {
+                    expected: initial_sequence,
+                    ..request
+                },
+                &[Operation::put(
+                    Table::Mailboxes,
+                    parent.as_bytes(),
+                    updated_bytes.get(..updated_len).unwrap(),
+                )
+                .unwrap()],
+                &mut [],
+            )
+            .unwrap();
+        assert_eq!(sequence, Sequence::from_u64(2));
+        assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
+        observe();
         while inputs.first().unwrap().position() != BODY_BYTES {
             for input in &mut inputs {
                 let n = input.read(&mut scratch).unwrap();
@@ -374,8 +399,20 @@ fn run_with_roots(
         }
         assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
         observe();
-    }
-    let returned: [_; READERS] = std::array::from_fn(|_| store.view(ACCOUNT, deadline).unwrap());
+        drop(pins);
+        let mut metadata = [0; 128];
+        for view in &mut views {
+            assert_eq!(view.identity(), identity);
+            let expected = account_check.then(|| (mailbox("parent", None), initial_sequence));
+            assert_eq!(
+                view.get(Key::Mailbox(parent), &mut metadata).unwrap(),
+                expected
+            );
+        }
+        sequence
+    };
+    let mut returned: [_; READERS] =
+        std::array::from_fn(|_| store.view(ACCOUNT, deadline).unwrap());
     assert!(returned.iter().all(|view| {
         view.identity()
             == ViewIdentity {
@@ -385,6 +422,13 @@ fn run_with_roots(
                 history_floor: Sequence::default(),
             }
     }));
+    let mut metadata = [0; 128];
+    for view in &mut returned {
+        assert_eq!(
+            view.get(Key::Mailbox(parent), &mut metadata).unwrap(),
+            Some((mailbox("updated parent", None), sequence))
+        );
+    }
     drop(returned);
     if account_check {
         check_account(
@@ -584,7 +628,7 @@ fn run_with_roots(
                 }]
             )
             .unwrap(),
-        Sequence::from_u64(2)
+        Sequence::from_u64(3)
     );
     observe();
 }
