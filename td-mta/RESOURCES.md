@@ -2645,9 +2645,9 @@ permitted. Explicit cold maintenance_view uses the same
 physical-cap-sized finite VM ceiling as integrity maintenance, installed
 once before capture; ordinary views remain capped at 8000000 steps,
 including after a maintenance slot is returned. Native query allocations
-remain within the separate SQLite caps. No maximum-database
-body-verification resource or whole-service overlap qualification is
-claimed.
+remain within the separate SQLite caps. The explicit maximum-database
+fixture below covers its body-dominated account only; arbitrary-account
+completion and whole-service overlap remain separate.
 
 Synchronous verify_account first retains the existing inline metadata
 sweep plus a fixed 1024-byte key buffer, reusing the caller's 64 KiB
@@ -2656,6 +2656,30 @@ scratch serves body verification. Explicit row/parent-read and
 blob-count/byte ceilings remain separate. No fresh view or per-stage
 clock/VM allowance is acquired. These fixed owner/buffer bounds do not
 qualify maximum-account completion or whole-service overlap.
+
+The explicit ignored maximum-database fixture in STORAGE.md passed an
+actual 8589934592-byte main file with an 8640991392-byte WAL and eight
+readers plus the writer. Public streamed commits filled all 2097152
+pages without using its padding fallback. Test-only per-chunk
+alteration/restoration created the dirty WAL without changing final body
+digests, metadata or account identity, bypassing normal WAL admission
+scheduling. TRUNCATE checkpoint took 18.874 seconds under the unchanged
+9 MiB individual and 16 MiB shared SQLite requested-allocation caps.
+Full physical and complete account checks passed before and after
+reopen, including 262 bodies and 8513712128 declared bytes, with one
+fixed 64 KiB account scratch and no per-body maintenance allowance
+renewal.
+
+The x86-64 GNU optimized host run passed in 697.74 seconds. Six RSS
+observations were 5644, 11356, 27652, 27652, 28240 and 11960 KiB; the
+largest reported VmHWM was 31024 KiB. These are host process
+observations with native allocation caps, not wrapped allocation
+attribution, a transient RSS bound, guarded-stack proof or combined
+service measurement. This qualifies the specific body-dominated full
+database checkpoint/maintenance case. Arbitrary-account metadata, normal
+service WAL scheduling, full faults, power loss, maximum backup and
+whole-service overlap remain separate. STORAGE.md records the executable
+hash, invocation, physical extents and verification timings.
 
 The separate --sqlite-account mode extends the bounded 32 MiB body
 scenario with parent/child mailboxes and complete account verification

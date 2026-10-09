@@ -1187,8 +1187,10 @@ subsequent TRUNCATE checkpoint. The parent verifies the final metadata
 commit and full body through the recovered WAL, then checks the zero-length
 WAL, integrity, metadata and body after checkpoint. The test also checks
 the 8 GiB database bound, but its database is only about
-32 MiB; an 8 GiB checkpoint and normal reservation scheduling remain
-unqualified. The producer changes normally immutable body chunks and
+32 MiB. That small-database fixture does not qualify an 8 GiB database
+checkpoint; the separate maximum-database fixture below covers its own
+body-dominated case. Normal reservation scheduling remains unqualified.
+The producer changes normally immutable body chunks and
 `created_at` without advancing the account sequence; its final state is
 valid for this physical WAL oracle but cannot come from the public API.
 The snapshot begins at an empty WAL. With automatic checkpointing disabled,
@@ -1218,6 +1220,75 @@ caps were unchanged. The largest reported child `VmHWM` sample was
 39480 KiB; the parent reported 48244 KiB after checkpoint. These are
 separate-process observations, not a whole-service memory peak or a bound
 on transient RSS.
+
+The separate ignored maximum_database_checkpoint_and_account_maintenance
+fixture fills the actual 8 GiB main database through public streamed
+Blob commits, checkpointing during admission and halving body sizes
+after clean Capacity refusals. It bounds admission at 512 attempts and
+retains only IDs and fixed-size expected rows. If public admission stops
+within 128 pages of the cap, a bounded test-only CREATE/INSERT/DROP
+padding table may leave free pages under auto_vacuum NONE; the completed
+database must still have the exact fixed schema on reopen. The recorded
+run reached the cap through public commits alone; it did not exercise
+the padding fallback.
+
+After asserting exactly 2097152 pages and 8589934592 main-file bytes, a
+test-only producer temporarily changes and restores each 64 KiB chunk
+before moving on, committing once per body. It preserves the original
+rows, digests, epoch and account sequence while bypassing normal WAL
+reservation scheduling. Require an aligned WAL of at least 8 GiB and at
+most the admitted WAL ceiling, plus the SHM bound. Keep all eight
+readers and the writer present for TRUNCATE checkpoint, require zero WAL
+length afterward and the unchanged main-file extent. This exercises a
+large dirty body dataset in a full database, not a claim that every
+main-file page is copied.
+
+Physical integrity and complete account verification then run before and
+after reopening with eight readers. The oracle compares every accepted
+typed Blob row and changed sequence, the epoch, account endpoint/history
+floor, permanent-ID count and complete metadata/body report counts and
+declared bytes. All bodies finish with their original digests. Account
+verification reuses one caller-owned 64 KiB buffer and the captured
+maintenance view allowance, without per-body renewal. The fixture uses a
+fixed clock and a 30-minute wall bound checked between calls; apply the
+outer 45-minute timeout for synchronous native calls.
+
+After the optimized native build above, use a private disk-backed TMPDIR
+with at least 40 GiB free and invoke the library test executable
+explicitly:
+
+```text
+TMPDIR=/path/on/disk timeout --kill-after=5s 2700 target/release/td-builder run-capped "$td_mta_lib_test" --ignored --exact store_fs::index::database_qualification::maximum_database_checkpoint_and_account_maintenance --nocapture --test-threads=1
+```
+
+Require exit status zero and exactly one passed test. Ordinary gates
+leave this disk-heavy case ignored. The fixture prints its private root;
+after external termination, confirm the invocation and all descendants
+have exited before removing only that root.
+
+The 2026-10-09 x86-64 GNU host run used rustc 1.99.0-nightly
+(6f72b5dd5), test opt-level 2, Linux 7.0.14 and btrfs. Public admission
+accepted 262 bodies and returned 16 clean Capacity refusals, reaching
+the exact 8 GiB database without padding. It produced an 8640991392-byte
+WAL and checkpointed in 18.874 seconds. Physical scans took 9.837 and
+9.770 seconds; complete account passes checked 8513712128 declared body
+bytes in 58.278 and 58.017 seconds, before and after reopen. The libtest
+summary passed exactly one test in 697.74 seconds with zero failures.
+The native library test executable SHA-256 was:
+
+```text
+0dd8f38dd9b654f7a1b3fbb6b5254f6f4f3046daf8fa3d4598e2722ad7c736f2
+```
+
+The 9 MiB individual and 16 MiB shared SQLite requested-allocation caps
+were unchanged. RSS samples were 5644 KiB at baseline, 11356 filled,
+27652 dirty and checkpointed, 28240 after verification and 11960 after
+reopened verification. The largest reported VmHWM value was 31024 KiB.
+These host observations qualify this body-dominated dataset and native
+checkpoint/maintenance path; they do not qualify arbitrary-account
+metadata, normal service WAL scheduling, wrapped allocator measurements,
+guarded stack, transient RSS, power loss, full filesystem faults,
+maximum backup or whole-service overlap.
 
 Creation is exclusive but not crash-atomic. A failed initial creation can
 leave an incomplete database or a complete durable database whose startup

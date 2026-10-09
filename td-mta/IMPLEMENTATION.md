@@ -2368,6 +2368,17 @@ the floor; old snapshots retain original history. STORAGE.md defines native
 bounds, conflict handling and passive receipts. Choosing retention boundaries,
 scheduling work and reconciling admission/physical usage remain M08 work.
 
+The explicit ignored maximum-database fixture now qualifies its body-
+dominated 8 GiB main file: public capacity admission, a multi-gigabyte
+test-produced WAL, TRUNCATE checkpoint with all nine native connections,
+and complete physical/account metadata/body verification before and
+after reopen. The successful host run checked 262 bodies and 8513712128
+declared bytes under the unchanged native allocation caps. STORAGE.md
+and RESOURCES.md record actual extents, timings, observations and
+limits. This does not qualify arbitrary-account metadata, normal service
+WAL scheduling, full filesystem faults, power loss, maximum backup or
+combined service overlap.
+
 **Acceptance:** snapshots across commits/checkpoints, pool exhaustion, native
 page/WAL/heap capacity, failed body streaming, indeterminate COMMIT recovery,
 queue references after visible email deletion, history resync, bounded reclamation
@@ -2625,7 +2636,8 @@ It does not perform the separate physical check or activate a command.
 The separate account resource probe exercises one maximum-size body and
 a parent/child mailbox tree before and after reopen. Its Rust/native/RSS
 thresholds and qualification scope are specified in RESOURCES.md;
-maximum-account/database and combined-service evidence remain separate.
+arbitrary-account and combined-service evidence remain separate. M08
+records the distinct explicit maximum-database dataset qualification.
 The separate backup resource mode passed the same maximum-size body and
 mailbox tree, consuming the source into a real copy and reopening both
 roots for physical and complete account verification. It qualifies only
