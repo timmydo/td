@@ -1,12 +1,13 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
 use crate::{
-    format::row::MailboxRow,
+    format::row::{BlobKind, BlobRow, MailboxRow},
     ids::MailboxId,
-    ports::{Tick, Time},
+    ports::{BlobReader, Tick, Time},
     store_fs::tests::Fixture,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
+use td_crypto::Crypto;
 const ACCOUNT: AccountId = AccountId::from_bytes([1; 16]);
 const OTHER: AccountId = AccountId::from_bytes([2; 16]);
 const EPOCH: StoreEpoch = StoreEpoch::from_bytes([9; 16]);
@@ -680,4 +681,280 @@ fn pruning_requires_an_existing_account_and_wal_headroom() {
         Sequence::default()
     );
     assert_eq!(store.prune_history(request(1, 1, 1)).unwrap().removed, 1);
+}
+
+#[test]
+fn full_reader_pool_retains_bodies_and_history_during_bounded_pruning() {
+    const READERS: usize = 8;
+    const BYTES: usize = 2 * 1024 * 1024;
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let clock = Arc::new(Timer(AtomicU64::new(1)));
+    let store = IndexStore::create(&mut root, EPOCH, clock.clone(), READERS, deadline()).unwrap();
+    store.create_account(ACCOUNT, deadline()).unwrap();
+    let blob = BlobId::from_bytes([4; 16]);
+    let parent = MailboxId::from_bytes([3; 16]);
+    let body: Vec<u8> = (0..BYTES).map(|n| (n % 251) as u8).collect();
+    let mut digest = td_crypto::Provider.sha256().unwrap();
+    digest.update(&body).unwrap();
+    let blob_row = Row::Blob(BlobRow {
+        kind: BlobKind::Message,
+        length: BYTES as u64,
+        digest: digest.finish().unwrap(),
+        created_at: 0,
+    });
+    let mut blob_bytes = [0; 128];
+    let blob_len = blob_row.encode(&mut blob_bytes).unwrap();
+    let parent_row = Row::Mailbox(MailboxRow {
+        name: "first",
+        parent: None,
+        role: None,
+        sort_order: 0,
+        subscribed: true,
+    });
+    let mut parent_bytes = [0; 128];
+    let parent_len = parent_row.encode(&mut parent_bytes).unwrap();
+    let mut source = body.as_slice();
+    assert_eq!(
+        store.commit(
+            &td_crypto::Provider,
+            CommitRequest {
+                account: ACCOUNT,
+                expected: Sequence::default(),
+                utc_ms: 0,
+                deadline: deadline()
+            },
+            &[
+                Operation::put(Table::Blobs, blob.as_bytes(), &blob_bytes[..blob_len]).unwrap(),
+                Operation::put(
+                    Table::Mailboxes,
+                    parent.as_bytes(),
+                    &parent_bytes[..parent_len]
+                )
+                .unwrap(),
+                Operation::change(
+                    ObjectType::Mailbox,
+                    ChangeAction::Created,
+                    parent.as_bytes()
+                ),
+            ],
+            &mut [BlobSource {
+                id: blob,
+                source: &mut source
+            }],
+        ),
+        Ok(Sequence::from_u64(1))
+    );
+    assert!(source.is_empty());
+    mailbox_commit(&store, 1, false);
+    let updated_parent = Row::Mailbox(MailboxRow {
+        name: "updated",
+        parent: None,
+        role: None,
+        sort_order: 0,
+        subscribed: true,
+    });
+    let old_identity = ViewIdentity {
+        account: ACCOUNT,
+        epoch: EPOCH,
+        committed_sequence: Sequence::from_u64(2),
+        history_floor: Sequence::default(),
+    };
+    let current_identity = ViewIdentity {
+        history_floor: Sequence::from_u64(2),
+        ..old_identity
+    };
+    let created = ChangeStep::Record(ChangeRecord {
+        cursor: cursor(1, 2),
+        change: Change {
+            kind: ObjectType::Mailbox,
+            action: ChangeAction::Created,
+            id: *parent.as_bytes(),
+        },
+    });
+    let updated = ChangeStep::Record(ChangeRecord {
+        cursor: cursor(2, 1),
+        change: Change {
+            kind: ObjectType::Mailbox,
+            action: ChangeAction::Updated,
+            id: *parent.as_bytes(),
+        },
+    });
+    let mut scratch = [0; 65536];
+    {
+        let mut views: [_; READERS] =
+            std::array::from_fn(|_| store.view(ACCOUNT, deadline()).unwrap());
+        assert!(views.iter().all(|v| v.identity() == old_identity));
+        assert!(matches!(
+            store.view(ACCOUNT, deadline()),
+            Err(ports::Error::Busy)
+        ));
+        let mut inputs = views.each_mut().map(|view| {
+            view.open_blob_input(&td_crypto::Provider, blob, BYTES as u64)
+                .unwrap()
+        });
+        for input in &mut inputs {
+            assert_eq!(input.read(&mut scratch).unwrap(), scratch.len());
+            assert_eq!(scratch.as_slice(), &body[..65536]);
+        }
+        let first = store.prune_history(request(2, 2, 1)).unwrap();
+        assert_eq!(
+            first,
+            HistoryPruned {
+                identity: current_identity,
+                removed: 1,
+                more: true
+            }
+        );
+        let second = store.prune_history(request(2, 2, 1)).unwrap();
+        assert_eq!(
+            second,
+            HistoryPruned {
+                identity: current_identity,
+                removed: 1,
+                more: false
+            }
+        );
+        assert_eq!(
+            store.prune_history(request(2, 2, 1)).unwrap(),
+            HistoryPruned {
+                identity: current_identity,
+                removed: 0,
+                more: false
+            }
+        );
+        assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
+        for offset in (65536..BYTES).step_by(65536) {
+            for input in &mut inputs {
+                assert_eq!(input.read(&mut scratch).unwrap(), scratch.len());
+                assert_eq!(scratch.as_slice(), &body[offset..offset + 65536]);
+            }
+        }
+        let mut pins = inputs.map(|input| input.finish().unwrap());
+        for pin in &mut pins {
+            assert_eq!(pin.len(), BYTES as u64);
+            assert_eq!(pin.read_at(65535, &mut scratch).unwrap(), scratch.len());
+            assert_eq!(scratch.as_slice(), &body[65535..65535 + 65536]);
+            assert_eq!(pin.read_at(BYTES as u64 - 1, &mut scratch).unwrap(), 1);
+            assert_eq!(scratch.first(), body.last());
+        }
+        assert!(matches!(
+            store.view(ACCOUNT, deadline()),
+            Err(ports::Error::Busy)
+        ));
+        drop(pins);
+        for view in &mut views {
+            assert_eq!(view.identity(), old_identity);
+            assert_eq!(
+                view.get(Key::Blob(blob), &mut scratch).unwrap(),
+                Some((blob_row, Sequence::from_u64(1)))
+            );
+            assert_eq!(
+                view.get(Key::Mailbox(parent), &mut scratch).unwrap(),
+                Some((updated_parent, Sequence::from_u64(2)))
+            );
+            assert_eq!(
+                view.next_change(cursor(0, u32::MAX), ObjectType::Mailbox)
+                    .unwrap(),
+                created
+            );
+            assert_eq!(
+                view.next_change(cursor(1, 2), ObjectType::Mailbox).unwrap(),
+                updated
+            );
+            assert_eq!(
+                view.next_change(cursor(2, 1), ObjectType::Mailbox).unwrap(),
+                ChangeStep::Complete
+            );
+        }
+        let [released, remaining @ ..] = views;
+        drop(released);
+        let mut current = store.view(ACCOUNT, deadline()).unwrap();
+        assert_eq!(current.identity(), current_identity);
+        assert_eq!(
+            current.next_change(cursor(0, u32::MAX), ObjectType::Mailbox),
+            Err(ports::Error::HistoryLost)
+        );
+        assert_eq!(
+            current
+                .next_change(cursor(2, u32::MAX), ObjectType::Mailbox)
+                .unwrap(),
+            ChangeStep::Complete
+        );
+        assert!(matches!(
+            store.view(ACCOUNT, deadline()),
+            Err(ports::Error::Busy)
+        ));
+        assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
+        for mut old in remaining {
+            assert_eq!(old.identity(), old_identity);
+            assert_eq!(
+                old.next_change(cursor(0, u32::MAX), ObjectType::Mailbox)
+                    .unwrap(),
+                created
+            );
+            assert_eq!(
+                old.next_change(cursor(1, 2), ObjectType::Mailbox).unwrap(),
+                updated
+            );
+        }
+        drop(current);
+        let mut fresh: [_; READERS] =
+            std::array::from_fn(|_| store.view(ACCOUNT, deadline()).unwrap());
+        for view in &mut fresh {
+            assert_eq!(view.identity(), current_identity);
+            assert_eq!(
+                view.get(Key::Blob(blob), &mut scratch).unwrap(),
+                Some((blob_row, Sequence::from_u64(1)))
+            );
+            assert_eq!(
+                view.get(Key::Mailbox(parent), &mut scratch).unwrap(),
+                Some((updated_parent, Sequence::from_u64(2)))
+            );
+            assert_eq!(
+                view.next_change(cursor(0, u32::MAX), ObjectType::Mailbox),
+                Err(ports::Error::HistoryLost)
+            );
+            assert_eq!(
+                view.next_change(cursor(2, u32::MAX), ObjectType::Mailbox)
+                    .unwrap(),
+                ChangeStep::Complete
+            );
+        }
+        drop(fresh);
+    }
+    store.checkpoint(deadline()).unwrap();
+    drop(store);
+    let store = IndexStore::open(&mut root, clock, READERS, deadline()).unwrap();
+    store.validate_integrity(deadline()).unwrap();
+    let mut reopened: [_; READERS] =
+        std::array::from_fn(|_| store.view(ACCOUNT, deadline()).unwrap());
+    for view in &mut reopened {
+        assert_eq!(view.identity(), current_identity);
+        assert_eq!(
+            view.get(Key::Blob(blob), &mut scratch).unwrap(),
+            Some((blob_row, Sequence::from_u64(1)))
+        );
+        assert_eq!(
+            view.get(Key::Mailbox(parent), &mut scratch).unwrap(),
+            Some((updated_parent, Sequence::from_u64(2)))
+        );
+        assert_eq!(
+            view.next_change(cursor(0, u32::MAX), ObjectType::Mailbox),
+            Err(ports::Error::HistoryLost)
+        );
+        assert_eq!(
+            view.next_change(cursor(2, u32::MAX), ObjectType::Mailbox)
+                .unwrap(),
+            ChangeStep::Complete
+        );
+        let mut input = view
+            .open_blob_input(&td_crypto::Provider, blob, BYTES as u64)
+            .unwrap();
+        for bytes in body.chunks(65536) {
+            assert_eq!(input.read(&mut scratch).unwrap(), bytes.len());
+            assert_eq!(scratch.as_slice(), bytes);
+        }
+        drop(input.finish().unwrap());
+    }
 }

@@ -559,6 +559,43 @@ charges: free pages, checkpoints, retained views and quota reconciliation
 remain distinct. Runtime retention scheduling and admission integration are
 unimplemented; the hard database ceiling may still refuse writes.
 
+A native full-reader-pool fixture now qualifies bounded public history
+pruning with eight retained partial body inputs. Public commits create a
+patterned 2 MiB body, parent mailbox and Created change at sequence one,
+then update the parent with an Updated change at sequence two. All eight
+views capture the full sequence-two/floor-zero identity and each input
+reads its first exact 64 KiB chunk before pruning.
+
+With all eight loans alive, prune_history at expected sequence two,
+through sequence two and max_rows one returns sequence two/floor two,
+one removed row and more true. A second call removes one row with more
+false; repeating returns zero and false. The endpoint does not advance.
+All eight inputs then finish the remaining 31 chunks, verify every
+original byte and complete independent digests; all pins pass
+cross-chunk and final-byte reads. After pins drop, all eight old views
+preserve their original full identity, typed BlobRow at changed sequence
+one, updated parent at changed sequence two, both exact original change
+records and completion.
+
+A ninth capture and checkpoint refuse Busy while the pool is full.
+Releasing one slot admits a current sequence-two/floor-two view
+alongside seven old views: below-floor history returns HistoryLost, the
+completed-floor sentinel returns Complete, and the old views retain both
+changes. Releasing all views permits simultaneous capture of all eight
+current slots with exact identity, typed rows and retired-history
+behavior. Checkpoint then succeeds. Reopen with eight readers passes
+physical integrity and repeats current identity, typed metadata, history
+and complete body-byte/digest verification in every slot.
+
+This is bounded native semantic evidence for sequential pruning with
+eight same-account/same-body loans. The fixture uses public mutations
+and pruning, without private SQL seeding, database-file opens, new fault
+hooks, production changes or widened unsafe allowances. It does not
+qualify portable allocation, RSS or guarded-stack limits, parallel
+threads, multiple accounts, maximum-database work, retention-policy
+authority, quota reconciliation, full filesystem faults, power loss or
+whole-service scheduling.
+
 Backup must capture one consistent SQLite state. Stop service activity,
 checkpoint successfully, close every connection, then copy the main database;
 that snapshot contains bodies and metadata together. Copying only the live
