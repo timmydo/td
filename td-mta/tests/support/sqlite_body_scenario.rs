@@ -43,6 +43,7 @@ pub const ACCOUNT_PHASES: &[&str] = &[
 ];
 pub const BODY_BYTES: u64 = 32 * 1024 * 1024;
 const CHUNK_BYTES: usize = 64 * 1024;
+const READERS: usize = 8;
 const ACCOUNT: AccountId = AccountId::from_bytes([0x35; 16]);
 const BLOB: BlobId = BlobId::from_bytes([0x46; 16]);
 struct Fixed;
@@ -313,7 +314,7 @@ fn run_with_roots(
         root,
         StoreEpoch::from_bytes([0x57; 16]),
         clock.clone(),
-        2,
+        READERS,
         deadline,
     )
     .unwrap();
@@ -381,7 +382,7 @@ fn run_with_roots(
         assert_eq!(receipt.epoch, StoreEpoch::from_bytes([0x57; 16]));
         assert!(receipt.bytes >= BODY_BYTES && receipt.bytes <= 8 * 1024 * 1024 * 1024);
         observe();
-        let original = IndexStore::open(root, clock.clone(), 2, deadline).unwrap();
+        let original = IndexStore::open(root, clock.clone(), READERS, deadline).unwrap();
         original.validate_integrity(deadline).unwrap();
         check_account(
             &original,
@@ -391,7 +392,7 @@ fn run_with_roots(
             &mut scratch,
         );
         observe();
-        let restored = IndexStore::open(destination, clock.clone(), 2, deadline).unwrap();
+        let restored = IndexStore::open(destination, clock.clone(), READERS, deadline).unwrap();
         restored.validate_integrity(deadline).unwrap();
         check_account(
             &restored,
@@ -425,7 +426,7 @@ fn run_with_roots(
             observe();
             restored.checkpoint(deadline).unwrap();
             drop(restored);
-            let restored = IndexStore::open(destination, clock, 2, deadline).unwrap();
+            let restored = IndexStore::open(destination, clock, READERS, deadline).unwrap();
             assert_eq!(
                 restored.view(ACCOUNT, deadline).unwrap().identity(),
                 current
@@ -444,7 +445,7 @@ fn run_with_roots(
     }
     store.checkpoint(deadline).unwrap();
     drop(store);
-    let reopened = IndexStore::open(root, clock, 2, deadline).unwrap();
+    let reopened = IndexStore::open(root, clock, READERS, deadline).unwrap();
     {
         let mut view = reopened.view(ACCOUNT, deadline).unwrap();
         assert_eq!(view.identity().committed_sequence, sequence);

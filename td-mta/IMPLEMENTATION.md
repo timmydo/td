@@ -2723,6 +2723,17 @@ inputs. This supplies bounded primitive stack evidence, without claiming
 numeric frame peaks, arbitrary-account/maximum-database paths, complete
 worker composition, full faults, power loss or activation.
 
+The shared portable body/account/backup/epoch resource fixtures now use
+eight readers plus the writer at creation and every reopen. The complete
+isolated static-musl qualification passed under all original allocation,
+RSS and guarded-stack ceilings. Backup/epoch retain both nine-connection
+stores through final verification, qualifying eighteen simultaneous
+owners for this fixed 32 MiB dataset. All phase sequences and semantic
+controls remain. RESOURCES.md and td-crypto/PORTABLE.md record actual
+metrics and inputs. This does not qualify eight borrowed views or
+simultaneous reader/body work, arbitrary-account/maximum-database paths,
+full faults or whole-service overlap.
+
 These primitives do not complete the restore command,
 selection/verification workflow or service activation.
 

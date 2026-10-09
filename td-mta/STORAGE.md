@@ -825,6 +825,32 @@ credentials/configuration snapshots, operational restore authorization or
 service activation. No production storage, schema, unsafe, dependency,
 allocator hook or native-cap change is introduced.
 
+The shared portable SQLite body/account/backup/epoch fixtures now
+request the supported maximum eight readers plus one writer at creation
+and every reopen. The source and destination stores in backup/epoch
+overlap with eighteen native owners through the final verification
+observations. The one-reader native warmup before baseline is unchanged.
+This qualifies full owner pools for the fixed 32 MiB body and mailbox
+dataset, not eight simultaneously borrowed views or concurrent reader
+work.
+
+The complete pinned static-musl qualification passed all four
+Rust/native/RSS observer cases and all four guarded worker-stack cases
+without changing any resource ceiling. Backup/epoch retain independently
+reopened physical/account checks, public copy and original source
+preservation; epoch delegates one actual warmed 16-byte entropy fill and
+persists the destination-only identity change through checkpoint/reopen.
+RESOURCES.md and td-crypto/PORTABLE.md record the measurements, scope
+and exact artifact inputs.
+
+This qualifies these healthy bounded fixtures and their owner
+configuration. It does not establish arbitrary-account or maximum-
+database behavior, simultaneous borrowed-reader/body execution, numeric
+frame high-water, a transient RSS bound, full filesystem faults, power
+loss, complete worker composition or service overlap. Earlier portable
+records remain tied to their own artifact/source hashes and used two
+readers plus a writer per measured store.
+
 The separate portable --sqlite-body-stack, --sqlite-account-stack,
 --sqlite-backup-stack and --sqlite-epoch-stack cases passed their shared
 32 MiB fixtures on one worker per fresh process. Each requests a 240 KiB

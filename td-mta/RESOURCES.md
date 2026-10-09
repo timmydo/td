@@ -2752,6 +2752,58 @@ not a general zero-allocation guarantee or method-only attribution.
 td-crypto/PORTABLE.md records the exact artifact, staged source/vendor
 pins, current SQLite ceilings and qualification limits.
 
+The shared portable SQLite body/account/backup/epoch fixtures now
+request the supported maximum eight readers plus one writer at creation
+and every reopen. The source and destination stores in backup/epoch
+overlap with eighteen native owners through the final verification
+observations. The one-reader native warmup before baseline is unchanged.
+This qualifies full owner pools for the fixed 32 MiB body and mailbox
+dataset, not eight simultaneously borrowed views or concurrent reader
+work.
+
+| Case | Observer | Warm baseline | Lifetime requested peak / maximum RSS sample | After teardown |
+| --- | --- | ---: | ---: | ---: |
+| Body | Rust requested bytes | 560 | 199846 | 560 |
+| Body | Wrapped C boundary requested bytes | 1344 | 2164550 | 1344 |
+| Body | Unwrapped RSS, KiB | 3400 | 6060 | 3620 |
+| Account | Rust requested bytes | 624 | 199910 | 624 |
+| Account | Wrapped C boundary requested bytes | 1424 | 2164830 | 1424 |
+| Account | Unwrapped RSS, KiB | 3396 | 6068 | 3624 |
+| Backup | Rust requested bytes | 688 | 333620 | 688 |
+| Backup | Wrapped C boundary requested bytes | 1504 | 4197372 | 1504 |
+| Backup | Unwrapped RSS, KiB | 3396 | 8300 | 3644 |
+| Epoch | Rust requested bytes | 880 | 333812 | 880 |
+| Epoch | Wrapped C boundary requested bytes | 134584 | 4330452 | 134584 |
+| Epoch | Unwrapped RSS, KiB | 3928 | 8768 | 4112 |
+
+The complete isolated static-musl command passed. All four guarded
+worker-stack cases retained equal before/after writable mappings of
+253952 bytes, bounded at 262144 bytes with adjacent inaccessible guards.
+The exact phase counts remain eight, nine, ten and thirteen. Rust and
+wrapped C-boundary live requested bytes return to their warm baselines;
+native block counts return to five in body/account/backup and thirteen
+in epoch, whose entropy handle remains live through the final sample.
+td-crypto/PORTABLE.md records the actual artifact and staged inputs.
+
+All original phase sequences, body rollback/refusal/ID-reuse controls,
+complete account checks, public backup, independently reopened physical
+checks, actual warmed SystemEntropy renewal and source-preservation
+assertions remain. Physical checks apply to backup/epoch; body/account
+retain their original coverage. Existing Rust 2 MiB, wrapped C-boundary
+17 MiB, sampled RSS growth 24 MiB and guarded writable stack 256 KiB
+ceilings remain unchanged. SQLite retains its separate 9 MiB individual
+and 16 MiB process-wide requested-heap caps across all pools. No
+production API, schema, unsafe surface, dependency, native cap or
+reservation changes.
+
+This qualifies these healthy bounded fixtures and their owner
+configuration. It does not establish arbitrary-account or maximum-
+database behavior, simultaneous borrowed-reader/body execution, numeric
+frame high-water, a transient RSS bound, full filesystem faults, power
+loss, complete worker composition or service overlap. Earlier portable
+records remain tied to their own artifact/source hashes and used two
+readers plus a writer per measured store.
+
 The separate portable SQLite worker-stack cases passed the same shared
 32 MiB body, account, backup and epoch fixtures. The existing unwrapped
 artifact runs each case in a fresh process with one explicit worker,
