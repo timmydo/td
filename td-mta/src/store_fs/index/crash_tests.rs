@@ -25,6 +25,8 @@ const EMAIL: EmailId = EmailId::from_bytes([0x74; 16]);
 const THREAD: ThreadId = ThreadId::from_bytes([0x75; 16]);
 const BODY_BYTES: u64 = 2 * 1024 * 1024;
 const CHILD_CASE: &str = "store_fs::index::crash_tests::crash_child";
+const BACKUP_CHILD_CASE: &str = "store_fs::index::crash_tests::backup_crash_child";
+const DESTINATION_ENV: &str = "TD_MTA_BACKUP_CRASH_DESTINATION";
 const ROOT_ENV: &str = "TD_MTA_CRASH_FIXTURE_ROOT";
 const PHASE_ENV: &str = "TD_MTA_CRASH_FIXTURE_PHASE";
 
@@ -165,10 +167,14 @@ impl Drop for ChildGuard {
     }
 }
 fn kill_at(root: &Path, phase: &str) {
-    let child = Command::new(std::env::current_exe().unwrap())
+    kill_child_at(root, phase, CHILD_CASE, None);
+}
+fn kill_child_at(root: &Path, phase: &str, case: &str, destination: Option<&Path>) {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args([
             "--exact",
-            CHILD_CASE,
+            case,
             "--ignored",
             "--nocapture",
             "--test-threads=1",
@@ -177,10 +183,16 @@ fn kill_at(root: &Path, phase: &str) {
         .env(PHASE_ENV, phase)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let mut child = ChildGuard(child);
+        .stderr(Stdio::inherit());
+    match destination {
+        Some(path) => {
+            command.env(DESTINATION_ENV, path);
+        }
+        None => {
+            command.env_remove(DESTINATION_ENV);
+        }
+    }
+    let mut child = ChildGuard(command.spawn().unwrap());
     let until = Instant::now() + Duration::from_secs(60);
     loop {
         assert!(
@@ -443,4 +455,204 @@ fn stopped_checkpoint_backup_restores_bodies_metadata_and_queue_retention() {
     ));
     verify_body(&mut view, BLOB);
     verify_body(&mut view, queued_blob);
+}
+
+struct BackupClock {
+    source: std::path::PathBuf,
+    destination: std::path::PathBuf,
+    pause: bool,
+}
+impl Clock for BackupClock {
+    fn sample(&self) -> Result<Time, ports::Error> {
+        if self.pause {
+            let partial = self.destination.join("metadata.sqlite3.backup-partial");
+            if let Ok(metadata) = fs::metadata(partial) {
+                if metadata.len() >= 65536 {
+                    let source_bytes = fs::metadata(self.source.join("metadata.sqlite3"))
+                        .unwrap()
+                        .len();
+                    assert!(metadata.len() < source_bytes);
+                    assert!(!self.destination.join("metadata.sqlite3").exists());
+                    acknowledge_and_wait(&self.source, "during-backup-copy");
+                }
+            }
+        }
+        Fixed.sample()
+    }
+}
+
+#[test]
+#[ignore = "child endpoint invoked only by the backup abrupt-death parent oracle"]
+fn backup_crash_child() {
+    let source_path = std::env::var_os(ROOT_ENV).unwrap();
+    let destination_path = std::env::var_os(DESTINATION_ENV).unwrap();
+    let phase = std::env::var(PHASE_ENV).unwrap();
+    assert!(matches!(
+        phase.as_str(),
+        "during-backup-copy" | "after-backup-receipt"
+    ));
+    with_probe_root_path(Path::new(&source_path), |source_root| {
+        with_probe_root_path(Path::new(&destination_path), |destination_root| {
+            let clock = Arc::new(BackupClock {
+                source: source_path.clone().into(),
+                destination: destination_path.clone().into(),
+                pause: phase == "during-backup-copy",
+            });
+            let store = IndexStore::open(source_root, clock, 2, deadline()).unwrap();
+            let receipt = store
+                .backup(destination_root, deadline(), &mut [0; 65536])
+                .unwrap();
+            assert_eq!(phase, "after-backup-receipt");
+            assert_eq!(receipt.epoch, StoreEpoch::from_bytes([0x95; 16]));
+            assert_eq!(
+                receipt.bytes,
+                fs::metadata(Path::new(&source_path).join("metadata.sqlite3"))
+                    .unwrap()
+                    .len()
+            );
+            assert_eq!(
+                receipt.bytes,
+                fs::metadata(Path::new(&destination_path).join("metadata.sqlite3"))
+                    .unwrap()
+                    .len()
+            );
+            assert!(!Path::new(&destination_path)
+                .join("metadata.sqlite3.backup-partial")
+                .exists());
+            acknowledge_and_wait(Path::new(&source_path), "after-backup-receipt");
+        });
+    });
+}
+
+fn verify_backup_account(store: &IndexStore<'_>) {
+    store.validate_integrity(deadline()).unwrap();
+    assert_eq!(store.epoch(), StoreEpoch::from_bytes([0x95; 16]));
+    let mut view = store.maintenance_view(ACCOUNT, deadline()).unwrap();
+    assert_eq!(view.identity().committed_sequence, Sequence::from_u64(1));
+    let report = view
+        .verify_account(
+            &td_crypto::Provider,
+            0,
+            super::super::AccountCheckLimits {
+                metadata: crate::metadata_sweep::Limits {
+                    rows: 2,
+                    parent_reads: 1,
+                },
+                bodies: super::super::BodyCheckLimits {
+                    blobs: 1,
+                    bytes: BODY_BYTES,
+                },
+            },
+            &mut [0; 65536],
+        )
+        .unwrap();
+    assert_eq!(report.identity(), view.identity());
+    assert_eq!(report.metadata().references().rows(), 2);
+    assert_eq!(report.metadata().mailboxes().mailboxes(), 1);
+    assert_eq!(
+        (report.bodies().blobs(), report.bodies().bytes()),
+        (1, BODY_BYTES)
+    );
+    let mut bytes = [0; 1024];
+    assert!(matches!(
+        view.get(Key::Mailbox(MAILBOX), &mut bytes).unwrap(),
+        Some((
+            Row::Mailbox(MailboxRow {
+                name: "Recovered",
+                ..
+            }),
+            _
+        ))
+    ));
+    verify_body(&mut view, BLOB);
+}
+
+#[test]
+fn abrupt_death_during_backup_copy_and_after_receipt_preserves_source_and_phase() {
+    for phase in ["during-backup-copy", "after-backup-receipt"] {
+        let source = Fixture::new();
+        let destination = Fixture::new();
+        let bytes = {
+            let mut root = source.locked();
+            let store = IndexStore::create(
+                &mut root,
+                StoreEpoch::from_bytes([0x95; 16]),
+                Arc::new(Fixed),
+                2,
+                deadline(),
+            )
+            .unwrap();
+            store.create_account(ACCOUNT, deadline()).unwrap();
+            let blob = blob_row();
+            let mailbox = mailbox_row();
+            let mut input = Generated {
+                remaining: BODY_BYTES,
+                pause_root: None,
+            };
+            store
+                .commit(
+                    &td_crypto::Provider,
+                    request(0),
+                    &[
+                        Operation::put(Table::Blobs, BLOB.as_bytes(), &blob).unwrap(),
+                        Operation::put(Table::Mailboxes, MAILBOX.as_bytes(), &mailbox).unwrap(),
+                    ],
+                    &mut [BlobSource {
+                        id: BLOB,
+                        source: &mut input,
+                    }],
+                )
+                .unwrap();
+            store.checkpoint(deadline()).unwrap();
+            fs::metadata(source.path.join("metadata.sqlite3"))
+                .unwrap()
+                .len()
+        };
+        kill_child_at(
+            &source.path,
+            phase,
+            BACKUP_CHILD_CASE,
+            Some(&destination.path),
+        );
+        let mut source_root = source.locked();
+        let store = IndexStore::open(&mut source_root, Arc::new(Fixed), 2, deadline()).unwrap();
+        verify_backup_account(&store);
+        let mut destination_root = destination.locked();
+        let final_path = destination.path.join("metadata.sqlite3");
+        let partial = destination.path.join("metadata.sqlite3.backup-partial");
+        if phase == "during-backup-copy" {
+            assert!(!final_path.exists());
+            let metadata = fs::metadata(&partial).unwrap();
+            assert!(metadata.len() >= 65536 && metadata.len() < bytes);
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            assert_eq!(metadata.nlink(), 1);
+            assert!(matches!(
+                IndexStore::open(&mut destination_root, Arc::new(Fixed), 1, deadline()),
+                Err(ports::Error::Io {
+                    kind: io::ErrorKind::NotFound,
+                    ..
+                })
+            ));
+            assert_eq!(
+                store.backup(&mut destination_root, deadline(), &mut [0; 65536]),
+                Err(super::backup::BackupError::Unpublished(
+                    ports::Error::Conflict
+                ))
+            );
+            assert_eq!(fs::metadata(&partial).unwrap().len(), metadata.len());
+            assert!(!final_path.exists());
+            let source_again =
+                IndexStore::open(&mut source_root, Arc::new(Fixed), 1, deadline()).unwrap();
+            verify_backup_account(&source_again);
+        } else {
+            assert!(!partial.exists());
+            let metadata = fs::metadata(&final_path).unwrap();
+            assert_eq!(metadata.len(), bytes);
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            assert_eq!(metadata.nlink(), 1);
+            let restored =
+                IndexStore::open(&mut destination_root, Arc::new(Fixed), 2, deadline()).unwrap();
+            verify_backup_account(&restored);
+        }
+    }
 }

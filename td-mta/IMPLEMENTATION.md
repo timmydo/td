@@ -2627,6 +2627,13 @@ a parent/child mailbox tree before and after reopen. Its Rust/native/RSS
 thresholds and qualification scope are specified in RESOURCES.md;
 maximum-account/database and combined-service evidence remain separate.
 
+The bounded backup process-death oracle kills its exact child during an
+observed incomplete partial copy and after a returned receipt. It verifies
+the original source in both cases, preserves/refuses the partial destination
+and verifies the completed backup. STORAGE.md states the two boundaries;
+power loss, link/unlink windows, sync errors and maximum backup remain
+separate qualification.
+
 Epoch renewal atomically replaces the epoch from admitted entropy while
 preserving account histories and bodies; every error consumes its owner.
 These primitives do not complete the restore command,

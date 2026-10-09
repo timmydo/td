@@ -585,6 +585,19 @@ before removing the partial link. Never auto-delete or overwrite a destination
 on an error. The engine is consumed even on refusal; callers may reopen its
 source while retaining the original lock.
 
+The ordinary backup abrupt-death oracle kills only its recorded child
+with SIGKILL in two phases. During copying, a test clock observes an
+actual nonempty, incomplete partial file before publication and parks
+the child. After success, the child parks only after backup returns its
+receipt. The parent reacquires both root locks, checks the source's
+physical integrity, captured account metadata and every body byte,
+and distinguishes the incomplete partial from the completed final file.
+An incomplete destination cannot open or be overwritten by a retry;
+its partial file remains for inspection. A returned backup reopens with
+the same epoch, sequence, metadata and body contents. This is a bounded
+2 MiB process-death oracle, not power loss, the link/unlink window, sync
+errors, complete filesystem faults or maximum-size backup qualification.
+
 The snapshot contains authoritative bodies and metadata, but receipt success
 does not verify every body digest or domain invariant. The snapshot may be opened for
 offline inspection with ordinary IndexStore::open and its normal checks.
