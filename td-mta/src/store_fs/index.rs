@@ -136,6 +136,7 @@ pub(in crate::store_fs) struct Native {
     connection: Mutex<Connection>,
     budget: Arc<Mutex<Budget>>,
     clock: Arc<dyn Clock>,
+    snapshot_failure: Mutex<Option<ports::Error>>,
 }
 impl Native {
     fn open(path: &Path, clock: Arc<dyn Clock>, deadline: Deadline) -> Result<Self, ports::Error> {
@@ -237,6 +238,7 @@ impl Native {
             connection: Mutex::new(connection),
             budget,
             clock,
+            snapshot_failure: Mutex::new(None),
         })
     }
     fn close(self) -> Result<(), ports::Error> {
@@ -307,6 +309,33 @@ impl Native {
         let result = f(&connection);
         drop(connection);
         self.check()?;
+        result
+    }
+    pub(in crate::store_fs) fn read_snapshot<T>(
+        &self,
+        read: impl FnOnce(&Native) -> Result<T, ports::Error>,
+    ) -> Result<T, ports::Error> {
+        if let Some(error) = *lock(&self.snapshot_failure)? {
+            return Err(error);
+        }
+        let native = self;
+        // SQLite may end a read transaction after NOMEM, IOERR or FULL.
+        let live = lock(&native.connection).map(|db| !db.is_autocommit());
+        if !matches!(live, Ok(true)) {
+            let error = live.err().unwrap_or(ports::Error::Corrupt);
+            *lock(&self.snapshot_failure)? = Some(error);
+            return Err(error);
+        }
+        let result = read(native);
+        let live = lock(&native.connection).map(|db| !db.is_autocommit());
+        if !matches!(live, Ok(true)) {
+            let error = live
+                .err()
+                .or_else(|| result.as_ref().err().copied())
+                .unwrap_or(ports::Error::Corrupt);
+            *lock(&self.snapshot_failure)? = Some(error);
+            return Err(error);
+        }
         result
     }
     fn rollback(&self) -> bool {
@@ -635,7 +664,6 @@ impl<'r> IndexStore<'r> {
                 slot,
                 native: Some(native),
                 identity,
-                failed: None,
             }),
             Err(error) => {
                 let returned = if native.rollback() {
@@ -1327,7 +1355,6 @@ pub struct IndexReadView<'s, 'r> {
     slot: usize,
     native: Option<Native>,
     identity: ViewIdentity,
-    failed: Option<ports::Error>,
 }
 impl IndexReadView<'_, '_> {
     fn native(&self) -> Result<&Native, ports::Error> {
@@ -1337,28 +1364,7 @@ impl IndexReadView<'_, '_> {
         &mut self,
         read: impl FnOnce(&Native) -> Result<T, ports::Error>,
     ) -> Result<T, ports::Error> {
-        if let Some(error) = self.failed {
-            return Err(error);
-        }
-        let native = self.native()?;
-        // SQLite may end a read transaction after NOMEM, IOERR or FULL.
-        let live = lock(&native.connection).map(|db| !db.is_autocommit());
-        if !matches!(live, Ok(true)) {
-            let error = live.err().unwrap_or(ports::Error::Corrupt);
-            self.failed = Some(error);
-            return Err(error);
-        }
-        let result = read(native);
-        let live = lock(&native.connection).map(|db| !db.is_autocommit());
-        if !matches!(live, Ok(true)) {
-            let error = live
-                .err()
-                .or_else(|| result.as_ref().err().copied())
-                .unwrap_or(ports::Error::Corrupt);
-            self.failed = Some(error);
-            return Err(error);
-        }
-        result
+        self.native()?.read_snapshot(read)
     }
     pub(in crate::store_fs) fn blob_scope(&mut self) -> Result<(&Native, Deadline), ports::Error> {
         let deadline = self.read_snapshot(|native| {
@@ -1409,7 +1415,8 @@ impl ReadView for IndexReadView<'_, '_> {
 impl Drop for IndexReadView<'_, '_> {
     fn drop(&mut self) {
         if let Some(native) = self.native.take() {
-            let returned = if self.failed.is_some() {
+            let returned = if !matches!(lock(&native.snapshot_failure), Ok(failure) if failure.is_none())
+            {
                 drop(native);
                 ReaderSlot::Retired
             } else if native.rollback() {
@@ -1940,6 +1947,135 @@ mod tests {
             Some((Row::Mailbox(MailboxRow { name: "new", .. }), _))
         ));
     }
+    #[test]
+    fn body_owners_refuse_lost_snapshots_and_retire_the_pool_slot() {
+        use super::super::pinned::snapshot_tests::{input_native, pin_native};
+        let mut wrong = Vec::new();
+        for stage in ["input_read", "input_finish", "pin_read", "pin_check"] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let clock = Arc::new(Timer(AtomicU64::new(1)));
+            let store = IndexStore::create(
+                &mut root,
+                StoreEpoch::from_bytes([9; 16]),
+                clock.clone(),
+                1,
+                deadline(),
+            )
+            .unwrap();
+            store.create_account(ACCOUNT, deadline()).unwrap();
+            let id = BlobId::from_bytes([4; 16]);
+            let replacement = BlobId::from_bytes([5; 16]);
+            let value = encode(Row::Blob(body_row(b"original", BlobKind::Message)));
+            store
+                .commit(
+                    &td_crypto::Provider,
+                    request(0),
+                    &[Operation::put(Table::Blobs, id.as_bytes(), &value).unwrap()],
+                    &mut [BlobSource {
+                        id,
+                        source: &mut b"original".as_slice(),
+                    }],
+                )
+                .unwrap();
+            let mut view = store.view(ACCOUNT, deadline()).unwrap();
+            let mut input = view
+                .open_blob_input(&td_crypto::Provider, id, MAX_BODY_BYTES)
+                .unwrap();
+            let native = input_native(&input);
+            let selected = Arc::new(AtomicU64::new(0));
+            let observed = selected.clone();
+            lock(&native.connection)
+                .unwrap()
+                .authorizer(Some(move |context: AuthContext<'_>| {
+                    if matches!(context.action, AuthAction::Select) {
+                        observed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Authorization::Allow
+                }))
+                .unwrap();
+            assert_eq!(input.read(&mut []), Ok(0));
+            assert!(selected.load(Ordering::Relaxed) > 0);
+            let mut output = [0; 8];
+            if stage != "input_read" {
+                assert_eq!(input.read(&mut output), Ok(8));
+                assert_eq!(&output, b"original");
+            }
+            let (mut input, mut pin) = if stage.starts_with("pin_") {
+                (None, Some(input.finish().unwrap()))
+            } else {
+                (Some(input), None)
+            };
+            let native = pin.as_ref().map(pin_native).unwrap_or(native);
+            native
+                .run(|db| db.execute_batch("ROLLBACK").map_err(sql))
+                .unwrap();
+            let changed = encode(Row::Blob(body_row(b"replaced", BlobKind::Message)));
+            store
+                .commit(
+                    &td_crypto::Provider,
+                    request(1),
+                    &[
+                        Operation::delete(Table::Blobs, id.as_bytes()).unwrap(),
+                        Operation::put(Table::Blobs, replacement.as_bytes(), &changed).unwrap(),
+                    ],
+                    &mut [BlobSource {
+                        id: replacement,
+                        source: &mut b"replaced".as_slice(),
+                    }],
+                )
+                .unwrap();
+            selected.store(0, Ordering::Relaxed);
+            let actual = match stage {
+                "input_read" => input.as_mut().unwrap().read(&mut output).map(|_| ()),
+                "input_finish" => input.take().unwrap().finish().map(drop),
+                "pin_read" => {
+                    ports::BlobReader::read_at(pin.as_mut().unwrap(), 0, &mut output).map(|_| ())
+                }
+                "pin_check" => pin.as_mut().unwrap().check_deadline(),
+                _ => panic!("unknown stage"),
+            };
+            if actual != Err(ports::Error::Corrupt) {
+                wrong.push((stage, actual, output));
+            }
+            if actual == Err(ports::Error::Corrupt) {
+                assert_eq!(selected.load(Ordering::Relaxed), 0, "{stage}");
+                native
+                    .run(|db| db.execute_batch("BEGIN DEFERRED").map_err(sql))
+                    .unwrap();
+                if let Some(input) = input.as_mut() {
+                    assert_eq!(input.read(&mut output), Err(ports::Error::Corrupt));
+                }
+                if let Some(pin) = pin.as_mut() {
+                    assert_eq!(pin.check_deadline(), Err(ports::Error::Corrupt));
+                    assert_eq!(
+                        ports::BlobReader::read_at(pin, 0, &mut output),
+                        Err(ports::Error::Corrupt)
+                    );
+                }
+            }
+            drop(input);
+            drop(pin);
+            let result = view.get(Key::Blob(replacement), &mut [0; 64]).map(|_| ());
+            assert_eq!(result, Err(ports::Error::Corrupt));
+            drop(view);
+            assert!(matches!(
+                store.view(ACCOUNT, deadline()),
+                Err(ports::Error::Busy)
+            ));
+            drop(store);
+            let reopened = IndexStore::open(&mut root, clock, 1, deadline()).unwrap();
+            let mut fresh = reopened.view(ACCOUNT, deadline()).unwrap();
+            let mut healthy = fresh
+                .open_blob_input(&td_crypto::Provider, replacement, MAX_BODY_BYTES)
+                .unwrap();
+            assert_eq!(healthy.read(&mut output), Ok(8));
+            assert_eq!(&output, b"replaced");
+            assert!(healthy.finish().is_ok());
+        }
+        assert!(wrong.is_empty(), "lost body snapshots accepted: {wrong:?}");
+    }
+
     #[test]
     fn sqlite_transactions_reopen_and_snapshot_real_metadata() {
         let fixture = Fixture::maximum_root();

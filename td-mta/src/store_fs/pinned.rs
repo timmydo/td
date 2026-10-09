@@ -29,12 +29,15 @@ impl Clock for VerifyClock<'_> {
 }
 fn checked<T>(
     clock: &VerifyClock<'_>,
+    native: &Native,
     run: impl FnOnce() -> Result<T, PolicyError>,
 ) -> Result<T, PolicyError> {
-    clock.sample()?;
-    let result = run();
-    clock.sample()?;
-    result
+    native.read_snapshot(|_| {
+        clock.sample()?;
+        let result = run();
+        clock.sample()?;
+        result
+    })
 }
 impl IndexReadView<'_, '_> {
     /// The original snapshot and deadline cover verification and subsequent reads.
@@ -63,7 +66,9 @@ impl IndexReadView<'_, '_> {
             deadline,
             last: AtomicU64::new(0),
         };
-        let digest = checked(&clock, || crypto.sha256().map_err(PolicyError::from))?;
+        let digest = checked(&clock, native, || {
+            crypto.sha256().map_err(PolicyError::from)
+        })?;
         Ok(PinnedBlobInput {
             native,
             crypto,
@@ -107,7 +112,7 @@ impl<'a, 'c, C: Crypto> PinnedBlobInput<'a, 'c, C> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        let result = checked(&self.clock, || {
+        let result = checked(&self.clock, self.native, || {
             let count =
                 self.native
                     .read_body(self.rowid, self.row.length, self.position, output)?;
@@ -129,7 +134,7 @@ impl<'a, 'c, C: Crypto> PinnedBlobInput<'a, 'c, C> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        checked(&self.clock, || {
+        checked(&self.clock, self.native, || {
             if self.position != self.row.length {
                 return Err(PolicyError::Invalid);
             }
@@ -142,7 +147,7 @@ impl<'a, 'c, C: Crypto> PinnedBlobInput<'a, 'c, C> {
             Ok(())
         })?;
         self.native
-            .verify_body_extent(self.rowid, self.row.length)?;
+            .read_snapshot(|native| native.verify_body_extent(self.rowid, self.row.length))?;
         Ok(PinnedBlob {
             native: self.native,
             id: self.id,
@@ -184,7 +189,7 @@ impl PinnedBlob<'_, '_> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        let result = checked(&self.clock, || Ok(()));
+        let result = checked(&self.clock, self.native, || Ok(()));
         if let Err(error) = result {
             self.failed = Some(error);
         }
@@ -199,7 +204,7 @@ impl BlobReader for PinnedBlob<'_, '_> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        let result = checked(&self.clock, || {
+        let result = checked(&self.clock, self.native, || {
             self.native
                 .read_body(self.rowid, self.row.length, offset, output)
         });
@@ -301,5 +306,18 @@ mod owner_size_tests {
             std::mem::size_of::<PinnedBlobInput<'static, 'static, td_crypto::Provider>>() <= 4096
         );
         assert!(std::mem::size_of::<PinnedBlob<'static, 'static>>() <= 4096);
+    }
+}
+
+#[cfg(test)]
+pub(in crate::store_fs) mod snapshot_tests {
+    use super::*;
+    pub(in crate::store_fs) fn input_native<'a, C: Crypto>(
+        input: &PinnedBlobInput<'a, '_, C>,
+    ) -> &'a Native {
+        input.native
+    }
+    pub(in crate::store_fs) fn pin_native<'a>(pin: &PinnedBlob<'a, '_>) -> &'a Native {
+        pin.native
     }
 }

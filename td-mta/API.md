@@ -6517,13 +6517,18 @@ caller buffers; next follows strictly increasing encoded keys. Missing rows
 return None; insufficient buffers return Capacity. Bad rows return Corrupt.
 Detached rows borrow the caller buffers and confer no body or view ownership.
 
-next_change reads the native kind/sequence/operation index through the captured
-endpoint. Below-floor cursors return HistoryLost; above-end cursors return
-Invalid. Matching entries retain action and operation order. The SQL adapter
-returns Record or Complete; it needs no replay-only Advanced step. Identity
-changes are refused. A view retains its original monotonic deadline and VM
-fuel; clock/VM-budget failure or reversed time is sticky. Drop ends the read transaction
-before returning its connection; failed rollback retires the slot.
+next_change reads the native kind/sequence/operation index through the
+captured endpoint. Below-floor cursors return HistoryLost; above-end
+cursors return Invalid. Matching entries retain action and operation
+order. The SQL adapter returns Record or Complete; it needs no
+replay-only Advanced step. Identity changes are refused. A view retains
+its original monotonic deadline and VM fuel; clock/VM-budget failure or
+reversed time is sticky. Snapshot-loss refusal is shared by metadata
+reads, body-input operations and completed pin reads/freshness checks.
+Checks before and after work preserve a sticky error; a replacement
+transaction cannot revive the old identity. Drop ends the read
+transaction before returning its connection; snapshot loss or failed
+rollback retires the slot.
 
 IndexStore::prune_history accepts HistoryPruneRequest (account, expected
 endpoint, inclusive through sequence, max_rows, deadline). It atomically

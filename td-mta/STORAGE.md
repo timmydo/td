@@ -388,9 +388,18 @@ verification, this checks the selected body's exact extent, not the rest
 of the store. The borrow and explicit destructor keep the pooled
 connection loan live until the body owner is destroyed, including when
 held inside a MIME owner.
-Drop rolls back the read transaction before returning the connection; failed
-cleanup closes and retires the slot. Cleanup bypasses expired request fuel
-without clearing its sticky failure. Reopen restores retired capacity.
+The native connection retains one shared sticky snapshot-loss error for
+metadata reads, body-input construction/polls/completion and completed
+pin reads/freshness checks. Each boundary checks SQL transaction liveness
+before and after work, including failed work; loss hides any success and
+preserves the operation error when one exists. A newly begun transaction
+cannot revive that captured identity. These checks add no SQL or clock
+samples and grant no replacement snapshot. The fixed error cell is part
+of the cold connection owner, with no per-poll allocation.
+Drop rolls back the read transaction before returning the connection;
+snapshot loss or failed cleanup closes and retires the slot. Cleanup
+bypasses expired request fuel without clearing its sticky failure.
+Reopen restores retired capacity.
 
 Deleting an unreferenced blob removes body and metadata transactionally. Old
 views can still read its old bytes through their WAL snapshot. SQLite reuses
