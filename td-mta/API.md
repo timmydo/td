@@ -6582,6 +6582,19 @@ primitive; protocol admission and acknowledgement remain service
 responsibilities. The core does not implement online backup, retention
 scheduling or runtime slot arbitration.
 
+`metadata_sweep::Sweep` composes reference_sweep, mailbox_sweep and
+recipient_sweep over one supplied view with finite Limits { rows,
+parent_reads }. Each advance runs one child turn, at most one next and
+two gets; the caller admits the lookups and checks its deadline. The row
+allowance applies independently to all three passes; parent gets share
+one separate allowance. Failures are terminal, and ChangedView covers
+movement before or during any pass. A final identity-checked advance
+reconciles the reference pass's mailbox/submission/recipient counts
+against the later passes before granting CompleteMetadata, which retains
+all three receipts. Repeated completion checks identity without I/O.
+This is a metadata composition; physical completeness, body verification,
+anchor cardinality, actual pins and activation remain external.
+
 ## 3. Reserve, stage, commit
 
 The existing ports::Store trait is the future authenticated service boundary;

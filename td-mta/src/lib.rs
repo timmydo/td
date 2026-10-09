@@ -36,6 +36,7 @@ pub use td_mime::json_string;
 pub mod limits;
 pub mod mailbox_parents;
 pub mod mailbox_sweep;
+pub mod metadata_sweep;
 pub use td_mime::attribute as mime_attribute;
 pub use td_mime::base64 as mime_base64;
 pub use td_mime::body_lists as mime_body_lists;

@@ -907,6 +907,29 @@ deadline checks for the supplied view's full next operation; one logical lookup
 is not a physical I/O/time limit. Fixed progress and 20-byte cursor scratch use
 the worker stack; caller key/value result partitions are reused.
 
+`metadata_sweep::Sweep` composes the direct-reference, mailbox-forest and
+recipient-coverage sweeps in that order under one captured ViewIdentity
+and trusted UTC sample. One advance performs one child turn, at most one
+next and two gets, using the caller's key/value buffers. Limits.rows
+bounds each pass independently; Limits.parent_reads bounds all parent
+walk gets. The three passes can enumerate up to three times the row
+allowance, with up to twice that allowance in direct-reference gets plus
+the separate parent-get allowance. These are logical lookup bounds;
+callers still admit each lookup's full physical work and deadline.
+
+Only one active child and fixed completion receipts are retained. Child
+failures retire the entire composition. View movement is reported as one
+top-level ChangedView, including movement accompanying lookup failure.
+Before completion, compare mailbox, submission and recipient counts from
+the reference pass with the corresponding later-pass counts. Mismatch
+refuses; failed or unfinished state cannot finish. The final advance and
+repeated completion check identity without I/O. Completion retains all
+three original receipts, including the UTC sample and parent-get count.
+This checks supplied rows and queue groups, not physical enumeration
+completeness, body digests/extents, anchor cardinality, historical
+transitions, authorization or pins. Actual snapshot custody and the
+remaining offline verification/activation checks belong to the caller.
+
 Thread assignment does not depend on disposable indexes or rescanning every
 body. Store at most one anchor per email: its first syntactically valid
 Message-ID within a 1004-byte ceiling (four-byte length plus ID plus 16-byte

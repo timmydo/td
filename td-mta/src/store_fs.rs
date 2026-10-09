@@ -299,7 +299,7 @@ pub fn with_probe_root_path(path: &Path, run: impl FnOnce(&mut LockedRoot)) {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::{
         io::{BufRead, Write},
@@ -310,13 +310,13 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    pub(super) struct Fixture {
+    pub(crate) struct Fixture {
         pub(super) path: PathBuf,
         directory: Directory,
         owner: u32,
     }
     impl Fixture {
-        pub(super) fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self::sized(false)
         }
         pub(super) fn maximum_root() -> Self {
@@ -352,7 +352,7 @@ mod tests {
         pub(super) fn lock(&self) -> Result<File, LockError> {
             acquire_lock(&self.directory, self.owner)
         }
-        pub(super) fn locked(&self) -> LockedRoot {
+        pub(crate) fn locked(&self) -> LockedRoot {
             let directory = Directory::from_path(self.path.to_str().unwrap()).unwrap();
             let lock = acquire_lock(&directory, self.owner).unwrap();
             LockedRoot {
