@@ -1021,6 +1021,85 @@ RESOURCES.md and td-crypto/PORTABLE.md record actual observer
 measurements and artifact inputs. Earlier metadata-writer evidence omits
 this fence.
 
+A separate portable sqlite-pruned-overlapping-accounts selector
+qualifies bounded history retirement and cleanup while maximum-size body
+loans remain open. It keeps the earlier six selectors independently
+runnable with phase counts 8/9/10/13/13/14 and adds a seventh
+fifteen-phase case. The two public accounts share BlobId and
+parent/child MailboxId values, with independently expected distinct 32
+MiB bodies, digests and names: 64 MiB logical body bytes per root. Only
+the seventh case appends a parent Created CHANGE at cursor (1,3) to each
+initial three-PUT commit and an account-A Updated CHANGE at cursor (2,1)
+to the parent update.
+
+Eight alternating source views at sequence one/floor zero hold eight
+partially read body inputs through the account-A update to sequence two
+and passive usage-fence checks. Drop that fence only in the seventh
+case, then publicly prune A through sequence two with a one-row budget
+while all eight partial inputs remain alive: exactly one row removed,
+floor two and more true. Interleave the remaining body chunks, verify
+every account-specific byte and complete digest, retain all eight pins
+through boundary/final-byte checks, then confirm the old views still
+retain their exact Created history and initial typed metadata. Current A
+has sequence two/floor two and refuses lost history; B stays sequence
+one/floor zero with its exact Created record and completion.
+
+Actual public backup preserves that pending A cleanup independently in
+source and copy. Complete physical/account verification, one actual
+warmed SystemEntropy fill with independently captured expected copied
+epoch, durable copied reopen and preserved source domain precede
+overlap. Both complete eight-reader pools then retain sixteen
+alternating views, eighteen native owners and sixteen 32 MiB inputs
+together. Every view checks explicit source/copied epoch, account,
+endpoint/floor, original typed BlobRow and changed sequence, full
+parent/child metadata and exact history. All sixteen inputs read their
+first 64 KiB before copied A then source A independently perform one-row
+cleanup: receipts remove one then zero rows, both more false, under each
+expected epoch. Both stores refuse ninth views and checkpoints. A
+pools_pruned observation occurs with all sixteen partial inputs alive.
+
+Interleave the remaining 511 chunks per input, compare every expected
+byte and verify complete digests through finish. Retain all sixteen
+completed pins through cross-chunk/final-byte reads, both Busy controls
+and pools_verified. After pin release, repeat all sixteen typed
+identity/history checks and Busy controls. Release views, checkpoint
+both roots, pass physical checks and repeat complete independent account
+verification including retained/lost history. One caller 64 KiB scratch
+is reused; no whole-body buffer is introduced.
+
+The complete isolated pinned Rust 1.96.0 release x86-64 musl command
+passed on its first attempt on 2026-10-09: all eight static artifacts,
+API confinement (schema 57, 29 fixtures, 786 reachable items), clean
+runtime, all existing resource/positive/quiet controls, seven SQLite
+allocation/RSS cases and seven guarded-stack workers. Builder parsers
+accept the exact seventh selector and fifteen-phase protocol, including
+pools_pruned then pools_verified before dropped. Allocation, RSS and
+stack negative matrices cover all seven selectors. These measurements
+are from a fresh seven-selector run; prior artifact measurements remain
+historical.
+
+This qualifies fixed two-account public history retirement/cleanup with
+eight initial partial maximum-size loans and sixteen copied/source
+partial maximum-size loans. It does not make the earlier sixth selector
+a pruning case or replace the separate native 2 MiB fixture. Lifetime
+requested peaks and exact warm teardown do not prove per-call allocation
+freedom. Wrapped C observations may include Rust System allocations and
+are not disjoint SQLite-only attribution. Named RSS samples include
+sixteen partial inputs and sixteen completed pins but do not bound
+transient RSS; the second initial body write has no separate writing
+sample. Writable mapping size is not frame high-water. Limits remain
+Rust 2 MiB, wrapped C-boundary 17 MiB, sampled RSS growth 24 MiB,
+guarded writable mapping 256 KiB, SQLite per-allocation 9 MiB and
+process-wide 16 MiB across all pools. No
+arbitrary-account/maximal-database resource, parallel-service, quota
+reservation, effect authorization, initialize_leases, quiescence, full
+filesystem-fault, power-loss or whole-service claim follows. No
+production API, schema, unsafe surface, syscall, hook, allowance,
+dependency, cap, compiler flag, probe shim or stack wrapper changed.
+
+RESOURCES.md and td-crypto/PORTABLE.md record the actual observer
+measurements and artifact inputs.
+
 A separate portable sqlite-overlapping-accounts selector extends the
 two-account maximum-body case with sixteen simultaneous loans in the
 source and its renewed copy. Both accounts share BlobId and parent/child

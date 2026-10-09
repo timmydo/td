@@ -11,11 +11,12 @@ use td_mta::{
         key::Key,
         operation::Operation,
         row::{BlobKind, BlobRow, MailboxRow, Row},
-        Sequence, Table,
+        ObjectType, Sequence, Table,
     },
     ids::{AccountId, BlobId, MailboxId, StoreEpoch},
     ports::{
-        BlobReader, Clock, Crypto, Deadline, Digest, Error, ReadView, Tick, Time, ViewIdentity,
+        BlobReader, Change, ChangeAction, ChangeCursor, ChangeRecord, ChangeStep, Clock, Crypto,
+        Deadline, Digest, Error, ReadView, Tick, Time, ViewIdentity,
     },
     sync::{DataState, DataType},
 };
@@ -118,6 +119,23 @@ pub const OVERLAPPING_PHASES: &[&str] = &[
     "pools_verified",
     "dropped",
 ];
+pub const PRUNED_OVERLAPPING_PHASES: &[&str] = &[
+    "baseline",
+    "opened",
+    "writing",
+    "committed",
+    "verified",
+    "account_verified",
+    "backed_up",
+    "source_verified",
+    "restored_verified",
+    "epoch_renewed",
+    "epoch_reopened",
+    "source_preserved",
+    "pools_pruned",
+    "pools_verified",
+    "dropped",
+];
 struct CountingEntropy {
     source: td_crypto::SystemEntropy,
     calls: usize,
@@ -150,6 +168,7 @@ pub enum Mode {
     Epoch,
     MultiAccount,
     OverlappingAccounts,
+    PrunedOverlappingAccounts,
 }
 impl Mode {
     pub fn from_argument(argument: &str) -> Option<Self> {
@@ -160,6 +179,7 @@ impl Mode {
             "--sqlite-epoch" => Some(Self::Epoch),
             "--sqlite-multi-account" => Some(Self::MultiAccount),
             "--sqlite-overlapping-accounts" => Some(Self::OverlappingAccounts),
+            "--sqlite-pruned-overlapping-accounts" => Some(Self::PrunedOverlappingAccounts),
             _ => None,
         }
     }
@@ -170,6 +190,7 @@ impl Mode {
             Self::Backup => BACKUP_PHASES,
             Self::Epoch | Self::MultiAccount => EPOCH_PHASES,
             Self::OverlappingAccounts => OVERLAPPING_PHASES,
+            Self::PrunedOverlappingAccounts => PRUNED_OVERLAPPING_PHASES,
         }
     }
     pub fn scenario(self) -> &'static str {
@@ -180,28 +201,107 @@ impl Mode {
             Self::Epoch => "sqlite-epoch",
             Self::MultiAccount => "sqlite-multi-account",
             Self::OverlappingAccounts => "sqlite-overlapping-accounts",
+            Self::PrunedOverlappingAccounts => "sqlite-pruned-overlapping-accounts",
         }
     }
     fn has_backup(self) -> bool {
         matches!(
             self,
-            Self::Backup | Self::Epoch | Self::MultiAccount | Self::OverlappingAccounts
+            Self::Backup
+                | Self::Epoch
+                | Self::MultiAccount
+                | Self::OverlappingAccounts
+                | Self::PrunedOverlappingAccounts
         )
     }
     fn renews_epoch(self) -> bool {
         matches!(
             self,
-            Self::Epoch | Self::MultiAccount | Self::OverlappingAccounts
+            Self::Epoch
+                | Self::MultiAccount
+                | Self::OverlappingAccounts
+                | Self::PrunedOverlappingAccounts
         )
     }
     fn has_multiple_accounts(self) -> bool {
-        matches!(self, Self::MultiAccount | Self::OverlappingAccounts)
+        matches!(
+            self,
+            Self::MultiAccount | Self::OverlappingAccounts | Self::PrunedOverlappingAccounts
+        )
+    }
+    fn has_overlapping_pools(self) -> bool {
+        matches!(
+            self,
+            Self::OverlappingAccounts | Self::PrunedOverlappingAccounts
+        )
+    }
+    fn prunes_history(self) -> bool {
+        self == Self::PrunedOverlappingAccounts
     }
     pub fn has_account(self) -> bool {
         self != Self::Body
     }
 }
+fn expected_floor(mode: Mode, account: AccountId) -> Sequence {
+    Sequence::from_u64(if mode.prunes_history() && account == ACCOUNT {
+        2
+    } else {
+        0
+    })
+}
+fn cursor(sequence: u64, operation: u32) -> ChangeCursor {
+    ChangeCursor {
+        sequence: Sequence::from_u64(sequence),
+        operation,
+    }
+}
+fn check_history(mode: Mode, view: &mut crate::store_fs::IndexReadView<'_, '_>) {
+    if !mode.prunes_history() {
+        return;
+    }
+    let identity = view.identity();
+    if identity.history_floor == Sequence::from_u64(2) {
+        assert_eq!(
+            view.next_change(cursor(0, u32::MAX), ObjectType::Mailbox),
+            Err(Error::HistoryLost)
+        );
+        assert_eq!(
+            view.next_change(cursor(2, u32::MAX), ObjectType::Mailbox)
+                .unwrap(),
+            ChangeStep::Complete
+        );
+    } else {
+        assert_eq!(identity.history_floor, Sequence::default());
+        assert_eq!(identity.committed_sequence, Sequence::from_u64(1));
+        assert_eq!(
+            view.next_change(cursor(0, u32::MAX), ObjectType::Mailbox)
+                .unwrap(),
+            ChangeStep::Record(ChangeRecord {
+                cursor: cursor(1, 3),
+                change: Change {
+                    kind: ObjectType::Mailbox,
+                    action: ChangeAction::Created,
+                    id: *MailboxId::from_bytes([0x70; 16]).as_bytes()
+                },
+            })
+        );
+        assert_eq!(
+            view.next_change(cursor(1, 3), ObjectType::Mailbox).unwrap(),
+            ChangeStep::Complete
+        );
+    }
+}
+fn prune_request(deadline: Deadline) -> crate::store_fs::HistoryPruneRequest {
+    crate::store_fs::HistoryPruneRequest {
+        account: ACCOUNT,
+        expected: Sequence::from_u64(2),
+        through: Sequence::from_u64(2),
+        max_rows: 1,
+        deadline,
+    }
+}
 fn check_account(
+    mode: Mode,
     store: &IndexStore<'_>,
     account: AccountId,
     epoch: StoreEpoch,
@@ -232,7 +332,11 @@ fn check_account(
     assert_eq!(report.identity().account, account);
     assert_eq!(store.epoch(), epoch);
     assert_eq!(report.identity().epoch, epoch);
-    assert_eq!(report.identity().history_floor, Sequence::default());
+    assert_eq!(
+        report.identity().history_floor,
+        expected_floor(mode, account)
+    );
+    check_history(mode, &mut view);
     assert_eq!(report.identity().committed_sequence, sequence);
     assert_eq!(report.metadata().references().rows(), 3);
     assert_eq!(
@@ -317,9 +421,10 @@ fn check_accounts(
     deadline: Deadline,
     scratch: &mut [u8],
 ) {
-    check_account(store, ACCOUNT, epoch, sequence, deadline, scratch);
+    check_account(mode, store, ACCOUNT, epoch, sequence, deadline, scratch);
     if mode.has_multiple_accounts() {
         check_account(
+            mode,
             store,
             OTHER,
             epoch,
@@ -440,7 +545,18 @@ fn run_with_roots(
         )
         .unwrap(),
     ];
-    let operations: &[Operation<'_>] = if account_check {
+    let pruned_operations = mode.prunes_history().then(|| {
+        let mut operations = account_operations.to_vec();
+        operations.push(Operation::change(
+            ObjectType::Mailbox,
+            ChangeAction::Created,
+            parent.as_bytes(),
+        ));
+        operations
+    });
+    let operations: &[Operation<'_>] = if let Some(operations) = &pruned_operations {
+        operations
+    } else if account_check {
         &account_operations
     } else {
         &body_operations
@@ -513,6 +629,35 @@ fn run_with_roots(
             sampled: false,
             observe: &mut silent,
         };
+        let other_operations = [
+            Operation::put(
+                Table::Blobs,
+                BLOB.as_bytes(),
+                other_bytes.get(..other_len).unwrap(),
+            )
+            .unwrap(),
+            Operation::put(
+                Table::Mailboxes,
+                parent.as_bytes(),
+                parent_bytes.get(..parent_len).unwrap(),
+            )
+            .unwrap(),
+            Operation::put(
+                Table::Mailboxes,
+                child.as_bytes(),
+                child_bytes.get(..child_len).unwrap(),
+            )
+            .unwrap(),
+        ];
+        let pruned_other_operations = mode.prunes_history().then(|| {
+            let mut operations = other_operations.to_vec();
+            operations.push(Operation::change(
+                ObjectType::Mailbox,
+                ChangeAction::Created,
+                parent.as_bytes(),
+            ));
+            operations
+        });
         assert_eq!(
             store
                 .commit(
@@ -521,26 +666,9 @@ fn run_with_roots(
                         account: OTHER,
                         ..request
                     },
-                    &[
-                        Operation::put(
-                            Table::Blobs,
-                            BLOB.as_bytes(),
-                            other_bytes.get(..other_len).unwrap()
-                        )
-                        .unwrap(),
-                        Operation::put(
-                            Table::Mailboxes,
-                            parent.as_bytes(),
-                            parent_bytes.get(..parent_len).unwrap()
-                        )
-                        .unwrap(),
-                        Operation::put(
-                            Table::Mailboxes,
-                            child.as_bytes(),
-                            child_bytes.get(..child_len).unwrap()
-                        )
-                        .unwrap(),
-                    ],
+                    pruned_other_operations
+                        .as_deref()
+                        .unwrap_or(&other_operations),
                     &mut [BlobSource {
                         id: BLOB,
                         source: &mut source
@@ -586,6 +714,21 @@ fn run_with_roots(
         let updated_parent = mailbox("updated parent", None);
         let mut updated_bytes = [0; 128];
         let updated_len = updated_parent.encode(&mut updated_bytes).unwrap();
+        let updated_operations = [Operation::put(
+            Table::Mailboxes,
+            parent.as_bytes(),
+            updated_bytes.get(..updated_len).unwrap(),
+        )
+        .unwrap()];
+        let pruned_updated_operations = mode.prunes_history().then(|| {
+            let mut operations = updated_operations.to_vec();
+            operations.push(Operation::change(
+                ObjectType::Mailbox,
+                ChangeAction::Updated,
+                parent.as_bytes(),
+            ));
+            operations
+        });
         let sequence = store
             .commit(
                 &td_crypto::Provider,
@@ -593,18 +736,15 @@ fn run_with_roots(
                     expected: initial_sequence,
                     ..request
                 },
-                &[Operation::put(
-                    Table::Mailboxes,
-                    parent.as_bytes(),
-                    updated_bytes.get(..updated_len).unwrap(),
-                )
-                .unwrap()],
+                pruned_updated_operations
+                    .as_deref()
+                    .unwrap_or(&updated_operations),
                 &mut [],
             )
             .unwrap();
         assert_eq!(sequence, Sequence::from_u64(2));
-        let fence = store.usage_fence(deadline).unwrap();
-        let usage = fence.usage();
+        let mut fence = Some(store.usage_fence(deadline).unwrap());
+        let usage = fence.as_ref().unwrap().usage();
         assert_eq!(
             (
                 usage.epoch,
@@ -625,7 +765,7 @@ fn run_with_roots(
                 0
             ),
         );
-        let files = fence.file_usage();
+        let files = fence.as_ref().unwrap().file_usage();
         assert!(
             files.database_bytes > 0
                 && files.database_bytes <= td_mta::limits::SQLITE_DATABASE_BYTES
@@ -652,6 +792,24 @@ fn run_with_roots(
         assert!(matches!(store.usage_fence(deadline), Err(Error::Busy)));
         assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
         observe();
+        if mode.prunes_history() {
+            drop(fence.take());
+            assert_eq!(
+                store.prune_history(prune_request(deadline)).unwrap(),
+                crate::store_fs::HistoryPruned {
+                    identity: ViewIdentity {
+                        account: ACCOUNT,
+                        epoch: store.epoch(),
+                        committed_sequence: sequence,
+                        history_floor: Sequence::from_u64(2)
+                    },
+                    removed: 1,
+                    more: true,
+                }
+            );
+            assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
+            assert_eq!(store.checkpoint(deadline), Err(Error::Busy));
+        }
         while inputs.first().unwrap().position() != BODY_BYTES {
             for (index, input) in inputs.iter_mut().enumerate() {
                 let n = input.read(&mut scratch).unwrap();
@@ -681,6 +839,7 @@ fn run_with_roots(
         drop(pins);
         let mut metadata = [0; 128];
         for (index, view) in views.iter_mut().enumerate() {
+            check_history(mode, view);
             let account = account_at(mode, index);
             assert_eq!(
                 view.identity(),
@@ -736,12 +895,13 @@ fn run_with_roots(
                 } else {
                     sequence
                 },
-                history_floor: Sequence::default()
+                history_floor: expected_floor(mode, account)
             }
         );
     }
     let mut metadata = [0; 128];
     for (index, view) in returned.iter_mut().enumerate() {
+        check_history(mode, view);
         let account = account_at(mode, index);
         assert_eq!(
             view.get(Key::Mailbox(parent), &mut metadata).unwrap(),
@@ -915,7 +1075,7 @@ fn run_with_roots(
                 &mut scratch,
             );
             observe();
-            if mode == Mode::OverlappingAccounts {
+            if mode.has_overlapping_pools() {
                 {
                     let mut source_views: [_; READERS] = std::array::from_fn(|index| {
                         original.view(account_at(mode, index), deadline).unwrap()
@@ -936,9 +1096,10 @@ fn run_with_roots(
                                     account,
                                     epoch,
                                     committed_sequence: expected_sequence,
-                                    history_floor: Sequence::default(),
+                                    history_floor: expected_floor(mode, account),
                                 }
                             );
+                            check_history(mode, view);
                             let mut metadata = [0; 128];
                             assert_eq!(
                                 view.get(Key::Blob(BLOB), &mut metadata).unwrap(),
@@ -1009,6 +1170,30 @@ fn run_with_roots(
                     for store in [&original, &restored] {
                         assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
                         assert_eq!(store.checkpoint(deadline), Err(Error::Busy));
+                    }
+                    if mode.prunes_history() {
+                        for (store, epoch) in [(&restored, current.epoch), (&original, prior.epoch)]
+                        {
+                            assert_eq!(store.epoch(), epoch);
+                            for removed in [1, 0] {
+                                assert_eq!(
+                                    store.prune_history(prune_request(deadline)).unwrap(),
+                                    crate::store_fs::HistoryPruned {
+                                        identity: ViewIdentity {
+                                            account: ACCOUNT,
+                                            epoch,
+                                            committed_sequence: sequence,
+                                            history_floor: Sequence::from_u64(2)
+                                        },
+                                        removed,
+                                        more: false,
+                                    }
+                                );
+                            }
+                            assert!(matches!(store.view(OTHER, deadline), Err(Error::Busy)));
+                            assert_eq!(store.checkpoint(deadline), Err(Error::Busy));
+                        }
+                        observe();
                     }
                     for _ in 1..BODY_BYTES / CHUNK_BYTES as u64 {
                         for inputs in [&mut source_inputs, &mut copied_inputs] {
