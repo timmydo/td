@@ -6501,8 +6501,14 @@ foreign-key scan at startup. SQLite checks pages as accessed; the separate
 validate_integrity(deadline) maintenance operation runs quick_check and
 foreign_key_check under an explicit deadline and a finite VM allowance sized
 for the physical database cap. Complete body verification still precedes a
-body pin. Both borrow LockedRoot exclusively for the owner's lifetime, preventing
-independent owners from bypassing its transaction/checkpoint fence.
+body pin. create and open both borrow LockedRoot exclusively for the
+owner's lifetime, preventing independent owners from bypassing its
+transaction/checkpoint fence.
+
+PinnedBlobInput::finish also refuses negative or trailing stored chunk
+ordinals with Corrupt, including any chunk for an empty body. Its indexed
+extent check shares the original snapshot, deadline and VM fuel; a failed
+check yields no completed pin.
 
 view captures a real SQLite WAL read transaction under the writer mutex.
 ViewIdentity contains account, epoch, committed_sequence and history_floor.

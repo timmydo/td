@@ -1071,7 +1071,35 @@ fn write_body<C: ports::Crypto>(
         Ok(())
     })
 }
+const BODY_EXTENT: &str = "SELECT
+    EXISTS(SELECT 1 FROM blob_chunks c WHERE c.account=b.account AND c.blob=b.id AND c.ordinal<0),
+    EXISTS(SELECT 1 FROM blob_chunks c WHERE c.account=b.account AND c.blob=b.id AND c.ordinal>=?2)
+    FROM blobs b WHERE b.rowid=?1";
+
 impl Native {
+    pub(in crate::store_fs) fn verify_body_extent(
+        &self,
+        rowid: i64,
+        length: u64,
+    ) -> Result<(), ports::Error> {
+        let chunks = length.div_ceil(super::MAX_FILE_STEP_BYTES as u64);
+        self.run(|db| {
+            let (before, after): (bool, bool) = db
+                .query_row(
+                    BODY_EXTENT,
+                    params![
+                        rowid,
+                        i64::try_from(chunks).map_err(|_| ports::Error::Corrupt)?
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(sql)?;
+            if before || after {
+                return Err(ports::Error::Corrupt);
+            }
+            Ok(())
+        })
+    }
     pub(in crate::store_fs) fn read_body(
         &self,
         rowid: i64,
@@ -3482,6 +3510,231 @@ mod tests {
             output.len()
         );
         assert!(output.iter().all(|byte| *byte == 0x5a));
+    }
+
+    #[test]
+    fn verified_bodies_refuse_chunks_outside_the_declared_extent() {
+        let mut wrong = Vec::new();
+        for length in [0usize, 1, 65536, 65537] {
+            for extra in [-1i64, (length as u64).div_ceil(65536) as i64, 511] {
+                let fixture = Fixture::new();
+                let mut root = fixture.locked();
+                let store = IndexStore::create(
+                    &mut root,
+                    StoreEpoch::from_bytes([9; 16]),
+                    Arc::new(Timer(AtomicU64::new(1))),
+                    2,
+                    deadline(),
+                )
+                .unwrap();
+                store.create_account(ACCOUNT, deadline()).unwrap();
+                let id = BlobId::from_bytes([4; 16]);
+                let bytes = vec![0x5a; length];
+                let value = encode(Row::Blob(body_row(&bytes, BlobKind::Message)));
+                let mut source = std::io::Cursor::new(&bytes);
+                store
+                    .commit(
+                        &td_crypto::Provider,
+                        request(0),
+                        &[Operation::put(Table::Blobs, id.as_bytes(), &value).unwrap()],
+                        &mut [BlobSource {
+                            id,
+                            source: &mut source,
+                        }],
+                    )
+                    .unwrap();
+                let mut old = store.view(ACCOUNT, deadline()).unwrap();
+                lock(&store.writer)
+                    .unwrap()
+                    .native
+                    .run(|db| {
+                        db.execute_batch("PRAGMA ignore_check_constraints=ON")
+                            .map_err(sql)?;
+                        db.execute(
+                            "INSERT INTO blob_chunks VALUES(?1,?2,?3,?4)",
+                            params![
+                                ACCOUNT.as_bytes().as_slice(),
+                                id.as_bytes().as_slice(),
+                                extra,
+                                b"extra".as_slice()
+                            ],
+                        )
+                        .map_err(sql)?;
+                        db.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                            .map_err(sql)
+                    })
+                    .unwrap();
+                let mut current = store.view(ACCOUNT, deadline()).unwrap();
+                for (view, corrupted) in [(&mut old, false), (&mut current, true)] {
+                    let mut input = view
+                        .open_blob_input(&td_crypto::Provider, id, MAX_BODY_BYTES)
+                        .unwrap();
+                    let mut output = [0; 65536];
+                    let mut position = 0;
+                    while position < length {
+                        let count = input.read(&mut output).unwrap();
+                        assert!(count > 0);
+                        assert!(output[..count].iter().all(|byte| *byte == 0x5a));
+                        position += count;
+                    }
+                    assert_eq!(input.read(&mut output), Ok(0));
+                    let actual = input.finish().map(drop);
+                    if corrupted {
+                        if actual != Err(ports::Error::Corrupt) {
+                            wrong.push((length, extra, actual));
+                        }
+                    } else {
+                        assert_eq!(actual, Ok(()));
+                    }
+                }
+                drop(current);
+                drop(old);
+                let mut reused = store.view(ACCOUNT, deadline()).unwrap();
+                assert_eq!(reused.identity().committed_sequence, Sequence::from_u64(1));
+                assert!(reused.get(Key::Blob(id), &mut [0; 64]).unwrap().is_some());
+            }
+        }
+        assert!(wrong.is_empty(), "unexpected chunks verified: {wrong:?}");
+    }
+
+    #[test]
+    fn body_extent_probes_are_indexed_scoped_and_keep_original_fuel() {
+        for fault in ["none", "deadline", "reversal", "budget", "denied"] {
+            let fixture = Fixture::new();
+            let mut root = fixture.locked();
+            let clock = Arc::new(Timer(AtomicU64::new(1)));
+            let store = IndexStore::create(
+                &mut root,
+                StoreEpoch::from_bytes([9; 16]),
+                clock.clone(),
+                2,
+                deadline(),
+            )
+            .unwrap();
+            let other = AccountId::from_bytes([8; 16]);
+            store.create_account(ACCOUNT, deadline()).unwrap();
+            store.create_account(other, deadline()).unwrap();
+            let id = BlobId::from_bytes([4; 16]);
+            let sibling = BlobId::from_bytes([5; 16]);
+            for (account, blob, bytes, expected) in [
+                (ACCOUNT, id, b"".as_slice(), 0),
+                (ACCOUNT, sibling, b"sibling".as_slice(), 1),
+                (other, id, b"other account".as_slice(), 0),
+            ] {
+                let value = encode(Row::Blob(body_row(bytes, BlobKind::Message)));
+                let mut source = std::io::Cursor::new(bytes);
+                store
+                    .commit(
+                        &td_crypto::Provider,
+                        CommitRequest {
+                            account,
+                            ..request(expected)
+                        },
+                        &[Operation::put(Table::Blobs, blob.as_bytes(), &value).unwrap()],
+                        &mut [BlobSource {
+                            id: blob,
+                            source: &mut source,
+                        }],
+                    )
+                    .unwrap();
+            }
+            let mut view = store.view(ACCOUNT, deadline()).unwrap();
+            let native = view.native().unwrap();
+            let plan: Vec<String> = native
+                .run(|db| {
+                    let mut statement = db
+                        .prepare(&format!("EXPLAIN QUERY PLAN {BODY_EXTENT}"))
+                        .map_err(sql)?;
+                    let rows = statement
+                        .query_map(params![1i64, 0i64], |row| row.get(3))
+                        .map_err(sql)?;
+                    rows.collect::<Result<_, _>>().map_err(sql)
+                })
+                .unwrap();
+            assert_eq!(
+                plan.iter()
+                    .filter(|step| step.contains("SEARCH c USING PRIMARY KEY"))
+                    .count(),
+                2,
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter().any(|step| step.contains("ordinal<?")),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter().any(|step| step.contains("ordinal>?")),
+                "{plan:?}"
+            );
+            let hook_budget = native.budget.clone();
+            let observed = Arc::new(AtomicU64::new(0));
+            let hook_observed = observed.clone();
+            let hook_clock = clock.clone();
+            let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let hook_armed = armed.clone();
+            lock(&native.connection)
+                .unwrap()
+                .authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                    if hook_armed.load(Ordering::Relaxed)
+                        && matches!(
+                            context.action,
+                            rusqlite::hooks::AuthAction::Read {
+                                table_name: "blob_chunks",
+                                ..
+                            }
+                        )
+                    {
+                        hook_observed.fetch_add(1, Ordering::Relaxed);
+                        match fault {
+                            "deadline" => hook_clock.0.store(100, Ordering::Relaxed),
+                            "reversal" => hook_clock.0.store(0, Ordering::Relaxed),
+                            "budget" => {
+                                hook_budget.lock().unwrap().failure = Some(ports::Error::Deadline)
+                            }
+                            "denied" => return rusqlite::hooks::Authorization::Deny,
+                            _ => {}
+                        }
+                    }
+                    rusqlite::hooks::Authorization::Allow
+                }))
+                .unwrap();
+            let input = view
+                .open_blob_input(&td_crypto::Provider, id, MAX_BODY_BYTES)
+                .unwrap();
+            armed.store(true, Ordering::Relaxed);
+            let actual = input.finish().map(drop);
+            let expected = match fault {
+                "none" => Ok(()),
+                "deadline" | "budget" => Err(ports::Error::Deadline),
+                "reversal" => Err(ports::Error::Invalid),
+                "denied" => Err(ports::Error::Io {
+                    kind: std::io::ErrorKind::Other,
+                    os_code: None,
+                }),
+                _ => panic!("unknown fault"),
+            };
+            assert_eq!(actual, expected, "{fault}");
+            assert!(observed.load(Ordering::Relaxed) > 0, "{fault}");
+            lock(&view.native().unwrap().connection)
+                .unwrap()
+                .authorizer(
+                    None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+                )
+                .unwrap();
+            clock.0.store(1, Ordering::Relaxed);
+            if matches!(fault, "deadline" | "reversal" | "budget") {
+                assert_eq!(view.get(Key::Blob(id), &mut [0; 64]).map(|_| ()), expected);
+            }
+            drop(view);
+            let mut next = store.view(ACCOUNT, deadline()).unwrap();
+            assert_eq!(
+                next.open_blob_input(&td_crypto::Provider, id, MAX_BODY_BYTES)
+                    .unwrap()
+                    .finish()
+                    .map(drop),
+                Ok(())
+            );
+        }
     }
 
     #[test]

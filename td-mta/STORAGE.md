@@ -373,12 +373,21 @@ body; already captured views remain usable. ViewIdentity contains account,
 epoch, committed sequence and history floor. SQL columns are decoded into
 caller buffers, without loading a mailbox into RAM.
 
-A verified body input and completed PinnedBlob borrow the live view. Indexed
-chunk reads use the retained read transaction to preserve identity. A read
-error that ends that transaction permanently fails the view; later operations
-cannot silently switch snapshots. Length/digest verification precedes completed random access. The
-borrow and explicit destructor keep the pooled connection loan live until
-the body owner is destroyed, including when held inside a MIME owner.
+A verified body input and completed PinnedBlob borrow the live view.
+Indexed chunk reads use the retained read transaction to preserve
+identity. A read error that ends that transaction permanently fails the
+view; later operations cannot silently switch snapshots. Length/digest
+verification precedes completed random access. Before issuing the
+completed pin, one closed query also rejects negative chunk ordinals and
+ordinals beyond the declared body's final chunk. Two primary-key range
+existence probes use the same account/blob and retained snapshot,
+without reading extra body payloads. Empty bodies require no chunk rows.
+The original native deadline and VM allowance cover this check; failure
+grants no completed pin. Together with sequential chunk length/digest
+verification, this checks the selected body's exact extent, not the rest
+of the store. The borrow and explicit destructor keep the pooled
+connection loan live until the body owner is destroyed, including when
+held inside a MIME owner.
 Drop rolls back the read transaction before returning the connection; failed
 cleanup closes and retires the slot. Cleanup bypasses expired request fuel
 without clearing its sticky failure. Reopen restores retired capacity.

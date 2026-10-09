@@ -141,6 +141,8 @@ impl<'a, 'c, C: Crypto> PinnedBlobInput<'a, 'c, C> {
             }
             Ok(())
         })?;
+        self.native
+            .verify_body_extent(self.rowid, self.row.length)?;
         Ok(PinnedBlob {
             native: self.native,
             id: self.id,
