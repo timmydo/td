@@ -1202,6 +1202,17 @@ body reports must identify the same snapshot before an offline
 coordinator combines them. This primitive does not enable the operational
 verify/restore CLI or qualify complete crash/fault/resource behavior.
 
+The pure account_checks::combine guard packages CompleteMetadata and
+CompleteBodies only after equality of account, epoch, committed sequence
+and history floor and matching declared Blob counts. An identity or
+count mismatch refuses without constructing CompleteChecks. The
+private-field result retains both historical reports and exposes them
+read-only; it acquires no view, pin, clock, I/O or renewed allowance.
+Matching historical WAL reports are admissible even after the current
+writer advances, so the package is neither ongoing freshness nor body
+custody or authority. Physical/index completeness and other full-store
+verification remain separate offline-coordinator requirements.
+
 Full validate_integrity maintenance refuses a stopped writer and holds
 the writer fence throughout its scan. Existing read views remain usable;
 new view capture and commits return Busy until it finishes. It reports

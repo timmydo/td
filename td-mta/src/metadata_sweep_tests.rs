@@ -416,3 +416,257 @@ fn all_passes_retain_one_native_wal_snapshot_while_the_writer_replaces_rows() {
     assert!(fresh.get(old.key, &mut value).unwrap().is_none());
     assert!(fresh.get(new.key, &mut value).unwrap().is_some());
 }
+
+struct ChecksClock;
+impl ports::Clock for ChecksClock {
+    fn sample(&self) -> Result<ports::Time, ports::Error> {
+        Ok(ports::Time {
+            utc_ms: 0,
+            monotonic: ports::Tick(1),
+        })
+    }
+}
+fn complete_native_metadata<V: ReadView>(view: &mut V) -> CompleteMetadata {
+    let mut checks = Sweep::new(
+        view.identity(),
+        0,
+        Limits {
+            rows: 4,
+            parent_reads: 4,
+        },
+    );
+    let mut key = [0; 2048];
+    let mut value = [0; 65536];
+    for _ in 0..100 {
+        if checks.advance(view, &mut key, &mut value).unwrap() == Step::Complete {
+            break;
+        }
+    }
+    checks.finish().unwrap()
+}
+
+#[test]
+fn account_reports_bind_all_identity_fields_and_declared_blob_counts() {
+    use crate::{
+        account_checks,
+        format::operation::Operation,
+        ports::{Deadline, Tick},
+        store_fs::{
+            tests::Fixture, BodyCheckLimits, CommitRequest, IndexStore, MAX_FILE_STEP_BYTES,
+        },
+    };
+    use std::sync::Arc;
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let account = AccountId::from_bytes([1; 16]);
+    let deadline = Deadline::after(Tick(0), 100).unwrap();
+    let store = IndexStore::create(
+        &mut root,
+        StoreEpoch::from_bytes([2; 16]),
+        Arc::new(ChecksClock),
+        1,
+        deadline,
+    )
+    .unwrap();
+    store.create_account(account, deadline).unwrap();
+    let record = mailbox(6, None);
+    let mut bytes = [0; 128];
+    let length = record.row.encode(&mut bytes).unwrap();
+    let key = encoded(record.key);
+    store
+        .commit(
+            &td_crypto::Provider,
+            CommitRequest {
+                account,
+                expected: Sequence::default(),
+                deadline,
+                utc_ms: 0,
+            },
+            &[Operation::put(Table::Mailboxes, &key, &bytes[..length]).unwrap()],
+            &mut [],
+        )
+        .unwrap();
+    store
+        .commit(
+            &td_crypto::Provider,
+            CommitRequest {
+                account,
+                expected: Sequence::from_u64(1),
+                deadline,
+                utc_ms: 0,
+            },
+            &[Operation::delete(Table::Mailboxes, &key).unwrap()],
+            &mut [],
+        )
+        .unwrap();
+    let mut native = store.view(account, deadline).unwrap();
+    let identity = native.identity();
+    assert_eq!(identity.committed_sequence, Sequence::from_u64(2));
+    let bodies = native
+        .verify_bodies(
+            &td_crypto::Provider,
+            BodyCheckLimits { blobs: 0, bytes: 0 },
+            &mut [0; MAX_FILE_STEP_BYTES],
+        )
+        .unwrap();
+    drop(native);
+    for field in ["none", "account", "epoch", "sequence", "floor"] {
+        let mut view = View::new();
+        view.rows.clear();
+        view.identity = identity;
+        match field {
+            "account" => view.identity.account = AccountId::from_bytes([11; 16]),
+            "epoch" => view.identity.epoch = StoreEpoch::from_bytes([99; 16]),
+            "sequence" => view.identity.committed_sequence = Sequence::from_u64(3),
+            "floor" => view.identity.history_floor = Sequence::from_u64(1),
+            _ => (),
+        }
+        let mut checks = sweep(&view, 0, 0);
+        run(&mut checks, &mut view).unwrap();
+        let calls = (view.nexts, view.gets);
+        let result = account_checks::combine(checks.finish().unwrap(), bodies);
+        assert_eq!((view.nexts, view.gets), calls);
+        if field == "none" {
+            let report = result.unwrap();
+            assert_eq!(report.identity(), identity);
+            assert_eq!(report.bodies(), bodies);
+            assert_eq!(report.metadata().references().rows(), 0);
+        } else {
+            assert_eq!(result, Err(account_checks::Error::Identity), "{field}");
+        }
+    }
+    // A same-identity supplied metadata scan with one extra declared blob.
+    let mut view = View::new();
+    view.identity = identity;
+    view.rows
+        .retain(|record| matches!(record.key, Key::Blob(_)));
+    let mut checks = sweep(&view, 1, 0);
+    run(&mut checks, &mut view).unwrap();
+    assert_eq!(
+        account_checks::combine(checks.finish().unwrap(), bodies),
+        Err(account_checks::Error::BlobCount)
+    );
+}
+
+#[test]
+fn account_reports_preserve_matching_old_wal_results_and_refuse_cross_snapshot_pairs() {
+    use crate::{
+        account_checks,
+        format::operation::Operation,
+        ports::{Crypto, Deadline, Digest, Tick},
+        store_fs::{
+            tests::Fixture, BlobSource, BodyCheckLimits, CommitRequest, IndexStore,
+            MAX_FILE_STEP_BYTES,
+        },
+    };
+    use std::sync::Arc;
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let account = AccountId::from_bytes([1; 16]);
+    let deadline = Deadline::after(Tick(0), 100).unwrap();
+    let store = IndexStore::create(
+        &mut root,
+        StoreEpoch::from_bytes([2; 16]),
+        Arc::new(ChecksClock),
+        2,
+        deadline,
+    )
+    .unwrap();
+    store.create_account(account, deadline).unwrap();
+    let row = |bytes: &[u8]| {
+        let mut digest = td_crypto::Provider.sha256().unwrap();
+        digest.update(bytes).unwrap();
+        Row::Blob(BlobRow {
+            kind: BlobKind::Message,
+            length: bytes.len() as u64,
+            digest: digest.finish().unwrap(),
+            created_at: 0,
+        })
+    };
+    let mut old_bytes = [0; 64];
+    let length = row(b"abc").encode(&mut old_bytes).unwrap();
+    let mut source = b"abc".as_slice();
+    store
+        .commit(
+            &td_crypto::Provider,
+            CommitRequest {
+                account,
+                expected: Sequence::default(),
+                deadline,
+                utc_ms: 0,
+            },
+            &[Operation::put(Table::Blobs, BLOB.as_bytes(), &old_bytes[..length]).unwrap()],
+            &mut [BlobSource {
+                id: BLOB,
+                source: &mut source,
+            }],
+        )
+        .unwrap();
+    let mut old = store.view(account, deadline).unwrap();
+    let old_metadata = complete_native_metadata(&mut old);
+    let replacement = BlobId::from_bytes([5; 16]);
+    let mut bytes = [0; 64];
+    let length = row(b"xy").encode(&mut bytes).unwrap();
+    let mut source = b"xy".as_slice();
+    store
+        .commit(
+            &td_crypto::Provider,
+            CommitRequest {
+                account,
+                expected: Sequence::from_u64(1),
+                deadline,
+                utc_ms: 0,
+            },
+            &[
+                Operation::delete(Table::Blobs, BLOB.as_bytes()).unwrap(),
+                Operation::put(Table::Blobs, replacement.as_bytes(), &bytes[..length]).unwrap(),
+            ],
+            &mut [BlobSource {
+                id: replacement,
+                source: &mut source,
+            }],
+        )
+        .unwrap();
+    let limits = BodyCheckLimits { blobs: 1, bytes: 3 };
+    let mut scratch = [0; MAX_FILE_STEP_BYTES];
+    let old_bodies = old
+        .verify_bodies(&td_crypto::Provider, limits, &mut scratch)
+        .unwrap();
+    drop(old);
+    let old_report = account_checks::combine(old_metadata, old_bodies).unwrap();
+    assert_eq!(
+        (old_report.bodies().blobs(), old_report.bodies().bytes()),
+        (1, 3)
+    );
+    assert_eq!(
+        old_report.identity().committed_sequence,
+        Sequence::from_u64(1)
+    );
+    let mut fresh = store.view(account, deadline).unwrap();
+    let fresh_metadata = complete_native_metadata(&mut fresh);
+    let fresh_bodies = fresh
+        .verify_bodies(&td_crypto::Provider, limits, &mut scratch)
+        .unwrap();
+    drop(fresh);
+    let fresh_report = account_checks::combine(fresh_metadata, fresh_bodies).unwrap();
+    assert_eq!(
+        (fresh_report.bodies().blobs(), fresh_report.bodies().bytes()),
+        (1, 2)
+    );
+    assert_eq!(
+        fresh_report.identity().committed_sequence,
+        Sequence::from_u64(2)
+    );
+    assert_eq!(
+        old_metadata.references().table_rows(Table::Blobs),
+        fresh_metadata.references().table_rows(Table::Blobs)
+    );
+    assert_eq!(
+        account_checks::combine(old_metadata, fresh_bodies),
+        Err(account_checks::Error::Identity)
+    );
+    assert_eq!(
+        account_checks::combine(fresh_metadata, old_bodies),
+        Err(account_checks::Error::Identity)
+    );
+}

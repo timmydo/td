@@ -6530,6 +6530,17 @@ coordinator must establish physical integrity separately and combine
 metadata and body results for the same snapshot. No verification CLI or
 service activation is enabled.
 
+account_checks::combine(metadata, bodies) binds completed metadata and
+body reports only when their complete ViewIdentity values match and the
+metadata reference pass's Blob count equals the verified-body count.
+Identity mismatch returns account_checks::Error::Identity; count mismatch
+returns BlobCount. It performs no I/O and renews no work scope.
+CompleteChecks retains both reports behind private fields with read-only
+identity/metadata/bodies accessors. It remains historical data: matching
+old WAL results may combine after a writer commits, while cross-snapshot
+pairs refuse even when their counts match. It is neither physical/full
+store verification nor a body pin, freshness proof or authorization.
+
 PinnedBlobInput::finish also refuses negative or trailing stored chunk
 ordinals with Corrupt, including any chunk for an empty body. Its indexed
 extent check shares the original snapshot, deadline and VM fuel; a failed

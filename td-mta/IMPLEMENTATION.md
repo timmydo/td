@@ -2610,11 +2610,14 @@ The native offline primitives now include consuming IndexStore::backup
 and IndexStore::renew_epoch, plus bounded IndexReadView::verify_bodies.
 The body pass reuses snapshot-bound inputs and caller scratch, reports
 historical account-snapshot identity/counts only on full completion, and
-remains separate from physical and metadata verification. Epoch renewal
-atomically replaces the epoch from admitted entropy while preserving
-account histories and bodies; every error consumes its owner. These
-primitives do not complete the restore command, selection/verification
-workflow or service activation.
+remains separate from physical and metadata verification.
+account_checks::combine packages completed metadata/body reports only
+for matching full view identities and Blob counts; its package remains
+historical, with no physical, custody, freshness or authorization claim.
+Epoch renewal atomically replaces the epoch from admitted entropy while
+preserving account histories and bodies; every error consumes its owner.
+These primitives do not complete the restore command,
+selection/verification workflow or service activation.
 
 **Acceptance:** backup while receiving and compacting, restore elsewhere, then
 verify every committed blob/reference/folder/queue record. Detect interior
