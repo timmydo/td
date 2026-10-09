@@ -2657,6 +2657,35 @@ blob-count/byte ceilings remain separate. No fresh view or per-stage
 clock/VM allowance is acquired. These fixed owner/buffer bounds do not
 qualify maximum-account completion or whole-service overlap.
 
+The separate --sqlite-account mode extends the bounded 32 MiB body
+scenario with parent/child mailboxes and complete account verification
+through maintenance_view and verify_account, including after reopen.
+Nine ordered observations add account_verified between body verification
+and reopen. Rust requested-byte growth must stay within 2 MiB and
+wrapped C-boundary growth within 17 MiB, with exact warmed teardown
+return and positive wrapped C-boundary allocation evidence during
+account verification. Rust observations retain their existing positive
+controls. Unwrapped RSS samples must stay within 24 MiB of their
+baseline. Distinct mode prefixes, phase counts and completion markers
+prevent body-only evidence from standing in for these account checks.
+These are probe requirements; measured evidence and portable
+qualification require successful runs. They do not qualify arbitrary-
+account metadata, the maximum database, transient RSS, guarded stack or
+whole-service overlap.
+
+The 2026-10-09 isolated static-musl account run passed the complete
+portable command. Rust requested bytes returned from a lifetime peak
+of 198086 to the warmed 624-byte baseline; wrapped C-boundary bytes
+returned from a 1060638-byte peak to 1424 bytes in five blocks. Nine
+unwrapped RSS samples ranged from 3360 to 4704 KiB, with 3508 KiB
+at teardown. The verified-to-account_verified interval includes earlier
+body pin/view release, maintenance capture, the complete account pass
+and view release. All Rust fields stayed unchanged across that interval;
+wrapped C malloc calls increased by 5718. This is fixture evidence,
+not a general zero-allocation guarantee or method-only attribution.
+td-crypto/PORTABLE.md records the exact artifact, staged source/vendor
+pins, current SQLite ceilings and qualification limits.
+
 SQLite setup and query calls may allocate Rust/native memory and are excluded
 from pure MIME zero-allocation claims. MIME fixtures prepare a real verified
 snapshot body pin cold; their existing intervals measure parser/adapter work

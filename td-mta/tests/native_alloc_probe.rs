@@ -283,11 +283,13 @@ fn main() {
         println!("native-allocation-probe-v1: zero-resize invalidated");
         return;
     }
-    if std::env::args()
+    if let Some(argument) = std::env::args()
         .nth(1)
-        .is_some_and(|arg| arg == "--sqlite-body")
+        .filter(|arg| matches!(arg.as_str(), "--sqlite-body" | "--sqlite-account"))
     {
-        sqlite_body();
+        let account = argument == "--sqlite-account";
+        drop(argument);
+        sqlite_body(account);
         return;
     }
     if std::env::args()
@@ -593,13 +595,43 @@ mod sqlite_body_scenario;
 pub mod store_fs;
 
 #[cfg(td_native_alloc_probe)]
-fn sqlite_body() {
+fn sqlite_body(account: bool) {
+    let phases = if account {
+        sqlite_body_scenario::ACCOUNT_PHASES
+    } else {
+        sqlite_body_scenario::PHASES
+    };
+    let scenario = if account {
+        "sqlite-account"
+    } else {
+        "sqlite-body"
+    };
+    let prefix = if account { "sqlite-account" } else { "sqlite" };
+
     use native_allocator_bridge::{calls, TD_MTA_NATIVE_REGISTRY as REGISTRY};
-    let mut samples = vec![(calls(), REGISTRY.snapshot()); sqlite_body_scenario::PHASES.len()];
+    let mut samples = vec![(calls(), REGISTRY.snapshot()); phases.len()];
     let mut slots = samples.iter_mut();
-    sqlite_body_scenario::run(|| *slots.next().unwrap() = (calls(), REGISTRY.snapshot()));
+    let observe = || *slots.next().unwrap() = (calls(), REGISTRY.snapshot());
+    if account {
+        sqlite_body_scenario::run_account(observe);
+    } else {
+        sqlite_body_scenario::run(observe);
+    }
     assert!(slots.next().is_none());
     let baseline = samples.first().unwrap().1;
+    if account {
+        assert!(
+            samples
+                .get(5)
+                .unwrap()
+                .0
+                .iter()
+                .zip(samples.get(4).unwrap().0)
+                .take(2)
+                .any(|(after, before)| *after > before),
+            "account verification did not exercise wrapped native allocation"
+        );
+    }
     assert!(samples.iter().all(|(_, s)| !s.invalid));
     // Bound the entire C boundary, including allocator forwarding overhead.
     for (_, sample) in &samples {
@@ -628,12 +660,12 @@ fn sqlite_body() {
             .any(|(after, before)| *after > before),
         "body scenario did not exercise wrapped native allocation"
     );
-    for (phase, (c, s)) in sqlite_body_scenario::PHASES.iter().zip(samples) {
+    for (phase, (c, s)) in phases.iter().zip(samples) {
         let [malloc, calloc, realloc, free, posix, aligned] = c;
         println!(
-            "sqlite-native {phase} {malloc} {calloc} {realloc} {free} {posix} {aligned} {} {} {}",
+            "{prefix}-native {phase} {malloc} {calloc} {realloc} {free} {posix} {aligned} {} {} {}",
             s.blocks, s.bytes, s.peak
         );
     }
-    println!("sqlite-body-allocation-v1: native passed");
+    println!("{scenario}-allocation-v1: native passed");
 }

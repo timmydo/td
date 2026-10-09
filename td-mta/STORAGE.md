@@ -1234,6 +1234,14 @@ cover every stage without renewal. Physical/index validation, whole-store
 coverage, custody, authorization and operational activation remain
 separate requirements; this method returns only historical CompleteChecks.
 
+The account allocation/RSS probe covers a bounded three-row snapshot:
+one 32 MiB body and a parent/child mailbox tree, checked through the
+explicit maintenance view before and after reopen. Its fixed source,
+digest oracle and streaming scratch do not retain the whole body.
+RESOURCES.md records the measured scope and limits; this fixture does
+not qualify maximum-account/database completion, complete filesystem
+fault recovery, guarded stack or service activation.
+
 Full validate_integrity maintenance refuses a stopped writer and holds
 the writer fence throughout its scan. Existing read views remain usable;
 new view capture and commits return Busy until it finishes. It reports

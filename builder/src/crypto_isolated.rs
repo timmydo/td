@@ -529,12 +529,29 @@ const SQLITE_BODY_PHASES: &[&str] = &[
     "dropped",
 ];
 
-fn sqlite_body_evidence(output: &str, native: bool) -> Result<()> {
+const SQLITE_ACCOUNT_PHASES: &[&str] = &[
+    "baseline",
+    "opened",
+    "writing",
+    "committed",
+    "verified",
+    "account_verified",
+    "reopened",
+    "rolled_back",
+    "dropped",
+];
+
+fn sqlite_evidence(output: &str, native: bool, scenario: &str) -> Result<()> {
+    let (prefix, phases) = match scenario {
+        "sqlite-body" => ("sqlite", SQLITE_BODY_PHASES),
+        "sqlite-account" => ("sqlite-account", SQLITE_ACCOUNT_PHASES),
+        _ => return Err("unknown SQLite observation scenario".into()),
+    };
     let domain = if native { "native" } else { "rust" };
     let width = if native { 9 } else { 7 };
     let mut lines = output.lines();
-    for phase in SQLITE_BODY_PHASES {
-        let prefix = format!("sqlite-{domain} {phase} ");
+    for phase in phases {
+        let prefix = format!("{prefix}-{domain} {phase} ");
         let row = lines
             .next()
             .and_then(|line| line.strip_prefix(&prefix))
@@ -550,7 +567,7 @@ fn sqlite_body_evidence(output: &str, native: bool) -> Result<()> {
             return Err("invalid SQLite allocation measurement".into());
         }
     }
-    let success = format!("sqlite-body-allocation-v1: {domain} passed");
+    let success = format!("{scenario}-allocation-v1: {domain} passed");
     if lines.next() != Some(success.as_str()) || lines.next().is_some() || !output.ends_with('\n') {
         return Err("invalid SQLite allocation completion".into());
     }
@@ -818,6 +835,7 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
     let phases: &[&str] = match scenario {
         "control" => &["baseline", "touched", "dropped"],
         "sqlite-body" => SQLITE_BODY_PHASES,
+        "sqlite-account" => SQLITE_ACCOUNT_PHASES,
         "client" => &[
             "baseline",
             "config",
@@ -1621,24 +1639,27 @@ pub(crate) fn runtime_inner() -> Result<()> {
         (false, "/artifacts/td-mta-rust-allocation-probe"),
         (true, "/artifacts/td-mta-native-allocation-probe"),
     ] {
-        let mut command = Command::new(path);
-        command
-            .arg("--sqlite-body")
-            .env_clear()
-            .stdin(Stdio::null());
-        crate::host_bin::arm_check_child(&mut command);
-        let domain = if native { "native" } else { "rust" };
-        let name = format!("sqlite-body-allocation-{domain}");
-        let output = bounded_output(&mut command, &name, 8192, 300)?;
-        sqlite_body_evidence(&output, native)?;
-        for line in output.lines() {
-            println!("portable SQLite allocation diagnostic: {line}");
+        for (scenario, argument) in [
+            ("sqlite-body", "--sqlite-body"),
+            ("sqlite-account", "--sqlite-account"),
+        ] {
+            let mut command = Command::new(path);
+            command.arg(argument).env_clear().stdin(Stdio::null());
+            crate::host_bin::arm_check_child(&mut command);
+            let domain = if native { "native" } else { "rust" };
+            let name = format!("{scenario}-allocation-{domain}");
+            let output = bounded_output(&mut command, &name, 8192, 300)?;
+            sqlite_evidence(&output, native, scenario)?;
+            for line in output.lines() {
+                println!("portable SQLite allocation diagnostic: {line}");
+            }
         }
     }
 
     for (scenario, argument) in [
         ("control", None),
         ("sqlite-body", Some("--sqlite-body")),
+        ("sqlite-account", Some("--sqlite-account")),
         ("client", Some("--tls-clients")),
         ("handshake", Some("--tls-handshake")),
         ("entropy", Some("--entropy-workers")),
@@ -1656,7 +1677,11 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
         crate::host_bin::arm_check_child(&mut command);
         let name = format!("rss-probe-{scenario}");
-        let timeout = if scenario == "sqlite-body" { 300 } else { 30 };
+        let timeout = if matches!(scenario, "sqlite-body" | "sqlite-account") {
+            300
+        } else {
+            30
+        };
         let output = bounded_output(&mut command, &name, 8192, timeout)?;
         rss_evidence(&output, scenario)?;
         for line in output.lines() {
@@ -2449,26 +2474,57 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_body_measurements_require_every_phase_and_exact_completion() {
-        for native in [false, true] {
-            let domain = if native { "native" } else { "rust" };
-            let columns = if native {
-                "1 2 3 4 5 6 7 8 9"
-            } else {
-                "1 2 3 4 5 6 7"
-            };
-            let mut output = String::new();
-            for phase in SQLITE_BODY_PHASES {
-                output.push_str(&format!("sqlite-{domain} {phase} {columns}\n"));
+    fn sqlite_measurements_require_every_phase_and_exact_scenario_completion() {
+        for (scenario, prefix, phases, other) in [
+            (
+                "sqlite-body",
+                "sqlite",
+                SQLITE_BODY_PHASES,
+                "sqlite-account",
+            ),
+            (
+                "sqlite-account",
+                "sqlite-account",
+                SQLITE_ACCOUNT_PHASES,
+                "sqlite-body",
+            ),
+        ] {
+            for native in [false, true] {
+                let domain = if native { "native" } else { "rust" };
+                let columns = if native {
+                    "1 2 3 4 5 6 7 8 9"
+                } else {
+                    "1 2 3 4 5 6 7"
+                };
+                let mut output = String::new();
+                let mut rss = String::new();
+                for phase in phases {
+                    output.push_str(&format!("{prefix}-{domain} {phase} {columns}\n"));
+                    rss.push_str(&format!("rss {scenario} {phase} 123\n"));
+                }
+                output.push_str(&format!("{scenario}-allocation-v1: {domain} passed\n"));
+                rss.push_str(&format!("rss-observation-v2: {scenario} passed\n"));
+                assert!(sqlite_evidence(&output, native, scenario).is_ok());
+                assert!(rss_evidence(&rss, scenario).is_ok());
+                assert!(sqlite_evidence(&output, native, other).is_err());
+                assert!(rss_evidence(&rss, other).is_err());
+                assert!(sqlite_evidence(&output, native, "unknown").is_err());
+                for bad in [
+                    output.replace("writing", "opened"),
+                    output.replace("1 2", "-1 2"),
+                    output.replace(columns, "1"),
+                    output.trim_end().to_owned(),
+                    format!("{output}extra\n"),
+                    output.replace("verified", "missing"),
+                    output.replace(&format!("{scenario}-allocation-v1"), "wrong-allocation-v1"),
+                ] {
+                    assert!(sqlite_evidence(&bad, native, scenario).is_err());
+                }
+                assert!(sqlite_evidence(&output, !native, scenario).is_err());
+                assert!(rss_evidence(&rss.replace("writing", "opened"), scenario).is_err());
+                assert!(rss_evidence(&rss.replace("verified", "missing"), scenario).is_err());
+                assert!(rss_evidence(&format!("{rss}extra\n"), scenario).is_err());
             }
-            output.push_str(&format!("sqlite-body-allocation-v1: {domain} passed\n"));
-            assert!(sqlite_body_evidence(&output, native).is_ok());
-            assert!(sqlite_body_evidence(&output.replace("writing", "opened"), native).is_err());
-            assert!(sqlite_body_evidence(&output.replace("1 2", "-1 2"), native).is_err());
-            assert!(sqlite_body_evidence(&output.replace(columns, "1"), native).is_err());
-            assert!(sqlite_body_evidence(output.trim_end(), native).is_err());
-            assert!(sqlite_body_evidence(&format!("{output}extra\n"), native).is_err());
-            assert!(sqlite_body_evidence(&output, !native).is_err());
         }
     }
 

@@ -12144,11 +12144,13 @@ fn retained_requested_source_bound_properties() {
 fn main() {
     allocation_counter::Counters::verify_model();
     forwarding();
-    if std::env::args()
+    if let Some(argument) = std::env::args()
         .nth(1)
-        .is_some_and(|arg| arg == "--sqlite-body")
+        .filter(|arg| matches!(arg.as_str(), "--sqlite-body" | "--sqlite-account"))
     {
-        sqlite_body();
+        let account = argument == "--sqlite-account";
+        drop(argument);
+        sqlite_body(account);
         return;
     }
     if std::env::args()
@@ -12710,10 +12712,27 @@ fn mailbox_parent_walks() {
 #[path = "support/sqlite_body_scenario.rs"]
 mod sqlite_body_scenario;
 
-fn sqlite_body() {
-    let mut samples = vec![COUNTERS.snapshot(); sqlite_body_scenario::PHASES.len()];
+fn sqlite_body(account: bool) {
+    let phases = if account {
+        sqlite_body_scenario::ACCOUNT_PHASES
+    } else {
+        sqlite_body_scenario::PHASES
+    };
+    let scenario = if account {
+        "sqlite-account"
+    } else {
+        "sqlite-body"
+    };
+    let prefix = if account { "sqlite-account" } else { "sqlite" };
+
+    let mut samples = vec![COUNTERS.snapshot(); phases.len()];
     let mut slots = samples.iter_mut();
-    sqlite_body_scenario::run(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    let observe = || *slots.next().unwrap() = COUNTERS.snapshot();
+    if account {
+        sqlite_body_scenario::run_account(observe);
+    } else {
+        sqlite_body_scenario::run(observe);
+    }
     assert!(slots.next().is_none());
     assert!(samples.iter().all(|s| !s.invalid));
     let baseline = *samples.first().unwrap();
@@ -12728,11 +12747,11 @@ fn sqlite_body() {
         baseline.live,
         "SQLite teardown retained Rust allocations"
     );
-    for (phase, s) in sqlite_body_scenario::PHASES.iter().zip(samples) {
+    for (phase, s) in phases.iter().zip(samples) {
         println!(
-            "sqlite-rust {phase} {} {} {} {} {} {} {}",
+            "{prefix}-rust {phase} {} {} {} {} {} {} {}",
             s.alloc, s.zeroed, s.realloc, s.free, s.failed, s.live, s.peak
         );
     }
-    println!("sqlite-body-allocation-v1: rust passed");
+    println!("{scenario}-allocation-v1: rust passed");
 }

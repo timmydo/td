@@ -2622,6 +2622,11 @@ the report guard over one supplied native view with explicit limits and
 caller-supplied trusted UTC. It reuses caller scratch and the original
 snapshot/deadline/allowance, returning no combined report on failure.
 It does not perform the separate physical check or activate a command.
+The separate account resource probe exercises one maximum-size body and
+a parent/child mailbox tree before and after reopen. Its Rust/native/RSS
+thresholds and qualification scope are specified in RESOURCES.md;
+maximum-account/database and combined-service evidence remain separate.
+
 Epoch renewal atomically replaces the epoch from admitted entropy while
 preserving account histories and bodies; every error consumes its owner.
 These primitives do not complete the restore command,

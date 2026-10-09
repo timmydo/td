@@ -109,7 +109,8 @@ fn observe<const N: usize>(scenario: &str, phases: [&str; N], run: impl FnOnce(&
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
-        Some("--sqlite-body") => sqlite_body(),
+        Some("--sqlite-body") => sqlite_body(false),
+        Some("--sqlite-account") => sqlite_body(true),
         Some("--tls-clients") => observe("client", tls_allocation_scenario::PHASES, |f| {
             tls_allocation_scenario::run(f)
         }),
@@ -180,11 +181,27 @@ mod sqlite_body_scenario;
 #[allow(unused)]
 pub mod store_fs;
 
-fn sqlite_body() {
+fn sqlite_body(account: bool) {
+    let phases = if account {
+        sqlite_body_scenario::ACCOUNT_PHASES
+    } else {
+        sqlite_body_scenario::PHASES
+    };
+    let scenario = if account {
+        "sqlite-account"
+    } else {
+        "sqlite-body"
+    };
+
     let mut observer = Observer::new();
-    let mut samples = vec![0; sqlite_body_scenario::PHASES.len()];
+    let mut samples = vec![0; phases.len()];
     let mut slots = samples.iter_mut();
-    sqlite_body_scenario::run(|| *slots.next().unwrap() = observer.sample());
+    let observe = || *slots.next().unwrap() = observer.sample();
+    if account {
+        sqlite_body_scenario::run_account(observe);
+    } else {
+        sqlite_body_scenario::run(observe);
+    }
     assert!(slots.next().is_none());
     let baseline = *samples.first().unwrap();
     for rss in &samples {
@@ -194,8 +211,8 @@ fn sqlite_body() {
             "32 MiB streamed body grew observed RSS by more than 24 MiB"
         );
     }
-    for (phase, rss) in sqlite_body_scenario::PHASES.iter().zip(samples) {
-        println!("rss sqlite-body {phase} {rss}");
+    for (phase, rss) in phases.iter().zip(samples) {
+        println!("rss {scenario} {phase} {rss}");
     }
-    println!("rss-observation-v2: sqlite-body passed");
+    println!("rss-observation-v2: {scenario} passed");
 }

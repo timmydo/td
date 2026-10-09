@@ -1011,6 +1011,57 @@ wrapped allocation lifetime high-water separately. Host native builds remain
 UNQUALIFIED; only the isolated static-musl wrappers can qualify their native
 observations. Guarded stack and combined-service workload remain separate.
 
+The additional --sqlite-account mode runs in separate fresh Rust,
+wrapped-native and RSS processes. It commits the same streamed 32 MiB
+body plus parent/child mailboxes, retains the existing body verification
+and refusal/reuse controls, then checks complete account metadata and
+bodies through a maintenance view before and after reopen. Nine phases
+add account_verified after verified. Its 2 MiB Rust, 17 MiB wrapped
+C-boundary and 24 MiB sampled RSS growth ceilings match the body
+scenario; allocation domains must return to their warmed baselines and
+the account pass must produce positive wrapped C-boundary allocation
+evidence. Rust observations retain their existing positive controls.
+Exact account prefixes, ordered phases and completion markers refuse
+cross-scenario evidence. This bounded fixture alone does not qualify
+arbitrary-account metadata, maximum-database maintenance, guarded stack,
+complete filesystem faults or whole-service overlap. Adding the mode
+does not establish a portable measurement until the isolated command
+succeeds.
+
+The fresh isolated x86-64 musl release qualification on 2026-10-09
+passed the complete portable command, including the eight static artifact
+checks, API confinement and clean runtime. It used pinned Rust 1.96.0,
+the declared GNU tools, and the current 9 MiB individual and 16 MiB
+shared SQLite allocation ceilings. The bounded account observations were:
+
+| Observer | Warm baseline | Lifetime requested peak / maximum RSS sample | After teardown |
+| --- | ---: | ---: | ---: |
+| Rust requested bytes | 624 | 198086 | 624 |
+| Wrapped C boundary requested bytes | 1424 (5 blocks) | 1060638 | 1424 (5 blocks) |
+| Unwrapped RSS, KiB | 3360 | 4704 | 3508 |
+
+All Rust counter fields remained unchanged from verified to
+account_verified; the wrapped C malloc count increased by 5718. That
+interval includes release of the earlier body pin/view, maintenance
+capture, the complete account pass and view release. It is an observation
+of this fixture and artifact, not a general zero-allocation guarantee.
+Both allocation domains returned exactly to their warmed live baselines.
+C-boundary counts may include Rust System calls and cannot be added to
+Rust counts as disjoint memory. The nine RSS samples do not establish a
+transient peak. This run qualifies the stated three-row account scenario;
+arbitrary-account metadata, maximum-database maintenance, complete
+filesystem faults, guarded stack and whole-service overlap remain separate.
+
+The artifact NAR was
+`1b2049d6d3f7006591571427ab929bf2495badd7cb67cc91cbf675452e614a05`.
+Its BUILD-INPUTS records staged source NAR
+`7589cfaed4e334ff4b622b321ce4fd9fb39233cd1538c118efba73e20c90f6f1`
+and the unchanged vendor NAR
+`d122b8e7843f7da35cfb1f393dd0d8aea43ef534e9f5cffddc77a095fe971916`.
+An initial attempt refused an incorrect demand for positive ordinary
+Rust allocations during the account interval. The successful fresh run
+retained Rust positive forwarding controls and required positive wrapped
+C-boundary account allocation; no artificial allocation was added.
 
 The isolated x86-64 musl release qualification on 2026-10-07, using the
 pinned Rust 1.96.0 kit and declared GNU tools on Linux 7.0.14, passed the

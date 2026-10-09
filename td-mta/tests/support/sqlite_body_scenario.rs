@@ -8,10 +8,10 @@ use td_mta::{
     format::{
         key::Key,
         operation::Operation,
-        row::{BlobKind, BlobRow, Row},
+        row::{BlobKind, BlobRow, MailboxRow, Row},
         Sequence, Table,
     },
-    ids::{AccountId, BlobId, StoreEpoch},
+    ids::{AccountId, BlobId, MailboxId, StoreEpoch},
     ports::{BlobReader, Clock, Crypto, Deadline, Digest, Error, ReadView, Tick, Time},
 };
 
@@ -21,6 +21,17 @@ pub const PHASES: &[&str] = &[
     "writing",
     "committed",
     "verified",
+    "reopened",
+    "rolled_back",
+    "dropped",
+];
+pub const ACCOUNT_PHASES: &[&str] = &[
+    "baseline",
+    "opened",
+    "writing",
+    "committed",
+    "verified",
+    "account_verified",
     "reopened",
     "rolled_back",
     "dropped",
@@ -56,7 +67,54 @@ impl Read for Generated<'_> {
     }
 }
 
-pub fn run(mut observe: impl FnMut()) {
+pub fn run(observe: impl FnMut()) {
+    run_mode(false, observe);
+}
+pub fn run_account(observe: impl FnMut()) {
+    run_mode(true, observe);
+}
+fn check_account(
+    store: &IndexStore<'_>,
+    sequence: Sequence,
+    deadline: Deadline,
+    scratch: &mut [u8],
+) {
+    use crate::store_fs::{AccountCheckLimits, BodyCheckLimits};
+    let mut view = store.maintenance_view(ACCOUNT, deadline).unwrap();
+    let report = view
+        .verify_account(
+            &td_crypto::Provider,
+            0,
+            AccountCheckLimits {
+                metadata: td_mta::metadata_sweep::Limits {
+                    rows: 3,
+                    parent_reads: 3,
+                },
+                bodies: BodyCheckLimits {
+                    blobs: 1,
+                    bytes: BODY_BYTES,
+                },
+            },
+            scratch.try_into().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(report.identity(), view.identity());
+    assert_eq!(report.identity().account, ACCOUNT);
+    assert_eq!(report.identity().epoch, StoreEpoch::from_bytes([0x57; 16]));
+    assert_eq!(report.identity().committed_sequence, sequence);
+    assert_eq!(report.metadata().references().rows(), 3);
+    assert_eq!(
+        report.metadata().references().table_rows(Table::Blobs),
+        Some(1)
+    );
+    assert_eq!(report.metadata().mailboxes().mailboxes(), 2);
+    assert_eq!(report.metadata().mailboxes().reads(), 3);
+    assert_eq!(
+        (report.bodies().blobs(), report.bodies().bytes()),
+        (1, BODY_BYTES)
+    );
+}
+fn run_mode(account_check: bool, mut observe: impl FnMut()) {
     // Initialize native process globals before the retention baseline.
     with_probe_root(|root| {
         let deadline = Deadline::after(Tick(0), 100).unwrap();
@@ -90,6 +148,44 @@ pub fn run(mut observe: impl FnMut()) {
         let mut bytes = [0; 64];
         let len = row.encode(&mut bytes).unwrap();
         let op = Operation::put(Table::Blobs, BLOB.as_bytes(), bytes.get(..len).unwrap()).unwrap();
+        let parent = MailboxId::from_bytes([0x70; 16]);
+        let child = MailboxId::from_bytes([0x71; 16]);
+        let mut parent_bytes = [0; 128];
+        let mut child_bytes = [0; 128];
+        let mailbox = |name, parent| {
+            Row::Mailbox(MailboxRow {
+                name,
+                parent,
+                role: None,
+                sort_order: 0,
+                subscribed: true,
+            })
+        };
+        let parent_len = mailbox("parent", None).encode(&mut parent_bytes).unwrap();
+        let child_len = mailbox("child", Some(parent))
+            .encode(&mut child_bytes)
+            .unwrap();
+        let body_operations = [op];
+        let account_operations = [
+            op,
+            Operation::put(
+                Table::Mailboxes,
+                parent.as_bytes(),
+                parent_bytes.get(..parent_len).unwrap(),
+            )
+            .unwrap(),
+            Operation::put(
+                Table::Mailboxes,
+                child.as_bytes(),
+                child_bytes.get(..child_len).unwrap(),
+            )
+            .unwrap(),
+        ];
+        let operations: &[Operation<'_>] = if account_check {
+            &account_operations
+        } else {
+            &body_operations
+        };
         let request = CommitRequest {
             account: ACCOUNT,
             expected: Sequence::default(),
@@ -115,7 +211,7 @@ pub fn run(mut observe: impl FnMut()) {
             .commit(
                 &td_crypto::Provider,
                 request,
-                &[op],
+                operations,
                 &mut [BlobSource {
                     id: BLOB,
                     source: &mut source,
@@ -144,6 +240,10 @@ pub fn run(mut observe: impl FnMut()) {
             assert_eq!(scratch.first(), Some(&0x5a));
             observe();
         }
+        if account_check {
+            check_account(&store, sequence, deadline, &mut scratch);
+            observe();
+        }
         store.checkpoint(deadline).unwrap();
         drop(store);
         let reopened = IndexStore::open(root, clock, 2, deadline).unwrap();
@@ -160,6 +260,9 @@ pub fn run(mut observe: impl FnMut()) {
             assert_eq!(pin.len(), BODY_BYTES);
             assert_eq!(pin.read_at(65535, &mut scratch).unwrap(), CHUNK_BYTES);
             assert!(scratch.iter().all(|&b| b == 0x5a));
+        }
+        if account_check {
+            check_account(&reopened, sequence, deadline, &mut scratch);
         }
         observe();
         // An incomplete source must roll back its body row and ID registration.
