@@ -2774,6 +2774,48 @@ metrics. This is bounded sequential metadata-writer/same-body evidence,
 not per-call allocation attribution, all writes/deletion, parallel
 threads, arbitrary-account or whole-service qualification.
 
+The shared portable body/account/backup/epoch fixtures also passed a
+public usage fence with all eight partial body inputs retained. After
+the metadata PUT commits sequence two, the fence captures exact passive
+totals: the current epoch, one account, 32 MiB body bytes, one blob and
+zero upload bytes, queue bytes and queue submissions. Main-file and WAL
+extents are positive and within their respective public
+SQLITE_DATABASE_BYTES and SQLITE_WAL_BYTES limits; the WAL limit
+includes frame overhead. With the fence alive, another metadata PUT at
+expected sequence two, checkpoint, a second fence and a ninth view all
+refuse Busy.
+
+The fence remains alive through the remaining 511 chunks of each input,
+all eight complete original-body digests, pinned random reads and the
+verified observation. Dropping the fence precedes dropping pins and old
+views. All eight old views retain sequence one and original typed
+metadata; all eight reacquired views expose sequence two and the updated
+parent. Thus the refused fenced commit does not advance the endpoint.
+All original selectors, phase counts, owner counts, copy/reopen/epoch
+checks and rollback/refusal/retry controls remain.
+
+The complete isolated pinned Rust 1.96.0 release x86-64 musl command
+passed on its first attempt on 2026-10-09: all eight static artifacts,
+API confinement, clean runtime, all resource and positive controls and
+four guarded worker-stack cases. No production API, unsafe boundary,
+syscall, dependency, reservation, cap or compiler flag changed.
+
+This qualifies passive usage capture and bounded refusals with eight
+same-account/same-body loans in one process or guarded worker.
+initialize_leases is not called: these totals grant no quota
+reservation, effect authorization or service quiescence. Whole-fixture
+peaks and exact warm teardown do not isolate usage_fence allocations or
+prove per-call allocation freedom. The complete suite also passes its
+separate unchanged quiet allocation controls. Rust 2 MiB, wrapped
+C-boundary 17 MiB, sampled RSS growth 24 MiB and guarded writable
+mapping 256 KiB limits remain unchanged, as do SQLite 9 MiB
+per-allocation and 16 MiB process-wide caps across all pools. No
+parallel-thread, multi-account, maximum-database, transient-RSS, frame
+high-water, full-fault, power-loss or whole-service claim follows.
+
+RESOURCES.md and td-crypto/PORTABLE.md record actual qualification
+measurements and inputs.
+
 These primitives do not complete the restore command,
 selection/verification workflow or service activation.
 

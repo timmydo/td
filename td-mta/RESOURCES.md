@@ -2752,6 +2752,72 @@ not a general zero-allocation guarantee or method-only attribution.
 td-crypto/PORTABLE.md records the exact artifact, staged source/vendor
 pins, current SQLite ceilings and qualification limits.
 
+The complete isolated pinned Rust 1.96.0 release x86-64 musl command
+passed on its first attempt on 2026-10-09: all eight static artifacts,
+API confinement, clean runtime, all resource and positive controls and
+four guarded worker-stack cases. No production API, unsafe boundary,
+syscall, dependency, reservation, cap or compiler flag changed.
+
+The shared portable body/account/backup/epoch fixtures also passed a
+public usage fence with all eight partial body inputs retained. After
+the metadata PUT commits sequence two, the fence captures exact passive
+totals: the current epoch, one account, 32 MiB body bytes, one blob and
+zero upload bytes, queue bytes and queue submissions. Main-file and WAL
+extents are positive and within their respective public
+SQLITE_DATABASE_BYTES and SQLITE_WAL_BYTES limits; the WAL limit
+includes frame overhead. With the fence alive, another metadata PUT at
+expected sequence two, checkpoint, a second fence and a ninth view all
+refuse Busy.
+
+The fence remains alive through the remaining 511 chunks of each input,
+all eight complete original-body digests, pinned random reads and the
+verified observation. Dropping the fence precedes dropping pins and old
+views. All eight old views retain sequence one and original typed
+metadata; all eight reacquired views expose sequence two and the updated
+parent. Thus the refused fenced commit does not advance the endpoint.
+All original selectors, phase counts, owner counts, copy/reopen/epoch
+checks and rollback/refusal/retry controls remain.
+
+| Case | Observer | Warm baseline | Lifetime requested peak / maximum RSS sample | After teardown |
+| --- | --- | ---: | ---: | ---: |
+| Body | Rust requested bytes | 560 | 199846 | 560 |
+| Body | Wrapped C boundary requested bytes | 1344 | 2943766 | 1344 |
+| Body | Unwrapped RSS, KiB | 3364 | 6856 | 3592 |
+| Account | Rust requested bytes | 624 | 199910 | 624 |
+| Account | Wrapped C boundary requested bytes | 1424 | 2943846 | 1424 |
+| Account | Unwrapped RSS, KiB | 3364 | 6856 | 3596 |
+| Backup | Rust requested bytes | 688 | 333620 | 688 |
+| Backup | Wrapped C boundary requested bytes | 1504 | 4197372 | 1504 |
+| Backup | Unwrapped RSS, KiB | 3360 | 8272 | 3616 |
+| Epoch | Rust requested bytes | 880 | 333812 | 880 |
+| Epoch | Wrapped C boundary requested bytes | 134584 | 4330452 | 134584 |
+| Epoch | Unwrapped RSS, KiB | 4084 | 8868 | 4212 |
+
+Writable worker mappings before/after were body 253952/253952 bytes,
+account 253952/253952 bytes, backup 253952/253952 bytes, epoch
+253952/253952 bytes. All have the required adjacent inaccessible guard
+and no grow-down flag, with explicit joins before completion. Native
+warm/final block counts remain five for body/account/backup and thirteen
+for epoch; the warmed entropy handle stays alive. Wrapped C observations
+are not SQLite-only attribution.
+
+This qualifies passive usage capture and bounded refusals with eight
+same-account/same-body loans in one process or guarded worker.
+initialize_leases is not called: these totals grant no quota
+reservation, effect authorization or service quiescence. Whole-fixture
+peaks and exact warm teardown do not isolate usage_fence allocations or
+prove per-call allocation freedom. The complete suite also passes its
+separate unchanged quiet allocation controls. Rust 2 MiB, wrapped
+C-boundary 17 MiB, sampled RSS growth 24 MiB and guarded writable
+mapping 256 KiB limits remain unchanged, as do SQLite 9 MiB
+per-allocation and 16 MiB process-wide caps across all pools. No
+parallel-thread, multi-account, maximum-database, transient-RSS, frame
+high-water, full-fault, power-loss or whole-service claim follows.
+
+td-crypto/PORTABLE.md records the exact artifact and staged inputs.
+Earlier metadata-writer measurements are historical and omit this usage
+fence.
+
 The shared portable SQLite body/account/backup/epoch fixtures passed a
 public metadata commit with eight retained partial body inputs. After
 the initial 32 MiB body commit at sequence one, all eight views capture

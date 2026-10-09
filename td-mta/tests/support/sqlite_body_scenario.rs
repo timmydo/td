@@ -377,6 +377,45 @@ fn run_with_roots(
             )
             .unwrap();
         assert_eq!(sequence, Sequence::from_u64(2));
+        let fence = store.usage_fence(deadline).unwrap();
+        let usage = fence.usage();
+        assert_eq!(
+            (
+                usage.epoch,
+                usage.accounts,
+                usage.body_bytes,
+                usage.blob_count,
+                usage.upload_bytes,
+                usage.queue_bytes,
+                usage.queue_submissions
+            ),
+            (store.epoch(), 1, BODY_BYTES, 1, 0, 0, 0),
+        );
+        let files = fence.file_usage();
+        assert!(
+            files.database_bytes > 0
+                && files.database_bytes <= td_mta::limits::SQLITE_DATABASE_BYTES
+        );
+        assert!(files.wal_bytes > 0 && files.wal_bytes <= td_mta::limits::SQLITE_WAL_BYTES);
+        assert_eq!(
+            store.commit(
+                &td_crypto::Provider,
+                CommitRequest {
+                    expected: sequence,
+                    ..request
+                },
+                &[Operation::put(
+                    Table::Mailboxes,
+                    parent.as_bytes(),
+                    updated_bytes.get(..updated_len).unwrap()
+                )
+                .unwrap()],
+                &mut [],
+            ),
+            Err(CommitError::Rejected(Error::Busy))
+        );
+        assert_eq!(store.checkpoint(deadline), Err(Error::Busy));
+        assert!(matches!(store.usage_fence(deadline), Err(Error::Busy)));
         assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
         observe();
         while inputs.first().unwrap().position() != BODY_BYTES {
@@ -399,6 +438,7 @@ fn run_with_roots(
         }
         assert!(matches!(store.view(ACCOUNT, deadline), Err(Error::Busy)));
         observe();
+        drop(fence);
         drop(pins);
         let mut metadata = [0; 128];
         for view in &mut views {
