@@ -12144,13 +12144,11 @@ fn retained_requested_source_bound_properties() {
 fn main() {
     allocation_counter::Counters::verify_model();
     forwarding();
-    if let Some(argument) = std::env::args()
+    if let Some(mode) = std::env::args()
         .nth(1)
-        .filter(|arg| matches!(arg.as_str(), "--sqlite-body" | "--sqlite-account"))
+        .and_then(|argument| sqlite_body_scenario::Mode::from_argument(&argument))
     {
-        let account = argument == "--sqlite-account";
-        drop(argument);
-        sqlite_body(account);
+        sqlite_body(mode);
         return;
     }
     if std::env::args()
@@ -12712,27 +12710,19 @@ fn mailbox_parent_walks() {
 #[path = "support/sqlite_body_scenario.rs"]
 mod sqlite_body_scenario;
 
-fn sqlite_body(account: bool) {
-    let phases = if account {
-        sqlite_body_scenario::ACCOUNT_PHASES
+fn sqlite_body(mode: sqlite_body_scenario::Mode) {
+    let phases = mode.phases();
+    let scenario = mode.scenario();
+    let prefix = if mode == sqlite_body_scenario::Mode::Body {
+        "sqlite"
     } else {
-        sqlite_body_scenario::PHASES
+        scenario
     };
-    let scenario = if account {
-        "sqlite-account"
-    } else {
-        "sqlite-body"
-    };
-    let prefix = if account { "sqlite-account" } else { "sqlite" };
 
     let mut samples = vec![COUNTERS.snapshot(); phases.len()];
     let mut slots = samples.iter_mut();
     let observe = || *slots.next().unwrap() = COUNTERS.snapshot();
-    if account {
-        sqlite_body_scenario::run_account(observe);
-    } else {
-        sqlite_body_scenario::run(observe);
-    }
+    sqlite_body_scenario::run(mode, observe);
     assert!(slots.next().is_none());
     assert!(samples.iter().all(|s| !s.invalid));
     let baseline = *samples.first().unwrap();

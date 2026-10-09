@@ -2626,6 +2626,11 @@ The separate account resource probe exercises one maximum-size body and
 a parent/child mailbox tree before and after reopen. Its Rust/native/RSS
 thresholds and qualification scope are specified in RESOURCES.md;
 maximum-account/database and combined-service evidence remain separate.
+The separate backup resource mode passed the same maximum-size body and
+mailbox tree, consuming the source into a real copy and reopening both
+roots for physical and complete account verification. It qualifies only
+that bounded offline path; RESOURCES.md and td-crypto/PORTABLE.md record
+its observation limits and isolated artifact evidence.
 
 The bounded backup process-death oracle kills its exact child during an
 observed incomplete partial copy and after a returned receipt. It verifies

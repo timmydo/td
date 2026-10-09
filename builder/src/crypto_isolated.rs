@@ -541,10 +541,24 @@ const SQLITE_ACCOUNT_PHASES: &[&str] = &[
     "dropped",
 ];
 
+const SQLITE_BACKUP_PHASES: &[&str] = &[
+    "baseline",
+    "opened",
+    "writing",
+    "committed",
+    "verified",
+    "account_verified",
+    "backed_up",
+    "source_verified",
+    "restored_verified",
+    "dropped",
+];
+
 fn sqlite_evidence(output: &str, native: bool, scenario: &str) -> Result<()> {
     let (prefix, phases) = match scenario {
         "sqlite-body" => ("sqlite", SQLITE_BODY_PHASES),
         "sqlite-account" => ("sqlite-account", SQLITE_ACCOUNT_PHASES),
+        "sqlite-backup" => ("sqlite-backup", SQLITE_BACKUP_PHASES),
         _ => return Err("unknown SQLite observation scenario".into()),
     };
     let domain = if native { "native" } else { "rust" };
@@ -836,6 +850,7 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
         "control" => &["baseline", "touched", "dropped"],
         "sqlite-body" => SQLITE_BODY_PHASES,
         "sqlite-account" => SQLITE_ACCOUNT_PHASES,
+        "sqlite-backup" => SQLITE_BACKUP_PHASES,
         "client" => &[
             "baseline",
             "config",
@@ -1642,6 +1657,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         for (scenario, argument) in [
             ("sqlite-body", "--sqlite-body"),
             ("sqlite-account", "--sqlite-account"),
+            ("sqlite-backup", "--sqlite-backup"),
         ] {
             let mut command = Command::new(path);
             command.arg(argument).env_clear().stdin(Stdio::null());
@@ -1660,6 +1676,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("control", None),
         ("sqlite-body", Some("--sqlite-body")),
         ("sqlite-account", Some("--sqlite-account")),
+        ("sqlite-backup", Some("--sqlite-backup")),
         ("client", Some("--tls-clients")),
         ("handshake", Some("--tls-handshake")),
         ("entropy", Some("--entropy-workers")),
@@ -1677,7 +1694,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
         crate::host_bin::arm_check_child(&mut command);
         let name = format!("rss-probe-{scenario}");
-        let timeout = if matches!(scenario, "sqlite-body" | "sqlite-account") {
+        let timeout = if matches!(scenario, "sqlite-body" | "sqlite-account" | "sqlite-backup") {
             300
         } else {
             30
@@ -2475,19 +2492,10 @@ mod tests {
 
     #[test]
     fn sqlite_measurements_require_every_phase_and_exact_scenario_completion() {
-        for (scenario, prefix, phases, other) in [
-            (
-                "sqlite-body",
-                "sqlite",
-                SQLITE_BODY_PHASES,
-                "sqlite-account",
-            ),
-            (
-                "sqlite-account",
-                "sqlite-account",
-                SQLITE_ACCOUNT_PHASES,
-                "sqlite-body",
-            ),
+        for (scenario, prefix, phases) in [
+            ("sqlite-body", "sqlite", SQLITE_BODY_PHASES),
+            ("sqlite-account", "sqlite-account", SQLITE_ACCOUNT_PHASES),
+            ("sqlite-backup", "sqlite-backup", SQLITE_BACKUP_PHASES),
         ] {
             for native in [false, true] {
                 let domain = if native { "native" } else { "rust" };
@@ -2506,8 +2514,12 @@ mod tests {
                 rss.push_str(&format!("rss-observation-v2: {scenario} passed\n"));
                 assert!(sqlite_evidence(&output, native, scenario).is_ok());
                 assert!(rss_evidence(&rss, scenario).is_ok());
-                assert!(sqlite_evidence(&output, native, other).is_err());
-                assert!(rss_evidence(&rss, other).is_err());
+                for other in ["sqlite-body", "sqlite-account", "sqlite-backup"] {
+                    if other != scenario {
+                        assert!(sqlite_evidence(&output, native, other).is_err());
+                        assert!(rss_evidence(&rss, other).is_err());
+                    }
+                }
                 assert!(sqlite_evidence(&output, native, "unknown").is_err());
                 for bad in [
                     output.replace("writing", "opened"),

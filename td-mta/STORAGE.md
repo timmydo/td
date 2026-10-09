@@ -598,6 +598,17 @@ the same epoch, sequence, metadata and body contents. This is a bounded
 2 MiB process-death oracle, not power loss, the link/unlink window, sync
 errors, complete filesystem faults or maximum-size backup qualification.
 
+The separate --sqlite-backup resource mode passed a public offline copy
+of one maximum-size 32 MiB body with parent/child mailboxes. Ten ordered
+observations include complete source-account verification, returned
+backup, and independently reopened source and destination with physical
+and complete account checks. Both two-reader stores remain live at the
+last verification point. RESOURCES.md states the requested-byte, warmed
+teardown and sampled RSS limits; td-crypto/PORTABLE.md records the
+isolated artifact evidence. This bounded fixture does not qualify an
+8 GiB database, arbitrary-account maintenance, full filesystem faults,
+power loss, guarded stack or whole-service overlap.
+
 The snapshot contains authoritative bodies and metadata, but receipt success
 does not verify every body digest or domain invariant. The snapshot may be
 opened for offline inspection with ordinary IndexStore::open and its normal

@@ -1028,6 +1028,59 @@ complete filesystem faults or whole-service overlap. Adding the mode
 does not establish a portable measurement until the isolated command
 succeeds.
 
+The separate --sqlite-backup mode runs in fresh Rust, wrapped C-boundary
+and unwrapped RSS processes. It commits the same streamed 32 MiB body
+and parent/child mailboxes, retains body and account verification, then
+consumes the source through public offline backup with caller-owned
+64 KiB scratch. It reopens both roots for physical integrity and complete
+account metadata/body checks. Both two-reader stores plus their writers
+remain live at restored_verified. Ten ordered phases add backed_up,
+source_verified and restored_verified on this separate copy path;
+existing body/account modes retain their refusal/reuse controls and
+original phase sequences. Growth limits remain 2 MiB Rust requested,
+17 MiB wrapped C-boundary requested and 24 MiB sampled RSS. Exact warmed
+teardown and positive forwarding/native account controls remain required.
+Distinct prefixes and completion markers reject cross-scenario evidence;
+each new observation process has the existing 300-second bound.
+
+The isolated x86-64 musl backup qualification on 2026-10-09 passed the
+complete portable command: all eight static artifact checks, API
+confinement and clean runtime, including the old body/account modes and
+new backup mode. It used pinned Rust 1.96.0, the declared GNU tools and
+the current 9 MiB individual/16 MiB shared SQLite allocation ceilings.
+The ten-point backup observations were:
+
+| Observer | Warm baseline | Lifetime requested peak / maximum RSS sample | After teardown |
+| --- | ---: | ---: | ---: |
+| Rust requested bytes | 688 | 329972 | 688 |
+| Wrapped C boundary requested bytes | 1504 (5 blocks) | 1988988 | 1504 (5 blocks) |
+| Unwrapped RSS, KiB | 3444 | 5868 | 3664 |
+
+Both allocation domains returned exactly to their warmed live baselines.
+All Rust fields stayed unchanged from verified to account_verified;
+wrapped C malloc calls increased by 5718. That interval includes release
+of the earlier body pin/view, maintenance capture, the complete account
+pass and view release. The copy interval includes destination validation,
+checkpoint, explicit connection close, copy and publication; source and
+restored intervals include reopen, physical integrity and account checks.
+Caller roots and scratch remain live at backed_up. C-boundary counts may
+include Rust System calls and are not disjoint memory or native-only
+method attribution. Ten RSS samples do not establish a transient peak.
+This qualifies the stated body/mailbox copy and dual-reopen fixture;
+maximum database/account, power loss, full filesystem faults, guarded
+stack and whole-service overlap remain separate.
+
+The backup artifact NAR was
+`631ad678414dcdf030b716063802092313257b166086fe09e5c0f689de39fdd9`.
+Its BUILD-INPUTS records staged source NAR
+`ed90427fbb877e31efc9db32de57847f9406e0e14a0ed8e7d1a847895a6e6a9b`
+and unchanged vendor NAR
+`d122b8e7843f7da35cfb1f393dd0d8aea43ef534e9f5cffddc77a095fe971916`.
+An initial attempt failed to compile the Rust probe because a destination
+closure captured both the live source store and its root for reopen.
+The successful fresh build prepares both locked roots before creating
+the store in one helper; the failed build supplies no measurements.
+
 The fresh isolated x86-64 musl release qualification on 2026-10-09
 passed the complete portable command, including the eight static artifact
 checks, API confinement and clean runtime. It used pinned Rust 1.96.0,

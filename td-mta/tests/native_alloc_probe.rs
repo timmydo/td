@@ -283,13 +283,11 @@ fn main() {
         println!("native-allocation-probe-v1: zero-resize invalidated");
         return;
     }
-    if let Some(argument) = std::env::args()
+    if let Some(mode) = std::env::args()
         .nth(1)
-        .filter(|arg| matches!(arg.as_str(), "--sqlite-body" | "--sqlite-account"))
+        .and_then(|argument| sqlite_body_scenario::Mode::from_argument(&argument))
     {
-        let account = argument == "--sqlite-account";
-        drop(argument);
-        sqlite_body(account);
+        sqlite_body(mode);
         return;
     }
     if std::env::args()
@@ -595,31 +593,23 @@ mod sqlite_body_scenario;
 pub mod store_fs;
 
 #[cfg(td_native_alloc_probe)]
-fn sqlite_body(account: bool) {
-    let phases = if account {
-        sqlite_body_scenario::ACCOUNT_PHASES
+fn sqlite_body(mode: sqlite_body_scenario::Mode) {
+    let phases = mode.phases();
+    let scenario = mode.scenario();
+    let prefix = if mode == sqlite_body_scenario::Mode::Body {
+        "sqlite"
     } else {
-        sqlite_body_scenario::PHASES
+        scenario
     };
-    let scenario = if account {
-        "sqlite-account"
-    } else {
-        "sqlite-body"
-    };
-    let prefix = if account { "sqlite-account" } else { "sqlite" };
 
     use native_allocator_bridge::{calls, TD_MTA_NATIVE_REGISTRY as REGISTRY};
     let mut samples = vec![(calls(), REGISTRY.snapshot()); phases.len()];
     let mut slots = samples.iter_mut();
     let observe = || *slots.next().unwrap() = (calls(), REGISTRY.snapshot());
-    if account {
-        sqlite_body_scenario::run_account(observe);
-    } else {
-        sqlite_body_scenario::run(observe);
-    }
+    sqlite_body_scenario::run(mode, observe);
     assert!(slots.next().is_none());
     let baseline = samples.first().unwrap().1;
-    if account {
+    if mode.has_account() {
         assert!(
             samples
                 .get(5)

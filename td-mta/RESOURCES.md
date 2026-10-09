@@ -3343,6 +3343,35 @@ write and sync calls remain synchronous; these checks are not hard scheduling
 interrupts. Backup requires separate caller quota and work admission and does
 not activate an online background slot or alter the startup memory ledger.
 
+The separate --sqlite-backup mode runs in fresh Rust, wrapped C-boundary
+and unwrapped RSS processes. It retains the existing maximum-size body
+and parent/child mailboxes, verifies the account, consumes its owner
+through public backup using the same caller-owned 64 KiB scratch, then
+reopens both roots for physical and complete account verification. Ten
+phases include backed_up, source_verified and restored_verified. Each
+store has two readers plus its writer, and both owners remain live at
+the last verification observation. Requested-byte growth stays within
+2 MiB in Rust and 17 MiB at the wrapped C boundary, with exact warmed
+live-byte/block teardown return. Positive forwarding controls and native
+account-pass allocation remain required. Ten RSS samples must grow by
+at most 24 MiB. The C boundary may include Rust System calls; the domains
+are not disjoint, and caller roots/scratch remain live at backed_up.
+No native-only per-return baseline or transient RSS peak is asserted.
+Maximum database/account, full faults, guarded stack and whole-service
+work remain separate qualification.
+
+The 2026-10-09 isolated static-musl backup run passed the complete
+portable command. Rust requested bytes returned from a lifetime peak
+of 329972 to the warmed 688-byte baseline; wrapped C-boundary bytes
+returned from a 1988988-byte peak to 1504 bytes in five blocks. Ten
+unwrapped RSS samples ranged from 3444 to 5868 KiB, with 3664 KiB
+at teardown. Both reopened stores remained live at restored_verified.
+The account interval includes earlier body pin/view release, maintenance
+capture, the account pass and view release; wrapped malloc calls rose
+by 5718. Copy and reopen intervals include their full owner, native and
+filesystem work, not method-only allocations. td-crypto/PORTABLE.md
+records the exact artifact and staged source/vendor pins.
+
 IngressSpool derives its disk reservation from configured ingress concurrency:
 (smtp_sessions + https_connections) * message_bytes, or 16 * 32 MiB = 512 MiB
 by default. Partial, finished and retired files retain one complete message
