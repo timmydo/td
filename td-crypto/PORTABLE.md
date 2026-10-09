@@ -1043,6 +1043,60 @@ teardown and positive forwarding/native account controls remain required.
 Distinct prefixes and completion markers reject cross-scenario evidence;
 each new observation process has the existing 300-second bound.
 
+The separate --sqlite-epoch mode adds public consuming epoch renewal to the
+real body/mailbox backup path, with actual SystemEntropy warmed on the same
+observing thread before baseline. Its counted wrapper requires exactly one
+16-byte renewal fill; the returned destination identity must differ only in
+epoch. Positive old/new passive state controls and destination checkpoint/
+reopen require the new identity to persist and old state to remain stale;
+the original source must retain its original identity and old state.
+Physical integrity and complete account metadata/body checks run in each
+root, after renewal, after destination reopen and again on the source.
+Both root locks and the source's two-reader/writer store remain held while
+the destination's two-reader/writer store is renewed and reopened.
+
+Thirteen ordered phases use distinct sqlite-epoch prefixes/completion:
+baseline, opened, writing, committed, verified, account_verified, backed_up,
+source_verified, restored_verified, epoch_renewed, epoch_reopened,
+source_preserved and dropped. The three existing modes retain their original
+phase layouts and controls. All three observer entrypoints use the shared
+mode; no new allocation instrumentation or linker wrapping is added.
+The driver runs separate fresh Rust/native/RSS processes with the existing
+300-second bound. Exact evidence parsing rejects other SQLite scenarios and
+missing, duplicated or reordered phases.
+
+The complete isolated x86-64 musl qualification on 2026-10-09 passed on its
+first attempt, including all eight static artifact checks, API confinement
+and the clean runtime with all previous modes plus the epoch mode. It used
+pinned Rust 1.96.0, declared GNU tools and unchanged SQLite
+9 MiB per-allocation/16 MiB process-wide requested-allocation caps.
+The process-wide limit is shared by both overlapping pools. Measurements were:
+
+| Observer | Warm baseline | Lifetime requested peak / maximum RSS sample | After teardown |
+| --- | ---: | ---: | ---: |
+| Rust requested bytes | 880 | 330164 | 880 |
+| Wrapped C boundary requested bytes | 134584 (13 blocks) | 2122068 | 134584 (13 blocks) |
+| Unwrapped RSS, KiB | 4300 | 6528 | 4328 |
+
+All three paths passed the unchanged 2 MiB Rust, 17 MiB C-boundary and
+24 MiB sampled RSS growth ceilings. Both allocation domains returned exactly
+to their warmed live baselines; positive forwarding/body/account controls
+remain. The warm baseline includes provider thread/global state; dropping
+the handle does not release that state. Retained source and destination
+stores overlap at restored_verified, epoch_renewed, epoch_reopened and
+source_preserved. Call/view/verification intervals do not isolate method
+allocations, and C counts may include Rust System calls. These samples do
+not establish transient RSS, guarded stack, maximum database/account,
+entropy quality or worst-case latency, unknown outcomes, full filesystem
+faults, power loss, whole-service resources or operational restore activation.
+
+The epoch artifact NAR was
+671d4bf8f5442f8c8cbc036f1fd93a78ff1262b58f5ba6a9d7701b85ed56c7b8.
+Its BUILD-INPUTS records staged source NAR
+b6f95f848ef01da6104a5d5404dd0a06f08dcc22f3a7a766ac007378347b86ed
+and unchanged vendor NAR
+d122b8e7843f7da35cfb1f393dd0d8aea43ef534e9f5cffddc77a095fe971916.
+
 The isolated x86-64 musl backup qualification on 2026-10-09 passed the
 complete portable command: all eight static artifact checks, API
 confinement and clean runtime, including the old body/account modes and

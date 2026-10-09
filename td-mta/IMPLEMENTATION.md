@@ -2690,6 +2690,19 @@ identity. STORAGE.md and RESOURCES.md record the 390.55-second host run and
 its limits. Entropy uniqueness, unknown outcomes, arbitrary metadata,
 portable resources, full faults, power loss and activation remain separate.
 
+The separate --sqlite-epoch resource fixture passed the complete isolated
+static-musl command with one streamed 32 MiB body and parent/child mailboxes.
+It uses actual SystemEntropy warmed on the observing thread before baseline,
+one counted 16-byte public renewal fill, destination checkpoint/reopen, and
+physical/complete account verification with the source unchanged. The two
+three-connection stores remain live through the final observations. All prior
+Rust/C-boundary/RSS ceilings, warm teardown and positive controls remain;
+RESOURCES.md and td-crypto/PORTABLE.md record the thirteen observations and
+exact artifact inputs. This supplies bounded resource evidence for the
+known-success primitive, without completing maximum-account, unknown-outcome,
+entropy-quality/latency, full-fault, power-loss, guarded-stack or activation
+qualification.
+
 These primitives do not complete the restore command,
 selection/verification workflow or service activation.
 

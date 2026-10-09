@@ -554,11 +554,28 @@ const SQLITE_BACKUP_PHASES: &[&str] = &[
     "dropped",
 ];
 
+const SQLITE_EPOCH_PHASES: &[&str] = &[
+    "baseline",
+    "opened",
+    "writing",
+    "committed",
+    "verified",
+    "account_verified",
+    "backed_up",
+    "source_verified",
+    "restored_verified",
+    "epoch_renewed",
+    "epoch_reopened",
+    "source_preserved",
+    "dropped",
+];
+
 fn sqlite_evidence(output: &str, native: bool, scenario: &str) -> Result<()> {
     let (prefix, phases) = match scenario {
         "sqlite-body" => ("sqlite", SQLITE_BODY_PHASES),
         "sqlite-account" => ("sqlite-account", SQLITE_ACCOUNT_PHASES),
         "sqlite-backup" => ("sqlite-backup", SQLITE_BACKUP_PHASES),
+        "sqlite-epoch" => ("sqlite-epoch", SQLITE_EPOCH_PHASES),
         _ => return Err("unknown SQLite observation scenario".into()),
     };
     let domain = if native { "native" } else { "rust" };
@@ -851,6 +868,7 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
         "sqlite-body" => SQLITE_BODY_PHASES,
         "sqlite-account" => SQLITE_ACCOUNT_PHASES,
         "sqlite-backup" => SQLITE_BACKUP_PHASES,
+        "sqlite-epoch" => SQLITE_EPOCH_PHASES,
         "client" => &[
             "baseline",
             "config",
@@ -1658,6 +1676,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
             ("sqlite-body", "--sqlite-body"),
             ("sqlite-account", "--sqlite-account"),
             ("sqlite-backup", "--sqlite-backup"),
+            ("sqlite-epoch", "--sqlite-epoch"),
         ] {
             let mut command = Command::new(path);
             command.arg(argument).env_clear().stdin(Stdio::null());
@@ -1677,6 +1696,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("sqlite-body", Some("--sqlite-body")),
         ("sqlite-account", Some("--sqlite-account")),
         ("sqlite-backup", Some("--sqlite-backup")),
+        ("sqlite-epoch", Some("--sqlite-epoch")),
         ("client", Some("--tls-clients")),
         ("handshake", Some("--tls-handshake")),
         ("entropy", Some("--entropy-workers")),
@@ -1694,7 +1714,10 @@ pub(crate) fn runtime_inner() -> Result<()> {
         }
         crate::host_bin::arm_check_child(&mut command);
         let name = format!("rss-probe-{scenario}");
-        let timeout = if matches!(scenario, "sqlite-body" | "sqlite-account" | "sqlite-backup") {
+        let timeout = if matches!(
+            scenario,
+            "sqlite-body" | "sqlite-account" | "sqlite-backup" | "sqlite-epoch"
+        ) {
             300
         } else {
             30
@@ -2496,6 +2519,7 @@ mod tests {
             ("sqlite-body", "sqlite", SQLITE_BODY_PHASES),
             ("sqlite-account", "sqlite-account", SQLITE_ACCOUNT_PHASES),
             ("sqlite-backup", "sqlite-backup", SQLITE_BACKUP_PHASES),
+            ("sqlite-epoch", "sqlite-epoch", SQLITE_EPOCH_PHASES),
         ] {
             for native in [false, true] {
                 let domain = if native { "native" } else { "rust" };
@@ -2514,13 +2538,35 @@ mod tests {
                 rss.push_str(&format!("rss-observation-v2: {scenario} passed\n"));
                 assert!(sqlite_evidence(&output, native, scenario).is_ok());
                 assert!(rss_evidence(&rss, scenario).is_ok());
-                for other in ["sqlite-body", "sqlite-account", "sqlite-backup"] {
+                for other in [
+                    "sqlite-body",
+                    "sqlite-account",
+                    "sqlite-backup",
+                    "sqlite-epoch",
+                ] {
                     if other != scenario {
                         assert!(sqlite_evidence(&output, native, other).is_err());
                         assert!(rss_evidence(&rss, other).is_err());
                     }
                 }
                 assert!(sqlite_evidence(&output, native, "unknown").is_err());
+                for phase in phases {
+                    let allocation_row = format!("{prefix}-{domain} {phase} {columns}\n");
+                    let rss_row = format!("rss {scenario} {phase} 123\n");
+                    for replacement in [String::new(), allocation_row.repeat(2)] {
+                        assert!(sqlite_evidence(
+                            &output.replace(&allocation_row, &replacement),
+                            native,
+                            scenario
+                        )
+                        .is_err());
+                    }
+                    for replacement in [String::new(), rss_row.repeat(2)] {
+                        assert!(
+                            rss_evidence(&rss.replace(&rss_row, &replacement), scenario).is_err()
+                        );
+                    }
+                }
                 for bad in [
                     output.replace("writing", "opened"),
                     output.replace("1 2", "-1 2"),

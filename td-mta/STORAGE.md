@@ -720,6 +720,31 @@ cuts do not qualify the entire UPDATE/COMMIT window, unknown commit
 outcomes, power loss, entropy uniqueness, full filesystem faults or
 service activation.
 
+The separate --sqlite-epoch resource mode exercises the consuming renewal
+primitive with an actual warmed td_crypto::SystemEntropy on its observing
+thread. Its separate Rust, wrapped C-boundary and unwrapped RSS processes
+commit one streamed 32 MiB body and parent/child mailboxes, perform real public
+backup with reused 64 KiB scratch, and independently verify both roots.
+A temporary pre-backup view supplies only a passive original identity.
+Exactly one 16-byte public renewal fill must return a different epoch; the
+destination identity changes only that field, old state becomes stale, and
+new state retains itself. Full physical integrity and complete account checks
+run after renewal, after destination checkpoint/reopen, and again on the
+source, which retains its original identity and old state.
+
+Both root locks remain held. Source and destination each have two readers
+plus a writer; both stores remain live at the renewed, reopened and final
+source observations. The thirteen-phase sequence extends the backup path
+with epoch_renewed, epoch_reopened and source_preserved. The prior body,
+account and backup modes keep their original phase counts and
+controls. RESOURCES.md specifies unchanged requested-byte/RSS limits and
+warm teardown requirements; td-crypto/PORTABLE.md records the successful
+isolated static-musl observations and exact staged inputs. Warming entropy
+before baseline does not claim that handle drop frees provider thread state.
+This bounded resource fixture does not qualify maximum database/account,
+entropy quality or worst-case latency, unknown outcomes, full faults,
+power loss, guarded stack, whole-service overlap or restore activation.
+
 The separate ignored
 maximum_database_backup_epoch_preserves_complete_account fixture qualifies
 known-success epoch replacement on a real body-dominated 8 GiB backup.

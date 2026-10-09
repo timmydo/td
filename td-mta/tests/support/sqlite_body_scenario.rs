@@ -1,4 +1,4 @@
-//! Body persistence, account verification and backup for independent observers.
+//! Body, account, backup and epoch paths for independent observers.
 use crate::store_fs::{
     with_probe_root, BlobSource, CommitError, CommitRequest, IndexStore, LockedRoot,
 };
@@ -14,7 +14,10 @@ use td_mta::{
         Sequence, Table,
     },
     ids::{AccountId, BlobId, MailboxId, StoreEpoch},
-    ports::{BlobReader, Clock, Crypto, Deadline, Digest, Error, ReadView, Tick, Time},
+    ports::{
+        BlobReader, Clock, Crypto, Deadline, Digest, Error, ReadView, Tick, Time, ViewIdentity,
+    },
+    sync::{DataState, DataType},
 };
 
 pub const PHASES: &[&str] = &[
@@ -81,11 +84,46 @@ pub const BACKUP_PHASES: &[&str] = &[
     "restored_verified",
     "dropped",
 ];
+pub const EPOCH_PHASES: &[&str] = &[
+    "baseline",
+    "opened",
+    "writing",
+    "committed",
+    "verified",
+    "account_verified",
+    "backed_up",
+    "source_verified",
+    "restored_verified",
+    "epoch_renewed",
+    "epoch_reopened",
+    "source_preserved",
+    "dropped",
+];
+struct CountingEntropy {
+    source: td_crypto::SystemEntropy,
+    calls: usize,
+}
+impl td_mta::ports::Entropy for CountingEntropy {
+    fn fill(&mut self, output: &mut [u8]) -> Result<(), td_mta::ports::CryptoError> {
+        assert_eq!(output.len(), 16);
+        self.calls += 1;
+        td_mta::ports::Entropy::fill(&mut self.source, output)
+    }
+}
+fn state(identity: ViewIdentity) -> DataState {
+    DataState {
+        account: identity.account,
+        epoch: identity.epoch,
+        kind: DataType::Email,
+        sequence: identity.committed_sequence,
+    }
+}
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Mode {
     Body,
     Account,
     Backup,
+    Epoch,
 }
 impl Mode {
     pub fn from_argument(argument: &str) -> Option<Self> {
@@ -93,6 +131,7 @@ impl Mode {
             "--sqlite-body" => Some(Self::Body),
             "--sqlite-account" => Some(Self::Account),
             "--sqlite-backup" => Some(Self::Backup),
+            "--sqlite-epoch" => Some(Self::Epoch),
             _ => None,
         }
     }
@@ -101,6 +140,7 @@ impl Mode {
             Self::Body => PHASES,
             Self::Account => ACCOUNT_PHASES,
             Self::Backup => BACKUP_PHASES,
+            Self::Epoch => EPOCH_PHASES,
         }
     }
     pub fn scenario(self) -> &'static str {
@@ -108,7 +148,11 @@ impl Mode {
             Self::Body => "sqlite-body",
             Self::Account => "sqlite-account",
             Self::Backup => "sqlite-backup",
+            Self::Epoch => "sqlite-epoch",
         }
+    }
+    fn has_backup(self) -> bool {
+        matches!(self, Self::Backup | Self::Epoch)
     }
     pub fn has_account(self) -> bool {
         self != Self::Body
@@ -116,6 +160,7 @@ impl Mode {
 }
 fn check_account(
     store: &IndexStore<'_>,
+    epoch: StoreEpoch,
     sequence: Sequence,
     deadline: Deadline,
     scratch: &mut [u8],
@@ -141,7 +186,9 @@ fn check_account(
         .unwrap();
     assert_eq!(report.identity(), view.identity());
     assert_eq!(report.identity().account, ACCOUNT);
-    assert_eq!(report.identity().epoch, StoreEpoch::from_bytes([0x57; 16]));
+    assert_eq!(store.epoch(), epoch);
+    assert_eq!(report.identity().epoch, epoch);
+    assert_eq!(report.identity().history_floor, Sequence::default());
     assert_eq!(report.identity().committed_sequence, sequence);
     assert_eq!(report.metadata().references().rows(), 3);
     assert_eq!(
@@ -170,14 +217,25 @@ pub fn run(mode: Mode, mut observe: impl FnMut()) {
             .unwrap(),
         );
     });
+    // Keep the actual entropy handle on this observing thread, warm before baseline.
+    let mut entropy = (mode == Mode::Epoch).then(|| CountingEntropy {
+        source: td_crypto::SystemEntropy::try_new().unwrap(),
+        calls: 0,
+    });
     observe();
     with_probe_root(|root| {
-        if mode == Mode::Backup {
+        if mode.has_backup() {
             with_probe_root(|destination| {
-                run_with_roots(root, Some(destination), mode, &mut observe)
+                run_with_roots(
+                    root,
+                    Some(destination),
+                    mode,
+                    entropy.as_mut(),
+                    &mut observe,
+                )
             });
         } else {
-            run_with_roots(root, None, mode, &mut observe);
+            run_with_roots(root, None, mode, None, &mut observe);
         }
     });
     observe();
@@ -186,6 +244,7 @@ fn run_with_roots(
     root: &mut LockedRoot,
     destination: Option<&mut LockedRoot>,
     mode: Mode,
+    entropy: Option<&mut CountingEntropy>,
     observe: &mut dyn FnMut(),
 ) {
     let account_check = mode.has_account();
@@ -299,10 +358,18 @@ fn run_with_roots(
         observe();
     }
     if account_check {
-        check_account(&store, sequence, deadline, &mut scratch);
+        check_account(
+            &store,
+            StoreEpoch::from_bytes([0x57; 16]),
+            sequence,
+            deadline,
+            &mut scratch,
+        );
         observe();
     }
-    if mode == Mode::Backup {
+    if mode.has_backup() {
+        let prior =
+            (mode == Mode::Epoch).then(|| store.view(ACCOUNT, deadline).unwrap().identity());
         let destination = destination.unwrap();
         let receipt = store
             .backup(
@@ -316,12 +383,63 @@ fn run_with_roots(
         observe();
         let original = IndexStore::open(root, clock.clone(), 2, deadline).unwrap();
         original.validate_integrity(deadline).unwrap();
-        check_account(&original, sequence, deadline, &mut scratch);
+        check_account(
+            &original,
+            StoreEpoch::from_bytes([0x57; 16]),
+            sequence,
+            deadline,
+            &mut scratch,
+        );
         observe();
-        let restored = IndexStore::open(destination, clock, 2, deadline).unwrap();
+        let restored = IndexStore::open(destination, clock.clone(), 2, deadline).unwrap();
         restored.validate_integrity(deadline).unwrap();
-        check_account(&restored, sequence, deadline, &mut scratch);
+        check_account(
+            &restored,
+            StoreEpoch::from_bytes([0x57; 16]),
+            sequence,
+            deadline,
+            &mut scratch,
+        );
         observe();
+        if mode == Mode::Epoch {
+            let prior = prior.unwrap();
+            let old = state(prior);
+            assert!(old.is_retained_for(old, prior.history_floor));
+            assert_eq!(restored.view(ACCOUNT, deadline).unwrap().identity(), prior);
+            let entropy = entropy.unwrap();
+            let restored = restored.renew_epoch(entropy, deadline).unwrap();
+            assert_eq!(entropy.calls, 1);
+            let current = restored.view(ACCOUNT, deadline).unwrap().identity();
+            assert_ne!(current.epoch, prior.epoch);
+            assert_eq!(
+                current,
+                ViewIdentity {
+                    epoch: current.epoch,
+                    ..prior
+                }
+            );
+            assert!(!old.is_retained_for(state(current), current.history_floor));
+            assert!(state(current).is_retained_for(state(current), current.history_floor));
+            restored.validate_integrity(deadline).unwrap();
+            check_account(&restored, current.epoch, sequence, deadline, &mut scratch);
+            observe();
+            restored.checkpoint(deadline).unwrap();
+            drop(restored);
+            let restored = IndexStore::open(destination, clock, 2, deadline).unwrap();
+            assert_eq!(
+                restored.view(ACCOUNT, deadline).unwrap().identity(),
+                current
+            );
+            assert!(!old.is_retained_for(state(current), current.history_floor));
+            restored.validate_integrity(deadline).unwrap();
+            check_account(&restored, current.epoch, sequence, deadline, &mut scratch);
+            observe();
+            assert_eq!(original.view(ACCOUNT, deadline).unwrap().identity(), prior);
+            assert!(old.is_retained_for(state(prior), prior.history_floor));
+            original.validate_integrity(deadline).unwrap();
+            check_account(&original, prior.epoch, sequence, deadline, &mut scratch);
+            observe();
+        }
         return;
     }
     store.checkpoint(deadline).unwrap();
@@ -342,7 +460,13 @@ fn run_with_roots(
         assert!(scratch.iter().all(|&b| b == 0x5a));
     }
     if account_check {
-        check_account(&reopened, sequence, deadline, &mut scratch);
+        check_account(
+            &reopened,
+            StoreEpoch::from_bytes([0x57; 16]),
+            sequence,
+            deadline,
+            &mut scratch,
+        );
     }
     observe();
     // An incomplete source must roll back its body row and ID registration.

@@ -3438,6 +3438,36 @@ by 5718. Copy and reopen intervals include their full owner, native and
 filesystem work, not method-only allocations. td-crypto/PORTABLE.md
 records the exact artifact and staged source/vendor pins.
 
+The distinct --sqlite-epoch mode extends the bounded real backup fixture
+through known-success public epoch renewal and destination checkpoint/reopen,
+then repeats physical and complete account verification on the original
+source. It warms actual SystemEntropy on the observing thread before baseline
+and delegates exactly one 16-byte renewal fill. Source/destination each have
+two readers plus a writer and both remain live at the final three verification
+observations. Old passive state is stale only for the changed destination
+identity; the source retains its original state. The thirteen ordered phases
+use a distinct scenario prefix/completion. Earlier body/account/backup phase
+counts and controls remain unchanged.
+
+All existing 2 MiB Rust requested-byte, 17 MiB wrapped C-boundary requested-byte
+and 24 MiB sampled RSS growth ceilings remain in force, with exact warmed
+Rust live-byte and C live-byte/block teardown return and positive forwarding,
+body and account controls. Warming does not free RNG thread/global state at
+handle drop. The C boundary may include Rust System allocations and domains
+overlap; phases include native/view/verification work and do not isolate
+method allocations or establish transient RSS.
+
+The 2026-10-09 complete isolated static-musl qualification passed on its first
+attempt. Rust requested bytes returned from a lifetime peak of 330164 to the
+warmed 880-byte baseline; wrapped C-boundary bytes returned from a
+2122068-byte peak to 134584 bytes in thirteen blocks. Thirteen RSS samples
+were 4300, 5312, 5432, 5388, 5508, 5516, 4388, 5492, 6528, 6380, 6236,
+6508 and 4328 KiB. The actual warmed entropy path and this body/mailbox copy,
+renewal and reopen are qualified; maximum database/account, entropy quality,
+worst-case RNG latency, unknown outcomes, full faults, power loss, guarded
+stack, whole-service resources and operational activation remain separate.
+td-crypto/PORTABLE.md records the exact artifact and staged source/vendor pins.
+
 IngressSpool derives its disk reservation from configured ingress concurrency:
 (smtp_sessions + https_connections) * message_bytes, or 16 * 32 MiB = 512 MiB
 by default. Partial, finished and retired files retain one complete message
