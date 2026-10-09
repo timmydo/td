@@ -656,3 +656,140 @@ fn abrupt_death_during_backup_copy_and_after_receipt_preserves_source_and_phase(
         }
     }
 }
+
+fn verify_digest_damaged_backup(store: &IndexStore<'_>) {
+    store.validate_integrity(deadline()).unwrap();
+    assert_eq!(store.epoch(), StoreEpoch::from_bytes([0x95; 16]));
+    let mut view = store.maintenance_view(ACCOUNT, deadline()).unwrap();
+    assert_eq!(view.identity().committed_sequence, Sequence::from_u64(1));
+    assert_eq!(view.identity().history_floor, Sequence::default());
+    let mut bytes = [0; 1024];
+    let (row, _) = view.get(Key::Blob(BLOB), &mut bytes).unwrap().unwrap();
+    assert_eq!(encode(row), blob_row());
+    let (row, _) = view
+        .get(Key::Mailbox(MAILBOX), &mut bytes)
+        .unwrap()
+        .unwrap();
+    assert_eq!(encode(row), mailbox_row());
+    assert_eq!(
+        view.verify_account(
+            &td_crypto::Provider,
+            0,
+            super::super::AccountCheckLimits {
+                metadata: crate::metadata_sweep::Limits {
+                    rows: 2,
+                    parent_reads: 1,
+                },
+                bodies: super::super::BodyCheckLimits {
+                    blobs: 1,
+                    bytes: BODY_BYTES,
+                },
+            },
+            &mut [0; 65536],
+        ),
+        Err(super::super::AccountCheckError::Bodies(
+            ports::Error::Corrupt
+        ))
+    );
+    let mut input = view
+        .open_blob_input(&td_crypto::Provider, BLOB, BODY_BYTES)
+        .unwrap();
+    let mut chunk = [0; 4096];
+    while input.position() < BODY_BYTES {
+        let offset = input.position();
+        let count = input.read(&mut chunk).unwrap();
+        assert!(count > 0);
+        for (index, byte) in chunk.get(..count).unwrap().iter().enumerate() {
+            let expected = if offset + (index as u64) < 65536 {
+                0xa5
+            } else {
+                0x5a
+            };
+            assert_eq!(*byte, expected);
+        }
+    }
+    assert!(matches!(input.finish(), Err(ports::Error::Corrupt)));
+}
+
+#[test]
+fn backup_preserves_digest_damage_without_granting_account_verification() {
+    let source = Fixture::new();
+    let destination = Fixture::new();
+    let mut source_root = source.locked();
+    let mut destination_root = destination.locked();
+    let store = IndexStore::create(
+        &mut source_root,
+        StoreEpoch::from_bytes([0x95; 16]),
+        Arc::new(Fixed),
+        2,
+        deadline(),
+    )
+    .unwrap();
+    store.create_account(ACCOUNT, deadline()).unwrap();
+    let blob = blob_row();
+    let mailbox = mailbox_row();
+    let mut input = Generated {
+        remaining: BODY_BYTES,
+        pause_root: None,
+    };
+    store
+        .commit(
+            &td_crypto::Provider,
+            request(0),
+            &[
+                Operation::put(Table::Blobs, BLOB.as_bytes(), &blob).unwrap(),
+                Operation::put(Table::Mailboxes, MAILBOX.as_bytes(), &mailbox).unwrap(),
+            ],
+            &mut [BlobSource {
+                id: BLOB,
+                source: &mut input,
+            }],
+        )
+        .unwrap();
+    verify_backup_account(&store);
+    {
+        let writer = lock(&store.writer).unwrap();
+        writer
+            .native
+            .run(|db| {
+                let changed = db
+                    .execute(
+                        "UPDATE blob_chunks SET body=?3 WHERE account=?1 AND blob=?2 AND ordinal=0",
+                        params![
+                            ACCOUNT.as_bytes().as_slice(),
+                            BLOB.as_bytes().as_slice(),
+                            [0xa5u8; 65536].as_slice()
+                        ],
+                    )
+                    .map_err(sql)?;
+                assert_eq!(changed, 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+    verify_digest_damaged_backup(&store);
+    let receipt = store
+        .backup(&mut destination_root, deadline(), &mut [0; 65536])
+        .unwrap();
+    assert_eq!(receipt.epoch, StoreEpoch::from_bytes([0x95; 16]));
+    assert_eq!(
+        receipt.bytes,
+        fs::metadata(destination.path.join("metadata.sqlite3"))
+            .unwrap()
+            .len()
+    );
+    assert_eq!(
+        receipt.bytes,
+        fs::metadata(source.path.join("metadata.sqlite3"))
+            .unwrap()
+            .len()
+    );
+    assert!(!destination
+        .path
+        .join("metadata.sqlite3.backup-partial")
+        .exists());
+    let original = IndexStore::open(&mut source_root, Arc::new(Fixed), 2, deadline()).unwrap();
+    let restored = IndexStore::open(&mut destination_root, Arc::new(Fixed), 2, deadline()).unwrap();
+    verify_digest_damaged_backup(&original);
+    verify_digest_damaged_backup(&restored);
+}

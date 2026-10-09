@@ -599,8 +599,19 @@ the same epoch, sequence, metadata and body contents. This is a bounded
 errors, complete filesystem faults or maximum-size backup qualification.
 
 The snapshot contains authoritative bodies and metadata, but receipt success
-does not verify every body digest or domain invariant. The snapshot may be opened for
-offline inspection with ordinary IndexStore::open and its normal checks.
+does not verify every body digest or domain invariant. The snapshot may be
+opened for offline inspection with ordinary IndexStore::open and its normal
+checks. The digest-damaged backup oracle starts with a verified 2 MiB body
+and mailbox, then changes the first 64 KiB chunk without changing its size.
+Physical integrity still passes, but account verification refuses body
+corruption. Public backup succeeds; both reopened roots retain the original
+metadata, sequence/floor and declared digest, every damaged first-chunk byte
+and every unchanged remaining byte. Full streamed digest verification
+refuses, granting no pin or completed account report. This bounded case
+qualifies preservation of same-size body damage, not arbitrary corruption,
+structural damage, repair, power loss, full filesystem faults or
+maximum-size backup resources.
+
 Serving a restored snapshot requires a fresh epoch so old client state
 tokens cannot identify a different history. IndexStore::renew_epoch
 consumes the engine and obtains one 16-byte candidate from the caller's

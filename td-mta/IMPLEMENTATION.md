@@ -2634,6 +2634,13 @@ and verifies the completed backup. STORAGE.md states the two boundaries;
 power loss, link/unlink windows, sync errors and maximum backup remain
 separate qualification.
 
+The digest-damaged backup oracle preserves a same-size first-chunk mutation
+in a 2 MiB body through a successful public backup and source/destination
+reopen. Physical checks pass while account and streamed digest checks
+refuse; original metadata and exact provisional bytes remain unchanged.
+A receipt is not account verification or repair. STORAGE.md states the
+bounded case and remaining qualification.
+
 Epoch renewal atomically replaces the epoch from admitted entropy while
 preserving account histories and bodies; every error consumes its owner.
 The restored-epoch process-death oracle creates a real backup and parks
