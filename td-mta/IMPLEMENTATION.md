@@ -2644,6 +2644,17 @@ roots for physical and complete account verification. It qualifies only
 that bounded offline path; RESOURCES.md and td-crypto/PORTABLE.md record
 its observation limits and isolated artifact evidence.
 
+The separate explicit maximum-backup fixture passed a public 8 GiB
+consuming copy and independently reopened source/destination physical
+and complete account verification. It reused the body-dominated maximum-
+database dataset and verified 262 bodies and 8513712128 declared bytes
+in each root, with both locks retained and nine native connections at a
+time. The native allocation caps are unchanged; STORAGE.md and
+RESOURCES.md record actual copy extent, timings, observations and the
+specific host scope. This does not qualify arbitrary-account metadata,
+simultaneous pools, full faults, power loss, credentials/configuration
+snapshots or activate restore/repair commands.
+
 The bounded backup process-death oracle kills its exact child during an
 observed incomplete partial copy and after a returned receipt. It verifies
 the original source in both cases, preserves/refuses the partial destination

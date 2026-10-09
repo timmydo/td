@@ -609,6 +609,63 @@ isolated artifact evidence. This bounded fixture does not qualify an
 8 GiB database, arbitrary-account maintenance, full filesystem faults,
 power loss, guarded stack or whole-service overlap.
 
+The separate ignored maximum_database_backup_preserves_complete_account
+fixture qualifies a public backup at the exact 8589934592-byte database
+ceiling. It reuses the maximum-database public admission helper below,
+checks all 2097152 pages, and passes one caller-owned 64 KiB buffer to
+the consuming backup. Require the original epoch and exact byte count in
+the receipt, both main-file lengths equal to 8 GiB and no destination
+partial name after success. Keep both root locks while reopening source
+and destination sequentially, with eight readers plus the writer in each
+verification pass; this does not claim simultaneous eighteen-connection
+overlap.
+
+Each reopened root passes full physical integrity and complete account
+verification, including expected typed Blob rows and changed sequences,
+epoch, endpoint/history floor, permanent-ID count, declared counts/bytes
+and original body digests. The receipt alone remains separate from these
+verification results. The fixture does not call the test-only dirty-body
+producer; backup performs its own public checkpoint and closes all
+native connections before copying. The fixed-clock, between-call
+30-minute bound and outer timeout have the same limitations as the
+maximum-database fixture below.
+
+After the optimized native build below, invoke its library test
+executable with a private disk-backed TMPDIR containing at least 40 GiB
+free:
+
+```text
+TMPDIR=/path/on/disk timeout --kill-after=5s 2700 target/release/td-builder run-capped "$td_mta_lib_test" --ignored --exact store_fs::index::database_qualification::maximum_database_backup_preserves_complete_account --nocapture --test-threads=1
+```
+
+Require exit status zero and exactly one passed test. Ordinary gates
+leave it ignored. Both fixture roots are printed; after external
+termination, confirm that the invocation and all descendants have exited
+before removing only those owned roots.
+
+The 2026-10-09 optimized x86-64 GNU host run used rustc 1.99.0-nightly
+(6f72b5dd5), Linux 7.0.14 and btrfs. Public admission accepted 262
+bodies with 16 clean Capacity refusals, reaching exactly 8 GiB without
+padding. The public consuming backup returned 8589934592 bytes in 8.978
+seconds. Source/destination physical scans took 15.891/12.473 seconds;
+complete account passes each verified 8513712128 declared body bytes in
+57.297/57.984 seconds. Exactly one test passed in 313.12 seconds with
+zero failures. The native library test executable SHA-256 was:
+
+```text
+d4511df913b16db24e8f2181accf9f5c766f1a6d870aa29c01bbc69b3a6e3910
+```
+
+The unchanged 9 MiB individual and 16 MiB shared SQLite requested-
+allocation caps remained active. Five RSS observations were 5640, 11016,
+10984, 11356 and 11512 KiB; the largest reported VmHWM sample was 11512
+KiB. This qualifies the specific body-dominated maximum-size copy and
+separate reopen/verification paths. It does not qualify arbitrary-
+account metadata, simultaneous pool overlap, wrapped allocation
+attribution, transient RSS, guarded stack, filesystem faults, power
+loss, backup credentials/configuration or operational
+restore/repair/activation.
+
 The snapshot contains authoritative bodies and metadata, but receipt success
 does not verify every body digest or domain invariant. The snapshot may be
 opened for offline inspection with ordinary IndexStore::open and its normal

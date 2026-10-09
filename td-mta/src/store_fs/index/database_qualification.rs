@@ -376,3 +376,77 @@ fn maximum_database_checkpoint_and_account_maintenance() {
     memory("reopened-verified");
     eprintln!("maximum-database qualified elapsed={:?}", started.elapsed());
 }
+
+#[test]
+#[ignore = "explicit qualification copies an 8 GiB database and verifies both roots"]
+fn maximum_database_backup_preserves_complete_account() {
+    let started = Instant::now();
+    let source = Fixture::new();
+    let destination = Fixture::new();
+    eprintln!(
+        "maximum-backup source={} destination={}",
+        source.path.display(),
+        destination.path.display()
+    );
+    memory("backup-baseline");
+    let mut root = source.locked();
+    let mut target = destination.locked();
+    let store = IndexStore::create(&mut root, EPOCH, Arc::new(Fixed), 8, deadline()).unwrap();
+    store.create_account(ACCOUNT, deadline()).unwrap();
+    let bodies = fill(&store, started);
+    fill_free_pages(&store, started);
+    assert_eq!(pages(&store), MAX_PAGES);
+    memory("backup-filled");
+    let mut scratch = [0; MAX_FILE_STEP_BYTES];
+    let phase = Instant::now();
+    let receipt = store.backup(&mut target, deadline(), &mut scratch).unwrap();
+    bounded(started);
+    assert_eq!(
+        receipt,
+        BackupReceipt {
+            epoch: EPOCH,
+            bytes: DATABASE_BYTES
+        }
+    );
+    assert_eq!(
+        fs::metadata(db_path(&root, RootEntry::Database).unwrap())
+            .unwrap()
+            .len(),
+        DATABASE_BYTES
+    );
+    assert_eq!(
+        fs::metadata(db_path(&target, RootEntry::Database).unwrap())
+            .unwrap()
+            .len(),
+        DATABASE_BYTES
+    );
+    assert!(
+        fs::symlink_metadata(db_path(&target, RootEntry::BackupPartial).unwrap())
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+    );
+    eprintln!(
+        "maximum-backup copy bytes={} elapsed={:?}",
+        receipt.bytes,
+        phase.elapsed()
+    );
+    memory("backup-copied");
+    // Verify sequentially under both root locks, with nine native owners at a time.
+    {
+        let store = IndexStore::open(&mut root, Arc::new(Fixed), 8, deadline()).unwrap();
+        assert_eq!(pages(&store), MAX_PAGES);
+        verify(&store, &bodies, started);
+    }
+    memory("backup-source-verified");
+    {
+        let store = IndexStore::open(&mut target, Arc::new(Fixed), 8, deadline()).unwrap();
+        assert_eq!(pages(&store), MAX_PAGES);
+        verify(&store, &bodies, started);
+    }
+    memory("backup-destination-verified");
+    eprintln!(
+        "maximum-backup qualified blobs={} bytes={} elapsed={:?}",
+        bodies.len(),
+        receipt.bytes,
+        started.elapsed()
+    );
+}

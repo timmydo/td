@@ -2677,9 +2677,32 @@ observations with native allocation caps, not wrapped allocation
 attribution, a transient RSS bound, guarded-stack proof or combined
 service measurement. This qualifies the specific body-dominated full
 database checkpoint/maintenance case. Arbitrary-account metadata, normal
-service WAL scheduling, full faults, power loss, maximum backup and
-whole-service overlap remain separate. STORAGE.md records the executable
-hash, invocation, physical extents and verification timings.
+service WAL scheduling, full faults, power loss and whole-service overlap
+remain separate. STORAGE.md records the executable hash, invocation,
+physical extents and verification timings. Maximum-size backup has its
+own separate fixture below.
+
+The separate explicit ignored maximum-backup fixture copied the full
+8589934592-byte database through the public consuming backup with one 64
+KiB caller buffer. Public admission reached all 2097152 pages without
+padding. Source and destination then reopened sequentially with nine
+native connections at a time, retaining both root locks. Each passed
+full physical integrity and complete account checks over 262 bodies and
+8513712128 declared bytes, including original
+row/sequence/epoch/floor/ID-count and digest comparisons. The 9 MiB
+individual and 16 MiB shared SQLite requested-allocation caps were
+unchanged; simultaneous eighteen-connection overlap is not exercised.
+
+The optimized GNU host run passed exactly one test in 313.12 seconds;
+backup took 8.978 seconds. Five RSS observations were 5640, 11016,
+10984, 11356 and 11512 KiB, with 11512 KiB the largest reported VmHWM
+sample. These observations and active native caps qualify the specific
+body-dominated maximum-size copy and separate reopen/verification paths.
+They do not establish portable/wrapped allocation attribution, transient
+RSS, guarded stack, arbitrary-account metadata, full faults, power loss
+or whole-service overlap. STORAGE.md records the invocation, executable
+hash, actual extents and independent verification timings; a receipt
+remains separate from verification.
 
 The separate --sqlite-account mode extends the bounded 32 MiB body
 scenario with parent/child mailboxes and complete account verification
