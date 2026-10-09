@@ -110,6 +110,13 @@ fn observe<const N: usize>(scenario: &str, phases: [&str; N], run: impl FnOnce(&
 fn main() {
     if let Some(mode) = std::env::args()
         .nth(1)
+        .and_then(|argument| sqlite_stack_scenario::from_argument(&argument))
+    {
+        sqlite_stack_scenario::run(mode);
+        return;
+    }
+    if let Some(mode) = std::env::args()
+        .nth(1)
         .and_then(|argument| sqlite_body_scenario::Mode::from_argument(&argument))
     {
         sqlite_body(mode);
@@ -182,6 +189,8 @@ use td_mta::{
 mod recipient_sweep;
 #[path = "support/sqlite_body_scenario.rs"]
 mod sqlite_body_scenario;
+#[path = "support/sqlite_stack_scenario.rs"]
+mod sqlite_stack_scenario;
 #[path = "../src/store_fs.rs"]
 #[allow(unused)]
 pub mod store_fs;

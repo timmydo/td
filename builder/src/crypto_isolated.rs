@@ -974,6 +974,42 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
     Ok(())
 }
 
+fn sqlite_stack_evidence(output: &str, scenario: &str) -> Result<()> {
+    if !matches!(
+        scenario,
+        "sqlite-body" | "sqlite-account" | "sqlite-backup" | "sqlite-epoch"
+    ) {
+        return Err("unknown SQLite stack scenario".into());
+    }
+    let mut lines = output.lines();
+    let mut previous = None;
+    for phase in ["before", "after"] {
+        let prefix = format!("{scenario}_stack_{phase}_mapping_bytes=");
+        let value = lines
+            .next()
+            .and_then(|line| line.strip_prefix(&prefix))
+            .ok_or("missing or reordered SQLite stack mapping")?;
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("invalid SQLite stack mapping".into());
+        }
+        let bytes = value
+            .parse::<usize>()
+            .map_err(|_| "SQLite stack mapping overflows")?;
+        if bytes == 0 || bytes > 256 * 1024 || previous.is_some_and(|old| old != bytes) {
+            return Err("SQLite stack mapping exceeds its ceiling or changed".into());
+        }
+        previous = Some(bytes);
+    }
+    let completion = format!("{scenario}-stack-v1: passed");
+    if lines.next() != Some(completion.as_str())
+        || lines.next().is_some()
+        || !output.ends_with('\n')
+    {
+        return Err("invalid SQLite stack completion".into());
+    }
+    Ok(())
+}
+
 fn native_allocation_evidence(output: &str, zero_resize: bool) -> Result<()> {
     if zero_resize {
         if output != "native-allocation-probe-v1: zero-resize invalidated\n" {
@@ -1726,6 +1762,23 @@ pub(crate) fn runtime_inner() -> Result<()> {
         rss_evidence(&output, scenario)?;
         for line in output.lines() {
             println!("portable RSS diagnostic (KiB): {line}");
+        }
+    }
+
+    for (scenario, argument) in [
+        ("sqlite-body", "--sqlite-body-stack"),
+        ("sqlite-account", "--sqlite-account-stack"),
+        ("sqlite-backup", "--sqlite-backup-stack"),
+        ("sqlite-epoch", "--sqlite-epoch-stack"),
+    ] {
+        let mut command = Command::new("/artifacts/td-mta-rss-probe");
+        command.arg(argument).env_clear().stdin(Stdio::null());
+        crate::host_bin::arm_check_child(&mut command);
+        let name = format!("{scenario}-stack");
+        let output = bounded_output(&mut command, &name, 8192, 300)?;
+        sqlite_stack_evidence(&output, scenario)?;
+        for line in output.lines() {
+            println!("portable SQLite stack diagnostic: {line}");
         }
     }
 
@@ -2482,6 +2535,65 @@ mod tests {
                 "unrelated_mapping=1".into(),
             ] {
                 assert!(stack_evidence(&bad, prefix, ceiling).is_err(), "{bad}");
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_stack_requires_bounded_unchanged_mapping_and_exact_scenario() {
+        for scenario in [
+            "sqlite-body",
+            "sqlite-account",
+            "sqlite-backup",
+            "sqlite-epoch",
+        ] {
+            let before = format!("{scenario}_stack_before_mapping_bytes=");
+            let after = format!("{scenario}_stack_after_mapping_bytes=");
+            let completion = format!("{scenario}-stack-v1: passed\n");
+            for bytes in [4096, 256 * 1024] {
+                let output = format!("{before}{bytes}\n{after}{bytes}\n{completion}");
+                assert!(sqlite_stack_evidence(&output, scenario).is_ok());
+                for other in [
+                    "sqlite-body",
+                    "sqlite-account",
+                    "sqlite-backup",
+                    "sqlite-epoch",
+                ] {
+                    if other != scenario {
+                        assert!(sqlite_stack_evidence(&output, other).is_err());
+                    }
+                }
+                assert!(sqlite_stack_evidence(&output, "unknown").is_err());
+                for bad in [
+                    String::new(),
+                    output.trim_end().to_owned(),
+                    format!("{output}extra\n"),
+                    output.replace(&before, &after),
+                    output.replace(&format!("{before}{bytes}\n"), ""),
+                    output.replace(&format!("{after}{bytes}\n"), ""),
+                    output.replace(
+                        &format!("{before}{bytes}\n"),
+                        &format!("{before}{bytes}\n{before}{bytes}\n"),
+                    ),
+                    output.replace(
+                        &format!("{after}{bytes}\n"),
+                        &format!("{after}{bytes}\n{after}{bytes}\n"),
+                    ),
+                    output.replace(&completion, ""),
+                    output.replace(&completion, &completion.repeat(2)),
+                    output.replace(&format!("{after}{bytes}"), &format!("{after}1")),
+                    output.replace(&format!("{before}{bytes}"), &format!("{before}+{bytes}")),
+                    output.replace(
+                        &format!("{before}{bytes}"),
+                        &format!("{before}184467440737095516160"),
+                    ),
+                ] {
+                    assert!(sqlite_stack_evidence(&bad, scenario).is_err(), "{bad}");
+                }
+            }
+            for bytes in [0, 256 * 1024 + 1] {
+                let output = format!("{before}{bytes}\n{after}{bytes}\n{completion}");
+                assert!(sqlite_stack_evidence(&output, scenario).is_err());
             }
         }
     }

@@ -2752,6 +2752,31 @@ not a general zero-allocation guarantee or method-only attribution.
 td-crypto/PORTABLE.md records the exact artifact, staged source/vendor
 pins, current SQLite ceilings and qualification limits.
 
+The separate portable SQLite worker-stack cases passed the same shared
+32 MiB body, account, backup and epoch fixtures. The existing unwrapped
+artifact runs each case in a fresh process with one explicit worker,
+requesting a 240 KiB stack. The unchanged safe Linux smaps helper finds
+the writable region containing a stack marker, requires an adjacent
+inaccessible guard of at least 4096 bytes, rejects grow-down mappings,
+and bounds the observed writable mapping at 262144 bytes. Checks before
+and after the complete scenario must agree; exact phase counts and an
+explicit join precede completion. These are separate stack cases, not
+Rust/native allocation or RSS observation modes.
+
+The complete isolated x86-64 musl run passed with unchanged requested-heap
+and sampled RSS limits. The body worker mapping was 249856 bytes;
+account, backup and epoch mappings were 253952 bytes, each unchanged after
+the fixture. Body/account retain short-source rollback, oversized-body refusal
+and successful ID reuse. Backup/epoch exercise the public consuming copy,
+physical and complete account verification after reopening both roots,
+and known-success renewal with actual warmed entropy for epoch mode.
+The mapping sizes describe the platform's writable region, rather than
+numeric frame high-water marks. They qualify these fixture operations on
+the guarded worker, not every admitted input, maximum database/account,
+whole-worker composition, allocation/RSS bounds, full faults, power loss
+or combined service overlap. No stack reservation or native cap changes.
+td-crypto/PORTABLE.md records the exact artifact and staged inputs.
+
 SQLite setup and query calls may allocate Rust/native memory and are excluded
 from pure MIME zero-allocation claims. MIME fixtures prepare a real verified
 snapshot body pin cold; their existing intervals measure parser/adapter work
@@ -2760,9 +2785,9 @@ probes define the explicit maximum-body acceptance scenario. The isolated
 x86-64 musl release run passed its Rust/native allocation and sampled RSS
 thresholds; td-crypto/PORTABLE.md records the exact artifact and measurements.
 This qualifies that bounded body scenario only. Combined service overlap,
-guarded native stack and complete
-fault qualification remain activation requirements. The resource ledger is
-planning, not measured combined-process usage or proof of durability.
+complete worker composition and fault qualification remain activation
+requirements. The resource ledger is planning, not measured combined-process
+usage or proof of durability.
 
 The forced x86-64 GNU host debug build with indexed chunk rows recorded
 these --sqlite-body observations:

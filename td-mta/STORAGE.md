@@ -825,6 +825,21 @@ credentials/configuration snapshots, operational restore authorization or
 service activation. No production storage, schema, unsafe, dependency,
 allocator hook or native-cap change is introduced.
 
+The separate portable --sqlite-body-stack, --sqlite-account-stack,
+--sqlite-backup-stack and --sqlite-epoch-stack cases passed their shared
+32 MiB fixtures on one worker per fresh process. Each requests a 240 KiB
+stack and verifies a non-growing writable mapping no larger than 256 KiB,
+with an adjacent inaccessible guard of at least 4 KiB. Mapping checks
+before and after the complete fixture agree; expected phase counts and
+explicit worker joins precede completion. The body/account paths retain
+their failed-source, oversized-body and ID-reuse controls; backup/epoch
+paths retain real copy, reopen, physical/account verification and original
+source checks. Epoch renewal uses actual warmed entropy on that worker.
+RESOURCES.md and td-crypto/PORTABLE.md record the observed mappings and
+artifact inputs. This is bounded fixture success on the fixed mapping,
+not a measured frame high-water mark, arbitrary-account, maximum-database,
+complete-worker, fault, power-loss or service-activation qualification.
+
 A live borrowed view or body prevents consuming the engine. Every
 returned error also consumes it, so an indeterminate commit cannot leave
 a reusable owner with a stale epoch. The caller retains the root lock

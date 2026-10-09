@@ -1097,6 +1097,50 @@ b6f95f848ef01da6104a5d5404dd0a06f08dcc22f3a7a766ac007378347b86ed
 and unchanged vendor NAR
 d122b8e7843f7da35cfb1f393dd0d8aea43ef534e9f5cffddc77a095fe971916.
 
+Separate --sqlite-body-stack, --sqlite-account-stack, --sqlite-backup-stack
+and --sqlite-epoch-stack cases reuse the unwrapped artifact and existing
+shared 32 MiB fixtures. Each fresh process starts one named worker with
+a requested 240 KiB stack, then checks its actual writable mapping before
+and after the complete scenario. The unchanged safe smaps helper requires
+a region containing a stack marker, an adjacent inaccessible guard of at
+least 4096 bytes, no grow-down flag and at most 262144 writable bytes.
+The before/after sizes must match; all original fixture assertions, exact
+phase counts and an explicit worker join precede the success marker.
+These cases require the pinned release Linux x86-64 musl artifact and do
+not emit allocation/RSS evidence. The runtime driver uses distinct logs
+and fresh 300-second processes. Its exact parser rejects wrong scenarios,
+missing/duplicated/reordered mappings, zero/overflow/oversized/changed sizes
+and incomplete or extra completion output.
+
+The complete isolated qualification on 2026-10-09 passed on its first
+attempt, including all eight static artifacts, API confinement, all prior
+allocation/RSS and runtime cases, and the four worker-stack cases. Pinned
+Rust 1.96.0 and declared GNU inputs retained SQLite's unchanged 9 MiB
+per-allocation and 16 MiB process-wide requested-heap caps. Observed
+writable regions, equal before and after, were:
+
+| Stack case | Writable bytes |
+| --- | ---: |
+| Body | 249856 |
+| Account | 253952 |
+| Backup | 253952 |
+| Epoch | 253952 |
+
+The epoch fixture warms actual SystemEntropy on that worker and
+delegates exactly one 16-byte renewal fill. Backup/epoch retain physical
+and complete account verification after reopening both roots and
+original source checks; epoch mode changes only the destination epoch.
+Body/account retain rollback, capacity and ID-reuse controls. This is
+success for these fixtures on the fixed guarded region, not a numeric
+frame peak, arbitrary-input/maximum-database, complete-worker,
+allocation/RSS, full-fault, power-loss or activation claim.
+The artifact NAR was
+fa94cf77fb4451c79fbd567983fecd670003363781710cfb189d0a1fc51705f4.
+Its BUILD-INPUTS records staged source NAR
+d92fac421cd62e61b438f6c22e9886f5900ec0ee50b32dde4efb6a4e5686d1dc
+and unchanged vendor NAR
+d122b8e7843f7da35cfb1f393dd0d8aea43ef534e9f5cffddc77a095fe971916.
+
 The isolated x86-64 musl backup qualification on 2026-10-09 passed the
 complete portable command: all eight static artifact checks, API
 confinement and clean runtime, including the old body/account modes and

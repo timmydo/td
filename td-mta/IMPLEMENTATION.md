@@ -2713,6 +2713,16 @@ known-success primitive, without completing maximum-account, unknown-outcome,
 entropy-quality/latency, full-fault, power-loss, guarded-stack or activation
 qualification.
 
+The separate portable SQLite stack cases passed the four shared 32 MiB
+body/account/backup/epoch fixtures on individual workers with a requested
+240 KiB stack. Before/after mapping checks require the same non-growing
+writable region, at most 256 KiB, with an adjacent inaccessible guard.
+Expected phase counts and explicit joins precede success. RESOURCES.md
+and td-crypto/PORTABLE.md record the observed mappings and actual artifact
+inputs. This supplies bounded primitive stack evidence, without claiming
+numeric frame peaks, arbitrary-account/maximum-database paths, complete
+worker composition, full faults, power loss or activation.
+
 These primitives do not complete the restore command,
 selection/verification workflow or service activation.
 
