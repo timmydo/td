@@ -685,6 +685,15 @@ fn pruning_requires_an_existing_account_and_wal_headroom() {
 
 #[test]
 fn full_reader_pool_retains_bodies_and_history_during_bounded_pruning() {
+    pruned_reader_scenario(false);
+}
+
+#[test]
+fn backup_preserves_retired_history_pending_bounded_cleanup() {
+    pruned_reader_scenario(true);
+}
+
+fn pruned_reader_scenario(copy_pending: bool) {
     const READERS: usize = 8;
     const BYTES: usize = 2 * 1024 * 1024;
     let fixture = Fixture::new();
@@ -806,23 +815,25 @@ fn full_reader_pool_retains_bodies_and_history_during_bounded_pruning() {
                 more: true
             }
         );
-        let second = store.prune_history(request(2, 2, 1)).unwrap();
-        assert_eq!(
-            second,
-            HistoryPruned {
-                identity: current_identity,
-                removed: 1,
-                more: false
-            }
-        );
-        assert_eq!(
-            store.prune_history(request(2, 2, 1)).unwrap(),
-            HistoryPruned {
-                identity: current_identity,
-                removed: 0,
-                more: false
-            }
-        );
+        if !copy_pending {
+            let second = store.prune_history(request(2, 2, 1)).unwrap();
+            assert_eq!(
+                second,
+                HistoryPruned {
+                    identity: current_identity,
+                    removed: 1,
+                    more: false
+                }
+            );
+            assert_eq!(
+                store.prune_history(request(2, 2, 1)).unwrap(),
+                HistoryPruned {
+                    identity: current_identity,
+                    removed: 0,
+                    more: false
+                }
+            );
+        }
         assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
         for offset in (65536..BYTES).step_by(65536) {
             for input in &mut inputs {
@@ -925,18 +936,14 @@ fn full_reader_pool_retains_bodies_and_history_during_bounded_pruning() {
     }
     store.checkpoint(deadline()).unwrap();
     drop(store);
-    let store = IndexStore::open(&mut root, clock, READERS, deadline()).unwrap();
-    store.validate_integrity(deadline()).unwrap();
-    let mut reopened: [_; READERS] =
-        std::array::from_fn(|_| store.view(ACCOUNT, deadline()).unwrap());
-    for view in &mut reopened {
+    let check_current = |view: &mut IndexReadView<'_, '_>, scratch: &mut [u8]| {
         assert_eq!(view.identity(), current_identity);
         assert_eq!(
-            view.get(Key::Blob(blob), &mut scratch).unwrap(),
+            view.get(Key::Blob(blob), scratch).unwrap(),
             Some((blob_row, Sequence::from_u64(1)))
         );
         assert_eq!(
-            view.get(Key::Mailbox(parent), &mut scratch).unwrap(),
+            view.get(Key::Mailbox(parent), scratch).unwrap(),
             Some((updated_parent, Sequence::from_u64(2)))
         );
         assert_eq!(
@@ -952,9 +959,94 @@ fn full_reader_pool_retains_bodies_and_history_during_bounded_pruning() {
             .open_blob_input(&td_crypto::Provider, blob, BYTES as u64)
             .unwrap();
         for bytes in body.chunks(65536) {
-            assert_eq!(input.read(&mut scratch).unwrap(), bytes.len());
-            assert_eq!(scratch.as_slice(), bytes);
+            assert_eq!(input.read(scratch).unwrap(), bytes.len());
+            assert_eq!(&*scratch, bytes);
         }
         drop(input.finish().unwrap());
+    };
+    let store = IndexStore::open(&mut root, clock.clone(), READERS, deadline()).unwrap();
+    store.validate_integrity(deadline()).unwrap();
+    {
+        let mut reopened: [_; READERS] =
+            std::array::from_fn(|_| store.view(ACCOUNT, deadline()).unwrap());
+        for view in &mut reopened {
+            check_current(view, &mut scratch);
+        }
+    }
+    if copy_pending {
+        let destination = Fixture::new();
+        let mut copied_root = destination.locked();
+        let receipt = store
+            .backup(&mut copied_root, deadline(), &mut scratch)
+            .unwrap();
+        assert_eq!(receipt.epoch, EPOCH);
+        assert!(
+            receipt.bytes > BYTES as u64 && receipt.bytes <= crate::limits::SQLITE_DATABASE_BYTES
+        );
+        assert_eq!(receipt.bytes % PAGE_BYTES, 0);
+        assert_eq!(
+            fs::symlink_metadata(db_path(&copied_root, RootEntry::Database).unwrap())
+                .unwrap()
+                .len(),
+            receipt.bytes
+        );
+        assert!(matches!(
+            fixture.lock(),
+            Err(crate::store_fs::LockError::Busy)
+        ));
+        assert!(matches!(
+            destination.lock(),
+            Err(crate::store_fs::LockError::Busy)
+        ));
+        let source = IndexStore::open(&mut root, clock.clone(), READERS, deadline()).unwrap();
+        let copied = IndexStore::open(&mut copied_root, clock, READERS, deadline()).unwrap();
+        source.validate_integrity(deadline()).unwrap();
+        copied.validate_integrity(deadline()).unwrap();
+        {
+            let mut source_views: [_; READERS] =
+                std::array::from_fn(|_| source.view(ACCOUNT, deadline()).unwrap());
+            let mut copied_views: [_; READERS] =
+                std::array::from_fn(|_| copied.view(ACCOUNT, deadline()).unwrap());
+            for view in source_views.iter_mut().chain(copied_views.iter_mut()) {
+                check_current(view, &mut scratch);
+            }
+            for store in [&copied, &source] {
+                assert!(matches!(
+                    store.view(ACCOUNT, deadline()),
+                    Err(ports::Error::Busy)
+                ));
+                assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
+                assert_eq!(
+                    store.prune_history(request(2, 2, 1)).unwrap(),
+                    HistoryPruned {
+                        identity: current_identity,
+                        removed: 1,
+                        more: false
+                    }
+                );
+                assert_eq!(
+                    store.prune_history(request(2, 2, 1)).unwrap(),
+                    HistoryPruned {
+                        identity: current_identity,
+                        removed: 0,
+                        more: false
+                    }
+                );
+            }
+            for view in source_views.iter_mut().chain(copied_views.iter_mut()) {
+                check_current(view, &mut scratch);
+            }
+            for store in [&copied, &source] {
+                assert!(matches!(
+                    store.view(ACCOUNT, deadline()),
+                    Err(ports::Error::Busy)
+                ));
+                assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
+            }
+        }
+        source.checkpoint(deadline()).unwrap();
+        copied.checkpoint(deadline()).unwrap();
+        source.validate_integrity(deadline()).unwrap();
+        copied.validate_integrity(deadline()).unwrap();
     }
 }

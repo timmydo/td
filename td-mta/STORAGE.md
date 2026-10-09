@@ -596,6 +596,44 @@ threads, multiple accounts, maximum-database work, retention-policy
 authority, quota reconciliation, full filesystem faults, power loss or
 whole-service scheduling.
 
+A second native full-reader fixture qualifies public backup with retired
+history still awaiting physical cleanup. It retains the same eight
+partial 2 MiB body inputs, raises the history floor to sequence two with
+max_rows one and deliberately leaves the receipt more true. Old views
+retain both original changes while fresh views already reject
+below-floor cursors. Complete body/digest checks, slot reuse, checkpoint
+and reopened eight-reader checks run before consuming backup.
+
+The real public backup returns the original epoch and a positive
+page-aligned main-file extent within the public database ceiling,
+matching the destination metadata. Both cooperative locks remain Busy.
+Source and copy reopen with eight readers each, retaining eighteen
+native owners and sixteen simultaneous current views. Both pass physical
+integrity; every view checks complete sequence-two/floor-two identity,
+exact typed body and updated parent with original changed sequences,
+below-floor HistoryLost, completed-floor Complete and all original body
+bytes and digest completion.
+
+While those sixteen views remain retained, cleanup in the copied store
+returns one removed row with more false, then zero and false.
+Independent source cleanup subsequently also returns one and false, then
+zero and false. This verifies that backup preserved the pending retired
+row and that cleaning the copy did not clean the source. Full
+identity/typed metadata/history/body verification repeats through all
+sixteen retained views after cleanup. Ninth captures and checkpoints
+refuse Busy in each full pool. After views drop, both checkpoints and
+physical integrity checks pass.
+
+The earlier fully cleaned full-pool fixture remains as a separate test
+through the shared scenario. This is bounded native sequential
+backup/pruning evidence for one account and body, without private SQL
+seeding or independent database-file opens in the fixture. The backup
+receipt alone is not semantic verification or restore approval. No
+production, unsafe, hook, dependency or cap change is introduced;
+portable resource limits, parallel work, multi-account/maximal stores,
+normal service retention/admission, full filesystem faults and power
+loss are not qualified.
+
 Backup must capture one consistent SQLite state. Stop service activity,
 checkpoint successfully, close every connection, then copy the main database;
 that snapshot contains bodies and metadata together. Copying only the live
