@@ -1475,11 +1475,17 @@ turn. Pending replies require an explicit flush acknowledgement; reservation,
 body writes and publication require separate trusted driver results before
 input resumes. A final DATA 250 follows only a successful commit result for
 the routed account. An indeterminate result closes without a final reply.
-A supplied result alone is not durability proof. The native StoreCoordinator
-now reserves ingress, replaces Return-Path, generates Received from trusted
-connection facts, resolves immutable threads and publishes one Inbox email
-with its body, envelope and history in one transaction. Transcript fixtures
-connect its actual outcomes to the session and verify reopened mail. The
+A supplied result alone is not durability proof. The native
+StoreCoordinator now reserves ingress, replaces Return-Path, generates
+Received from trusted connection facts, resolves immutable threads and
+publishes one Inbox email with its body, envelope and history in one
+transaction. A delivery job owns its connection authorization adapter,
+so a worker can construct it and transfer the job without borrowing that
+worker's stack. Borrowed adapters remain supported through the same
+interface. Publication still acquires a fresh policy guard; retaining
+the adapter does not retain permission. Tests between workers verify
+durable publication and refusal after revocation. Transcript fixtures
+connect actual outcomes to the session and verify reopened mail. The
 receiving network driver additionally exercises real local TCP delivery
 and reopened storage. Worker scheduling and listener activation remain
 M11 work. The engine binds routing for its lifetime, accepts only

@@ -22,6 +22,8 @@ pub struct DeliveryPeer<'a> {
 /// Its guard excludes relevant revocation through the synchronous commit;
 /// pinned recipient routing alone does not authorize a revoked gateway.
 /// Acquisition must refuse within deadline and must not call the coordinator.
+/// Adapter destruction must be bounded; it runs on the storage worker during
+/// reservation refusal or job retirement, after local spool/lease cleanup.
 pub trait DeliveryAuthorization {
     type Guard<'a>: DeliveryGuard
     where
@@ -32,6 +34,20 @@ pub trait DeliveryAuthorization {
         deadline: Deadline,
     ) -> Result<Self::Guard<'_>, ports::Error>;
 }
+impl<A: DeliveryAuthorization + ?Sized> DeliveryAuthorization for &A {
+    type Guard<'a>
+        = A::Guard<'a>
+    where
+        Self: 'a;
+    fn authorize(
+        &self,
+        account: AccountId,
+        deadline: Deadline,
+    ) -> Result<Self::Guard<'_>, ports::Error> {
+        (**self).authorize(account, deadline)
+    }
+}
+
 pub trait DeliveryGuard {
     fn access(&self) -> Access;
     fn peer(&self) -> DeliveryPeer<'_>;
@@ -147,9 +163,13 @@ pub struct DeliveryRequest {
     pub deadline: Deadline,
 }
 
+/// Carries its connection authorization adapter between storage worker turns.
+/// Owning the adapter does not cache permission: publication authorizes again.
+/// Retire terminal failures with discard or Drop on a storage worker.
+/// CoordinationBusy retains the job for retry under its original deadline.
 pub struct Delivery<'c, 's, 'r, 'a, C: Crypto, P, A: DeliveryAuthorization> {
     coordinator: &'c StoreCoordinator<'r, 'a, P>,
-    authorization: &'c A,
+    authorization: A,
     crypto: &'c C,
     stage: Stage<'s, 'r, C::Sha256>,
     lease: Option<LeaseId>,
@@ -173,12 +193,15 @@ pub struct Delivery<'c, 's, 'r, 'a, C: Crypto, P, A: DeliveryAuthorization> {
 impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
     /// Reserve only after this validated session requests DATA admission. The
     /// trusted driver supplies its connection policy and configured header bound.
+    /// Transfer the adapter into the job, or pass a reference for an outer owner.
+    /// Run this call on a storage worker; refusal drops the supplied adapter
+    /// after local cleanup. An admitted job retains it until discard or Drop.
     pub fn reserve_delivery<'c, 's, C: Crypto, A: DeliveryAuthorization>(
         &'c self,
         crypto: &'c C,
         entropy: &mut impl Entropy,
         spool: &'s IngressSpool<'r>,
-        authorization: &'c A,
+        authorization: A,
         session: &Session<'_>,
         request: DeliveryRequest,
     ) -> Result<Delivery<'c, 's, 'r, 'a, C, P, A>, DeliveryError> {

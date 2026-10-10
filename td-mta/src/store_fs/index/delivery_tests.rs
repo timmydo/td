@@ -355,16 +355,18 @@ fn deliver<'r, 'a>(
     source: &[u8],
 ) -> DeliveryCompletion {
     let mut session = session(routes);
-    let mut delivery = coordinator
-        .reserve_delivery(
+    let request = request();
+    let mut delivery = retry_reservation(|| {
+        coordinator.reserve_delivery(
             &td_crypto::Provider,
             random,
             spool,
             policy,
             &session,
-            request(),
+            request,
         )
-        .unwrap();
+    })
+    .unwrap();
     session.data_ready(Ok(())).unwrap();
     session.reply_sent().unwrap();
     // Actual wire data is deliberately fragmented down to individual octets.
@@ -1464,11 +1466,20 @@ fn delivery_spool_creation_runs_outside_coordination_and_rolls_back_failure() {
                     Ok(())
                 }
             });
+            let retired = Arc::new(AtomicU64::new(0));
+            let authorization = OwnedPolicy {
+                policy: Policy(policy.0.clone(), policy.1),
+                retired: retired.clone(),
+                retiring: || {
+                    assert_eq!(coordinator.try_state().unwrap().ledger.available_cells(), 4);
+                    assert_eq!(spool.status().unwrap().occupied_slots, 0);
+                },
+            };
             let result = coordinator.reserve_delivery(
                 &crypto,
                 &mut Random(10),
                 spool,
-                policy,
+                authorization,
                 &session,
                 request(),
             );
@@ -1482,6 +1493,7 @@ fn delivery_spool_creation_runs_outside_coordination_and_rolls_back_failure() {
             } else {
                 result.unwrap().discard().unwrap();
             }
+            assert_eq!(retired.load(Ordering::SeqCst), 1);
             assert_eq!(
                 coordinator.state.lock().unwrap().ledger.available_cells(),
                 4
@@ -1634,4 +1646,162 @@ fn real_tcp_delivery_acknowledges_only_recoverable_mail() {
             },
         );
     }
+}
+
+struct OwnedPolicy<F: Fn() = fn()> {
+    policy: Policy,
+    retired: Arc<AtomicU64>,
+    retiring: F,
+}
+impl<F: Fn()> DeliveryAuthorization for OwnedPolicy<F> {
+    type Guard<'a>
+        = Guard<'a>
+    where
+        Self: 'a;
+    fn authorize(&self, account: AccountId, deadline: Deadline) -> Result<Guard<'_>, ports::Error> {
+        self.policy.authorize(account, deadline)
+    }
+}
+impl<F: Fn()> Drop for OwnedPolicy<F> {
+    fn drop(&mut self) {
+        (self.retiring)();
+        self.retired.fetch_add(1, Ordering::SeqCst);
+    }
+}
+fn owned_policy(policy: &Policy, retired: &Arc<AtomicU64>) -> OwnedPolicy {
+    OwnedPolicy {
+        policy: Policy(policy.0.clone(), policy.1),
+        retired: retired.clone(),
+        retiring: || {},
+    }
+}
+
+#[test]
+fn delivery_carries_worker_local_authorization_to_later_publication() {
+    fixture(|coordinator, spool, policy, _, routes| {
+        let coordinator = &*coordinator;
+        let retired = Arc::new(AtomicU64::new(0));
+        let session = session(routes);
+        let result = std::thread::scope(|scope| {
+            let job = scope
+                .spawn(|| {
+                    let authorization = owned_policy(policy, &retired);
+                    coordinator
+                        .reserve_delivery(
+                            &td_crypto::Provider,
+                            &mut Random(10),
+                            spool,
+                            authorization,
+                            &session,
+                            request(),
+                        )
+                        .unwrap()
+                })
+                .join()
+                .unwrap();
+            assert_eq!(retired.load(Ordering::SeqCst), 0);
+            scope
+                .spawn(move || {
+                    let mut job = job;
+                    job.write(b"Subject: worker transfer\r\n").unwrap();
+                    job.write(b"\r\n").unwrap();
+                    job.write(b"body\r\n").unwrap();
+                    job.prepare().unwrap();
+                    job.commit().unwrap()
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!(retired.load(Ordering::SeqCst), 1);
+        assert_eq!(spool.status().unwrap().occupied_slots, 0);
+        vec![Expected {
+            result,
+            tail: "Subject: worker transfer\r\n\r\nbody\r\n".into(),
+        }]
+    });
+}
+
+#[test]
+fn owned_delivery_authorization_still_rechecks_revocation_and_releases_on_refusal() {
+    for discard in [false, true] {
+        fixture(|coordinator, spool, policy, _, routes| {
+            let coordinator = &*coordinator;
+            let retired = Arc::new(AtomicU64::new(0));
+            let session = session(routes);
+            let mut job = coordinator
+                .reserve_delivery(
+                    &td_crypto::Provider,
+                    &mut Random(10),
+                    spool,
+                    owned_policy(policy, &retired),
+                    &session,
+                    request(),
+                )
+                .unwrap();
+            job.write(b"\r\n").unwrap();
+            job.prepare().unwrap();
+            *policy.0.lock().unwrap() = false;
+            std::thread::scope(|scope| {
+                let retired = &retired;
+                scope
+                    .spawn(move || {
+                        assert!(matches!(
+                            job.commit(),
+                            Err(DeliveryError::Storage(UploadError::Store(
+                                ports::Error::Forbidden
+                            )))
+                        ));
+                        assert_eq!(retired.load(Ordering::SeqCst), 0);
+                        if discard {
+                            job.discard().unwrap();
+                        } else {
+                            drop(job);
+                        }
+                        assert_eq!(retired.load(Ordering::SeqCst), 1);
+                    })
+                    .join()
+                    .unwrap();
+            });
+            assert_eq!(retired.load(Ordering::SeqCst), 1);
+            assert_eq!(spool.status().unwrap().occupied_slots, 0);
+            assert_eq!(coordinator.used(Kind::BlobCount).unwrap(), 0);
+            assert_eq!(
+                coordinator.state.lock().unwrap().ledger.available_cells(),
+                4
+            );
+            assert!(matches!(
+                coordinator.reserve_delivery(
+                    &td_crypto::Provider,
+                    &mut Random(40),
+                    spool,
+                    owned_policy(policy, &retired),
+                    &session,
+                    request(),
+                ),
+                Err(DeliveryError::Storage(UploadError::Store(
+                    ports::Error::Forbidden
+                )))
+            ));
+            assert_eq!(retired.load(Ordering::SeqCst), 2);
+            assert_eq!(spool.status().unwrap().occupied_slots, 0);
+            Vec::new()
+        });
+    }
+}
+
+// Parallel tests may race the one-shot global ticket issue before effects.
+fn retry_reservation<T>(
+    mut attempt: impl FnMut() -> Result<T, DeliveryError>,
+) -> Result<T, DeliveryError> {
+    for _ in 0..1000 {
+        match attempt() {
+            Err(DeliveryError::Storage(UploadError::Ledger(logical::Error::Slot(
+                crate::ownership::Error::Contended,
+            )))) => std::thread::yield_now(),
+            result => return result,
+        }
+    }
+    Err(DeliveryError::Storage(UploadError::Ledger(
+        logical::Error::Slot(crate::ownership::Error::Contended),
+    )))
 }

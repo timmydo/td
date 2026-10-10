@@ -2725,12 +2725,17 @@ public AUTH, DSN advertisement, or port binding in this task.
 timeouts, startup/shutdown state and SMTP TLS wiring.
 
 Concurrent store coordination is implemented: idle ingress jobs retain
-no shared mutex, publication plans and settles under one coordinator lock,
-and delivery CoordinationBusy can be rescheduled. Upload retry refreshes
-its sequence under the commit lock. Checkpoint and expiry maintenance run
-beside idle ingress. Native tests cover worker
-progress beside an idle sender, current thread-anchor selection, independent
-quota release, physical completion capacity and uncertainty/poison refusal.
+no shared mutex, publication plans and settles under one coordinator
+lock, and delivery CoordinationBusy can be rescheduled. Delivery jobs
+now carry owned authorization adapters between worker turns while
+preserving borrowed callers and a fresh publication guard. Native tests
+move a worker-created adapter with its job to another worker, verify
+reopened mail, and cover revocation and adapter retirement on refusal.
+Upload retry refreshes its sequence under the commit lock. Checkpoint
+and expiry maintenance run beside idle ingress. Native tests cover
+worker progress beside an idle sender, current thread-anchor selection,
+independent quota release, physical completion capacity and
+uncertainty/poison refusal.
 The receiving network driver owns a session and performs bounded
 nonblocking transport/parser turns. It preserves buffered tails over
 typed worker handoffs, handles partial writes and flush completion,
