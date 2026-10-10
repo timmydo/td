@@ -533,3 +533,134 @@ fn backup_arguments_refuse_before_either_root_is_accessed() {
     assert!(!source.0.join("LOCK").exists());
     assert!(!destination.0.join("LOCK").exists());
 }
+
+#[test]
+fn whole_database_verification_checks_every_account_before_success() {
+    if private_case("whole_database_verification_checks_every_account_before_success") {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.seed();
+    let all = || {
+        Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(["store", "verify", "--all", "--root"])
+            .arg(&fixture.0)
+            .args(["--timeout-seconds", "60"])
+            .output()
+            .unwrap()
+    };
+    let json = report(&all(), 0);
+    assert_eq!(json.get("scope").unwrap().as_str(), Some("database"));
+    assert_eq!(
+        json.get("physical_integrity"),
+        Some(&td_json::Json::Bool(true))
+    );
+    assert_eq!(
+        json.get("epoch").unwrap().as_str(),
+        Some(StoreEpoch::from_bytes([9; 16]).to_string().as_str())
+    );
+    for (field, count) in [
+        ("accounts", 2),
+        ("metadata_rows", 2),
+        ("mailboxes", 0),
+        ("submissions", 0),
+        ("recipients", 0),
+        ("blobs", 2),
+        ("body_bytes", 65_596),
+    ] {
+        assert_eq!(json.get(field).unwrap().as_u64(), Some(count), "{field}");
+    }
+    for field in ["account", "sequence", "history_floor"] {
+        assert!(json.get(field).is_none(), "{field}");
+    }
+    assert!(json.get("checked_at_ms").unwrap().as_u64().unwrap() > 0);
+    fixture.corrupt(OTHER_MARKER);
+    report(&fixture.verify(ACCOUNT), 0);
+    let failed = report(&all(), 1);
+    assert_eq!(failed.get("stage").unwrap().as_str(), Some("bodies"));
+    assert_eq!(failed.get("error").unwrap().as_str(), Some("corrupt"));
+    for field in [
+        "accounts",
+        "metadata_rows",
+        "blobs",
+        "body_bytes",
+        "physical_integrity",
+        "epoch",
+    ] {
+        assert!(failed.get(field).is_none(), "{field}");
+    }
+}
+
+#[test]
+fn whole_database_verification_accepts_empty_and_refuses_invalid_selection() {
+    if private_case("whole_database_verification_accepts_empty_and_refuses_invalid_selection") {
+        return;
+    }
+    let fixture = Fixture::new();
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_td-mta"));
+        command.args(["store", "verify", "--root"]).arg(&fixture.0);
+        command
+    };
+    let account = ACCOUNT.to_string();
+    for flags in [
+        vec!["--all", "--all"],
+        vec!["--all", "--account", account.as_str()],
+        vec!["--account", account.as_str(), "--all"],
+        vec!["--all", "value"],
+        vec![],
+    ] {
+        let failed = report(&command().args(flags).output().unwrap(), 2);
+        assert_eq!(
+            failed.get("error").unwrap().as_str(),
+            Some("invalid-arguments")
+        );
+        assert!(!fixture.0.join("LOCK").exists());
+    }
+    {
+        let mut root = PrivateRoot::open(fixture.0.to_str().unwrap())
+            .unwrap()
+            .try_lock()
+            .unwrap();
+        let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
+        let deadline = Deadline::after(clock.sample().unwrap().monotonic, 60_000).unwrap();
+        let _store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            clock,
+            1,
+            deadline,
+        )
+        .unwrap();
+    }
+    let json = report(&command().arg("--all").output().unwrap(), 0);
+    assert_eq!(json.get("scope").unwrap().as_str(), Some("database"));
+    for field in [
+        "accounts",
+        "metadata_rows",
+        "mailboxes",
+        "submissions",
+        "recipients",
+        "blobs",
+        "body_bytes",
+    ] {
+        assert_eq!(json.get(field).unwrap().as_u64(), Some(0), "{field}");
+    }
+    let held = PrivateRoot::open(fixture.0.to_str().unwrap())
+        .unwrap()
+        .try_lock()
+        .unwrap();
+    let failed = report(&command().arg("--all").output().unwrap(), 1);
+    assert_eq!(failed.get("stage").unwrap().as_str(), Some("lock"));
+    assert_eq!(failed.get("error").unwrap().as_str(), Some("busy"));
+    drop(held);
+    let path = fixture.0.join("metadata.sqlite3");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[0] = 0;
+    fs::write(path, bytes).unwrap();
+    let failed = report(&command().arg("--all").output().unwrap(), 1);
+    assert!(matches!(
+        failed.get("stage").unwrap().as_str(),
+        Some("open") | Some("physical")
+    ));
+}

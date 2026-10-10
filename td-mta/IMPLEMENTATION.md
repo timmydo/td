@@ -2845,8 +2845,14 @@ unpublished/uncertain failure. It copies all accounts' database state without
 claiming semantic verification, a fresh restore epoch, service credentials or
 configuration. Process fixtures verify both accounts after copying, reject
 lock/policy/conflict/argument errors and preserve digest damage honestly.
-Whole-store semantic enumeration, repair, restore, online/configuration backup
-and runtime administration remain separate increments.
+Whole-database verification is also implemented with `store verify --all`.
+It enumerates the existing capped account table under the writer fence, then
+reuses each account's maintenance passes sequentially under the offline root
+lock and one absolute deadline. It reports checked aggregate counts only
+after every account completes, including zero-account stores; a later-account
+failure emits no partial counts. This covers the stated current metadata/body
+checks, not retained-history replay. Repair, restore, online/configuration
+backup and runtime administration remain separate increments.
 
 The native offline primitives now include consuming IndexStore::backup
 and IndexStore::renew_epoch, plus bounded IndexReadView::verify_bodies

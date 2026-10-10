@@ -2119,6 +2119,27 @@ local AccountId is required. Physical checks cover the database; semantic
 metadata and body-digest checks cover only that account, including when other
 accounts share its object IDs. Success never claims all accounts were checked.
 
+`td-mta store verify --root PATH --all [--timeout-seconds N]` instead runs
+those same metadata/reference, mailbox-forest, recipient-coverage and complete
+body-digest passes for every current account. Exactly one of `--account ID`
+and `--all` is required. The offline owner retains its root lock and performs
+no logical mutations between physical validation, account enumeration and
+account checks. Each account view is released before acquiring the next;
+one caller scratch buffer is reused for the entire command.
+
+`IndexStore::account_ids` enumerates the account table in ID order under the
+writer fence, with its ordinary native VM allowance and original deadline.
+It returns an owned list only after successful completion and refuses more
+than the existing 128-account cap. The IDs are historical observations, not
+a retained snapshot or authority: other callers must separately quiesce
+mutations when using the list for subsequent work. The CLI does so through
+its stopped-store lock and sole engine ownership. There is no body or mailbox
+materialization. Whole-database verification retains the same absolute
+deadline across enumeration and every account; each account view receives
+one existing maintenance allowance, retained across all of that account's
+passes. It does not renew fuel within an account or a body.
+
+
 Run offline as a local administrator with filesystem access to the private
 root, under the existing stable-path and dedicated-owner deployment rules.
 The command is not a network authorization path. Invalid root permissions,
@@ -2148,9 +2169,24 @@ Success has `command: "store.verify"`, `status: "ok"`, `scope: "account"`,
 `submissions`, `recipients`, `blobs` and `body_bytes`. The lock is released
 after verification and native cleanup, before output. The report is historical
 completion, not serving readiness, body custody or permanent freshness.
+Whole-database success instead has `scope: "database"`, the common `epoch`,
+`physical_integrity: true`, `accounts` and checked aggregate `metadata_rows`,
+`mailboxes`, `submissions`, `recipients`, `blobs` and `body_bytes`. Aggregate
+body bytes must fit the existing database ceiling. `checked_at_ms` is sampled
+after all account passes complete; the report has no account, sequence or
+history-floor field because those belong to distinct account identities.
+An empty database can succeed with zero counts. No partial success report is
+emitted when any account fails, even after earlier accounts passed. Whole
+scope means the stated current metadata/body passes covered every account;
+it does not add retained-history replay, repair or configuration validation.
 Failure has `status: "error"`, a fixed `stage` and fixed `error` code; it emits
 no partial success counts, pathnames or message text. Root policy and root I/O
-share `root-policy-or-io`; metadata/report failures use `verification-failed`.
+share `root-policy-or-io`; account metadata and combined-account report failures
+use `verification-failed`. Whole-database enumeration uses `stage: "accounts"`
+with the fixed native adapter code. Aggregate failures use `stage: "reports"`,
+`error: "corrupt"` for an epoch mismatch or `error: "capacity"` for checked
+count overflow or the aggregate body-byte ceiling. The combined-account report
+guard also uses `stage: "reports"`, with `error: "verification-failed"`.
 Clock sampling uses `stage: "clock"`; absolute deadline arithmetic overflow
 uses `stage: "arguments"` and exits two before root access. Lock policy
 refusal uses `stage: "lock"`, `error: "lock-policy"`.
@@ -2167,6 +2203,12 @@ bytes refuses after physical validation; corrupting the other account's body
 does not enlarge selected-account scope. Corrupt database headers, occupied
 locks, missing accounts, invalid permissions and malformed arguments refuse.
 Reopen checks preserve the original epoch and committed account sequence.
+Whole-database process cases verify combined counts for shared IDs and distinct
+bodies, refusal after a later-account digest failure with no partial counts,
+empty stores, incompatible selection options, occupied locks and damaged
+headers. The enumeration unit case checks empty and complete ordered lists,
+the existing account cap, fence contention, stopped writer and deadline.
+
 
 ## Offline database backup command
 

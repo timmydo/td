@@ -598,6 +598,30 @@ impl<'r> IndexStore<'r> {
     pub fn epoch(&self) -> StoreEpoch {
         self.epoch
     }
+    /// Cold enumeration under the writer fence and ordinary native work limits.
+    /// IDs are historical observations; callers quiesce mutations for later use.
+    pub fn account_ids(&self, deadline: Deadline) -> Result<Vec<AccountId>, ports::Error> {
+        let (writer, acquired) = self.writer_observed(deadline)?;
+        if writer.stopped {
+            return Err(ports::Error::WriterStopped);
+        }
+        writer.native.begin_work_after(deadline, acquired)?;
+        writer.native.run(|db| {
+            let mut statement = db
+                .prepare("SELECT id FROM accounts ORDER BY id")
+                .map_err(sql)?;
+            let mut rows = statement.query([]).map_err(sql)?;
+            let mut accounts = Vec::new();
+            while let Some(row) = rows.next().map_err(sql)? {
+                writer.native.check()?;
+                if accounts.len() >= MAX_ACCOUNTS as usize {
+                    return Err(ports::Error::Capacity);
+                }
+                accounts.push(AccountId::from_bytes(fixed_blob(row, 0)?));
+            }
+            Ok(accounts)
+        })
+    }
     pub fn create_account(
         &self,
         account: AccountId,
@@ -1723,6 +1747,68 @@ mod tests {
     const ACCOUNT: AccountId = AccountId::from_bytes([1; 16]);
     const ID: MailboxId = MailboxId::from_bytes([2; 16]);
     const MEMBERSHIP_EMAIL: &str = "SELECT email_id FROM memberships INDEXED BY memberships_mailbox WHERE account=?1 AND mailbox_id=?2";
+    #[test]
+    fn account_enumeration_is_complete_capped_and_fenced() {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let clock = Arc::new(Timer(AtomicU64::new(1)));
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            clock.clone(),
+            1,
+            deadline(),
+        )
+        .unwrap();
+        assert_eq!(store.account_ids(deadline()).unwrap(), Vec::new());
+        for ordinal in (0..MAX_ACCOUNTS).rev() {
+            store
+                .create_account(
+                    AccountId::from_bytes(u128::from(ordinal).to_be_bytes()),
+                    deadline(),
+                )
+                .unwrap();
+        }
+        let expected: Vec<_> = (0..MAX_ACCOUNTS)
+            .map(|ordinal| AccountId::from_bytes(u128::from(ordinal).to_be_bytes()))
+            .collect();
+        assert_eq!(store.account_ids(deadline()).unwrap(), expected);
+        let writer = store.writer.lock().unwrap();
+        assert_eq!(store.account_ids(deadline()), Err(ports::Error::Busy));
+        drop(writer);
+        clock.0.store(101, Ordering::Relaxed);
+        assert_eq!(store.account_ids(deadline()), Err(ports::Error::Deadline));
+        clock.0.store(1, Ordering::Relaxed);
+        {
+            let mut writer = store.writer.lock().unwrap();
+            writer.stopped = true;
+        }
+        assert_eq!(
+            store.account_ids(deadline()),
+            Err(ports::Error::WriterStopped)
+        );
+        {
+            let mut writer = store.writer.lock().unwrap();
+            writer.stopped = false;
+            writer.native.begin_work(deadline()).unwrap();
+            writer
+                .native
+                .run(|db| {
+                    db.execute(
+                        "INSERT INTO accounts VALUES(?1,?2,?2)",
+                        params![
+                            u128::from(MAX_ACCOUNTS).to_be_bytes().as_slice(),
+                            0u64.to_be_bytes().as_slice()
+                        ],
+                    )
+                    .map_err(sql)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(store.account_ids(deadline()), Err(ports::Error::Capacity));
+    }
+
     #[test]
     fn writer_entry_observation_is_preserved_by_native_scope_handoff() {
         const COUNTS: &str =

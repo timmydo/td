@@ -6945,6 +6945,25 @@ maintenance fence are specified in STORAGE.md section 2. Logical MIME byte
 meters do not measure SQLite copying. Full integrity maintenance refuses a
 stopped writer; new view capture and commits return Busy during its scan.
 
+### Offline account enumeration and verification
+
+`IndexStore::account_ids(deadline: Deadline) -> Result<Vec<AccountId>, Error>`
+reads the full account table in ID order under the writer fence, refusing a
+stopped writer, deadline/work failure or more than the existing 128-account
+limit. No partial list is returned. It retains the ordinary native VM
+allowance and validates each fixed-width ID. The owned IDs are historical
+observations; the method does not retain a snapshot or stabilize subsequent
+account views. An offline caller must quiesce mutations separately.
+
+The installed `store verify` command requires exactly one of `--account ID`
+and `--all`. The latter combines whole physical validation with the existing
+current metadata/body checks for every enumerated account, under one retained
+root lock and absolute deadline. It reports database scope and aggregate counts
+only after all passes finish, including zero-account stores. Account views
+reuse one scratch buffer sequentially; each retains its own existing
+maintenance allowance. STORAGE.md owns output fields, errors and limits.
+This grants no retained-history replay, repair or service activation.
+
 ### Offline SQLite snapshot primitive
 
 IndexStore::backup consumes the engine and accepts a fresh destination

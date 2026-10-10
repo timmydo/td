@@ -151,7 +151,7 @@ tree is removed in the same change.
 
 Use `td-mta/` for the service library and installed binary named `td-mta`.
 The packaging entry point supports `--version`, `--help`, and offline
-`store verify` for an explicitly selected account and stopped-database
+`store verify` for an explicitly selected account or all accounts, and stopped-database
 `backup` to a fresh destination. STORAGE.md owns their scope and
 machine-readable results. Other commands arrive with their implementations.
 Its direct

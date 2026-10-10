@@ -10,7 +10,7 @@ use std::{
 use td_mta::{
     account_checks::CompleteChecks,
     clock::RuntimeClock,
-    ids::AccountId,
+    ids::{AccountId, StoreEpoch},
     limits::SQLITE_DATABASE_BYTES,
     metadata_sweep,
     ports::{self, Clock, Deadline},
@@ -20,32 +20,41 @@ use td_mta::{
     },
 };
 
-const HELP: &str = "Usage: td-mta --version | --help\n       td-mta store verify --root PATH --account ID [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and the selected account's metadata and body digests.\nRun offline with access to the private store; the writer lock must be free.\nVerification JSON describes only the selected account. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nNo repair, restore or serving commands are available.\n";
+const HELP: &str = "Usage: td-mta --version | --help\n       td-mta store verify --root PATH (--account ID | --all) [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and metadata/body digests for selected or all accounts.\nRun offline with access to the private store; the writer lock must be free.\nVerification JSON identifies its account or database scope. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nNo repair, restore or serving commands are available.\n";
+
+enum Selection {
+    Account(AccountId),
+    All,
+}
 
 struct Verify {
     root: String,
-    account: AccountId,
+    selection: Selection,
     timeout_ms: u64,
 }
 
 fn arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Verify> {
     let mut root = None;
-    let mut account = None;
+    let mut selection = None;
     let mut timeout = None;
     while let Some(flag) = args.next() {
-        let value = args.next()?.into_string().ok()?;
         match flag.to_str()? {
-            "--root" if root.is_none() => root = Some(value),
-            "--account" if account.is_none() => account = Some(AccountId::parse(&value).ok()?),
+            "--root" if root.is_none() => root = Some(args.next()?.into_string().ok()?),
+            "--account" if selection.is_none() => {
+                selection = Some(Selection::Account(
+                    AccountId::parse(args.next()?.to_str()?).ok()?,
+                ));
+            }
+            "--all" if selection.is_none() => selection = Some(Selection::All),
             "--timeout-seconds" if timeout.is_none() => {
-                timeout = Some(timeout_ms(&value)?);
+                timeout = Some(timeout_ms(args.next()?.to_str()?)?);
             }
             _ => return None,
         }
     }
     Some(Verify {
         root: root?,
-        account: account?,
+        selection: selection?,
         timeout_ms: timeout.unwrap_or(600_000),
     })
 }
@@ -190,12 +199,12 @@ fn backup_failure(output: &mut impl Write, error: BackupFailure) -> io::Result<(
     writeln!(output, "{{\"schema\":1,\"command\":\"backup\",\"status\":\"error\",\"stage\":\"{}\",\"error\":\"{}\",\"publication\":\"{}\"}}", error.failure.stage, error.failure.code, error.publication)
 }
 
-fn verify(options: Verify) -> Result<CompleteChecks, Failure> {
+fn verify(options: Verify) -> Result<Verification, Failure> {
     let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
     verify_with_clock(options, clock)
 }
 
-fn verify_with_clock(options: Verify, clock: Arc<dyn Clock>) -> Result<CompleteChecks, Failure> {
+fn verify_with_clock(options: Verify, clock: Arc<dyn Clock>) -> Result<Verification, Failure> {
     let deadline = scope(clock.as_ref(), options.timeout_ms)?;
     let mut root = locked_root(&options.root, "root", "lock")?;
     let store = IndexStore::open(&mut root, Arc::clone(&clock), 1, deadline)
@@ -203,14 +212,99 @@ fn verify_with_clock(options: Verify, clock: Arc<dyn Clock>) -> Result<CompleteC
     store
         .validate_integrity(deadline)
         .map_err(|error| adapter("physical", error))?;
+    let mut scratch = [0; 65536];
+    match options.selection {
+        Selection::Account(account) => {
+            check_account(&store, account, clock.as_ref(), deadline, &mut scratch)
+                .map(|report| Verification::Account(Box::new(report)))
+        }
+        Selection::All => {
+            let accounts = store
+                .account_ids(deadline)
+                .map_err(|error| adapter("accounts", error))?;
+            let mut report = DatabaseChecks {
+                epoch: store.epoch(),
+                checked_at_ms: 0,
+                accounts: 0,
+                metadata_rows: 0,
+                mailboxes: 0,
+                submissions: 0,
+                recipients: 0,
+                blobs: 0,
+                body_bytes: 0,
+            };
+            for account in accounts {
+                let checked =
+                    check_account(&store, account, clock.as_ref(), deadline, &mut scratch)?;
+                report.add(checked)?;
+            }
+            report.checked_at_ms = clock
+                .sample()
+                .map_err(|error| adapter("clock", error))?
+                .utc_ms;
+            Ok(Verification::Database(report))
+        }
+    }
+}
+
+enum Verification {
+    Account(Box<CompleteChecks>),
+    Database(DatabaseChecks),
+}
+
+struct DatabaseChecks {
+    epoch: StoreEpoch,
+    checked_at_ms: i64,
+    accounts: u64,
+    metadata_rows: u64,
+    mailboxes: u64,
+    submissions: u64,
+    recipients: u64,
+    blobs: u64,
+    body_bytes: u64,
+}
+impl DatabaseChecks {
+    fn add(&mut self, checked: CompleteChecks) -> Result<(), Failure> {
+        if checked.identity().epoch != self.epoch {
+            return Err(adapter("reports", ports::Error::Corrupt));
+        }
+        let metadata = checked.metadata();
+        let bodies = checked.bodies();
+        for (total, count) in [
+            (&mut self.accounts, 1),
+            (&mut self.metadata_rows, metadata.references().rows()),
+            (&mut self.mailboxes, metadata.mailboxes().mailboxes()),
+            (&mut self.submissions, metadata.recipients().submissions()),
+            (&mut self.recipients, metadata.recipients().recipients()),
+            (&mut self.blobs, bodies.blobs()),
+            (&mut self.body_bytes, bodies.bytes()),
+        ] {
+            *total = total
+                .checked_add(count)
+                .ok_or_else(|| adapter("reports", ports::Error::Capacity))?;
+        }
+        if self.body_bytes > SQLITE_DATABASE_BYTES {
+            return Err(adapter("reports", ports::Error::Capacity));
+        }
+        Ok(())
+    }
+}
+
+fn check_account(
+    store: &IndexStore<'_>,
+    account: AccountId,
+    clock: &dyn Clock,
+    deadline: Deadline,
+    scratch: &mut [u8; 65536],
+) -> Result<CompleteChecks, Failure> {
     let mut view = store
-        .maintenance_view(options.account, deadline)
+        .maintenance_view(account, deadline)
         .map_err(|error| adapter("account", error))?;
     let utc_ms = clock
         .sample()
         .map_err(|error| adapter("clock", error))?
         .utc_ms;
-    // The captured maintenance VM allowance and absolute deadline bound all passes.
+    // Each captured account view retains one allowance across all its passes.
     let limits = AccountCheckLimits {
         metadata: metadata_sweep::Limits {
             rows: u64::MAX,
@@ -221,7 +315,7 @@ fn verify_with_clock(options: Verify, clock: Arc<dyn Clock>) -> Result<CompleteC
             bytes: SQLITE_DATABASE_BYTES,
         },
     };
-    view.verify_account(&td_crypto::Provider, utc_ms, limits, &mut [0; 65536])
+    view.verify_account(&td_crypto::Provider, utc_ms, limits, scratch)
         .map_err(|error| match error {
             AccountCheckError::Bodies(error) => adapter("bodies", error),
             AccountCheckError::Metadata(_) => Failure {
@@ -291,7 +385,11 @@ fn run() -> io::Result<ExitCode> {
             return Ok(ExitCode::from(2));
         };
         return match verify(options) {
-            Ok(report) => {
+            Ok(Verification::Database(report)) => {
+                writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"store.verify\",\"status\":\"ok\",\"scope\":\"database\",\"physical_integrity\":true,\"epoch\":\"{}\",\"checked_at_ms\":{},\"accounts\":{},\"metadata_rows\":{},\"mailboxes\":{},\"submissions\":{},\"recipients\":{},\"blobs\":{},\"body_bytes\":{}}}", report.epoch, report.checked_at_ms, report.accounts, report.metadata_rows, report.mailboxes, report.submissions, report.recipients, report.blobs, report.body_bytes)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Ok(Verification::Account(report)) => {
                 let identity = report.identity();
                 let metadata = report.metadata();
                 let bodies = report.bodies();
@@ -350,7 +448,7 @@ mod tests {
             let error = verify_with_clock(
                 Verify {
                     root: String::new(),
-                    account: AccountId::from_bytes([1; 16]),
+                    selection: Selection::Account(AccountId::from_bytes([1; 16])),
                     timeout_ms: 18_446_744_073_709_551_000,
                 },
                 Arc::new(FixedClock(tick)),
