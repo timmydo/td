@@ -20,7 +20,10 @@ Typed and encoded object commits and history pruning require a captured
 store epoch as well as the expected account sequence. A stale epoch
 refuses before body reads or SQL writes, including after restore
 preserves the endpoint under a fresh epoch. Authenticated transaction
-coordination remains separate. SQLite owns relational metadata, immutable
+coordination remains separate. Optional commit completions retain durable
+outcomes separately from database/WAL observations under the original
+writer scope; admission and ledger reconciliation remain service work.
+SQLite owns relational metadata, immutable
 body chunks, atomic transactions, native indexes, WAL snapshots and crash
 recovery. The store_fs adapter verifies streamed bodies inside their metadata
 transaction and retains the read snapshot through MIME processing. A fixed
@@ -28,7 +31,7 @@ connection pool,
 closed SQL, native heap/page ceilings and monotonic operation bounds constrain
 the core. [STORAGE.md](STORAGE.md) owns these implemented boundaries.
 The custom journal/checkpoint/replay engine has been removed atomically.
-Protocol authorization, full mutation policy, operational tools, native
+Protocol authorization, full mutation policy, the full operational suite, native
 resource and complete crash/fault qualification, and service activation
 remain unimplemented.
 Mailbox-parent, reference and recipient validators remain reusable. SQLite

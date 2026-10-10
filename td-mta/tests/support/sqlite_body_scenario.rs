@@ -1,6 +1,7 @@
 //! Body, account, backup and epoch paths for independent observers.
 use crate::store_fs::{
-    with_probe_root, BlobSource, CommitError, CommitRequest, IndexStore, LockedRoot,
+    with_probe_root, BlobSource, CommitError, CommitFileUsage, CommitRequest, IndexStore,
+    LockedRoot,
 };
 use std::{
     io::{self, Read},
@@ -588,17 +589,25 @@ fn run_with_roots(
         sampled: false,
         observe: &mut *observe,
     };
-    let initial_sequence = store
-        .commit(
-            &td_crypto::Provider,
-            request,
-            operations,
-            &mut [BlobSource {
-                id: BLOB,
-                source: &mut source,
-            }],
-        )
-        .unwrap();
+    let initial_completion = store.commit_with_files(
+        &td_crypto::Provider,
+        request,
+        operations,
+        &mut [BlobSource {
+            id: BLOB,
+            source: &mut source,
+        }],
+    );
+    let initial_sequence = initial_completion.outcome().unwrap();
+    assert!(!initial_completion.writer_stopped());
+    assert!(!initial_completion.is_sequence_conflict());
+    match initial_completion.files() {
+        CommitFileUsage::Measured(files) => {
+            assert!(files.database_bytes > 0);
+            assert!(files.wal_bytes > 0);
+        }
+        other => panic!("initial body commit file usage: {other:?}"),
+    }
     assert_eq!(source.remaining, 0);
     assert!(source.sampled);
     assert_eq!(initial_sequence, Sequence::from_u64(1));

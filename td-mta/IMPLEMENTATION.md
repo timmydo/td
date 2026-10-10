@@ -2394,6 +2394,15 @@ Complete outcome transition and worker validation, reply updates by active
 attempts, phase changes outside InFlight, transport ordering, entropy/collision
 checks, changed-object coverage, category quota reconciliation and request
 idempotence remain service work.
+The core's commit_with_files and commit_batch_with_files now preserve the
+durable outcome separately from a file observation captured under the
+writer and original native scope. Native tests cover rollback WAL growth,
+known success with expired accounting, a pre-SQL deadline refusal and
+precise sequence-conflict classification. The existing target body
+scenario exercises the new completion on its initial body commit.
+These observations provide no ledger or authorization authority; the
+private quota transition and reserved upload adapter remain planned.
+
 The next concrete adapter is the first reserved upload transaction in
 ADMISSION.md section 2: bind authorized device context and captured store
 identity to actual IngressSpool custody, then atomically publish the body

@@ -384,6 +384,54 @@ Never acknowledge before a proven successful COMMIT. Queue transitions,
 authorization, result idempotence and ports::Store
 coordination remain service work; the low-level core grants no permission.
 
+### Commit completion and file usage
+
+IndexStore::commit_with_files and commit_batch_with_files use the same
+object transaction and durable outcome classification as commit and
+commit_batch. Their non-Clone CommitCompletion retains outcome separately
+from CommitFileUsage and writer-stop state. File accounting failure cannot
+relabel a known successful COMMIT or hide an indeterminate one.
+
+The completion runs before releasing the writer mutex. Unchanged means
+this attempt issued no storage-changing SQL: acquisition, original native
+scope admission and validation can refuse before BEGIN. The marker is set
+inside the native operation immediately before issuing BEGIN IMMEDIATE,
+after its original clock check. This proof concerns this attempt's
+main/WAL effects only, not earlier uncertain work, staged ingress or other
+resource owners. An Error or Rejected result alone supplies no such proof.
+It permits release of unused physical headroom without a new measurement,
+including a deadline expiring between acquisition and native admission.
+
+After SQL may have begun, Measured retains validated database/WAL lengths
+under the same mutex and original native scope. It reuses StoreFileUsage
+validation, including trusted stable paths, owner/private regular-file
+checks, existing length ceilings and absent-WAL handling. Lengths include
+allocated reusable pages and retained WAL tails, not filesystem blocks or
+free space. Rollback does not imply zero growth. No whole-account scan,
+checkpoint, fresh deadline or work-scope renewal is performed.
+
+Unavailable preserves the accounting error rather than substituting zero.
+A deadline during known successful completion can therefore return an Ok
+sequence with Unavailable(Deadline). A future coordinator must preserve
+that durable success and stop new admission until reconciliation; a
+healthy low-level writer flag does not override that responsibility.
+Indeterminate results retain the core's stopped writer even if file
+measurement succeeds. The receipt grants no authentication, ledger update,
+completion ticket or retry authority against arbitrary callers.
+
+is_sequence_conflict identifies only the account endpoint comparison
+inside BEGIN, before body reads, after successful rollback and file
+capture on a healthy writer. Epoch mismatch and other Conflict causes do
+not grant this disposition. If accounting fails, it is false. This permits
+a trusted coordinator's bounded same-epoch replan without inferring the
+cause from the generic Conflict code.
+
+Retaining the receipt does not retain the writer fence: measurements are
+historical after return. The coordinator must exclusively own mutation and
+maintenance admission through its ledger reconciliation and preserve
+store/ledger association. Private atomic measured-bucket replacement and
+reserved upload policy remain service integration work.
+
 ### Snapshots, changes, reclamation and backup
 
 The cold pool owns one to eight connections. Capturing a view under the writer

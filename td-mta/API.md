@@ -6694,6 +6694,20 @@ That adapter must bind prepared ownership to authenticated reservations before
 SMTP/JMAP ingress is activated. The future coordinator must keep
 slow peers outside the global writer while they deliver their messages.
 
+IndexStore::commit_with_files and commit_batch_with_files return a
+non-Clone CommitCompletion with outcome(), files(), writer_stopped() and
+is_sequence_conflict(). Both use the existing object transaction.
+CommitFileUsage distinguishes Unchanged before storage-changing SQL,
+Measured(StoreFileUsage) and Unavailable(Error), retaining a known durable
+outcome separately from accounting refusal. Capture runs under the writer
+mutex and original scope; it performs no cold account scan or checkpoint.
+Only a healthy, accounted endpoint mismatch before body reads reports
+is_sequence_conflict; another Conflict alone cannot authorize a replan.
+The receipt retains no writer fence after return and supplies no ledger or
+account authority. STORAGE.md owns exact proof/capture rules; the trusted
+coordinator must serialize mutations/maintenance through reconciliation
+and stop admission on missing physical accounting, even for known success.
+
 `format::batch::Batch::decode` validates the entire encoded TransactionInput
 using caller-reserved offset slots and retains immutable original bytes.
 Indexed `get` returns a reborrowed locally valid Operation, never a copied

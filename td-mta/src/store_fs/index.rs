@@ -61,6 +61,10 @@ mod usage_fence;
 pub use usage_fence::{
     AuxiliaryUsage, LedgerInitError, StoreFileUsage, StoreLogicalUsage, UsageFence,
 };
+#[path = "index/completion.rs"]
+mod completion;
+pub use completion::{CommitCompletion, CommitFileUsage};
+use completion::{CommitPhase, CommitWork};
 #[path = "index/backup.rs"]
 mod backup;
 #[cfg(test)]
@@ -754,41 +758,75 @@ impl<'r> IndexStore<'r> {
         operations: Operations<'_, '_>,
         sources: &mut [BlobSource<'_>],
     ) -> Result<Sequence, CommitError> {
-        self.transaction(request.deadline, |native, scratch| {
-            self.apply(native, crypto, request, operations, sources, scratch)
-        })
+        self.commit_operations_observed(crypto, request, operations, sources, |result, _, _| result)
+    }
+    fn commit_operations_observed<C: ports::Crypto, T>(
+        &self,
+        crypto: &C,
+        request: CommitRequest,
+        operations: Operations<'_, '_>,
+        sources: &mut [BlobSource<'_>],
+        observe: impl FnOnce(Result<Sequence, CommitError>, CommitPhase, Option<&Writer>) -> T,
+    ) -> T {
+        let phase = std::cell::Cell::new(CommitPhase::BeforeSql);
+        self.transaction_observed(
+            request.deadline,
+            |native, scratch| {
+                self.apply(
+                    native,
+                    crypto,
+                    request,
+                    operations,
+                    sources,
+                    CommitWork {
+                        scratch,
+                        phase: &phase,
+                    },
+                )
+            },
+            |result, writer| observe(result, phase.get(), writer),
+        )
     }
     fn transaction<T>(
         &self,
         deadline: Deadline,
         apply: impl FnOnce(&Native, &mut [u8]) -> Result<T, ports::Error>,
     ) -> Result<T, CommitError> {
-        let (mut writer, acquired) = self
-            .writer_observed(deadline)
-            .map_err(CommitError::Rejected)?;
+        self.transaction_observed(deadline, apply, |result, _| result)
+    }
+    fn transaction_observed<T, O>(
+        &self,
+        deadline: Deadline,
+        apply: impl FnOnce(&Native, &mut [u8]) -> Result<T, ports::Error>,
+        observe: impl FnOnce(Result<T, CommitError>, Option<&Writer>) -> O,
+    ) -> O {
+        let (mut writer, acquired) = match self.writer_observed(deadline) {
+            Ok(writer) => writer,
+            Err(error) => return observe(Err(CommitError::Rejected(error)), None),
+        };
         if writer.stopped {
-            return Err(CommitError::Rejected(ports::Error::WriterStopped));
+            return observe(
+                Err(CommitError::Rejected(ports::Error::WriterStopped)),
+                Some(&writer),
+            );
         }
-        writer
-            .native
-            .begin_work_after(deadline, acquired)
-            .map_err(CommitError::Rejected)?;
+        if let Err(error) = writer.native.begin_work_after(deadline, acquired) {
+            return observe(Err(CommitError::Rejected(error)), Some(&writer));
+        }
         let Writer {
             native, scratch, ..
         } = &mut *writer;
         let result = apply(native, scratch);
-        match result {
-            Ok(next) => {
-                finish_commit(&mut writer)?;
-                Ok(next)
-            }
+        let result = match result {
+            Ok(next) => finish_commit(&mut writer).map(|()| next),
             Err(error) => {
                 if !writer.native.rollback() {
                     writer.stopped = true;
                 }
                 Err(CommitError::Rejected(error))
             }
-        }
+        };
+        observe(result, Some(&writer))
     }
     fn apply<C: ports::Crypto>(
         &self,
@@ -797,8 +835,9 @@ impl<'r> IndexStore<'r> {
         request: CommitRequest,
         operations: Operations<'_, '_>,
         sources: &mut [BlobSource<'_>],
-        scratch: &mut [u8],
+        work: CommitWork<'_>,
     ) -> Result<Sequence, ports::Error> {
+        let CommitWork { scratch, phase } = work;
         if request.epoch != self.epoch {
             return Err(ports::Error::Conflict);
         }
@@ -850,9 +889,13 @@ impl<'r> IndexStore<'r> {
             return Err(ports::Error::Capacity);
         }
         reserve_wal(self.root)?;
-        native.run(|db| db.execute_batch("BEGIN IMMEDIATE").map_err(sql))?;
+        native.run(|db| {
+            phase.set(CommitPhase::SqlStarted);
+            db.execute_batch("BEGIN IMMEDIATE").map_err(sql)
+        })?;
         let current = native.run(|db| identity(db, account, self.epoch))?;
         if current.committed_sequence != expected {
+            phase.set(CommitPhase::SequenceConflict);
             return Err(ports::Error::Conflict);
         }
         let next = expected.successor().map_err(|_| ports::Error::Capacity)?;

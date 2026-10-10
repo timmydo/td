@@ -115,7 +115,7 @@ pub struct StoreFileUsage {
     pub wal_bytes: u64,
 }
 impl StoreFileUsage {
-    fn capture(root: &LockedRoot, native: &Native) -> Result<Self, ports::Error> {
+    pub(super) fn capture(root: &LockedRoot, native: &Native) -> Result<Self, ports::Error> {
         native.check()?;
         let database = fs::symlink_metadata(db_path(root, RootEntry::Database)?)?;
         let database_bytes = validated_file_length(root, &database, MAX_PAGES * PAGE_BYTES)?;
