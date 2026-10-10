@@ -42,7 +42,7 @@ pub const USAGE: &str = "usage: td-agent review [--model MODEL] [--effort LEVEL]
        td-agent review --repo DIRECTORY [--commit REV] [--sparse DIRECTORY]...\n\
                        [--model MODEL] [--effort LEVEL] [--max-tokens N]\n\
                        [--max-cost USD] [--log-dir DIRECTORY]\n\
-                       [--tool-output-bytes N] [--tool-context-bytes N]\n\
+                       [--tool-output-bytes N] [--tool-context-bytes N] [--context-tokens N]\n\
                        [--routing MODE] [--provider SLUG]... [--no-provider-fallbacks]\n\
                        [--max-input-price USD/M] [--max-output-price USD/M]\n\
                        [--vendor DIRECTORY] [--test-runner TD-BUILDER]\n\
@@ -119,6 +119,7 @@ pub struct Options {
     pub max_output_price: Option<u64>,
     pub effort: Option<String>,
     pub max_tokens: Option<u64>,
+    pub context_tokens: Option<u64>,
     /// None for standard input.
     pub input: Option<PathBuf>,
     pub repository: Option<PathBuf>,
@@ -247,6 +248,15 @@ impl Options {
                         .ok_or_else(|| format!("{arg} must be 1024 to {maximum} bytes"))?;
                     *slot = Some(count);
                 }
+                "--context-tokens" if !options_done && options.context_tokens.is_none() => {
+                    options.context_tokens = Some(
+                        value()?
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|n| (1024..=16_777_216).contains(n))
+                            .ok_or("--context-tokens must be 1024 to 16777216 tokens")?,
+                    );
+                }
                 "--vendor" if !options_done && options.vendor.is_none() => {
                     options.vendor = Some(PathBuf::from(value()?));
                 }
@@ -274,6 +284,7 @@ impl Options {
         if options.repository.is_none()
             && (options.revision.is_some()
                 || !options.sparse.is_empty()
+                || options.context_tokens.is_some()
                 || options.tool_output_bytes.is_some()
                 || options.tool_context_bytes.is_some()
                 || options.vendor.is_some()
@@ -753,13 +764,33 @@ fn run_diff(
     Ok(())
 }
 
+/// A request failure keeps status for bounded review-context recovery.
+#[derive(Debug)]
+pub(crate) struct RequestFailure {
+    pub(crate) message: String,
+    pub(crate) status: Option<u16>,
+}
+impl From<String> for RequestFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            status: None,
+        }
+    }
+}
+impl From<RequestFailure> for String {
+    fn from(failure: RequestFailure) -> Self {
+        failure.message
+    }
+}
+
 pub(crate) fn request(
     client: &Client,
     key: &crate::key::Secret,
     body: &str,
     out: &mut impl Write,
     journal: &mut crate::review_log::Journal,
-) -> Result<(Completion, Served), String> {
+) -> Result<(Completion, Served), RequestFailure> {
     journal.text("request_body", body)?;
     let rate_ceiling = td_json::parse(body)
         .ok()
@@ -783,7 +814,7 @@ pub(crate) fn request(
                 journal
                     .text("request_error", &why)
                     .map_err(|logging| format!("{why}; recording request failure: {logging}"))?;
-                return Err(why);
+                return Err(why.into());
             }
         };
         let json = stream.headers.iter().any(|(name, value)| {
@@ -821,7 +852,7 @@ pub(crate) fn request(
         });
         let consumed = consume(status, head, json, chunks, out, &mut served);
         if let Some(why) = logging_error {
-            return Err(why);
+            return Err(why.into());
         }
         match consumed {
             Ok(completion) => break completion,
@@ -840,7 +871,10 @@ pub(crate) fn request(
                         served = Served::default();
                     }
                     None => {
-                        return Err(ended.text().to_string());
+                        return Err(RequestFailure {
+                            message: ended.text().to_string(),
+                            status: Some(status),
+                        });
                     }
                 }
             }
@@ -1245,5 +1279,24 @@ mod tests {
             .unwrap_err()
             .contains("--max-tokens"));
         assert!(whole(&finished("content_filter", "")).is_err());
+    }
+    #[test]
+    fn explicit_review_context_limit_requires_a_repository_and_valid_range() {
+        let parse = |args: &[&str]| {
+            Options::parse(&args.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            parse(&["--repo", ".", "--context-tokens", "14000"])
+                .unwrap()
+                .context_tokens,
+            Some(14000)
+        );
+        for args in [
+            &["--context-tokens", "14000"][..],
+            &["--repo", ".", "--context-tokens", "0"][..],
+            &["--repo", ".", "--context-tokens", "16777217"][..],
+        ] {
+            assert!(parse(args).is_err());
+        }
     }
 }

@@ -47,6 +47,13 @@ impl Analysis {
                         "tool" => "tool_results",
                         "assistant" => "assistant_text",
                         "user"
+                            if m.get("content").and_then(Json::as_str).is_some_and(|s| {
+                                s.starts_with("[Review harness: older review steps were compacted.")
+                            }) =>
+                        {
+                            "handoff_summary"
+                        }
+                        "user"
                             if m.get("content")
                                 .and_then(Json::as_str)
                                 .is_some_and(|s| s.starts_with("[Review harness")) =>

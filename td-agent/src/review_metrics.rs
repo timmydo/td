@@ -150,6 +150,15 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
     let mut tool_metrics = 0u64;
     let mut token_reports = [0u64; 5];
     let mut error_count = 0u64;
+    let mut prunings = 0u64;
+    let mut pruned_results = 0u64;
+    let mut pruned_bytes = 0u64;
+    let mut compactions = 0u64;
+    let mut compaction_attempts = 0u64;
+    let mut shortened_summary_inputs = 0u64;
+    let mut context_refusals = 0u64;
+    let mut unavailable_artifacts = 0u64;
+    let mut compacted_bytes = 0u64;
     let mut duration_ms = 0u64;
     let mut preflight_failures = 0u64;
     let mut nonzero_exits = 0u64;
@@ -219,6 +228,33 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
                 preflight_failures = preflight_failures.saturating_add(u64::from(
                     data.get("available").and_then(Json::as_bool) == Some(false),
                 ))
+            }
+            "context_prune" => {
+                let n = data
+                    .get("results")
+                    .and_then(Json::as_arr)
+                    .map_or(0, |v| v.len() as u64);
+                prunings = prunings.saturating_add(u64::from(n > 0));
+                pruned_results = pruned_results.saturating_add(n);
+                pruned_bytes = pruned_bytes.saturating_add(
+                    count("before_message_bytes").saturating_sub(count("after_message_bytes")),
+                );
+            }
+            "context_compaction_start" => {
+                compaction_attempts = compaction_attempts.saturating_add(1)
+            }
+            "context_compaction_input" => {
+                shortened_summary_inputs = shortened_summary_inputs.saturating_add(1)
+            }
+            "context_refusal" => context_refusals = context_refusals.saturating_add(1),
+            "tool_artifact_unavailable" => {
+                unavailable_artifacts = unavailable_artifacts.saturating_add(1)
+            }
+            "context_compaction" => {
+                compactions = compactions.saturating_add(1);
+                compacted_bytes = compacted_bytes.saturating_add(
+                    count("before_context_bytes").saturating_sub(count("after_context_bytes")),
+                );
             }
             "tool_call" => tools = tools.saturating_add(1),
             "tool_metrics" => {
@@ -306,6 +342,27 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
         ("cleanup".into(), cleanup.unwrap_or(Json::Null)),
         ("elapsed_ms".into(), Json::from(last_elapsed)),
         ("requests".into(), Json::from(requests)),
+        ("context_prunings".into(), Json::from(prunings)),
+        ("pruned_results".into(), Json::from(pruned_results)),
+        ("pruned_message_bytes".into(), Json::from(pruned_bytes)),
+        ("context_compactions".into(), Json::from(compactions)),
+        (
+            "context_compaction_attempts".into(),
+            Json::from(compaction_attempts),
+        ),
+        (
+            "shortened_summary_inputs".into(),
+            Json::from(shortened_summary_inputs),
+        ),
+        ("context_refusals".into(), Json::from(context_refusals)),
+        (
+            "unavailable_tool_artifacts".into(),
+            Json::from(unavailable_artifacts),
+        ),
+        (
+            "compacted_context_bytes".into(),
+            Json::from(compacted_bytes),
+        ),
         (
             "request_attempts".into(),
             transport.count(transport.attempts),

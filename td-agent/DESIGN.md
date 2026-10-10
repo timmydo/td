@@ -306,7 +306,7 @@ bytes and 64 KiB / 8 MiB respectively. Limits count result content bytes,
 including harness notices, not tokens or JSON framing; the complete serialized
 request remains bounded separately below. Read windows default to 128 lines.
 Shortening preserves the head and a larger tail, including failure summaries.
-Each shortened controller result is retained in scratch for narrower reads
+Each controller result is retained in scratch for narrower reads
 and searches, with its path in the notice, and whole in the trace. Existing
 controller output bounds still apply; raw command bytes are captured before
 those bounds. At exhaustion subsequent tools are refused and the next status
@@ -321,8 +321,59 @@ Anthropic repository reviews request automatic prompt caching;
 other providers retain their implicit caching behavior. Savings depend on the
 provider; admission still reserves undiscounted worst-case cost.
 
-At most 64 model requests run, with a 16 MiB context bound and a single
-cost budget (§5). Tool calls and their results remain intermediate; only
+At most 64 model requests run, including handoff summaries, with a 16 MiB
+serialized context bound and a single cost budget (§5). Repository reviews
+also use the selected model/endpoint context length; `--context-tokens N`
+may lower it (1024 to 16777216, never raising a known model limit). Without
+metadata or an explicit limit, the serialized bound remains the fallback.
+The context estimate starts at the review text heuristic plus 1024 framing
+tokens, then anchors at the latest completed tool reply's reported prompt
+plus completion tokens. That report calibrates tokens per serialized byte;
+subsequent growth, pruning and summary selection use the same density until
+a newer report replaces it. This is an estimate, not a provider tokenizer.
+Monetary reservation retains
+its separate conservative one-token-per-byte bound. Request metrics record
+both estimates, their source, model/effective context limits and purpose.
+The requested completion bound is lowered to estimated available room.
+A request with fewer than 256 completion tokens (or the explicit requested
+maximum if smaller) fails before spending money.
+
+Before crossing 80% of token context (including completion room), or
+80% of the serialized bound, older tool results become recoverable stubs,
+keeping the latest two complete assistant/tool steps and exact opaque
+reasoning. Pruning never resets the lifetime tool-output allowance. If it
+cannot free enough space, the chosen model writes a bounded handoff summary
+(at most 4096 tokens or a tenth of context) against the same cost and
+request budgets. A handoff requires a remaining request slot and a
+conservative reservation for both the summary and a final answer; otherwise
+the harness requests a final answer immediately with tools disabled. Budget
+pressure never asks a handoff request to return a final review. Summary input
+is bounded separately, dropping only older complete steps if necessary and
+retaining the full commit, previous notes and latest complete step. Any such
+omission is logged and explicitly cautioned in the handoff. Tools remain
+defined to preserve the prefix; tool choice
+is none when supported, and a summary calling tools is always refused.
+The exact full commit/preflight message, quoted model notes and two recent
+complete steps are carried forward, reduced to one recent step if needed.
+Every assistant/tool pair and retained reasoning detail stays intact.
+A summary that cannot reduce the view below the threshold while preserving
+the commit and last complete step fails honestly. No initial commit text
+is discarded to make a request fit. A provider context-length refusal
+(400/413) can trigger one prune/summary recovery when older complete history
+exists. The failed request retains its full cost reservation; an oversized
+initial commit or failed recovery is an incomplete review, never a success.
+
+Pruning and compaction events name sizes, message indices, summaries and
+scratch artifacts containing earlier views. Exact precompaction views are
+also recorded in durable transcript events. Artifact-write failures for tool
+results are logged; their full trace remains intact, and results without
+recoverable artifacts cannot be pruned. Small results need no scratch copy.
+Artifacts last for the review; the durable full trace survives cleanup and is never pruned or compacted.
+Diagnostics distinguish handoff notes, and summaries count pruned results,
+successful and attempted compactions, shortened summary inputs, context
+refusals, artifact failures and bytes removed. A failed summary is an incomplete review,
+not a successful final answer. Tool calls and results remain intermediate;
+only
 a whole final reply whose first line exactly identifies the resolved
 subject and full commit id reaches standard output. Reasoning details
 are echoed with their exact wire bytes as in §5. Source, quoted preflight

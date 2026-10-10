@@ -213,6 +213,10 @@ impl Journal {
                 ),
                 ("agent_binary_sha256".into(), Json::Str(binary_hash)),
                 (
+                    "context_tokens".into(),
+                    options.context_tokens.map_or(Json::Null, Json::from),
+                ),
+                (
                     "agent_version".into(),
                     Json::Str(env!("CARGO_PKG_VERSION").into()),
                 ),

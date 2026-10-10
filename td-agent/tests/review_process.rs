@@ -1280,3 +1280,428 @@ fn retry_identity_and_raw_usage_belong_to_the_successful_attempt() {
     );
     fixture.no_workspaces();
 }
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn review_compacts_without_losing_recent_tool_pairs_or_full_trace() {
+    let fixture = Fixture::new();
+    let args = Json::Obj(vec![(
+        "command".into(),
+        Json::Str("printf '%09000d' 0".into()),
+    )]);
+    let mut latest = tool("shell", args.clone());
+    if let Reply::Http { body, .. } = &mut latest {
+        let mut value = td_json::parse_slice(body).unwrap();
+        if let Some(Json::Obj(fields)) = value.get_mut("usage") {
+            if let Some((_, slot)) = fields.iter_mut().find(|(k, _)| k == "prompt_tokens") {
+                *slot = Json::from(6000u64);
+            }
+        }
+        let choices = match value.get_mut("choices").unwrap() {
+            Json::Arr(v) => v,
+            _ => panic!("choices"),
+        };
+        let message = choices.first_mut().unwrap().get_mut("message").unwrap();
+        if let Json::Obj(fields) = message {
+            fields.push((
+                "reasoning_details".into(),
+                td_json::parse(r#"[{"type":"reasoning.encrypted","data":"opaque-recent"}]"#)
+                    .unwrap(),
+            ));
+        }
+        *body = value.to_string().into_bytes();
+    }
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            tool("shell", args),
+            latest,
+            completion(
+                "Inspected two outputs; no test was run. Continue reviewing the exact commit.",
+                None,
+                "stop",
+            ),
+            fixture.final_reply(),
+        ],
+    );
+    let result = fixture
+        .command(&mock, "0.02")
+        .args(["--context-tokens", "14000"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 5);
+    let summary = td_json::parse(&requests[3].text()).unwrap();
+    assert!(summary.get("max_tokens").unwrap().as_u64().unwrap() <= 1400);
+    assert!(requests[3]
+        .text()
+        .contains("write a concise handoff summary"));
+    let final_body = td_json::parse(&requests[4].text()).unwrap();
+    let messages = final_body.get("messages").unwrap().as_arr().unwrap();
+    let recent = messages
+        .iter()
+        .find(|m| m.get("role").and_then(Json::as_str) == Some("assistant"))
+        .unwrap();
+    assert_eq!(
+        recent.get_path(&["reasoning_details"]).unwrap().to_string(),
+        r#"[{"type":"reasoning.encrypted","data":"opaque-recent"}]"#
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Json::as_str) == Some("assistant"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Json::as_str) == Some("tool"))
+            .count(),
+        1
+    );
+    assert!(requests[4].text().contains(&fixture.commit));
+    assert!(!requests[4]
+        .text()
+        .contains("write a concise handoff summary"));
+    let logs = fixture.logs();
+    assert_eq!(
+        logs[0]
+            .lines()
+            .filter(|s| s.contains("\"kind\":\"tool_full_result\""))
+            .count(),
+        2
+    );
+    let metrics = td_agent::review_metrics::summarize(logs[0].as_bytes()).unwrap();
+    assert_eq!(
+        metrics.get("context_compactions").and_then(Json::as_u64),
+        Some(1)
+    );
+    assert_eq!(metrics.get("requests").and_then(Json::as_u64), Some(4));
+    assert!(
+        metrics
+            .get("compacted_context_bytes")
+            .unwrap()
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn oversized_compaction_input_is_bounded_before_the_summary_request() {
+    let fixture = Fixture::new();
+    let args = Json::Obj(vec![(
+        "command".into(),
+        Json::Str("printf '%09000d' 0".into()),
+    )]);
+    let mut latest = tool(
+        "shell",
+        Json::Obj(vec![(
+            "command".into(),
+            Json::Str("printf '%01000d' 0".into()),
+        )]),
+    );
+    if let Reply::Http { body, .. } = &mut latest {
+        let mut value = td_json::parse_slice(body).unwrap();
+        if let Some(Json::Obj(fields)) = value.get_mut("usage") {
+            if let Some((_, slot)) = fields.iter_mut().find(|(k, _)| k == "prompt_tokens") {
+                *slot = Json::from(12000u64);
+            }
+        }
+        let choices = match value.get_mut("choices").unwrap() {
+            Json::Arr(v) => v,
+            _ => panic!("choices"),
+        };
+        let message = choices.first_mut().unwrap().get_mut("message").unwrap();
+        if let Json::Obj(fields) = message {
+            fields.push((
+                "reasoning_details".into(),
+                td_json::parse(r#"[{"type":"reasoning.encrypted","data":"opaque-recent"}]"#)
+                    .unwrap(),
+            ));
+        }
+        *body = value.to_string().into_bytes();
+    }
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            tool("shell", args),
+            latest,
+            completion(
+                "Inspected two outputs; no test was run. Continue reviewing the exact commit.",
+                None,
+                "stop",
+            ),
+            fixture.final_reply(),
+        ],
+    );
+    let result = fixture
+        .command(&mock, "0.02")
+        .args(["--context-tokens", "14000"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 5);
+    let summary = td_json::parse(&requests[3].text()).unwrap();
+    assert!(summary.get("max_tokens").unwrap().as_u64().unwrap() <= 1400);
+    assert!(requests[3]
+        .text()
+        .contains("write a concise handoff summary"));
+    let final_body = td_json::parse(&requests[4].text()).unwrap();
+    let messages = final_body.get("messages").unwrap().as_arr().unwrap();
+    let recent = messages
+        .iter()
+        .find(|m| m.get("role").and_then(Json::as_str) == Some("assistant"))
+        .unwrap();
+    assert_eq!(
+        recent.get_path(&["reasoning_details"]).unwrap().to_string(),
+        r#"[{"type":"reasoning.encrypted","data":"opaque-recent"}]"#
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Json::as_str) == Some("assistant"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Json::as_str) == Some("tool"))
+            .count(),
+        1
+    );
+    assert!(requests[4].text().contains(&fixture.commit));
+    assert!(!requests[4]
+        .text()
+        .contains("write a concise handoff summary"));
+    let logs = fixture.logs();
+    assert!(logs[0].contains("context_compaction_input"));
+    assert_eq!(
+        logs[0]
+            .lines()
+            .filter(|s| s.contains("\"kind\":\"tool_full_result\""))
+            .count(),
+        2
+    );
+    let metrics = td_agent::review_metrics::summarize(logs[0].as_bytes()).unwrap();
+    assert_eq!(
+        metrics.get("context_compactions").and_then(Json::as_u64),
+        Some(1)
+    );
+    assert_eq!(metrics.get("requests").and_then(Json::as_u64), Some(4));
+    assert_eq!(
+        metrics
+            .get("shortened_summary_inputs")
+            .and_then(Json::as_u64),
+        Some(1)
+    );
+    assert!(
+        metrics
+            .get("compacted_context_bytes")
+            .unwrap()
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn provider_context_refusal_compacts_once_and_preserves_its_reservation() {
+    let fixture = Fixture::new();
+    let args = Json::Obj(vec![("command".into(), Json::Str("printf STEP".into()))]);
+    let refusal = Reply::Http {
+        status: 400,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: br#"{"error":{"message":"context length exceeded"}}"#.to_vec(),
+    };
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            tool("shell", args.clone()),
+            tool("shell", args),
+            refusal,
+            completion(
+                "Two commands produced STEP. No tests were run.",
+                None,
+                "stop",
+            ),
+            fixture.final_reply(),
+        ],
+    );
+    let result = run(&fixture, &mock, "0.10");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(mock.requests().len(), 6);
+    let logs = fixture.logs();
+    assert!(logs[0].contains("context_refusal"));
+    let metrics = td_agent::review_metrics::summarize(logs[0].as_bytes()).unwrap();
+    assert_eq!(
+        metrics.get("context_compactions").and_then(Json::as_u64),
+        Some(1)
+    );
+    assert!(
+        metrics
+            .get("unreported_accounting")
+            .unwrap()
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn repeated_provider_context_refusal_is_not_retried_indefinitely() {
+    let fixture = Fixture::new();
+    let args = Json::Obj(vec![("command".into(), Json::Str("printf STEP".into()))]);
+    let refusal = || Reply::Http {
+        status: 413,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: br#"{"error":{"message":"context length exceeded"}}"#.to_vec(),
+    };
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            tool("shell", args.clone()),
+            tool("shell", args),
+            refusal(),
+            completion(
+                "Two commands produced STEP. No tests were run.",
+                None,
+                "stop",
+            ),
+            refusal(),
+        ],
+    );
+    let result = run(&fixture, &mock, "0.10");
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert_eq!(mock.requests().len(), 6);
+    let logs = fixture.logs();
+    let metrics = td_agent::review_metrics::summarize(logs[0].as_bytes()).unwrap();
+    assert_eq!(
+        metrics
+            .get("context_compaction_attempts")
+            .and_then(Json::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        metrics.get("context_refusals").and_then(Json::as_u64),
+        Some(1)
+    );
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn compaction_leaves_the_last_affordable_request_for_the_final_answer() {
+    let fixture = Fixture::new();
+    let args = Json::Obj(vec![(
+        "command".into(),
+        Json::Str("printf '%09000d' 0".into()),
+    )]);
+    let mut latest = tool("shell", args.clone());
+    if let Reply::Http { body, .. } = &mut latest {
+        let mut value = td_json::parse_slice(body).unwrap();
+        if let Some(Json::Obj(fields)) = value.get_mut("usage") {
+            if let Some((_, slot)) = fields.iter_mut().find(|(k, _)| k == "prompt_tokens") {
+                *slot = Json::from(6000u64);
+            }
+        }
+        *body = value.to_string().into_bytes();
+    }
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![models(), tool("shell", args), latest, fixture.final_reply()],
+    );
+    let result = fixture
+        .command(&mock, "0.0045")
+        .args(["--context-tokens", "14000"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[3].text().contains("produce the final review now"));
+    assert!(!requests[3]
+        .text()
+        .contains("write a concise handoff summary"));
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn unusable_context_room_fails_before_a_paid_request() {
+    let fixture = Fixture::new();
+    let mock = MockFetch::start(&fixture.root.join("run"), vec![models()]);
+    let result = fixture
+        .command(&mock, "0.02")
+        .args(["--context-tokens", "1024"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("minimum useful completion tokens"));
+    assert_eq!(mock.requests().len(), 1);
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn request_limit_reserves_its_last_slot_for_a_final_review() {
+    let fixture = Fixture::new();
+    let args = Json::Obj(vec![("command".into(), Json::Str("printf STEP".into()))]);
+    let mut replies = vec![models()];
+    for _ in 0..63 {
+        replies.push(tool("shell", args.clone()));
+    }
+    replies.push(fixture.final_reply());
+    let mock = MockFetch::start(&fixture.root.join("run"), replies);
+    let result = run(&fixture, &mock, "0.10");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 65);
+    assert!(requests
+        .last()
+        .unwrap()
+        .text()
+        .contains("produce the final review now"));
+    assert!(!requests
+        .last()
+        .unwrap()
+        .text()
+        .contains("write a concise handoff summary"));
+    fixture.no_workspaces();
+}
