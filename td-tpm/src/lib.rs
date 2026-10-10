@@ -1,7 +1,8 @@
 //! td's TPM 2.0 client: bounded command transport, password and policy
 //! sessions, salted and PIN-authorized sessions, the owner storage
-//! primary, PCR policy sealing, and PCR extension. Envelope formats and
-//! refusal policy belong to callers (DESIGN.md).
+//! primary, PCR policy sealing, PCR extension, and the lockout hierarchy's
+//! commands. Envelope formats and refusal policy belong to callers
+//! (DESIGN.md).
 #![forbid(unsafe_code)]
 #![cfg_attr(
     test,
@@ -23,12 +24,17 @@ mod sha256;
 mod auth;
 #[cfg(test)]
 mod emulator_tests;
+mod lockout;
 mod session;
 pub use auth::{
     auth_policy_digest, validate_auth_sealed_public, AuthRefusal, AuthSealed, DictionaryAttack,
     DA_SEALED_ATTRIBUTES, GET_CAPABILITY, NO_DA, POLICY_AUTH_VALUE, PT_LOCKOUT_COUNTER,
     PT_LOCKOUT_INTERVAL, PT_LOCKOUT_RECOVERY, PT_MAX_AUTH_FAIL, PT_PERMANENT, RC_AUTH_FAIL,
     RC_LOCKOUT,
+};
+pub use lockout::{
+    DaParameters, LockoutAuth, LockoutError, CLEAR, DICTIONARY_ATTACK_LOCK_RESET,
+    DICTIONARY_ATTACK_PARAMETERS, HIERARCHY_CHANGE_AUTH, LOCKOUT, RC_DISABLED, SET_PRIMARY_POLICY,
 };
 pub use session::{trim_auth, MAX_AUTH_VALUE};
 

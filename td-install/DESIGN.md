@@ -311,7 +311,8 @@ its error. Those two device opens are the documented exceptions;
 td-protector's cryptsetup runner also execs the absolute cryptsetup path
 td-install gives it, naming that program in its errors, which is an exec
 of a path this crate chose rather than an open. td-tpm's salted
-sessions read `/dev/random` and td-fido's hidraw code opens its
+sessions and its lockout authorization read `/dev/random` and td-fido's
+hidraw code opens its
 devices, but the device-bound path calls neither. Nothing else reaches
 another path through td-tpm, td-fido, td-protector or td-json, and a
 further path a linked sibling opens for this binary is an amendment here,

@@ -202,17 +202,78 @@ derivation.
   HMAC: what it reports can deny service or mislead a display, never
   prove the TPM's state.
 
+## Lockout hierarchy
+
+`td-install/ENCRYPTION.md` increment 8a's lockout commands ("Lockout"
+there), `lockout.rs`: library code nothing in production calls before
+item 9, bytes over the same safe file I/O in the sessions above. Which
+values, Names and sequences they serve is td-protector's (take, proof,
+reset and clear, td-protector/DESIGN.md "Protected roles").
+
+- **The authorization.** `LockoutAuth` holds 32 bytes in one heap
+  allocation, zeroed on drop and never printed. `generate` reads them
+  from `/dev/random`, as the salted session's scalar is read;
+  `from_bytes` takes a value a consumer decrypted, copying it and
+  zeroing the caller's array, refused or not; `bytes` lends it to the
+  lockout token's encryption. One empty once trimmed is refused, since
+  the hierarchy would then be authorized by nothing.
+- **Commands.** Each takes the storage primary's Name the consumer
+  recorded, creates the unpersonalized primary and refuses another Name
+  (`LockoutError::OtherPrimary`) before any session is salted to it, so
+  no new authorization crosses to a primary td did not record; then sends
+  one command authorizing `TPM_RH_LOCKOUT` (whose Name is its handle) in
+  an HMAC session salted to that primary, keyed with the lockout
+  authorization. `take_lockout` first reads `dictionary_attack` and,
+  with lockoutAuthSet set, is `LockoutError::AlreadySet`, sending nothing
+  to the lockout hierarchy, so a take never guesses; otherwise it sends
+  TPM2_HierarchyChangeAuth from the empty authorization with `decrypt`,
+  so the new value, trimmed as the TPM stores it, crosses the bus
+  encrypted, and then `clear_lockout_policy` under the new value. The
+  take is complete only when both succeed. HierarchyChangeAuth changes
+  the authValue alone: a lockoutPolicy another system set beside an
+  empty lockoutAuth would still authorize LockReset, the parameters and
+  Clear by a policy session, without the value td holds.
+  `clear_lockout_policy` sends TPM2_SetPrimaryPolicy of `TPM_RH_LOCKOUT`
+  with an empty authPolicy and `TPM_ALG_NULL`, after which only the
+  authorization does; it is idempotent, and td's proof sends it again,
+  so a take interrupted between its two commands is repaired by the
+  next proof. td does not read `TPM_CAP_AUTH_POLICIES` to decide: that
+  read is unauthenticated, and emptying the policy under the
+  authorization, its reply verified, costs one command.
+  `set_dictionary_attack` sends TPM2_DictionaryAttackParameters with a
+  `DaParameters` (newMaxTries, newRecoveryTime, lockoutRecovery, which
+  the consumer chooses), `reset_lockout` TPM2_DictionaryAttackLockReset
+  and `clear` TPM2_Clear, each under a `LockoutAuth` and with no
+  parameter to encrypt. The TPM keys a reply's HMAC with the
+  authorization the hierarchy holds once the command has run, so
+  HierarchyChangeAuth's reply verifies under the new value and Clear's
+  under the empty one; the pinned swtpm confirms both. After each
+  command every handle it left owned is flushed, best effort: the
+  primary, a session the TPM did not end, and a session whose
+  StartAuthSession reply was refused after the TPM had started it. A
+  successful Clear flushed the primary itself.
+- **Refusals.** A refusal of the lockout command itself with
+  `TPM_RC_AUTH_FAIL` or `TPM_RC_LOCKOUT` is
+  `LockoutError::Authorization` with the command and its `AuthRefusal`:
+  a wrong value, after which the TPM refuses the lockout authorization
+  until lockoutRecovery has passed (zero: until the TPM's next reset),
+  and that refusal. Nothing is retried: one call sends one command, so
+  one wrong value costs the hierarchy's one attempt and no more. The
+  same codes from another command, such as CreatePrimary under an owner
+  authorization another system set, are `LockoutError::Failed` with
+  that refusal, as is every other failure but one: Clear refused with
+  `TPM_RC_DISABLED` (0x120), which TPM2_ClearControl causes and only the
+  platform hierarchy or firmware undoes, is `LockoutError::ClearDisabled`,
+  so a clear screen can name the reason. As with Unseal's, an error
+  response carries no HMAC: a typed refusal is grounds to stop, never
+  proof, and lockoutAuthSet is read without authorization.
+
 ## Planned: protected-tier commands
 
-Nothing here is current. `td-install/ENCRYPTION.md` increment 8 (8a's
-next commit, and 8i for signing) adds, still as bytes over the same safe
-file I/O, in the sessions above, and with no syscall surface:
+Nothing here is current. `td-install/ENCRYPTION.md` increment 8i adds,
+still as bytes over the same safe file I/O, in the sessions above, and
+with no syscall surface:
 
-- **Lockout hierarchy.** TPM2_HierarchyChangeAuth of `TPM_RH_LOCKOUT`
-  from the empty authorization to a caller's value,
-  TPM2_DictionaryAttackParameters, TPM2_DictionaryAttackLockReset and
-  TPM2_Clear under it, each in a salted HMAC session, the new
-  authorization sent encrypted.
 - **Signing keys (8i).** Creating an RSA-2048 signing key under the
   storage primary with a policy and an authValue, transient or kept by
   the caller; TPM2_Sign with RSASSA over a caller's SHA-256 digest;
@@ -287,17 +348,54 @@ I/O, each session kind's handle class, and a session left owned after a
 forged or malformed success reply. td-fido's tests pin AES-128
 against FIPS 197 and CFB against SP 800-38A.
 
+The lockout commands' unit tests pin, against the same vectors, the
+whole TPM2_HierarchyChangeAuth command with its newAuth encrypted (the
+new value absent from it), TPM2_SetPrimaryPolicy with the empty
+authPolicy and `TPM_ALG_NULL`, TPM2_DictionaryAttackParameters with
+td's three values, TPM2_DictionaryAttackLockReset and TPM2_Clear, each
+reply verifying under the authorization the hierarchy then holds and
+refused under the one before or another; `LockoutAuth`'s refusal of an
+empty value and zeroing of its source; and, against a scripted TPM,
+`AlreadySet` sending only GetCapability, a refused change sending no
+SetPrimaryPolicy, another primary's Name refused with no session
+started, each command's `TPM_RC_AUTH_FAIL` and `TPM_RC_LOCKOUT` typed
+after exactly one attempt with every handle flushed, another code
+untyped, a well-formed success whose HMAC does not verify untyped with
+its session and primary flushed, Clear's `TPM_RC_DISABLED` typed and
+another command's not, and an authorization code from a command before
+the lockout one not typed as the lockout's.
+
 Ignored oracles against the pinned swtpm 0.10.1 (`emulator_tests.rs`:
 `TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test --manifest-path
 td-tpm/Cargo.toml emulator_ -- --ignored`) seal and unseal with the
 right PIN in a salted session; refuse a wrong PIN with 0x98e and raise
 the counter, which an orderly restart keeps, while a noDA object's wrong
 PIN is 0x9a2 and uncounted; lock out after 32 wrong PINs with 0x921,
-refusing the right PIN too, the DA parameters set by a raw
-TPM2_DictionaryAttackParameters under swtpm's empty lockoutAuth until
-the lockout commands are the client's; refuse a changed PCR 4 and a
+refusing the right PIN too, a lockout that outlasts a restart until
+`reset_lockout` under the lockout authorization ends it and the right
+PIN unseals; refuse a changed PCR 4 and a
 closed PCR 12 at PolicyPCR and, in a session over the PCRs as they read,
 at Unseal's policy check, without the counter moving; refuse a fresh TPM
 state at Load; refuse another primary's Name before Load; re-seal under
 the recorded primary's Name; and refuse, under a fresh TPM, a re-seal
-recording the first TPM's primary before its Create is sent.
+recording the first TPM's primary before its Create is sent. For the
+lockout hierarchy they take it from the empty authorization, refuse a
+take under another primary's Name with nothing sent and a second take
+with only GetCapability sent, and keep the authorization and the
+parameters across a restart; set td's parameters and others, read back
+by `dictionary_attack` and taking effect at the PIN; refuse a wrong
+value at LockReset and at DictionaryAttackParameters with 0x98e, then
+the right one with 0x921 inside a lockoutRecovery of four seconds, the
+PIN counter untouched, and accept it once that has passed; take a TPM
+whose lockoutPolicy another system set beside the empty lockoutAuth
+(the zero digest, set by a raw TPM2_SetPrimaryPolicy that stands for
+that system), after which a policy session that LockReset and the
+parameters accepted before is refused with `TPM_RC_AUTH_UNAVAILABLE`
+(0x12f); repair a take stopped after its HierarchyChangeAuth, the
+foreign policy still authorizing until `clear_lockout_policy`; and
+clear the TPM, emptying the lockout authorization and changing the
+primary, so the old object no longer loads and the TPM can be taken
+again, and once TPM2_ClearControl has disabled Clear, refuse it as
+`ClearDisabled`. Every command td sends to the lockout hierarchy in
+them goes through the client; only the foreign policy and the policy
+sessions that use it, and ClearControl, are the test's own.

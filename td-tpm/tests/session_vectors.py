@@ -337,3 +337,33 @@ out("capability_permanent", command(GET_CAPABILITY, [], None,
                                     be32(6) + be32(0x200) + be32(1)))
 out("capability_lockout", command(GET_CAPABILITY, [], None,
                                   be32(6) + be32(0x20E) + be32(4)))
+
+# The lockout hierarchy's commands, each the first in a salted HMAC session
+# with the vector HMAC session's key and nonceTPM, authorizing TPM_RH_LOCKOUT,
+# whose Name is its handle. The lockout authorization ends in a zero the
+# TPM trims. HierarchyChangeAuth goes from the empty authorization with its
+# newAuth encrypted (decrypt); its reply is keyed with the new value, as
+# TPM2_Clear's is with the empty value it leaves. SetPrimaryPolicy empties
+# the lockout hierarchy's authPolicy (an empty TPM2B_DIGEST, TPM_ALG_NULL).
+HIERARCHY_CHANGE_AUTH, CLEAR, SET_PRIMARY_POLICY = 0x129, 0x126, 0x12E
+DA_LOCK_RESET, DA_PARAMETERS = 0x139, 0x13A
+LOCKOUT = 0x4000000A
+lockout = sha(b"td-tpm/session-vector/lockout")[:31] + b"\0"
+out("lockout_auth", lockout)
+for label, code, auth, after, attributes, parameters in (
+        ("change_auth", HIERARCHY_CHANGE_AUTH, b"", lockout, 0x20, blob(trim(lockout))),
+        ("set_primary_policy", SET_PRIMARY_POLICY, lockout, lockout, 0,
+         blob(b"") + be16(0x10)),
+        ("da_parameters", DA_PARAMETERS, lockout, lockout, 0,
+         be32(32) + be32(600) + be32(86400)),
+        ("lock_reset", DA_LOCK_RESET, lockout, lockout, 0, b""),
+        ("clear", CLEAR, lockout, b"", 0, b"")):
+    nonce_caller = sha(b"td-tpm/session-vector/" + label.encode() + b"/caller")
+    nonce_tpm = sha(b"td-tpm/session-vector/" + label.encode() + b"/tpm")
+    out(label + "_caller", nonce_caller)
+    out(label, session_command(code, [LOCKOUT], [be32(LOCKOUT)], hmac_key, auth,
+                               sha(b"td-tpm/session-vector/hmac/tpm"), nonce_caller,
+                               attributes, parameters))
+    out(label + "_reply_tpm", nonce_tpm)
+    out(label + "_reply", session_response(code, hmac_key, after, nonce_tpm, nonce_caller,
+                                           attributes, b""))

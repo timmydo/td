@@ -1052,8 +1052,8 @@ device-bound tier's volume format, release order, PCR 12 cap and
 volatile handoff, which it keeps. td-protector carries its policies,
 token formats and planner (td-protector/DESIGN.md, "Protected roles
 (planned)"), and td-tpm the commands it adds (td-tpm/DESIGN.md,
-"Salted and PIN-authorized sessions" and "Planned: protected-tier
-commands"). The storage operations here that
+"Salted and PIN-authorized sessions", "Lockout hierarchy" and
+"Planned: protected-tier commands"). The storage operations here that
 run on the booted system are refused by td-authd until item 9; root can
 run their worker directly, which is how the oracles reach them. The
 selector's half is not unreachable before item 9: from 8c on, the
@@ -1169,18 +1169,47 @@ volume key:
 - **Taking it** runs after the cap and only after the released
   keyslot's test passed, so a boot that has proven nothing never changes
   TPM state irreversibly; the lockout hierarchy binds no PCR. With
-  `TPM_PT_PERMANENT`'s `lockoutAuthSet` clear, td first imports the
-  token with a fresh `L`, replacing any token present, then sends
-  TPM2_HierarchyChangeAuth for `TPM_RH_LOCKOUT` from the empty
-  authorization to `L`, TPM2_DictionaryAttackParameters with the three
-  values under `L`, and TPM2_DictionaryAttackLockReset under `L`, whose
-  success proves possession. A crash before the change leaves a token
-  the next take replaces; one after it leaves the token holding the `L`
-  the TPM now has.
+  `TPM_PT_PERMANENT`'s `lockoutAuthSet` clear, td takes it under an `L`
+  it keeps on the header first. A lockout token whose tag verifies
+  under this volume key and whose Name is this TPM's primary is kept
+  and its `L` reused. A TPM clear changes the primary, so the TPM then
+  holds that `L`, the empty authorization (a crash before the change),
+  or a foreign value: another system can set one while the
+  authorization is empty, or, after a take interrupted before its
+  policy step, through a lockoutPolicy it set. Under a forged clear
+  `lockoutAuthSet`, reusing the token's `L` is never worse than drawing
+  a fresh one, and it keeps the only copy of an `L` the TPM may hold.
+  Without such a token td imports one with a fresh `L`, replacing any
+  lockout token present, which proves nothing. A fresh token is
+  imported unproven (`"proven":"0"`, td-protector/DESIGN.md "Tokens");
+  a reused one keeps its mark. td then sends TPM2_HierarchyChangeAuth for
+  `TPM_RH_LOCKOUT` from the empty authorization to `L`;
+  TPM2_SetPrimaryPolicy for `TPM_RH_LOCKOUT` with an empty authPolicy
+  under `L`, since the change leaves any lockoutPolicy another system
+  set able to authorize the hierarchy without `L`;
+  TPM2_DictionaryAttackParameters with the three values under `L`; and
+  TPM2_DictionaryAttackLockReset under `L`, whose success proves
+  possession and marks the token proven. A crash before the change
+  leaves a token the next take reuses; one after it leaves the token
+  holding the `L` the TPM now has, and the next boot's proof empties
+  the policy. `lockoutAuthSet` is read without authorization, so an
+  interposer can show it clear while the TPM holds `L`: the change from
+  the empty authorization is then refused, spending the lockout
+  hierarchy's one attempt, and the reused token still holds `L`. A
+  refusal is unauthenticated too: an interposer can forward the change,
+  let the TPM take `L` and return a forged `TPM_RC_AUTH_FAIL`. A
+  refused change therefore keeps its token, and an unproven one stays
+  for exactly one proof at the next boot, which removes it if refused
+  too: a forged refusal costs one boot's attempt instead of `L`, and a
+  genuine one costs one attempt more before td stops trying.
 - **Proving it**, with `lockoutAuthSet` set, needs a token whose tag
   verifies under this volume key and whose Name is this TPM's primary:
-  td sends TPM2_DictionaryAttackParameters with the three values under
-  `L`, which also repairs them. Anything else is a TPM td cannot prove:
+  td sends TPM2_SetPrimaryPolicy with an empty authPolicy under `L`,
+  completing a take a crash or a forged refusal interrupted, then
+  TPM2_DictionaryAttackParameters with the three values under `L`,
+  which also repairs them, and marks an unproven token proven. A
+  refused proof removes an unproven token and keeps a proven one.
+  Anything else is a TPM td cannot prove:
   `lockoutAuthSet` set without a token (another system, such as a
   Windows installation, provisioned it), a tag that fails, another
   primary, or a refused proof. td never matches parameters instead. It
@@ -1206,7 +1235,8 @@ volume key:
   recovery key; a PIN release leaves it to decay.
 - **Clearing.** A TPM clear requested from the running system
   ("Protector management") is TPM2_Clear under `L`, run by the selector
-  after a release.
+  after a release. A TPM on which TPM2_ClearControl disabled it refuses
+  with `TPM_RC_DISABLED`, which the selector names.
 
 A wrong PIN fails with `TPM_RC_AUTH_FAIL` on Unseal's session (0x98e), a
 locked-out TPM with `TPM_RC_LOCKOUT` (0x921). The TPM compares a policy
@@ -2096,8 +2126,9 @@ commit.
      and noDA clear, Unseal's typed `TPM_RC_AUTH_FAIL` and
      `TPM_RC_LOCKOUT`, and GetCapability of the dictionary-attack
      properties; td-tpm's lockout commands (TPM2_HierarchyChangeAuth,
-     TPM2_DictionaryAttackParameters, TPM2_DictionaryAttackLockReset and
-     TPM2_Clear); td-protector's PIN codec, authValue derivation,
+     TPM2_SetPrimaryPolicy, TPM2_DictionaryAttackParameters,
+     TPM2_DictionaryAttackLockReset and TPM2_Clear); td-protector's
+     PIN codec, authValue derivation,
      tpm-pin policy and chain check; td-protector's protected token
      codecs (tpm-pin, fido2, `recovery-key`, `lockout`, `td-upgrade`,
      `td-request`), the lockout token's encryption, and the reader's
@@ -2149,7 +2180,9 @@ commit.
    - **8g, protector management.** `storage-operation`'s FIDO2 token
      addition and removal and recovery-key removal; the PIN-change
      request and its selector half; the TPM-clear request and its
-     selector half.
+     selector half, whose refusal names a TPM with TPM2_Clear disabled
+     (td-tpm's `ClearDisabled`, `TPM_RC_DISABLED`), which only firmware
+     can enable.
    - **8h, the combined oracle.** The host's virtual FIDO2 authenticator
      over QEMU `usb-redir` ("Acceptance evidence"); then
      `qemu-boot-protected` with every leg below. The hardware evidence
@@ -2482,7 +2515,7 @@ Increment 8's evidence, by sub-increment:
   the counter moving; a fresh TPM state refusing at Load; another
   primary's Name refused before Unseal; and the lockout commands' take,
   proof, reset and clear, with a proof under a wrong authorization
-  refused.
+  refused and a take emptying a lockoutPolicy another system set.
 - **8b.** td-fido's tests drive the disk flows against the virtual
   authenticator with independent literal vectors
   (`td-fido/tests/disk_vectors.py`): the client-data hashes of every

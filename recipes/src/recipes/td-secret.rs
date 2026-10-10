@@ -14,6 +14,10 @@ const TPM_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-tpm/src/auth.rs"),
     ),
     (
+        "{src}/td-tpm/src/lockout.rs",
+        include_str!("../../../td-tpm/src/lockout.rs"),
+    ),
+    (
         "{src}/td-tpm/src/session.rs",
         include_str!("../../../td-tpm/src/session.rs"),
     ),

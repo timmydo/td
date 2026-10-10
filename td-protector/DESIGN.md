@@ -642,8 +642,10 @@ implement ENCRYPTION.md's lockout token: HKDF-SHA256 over the volume key
 with the info `td/disk-protector/lockout/v1`, a zero byte, the UUID and
 the nonce, 64 bytes split into `k_enc` and `k_mac`; the ciphertext is
 `L` XOR `k_enc`; the tag is HMAC-SHA256 under `k_mac` over the nonce,
-ciphertext and Name, compared in constant time. `take`, `prove`,
-`reset` and `clear` are the sequences that section gives, the
+ciphertext and Name, compared in constant time; `L` is td-tpm's
+`LockoutAuth`, which `open` builds with `from_bytes`. `take`, `prove`,
+`reset` and `clear` are the sequences that section gives, over td-tpm's
+lockout commands (td-tpm/DESIGN.md "Lockout hierarchy"), the
 parameters `DA_MAX_TRIES` 32, `DA_RECOVERY_SECS` 600 and
 `DA_LOCKOUT_RECOVERY_SECS` 86400 pinned by test; none matches
 parameters in place of a proof.
@@ -660,7 +662,8 @@ hexadecimal string as the device-bound format's are:
  "account":"1000","credential":"HEX","salt":"HEX","x":"HEX","y":"HEX"}
 {"type":"td-protector","keyslots":["N"],"role":"recovery-key"}
 {"type":"td-protector","keyslots":[],"role":"lockout",
- "primary":"HEX","nonce":"HEX","ciphertext":"HEX","tag":"HEX"}
+ "primary":"HEX","nonce":"HEX","ciphertext":"HEX","tag":"HEX",
+ "proven":"1"}
 {"type":"td-protector","keyslots":[],"role":"secure-boot",
  "salt":"HEX","public":"HEX","private":"HEX"}
 {"type":"td-protector","keyslots":[],"role":"config","tags":["HEX"]}
@@ -676,7 +679,12 @@ and a pending one has empty `keyslots`; `shape` is `tpm` or `fido2`;
 `from` is 32 bytes; `tags` holds one or two distinct 32-byte HMAC-SHA256
 tags; `pair` is the SHA-256 over the staged pair's two digests and `tag`
 its 32-byte HMAC-SHA256 under the update-retry key; `operation` is
-`pin-change` or `tpm-clear`; `account` is `1000`. `salt`, `x`, `y`,
+`pin-change` or `tpm-clear`; `account` is `1000`; `proven` is `0`
+until a take's LockReset or a proof under the lockout token succeeds
+and `1` after (ENCRYPTION.md "Lockout"), outside the tag, since
+whoever can write the header can remove the token anyway; marking a
+token over a wrong `L` proven costs only one refused proof per boot,
+bounded by the lockout hierarchy's own recovery. `salt`, `x`, `y`,
 `nonce`, `ciphertext` and `tag` are 32 bytes, `public` and `private`
 keep the device-bound bounds (the secure-boot token's sized for an
 RSA-2048 key), and `credential` is 1 to 255 bytes. The `td-upgrade` and
@@ -734,7 +742,10 @@ script; the chain check, warning and verified reseal run before the cap
 and the lockout's take, proof and reset after the keyslot test, as
 ENCRYPTION.md's "Protected release" says. Its bounds grow by the FIDO2
 attempts, which are the person's, one seal and one verifying unseal per
-reseal, and the lockout's four commands.
+reseal, and the lockout's commands: a take's four (HierarchyChangeAuth,
+SetPrimaryPolicy, DictionaryAttackParameters, LockReset) or a proof's
+two (SetPrimaryPolicy, DictionaryAttackParameters), then at most one
+counter reset and one requested clear.
 
 ## Bounds
 

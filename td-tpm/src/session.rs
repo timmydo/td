@@ -249,7 +249,7 @@ fn start_parameters(
     clippy::too_many_arguments,
     reason = "the command's fields, each one Part 1 names"
 )]
-fn session_command(
+pub(crate) fn session_command(
     code: u32,
     handles: &[u32],
     names: &[&[u8]],
@@ -314,7 +314,7 @@ fn session_command(
 /// anything in it is trusted, the session's nonce rolled, and its first
 /// parameter decrypted when `attributes` sets ENCRYPT. No session command
 /// returns a handle.
-fn session_response(
+pub(crate) fn session_response(
     code: u32,
     session: &mut Session,
     auth: &[u8],
@@ -427,6 +427,30 @@ impl<T: Transport> Client<T> {
         attributes: u8,
         parameters: &[u8],
     ) -> Result<Vec<u8>, String> {
+        self.call_session_changing(
+            code, handles, names, session, auth, auth, attributes, parameters,
+        )
+    }
+
+    /// `call_session` for a command that changes the authorized entity's
+    /// authValue: the TPM keys its reply's HMAC with the authValue the
+    /// entity holds once the command has run, `response_auth`, such as
+    /// TPM2_HierarchyChangeAuth's new value or TPM2_Clear's empty one.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the command's fields, each one Part 1 names"
+    )]
+    pub(crate) fn call_session_changing(
+        &mut self,
+        code: u32,
+        handles: &[u32],
+        names: &[&[u8]],
+        session: &mut Session,
+        auth: &[u8],
+        response_auth: &[u8],
+        attributes: u8,
+        parameters: &[u8],
+    ) -> Result<Vec<u8>, String> {
         self.refused = None;
         let nonce_caller = random()?;
         let mut command = session_command(
@@ -456,7 +480,14 @@ impl<T: Transport> Client<T> {
                 self.refused = Some(Refusal { command: code, rc });
                 return Err(format!("TPM command {code:#x} refused: {rc:#x}"));
             }
-            let out = session_response(code, session, auth, attributes, &nonce_caller, &response)?;
+            let out = session_response(
+                code,
+                session,
+                response_auth,
+                attributes,
+                &nonce_caller,
+                &response,
+            )?;
             // Only a verified success shows the TPM ended the session;
             // otherwise it stays owned, for drop to flush.
             if attributes & CONTINUE_SESSION == 0 {
@@ -527,7 +558,7 @@ pub(crate) mod tests {
         SecretScalar::from_bytes(Box::new(array("ephemeral_scalar"))).unwrap()
     }
 
-    fn session(key: &str, nonce_tpm: &str) -> Session {
+    pub(crate) fn session(key: &str, nonce_tpm: &str) -> Session {
         Session {
             handle: 0x0300_0000,
             key: Key::new(array(key)),

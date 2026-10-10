@@ -111,15 +111,16 @@ Increment 8a moved td-secret's CTAP codecs, PIN protocols, P-256, AES and
 hidraw transport with its worker there; none of it was ever part of §15,
 whose surface stays in td-secret unchanged, and the transport is std file
 I/O and sysfs reads with no hidraw ioctl. td-tpm's salted and
-PIN-authorized sessions (td-tpm/DESIGN.md) add none either: their
-commands are bytes over td-tpm's safe file I/O on `/dev/tpmrm0`, their
-ephemeral key a std read of `/dev/random`, and their cryptography
-td-fido's safe P-256, AES and HMAC-SHA256.
+PIN-authorized sessions and its lockout hierarchy commands
+(td-tpm/DESIGN.md) add none either: their commands are bytes over
+td-tpm's safe file I/O on `/dev/tpmrm0`, their ephemeral key and the
+lockout authorization std reads of `/dev/random`, and their
+cryptography td-fido's safe P-256, AES and HMAC-SHA256.
 
 Planned, not current: `td-install/ENCRYPTION.md` increment 8's protected
 tier is planned to add no surface ("Unsafe and syscall surfaces" there).
-td-tpm's lockout and signing commands are bytes over its safe file I/O,
-in the same sessions. td-boot's FIDO2 `fido-worker` reads
+td-tpm's signing commands are bytes over its safe file I/O, in the same
+sessions. td-boot's FIDO2 `fido-worker` reads
 and writes `/dev/hidrawN` with std file I/O and reads the report
 descriptor from sysfs, so no hidraw ioctl (`HIDIOCGRDESC` or another)
 joins any roster, and the `td-fido` crate it shares with td-secret and
