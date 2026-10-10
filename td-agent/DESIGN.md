@@ -249,11 +249,51 @@ this profile. The host tool closure is the existing §8 closure; source
 dependencies or tools outside it remain unavailable. Tests requiring
 source writes or absent inputs must be reported as limitations.
 
+Repository reviews prepare a private Cargo home, expand explicit relative
+path dependencies and non-wildcard workspace members from tracked manifests,
+and run bounded `cargo metadata --offline --locked` preflight for up to 16
+initially selected manifests, prioritizing the root workspace. This resolves
+inputs without running build
+scripts; it is not test evidence. Unsupported workspace patterns and missing
+inputs remain explicit limitations. `--vendor DIRECTORY` supplies an explicit
+read-only Cargo directory source; credentials and ambient caches are never
+imported. Cargo validates its locked packages and checksums. `--test-runner
+FILE` supplies a compatible ELF td-builder, otherwise the source repository's
+`target/release/td-builder` is used when present. The controller copies it into
+scratch and records its origin and SHA-256; ELF validation is not proof of
+identity. An unusable automatic runner is a logged limitation; an invalid
+explicit runner is an error. The repository's x86-64 GNU and musl Cargo tests
+receive the copied `run-capped` runner through a
+typed environment override. These inputs do not widen the tool capability
+profile. Preflight output and the prepared sparse/input environment are logged.
+
+Tool results default to 8192 UTF-8 bytes per call and 512 KiB cumulatively.
+`--tool-output-bytes` and `--tool-context-bytes` select limits between 1024
+bytes and 64 KiB / 8 MiB respectively. Limits count result content bytes,
+including harness notices, not tokens or JSON framing; the complete serialized
+request remains bounded separately below. Read windows default to 128 lines.
+Shortening preserves the head and a larger tail, including failure summaries.
+Each shortened controller result is retained in scratch for narrower reads
+and searches, with its path in the notice, and whole in the trace. Existing
+controller output bounds still apply; raw command bytes are captured before
+those bounds. At exhaustion subsequent tools are refused and the next status
+message requests a final review with limitations. Identical normalized tool
+arguments produce warnings, not suppression: changed scratch state can justify
+reruns. Each request appends budget, tool-context status and estimated
+conservative
+admission margin without modifying previous messages. Low admission margin
+warns the model that this may be its final admitted request, even when reported
+spending is far below the cap. The final body is repriced after adding feedback.
+Anthropic repository reviews request automatic prompt caching;
+other providers retain their implicit caching behavior. Savings depend on the
+provider; admission still reserves undiscounted worst-case cost.
+
 At most 64 model requests run, with a 16 MiB context bound and a single
 cost budget (§5). Tool calls and their results remain intermediate; only
 a whole final reply whose first line exactly identifies the resolved
 subject and full commit id reaches standard output. Reasoning details
-are echoed with their exact wire bytes as in §5. Source and tool results
+are echoed with their exact wire bytes as in §5. Source, quoted preflight
+diagnostics and tool results
 are untrusted review material; project instructions cannot widen the
 profile. No conversation or daily ledger is created.
 
@@ -291,6 +331,20 @@ provider-internal reasoning is unavailable. Response chunks retain exact
 bytes through the response parser's termination, including malformed
 responses. Log write failures stop the review rather than silently losing
 records; logging adds no model-output, tool-output or log-size limit.
+
+Additional request/tool metrics record context size, token reservation,
+remaining budget, cache request, effective tool arguments, repetitions, elapsed
+time, command exit status, signal, timeout/interruption and unsuccessful-process
+flags, raw/retained/model-visible byte counts, shortening
+and artifact paths. Normalized usage includes cached and cache-write tokens;
+raw replies preserve additional provider fields. `td-agent review-log FILE`
+summarizes complete or interrupted traces without modifying them, distinguishes
+reported from accounted cost, and reports unrecorded token fields as null. The shared usage parser
+defaults absent provider counts to zero in normalized completions; raw replies
+remain the authority for distinguishing absent counts from reported zero. Tool metric record counts identify older traces lacking these fields;
+peak context is null when unrecorded. Summaries retain at most 32 request errors
+and count all of them. Monetary values remain pico-dollars. This command cannot
+recover a provider charge from a response that never arrived.
 
 The terminal `end` record reports success or failure; normal repository
 loop exits also record budget totals and cleanup. Records are written

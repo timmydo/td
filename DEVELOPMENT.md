@@ -986,6 +986,31 @@ be absent, and external dependency sources are not supplied from the
 host's caches. Report an unrun test as a limitation. Review tests do not
 replace the branch's `ready` gate.
 
+Repository reviews expand declared path dependencies and prepare a private
+Cargo home. Metadata preflight reports unavailable locked inputs before the
+model starts; it does not execute tests. Use `--vendor DIRECTORY` for explicit
+offline vendored sources and `--test-runner FILE` for a compatible td-builder
+when source `target/release/td-builder` is absent. Inputs and the runner hash
+are recorded. These options supply review inputs, not ambient host caches.
+
+Tool results default to 8192 UTF-8 bytes each and 512 KiB cumulatively.
+Use `--tool-output-bytes N` and `--tool-context-bytes N` to adjust them.
+Shortened results identify scratch files for focused retrieval; full retained
+results and raw command bytes remain in the trace. Repeated identical calls
+warn the model, and each turn receives remaining cost, context allowances and
+conservative admission margin. Low margin requests a final answer before more
+tool results can make the next request inadmissible.
+Repository reviews request Anthropic prompt caching; the cost reservation
+remains undiscounted, so cache savings do not guarantee request admission.
+
+Run `td-agent review-log FILE` for JSON metrics: reported and accounted cost,
+cache usage, request/context sizes, repetitions, output shortening, timings,
+preflight failures, and cleanup/completion state. Unrecorded normalized token
+fields are null; absent provider counts default to zero in the shared parser,
+so inspect raw usage when that distinction matters;
+`tool_metric_records` identifies traces with tool instrumentation. Raw records
+remain the authority for provider fields and detailed test evidence.
+
 The private JSONL trace path prints to stderr before setup and survives
 workspace cleanup. `--log-dir DIRECTORY` chooses a private location
 outside the repository and review mounts. The parent agent should inspect

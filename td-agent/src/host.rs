@@ -89,6 +89,8 @@ pub enum Call {
         timeout_ms: Option<u64>,
         workdir: Option<String>,
         target_dir: String,
+        runner: Option<String>,
+        cargo_home: Option<String>,
     },
     /// A `shell` call with `background`: its instance outlives the call
     /// that started it, answered when the command ends (DESIGN.md §12).
@@ -452,11 +454,15 @@ impl Call {
                 timeout_ms,
                 workdir,
                 target_dir,
+                runner,
+                cargo_home,
             } => member(vec![
                 ("command", Json::Str(command.clone())),
                 ("timeout_ms", opt_num(*timeout_ms)),
                 ("workdir", opt_str(workdir.as_deref())),
                 ("target_dir", Json::Str(target_dir.clone())),
+                ("runner", opt_str(runner.as_deref())),
+                ("cargo_home", opt_str(cargo_home.as_deref())),
             ]),
             Self::Shell {
                 command,
@@ -536,6 +542,8 @@ impl Call {
                 timeout_ms: number("timeout_ms")?,
                 workdir: maybe("workdir")?,
                 target_dir: text("target_dir")?,
+                runner: maybe("runner")?,
+                cargo_home: maybe("cargo_home")?,
             },
             "read_file" => Self::Read {
                 path: text("path")?,

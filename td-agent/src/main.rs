@@ -17,6 +17,7 @@ const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
 \x20      td-agent review --repo DIRECTORY [--commit REV] [--sparse DIRECTORY]...\n\
 \x20                      [--model MODEL] [--effort LEVEL] [--max-tokens N]\n\
 \x20                      [--max-cost USD] [--log-dir DIRECTORY]\n\
+\x20      td-agent review-log FILE\n\
 \x20      td-agent calibrate FIXTURES\n\
 \x20      td-agent --help\n\
 \n\
@@ -134,6 +135,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((first, rest)) if first == "conversation" => conversation(rest),
+        Some((first, rest)) if first == "review-log" => td_agent::review_metrics::run(rest),
         Some((first, rest)) if first == "review" => td_agent::review::run(rest),
         Some((first, rest)) if first == "calibrate" => td_agent::calibrate::run(rest),
         Some((first, rest)) if first == "tool-host" => td_agent::toolhost::Config::parse(rest)

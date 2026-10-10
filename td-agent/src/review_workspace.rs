@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -27,6 +28,9 @@ pub struct Workspace {
     pub subject: String,
     pub diff: String,
     pub sparse: Vec<String>,
+    pub(crate) vendor: Option<PathBuf>,
+    pub(crate) runner: Option<String>,
+    pub(crate) cargo_home: Option<PathBuf>,
     programs: jail::Programs,
     repository: PathBuf,
     objects: PathBuf,
@@ -190,6 +194,9 @@ impl Workspace {
             subject: String::new(),
             diff: String::new(),
             sparse: Vec::new(),
+            vendor: None,
+            runner: None,
+            cargo_home: None,
             programs,
             git,
         };
@@ -299,7 +306,7 @@ impl Workspace {
     }
 
     pub fn policy(&self) -> jail::Policy {
-        jail::Policy {
+        let mut policy = jail::Policy {
             home: self.root.join("home"),
             read: vec![
                 self.checkout.clone(),
@@ -309,6 +316,27 @@ impl Workspace {
             worktrees: vec![self.scratch.clone()],
             directory: Some(self.checkout.clone()),
             ..jail::Policy::default()
+        };
+        if let Some(vendor) = &self.vendor {
+            policy.read.push(vendor.clone());
+        }
+        policy
+    }
+
+    pub(crate) fn tracked_text(&self, path: &Path) -> Result<Option<String>, String> {
+        let path = path.to_str().ok_or("manifest path is not UTF-8")?;
+        let mut inspect = command(&self.git, &self.root);
+        inspect
+            .env("GIT_DIR", &self.repository)
+            .args(["show", &format!("{}:{path}", self.commit)]);
+        match said(&mut inspect, 1024 * 1024) {
+            Ok(text) => Ok(Some(text)),
+            Err(why)
+                if why.contains("does not exist") || why.contains("exists on disk, but not") =>
+            {
+                Ok(None)
+            }
+            Err(why) => Err(why),
         }
     }
 
@@ -371,6 +399,8 @@ impl Workspace {
                         .min(MAX_SHELL_TIMEOUT_MS),
                 ),
                 workdir,
+                runner: self.runner.clone(),
+                cargo_home: self.cargo_home.as_ref().map(|p| p.display().to_string()),
                 target_dir: self
                     .scratch
                     .join("target")
@@ -415,6 +445,23 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    pub(crate) fn retain_output(&self, number: u64, content: &str) -> Result<PathBuf, String> {
+        let path = self.scratch.join(format!(
+            "review-output-{number}-{}.txt",
+            crate::store::random_hex(16)?
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(crate::store::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| format!("review output artifact: {e}"))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("review output artifact: {e}"))?;
+        Ok(path)
     }
 
     pub fn cleanup(&mut self) -> Result<(), String> {

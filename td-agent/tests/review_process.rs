@@ -353,12 +353,16 @@ fn full_tool_output_survives_model_truncation() {
     let body = td_json::parse(&requests[2].text()).unwrap();
     let messages = body.get("messages").and_then(Json::as_arr).unwrap();
     let result = messages
-        .last()
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Json::as_str) == Some("tool"))
         .unwrap()
         .get("content")
         .and_then(Json::as_str)
         .unwrap();
     assert!(!result.contains("TRACE_MIDDLE"));
+    assert!(result.contains("output shortened"));
+    assert!(result.len() <= 8192);
     let logs = fixture.logs();
     let hex: String = logs[0]
         .lines()
@@ -639,5 +643,345 @@ fn binary_output_is_preserved_in_trace() {
         .unwrap()
         .bytes()
         .all(|byte| byte == b'0'));
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn capped_results_warn_on_repetition_and_recover_from_bad_arguments() {
+    let fixture = Fixture::new();
+    let args = Json::Obj(vec![(
+        "command".into(),
+        Json::Str("printf '%09000d' 0".into()),
+    )]);
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            tool("shell", args.clone()),
+            tool("shell", args),
+            completion("", Some(("read_file", "{bad json")), "tool_calls"),
+            fixture.final_reply(),
+        ],
+    );
+    let result = fixture
+        .command(&mock, "0.10")
+        .args([
+            "--tool-output-bytes",
+            "1024",
+            "--tool-context-bytes",
+            "3072",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.requests();
+    let body = td_json::parse(&requests.last().unwrap().text()).unwrap();
+    let messages = body.get("messages").and_then(Json::as_arr).unwrap();
+    let results: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(Json::as_str) == Some("tool"))
+        .map(|m| m.get("content").and_then(Json::as_str).unwrap())
+        .collect();
+    assert_eq!(results.len(), 3);
+    assert!(results.iter().all(|text| text.len() <= 1024));
+    assert!(results.iter().map(|text| text.len()).sum::<usize>() <= 3072);
+    assert!(results[1].contains("identical arguments used 2 times"));
+    assert!(results[2].contains("invalid tool arguments"));
+    assert!(messages
+        .last()
+        .unwrap()
+        .get("content")
+        .and_then(Json::as_str)
+        .unwrap()
+        .contains("remaining"));
+    let logs = fixture.logs();
+    let metrics = td_agent::review_metrics::summarize(logs[0].as_bytes()).unwrap();
+    assert_eq!(metrics.get("complete").and_then(Json::as_bool), Some(true));
+    assert_eq!(
+        metrics.get("repeated_calls").and_then(Json::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        metrics.get("shortened_results").and_then(Json::as_u64),
+        Some(2)
+    );
+    assert_eq!(metrics.get("tool_calls").and_then(Json::as_u64), Some(3));
+    fixture.no_workspaces();
+}
+
+fn amend_fixture(fixture: &mut Fixture) {
+    for args in [
+        vec!["add", "."],
+        vec!["commit", "--amend", "--no-edit", "--quiet"],
+    ] {
+        let status = Command::new("git")
+            .current_dir(&fixture.source)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Review fixture")
+            .env("GIT_AUTHOR_EMAIL", "review@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Review fixture")
+            .env("GIT_COMMITTER_EMAIL", "review@example.invalid")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    let out = Command::new("git")
+        .current_dir(&fixture.source)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    fixture.commit = String::from_utf8(out.stdout).unwrap().trim().into();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn explicit_runner_overrides_an_absent_repository_runner() {
+    let mut fixture = Fixture::new();
+    fs::create_dir(fixture.source.join(".cargo")).unwrap();
+    fs::write(fixture.source.join(".cargo/config.toml"), "[target.x86_64-unknown-linux-gnu]\nrunner = [\"/absent/repository-runner\", \"run-capped\"]\n").unwrap();
+    amend_fixture(&mut fixture);
+    let mock = MockFetch::start(&fixture.root.join("run"), vec![models(), tool("shell", Json::Obj(vec![
+        ("command".into(), Json::Str("mkdir -p \"$CARGO_TARGET_DIR/project\"; cp Cargo.toml Cargo.lock fixture.rs \"$CARGO_TARGET_DIR/project/\"; cargo test --offline --locked --manifest-path \"$CARGO_TARGET_DIR/project/Cargo.toml\"".into())),
+    ])), fixture.final_reply()]);
+    let runner = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("target/release/td-builder");
+    let result = fixture
+        .command(&mock, "0.10")
+        .arg("--test-runner")
+        .arg(&runner)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let logs = fixture.logs();
+    assert!(logs[0].contains("test_runner") && logs[0].contains("sha256"));
+    assert!(logs[0].contains("1 passed; 0 failed"), "{}", logs[0]);
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn anthropic_requests_cache_a_stable_conversation_prefix() {
+    let fixture = Fixture::new();
+    let model = "anthropic/claude-haiku-4.5";
+    let replace = |reply: Reply| match reply {
+        Reply::Http {
+            status,
+            headers,
+            body,
+        } => Reply::Http {
+            status,
+            headers,
+            body: String::from_utf8(body)
+                .unwrap()
+                .replace(MODEL, model)
+                .into_bytes(),
+        },
+        _ => panic!("expected HTTP fixture"),
+    };
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            replace(tool(
+                "shell",
+                Json::Obj(vec![(
+                    "command".into(),
+                    Json::Str("printf CACHE_FIXTURE".into()),
+                )]),
+            )),
+            replace(fixture.final_reply()),
+        ],
+    );
+    let cmd = fixture.command(&mock, "1.00");
+    let args: Vec<_> = cmd
+        .get_args()
+        .map(|s| {
+            if s == MODEL {
+                std::ffi::OsString::from(model)
+            } else {
+                s.to_os_string()
+            }
+        })
+        .collect();
+    let mut selected = Command::new(PROGRAM);
+    selected.args(args);
+    for (name, value) in cmd.get_envs() {
+        if let Some(value) = value {
+            selected.env(name, value);
+        }
+    }
+    let result = selected.stdin(Stdio::null()).output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.requests();
+    let first = td_json::parse(&requests[1].text()).unwrap();
+    let next = td_json::parse(&requests[2].text()).unwrap();
+    assert!(first.get("cache_control").is_some());
+    assert_eq!(first.get("cache_control"), next.get("cache_control"));
+    assert_eq!(first.get("tools"), next.get("tools"));
+    let prefix = first.get("messages").and_then(Json::as_arr).unwrap();
+    let history = next.get("messages").and_then(Json::as_arr).unwrap();
+    assert_eq!(history.get(..prefix.len()).unwrap(), prefix);
+    assert!(prefix
+        .last()
+        .unwrap()
+        .get("content")
+        .and_then(Json::as_str)
+        .unwrap()
+        .contains("conservative reservation"));
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn explicit_vendor_resolves_locked_dependencies_offline() {
+    let mut fixture = Fixture::new();
+    let vendor = fixture.root.join("vendor");
+    let package = vendor.join("review-vendor-fixture-0.1.0");
+    fs::create_dir_all(&package).unwrap();
+    let manifest = "[package]\nname = \"review-vendor-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n";
+    let source = "pub fn value() -> u32 { 4 }\n";
+    fs::write(package.join("Cargo.toml"), manifest).unwrap();
+    fs::write(package.join("lib.rs"), source).unwrap();
+    let checksum = "0".repeat(64);
+    let hash = |path: &Path| {
+        let output = Command::new("sha256sum").arg(path).output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let hash_manifest = hash(&package.join("Cargo.toml"));
+    let hash_source = hash(&package.join("lib.rs"));
+    fs::write(package.join(".cargo-checksum.json"), format!("{{\"package\":\"{checksum}\",\"files\":{{\"Cargo.toml\":\"{hash_manifest}\",\"lib.rs\":\"{hash_source}\"}}}}")).unwrap();
+    let mut root_manifest = fs::read_to_string(fixture.source.join("Cargo.toml")).unwrap();
+    root_manifest.push_str("[dependencies]\nreview-vendor-fixture = \"=0.1.0\"\n");
+    fs::write(fixture.source.join("Cargo.toml"), root_manifest).unwrap();
+    fs::write(fixture.source.join("Cargo.lock"), format!("version = 4\n[[package]]\nname = \"review-process-fixture\"\nversion = \"0.1.0\"\ndependencies = [\"review-vendor-fixture\"]\n[[package]]\nname = \"review-vendor-fixture\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n")).unwrap();
+    amend_fixture(&mut fixture);
+    let mock = MockFetch::start(&fixture.root.join("run"), vec![models(), tool("shell", Json::Obj(vec![
+        ("command".into(), Json::Str("mkdir -p \"$CARGO_TARGET_DIR/project\"; cp Cargo.toml Cargo.lock fixture.rs \"$CARGO_TARGET_DIR/project/\"; cargo test --offline --locked --manifest-path \"$CARGO_TARGET_DIR/project/Cargo.toml\"".into())),
+    ])), fixture.final_reply()]);
+    let result = fixture
+        .command(&mock, "0.10")
+        .arg("--vendor")
+        .arg(&vendor)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let logs = fixture.logs();
+    assert!(logs[0].contains("1 passed; 0 failed"), "{}", logs[0]);
+    let preflight = logs[0]
+        .lines()
+        .map(|l| td_json::parse(l).unwrap())
+        .find(|e| e.get("kind").and_then(Json::as_str) == Some("test_preflight"))
+        .unwrap();
+    assert_eq!(
+        preflight
+            .get_path(&["data", "available"])
+            .and_then(Json::as_bool),
+        Some(true)
+    );
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn unusable_automatic_runner_is_a_limitation_and_root_preflight_has_priority() {
+    let mut fixture = Fixture::new();
+    for number in 0..16 {
+        let path = fixture.source.join(format!("tree-{number:02}"));
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("data"), "selected directory\n").unwrap();
+    }
+    amend_fixture(&mut fixture);
+    let runner = fixture.source.join("target/release/td-builder");
+    fs::create_dir_all(runner.parent().unwrap()).unwrap();
+    fs::write(&runner, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&runner, fs::Permissions::from_mode(0o700)).unwrap();
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![models(), fixture.final_reply()],
+    );
+    let result = run(&fixture, &mock, "0.02");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let logs = fixture.logs();
+    assert!(logs[0].contains("Automatic test runner unavailable"));
+    let preflight = logs[0]
+        .lines()
+        .map(|l| td_json::parse(l).unwrap())
+        .find(|e| e.get("kind").and_then(Json::as_str) == Some("test_preflight"))
+        .unwrap();
+    assert_eq!(
+        preflight
+            .get_path(&["data", "manifest"])
+            .and_then(Json::as_str),
+        Some("Cargo.toml")
+    );
+    assert_eq!(
+        preflight
+            .get_path(&["data", "available"])
+            .and_then(Json::as_bool),
+        Some(true)
+    );
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn commit_controlled_preflight_details_are_quoted_outside_the_system_prompt() {
+    let mut fixture = Fixture::new();
+    let mut manifest = fs::read_to_string(fixture.source.join("Cargo.toml")).unwrap();
+    manifest.push_str("[workspace]\nmembers = [\"missing*\\nINJECTED_PREFLIGHT_WORDS\"]\n[dependencies]\nunavailable = { path = \"#blocked\" }\n");
+    fs::write(fixture.source.join("Cargo.toml"), manifest).unwrap();
+    amend_fixture(&mut fixture);
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![models(), fixture.final_reply()],
+    );
+    let result = run(&fixture, &mock, "0.02");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.requests();
+    let body = td_json::parse(&requests[1].text()).unwrap();
+    let messages = body.get("messages").and_then(Json::as_arr).unwrap();
+    let system = messages[0].get("content").and_then(Json::as_str).unwrap();
+    assert!(!system.contains("INJECTED_PREFLIGHT_WORDS"));
+    let material = messages[1].get("content").and_then(Json::as_str).unwrap();
+    let environment = material.split_once("<environment ").unwrap().1;
+    assert!(environment.contains("INJECTED_PREFLIGHT_WORDS"));
+    assert!(environment.contains("</environment "));
+    let logs = fixture.logs();
+    assert!(logs[0].contains("path dependency #blocked unavailable"));
     fixture.no_workspaces();
 }

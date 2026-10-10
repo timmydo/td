@@ -67,7 +67,7 @@ pub struct Params<'a> {
     pub effort: Option<&'a str>,
     pub client: &'a Client,
     /// Whether an Anthropic model is asked to cache the prompt: a turn's
-    /// is resent, a review's never is.
+    /// is resent, as is a repository review's tool context.
     pub cache: bool,
     /// Whether the model may call the tools the prefix defines; when
     /// not, `tool_choice` is `none`, the tools still defined so that the

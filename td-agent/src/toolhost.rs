@@ -457,7 +457,13 @@ fn act(
                 return Err(format!("`workdir` {} is not a directory", dir.display()));
             }
             let mut process = shell::shell(command, &dir, config.proxy);
-            if let Call::ReviewShell { target_dir, .. } = call {
+            if let Call::ReviewShell {
+                target_dir,
+                runner,
+                cargo_home,
+                ..
+            } = call
+            {
                 if config.proxy {
                     return Err("review commands cannot use a network proxy".into());
                 }
@@ -467,6 +473,19 @@ fn act(
                 process
                     .env("CARGO_TARGET_DIR", target)
                     .env("CARGO_NET_OFFLINE", REVIEW_CARGO_OFFLINE);
+                if let Some(home) = cargo_home {
+                    process.env("CARGO_HOME", config.path(home, "cargo_home")?);
+                }
+                if let Some(runner) = runner {
+                    let runner = config.path(runner, "runner")?;
+                    let value = format!("{} run-capped", runner.display());
+                    for name in [
+                        "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER",
+                        "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUNNER",
+                    ] {
+                        process.env(name, &value);
+                    }
+                }
             }
             let review = matches!(call, Call::ReviewShell { .. });
             let exit = if review {
@@ -764,6 +783,8 @@ mod tests {
                 timeout_ms: Some(30_000),
                 workdir: None,
                 target_dir: dir.join("target").display().to_string(),
+                runner: None,
+                cargo_home: None,
             })
             .unwrap();
         std::thread::sleep(Duration::from_secs(1));
@@ -805,6 +826,7 @@ mod tests {
             command: "(i=0; while [ $i -lt 8 ]; do printf .; sleep 0.1; i=$((i+1)); done; printf TRAILING) & printf EARLY".into(),
             timeout_ms: Some(5_000), workdir: None,
             target_dir: dir.join("target").display().to_string(),
+            runner: None, cargo_home: None,
         }, &config, &AtomicBool::new(false), &mut |bytes| output.extend_from_slice(bytes)).unwrap();
         assert!(String::from_utf8(output).unwrap().contains("TRAILING"));
         assert!(done.text.contains("TRAILING"));

@@ -42,13 +42,20 @@ pub const USAGE: &str = "usage: td-agent review [--model MODEL] [--effort LEVEL]
        td-agent review --repo DIRECTORY [--commit REV] [--sparse DIRECTORY]...\n\
                        [--model MODEL] [--effort LEVEL] [--max-tokens N]\n\
                        [--max-cost USD] [--log-dir DIRECTORY]\n\
+                       [--tool-output-bytes N] [--tool-context-bytes N]\n\
+                       [--vendor DIRECTORY] [--test-runner TD-BUILDER]\n\
 \n\
 With --repo, reviews REV (HEAD by default) in a disposable sparse checkout,\n\
 with read/search tools and confined commands for tests. Source and git\n\
 metadata are read-only; scratch outputs are writable; network, edits,\n\
 publication and peer tools are unavailable. Changed top-level directories\n\
 are included automatically; --sparse adds directories, and the model can\n\
-widen the checkout. --max-cost caps all model requests in this review,\n\
+widen the checkout. Tool results default to 8192 UTF-8 bytes each and\n\
+512 KiB total (not tokens); full results remain in logs. --vendor mounts\n\
+explicit offline Cargo sources read-only. --test-runner copies a compatible\n\
+td-builder into scratch; otherwise source target/release/td-builder is used\n\
+when present. td-agent review-log FILE summarizes a retained trace.\n\
+--max-cost caps all model requests in this review,\n\
 defaulting to max_cost_per_turn (or $0.50 when disabled). Missing usage\n\
 is charged at its reservation. The checkout is removed on completion or\n\
 error; after abrupt process death it is collected by the next review.\n\
@@ -105,6 +112,10 @@ pub struct Options {
     pub sparse: Vec<String>,
     pub max_cost: Option<u64>,
     pub log_dir: Option<PathBuf>,
+    pub tool_output_bytes: Option<usize>,
+    pub tool_context_bytes: Option<usize>,
+    pub vendor: Option<PathBuf>,
+    pub test_runner: Option<PathBuf>,
 }
 
 impl Options {
@@ -158,6 +169,35 @@ impl Options {
                 "--log-dir" if !options_done && options.log_dir.is_none() => {
                     options.log_dir = Some(PathBuf::from(value()?));
                 }
+                "--tool-output-bytes" | "--tool-context-bytes" if !options_done => {
+                    let (slot, maximum) = if arg == "--tool-output-bytes" {
+                        (
+                            &mut options.tool_output_bytes,
+                            crate::review_controls::OUTPUT_MAX,
+                        )
+                    } else {
+                        (
+                            &mut options.tool_context_bytes,
+                            crate::review_controls::CONTEXT_MAX,
+                        )
+                    };
+                    if slot.is_some() {
+                        return Err(usage());
+                    }
+                    let text = value()?;
+                    let count = text
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| (1024..=maximum).contains(n))
+                        .ok_or_else(|| format!("{arg} must be 1024 to {maximum} bytes"))?;
+                    *slot = Some(count);
+                }
+                "--vendor" if !options_done && options.vendor.is_none() => {
+                    options.vendor = Some(PathBuf::from(value()?));
+                }
+                "--test-runner" if !options_done && options.test_runner.is_none() => {
+                    options.test_runner = Some(PathBuf::from(value()?));
+                }
                 "--max-cost" if !options_done && options.max_cost.is_none() => {
                     let text = value()?;
                     options.max_cost = Some(
@@ -177,9 +217,16 @@ impl Options {
             return Err("--repo reviews --commit (HEAD by default), not FILE or stdin".into());
         }
         if options.repository.is_none()
-            && (options.revision.is_some() || !options.sparse.is_empty())
+            && (options.revision.is_some()
+                || !options.sparse.is_empty()
+                || options.tool_output_bytes.is_some()
+                || options.tool_context_bytes.is_some()
+                || options.vendor.is_some()
+                || options.test_runner.is_some())
         {
-            return Err("--commit and --sparse require --repo".into());
+            return Err(
+                "--commit, --sparse, tool limits, --vendor and --test-runner require --repo".into(),
+            );
         }
         crate::repo::cone(Some(&options.sparse))?;
         Ok(options)
@@ -754,7 +801,16 @@ pub(crate) fn request(
                             "reasoning_tokens".into(),
                             Json::from(usage.tokens.reasoning),
                         ),
+                        ("cached_tokens".into(), Json::from(usage.tokens.cached)),
+                        (
+                            "cache_write_tokens".into(),
+                            Json::from(usage.tokens.cache_write),
+                        ),
                         ("cost".into(), usage.cost.map_or(Json::Null, Json::from)),
+                        (
+                            "missing_token_counts_default_to_zero".into(),
+                            Json::Bool(true),
+                        ),
                     ])
                 }),
             ),
@@ -796,6 +852,13 @@ mod tests {
             Some(PathBuf::from("-x.diff"))
         );
         for bad in [
+            "--tool-output-bytes 1024",
+            "--repo . --tool-output-bytes 0",
+            "--repo . --tool-output-bytes 65537",
+            "--repo . --tool-context-bytes 8388609",
+            "--repo . --tool-context-bytes 1024 --tool-context-bytes 2048",
+            "--repo . --vendor a --vendor b",
+            "--test-runner runner",
             "--commit HEAD",
             "--sparse src",
             "--repo . -",
