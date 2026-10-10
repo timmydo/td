@@ -529,8 +529,18 @@ ticket or authenticated mutation authority is created.
 Changes use the native account/kind/sequence/operation indexes.
 IndexStore::prune_history supplies explicit bounded history retirement and
 physical row reclamation. Its HistoryPruneRequest identifies an account,
-expected committed endpoint, inclusive through sequence, max_rows in
-1 through 4096, and one deadline. The trusted caller owns retention policy,
+captured store epoch, expected committed endpoint, inclusive through
+sequence, max_rows in 1 through 4096, and one deadline. Under the writer
+mutex and original native scope, the captured epoch must match the opened
+store before row-limit validation, WAL admission or SQL. Mismatch returns
+Rejected(Conflict) without changing the floor or history and does not stop
+a healthy writer. Acquisition, stopped-writer and native clock/deadline
+failures may precede this comparison. A restored copy retains endpoints
+under its new epoch, so stale pruning must refuse even with a matching
+sequence. Retain the epoch captured when selecting the boundary rather
+than substitute the live one to admit stale work. This is optimistic
+identity checking, not retention authorization or quota reconciliation.
+The trusted caller owns retention policy,
 account authorization and resource admission; there is no automatic pruning
 or retention scheduler. A changed endpoint or a through sequence below the
 current floor returns Conflict; a future boundary or invalid row limit returns

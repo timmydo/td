@@ -1909,6 +1909,7 @@ mod tests {
                         store
                             .prune_history(HistoryPruneRequest {
                                 account: ACCOUNT,
+                                epoch: store.epoch(),
                                 expected: Sequence::from_u64(1),
                                 through: Sequence::from_u64(1),
                                 max_rows: 1,

@@ -2403,8 +2403,14 @@ snapshots, fixed disk/heap ceilings and atomic body/metadata commits.
 
 The native prune_history primitive now atomically advances an account's
 history floor without advancing its committed endpoint and reclaims at most
-4096 retired rows per call. Repeated calls may finish physical cleanup behind
-the floor; old snapshots retain original history. STORAGE.md defines native
+4096 retired rows per call.
+Its request carries the epoch captured when choosing retention. A stale
+pre-restore epoch refuses before WAL admission or SQL, even with an equal
+endpoint; a native regression pins unchanged copied history/floor after
+refusal, normal current-epoch pruning and durable reopening. Existing
+cleanup fixtures retain each source/copied store's intended epoch.
+Repeated calls may finish physical cleanup behind the floor; old
+snapshots retain original history. STORAGE.md defines native
 bounds, conflict handling and passive receipts. Choosing retention boundaries,
 scheduling work and reconciling admission/physical usage remain M08 work.
 

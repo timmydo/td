@@ -10,6 +10,8 @@ const DELETE_PREFIX: &str =
 #[derive(Clone, Copy, Debug)]
 pub struct HistoryPruneRequest {
     pub account: AccountId,
+    /// Store epoch captured when selecting the retention boundary.
+    pub epoch: StoreEpoch,
     pub expected: Sequence,
     pub through: Sequence,
     pub max_rows: u32,
@@ -32,6 +34,9 @@ impl IndexStore<'_> {
         request: HistoryPruneRequest,
     ) -> Result<HistoryPruned, CommitError> {
         self.transaction(request.deadline, |native, _| {
+            if request.epoch != self.epoch {
+                return Err(ports::Error::Conflict);
+            }
             if request.max_rows == 0 || request.max_rows > MAX_ROWS {
                 return Err(ports::Error::Invalid);
             }

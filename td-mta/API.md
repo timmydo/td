@@ -6599,9 +6599,17 @@ transaction cannot revive the old identity. Drop ends the read
 transaction before returning its connection; snapshot loss or failed
 rollback retires the slot.
 
-IndexStore::prune_history accepts HistoryPruneRequest (account, expected
-endpoint, inclusive through sequence, max_rows, deadline). It atomically
-retires complete sequences and deletes a bounded prefix of retired rows.
+IndexStore::prune_history accepts HistoryPruneRequest (account, captured
+store epoch, expected endpoint, inclusive through sequence, max_rows,
+deadline). Under the writer fence and original native scope, it compares
+the captured epoch before row-limit validation, WAL admission or SQL.
+Mismatch returns Rejected(Conflict) without changing the floor/history
+or stopping a healthy writer. Writer/clock refusals retain precedence.
+Capture the epoch with the state used to select retention; do not replace
+a stale epoch with the live one to admit an old plan. A restored copy can
+retain the endpoint but have a different epoch. Matching requests
+atomically retire complete sequences and delete a bounded prefix of
+retired rows.
 HistoryPruned reports the unchanged endpoint, new floor, removed count and
 whether retired rows remain. Repeating the same floor continues cleanup.
 At a nonzero floor, only the completed-sequence cursor (operation u32::MAX)

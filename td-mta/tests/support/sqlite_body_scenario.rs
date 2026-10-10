@@ -291,9 +291,10 @@ fn check_history(mode: Mode, view: &mut crate::store_fs::IndexReadView<'_, '_>) 
         );
     }
 }
-fn prune_request(deadline: Deadline) -> crate::store_fs::HistoryPruneRequest {
+fn prune_request(epoch: StoreEpoch, deadline: Deadline) -> crate::store_fs::HistoryPruneRequest {
     crate::store_fs::HistoryPruneRequest {
         account: ACCOUNT,
+        epoch,
         expected: Sequence::from_u64(2),
         through: Sequence::from_u64(2),
         max_rows: 1,
@@ -796,7 +797,9 @@ fn run_with_roots(
         if mode.prunes_history() {
             drop(fence.take());
             assert_eq!(
-                store.prune_history(prune_request(deadline)).unwrap(),
+                store
+                    .prune_history(prune_request(store.epoch(), deadline))
+                    .unwrap(),
                 crate::store_fs::HistoryPruned {
                     identity: ViewIdentity {
                         account: ACCOUNT,
@@ -1178,7 +1181,9 @@ fn run_with_roots(
                             assert_eq!(store.epoch(), epoch);
                             for removed in [1, 0] {
                                 assert_eq!(
-                                    store.prune_history(prune_request(deadline)).unwrap(),
+                                    store
+                                        .prune_history(prune_request(store.epoch(), deadline))
+                                        .unwrap(),
                                     crate::store_fs::HistoryPruned {
                                         identity: ViewIdentity {
                                             account: ACCOUNT,

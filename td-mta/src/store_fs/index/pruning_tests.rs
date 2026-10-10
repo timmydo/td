@@ -23,9 +23,10 @@ impl Clock for Timer {
 fn deadline() -> Deadline {
     Deadline::after(Tick(0), 100).unwrap()
 }
-fn request(expected: u64, through: u64, max_rows: u32) -> HistoryPruneRequest {
+fn request(epoch: StoreEpoch, expected: u64, through: u64, max_rows: u32) -> HistoryPruneRequest {
     HistoryPruneRequest {
         account: ACCOUNT,
+        epoch,
         expected: Sequence::from_u64(expected),
         through: Sequence::from_u64(through),
         max_rows,
@@ -142,7 +143,9 @@ fn retirement_is_atomic_while_bounded_cleanup_preserves_old_snapshots() {
         .next_change(cursor(0, u32::MAX), ObjectType::Mailbox)
         .unwrap();
     assert!(matches!(first, ChangeStep::Record(_)));
-    let receipt = store.prune_history(request(1, 1, 1)).unwrap();
+    let receipt = store
+        .prune_history(request(store.epoch(), 1, 1, 1))
+        .unwrap();
     assert_eq!(
         receipt,
         HistoryPruned {
@@ -180,11 +183,17 @@ fn retirement_is_atomic_while_bounded_cleanup_preserves_old_snapshots() {
         old.next_change(cursor(0, u32::MAX), ObjectType::Mailbox),
         Ok(first)
     );
-    let receipt = store.prune_history(request(1, 1, 1)).unwrap();
+    let receipt = store
+        .prune_history(request(store.epoch(), 1, 1, 1))
+        .unwrap();
     assert_eq!((receipt.removed, receipt.more), (1, true));
-    let receipt = store.prune_history(request(1, 1, 1)).unwrap();
+    let receipt = store
+        .prune_history(request(store.epoch(), 1, 1, 1))
+        .unwrap();
     assert_eq!((receipt.removed, receipt.more), (1, false));
-    let receipt = store.prune_history(request(1, 1, 1)).unwrap();
+    let receipt = store
+        .prune_history(request(store.epoch(), 1, 1, 1))
+        .unwrap();
     assert_eq!((receipt.removed, receipt.more), (0, false));
     assert_eq!(
         old.next_change(cursor(0, u32::MAX), ObjectType::Mailbox),
@@ -222,7 +231,9 @@ fn retirement_is_atomic_while_bounded_cleanup_preserves_old_snapshots() {
     );
     assert_eq!(count(&store, ACCOUNT), 2);
     assert_eq!(count(&store, OTHER), 2);
-    let receipt = store.prune_history(request(3, 3, 4096)).unwrap();
+    let receipt = store
+        .prune_history(request(store.epoch(), 3, 3, 4096))
+        .unwrap();
     assert_eq!((receipt.removed, receipt.more), (2, false));
     let mut view = store.view(ACCOUNT, deadline()).unwrap();
     assert_eq!(
@@ -276,10 +287,14 @@ fn maximum_batch_uses_a_primary_key_prefix_and_one_lookahead() {
             );
         }
     }
-    let receipt = store.prune_history(request(2, 2, 4096)).unwrap();
+    let receipt = store
+        .prune_history(request(store.epoch(), 2, 2, 4096))
+        .unwrap();
     assert_eq!((receipt.removed, receipt.more), (4096, true));
     assert_eq!(count(&store, ACCOUNT), 1);
-    let receipt = store.prune_history(request(2, 2, 4096)).unwrap();
+    let receipt = store
+        .prune_history(request(store.epoch(), 2, 2, 4096))
+        .unwrap();
     assert_eq!((receipt.removed, receipt.more), (1, false));
 }
 
@@ -298,10 +313,10 @@ fn invalid_or_stale_requests_leave_history_and_counters_unchanged() {
     store.create_account(ACCOUNT, deadline()).unwrap();
     seed(&store, ACCOUNT, 3);
     for (request, error) in [
-        (request(1, 1, 0), ports::Error::Invalid),
-        (request(1, 1, 4097), ports::Error::Invalid),
-        (request(0, 1, 1), ports::Error::Conflict),
-        (request(1, 2, 1), ports::Error::Invalid),
+        (request(store.epoch(), 1, 1, 0), ports::Error::Invalid),
+        (request(store.epoch(), 1, 1, 4097), ports::Error::Invalid),
+        (request(store.epoch(), 0, 1, 1), ports::Error::Conflict),
+        (request(store.epoch(), 1, 2, 1), ports::Error::Invalid),
     ] {
         assert_eq!(
             store.prune_history(request),
@@ -317,21 +332,23 @@ fn invalid_or_stale_requests_leave_history_and_counters_unchanged() {
             Sequence::default()
         );
     }
-    store.prune_history(request(1, 1, 1)).unwrap();
+    store
+        .prune_history(request(store.epoch(), 1, 1, 1))
+        .unwrap();
     assert_eq!(
-        store.prune_history(request(1, 0, 1)),
+        store.prune_history(request(store.epoch(), 1, 0, 1)),
         Err(CommitError::Rejected(ports::Error::Conflict))
     );
     assert_eq!(count(&store, ACCOUNT), 2);
     let fence = store.usage_fence(deadline()).unwrap();
     assert_eq!(
-        store.prune_history(request(1, 1, 1)),
+        store.prune_history(request(store.epoch(), 1, 1, 1)),
         Err(CommitError::Rejected(ports::Error::Busy))
     );
     drop(fence);
     lock(&store.writer).unwrap().stopped = true;
     assert_eq!(
-        store.prune_history(request(1, 1, 1)),
+        store.prune_history(request(store.epoch(), 1, 1, 1)),
         Err(CommitError::Rejected(ports::Error::WriterStopped))
     );
 }
@@ -370,7 +387,7 @@ fn selected_prefix_and_lookahead_require_valid_cursor_metadata() {
                 .unwrap();
         }
         assert_eq!(
-            store.prune_history(request(1, 1, max_rows)),
+            store.prune_history(request(store.epoch(), 1, 1, max_rows)),
             Err(CommitError::Rejected(ports::Error::Corrupt))
         );
         assert_eq!(count(&store, ACCOUNT), 3);
@@ -448,7 +465,7 @@ fn native_failures_roll_back_deletion_and_floor_together() {
                     .unwrap();
             }
             assert_eq!(
-                store.prune_history(request(1, 1, 2)),
+                store.prune_history(request(store.epoch(), 1, 1, 2)),
                 Err(CommitError::Rejected(error))
             );
             assert!(hit.load(Ordering::Relaxed) > 0);
@@ -466,7 +483,13 @@ fn native_failures_roll_back_deletion_and_floor_together() {
                 Sequence::default()
             );
             assert!(!lock(&store.writer).unwrap().stopped);
-            assert_eq!(store.prune_history(request(1, 1, 2)).unwrap().removed, 2);
+            assert_eq!(
+                store
+                    .prune_history(request(store.epoch(), 1, 1, 2))
+                    .unwrap()
+                    .removed,
+                2
+            );
         }
     }
 }
@@ -482,7 +505,7 @@ fn pruning_uses_original_deadline_and_common_commit_outcomes() {
         seed(&store, ACCOUNT, 3);
         clock.0.store(100, Ordering::Relaxed);
         assert_eq!(
-            store.prune_history(request(1, 1, 1)),
+            store.prune_history(request(store.epoch(), 1, 1, 1)),
             Err(CommitError::Rejected(ports::Error::Deadline))
         );
         clock.0.store(1, Ordering::Relaxed);
@@ -503,7 +526,7 @@ fn pruning_uses_original_deadline_and_common_commit_outcomes() {
                 }))
                 .unwrap();
             assert!(matches!(
-                store.prune_history(request(1, 1, 1)),
+                store.prune_history(request(store.epoch(), 1, 1, 1)),
                 Err(CommitError::Indeterminate(_))
             ));
             lock(&lock(&store.writer).unwrap().native.connection)
@@ -521,7 +544,7 @@ fn pruning_uses_original_deadline_and_common_commit_outcomes() {
                 Sequence::default()
             );
             assert_eq!(
-                store.prune_history(request(1, 1, 1)),
+                store.prune_history(request(store.epoch(), 1, 1, 1)),
                 Err(CommitError::Rejected(ports::Error::WriterStopped))
             );
         } else {
@@ -533,7 +556,9 @@ fn pruning_uses_original_deadline_and_common_commit_outcomes() {
                     false
                 }))
                 .unwrap();
-            let receipt = store.prune_history(request(1, 1, 1)).unwrap();
+            let receipt = store
+                .prune_history(request(store.epoch(), 1, 1, 1))
+                .unwrap();
             assert_eq!((receipt.removed, receipt.more), (1, true));
             assert_eq!(clock.0.load(Ordering::Relaxed), 100);
             clock.0.store(1, Ordering::Relaxed);
@@ -572,7 +597,9 @@ fn partway_cursor_cannot_resume_in_a_retired_floor_sequence() {
         panic!("missing initial record")
     };
     assert_eq!(first.cursor, cursor(1, 0));
-    store.prune_history(request(1, 1, 1)).unwrap();
+    store
+        .prune_history(request(store.epoch(), 1, 1, 1))
+        .unwrap();
     let mut new = store.view(ACCOUNT, deadline()).unwrap();
     let resumed = new.next_change(first.cursor, ObjectType::Mailbox);
     let later = old.next_change(first.cursor, ObjectType::Mailbox).unwrap();
@@ -598,7 +625,9 @@ fn advancing_floor_reclaims_old_leftovers_before_newly_retired_rows() {
     .unwrap();
     store.create_account(ACCOUNT, deadline()).unwrap();
     seed(&store, ACCOUNT, 3);
-    let receipt = store.prune_history(request(1, 1, 1)).unwrap();
+    let receipt = store
+        .prune_history(request(store.epoch(), 1, 1, 1))
+        .unwrap();
     assert_eq!((receipt.removed, receipt.more), (1, true));
     mailbox_commit(&store, 1, true);
     mailbox_commit(&store, 2, false);
@@ -607,7 +636,9 @@ fn advancing_floor_reclaims_old_leftovers_before_newly_retired_rows() {
         .next_change(cursor(1, u32::MAX), ObjectType::Mailbox)
         .unwrap();
     assert!(matches!(before, ChangeStep::Record(record) if record.cursor == cursor(2, 1)));
-    let receipt = store.prune_history(request(3, 3, 2)).unwrap();
+    let receipt = store
+        .prune_history(request(store.epoch(), 3, 3, 2))
+        .unwrap();
     assert_eq!((receipt.removed, receipt.more), (2, true));
     assert_eq!(receipt.identity.history_floor, Sequence::from_u64(3));
     assert_eq!(receipt.identity.committed_sequence, Sequence::from_u64(3));
@@ -628,7 +659,9 @@ fn advancing_floor_reclaims_old_leftovers_before_newly_retired_rows() {
             vec![2u64.to_be_bytes().to_vec(), 3u64.to_be_bytes().to_vec()]
         );
     }
-    let receipt = store.prune_history(request(3, 3, 2)).unwrap();
+    let receipt = store
+        .prune_history(request(store.epoch(), 3, 3, 2))
+        .unwrap();
     assert_eq!((receipt.removed, receipt.more), (2, false));
     assert_eq!(count(&store, ACCOUNT), 0);
     assert_eq!(
@@ -658,7 +691,7 @@ fn pruning_requires_an_existing_account_and_wal_headroom() {
     )
     .unwrap();
     assert_eq!(
-        store.prune_history(request(0, 0, 1)),
+        store.prune_history(request(store.epoch(), 0, 0, 1)),
         Err(CommitError::Rejected(ports::Error::NotFound))
     );
     assert_eq!(count(&store, ACCOUNT), 0);
@@ -669,7 +702,7 @@ fn pruning_requires_an_existing_account_and_wal_headroom() {
     let original = wal.metadata().unwrap().len();
     wal.set_len(MAX_WAL_BYTES - TRANSACTION_WAL_BYTES + 1)
         .unwrap();
-    let refused = store.prune_history(request(1, 1, 1));
+    let refused = store.prune_history(request(store.epoch(), 1, 1, 1));
     wal.set_len(original).unwrap();
     assert_eq!(refused, Err(CommitError::Rejected(ports::Error::Busy)));
     assert_eq!(count(&store, ACCOUNT), 3);
@@ -681,7 +714,13 @@ fn pruning_requires_an_existing_account_and_wal_headroom() {
             .history_floor,
         Sequence::default()
     );
-    assert_eq!(store.prune_history(request(1, 1, 1)).unwrap().removed, 1);
+    assert_eq!(
+        store
+            .prune_history(request(store.epoch(), 1, 1, 1))
+            .unwrap()
+            .removed,
+        1
+    );
 }
 
 #[test]
@@ -825,7 +864,9 @@ fn pruned_reader_scenario(scenario: PrunedScenario) {
             assert_eq!(input.read(&mut scratch).unwrap(), scratch.len());
             assert_eq!(scratch.as_slice(), &body[..65536]);
         }
-        let first = store.prune_history(request(2, 2, 1)).unwrap();
+        let first = store
+            .prune_history(request(store.epoch(), 2, 2, 1))
+            .unwrap();
         assert_eq!(
             first,
             HistoryPruned {
@@ -835,7 +876,9 @@ fn pruned_reader_scenario(scenario: PrunedScenario) {
             }
         );
         if !copy_pending {
-            let second = store.prune_history(request(2, 2, 1)).unwrap();
+            let second = store
+                .prune_history(request(store.epoch(), 2, 2, 1))
+                .unwrap();
             assert_eq!(
                 second,
                 HistoryPruned {
@@ -845,7 +888,9 @@ fn pruned_reader_scenario(scenario: PrunedScenario) {
                 }
             );
             assert_eq!(
-                store.prune_history(request(2, 2, 1)).unwrap(),
+                store
+                    .prune_history(request(store.epoch(), 2, 2, 1))
+                    .unwrap(),
                 HistoryPruned {
                     identity: current_identity,
                     removed: 0,
@@ -1075,7 +1120,9 @@ fn pruned_reader_scenario(scenario: PrunedScenario) {
                 ));
                 assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
                 assert_eq!(
-                    store.prune_history(request(2, 2, 1)).unwrap(),
+                    store
+                        .prune_history(request(store.epoch(), 2, 2, 1))
+                        .unwrap(),
                     HistoryPruned {
                         identity: ViewIdentity {
                             epoch,
@@ -1086,7 +1133,9 @@ fn pruned_reader_scenario(scenario: PrunedScenario) {
                     }
                 );
                 assert_eq!(
-                    store.prune_history(request(2, 2, 1)).unwrap(),
+                    store
+                        .prune_history(request(store.epoch(), 2, 2, 1))
+                        .unwrap(),
                     HistoryPruned {
                         identity: ViewIdentity {
                             epoch,
@@ -1217,7 +1266,9 @@ fn shared_account_cleanup(partial_inputs: bool) {
         history_floor: Sequence::from_u64(if account == ACCOUNT { 2 } else { 0 }),
     };
     assert_eq!(
-        store.prune_history(request(2, 2, 1)).unwrap(),
+        store
+            .prune_history(request(store.epoch(), 2, 2, 1))
+            .unwrap(),
         HistoryPruned {
             identity: identity(ACCOUNT, EPOCH),
             removed: 1,
@@ -1349,7 +1400,9 @@ fn shared_account_cleanup(partial_inputs: bool) {
                 assert_eq!(store.checkpoint(deadline()), Err(ports::Error::Busy));
                 for removed in [1, 0] {
                     assert_eq!(
-                        store.prune_history(request(2, 2, 1)).unwrap(),
+                        store
+                            .prune_history(request(store.epoch(), 2, 2, 1))
+                            .unwrap(),
                         HistoryPruned {
                             identity: identity(ACCOUNT, epoch),
                             removed,

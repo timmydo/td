@@ -237,6 +237,116 @@ fn typed_commit_refuses_a_pre_restore_epoch_before_reading_a_body() {
 fn encoded_commit_refuses_a_pre_restore_epoch_before_reading_a_body() {
     stale_epoch_commit(true);
 }
+
+#[test]
+fn pruning_refuses_a_pre_restore_epoch_without_retiring_copied_history() {
+    let source = Fixture::new();
+    let destination = Fixture::new();
+    let mut source_root = source.locked();
+    let mut destination_root = destination.locked();
+    let store = IndexStore::create(&mut source_root, EPOCH, clock(), 2, deadline()).unwrap();
+    seed(&store);
+    let captured = store.view(ACCOUNT, deadline()).unwrap().identity();
+    let stale = HistoryPruneRequest {
+        account: captured.account,
+        epoch: captured.epoch,
+        expected: captured.committed_sequence,
+        through: captured.committed_sequence,
+        max_rows: 1,
+        deadline: deadline(),
+    };
+    store
+        .backup(&mut destination_root, deadline(), &mut [0; 65536])
+        .unwrap();
+    let copied = IndexStore::open(&mut destination_root, clock(), 2, deadline()).unwrap();
+    let copied = copied
+        .renew_epoch(&mut Entropy::fresh(), deadline())
+        .unwrap();
+    drop(copied);
+    let copied = IndexStore::open(&mut destination_root, clock(), 2, deadline()).unwrap();
+    inspect(&copied, FRESH);
+    let current = copied.view(ACCOUNT, deadline()).unwrap().identity();
+    assert_eq!(current.committed_sequence, stale.expected);
+    assert_ne!(current.epoch, stale.epoch);
+    assert_eq!(
+        copied.prune_history(stale),
+        Err(CommitError::Rejected(ports::Error::Conflict))
+    );
+    inspect(&copied, FRESH);
+    let active = HistoryPruneRequest {
+        epoch: current.epoch,
+        ..stale
+    };
+    assert_eq!(
+        copied.prune_history(HistoryPruneRequest {
+            expected: Sequence::from_u64(1),
+            through: Sequence::from_u64(1),
+            ..active
+        }),
+        Err(CommitError::Rejected(ports::Error::Conflict))
+    );
+    inspect(&copied, FRESH);
+    let pruned = ViewIdentity {
+        history_floor: stale.through,
+        ..current
+    };
+    assert_eq!(
+        copied.prune_history(active).unwrap(),
+        HistoryPruned {
+            identity: pruned,
+            removed: 1,
+            more: false
+        }
+    );
+    assert_eq!(
+        copied.prune_history(active).unwrap(),
+        HistoryPruned {
+            identity: pruned,
+            removed: 0,
+            more: false
+        }
+    );
+    copied.checkpoint(deadline()).unwrap();
+    drop(copied);
+    let copied = IndexStore::open(&mut destination_root, clock(), 2, deadline()).unwrap();
+    copied.validate_integrity(deadline()).unwrap();
+    let mut view = copied.view(ACCOUNT, deadline()).unwrap();
+    assert_eq!(view.identity(), pruned);
+    let mut bytes = [0; 128];
+    assert_eq!(
+        view.get(Key::Mailbox(MAILBOX), &mut bytes).unwrap(),
+        Some((mailbox("current"), captured.committed_sequence))
+    );
+    assert_eq!(
+        view.next_change(
+            ChangeCursor {
+                sequence: captured.history_floor,
+                operation: u32::MAX
+            },
+            ObjectType::Mailbox
+        ),
+        Err(ports::Error::HistoryLost)
+    );
+    assert_eq!(
+        view.next_change(
+            ChangeCursor {
+                sequence: stale.through,
+                operation: u32::MAX
+            },
+            ObjectType::Mailbox
+        )
+        .unwrap(),
+        ChangeStep::Complete
+    );
+    let mut body = view
+        .open_blob_input(&td_crypto::Provider, BODY, RAW.len() as u64)
+        .unwrap();
+    assert_eq!(body.read(&mut bytes).unwrap(), RAW.len());
+    assert_eq!(&bytes[..RAW.len()], RAW);
+    body.finish().unwrap();
+    let original = IndexStore::open(&mut source_root, clock(), 2, deadline()).unwrap();
+    inspect(&original, EPOCH);
+}
 fn mailbox(name: &str) -> Row<'_> {
     Row::Mailbox(MailboxRow {
         name,
@@ -310,6 +420,7 @@ fn seed(store: &IndexStore<'_>) {
     store
         .prune_history(HistoryPruneRequest {
             account: ACCOUNT,
+            epoch: store.epoch(),
             expected: Sequence::from_u64(2),
             through: Sequence::from_u64(1),
             max_rows: 4096,
