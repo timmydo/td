@@ -356,6 +356,16 @@ pub fn recipe() -> Recipe {
             "{src}/td-firstboot/src/hostname.rs",
             include_str!("../../../td-firstboot/src/hostname.rs"),
         ),
+        // The cutover record the paired desktop guests provision.
+        (
+            "{src}/td-firstboot/src/cutover.rs",
+            include_str!("../../../td-firstboot/src/cutover.rs"),
+        ),
+        // The login directory the TPM desktop guests ensure.
+        (
+            "{src}/td-firstboot/src/login_directory.rs",
+            include_str!("../../../td-firstboot/src/login_directory.rs"),
+        ),
         (
             "{src}/engine/src/principals.rs",
             include_str!("../../../engine/src/principals.rs"),

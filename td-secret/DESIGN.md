@@ -2684,7 +2684,25 @@ worker's own `operate`, root simulated and both retained deployments
 reading this build's version, as `login-enroll-one` does. The pair is
 the fido-desktop guest's (`Pair`, `Keyboard` and `Process` from
 `fido_device`'s desktop module), without its TPM measurement, store or
-portal.
+portal. The desktop guests have no stage 1 and provision what it would
+leave: the login directory and the cutover record. The TPM desktop
+guests (`fido-desktop` and the `fido-cold-*` guests) ensure the
+unenrolled login directory through firstboot's own `login_directory.rs`,
+root's with mode 0700, before their first pair, since without one the
+paired session starts locked on a damaged directory; this guest makes
+it as the worker guests do. Every pair, the TPM desktop guests' included,
+starts with the record stage 1's `render-primary-sshd` would publish:
+before each generation `Pair::start` publishes the cutover record
+(td-authd/DESIGN.md amendment 7) through firstboot's own
+`cutover.rs`, root's and mode 0600, naming for this boot the reduced
+state the shared predicate reads, enforced for a record or a damaged
+directory and unenrolled otherwise. td-authd's first check after
+Prepare then settles; without it, it would cut over through the td-svc
+the guest lacks and end the generation. After each generation the
+guest requires that record unchanged, naming the state that generation
+expected, and no cutover in td-authd's log. Since each generation is
+provisioned afresh, the guest exercises no change of state between
+generations within one boot; `qemu-login-system` does.
 
 The host checks the display. The guest writes `TD-LOGIN-SCREEN NAME
 [ARGUMENT...]` to `/dev/console` and waits on ttyS0, read without

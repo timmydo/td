@@ -1516,12 +1516,37 @@ pub(crate) mod vm_tests {
             }
         }
 
+        /// What stage 1's `render-primary-sshd` leaves and this diskless
+        /// guest has no stage 1 to write: the cutover record naming, for
+        /// this boot, the reduced state the shared predicate reads
+        /// (td-authd/DESIGN.md amendment 7). The paired td-authd's first
+        /// check after Prepare then settles; a mismatch would cut over
+        /// through the td-svc this guest lacks and end the generation.
+        fn provision_cutover() {
+            use crate::cutover::{self, BootId, Reduced};
+            let reduced = match crate::login_state::state(Path::new("/"), 1000) {
+                crate::login_state::State::Unenrolled => Reduced::Unenrolled,
+                crate::login_state::State::Enrolled | crate::login_state::State::Unavailable(_) => {
+                    Reduced::Enforced
+                }
+            };
+            let boot = BootId::read(Path::new(cutover::BOOT_ID)).unwrap();
+            cutover::publish(
+                &Path::new("/").join(cutover::RECORD),
+                cutover::record(&boot, reduced).as_bytes(),
+                0,
+                0,
+            )
+            .unwrap();
+        }
+
         pub(crate) struct Pair {
             compositor: Process,
             authority: Process,
         }
         impl Pair {
             pub(crate) fn start() -> Self {
+                provision_cutover();
                 let (root, peer) = UnixStream::pair().unwrap();
                 let mut command = Command::new("/bin/td-authd");
                 command
@@ -1617,6 +1642,10 @@ pub(crate) mod vm_tests {
             } else {
                 prepare_operation_store();
             }
+            // Stage 1's unenrolled login directory, through firstboot's own
+            // ensure: absent, the paired session would start locked on a
+            // damaged directory.
+            crate::login_directory::ensure(Path::new("/")).unwrap();
             fs::write(
                 "/etc/td-bus-applications.tsv",
                 "td-bus-applications-v1\t1000\n65537\tmail\t\n",

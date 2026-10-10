@@ -203,6 +203,18 @@ fn parse_uid(value: &str) -> Result<u32, String> {
 #[allow(dead_code, reason = "PTY allocation for PIN terminal fixtures only")]
 mod terminal_fixture_sys;
 
+// The cutover record stage 1 leaves (td-authd/DESIGN.md amendment 7),
+// which the paired desktop guests provision before each generation.
+#[cfg(test)]
+#[path = "../../td-firstboot/src/cutover.rs"]
+mod cutover;
+
+// Firstboot's login directory, which the TPM desktop guests ensure as
+// stage 1 does.
+#[cfg(test)]
+#[path = "../../td-firstboot/src/login_directory.rs"]
+mod login_directory;
+
 // td-fido's test-only authenticator side (td-fido/DESIGN.md, "Test
 // support"): the virtual authenticator and the transcript fixtures, over a
 // test copy of its P-256 that can sign. `fido_uhid` presents a virtual key

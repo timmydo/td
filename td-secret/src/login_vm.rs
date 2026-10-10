@@ -1445,6 +1445,19 @@ fn settled() -> Pair {
     pair
 }
 
+/// The generation just ended found the cutover record `Pair::start`
+/// provisioned, as stage 1 would, naming `reduced` for this boot, and
+/// began no cutover, whose first step removes it.
+fn uncut(reduced: crate::cutover::Reduced) {
+    let boot = crate::cutover::BootId::read(Path::new(crate::cutover::BOOT_ID)).unwrap();
+    let log = fs::read_to_string("/run/desktop-authd.log").unwrap();
+    assert!(!log.contains("cutting over"), "{log}");
+    assert_eq!(
+        fs::read_to_string(Path::new("/").join(crate::cutover::RECORD)).unwrap(),
+        crate::cutover::record(&boot, reduced)
+    );
+}
+
 #[test]
 #[ignore = "requires qemu-secret with a disposable guest, UHID and the paired desktop"]
 fn qemu_login_desktop_starts_every_generation_locked_and_unlocks_with_the_key() {
@@ -1533,6 +1546,7 @@ fn qemu_login_desktop_starts_every_generation_locked_and_unlocks_with_the_key() 
     assert!(reaped(pair.authority()) > before);
     pair.disconnect();
     drop(client);
+    uncut(crate::cutover::Reduced::Enforced);
     // The unlock's identify and assertion sessions.
     assert_eq!(plugged.remove().channels, 2);
 
@@ -1542,6 +1556,7 @@ fn qemu_login_desktop_starts_every_generation_locked_and_unlocks_with_the_key() 
     let pair = settled();
     host.screen("locked", &[]);
     pair.disconnect();
+    uncut(crate::cutover::Reduced::Enforced);
 
     // A damaged directory: locked with its cause, and the chord shows the
     // cause and sends no unlock, so td-authd starts no worker.
@@ -1561,6 +1576,7 @@ fn qemu_login_desktop_starts_every_generation_locked_and_unlocks_with_the_key() 
     std::thread::sleep(Duration::from_secs(1));
     assert_eq!(idle(pair.authority()), before);
     pair.disconnect();
+    uncut(crate::cutover::Reduced::Enforced);
     fs::set_permissions(directory(), Permissions::from_mode(0o700)).unwrap();
 
     // Unenrolled, the record removed through the worker: unlocked from the
@@ -1577,6 +1593,7 @@ fn qemu_login_desktop_starts_every_generation_locked_and_unlocks_with_the_key() 
     let pair = Pair::start();
     host.screen("desktop", &[]);
     pair.disconnect();
+    uncut(crate::cutover::Reduced::Unenrolled);
     finish();
 }
 
