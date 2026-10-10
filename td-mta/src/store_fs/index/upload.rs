@@ -74,15 +74,16 @@ pub struct UploadRequest {
     pub deadline: Deadline,
 }
 
-pub struct UploadCoordinator<'r, 'a, P> {
+pub struct StoreCoordinator<'r, 'a, P> {
     store: IndexStore<'r>,
     ledger: Leases<'a>,
     authorization: P,
+    work: crate::admission::WorkLimits,
     active: bool,
     stopped: bool,
     recoverable_files: bool,
 }
-impl<'r, 'a, P: UploadAuthorization> UploadCoordinator<'r, 'a, P> {
+impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
     /// Cold initialization requires quiescent auxiliary owners and settled effects.
     pub fn new(
         store: IndexStore<'r>,
@@ -104,6 +105,7 @@ impl<'r, 'a, P: UploadAuthorization> UploadCoordinator<'r, 'a, P> {
             store,
             ledger,
             authorization,
+            work: *plan.work(),
             active: false,
             stopped: false,
             recoverable_files: false,
@@ -115,6 +117,8 @@ impl<'r, 'a, P: UploadAuthorization> UploadCoordinator<'r, 'a, P> {
     pub fn used(&self, kind: Kind) -> Result<u64, logical::Error> {
         self.ledger.used(kind)
     }
+}
+impl<'r, 'a, P: UploadAuthorization> StoreCoordinator<'r, 'a, P> {
     pub fn reserve<'c, 's, C: Crypto>(
         &'c mut self,
         crypto: &'c C,
@@ -228,7 +232,7 @@ enum Stage<'s, 'r, D: Digest> {
     Finished,
 }
 pub struct Upload<'c, 's, 'r, 'a, C: Crypto, P> {
-    coordinator: &'c mut UploadCoordinator<'r, 'a, P>,
+    coordinator: &'c mut StoreCoordinator<'r, 'a, P>,
     crypto: &'c C,
     stage: Stage<'s, 'r, C::Sha256>,
     lease: Option<LeaseId>,
@@ -418,34 +422,15 @@ impl<C: Crypto, P: UploadAuthorization> Upload<'_, '_, '_, '_, C, P> {
         ];
         let planned = [self.length, 1, self.length, 0];
         let lease = self.lease.ok_or(ports::Error::Invalid)?;
-        let logical_part = self.coordinator.ledger.part(lease, 0)?;
-        let (physical_lease, mut physical_ticket) = reserve_physical(
+        let mut effects = begin_publication(
             &mut self.coordinator.ledger,
             &mut self.coordinator.stopped,
             &mut self.coordinator.recoverable_files,
+            lease,
+            planned,
             self.deadline,
             time.monotonic,
         )?;
-        let mut logical_ticket =
-            match self
-                .coordinator
-                .ledger
-                .begin_effect(logical_part, planned, time.monotonic)
-            {
-                Ok(ticket) => ticket,
-                Err(error) => {
-                    if self
-                        .coordinator
-                        .ledger
-                        .complete_effect(&mut physical_ticket, EffectResult::Proven([0; 4]))
-                        .is_err()
-                        || self.coordinator.ledger.cancel(physical_lease).is_err()
-                    {
-                        self.coordinator.stopped = true;
-                    }
-                    return Err(error.into());
-                }
-            };
         let completion = self.coordinator.store.commit_with_files(
             self.crypto,
             CommitRequest {
@@ -462,36 +447,14 @@ impl<C: Crypto, P: UploadAuthorization> Upload<'_, '_, '_, '_, C, P> {
             }],
         );
         drop(guard);
-        let physical_settled = settle_physical(
-            &mut self.coordinator.ledger,
-            &mut physical_ticket,
-            completion.files(),
-        );
-        if !physical_settled || matches!(completion.files(), CommitFileUsage::Unavailable(_)) {
-            self.coordinator.stopped = true;
-        }
-        let physical_canceled = self.coordinator.ledger.cancel(physical_lease).is_ok();
-        if !physical_canceled {
-            self.coordinator.stopped = true;
-        }
         let outcome = completion.outcome();
-        let effect = match outcome {
-            Ok(_) => EffectResult::Proven(planned),
-            Err(CommitError::Rejected(_)) => EffectResult::Proven([0; 4]),
-            Err(CommitError::Indeterminate(_)) => {
-                self.coordinator.stopped = true;
-                EffectResult::Uncertain
-            }
-        };
-        let logical_settled = self
-            .coordinator
-            .ledger
-            .complete_effect(&mut logical_ticket, effect)
-            .is_ok();
-        if !logical_settled {
-            self.coordinator.stopped = true;
-        }
-        self.coordinator.stopped |= completion.writer_stopped();
+        let recoverable = settle_publication(
+            &mut self.coordinator.ledger,
+            &mut self.coordinator.stopped,
+            &mut effects,
+            planned,
+            &completion,
+        );
         if completion.is_sequence_conflict() && !self.coordinator.stopped && !self.replanned {
             self.replan_allowed = true;
             return Ok(UploadAttempt::SequenceConflict);
@@ -500,14 +463,7 @@ impl<C: Crypto, P: UploadAuthorization> Upload<'_, '_, '_, '_, C, P> {
         if !logical_canceled {
             self.coordinator.stopped = true;
         }
-        self.coordinator.recoverable_files =
-            matches!(completion.files(), CommitFileUsage::Unavailable(_))
-                && physical_settled
-                && physical_canceled
-                && logical_settled
-                && logical_canceled
-                && !completion.writer_stopped()
-                && !matches!(outcome, Err(CommitError::Indeterminate(_)));
+        self.coordinator.recoverable_files = recoverable && logical_canceled;
         self.lease = None;
         let cleanup_error =
             discard_stage(std::mem::replace(&mut self.stage, Stage::Finished)).err();
@@ -615,7 +571,7 @@ fn reserve_physical(
     };
     Ok((lease, ticket))
 }
-impl<P> UploadCoordinator<'_, '_, P> {
+impl<P> StoreCoordinator<'_, '_, P> {
     /// Run after the upload job has finished. Unknown commits require reopen.
     pub fn checkpoint(&mut self, deadline: Deadline) -> Result<UploadMaintenance, UploadError> {
         if self.active {
@@ -710,3 +666,79 @@ mod tests;
 #[path = "upload_cleanup.rs"]
 mod cleanup;
 pub use cleanup::{UploadCleanup, UploadSweepDisposition};
+
+#[path = "delivery.rs"]
+mod delivery;
+pub use delivery::{
+    smtp_trace_allowance, Delivery, DeliveryAuthorization, DeliveryCompletion, DeliveryError,
+    DeliveryGuard, DeliveryPeer, DeliveryRequest,
+};
+
+struct PublicationEffects {
+    logical: logical::EffectTicket,
+    physical: logical::EffectTicket,
+    physical_lease: LeaseId,
+}
+fn begin_publication(
+    ledger: &mut Leases<'_>,
+    stopped: &mut bool,
+    recoverable_files: &mut bool,
+    lease: LeaseId,
+    planned: [u64; 4],
+    deadline: Deadline,
+    now: Tick,
+) -> Result<PublicationEffects, UploadError> {
+    let part = ledger.part(lease, 0)?;
+    let (physical_lease, mut physical) =
+        reserve_physical(ledger, stopped, recoverable_files, deadline, now)?;
+    let logical = match ledger.begin_effect(part, planned, now) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            if ledger
+                .complete_effect(&mut physical, EffectResult::Proven([0; 4]))
+                .is_err()
+                || ledger.cancel(physical_lease).is_err()
+            {
+                *stopped = true;
+            }
+            return Err(error.into());
+        }
+    };
+    Ok(PublicationEffects {
+        logical,
+        physical,
+        physical_lease,
+    })
+}
+// Return whether a known durable outcome can recover solely by observing files.
+// The caller must also successfully retire its logical reservation.
+fn settle_publication(
+    ledger: &mut Leases<'_>,
+    stopped: &mut bool,
+    effects: &mut PublicationEffects,
+    planned: [u64; 4],
+    completion: &CommitCompletion,
+) -> bool {
+    let physical_settled = settle_physical(ledger, &mut effects.physical, completion.files());
+    let physical_canceled = ledger.cancel(effects.physical_lease).is_ok();
+    let uncertain = matches!(completion.outcome(), Err(CommitError::Indeterminate(_)));
+    let effect = match completion.outcome() {
+        Ok(_) => EffectResult::Proven(planned),
+        Err(CommitError::Rejected(_)) => EffectResult::Proven([0; 4]),
+        Err(CommitError::Indeterminate(_)) => EffectResult::Uncertain,
+    };
+    let logical_settled = ledger.complete_effect(&mut effects.logical, effect).is_ok();
+    let unavailable = matches!(completion.files(), CommitFileUsage::Unavailable(_));
+    *stopped |= !physical_settled
+        || !physical_canceled
+        || !logical_settled
+        || uncertain
+        || unavailable
+        || completion.writer_stopped();
+    unavailable
+        && physical_settled
+        && physical_canceled
+        && logical_settled
+        && !uncertain
+        && !completion.writer_stopped()
+}

@@ -45,6 +45,10 @@ use recipient_sweep as measured_recipient_sweep;
 #[path = "../src/reference_sweep.rs"]
 #[allow(unused)]
 mod measured_reference_sweep;
+pub use td_mta::smtp_wire;
+#[path = "../src/smtp_session.rs"]
+#[allow(unused)] // Keep the receiving context with the recompiled storage core.
+mod smtp_session;
 #[path = "../src/store_fs.rs"]
 #[allow(unused)] // Second compilation; the library build remains the lint authority.
 pub mod store_fs;

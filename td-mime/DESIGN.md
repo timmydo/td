@@ -49,3 +49,9 @@ response adapters use the separate flat mime_response module. Its sibling
 adapters can access internal owner fields for composition; external
 callers cannot construct those owners or extract their admission handles.
 The shared crate owns no storage format, database index or transaction.
+
+The raw MessageIds cursor exposes its consumed source offset so an enclosing
+owner can retain an identifier's bracketed extent at Begin/End. The extent
+is passive and provisional until the complete field validates. Replaying a
+selected extent still uses the original source and live work meter; no copy
+of parser progress duplicates source custody or admission.

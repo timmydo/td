@@ -592,6 +592,12 @@ mod recipient_sweep;
 #[path = "support/sqlite_body_scenario.rs"]
 mod sqlite_body_scenario;
 #[cfg(td_native_alloc_probe)]
+pub use td_mta::smtp_wire;
+#[cfg(td_native_alloc_probe)]
+#[path = "../src/smtp_session.rs"]
+#[allow(unused)] // Keep the receiving context with the recompiled storage core.
+mod smtp_session;
+#[cfg(td_native_alloc_probe)]
 #[path = "../src/store_fs.rs"]
 #[allow(unused)]
 pub mod store_fs;

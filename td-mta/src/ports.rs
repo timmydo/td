@@ -587,6 +587,7 @@ mod crypto_boundary_tests {
             dependencies,
             [
                 r#"rusqlite = { version = "=0.40.2", default-features = false, features = ["blob", "bundled", "hooks", "limits"] }"#,
+                r#"td-civil = { path = "../td-civil" }"#,
                 r#"td-crypto = { path = "../td-crypto" }"#,
                 r#"td-header = { path = "../td-header" }"#,
                 r#"td-json = { path = "../td-json" }"#,

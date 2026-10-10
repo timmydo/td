@@ -66,9 +66,9 @@ checkout's root `.cargo/config.toml` is required. Ancestor
 `.cargo/config.toml` files are accepted only when each matches that same
 compiled pin, allowing nested worktrees to use their own runner. Legacy
 `.cargo/config` files remain refused at every level. Automatic build.rs
-files are refused for all six local source packages: td-crypto,
-td-header, td-json, td-mime, td-nfc and td-mta. Their exact manifests and locks are
-pinned; td-header, td-json, td-mime and td-nfc remain ordinary std-only roster
+files are refused for all seven local source packages: td-civil,
+td-crypto, td-header, td-json, td-mime, td-nfc and td-mta. Their exact manifests and locks are
+pinned; td-civil, td-header, td-json, td-mime and td-nfc remain std-only roster
 crates. The Cargo config pin contains only target runner settings, for
 which Cargo selects the deepest definition. Any future pin change must
 recheck ancestor merging and relative path behavior; identical files with

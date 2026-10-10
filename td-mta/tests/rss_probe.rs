@@ -194,6 +194,10 @@ mod recipient_sweep;
 mod sqlite_body_scenario;
 #[path = "support/sqlite_stack_scenario.rs"]
 mod sqlite_stack_scenario;
+pub use td_mta::smtp_wire;
+#[path = "../src/smtp_session.rs"]
+#[allow(unused)] // Keep the receiving context with the recompiled storage core.
+mod smtp_session;
 #[path = "../src/store_fs.rs"]
 #[allow(unused)]
 pub mod store_fs;

@@ -10,11 +10,13 @@ use std::{
 #[path = "store_fs/index.rs"]
 mod index;
 pub use index::{
-    AuxiliaryUsage, BackupError, BackupReceipt, BlobSource, CommitCompletion, CommitError,
-    CommitFileUsage, CommitRequest, HistoryPruneRequest, HistoryPruned, IndexReadView, IndexStore,
-    LedgerInitError, LogicalUsage, StoreFileUsage, StoreLogicalUsage, Upload, UploadAttempt,
-    UploadAuthorization, UploadCleanup, UploadCompletion, UploadCoordinator, UploadError,
-    UploadGuard, UploadMaintenance, UploadRequest, UploadSweepDisposition, UsageFence,
+    smtp_trace_allowance, AuxiliaryUsage, BackupError, BackupReceipt, BlobSource, CommitCompletion,
+    CommitError, CommitFileUsage, CommitRequest, Delivery, DeliveryAuthorization,
+    DeliveryCompletion, DeliveryError, DeliveryGuard, DeliveryPeer, DeliveryRequest,
+    HistoryPruneRequest, HistoryPruned, IndexReadView, IndexStore, LedgerInitError, LogicalUsage,
+    StoreCoordinator, StoreFileUsage, StoreLogicalUsage, Upload, UploadAttempt,
+    UploadAuthorization, UploadCleanup, UploadCompletion, UploadError, UploadGuard,
+    UploadMaintenance, UploadRequest, UploadSweepDisposition, UsageFence,
 };
 #[path = "store_fs/body_verify.rs"]
 mod body_verify;

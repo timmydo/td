@@ -127,7 +127,7 @@ fn seed_at(store: &IndexStore<'_>, account: AccountId, id: BlobId, expires_at: i
 }
 fn fixture(
     run: impl for<'r, 'a, 's> FnOnce(
-        &mut UploadCoordinator<'r, 'a, Policy>,
+        &mut StoreCoordinator<'r, 'a, Policy>,
         &'s IngressSpool<'r>,
         &Arc<Timer>,
         &Arc<Mutex<PolicyState>>,
@@ -139,7 +139,7 @@ fn fixture(
 fn fixture_cells(
     count: usize,
     run: impl for<'r, 'a, 's> FnOnce(
-        &mut UploadCoordinator<'r, 'a, Policy>,
+        &mut StoreCoordinator<'r, 'a, Policy>,
         &'s IngressSpool<'r>,
         &Arc<Timer>,
         &Arc<Mutex<PolicyState>>,
@@ -153,7 +153,7 @@ fn fixture_config(
     expires_at: i64,
     setup: impl FnOnce(&IndexStore<'_>),
     run: impl for<'r, 'a, 's> FnOnce(
-        &mut UploadCoordinator<'r, 'a, Policy>,
+        &mut StoreCoordinator<'r, 'a, Policy>,
         &'s IngressSpool<'r>,
         &Arc<Timer>,
         &Arc<Mutex<PolicyState>>,
@@ -206,7 +206,7 @@ fn fixture_config(
         generation: 1,
         device: DEVICE,
     }));
-    let coordinator = UploadCoordinator::new(
+    let coordinator = StoreCoordinator::new(
         store,
         &plan,
         AuxiliaryUsage {
@@ -1351,7 +1351,7 @@ fn rejected_upload_retirement_keeps_rows_and_logical_charges() {
     );
 }
 
-fn assert_recount(coordinator: &UploadCoordinator<'_, '_, Policy>) {
+fn assert_recount(coordinator: &StoreCoordinator<'_, '_, Policy>) {
     let usage = coordinator.store.usage_fence(deadline()).unwrap().usage();
     for (kind, amount) in [
         (Kind::BodyBytes, usage.body_bytes),

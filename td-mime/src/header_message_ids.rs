@@ -150,6 +150,12 @@ impl<'a> Cursor<'a> {
         (self.purpose == Purpose::RouteDomain && matches!(self.phase, Phase::Complete))
             .then_some(self.position)
     }
+    /// Passive consumed-source offset. Immediately after Begin it follows '<';
+    /// immediately after End it follows '>'. These ranges remain provisional
+    /// until Complete validates the whole field; this grants no source custody.
+    pub const fn source_position(&self) -> usize {
+        self.position
+    }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
         self.poll_with_work(now, work)
     }
@@ -502,6 +508,32 @@ mod tests {
             }
         }
         panic!("message-id list did not finish");
+    }
+    #[test]
+    fn event_positions_retain_bracketed_identifiers_with_internal_cfws() {
+        let source = b"old phrase < (left) a @ b > (between) <c@[d]>";
+        let mut cursor = Cursor::new(source, Mode::ObsoletePhrases);
+        let mut meter = work();
+        let mut start = None;
+        let mut ranges = Vec::new();
+        loop {
+            match cursor.poll(Tick(1), &mut meter).unwrap() {
+                Status::Begin => start = Some(cursor.source_position() - 1),
+                Status::End => {
+                    ranges.push(&source[start.take().unwrap()..cursor.source_position()])
+                }
+                Status::Complete => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            ranges,
+            [b"< (left) a @ b >".as_slice(), b"<c@[d]>".as_slice()]
+        );
+        assert_eq!(cursor.source_position(), source.len());
+        for range in ranges {
+            assert_eq!(collect(range, Mode::Strict).unwrap().len(), 1);
+        }
     }
     #[test]
     fn literal_lists_strip_only_grammatical_cfws_and_outer_angles() {

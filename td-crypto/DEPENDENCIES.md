@@ -7,8 +7,8 @@ normal/build features
 for the initial x86-64 Linux GNU/musl host targets. The portable musl artifact
 and its compiler/sysroot pins remain M03b2.
 
-The mail lock additionally includes local std-only td-header, td-json, td-mime and
-td-nfc. They add no registry source or private backend input; their exact
+The mail lock additionally includes local std-only td-civil, td-header,
+td-json, td-mime and td-nfc. They add no registry source or private backend input; their exact
 manifests, locks and source staging are admitted alongside td-crypto and
 td-mta.
 

@@ -5,6 +5,7 @@ use std::io::Read;
 use std::path::Path;
 
 pub(crate) const LOCAL_SOURCES: &[&str] = &[
+    "td-civil",
     "td-crypto",
     "td-header",
     "td-json",
@@ -25,8 +26,9 @@ pub(crate) fn admitted(name: &str) -> bool {
 
 pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
+        "td-civil" => "434e8c6ab3f8d304ce8c090478324e4e1398e39561395b0c7a59bf4cdc20b1ca",
         "td-crypto" => "7ca2d70176ddb80083ff07de51465e8194fd01e4e4d435201444f11ed997c308",
-        "td-mta" => "f9bf0543fce3301c2f3031661c7b188b5e873bfd4d175c868e7bce88933d7ad2",
+        "td-mta" => "e2b5ac1b68ff34d452a118fdbe106705108d13476ef3c0030d755460b4f9af23",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
         "td-json" => "2793cd9cd8ffc7bac436069324b42b503f7f3114418fc95f558fb0831060e8b3",
         "td-nfc" => "39d752d381e239345e4ba213ea2ce2fb4efb723a4ea9f16f1d8aa1f1173359cf",
@@ -42,8 +44,9 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
 
 pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
+        "td-civil" => "d05684e2af245c0a796e154148ced1bc85ea08d9f31799d65a4fe1a62b7fc66a",
         "td-crypto" => "499bfd9b6780ca6cc7df5c928a16d7397c43b61bbde1d164d532c494c530514b",
-        "td-mta" => "575d661fb04a0af98ba5269132716679cf33e4c98504861e7ebf72169d037df3",
+        "td-mta" => "7e660bfdc392c579e0b5ddfd3c1f9764d1be24b970d3fe42589e9fe3ba669547",
         "td-header" => "2862fd9186d5cdef3d645af0b43dee9f77ba51beee5d98219e5aae30db11eabc",
         "td-json" => "679f89cdafa0f8457884ba0d0f0c197814d2b13e4f6ece4557575c9bdfe3848c",
         "td-nfc" => "6b447fb42d5b4e2aa2a02da0817647db6f178d445f8dc3861c7c9a011cce4695",
@@ -173,7 +176,14 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
     let mut local = vec!["td-crypto"];
     if name == "td-mta" {
         expected.extend(SQLITE_ACTIVE.lines().map(str::to_owned));
-        local.extend(["td-header", "td-json", "td-mime", "td-mta", "td-nfc"]);
+        local.extend([
+            "td-civil",
+            "td-header",
+            "td-json",
+            "td-mime",
+            "td-mta",
+            "td-nfc",
+        ]);
     }
     for package in local {
         let path = root
@@ -316,7 +326,7 @@ mod tests {
     #[test]
     fn std_source_pins_refuse_dependency_changes() {
         let root = root();
-        for name in ["td-header", "td-json", "td-mime", "td-nfc"] {
+        for name in ["td-civil", "td-header", "td-json", "td-mime", "td-nfc"] {
             if !root.join(name).join("Cargo.toml").exists() {
                 continue;
             }
@@ -391,12 +401,14 @@ mod tests {
             assert!(active_graph(&root, "td-crypto", &bad).is_err());
         }
         let mail = root.join("td-mta").canonicalize().unwrap();
+        let civil = root.join("td-civil").canonicalize().unwrap();
         let json = root.join("td-json").canonicalize().unwrap();
         let header = root.join("td-header").canonicalize().unwrap();
         let nfc = root.join("td-nfc").canonicalize().unwrap();
         let mime = root.join("td-mime").canonicalize().unwrap();
         let mailgraph = format!(
-            "{graph}{SQLITE_ACTIVE}td-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\n",
+            "{graph}{SQLITE_ACTIVE}td-civil v0.1.0 ({})|\ntd-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\n",
+            civil.display(),
             mail.display(),
             json.display(),
             header.display(),
@@ -447,6 +459,12 @@ mod tests {
             &root,
             "td-mta",
             &mailgraph.replace(&format!("td-mime v0.1.0 ({})|\n", mime.display()), "")
+        )
+        .is_err());
+        assert!(active_graph(
+            &root,
+            "td-mta",
+            &mailgraph.replace(&format!("td-civil v0.1.0 ({})|\n", civil.display()), "")
         )
         .is_err());
         assert!(active_graph(&root, "td-mta", &graph).is_err());

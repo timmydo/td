@@ -11,9 +11,10 @@ The M01 library skeleton provides typed local IDs, configuration versioning and
 checked resource planning only. [RESOURCES.md](RESOURCES.md) records the
 current planner and component observations; section 5 owns resource policy.
 [CONFORMANCE.md](CONFORMANCE.md) inventories the unimplemented JMAP
-contract and current client calls. The receiving session state machine is
-implemented separately from its native delivery adapter and runtime; there
-are no listeners or advertised service capabilities.
+contract and current client calls. The receiving session and native Inbox
+delivery adapter are implemented; transcript tests bind acceptance to
+reopened mail. The transport driver and runtime remain separate, with no
+listeners or advertised service capabilities.
 Checked scalar/key/row and operation codecs define bounded application
 values in [FORMAT.md](FORMAT.md). Its complete batch decoder binds exact
 encoded input to caller-reserved offset slots without copying row data;
@@ -21,10 +22,12 @@ the SQLite writer consumes that binding through its shared commit path.
 Typed and encoded object commits and history pruning require a captured
 store epoch as well as the expected account sequence. A stale epoch
 refuses before body reads or SQL writes, including after restore
-preserves the endpoint under a fresh epoch. Authenticated transaction
-coordination remains separate. Optional commit completions retain durable
-outcomes separately from database/WAL observations under the original
-writer scope; admission and ledger reconciliation remain service work.
+preserves the endpoint under a fresh epoch. Device credential and live
+transport verification remain separate. Native upload and receiving jobs
+share the owning coordinator, quota ledger and commit effects.
+Optional commit completions retain durable outcomes separately from
+database/WAL observations under the original writer scope; general mutation
+coordination and runtime scheduling remain service work.
 SQLite owns relational metadata, immutable
 body BLOBs, atomic transactions, native indexes, WAL snapshots and crash
 recovery. The store_fs adapter verifies streamed bodies inside their metadata
@@ -163,7 +166,7 @@ The packaging entry point supports `--version`, `--help`, and offline
 stopped-database `backup` and verified fresh-epoch `restore` to a fresh
 destination. STORAGE.md owns their scope and machine-readable results. Other commands arrive with their implementations.
 Its direct
-dependencies are the local `td-crypto`, `td-header`, `td-json`, `td-mime`
+dependencies are the local `td-civil`, `td-crypto`, `td-header`, `td-json`, `td-mime`
 and `td-nfc` crates, plus the approved private rusqlite dependency with
 bundled SQLite. Application protocols, configuration and scheduling use std
 plus the local libraries; store_fs/index.rs alone owns native SQL. There is
@@ -1468,11 +1471,13 @@ turn. Pending replies require an explicit flush acknowledgement; reservation,
 body writes and publication require separate trusted driver results before
 input resumes. A final DATA 250 follows only a successful commit result for
 the routed account. An indeterminate result closes without a final reply.
-This is a protocol boundary, not proof that a supplied result is durable:
-the native delivery adapter, trace generation, threading/Inbox publication,
-transport deadlines and live STARTTLS integration remain M10/M11 work.
-Transcript fixtures exercise the engine but do not yet satisfy the recovered
-mail acceptance criterion. The engine binds routing for its lifetime, accepts
+A supplied result alone is not durability proof. The native StoreCoordinator
+now reserves ingress, replaces Return-Path, generates Received from trusted
+connection facts, resolves immutable threads and publishes one Inbox email
+with its body, envelope and history in one transaction. Transcript fixtures
+connect its actual outcomes to the session and verify reopened mail. Live
+transport deadlines, STARTTLS integration and listener activation remain M11
+work. The engine binds routing for its lifetime, accepts
 only configured recipients, retains accepted envelope spellings, and exposes
 one account for one atomic delivery. It advertises SIZE, 8BITMIME and enhanced
 status codes; optional STARTTLS hands the original command to the transport
@@ -1480,7 +1485,12 @@ owner without generating 220. Only successful TLS completion resets SMTP
 state. No PIPELINING or other unimplemented extension is advertised.
 The advertised incoming SIZE excludes the delivery adapter's declared trace
 allowance; admission reserves the stored-message ceiling including that
-allowance. The adapter must fit its generated fields within that allowance.
+allowance. The native adapter derives the allowance from its trace format and protocol
+bounds; its generated fields fit within it. Root headers are bounded both
+before filtering and after adding local trace fields. Header overflow yields
+552 5.3.4; work or storage refusal remains temporary. The shared raw scanner
+preserves malformed body boundaries, and MessageIds source extents retain
+only the bounded policy lookback.
 Framing, line-size, message-size and streaming-write failures during DATA
 close the connection, so the remaining stream cannot become commands.
 The runtime must flush a close reply and use bounded transport draining so

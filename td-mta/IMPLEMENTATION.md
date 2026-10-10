@@ -2401,7 +2401,7 @@ known success with expired accounting, a pre-SQL deadline refusal and
 precise sequence-conflict classification. The existing target body
 scenario exercises the new completion on its initial body commit.
 These observations provide no authority over an arbitrary ledger or policy.
-UploadCoordinator now owns one IndexStore and its consuming-initialized
+StoreCoordinator now owns one IndexStore and its consuming-initialized
 Leases ledger. It reserves logical body/count/upload quotas before taking
 actual IngressSpool custody, constructs a fresh body and device-bound lease,
 and reserves physical headroom before their atomic native commit. Its
@@ -2686,21 +2686,23 @@ explicit runtime data, never permission to use public DNS during automated tests
 Implemented: `smtp_session` provides receiving command/envelope state,
 configured recipient routing, CRLF/dot-transparency decoding, message/line
 bounds and explicit reply, reservation, write, commit and STARTTLS handoffs.
-It stops input while an operation is pending; only a successful trusted
-commit result emits final acceptance. Transcript tests cover every split of
-an EHLO command and a DATA transcript, sequencing, alias/Postmaster
-behavior, null and quoted senders, extensions, refusals and uncertain
-publication. These fixtures use
-supplied operation outcomes and do not establish recovered durable delivery.
-Remaining: the owning native delivery adapter must reserve/store decoded
-mail, generate truthful trace fields, select immutable threads, file once
-in Inbox and publish history atomically. Connect its actual results to the
-session, then prove recovery from the acceptance transcript. Stored-message
-reservations include an adapter-supplied trace allowance excluded from the
-incoming SIZE limit. A legal-boundary 421 operation supports ordered service
-closure after a temporary DATA refusal. Runtime deadlines, bounded transport
-close/drain and connecting actual handshake success to the implemented SMTP
-reset remain M11 integration.
+StoreCoordinator reserves one delivery, checks its trusted connection policy,
+streams decoded mail through ingress, replaces Return-Path and generates a
+truthful Received trace. It applies POLICY section 5 threading and commits
+body, email, one Inbox membership, anchor and change history atomically.
+Transcript tests connect real storage outcomes to final SMTP replies and
+verify recovered mail after reopening. Other fixtures cover framing splits,
+sequencing, Postmaster, aliases, null/quoted senders and extensions.
+Header overflow is a permanent 552; resource/storage refusal is temporary;
+indeterminate publication closes without final acceptance. Stored-message
+reservations include format-derived trace room excluded from incoming SIZE.
+Remaining: the runtime must bind receiving authorization to actual sockets,
+TLS evidence and current gateway policy, drive deadlines and bounded
+transport close/drain, and connect actual handshake success to SMTP reset.
+The coordinator permits one outstanding ingress mutation job; concurrent
+receiving and fair scheduling remain required before listener activation.
+A legal-boundary 421 operation supports ordered service closure after a
+flushed DATA result. These transport and runtime pieces remain M11 work.
 
 Implement the DESIGN section 9 command/extension set as a pure state machine
 fed bounded chunks and a transport-independent peer context. Resolve aliases,

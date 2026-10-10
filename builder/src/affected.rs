@@ -5201,12 +5201,19 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// `workspace_exemption_requires_no_distribution_recipe` holds, and a crate
 /// leaves the list in the landing that makes a recipe name it; a crate that
 /// gains a reader is no longer alone after reader closure, so it takes the
-/// whole list without the list changing. td-mta reads td-crypto, td-header,
+/// whole list without the list changing. td-mta reads td-civil, td-crypto, td-header,
 /// td-json, td-mime and td-nfc, its direct dependencies. td-agent left the
 /// list with its packaging (td-agent/DESIGN.md §17).
 const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[(
     "td-mta",
-    &["td-crypto", "td-header", "td-json", "td-mime", "td-nfc"],
+    &[
+        "td-civil",
+        "td-crypto",
+        "td-header",
+        "td-json",
+        "td-mime",
+        "td-nfc",
+    ],
 )];
 
 /// The subset of the derived command list a diff over `changed` can actually
@@ -10088,6 +10095,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         for name in [
             "td-mta",
+            "td-civil",
             "td-crypto",
             "td-header",
             "td-json",

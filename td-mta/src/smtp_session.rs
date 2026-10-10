@@ -148,6 +148,25 @@ impl<'a> Session<'a> {
             recipient_bytes: 0,
         })
     }
+    pub(crate) fn delivery_context(&self) -> Result<(&Settings<'a>, &Envelope, bool), Error> {
+        if self.state != State::Begin {
+            return Err(Error::Conflict);
+        }
+        Ok((
+            &self.settings,
+            self.envelope.as_ref().ok_or(Error::Invalid)?,
+            self.extended,
+        ))
+    }
+    /// Native root-header admission can discover a permanent size refusal
+    /// while writing the final line or finishing an EOF-terminated header block.
+    pub fn message_too_large(&mut self) -> Result<(), Error> {
+        if !matches!(self.state, State::Write | State::Commit) {
+            return Err(Error::Conflict);
+        }
+        self.respond("552 5.3.4 Message headers too large\r\n", Next::Closed);
+        Ok(())
+    }
     pub fn pending(&self) -> Pending<'_> {
         match self.state {
             State::Command | State::Data => Pending::Input,

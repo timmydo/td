@@ -13,6 +13,7 @@ clippy-all-targets = true
 
 [dependencies]
 rusqlite = { version = "=0.40.2", default-features = false, features = ["blob", "bundled", "hooks", "limits"] }
+td-civil = { path = "../td-civil" }
 td-crypto = { path = "../td-crypto" }
 td-header = { path = "../td-header" }
 td-json = { path = "../td-json" }

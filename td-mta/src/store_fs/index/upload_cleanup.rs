@@ -18,7 +18,7 @@ pub struct UploadCleanup {
     pub admission_stopped: bool,
 }
 
-impl<P> UploadCoordinator<'_, '_, P> {
+impl<P> StoreCoordinator<'_, '_, P> {
     /// Inspect one lease in account-local ID order. Only an Ok disposition lets
     /// the caller advance to its ID. Reset the cursor after None to start a new
     /// pass, including leases inserted before the previous cursor.
