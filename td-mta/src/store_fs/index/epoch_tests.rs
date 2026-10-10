@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
 use crate::{
-    format::row::{BlobKind, BlobRow, MailboxRow},
+    format::row::{BlobRow, MailboxRow},
     ids::MailboxId,
     ports::{Crypto, Tick, Time},
     store_fs::tests::Fixture,
@@ -366,7 +366,6 @@ fn blob() -> BlobRow {
     let mut digest = td_crypto::Provider.sha256().unwrap();
     digest.update(RAW).unwrap();
     BlobRow {
-        kind: BlobKind::Message,
         length: RAW.len() as u64,
         digest: digest.finish().unwrap(),
         created_at: 0,

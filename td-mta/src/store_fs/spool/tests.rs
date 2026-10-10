@@ -77,13 +77,7 @@ fn quota_is_reserved_before_creation_and_held_by_finished_input() {
     for _ in 0..spool.capacity().slots {
         owners.push(
             spool
-                .begin(
-                    &td_crypto::Provider,
-                    ACCOUNT,
-                    BLOB,
-                    BlobKind::Message,
-                    deadline(),
-                )
+                .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
                 .unwrap()
                 .finish()
                 .unwrap(),
@@ -91,24 +85,12 @@ fn quota_is_reserved_before_creation_and_held_by_finished_input() {
     }
     assert_eq!(spool.status().unwrap().reserved_bytes, 128);
     assert!(matches!(
-        spool.begin(
-            &td_crypto::Provider,
-            ACCOUNT,
-            BLOB,
-            BlobKind::Upload,
-            deadline()
-        ),
+        spool.begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline()),
         Err(ports::Error::Quota)
     ));
     owners.pop().unwrap().discard().unwrap();
     let replacement = spool
-        .begin(
-            &td_crypto::Provider,
-            ACCOUNT,
-            BLOB,
-            BlobKind::Upload,
-            deadline(),
-        )
+        .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
         .unwrap();
     assert_eq!(spool.status().unwrap().occupied_slots, 16);
     drop(replacement);
@@ -125,20 +107,14 @@ fn finished_bytes_digest_and_passive_metadata_commit_to_sqlite() {
     let timer = clock();
     let spool = IngressSpool::open(&mut root, &resources(16), timer.clone(), deadline()).unwrap();
     let mut writer = spool
-        .begin(
-            &td_crypto::Provider,
-            ACCOUNT,
-            BLOB,
-            BlobKind::Upload,
-            deadline(),
-        )
+        .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
         .unwrap();
     writer.write(b"hello ").unwrap();
     writer.write(b"world").unwrap();
     let mut input = writer.finish().unwrap();
     assert_eq!(
-        (input.account(), input.id(), input.kind(), input.len()),
-        (ACCOUNT, BLOB, BlobKind::Upload, 11)
+        (input.account(), input.id(), input.len()),
+        (ACCOUNT, BLOB, 11)
     );
     let mut expected = td_crypto::Provider.sha256().unwrap();
     expected.update(b"hello world").unwrap();
@@ -205,13 +181,7 @@ fn maximum_message_streams_in_fixed_chunks_and_larger_turn_is_refused() {
     )
     .unwrap();
     let mut writer = spool
-        .begin(
-            &td_crypto::Provider,
-            ACCOUNT,
-            BLOB,
-            BlobKind::Message,
-            deadline(),
-        )
+        .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
         .unwrap();
     let chunk = [0xa5; SQLITE_BODY_CHUNK_BYTES];
     for _ in 0..MAX_MESSAGE_BYTES / chunk.len() {
@@ -236,25 +206,13 @@ fn maximum_message_streams_in_fixed_chunks_and_larger_turn_is_refused() {
     assert_eq!(total, MAX_MESSAGE_BYTES);
     input.discard().unwrap();
     let mut writer = spool
-        .begin(
-            &td_crypto::Provider,
-            ACCOUNT,
-            BLOB,
-            BlobKind::Message,
-            deadline(),
-        )
+        .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
         .unwrap();
     assert_eq!(writer.write(&output), Err(ports::Error::Capacity));
     assert_eq!(fs::metadata(fixture.path.join("slot-00")).unwrap().len(), 0);
     writer.discard().unwrap();
     let mut writer = spool
-        .begin(
-            &td_crypto::Provider,
-            ACCOUNT,
-            BLOB,
-            BlobKind::Message,
-            deadline(),
-        )
+        .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
         .unwrap();
     writer.length = u64::MAX;
     assert_eq!(writer.write(b"a"), Err(ports::Error::Capacity));
@@ -298,13 +256,7 @@ fn crash_cleanup_accepts_only_nonexecuting_owner_permission_subsets() {
     assert_eq!(spool.status().unwrap().reserved_bytes, 0);
     assert_eq!(fs::read_dir(&fixture.path).unwrap().count(), 1);
     let mut writer = spool
-        .begin(
-            &td_crypto::Provider,
-            ACCOUNT,
-            BLOB,
-            BlobKind::Message,
-            deadline(),
-        )
+        .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
         .unwrap();
     writer
         .owner
@@ -349,13 +301,7 @@ fn partial_io_and_length_refusal_are_sticky_and_retain_quota_until_cleanup() {
     let mut root = fixture.locked();
     let spool = IngressSpool::open(&mut root, &resources(4), clock(), deadline()).unwrap();
     let mut writer = spool
-        .begin(
-            &td_crypto::Provider,
-            ACCOUNT,
-            BLOB,
-            BlobKind::Message,
-            deadline(),
-        )
+        .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
         .unwrap();
     let error = writer
         .write_with(b"abcd", |file, bytes| {
@@ -369,13 +315,7 @@ fn partial_io_and_length_refusal_are_sticky_and_retain_quota_until_cleanup() {
     assert!(matches!(writer.finish(), Err(e) if e == error));
     assert_eq!(spool.status().unwrap().reserved_bytes, 0);
     let mut writer = spool
-        .begin(
-            &td_crypto::Provider,
-            ACCOUNT,
-            BLOB,
-            BlobKind::Message,
-            deadline(),
-        )
+        .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
         .unwrap();
     writer.write(b"abcd").unwrap();
     assert_eq!(writer.write(b"e"), Err(ports::Error::Capacity));
@@ -390,13 +330,7 @@ fn cleanup_failure_closes_descriptor_and_retires_full_charge_until_restart() {
     {
         let spool = IngressSpool::open(&mut root, &resources(8), clock(), deadline()).unwrap();
         let mut input = spool
-            .begin(
-                &td_crypto::Provider,
-                ACCOUNT,
-                BLOB,
-                BlobKind::Message,
-                deadline(),
-            )
+            .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
             .unwrap()
             .finish()
             .unwrap();
@@ -427,25 +361,13 @@ fn deadline_finish_length_and_source_read_errors_cannot_be_retried() {
     let timer = clock();
     let spool = IngressSpool::open(&mut root, &resources(8), timer.clone(), deadline()).unwrap();
     let mut writer = spool
-        .begin(
-            &td_crypto::Provider,
-            ACCOUNT,
-            BLOB,
-            BlobKind::Message,
-            deadline(),
-        )
+        .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
         .unwrap();
     writer.write(b"abc").unwrap();
     writer.owner.file().unwrap().set_len(4).unwrap();
     assert!(matches!(writer.finish(), Err(ports::Error::Corrupt)));
     let mut input = spool
-        .begin(
-            &td_crypto::Provider,
-            ACCOUNT,
-            BLOB,
-            BlobKind::Message,
-            deadline(),
-        )
+        .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
         .unwrap()
         .finish()
         .unwrap();
@@ -455,13 +377,7 @@ fn deadline_finish_length_and_source_read_errors_cannot_be_retried() {
     assert!(input.rewind().is_err());
     input.discard().unwrap();
     let mut writer = spool
-        .begin(
-            &td_crypto::Provider,
-            ACCOUNT,
-            BLOB,
-            BlobKind::Message,
-            deadline(),
-        )
+        .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
         .unwrap();
     timer.0.store(100, Ordering::SeqCst);
     assert_eq!(writer.write(b"a"), Err(ports::Error::Deadline));
@@ -475,13 +391,7 @@ fn a_fresh_seek_error_is_terminal_for_rewind_and_read() {
     let mut root = fixture.locked();
     let spool = IngressSpool::open(&mut root, &resources(8), clock(), deadline()).unwrap();
     let mut input = spool
-        .begin(
-            &td_crypto::Provider,
-            ACCOUNT,
-            BLOB,
-            BlobKind::Message,
-            deadline(),
-        )
+        .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
         .unwrap()
         .finish()
         .unwrap();
@@ -515,13 +425,7 @@ fn unproven_creation_releases_only_positive_absence_and_never_removes_an_inode()
     // A failed create_new must not reclaim an already existing unknown inode.
     temporary(&fixture.path.join("slot-00"), 1);
     assert!(spool
-        .begin(
-            &td_crypto::Provider,
-            ACCOUNT,
-            BLOB,
-            BlobKind::Message,
-            deadline()
-        )
+        .begin(&td_crypto::Provider, ACCOUNT, BLOB, deadline())
         .is_err());
     assert_eq!(spool.status().unwrap().retired_slots, 1);
     assert_eq!(fs::metadata(fixture.path.join("slot-00")).unwrap().len(), 1);

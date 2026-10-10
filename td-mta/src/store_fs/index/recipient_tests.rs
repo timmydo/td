@@ -4,8 +4,8 @@ use super::super::tests::Fixture;
 use super::*;
 use crate::{
     format::row::{
-        AttemptPhase, BlobKind, BlobRow, FailureReason, NotificationState, RecipientRow,
-        RecipientState, SubmissionRow,
+        AttemptPhase, BlobRow, FailureReason, NotificationState, RecipientRow, RecipientState,
+        SubmissionRow,
     },
     ids::{AttemptId, EmailId, IdentityId, SubmissionId, ThreadId},
     ports::{Crypto, Tick, Time},
@@ -126,7 +126,6 @@ fn create_group(
     let mut digest = td_crypto::Provider.sha256().unwrap();
     digest.update(body).unwrap();
     let blob = encode(Row::Blob(BlobRow {
-        kind: BlobKind::Message,
         length: body.len() as u64,
         digest: digest.finish().unwrap(),
         created_at: 0,
@@ -520,7 +519,7 @@ fn validation_seeks_only_the_affected_account_and_group() {
             params![other.as_bytes().as_slice(), BLOB.as_bytes().as_slice()],
         )
         .unwrap();
-        db.execute("INSERT INTO blobs(account,id,kind,length,digest,created_at,changed,body) SELECT ?1,id,kind,length,digest,created_at,changed,body FROM blobs WHERE account=?2", params![other.as_bytes().as_slice(), ACCOUNT.as_bytes().as_slice()]).unwrap();
+        db.execute("INSERT INTO blobs(account,id,length,digest,created_at,changed,body) SELECT ?1,id,length,digest,created_at,changed,body FROM blobs WHERE account=?2", params![other.as_bytes().as_slice(), ACCOUNT.as_bytes().as_slice()]).unwrap();
         relational::put(
             &db,
             other,
@@ -698,7 +697,6 @@ fn blob_value(body: &[u8]) -> Vec<u8> {
     let mut digest = td_crypto::Provider.sha256().unwrap();
     digest.update(body).unwrap();
     encode(Row::Blob(BlobRow {
-        kind: BlobKind::Message,
         length: body.len() as u64,
         digest: digest.finish().unwrap(),
         created_at: 0,

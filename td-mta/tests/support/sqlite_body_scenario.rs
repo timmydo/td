@@ -11,7 +11,7 @@ use td_mta::{
     format::{
         key::Key,
         operation::Operation,
-        row::{BlobKind, BlobRow, MailboxRow, Row},
+        row::{BlobRow, MailboxRow, Row},
         ObjectType, Sequence, Table,
     },
     ids::{AccountId, BlobId, MailboxId, StoreEpoch},
@@ -406,7 +406,6 @@ fn check_account(
         blob,
         Some((
             Row::Blob(BlobRow {
-                kind: BlobKind::Message,
                 length: BODY_BYTES,
                 digest: digest.finish().unwrap(),
                 created_at: 0,
@@ -506,7 +505,6 @@ fn run_with_roots(
         digest.update(&scratch).unwrap();
     }
     let row = Row::Blob(BlobRow {
-        kind: BlobKind::Message,
         length: BODY_BYTES,
         digest: digest.finish().unwrap(),
         created_at: 0,
@@ -618,7 +616,6 @@ fn run_with_roots(
             digest.update(&scratch).unwrap();
         }
         let other_row = Row::Blob(BlobRow {
-            kind: BlobKind::Message,
             length: BODY_BYTES,
             digest: digest.finish().unwrap(),
             created_at: 0,
@@ -1319,7 +1316,6 @@ fn run_with_roots(
         assert!(view.get(Key::Blob(refused), &mut bytes).unwrap().is_none());
     }
     let too_large = Row::Blob(BlobRow {
-        kind: BlobKind::Message,
         length: BODY_BYTES + 1,
         digest: [0; 32],
         created_at: 0,
@@ -1352,7 +1348,6 @@ fn run_with_roots(
     let mut digest = td_crypto::Provider.sha256().unwrap();
     digest.update(b"retry").unwrap();
     let row = Row::Blob(BlobRow {
-        kind: BlobKind::Message,
         length: 5,
         digest: digest.finish().unwrap(),
         created_at: 0,

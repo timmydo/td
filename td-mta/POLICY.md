@@ -732,7 +732,7 @@ promise stable matching/order only for identical query arguments under that
 interpretation version; tokens need not hash query arguments. Any
 parser/search/collation change that can alter results increments this version
 and invalidates corresponding caches, even without a journal write. Versions
-must not be reused for changed semantics. FORMAT store schema 1 binds
+must not be reused for changed semantics. The current store schema binds
 immutable Email projections to this interpretation policy. A version bump
 alone cannot alter parsed headers, part IDs/structure, body lists or
 hasAttachment for an existing Email ID. Preserve those derivations, or require

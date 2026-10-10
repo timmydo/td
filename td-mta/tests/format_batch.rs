@@ -33,10 +33,10 @@ fn sentinel() -> StagedOperation {
 }
 #[test]
 fn literal_mixed_batch_reborrows_original_bytes_and_preserves_slot_suffix() {
-    let mut bytes = hex(include_str!("fixtures/format-v1/operation-put-blob.hex"));
+    let mut bytes = hex(include_str!("fixtures/format-v2/operation-put-blob.hex"));
     let put_len = bytes.len();
     bytes.extend(hex(include_str!(
-        "fixtures/format-v1/operation-delete-change.hex"
+        "fixtures/format-v2/operation-delete-change.hex"
     )));
     let mut slots = [Some(sentinel()); 4];
     {
@@ -78,7 +78,7 @@ fn literal_mixed_batch_reborrows_original_bytes_and_preserves_slot_suffix() {
 #[test]
 fn all_truncations_wrong_counts_and_trailing_bytes_refuse_whole_completion() {
     let bytes = hex(include_str!(
-        "fixtures/format-v1/operation-delete-change.hex"
+        "fixtures/format-v2/operation-delete-change.hex"
     ));
     let mut slots = [Some(sentinel()); 3];
     for end in 0..bytes.len() {
@@ -114,18 +114,18 @@ fn all_truncations_wrong_counts_and_trailing_bytes_refuse_whole_completion() {
 #[test]
 fn malformed_last_row_and_header_cannot_yield_a_complete_prefix() {
     let first = hex(include_str!(
-        "fixtures/format-v1/operation-delete-change.hex"
+        "fixtures/format-v2/operation-delete-change.hex"
     ));
-    let put = hex(include_str!("fixtures/format-v1/operation-put-blob.hex"));
+    let put = hex(include_str!("fixtures/format-v2/operation-put-blob.hex"));
     let mut bytes = first.clone();
     bytes.extend(&put);
     let mut slots = [None; 3];
-    bytes[first.len() + 28] = 255; // invalid BlobKind in the final PUT
+    bytes[first.len() + 8] = 47; // declared row omits its final time byte
     assert_eq!(
         Batch::decode(input(&bytes, 3), &mut slots).err(),
-        Some(Error::InvalidTag)
+        Some(Error::Truncated)
     );
-    bytes[first.len() + 28] = put[28];
+    bytes[first.len() + 8] = put[8];
     bytes[first.len()] = 255;
     assert_eq!(
         Batch::decode(input(&bytes, 3), &mut slots).err(),

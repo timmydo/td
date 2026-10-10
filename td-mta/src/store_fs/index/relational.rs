@@ -180,7 +180,6 @@ pub(super) fn put(
                 params![
                     a,
                     id.as_bytes().as_slice(),
-                    v.kind.tag(),
                     i64::try_from(v.length).map_err(|_| ports::Error::Capacity)?,
                     v.digest.as_slice(),
                     v.created_at,
@@ -438,9 +437,8 @@ mod tests {
         }
         db
     }
-    fn blob(kind: BlobKind) -> Row<'static> {
+    fn blob() -> Row<'static> {
         Row::Blob(BlobRow {
-            kind,
             length: 3,
             digest: [9; 32],
             created_at: -11,
@@ -467,8 +465,8 @@ mod tests {
         let changed = Sequence::from_u64(1);
         db.execute_batch("BEGIN").unwrap();
         for (key, row) in [
-            (Key::Blob(MESSAGE), blob(BlobKind::Message)),
-            (Key::Blob(UPLOAD), blob(BlobKind::Upload)),
+            (Key::Blob(MESSAGE), blob()),
+            (Key::Blob(UPLOAD), blob()),
             (Key::Thread(THREAD), Row::Thread),
             (Key::Mailbox(MAILBOX), mailbox()),
             (Key::Email(EMAIL), email(EmailOrigin::Jmap)),
@@ -509,7 +507,7 @@ mod tests {
             recipients: receipt,
         });
         let rows = [
-            (Key::Blob(MESSAGE), blob(BlobKind::Message)),
+            (Key::Blob(MESSAGE), blob()),
             (Key::Mailbox(MAILBOX), mailbox()),
             (Key::Email(EMAIL), email(origin)),
             (Key::Membership(EMAIL, MAILBOX), Row::Membership),
@@ -634,14 +632,7 @@ mod tests {
             params![ACCOUNT.as_bytes().as_slice(), MESSAGE.as_bytes().as_slice()],
         )
         .unwrap();
-        put(
-            &db,
-            ACCOUNT,
-            Key::Blob(MESSAGE),
-            blob(BlobKind::Message),
-            changed,
-        )
-        .unwrap();
+        put(&db, ACCOUNT, Key::Blob(MESSAGE), blob(), changed).unwrap();
         assert_eq!(
             db.query_row(
                 "SELECT body FROM blobs WHERE account=?1 AND id=?2",

@@ -41,8 +41,8 @@ fn check(bytes: &[u8], expected: Operation<'_>) {
 }
 #[test]
 fn independent_payloads_pin_all_three_operation_encodings() {
-    let put = hex(include_str!("fixtures/format-v1/operation-put-blob.hex"));
-    let row = hex(include_str!("fixtures/format-v1/row-blob.hex"));
+    let put = hex(include_str!("fixtures/format-v2/operation-put-blob.hex"));
+    let row = hex(include_str!("fixtures/format-v2/row-blob.hex"));
     let key = [0x44; 16];
     let operation = Operation::put(Table::Blobs, &key, &row).unwrap();
     check(&put, operation);
@@ -58,7 +58,7 @@ fn independent_payloads_pin_all_three_operation_encodings() {
         })
     );
     let pair = hex(include_str!(
-        "fixtures/format-v1/operation-delete-change.hex"
+        "fixtures/format-v2/operation-delete-change.hex"
     ));
     let deletion = Operation::delete(Table::Blobs, &key).unwrap();
     check(&pair[..28], deletion);
@@ -181,7 +181,7 @@ fn deletion_validates_the_selected_tables_entire_key_grammar() {
 }
 #[test]
 fn malformed_operation_prefixes_and_rows_are_refused_without_integrity_claims() {
-    let literal = hex(include_str!("fixtures/format-v1/operation-put-blob.hex"));
+    let literal = hex(include_str!("fixtures/format-v2/operation-put-blob.hex"));
     let payload = &literal;
     for (offset, byte) in [(0, 0), (0, 4), (1, 1), (2, 0), (2, 12)] {
         let mut bytes = payload.to_vec();
@@ -201,8 +201,9 @@ fn malformed_operation_prefixes_and_rows_are_refused_without_integrity_claims() 
         assert_eq!(extent(&bytes[..12]), Err(Error::Limit));
     }
     let mut invalid_row = payload.to_vec();
-    invalid_row[28] = 255;
-    assert_eq!(Operation::decode(&invalid_row), Err(Error::InvalidTag));
+    invalid_row[8] = 47;
+    invalid_row.pop();
+    assert_eq!(Operation::decode(&invalid_row), Err(Error::Truncated));
     for action in 1..=u8::MAX {
         let bytes = [2, action, 1, 0, 16, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(extent(&bytes), Err(Error::InvalidTag));

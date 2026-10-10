@@ -4,9 +4,7 @@ use super::super::tests::Fixture;
 use super::super::{with_probe_root_path, BlobSource};
 use super::*;
 use crate::{
-    format::row::{
-        BlobKind, BlobRow, EmailOrigin, EmailRow, MailboxRow, NotificationState, SubmissionRow,
-    },
+    format::row::{BlobRow, EmailOrigin, EmailRow, MailboxRow, NotificationState, SubmissionRow},
     ids::{BlobId, EmailId, IdentityId, MailboxId, SubmissionId, ThreadId},
     ports::{BlobReader, Crypto, Digest, Tick, Time},
 };
@@ -65,7 +63,6 @@ fn blob_row() -> Vec<u8> {
         digest.update(&chunk).unwrap();
     }
     encode(Row::Blob(BlobRow {
-        kind: BlobKind::Message,
         length: BODY_BYTES,
         digest: digest.finish().unwrap(),
         created_at: 0,

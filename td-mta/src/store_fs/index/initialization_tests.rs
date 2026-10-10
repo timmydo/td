@@ -6,7 +6,7 @@ use crate::{
         quota::Kind,
         DiskLimits, Plan, ViewMode, WorkLimits,
     },
-    format::row::{BlobKind, BlobRow, LeaseRow, LeaseUse, NotificationState, SubmissionRow},
+    format::row::{BlobRow, LeaseRow, LeaseUse, NotificationState, SubmissionRow},
     ids::{DeviceId, EmailId, IdentityId, SubmissionId, ThreadId},
     ownership::SlotState,
     ports::{Crypto, Tick, Time},
@@ -59,11 +59,10 @@ fn auxiliary() -> AuxiliaryUsage {
         cold_bytes: 31,
     }
 }
-fn blob(kind: BlobKind, bytes: &[u8]) -> Row<'static> {
+fn blob(bytes: &[u8]) -> Row<'static> {
     let mut hash = td_crypto::Provider.sha256().unwrap();
     hash.update(bytes).unwrap();
     Row::Blob(BlobRow {
-        kind,
         length: bytes.len() as u64,
         digest: hash.finish().unwrap(),
         created_at: 0,
@@ -76,8 +75,8 @@ fn open(root: &mut LockedRoot, clock: Arc<Timer>) -> IndexStore<'_> {
     let mut message = b"queue".as_slice();
     let mut upload = b"uploaded".as_slice();
     let rows = [
-        (Key::Blob(BODY), blob(BlobKind::Message, message)),
-        (Key::Blob(UPLOAD), blob(BlobKind::Upload, upload)),
+        (Key::Blob(BODY), blob(message)),
+        (Key::Blob(UPLOAD), blob(upload)),
         (
             Key::Lease(UPLOAD),
             Row::Lease(LeaseRow {

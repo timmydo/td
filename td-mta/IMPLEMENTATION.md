@@ -563,7 +563,7 @@ committed-body file collection are removed. Application codecs remain
 transient typed operation/read adapters. The private dependency retains its
 existing pinned source closure; no package is added.
 
-Implemented boundaries include fresh create/reopen and schema-4 refusal of older
+Implemented boundaries include fresh create/reopen and schema-5 refusal of older
 stores, expected-sequence transactions, deferred owning foreign keys, parent
 cycle checks, 32 MiB body limit and 64 KiB streaming, exact length/EOF/digest
 verification, snapshot-borrowed body readers, permanent blob IDs, native indexed

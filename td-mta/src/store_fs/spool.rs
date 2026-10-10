@@ -1,7 +1,7 @@
 //! Disposable ingress bytes, separately locked and never durable mail authority.
 use super::{same_file, LockedRoot, MAX_PATH_BYTES};
 use crate::{
-    format::row::{BlobKind, BlobRow},
+    format::row::BlobRow,
     ids::{AccountId, BlobId},
     limits::{ResourcePlan, MAX_MESSAGE_BYTES, SQLITE_BODY_CHUNK_BYTES},
     ports::{self, Clock, Crypto, Deadline, Digest, Tick},
@@ -196,13 +196,12 @@ impl<'r> IngressSpool<'r> {
         Err(ports::Error::Busy)
     }
     /// Reserve the entire configured maximum before creating a temporary file.
-    /// Account, ID and kind are passive caller metadata, never authorization.
+    /// Account and ID are passive caller metadata, never authorization.
     pub fn begin<C: Crypto>(
         &self,
         crypto: &C,
         account: AccountId,
         id: BlobId,
-        kind: BlobKind,
         deadline: Deadline,
     ) -> Result<SpoolWriter<'_, 'r, C::Sha256>, ports::Error> {
         let mut scope = Scope::new(Arc::clone(&self.clock), deadline)?;
@@ -237,7 +236,6 @@ impl<'r> IngressSpool<'r> {
             digest: Some(digest),
             account,
             id,
-            kind,
             length: 0,
         })
     }
@@ -379,7 +377,6 @@ pub struct SpoolWriter<'s, 'r, D: Digest> {
     digest: Option<D>,
     account: AccountId,
     id: BlobId,
-    kind: BlobKind,
     length: u64,
 }
 impl<D: Digest> SpoolWriter<'_, '_, D> {
@@ -444,7 +441,6 @@ impl<'s, 'r, D: Digest> SpoolWriter<'s, 'r, D> {
             scope: self.scope,
             account: self.account,
             id: self.id,
-            kind: self.kind,
             length: self.length,
             digest,
             position: 0,
@@ -458,7 +454,6 @@ pub struct SpoolInput<'s, 'r> {
     scope: Scope,
     account: AccountId,
     id: BlobId,
-    kind: BlobKind,
     length: u64,
     digest: [u8; 32],
     position: u64,
@@ -469,9 +464,6 @@ impl SpoolInput<'_, '_> {
     }
     pub const fn id(&self) -> BlobId {
         self.id
-    }
-    pub const fn kind(&self) -> BlobKind {
-        self.kind
     }
     pub const fn len(&self) -> u64 {
         self.length
@@ -488,7 +480,6 @@ impl SpoolInput<'_, '_> {
     }
     pub fn row(&self, created_at: i64) -> BlobRow {
         BlobRow {
-            kind: self.kind,
             length: self.length,
             digest: self.digest,
             created_at,

@@ -44,7 +44,6 @@ fn ingress_crash_child() {
             &td_crypto::Provider,
             AccountId::from_bytes([1; 16]),
             BlobId::from_bytes([2; 16]),
-            BlobKind::Message,
             deadline(),
         )
         .unwrap();

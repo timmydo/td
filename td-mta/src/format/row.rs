@@ -21,7 +21,6 @@ macro_rules! tags {
     };
 }
 
-tags!(BlobKind { Message = 1, Upload = 2 });
 tags!(ReceiptTls { Plain = 0, Tls12 = 1, Tls13 = 2 });
 tags!(RecipientState { Queued = 1, InFlight = 2, RetryWait = 3,
     Accepted = 4, Failed = 5, Canceled = 6, OutcomeUnknown = 7 });
@@ -35,7 +34,6 @@ tags!(FailureReason { None = 0, SmtpTemporary = 1, SmtpPermanent = 2,
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlobRow {
-    pub kind: BlobKind,
     pub length: u64,
     pub digest: [u8; 32],
     pub created_at: i64,
@@ -348,7 +346,6 @@ impl Row<'_> {
     fn write_fields(self, w: &mut Writer<'_>) -> Result<(), Error> {
         match self {
             Self::Blob(v) => {
-                w.u8(v.kind.tag())?;
                 w.u64(v.length)?;
                 w.put(&v.digest)?;
                 w.i64(v.created_at)?;
@@ -486,7 +483,6 @@ impl<'a> Row<'a> {
         let mut r = Reader::new(bytes);
         let value = match table {
             Table::Blobs => Self::Blob(BlobRow {
-                kind: BlobKind::from_tag(r.u8()?)?,
                 length: r.u64()?,
                 digest: r.fixed()?,
                 created_at: r.i64()?,

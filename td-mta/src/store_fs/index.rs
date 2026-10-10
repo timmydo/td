@@ -487,7 +487,7 @@ impl<'r> IndexStore<'r> {
             .map_err(sql)?;
             db.pragma_update(None, "application_id", APP_ID)
                 .map_err(sql)?;
-            db.pragma_update(None, "user_version", 4).map_err(sql)?;
+            db.pragma_update(None, "user_version", 5).map_err(sql)?;
             db.execute_batch("COMMIT").map_err(sql)
         })?;
         root.root.directory.file.sync_all()?;
@@ -541,7 +541,7 @@ impl<'r> IndexStore<'r> {
             let page_size: i64 = db
                 .pragma_query_value(None, "page_size", |row| row.get(0))
                 .map_err(sql)?;
-            if app != APP_ID || version != 4 || mode != "wal" || page_size != PAGE_BYTES as i64 {
+            if app != APP_ID || version != 5 || mode != "wal" || page_size != PAGE_BYTES as i64 {
                 return Err(ports::Error::Corrupt);
             }
             let expected = SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty());
@@ -1808,7 +1808,7 @@ mod tests {
     use super::super::tests::Fixture;
     use super::*;
     use crate::{
-        format::row::{BlobKind, BlobRow, EmailOrigin, EmailRow, LeaseRow, LeaseUse, MailboxRow},
+        format::row::{BlobRow, EmailOrigin, EmailRow, LeaseRow, LeaseUse, MailboxRow},
         ids::{BlobId, DeviceId, EmailId, MailboxId, ThreadId},
         ports::{Crypto, Digest, Tick, Time},
     };
@@ -2287,7 +2287,7 @@ mod tests {
             store.create_account(ACCOUNT, deadline()).unwrap();
             let id = BlobId::from_bytes([4; 16]);
             let replacement = BlobId::from_bytes([5; 16]);
-            let value = encode(Row::Blob(body_row(b"original", BlobKind::Message)));
+            let value = encode(Row::Blob(body_row(b"original")));
             store
                 .commit(
                     &td_crypto::Provider,
@@ -2332,7 +2332,7 @@ mod tests {
                 .map(|pin| pin_body(pin).connection)
                 .unwrap_or(connection);
             connection.execute_batch("ROLLBACK").unwrap();
-            let changed = encode(Row::Blob(body_row(b"replaced", BlobKind::Message)));
+            let changed = encode(Row::Blob(body_row(b"replaced")));
             store
                 .commit(
                     &td_crypto::Provider,
@@ -3314,7 +3314,7 @@ mod tests {
             .lock()
             .unwrap()
             .native
-            .run(|db| db.pragma_update(None, "user_version", 3).map_err(sql))
+            .run(|db| db.pragma_update(None, "user_version", 4).map_err(sql))
             .unwrap();
         drop(store);
         assert!(matches!(
@@ -3468,11 +3468,10 @@ mod tests {
             ))
         ));
     }
-    fn body_row(bytes: &[u8], kind: BlobKind) -> BlobRow {
+    fn body_row(bytes: &[u8]) -> BlobRow {
         let mut digest = td_crypto::Provider.sha256().unwrap();
         digest.update(bytes).unwrap();
         BlobRow {
-            kind,
             length: bytes.len() as u64,
             digest: digest.finish().unwrap(),
             created_at: 0,
@@ -3503,7 +3502,7 @@ mod tests {
         store.create_account(ACCOUNT, deadline()).unwrap();
         let id = BlobId::from_bytes([4; 16]);
         let raw = b"Subject: test\r\n\r\nbody\r\n";
-        let row = body_row(raw, BlobKind::Message);
+        let row = body_row(raw);
         let value = encode(Row::Blob(row));
         let op = Operation::put(Table::Blobs, id.as_bytes(), &value).unwrap();
         assert_eq!(
@@ -3638,7 +3637,7 @@ mod tests {
             let raw: Vec<u8> = (0..LENGTH)
                 .map(|n| ((n / CHUNK) ^ (n % 251)) as u8)
                 .collect();
-            let row = body_row(&raw, BlobKind::Message);
+            let row = body_row(&raw);
             let value = encode(Row::Blob(row));
             let put = Operation::put(Table::Blobs, id.as_bytes(), &value).unwrap();
             assert_eq!(
@@ -3851,7 +3850,7 @@ mod tests {
         let original = BlobId::from_bytes([0x91; 16]);
         let candidate = BlobId::from_bytes([0x92; 16]);
         let original_body = b"previous committed body";
-        let original_row = encode(Row::Blob(body_row(original_body, BlobKind::Message)));
+        let original_row = encode(Row::Blob(body_row(original_body)));
         let original_mailbox = mailbox("original", None);
         store
             .commit(
@@ -3904,7 +3903,7 @@ mod tests {
             }
         }
         let body = vec![0x5a; BODY_BYTES];
-        let row = encode(Row::Blob(body_row(&body, BlobKind::Message)));
+        let row = encode(Row::Blob(body_row(&body)));
         let changed_mailbox = mailbox("replacement", None);
         let operations = [
             Operation::put(Table::Mailboxes, ID.as_bytes(), &changed_mailbox).unwrap(),
@@ -4031,7 +4030,6 @@ mod tests {
             digest.update(&chunk).unwrap();
         }
         let value = encode(Row::Blob(BlobRow {
-            kind: BlobKind::Message,
             length: MAX_BODY_BYTES,
             digest: digest.finish().unwrap(),
             created_at: 0,
@@ -4153,7 +4151,6 @@ mod tests {
             digest.update(&chunk).unwrap();
         }
         let value = encode(Row::Blob(BlobRow {
-            kind: BlobKind::Message,
             length: MAX_BODY_BYTES,
             digest: digest.finish().unwrap(),
             created_at: 0,
@@ -4244,7 +4241,7 @@ mod tests {
         .unwrap();
         store.create_account(ACCOUNT, deadline()).unwrap();
         let id = BlobId::from_bytes([4; 16]);
-        let value = encode(Row::Blob(body_row(b"body", BlobKind::Message)));
+        let value = encode(Row::Blob(body_row(b"body")));
         let op = Operation::put(Table::Blobs, id.as_bytes(), &value).unwrap();
         let mut expiring = Expiring {
             timer: &timer,
@@ -4302,7 +4299,7 @@ mod tests {
         .unwrap();
         store.create_account(ACCOUNT, deadline()).unwrap();
         let id = BlobId::from_bytes([4; 16]);
-        let value = encode(Row::Blob(body_row(b"", BlobKind::Upload)));
+        let value = encode(Row::Blob(body_row(b"")));
         let mailbox = mailbox("must roll back", None);
         let ops = [
             Operation::put(Table::Mailboxes, ID.as_bytes(), &mailbox).unwrap(),
@@ -4508,7 +4505,6 @@ mod tests {
         store.create_account(ACCOUNT, deadline()).unwrap();
         let id = BlobId::from_bytes([4; 16]);
         let value = encode(Row::Blob(BlobRow {
-            kind: BlobKind::Message,
             length: MAX_BODY_BYTES + 1,
             digest: [0; 32],
             created_at: 0,
@@ -4738,7 +4734,6 @@ mod tests {
                 }));
                 let thread_bytes = encode(Row::Thread);
                 let empty_blob = encode(Row::Blob(BlobRow {
-                    kind: BlobKind::Message,
                     length: 0,
                     digest: td_crypto::Provider.sha256().unwrap().finish().unwrap(),
                     created_at: 0,
@@ -4772,7 +4767,6 @@ mod tests {
                 let mut hash = td_crypto::Provider.sha256().unwrap();
                 hash.update(body).unwrap();
                 let fresh_bytes = encode(Row::Blob(BlobRow {
-                    kind: BlobKind::Message,
                     length: body.len() as u64,
                     digest: hash.finish().unwrap(),
                     created_at: 0,
@@ -4901,7 +4895,6 @@ mod tests {
         let blob = BlobId::from_bytes([4; 16]);
         let thread = ThreadId::from_bytes([5; 16]);
         let blob_bytes = encode(Row::Blob(BlobRow {
-            kind: BlobKind::Message,
             length: 0,
             digest: td_crypto::Provider.sha256().unwrap().finish().unwrap(),
             created_at: 0,
@@ -5141,7 +5134,7 @@ mod tests {
         let mut old = store.maintenance_view(ACCOUNT, deadline()).unwrap();
         let original = old.identity();
         let replacement = BlobId::from_bytes([10; 16]);
-        let value = encode(Row::Blob(body_row(b"yy", BlobKind::Message)));
+        let value = encode(Row::Blob(body_row(b"yy")));
         let mut source = b"yy".as_slice();
         store
             .commit(
@@ -5451,17 +5444,10 @@ mod tests {
 
     fn seed_body_verification(store: &IndexStore<'_>, account: AccountId) {
         store.create_account(account, deadline()).unwrap();
-        for (sequence, (tag, length, kind)) in [
-            (4, 0, BlobKind::Message),
-            (5, 1, BlobKind::Upload),
-            (6, 65537, BlobKind::Message),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (sequence, (tag, length)) in [(4, 0), (5, 1), (6, 65537)].into_iter().enumerate() {
             let id = BlobId::from_bytes([tag; 16]);
             let bytes = vec![b'x'; length];
-            let value = encode(Row::Blob(body_row(&bytes, kind)));
+            let value = encode(Row::Blob(body_row(&bytes)));
             let mut source = bytes.as_slice();
             store
                 .commit(
@@ -5499,7 +5485,7 @@ mod tests {
         store.create_account(other, deadline()).unwrap();
         store.create_account(empty_account, deadline()).unwrap();
         let id = BlobId::from_bytes([4; 16]);
-        let value = encode(Row::Blob(body_row(b"other", BlobKind::Upload)));
+        let value = encode(Row::Blob(body_row(b"other")));
         let mut source = b"other".as_slice();
         store
             .commit(
@@ -5518,7 +5504,7 @@ mod tests {
         let mut old = store.view(ACCOUNT, deadline()).unwrap();
         let original = old.identity();
         let replacement = BlobId::from_bytes([7; 16]);
-        let value = encode(Row::Blob(body_row(b"yy", BlobKind::Message)));
+        let value = encode(Row::Blob(body_row(b"yy")));
         let mut source = b"yy".as_slice();
         store
             .commit(
@@ -5819,7 +5805,7 @@ mod tests {
         let blob = BlobId::from_bytes([4; 16]);
         let thread = ThreadId::from_bytes([5; 16]);
         let email = EmailId::from_bytes([6; 16]);
-        let blob_bytes = encode(Row::Blob(body_row(b"", BlobKind::Message)));
+        let blob_bytes = encode(Row::Blob(body_row(b"")));
         let thread_bytes = encode(Row::Thread);
         let email_bytes = encode(Row::Email(EmailRow {
             blob,
@@ -6073,7 +6059,6 @@ mod tests {
             )
             .unwrap();
             let blob_bytes = encode(Row::Blob(BlobRow {
-                kind: BlobKind::Message,
                 length: 0,
                 digest: td_crypto::Provider.sha256().unwrap().finish().unwrap(),
                 created_at: 0,
@@ -6252,7 +6237,6 @@ mod tests {
                     let email_bytes = encode(Row::Email(row));
                     let thread_bytes = encode(Row::Thread);
                     let blob_bytes = encode(Row::Blob(BlobRow {
-                        kind: BlobKind::Message,
                         length: 0,
                         digest: td_crypto::Provider.sha256().unwrap().finish().unwrap(),
                         created_at: 0,
@@ -6324,7 +6308,6 @@ mod tests {
                     let mut hash = td_crypto::Provider.sha256().unwrap();
                     hash.update(body).unwrap();
                     let fresh_bytes = encode(Row::Blob(BlobRow {
-                        kind: BlobKind::Message,
                         length: body.len() as u64,
                         digest: hash.finish().unwrap(),
                         created_at: 0,
@@ -6489,7 +6472,6 @@ mod tests {
         let mut digest = td_crypto::Provider.sha256().unwrap();
         digest.update(raw).unwrap();
         let blob_value = encode(Row::Blob(BlobRow {
-            kind: BlobKind::Message,
             length: raw.len() as u64,
             digest: digest.finish().unwrap(),
             created_at: 0,
@@ -6622,7 +6604,6 @@ mod tests {
         let mut digest = td_crypto::Provider.sha256().unwrap();
         digest.update(b"upload").unwrap();
         let blob_value = encode(Row::Blob(BlobRow {
-            kind: BlobKind::Upload,
             length: 6,
             digest: digest.finish().unwrap(),
             created_at: 0,

@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     format::row::{
-        BlobKind, BlobRow, EmailOrigin, EmailRow, ReceiptRecipients, ReceiptTls, SmtpReceipt,
+        BlobRow, EmailOrigin, EmailRow, ReceiptRecipients, ReceiptTls, SmtpReceipt,
         MAX_RECEIPT_BYTES,
     },
     ports::{Crypto, Digest, Tick, Time},
@@ -86,7 +86,6 @@ fn seed(store: &IndexStore<'_>, account: AccountId, entries: &[(EmailId, ThreadI
     let mut rows = vec![(
         Key::Blob(BODY),
         Row::Blob(BlobRow {
-            kind: BlobKind::Message,
             length: 0,
             digest: td_crypto::Provider.sha256().unwrap().finish().unwrap(),
             created_at: 0,

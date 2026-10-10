@@ -44,8 +44,9 @@ per-request quota, and per-request response quota must fit
 least two storage views; ForegroundOnly requires one. The cache must fit the
 1 KiB maintenance cursor reserve. These relationships do not enlarge RAM.
 
-Upload/queue are subquotas of raw bodies: one body is charged logically once,
-even when both categories reference it. Completed retained submissions still
+BodyBytes and BlobCount charge each body once. UploadBytes and QueueBytes
+each charge it while their respective lease or submission references exist.
+Completed retained submissions still
 consume queue count and body categories. Releasing a lease/category does not
 release body charge until proven transactional body deletion. Rolled-back
 writes may leave allocated database/WAL space, which remains physically charged. Cancel releases only unused reservations; uncertainty cannot
@@ -136,7 +137,7 @@ unimplemented; do not infer them from pure accounting helper tests.
 ### First reserved upload transaction
 
 This is the next M08 implementation boundary, not a running service.
-Start with one device-authorized upload that commits a fresh Upload-kind
+Start with one device-authorized upload that commits a fresh
 BlobRow and its device-bound LeaseRow atomically. The adapter constructs
 these rows from its actual prepared input; it accepts neither an
 arbitrary transaction batch nor caller-supplied proof of a body digest.

@@ -19,14 +19,12 @@ CREATE TABLE blob_ids(
 CREATE TABLE blobs(
     account BLOB NOT NULL CHECK(length(account)=16),
     id BLOB NOT NULL CHECK(length(id)=16),
-    kind INTEGER NOT NULL CHECK(kind IN (1,2)),
     length INTEGER NOT NULL CHECK(length BETWEEN 0 AND 33554432),
     digest BLOB NOT NULL CHECK(length(digest)=32),
     created_at INTEGER NOT NULL,
     changed BLOB NOT NULL CHECK(length(changed)=8),
     body BLOB NOT NULL CHECK(length(body)=length),
     UNIQUE(account,id),
-    UNIQUE(account,id,kind),
     FOREIGN KEY(account,id) REFERENCES blob_ids(account,id)
 ) STRICT;
 CREATE TABLE mailboxes(
@@ -55,7 +53,6 @@ CREATE TABLE emails(
     account BLOB NOT NULL CHECK(length(account)=16),
     id BLOB NOT NULL CHECK(length(id)=16),
     blob_id BLOB NOT NULL CHECK(length(blob_id)=16),
-    blob_kind INTEGER NOT NULL DEFAULT 1 CHECK(blob_kind=1),
     thread_id BLOB NOT NULL CHECK(length(thread_id)=16),
     received_at INTEGER NOT NULL,
     origin INTEGER NOT NULL CHECK(origin BETWEEN 1 AND 4),
@@ -70,10 +67,10 @@ CREATE TABLE emails(
     CHECK((origin=1 AND peer_family IS NOT NULL AND peer_family IN (4,6) AND peer_octets IS NOT NULL AND length(peer_octets)=CASE peer_family WHEN 4 THEN 4 ELSE 16 END AND tls IS NOT NULL AND tls IN (0,1,2) AND ehlo IS NOT NULL AND length(CAST(ehlo AS BLOB)) BETWEEN 1 AND 255 AND reverse_path IS NOT NULL AND length(CAST(reverse_path AS BLOB))<=254 AND receipt_count IS NOT NULL AND receipt_count BETWEEN 1 AND 1000) OR (origin<>1 AND peer_family IS NULL AND peer_octets IS NULL AND gateway IS NULL AND tls IS NULL AND ehlo IS NULL AND reverse_path IS NULL AND receipt_count IS NULL)),
     PRIMARY KEY(account,id),
     FOREIGN KEY(account) REFERENCES accounts(id),
-    FOREIGN KEY(account,blob_id,blob_kind) REFERENCES blobs(account,id,kind) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(account,blob_id) REFERENCES blobs(account,id) DEFERRABLE INITIALLY DEFERRED,
     FOREIGN KEY(account,thread_id) REFERENCES threads(account,id) DEFERRABLE INITIALLY DEFERRED
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX emails_blob ON emails(account,blob_id,blob_kind);
+CREATE INDEX emails_blob ON emails(account,blob_id);
 CREATE INDEX emails_thread ON emails(account,thread_id,id);
 CREATE TABLE smtp_receipt_recipients(
     account BLOB NOT NULL CHECK(length(account)=16),
@@ -120,7 +117,6 @@ CREATE TABLE submissions(
     thread_id BLOB NOT NULL CHECK(length(thread_id)=16),
     identity_id BLOB NOT NULL CHECK(length(identity_id)=16),
     transmitted_blob_id BLOB NOT NULL CHECK(length(transmitted_blob_id)=16),
-    blob_kind INTEGER NOT NULL DEFAULT 1 CHECK(blob_kind=1),
     reverse_path TEXT NOT NULL CHECK(length(CAST(reverse_path AS BLOB)) BETWEEN 0 AND 254),
     send_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL CHECK(expires_at>=send_at),
@@ -132,9 +128,9 @@ CREATE TABLE submissions(
     CHECK((notification=2)=(notification_email_id IS NOT NULL)),
     PRIMARY KEY(account,id),
     FOREIGN KEY(account) REFERENCES accounts(id),
-    FOREIGN KEY(account,transmitted_blob_id,blob_kind) REFERENCES blobs(account,id,kind) DEFERRABLE INITIALLY DEFERRED
+    FOREIGN KEY(account,transmitted_blob_id) REFERENCES blobs(account,id) DEFERRABLE INITIALLY DEFERRED
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX submissions_blob ON submissions(account,transmitted_blob_id,blob_kind);
+CREATE INDEX submissions_blob ON submissions(account,transmitted_blob_id);
 CREATE TABLE recipients(
     account BLOB NOT NULL CHECK(length(account)=16),
     submission_id BLOB NOT NULL CHECK(length(submission_id)=16),
@@ -162,14 +158,13 @@ CREATE TABLE recipients(
 CREATE TABLE leases(
     account BLOB NOT NULL CHECK(length(account)=16),
     blob_id BLOB NOT NULL CHECK(length(blob_id)=16),
-    blob_kind INTEGER NOT NULL DEFAULT 2 CHECK(blob_kind=2),
     device_id BLOB NOT NULL CHECK(length(device_id)=16),
     expires_at INTEGER NOT NULL,
     uses INTEGER NOT NULL CHECK(uses IN (1,2,3)),
     changed BLOB NOT NULL CHECK(length(changed)=8),
     PRIMARY KEY(account,blob_id),
     FOREIGN KEY(account) REFERENCES accounts(id),
-    FOREIGN KEY(account,blob_id,blob_kind) REFERENCES blobs(account,id,kind) DEFERRABLE INITIALLY DEFERRED
+    FOREIGN KEY(account,blob_id) REFERENCES blobs(account,id) DEFERRABLE INITIALLY DEFERRED
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE imports(
     account BLOB NOT NULL CHECK(length(account)=16),
@@ -225,13 +220,13 @@ pub(super) fn queries(table: Table) -> Queries {
 }
 
 const BLOBS: Queries = Queries {
-    get: "SELECT id,kind,length,digest,created_at,changed FROM blobs WHERE account=?1 AND id=?2",
+    get: "SELECT id,length,digest,created_at,changed FROM blobs WHERE account=?1 AND id=?2",
     first: concat!(
-        "SELECT id,kind,length,digest,created_at,",
+        "SELECT id,length,digest,created_at,",
         "changed FROM blobs WHERE account=?1 ORDER BY id LIMIT 1",
     ),
     next: concat!(
-        "SELECT id,kind,length,digest,created_at,",
+        "SELECT id,length,digest,created_at,",
         "changed FROM blobs WHERE account=?1 AND id>?2 ORDER BY id LIMIT 1",
     ),
     delete: "DELETE FROM blobs WHERE account=?1 AND id=?2",
@@ -406,8 +401,8 @@ delete: "DELETE FROM imports WHERE account=?1 AND source_instance=?2 AND source_
 
 // Identical immutable metadata puts retain the original changed sequence.
 pub(super) const PUT_BLOBS: &str = concat!(
-    "INSERT INTO blobs(account,id,kind,length,digest,created_at,changed,body) ",
-    "VALUES(?1,?2,?3,?4,?5,?6,?7,zeroblob(?4)) ON CONFLICT(account,id) DO NOTHING",
+    "INSERT INTO blobs(account,id,length,digest,created_at,changed,body) ",
+    "VALUES(?1,?2,?3,?4,?5,?6,zeroblob(?3)) ON CONFLICT(account,id) DO NOTHING",
 );
 
 pub(super) const PUT_MAILBOXES: &str = concat!(

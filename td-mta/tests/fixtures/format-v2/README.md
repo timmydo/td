@@ -1,4 +1,4 @@
-# Format v1 literal oracles
+# Format v2 literal oracles
 
 Each `.hex` file is one binary artifact written as lowercase hexadecimal with
 whitespace ignored. Empty row files represent zero-byte values. All integers,

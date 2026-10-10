@@ -7062,7 +7062,7 @@ Input owns the reservation and File until explicit discard or Drop. Its Read
 implementation returns at most 64 KiB, retains the original deadline, and
 makes read/seek failures terminal; failure retains their original typed error
 when Read reports an I/O kind. Rewind does not renew admission. It can be
-borrowed directly as BlobSource.source. Account, blob ID, kind and BlobRow
+borrowed directly as BlobSource.source. Account, blob ID and BlobRow
 metadata are passive caller data, not authenticated permissions or durability.
 
 Explicit discard closes the descriptor and removes only the owned inode

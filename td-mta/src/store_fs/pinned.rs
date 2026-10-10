@@ -3,7 +3,7 @@ use super::{index::BodyRead, IndexReadView};
 use crate::{
     format::{
         key::Key,
-        row::{BlobKind, BlobRow, Row},
+        row::{BlobRow, Row},
     },
     ids::BlobId,
     ports::{BlobReader, Clock, Crypto, Deadline, Digest, Error as PolicyError, ReadView, Time},
@@ -166,9 +166,6 @@ impl PinnedBlob<'_, '_> {
     pub fn id(&self) -> BlobId {
         self.id
     }
-    pub fn kind(&self) -> BlobKind {
-        self.row.kind
-    }
     pub fn digest(&self) -> &[u8; 32] {
         &self.row.digest
     }
@@ -242,7 +239,6 @@ pub fn with_pinned_fixture(bytes: &[u8], clock: &dyn Clock, run: impl FnOnce(Pin
     let mut digest = td_crypto::Provider.sha256().unwrap();
     digest.update(bytes).unwrap();
     let row = Row::Blob(BlobRow {
-        kind: BlobKind::Message,
         length: bytes.len() as u64,
         digest: digest.finish().unwrap(),
         created_at: 0,

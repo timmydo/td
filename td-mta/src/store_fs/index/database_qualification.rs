@@ -4,7 +4,7 @@
 use super::super::tests::Fixture;
 use super::*;
 use crate::{
-    format::row::{BlobKind, BlobRow},
+    format::row::BlobRow,
     ports::{Crypto, Tick, Time},
     store_fs::{AccountCheckLimits, BodyCheckLimits, MAX_FILE_STEP_BYTES},
     sync::{DataState, DataType},
@@ -91,7 +91,6 @@ fn row(length: u64) -> BlobRow {
         remaining -= count as u64;
     }
     BlobRow {
-        kind: BlobKind::Message,
         length,
         digest: digest.finish().unwrap(),
         created_at: 0,

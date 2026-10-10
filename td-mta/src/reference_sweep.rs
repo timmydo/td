@@ -287,7 +287,6 @@ pub(crate) mod tests {
                     record(
                         Key::Blob(BLOB),
                         Row::Blob(BlobRow {
-                            kind: BlobKind::Message,
                             length: 1,
                             digest: [0; 32],
                             created_at: 0,

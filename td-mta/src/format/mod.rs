@@ -8,7 +8,7 @@ pub mod operation;
 pub mod row;
 pub mod scalar;
 
-pub const SCHEMA_VERSION: u16 = 1;
+pub const SCHEMA_VERSION: u16 = 2;
 pub const MAX_KEY_BYTES: usize = 1024;
 pub const MIN_KEY_BYTES: usize = 16;
 pub const MAX_VALUE_BYTES: usize = 65536;

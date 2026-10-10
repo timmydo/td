@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     format::row::{
-        BlobKind, BlobRow, FailureReason, LeaseRow, LeaseUse, NotificationState, RecipientState,
+        BlobRow, FailureReason, LeaseRow, LeaseUse, NotificationState, RecipientState,
         SubmissionRow,
     },
     ids::{DeviceId, EmailId, IdentityId, SubmissionId, ThreadId},
@@ -41,11 +41,10 @@ fn key_bytes(key: Key<'_>) -> Vec<u8> {
     bytes.truncate(n);
     bytes
 }
-fn body(kind: BlobKind, bytes: &[u8]) -> Row<'static> {
+fn body(bytes: &[u8]) -> Row<'static> {
     let mut hash = td_crypto::Provider.sha256().unwrap();
     hash.update(bytes).unwrap();
     Row::Blob(BlobRow {
-        kind,
         length: bytes.len() as u64,
         digest: hash.finish().unwrap(),
         created_at: 0,
@@ -158,9 +157,9 @@ fn categories_deduplicate_references_and_follow_retained_snapshot_rows() {
         ACCOUNT,
         0,
         &[
-            (Key::Blob(BODY), body(BlobKind::Message, bytes)),
-            (Key::Blob(UPLOAD), body(BlobKind::Upload, upload)),
-            (Key::Blob(EMPTY), body(BlobKind::Message, empty)),
+            (Key::Blob(BODY), body(bytes)),
+            (Key::Blob(UPLOAD), body(upload)),
+            (Key::Blob(EMPTY), body(empty)),
             (
                 Key::Lease(UPLOAD),
                 Row::Lease(LeaseRow {
@@ -198,8 +197,8 @@ fn categories_deduplicate_references_and_follow_retained_snapshot_rows() {
         OTHER,
         0,
         &[
-            (Key::Blob(BODY), body(BlobKind::Message, foreign)),
-            (Key::Blob(UPLOAD), body(BlobKind::Upload, foreign_upload)),
+            (Key::Blob(BODY), body(foreign)),
+            (Key::Blob(UPLOAD), body(foreign_upload)),
         ],
         &[],
         &mut [
@@ -405,13 +404,8 @@ fn populated_scan_and_second_aggregate_consume_the_original_vm_allowance() {
         .collect();
     let mut puts = Vec::new();
     for (ordinal, id) in ids.iter().copied().enumerate() {
-        let kind = if ordinal % 2 == 0 {
-            BlobKind::Upload
-        } else {
-            BlobKind::Message
-        };
-        puts.push((Key::Blob(id), body(kind, b"")));
-        if kind == BlobKind::Upload {
+        puts.push((Key::Blob(id), body(b"")));
+        if ordinal % 2 == 0 {
             puts.push((
                 Key::Lease(id),
                 Row::Lease(LeaseRow {
@@ -509,7 +503,7 @@ fn whole_store_usage_fence_keeps_writes_busy_but_old_views_readable() {
             &store,
             account,
             0,
-            &[(Key::Blob(BODY), body(BlobKind::Message, bytes))],
+            &[(Key::Blob(BODY), body(bytes))],
             &[],
             &mut [BlobSource {
                 id: BODY,
@@ -831,4 +825,156 @@ fn expiry_during_capture_or_cleanup_rolls_back_without_stopping_the_writer() {
         clock.0.store(1, Ordering::Relaxed);
         assert_eq!(store.usage_fence(deadline()).unwrap().usage().accounts, 1);
     }
+}
+#[test]
+fn one_body_supports_email_upload_and_queue_references() {
+    use crate::format::row::{EmailOrigin, EmailRow};
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let store = IndexStore::create(
+        &mut root,
+        StoreEpoch::from_bytes([25; 16]),
+        Arc::new(Timer(AtomicU64::new(1))),
+        3,
+        deadline(),
+    )
+    .unwrap();
+    store.create_account(ACCOUNT, deadline()).unwrap();
+    store.create_account(OTHER, deadline()).unwrap();
+    let email = EmailId::from_bytes([8; 16]);
+    let thread = ThreadId::from_bytes([9; 16]);
+    let mut bytes = b"same".as_slice();
+    let Row::Submission(mut completed) = submission() else {
+        panic!("submission fixture");
+    };
+    completed.completed_at = Some(1);
+    let mut canceled = queued();
+    canceled.state = RecipientState::Canceled;
+    canceled.next_attempt_at = None;
+    canceled.reason = FailureReason::Canceled;
+    let lease = LeaseRow {
+        account: ACCOUNT,
+        device: DeviceId::from_bytes([11; 16]),
+        expires_at: -1,
+        uses: LeaseUse::Both,
+    };
+    commit(
+        &store,
+        ACCOUNT,
+        0,
+        &[
+            (Key::Blob(BODY), body(bytes)),
+            (Key::Thread(thread), Row::Thread),
+            (
+                Key::Email(email),
+                Row::Email(EmailRow {
+                    blob: BODY,
+                    thread,
+                    received_at: 0,
+                    origin: EmailOrigin::Jmap,
+                }),
+            ),
+            (Key::Lease(BODY), Row::Lease(lease)),
+            (Key::Submission(FIRST), Row::Submission(completed)),
+            (Key::Recipient(FIRST, 0), Row::Recipient(canceled)),
+        ],
+        &[],
+        &mut [BlobSource {
+            id: BODY,
+            source: &mut bytes,
+        }],
+    );
+    let mut old = store.view(ACCOUNT, deadline()).unwrap();
+    assert_eq!(amounts(old.logical_usage().unwrap()), [4, 1, 4, 4, 1]);
+    let request = |account, sequence| CommitRequest {
+        account,
+        epoch: store.epoch(),
+        expected: Sequence::from_u64(sequence),
+        utc_ms: 0,
+        deadline: deadline(),
+    };
+    let reject_delete = |sequence| {
+        assert!(matches!(
+            store.commit(
+                &td_crypto::Provider,
+                request(ACCOUNT, sequence),
+                &[Operation::delete(Table::Blobs, BODY.as_bytes()).unwrap()],
+                &mut []
+            ),
+            Err(CommitError::Rejected(ports::Error::Conflict))
+        ));
+    };
+    reject_delete(1);
+    let foreign = encoded(Row::Lease(LeaseRow {
+        account: OTHER,
+        ..lease
+    }));
+    assert!(matches!(
+        store.commit(
+            &td_crypto::Provider,
+            request(OTHER, 0),
+            &[Operation::put(Table::Leases, BODY.as_bytes(), &foreign).unwrap()],
+            &mut []
+        ),
+        Err(CommitError::Rejected(ports::Error::Conflict))
+    ));
+    commit(&store, ACCOUNT, 1, &[], &[Key::Lease(BODY)], &mut []);
+    assert_eq!(
+        amounts(
+            store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .logical_usage()
+                .unwrap()
+        ),
+        [4, 1, 0, 4, 1]
+    );
+    reject_delete(2);
+    commit(&store, ACCOUNT, 2, &[], &[Key::Email(email)], &mut []);
+    reject_delete(3);
+    commit(
+        &store,
+        ACCOUNT,
+        3,
+        &[],
+        &[Key::Recipient(FIRST, 0), Key::Submission(FIRST)],
+        &mut [],
+    );
+    assert_eq!(
+        amounts(
+            store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .logical_usage()
+                .unwrap()
+        ),
+        [4, 1, 0, 0, 0]
+    );
+    commit(&store, ACCOUNT, 4, &[], &[Key::Blob(BODY)], &mut []);
+    assert_eq!(
+        amounts(
+            store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .logical_usage()
+                .unwrap()
+        ),
+        [0; 5]
+    );
+    assert_eq!(amounts(old.logical_usage().unwrap()), [4, 1, 4, 4, 1]);
+    drop(old);
+    let value = encoded(body(b"same"));
+    assert!(matches!(
+        store.commit(
+            &td_crypto::Provider,
+            request(ACCOUNT, 5),
+            &[Operation::put(Table::Blobs, BODY.as_bytes(), &value).unwrap()],
+            &mut [BlobSource {
+                id: BODY,
+                source: &mut b"same".as_slice()
+            }]
+        ),
+        Err(CommitError::Rejected(ports::Error::Conflict))
+    ));
+    store.validate_integrity(deadline()).unwrap();
 }

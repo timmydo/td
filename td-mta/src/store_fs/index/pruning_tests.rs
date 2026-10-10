@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
 use crate::{
-    format::row::{BlobKind, BlobRow, MailboxRow},
+    format::row::{BlobRow, MailboxRow},
     ids::MailboxId,
     ports::{BlobReader, Tick, Time},
     store_fs::tests::Fixture,
@@ -764,7 +764,6 @@ fn pruned_reader_scenario(scenario: PrunedScenario) {
     let mut digest = td_crypto::Provider.sha256().unwrap();
     digest.update(&body).unwrap();
     let blob_row = Row::Blob(BlobRow {
-        kind: BlobKind::Message,
         length: BYTES as u64,
         digest: digest.finish().unwrap(),
         created_at: 0,
@@ -1201,7 +1200,6 @@ fn shared_account_cleanup(partial_inputs: bool) {
         let mut digest = td_crypto::Provider.sha256().unwrap();
         digest.update(&bodies[index]).unwrap();
         Row::Blob(BlobRow {
-            kind: BlobKind::Message,
             length: BYTES as u64,
             digest: digest.finish().unwrap(),
             created_at: 0,

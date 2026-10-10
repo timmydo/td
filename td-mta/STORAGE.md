@@ -34,7 +34,7 @@ SQLite uses its bundled Unix VFS; td-owned Rust adds no direct syscall
 or unsafe allowance. A database or sidecar symlink, wrong owner/mode,
 extra hard link or oversized file refuses startup. Creation refuses
 preexisting database/WAL/SHM paths. Application ID, exact schema version
-4, closed schema and 4096-byte pages are checked before accepting the
+5, closed schema and 4096-byte pages are checked before accepting the
 store. Full integrity_check, foreign_key_check, per-Email anchor
 cardinality and body-length constraints are explicit
 validate_integrity maintenance, not an opening scan. SQLite validates
@@ -155,7 +155,7 @@ submission matching decode only the relevant fixed-size keys, not row values.
 The caller retains input/slot admission and prepared-source ownership.
 Local framing validation grants no account or reservation authority.
 Each source identifies a BlobId and supplies a std::io::Read. Each source matches exactly one Blob PUT. The matching
-BlobRow supplies the exact expected length, SHA-256, kind and creation time.
+BlobRow supplies the exact expected length, SHA-256 and creation time.
 The writer admits the maximum length before inserting a row, then inserts
 a zeroblob and fills it through one writable incremental handle while hashing.
 The handle closes before COMMIT. Exact length, physical
@@ -519,10 +519,11 @@ and unreferenced bodies. Upload bytes count bodies with a retained lease;
 queue bytes count bodies with at least one retained submission, regardless
 of how many submissions share them. Expired leases and completed submissions
 remain charged until explicit row deletion. Queue count includes every
-retained submission. Current typed foreign keys restrict leases to Upload
-blobs and submissions to Message blobs; LeaseUse::Both names permitted
-upload uses, not overlapping categories. Body bytes are independent of
-category references; deleting a category row alone never reduces that total.
+retained submission. Account-scoped foreign keys permit a body to have
+email, lease and submission references together. Each retained category
+charges that body independently; LeaseUse::Both names permitted upload uses.
+Body bytes are independent of category references; deleting a category row
+alone never reduces that total.
 
 Schema constraints keep each body length in 0..32 MiB; with the fixed
 8 GiB logical database ceiling, valid integer sums fit within SQLite i64.
@@ -1526,7 +1527,7 @@ partial filesystem writes. Finish verifies descriptor identity, exact length
 and physical EOF, finalizes the digest, checks the original clock/deadline and
 rewinds before yielding an owned SpoolInput. It performs no fsync or durable
 publication. Input retains its File and reservation, exposes passive account,
-blob ID, kind, length and digest metadata, and implements bounded Read for
+blob ID, length and digest metadata, and implements bounded Read for
 BlobSource. SQLite independently checks expected length, EOF and digest in
 its atomic body/metadata transaction. No network read occurs through this
 prepared input. File reads and rewind preserve the original deadline and
@@ -1570,17 +1571,33 @@ in full into RAM.
 
 | Table | Key | Authoritative value |
 | --- | --- | --- |
-| `blobs` | blob ID | Kind (message/upload), length, SHA-256, creation time, immutable body BLOB |
+| `blobs` | blob ID | Length, SHA-256, creation time, immutable body BLOB |
 | `mailboxes` | mailbox ID | Name, parent ID, role, sort order, subscription state |
-| `emails` | email ID | Message blob ID, thread ID, receivedAt, SMTP receipt/envelope metadata |
+| `emails` | email ID | Blob ID, thread ID, receivedAt, SMTP receipt/envelope metadata |
 | `memberships` | email ID + mailbox ID | Empty; presence means membership |
 | `keywords` | email ID + keyword bytes | Empty; presence means set |
 | `threads` | thread ID | Persisted immutable grouping identity |
-| `thread-anchors` | Length-prefixed Message-ID + email ID | Empty; authoritative lookup from message header ID to live email |
+| `thread-anchors` | Message-ID + email ID | Empty; authoritative lookup from message header ID to live email |
 | `submissions` | submission ID | Email/thread/identity IDs, immutable transmitted blob ID, envelope sender, sendAt, lifecycle/notification state |
 | `recipients` | submission ID + recipient ordinal | Address, attempt/phase, result, retry time, uncertainty, bounded diagnostic |
-| `leases` | upload blob ID | Owning account/device, expiry and permitted use |
-| `imports` | source-instance ID + source object kind + length-prefixed source-account and object bytes | Local IDs and verified source digest/mapping |
+| `leases` | blob ID | Owning account/device, expiry and permitted use |
+| `imports` | source-instance ID + source object kind + source-account and object bytes | Local IDs and verified source digest/mapping |
+
+A blob records immutable bytes without an exclusive message/upload kind.
+Email, Submission and device-bound Lease rows independently own their
+account-local references to those bytes. One blob may serve all three;
+body/count charges apply once, while upload and queue subquotas each charge
+it once when their corresponding references exist. Blob deletion is refused
+while any owning reference remains. Permanent blob IDs and the existing
+account-scoped foreign keys remain mandatory.
+
+A stored body is not proof of a valid message or authorization to import,
+attach or submit it. Those checks belong to the authenticated operation and
+message-validation paths before their references are published. Removing
+the caller-supplied kind creates no content deduplication, cross-account
+reuse or additional upload-lease rights. QUEUE.md section 1 still requires
+a submission to publish its separate Bcc-stripped transmission body; the
+storage-level ability to share references does not relax that rule.
 
 SMTP receipt recipients occupy smtp_receipt_recipients(account,email_id,ordinal,
 address), preserving accepted order and duplicates. Email replacement updates
@@ -1604,8 +1621,8 @@ collision-resolving source record is not a substitute.
 Keywords and addresses obey their more specific protocol/config limits.
 
 Live owning references must resolve within the same account: email to
-message blob/thread, membership to email/mailbox, keyword to email, recipient
-to submission, submission to transmitted blob, and every lease to upload blob.
+blob/thread, membership to email/mailbox, keyword to email, recipient
+to submission, submission to transmitted blob, and every lease to blob.
 Mailbox parents must resolve without cycles. Submission email/thread/identity
 IDs are historical identifiers: creation validates them and authorization,
 but later deletion or configuration changes need not leave their targets live.
@@ -1669,24 +1686,25 @@ only: physical enumeration completeness, actual pins, configured depth policy
 and other graph invariants remain separate requirements.
 
 `row_references::ReferenceCheck` validates direct owning references of one
-supplied final row. Validate the source key/value and sequence ceiling first,
-then retain only the borrowed source key and at most two copied typed targets.
-Each advance performs at most one get through the supplied ReadView, checks
-exact identity before and after it, validates the target row/key and sequence,
-and requires the expected blob kind or recipient ordinal below the owning
-submission's recipient_count. View movement takes precedence over a returned
-row, absence or lookup error. Missing targets, invalid kinds/counts, malformed
-rows, future sequences and lookup failures retire the whole check.
+supplied final row. Validate the source key/value and sequence ceiling
+first, then retain only the borrowed source key and at most two copied
+typed targets. Each advance performs at most one get through the supplied
+ReadView, checks exact identity before and after it, validates the target
+row/key and sequence, and requires the expected target row type or
+recipient ordinal below the owning submission's recipient_count. View
+movement takes precedence over a returned row, absence or lookup error.
+Missing targets, invalid row types/counts, malformed rows, future
+sequences and lookup failures retire the whole check.
 
-Email requires a message blob and thread; membership requires email/mailbox;
+Email requires a blob and thread; membership requires email/mailbox;
 keyword and thread anchor require email; submission requires its transmitted
-message blob; recipient requires submission; a mailbox's immediate parent must
-exist. This direct check does not detect parent cycles; ParentWalk handles the
-full chain separately. Submission email/thread/identity/notification IDs and
+blob; lease requires its blob; recipient requires submission; a mailbox's
+immediate parent must exist. This direct check does not detect parent cycles;
+ParentWalk handles the full chain separately. Submission email/thread/identity/notification IDs and
 import mappings remain historical and cause no lookup. Blob and thread rows
 have no outgoing owning references.
 
-A lease must name the view's account and retain its upload target until the
+A lease must name the view's account and retain its blob until the
 lease is explicitly removed. The validation completion retains the trusted
 UTC sample, but ownership is independent of expiration. Device authorization,
 revocation and unexpired-use checks remain separate. CompleteReferences grants
@@ -1882,7 +1900,7 @@ anchor/body correspondence and authorizing anchor changes remain service
 obligations. Deferred owning foreign keys require anchor removal with
 Email deletion.
 
-A committing writer validates these rules, blob kinds, keyword limits and
+A committing writer validates these rules, keyword limits and
 submission/blob pins. Derived counters are calculated or cached, never
 independently authoritative. A transaction that updates folder membership also
 declares the affected JMAP objects/state types for change APIs.

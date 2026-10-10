@@ -8,7 +8,7 @@ test contacts a real provider, public CA or production mail store.
 
 Use literal expected bytes/JSON or independently specified records. Do not
 produce expected answers with the parser, query, codec or state machine under
-test. The existing format-v1 fixtures and wire/sync tests retain their own
+test. The existing format-v2 fixtures and wire/sync tests retain their own
 byte-level evidence; this registry adds endpoint and interpretation evidence.
 
 ## Shared fixture conventions

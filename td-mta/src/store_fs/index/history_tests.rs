@@ -102,7 +102,6 @@ fn submission_envelope_and_creation_identity_are_immutable() {
         let alternate = BlobId::from_bytes([10; 16]);
         let hash = td_crypto::Provider.sha256().unwrap().finish().unwrap();
         let blob = encode(Row::Blob(BlobRow {
-            kind: BlobKind::Message,
             length: 0,
             digest: hash,
             created_at: 0,
@@ -124,7 +123,6 @@ fn submission_envelope_and_creation_identity_are_immutable() {
         let mut hash = td_crypto::Provider.sha256().unwrap();
         hash.update(body).unwrap();
         let fresh_row = encode(Row::Blob(BlobRow {
-            kind: BlobKind::Message,
             length: body.len() as u64,
             digest: hash.finish().unwrap(),
             created_at: 0,
@@ -292,7 +290,6 @@ fn maximum_distinct_encoded_history_batch_fits_a_production_commit_deadline() {
     store.create_account(ACCOUNT, request(0).deadline).unwrap();
     let hash = td_crypto::Provider.sha256().unwrap().finish().unwrap();
     let blob = encode(Row::Blob(BlobRow {
-        kind: BlobKind::Message,
         length: 0,
         digest: hash,
         created_at: 0,

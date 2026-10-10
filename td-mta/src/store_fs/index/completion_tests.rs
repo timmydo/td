@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
 use crate::{
-    format::row::{BlobKind, BlobRow},
+    format::row::BlobRow,
     ports::{Crypto, Tick, Time},
     store_fs::tests::Fixture,
 };
@@ -53,7 +53,6 @@ fn row(bytes: &[u8]) -> Vec<u8> {
     let mut digest = td_crypto::Provider.sha256().unwrap();
     digest.update(bytes).unwrap();
     let row = Row::Blob(BlobRow {
-        kind: BlobKind::Upload,
         length: bytes.len() as u64,
         digest: digest.finish().unwrap(),
         created_at: 0,

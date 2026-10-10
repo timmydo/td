@@ -1,18 +1,13 @@
 //! Bounded direct owning-reference checks over one caller-owned final view.
 use crate::{
-    format::{
-        self,
-        key::Key,
-        row::{BlobKind, Row},
-        Sequence,
-    },
+    format::{self, key::Key, row::Row, Sequence},
     ids::{BlobId, EmailId, MailboxId, SubmissionId, ThreadId},
     ports::{self, ReadView, ViewIdentity},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Target {
-    Blob { id: BlobId, kind: BlobKind },
+    Blob(BlobId),
     Mailbox(MailboxId),
     Email(EmailId),
     Thread(ThreadId),
@@ -21,7 +16,7 @@ pub enum Target {
 impl Target {
     pub(crate) fn key(self) -> Key<'static> {
         match self {
-            Self::Blob { id, .. } => Key::Blob(id),
+            Self::Blob(id) => Key::Blob(id),
             Self::Mailbox(id) => Key::Mailbox(id),
             Self::Email(id) => Key::Email(id),
             Self::Thread(id) => Key::Thread(id),
@@ -30,7 +25,7 @@ impl Target {
     }
     fn accepts(self, row: Row<'_>) -> bool {
         match (self, row) {
-            (Self::Blob { kind, .. }, Row::Blob(blob)) => kind == blob.kind,
+            (Self::Blob(_), Row::Blob(_)) => true,
             (Self::Submission { ordinal, .. }, Row::Submission(submission)) => {
                 ordinal < submission.recipient_count
             }
@@ -91,10 +86,7 @@ impl<'k> ReferenceCheck<'k> {
         let targets = match (source, row) {
             (_, Row::Mailbox(row)) => [row.parent.map(Target::Mailbox), None],
             (_, Row::Email(row)) => [
-                Some(Target::Blob {
-                    id: row.blob,
-                    kind: BlobKind::Message,
-                }),
+                Some(Target::Blob(row.blob)),
                 Some(Target::Thread(row.thread)),
             ],
             (Key::Membership(email, mailbox), Row::Membership) => {
@@ -104,13 +96,7 @@ impl<'k> ReferenceCheck<'k> {
             | (Key::ThreadAnchor(_, email), Row::ThreadAnchor) => {
                 [Some(Target::Email(email)), None]
             }
-            (_, Row::Submission(row)) => [
-                Some(Target::Blob {
-                    id: row.transmitted_blob,
-                    kind: BlobKind::Message,
-                }),
-                None,
-            ],
+            (_, Row::Submission(row)) => [Some(Target::Blob(row.transmitted_blob)), None],
             (Key::Recipient(id, ordinal), Row::Recipient(_)) => {
                 [Some(Target::Submission { id, ordinal }), None]
             }
@@ -118,13 +104,7 @@ impl<'k> ReferenceCheck<'k> {
                 if row.account != identity.account {
                     return Err(Error::Format(format::Error::InvalidValue));
                 }
-                [
-                    Some(Target::Blob {
-                        id,
-                        kind: BlobKind::Upload,
-                    }),
-                    None,
-                ]
+                [Some(Target::Blob(id)), None]
             }
             (_, Row::Blob(_) | Row::Thread | Row::Import(_)) => [None, None],
             _ => return Err(Error::Format(format::Error::InvalidValue)),
@@ -253,9 +233,8 @@ pub(crate) mod tests {
             history_floor: Sequence::default(),
         }
     }
-    fn blob(kind: BlobKind) -> Row<'static> {
+    fn blob() -> Row<'static> {
         Row::Blob(BlobRow {
-            kind,
             length: 1,
             digest: [0; 32],
             created_at: 0,
@@ -331,8 +310,8 @@ pub(crate) mod tests {
             Self {
                 identity: identity(),
                 rows: [
-                    (Key::Blob(BLOB), blob(BlobKind::Message)),
-                    (Key::Blob(UPLOAD), blob(BlobKind::Upload)),
+                    (Key::Blob(BLOB), blob()),
+                    (Key::Blob(UPLOAD), blob()),
                     (Key::Mailbox(MAILBOX), mailbox(None)),
                     (Key::Thread(THREAD), Row::Thread),
                     (Key::Email(EMAIL), email()),
@@ -394,7 +373,7 @@ pub(crate) mod tests {
     pub(crate) fn probe() {
         let mut value = [0; 512];
         for (key, row, reads) in [
-            (Key::Blob(BLOB), blob(BlobKind::Message), 0),
+            (Key::Blob(BLOB), blob(), 0),
             (
                 Key::Mailbox(MailboxId::from_bytes([10; 16])),
                 mailbox(Some(MAILBOX)),
@@ -474,27 +453,21 @@ pub(crate) mod tests {
         assert!(std::mem::size_of::<ReferenceCheck<'_>>() <= 512);
     }
     #[test]
-    fn kind_ordinal_and_lease_account_refuse() {
-        for (key, row) in [
-            (Key::Email(EMAIL), email()),
-            (Key::Lease(UPLOAD), lease(101)),
-            (Key::Recipient(SUBMISSION, 2), recipient()),
-        ] {
-            let mut view = View::new();
-            if key == Key::Email(EMAIL) {
-                view.rows[0].1 = blob(BlobKind::Upload);
-            }
-            if key == Key::Lease(UPLOAD) {
-                view.rows[1].1 = blob(BlobKind::Message);
-            }
-            let mut check =
-                ReferenceCheck::new(identity(), key, row, Sequence::from_u64(1), 100).unwrap();
-            assert!(matches!(
-                check.advance(&mut view, &mut [0; 512]),
-                Err(Error::InvalidTarget(_))
-            ));
-            assert!(matches!(check.finish(), Err(Error::Failed)));
-        }
+    fn ordinal_and_lease_account_refuse() {
+        let mut view = View::new();
+        let mut check = ReferenceCheck::new(
+            identity(),
+            Key::Recipient(SUBMISSION, 2),
+            recipient(),
+            Sequence::from_u64(1),
+            100,
+        )
+        .unwrap();
+        assert!(matches!(
+            check.advance(&mut view, &mut [0; 512]),
+            Err(Error::InvalidTarget(_))
+        ));
+        assert!(matches!(check.finish(), Err(Error::Failed)));
         let Row::Lease(mut row) = lease(99) else {
             panic!("expected fixture lease");
         };

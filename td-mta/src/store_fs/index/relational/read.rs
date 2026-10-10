@@ -144,7 +144,6 @@ pub(super) fn value(
     let mut writer = Writer::new(output);
     match table {
         Table::Blobs => {
-            columns.u8(&mut writer)?;
             writer
                 .u64(u64::try_from(columns.integer()?).map_err(|_| ports::Error::Corrupt)?)
                 .map_err(format_error)?;

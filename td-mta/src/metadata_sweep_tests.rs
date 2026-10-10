@@ -44,7 +44,6 @@ impl View {
                 Record {
                     key: Key::Blob(BLOB),
                     row: Row::Blob(BlobRow {
-                        kind: BlobKind::Message,
                         length: 0,
                         digest: [0; 32],
                         created_at: 0,
@@ -581,7 +580,6 @@ fn account_reports_preserve_matching_old_wal_results_and_refuse_cross_snapshot_p
         let mut digest = td_crypto::Provider.sha256().unwrap();
         digest.update(bytes).unwrap();
         Row::Blob(BlobRow {
-            kind: BlobKind::Message,
             length: bytes.len() as u64,
             digest: digest.finish().unwrap(),
             created_at: 0,

@@ -1250,7 +1250,7 @@ Initial default ceilings (validated together at startup):
 | JSON nesting / parser tokens per request | 32 / 32768 |
 | Combined resident index cache | 4 MiB |
 | Storage read views | 2, each with bounded row/key/cursor scratch and a SQLite snapshot |
-| Unattached upload storage | 128 MiB per account, expiry after 24 hours |
+| Bodies retained by upload leases | 128 MiB per account, expiry after 24 hours |
 | Retained submission storage | 256 MiB and 1000 submissions |
 | Maintenance sort scratch on disk | 64 MiB per account |
 | Active log plus retained generations | 8 MiB each, 4 retained |
@@ -1416,7 +1416,7 @@ FULL. Each blob row holds one immutable body BLOB. Retained incremental
 handles stream at most 64 KiB per call under a 32 MiB hard message/upload
 limit, without a whole-body memory buffer. Existing read transactions
 preserve old body snapshots after deletion. Native foreign keys enforce
-ownership; an expired lease retains its upload until explicit
+ownership; an expired lease retains its blob until explicit
 transactional removal. An uncertain COMMIT retires writes until
 reopen/recovery. Never acknowledge before COMMIT succeeds. Preserve
 transmission bytes independently of visible email lifetime. A stopped

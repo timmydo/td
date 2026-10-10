@@ -18,7 +18,7 @@ use td_mta::{
     clock::RuntimeClock,
     format::{
         operation::Operation,
-        row::{BlobKind, BlobRow, Row},
+        row::{BlobRow, Row},
         Sequence, Table,
     },
     ids::{AccountId, BlobId, StoreEpoch},
@@ -117,7 +117,6 @@ impl Fixture {
             let mut hash = td_crypto::Provider.sha256().unwrap();
             hash.update(&bytes).unwrap();
             let row = Row::Blob(BlobRow {
-                kind: BlobKind::Message,
                 length: bytes.len() as u64,
                 digest: hash.finish().unwrap(),
                 created_at: 17,

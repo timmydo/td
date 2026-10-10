@@ -4,7 +4,7 @@
 use super::super::tests::Fixture;
 use super::*;
 use crate::{
-    format::row::{BlobKind, BlobRow},
+    format::row::BlobRow,
     ports::{BlobReader, Crypto, Digest, ReadView, Tick, Time},
     store_fs::with_probe_root_path,
 };
@@ -89,7 +89,6 @@ fn put_body(store: &IndexStore<'_>) {
         digest.update(BODY_CHUNK.as_slice()).unwrap();
     }
     let row = Row::Blob(BlobRow {
-        kind: BlobKind::Message,
         length: BODY_BYTES,
         digest: digest.finish().unwrap(),
         created_at: 0,

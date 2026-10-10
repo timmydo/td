@@ -3,11 +3,7 @@
 pub use td_crypto::{Crypto, Digest, Entropy, Error as CryptoError};
 
 use crate::{
-    format::{
-        key::Key,
-        row::{BlobKind, Row},
-        ObjectType, Sequence, Table,
-    },
+    format::{key::Key, row::Row, ObjectType, Sequence, Table},
     ids::{AccountId, BlobId, DeviceId, StoreEpoch},
 };
 use std::{io::ErrorKind, net::IpAddr};
@@ -363,7 +359,6 @@ pub trait Store: Send + Sync {
         &'a self,
         reservation: &'a mut Self::Reserved<'_>,
         id: BlobId,
-        kind: BlobKind,
     ) -> Result<Self::Writer<'a>, Error>;
     /// Includes retained CHANGE bytes/count; fails before a new body is admitted.
     fn reserve(
@@ -525,7 +520,6 @@ mod tests {
         let blob_put = OPERATION_HEADER_BYTES
             + Key::Blob(blob_id).encoded_len()?
             + Row::Blob(crate::format::row::BlobRow {
-                kind: BlobKind::Message,
                 length: 1,
                 digest: [0; 32],
                 created_at: 0,

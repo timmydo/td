@@ -21,7 +21,7 @@ fn hex(input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 }
 macro_rules! fixture {
     ($name:literal) => {
-        hex(include_str!(concat!("fixtures/format-v1/", $name, ".hex")))?
+        hex(include_str!(concat!("fixtures/format-v2/", $name, ".hex")))?
     };
 }
 
@@ -58,7 +58,6 @@ fn every_row_has_an_independent_literal_oracle() -> Result<(), Box<dyn std::erro
         .map_err(|_| "digest length")?;
     check(
         Row::Blob(BlobRow {
-            kind: BlobKind::Message,
             length: 3,
             digest,
             created_at: 0,
@@ -273,8 +272,8 @@ fn invalid_local_fields_refuse_without_touching_output() -> Result<(), Box<dyn s
         assert_eq!(output, [0xa5; 1024]);
     }
     let mut bytes = fixture!("row-blob");
-    *bytes.get_mut(0).ok_or("kind")? = 0;
-    assert_eq!(Row::decode(Table::Blobs, &bytes), Err(Error::InvalidTag));
+    bytes.pop();
+    assert_eq!(Row::decode(Table::Blobs, &bytes), Err(Error::Truncated));
     let mut bytes = fixture!("row-mailbox");
     *bytes.get_mut(4).ok_or("name")? = 0xff;
     assert_eq!(

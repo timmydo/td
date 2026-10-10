@@ -3,7 +3,7 @@
 This is the normative application-byte companion to [STORAGE.md](STORAGE.md).
 SQLite owns physical pages, WAL, transactions and recovery. The allocation-free
 scalar, key, row and operation codecs define only bounded transient application
-values. Schema version 2 persists explicit SQL columns, never encoded row
+values. The physical schema persists explicit SQL columns, never encoded row
 payloads or canonical-key shadow blobs. STORAGE.md owns that physical schema.
 No custom FORMAT/CURRENT/table/manifest/journal container is emitted.
 
@@ -25,9 +25,11 @@ address or keyword syntax. Generic scalar text does not normalize or sanitize.
 Every top-level decoder consumes exactly its input. Extra bytes, unknown tags,
 unsupported versions, nonzero reserved flags and malformed lengths are errors.
 There are no skippable unknown fields or implicit default values. Row fields
-are positional within schema 1, with field numbers for documentation;
-they are not an extensible TLV protocol. A changed layout needs a new schema
-and explicit migration. Reuse of a retired numeric tag is forbidden.
+are positional within application schema 2, with field numbers for
+documentation; they are not an extensible TLV protocol. A changed layout
+needs a new application schema and atomic caller cutover. Physical-store
+version refusal is specified in STORAGE.md. Reuse of a retired numeric tag
+is forbidden.
 
 All times are signed i64 UTC milliseconds since the Unix epoch. Protocol date
 validation and presentation are separate. Account sequence 0 denotes an
@@ -62,7 +64,7 @@ Logical ordering uses `Table::tag()`, never Rust enum declaration order.
 | 7 | `thread-anchors` | `text(1004)` header Message-ID, email ID | 21..1024 |
 | 8 | `submissions` | submission ID | 16 |
 | 9 | `recipients` | submission ID, `be32` recipient ordinal | 20 |
-| 10 | `leases` | upload blob ID | 16 |
+| 10 | `leases` | blob ID | 16 |
 | 11 | `imports` | source instance ID, u8 source kind, source account bytes, source object bytes | 27..1024 |
 
 For imports, source kind 1 is Mailbox and 3 is Email, from the shared
@@ -167,7 +169,7 @@ not to the ability to read previously accepted bodies after limits decrease.
 
 | Table | Ordered fields |
 | --- | --- |
-| blobs | 1 kind:u8; 2 length:u64; 3 raw-body SHA-256:H; 4 createdAt:i64 |
+| blobs | 1 length:u64; 2 raw-body SHA-256:H; 3 createdAt:i64 |
 | mailboxes | 1 name:text(1024); 2 parent:?ID; 3 role:?text(64); 4 sortOrder:u32; 5 subscribed:bool |
 | emails | 1 blob:ID; 2 thread:ID; 3 receivedAt:i64; 4 origin:u8; 5 receipt only for SMTP origin |
 | memberships | Empty value; the key is the complete relationship |
@@ -237,7 +239,7 @@ would be illegal. No caller may infer queue validity from successful decoding.
 
 | Field | Tags |
 | --- | --- |
-| Blob kind | Message=1, Upload=2 |
+| Retired blob kind (application schema 1 only) | Message=1, Upload=2; neither tag is emitted |
 | Email origin | SMTP=1, JMAP=2, Import=3, FailureNotice=4 |
 | Receipt TLS | Plain=0, TLS1.2=1, TLS1.3=2 |
 | Recipient state | Queued=1, InFlight=2, RetryWait=3, Accepted=4, Failed=5, Canceled=6, OutcomeUnknown=7 |
@@ -282,6 +284,6 @@ thread assignment, cache, SMTP receipt, or export time enters this digest.
 
 format_operations and format_rows exercise literal application values and
 rejections; inline scalar/key tests pin numeric and primary-key encodings.
-Actual SQLite transaction and chunked-body tests exercise persistence
+Actual SQLite transaction and single-BLOB body tests exercise persistence
 separately.
 A row codec does not establish SQLite integrity, authorization or durability.
