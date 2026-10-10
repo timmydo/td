@@ -1,5 +1,6 @@
-//! `ln`, `mkdir`, `readlink` and `rm` — the directory and link work the boot
-//! scripts do before, and just after, the pivot.
+//! `ln`, `mkdir`, `mv`, `readlink` and `rm` — the directory and link work the
+//! boot scripts do before, and just after, the pivot, and that a jailed
+//! foreign runtime, which has no td loader, needs a static binary for.
 
 use std::io::Write;
 use std::path::Path;
@@ -103,6 +104,41 @@ fn link_target(path: &str, out: &mut impl Write) -> Result<u8, String> {
         Ok(()) => Ok(0),
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
         Err(e) => Err(format!("{path}: {e}")),
+    }
+}
+
+/// `mv SRC DST` as one `rename(2)`: into DST when DST is a directory, as
+/// POSIX has it. A cross-device move is refused rather than emulated by copy
+/// and delete, which would make a refused rename look like a success.
+pub fn mv(args: &[String]) -> Result<u8, String> {
+    let usage = "usage: mv SRC DST";
+    let mut rest: Vec<&str> = Vec::new();
+    for a in args {
+        if a.starts_with('-') && a.len() > 1 {
+            return Err(format!("unrecognised option '{a}'\n{usage}"));
+        }
+        rest.push(a.as_str());
+    }
+    let (Some(src), Some(dst), 2) = (rest.first(), rest.get(1), rest.len()) else {
+        return Err(usage.to_string());
+    };
+    let src_path = Path::new(src);
+    let dst_path = Path::new(dst);
+    let target = if dst_path.is_dir() {
+        let Some(name) = src_path.file_name() else {
+            return Err(format!("{src}: no final component to move into {dst}"));
+        };
+        dst_path.join(name)
+    } else {
+        dst_path.to_path_buf()
+    };
+    match std::fs::rename(src_path, &target) {
+        Ok(()) => Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => Err(format!(
+            "{src} -> {}: crosses devices; this mv only renames",
+            target.display()
+        )),
+        Err(e) => Err(format!("{src} -> {}: {e}", target.display())),
     }
 }
 
@@ -315,6 +351,89 @@ mod tests {
             "no operand and no -f is a usage error"
         );
         assert_eq!(rm(&args(&["-f"])), Ok(0));
+    }
+
+    fn ino(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    /// `mv` renames (the inode survives, so nothing was copied), moves into an
+    /// existing directory, and refuses what it does not implement rather than
+    /// guessing.
+    #[test]
+    fn mv_renames_or_moves_into_a_directory() {
+        let d = scratch("mv");
+        let a = d.join("a");
+        let b = d.join("b");
+        let into = d.join("into");
+        std::fs::create_dir_all(a.join("inner")).unwrap();
+        std::fs::create_dir_all(&into).unwrap();
+        let before = ino(&a);
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        assert_eq!(mv(&args(&[&s(&a), &s(&b)])), Ok(0));
+        assert!(
+            !a.exists() && b.join("inner").is_dir(),
+            "rename did not happen"
+        );
+        assert_eq!(ino(&b), before, "the rename copied");
+        assert_eq!(mv(&args(&[&s(&b), &s(&into)])), Ok(0));
+        let moved = into.join("b");
+        assert!(
+            !b.exists() && moved.join("inner").is_dir(),
+            "did not move into"
+        );
+        assert_eq!(ino(&moved), before, "the move into a directory copied");
+        assert!(
+            mv(&args(&[&s(&b), &s(&a)])).is_err(),
+            "a missing source must fail"
+        );
+        // Every operand exists and the last is a directory, so a multi-source
+        // mv would succeed here rather than fail for a missing destination.
+        let (s1, s2) = (d.join("s1"), d.join("s2"));
+        std::fs::create_dir_all(&s1).unwrap();
+        std::fs::create_dir_all(&s2).unwrap();
+        for argv in [
+            vec!["-f".to_string(), s(&moved), s(&a)],
+            vec![s(&moved)],
+            vec![s(&s1), s(&s2), s(&into)],
+        ] {
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            assert!(mv(&args(&argv)).is_err(), "{argv:?} must be refused");
+        }
+        assert!(
+            moved.is_dir() && !a.exists(),
+            "a refused mv moved something"
+        );
+        assert!(s1.is_dir() && s2.is_dir() && !into.join("s1").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Across filesystems mv refuses instead of copying and deleting. Needs a
+    /// second writable filesystem; where /dev/shm is not one, it proves nothing.
+    #[test]
+    fn mv_refuses_to_cross_devices() {
+        use std::os::unix::fs::MetadataExt;
+        let d = scratch("mv-xdev");
+        let shm = Path::new("/dev/shm");
+        let other = shm.join(format!("td-util-mv-xdev-{}", std::process::id()));
+        let dev = |p: &Path| std::fs::metadata(p).map(|m| m.dev()).ok();
+        if dev(shm).is_none() || dev(shm) == dev(&d) || std::fs::create_dir(&other).is_err() {
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        let src = d.join("f");
+        std::fs::write(&src, b"x").unwrap();
+        let dst = other.join("f");
+        let r = mv(&args(&[&src.to_string_lossy(), &dst.to_string_lossy()]));
+        let left = (src.exists(), dst.exists());
+        let _ = std::fs::remove_dir_all(&other);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(
+            r.as_ref().is_err_and(|e| e.contains("crosses devices")),
+            "{r:?}"
+        );
+        assert_eq!(left, (true, false), "a refused cross-device mv moved data");
     }
 
     /// A directory needs -r; without it this must not silently recurse.

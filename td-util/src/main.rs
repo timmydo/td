@@ -10,7 +10,8 @@
 //! `cat`/`chmod`/`chown`/`ln`/`mkdir`/`printf`/`readlink`/`rm`/`sleep`/`test` it
 //! DOES provide — dynamically linked, against a runtime closure that the pre-pivot
 //! initramfs has no loader for and that the boot self-check exists to report the
-//! breakage of. Both sets need a binary that works when the closure does not, which
+//! breakage of; `mv` too, for a jailed foreign runtime where /td/store is not
+//! mounted. Both sets need a binary that works when the closure does not, which
 //! is what this one is.
 //!
 //! uutils owns those `/bin` names (the farms are disjoint), so these are reached
@@ -119,6 +120,7 @@ const APPLETS: &[(&str, Applet)] = &[
     ("less", less::run),
     ("ln", fileops::ln),
     ("mkdir", fileops::mkdir),
+    ("mv", fileops::mv),
     ("od", od::run),
     ("printf", printf::run),
     ("ps", ps::run),

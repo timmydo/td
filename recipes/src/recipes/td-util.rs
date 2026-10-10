@@ -17,12 +17,13 @@ use crate::types::{Recipe, Step};
 // `cat`, `chmod`, `chown`, `ln`, `mkdir`, `printf`, `readlink`, `rm`, `sleep` and
 // `test` it DOES provide — dynamically linked, which the pre-pivot initramfs has no
 // loader for and which `/etc/rootcheck` must not depend on, since reporting a broken
-// runtime closure is its job. Those ten carry no `/bin` name here (uutils owns them
-// and the farms are disjoint) and are reached as `td-util <applet>`.
+// runtime closure is its job. `mv` joins them for td-jail-test's jailed foreign
+// runtime, where /td/store is not mounted. Those eleven carry no `/bin` name here
+// (uutils owns them and the farms are disjoint) and are reached as `td-util <applet>`.
 //
 // A third kind replaces busybox in the build graph: find, xargs, cmp, diff,
 // gzip/gunzip/zcat and cpio. They are served by `td-util <applet>` like the
-// ten above and get no `/bin` name. `find` and `xargs` are the retired
+// eleven above and get no `/bin` name. `find` and `xargs` are the retired
 // findutils words, so the ladder guard's TOOL_PROVIDER_BODIES names the three
 // bodies that serve them. main.rs's two `#[path]` includes reach the engine's
 // CRC and inflater, staged at the checkout's layout below.
@@ -39,7 +40,7 @@ use crate::types::{Recipe, Step};
 // syscall this roster does not have, which is a further reviewed amendment.
 //
 // system-x86-64 packs td-util into the real root AND both initramfs cpios, routes
-// /bin/{clear,which,free,ps,dmesg,less} here, and calls the other ten as
+// /bin/{clear,which,free,ps,dmesg,less} here, and calls the others as
 // `td-util <applet>` where it used to call `busybox <applet>`. The greeter runs each
 // by its /bin path and emits TD_UTIL_RUNTIME_MARKER only if all six exit 0, so
 // `td-recipe-eval qemu-boot-system` re-proves the whole
